@@ -1126,8 +1126,9 @@ fn kr_req_07_60_a_close_ends_the_server_and_what_it_started_after_the_acceptance
     );
 }
 
-/// KR-REQ-07.60: a server that ignores both the end of its input and a terminate, with a command
-/// that ignores a terminate too, is ended by force with the command when the program ends.
+/// KR-REQ-07.60 and KR-REQ-07.53: a server that ignores both the end of its input and a terminate,
+/// with a command that ignores a terminate too, is ended by force with the command when the program
+/// ends, and not before five seconds after the program's end began the ending.
 #[test]
 fn kr_req_07_60_a_stubborn_server_and_its_command_end_by_force_with_the_program() {
     let shell = Gateway::new();
@@ -1150,12 +1151,18 @@ fn kr_req_07_60_a_stubborn_server_and_its_command_end_by_force_with_the_program(
     });
     let server = shell.servers().remove(0);
     let started = shell.started_by_servers();
+    let killed = std::time::Instant::now();
     let _ = launched.child.kill();
     let _ = launched.ends();
     for process in std::iter::once(&server).chain(&started) {
         eventually("everything the server started ended with it", || {
             kr_ipc::identity::process_state(process) == kr_ipc::identity::ProcessState::Ended
         });
+        assert!(
+            killed.elapsed() >= std::time::Duration::from_secs(5),
+            "{process:?} was forced {:?} after the program was killed",
+            killed.elapsed()
+        );
     }
 }
 

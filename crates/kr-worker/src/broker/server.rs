@@ -11,15 +11,19 @@
 //! hashed. From the moment it exists it is held by a guard: if nothing retires it, dropping it ends
 //! the process by its identity.
 //!
-//! **Ending.** One operation, whatever the reason: the server's input is closed and it is given a
-//! moment to finish what it does when its input ends, which for the application's own server is to
-//! end the commands it started; if it is still there it is asked to terminate (never to hang up: a
-//! hang-up kills it at once and leaves its commands behind) and given a moment more; if it is
-//! still there it is ended. Then every process the session recorded below it is ended by its
-//! identity, because a command of the server's leaves its process group and its session and
-//! outlives a server that dies. What the session recorded is read before the server is asked
-//! anything and again before it is ended, since a command whose parent has gone can no longer be
-//! found by its parentage. A process the ladder ends by force is noted as forced.
+//! **Ending.** One operation, whatever the reason, with one window of five seconds from the moment
+//! it begins, and nothing in it is forced before the window is over. The server's input is closed
+//! and it is given a moment to finish what it does when its input ends, which for the
+//! application's own server is to end the commands it started. If it is still there it is asked to
+//! terminate (never to hang up: a hang-up kills it at once and leaves its commands behind), and so
+//! is every process the session recorded below it, which is ended by its identity because a
+//! command of the server's leaves its process group and its session and outlives a server that
+//! dies; a recorded process is asked as soon as the server is gone when that is sooner. What is
+//! still running when the window is over is ended by force, and a process that was forced has two
+//! more seconds to be gone, after which the survivors are recorded. What the session recorded is
+//! read before the server is asked anything and again before it is ended, since a command whose
+//! parent has gone can no longer be found by its parentage. A process the ending forces is noted
+//! as forced.
 //!
 //! **A limit.** On Linux the worker is the child subreaper, so a command the server leaves behind
 //! and the ladder then ends is a child of the worker's that nothing collects: it stays in the
@@ -45,14 +49,16 @@ use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
 use crate::broker::image::{ExecutableIdentity, HashedFiles, VerifiedFiles};
 
-/// How long the server has to end after its input has closed.
+/// How long the server has to end after its input has closed, before it is asked to terminate.
 pub const INPUT_GRACE: Duration = Duration::from_millis(1500);
 
-/// How long it has to end after it was asked to terminate.
-pub const TERMINATE_GRACE: Duration = Duration::from_millis(1500);
+/// How long an ending lasts before anything in it is forced, counted from its beginning: the
+/// grace a session gives the processes it owns.
+pub const GRACE_WINDOW: Duration = crate::session::GRACE_PERIOD;
 
-/// How long a process that was ended by force has to be gone.
-pub const FORCE_WAIT: Duration = Duration::from_secs(5);
+/// How long a process that was ended by force has to be gone: the drain a session gives after it
+/// forces what it owns.
+pub const FORCE_WAIT: Duration = crate::session::DRAIN_PERIOD;
 
 /// How much of what the server writes to its error stream is kept: the last of it.
 pub const MAX_ERROR_BYTES: usize = 64 * 1024;
@@ -115,10 +121,10 @@ pub enum Ended {
     Already,
     /// It ended when its input closed.
     Input,
-    /// It ended when it was asked to terminate.
+    /// It ended when it was asked to terminate, within the window.
     Terminate,
-    /// It was still running a moment after it was asked to terminate, and was ended by force, or
-    /// ended of itself as that was done.
+    /// It was still running when the window was over, and was ended by force, or ended of itself
+    /// as that was done.
     Force,
     /// It was still running when the ending was over: a signal was refused, or it did not end in
     /// the time a forced end is given. It is among the survivors.
@@ -426,13 +432,13 @@ impl Server {
         self.errors.text()
     }
 
-    /// Waits up to `grace` for the server to end, and reaps it when it has.
-    async fn ended_within(&self, grace: Duration) -> bool {
+    /// Waits until `deadline` for the server to end, and reaps it when it has.
+    async fn ended_by(&self, deadline: tokio::time::Instant) -> bool {
         let mut held = self.child.lock().await;
         let Some(child) = held.as_mut() else {
             return true;
         };
-        match tokio::time::timeout(grace, child.wait()).await {
+        match tokio::time::timeout_at(deadline, child.wait()).await {
             Ok(Ok(_)) => {
                 *held = None;
                 true
@@ -440,7 +446,7 @@ impl Server {
             // The system will not say how it ended, so the kernel is asked whether it did.
             Ok(Err(_)) => {
                 let mut remaining = vec![self.identity.clone()];
-                wait_until_ended(&mut remaining, grace).await;
+                wait_until_ended(&mut remaining, deadline).await;
                 remaining.is_empty()
             }
             Err(_) => false,
@@ -481,20 +487,24 @@ impl Server {
     /// What comes back says how the server ended, which processes were ended by force, and which
     /// are still running: the server too, when it would not end.
     pub async fn retire(&self, owned: &dyn Owned) -> Retirement {
+        let begun = tokio::time::Instant::now();
+        let window_over = begun + GRACE_WINDOW;
         let mut known: BTreeSet<ProcessStartIdentity> =
             owned.below(&self.identity).into_iter().collect();
+        let mut asked = BTreeSet::new();
         let mut forced = Vec::new();
-        let ended = if self.ended_within(Duration::ZERO).await {
+        let ended = if self.ended_by(begun).await {
             Ended::Already
         } else {
             // Its input closes, and with it the application's own end of the session.
             self.input.close();
-            if self.ended_within(INPUT_GRACE).await {
+            if self.ended_by(begun + INPUT_GRACE).await {
                 Ended::Input
             } else {
                 known.extend(owned.below(&self.identity));
                 self.ask(Stop::Term, owned).await;
-                if self.ended_within(TERMINATE_GRACE).await {
+                ask_below(&known, &mut asked, owned);
+                if self.ended_by(window_over).await {
                     Ended::Terminate
                 } else {
                     // The last reading before the process that holds the trees is gone.
@@ -503,7 +513,10 @@ impl Server {
                         owned.forced(&self.identity);
                         forced.push(self.identity.clone());
                     }
-                    if self.ended_within(FORCE_WAIT).await {
+                    if self
+                        .ended_by(tokio::time::Instant::now() + FORCE_WAIT)
+                        .await
+                    {
                         Ended::Force
                     } else {
                         Ended::Alive
@@ -511,7 +524,15 @@ impl Server {
                 }
             }
         };
-        let mut survivors = end_below(&self.identity, known, owned, &mut forced).await;
+        let mut survivors = end_below(
+            &self.identity,
+            known,
+            asked,
+            window_over,
+            owned,
+            &mut forced,
+        )
+        .await;
         if ended == Ended::Alive {
             // The guard has one more try when this is dropped.
             survivors.push(self.identity.clone());
@@ -549,13 +570,28 @@ fn is_variable_name(name: &[u8]) -> bool {
     !name.is_empty() && !name.contains(&b'=') && !name.contains(&0)
 }
 
+/// Asks each of `known` that is running and has not been asked to terminate, by its identity.
+fn ask_below(
+    known: &BTreeSet<ProcessStartIdentity>,
+    asked: &mut BTreeSet<ProcessStartIdentity>,
+    owned: &dyn Owned,
+) {
+    for process in known {
+        if process_state(process) != ProcessState::Ended && asked.insert(process.clone()) {
+            signal(process, Stop::Term, owned);
+        }
+    }
+}
+
 /// Ends each process recorded below `server` that is running, by its identity: asked to terminate
-/// first and given a moment, then ended. The record is read again after each wait, since a process
-/// that was ended may have started another that the session recorded meanwhile. Returns the
-/// processes still running at the end.
+/// if it has not been, given until `window_over`, then ended by force. The record is read again
+/// after each wait, since a process that was ended may have started another that the session
+/// recorded meanwhile. Returns the processes still running at the end.
 async fn end_below(
     server: &ProcessStartIdentity,
     mut known: BTreeSet<ProcessStartIdentity>,
+    mut asked: BTreeSet<ProcessStartIdentity>,
+    window_over: tokio::time::Instant,
     owned: &dyn Owned,
     forced: &mut Vec<ProcessStartIdentity>,
 ) -> Vec<ProcessStartIdentity> {
@@ -566,11 +602,9 @@ async fn end_below(
             .collect()
     };
     known.extend(owned.below(server));
+    ask_below(&known, &mut asked, owned);
     let mut remaining = running(&known);
-    for process in &remaining {
-        signal(process, Stop::Term, owned);
-    }
-    wait_until_ended(&mut remaining, TERMINATE_GRACE).await;
+    wait_until_ended(&mut remaining, window_over).await;
     // A few rounds: each ends what is running and reads the record for what that left.
     for _ in 0..KILL_ROUNDS {
         known.extend(owned.below(server));
@@ -584,7 +618,7 @@ async fn end_below(
                 forced.push(process.clone());
             }
         }
-        wait_until_ended(&mut remaining, FORCE_WAIT).await;
+        wait_until_ended(&mut remaining, tokio::time::Instant::now() + FORCE_WAIT).await;
     }
     known.extend(owned.below(server));
     running(&known)
@@ -606,10 +640,12 @@ fn signal(process: &ProcessStartIdentity, stop: Stop, owned: &dyn Owned) -> bool
     }
 }
 
-/// Waits up to `grace` for every process in `remaining` to be gone, and leaves the ones that are
-/// not.
-async fn wait_until_ended(remaining: &mut Vec<ProcessStartIdentity>, grace: Duration) {
-    let deadline = tokio::time::Instant::now() + grace;
+/// Waits until `deadline` for every process in `remaining` to be gone, and leaves the ones that
+/// are not.
+async fn wait_until_ended(
+    remaining: &mut Vec<ProcessStartIdentity>,
+    deadline: tokio::time::Instant,
+) {
     loop {
         remaining.retain(|process| process_state(process) != ProcessState::Ended);
         if remaining.is_empty() || tokio::time::Instant::now() >= deadline {

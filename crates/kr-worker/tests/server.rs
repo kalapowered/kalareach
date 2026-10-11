@@ -8,6 +8,7 @@
 //! | Row | What proves it |
 //! | --- | --- |
 //! | KR-REQ-07.60 | a server is started in a group of its own with the presented environment less the two variables that name the launch, in the directory asked, only when the executable is the one the record names; an ending that needs no more than the end of its input, one that needs a terminate, and one that needs force each end the server and what the session recorded below it, a command that outlived a server that died included; the server's error stream is read and only its last part kept |
+//! | KR-REQ-07.53 | an ending forces nothing before five seconds from its beginning: a server and a command that ignore everything they are asked are still there just before it and are forced after it, a command that outlives a server that ended is too, and one that ends when it is asked within the five seconds is not forced |
 //! | KR-REQ-07.66 | a process the ladder ends by force is noted as forced, and none that ended when it was asked is |
 
 #![cfg(unix)]
@@ -271,6 +272,26 @@ async fn goes(process: &ProcessStartIdentity) -> bool {
     true
 }
 
+/// Watches `processes` from now on, and returns when each was first seen gone, in the order given.
+/// A process is seen no earlier than it went, so a time read from here is never before its end.
+fn watch_until_gone(processes: Vec<ProcessStartIdentity>) -> tokio::task::JoinHandle<Vec<Instant>> {
+    tokio::spawn(async move {
+        let mut seen: Vec<Option<Instant>> = vec![None; processes.len()];
+        while seen.iter().any(Option::is_none) {
+            for (process, at) in processes.iter().zip(seen.iter_mut()) {
+                if at.is_none() && gone(process) {
+                    *at = Some(Instant::now());
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        seen.into_iter().flatten().collect()
+    })
+}
+
+/// The five seconds section 7 gives an ending before anything in it is forced.
+const FIVE_SECONDS: Duration = Duration::from_secs(5);
+
 /// Waits until the server's error stream has said `text`, and says whether it did. What the server
 /// wrote before it ended is read by a task of its own, which is a moment behind.
 async fn says(server: &Server, text: &str) -> bool {
@@ -333,6 +354,8 @@ async fn kr_req_07_66_a_server_and_a_command_that_ignore_a_terminate_are_ended_b
     let _session = to_the_approval(&server).await;
     let command = command_of(&server, &record).await;
 
+    let begun = Instant::now();
+    let watching = watch_until_gone(vec![server.identity().clone(), command.clone()]);
     let retirement = server.retire(&record).await;
     assert_eq!(retirement.ended, Ended::Force);
     assert!(retirement.forced.contains(server.identity()));
@@ -344,6 +367,46 @@ async fn kr_req_07_66_a_server_and_a_command_that_ignore_a_terminate_are_ended_b
     assert!(retirement.survivors.is_empty());
     assert!(gone(server.identity()) && gone(&command));
     assert_eq!(*record.forced.lock().expect("the list"), retirement.forced);
+    // KR-REQ-07.53: both were there until the five seconds were over, and no longer.
+    for (what, went) in ["the server", "its command"]
+        .into_iter()
+        .zip(watching.await.expect("the watch is joined"))
+    {
+        assert!(
+            went.duration_since(begun) >= FIVE_SECONDS,
+            "{what} was forced {:?} after the ending began",
+            went.duration_since(begun)
+        );
+    }
+}
+
+/// A command that ends when it is asked to terminate ends within the five seconds, whether or not
+/// its server does: it is asked while the server still ignores everything, and is not forced; the
+/// server is.
+#[tokio::test]
+async fn kr_req_07_53_a_command_that_ends_when_asked_is_not_forced_with_a_server_that_will_not() {
+    let stand_in = stand_in();
+    let server = start(&stand_in, "ignore-eof,ignore-term", PLAIN).await;
+    let record = Record::of(&server);
+    let _session = to_the_approval(&server).await;
+    let command = command_of(&server, &record).await;
+
+    let begun = Instant::now();
+    let watching = watch_until_gone(vec![command.clone(), server.identity().clone()]);
+    let retirement = server.retire(&record).await;
+    assert_eq!(retirement.ended, Ended::Force);
+    assert_eq!(retirement.forced, vec![server.identity().clone()]);
+    assert!(retirement.survivors.is_empty());
+    let went = watching.await.expect("the watch is joined");
+    assert!(
+        went[0].duration_since(begun) < FIVE_SECONDS,
+        "the command was still there when the five seconds were over"
+    );
+    assert!(
+        went[1].duration_since(begun) >= FIVE_SECONDS,
+        "the server was forced {:?} after the ending began",
+        went[1].duration_since(begun)
+    );
 }
 
 /// A server that dies with its command running leaves a command no parent names, and the ladder
@@ -369,6 +432,8 @@ async fn kr_req_07_60_a_command_that_outlives_a_server_that_died_is_ended_by_wha
     }
     assert!(!gone(&command), "the command outlived the server");
 
+    let begun = Instant::now();
+    let watching = watch_until_gone(vec![command.clone()]);
     let retirement = server.retire(&record).await;
     assert_eq!(retirement.ended, Ended::Already);
     assert!(
@@ -378,6 +443,14 @@ async fn kr_req_07_60_a_command_that_outlives_a_server_that_died_is_ended_by_wha
     );
     assert!(retirement.survivors.is_empty());
     assert!(gone(&command));
+    // KR-REQ-07.53: it was asked to terminate when the ending began, ignored it, and was there
+    // until the five seconds were over.
+    let went = watching.await.expect("the watch is joined")[0];
+    assert!(
+        went.duration_since(begun) >= FIVE_SECONDS,
+        "the command was forced {:?} after the ending began",
+        went.duration_since(begun)
+    );
 }
 
 /// A server that writes without end to its error stream is not stopped by it, and only the last of
