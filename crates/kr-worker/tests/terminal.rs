@@ -1473,7 +1473,15 @@ async fn kr_req_10_50_a_screen_preview_is_the_buffer_that_is_showing_and_not_the
          printf 'on the alternate screen\\n'; read -r _",
     )
     .await;
-    produced(&host.runtime, b"on the alternate screen\r\n").await;
+    // A Windows pseudo-console draws the alternate screen itself, one row at a time, and clears
+    // the rest of a row before it ends the line, so the line arrives as the text, the clear and
+    // then the line ending.
+    let line: &[u8] = if cfg!(windows) {
+        b"on the alternate screen\x1b[K\r\n"
+    } else {
+        b"on the alternate screen\r\n"
+    };
+    produced(&host.runtime, line).await;
 
     let preview = screen_previewed(&host, true)
         .await
