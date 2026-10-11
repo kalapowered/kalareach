@@ -100,7 +100,8 @@ configuration file this host reads.
 
 ```json
 {
-  "version": 2,
+  "version": 3,
+  "level": 1,
   "revision": 3,
   "preferences": { "sleep_inhibition": "mains_only" },
   "profiles": { "review": { "worker_profile": "headless_user" } },
@@ -121,11 +122,12 @@ configuration file this host reads.
 
 | Rule | What it means |
 | --- | --- |
-| `version` | The schema version, 2. A document at version 1 is read as one at version 2 with no `storage` section, and the next edit writes it at version 2. A document declaring any other version is left exactly as it is, nothing is read out of it, the host fails closed until it is put right, and `kr doctor` reports the version it found and what to do |
+| `version` | The schema version, 3. A document at version 1 or 2 is read as one at version 3 with the sections it lacks left out, and the next edit writes it at version 3. A document declaring any other version is left exactly as it is, nothing is read out of it, the host fails closed until it is put right, and `kr doctor` reports the version it found and what to do |
+| `level` | The highest level among the sections the document holds that arrived with a level. A writer sets it, and a document that states none is at level 1. See "Levels" below |
 | `revision` | Rises by one with each validated edit. An edit names the revision it was built on and is refused if another writer moved it first, so no edit silently erases another |
 | 64 KiB | The most of the document that is ever read. A larger file is not one of ours and is refused rather than parsed |
 | owner-only | A document that is a symbolic link, or that belongs to another user, is refused rather than read |
-| unknown fields | Refused. A misspelled key is a mistake a person can see, not a setting that quietly does nothing |
+| unknown fields | Refused, in a document at or below the reader's level. A misspelled key is a mistake a person can see, not a setting that quietly does nothing. See "Levels" for a document above it |
 | omitted fields | The product's own value, and reported as the product's own. Every budget inside `enrolment` is separate: the example above configures one of the eleven, and `kr doctor` names that one rather than reporting eleven choices nobody made |
 
 If the host cannot use a configuration document, it leaves the document alone and fails closed. The
@@ -145,6 +147,16 @@ write, within the size bound. The refusal and the descriptions follow the docume
 acceptance, which `kr doctor` and `kr new` make, and a create makes while the document is unusable.
 When the problem is fixed, descriptions and new sessions return then, and the closed selections
 return at the next start of the daemon.
+
+### Levels
+
+If a document has sections added which are optional (if the section doesn't exist, the setting doesn't apply) and can be added without creating a new version, they are added with a level. The `level` member defines the highest level of all sections in the document. The level is written by the release which edits the document. A document with no newer sections will have a level of 1. All releases which read version 3 documents will read this document strictly.
+
+A release reading a document of the same or lower level will read it strictly like any other document. Any unknown key will cause the document to be refused. If a release encounters a document of a higher level, it will ignore any unknown top-level sections, record how many it ignores, and proceed to apply the document. Any sections it does know will be read strictly, all the way down. The host will not fail closed since no new level will remove options. However, `kr doctor` will show a warning with the levels, and the number of ignored sections. The names of the sections will be printed to the console, but the report sent to support will only contain the class and length of each name.
+
+This release will not edit these documents, since doing so would remove the newer sections. Instead, it will not write anything when asked to edit one of these documents. To edit, either switch to a release which reads documents of this level, or remove the newer sections and lower `level`.
+
+If a document contains a key which matches closely to an existing key (for example, `ceilngs` or a top-level field of `ceilings` ), it will be refused as an invalid document, with a note containing the name of the matched key. This is because removing this key would remove a restriction. A restriction is never a level: anything that narrows what a host may do stays in `ceilings` and raises the version.
 
 Editing is validated before a revision is applied, and one writer edits at a time: a writer takes an
 operating-system lock on `.config.lock` in the environment's state directory, reads, validates,
