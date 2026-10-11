@@ -171,6 +171,15 @@ impl Fixture {
     /// socket: what the host's local owner must do on an exclusively organisation-managed host
     /// before it is served anything but what recovers the host.
     pub async fn lease_the_local_owner(&self) -> MembershipPresentResult {
+        self.try_to_lease_the_local_owner()
+            .await
+            .expect("the host takes the lease for its local owner")
+    }
+
+    /// As [`Self::lease_the_local_owner`], answering with the host's refusal where it refuses.
+    pub async fn try_to_lease_the_local_owner(
+        &self,
+    ) -> Result<MembershipPresentResult, ProtocolError> {
         let listed = self.listed().await;
         let lease = self.organisation.lease(
             2,
@@ -191,7 +200,6 @@ impl Fixture {
             },
         )
         .await
-        .expect("the host takes the lease for its local owner")
     }
 
     /// The authority revision the host's policy follows now.

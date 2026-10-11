@@ -981,6 +981,34 @@ async fn an_exclusive_host_recovers_after_its_leases_ended_and_after_a_restart()
     fixture.host.stop().await;
 }
 
+/// KR-REQ-17.54: the host's own local owner answers to a lease only on a host that is exclusively
+/// organisation-managed. Before that the host refuses a lease for its own key and says why, and it
+/// takes the same lease once the owner has made the host exclusive.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_host_takes_a_lease_for_its_own_key_only_once_it_is_exclusively_organisation_managed() {
+    let fixture = Fixture::start().await;
+    let refused = fixture
+        .try_to_lease_the_local_owner()
+        .await
+        .expect_err("a host that is not exclusive takes no lease for its own local owner");
+    assert_eq!(refused.code, ErrorCode::PermissionDenied, "{refused:?}");
+    assert!(
+        refused
+            .message
+            .contains("not exclusively organisation-managed"),
+        "{refused:?}"
+    );
+
+    let mut client = fixture.host.client().await;
+    fixture
+        .set_exclusive(&mut client, ActionId::new(kr_ipc::new_uuid()), true)
+        .await
+        .expect("the owner makes the host exclusive");
+    drop(client);
+    fixture.lease_the_local_owner().await;
+    fixture.host.stop().await;
+}
+
 /// KR-REQ-17.54: what recovers the host is for the device that can recover it. An owner's device
 /// whose grant ends is refused on a lapsed exclusive host, a leased owner device keeps every
 /// confirmation, and the confirmation of ending exclusive management is not carried by a device
