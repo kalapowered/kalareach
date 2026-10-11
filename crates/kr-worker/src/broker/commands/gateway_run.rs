@@ -18,8 +18,9 @@
 //!   connection within the bound ends the server through one operation (see
 //!   [`crate::broker::server`]), run in a task of its own that retiring the backend does not abort.
 //!   A session that is closing ends its servers after the acceptance of its close is delivered, so
-//!   until then none of those ends the server: the connection ending leaves the server running with
-//!   its input open and its output read and discarded.
+//!   until then none of the first three ends the server: the connection ending leaves the server
+//!   running with its input open and its output read and discarded. (The bound for a program that
+//!   never connected ends a server nothing ever spoke to, whatever the session is doing.)
 
 use std::pin::Pin;
 use std::sync::atomic::Ordering;
@@ -53,9 +54,10 @@ const START_DEADLINE: Duration = Duration::from_millis(1700);
 
 /// The server's output as the program's connection reads it.
 ///
-/// When the connection lets go of it, it is not closed: it is read and discarded until the server
-/// ends. A server whose output is closed fails its next write, and an application server is right
-/// to end its commands then; one of them may be what asked the session to close.
+/// When the connection lets go of it, it is not closed: it is read and discarded until the pipe
+/// closes, which is when the server and everything that inherited it have let go. A server whose
+/// output is closed fails its next write, and an application server is right to end its commands
+/// then; one of them may be what asked the session to close.
 struct LentOutput {
     output: Option<ChildStdout>,
 }
@@ -168,11 +170,12 @@ impl Backend {
         }
     }
 
-    /// Ends what the program's connection leaves when it ends: the server too, unless the session
-    /// is closing, whose closure ends the servers after the acceptance of its close has been
-    /// delivered ([`CommandBackends::end_servers`]), since the command that asked for the close may
-    /// be one the server started.
-    pub(super) fn end_after_connection(&self) {
+    /// Ends the server, unless the session is closing, whose closure ends the servers after the
+    /// acceptance of its close has been delivered ([`CommandBackends::end_servers`]), since the
+    /// command that asked for the close may be one the server started. It is what the end of the
+    /// program's connection, the end of the program and a retirement ask for; a launch that had
+    /// not committed has no such command and ends its server outright ([`Backend::end_gateway`]).
+    pub(super) fn end_unless_closing(&self) {
         if !self.closing.load(Ordering::SeqCst) {
             self.end_gateway();
         }
@@ -355,7 +358,7 @@ fn end_unconnected(backend: &Arc<Backend>, broker: &Arc<Broker>) {
         backend.application_instance_id,
         crate::broker::InstanceEnding::NativeExit,
     );
-    backend.end_gateway();
+    backend.end_unless_closing();
     backend.announce_ended();
 }
 
@@ -471,6 +474,6 @@ async fn handle(
             delivering.abort();
         }
         // The connection is over, and nothing is left for the server to serve.
-        backend.end_after_connection();
+        backend.end_unless_closing();
     });
 }
