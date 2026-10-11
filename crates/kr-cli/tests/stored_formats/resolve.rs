@@ -67,6 +67,11 @@ const STANDARD_CRATES: [&str; 3] = ["std", "core", "alloc"];
 /// The deepest chain of re-exports and `use` lines followed.
 const DEPTH: usize = 12;
 
+/// Whether `why` says only that a name is not in the place that was looked in: what a module that
+/// lacks it answers, as opposed to a module the walk cannot follow.
+fn is_absence(why: &str) -> bool {
+    why.contains(" is neither defined ")
+}
 /// One `use` line, reduced to the name it binds and the path it names.
 #[derive(Clone, Debug)]
 struct Binding {
@@ -301,21 +306,14 @@ impl Workspace {
             let (inner_crate, inner_module) = Self::place_of(&file)?;
             return self.follow(&inner_crate, &inner_module, &binding.path, depth + 1, &file);
         }
-        for glob in &contents.globs {
-            // What a glob of the standard library brings in is known by name, and nothing else is
-            // taken to come from it.
-            if glob
-                .first()
-                .is_some_and(|first| STANDARD_CRATES.contains(&first.as_str()))
-            {
-                continue;
-            }
-            let (inner_crate, inner_module) = Self::place_of(&file)?;
-            let mut path = glob.clone();
-            path.push(name.to_owned());
-            if let Ok(found) = self.follow(&inner_crate, &inner_module, &path, depth + 1, &file) {
-                return Ok(found);
-            }
+        // What a glob of the standard library brings in is known by name, and nothing else is
+        // taken to come from it.
+        let (inner_crate, inner_module) = Self::place_of(&file)?;
+        let globbed = Self::through_globs(&contents.globs, name, &file, |path| {
+            self.follow(&inner_crate, &inner_module, path, depth + 1, &file)
+        })?;
+        if let Some(found) = globbed {
+            return Ok(found);
         }
         if contents.macro_words.contains(name) {
             return Ok(Type {
@@ -426,6 +424,51 @@ impl Workspace {
         self.defined_in(&start_crate, &full, name, depth)
     }
 
+    /// Where the glob imports of a file bring `name` in from, or `None` when none does.
+    ///
+    /// A glob that does not have the name is no failure; a glob that cannot be followed (an alias,
+    /// a module the walk refuses, an import too deep) might have had it, so the name is not taken
+    /// to be anything else, a standard name least of all, and what stopped it is the error. Two
+    /// globs that bring in different types of the name are an error too: the code would not build.
+    fn through_globs(
+        globs: &[Vec<String>],
+        name: &str,
+        holder: &str,
+        mut follow: impl FnMut(&[String]) -> Result<Type, String>,
+    ) -> Result<Option<Type>, String> {
+        let mut found: Vec<Type> = Vec::new();
+        for glob in globs {
+            if glob
+                .first()
+                .is_some_and(|first| STANDARD_CRATES.contains(&first.as_str()))
+            {
+                continue;
+            }
+            let mut path = glob.clone();
+            path.push(name.to_owned());
+            match follow(&path) {
+                Ok(brought) => {
+                    if !found.contains(&brought) {
+                        found.push(brought);
+                    }
+                }
+                Err(why) if is_absence(&why) => {}
+                Err(why) => {
+                    return Err(format!(
+                        "{name} may come from the glob {}::* in {holder}, which cannot be followed: {why}",
+                        glob.join("::")
+                    ));
+                }
+            }
+        }
+        if found.len() > 1 {
+            return Err(format!(
+                "{name} is brought into {holder} by more than one glob"
+            ));
+        }
+        Ok(found.pop())
+    }
+
     /// Where the bare name `name`, as written in `holder`, comes from.
     fn bare(
         &self,
@@ -459,18 +502,11 @@ impl Workspace {
             }
             return self.follow(krate, module, &binding.path, depth + 1, holder);
         }
-        for glob in &contents.globs {
-            if glob
-                .first()
-                .is_some_and(|first| STANDARD_CRATES.contains(&first.as_str()))
-            {
-                continue;
-            }
-            let mut path = glob.clone();
-            path.push(name.to_owned());
-            if let Ok(found) = self.follow(krate, module, &path, depth + 1, holder) {
-                return Ok(found);
-            }
+        let globbed = Self::through_globs(&contents.globs, name, holder, |path| {
+            self.follow(krate, module, path, depth + 1, holder)
+        })?;
+        if let Some(found) = globbed {
+            return Ok(found);
         }
         if STANDARD.contains(&name) {
             return Ok(Type {
