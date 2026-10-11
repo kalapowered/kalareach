@@ -58,9 +58,19 @@ pub(super) fn delegation_named(
         }],
         confirmation: Nullable::null(),
     };
+    voice_mutation_of(Method::VoiceDelegate, environment_id, &params)
+}
+
+/// A voice mutation of `method` as it reaches the host from a device, under a fresh action
+/// identifier.
+pub(super) fn voice_mutation_of<P: serde::Serialize>(
+    method: Method,
+    environment_id: kr_protocol::ids::EnvironmentId,
+    params: &P,
+) -> MutationRequest {
     MutationRequest {
         request_id: RequestId::new(1),
-        method: Method::VoiceDelegate.into(),
+        method: method.into(),
         method_version: MethodVersion::V1,
         action_id: ActionId::new(kr_ipc::new_uuid()),
         grant_id: Nullable::null(),
@@ -74,7 +84,7 @@ pub(super) fn delegation_named(
         expected: ParamsValue::empty(),
         action_window_id: ActionWindowId::new("device:test").expect("a window"),
         requested_ttl_ms: DurationMs::new(30_000),
-        params: ParamsValue::from_typed(&params).expect("encodes"),
+        params: ParamsValue::from_typed(params).expect("encodes"),
     }
 }
 
@@ -132,6 +142,24 @@ pub(super) async fn ask(
     device_id: kr_protocol::ids::DeviceId,
     mutation: &MutationRequest,
 ) -> crate::error::Result<ParamsValue> {
+    ask_voice(
+        controller,
+        actor_id,
+        device_id,
+        Method::VoiceDelegate,
+        mutation,
+    )
+    .await
+}
+
+/// A voice mutation of `method` submitted on a connection this host admitted, as `actor_id`.
+pub(super) async fn ask_voice(
+    controller: &Arc<Controller>,
+    actor_id: &kr_protocol::ids::ActorId,
+    device_id: kr_protocol::ids::DeviceId,
+    method: Method,
+    mutation: &MutationRequest,
+) -> crate::error::Result<ParamsValue> {
     let accepted = AcceptedDeadline {
         deadline: controller
             .clock
@@ -151,7 +179,7 @@ pub(super) async fn ask(
                 route: None,
             },
             mutation,
-            Method::VoiceDelegate,
+            method,
             revision,
             carried,
         )
