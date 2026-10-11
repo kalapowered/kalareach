@@ -1021,6 +1021,19 @@ fn shape_findings(name: &str, property: &Property) -> Vec<String> {
             "the section {name} is not an object that cannot be null: a nullable section is omitted when unused but read back as present, so the record differs from the file"
         ));
     }
+    // The section itself declares its fields and refuses any other. A map is allowed as a field
+    // inside it, never as the section, which would accept any key and read back differently from
+    // the copy the registry keeps once it is unused.
+    if schema
+        .get("properties")
+        .and_then(Value::as_object)
+        .is_none()
+        || schema.get("additionalProperties") != Some(&Value::Bool(false))
+    {
+        found.push(format!(
+            "the section {name} does not declare its fields and refuse every other: it has to be an object with properties and additionalProperties false, and a map may only be a field inside it"
+        ));
+    }
     open_objects(name, schema, &mut found);
     let nullable = |field: &Value| -> bool {
         let alternatives_null = |keyword: &str| {
@@ -1194,7 +1207,7 @@ fn level_findings(name: &str, now: &Observed, locked: &Locked) -> Vec<String> {
     let Some(levels) = &now.levels else {
         if locked.level.is_some() || locked.near_miss.is_some() || !locked.members.is_empty() {
             found.push(format!(
-                "the lock records levels for the store {name} and the code does not: write the lock"
+                "the lock records levels for the store {name} and the code does not: the levels of a store are kept, and the lock is not written without them"
             ));
         }
         return found;
@@ -1327,8 +1340,17 @@ pub fn write(
                     now.entry.version
                 ));
             }
-            if let Some(levels) = &now.levels {
-                refused.extend(level_refusals(name, now, levels, locked));
+            match &now.levels {
+                Some(levels) => refused.extend(level_refusals(name, now, levels, locked)),
+                None if locked.level.is_some()
+                    || locked.near_miss.is_some()
+                    || !locked.members.is_empty() =>
+                {
+                    refused.push(format!(
+                        "the levels of the store {name} would leave the lock: a store that has levels keeps them, and its level, its distance and its sections are not removed by a change that does not state them"
+                    ));
+                }
+                None => {}
             }
         }
     }
