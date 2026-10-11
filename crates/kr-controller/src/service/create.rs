@@ -254,19 +254,26 @@ impl Drop for CreateHold {
 }
 
 impl Controller {
-    /// Why this host creates no new session, when it cannot use its configuration document.
+    /// Accepts the configuration document again when this host holds one it cannot use, as every
+    /// `kr doctor` does, so one put right since the last acceptance lifts the refusal of a new
+    /// session on the next create without anything else asking.
     ///
-    /// The document is accepted again first, as every `kr doctor` does, so one put right since the
-    /// last acceptance lifts the refusal on the next create without anything else asking. That
-    /// acceptance is a whole one: a document that moves the rights ceiling, or owes a fence,
+    /// That acceptance is a whole one: a document that moves the rights ceiling, or owes a fence,
     /// withdraws the authority this connection was admitted under, and the create that triggered it
     /// is then refused as one made under withdrawn authority, to be made again on a new connection;
     /// `kr new` asks the host what it is configured as first, which takes the acceptance before it
-    /// creates.
-    async fn unusable_now(&self) -> Option<crate::config::Unusable> {
-        self.in_force().unusable.as_ref()?;
-        drop(self.accept_configuration().await);
-        self.in_force().unusable
+    /// creates. The refusal itself is decided later, against what is in force then.
+    async fn accept_when_unusable(&self) {
+        if self.in_force().unusable.is_some() {
+            drop(self.accept_configuration().await);
+        }
+    }
+
+    /// The refusal of a new session while the document in force is one this host cannot use.
+    fn refusal_for_unusable_document(&self) -> Option<ControllerError> {
+        self.in_force()
+            .unusable
+            .map(|unusable| ControllerError::NotConfigured(unusable.refusal()))
     }
 
     /// The environment a session started with the host's is given: the daemon's own, as it was
@@ -328,7 +335,7 @@ impl Controller {
         // among it: a document put right since the last acceptance is accepted first, so this
         // create is made under what it now says. Before the registry is locked, because accepting
         // the document takes that lock.
-        let unusable = self.unusable_now().await;
+        self.accept_when_unusable().await;
         // Before the reservation, because this is a request that can never be served rather than
         // one this environment happens to have no room for. The palette travels to the worker in
         // the launch specification and is recorded there; what cannot travel is a provenance
@@ -419,8 +426,11 @@ impl Controller {
             // A host that cannot use its configuration document creates no new session: the
             // owner's choice between the two execution contexts is in it, and neither is inside
             // the other. The request cannot say it chose: a client fills in the host's default.
-            if !known && let Some(unusable) = &unusable {
-                return Err(ControllerError::NotConfigured(unusable.refusal()));
+            // What is in force is read here, under the lock the reservation is taken under, and
+            // not before the lock was waited for: a document accepted while this create queued
+            // refuses it.
+            if !known && let Some(refusal) = self.refusal_for_unusable_document() {
+                return Err(refusal);
             }
             if !known && let Some(qualified) = qualified {
                 // Nothing is reserved and nothing is spawned before this, so an unsupported shell
@@ -534,7 +544,15 @@ impl Controller {
             // deadline, in that order. The registration is read with the registry lock already
             // held, which is the order a revocation takes, and the clock is read last, so the last
             // thing between this create and its launch is a reading with nothing left to wait for.
-            if let Err(refusal) = self.check_admission(&registry, &carried) {
+            //
+            // The document in force is read in the same section: one accepted as unusable while
+            // this create prepared its launch refuses it here, as an action whose authority was
+            // withdrawn is. A document accepted after this section has no create left to refuse;
+            // it was made before it.
+            if let Err(refusal) = self
+                .check_admission(&registry, &carried)
+                .and_then(|()| self.refusal_for_unusable_document().map_or(Ok(()), Err))
+            {
                 // Nothing was started, so the reservation is resolved as a confirmed failure and
                 // stops occupying the environment. The caller is told which of the two it was.
                 registry.set_phase(reservation.reservation_id, LaunchPhase::Failed)?;
