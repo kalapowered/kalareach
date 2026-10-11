@@ -1467,56 +1467,75 @@ describe('a kept draft an act is working on', () => {
   })
 })
 
+/**
+ * A book holding a prompt the host did not take and the store will not keep for its size, with
+ * another thing typed in the composer meanwhile. The store takes saves again from here on only
+ * when a test says so.
+ */
+async function withAnUnstoredPrompt(
+  store: FakeDraftStore,
+  port: HostPort = portOver(store)
+): Promise<{ readonly book: DraftBook; readonly id: string }> {
+  const book = new DraftBook(port)
+  await book.hydrate()
+  type(book, MAIN, 'send')
+  await book.settled()
+  store.refuseSaves({ code: 'QUOTA_EXCEEDED', message: 'too large to keep' })
+  type(book, MAIN, 'send this')
+  await book.settled()
+  const token = book.beginSend(MAIN)
+  type(book, MAIN, '')
+  type(book, MAIN, 'the next thing')
+  await book.settled()
+  book.endSend(token, 'refused')
+  await book.settled()
+  const held = book.snapshot().unstored[0]
+  expect(held?.text).toBe('send this')
+  return { book, id: held?.id ?? '' }
+}
+
 describe('an unstored prompt put in its composer', () => {
-  it('is in the composer, not stored, with the warning, and leaves the list', async () => {
+  it('is copied there, stays listed until the person lets go of it, and the warning is on', async () => {
     const store = new FakeDraftStore()
-    const book = await opened(store)
-    type(book, MAIN, 'send')
-    await book.settled()
-    store.refuseSaves({ code: 'QUOTA_EXCEEDED', message: 'too large to keep' })
-    type(book, MAIN, 'send this')
-    await book.settled()
-    const token = book.beginSend(MAIN)
-    type(book, MAIN, '')
-    type(book, MAIN, 'the next thing')
-    await book.settled()
-    book.endSend(token, 'refused')
-    await book.settled()
-    const held = book.snapshot().unstored[0]
-    expect(held?.text).toBe('send this')
+    const { book, id } = await withAnUnstoredPrompt(store)
 
     // The composer holds something else: the prompt is not put over it.
-    expect(await book.useUnstored(held?.id ?? '')).toBe(false)
+    expect(await book.useUnstored(id)).toBe(false)
     expect(book.snapshot().unstored).toHaveLength(1)
     expect(book.draft(MAIN).text).toBe('the next thing')
 
     type(book, MAIN, '')
     await book.settled()
-    expect(await book.useUnstored(held?.id ?? '')).toBe(true)
+    // A composer with nothing in it has nothing to keep: no failure is left from what it held.
+    expect(book.snapshot().problem).toBeNull()
+    expect(await book.useUnstored(id)).toBe(true)
     await book.settled()
     expect(book.draft(MAIN).text).toBe('send this')
-    expect(book.snapshot().unstored).toEqual([])
-    // It is in the composer only: the store refuses it for its size, and the person is told.
+    // The store was asked for it and refused: it is in the composer only, and the person is told.
+    expect(store.calls.at(-1)).toEqual({ kind: 'save', text: 'send this' })
     expect(store.all().map((draft) => draft.text)).not.toContain('send this')
     expect(book.snapshot().problem).not.toBeNull()
+    // The composer is a place the text can be lost from (its session can close with nothing stored
+    // for it), so the prompt stays listed, and says a copy is there.
+    expect(book.snapshot().unstored).toMatchObject([{ id, text: 'send this', inComposer: true }])
+
+    // Pressing again puts nothing anywhere and changes nothing.
+    expect(await book.useUnstored(id)).toBe(false)
+    expect(book.draft(MAIN).text).toBe('send this')
+
+    // The person clears the composer: the text is only in the list again, and can be put back.
+    type(book, MAIN, '')
+    await book.settled()
+    expect(book.snapshot().unstored).toMatchObject([{ id, inComposer: false }])
+    expect(book.snapshot().problem).toBeNull()
+
+    book.forgetUnstored(id)
+    expect(book.snapshot().unstored).toEqual([])
   })
 
-  it('is not put over a file that is still uploading, or a record waiting to be removed', async () => {
+  it('is not put over a file that is still uploading', async () => {
     const store = new FakeDraftStore()
-    const book = await opened(store)
-    type(book, MAIN, 'send')
-    await book.settled()
-    store.refuseSaves({ code: 'QUOTA_EXCEEDED', message: 'too large to keep' })
-    type(book, MAIN, 'send this')
-    await book.settled()
-    const token = book.beginSend(MAIN)
-    type(book, MAIN, '')
-    type(book, MAIN, 'the next thing')
-    await book.settled()
-    book.endSend(token, 'refused')
-    await book.settled()
-    const held = book.snapshot().unstored[0]
-    expect(held?.text).toBe('send this')
+    const { book, id } = await withAnUnstoredPrompt(store)
     type(book, MAIN, '')
     store.refuseSaves(null)
     await book.settled()
@@ -1538,8 +1557,74 @@ describe('an unstored prompt put in its composer', () => {
         }
       ]
     }))
-    expect(await book.useUnstored(held?.id ?? '')).toBe(false)
+    expect(await book.useUnstored(id)).toBe(false)
     expect(book.draft(MAIN).attachments).toHaveLength(1)
+    expect(book.snapshot().unstored).toHaveLength(1)
+  })
+
+  it('waits for the removal of the stored version the person cleared, and then puts the text there', async () => {
+    const store = new FakeDraftStore()
+    const real = portOver(store)
+    let armed = false
+    let release: () => void = () => undefined
+    const gate = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    let reach: () => void = () => undefined
+    const reached = new Promise<void>((resolve) => {
+      reach = resolve
+    })
+    const port: HostPort = {
+      ...real,
+      deviceDraftDiscard: async (request: DraftDiscardRequest) => {
+        if (armed) {
+          armed = false
+          reach()
+          await gate
+        }
+        return await real.deviceDraftDiscard(request)
+      }
+    }
+    const { book, id } = await withAnUnstoredPrompt(store, port)
+    // The composer's text is stored under a record, and the person clears it: the record is on its
+    // way out when the person asks for the prompt to be put there.
+    store.refuseSaves(null)
+    type(book, MAIN, 'stored for a moment')
+    await book.settled()
+    expect(store.all().map((draft) => draft.text)).toContain('stored for a moment')
+    armed = true
+    type(book, MAIN, '')
+    await reached
+
+    let answered = false
+    const using = book.useUnstored(id).then((put) => {
+      answered = true
+      return put
+    })
+    await Promise.resolve()
+    expect(answered).toBe(false)
+    release()
+    expect(await using).toBe(true)
+    await book.settled()
+    expect(book.draft(MAIN).text).toBe('send this')
+    // The version the person cleared is gone, and the text put there is what the store holds now.
+    const stored = store.all().map((draft) => draft.text)
+    expect(stored).not.toContain('stored for a moment')
+    expect(stored).toContain('send this')
+  })
+
+  it('is not put in a composer whose stored version could not be removed', async () => {
+    const store = new FakeDraftStore()
+    const { book, id } = await withAnUnstoredPrompt(store)
+    store.refuseSaves(null)
+    type(book, MAIN, 'stored for a moment')
+    await book.settled()
+    store.refuseDiscards({ code: 'STORAGE_UNAVAILABLE', message: 'the disk is full' })
+    type(book, MAIN, '')
+    await book.settled()
+
+    expect(await book.useUnstored(id)).toBe(false)
+    expect(book.draft(MAIN).text).toBe('')
     expect(book.snapshot().unstored).toHaveLength(1)
   })
 })
@@ -1579,10 +1664,75 @@ describe('a listed draft whose act failed', () => {
   })
 })
 
+describe('a listed draft whose act ended while the store would not be read', () => {
+  /** A store with two orphaned drafts and a book that has read them. */
+  async function twoDrafts(gate: ReturnType<typeof holding>, store: FakeDraftStore) {
+    for (const text of ['for a session that went', 'newer']) {
+      store.save({
+        id: null,
+        expectedRevision: null,
+        sessionId: BUILD,
+        applicationInstanceId: null,
+        agentBindingRevision: null,
+        state: 'orphaned',
+        text,
+        attachments: []
+      })
+    }
+    const book = new DraftBook(gate.port)
+    await book.hydrate()
+    const row = book.snapshot().kept.find((kept) => !kept.inComposer)
+    expect(row?.text).toBe('for a session that went')
+    return { book, row }
+  }
+
+  it('is back in the list when the act failed, though the list cannot be read again', async () => {
+    const store = new FakeDraftStore()
+    const gate = holding(store, 'deviceDraftDiscard', 'before')
+    const { book, row } = await twoDrafts(gate, store)
+    const discarding = book.discard(row?.id ?? '', row?.revision ?? '')
+    await gate.reached
+    await book.reload()
+    expect(book.snapshot().kept.some((kept) => kept.text === 'for a session that went')).toBe(false)
+    store.refuseDiscards({ code: 'STORAGE_UNAVAILABLE', message: 'the disk is full' })
+    store.breakOpening()
+    gate.release()
+    await expect(discarding).rejects.toMatchObject({ code: 'STORAGE_UNAVAILABLE' })
+    await book.settled()
+    expect(book.snapshot().kept.some((kept) => kept.text === 'for a session that went')).toBe(true)
+  })
+
+  it('stays out of the list when the act worked, though the list cannot be read again', async () => {
+    const store = new FakeDraftStore()
+    const gate = holding(store, 'deviceDraftDiscard', 'before')
+    const { book, row } = await twoDrafts(gate, store)
+    const discarding = book.discard(row?.id ?? '', row?.revision ?? '')
+    await gate.reached
+    await book.reload()
+    store.breakOpening()
+    gate.release()
+    await discarding
+    await book.settled()
+    expect(store.all().map((draft) => draft.text)).toEqual(['newer'])
+    expect(book.snapshot().kept.some((kept) => kept.text === 'for a session that went')).toBe(false)
+  })
+})
+
 describe('what the entry to the kept drafts says', () => {
+  const none = { kept: [], unreadable: 0, unstored: [] } as const
+  const one = { id: 'a', sessionId: MAIN, text: 'x', files: 0, inComposer: false }
+  const kept = {
+    id: 'k',
+    revision: '1',
+    sessionId: MAIN,
+    text: 'y',
+    files: 0,
+    why: 'other',
+    updatedAtMs: 1,
+    inComposer: false
+  } as const
+
   it('says text is held in this window only, and does not call it a kept draft', () => {
-    const none = { kept: [], unreadable: 0, unstored: [] } as const
-    const one = { id: 'a', sessionId: MAIN, text: 'x', files: 0 }
     expect(keptEntry(none)).toBeNull()
     expect(keptEntry({ ...none, unstored: [one] })).toMatchObject({
       title: 'One prompt held in this window only'
@@ -1590,5 +1740,12 @@ describe('what the entry to the kept drafts says', () => {
     expect(keptEntry({ ...none, unstored: [one, { ...one, id: 'b' }] })?.title).toBe(
       '2 prompts held in this window only'
     )
+  })
+
+  it('says it in the line a phone shows, when there are kept drafts as well', () => {
+    expect(keptEntry({ ...none, kept: [kept], unstored: [one] })?.title).toBe(
+      'One kept draft, and text held in this window only'
+    )
+    expect(keptEntry({ ...none, kept: [kept] })?.title).toBe('One kept draft')
   })
 })

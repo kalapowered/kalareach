@@ -46,6 +46,16 @@ function sessionName(session: Session): string {
   return `Session ${session.display_number} · ${session.cwd}`
 }
 
+/**
+ * How a draft's session is named: by its number and directory, as not listed when the host named
+ * the sessions it has and this was not one, and as unknown when the host could not be asked.
+ */
+function homeLine(sessions: readonly Session[] | null, sessionId: string): string {
+  if (sessions === null) return 'Its session cannot be listed now'
+  const home = sessions.find((session) => session.session_id === sessionId)
+  return home === undefined ? 'A session that is not listed' : sessionName(home)
+}
+
 /** The kept drafts, and what a person can do with each. */
 export function KeptDrafts({
   onBack,
@@ -91,22 +101,20 @@ export function KeptDrafts({
       })
   }
 
+  const stay =
+    unstored.length === 0
+      ? 'They stay on this device until you discard them, and nothing here is sent.'
+      : 'They stay on this device until you discard them, except text held in this window only, which is lost when the application closes. Nothing here is sent.'
   return (
     <>
       {phone ? (
-        <p className="small muted">
-          Drafts that are not in a composer. They stay on this device until you discard them, and
-          nothing here is sent.
-        </p>
+        <p className="small muted">Drafts that are not in a composer. {stay}</p>
       ) : (
         <header className="page-heading">
           <div>
             <p className="eyebrow">Sessions</p>
             <h1>Kept drafts</h1>
-            <p>
-              Drafts that are not in a composer. They stay on this device until you discard them, and
-              nothing here is sent.
-            </p>
+            <p>Drafts that are not in a composer. {stay}</p>
           </div>
           {onBack === undefined ? null : (
             <div className="page-actions">
@@ -158,20 +166,31 @@ export function KeptDrafts({
             return (
               <li className="kept-draft" data-testid="unstored-prompt" key={each.id}>
                 <p className="eyebrow">
-                  {home === null ? 'A session that is not listed' : sessionName(home)}
+                  {homeLine(sessions, each.sessionId)}
                   {' · '}held in this window only
                 </p>
                 <p className="small muted">
                   The host did not take this prompt, or could not say it did, and it is too long for
-                  this device to keep as a draft. It is held in this window only, so put it in its
-                  composer or copy it before the window is closed. Check that the agent did not take it
-                  before you send it again.
+                  this device to keep as a draft. It is held in this window only and is lost when the
+                  application closes.{' '}
+                  {each.inComposer
+                    ? ''
+                    : home === null
+                      ? 'Copy it before then.'
+                      : 'Put it in its composer or copy it before then.'}{' '}
+                  Check that the agent did not take it before you send it again.
                 </p>
+                {each.inComposer ? (
+                  <p className="small muted" data-testid="unstored-prompt-copy">
+                    A copy is in its composer. The device will not keep that copy either, so this one
+                    stays listed until you remove it.
+                  </p>
+                ) : null}
                 <pre className="kept-draft-text" data-testid="unstored-prompt-text" tabIndex={0}>
                   {each.text}
                 </pre>
                 <div className="row wrap">
-                  {home === null ? null : (
+                  {home === null || each.inComposer ? null : (
                     <Button
                       data-testid="unstored-prompt-use"
                       onClick={() => {
@@ -188,7 +207,7 @@ export function KeptDrafts({
                       book.forgetUnstored(each.id)
                     }}
                   >
-                    I have copied it
+                    {each.inComposer ? 'Remove it from this list' : 'I have copied it'}
                   </CommitButton>
                 </div>
               </li>
@@ -238,7 +257,7 @@ function KeptRow({
   const choices = (sessions ?? []).filter((session) => session.session_id !== kept.sessionId)
   return (
     <li className="kept-draft" data-testid="kept-draft" data-why={kept.why}>
-      <p className="eyebrow">{home === null ? 'A session that is not listed' : sessionName(home)}</p>
+      <p className="eyebrow">{homeLine(sessions, kept.sessionId)}</p>
       <p className="small muted" data-testid="kept-draft-why">
         {whyWords(kept.why)}
       </p>

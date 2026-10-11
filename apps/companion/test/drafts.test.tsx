@@ -345,22 +345,51 @@ describe('a prompt the host did not take, and the text it was sent from (KR-REQ-
     })
   })
 
-  it('puts the text of a prompt that is too long to keep in its composer, when the composer is empty', async () => {
+  it('puts a copy of a prompt that is too long to keep in its composer, and keeps it listed until the person lets go of it', async () => {
     const { person } = await withAnUnstoredPrompt()
     // Clear what was written since, so that the composer is empty.
     await person.clear(screen.getByTestId('composer-input'))
     await person.click(screen.getByRole('button', { name: 'Sessions' }))
     await person.click(await screen.findByRole('button', { name: 'One prompt' }))
     await person.click(await screen.findByTestId('unstored-prompt-use'))
+    // The composer is a place the text can be lost from, so the row stays and says a copy is there.
+    const row = await screen.findByTestId('unstored-prompt')
     await waitFor(() => {
-      expect(screen.queryByTestId('unstored-prompt')).toBeNull()
+      expect(within(row).getByText(/A copy is in its composer/)).toBeInTheDocument()
     })
+    expect(within(row).queryByTestId('unstored-prompt-use')).toBeNull()
+    expect(within(row).getByTestId('unstored-prompt-text')).toHaveTextContent('send this')
+
     await person.click(screen.getByRole('button', { name: 'Sessions' }))
     await person.click(await screen.findByTestId('session-row-1'))
     expect(await screen.findByTestId('composer-input')).toHaveValue('send this')
+
+    await person.click(screen.getByRole('button', { name: 'Sessions' }))
+    await person.click(await screen.findByRole('button', { name: 'One prompt' }))
+    await person.click(await screen.findByTestId('unstored-prompt-forget'))
+    await waitFor(() => {
+      expect(screen.queryByTestId('unstored-prompt')).toBeNull()
+    })
   })
 
-  it('offers no way to put it in a composer when the session is not listed, and names it as not listed', async () => {
+  it('offers no way to put it in a composer when the session is not listed, and does not tell a person to', async () => {
+    const { person } = await withAnUnstoredPrompt((port) => ({
+      ...port,
+      sessionList: async (request) => ({ ...(await port.sessionList(request)), sessions: [] })
+    }))
+    await person.click(screen.getByRole('button', { name: 'Sessions' }))
+    await person.click(await screen.findByRole('button', { name: 'One prompt' }))
+    const row = await screen.findByTestId('unstored-prompt')
+    await waitFor(() => {
+      expect(within(row).getByText(/A session that is not listed/)).toBeInTheDocument()
+    })
+    expect(within(row).queryByTestId('unstored-prompt-use')).toBeNull()
+    expect(within(row).queryByText(/put it in its composer/i)).toBeNull()
+    // The text can still be selected and copied, and let go of when it has been.
+    expect(within(row).getByTestId('unstored-prompt-text')).toHaveTextContent('send this')
+  })
+
+  it('does not say a session is not listed when the host could not be asked', async () => {
     const { person } = await withAnUnstoredPrompt((port) => ({
       ...port,
       sessionList: () => Promise.reject({ code: 'UNAVAILABLE', message: 'No host.', user_action: 'retry' })
@@ -368,9 +397,10 @@ describe('a prompt the host did not take, and the text it was sent from (KR-REQ-
     await person.click(screen.getByRole('button', { name: 'Sessions' }))
     await person.click(await screen.findByRole('button', { name: 'One prompt' }))
     const row = await screen.findByTestId('unstored-prompt')
-    expect(within(row).getByText(/A session that is not listed/)).toBeInTheDocument()
+    expect(within(row).queryByText(/A session that is not listed/)).toBeNull()
+    expect(within(row).getByText(/cannot be listed now/)).toBeInTheDocument()
     expect(within(row).queryByTestId('unstored-prompt-use')).toBeNull()
-    // The text can still be selected and copied, and let go of when it has been.
+    expect(within(row).queryByText(/put it in its composer/i)).toBeNull()
     expect(within(row).getByTestId('unstored-prompt-text')).toHaveTextContent('send this')
   })
 
