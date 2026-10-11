@@ -1978,10 +1978,20 @@ impl Controller {
             .policy
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // A floor still owed its record is written before anything is decided on it, as a typed
-        // request's decision does.
+        // A floor still owed its record is written before anything is decided on it, and nothing
+        // that reads the clock is decided while this boot's clock continuity is lost or the floor
+        // is owed its record, as a typed request's decision does ([`crate::grants::decide`]).
         self.write_owed_floor(&policy);
-        let now_ms = policy.settled_now(self.wall_now_ms());
+        let continuity_lost = policy.utc_floor().continuity_lost();
+        let now_ms = policy.utc_floor().observe(self.wall_now_ms());
+        if policy.stands_on_the_clock(&narrowed, kr_protocol::actor::ActorIngress::PairedDevice) {
+            if continuity_lost {
+                return Err(crate::grants::Refusal::ClockUnproven);
+            }
+            if policy.utc_floor().is_owed() {
+                return Err(crate::grants::Refusal::FloorUnrecorded);
+            }
+        }
         let request = crate::grants::AccessRequest {
             method: kr_protocol::method::Method::VoiceDelegate,
             ingress: kr_protocol::actor::ActorIngress::PairedDevice,
@@ -3308,6 +3318,46 @@ pub(crate) mod tests {
                 refused,
                 CeilingRefusal::Refused(Refusal::OfflineValidityLapsed { .. })
             ),
+            "{refused:?}"
+        );
+        drop(controller);
+    }
+
+    /// KR-REQ-26.16: a spoken action's read of a device's grant states a lapse the clock decided
+    /// only once the floor it stands on is on disk, as a typed request's decision does. Until then
+    /// the host cannot say the bound lapsed, because a restart with the clock set back could decide
+    /// the other way; once the floor is written the lapse is stated.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_lapse_is_not_stated_to_a_spoken_action_before_its_floor_is_on_disk() {
+        let temp = kr_ipc::testing::TempHost::create();
+        let (continuous, wall, clocks) = manual_clocks();
+        let controller = daemon_on(&temp, clocks).await;
+        let revision = controller.policy().authority_revision();
+        let synchronised = wall.load(std::sync::atomic::Ordering::SeqCst);
+        let hour = 60 * 60 * 1000;
+        choose_offline_bound(&controller, synchronised, hour);
+        let (lasting, _) = granted(GrantExpiry::Never, revision);
+        controller
+            .as_this_host_lets_it_be_used(lasting.clone())
+            .expect("inside the bound");
+
+        let registry = refuse_policy_writes(&temp);
+        continuous.advance(std::time::Duration::from_millis(2 * hour));
+        wall.store(synchronised + 2 * hour, std::sync::atomic::Ordering::SeqCst);
+        let refused = controller
+            .as_this_host_lets_it_be_used(lasting.clone())
+            .expect_err("the bound has run out");
+        assert!(
+            matches!(refused, Refusal::FloorUnrecorded),
+            "the lapse is not stated while its floor is not on disk: {refused:?}"
+        );
+
+        allow_policy_writes(&registry);
+        let refused = controller
+            .as_this_host_lets_it_be_used(lasting)
+            .expect_err("the bound has run out");
+        assert!(
+            matches!(refused, Refusal::OfflineValidityLapsed { .. }),
             "{refused:?}"
         );
         drop(controller);
