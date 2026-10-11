@@ -14,7 +14,7 @@ use tokio::process::{Child, Command};
 use tokio::signal::unix::{Signal, SignalKind, signal};
 
 use crate::contract::{Contract, Frame, RELEASE, Side};
-use crate::variants::{Variants, padded};
+use crate::variants::{SPEAK_VARIABLE, Variants, padded};
 
 /// The identifier of the one approval the server asks for.
 const APPROVAL: &str = "approval-1";
@@ -94,6 +94,31 @@ impl Server {
         let mut line = frame.to_string();
         line.push('\n');
         if self.out.write_all(line.as_bytes()).await.is_err() || self.out.flush().await.is_err() {
+            self.finish().await;
+        }
+    }
+
+    /// Writes one notification once the file `KR_STAND_IN_SPEAK` names exists, and leaves a file
+    /// beside it that says whether the write went; a write that fails ends the server's commands,
+    /// as every write that fails does.
+    async fn speak(&mut self, release: &std::path::Path) {
+        let frame = json!({
+            "method": "remoteControl/status/changed",
+            "params": {
+                "status": "disabled",
+                "serverName": "stand-in",
+                "installationId": "00000000-0000-4000-8000-000000000000",
+                "environmentId": null
+            }
+        });
+        let mut line = frame.to_string();
+        line.push('\n');
+        let wrote =
+            self.out.write_all(line.as_bytes()).await.is_ok() && self.out.flush().await.is_ok();
+        let mut marker = release.as_os_str().to_owned();
+        marker.push(".spoke");
+        let _ = std::fs::write(marker, if wrote { "wrote" } else { "failed" });
+        if !wrote {
             self.finish().await;
         }
     }
@@ -396,8 +421,20 @@ pub async fn run(variants: Variants) -> ! {
         commands: Vec::new(),
     };
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
+    let speak = server
+        .variants
+        .write_when_released
+        .then(|| std::env::var_os(SPEAK_VARIABLE).map(std::path::PathBuf::from))
+        .flatten();
+    let mut spoken = false;
     loop {
         tokio::select! {
+            () = tokio::time::sleep(std::time::Duration::from_millis(20)), if !spoken && speak.is_some() => {
+                if let Some(release) = speak.as_ref().filter(|release| release.exists()) {
+                    spoken = true;
+                    server.speak(release).await;
+                }
+            }
             () = terminated(&mut terminate) => {
                 if !ignore_term {
                     server.finish().await;
