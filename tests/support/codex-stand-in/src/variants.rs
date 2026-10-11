@@ -19,6 +19,9 @@ pub const PAD_VARIABLE: &str = "KR_STAND_IN_PAD";
 /// The key the terminal signs in with under the `login` variant.
 pub const KEY_VARIABLE: &str = "KR_STAND_IN_API_KEY";
 
+/// The file a terminal under `answer-when-released` waits for before it answers the approval.
+pub const RELEASE_VARIABLE: &str = "KR_STAND_IN_RELEASE";
+
 /// The ways a run can differ from the default.
 #[derive(Clone, Debug, Default)]
 pub struct Variants {
@@ -53,6 +56,12 @@ pub struct Variants {
     pub login: bool,
     /// The terminal's upgrade request carries an `Origin` header, as a browser's does.
     pub origin: bool,
+    /// A terminal whose upgrade was refused tries once more, without the `Origin` header.
+    pub retry_plain: bool,
+    /// The terminal never connects: it runs until it is ended.
+    pub idle: bool,
+    /// The terminal does not answer the approval until the file `KR_STAND_IN_RELEASE` names exists.
+    pub answer_when_released: bool,
 }
 
 impl Variants {
@@ -84,6 +93,9 @@ impl Variants {
                 "stay" => variants.stay = true,
                 "login" => variants.login = true,
                 "origin" => variants.origin = true,
+                "retry-plain" => variants.retry_plain = true,
+                "idle" => variants.idle = true,
+                "answer-when-released" => variants.answer_when_released = true,
                 other => panic!("{VARIABLE} names a variant this program does not have: {other}"),
             }
         }
