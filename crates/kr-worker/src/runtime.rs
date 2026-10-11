@@ -84,8 +84,9 @@ pub const STOP_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_mi
 /// How long the closure waits, after it has forced what was left, for the servers of its backends
 /// to be ended.
 ///
-/// A server that ignores the end of its input and a terminate is ended by force within about five
-/// seconds of the closure's release, so a server still running after this is one that cannot be
+/// A server that ignores the end of its input and a terminate is ended by force five seconds after
+/// the closure's release, and has two seconds more to be gone, which is when the closure forces
+/// what it owns and drains. A server still running ten seconds after that is one that cannot be
 /// ended: the closure goes on, and its receipt names what survived.
 #[cfg(unix)]
 const SERVERS_ENDING_BOUND: std::time::Duration = std::time::Duration::from_secs(10);
