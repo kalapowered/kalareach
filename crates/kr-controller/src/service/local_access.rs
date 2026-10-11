@@ -43,7 +43,11 @@ pub(crate) struct LocalAccessState {
 #[derive(Debug, Default)]
 struct Drawn {
     sequence: u64,
-    bound: Option<LocalBound>,
+    /// What the policy said when the last statement was drawn, and the statement drawn for it.
+    /// A statement is converted for the worker once for each distinct answer of the policy, and
+    /// sent again unchanged: converting an unchanged lease again would read two clocks at two
+    /// moments and differ by a millisecond, which a worker takes for a lease that ends sooner.
+    last: Option<(LocalOwnerBound, LocalAccess)>,
 }
 
 /// What this daemon knows of one worker's side of the statement.
@@ -74,19 +78,23 @@ impl LocalAccessState {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Draws the statement for `bound`: the last one again when nothing changed, the next one
-    /// otherwise. Called with the policy's lock held, so the pair is drawn in the order the
-    /// policy changes.
-    fn draw(&self, bound: LocalBound) -> LocalAccess {
+    /// Draws the statement for `owner`: the last one again when the policy's answer has not
+    /// changed, the next one otherwise, converted by `convert` only in that case. Called with the
+    /// policy's lock held, so the pair is drawn in the order the policy changes.
+    fn draw(&self, owner: LocalOwnerBound, convert: impl FnOnce() -> LocalBound) -> LocalAccess {
         let mut drawn = self.lock_drawn();
-        if drawn.bound != Some(bound) {
-            drawn.sequence += 1;
-            drawn.bound = Some(bound);
+        if let Some((held, statement)) = drawn.last
+            && held == owner
+        {
+            return statement;
         }
-        LocalAccess {
+        drawn.sequence += 1;
+        let statement = LocalAccess {
             sequence: U64::new(drawn.sequence),
-            bound,
-        }
+            bound: convert(),
+        };
+        drawn.last = Some((owner, statement));
+        statement
     }
 
     /// Records what a worker's hello said and what it acknowledged.
@@ -142,23 +150,25 @@ impl Controller {
     /// What the host's local owner may do now, as the statement to send: the bound computed under
     /// the policy's lock, and the sequence drawn with it.
     pub(crate) fn local_access_now(&self) -> LocalAccess {
+        // The continuous clock first, then the wall clock: see `protocol_bound`.
+        let now = self.clock.now();
         let now_ms = self.settled_utc_now();
         let policy = self
             .policy
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let bound = policy.local_owner_bound(self.local_owner_device(), self.clock.now(), now_ms);
-        let protocol = self.protocol_bound(bound);
-        self.local_access.draw(protocol)
+        let bound = policy.local_owner_bound(self.local_owner_device(), now, now_ms);
+        self.local_access.draw(bound, || self.protocol_bound(bound))
     }
 
     /// What the host's local owner may do now.
     pub(crate) fn local_owner_bound_now(&self) -> LocalOwnerBound {
+        let now = self.clock.now();
         let now_ms = self.settled_utc_now();
         self.policy
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .local_owner_bound(self.local_owner_device(), self.clock.now(), now_ms)
+            .local_owner_bound(self.local_owner_device(), now, now_ms)
     }
 
     /// Whether the host is exclusively organisation-managed and its local owner has no live
@@ -186,8 +196,10 @@ impl Controller {
         if kr_protocol::method::local_hold(method) == kr_protocol::method::LocalHold::Free {
             return Ok(None);
         }
-        let now_ms = self.settled_utc_now();
+        // The continuous clock is read first and the wall clock after it, so a pause between the
+        // two readings shortens the time laid over the continuous clock and never lengthens it.
         let now = self.clock.now();
+        let now_ms = self.settled_utc_now();
         let bound = self
             .policy
             .lock()
@@ -240,10 +252,12 @@ impl Controller {
             LocalOwnerBound::Open => LocalBound::Open,
             LocalOwnerBound::Closed => LocalBound::Closed,
             LocalOwnerBound::Until { continuous, utc_ms } => {
+                // The clock the worker reads is read first and the daemon's after it, so a pause
+                // between the two readings shortens what is laid over the first and never
+                // lengthens it.
+                let boot_now = self.shared_clock.boot_elapsed_ms();
                 let remaining = continuous.saturating_duration_since(self.clock.now());
-                let boot_ms = self
-                    .shared_clock
-                    .boot_elapsed_ms()
+                let boot_ms = boot_now
                     .saturating_add(u64::try_from(remaining.as_millis()).unwrap_or(u64::MAX));
                 LocalBound::Until {
                     boot_deadline_ms: U64::new(boot_ms),
@@ -349,6 +363,11 @@ impl Controller {
         }
         for phase in [LaunchPhase::Claimed, LaunchPhase::Fenced] {
             for reservation in registry.reservations_in(phase)? {
+                // A reservation fenced before any worker claimed it handed nobody a specification,
+                // so there is no worker behind it.
+                if phase == LaunchPhase::Fenced && reservation.claimed_key.is_none() {
+                    continue;
+                }
                 if !self.local_access.made_here(reservation.reservation_id) {
                     lacking.insert(reservation.session_id);
                 }
@@ -379,5 +398,44 @@ impl Controller {
                 let _ = tokio::time::timeout(REPEAT, notified).await;
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kr_transport::clock::{ContinuousClock as _, ManualClock};
+
+    /// A lease that has not changed is sent again as it was, not converted again: two readings of
+    /// two clocks at two moments differ by a millisecond, and a worker takes a lease that ends a
+    /// millisecond sooner for one that was cut short and withdraws what its local owner holds.
+    #[test]
+    fn a_statement_is_converted_once_for_each_answer_of_the_policy() {
+        let state = LocalAccessState::default();
+        let clock = ManualClock::new();
+        let lease = LocalOwnerBound::Until {
+            continuous: clock.now(),
+            utc_ms: 5,
+        };
+        let until = |boot_deadline_ms: u64| LocalBound::Until {
+            boot_deadline_ms: U64::new(boot_deadline_ms),
+            utc_deadline_ms: U64::new(5),
+        };
+        let first = state.draw(lease, || until(1_000));
+        let again = state.draw(lease, || until(1_001));
+        assert_eq!(
+            again, first,
+            "the same lease is the same statement, byte for byte"
+        );
+        let renewed = state.draw(
+            LocalOwnerBound::Until {
+                continuous: clock.now(),
+                utc_ms: 6,
+            },
+            || until(2_000),
+        );
+        assert_eq!(renewed.sequence.get(), first.sequence.get() + 1);
+        let closed = state.draw(LocalOwnerBound::Closed, || LocalBound::Closed);
+        assert_eq!(closed.sequence.get(), renewed.sequence.get() + 1);
     }
 }

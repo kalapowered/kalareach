@@ -482,6 +482,14 @@ impl Ticket {
     }
 }
 
+/// A lease that an answer is held to as it is written ([`AttentionModule::write_released_held`]).
+pub struct LeaseHold<'a> {
+    /// Whether the lease holds now.
+    pub permitted: &'a (dyn Fn() -> bool + Sync),
+    /// What is written instead of an answer none of which has gone, once the lease has ended.
+    pub refusal: kr_protocol::envelope::ControlFrame,
+}
+
 /// One read of this group's answer, ready to be released to the reader who asked.
 #[derive(Debug)]
 pub struct Released {
@@ -1055,14 +1063,32 @@ impl AttentionModule {
         kind: kr_protocol::frame::StreamKind,
         released: Released,
     ) -> kr_ipc::Result<()> {
+        self.write_released_held(writer, kind, released, None).await
+    }
+
+    /// As [`Self::write_released`], for an answer that is also held to a lease: `lease` is asked
+    /// before every transport write as the ticket is, and when it stops holding, an answer none
+    /// of which has gone is taken back and its refusal is written instead.
+    ///
+    /// # Errors
+    ///
+    /// Returns the connection's failure, or a refusal to finish an answer the reader has part of.
+    pub async fn write_released_held(
+        &self,
+        writer: &mut kr_ipc::framed::FrameWriter,
+        kind: kr_protocol::frame::StreamKind,
+        released: Released,
+        lease: Option<&LeaseHold<'_>>,
+    ) -> kr_ipc::Result<()> {
         let Released {
             frame,
             withheld,
             ticket,
         } = released;
-        let Some(withheld) = withheld.filter(|_| !ticket.is_empty()) else {
+        let withheld = withheld.filter(|_| !ticket.is_empty());
+        if withheld.is_none() && lease.is_none() {
             return writer.write_message(&frame).await;
-        };
+        }
         let bytes = kr_ipc::framed::FrameWriter::encode(kind, &frame)?;
         let mut begun = false;
         loop {
@@ -1073,8 +1099,10 @@ impl AttentionModule {
                 // state that has gone.
                 let standing = ticket.standing();
                 let may_write = || {
-                    standing.is_some()
-                        && ticket.holds_text(&fences, kr_ipc::clock::boot_elapsed_ms())
+                    (withheld.is_none()
+                        || (standing.is_some()
+                            && ticket.holds_text(&fences, kr_ipc::clock::boot_elapsed_ms())))
+                        && lease.is_none_or(|lease| (lease.permitted)())
                 };
                 if begun {
                     writer.resume_frame_checked(may_write)
@@ -1087,14 +1115,24 @@ impl AttentionModule {
                 CheckedWrite::Complete => return Ok(()),
                 CheckedWrite::Blocked => writer.writable().ready().await?,
                 CheckedWrite::Refused => {
+                    let lapsed = lease.filter(|lease| !(lease.permitted)());
                     if writer.withdraw_unstarted() {
-                        return writer.write_message(&withheld).await;
+                        if let Some(lease) = lapsed {
+                            return writer.write_message(&lease.refusal).await;
+                        }
+                        if let Some(withheld) = &withheld {
+                            return writer.write_message(withheld).await;
+                        }
+                        // Neither stopped it any more: the lease was presented again. Offered
+                        // afresh.
+                        begun = false;
+                        continue;
                     }
                     return Err(kr_ipc::IpcError::socket(
                         "write",
                         std::io::Error::other(
-                            "the session text this answer carries may no longer be released, and \
-                             part of the answer has gone",
+                            "what this answer carries may no longer be released, and part of the \
+                             answer has gone",
                         ),
                     ));
                 }

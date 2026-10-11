@@ -184,6 +184,80 @@ impl Controller {
         matches!(tokio::time::timeout(bound, written).await, Ok(Ok(())))
     }
 
+    /// What a local caller is told when the local owner's lease ended while its answer was being
+    /// written.
+    fn lease_ended_reply(&self, request_id: RequestId) -> ControlFrame {
+        error_reply(
+            request_id,
+            ErrorCode::PermissionDenied,
+            "this host is exclusively organisation-managed and its local owner's membership lease \
+             ended before this result could be sent, so the result is withheld; if the request \
+             changed anything the change stands, and the request is not to be repeated under a new \
+             identifier. Present a new lease with `kr organisation present`.",
+        )
+    }
+
+    /// Writes the answer to a local caller's request for `method`, and says whether the
+    /// connection goes on.
+    ///
+    /// The answer of a method that is held to the local owner's lease is written only while the
+    /// lease holds. The lease is asked again before every transport write, and while the peer has
+    /// no room it is asked again each time the peer reads, so an answer that waited for a peer is
+    /// not finished under a lease that ended meanwhile: one none of which has gone is taken back
+    /// and its refusal written, and one the peer has part of ends the connection.
+    async fn write_answer(
+        &self,
+        writer: &mut kr_ipc::framed::FrameWriter,
+        kind: StreamKind,
+        answer: &ControlFrame,
+        method: Option<Method>,
+        request_id: RequestId,
+    ) -> bool {
+        use kr_ipc::framed::CheckedWrite;
+
+        let Some(method) = method.filter(|method| {
+            kr_protocol::method::local_hold(*method) == kr_protocol::method::LocalHold::Held
+        }) else {
+            return writer.write_message(answer).await.is_ok();
+        };
+        let Ok(bytes) = kr_ipc::framed::FrameWriter::encode(kind, answer) else {
+            return false;
+        };
+        let permitted = || self.local_hold(method).is_ok();
+        let mut begun = false;
+        loop {
+            let attempt = if begun {
+                writer.resume_frame_checked(&permitted)
+            } else {
+                begun = true;
+                writer.begin_frame_checked(&bytes, &permitted)
+            };
+            match attempt {
+                Ok(CheckedWrite::Complete) => return true,
+                Ok(CheckedWrite::Blocked) => {
+                    if writer.writable().ready().await.is_err() {
+                        return false;
+                    }
+                }
+                Ok(CheckedWrite::Refused) => {
+                    if !writer.withdraw_unstarted() {
+                        return false;
+                    }
+                    if self.local_hold(method).is_ok() {
+                        // The lease was presented again meanwhile: offered afresh.
+                        begun = false;
+                        continue;
+                    }
+                    return writer
+                        .write_message(&self.lease_ended_reply(request_id))
+                        .await
+                        .is_ok();
+                }
+                Err(_) => return false,
+            }
+        }
+    }
+
     /// Arms the pause the next call stops at once it has looked for a retained answer, whether or
     /// not it found one, before the admission it arrived under is asked again. Returns the end that
     /// says the call has arrived, and the end that lets it go. The pause fires once.
@@ -516,33 +590,50 @@ impl Controller {
                     // carries what a model wrote. Neither leaves this daemon except under the
                     // privacy fence it was read under: its ticket is checked before every write.
                     match self.authorised(connection_id) {
-                        Ok(_) if self.read_refused(&request).is_some() => self
-                            .read_refused(&request)
-                            .unwrap_or_else(|| unreachable!()),
-                        Ok(_) => {
-                            let released = self.read_released(&actor_id, &request).await;
-                            match self.authorised(connection_id) {
-                                Ok(_) if self.read_refused(&request).is_some() => self
-                                    .read_refused(&request)
-                                    .unwrap_or_else(|| unreachable!()),
-                                Ok(_) => {
-                                    if self
-                                        .attention
-                                        .write_released(writer, kind, released)
-                                        .await
-                                        .is_err()
-                                    {
-                                        break;
-                                    }
-                                    continue;
+                        Ok(_) => match self.read_refused(&request) {
+                            Some(refused) => refused,
+                            None => {
+                                let released = self.read_released(&actor_id, &request).await;
+                                match self.authorised(connection_id) {
+                                    Ok(_) => match self.read_refused(&request) {
+                                        Some(refused) => refused,
+                                        None => {
+                                            // Held to the local owner's lease at every transport
+                                            // write, as to the privacy fence.
+                                            let method = request.method.method();
+                                            let permitted = || {
+                                                method.is_none_or(|method| {
+                                                    self.local_hold(method).is_ok()
+                                                })
+                                            };
+                                            let lease = crate::attention::LeaseHold {
+                                                permitted: &permitted,
+                                                refusal: self.lease_ended_reply(request.request_id),
+                                            };
+                                            if self
+                                                .attention
+                                                .write_released_held(
+                                                    writer,
+                                                    kind,
+                                                    released,
+                                                    Some(&lease),
+                                                )
+                                                .await
+                                                .is_err()
+                                            {
+                                                break;
+                                            }
+                                            continue;
+                                        }
+                                    },
+                                    Err(error) => error_reply(
+                                        request.request_id,
+                                        ErrorCode::PermissionDenied,
+                                        error.to_string(),
+                                    ),
                                 }
-                                Err(error) => error_reply(
-                                    request.request_id,
-                                    ErrorCode::PermissionDenied,
-                                    error.to_string(),
-                                ),
                             }
-                        }
+                        },
                         Err(error) => error_reply(
                             request.request_id,
                             ErrorCode::PermissionDenied,
@@ -552,27 +643,41 @@ impl Controller {
                 }
                 ControlFrame::Request(request) if negotiated => {
                     match self.authorised(connection_id) {
-                        Ok(_) if self.read_refused(&request).is_some() => self
-                            .read_refused(&request)
-                            .unwrap_or_else(|| unreachable!()),
-                        Ok(_) => {
-                            let answer = self.read_method(&actor_id, &request).await;
-                            // Checked again now the read has finished. A read that passed its check
-                            // and then waited for the registry can complete after the authority
-                            // behind it was withdrawn, and what the contract forbids is *serving*
-                            // that state rather than reading it.
-                            match self.authorised(connection_id) {
-                                Ok(_) if self.read_refused(&request).is_some() => self
-                                    .read_refused(&request)
-                                    .unwrap_or_else(|| unreachable!()),
-                                Ok(_) => answer,
-                                Err(error) => error_reply(
-                                    request.request_id,
-                                    ErrorCode::PermissionDenied,
-                                    error.to_string(),
-                                ),
+                        Ok(_) => match self.read_refused(&request) {
+                            Some(refused) => refused,
+                            None => {
+                                let answer = self.read_method(&actor_id, &request).await;
+                                // Checked again now the read has finished. A read that passed its
+                                // check and then waited for the registry can complete after the
+                                // authority behind it was withdrawn, and what the contract forbids
+                                // is *serving* that state rather than reading it.
+                                match self.authorised(connection_id) {
+                                    Ok(_) => match self.read_refused(&request) {
+                                        Some(refused) => refused,
+                                        None => {
+                                            if !self
+                                                .write_answer(
+                                                    writer,
+                                                    kind,
+                                                    &answer,
+                                                    request.method.method(),
+                                                    request.request_id,
+                                                )
+                                                .await
+                                            {
+                                                break;
+                                            }
+                                            continue;
+                                        }
+                                    },
+                                    Err(error) => error_reply(
+                                        request.request_id,
+                                        ErrorCode::PermissionDenied,
+                                        error.to_string(),
+                                    ),
+                                }
                             }
-                        }
+                        },
                         Err(error) => error_reply(
                             request.request_id,
                             ErrorCode::PermissionDenied,
@@ -584,27 +689,26 @@ impl Controller {
                     let confirm = mutation.action_id;
                     let request_id = mutation.request_id;
                     let method = mutation.method.method();
-                    let reply = self
-                        .perform(&actor_id, connection_id, origin, *mutation)
-                        .await;
-                    // The answer of a held method is shown only while the local owner's lease
-                    // holds: a retained answer, or one that waited for a worker or a store, is
-                    // withheld once it has ended. The action it asked for stays recorded.
-                    let reply = match method.map(|method| self.local_hold(method)) {
-                        Some(Err(error)) => error_reply(
-                            request_id,
-                            error.code(),
-                            format!(
-                                "{error}. The result of this request is withheld; the action it \
-                                 asked for is recorded and is not to be asked again under a new \
-                                 identifier."
-                            ),
-                        ),
-                        _ => reply,
+                    // A held method is refused before it is performed once no lease is live:
+                    // nothing was done, and the refusal says so.
+                    let reply = match method.map(|method| (method, self.local_hold(method))) {
+                        Some((_, Err(error))) if self.authorised(connection_id).is_ok() => {
+                            error_reply(request_id, error.code(), error.to_string())
+                        }
+                        _ => {
+                            self.perform(&actor_id, connection_id, origin, *mutation)
+                                .await
+                        }
                     };
                     // The acceptance reaches the caller here. A worker that is holding a close for
-                    // this action learns that it has, and only then starts signalling.
-                    if writer.write_message(&reply).await.is_err() {
+                    // this action learns that it has, and only then starts signalling. The answer
+                    // of a held method is written only while the lease holds, asked again before
+                    // every transport write; a result that waited for a worker or a store is
+                    // withheld once the lease has ended.
+                    if !self
+                        .write_answer(writer, kind, &reply, method, request_id)
+                        .await
+                    {
                         break;
                     }
                     self.confirm_delivery(confirm).await;
