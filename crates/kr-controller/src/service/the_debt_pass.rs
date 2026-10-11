@@ -107,7 +107,7 @@ async fn a_debt_is_raised_while_an_earlier_barrier_of_the_pass_waits_for_its_wor
     let temp = kr_ipc::testing::TempHost::create();
     let (controller, passes) = daemon_passing_by_hand(&temp).await;
     let before = revision(&controller).await;
-    let (arrived, go) = controller.before_the_pass_tells.arm();
+    let (arrived, go) = controller.before_a_barrier_tells.arm();
     a_change_that_stopped_waiting(&controller).await;
     until_the_pass_tells(&passes, arrived).await;
     assert_eq!(revision(&controller).await, before + 1);
@@ -140,7 +140,7 @@ async fn a_debt_is_raised_while_an_earlier_barrier_of_the_pass_waits_for_its_wor
 async fn a_daemon_let_go_while_its_pass_waits_for_workers_lets_its_environment_go() {
     let temp = kr_ipc::testing::TempHost::create();
     let (controller, passes) = daemon_passing_by_hand(&temp).await;
-    let (arrived, _never) = controller.before_the_pass_tells.arm();
+    let (arrived, _never) = controller.before_a_barrier_tells.arm();
     a_change_that_stopped_waiting(&controller).await;
     until_the_pass_tells(&passes, arrived).await;
 

@@ -293,8 +293,6 @@ async fn debt_pass(
             let daemon = daemon.clone();
             telling = Some(tokio::spawn(async move {
                 let told = while_held(&daemon, async |controller: &Controller| {
-                    #[cfg(test)]
-                    controller.before_the_pass_tells.wait().await;
                     controller.tell(&captured).await
                 })
                 .await;
@@ -417,59 +415,23 @@ impl Controller {
                         // revocation from reporting `pending` for it, and must not stop the
                         // announcement reaching the workers after it. Section 9 makes waiting the
                         // opposite of completion.
-                        let mut notices = self.revision_notices(
-                            revision,
-                            recorded
-                                .get(&session_id)
-                                .copied()
-                                .unwrap_or_else(|| AuthorityRevision::new(0)),
-                            0,
-                            &link.client().acknowledgement().capabilities,
-                        );
-                        let notice = notices.pop().expect("an announcement is made");
-                        // A worker not told a revision before the next advanced is told them oldest
-                        // first. Each is a revision of its own, acknowledged as one.
-                        let mut missed = false;
-                        for earlier in notices {
-                            #[cfg(feature = "testing")]
-                            self.record_announcement(session_id, &earlier);
-                            match tokio::time::timeout(
-                                WORKER_EXCHANGE,
-                                link.client().announce_revision(earlier),
+                        let answered = self
+                            .tell_revisions(
+                                session_id,
+                                binding,
+                                &mut link,
+                                revision,
+                                recorded
+                                    .get(&session_id)
+                                    .copied()
+                                    .unwrap_or_else(|| AuthorityRevision::new(0)),
+                                Some(WORKER_EXCHANGE),
                             )
-                            .await
-                            {
-                                Ok(Ok(ack)) => {
-                                    self.note_earlier_acknowledgement(session_id, binding, ack)
-                                        .await;
-                                }
-                                Ok(Err(_)) | Err(_) => {
-                                    missed = true;
-                                    break;
-                                }
-                            }
-                        }
-                        #[cfg(feature = "testing")]
-                        self.record_announcement(session_id, &notice);
-                        let answered = if missed {
-                            Ok(Err(kr_ipc::IpcError::PeerClosed))
-                        } else {
-                            tokio::time::timeout(
-                                WORKER_EXCHANGE,
-                                link.client().announce_revision(notice),
-                            )
-                            .await
-                        };
-                        match answered {
-                            Ok(Ok(ack)) => {
-                                link.give_back();
-                                Some(ack)
-                            }
-                            // An exchange that failed or ran out leaves a client whose stream
-                            // position nothing knows, so the link is closed rather than returned,
-                            // and the path it was on is given up with it as it goes out of scope.
-                            Ok(Err(_)) | Err(_) => None,
-                        }
+                            .await;
+                        // An exchange that failed or ran out leaves a client whose stream position
+                        // nothing knows, so the link is closed rather than returned, and the path
+                        // it was on is given up with it as it goes out of scope.
+                        answered.inspect(|_| link.give_back())
                     }
                     // The wait for the link ran out: another operation holds it, and what that
                     // operation does with it is its own to answer for, so nothing is given up
@@ -529,6 +491,13 @@ impl Controller {
                 continue;
             }
             self.reconcile(*session_id).await?;
+        }
+        // What a worker's fences for the revisions announced to it before this one named is part of
+        // this revision's result, and a worker that has not been asked about one is asked here,
+        // with the first page of every worker's evidence, before any of the pages that follow.
+        for (session_id, binding) in &acknowledged {
+            self.claim_earlier_fences(*session_id, *binding, revision)
+                .await;
         }
         for (session_id, binding) in acknowledged {
             self.collect_owed_evidence(session_id, binding, revision)
@@ -607,6 +576,20 @@ impl Controller {
         binding: kr_transport::lease::WorkerBinding,
         revision: AuthorityRevision,
     ) {
+        let mut budget = self.evidence_budget();
+        self.collect_fence_evidence(session_id, binding, revision, &mut budget, false)
+            .await;
+        for older in self.leases.evidence_outstanding(session_id, revision) {
+            if budget.pages == 0 {
+                return;
+            }
+            self.collect_fence_evidence(session_id, binding, older, &mut budget, false)
+                .await;
+        }
+    }
+
+    /// What one announcement may spend collecting a worker's fence evidence in one step.
+    fn evidence_budget(&self) -> EvidenceBudget {
         #[cfg(feature = "testing")]
         let pages = MAX_EVIDENCE_PAGES.min(
             self.evidence_pages_limit
@@ -614,18 +597,92 @@ impl Controller {
         );
         #[cfg(not(feature = "testing"))]
         let pages = MAX_EVIDENCE_PAGES;
-        let mut budget = EvidenceBudget {
+        EvidenceBudget {
             pages,
             retries: MAX_PAGE_RETRIES,
-        };
-        self.collect_fence_evidence(session_id, binding, revision, &mut budget)
-            .await;
-        for older in self.leases.evidence_outstanding(session_id, revision) {
-            if budget.pages == 0 {
-                return;
+        }
+    }
+
+    /// Makes what a worker's fences named for the revisions announced to it before `revision` part
+    /// of the result of `revision`, once the worker has acknowledged it.
+    ///
+    /// A worker's fence files its names under the revision it ran for and starts from where the
+    /// fence before it ended, so a worker told several revisions in one announcement, or one that
+    /// refused an announcement and fenced it afterwards by itself, names nothing under the revision
+    /// of the announcement that follows. A revision the worker answered is carried as it is. One it
+    /// has said nothing about is asked for its first page, which the worker answers from its journal
+    /// whether or not its fence ran for it; the pages that follow come with the rest of the
+    /// evidence the worker owes ([`Self::collect_owed_evidence`]). A revision that could not be
+    /// asked about stays announced, and the result says so.
+    pub(super) async fn claim_earlier_fences(
+        &self,
+        session_id: SessionId,
+        binding: WorkerBinding,
+        revision: AuthorityRevision,
+    ) {
+        let mut budget = self.evidence_budget();
+        for (earlier, answered) in self.leases.unclaimed_before(session_id, revision) {
+            if !answered {
+                self.collect_fence_evidence(session_id, binding, earlier, &mut budget, true)
+                    .await;
             }
-            self.collect_fence_evidence(session_id, binding, older, &mut budget)
+        }
+        self.leases.claim(session_id, binding, revision);
+    }
+
+    /// Tells a worker the revisions it has not fenced, over the link the caller holds, oldest
+    /// first, and answers the acknowledgement of the last, which is the one the barrier waits on.
+    /// It answers nothing when an exchange failed or ran out, `bound` after it began when one is
+    /// given.
+    ///
+    /// Each is a revision of its own, acknowledged as one ([`Self::note_earlier_acknowledgement`]).
+    /// All are recorded as announced before any is sent, because the worker's fence may run for any
+    /// of them whatever becomes of the answer, and what it names is owed to the result of the
+    /// revision the announcement was for ([`AuthorityBarrier::claim`]).
+    ///
+    /// [`AuthorityBarrier::claim`]: crate::authority::AuthorityBarrier::claim
+    pub(crate) async fn tell_revisions(
+        &self,
+        session_id: SessionId,
+        binding: WorkerBinding,
+        link: &mut super::workers::WorkerLink,
+        revision: AuthorityRevision,
+        held: AuthorityRevision,
+        bound: Option<std::time::Duration>,
+    ) -> Option<kr_protocol::worker::AuthorityRevisionAck> {
+        let mut notices = self.revision_notices(
+            revision,
+            held,
+            0,
+            &link.client().acknowledgement().capabilities,
+        );
+        self.leases.announced(
+            session_id,
+            binding,
+            notices.iter().map(|notice| notice.revision),
+        );
+        let last = notices.pop().expect("an announcement is made");
+        for earlier in notices {
+            #[cfg(feature = "testing")]
+            self.record_announcement(session_id, &earlier);
+            let ack = Self::exchange(bound, link.client().announce_revision(earlier)).await?;
+            self.note_earlier_acknowledgement(session_id, binding, ack)
                 .await;
+        }
+        #[cfg(feature = "testing")]
+        self.record_announcement(session_id, &last);
+        Self::exchange(bound, link.client().announce_revision(last)).await
+    }
+
+    /// The answer of one exchange with a worker, or nothing when it failed or took longer than
+    /// `bound`.
+    async fn exchange<T>(
+        bound: Option<std::time::Duration>,
+        exchange: impl std::future::Future<Output = std::result::Result<T, kr_ipc::IpcError>>,
+    ) -> Option<T> {
+        match bound {
+            Some(bound) => tokio::time::timeout(bound, exchange).await.ok()?.ok(),
+            None => exchange.await.ok(),
         }
     }
 
@@ -642,18 +699,27 @@ impl Controller {
     /// answered to its end, so the link goes back and the worker's lease keeps renewing. A refusal
     /// of any other kind, a failed exchange and a retry budget that has run out stop the
     /// collection as before.
+    ///
+    /// `unasked` says the worker has been asked nothing of this revision yet, so that the first
+    /// page starts at nought and its answer makes the worker's report of the revision.
     async fn collect_fence_evidence(
         &self,
         session_id: SessionId,
         binding: kr_transport::lease::WorkerBinding,
         revision: AuthorityRevision,
         budget: &mut EvidenceBudget,
+        mut unasked: bool,
     ) {
         let mut pause = PAGE_RETRY_PAUSE;
         while budget.pages > 0 {
             budget.pages -= 1;
-            let Some(from) = self.leases.evidence_owed(session_id, revision) else {
-                return;
+            let from = if unasked {
+                0
+            } else {
+                let Some(from) = self.leases.evidence_owed(session_id, revision) else {
+                    return;
+                };
+                from
             };
             // A continuation asks for names of a revision the worker has already fenced, so it
             // names no reach.
@@ -713,6 +779,7 @@ impl Controller {
             {
                 return;
             }
+            unasked = false;
         }
     }
 
@@ -1144,6 +1211,8 @@ impl Controller {
     /// because that is the record that their barrier finished. A row this cannot delete stays on
     /// disk, and the next start raises one more barrier for it.
     async fn tell(&self, captured: &[crate::grants::store::DebtId]) -> Result<RevocationBarrier> {
+        #[cfg(any(test, feature = "testing"))]
+        self.before_a_barrier_tells.wait().await;
         let barrier = self.announce_authority_revision().await?;
         self.update_policy(|policy| {
             policy.advance_authority_revision(barrier.authority_revision);

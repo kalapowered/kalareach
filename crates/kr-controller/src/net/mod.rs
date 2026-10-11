@@ -1691,32 +1691,10 @@ impl Controller {
             let mut link = self.worker_client(&worker).await?;
             // The first page of whatever its fence named: this worker has said nothing about this
             // revocation yet, so there is nothing to continue from.
-            let mut notices = self.revision_notices(
-                revision,
-                held,
-                0,
-                &link.client().acknowledgement().capabilities,
-            );
-            let notice = notices.pop().expect("an announcement is made");
-            // The revisions the worker has not fenced are told it oldest first, each as a revision
-            // of its own.
-            for earlier in notices {
-                #[cfg(feature = "testing")]
-                self.record_announcement(session_id, &earlier);
-                let ack = link.client().announce_revision(earlier).await?;
-                self.note_earlier_acknowledgement(session_id, binding, ack)
-                    .await;
-            }
-            #[cfg(feature = "testing")]
-            self.record_announcement(session_id, &notice);
-            let answered = link.client().announce_revision(notice).await;
-            match answered {
-                Ok(ack) => {
-                    link.give_back();
-                    Ok(Some(ack))
-                }
-                Err(error) => Err(ControllerError::from(error)),
-            }
+            let answered = self
+                .tell_revisions(session_id, binding, &mut link, revision, held, None)
+                .await;
+            Ok::<_, ControllerError>(answered.inspect(|_| link.give_back()))
         };
         let answered = match tokio::time::timeout(ACKNOWLEDGEMENT_TIMEOUT, exchange).await {
             Ok(Ok(answered)) => answered,
@@ -1745,6 +1723,8 @@ impl Controller {
                     // one. The rest of what this worker owes, for this revocation and for any
                     // older one whose pages never finished arriving, is collected here as it is
                     // after the announcement every worker gets.
+                    self.claim_earlier_fences(session_id, binding, revision)
+                        .await;
                     self.collect_owed_evidence(session_id, binding, revision)
                         .await;
                 }

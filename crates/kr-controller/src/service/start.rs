@@ -783,8 +783,8 @@ impl Controller {
             local_writes_blocked: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
             before_the_record: ReadPause::default(),
-            #[cfg(test)]
-            before_the_pass_tells: ReadPause::default(),
+            #[cfg(any(test, feature = "testing"))]
+            before_a_barrier_tells: ReadPause::default(),
             #[cfg(test)]
             before_a_worker_is_published: ReadPause::default(),
             #[cfg(test)]

@@ -3342,6 +3342,470 @@ async fn an_announcement_names_the_grants_a_withdrawal_reached_and_the_host_for_
     );
 }
 
+/// A grant that lets its holder watch the terminal and type into it, under `parent`.
+fn a_typists_grant(
+    id: kr_protocol::ids::GrantId,
+    parent: Option<kr_protocol::ids::GrantId>,
+) -> kr_protocol::grant::Grant {
+    use kr_protocol::grant::{
+        EnvironmentSelector, Grant, GrantExpiry, HistoryScope, SessionSelector,
+    };
+    use kr_protocol::ids::DeviceId;
+    use kr_protocol::rights::ActionRight;
+    use kr_protocol::scalars::CanonicalSet;
+
+    Grant {
+        grant_id: id,
+        parent_grant_id: Nullable(parent),
+        issuer_device_id: DeviceId::new(Uuid::from_bytes([0xf0; 16])),
+        recipient_device_id: DeviceId::new(Uuid::from_bytes([0xf1; 16])),
+        authority_revision: AuthorityRevision::new(1),
+        environment_selector: EnvironmentSelector::Any,
+        session_selector: SessionSelector::Any,
+        actions: [ActionRight::SessionView, ActionRight::TerminalInput]
+            .into_iter()
+            .collect(),
+        history: HistoryScope {
+            lower_bound_ms: Nullable::some(TimestampMs::new(1)),
+            include_live_screen: false,
+            named_questions: CanonicalSet::new(),
+            named_approvals: CanonicalSet::new(),
+        },
+        expiry: GrantExpiry::Never,
+        organisation: Nullable::null(),
+    }
+}
+
+/// Writes a share of `delegated + 1` grants that each carry the input right, and returns its root.
+///
+/// The root goes through the store, and the grants delegated from it are written into its table
+/// directly, as an earlier build wrote them, so that a share of thousands is not a case that takes
+/// minutes.
+fn a_share_of_typists(hosted: &Hosted, first: u8, delegated: u32) -> kr_protocol::ids::GrantId {
+    use kr_controller::grants::GrantRecord;
+    use kr_protocol::ids::GrantId;
+
+    let root = a_typists_grant(GrantId::new(Uuid::from_bytes([first; 16])), None);
+    hosted
+        .controller
+        .sharing()
+        .grants()
+        .issue(
+            &GrantRecord {
+                grant: root.clone(),
+                session_id: None,
+                issued_at_ms: 1_000,
+                activated_at_ms: Some(1_000),
+                revoked_at_ms: None,
+                revoked_by_parent: None,
+            },
+            || Ok(()),
+        )
+        .expect("the root is written");
+    let registry = rusqlite::Connection::open(hosted._temp.environment().registry_database())
+        .expect("the registry opens");
+    registry
+        .execute_batch("BEGIN")
+        .expect("the writes are one transaction");
+    for index in 0..delegated {
+        let mut bytes = [first; 16];
+        bytes[..4].copy_from_slice(&(index + 1).to_be_bytes());
+        let child = a_typists_grant(GrantId::new(Uuid::from_bytes(bytes)), Some(root.grant_id));
+        registry
+            .execute(
+                "INSERT INTO grants (grant_id, parent_grant_id, recipient_device_id, session_id,
+                                     grant, issued_at_ms, activated_at_ms)
+                 VALUES (?1, ?2, ?3, NULL, ?4, 1000, 1000)",
+                rusqlite::params![
+                    child.grant_id.get().as_bytes().as_slice(),
+                    root.grant_id.get().as_bytes().as_slice(),
+                    child.recipient_device_id.get().as_bytes().as_slice(),
+                    kr_cbor::to_canonical_vec(&child).expect("a grant encodes"),
+                ],
+            )
+            .expect("a grant delegated from the root");
+    }
+    registry.execute_batch("COMMIT").expect("the writes land");
+    root.grant_id
+}
+
+/// An attachment of the worker's session that holds the input lease under `grant_id`, and the
+/// epoch of that lease.
+fn a_lease_under(
+    hosted: &Hosted,
+    grant_id: kr_protocol::ids::GrantId,
+) -> (kr_protocol::ids::AttachmentId, u64) {
+    use kr_protocol::attachment::{AttachMode, AttachmentCapability, SessionAttachParams};
+
+    let attachment_id = kr_protocol::ids::AttachmentId::new(kr_ipc::new_uuid());
+    let mut requested = kr_protocol::scalars::CanonicalSet::new();
+    requested.insert(AttachmentCapability::ObserveTerminal);
+    requested.insert(AttachmentCapability::Input);
+    let mut session = hosted.runtime.session();
+    session
+        .attach(
+            &SessionAttachParams {
+                session_id: hosted.session_id,
+                mode: AttachMode::Terminal,
+                claim_geometry: false,
+                dimensions: Nullable::some(Dimensions::new(80, 24)),
+                terminal_profile_id: Nullable::some("xterm-256color".to_owned()),
+                requested: requested.clone(),
+            },
+            requested,
+            attachment_id,
+        )
+        .expect("the attachment is made");
+    session.note_granted_attachment(
+        attachment_id,
+        kr_worker::session::GrantedBy {
+            grant_id: Some(grant_id),
+            device_id: None,
+        },
+    );
+    session
+        .acquire_input(attachment_id, ConnectionId::new(kr_ipc::new_uuid()), None)
+        .expect("the lease is taken");
+    let lease = session.lease();
+    assert_eq!(lease.holder.0, Some(attachment_id));
+    (attachment_id, lease.epoch.get())
+}
+
+/// Makes the worker's session dispatch one real action, and returns it.
+async fn a_dispatched_action(hosted: &Hosted) -> ActionId {
+    let mut client = LocalClient::connect(&hosted.endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects to the worker");
+    let action_id = ActionId::new(kr_ipc::new_uuid());
+    let mut requested = kr_protocol::scalars::CanonicalSet::new();
+    requested.insert(kr_protocol::attachment::AttachmentCapability::ObserveTerminal);
+    client
+        .mutate(
+            Method::SessionAttach,
+            action_id,
+            ActionTarget {
+                environment_id: hosted.environment_id,
+                session_id: Nullable::some(hosted.session_id),
+                session_epoch: Nullable::some(SessionEpoch::V1),
+                application_instance_id: Nullable::null(),
+                agent_binding_revision: Nullable::null(),
+            },
+            &kr_protocol::attachment::SessionAttachParams {
+                session_id: hosted.session_id,
+                mode: kr_protocol::attachment::AttachMode::Terminal,
+                claim_geometry: false,
+                dimensions: Nullable::some(Dimensions::new(80, 24)),
+                terminal_profile_id: Nullable::some("xterm-256color".to_owned()),
+                requested,
+            },
+        )
+        .await
+        .expect("reaches the worker")
+        .expect("the action is accepted");
+    action_id
+}
+
+/// What a worker that was told two revisions in one announcement owes the result of each: the
+/// actions its fence for the earlier revision rejected, and the ones past their dispatch marker, are
+/// named in the result of the revision the announcement was for.
+fn names_the_actions(
+    barrier: &kr_protocol::action::RevocationBarrier,
+    hosted: &Hosted,
+    device: &ActorId,
+    rejected: usize,
+    dispatched: ActionId,
+) {
+    assert!(barrier.holds(), "{barrier:?}");
+    let reported = worker_report(barrier, hosted.session_id);
+    assert_eq!(reported.state, BarrierState::Acknowledged, "{reported:?}");
+    assert_eq!(
+        reported.rejected_actions.len(),
+        rejected,
+        "every intent a fence of the announcement took back is named: {reported:?}"
+    );
+    assert!(
+        reported
+            .rejected_actions
+            .iter()
+            .all(|named| named.actor_id == *device)
+    );
+    assert!(
+        reported
+            .possibly_executed
+            .iter()
+            .any(|named| named.action_id == dispatched),
+        "the action past its marker is named: {reported:?}"
+    );
+    assert_eq!(reported.names_pending.get(), 0);
+    assert_eq!(reported.omitted_actions.get(), 0);
+}
+
+/// A daemon and a worker that has fenced the revision in force and told the daemon so, with a lease
+/// the worker holds under a grant of a share no case revokes.
+async fn a_worker_at_the_revision_in_force() -> (Hosted, u64) {
+    let hosted = hosted_worker().await;
+    let first = tokio::time::timeout(
+        Duration::from_secs(60),
+        hosted.controller.revoke_authority(),
+    )
+    .await
+    .expect("the revocation reports")
+    .expect("the revocation is recorded");
+    let settled = announced_until(&hosted.controller, first, |barrier| barrier.holds()).await;
+    let revision = settled.authority_revision.get();
+    assert!(
+        hosted
+            .controller
+            .revision_pending()
+            .await
+            .expect("the daemon reports what is pending")
+            .is_empty(),
+        "the daemon has recorded the worker's acknowledgement of revision {revision}"
+    );
+    (hosted, revision)
+}
+
+/// KR-REQ-09.13 and KR-REQ-10.45: a worker that was told two revisions in one announcement, each by
+/// name because they do not fit one notice together, has the actions its fence for the first
+/// revision rejected and could not take back named in the result of both revocations, and keeps the
+/// lease of a grant neither revocation named.
+///
+/// Two shares of more than half a notice's names each are revoked from two tasks, and the first
+/// barrier is stopped after it advanced the revision and before it told the worker, so that the
+/// second advances it again first. The worker is then told both revisions in order, the first fences
+/// the intents it rejects and the actions it names under its own revision, and the second finds
+/// nothing left to name. The result of the revision the announcement was for must carry what the
+/// first fence named, and the revocation that was stopped is answered at that same revision.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_worker_told_two_revisions_by_name_has_the_actions_of_both_in_each_result() {
+    use kr_controller::service::Audience;
+    use kr_protocol::worker::{MAX_REVISION_REACH_NAMES, RevisionReach};
+
+    let (hosted, held) = a_worker_at_the_revision_in_force().await;
+    let device = actor("device:phone");
+    let rejected = 3;
+    seed_undispatched_intents(&hosted, &device, rejected);
+    let dispatched = a_dispatched_action(&hosted).await;
+    let half = u32::try_from(MAX_REVISION_REACH_NAMES / 2).expect("fits");
+    let (first, second) = (
+        a_share_of_typists(&hosted, 0x51, half),
+        a_share_of_typists(&hosted, 0x52, half),
+    );
+    let unrelated = a_share_of_typists(&hosted, 0x53, 0);
+    let (_attachment, epoch) = a_lease_under(&hosted, unrelated);
+    let before = hosted.controller.announcements_sent_for_tests().len();
+
+    let (arrived, go) = hosted.controller.stop_before_a_barrier_tells_for_tests();
+    let stopped = tokio::spawn({
+        let controller = Arc::clone(&hosted.controller);
+        async move {
+            controller
+                .revoke_grant(first, Audience::Host, None, None)
+                .await
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(120), arrived)
+        .await
+        .expect("the first revocation reaches its stop")
+        .expect("the stop reports its arrival");
+    let answered = tokio::time::timeout(
+        Duration::from_secs(120),
+        hosted
+            .controller
+            .revoke_grant(second, Audience::Host, None, None),
+    )
+    .await
+    .expect("the second revocation reports")
+    .expect("the second revocation is recorded");
+    assert_eq!(answered.authority_revision.get(), held + 2);
+    names_the_actions(&answered.barrier, &hosted, &device, rejected, dispatched);
+
+    go.send(()).expect("the first revocation waits at its stop");
+    let late = tokio::time::timeout(Duration::from_secs(120), stopped)
+        .await
+        .expect("the first revocation reports")
+        .expect("the revoking task finishes")
+        .expect("the first revocation is recorded");
+    assert_eq!(late.authority_revision.get(), held + 2);
+    names_the_actions(&late.barrier, &hosted, &device, rejected, dispatched);
+
+    let told: Vec<_> = hosted.controller.announcements_sent_for_tests()[before..]
+        .iter()
+        .filter(|sent| sent.session_id == hosted.session_id && sent.evidence_from == 0)
+        .map(|sent| match &sent.reach {
+            RevisionReach::Within { since, grants, .. } => {
+                (sent.revision, Some((since.get(), grants.len())))
+            }
+            RevisionReach::Host => (sent.revision, None),
+        })
+        .collect();
+    let names = usize::try_from(half).expect("fits") + 1;
+    assert_eq!(
+        told[..2],
+        [
+            (held + 1, Some((held, names))),
+            (held + 2, Some((held + 1, names)))
+        ],
+        "each revision by name, oldest first, each following the one before: {told:?}"
+    );
+    assert!(
+        hosted
+            .controller
+            .revision_pending()
+            .await
+            .expect("the daemon reports what is pending")
+            .is_empty(),
+        "the worker's acknowledgement of the last revision is recorded"
+    );
+    let lease = hosted.runtime.session().lease();
+    assert_eq!(
+        (lease.holder.0.is_some(), lease.epoch.get()),
+        (true, epoch),
+        "a lease under a grant neither revocation named is not taken"
+    );
+}
+
+/// KR-REQ-09.13: a worker that was told a revision of the whole host's and then one by name in one
+/// announcement has the actions its fence for the first named in the result of both revocations,
+/// the pages of them that follow the first included.
+///
+/// The whole host's revision comes first and the one by name after it, both advanced before either
+/// announcement, so the worker is told the first as the host's and its fence takes everything it
+/// finds; the notice for the second then finds nothing left, and the result of the revision the
+/// announcement was for has to carry what the first fence named.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_worker_told_a_revision_of_the_host_and_then_one_by_name_has_the_actions_of_both_in_each_result()
+ {
+    use kr_controller::service::Audience;
+    use kr_protocol::worker::RevisionReach;
+
+    let (hosted, held) = a_worker_at_the_revision_in_force().await;
+    let device = actor("device:phone");
+    // More than one acknowledgement carries, so the first fence's names come in pages that follow
+    // the revision they were filed under.
+    let rejected = kr_protocol::action::MAX_NAMED_FENCED_ACTIONS + 5;
+    seed_undispatched_intents(&hosted, &device, rejected);
+    let dispatched = a_dispatched_action(&hosted).await;
+    let share = a_share_of_typists(&hosted, 0x54, 0);
+    let before = hosted.controller.announcements_sent_for_tests().len();
+
+    let (arrived, go) = hosted.controller.stop_before_a_barrier_tells_for_tests();
+    let stopped = tokio::spawn({
+        let controller = Arc::clone(&hosted.controller);
+        async move { controller.revoke_authority().await }
+    });
+    tokio::time::timeout(Duration::from_secs(60), arrived)
+        .await
+        .expect("the first revocation reaches its stop")
+        .expect("the stop reports its arrival");
+    let answered = tokio::time::timeout(
+        Duration::from_secs(60),
+        hosted
+            .controller
+            .revoke_grant(share, Audience::Host, None, None),
+    )
+    .await
+    .expect("the second revocation reports")
+    .expect("the second revocation is recorded");
+    assert_eq!(answered.authority_revision.get(), held + 2);
+    names_the_actions(&answered.barrier, &hosted, &device, rejected, dispatched);
+
+    go.send(()).expect("the first revocation waits at its stop");
+    let late = tokio::time::timeout(Duration::from_secs(60), stopped)
+        .await
+        .expect("the first revocation reports")
+        .expect("the revoking task finishes")
+        .expect("the first revocation is recorded");
+    assert_eq!(late.authority_revision, AuthorityRevision::new(held + 2));
+    names_the_actions(&late, &hosted, &device, rejected, dispatched);
+
+    let told: Vec<_> = hosted.controller.announcements_sent_for_tests()[before..]
+        .iter()
+        .filter(|sent| sent.session_id == hosted.session_id && sent.evidence_from == 0)
+        .map(|sent| (sent.revision, sent.reach.clone()))
+        .collect();
+    assert_eq!(told[0], (held + 1, RevisionReach::Host), "{told:?}");
+    assert!(
+        matches!(
+            &told[1],
+            (revision, RevisionReach::Within { since, .. })
+                if *revision == held + 2 && since.get() == held + 1
+        ),
+        "{told:?}"
+    );
+    assert!(
+        hosted
+            .controller
+            .revision_pending()
+            .await
+            .expect("the daemon reports what is pending")
+            .is_empty(),
+        "the worker's acknowledgement of the last revision is recorded"
+    );
+}
+
+/// KR-REQ-09.13: the actions a worker's fence named for a revision it was refused, and fenced
+/// afterwards by its own maintenance, are named in the result of the next revocation the worker
+/// acknowledges.
+///
+/// The first revocation is refused whole because the worker's dispatch boundary is held, and its
+/// result says pending. The worker's maintenance then fences it and files what it names under that
+/// revision, which no later announcement asks for by name: the next revocation is told the worker
+/// as one revision, and its own fence finds nothing left. Its result is what a person asks for
+/// when the first one was pending, and has to name them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn the_actions_a_refused_revision_was_fenced_for_are_named_by_the_next_revocation() {
+    let hosted = hosted_worker_apart().await;
+    let settled = announced_until(
+        &hosted.controller,
+        hosted
+            .controller
+            .revoke_authority()
+            .await
+            .expect("the revocation is recorded"),
+        |barrier| barrier.holds(),
+    )
+    .await;
+    let held = settled.authority_revision.get();
+    let device = actor("device:phone");
+    let rejected = 3;
+    seed_undispatched_intents(&hosted, &device, rejected);
+    let dispatched = a_dispatched_action(&hosted).await;
+
+    let boundary = HeldBoundary::take(&hosted).await;
+    let refused = tokio::time::timeout(
+        Duration::from_secs(60),
+        hosted.controller.revoke_authority(),
+    )
+    .await
+    .expect("the revocation reports")
+    .expect("the revocation is recorded");
+    assert_eq!(refused.pending(), vec![hosted.session_id], "{refused:?}");
+    boundary.release().await;
+    hosted.service.fence_what_is_owed_for_tests();
+
+    let next = announced_until(
+        &hosted.controller,
+        hosted
+            .controller
+            .revoke_authority()
+            .await
+            .expect("the next revocation is recorded"),
+        |barrier| barrier.holds() && barrier.authority_revision.get() == held + 2,
+    )
+    .await;
+    names_the_actions(&next, &hosted, &device, rejected, dispatched);
+    assert!(
+        hosted
+            .controller
+            .revision_pending()
+            .await
+            .expect("the daemon reports what is pending")
+            .is_empty(),
+        "the worker's acknowledgement of the last revision is recorded"
+    );
+}
+
 /// Writes one mutation to this daemon and returns what it answered.
 async fn submit(client: &mut LocalClient, mutation: MutationRequest) -> Outcome {
     client

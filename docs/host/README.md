@@ -2268,7 +2268,9 @@ between the two leaves the conservative answer rather than none.
 
 The daemon keeps its reports the same way, one per revocation rather than one per worker. An older
 revocation's result names what that revocation's fence named, and a newer one's lists are a
-different question's answer. It also asks again for the pages an older revocation still owes: the
+different question's answer. The result of the revision an announcement was for also names what the
+worker's fences for the other revisions of that announcement named, and for any revision announced
+to it earlier that no later acknowledgement has taken in. It also asks again for the pages an older revocation still owes: the
 revision in force comes first, and the unfinished ones after it, out of one page budget per
 announcement.
 

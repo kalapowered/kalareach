@@ -23,7 +23,7 @@
 //! worker that will not answer is the worker ending of its own accord or being confirmed gone,
 //! and both arrive through [`AuthorityBarrier::worker_ended`].
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Mutex;
 
 use kr_protocol::action::{BarrierState, PossiblyExecutedAction, RevocationBarrier, WorkerBarrier};
@@ -162,6 +162,17 @@ struct FenceReport {
     rejected: Vec<kr_protocol::action::FencedAction>,
     possibly_executed: Vec<PossiblyExecutedAction>,
     omitted: u64,
+    /// The earlier revisions whose fences this worker ran for the announcement of this one, and
+    /// whose names are part of this revocation's result.
+    ///
+    /// A worker told several revisions in one announcement, or one that fenced a revision it
+    /// refused before it was told the next, files what each fence names under the revision that
+    /// fence ran for, and a fence starts from where the one before it ended. So the fence of the
+    /// revision the announcement was for finds nothing of what the earlier ones took, and the
+    /// result of that revision has to read their reports as well as its own ([`WorkerFences::told_at`]).
+    /// They are read where they are held, so the pages of names that follow them are part of the
+    /// result as they arrive.
+    carried: Vec<AuthorityRevision>,
 }
 
 impl FenceReport {
@@ -174,6 +185,7 @@ impl FenceReport {
             rejected: Vec::new(),
             possibly_executed: Vec::new(),
             omitted: 0,
+            carried: Vec::new(),
         }
     }
 
@@ -224,10 +236,55 @@ impl FenceReport {
     }
 }
 
+/// How many announced revisions a worker is owed an answer about at once.
+///
+/// A worker keeps the names of the last revocations its journal holds, so the names of one older
+/// than that are gone from it whatever this daemon asks.
+const MAX_UNCLAIMED_REVISIONS: usize = MAX_HELD_FENCE_REPORTS;
+
+/// What the result of one revision names of one worker: its own report and the reports it carries.
+#[derive(Debug, Default)]
+struct Told {
+    rejected: Vec<kr_protocol::action::FencedAction>,
+    possibly_executed: Vec<PossiblyExecutedAction>,
+    remaining: u64,
+    omitted: u64,
+}
+
+impl Told {
+    /// Takes one report's names in, a later report's entry for an action replacing an earlier one's:
+    /// what a receipt says of an action past its marker is what it said last.
+    fn take(&mut self, report: &FenceReport) {
+        for action in &report.rejected {
+            if !self.rejected.contains(action) {
+                self.rejected.push(action.clone());
+            }
+        }
+        for action in &report.possibly_executed {
+            match self
+                .possibly_executed
+                .iter_mut()
+                .find(|held| held.action_id == action.action_id && held.actor_id == action.actor_id)
+            {
+                Some(held) => *held = action.clone(),
+                None => self.possibly_executed.push(action.clone()),
+            }
+        }
+        self.remaining = self.remaining.saturating_add(report.remaining);
+        self.omitted = self.omitted.saturating_add(report.omitted);
+    }
+}
+
 /// What one worker has said about each revocation it has answered, oldest first.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct WorkerFences {
     reports: Vec<FenceReport>,
+    /// The revisions announced to this worker that no acknowledgement of a later announcement has
+    /// yet taken in. Its fence may have run for any of them, whether or not it answered: it may have
+    /// refused the announcement and fenced afterwards by itself, or answered where the answer was
+    /// lost. What it named is owed to the result of the next revision it acknowledges
+    /// ([`AuthorityBarrier::claim`]).
+    unclaimed: BTreeSet<AuthorityRevision>,
 }
 
 impl WorkerFences {
@@ -287,13 +344,44 @@ impl WorkerFences {
             .any(|report| report.revision >= revision && report.reported)
     }
 
-    /// Returns the revisions at or above `floor` at which this worker holds names.
+    /// Returns the revisions at or above `floor` whose results name something of this worker's:
+    /// each report's own, or the later revision that carries it.
     fn named_from(&self, floor: AuthorityRevision) -> Vec<AuthorityRevision> {
         self.reports
             .iter()
-            .filter(|report| report.revision >= floor && report.names())
-            .map(|report| report.revision)
+            .filter(|report| report.names())
+            .map(|report| {
+                self.reports
+                    .iter()
+                    .filter(|later| later.carried.contains(&report.revision))
+                    .map(|later| later.revision)
+                    .fold(report.revision, std::cmp::max)
+            })
+            .filter(|revision| *revision >= floor)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
             .collect()
+    }
+
+    /// Returns what the result of one revision names of this worker: what its fence for that
+    /// revision reported, and what its fences for the revisions that announcement carried reported.
+    fn told_at(&self, revision: AuthorityRevision) -> Option<Told> {
+        let own = self.at(revision)?;
+        let mut told = Told::default();
+        for carried in own.carried.iter().filter_map(|carried| self.at(*carried)) {
+            told.take(carried);
+        }
+        told.take(own);
+        Some(told)
+    }
+
+    /// Returns how many of the revisions announced before `revision` this worker has said nothing
+    /// about, which its result cannot name.
+    fn unasked_before(&self, revision: AuthorityRevision) -> usize {
+        self.unclaimed
+            .range(..revision)
+            .filter(|earlier| self.at(**earlier).is_none())
+            .count()
     }
 }
 
@@ -576,6 +664,94 @@ impl AuthorityBarrier {
         })
     }
 
+    /// Records that these revisions are about to be announced to a worker, before any of them
+    /// travels.
+    ///
+    /// Whatever becomes of an announcement, the worker's fence may have run for it, and what that
+    /// fence named belongs to the result of the next revision the worker acknowledges
+    /// ([`Self::claim`]). A worker nothing is held of, or one this daemon has given up on the path
+    /// to, is not made a record of.
+    pub fn announced(
+        &self,
+        session_id: SessionId,
+        binding: WorkerBinding,
+        revisions: impl IntoIterator<Item = AuthorityRevision>,
+    ) {
+        let _order = self.ordered();
+        if binding == WorkerBinding::default() || binding != self.leases.binding(session_id) {
+            return;
+        }
+        let mut fences = self.lock();
+        let held = fences.entry(session_id).or_default();
+        held.unclaimed.extend(revisions);
+        while held.unclaimed.len() > MAX_UNCLAIMED_REVISIONS {
+            held.unclaimed.pop_first();
+        }
+    }
+
+    /// Returns the revisions announced to a worker before `revision` that no later acknowledgement
+    /// has taken in, oldest first, each with whether the worker has said anything about its fence
+    /// for it.
+    #[must_use]
+    pub fn unclaimed_before(
+        &self,
+        session_id: SessionId,
+        revision: AuthorityRevision,
+    ) -> Vec<(AuthorityRevision, bool)> {
+        let _order = self.ordered();
+        let fences = self.lock();
+        fences.get(&session_id).map_or_else(Vec::new, |held| {
+            held.unclaimed
+                .range(..revision)
+                .map(|earlier| (*earlier, held.at(*earlier).is_some()))
+                .collect()
+        })
+    }
+
+    /// Takes the worker's acknowledgement of `revision` in: the revisions announced before it whose
+    /// fences the worker has reported on are part of the result of `revision`, and `revision`
+    /// itself is announced no more.
+    ///
+    /// Only an acknowledgement does this. The revisions carried are not installed by it: the
+    /// worker's own acknowledgement of `revision` is what makes it so, and has been recorded
+    /// before this. A revision the worker has said nothing about stays announced, for the next
+    /// acknowledgement to ask about.
+    pub fn claim(
+        &self,
+        session_id: SessionId,
+        binding: WorkerBinding,
+        revision: AuthorityRevision,
+    ) {
+        let _order = self.ordered();
+        if binding == WorkerBinding::default() || binding != self.leases.binding(session_id) {
+            return;
+        }
+        let mut fences = self.lock();
+        let Some(held) = fences.get_mut(&session_id) else {
+            return;
+        };
+        let Some(position) = held
+            .reports
+            .iter()
+            .position(|report| report.revision == revision)
+        else {
+            return;
+        };
+        let answered: Vec<AuthorityRevision> = held
+            .unclaimed
+            .range(..revision)
+            .filter(|earlier| held.at(**earlier).is_some())
+            .copied()
+            .collect();
+        for earlier in &answered {
+            held.unclaimed.remove(earlier);
+            if !held.reports[position].carried.contains(earlier) {
+                held.reports[position].carried.push(*earlier);
+            }
+        }
+        held.unclaimed.remove(&revision);
+    }
+
     /// Records that a worker's execution has ended.
     ///
     /// A worker that can no longer dispatch satisfies the barrier as surely as one that
@@ -786,9 +962,11 @@ impl AuthorityBarrier {
         revision: AuthorityRevision,
     ) -> WorkerBarrier {
         let held = fences.get(&session_id);
-        // The names are this revocation's own. Whether the barrier holds is a question a later
-        // revocation also answers, because installing it fences everything this one would have.
-        let fence = held.and_then(|held| held.at(revision));
+        // The names are this revocation's own, and those of the fences that ran for the same
+        // announcement. Whether the barrier holds is a question a later revocation also answers,
+        // because installing it fences everything this one would have.
+        let told = held.and_then(|held| held.told_at(revision));
+        let unasked = held.map_or(0, |held| held.unasked_before(revision));
         let acknowledged = held
             .and_then(WorkerFences::installed)
             .filter(|held| *held >= revision);
@@ -807,8 +985,8 @@ impl AuthorityBarrier {
         } else {
             BarrierState::Pending
         };
-        let pending_names = fence.map_or(0, |report| report.remaining);
-        let omitted_names = fence.map_or(0, |report| report.omitted);
+        let pending_names = told.as_ref().map_or(0, |told| told.remaining);
+        let omitted_names = told.as_ref().map_or(0, |told| told.omitted);
         // This revocation answered by a later one: the worker went straight past it, or it
         // installed it without saying what its fence did, or this daemon no longer holds its
         // report. The barrier holds and the names are another revocation's, so this says so rather
@@ -834,6 +1012,13 @@ impl AuthorityBarrier {
                 "this worker's barrier holds, and {omitted_names} of the actions its fence named \
                  are no longer held by the worker that named them, so this names what reached \
                  this daemon rather than everything the fence found"
+            ),
+            // Revisions announced to this worker before this one, whose fences it has not yet been
+            // asked about: it may have named actions in them.
+            BarrierState::Acknowledged if unasked > 0 => format!(
+                "this worker's barrier holds, and it has not yet been asked what its fence named \
+                 for {unasked} of the revisions announced to it before revision {revision}; the \
+                 next announcement asks"
             ),
             // The barrier for this revocation held because a later one was installed, and a later
             // revocation's fence is a different question's answer. Only an acknowledgement is
@@ -870,18 +1055,18 @@ impl AuthorityBarrier {
             // acknowledgement or by its own ending. An ending proves that no further dispatch can
             // happen; it says nothing about what already did, and dropping the names would lose
             // exactly the actions section 9 requires to be named.
-            rejected_actions: fence
-                .map(|report| report.rejected.clone())
-                .unwrap_or_default(),
             rejected_actions_total: kr_protocol::scalars::U64::new(
-                fence.map_or(0, |report| report.rejected.len() as u64),
+                told.as_ref().map_or(0, |told| told.rejected.len() as u64),
             ),
-            possibly_executed: fence
-                .map(|report| report.possibly_executed.clone())
-                .unwrap_or_default(),
             possibly_executed_total: kr_protocol::scalars::U64::new(
-                fence.map_or(0, |report| report.possibly_executed.len() as u64),
+                told.as_ref()
+                    .map_or(0, |told| told.possibly_executed.len() as u64),
             ),
+            rejected_actions: told
+                .as_ref()
+                .map(|told| told.rejected.clone())
+                .unwrap_or_default(),
+            possibly_executed: told.map(|told| told.possibly_executed).unwrap_or_default(),
             omitted_actions: kr_protocol::scalars::U64::new(omitted_names),
             names_pending: kr_protocol::scalars::U64::new(pending_names),
             detail,

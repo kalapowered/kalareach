@@ -501,10 +501,11 @@ pub struct Controller {
     /// away in every shipped build.
     #[cfg(test)]
     before_the_record: ReadPause,
-    /// Where this host's own tests stop a barrier the debt pass raised, once it has captured its
-    /// debts and before it tells the workers. Compiled away in every shipped build.
-    #[cfg(test)]
-    before_the_pass_tells: ReadPause,
+    /// Where this host's own tests stop a barrier, once it has captured its debts and advanced the
+    /// revision and before it tells the workers, so that another change can advance the revision
+    /// in between. Compiled away in every shipped build.
+    #[cfg(any(test, feature = "testing"))]
+    before_a_barrier_tells: ReadPause,
     /// Where this host's own tests stop an adoption that has recorded a worker, before it
     /// publishes the worker, so that a closure can land in between. Compiled away in every shipped
     /// build.
@@ -835,6 +836,16 @@ impl Controller {
         &self,
     ) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
         self.after_an_acknowledgement.arm()
+    }
+
+    /// Stops the next barrier once it has advanced the revision and before it tells the workers,
+    /// for this host's own tests. Returns the end that says the barrier has arrived there, and the
+    /// end that lets it go. The stop fires once.
+    #[cfg(feature = "testing")]
+    pub fn stop_before_a_barrier_tells_for_tests(
+        &self,
+    ) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+        self.before_a_barrier_tells.arm()
     }
 
     /// Returns every announcement of an authority revision this daemon has sent to a worker so far,
