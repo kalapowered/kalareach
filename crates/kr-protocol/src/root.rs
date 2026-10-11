@@ -1008,6 +1008,13 @@ pub struct CommandBackend {
     pub launcher: String,
 }
 
+/// The variables that name a launch: the registration the worker publishes for it and the
+/// credential its program is not to be given.
+///
+/// The launcher takes them out of a program that runs as typed, and the worker leaves them out of
+/// the environment of a server it starts for a launch.
+pub const LAUNCH_VARIABLES: [&str; 2] = ["KR_REGISTRATION", "KR_CREDENTIAL"];
+
 /// Parameters of `root.command.resolve`.
 ///
 /// The integration's pre-execution hook asks the worker what to run, before it runs anything. The

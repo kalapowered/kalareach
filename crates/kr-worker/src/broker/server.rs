@@ -27,13 +27,17 @@
 
 use std::collections::{BTreeSet, VecDeque};
 use std::ffi::OsString;
+use std::os::unix::ffi::OsStrExt as _;
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
+use std::task::Waker;
 use std::time::Duration;
 
-use kr_ipc::identity::{ProcessState, Stop, process_state, started_process_identity, stop_process};
+use kr_ipc::identity::{
+    ProcessState, Stop, Stopped, process_state, started_process_identity, stop_process,
+};
 use kr_protocol::identity::ProcessStartIdentity;
 use kr_protocol::scalars::Digest256;
 use tokio::io::{AsyncReadExt as _, AsyncWrite};
@@ -55,7 +59,7 @@ pub const MAX_ERROR_BYTES: usize = 64 * 1024;
 
 /// The variables of the launch that are not given to the server: the launcher's registration and
 /// its credential name the launch, and the server is not the launched program.
-pub const WITHHELD_VARIABLES: [&str; 2] = ["KR_REGISTRATION", "KR_CREDENTIAL"];
+pub const WITHHELD_VARIABLES: [&str; 2] = kr_protocol::root::LAUNCH_VARIABLES;
 
 /// What a session recorded of the processes below its servers, as the ending reads and changes it.
 ///
@@ -67,6 +71,10 @@ pub trait Owned: Send + Sync {
 
     /// Notes that `process` was ended by force.
     fn forced(&self, process: &ProcessStartIdentity);
+
+    /// Notes that `process` could not be signalled, and why: the system refused, or could not tell
+    /// the process from a stranger that holds its number.
+    fn unsignalled(&self, process: &ProcessStartIdentity, why: &str);
 }
 
 /// What the server is started from.
@@ -95,6 +103,9 @@ pub enum Ended {
     Terminate,
     /// It was ended by force.
     Force,
+    /// It was still running when the ending was over: a signal was refused, or it did not end in
+    /// the time a forced end is given. It is among the survivors.
+    Alive,
 }
 
 /// What ending a server came to.
@@ -104,36 +115,64 @@ pub struct Retirement {
     pub ended: Ended,
     /// The processes that were ended by force, the server among them when it was.
     pub forced: Vec<ProcessStartIdentity>,
-    /// The processes recorded below the server that are still running.
+    /// The processes still running when the ending was over: the ones recorded below the server,
+    /// and the server itself when it is [`Ended::Alive`].
     pub survivors: Vec<ProcessStartIdentity>,
 }
 
 /// The server's input, which the connection writes to and the ending closes.
 ///
 /// The connection owns what it writes through; the ending has to close the pipe whoever holds it,
-/// so the pipe is shared, and closing it makes every later write fail.
+/// so the pipe is shared, and closing it makes every later write fail and wakes a write that was
+/// waiting. A shutdown of a holder's end closes it for every holder, which is the end of the
+/// server's input.
 #[derive(Clone, Debug)]
-pub struct Input(Arc<Mutex<Option<ChildStdin>>>);
+pub struct Input(Arc<Mutex<InputState>>);
+
+#[derive(Debug)]
+struct InputState {
+    pipe: Option<ChildStdin>,
+    /// The task whose write or flush is waiting, woken when the pipe is closed.
+    waiting: Option<Waker>,
+}
 
 impl Input {
+    fn new(pipe: Option<ChildStdin>) -> Self {
+        Self(Arc::new(Mutex::new(InputState {
+            pipe,
+            waiting: None,
+        })))
+    }
+
     /// Closes the pipe, for every holder.
     fn close(&self) {
-        drop(self.0.lock().unwrap_or_else(PoisonError::into_inner).take());
+        let (pipe, waiting) = {
+            let mut state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+            (state.pipe.take(), state.waiting.take())
+        };
+        drop(pipe);
+        if let Some(waker) = waiting {
+            waker.wake();
+        }
     }
 
     fn with<T>(
         &self,
-        use_pipe: impl FnOnce(std::pin::Pin<&mut ChildStdin>) -> std::task::Poll<std::io::Result<T>>,
+        cx: &mut std::task::Context<'_>,
+        use_pipe: impl FnOnce(
+            std::pin::Pin<&mut ChildStdin>,
+            &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<T>>,
     ) -> std::task::Poll<std::io::Result<T>> {
-        match self
-            .0
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .as_mut()
-        {
-            Some(pipe) => use_pipe(std::pin::Pin::new(pipe)),
-            None => std::task::Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into())),
+        let mut state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some(pipe) = state.pipe.as_mut() else {
+            return std::task::Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into()));
+        };
+        let polled = use_pipe(std::pin::Pin::new(pipe), cx);
+        if polled.is_pending() {
+            state.waiting = Some(cx.waker().clone());
         }
+        polled
     }
 }
 
@@ -143,14 +182,14 @@ impl AsyncWrite for Input {
         cx: &mut std::task::Context<'_>,
         buffer: &[u8],
     ) -> std::task::Poll<std::io::Result<usize>> {
-        self.with(|pipe| pipe.poll_write(cx, buffer))
+        self.with(cx, |pipe, cx| pipe.poll_write(cx, buffer))
     }
 
     fn poll_flush(
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
-        self.with(|pipe| pipe.poll_flush(cx))
+        self.with(cx, |pipe, cx| pipe.poll_flush(cx))
     }
 
     fn poll_shutdown(
@@ -201,6 +240,22 @@ impl Server {
     /// not be read or is not the one the record names, the process could not be started, could not
     /// be read once started, or does not run the code that was hashed.
     pub async fn start(spec: &ServerSpec<'_>) -> Result<Self, String> {
+        if !spec.executable.is_absolute() {
+            return Err(format!(
+                "{} is not an absolute path, so no server was started",
+                spec.executable.display()
+            ));
+        }
+        if let Some((name, _)) = spec
+            .presented
+            .iter()
+            .find(|(name, _)| !is_variable_name(name.as_bytes()))
+        {
+            return Err(format!(
+                "the environment presented holds the name {name:?}, which no variable has, so no \
+                 server was started"
+            ));
+        }
         let path = spec.executable.to_path_buf();
         let stop = Arc::new(AtomicBool::new(false));
         let hashed = {
@@ -248,15 +303,6 @@ impl Server {
             }
             None => return Err("the server ended as it started".to_owned()),
         };
-        let shown = crate::broker::image::verify_image(
-            &identity,
-            &ExecutableIdentity {
-                hashed,
-                version: None,
-            },
-            &VerifiedFiles::default(),
-            &stop,
-        );
         let errors = Arc::new(Tail::default());
         let output = child.stdout.take();
         let input = child.stdin.take();
@@ -272,23 +318,34 @@ impl Server {
                 }
             });
         }
+        // From here the guard holds it: whatever returns or is dropped below ends the process.
         let server = Self {
-            identity,
+            identity: identity.clone(),
             child: tokio::sync::Mutex::new(Some(child)),
-            input: Input(Arc::new(Mutex::new(input))),
+            input: Input::new(input),
             output: Mutex::new(output),
             errors,
             retired: AtomicBool::new(false),
         };
+        // Off the runtime's threads: where the image is hashed again, it is the whole file.
+        let shown = tokio::task::spawn_blocking(move || {
+            crate::broker::image::verify_image(
+                &identity,
+                &ExecutableIdentity {
+                    hashed,
+                    version: None,
+                },
+                &VerifiedFiles::default(),
+                &stop,
+            )
+        })
+        .await
+        .map_err(|error| format!("the server's image could not be read: {error}"))?;
         match shown {
             Ok(()) => Ok(server),
-            Err(why) => {
-                // The guard ends it.
-                Err(format!(
-                    "the server started does not run the code that was hashed, so it was ended: \
-                     {why}"
-                ))
-            }
+            Err(why) => Err(format!(
+                "the server started does not run the code that was hashed, so it was ended: {why}"
+            )),
         }
     }
 
@@ -321,14 +378,52 @@ impl Server {
         let Some(child) = held.as_mut() else {
             return true;
         };
-        if tokio::time::timeout(grace, child.wait()).await.is_ok() {
-            *held = None;
-            return true;
+        match tokio::time::timeout(grace, child.wait()).await {
+            Ok(Ok(_)) => {
+                *held = None;
+                true
+            }
+            // The system will not say how it ended, so the kernel is asked whether it did.
+            Ok(Err(_)) => {
+                let mut remaining = vec![self.identity.clone()];
+                wait_until_ended(&mut remaining, grace).await;
+                remaining.is_empty()
+            }
+            Err(_) => false,
         }
-        false
+    }
+
+    /// Asks the server to end with `stop`, by its identity; where the system will not signal by
+    /// identity, through the child this holds, which has not been collected and so still names
+    /// the server.
+    async fn ask(&self, stop: Stop, owned: &dyn Owned) -> bool {
+        match stop_process(&self.identity, stop) {
+            Stopped::Signalled | Stopped::Gone | Stopped::Unsupported => true,
+            Stopped::Refused(why) | Stopped::Unsafe(why) => {
+                let mut held = self.child.lock().await;
+                let signalled = held.as_mut().is_some_and(|child| match stop {
+                    Stop::Kill => child.start_kill().is_ok(),
+                    _ => child
+                        .id()
+                        .and_then(|pid| i32::try_from(pid).ok())
+                        .and_then(rustix::process::Pid::from_raw)
+                        .is_some_and(|pid| {
+                            rustix::process::kill_process(pid, rustix::process::Signal::TERM)
+                                .is_ok()
+                        }),
+                });
+                if !signalled {
+                    owned.unsignalled(&self.identity, &why);
+                }
+                signalled
+            }
+        }
     }
 
     /// Ends the server, and everything the session recorded below it.
+    ///
+    /// What comes back says how the server ended, which processes were ended by force, and which
+    /// are still running: the server too, when it would not end.
     pub async fn retire(&self, owned: &dyn Owned) -> Retirement {
         let mut known: BTreeSet<ProcessStartIdentity> =
             owned.below(&self.identity).into_iter().collect();
@@ -342,23 +437,31 @@ impl Server {
                 Ended::Input
             } else {
                 known.extend(owned.below(&self.identity));
-                let _ = stop_process(&self.identity, Stop::Term);
+                self.ask(Stop::Term, owned).await;
                 if self.ended_within(TERMINATE_GRACE).await {
                     Ended::Terminate
                 } else {
                     // The last reading before the process that holds the trees is gone.
                     known.extend(owned.below(&self.identity));
-                    let _ = stop_process(&self.identity, Stop::Kill);
-                    owned.forced(&self.identity);
-                    forced.push(self.identity.clone());
-                    self.ended_within(FORCE_WAIT).await;
-                    Ended::Force
+                    if self.ask(Stop::Kill, owned).await {
+                        owned.forced(&self.identity);
+                        forced.push(self.identity.clone());
+                    }
+                    if self.ended_within(FORCE_WAIT).await {
+                        Ended::Force
+                    } else {
+                        Ended::Alive
+                    }
                 }
             }
         };
-        self.retired.store(true, Ordering::Release);
-        known.extend(owned.below(&self.identity));
-        let survivors = end_by_identity(known, owned, &mut forced).await;
+        let mut survivors = end_below(&self.identity, known, owned, &mut forced).await;
+        if ended == Ended::Alive {
+            // The guard has one more try when this is dropped.
+            survivors.push(self.identity.clone());
+        } else {
+            self.retired.store(true, Ordering::Release);
+        }
         Retirement {
             ended,
             forced,
@@ -370,15 +473,33 @@ impl Server {
 impl Drop for Server {
     fn drop(&mut self) {
         if !self.retired.load(Ordering::Acquire) {
+            // Closed for every holder of the pipe, so a server that ends with its input does.
+            self.input.close();
             let _ = stop_process(&self.identity, Stop::Kill);
+            // The child is held and not collected, so it names the server even where the system
+            // would not signal by identity.
+            if let Ok(mut held) = self.child.try_lock()
+                && let Some(child) = held.as_mut()
+            {
+                let _ = child.start_kill();
+            }
         }
     }
 }
 
-/// Ends each of `processes` that is running, by its identity: asked to terminate first and given
-/// a moment, then ended. Returns the ones still running at the end.
-async fn end_by_identity(
-    processes: BTreeSet<ProcessStartIdentity>,
+/// Whether `name` can be the name of a variable the server is given: not empty, and holding no
+/// `=` (which would end the name where the system writes `NAME=value`) and no NUL.
+fn is_variable_name(name: &[u8]) -> bool {
+    !name.is_empty() && !name.contains(&b'=') && !name.contains(&0)
+}
+
+/// Ends each process recorded below `server` that is running, by its identity: asked to terminate
+/// first and given a moment, then ended. The record is read again after each wait, since a process
+/// that was ended may have started another that the session recorded meanwhile. Returns the
+/// processes still running at the end.
+async fn end_below(
+    server: &ProcessStartIdentity,
+    mut known: BTreeSet<ProcessStartIdentity>,
     owned: &dyn Owned,
     forced: &mut Vec<ProcessStartIdentity>,
 ) -> Vec<ProcessStartIdentity> {
@@ -388,18 +509,45 @@ async fn end_by_identity(
             .cloned()
             .collect()
     };
-    let mut remaining = running(&processes);
+    known.extend(owned.below(server));
+    let mut remaining = running(&known);
     for process in &remaining {
-        let _ = stop_process(process, Stop::Term);
+        signal(process, Stop::Term, owned);
     }
     wait_until_ended(&mut remaining, TERMINATE_GRACE).await;
-    for process in &remaining {
-        let _ = stop_process(process, Stop::Kill);
-        owned.forced(process);
-        forced.push(process.clone());
+    // A few rounds: each ends what is running and reads the record for what that left.
+    for _ in 0..KILL_ROUNDS {
+        known.extend(owned.below(server));
+        remaining = running(&known);
+        if remaining.is_empty() {
+            break;
+        }
+        for process in &remaining {
+            if signal(process, Stop::Kill, owned) {
+                owned.forced(process);
+                forced.push(process.clone());
+            }
+        }
+        wait_until_ended(&mut remaining, FORCE_WAIT).await;
     }
-    wait_until_ended(&mut remaining, FORCE_WAIT).await;
-    remaining
+    known.extend(owned.below(server));
+    running(&known)
+}
+
+/// How many times the ending reads the record again and ends what it finds there.
+const KILL_ROUNDS: usize = 3;
+
+/// Signals one process by its identity, and says whether it was signalled; a refusal goes to
+/// `owned`.
+fn signal(process: &ProcessStartIdentity, stop: Stop, owned: &dyn Owned) -> bool {
+    match stop_process(process, stop) {
+        Stopped::Signalled => true,
+        Stopped::Gone | Stopped::Unsupported => false,
+        Stopped::Refused(why) | Stopped::Unsafe(why) => {
+            owned.unsignalled(process, &why);
+            false
+        }
+    }
 }
 
 /// Waits up to `grace` for every process in `remaining` to be gone, and leaves the ones that are
