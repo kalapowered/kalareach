@@ -1268,6 +1268,25 @@ fn a_revocation_reaches_the_grants_that_can_still_hold_input() {
         "and the viewer's grant is not one an input lease is held under"
     );
 
+    // Grant 4 is revoked and its fence completed, and then another change owes a fence at the same
+    // moment the clock reads: the moments the changes are made at are told apart, so that debt does
+    // not stand for grant 4.
+    let directory = GrantDirectory::in_memory().expect("a grant store");
+    build(&directory);
+    let early = directory
+        .revoke(grant_id(4), now - 3_000, || Ok(()))
+        .expect("the child is revoked");
+    directory
+        .fence_completed(&early.debt.into_iter().collect::<Vec<_>>())
+        .expect("its fence is done");
+    directory
+        .owe_fence("another change", now - 3_000)
+        .expect("another change owes a fence");
+    let revocation = directory
+        .revoke(grant_id(1), now, || Ok(()))
+        .expect("the root is revoked");
+    assert_eq!(revocation.reached, ids(&[1, 2, 3, 5]));
+
     // The same with grant 4 revoked a moment before and its fence still owed.
     let directory = GrantDirectory::in_memory().expect("a grant store");
     build(&directory);
@@ -1358,10 +1377,17 @@ fn a_delegation_tree_takes_no_grant_past_the_limit() {
         .issue(&delegated(1_000_001, other_root.grant_id), || Ok(()))
         .expect("another tree has room");
 
-    // A grant withdrawn gives its room back.
-    directory
+    // A grant withdrawn gives its room back once its fence is done, not before: until then a
+    // revocation of the tree still reaches it.
+    let withdrawn = directory
         .revoke(last, 5_000, || Ok(()))
         .expect("the end of the chain is withdrawn");
+    directory
+        .issue(&delegated(1_000_002, root.grant_id), || Ok(()))
+        .expect_err("the withdrawn grant's fence is still owed");
+    directory
+        .fence_completed(&withdrawn.debt.into_iter().collect::<Vec<_>>())
+        .expect("its fence is done");
     directory
         .issue(&delegated(1_000_002, root.grant_id), || Ok(()))
         .expect("room again");
@@ -3986,8 +4012,11 @@ async fn a_withdrawal_larger_than_one_message_is_read_back_and_its_fence_settled
         .grants()
         .issue(&record(parent.clone()), || Ok(()))
         .expect("written");
+    // A share from before the limit holds more than a collection of a message does: the tree is
+    // filled to the limit, and the rest is written as an earlier build wrote it.
     let children = kr_cbor::Limits::DEFAULT.max_collection_len + 4;
-    for index in 0..children {
+    let kept = MAX_GRANTS_PER_TREE - 1;
+    for index in 0..kept {
         let child = Grant {
             grant_id: GrantId::new(Uuid::from_bytes(
                 (0x1000_u128 + index as u128).to_be_bytes(),
@@ -4002,6 +4031,38 @@ async fn a_withdrawal_larger_than_one_message_is_read_back_and_its_fence_settled
             .issue(&record(child), || Ok(()))
             .expect("written");
     }
+    let earlier = rusqlite::Connection::open(host.temp.environment().registry_database())
+        .expect("the registry opens");
+    for index in kept..children {
+        let child = Grant {
+            grant_id: GrantId::new(Uuid::from_bytes(
+                (0x1000_u128 + index as u128).to_be_bytes(),
+            )),
+            parent_grant_id: Nullable::some(parent.grant_id),
+            recipient_device_id: device_id(0xf2),
+            ..parent.clone()
+        };
+        let stored = record(child.clone());
+        earlier
+            .execute(
+                "INSERT INTO grants (grant_id, parent_grant_id, recipient_device_id, session_id,
+                                     grant, issued_at_ms, activated_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                rusqlite::params![
+                    child.grant_id.get().as_bytes().as_slice(),
+                    parent.grant_id.get().as_bytes().as_slice(),
+                    child.recipient_device_id.get().as_bytes().as_slice(),
+                    stored
+                        .session_id
+                        .map(|session| session.get().as_bytes().to_vec()),
+                    kr_cbor::to_canonical_vec(&child).expect("a grant encodes"),
+                    1_000_i64,
+                    1_000_i64,
+                ],
+            )
+            .expect("a grant written before the limit");
+    }
+    drop(earlier);
     let before = controller.policy().authority_revision();
     let mut client = host.client().await;
     let action_id = kr_protocol::ids::ActionId::new(Uuid::from_bytes([0x71; 16]));

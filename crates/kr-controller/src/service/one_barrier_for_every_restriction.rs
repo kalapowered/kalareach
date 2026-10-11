@@ -590,12 +590,13 @@ async fn a_revision_names_the_input_grants_it_reached_and_never_more_than_a_noti
     drop(controller);
 }
 
-/// KR-REQ-10.45: a notice joins the revisions after the one a worker acknowledged while what they
-/// name together fits one notice, and stops before the revision that would not fit: the worker is
-/// then told the later ones, says it follows the stopping point, and fences every caller under a
-/// grant if it has not fenced that revision.
+/// KR-REQ-10.45: a worker not told a revision before the next advanced is told every revision after
+/// the one it acknowledged by name, oldest first, as many to a notice as fit one: two revisions that
+/// fit alone and not together are two notices, each following the one before, so the worker has fenced
+/// what each describes and keeps every lease no revision named; a worker that is told only the
+/// newest has fenced nothing of the older and fences every caller under a grant.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_join_of_revisions_stops_before_what_a_notice_cannot_carry() {
+async fn a_worker_that_missed_a_revision_is_told_each_in_order_by_name() {
     use kr_protocol::worker::RevisionReach;
 
     let temp = kr_ipc::testing::TempHost::create();
@@ -616,27 +617,30 @@ async fn a_join_of_revisions_stops_before_what_a_notice_cannot_carry() {
     };
     let older = barrier_for(&controller, input_grants(1, bound / 2 + 1)).await;
     let newer = barrier_for(&controller, input_grants(100_000, bound / 2 + 1)).await;
+    let count = usize::try_from(bound / 2 + 1).expect("fits");
 
-    let RevisionReach::Within { since, grants, .. } = controller
-        .revision_notice(newer, one_before(older), 0, &stating())
-        .reach
-    else {
-        panic!("the revisions are named");
-    };
-    assert_eq!(since, older, "the join stops before the older revision");
-    assert_eq!(grants.len(), usize::try_from(bound / 2 + 1).expect("fits"));
+    let notices = controller.revision_notices(newer, one_before(older), 0, &stating());
+    let told: Vec<_> = notices
+        .iter()
+        .map(|notice| match &notice.reach {
+            RevisionReach::Within { since, grants, .. } => (notice.revision, *since, grants.len()),
+            RevisionReach::Host => panic!("the revisions are named"),
+        })
+        .collect();
+    assert_eq!(
+        told,
+        vec![(older, one_before(older), count), (newer, older, count)],
+        "each revision by name, oldest first, each following the one before"
+    );
+
+    // Two that fit together are one notice.
+    let small = barrier_for(&controller, input_grants(200_000, 10)).await;
+    let notices = controller.revision_notices(small, newer, 0, &stating());
+    assert_eq!(notices.len(), 1);
     drop(controller);
 }
 
-/// A grant of the kind a device holds below another, for the store.
-fn a_held_grant(
-    id: kr_protocol::ids::GrantId,
-    parent: Option<kr_protocol::ids::GrantId>,
-) -> kr_protocol::grant::Grant {
-    a_typists_grant(id, parent, &[kr_protocol::rights::ActionRight::SessionView])
-}
-
-/// A grant of the same kind that carries `actions`.
+/// A grant of the kind a device holds below another, for the store, that carries `actions`.
 fn a_typists_grant(
     id: kr_protocol::ids::GrantId,
     parent: Option<kr_protocol::ids::GrantId>,

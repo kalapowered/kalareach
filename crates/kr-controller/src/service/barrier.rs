@@ -417,7 +417,7 @@ impl Controller {
                         // revocation from reporting `pending` for it, and must not stop the
                         // announcement reaching the workers after it. Section 9 makes waiting the
                         // opposite of completion.
-                        let notice = self.revision_notice(
+                        let mut notices = self.revision_notices(
                             revision,
                             recorded
                                 .get(&session_id)
@@ -426,13 +426,40 @@ impl Controller {
                             0,
                             &link.client().acknowledgement().capabilities,
                         );
+                        let notice = notices.pop().expect("an announcement is made");
+                        // A worker not told a revision before the next advanced is told them oldest
+                        // first. Each is a revision of its own, acknowledged as one.
+                        let mut missed = false;
+                        for earlier in notices {
+                            #[cfg(feature = "testing")]
+                            self.record_announcement(session_id, &earlier);
+                            match tokio::time::timeout(
+                                WORKER_EXCHANGE,
+                                link.client().announce_revision(earlier),
+                            )
+                            .await
+                            {
+                                Ok(Ok(ack)) => {
+                                    self.note_earlier_acknowledgement(session_id, binding, ack)
+                                        .await;
+                                }
+                                Ok(Err(_)) | Err(_) => {
+                                    missed = true;
+                                    break;
+                                }
+                            }
+                        }
                         #[cfg(feature = "testing")]
                         self.record_announcement(session_id, &notice);
-                        let answered = tokio::time::timeout(
-                            WORKER_EXCHANGE,
-                            link.client().announce_revision(notice),
-                        )
-                        .await;
+                        let answered = if missed {
+                            Ok(Err(kr_ipc::IpcError::PeerClosed))
+                        } else {
+                            tokio::time::timeout(
+                                WORKER_EXCHANGE,
+                                link.client().announce_revision(notice),
+                            )
+                            .await
+                        };
                         match answered {
                             Ok(Ok(ack)) => {
                                 link.give_back();
@@ -869,62 +896,133 @@ impl Controller {
             .then(|| std::sync::Arc::new(named))
     }
 
-    /// What the revisions a worker has not fenced withdrew, up to `revision`.
-    ///
-    /// `held` is the revision the worker last acknowledged, as this daemon recorded it, so the
-    /// reach joins the revisions after it and no older ones: a lease the worker holds from before
-    /// is a lease its holder took after those revisions, and a notice that named the holders of an
-    /// older revision again would take it. The reaches of consecutive revisions that each name
-    /// their authority are joined, back to the first one this daemon cannot name or the join of
-    /// which a notice cannot carry; the reach says it follows that one, and a worker that has
-    /// fenced it applies the reach, while any other fences every caller under a grant. A worker
-    /// that was refused revisions joins its own exact record of them. A revision this daemon holds
-    /// no reach for, because it restarted since, is the whole host's.
-    fn reach_up_to(
+    /// Takes the acknowledgement of a revision older than the one a barrier waits on, which a worker
+    /// that missed it gave while it was told the revisions in order: it is news about that
+    /// revision and nothing else, as an acknowledgement of an older revision is.
+    pub(crate) async fn note_earlier_acknowledgement(
         &self,
-        revision: AuthorityRevision,
-        held: AuthorityRevision,
-    ) -> kr_protocol::worker::RevisionReach {
-        // The entries are taken under the lock and joined outside it: they are shared, not copied.
-        let entries: Vec<std::sync::Arc<Named>> = {
-            let debts = self.debts();
-            let mut entries = Vec::new();
-            let mut at = revision.get();
-            while at > held.get() {
-                let Some(Some(entry)) = debts.reaches.get(&at) else {
-                    break;
-                };
-                entries.push(std::sync::Arc::clone(entry));
-                at -= 1;
-            }
-            entries
-        };
-        let Some((newest, older)) = entries.split_first() else {
-            return kr_protocol::worker::RevisionReach::Host;
-        };
-        let mut named = Named::clone(newest);
-        let mut lowest = revision.get();
-        for entry in older {
-            let joined = named.joined(entry);
-            if joined.len() > kr_protocol::worker::MAX_REVISION_REACH_NAMES {
-                break;
-            }
-            named = joined;
-            lowest -= 1;
-        }
-        kr_protocol::worker::RevisionReach::Within {
-            since: AuthorityRevision::new(lowest.saturating_sub(1)),
-            grants: named.grants.into_iter().collect(),
-            devices: named.devices.into_iter().collect(),
+        session_id: SessionId,
+        binding: WorkerBinding,
+        ack: kr_protocol::worker::AuthorityRevisionAck,
+    ) {
+        let evidenced = ack.fence.is_some();
+        let revision = ack.revision;
+        if self
+            .leases
+            .acknowledge(session_id, binding, revision, ack.fence)
+            && evidenced
+        {
+            let _ = self
+                .registry
+                .lock()
+                .await
+                .record_acknowledged_revision(session_id, revision);
         }
     }
 
-    /// The announcement of `revision` to a worker that said `capabilities` in its hello and last
-    /// acknowledged `held`, as this daemon recorded it.
+    /// What the revisions a worker has not fenced withdrew, up to `revision`, in the notices it is
+    /// told them by: each is the last revision of a group and says which revision it follows.
     ///
-    /// It names whose authority the revisions withdrew ([`Self::reach_up_to`]) only to a worker
+    /// `held` is the revision the worker last acknowledged, as this daemon recorded it, so the
+    /// reach covers the revisions after it and no older ones: a lease the worker holds from before
+    /// is a lease its holder took after those revisions, and a notice that named the holders of an
+    /// older revision again would take it. The revisions are grouped, oldest first, as many to a
+    /// group as their names together fit one notice, so a worker that was not told one revision
+    /// before the next advanced is told every one of them by name. A revision this daemon holds no
+    /// reach for, because it restarted since or it passed what a notice carries, is the whole
+    /// host's: the worker is told that revision as such, and the ones after it by name. A worker
+    /// that was refused revisions joins its own exact record of them.
+    fn reach_groups(
+        &self,
+        revision: AuthorityRevision,
+        held: AuthorityRevision,
+    ) -> Vec<(AuthorityRevision, kr_protocol::worker::RevisionReach)> {
+        use kr_protocol::worker::RevisionReach;
+
+        let host = || vec![(revision, RevisionReach::Host)];
+        if held.get() >= revision.get()
+            || revision.get() - held.get() > KEPT_REVISION_REACHES as u64
+        {
+            return host();
+        }
+        // The entries are taken under the lock and joined outside it: they are shared, not copied.
+        let entries: Vec<(u64, Option<std::sync::Arc<Named>>)> = {
+            let debts = self.debts();
+            (held.get() + 1..=revision.get())
+                .map(|at| (at, debts.reaches.get(&at).cloned().flatten()))
+                .collect()
+        };
+        let unnamed = entries.iter().rev().find(|(_, entry)| entry.is_none());
+        let mut groups = Vec::new();
+        let mut start = held.get() + 1;
+        if let Some((at, _)) = unnamed {
+            if *at == revision.get() {
+                return host();
+            }
+            groups.push((AuthorityRevision::new(*at), RevisionReach::Host));
+            start = at + 1;
+        }
+        let bound = kr_protocol::worker::MAX_REVISION_REACH_NAMES;
+        let within = |since: u64, named: Named| RevisionReach::Within {
+            since: AuthorityRevision::new(since),
+            grants: named.grants.into_iter().collect(),
+            devices: named.devices.into_iter().collect(),
+        };
+        let mut group = Named::default();
+        let mut since = start - 1;
+        let mut previous = since;
+        for (at, entry) in entries.iter().filter(|(at, _)| *at >= start) {
+            let named = entry.as_deref().cloned().unwrap_or_default();
+            let joined = group.joined(&named);
+            if joined.len() > bound && previous >= start {
+                groups.push((AuthorityRevision::new(previous), within(since, group)));
+                group = named;
+                since = at - 1;
+            } else {
+                group = joined;
+            }
+            previous = *at;
+        }
+        groups.push((revision, within(since, group)));
+        groups
+    }
+
+    /// The announcements of `revision` to a worker that said `capabilities` in its hello and last
+    /// acknowledged `held`, as this daemon recorded it, oldest first: the last is the one the
+    /// barrier waits on.
+    ///
+    /// They name whose authority the revisions withdrew ([`Self::reach_groups`]) only to a worker
     /// that reads that, and only for the first page of the revision's evidence: a continuation asks
     /// for names of a revision the worker has already fenced.
+    pub(crate) fn revision_notices(
+        &self,
+        revision: AuthorityRevision,
+        held: AuthorityRevision,
+        evidence_from: u64,
+        capabilities: &kr_protocol::scalars::CanonicalSet<kr_protocol::ids::CapabilityId>,
+    ) -> Vec<kr_protocol::worker::AuthorityRevisionNotice> {
+        let notice =
+            |revision, reach, evidence_from| kr_protocol::worker::AuthorityRevisionNotice {
+                environment_id: self.paths.environment_id(),
+                revision,
+                reach,
+                evidence_from,
+            };
+        if evidence_from != 0 || !kr_protocol::local::reads_revision_reach(capabilities) {
+            return vec![notice(
+                revision,
+                kr_protocol::worker::RevisionReach::Host,
+                evidence_from,
+            )];
+        }
+        self.reach_groups(revision, held)
+            .into_iter()
+            .map(|(revision, reach)| notice(revision, reach, 0))
+            .collect()
+    }
+
+    /// The last announcement of [`Self::revision_notices`], for a test that reads one.
+    #[cfg(test)]
     pub(crate) fn revision_notice(
         &self,
         revision: AuthorityRevision,
@@ -932,18 +1030,9 @@ impl Controller {
         evidence_from: u64,
         capabilities: &kr_protocol::scalars::CanonicalSet<kr_protocol::ids::CapabilityId>,
     ) -> kr_protocol::worker::AuthorityRevisionNotice {
-        let reach = if evidence_from == 0 && kr_protocol::local::reads_revision_reach(capabilities)
-        {
-            self.reach_up_to(revision, held)
-        } else {
-            kr_protocol::worker::RevisionReach::Host
-        };
-        kr_protocol::worker::AuthorityRevisionNotice {
-            environment_id: self.paths.environment_id(),
-            revision,
-            reach,
-            evidence_from,
-        }
+        self.revision_notices(revision, held, evidence_from, capabilities)
+            .pop()
+            .expect("an announcement is made")
     }
 
     /// A barrier's first step. Inside the registry critical section that advances the revision,

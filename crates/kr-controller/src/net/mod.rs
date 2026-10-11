@@ -1691,12 +1691,22 @@ impl Controller {
             let mut link = self.worker_client(&worker).await?;
             // The first page of whatever its fence named: this worker has said nothing about this
             // revocation yet, so there is nothing to continue from.
-            let notice = self.revision_notice(
+            let mut notices = self.revision_notices(
                 revision,
                 held,
                 0,
                 &link.client().acknowledgement().capabilities,
             );
+            let notice = notices.pop().expect("an announcement is made");
+            // The revisions the worker has not fenced are told it oldest first, each as a revision
+            // of its own.
+            for earlier in notices {
+                #[cfg(feature = "testing")]
+                self.record_announcement(session_id, &earlier);
+                let ack = link.client().announce_revision(earlier).await?;
+                self.note_earlier_acknowledgement(session_id, binding, ack)
+                    .await;
+            }
             #[cfg(feature = "testing")]
             self.record_announcement(session_id, &notice);
             let answered = link.client().announce_revision(notice).await;
