@@ -284,8 +284,8 @@ fn unreadable_records(
         environment: None,
         place: install.roots(),
         why: Why::Unreadable(shown!(
-            "{}; make the record it names owner-only, or remove it: the command or daemon that works \
-             there next writes it again",
+            "{}; make the record it names owner-only, or remove it: until the command or daemon \
+             that works there next writes it again, the update does not look at the root it named",
             super::said(error)
         )),
     }
