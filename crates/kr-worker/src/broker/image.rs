@@ -192,7 +192,7 @@ pub(crate) fn read_holding(
 
 /// Opens a file to read without waiting for it, whatever the file is: a FIFO or a device in its
 /// place cannot hold the reader, and what it is decides afterwards.
-fn open_without_waiting(path: &Path) -> std::io::Result<std::fs::File> {
+pub(crate) fn open_without_waiting(path: &Path) -> std::io::Result<std::fs::File> {
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
