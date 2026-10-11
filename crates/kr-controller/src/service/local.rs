@@ -689,17 +689,25 @@ impl Controller {
                     let confirm = mutation.action_id;
                     let request_id = mutation.request_id;
                     let method = mutation.method.method();
+                    // Receipt time, before anything this daemon waits for, the lease check included.
+                    let received_at = self.clock.now();
                     // A held method is refused before it is performed once no lease is live:
-                    // nothing was done, and the refusal says so.
-                    let reply = match method.map(|method| (method, self.local_hold(method))) {
-                        Some((_, Err(error))) if self.authorised(connection_id).is_ok() => {
-                            error_reply(request_id, error.code(), error.to_string())
+                    // nothing was done, no result is withheld, and the refusal is written as it
+                    // is.
+                    let refused = method
+                        .and_then(|method| self.local_hold(method).err())
+                        .filter(|_| self.authorised(connection_id).is_ok());
+                    if let Some(error) = refused {
+                        let refusal = error_reply(request_id, error.code(), error.to_string());
+                        if writer.write_message(&refusal).await.is_err() {
+                            break;
                         }
-                        _ => {
-                            self.perform(&actor_id, connection_id, origin, *mutation)
-                                .await
-                        }
-                    };
+                        self.confirm_delivery(confirm).await;
+                        continue;
+                    }
+                    let reply = self
+                        .perform_at(&actor_id, connection_id, origin, *mutation, received_at)
+                        .await;
                     // The acceptance reaches the caller here. A worker that is holding a close for
                     // this action learns that it has, and only then starts signalling. The answer
                     // of a held method is written only while the lease holds, asked again before
@@ -727,13 +735,9 @@ impl Controller {
         Ok(())
     }
 
-    /// Admits one mutation and performs it on an owner that outlives this connection.
-    ///
-    /// A connection task is dropped the moment its control stream ends, and dropping a future is a
-    /// cancellation: destructors run, but nothing after an outstanding `await` finishes. A durable
-    /// commit cannot be left half done by a peer going away, so the effect runs in its own task.
-    /// Dropping the handle this awaits does not stop that task; it only stops this connection
-    /// hearing the answer.
+    /// Admits one mutation as [`Self::perform_at`] does, for a request that has just arrived, for
+    /// the tests that call the door without a connection.
+    #[cfg(test)]
     pub(super) async fn perform(
         self: &Arc<Self>,
         actor_id: &ActorId,
@@ -746,6 +750,26 @@ impl Controller {
         // the registry lock: sampling the clock after it would hand the request its whole lifetime
         // back after the wait.
         let received_at = self.clock.now();
+        self.perform_at(actor_id, connection_id, origin, mutation, received_at)
+            .await
+    }
+
+    /// Admits one mutation that arrived at `received_at` and performs it on an owner that outlives
+    /// this connection.
+    ///
+    /// A connection task is dropped the moment its control stream ends, and dropping a future is a
+    /// cancellation: destructors run, but nothing after an outstanding `await` finishes. A durable
+    /// commit cannot be left half done by a peer going away, so the effect runs in its own task.
+    /// Dropping the handle this awaits does not stop that task; it only stops this connection
+    /// hearing the answer.
+    pub(super) async fn perform_at(
+        self: &Arc<Self>,
+        actor_id: &ActorId,
+        connection_id: ConnectionId,
+        origin: Option<kr_protocol::local::BridgeOrigin>,
+        mutation: MutationRequest,
+        received_at: kr_transport::clock::ContinuousInstant,
+    ) -> ControlFrame {
         if let Err(error) = self.authorised(connection_id) {
             return error_reply(
                 mutation.request_id,

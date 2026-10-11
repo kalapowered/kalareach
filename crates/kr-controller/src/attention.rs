@@ -1089,7 +1089,10 @@ impl AttentionModule {
         if withheld.is_none() && lease.is_none() {
             return writer.write_message(&frame).await;
         }
-        let bytes = kr_ipc::framed::FrameWriter::encode(kind, &frame)?;
+        // What is being written, and whether its session text is still held to the ticket: the
+        // answer with its text withheld carries none, and is held to the lease alone.
+        let mut bytes = kr_ipc::framed::FrameWriter::encode(kind, &frame)?;
+        let mut text_held = withheld.is_some();
         let mut begun = false;
         loop {
             let attempt = {
@@ -1099,7 +1102,7 @@ impl AttentionModule {
                 // state that has gone.
                 let standing = ticket.standing();
                 let may_write = || {
-                    (withheld.is_none()
+                    (!text_held
                         || (standing.is_some()
                             && ticket.holds_text(&fences, kr_ipc::clock::boot_elapsed_ms())))
                         && lease.is_none_or(|lease| (lease.permitted)())
@@ -1116,25 +1119,28 @@ impl AttentionModule {
                 CheckedWrite::Blocked => writer.writable().ready().await?,
                 CheckedWrite::Refused => {
                     let lapsed = lease.filter(|lease| !(lease.permitted)());
-                    if writer.withdraw_unstarted() {
-                        if let Some(lease) = lapsed {
-                            return writer.write_message(&lease.refusal).await;
-                        }
-                        if let Some(withheld) = &withheld {
-                            return writer.write_message(withheld).await;
-                        }
-                        // Neither stopped it any more: the lease was presented again. Offered
-                        // afresh.
-                        begun = false;
-                        continue;
+                    if !writer.withdraw_unstarted() {
+                        return Err(kr_ipc::IpcError::socket(
+                            "write",
+                            std::io::Error::other(
+                                "what this answer carries may no longer be released, and part of \
+                                 the answer has gone",
+                            ),
+                        ));
                     }
-                    return Err(kr_ipc::IpcError::socket(
-                        "write",
-                        std::io::Error::other(
-                            "what this answer carries may no longer be released, and part of the \
-                             answer has gone",
-                        ),
-                    ));
+                    if let Some(lease) = lapsed {
+                        // The refusal carries no result, so it is written whatever the lease says.
+                        return writer.write_message(&lease.refusal).await;
+                    }
+                    if text_held && let Some(withheld) = &withheld {
+                        // The ticket stopped it: the same answer without its text, which the lease
+                        // still holds.
+                        bytes = kr_ipc::framed::FrameWriter::encode(kind, withheld)?;
+                        text_held = false;
+                    }
+                    // Offered afresh: the answer with its text withheld, or the same answer once
+                    // more where neither stopped it any longer.
+                    begun = false;
                 }
             }
         }
