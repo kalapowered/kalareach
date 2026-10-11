@@ -318,3 +318,75 @@ async fn the_host_counts_the_workers_it_cannot_tell_and_not_those_it_has_told_or
     assert!(lacking(&silent).await.is_empty());
     silent.serving.abort();
 }
+
+/// KR-REQ-17.54: a claim the daemon recovers is recorded before the worker is told anything, and
+/// the worker is told what is in force when it is published, not what was drawn before a
+/// restriction committed.
+///
+/// The worker is real and starts closed, as one the daemon launched does. The daemon stops with the
+/// statement drawn and not yet sent; at that moment the registry already holds the worker, so any
+/// restriction from here on counts it, and the worker is not visible. A restriction commits there.
+/// Once the tell ends, the worker holds the restriction, and only then is it published.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_recovered_claim_is_recorded_before_it_is_told_and_published_on_what_is_in_force() {
+    use super::a_link_that_is_not_given_back::Served;
+
+    let (world, _reservation) = Served::claimed().await;
+    let controller = &world.controller;
+    let session_id = world.session_id;
+    world.service().hold_local_access_until_told();
+    let (drawn, go) = controller.after_the_local_access_is_drawn.arm();
+
+    let recovering = tokio::spawn({
+        let controller = Arc::clone(controller);
+        async move { controller.recover_claims().await }
+    });
+    tokio::time::timeout(WAIT, drawn)
+        .await
+        .expect("the daemon draws what it will tell the worker")
+        .expect("the pause is armed");
+
+    assert!(
+        controller
+            .registry
+            .lock()
+            .await
+            .workers()
+            .expect("the registry answers")
+            .iter()
+            .any(|row| row.session_id == session_id),
+        "the worker has its row before it is told anything, so every barrier counts it"
+    );
+    assert!(
+        controller.directory.lock().await.get(session_id).is_none(),
+        "and nothing can find it yet"
+    );
+    assert_eq!(
+        world.service().local_gate().check(),
+        Err(kr_worker::local_gate::Refused::NotTold),
+        "the worker has been told nothing, and serves its local owner nothing that is held"
+    );
+
+    // A restriction commits after the statement was drawn and before it is sent.
+    controller
+        .policy
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .set_exclusively_managed(true);
+    go.send(()).expect("the tell is waiting");
+    tokio::time::timeout(WAIT, recovering)
+        .await
+        .expect("the recovery ends")
+        .expect("the task ends")
+        .expect("the claim is recovered");
+
+    assert!(
+        controller.directory.lock().await.get(session_id).is_some(),
+        "the worker is published"
+    );
+    assert_eq!(
+        world.service().local_gate().check(),
+        Err(kr_worker::local_gate::Refused::Closed),
+        "and it holds the restriction that committed meanwhile, not the answer drawn before it"
+    );
+}

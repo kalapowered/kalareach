@@ -269,6 +269,8 @@ impl Controller {
             return Ok(None);
         }
         let mut frame = self.local_access_now();
+        #[cfg(test)]
+        self.after_the_local_access_is_drawn.wait().await;
         loop {
             let ack = client
                 .announce_local_access(frame)

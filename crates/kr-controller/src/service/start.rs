@@ -819,6 +819,8 @@ impl Controller {
             #[cfg(test)]
             before_a_worker_is_made_known: ReadPause::default(),
             #[cfg(test)]
+            after_the_local_access_is_drawn: ReadPause::default(),
+            #[cfg(test)]
             before_a_descriptor_is_written: BlockingPause::default(),
             #[cfg(test)]
             stopped_at: std::sync::Mutex::new(None),

@@ -553,6 +553,11 @@ impl Served {
         (world, reservation.reservation_id)
     }
 
+    /// The worker's service, so that a test can read what the worker holds.
+    pub(super) fn service(&self) -> &Arc<kr_worker::service::WorkerService> {
+        &self._stopping.service
+    }
+
     /// The identity a worker of `session_id` has under `controller`'s boot.
     fn identity_of(controller: &Controller, session_id: SessionId) -> Arc<WorkerIdentity> {
         Arc::new(

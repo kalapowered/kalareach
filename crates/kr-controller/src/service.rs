@@ -544,6 +544,11 @@ pub struct Controller {
     /// the publication is in flight. Compiled away in every shipped build.
     #[cfg(test)]
     before_a_worker_is_made_known: ReadPause,
+    /// Where this host's own tests stop a tell of a worker after the statement has been drawn and
+    /// before it is sent, so that a change of the bound can commit between the two. Compiled away
+    /// in every shipped build.
+    #[cfg(test)]
+    after_the_local_access_is_drawn: ReadPause,
     /// Where this host's own tests stop the thread that writes a worker's descriptor, before it
     /// writes, so that the daemon can be let go while the write is still to be made. Compiled away
     /// in every shipped build.
