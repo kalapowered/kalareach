@@ -409,7 +409,7 @@ fn the_folding_and_the_metric_of_the_near_miss_rule_are_pinned() {
         ("ceilnigs", "ceilings"),
         ("ceiling", "ceilings"),
         ("sessionlimit", "session_limit"),
-        // Six separators fold away; with none folded this is six edits.
+        // Seven separators fold away; with none folded this is seven edits.
         ("c_e-i_l-i_n-g_s", "ceilings"),
         // Two accents are two edits of characters, and four of bytes.
         ("c\u{e9}il\u{ef}ngs", "ceilings"),
@@ -652,13 +652,15 @@ fn the_levels_of_a_store_are_not_removed_from_the_lock() {
     let one = release(1, &[]);
     let lock = write(None, &[observed(VERSION as u32, "aa", &schema, &one)], &[]).expect("a lock");
     assert_eq!(lock.stores[0].level, Some(1));
-    let mut without = observed(VERSION as u32, "aa", &schema, &one);
-    without.levels = None;
-    let refused = write(Some(&lock), &[without], &[]).expect_err("the levels are kept");
-    assert!(
-        messages(&refused).contains("would leave the lock"),
-        "{refused:?}"
-    );
+    for version in [VERSION as u32, VERSION as u32 + 1] {
+        let mut without = observed(version, "aa", &schema, &one);
+        without.levels = None;
+        let refused = write(Some(&lock), &[without], &[]).expect_err("the levels are kept");
+        assert!(
+            messages(&refused).contains("would leave the lock"),
+            "version {version}: {refused:?}"
+        );
+    }
     let mut without = observed(VERSION as u32, "aa", &schema, &one);
     without.levels = None;
     let found = findings(&lock, &[without], &[]);
@@ -669,8 +671,8 @@ fn the_levels_of_a_store_are_not_removed_from_the_lock() {
 }
 
 /// The check reports each way the levels of a store differ from the lock's: a section's level, the
-/// level of the store alone, and the distance; and the window refuses a new section that claims a
-/// level above the store's, which is a section without a level raise.
+/// level of the store alone, and the distance; and a new section that claims a level above the
+/// store's, which is a section without a level raise, cannot be written.
 #[test]
 fn the_check_reports_each_way_the_levels_differ_and_the_window_has_an_upper_bound() {
     let schema = document();
@@ -724,11 +726,11 @@ fn the_check_reports_each_way_the_levels_differ_and_the_window_has_an_upper_boun
     );
 }
 
-/// A definition that a base section reaches stays in the base digest, whichever sections of a level
-/// share it, so a change to it needs the version raised.
+/// A definition that a base section reaches stays in the base digest, though sections of a level
+/// reach it too, so a change to it needs the version raised.
 #[test]
 fn a_definition_a_base_section_shares_stays_in_the_base_digest() {
-    let two = release(2, &[TELEMETRY]);
+    let three = release(3, &[TELEMETRY, RELAYS]);
     let mut schema = document();
     schema["$defs"]["Storage"]["properties"]["origin"] =
         nullable(json!({ "$ref": "#/$defs/Limits" }));
@@ -740,7 +742,11 @@ fn a_definition_a_base_section_shares_stays_in_the_base_digest() {
                 writers: Writers::Daemon,
                 entry: entry(3),
                 owned: Vec::<Claim>::new(),
-                kept: vec![Kept::Protocol("Doc", at_base(schema, two.levelled), "Doc")],
+                kept: vec![Kept::Protocol(
+                    "Doc",
+                    at_base(schema, three.levelled),
+                    "Doc",
+                )],
                 levels: None,
             },
             &[],
