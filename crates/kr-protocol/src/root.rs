@@ -1015,6 +1015,10 @@ pub struct CommandBackend {
 /// the environment of a server it starts for a launch.
 pub const LAUNCH_VARIABLES: [&str; 2] = ["KR_REGISTRATION", "KR_CREDENTIAL"];
 
+/// The most bytes of environment, names and values, a launcher presents to a backend that starts
+/// an application server with it, and a backend takes.
+pub const MAX_PRESENTED_ENVIRONMENT_BYTES: usize = 256 * 1024;
+
 /// Parameters of `root.command.resolve`.
 ///
 /// The integration's pre-execution hook asks the worker what to run, before it runs anything. The
