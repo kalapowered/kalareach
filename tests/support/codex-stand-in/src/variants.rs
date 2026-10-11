@@ -44,8 +44,9 @@ pub struct Variants {
     /// The server starts a command of its own whenever it is told to end and does not: when its
     /// input ends under `ignore-eof`, and each time it is asked to terminate under `ignore-term`.
     pub spawn_late: bool,
-    /// The server asks for its approval under the identifier of the terminal's request to start a
-    /// turn, before it answers that request.
+    /// The server asks for its approval under the number the terminal gives its request to start a
+    /// turn, before it answers that request, so that two requests, one from each side, carry one
+    /// spelling and are outstanding at once.
     pub colliding_ids: bool,
     /// The terminal reads the server's request for an approval and does not answer it.
     pub leave_unanswered: bool,
@@ -61,6 +62,8 @@ pub struct Variants {
     pub retry_plain: bool,
     /// The terminal never connects: it runs until it is ended.
     pub idle: bool,
+    /// The terminal stops reading once its turn is running, as a terminal that is stopped does.
+    pub stop_reading: bool,
     /// The terminal does not answer the approval until the file `KR_STAND_IN_RELEASE` names exists.
     pub answer_when_released: bool,
     /// The terminal says it is waiting, and does not connect until the file `KR_STAND_IN_RELEASE`
@@ -99,6 +102,7 @@ impl Variants {
                 "origin" => variants.origin = true,
                 "retry-plain" => variants.retry_plain = true,
                 "idle" => variants.idle = true,
+                "stop-reading" => variants.stop_reading = true,
                 "answer-when-released" => variants.answer_when_released = true,
                 "wait-to-connect" => variants.wait_to_connect = true,
                 other => panic!("{VARIABLE} names a variant this program does not have: {other}"),
