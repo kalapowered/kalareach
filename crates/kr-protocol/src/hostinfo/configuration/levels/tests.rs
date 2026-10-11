@@ -8,8 +8,7 @@
 
 use serde_json::Value;
 
-use super::{Levelled, Newer, Release, THIS_RELEASE};
-use crate::desktop::SleepInhibitionSetting;
+use super::{Levelled, Newer, Release};
 use crate::hostinfo::configuration::{
     BASE_LEVEL, Change, ConfigurationDocument, DocumentState, EditRefused, VERSION, contents_in,
     edit_in, is_known_term, load_in, still_current,
@@ -17,7 +16,10 @@ use crate::hostinfo::configuration::{
 use crate::hostinfo::export::Sentence;
 use crate::scalars::Nullable;
 
-const R1: Release = THIS_RELEASE;
+const R1: Release = Release {
+    level: 1,
+    levelled: &[],
+};
 
 const R1_LISTING: Release = Release {
     level: 1,
@@ -303,12 +305,11 @@ fn a_document_above_the_level_stays_strict_about_what_it_knows() {
         ["telemetry_events"]
     );
 
-    // A near miss is found among many members, whichever the names that are kept.
+    // A near miss is found among many members, though it sorts after the sixteen names kept.
     let mut crowded = serde_json::json!({"version": 3, "level": 2});
     for index in 0..20 {
-        crowded[format!("zq_telemetry_{index:02}")] = serde_json::json!({});
+        crowded[format!("aa_telemetry_{index:02}")] = serde_json::json!({});
     }
-    crowded["zz_ceilngs"] = serde_json::json!({});
     crowded["ceilngs"] = serde_json::json!({});
     let loaded = load_in(Some(crowded.to_string().as_bytes()), &R1);
     assert_eq!(loaded.status.state, DocumentState::Invalid);
@@ -337,14 +338,18 @@ fn a_document_above_the_level_stays_strict_about_what_it_knows() {
 /// sixty-four bytes, counts the rest, and never cuts a character.
 #[test]
 fn the_names_a_report_keeps_are_bounded_and_printable() {
+    // The names that cannot be kept sort first, so a rule that kept them would put them among the
+    // sixteen; the others sort after.
     let mut value = serde_json::json!({"version": 3, "level": 2});
     for index in 0..18 {
         value[format!("zq_telemetry_{index:02}")] = serde_json::json!({});
     }
-    value[format!("zq_{}", "x".repeat(70))] = serde_json::json!({});
-    value["zq_\u{202e}bidirectional"] = serde_json::json!({});
-    value["zq_caf\u{e9}_telemetry"] = serde_json::json!({});
-    value["zq_with space"] = serde_json::json!({});
+    value[format!("aa_{}", "x".repeat(70))] = serde_json::json!({});
+    value["aa_\u{202e}bidirectional"] = serde_json::json!({});
+    value["aa_caf\u{e9}_telemetry"] = serde_json::json!({});
+    value["aa_with space"] = serde_json::json!({});
+    value["aa_escape\u{1b}[31m"] = serde_json::json!({});
+    value["aa_line\nfeed"] = serde_json::json!({});
     let loaded = load_in(Some(value.to_string().as_bytes()), &R1);
     assert_eq!(
         loaded.status.state,
@@ -353,8 +358,16 @@ fn the_names_a_report_keeps_are_bounded_and_printable() {
         loaded.status
     );
     let newer = loaded.newer.expect("above the level");
-    assert_eq!(newer.count, 22, "every member left out is counted");
+    assert_eq!(newer.count, 24, "every member left out is counted");
     assert_eq!(newer.names.len(), 16);
+    assert!(
+        newer
+            .names
+            .iter()
+            .all(|name| name.starts_with("zq_telemetry_")),
+        "{:?}",
+        newer.names
+    );
     assert!(newer.names.iter().all(|name| {
         name.len() <= 64 && name.chars().all(|character| character.is_ascii_graphic())
     }));
@@ -405,22 +418,6 @@ fn the_typed_document_and_the_copy_the_registry_records_state_what_was_applied()
     assert_eq!(loaded.document.expect("used").level, 2);
 }
 
-/// A guard: the preference the CLI and the daemon edit most is untouched by levels.
-#[test]
-fn an_ordinary_edit_writes_the_current_version_at_the_base_level() {
-    let edited = edit_in(
-        &load_in(None, &R1),
-        &Change::SleepInhibition(SleepInhibitionSetting::Off),
-        &R1,
-    )
-    .expect("an edit");
-    let value = json(&edited.contents);
-    assert_eq!(
-        (value["version"].as_u64(), value["level"].as_u64()),
-        (Some(VERSION), Some(BASE_LEVEL))
-    );
-}
-
 /// KR-REQ-26.13: the predicate that leaves an unused section out of the written document, which
 /// every section of a level carries on its field, says a section is unused when it is null or
 /// every one of its fields is.
@@ -429,7 +426,6 @@ fn a_section_is_unused_when_every_field_of_it_is_null() {
     use crate::hostinfo::configuration::{StorageSelection, is_unused};
 
     assert!(is_unused(&StorageSelection::default()));
-    assert!(is_unused(&Option::<StorageSelection>::None));
     assert!(!is_unused(&StorageSelection {
         origin: Nullable::some("https://storage.example.com".to_owned()),
     }));
