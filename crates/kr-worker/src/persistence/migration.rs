@@ -21,7 +21,7 @@
 //!   successor already refused it, and [`crate::persistence::import`] reads it.
 
 /// The schema version this build reads after migration.
-pub const CURRENT: i64 = 7;
+pub const CURRENT: i64 = 8;
 
 /// The oldest schema version this build's ladder brings forward on its own.
 ///
@@ -68,6 +68,12 @@ pub static LADDER: &[Migration] = &[
         to: 7,
         summary: "the processes the session owns, so a control daemon can stop what a crashed worker \
                   left, seeded with the root shell the session's summary names",
+    },
+    Migration {
+        from: 7,
+        to: 8,
+        summary: "the servers the worker started for the session, named in the record of the \
+                  processes it owns so a control daemon asks each to end without a hang-up",
     },
 ];
 
