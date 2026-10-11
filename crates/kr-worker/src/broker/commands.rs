@@ -1974,7 +1974,7 @@ async fn admit_launch(
                 ));
             }
             Some(environment)
-                if environment.bytes() > crate::broker::attach::MAX_PRESENTED_ENVIRONMENT_BYTES =>
+                if environment.bytes() > kr_protocol::root::MAX_PRESENTED_ENVIRONMENT_BYTES =>
             {
                 return Err(BrokerError::denied(
                     "the launcher presented more environment than a backend takes",
