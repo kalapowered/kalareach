@@ -17,9 +17,11 @@
 //!   restored old policy can revive authority." Two halves. Expiry is decided from the clocks
 //!   at every request, so a host that wakes or starts has nothing cached across the gap to
 //!   revalidate: the continuous clock counts the sleep, and the floor of UTC readings only rises.
-//!   And a policy document restored from a backup cannot put back an authority the host has
-//!   already moved past, which [`HostPolicy::restore`] ensures by keeping the higher of the
-//!   revision the document was stored at and the one the registry holds.
+//!   And a policy document restored from a backup cannot lower the revision the host has reached,
+//!   which [`HostPolicy::restore`] ensures by keeping the higher of the revision the document was
+//!   stored at and the one the registry holds. That is the whole of the rule: a document with an
+//!   older row also brings back the enrolments, the exclusive flag and the lease records it
+//!   held, so a whole-store rollback is not refused.
 //!
 //! The third rule is the one an implementation loses by accident: a host that simply loads
 //! whatever its policy file holds will happily load last month's file. The floor is separate from

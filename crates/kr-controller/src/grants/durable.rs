@@ -9,7 +9,9 @@
 //! So four things are written down.
 //!
 //! * **The authority floor.** The highest revision this host has ever accepted. It only rises, and
-//!   a policy document naming anything at or below it is refused.
+//!   a policy document read back at a lower revision does not lower it. The document's other
+//!   contents are read back as written, so an older row restores the enrolments and flags it
+//!   held.
 //! * **The time floor.** The highest UTC reading this host has decided expiry from. A clock wound
 //!   back past a deadline therefore does not revive a grant this host has already refused.
 //! * **The host's restrictions.** The bounded offline-validity policy, whether this host is
