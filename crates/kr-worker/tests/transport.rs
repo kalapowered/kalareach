@@ -4851,7 +4851,8 @@ async fn kr_req_11_32_a_request_identifier_that_is_not_an_integer_or_a_short_str
     let broker = broker();
     let (owner, _upstream, _client, writes) = duplex_over_pipes(&broker, 1 << 20);
     let driving = tokio::spawn(writes);
-    let longest = "i".repeat(kr_worker::broker::MAX_CLIENT_IDENTIFIER_BYTES);
+    // The bound is on the spelling, quotes included.
+    let longest = "i".repeat(kr_worker::broker::MAX_CLIENT_IDENTIFIER_BYTES - 2);
     let request = |id: &str| format!(r#"{{"id":{id},"method":"session/update","params":{{}}}}"#);
     for (what, id, carried) in [
         ("an integer", "9007199254740993".to_owned(), true),
@@ -4861,6 +4862,11 @@ async fn kr_req_11_32_a_request_identifier_that_is_not_an_integer_or_a_short_str
             true,
         ),
         ("a string above it", format!("\"{longest}i\""), false),
+        (
+            "a short string spelled with escapes into more than the bound",
+            format!("\"{}\"", r"\u0069".repeat(50)),
+            false,
+        ),
         ("a fraction", "1.5".to_owned(), false),
         ("a null", "null".to_owned(), false),
         ("an object", r#"{"a":1}"#.to_owned(), false),
@@ -4870,6 +4876,45 @@ async fn kr_req_11_32_a_request_identifier_that_is_not_an_integer_or_a_short_str
             .await;
         assert_eq!(outcome.is_ok(), carried, "{what}: {outcome:?}");
     }
+    owner.shutdown();
+    driving.abort();
+}
+
+/// KR-REQ-11.32: a reply of exactly the frame bound is carried back under the longest identifier a
+/// terminal may use, though the identifier is longer than the one this host sent it under.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_11_32_a_reply_at_the_bound_is_carried_back_under_the_longest_identifier() {
+    let broker = broker();
+    let (owner, mut upstream, client, writes) = duplex_over_pipes(&broker, 4 << 20);
+    let driving = tokio::spawn(writes);
+    let mut upstream = tokio::io::BufReader::new(&mut upstream);
+    let mut client = tokio::io::BufReader::new(client);
+
+    let longest = "i".repeat(kr_worker::broker::MAX_CLIENT_IDENTIFIER_BYTES - 2);
+    let sent = format!(r#"{{"id":"{longest}","method":"session/update","params":{{}}}}"#);
+    owner
+        .from_client(sent.as_bytes(), TimestampMs::new(2))
+        .await
+        .expect("the terminal's request is carried");
+    let arrived = next_line_from(&mut upstream).await;
+    assert!(arrived.contains(r#""id":"kr-1""#), "{arrived}");
+
+    let bound = kr_worker::broker::gateway::MAX_NATIVE_FRAME_BYTES;
+    let (head, tail) = (r#"{"id":"kr-1","result":""#, r#""}"#);
+    let reply = format!(
+        "{head}{}{tail}",
+        "x".repeat(bound - head.len() - tail.len())
+    );
+    assert_eq!(reply.len(), bound);
+    owner
+        .from_upstream(reply.as_bytes(), TimestampMs::new(3))
+        .await
+        .expect("the reply is carried");
+    let returned = next_line_from(&mut client).await;
+    assert_eq!(
+        returned.trim_end(),
+        reply.replace(r#""id":"kr-1""#, &format!(r#""id":"{longest}""#)),
+    );
     owner.shutdown();
     driving.abort();
 }
