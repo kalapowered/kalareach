@@ -208,8 +208,8 @@ as the terminal.
 The host will only accept one connection on the socket, from the process the launch registered. It
 then reads the upgrade request, which must arrive within 5 seconds and be no more than 16 KiB. The
 upgrade request must be a plain `GET` request using HTTP/1.1 protocol. A request with a header that
-a browser adds is refused, and a refused request does not use the connection. Text messages are
-used, one JSON message to a WebSocket message, and the host passes each one, a line at a time,
+a browser adds is refused, and a refused request does not use up the one connection. Text messages
+are used, one JSON message to a WebSocket message, and the host passes each one, a line at a time,
 between the terminal and the server's standard streams.
 
 The server is ended when the terminal ends, when the connection to the terminal ends, when 30
@@ -565,14 +565,15 @@ component fault disables rich meaning without stalling or discarding valid nativ
   `"sdk_range": ">=0.1.5, <0.2.0"`.
 - **Limits:** the host carries messages of at most 1 MiB, whatever the package says: if
   `max_message_bytes` is below this, that value is used, and if it is above, this value is used. A
-  message over the limit ends the connection with the reason. A message the size of the limit is
-  carried both ways: a queue that holds nothing takes one message of the limit, and swapping the
-  host's identifier for the terminal's own can lengthen a message by at most 258 bytes. A terminal's
-  request identifier is limited to 256 bytes for a string and 20 digits for an integer, and any
-  other spelling is refused. A terminal may have 256 requests outstanding at a time, and if the
-  server has not answered one after 120 seconds, it is refused to the terminal. If a terminal stops
-  reading for 5 seconds, its connection is ended. A terminal may send at most 256 pings and pongs in
-  a minute, which a keepalive stays far below, and a flood ends the connection.
+  message over the limit ends the connection, with the close code for a message that is too big. A
+  message the size of the limit is carried both ways: a queue that holds nothing takes one message
+  of the limit, and swapping the host's identifier for the terminal's own can lengthen a message by
+  at most 258 bytes. A terminal's request identifier is a string of at most 256 bytes, quotes and
+  escapes counted, or an integer that fits in 64 bits, and any other spelling is refused. A terminal
+  may have 256 requests outstanding at a time, and if the server has not answered one after 120
+  seconds, it is refused to the terminal. A message that cannot be written to the terminal within 5
+  seconds ends its connection. A terminal may send at most 256 pings and pongs in a minute, which a
+  keepalive stays far below, and a flood ends the connection.
 - **Protocol pin:** the upstream protocol name, the versions the table was qualified against and
   the exact version the publisher tested.
 
