@@ -1973,6 +1973,48 @@ pub struct LaunchHello {
     pub executable: String,
     /// The argument vector it will run it with, command name first.
     pub arguments: Vec<String>,
+    /// The environment the launcher runs in, which a backend that starts an application server
+    /// for the program starts it with. Presented only to a backend whose launch record names a
+    /// gateway.
+    #[serde(default)]
+    pub environment: Option<PresentedEnvironment>,
+}
+
+/// The most bytes of environment, names and values, that a launch presents.
+pub const MAX_PRESENTED_ENVIRONMENT_BYTES: usize = 256 * 1024;
+
+/// The environment a launcher presented.
+///
+/// It can hold what the person keeps in their environment, so it is shown to nothing: its debug
+/// form says how many variables it has and no more.
+#[derive(Clone, Default, serde::Deserialize)]
+#[serde(transparent)]
+pub struct PresentedEnvironment(BTreeMap<String, String>);
+
+impl PresentedEnvironment {
+    /// The bytes of its names and values together.
+    #[must_use]
+    pub fn bytes(&self) -> usize {
+        self.0
+            .iter()
+            .map(|(name, value)| name.len() + value.len())
+            .sum()
+    }
+
+    /// The variables, as a process is started with them.
+    #[must_use]
+    pub fn pairs(&self) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+        self.0
+            .iter()
+            .map(|(name, value)| (name.into(), value.into()))
+            .collect()
+    }
+}
+
+impl std::fmt::Debug for PresentedEnvironment {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "PresentedEnvironment({} variables)", self.0.len())
+    }
 }
 
 /// One connection whose first frame said it is what it opened as.
