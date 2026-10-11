@@ -3270,7 +3270,9 @@ async fn an_announcement_names_the_grants_a_withdrawal_reached_and_the_host_for_
         authority_revision: AuthorityRevision::new(1),
         environment_selector: EnvironmentSelector::Any,
         session_selector: SessionSelector::Any,
-        actions: [ActionRight::SessionView].into_iter().collect(),
+        actions: [ActionRight::SessionView, ActionRight::TerminalInput]
+            .into_iter()
+            .collect(),
         history: HistoryScope {
             lower_bound_ms: Nullable::some(TimestampMs::new(1)),
             include_live_screen: false,

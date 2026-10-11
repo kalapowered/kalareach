@@ -60,14 +60,14 @@ pub(crate) enum Reach {
     /// revision the barrier advances to, so one device's revocation is not everybody's reconnect.
     Device(kr_protocol::ids::DeviceId),
     /// The connections acting under these grants, which a share's revocation withdrew with its
-    /// descendants, each with the device it was issued to, in the sessions they cover. A connection
-    /// that acts under any other grant, and the owner's own, are admitted again at the revision the
-    /// barrier advances to.
+    /// descendants. A connection that acts under any other grant, and the owner's own, are
+    /// admitted again at the revision the barrier advances to.
     Grants {
-        /// The grants, each with the device it was issued to.
-        grants: std::collections::BTreeMap<kr_protocol::ids::GrantId, kr_protocol::ids::DeviceId>,
-        /// The sessions they cover: a worker of any other session holds nothing under them.
-        sessions: crate::grants::SessionScope,
+        /// Every grant the revocation reached.
+        grants: std::collections::BTreeSet<kr_protocol::ids::GrantId>,
+        /// The ones that carry `terminal.input`, which are the only ones a worker holds an input
+        /// lease under, and so the only ones it is told.
+        with_input: std::collections::BTreeSet<kr_protocol::ids::GrantId>,
     },
 }
 
@@ -99,37 +99,13 @@ pub(super) struct Debts {
     ///
     /// A daemon that restarts keeps none, and a revision with no entry is announced as the whole
     /// host's, which fences every caller under a grant.
-    reaches: BTreeMap<u64, Option<std::sync::Arc<Withdrawn>>>,
-}
-
-/// What one revision withdrew, in the parts its debts reached, each with the sessions whose
-/// workers can hold input under it.
-#[derive(Debug, Default, PartialEq, Eq)]
-pub(super) struct Withdrawn {
-    parts: Vec<(crate::grants::SessionScope, Named)>,
-}
-
-impl Withdrawn {
-    /// What the worker of `session_id` is told of this revision: the parts that cover its session,
-    /// joined. A grant withdrawn in other sessions holds nothing there, and a device named for
-    /// them keeps what it holds here.
-    fn seen_by(&self, session_id: SessionId) -> Named {
-        self.parts
-            .iter()
-            .filter(|(sessions, _)| sessions.covers(session_id))
-            .fold(Named::default(), |named, (_, part)| named.joined(part))
-    }
-
-    fn len(&self) -> usize {
-        self.parts.iter().map(|(_, part)| part.len()).sum()
-    }
+    reaches: BTreeMap<u64, Option<std::sync::Arc<Named>>>,
 }
 
 /// The grants and the devices one revision withdrew authority from.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(super) struct Named {
-    /// The grants, each with the device it was issued to, which is the device that acts under it.
-    grants: std::collections::BTreeMap<kr_protocol::ids::GrantId, kr_protocol::ids::DeviceId>,
+    grants: std::collections::BTreeSet<kr_protocol::ids::GrantId>,
     devices: std::collections::BTreeSet<kr_protocol::ids::DeviceId>,
 }
 
@@ -141,45 +117,11 @@ impl Named {
 
     fn joined(&self, other: &Self) -> Self {
         Self {
-            grants: self
-                .grants
-                .iter()
-                .chain(other.grants.iter())
-                .map(|(grant, device)| (*grant, *device))
-                .collect(),
+            grants: self.grants.union(&other.grants).copied().collect(),
             devices: self.devices.union(&other.devices).copied().collect(),
         }
     }
-
-    /// This named by devices alone: the devices it names and the devices that hold its grants.
-    /// A device that took part in what was withdrawn loses its input under every grant it holds.
-    fn by_devices(&self) -> Self {
-        Self {
-            grants: std::collections::BTreeMap::new(),
-            devices: self
-                .devices
-                .iter()
-                .chain(self.grants.values())
-                .copied()
-                .collect(),
-        }
-    }
-
-    /// This as a notice can carry it: as it is when it fits, and otherwise by devices
-    /// ([`Self::by_devices`]). Only more devices than a notice can name make it none: the whole
-    /// host's.
-    fn fitted(self) -> Option<Self> {
-        if self.len() <= kr_protocol::worker::MAX_REVISION_REACH_NAMES {
-            return Some(self);
-        }
-        Some(self.by_devices())
-            .filter(|named| named.len() <= kr_protocol::worker::MAX_REVISION_REACH_NAMES)
-    }
 }
-
-/// How many grants and devices one revision's reach is kept with, in all its parts. A revision that
-/// withdrew more is announced as the whole host's.
-const MAX_RETAINED_REACH_NAMES: usize = 65_536;
 
 /// How many revisions' reaches the daemon keeps for their announcements.
 ///
@@ -333,7 +275,7 @@ async fn debt_pass(
             telling = None;
         } else {
             match while_held(&daemon, async |controller: &Controller| {
-                controller.withdraw(Capture::Left).await
+                controller.withdraw(Capture::Left, &[]).await
             })
             .await
             {
@@ -481,7 +423,6 @@ impl Controller {
                                 .get(&session_id)
                                 .copied()
                                 .unwrap_or_else(|| AuthorityRevision::new(0)),
-                            session_id,
                             0,
                             &link.client().acknowledgement().capabilities,
                         );
@@ -857,7 +798,7 @@ impl Controller {
     /// not capture stays published then, so admission and forwarding stay refused until the debt
     /// pass raises its barrier.
     pub(crate) async fn barrier(&self, own: OwnBarrier) -> Result<RevocationBarrier> {
-        let withdrawn = self.withdraw(Capture::Every).await;
+        let withdrawn = self.withdraw(Capture::Every, &own.debts).await;
         drop(own);
         match withdrawn? {
             Some(captured) => self.tell(&captured).await,
@@ -865,61 +806,87 @@ impl Controller {
         }
     }
 
+    /// The published debts one barrier takes: the ones `first` names, then the rest while what they
+    /// name together still fits one notice, so that a revision is always told exactly. A debt
+    /// that does not fit stays published and has a barrier of its own; one that reaches the whole
+    /// host is taken whatever else is, since that revision is the whole host's.
+    fn capturable(
+        &self,
+        capture: &Capture,
+        first: &[crate::grants::store::DebtId],
+    ) -> BTreeMap<crate::grants::store::DebtId, Reach> {
+        let mut candidates: Vec<(crate::grants::store::DebtId, Reach)> = self
+            .debts()
+            .published
+            .iter()
+            .filter(|(_, published)| *capture == Capture::Every || !published.covered)
+            .map(|(debt, published)| (*debt, published.reach.clone()))
+            .collect();
+        candidates.sort_by_key(|(debt, _)| !first.contains(debt));
+        let mut captured = BTreeMap::new();
+        let mut names = 0_usize;
+        for (debt, reach) in candidates {
+            let weight = match &reach {
+                Reach::Host => 0,
+                Reach::Device(_) => 1,
+                Reach::Grants { with_input, .. } => with_input.len(),
+            };
+            if captured.is_empty()
+                || reach == Reach::Host
+                || names + weight <= kr_protocol::worker::MAX_REVISION_REACH_NAMES
+            {
+                names += weight;
+                captured.insert(debt, reach);
+            }
+        }
+        captured
+    }
+
     /// Whose authority the debts one revision captured withdrew, or none when that is the whole
     /// host's or cannot be named.
     ///
-    /// A debt that reaches every connection is the whole host. The others are the grants and the
-    /// devices they name, or the devices that hold the grants when there are too many to name
-    /// ([`Named::fitted`]).
+    /// A debt that reaches every connection is the whole host. The others are the grants that carry
+    /// `terminal.input` and the devices they name. A delegation tree cannot hold more grants than a
+    /// notice names ([`crate::grants::MAX_GRANTS_PER_TREE`]), so a revocation is named exactly; what
+    /// is left to name more is a tree from before that limit, and the fence it owes is the whole
+    /// host's. That fence can go once no tree is left that holds more than the limit.
     fn reach_of(
         captured: &BTreeMap<crate::grants::store::DebtId, Reach>,
-    ) -> Option<std::sync::Arc<Withdrawn>> {
-        let mut withdrawn = Withdrawn::default();
+    ) -> Option<std::sync::Arc<Named>> {
+        let mut named = Named::default();
         for reach in captured.values() {
-            let part = match reach {
+            match reach {
                 Reach::Host => return None,
-                Reach::Device(device_id) => (
-                    crate::grants::SessionScope::Every,
-                    Named {
-                        grants: BTreeMap::new(),
-                        devices: [*device_id].into_iter().collect(),
-                    },
-                ),
-                Reach::Grants { grants, sessions } => (
-                    sessions.clone(),
-                    Named {
-                        grants: grants.clone(),
-                        devices: std::collections::BTreeSet::new(),
-                    },
-                ),
-            };
-            withdrawn.parts.push(part);
+                Reach::Device(device_id) => {
+                    named.devices.insert(*device_id);
+                }
+                Reach::Grants { with_input, .. } => {
+                    named.grants.extend(with_input.iter().copied());
+                }
+            }
         }
-        (withdrawn.len() > 0 && withdrawn.len() <= MAX_RETAINED_REACH_NAMES)
-            .then(|| std::sync::Arc::new(withdrawn))
+        (named.len() <= kr_protocol::worker::MAX_REVISION_REACH_NAMES)
+            .then(|| std::sync::Arc::new(named))
     }
 
-    /// What the revisions a worker has not fenced withdrew, up to `revision`, as far as the worker
-    /// of `session_id` is concerned.
+    /// What the revisions a worker has not fenced withdrew, up to `revision`.
     ///
     /// `held` is the revision the worker last acknowledged, as this daemon recorded it, so the
     /// reach joins the revisions after it and no older ones: a lease the worker holds from before
     /// is a lease its holder took after those revisions, and a notice that named the holders of an
-    /// older revision again would take it. Only what was withdrawn in the worker's session is
-    /// named. The reaches of consecutive revisions that each name their authority are joined, back
-    /// to the first one this daemon cannot name; the reach says it follows that one, and a worker
-    /// that has fenced it applies the reach, while any other fences every caller under a grant. A
-    /// join that passes what a notice can name is named by the devices of its older revisions
-    /// first ([`Named::by_devices`]), and the newest are kept by grant for as long as they fit. A
-    /// revision this daemon holds no reach for, because it restarted since, is the whole host's.
+    /// older revision again would take it. The reaches of consecutive revisions that each name
+    /// their authority are joined, back to the first one this daemon cannot name or the join of
+    /// which a notice cannot carry; the reach says it follows that one, and a worker that has
+    /// fenced it applies the reach, while any other fences every caller under a grant. A worker
+    /// that was refused revisions joins its own exact record of them. A revision this daemon holds
+    /// no reach for, because it restarted since, is the whole host's.
     fn reach_up_to(
         &self,
         revision: AuthorityRevision,
         held: AuthorityRevision,
-        session_id: SessionId,
     ) -> kr_protocol::worker::RevisionReach {
         // The entries are taken under the lock and joined outside it: they are shared, not copied.
-        let entries: Vec<std::sync::Arc<Withdrawn>> = {
+        let entries: Vec<std::sync::Arc<Named>> = {
             let debts = self.debts();
             let mut entries = Vec::new();
             let mut at = revision.get();
@@ -935,29 +902,19 @@ impl Controller {
         let Some((newest, older)) = entries.split_first() else {
             return kr_protocol::worker::RevisionReach::Host;
         };
-        let bound = kr_protocol::worker::MAX_REVISION_REACH_NAMES;
-        let Some(mut named) = newest.seen_by(session_id).fitted() else {
-            return kr_protocol::worker::RevisionReach::Host;
-        };
+        let mut named = Named::clone(newest);
         let mut lowest = revision.get();
         for entry in older {
-            let entry = entry.seen_by(session_id);
-            // As it is when it fits. Past what a notice can name, the older revision is named by
-            // its devices and the newer ones stay by grant while that fits, and then all are
-            // named by devices.
-            let fits = |joined: Named| Some(joined).filter(|joined| joined.len() <= bound);
-            let joined = fits(named.joined(&entry))
-                .or_else(|| fits(named.joined(&entry.by_devices())))
-                .or_else(|| fits(named.by_devices().joined(&entry.by_devices())));
-            let Some(joined) = joined else {
+            let joined = named.joined(entry);
+            if joined.len() > kr_protocol::worker::MAX_REVISION_REACH_NAMES {
                 break;
-            };
+            }
             named = joined;
             lowest -= 1;
         }
         kr_protocol::worker::RevisionReach::Within {
             since: AuthorityRevision::new(lowest.saturating_sub(1)),
-            grants: named.grants.into_keys().collect(),
+            grants: named.grants.into_iter().collect(),
             devices: named.devices.into_iter().collect(),
         }
     }
@@ -972,13 +929,12 @@ impl Controller {
         &self,
         revision: AuthorityRevision,
         held: AuthorityRevision,
-        session_id: SessionId,
         evidence_from: u64,
         capabilities: &kr_protocol::scalars::CanonicalSet<kr_protocol::ids::CapabilityId>,
     ) -> kr_protocol::worker::AuthorityRevisionNotice {
         let reach = if evidence_from == 0 && kr_protocol::local::reads_revision_reach(capabilities)
         {
-            self.reach_up_to(revision, held, session_id)
+            self.reach_up_to(revision, held)
         } else {
             kr_protocol::worker::RevisionReach::Host
         };
@@ -1005,16 +961,11 @@ impl Controller {
     async fn withdraw(
         &self,
         capture: Capture,
+        first: &[crate::grants::store::DebtId],
     ) -> Result<Option<Vec<crate::grants::store::DebtId>>> {
         let captured = {
             let mut registry = self.registry.lock().await;
-            let captured: BTreeMap<crate::grants::store::DebtId, Reach> = self
-                .debts()
-                .published
-                .iter()
-                .filter(|(_, published)| capture == Capture::Every || !published.covered)
-                .map(|(debt, published)| (*debt, published.reach.clone()))
-                .collect();
+            let captured = self.capturable(&capture, first);
             if captured.is_empty() {
                 None
             } else {
@@ -1029,7 +980,7 @@ impl Controller {
                     captured
                         .values()
                         .filter_map(|reach| match reach {
-                            Reach::Grants { grants, .. } => Some(grants.keys().copied()),
+                            Reach::Grants { grants, .. } => Some(grants.iter().copied()),
                             Reach::Host | Reach::Device(_) => None,
                         })
                         .flatten()
@@ -1138,7 +1089,7 @@ impl Controller {
     ///
     /// Returns the barrier's error; a debt it could not capture stays published.
     pub(crate) async fn raise_owed_barrier(&self) -> Result<Option<RevocationBarrier>> {
-        match self.withdraw(Capture::Left).await? {
+        match self.withdraw(Capture::Left, &[]).await? {
             Some(captured) => self.tell(&captured).await.map(Some),
             None => Ok(None),
         }

@@ -134,7 +134,7 @@ impl Controller {
                     debt,
                     Reach::Grants {
                         grants: revocation.reached.iter().copied().collect(),
-                        sessions: revocation.reached_in.clone(),
+                        with_input: revocation.reached_with_input.clone(),
                     },
                 )
             })

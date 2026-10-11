@@ -457,8 +457,8 @@ fn is_first_page(evidence_from: &u64) -> bool {
 /// How many grants and devices together a revision's reach may name.
 ///
 /// It is the most members one list of a control frame may hold, so a notice at the bound is one
-/// the receiving end reads. A host that has more to name than this names the devices that hold the
-/// grants instead, and only more devices than this make the reach the whole host's.
+/// the receiving end reads. A delegation tree cannot hold more grants than this, so what one
+/// revocation withdraws is named in full, grant by grant.
 pub const MAX_REVISION_REACH_NAMES: usize = 4_096;
 
 const _: () = assert!(
@@ -493,13 +493,10 @@ pub enum RevisionReach {
     Within {
         /// The last revision before the ones this describes, which the worker must have fenced.
         since: AuthorityRevision,
-        /// The grants the revisions withdrew, with everything delegated from them that anyone
-        /// held. A revision that withdrew more than [`MAX_REVISION_REACH_NAMES`] names, and the
-        /// older revisions of a join that passes it, are named by the devices that hold their
-        /// grants instead, in `devices`.
+        /// The grants the revisions withdrew that can hold an input lease, with everything
+        /// delegated from them that anyone held.
         grants: CanonicalSet<GrantId>,
-        /// The devices the revisions withdrew, and the devices that hold the grants of the
-        /// revisions named by device.
+        /// The devices the revisions withdrew.
         devices: CanonicalSet<DeviceId>,
     },
 }

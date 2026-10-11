@@ -31730,7 +31730,7 @@
               "additionalProperties": false,
               "properties": {
                 "devices": {
-                  "description": "The devices the revisions withdrew, and the devices that hold the grants of the\nrevisions named by device.",
+                  "description": "The devices the revisions withdrew.",
                   "items": {
                     "$ref": "#/$defs/DeviceId"
                   },
@@ -31738,7 +31738,7 @@
                   "uniqueItems": true
                 },
                 "grants": {
-                  "description": "The grants the revisions withdrew, with everything delegated from them that anyone\nheld. A revision that withdrew more than [`MAX_REVISION_REACH_NAMES`] names, and the\nolder revisions of a join that passes it, are named by the devices that hold their\ngrants instead, in `devices`.",
+                  "description": "The grants the revisions withdrew that can hold an input lease, with everything\ndelegated from them that anyone held.",
                   "items": {
                     "$ref": "#/$defs/GrantId"
                   },

@@ -6331,15 +6331,12 @@ export interface AuthorityRevisionNotice {
     | {
         within: {
           /**
-           * The devices the revisions withdrew, and the devices that hold the grants of the
-           * revisions named by device.
+           * The devices the revisions withdrew.
            */
           devices: DeviceId[]
           /**
-           * The grants the revisions withdrew, with everything delegated from them that anyone
-           * held. A revision that withdrew more than [`MAX_REVISION_REACH_NAMES`] names, and the
-           * older revisions of a join that passes it, are named by the devices that hold their
-           * grants instead, in `devices`.
+           * The grants the revisions withdrew that can hold an input lease, with everything
+           * delegated from them that anyone held.
            */
           grants: GrantId[]
           /**

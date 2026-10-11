@@ -15,7 +15,7 @@
 //! | KR-REQ-10.41 | `a_method_is_decided_from_the_registry_table_and_never_from_a_capability` |
 //! | KR-REQ-10.43 | `an_owner_grant_stays_valid_until_it_is_revoked`, `an_invitation_is_view_only_for_an_hour_and_bounded_at_thirty_days` |
 //! | KR-REQ-10.44 | `the_offline_validity_policy_is_optional_and_bounded_when_it_is_chosen`, `an_expired_grant_is_refused_rather_than_downgraded_to_view_only` |
-//! | KR-REQ-10.45 | `a_local_revocation_advances_the_revision_fences_the_leases_and_reports_per_worker`, `a_revocation_reaches_the_grants_that_can_still_hold_input_each_with_its_device` |
+//! | KR-REQ-10.45 | `a_local_revocation_advances_the_revision_fences_the_leases_and_reports_per_worker`, `a_revocation_reaches_the_grants_that_can_still_hold_input` |
 //! | KR-REQ-10.49 | `a_grant_with_no_history_cursor_is_read_from_the_moment_its_invitation_was_redeemed` |
 //! | KR-REQ-17.54 | `an_expired_membership_blocks_organisation_mediated_work_on_a_live_transport`, `personal_access_survives_an_organisation_outage_unless_the_host_is_exclusively_managed` |
 //! | KR-REQ-19.02 | `a_delegation_cannot_grant_a_right_the_delegating_actor_lacks` |
@@ -34,8 +34,8 @@ mod organisation_support;
 
 use kr_controller::grants::organisation::LeasePresentation;
 use kr_controller::grants::{
-    AccessRequest, AuthorityFeed, FeedRefusal, GrantDirectory, GrantRecord, HostPolicy, Refusal,
-    decide, rights_for, unconditional_rights_for,
+    AccessRequest, AuthorityFeed, FeedRefusal, GrantDirectory, GrantRecord, HostPolicy,
+    MAX_GRANTS_PER_TREE, Refusal, decide, rights_for, unconditional_rights_for,
 };
 use kr_controller::service::{Audience, Controller, ControllerSetup};
 use kr_controller::supervision::{LaunchOutcome, WorkerLaunch, WorkerSupervisor};
@@ -1200,33 +1200,34 @@ fn a_grant_with_no_history_cursor_is_read_from_the_moment_its_invitation_was_red
 }
 
 /// KR-REQ-10.45: what a revocation reaches is every grant of its subtree that can still hold input
-/// at a worker, each with the device it was issued to, in the sessions they cover, and no more. A
-/// grant revoked earlier whose fence is done and a proposal nobody redeemed are not in it, so a
-/// subtree's old rows do not widen a fence, whatever other fence is owed meanwhile; a grant a
-/// concurrent revocation withdrew a moment before is, for as long as that revocation's debt is on
-/// disk; and one that has run out by this host's clock is, since the worker takes its lease at its
-/// own deadline on its own clock.
+/// at a worker, and no more; of those, the ones that carry `terminal.input` are the ones a worker is
+/// told. A grant revoked earlier whose fence is done and a proposal nobody redeemed are not in it,
+/// so a subtree's old rows do not widen a fence, whatever other fence is owed meanwhile, even one
+/// recorded at the same moment; a grant a concurrent revocation withdrew a moment before is, for as
+/// long as that revocation's debt is on disk; and one that has run out by this host's clock is,
+/// since the worker takes its lease at its own deadline on its own clock.
 #[test]
-fn a_revocation_reaches_the_grants_that_can_still_hold_input_each_with_its_device() {
+fn a_revocation_reaches_the_grants_that_can_still_hold_input() {
     let now = kr_ipc::now_ms().get();
-    let issued_to = |byte: u8, id: u8, expiry: GrantExpiry| Grant {
-        recipient_device_id: device_id(byte),
-        ..grant(id, Some(grant_id(1)), VIEW, expiry)
+    let issued_to = |id: u8, rights: &[ActionRight], expiry: GrantExpiry| Grant {
+        recipient_device_id: device_id(id),
+        ..grant(id, Some(grant_id(1)), rights, expiry)
     };
+    let typist = [ActionRight::SessionView, ActionRight::TerminalInput];
     let runs_out = GrantExpiry::At {
         expires_at_ms: TimestampMs::new(now + DAY_MS),
     };
-    // The subtree below the root: two live children held by two devices, one revoked in each test,
-    // one that runs out after a day, and a proposal.
+    // The subtree below the root: two live children, one of them a viewer's, one revoked in each
+    // test, one that runs out after a day, and a proposal.
     let build = |directory: &GrantDirectory| {
-        let root = grant(1, None, VIEW, GrantExpiry::Never);
+        let root = grant(1, None, &typist, GrantExpiry::Never);
         directory.issue(&record(root), || Ok(())).expect("root");
         for (grant, activated) in [
-            (issued_to(0x21, 2, GrantExpiry::Never), true),
-            (issued_to(0x22, 3, GrantExpiry::Never), true),
-            (issued_to(0x23, 4, GrantExpiry::Never), true),
-            (issued_to(0x24, 5, runs_out), true),
-            (issued_to(0x25, 6, GrantExpiry::Never), false),
+            (issued_to(2, &typist, GrantExpiry::Never), true),
+            (issued_to(3, VIEW, GrantExpiry::Never), true),
+            (issued_to(4, &typist, GrantExpiry::Never), true),
+            (issued_to(5, &typist, runs_out), true),
+            (issued_to(6, &typist, GrantExpiry::Never), false),
         ] {
             let stored = if activated {
                 record(grant)
@@ -1236,20 +1237,15 @@ fn a_revocation_reaches_the_grants_that_can_still_hold_input_each_with_its_devic
             directory.issue(&stored, || Ok(())).expect("a descendant");
         }
     };
-    let reached = |revocation: &kr_controller::grants::GrantRevocation| {
-        revocation
-            .reached
-            .iter()
-            .map(|(grant, device)| (*grant, *device))
-            .collect::<std::collections::BTreeMap<_, _>>()
-    };
+    let ids = |grants: &[u8]| grants.iter().map(|id| grant_id(*id)).collect::<Vec<_>>();
 
     // Grant 4 is revoked and its fence completed, while a fence that is another change's stays
-    // owed: nothing is owed for grant 4, and the other debt does not bring it back.
+    // owed at the very moment grant 4 was revoked at: nothing is owed for grant 4, and the other
+    // debt does not bring it back.
     let directory = GrantDirectory::in_memory().expect("a grant store");
     build(&directory);
     directory
-        .owe_fence("another change", now - 5_000)
+        .owe_fence("another change", now - 3_000)
         .expect("another change owes a fence");
     let early = directory
         .revoke(grant_id(4), now - 3_000, || Ok(()))
@@ -1262,22 +1258,14 @@ fn a_revocation_reaches_the_grants_that_can_still_hold_input_each_with_its_devic
         .revoke(grant_id(1), now + 2 * DAY_MS, || Ok(()))
         .expect("the root is revoked");
     assert_eq!(
-        reached(&revocation),
-        [
-            (grant_id(1), device_id(0xf1)),
-            (grant_id(2), device_id(0x21)),
-            (grant_id(3), device_id(0x22)),
-            (grant_id(5), device_id(0x24)),
-        ]
-        .into_iter()
-        .collect(),
-        "the live ones, each with the device it was issued to, and one that has run out: not the \
-         one revoked and fenced, or the proposal"
+        revocation.reached,
+        ids(&[1, 2, 3, 5]),
+        "the live ones and one that has run out: not the one revoked and fenced, or the proposal"
     );
     assert_eq!(
-        revocation.reached_in,
-        kr_controller::grants::SessionScope::These([session_id(0xa0)].into_iter().collect()),
-        "in the session the grants cover"
+        revocation.reached_with_input,
+        ids(&[1, 2, 5]).into_iter().collect(),
+        "and the viewer's grant is not one an input lease is held under"
     );
 
     // The same with grant 4 revoked a moment before and its fence still owed.
@@ -1290,16 +1278,8 @@ fn a_revocation_reaches_the_grants_that_can_still_hold_input_each_with_its_devic
         .revoke(grant_id(1), now, || Ok(()))
         .expect("the root is revoked");
     assert_eq!(
-        reached(&revocation),
-        [
-            (grant_id(1), device_id(0xf1)),
-            (grant_id(2), device_id(0x21)),
-            (grant_id(3), device_id(0x22)),
-            (grant_id(4), device_id(0x23)),
-            (grant_id(5), device_id(0x24)),
-        ]
-        .into_iter()
-        .collect(),
+        revocation.reached,
+        ids(&[1, 2, 3, 4, 5]),
         "a grant revoked a moment before, whose fence is owed, is reached; the proposal is not"
     );
 
@@ -1311,29 +1291,162 @@ fn a_revocation_reaches_the_grants_that_can_still_hold_input_each_with_its_devic
         .revoke(grant_id(5), now + 2 * DAY_MS, || Ok(()))
         .expect("the grant that ran out is revoked");
     assert!(revocation.debt.is_some());
-    assert_eq!(
-        reached(&revocation),
-        [(grant_id(5), device_id(0x24))].into_iter().collect()
-    );
+    assert_eq!(revocation.reached, ids(&[5]));
 
-    // Revoking the device that holds the root takes its grants and everything delegated from them,
-    // each reached with the device it was issued to.
+    // Revoking the device that holds the root takes its grants and everything delegated from them.
     let directory = GrantDirectory::in_memory().expect("a grant store");
     build(&directory);
     let revocation = directory
         .revoke_device(device_id(0xf1), now, || Ok(()), None)
         .expect("the device is revoked");
-    assert_eq!(
-        reached(&revocation),
-        [
-            (grant_id(1), device_id(0xf1)),
-            (grant_id(2), device_id(0x21)),
-            (grant_id(3), device_id(0x22)),
-            (grant_id(4), device_id(0x23)),
-            (grant_id(5), device_id(0x24)),
-        ]
-        .into_iter()
-        .collect(),
+    assert_eq!(revocation.reached, ids(&[1, 2, 3, 4, 5]));
+}
+
+/// A grant delegated from `parent` to a device, for the tree-size cases.
+fn delegated(id: u32, parent: GrantId) -> GrantRecord {
+    let mut bytes = [0_u8; 16];
+    bytes[..4].copy_from_slice(&id.to_be_bytes());
+    bytes[15] = 0x77;
+    GrantRecord {
+        grant: Grant {
+            grant_id: GrantId::new(Uuid::from_bytes(bytes)),
+            recipient_device_id: device_id(0x30),
+            ..grant(
+                0,
+                Some(parent),
+                &[ActionRight::SessionView, ActionRight::TerminalInput],
+                GrantExpiry::Never,
+            )
+        },
+        ..record(grant(0, None, VIEW, GrantExpiry::Never))
+    }
+}
+
+/// KR-REQ-10.45: a delegation tree holds at most [`MAX_GRANTS_PER_TREE`] grants that are not
+/// revoked, so that what one revocation reaches is always named in full in one notice. The grant
+/// after the last is refused with a quota error a client can show; a grant of another tree is not;
+/// and the room comes back when a grant is withdrawn.
+#[test]
+fn a_delegation_tree_takes_no_grant_past_the_limit() {
+    let directory = GrantDirectory::in_memory().expect("a grant store");
+    let typing = [ActionRight::SessionView, ActionRight::TerminalInput];
+    let root = grant(1, None, &typing, GrantExpiry::Never);
+    let other_root = grant(2, None, &typing, GrantExpiry::Never);
+    directory
+        .issue(&record(root.clone()), || Ok(()))
+        .expect("root");
+    directory
+        .issue(&record(other_root.clone()), || Ok(()))
+        .expect("another tree's root");
+
+    // The root and a chain below it, then children, to the limit.
+    let mut last = root.grant_id;
+    for number in 1..u32::try_from(MAX_GRANTS_PER_TREE).expect("fits") {
+        let next = delegated(number, last);
+        last = next.grant.grant_id;
+        directory.issue(&next, || Ok(())).expect("room in the tree");
+    }
+    let refused = directory
+        .issue(&delegated(1_000_000, root.grant_id), || Ok(()))
+        .expect_err("the tree is full");
+    assert_eq!(refused.code(), kr_protocol::error::ErrorCode::QuotaExceeded);
+    assert!(
+        refused.to_string().contains("4096"),
+        "the refusal says what the limit is: {refused}"
+    );
+    directory
+        .issue(&delegated(1_000_001, other_root.grant_id), || Ok(()))
+        .expect("another tree has room");
+
+    // A grant withdrawn gives its room back.
+    directory
+        .revoke(last, 5_000, || Ok(()))
+        .expect("the end of the chain is withdrawn");
+    directory
+        .issue(&delegated(1_000_002, root.grant_id), || Ok(()))
+        .expect("room again");
+}
+
+/// KR-REQ-10.45: a tree that holds more grants than the limit, which only data from before the limit
+/// can, takes no more live grants: the invitation of its last proposal is refused at redemption with
+/// the quota error, and the proposal stays unredeemed. A tree at the limit redeems.
+#[test]
+fn a_tree_over_the_limit_redeems_no_invitation() {
+    let temp = tempfile::tempdir().expect("a directory on the internal disk");
+    let database = temp.path().join("grants.db");
+    let directory = GrantDirectory::open(&database).expect("the grant store");
+    let typing = [ActionRight::SessionView, ActionRight::TerminalInput];
+    let root = grant(1, None, &typing, GrantExpiry::Never);
+    directory
+        .issue(&record(root.clone()), || Ok(()))
+        .expect("root");
+    for number in 1..u32::try_from(MAX_GRANTS_PER_TREE - 2).expect("fits") {
+        directory
+            .issue(&delegated(number, root.grant_id), || Ok(()))
+            .expect("room in the tree");
+    }
+
+    // Two proposals, which make the tree hold the limit, each carried by an invitation.
+    let now = kr_ipc::now_ms().get();
+    let redeemer = device_id(0x31);
+    let pending = |id: u32, invitation: u8| {
+        let mut carried = delegated(id, root.grant_id);
+        carried.grant.recipient_device_id = redeemer;
+        carried.activated_at_ms = None;
+        let preview = kr_protocol::sharing::InvitationPreview {
+            invitation_id: kr_protocol::ids::InvitationId::new(Uuid::from_bytes([invitation; 16])),
+            session_id: session_id(0xa0),
+            environment_id: environment_id(0xe0),
+            role: kr_protocol::sharing::SessionRole::Viewer,
+            actions: carried.grant.actions.clone(),
+            history: no_history(),
+            expires_at_ms: TimestampMs::new(now + DAY_MS),
+            live_screen: Nullable::null(),
+            named_questions: Vec::new(),
+            named_approvals: Vec::new(),
+            notices: CanonicalSet::from_iter([]),
+            historical_attachment_keys: false,
+            single_use: true,
+        };
+        (carried, preview)
+    };
+    let (first, first_preview) = pending(2_000_000, 0x91);
+    let (last, last_preview) = pending(2_000_001, 0x92);
+    for (carried, preview) in [(&first, &first_preview), (&last, &last_preview)] {
+        directory
+            .issue_shared(carried, preview, device_id(0xf0), now, || Ok(()))
+            .expect("room in the tree");
+    }
+    directory
+        .redeem(first_preview.invitation_id, redeemer, now, || Ok(()), None)
+        .expect("a tree at the limit redeems");
+
+    // A tree from before the limit: a row written past it.
+    rusqlite::Connection::open(&database)
+        .expect("the store opens")
+        .execute(
+            "INSERT INTO grants (grant_id, parent_grant_id, recipient_device_id, session_id, grant,
+                                 issued_at_ms, activated_at_ms)
+             SELECT ?1, parent_grant_id, recipient_device_id, session_id, grant, issued_at_ms,
+                    activated_at_ms
+               FROM grants WHERE grant_id = ?2",
+            rusqlite::params![
+                [0xee_u8; 16].as_slice(),
+                first.grant.grant_id.get().as_bytes().as_slice()
+            ],
+        )
+        .expect("a row from before the limit");
+    let refused = directory
+        .redeem(last_preview.invitation_id, redeemer, now, || Ok(()), None)
+        .expect_err("a tree over the limit redeems nothing more");
+    assert_eq!(refused.code(), kr_protocol::error::ErrorCode::QuotaExceeded);
+    assert!(
+        !directory
+            .record(last.grant.grant_id)
+            .expect("readable")
+            .expect("present")
+            .is_active(),
+        "and the proposal stays unredeemed"
     );
 }
 
