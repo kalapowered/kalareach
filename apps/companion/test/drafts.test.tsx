@@ -302,14 +302,15 @@ describe('a prompt the host did not take, and the text it was sent from (KR-REQ-
     expect(await screen.findByTestId('composer-input')).toHaveValue('send this')
   })
 
-  it('lists the text of a prompt that is too long to keep, so that it can be copied, and lets it go when asked', async () => {
+  /** The desktop with a prompt the host did not take and the store will not keep, in Kept drafts. */
+  async function withAnUnstoredPrompt(wrap?: (port: HostPort) => HostPort) {
     const device = new FakeDraftStore()
     const person = userEvent.setup()
     const answer = held<never>()
-    startOver(device, IN_MAIN, (port) => ({
-      ...port,
-      composerSubmit: () => answer.promise
-    }))
+    startOver(device, IN_MAIN, (port) => {
+      const base = { ...port, composerSubmit: () => answer.promise }
+      return wrap ? wrap(base) : base
+    })
     await person.type(await screen.findByTestId('composer-input'), 'send')
     await waitFor(() => {
       expect(device.all()).toHaveLength(1)
@@ -323,9 +324,16 @@ describe('a prompt the host did not take, and the text it was sent from (KR-REQ-
     await person.click(screen.getByTestId('composer-send'))
     await person.type(screen.getByTestId('composer-input'), 'the next thing')
     answer.reject({ code: 'UNAVAILABLE', message: 'The host did not answer.', user_action: 'retry' })
+    await waitFor(() => {
+      expect(device.all().map((draft) => draft.text)).toEqual(['send'])
+    })
+    return { device, person }
+  }
 
+  it('lists the text of a prompt that is too long to keep, so that it can be copied, and lets it go when asked', async () => {
+    const { person } = await withAnUnstoredPrompt()
     await person.click(screen.getByRole('button', { name: 'Sessions' }))
-    await person.click(await screen.findByRole('button', { name: 'One kept draft' }))
+    await person.click(await screen.findByRole('button', { name: 'One prompt' }))
     expect(await screen.findByTestId('unstored-prompt-text')).toHaveTextContent('send this')
     // The composer holds the next thing, so the prompt is not put over it; the person is told.
     await person.click(screen.getByTestId('unstored-prompt-use'))
@@ -335,6 +343,35 @@ describe('a prompt the host did not take, and the text it was sent from (KR-REQ-
     await waitFor(() => {
       expect(screen.queryByTestId('unstored-prompt')).toBeNull()
     })
+  })
+
+  it('puts the text of a prompt that is too long to keep in its composer, when the composer is empty', async () => {
+    const { person } = await withAnUnstoredPrompt()
+    // Clear what was written since, so that the composer is empty.
+    await person.clear(screen.getByTestId('composer-input'))
+    await person.click(screen.getByRole('button', { name: 'Sessions' }))
+    await person.click(await screen.findByRole('button', { name: 'One prompt' }))
+    await person.click(await screen.findByTestId('unstored-prompt-use'))
+    await waitFor(() => {
+      expect(screen.queryByTestId('unstored-prompt')).toBeNull()
+    })
+    await person.click(screen.getByRole('button', { name: 'Sessions' }))
+    await person.click(await screen.findByTestId('session-row-1'))
+    expect(await screen.findByTestId('composer-input')).toHaveValue('send this')
+  })
+
+  it('offers no way to put it in a composer when the session is not listed, and names it as not listed', async () => {
+    const { person } = await withAnUnstoredPrompt((port) => ({
+      ...port,
+      sessionList: () => Promise.reject({ code: 'UNAVAILABLE', message: 'No host.', user_action: 'retry' })
+    }))
+    await person.click(screen.getByRole('button', { name: 'Sessions' }))
+    await person.click(await screen.findByRole('button', { name: 'One prompt' }))
+    const row = await screen.findByTestId('unstored-prompt')
+    expect(within(row).getByText(/A session that is not listed/)).toBeInTheDocument()
+    expect(within(row).queryByTestId('unstored-prompt-use')).toBeNull()
+    // The text can still be selected and copied, and let go of when it has been.
+    expect(within(row).getByTestId('unstored-prompt-text')).toHaveTextContent('send this')
   })
 
   it('gives the text back when the tab it was sent from was closed before the answer', async () => {

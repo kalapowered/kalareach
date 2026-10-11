@@ -1162,7 +1162,7 @@ describe('a prompt kept apart from the composer', () => {
     expect(notices.join(' ')).toMatch(/too long/i)
     // The text is held for the person to copy, with the kept drafts, after the tab is gone as well.
     expect(book.snapshot().unstored.map((each) => each.text)).toEqual(['send this'])
-    expect(keptEntry(book.snapshot())?.title).toBe('One kept draft')
+    expect(keptEntry(book.snapshot())?.title).toBe('One prompt held in this window only')
     store.refuseSaves(null)
     book.writeAll()
     await book.settled()
@@ -1486,14 +1486,109 @@ describe('an unstored prompt put in its composer', () => {
     expect(held?.text).toBe('send this')
 
     // The composer holds something else: the prompt is not put over it.
-    expect(book.useUnstored(held?.id ?? '')).toBe(false)
+    expect(await book.useUnstored(held?.id ?? '')).toBe(false)
     expect(book.snapshot().unstored).toHaveLength(1)
     expect(book.draft(MAIN).text).toBe('the next thing')
 
     type(book, MAIN, '')
     await book.settled()
-    expect(book.useUnstored(held?.id ?? '')).toBe(true)
+    expect(await book.useUnstored(held?.id ?? '')).toBe(true)
+    await book.settled()
     expect(book.draft(MAIN).text).toBe('send this')
     expect(book.snapshot().unstored).toEqual([])
+    // It is in the composer only: the store refuses it for its size, and the person is told.
+    expect(store.all().map((draft) => draft.text)).not.toContain('send this')
+    expect(book.snapshot().problem).not.toBeNull()
+  })
+
+  it('is not put over a file that is still uploading, or a record waiting to be removed', async () => {
+    const store = new FakeDraftStore()
+    const book = await opened(store)
+    type(book, MAIN, 'send')
+    await book.settled()
+    store.refuseSaves({ code: 'QUOTA_EXCEEDED', message: 'too large to keep' })
+    type(book, MAIN, 'send this')
+    await book.settled()
+    const token = book.beginSend(MAIN)
+    type(book, MAIN, '')
+    type(book, MAIN, 'the next thing')
+    await book.settled()
+    book.endSend(token, 'refused')
+    await book.settled()
+    const held = book.snapshot().unstored[0]
+    expect(held?.text).toBe('send this')
+    type(book, MAIN, '')
+    store.refuseSaves(null)
+    await book.settled()
+
+    // The composer holds only a file that is still uploading: that is not nothing.
+    book.update(MAIN, (draft) => ({
+      ...draft,
+      attachments: [
+        {
+          localId: 'file-1',
+          transferId: null,
+          name: 'diagram.png',
+          byteLen: 4096,
+          mediaType: 'image/png',
+          presentedAsImage: true,
+          upload: 'uploading',
+          acceptedUpstream: false,
+          handle: null
+        }
+      ]
+    }))
+    expect(await book.useUnstored(held?.id ?? '')).toBe(false)
+    expect(book.draft(MAIN).attachments).toHaveLength(1)
+    expect(book.snapshot().unstored).toHaveLength(1)
+  })
+})
+
+describe('a listed draft whose act failed', () => {
+  it('is back in the list when a read hid it while the act ran', async () => {
+    const store = new FakeDraftStore()
+    for (const text of ['for a session that went', 'newer']) {
+      store.save({
+        id: null,
+        expectedRevision: null,
+        sessionId: BUILD,
+        applicationInstanceId: null,
+        agentBindingRevision: null,
+        state: 'orphaned',
+        text,
+        attachments: []
+      })
+    }
+    const gate = holding(store, 'deviceDraftDiscard', 'before')
+    const book = new DraftBook(gate.port)
+    await book.hydrate()
+    const row = book.snapshot().kept.find((kept) => !kept.inComposer)
+    expect(row?.text).toBe('for a session that went')
+    const discarding = book.discard(row?.id ?? '', row?.revision ?? '')
+    await gate.reached
+    // A read while the act runs leaves its row out of the list, as it should.
+    await book.reload()
+    expect(book.snapshot().kept.some((kept) => kept.text === 'for a session that went')).toBe(false)
+    // The store then refuses the discard.
+    store.refuseDiscards({ code: 'STORAGE_UNAVAILABLE', message: 'the disk is full' })
+    gate.release()
+    await expect(discarding).rejects.toMatchObject({ code: 'STORAGE_UNAVAILABLE' })
+    await book.settled()
+    expect(store.all().map((draft) => draft.text).sort()).toEqual(['for a session that went', 'newer'])
+    expect(book.snapshot().kept.some((kept) => kept.text === 'for a session that went')).toBe(true)
+  })
+})
+
+describe('what the entry to the kept drafts says', () => {
+  it('says text is held in this window only, and does not call it a kept draft', () => {
+    const none = { kept: [], unreadable: 0, unstored: [] } as const
+    const one = { id: 'a', sessionId: MAIN, text: 'x', files: 0 }
+    expect(keptEntry(none)).toBeNull()
+    expect(keptEntry({ ...none, unstored: [one] })).toMatchObject({
+      title: 'One prompt held in this window only'
+    })
+    expect(keptEntry({ ...none, unstored: [one, { ...one, id: 'b' }] })?.title).toBe(
+      '2 prompts held in this window only'
+    )
   })
 })

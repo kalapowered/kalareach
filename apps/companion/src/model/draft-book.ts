@@ -124,17 +124,24 @@ export interface BookSnapshot {
 export function keptEntry(
   book: Pick<BookSnapshot, 'kept' | 'unreadable' | 'unstored'>
 ): { readonly title: string; readonly label: string; readonly rest: string } | null {
-  const count = book.kept.length + book.unstored.length
-  if (count === 0) {
+  const stored = book.kept.length
+  const held = book.unstored.length
+  if (stored === 0 && held === 0) {
     return book.unreadable === 0
       ? null
       : { title: 'Some drafts could not be read', label: 'Some drafts', rest: 'could not be read.' }
   }
-  const label = count === 1 ? 'One kept draft' : `${String(count)} kept drafts`
+  if (stored === 0) {
+    // Text that is held in this window only, and is lost when the application stops.
+    const label = held === 1 ? 'One prompt' : `${String(held)} prompts`
+    return { title: `${label} held in this window only`, label, rest: 'held in this window only.' }
+  }
+  const label = stored === 1 ? 'One kept draft' : `${String(stored)} kept drafts`
+  const alone = held === 0 ? '' : ' Some text is held in this window only.'
   return {
     title: label,
     label,
-    rest: count === 1 ? 'is not in a composer.' : 'are not in a composer.'
+    rest: `${stored === 1 ? 'is' : 'are'} not in a composer.${alone}`
   }
 }
 
@@ -698,19 +705,33 @@ export class DraftBook {
    * from. It stays in this window only, with the warning that it is not kept, until it is short
    * enough for the store.
    */
-  useUnstored(id: string): boolean {
-    const flight = this.#unstored.find((each) => each.id === id)
-    if (flight === undefined) return false
-    const key = flight.composer
-    const composer = this.#find(key)
-    if (composer !== undefined && !holdsNothing(composer)) {
-      this.#say('The composer holds something. Send it or clear it first, then put this prompt there.')
-      return false
-    }
-    this.#adopt(key, flight.sent, composer, null)
-    this.#unstored = this.#unstored.filter((each) => each.id !== id)
-    this.#changed()
-    return true
+  async useUnstored(id: string): Promise<boolean> {
+    const first = this.#unstored.find((each) => each.id === id)
+    if (first === undefined) return false
+    const key = first.composer
+    let put = false
+    // After the composer's own writes, so that a record it still holds for what the person cleared
+    // has gone, and what is on the screen is what the book holds.
+    await this.#enqueueAwait(key, () => {
+      const flight = this.#unstored.find((each) => each.id === id)
+      if (flight === undefined) return Promise.resolve()
+      const composer = this.#find(key)
+      // Empty means nothing at all: no text, no file, whatever state its upload is in, and no
+      // stored record that is waiting to be removed.
+      const empty =
+        composer === undefined ||
+        (composer.stored === null && composer.text === '' && composer.attachments.length === 0)
+      if (!empty) {
+        this.#say('The composer holds something. Send it or clear it first, then put this prompt there.')
+        return Promise.resolve()
+      }
+      this.#adopt(key, flight.sent, composer, null)
+      this.#unstored = this.#unstored.filter((each) => each.id !== id)
+      this.#changed()
+      put = true
+      return Promise.resolve()
+    })
+    return put
   }
 
   /** Lets go of the text of a prompt a person has copied or no longer wants. */
@@ -1056,8 +1077,9 @@ export class DraftBook {
    * the old version lets go of it and keeps its text as a draft of its own.
    */
   async #sawTheirs(composer: string | undefined, failure: unknown): Promise<void> {
-    if (failureCode(failure) !== 'DRAFT_CONFLICT') return
-    if (composer !== undefined) this.#letGo(composer)
+    // Whatever the refusal was, the act is over and its row was out of the list while it ran: the
+    // list is read again so that the row is back, and a change by another window is let go of.
+    if (failureCode(failure) === 'DRAFT_CONFLICT' && composer !== undefined) this.#letGo(composer)
     await this.reload()
   }
 

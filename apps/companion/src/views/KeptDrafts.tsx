@@ -153,39 +153,47 @@ export function KeptDrafts({
         </p>
       ) : (
         <ul className="kept-drafts" data-testid="kept-drafts">
-          {unstored.map((each) => (
-            <li className="kept-draft" data-testid="unstored-prompt" key={each.id}>
-              <p className="eyebrow">Held in this window only</p>
-              <p className="small muted">
-                The host did not take this prompt, or could not say it did, and it is too long for
-                this device to keep as a draft. It is held in this window only, so put it in its
-                composer or copy it before the window is closed. Check that the agent did not take it
-                before you send it again.
-              </p>
-              <pre className="kept-draft-text" data-testid="unstored-prompt-text" tabIndex={0}>
-                {each.text}
-              </pre>
-              <div className="row wrap">
-                <Button
-                  data-testid="unstored-prompt-use"
-                  onClick={() => {
-                    book.useUnstored(each.id)
-                  }}
-                >
-                  Put it in its composer
-                </Button>
-                <CommitButton
-                  tone="quiet"
-                  data-testid="unstored-prompt-forget"
-                  onCommit={() => {
-                    book.forgetUnstored(each.id)
-                  }}
-                >
-                  I have copied it
-                </CommitButton>
-              </div>
-            </li>
-          ))}
+          {unstored.map((each) => {
+            const home = sessions?.find((session) => session.session_id === each.sessionId) ?? null
+            return (
+              <li className="kept-draft" data-testid="unstored-prompt" key={each.id}>
+                <p className="eyebrow">
+                  {home === null ? 'A session that is not listed' : sessionName(home)}
+                  {' · '}held in this window only
+                </p>
+                <p className="small muted">
+                  The host did not take this prompt, or could not say it did, and it is too long for
+                  this device to keep as a draft. It is held in this window only, so put it in its
+                  composer or copy it before the window is closed. Check that the agent did not take it
+                  before you send it again.
+                </p>
+                <pre className="kept-draft-text" data-testid="unstored-prompt-text" tabIndex={0}>
+                  {each.text}
+                </pre>
+                <div className="row wrap">
+                  {home === null ? null : (
+                    <Button
+                      data-testid="unstored-prompt-use"
+                      onClick={() => {
+                        void book.useUnstored(each.id)
+                      }}
+                    >
+                      Put it in its composer
+                    </Button>
+                  )}
+                  <CommitButton
+                    tone="quiet"
+                    data-testid="unstored-prompt-forget"
+                    onCommit={() => {
+                      book.forgetUnstored(each.id)
+                    }}
+                  >
+                    I have copied it
+                  </CommitButton>
+                </div>
+              </li>
+            )
+          })}
           {kept.map((each) => (
             <KeptRow
               key={each.id}
