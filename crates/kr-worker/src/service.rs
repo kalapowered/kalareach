@@ -305,6 +305,16 @@ pub struct WorkerService {
     /// random. It is compiled away in every shipped build.
     #[cfg(feature = "testing")]
     prepared_first: std::sync::atomic::AtomicBool,
+    /// A pause in a raw input write that has passed the local owner's lease check and has not yet
+    /// taken the session, which this host's own tests arm to stand a batch there while the lease
+    /// ends. It is compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    input_pause: Mutex<
+        Option<(
+            std::sync::mpsc::SyncSender<()>,
+            std::sync::mpsc::Receiver<()>,
+        )>,
+    >,
     /// How many announcements of an authority revision have been refused because the dispatch
     /// boundary was held, for this host's own tests. It is compiled away in every shipped build.
     #[cfg(feature = "testing")]
@@ -571,6 +581,8 @@ impl WorkerService {
             boundary_pause: Mutex::new(None),
             #[cfg(feature = "testing")]
             prepared_first: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(feature = "testing")]
+            input_pause: Mutex::new(None),
             #[cfg(feature = "testing")]
             refused_for_the_boundary: tokio::sync::watch::Sender::new(0),
             #[cfg(feature = "testing")]
@@ -1083,6 +1095,46 @@ impl WorkerService {
     ) -> Option<ReadyPreparation> {
         None
     }
+
+    /// Stops the next raw input write after it has passed the check that holds a local owner to
+    /// its lease and before it takes the session, for this host's own tests.
+    ///
+    /// Returns the end that says the write has arrived, and the end that lets it go. The pause
+    /// fires once.
+    #[cfg(feature = "testing")]
+    pub fn pause_input_before_the_session(
+        &self,
+    ) -> (
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::SyncSender<()>,
+    ) {
+        let (arrived, watch) = std::sync::mpsc::sync_channel(1);
+        let (release, go) = std::sync::mpsc::sync_channel(1);
+        *self.input_pause.lock().expect("the pause is not poisoned") = Some((arrived, go));
+        (watch, release)
+    }
+
+    /// Waits at the pause above, where one is armed. Compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    fn wait_before_the_input_session(&self) {
+        let armed = self
+            .input_pause
+            .lock()
+            .expect("the pause is not poisoned")
+            .take();
+        if let Some((arrived, go)) = armed {
+            let _ = arrived.send(());
+            let _ = go.recv();
+        }
+    }
+
+    /// The same, without the feature: there is no pause.
+    #[cfg(not(feature = "testing"))]
+    #[expect(
+        clippy::unused_self,
+        reason = "it is the shipped form of a method that reads this service's own pause"
+    )]
+    const fn wait_before_the_input_session(&self) {}
 
     /// Says, once, when the next authority revision announcement holds the dispatch boundary, for
     /// this host's own tests.
@@ -7232,6 +7284,7 @@ impl WorkerService {
                 kr_protocol::limits::MAX_INPUT_FRAME_LEN
             )));
         }
+        self.wait_before_the_input_session();
         let accepted = {
             let mut session = self.runtime.session();
             // Inside the session's own boundary, where the lease and the fence are: a forwarded
