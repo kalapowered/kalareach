@@ -72,11 +72,6 @@ const MAX_ANSWER_BYTES: usize = 4096;
 #[cfg(unix)]
 const GATEWAY_ELEMENT: &str = "{gateway}";
 
-/// The most bytes of environment, names and values, the launcher presents to a backend that
-/// starts a server with it.
-#[cfg(unix)]
-const MAX_ENVIRONMENT_BYTES: usize = 256 * 1024;
-
 /// How long the launcher waits before it connects again to an endpoint whose queue is full.
 #[cfg(unix)]
 const CONNECT_RETRY: Duration = Duration::from_millis(10);
@@ -508,7 +503,7 @@ fn present(
 /// # Errors
 ///
 /// Returns why it cannot be presented: a variable that is not text (named, never its value), or
-/// more than [`MAX_ENVIRONMENT_BYTES`] of names and values.
+/// more than [`kr_protocol::root::MAX_PRESENTED_ENVIRONMENT_BYTES`] of names and values.
 #[cfg(unix)]
 fn environment_text() -> Result<std::collections::BTreeMap<String, String>, String> {
     let mut text = std::collections::BTreeMap::new();
@@ -522,10 +517,11 @@ fn environment_text() -> Result<std::collections::BTreeMap<String, String>, Stri
             ));
         };
         bytes = bytes.saturating_add(name_text.len() + value_text.len());
-        if bytes > MAX_ENVIRONMENT_BYTES {
+        if bytes > kr_protocol::root::MAX_PRESENTED_ENVIRONMENT_BYTES {
             return Err(format!(
-                "the environment is more than {MAX_ENVIRONMENT_BYTES} bytes, which a backend that \
-                 starts a server with it does not take"
+                "the environment is more than {} bytes, which a backend that starts a server \
+                 with it does not take",
+                kr_protocol::root::MAX_PRESENTED_ENVIRONMENT_BYTES
             ));
         }
         text.insert(name_text.to_owned(), value_text.to_owned());
