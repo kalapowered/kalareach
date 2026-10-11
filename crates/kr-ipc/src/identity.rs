@@ -254,9 +254,10 @@ pub fn process_lineage(pid: u32) -> Result<Lineage> {
 ///
 /// A process names its session by the identifier of the session's leader as seen from its own
 /// process identifier namespace. In a container, a command the container's runtime started from
-/// outside it can be in a session whose leader is outside the container; the kernel then names
-/// that session `0`, which no process leads. Where the platform names no session, or the reading
-/// fails, the process is not taken to lead one.
+/// outside it, and every process that command starts, can be in a session whose leader is outside
+/// the container; the kernel then names that session `0`, which no process here has as its
+/// number. Where the platform gives no session to read, or the reading fails, the process is not
+/// taken to lead one.
 #[must_use]
 pub fn leads_its_session() -> bool {
     let pid = std::process::id();
