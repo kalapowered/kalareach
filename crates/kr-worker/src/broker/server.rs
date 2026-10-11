@@ -117,7 +117,8 @@ pub enum Ended {
     Input,
     /// It ended when it was asked to terminate.
     Terminate,
-    /// It was ended by force.
+    /// It was still running a moment after it was asked to terminate, and was ended by force, or
+    /// ended of itself as that was done.
     Force,
     /// It was still running when the ending was over: a signal was refused, or it did not end in
     /// the time a forced end is given. It is among the survivors.
