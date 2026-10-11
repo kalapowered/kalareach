@@ -575,10 +575,11 @@ impl Controller {
         let mut budget = self.evidence_budget();
         self.collect_fence_evidence(session_id, binding, revision, &mut budget, false)
             .await;
-        // The revisions announced to the worker with this one or before it that its result reads
-        // and the worker has said nothing about, because the announcement was refused or lost. Its
-        // fence may have run for them since, and what it named is part of this revision's result:
-        // each is asked for, its pages as well as its first, out of the same budget.
+        // The revisions announced to the worker that a result it holds a report for reads and the
+        // worker has said nothing about, because the announcement was refused or lost. Its fence
+        // may have run for them since, and what it named is part of those results: each is asked
+        // for, its pages as well as its first, out of the same budget. They are older than this
+        // revision, which the worker acknowledged, so asking makes it fence nothing.
         for earlier in self.leases.unasked_before(session_id, revision) {
             if budget.pages == 0 {
                 return;
@@ -616,10 +617,10 @@ impl Controller {
     /// given.
     ///
     /// Each is a revision of its own, acknowledged as one ([`Self::note_earlier_acknowledgement`]).
-    /// All are recorded as announced before any is sent, because the worker's fence may run for any
-    /// of them whatever becomes of the answer, and what it names is owed to the result of the
-    /// revision the worker next acknowledges as the last of an announcement
-    /// ([`crate::authority::AuthorityBarrier::acknowledge_announced`]).
+    /// All are recorded as announced before any is sent, and with them what the result of each reads
+    /// besides its own report ([`crate::authority::AuthorityBarrier::announced`]): the worker's
+    /// fence may run for any of them whatever becomes of the answer, and which answer this daemon
+    /// accepts does not change what it names.
     pub(crate) async fn tell_revisions(
         &self,
         session_id: SessionId,

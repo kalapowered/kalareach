@@ -148,10 +148,18 @@ const MAX_CARRIED_REVISIONS: usize = MAX_HELD_FENCE_REPORTS - 1;
 
 /// How many revisions announced to a worker and not yet taken in by a result are tracked.
 ///
-/// Only a worker that answers none of the announcements made to it, for as many revisions as this,
-/// goes past it; the oldest are then no longer asked about, and the result says how many
-/// ([`Carries::unread`]).
-const MAX_TOLD_REVISIONS: usize = 64;
+/// A worker that answers none of the announcements made to it for as many revisions as this goes
+/// past it; the oldest are then no longer followed, and the results that would have read them say
+/// how many ([`Carries::unread`]).
+const MAX_TOLD_REVISIONS: usize = 4096;
+
+/// How many revisions one result remembers it reads. The newest it can read are read
+/// ([`MAX_CARRIED_REVISIONS`]); the rest, up to this many, are counted as unread, and the oldest of
+/// them are forgotten in favour of a count.
+const MAX_REMEMBERED_REVISIONS: usize = 64;
+
+/// How many results' associations are held for revisions no report is held for yet.
+const MAX_ASSOCIATIONS: usize = 4096;
 
 /// What one worker's fence reported when it installed one revision.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -187,18 +195,25 @@ struct FenceReport {
 /// the announcement that follows, and the result of that revision has to read their reports as well
 /// as its own ([`WorkerFences::told_at`]).
 ///
-/// Fixed when the announcement is recorded, before it travels ([`WorkerFences::announce`]), and
-/// never by an acknowledgement: which acknowledgement of a notice this daemon accepts, and over
-/// which control path, does not change what the notice's announcement named.
+/// Made once, when the announcement is recorded, before it travels ([`WorkerFences::announce`]),
+/// and never by an acknowledgement: which acknowledgement of a notice this daemon accepts, and over
+/// which control path, does not change what the notice's announcement named. It is kept until the
+/// report of the revision goes ([`WorkerFences::lose`]), whether or not that report has arrived.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct Carries {
-    /// The revisions, oldest first.
+    /// The revisions, oldest first: at most [`MAX_REMEMBERED_REVISIONS`], the newest.
     revisions: BTreeSet<AuthorityRevision>,
-    /// How many names went with a report of one of them that was let go for room.
+    /// The highest revision forgotten in favour of `unread`, which a recording of the same
+    /// announcement again does not count again.
+    forgotten_through: AuthorityRevision,
+    /// How many names went with a report of one of the revisions that was let go for room.
     lost: u64,
-    /// How many earlier revisions announced to this worker this result does not read, for want of
-    /// room to keep them.
+    /// How many revisions announced to this worker this result cannot read: those forgotten, and
+    /// reports that said nothing and went.
     unread: u64,
+    /// How many revisions the daemon stopped following, for want of room, before this result's
+    /// announcement; recording the announcement again counts none of them again.
+    dropped: u64,
 }
 
 impl FenceReport {
@@ -285,7 +300,12 @@ impl Told {
     /// once, with the later state. What went from the results the carried reports carried is not
     /// read here: it belongs to those results, and is `own`'s only for what `own` itself carried
     /// (`carries`).
-    fn read(own: &FenceReport, carried: &[Option<&FenceReport>], carries: &Carries) -> Self {
+    fn read(
+        own: &FenceReport,
+        carried: &[Option<&FenceReport>],
+        carries: &Carries,
+        unread: u64,
+    ) -> Self {
         let mut told = Self::default();
         let mut rejected = std::collections::HashSet::new();
         let mut executed: HashMap<(kr_protocol::ids::ActorId, kr_protocol::ids::ActionId), usize> =
@@ -316,7 +336,7 @@ impl Told {
             told.omitted = told.omitted.saturating_add(report.omitted);
         }
         told.omitted = told.omitted.saturating_add(carries.lost);
-        told.unread = carries.unread;
+        told.unread = unread;
         for report in carried {
             match report {
                 None => told.unasked += 1,
@@ -343,8 +363,13 @@ struct WorkerFences {
     claimed_through: AuthorityRevision,
     /// What the result of each announced revision reads besides its own report.
     carries: BTreeMap<AuthorityRevision, Carries>,
-    /// How many revisions went from `told` for want of room since an announcement last read it.
-    unread: u64,
+    /// The highest revision whose association was forgotten for room before its report arrived.
+    forgotten_through: AuthorityRevision,
+    /// How many revisions went from `told` for want of room since a result last took the rest in,
+    /// and the highest of them: those are not announced again, and a result that takes in the rest
+    /// says how many it did not follow.
+    dropped: u64,
+    dropped_through: AuthorityRevision,
 }
 
 impl WorkerFences {
@@ -385,7 +410,7 @@ impl WorkerFences {
     /// Says, in the results that read a report that has gone, what went with it.
     ///
     /// A result never reads a revision as one that named nothing because its report is not there.
-    /// The results of revisions that no report is held for any more are let go with it.
+    /// The association of the revision whose report has gone is let go with it.
     fn lose(&mut self, gone: &FenceReport) {
         let names = u64::try_from(
             gone.rejected
@@ -409,56 +434,62 @@ impl WorkerFences {
     /// Records the notices of an announcement about to travel to this worker, oldest first, and
     /// what the result of each reads besides its own report.
     ///
-    /// Each result reads the notices before it in this announcement. The last, which is the
-    /// revision the barrier waits on, also reads the revisions announced to the worker before this
-    /// that no acknowledged announcement has taken in: the refused and lost ones. A revision at or
-    /// below `claimed_through` was taken in by a result already and is read by none other. What is
-    /// read is added to what an earlier announcement of the same revision recorded, never
-    /// replacing it. At most [`MAX_CARRIED_REVISIONS`] are read by one result, the newest; the
-    /// others are counted as unread.
+    /// Each result reads the notices before it in this announcement, and the revisions announced to
+    /// the worker before it that no acknowledged announcement has taken in: the refused and lost
+    /// ones, whose fences may have run since, so that a notice's fence starts after them. A revision
+    /// at or below `claimed_through` was taken in by a result already and is read by none other.
+    /// What is read is added to what an earlier recording of the same revision stored, never
+    /// replacing it, and recording the same announcement again counts nothing twice.
     fn announce(&mut self, notices: &[AuthorityRevision]) {
-        let Some(last) = notices.last().copied() else {
-            return;
-        };
         let floor = self.claimed_through;
-        let leftovers: Vec<AuthorityRevision> = self
-            .told
-            .iter()
-            .copied()
-            .filter(|told| *told > floor && *told < last)
-            .collect();
         for (at, revision) in notices.iter().enumerate() {
-            let mut reads: BTreeSet<AuthorityRevision> = notices[..at]
-                .iter()
-                .copied()
-                .filter(|earlier| *earlier > floor)
-                .collect();
-            let mut unread = 0;
-            if *revision == last {
-                reads.extend(leftovers.iter().copied());
-                unread = std::mem::take(&mut self.unread);
+            if *revision <= floor {
+                continue;
             }
             let carries = self.carries.entry(*revision).or_default();
-            carries.revisions.extend(reads);
-            carries.unread = carries.unread.saturating_add(unread);
-            while carries.revisions.len() > MAX_CARRIED_REVISIONS {
-                carries.revisions.pop_first();
-                carries.unread = carries.unread.saturating_add(1);
+            let reads: BTreeSet<AuthorityRevision> = notices[..at]
+                .iter()
+                .chain(self.told.range(..*revision))
+                .copied()
+                .filter(|read| *read > floor && *read < *revision)
+                .collect();
+            carries.dropped = carries.dropped.max(self.dropped);
+            carries.revisions.extend(
+                reads
+                    .into_iter()
+                    .filter(|read| *read > carries.forgotten_through),
+            );
+            while carries.revisions.len() > MAX_REMEMBERED_REVISIONS {
+                if let Some(oldest) = carries.revisions.pop_first() {
+                    carries.forgotten_through = carries.forgotten_through.max(oldest);
+                    carries.unread = carries.unread.saturating_add(1);
+                }
             }
         }
-        self.told
-            .extend(notices.iter().copied().filter(|revision| *revision > floor));
+        for revision in notices {
+            if *revision > floor && *revision > self.dropped_through {
+                self.told.insert(*revision);
+            }
+        }
         while self.told.len() > MAX_TOLD_REVISIONS {
-            self.told.pop_first();
-            self.unread = self.unread.saturating_add(1);
+            if let Some(oldest) = self.told.pop_first() {
+                self.dropped_through = self.dropped_through.max(oldest);
+                self.dropped = self.dropped.saturating_add(1);
+            }
         }
-        // The results of announcements whose reports have gone are not read again.
-        let oldest = self.reports.first().map(|report| report.revision);
-        if let Some(oldest) = oldest {
-            self.carries.retain(|revision, _| *revision >= oldest);
-        }
-        while self.carries.len() > MAX_TOLD_REVISIONS {
-            self.carries.pop_first();
+        // Associations of results no report is held for are bounded; the oldest of those go first,
+        // and a report that arrives for one is read as a result that follows nothing.
+        while self.carries.len() > MAX_ASSOCIATIONS {
+            let Some(forgotten) = self
+                .carries
+                .keys()
+                .copied()
+                .find(|revision| self.at(*revision).is_none())
+            else {
+                break;
+            };
+            self.carries.remove(&forgotten);
+            self.forgotten_through = self.forgotten_through.max(forgotten);
         }
     }
 
@@ -469,8 +500,22 @@ impl WorkerFences {
             self.claimed_through = revision;
             self.told = self
                 .told
-                .split_off(&AuthorityRevision::new(revision.get() + 1));
+                .split_off(&AuthorityRevision::new(revision.get().saturating_add(1)));
+            if self.dropped_through <= revision {
+                self.dropped = 0;
+            }
         }
+    }
+
+    /// Returns the revisions the result of a revision reads besides its own: those it has an answer
+    /// for first, then the newest of the others, at most [`MAX_CARRIED_REVISIONS`], oldest first.
+    fn selection(&self, carries: &Carries) -> Vec<AuthorityRevision> {
+        let mut selected: Vec<AuthorityRevision> = carries.revisions.iter().copied().collect();
+        selected
+            .sort_by_key(|revision| (self.at(*revision).is_none(), std::cmp::Reverse(*revision)));
+        selected.truncate(MAX_CARRIED_REVISIONS);
+        selected.sort_unstable();
+        selected
     }
 
     /// Returns the highest revision this worker has said it installed.
@@ -512,11 +557,16 @@ impl WorkerFences {
             }
         }
         for (revision, carries) in &self.carries {
-            let unsaid = carries
-                .revisions
+            let selected = self.selection(carries);
+            let unsaid = selected
                 .iter()
                 .any(|carried| !self.at(*carried).is_some_and(|carried| carried.reported));
-            if self.at(*revision).is_some() && (unsaid || carries.lost > 0 || carries.unread > 0) {
+            if unsaid
+                || carries.lost > 0
+                || carries.unread > 0
+                || carries.dropped > 0
+                || selected.len() < carries.revisions.len()
+            {
                 revisions.insert(*revision);
             }
         }
@@ -528,31 +578,53 @@ impl WorkerFences {
 
     /// Returns what the result of one revision names of this worker: what its fence for that
     /// revision reported, and what its fences for the revisions that announcement carried reported.
+    ///
+    /// A result whose own report has not arrived reads the rest all the same.
     fn told_at(&self, revision: AuthorityRevision) -> Option<Told> {
-        let own = self.at(revision)?;
-        let carries = self.carries.get(&revision).cloned().unwrap_or_default();
-        let carried: Vec<Option<&FenceReport>> = carries
-            .revisions
-            .iter()
-            .map(|carried| self.at(*carried))
-            .collect();
-        Some(Told::read(own, &carried, &carries))
+        let carries = match self.carries.get(&revision) {
+            Some(carries) => carries.clone(),
+            None if revision <= self.forgotten_through => Carries {
+                unread: 1,
+                ..Carries::default()
+            },
+            None => Carries::default(),
+        };
+        if self.at(revision).is_none() && carries == Carries::default() {
+            return None;
+        }
+        let opened;
+        let own = match self.at(revision) {
+            Some(own) => own,
+            None => {
+                opened = FenceReport::opened(revision);
+                &opened
+            }
+        };
+        let selected = self.selection(&carries);
+        let carried: Vec<Option<&FenceReport>> =
+            selected.iter().map(|carried| self.at(*carried)).collect();
+        let unread = carries
+            .unread
+            .saturating_add(carries.dropped)
+            .saturating_add((carries.revisions.len() - selected.len()) as u64);
+        Some(Told::read(own, &carried, &carries, unread))
     }
 
     /// Returns the revisions the results this worker has reports for read and the worker has not
     /// been asked about, older than `before`, oldest first.
+    ///
+    /// A worker is asked only about revisions older than one it acknowledged, which it has fenced.
     fn unasked(&self, before: AuthorityRevision) -> Vec<AuthorityRevision> {
         let mut unasked = BTreeSet::new();
         for (revision, carries) in &self.carries {
-            if self.at(*revision).is_some() {
-                unasked.extend(
-                    carries
-                        .revisions
-                        .iter()
-                        .filter(|carried| **carried < before && self.at(**carried).is_none())
-                        .copied(),
-                );
+            if self.at(*revision).is_none() {
+                continue;
             }
+            unasked.extend(
+                self.selection(carries)
+                    .into_iter()
+                    .filter(|carried| *carried < before && self.at(*carried).is_none()),
+            );
         }
         unasked.into_iter().collect()
     }
@@ -2592,10 +2664,10 @@ mod tests {
 
     /// KR-REQ-09.13: the revisions an announcement tells a worker are part of one result. A
     /// worker's fence files what it names under the revision it ran for, and the result of the
-    /// announcement's last revision reads the reports of the others, wherever the worker is bound
-    /// by then.
+    /// announcement's last revision reads the reports of the others, though the worker is bound
+    /// again by the time the result is read.
     #[test]
-    fn a_result_names_what_the_fences_of_its_announcement_named_whichever_announcement_binds_the_worker_last()
+    fn a_result_names_what_the_fences_of_its_announcement_named_though_the_worker_is_bound_again_after()
      {
         let barrier = barrier();
         let first = barrier.bind(session(1));
@@ -3066,5 +3138,227 @@ mod tests {
             "{:?}",
             report.workers[0].detail
         );
+    }
+
+    /// KR-REQ-09.13: a later announcement does not take the association of a result whose report
+    /// has not arrived: the report of revision 5 is the last to come.
+    #[test]
+    fn a_later_announcement_leaves_the_association_of_a_result_whose_report_has_not_arrived() {
+        // A told 4 then 5, and neither answer was recorded (the worker was bound again); B tells
+        // 6 alone and its answer is recorded; then a later announcement is recorded, and only then
+        // are the asks for 4 and 5 answered.
+        let barrier = barrier();
+        let first = barrier.bind(session(1));
+        barrier.announced(session(1), &told(4, 5));
+        let second = barrier.bind(session(1));
+        assert!(!barrier.acknowledge(
+            session(1),
+            first,
+            revision(4),
+            evidence(vec![action(10)], Vec::new()),
+        ));
+        barrier.announced(session(1), &[revision(6)]);
+        assert!(barrier.acknowledge_announced(
+            session(1),
+            second,
+            revision(6),
+            evidence(Vec::new(), Vec::new()),
+        ));
+        barrier.announced(session(1), &[revision(7)]);
+        assert!(barrier.acknowledge(
+            session(1),
+            second,
+            revision(4),
+            evidence(vec![action(10)], Vec::new()),
+        ));
+        assert!(barrier.acknowledge(
+            session(1),
+            second,
+            revision(5),
+            evidence(Vec::new(), Vec::new()),
+        ));
+        let report = barrier.report(revision(5), [session(1)]);
+        assert_eq!(report.workers[0].rejected_actions, vec![fenced(10)]);
+
+        // A result overtaken by a later one, announced again after, whose reports come last.
+        let barrier = AuthorityBarrier::new(ControllerGeneration::new(7), revision(3));
+        let binding = barrier.bind(session(1));
+        barrier.announced(session(1), &told(4, 5));
+        barrier.announced(session(1), &told(6, 7));
+        assert!(barrier.acknowledge(
+            session(1),
+            binding,
+            revision(6),
+            evidence(Vec::new(), Vec::new()),
+        ));
+        assert!(barrier.acknowledge_announced(
+            session(1),
+            binding,
+            revision(7),
+            evidence(Vec::new(), Vec::new()),
+        ));
+        barrier.announced(session(1), &[revision(8)]);
+        assert!(barrier.acknowledge(
+            session(1),
+            binding,
+            revision(4),
+            evidence(vec![action(10)], Vec::new()),
+        ));
+        assert!(barrier.acknowledge_announced(
+            session(1),
+            binding,
+            revision(5),
+            evidence(Vec::new(), Vec::new()),
+        ));
+        let report = barrier.report(revision(5), [session(1)]);
+        assert_eq!(report.workers[0].rejected_actions, vec![fenced(10)]);
+    }
+
+    /// KR-REQ-09.13: the association of a result whose report is held stays while a great many
+    /// revisions are announced after it, and a worker that answers none of more than the daemon
+    /// follows is read as far as it is followed.
+    #[test]
+    fn a_great_many_announcements_leave_the_association_of_a_held_report_and_are_counted() {
+        let barrier = barrier();
+        let binding = barrier.bind(session(1));
+        barrier.announced(session(1), &told(4, 5));
+        assert!(barrier.acknowledge(
+            session(1),
+            binding,
+            revision(4),
+            evidence(vec![action(10)], Vec::new()),
+        ));
+        assert!(barrier.acknowledge_announced(
+            session(1),
+            binding,
+            revision(5),
+            evidence(Vec::new(), Vec::new()),
+        ));
+        let last = u64::try_from(MAX_TOLD_REVISIONS).expect("fits") + 100;
+        for number in 6..=last {
+            barrier.announced(session(1), &[revision(number)]);
+        }
+        let report = barrier.report(revision(5), [session(1)]);
+        assert_eq!(report.workers[0].rejected_actions, vec![fenced(10)]);
+
+        assert!(barrier.acknowledge_announced(
+            session(1),
+            binding,
+            revision(last),
+            evidence(Vec::new(), Vec::new()),
+        ));
+        let report = barrier.report(revision(last), [session(1)]);
+        assert!(
+            report.workers[0].detail.contains("not read"),
+            "{:?}",
+            report.workers[0].detail
+        );
+    }
+
+    /// KR-REQ-09.13: a result says exactly how many revisions it does not read, however often its
+    /// announcement is recorded and whatever was announced before it.
+    #[test]
+    fn a_result_counts_each_revision_it_does_not_read_once() {
+        let unread = |number: u64| {
+            format!(
+                "{number} of the revisions announced to this worker before revision 12 are not \
+                 read for what their fences named"
+            )
+        };
+        // Nine announced one by one, and the last announced again before it is acknowledged.
+        let barrier = barrier();
+        let binding = barrier.bind(session(1));
+        for number in 4..=12 {
+            barrier.announced(session(1), &[revision(number)]);
+        }
+        barrier.announced(session(1), &[revision(12)]);
+        assert!(barrier.acknowledge_announced(
+            session(1),
+            binding,
+            revision(12),
+            evidence(Vec::new(), Vec::new()),
+        ));
+        let report = barrier.report(revision(12), [session(1)]);
+        assert!(
+            report.workers[0].detail.ends_with(&unread(1)),
+            "{:?}",
+            report.workers[0].detail
+        );
+
+        // Sixty-six announced one by one: seven are read, and the other fifty-nine are counted,
+        // whichever of them the daemon still remembers by name.
+        let barrier = AuthorityBarrier::new(ControllerGeneration::new(7), revision(3));
+        let binding = barrier.bind(session(1));
+        for number in 4..=70 {
+            barrier.announced(session(1), &[revision(number)]);
+        }
+        assert!(barrier.acknowledge_announced(
+            session(1),
+            binding,
+            revision(70),
+            evidence(Vec::new(), Vec::new()),
+        ));
+        let report = barrier.report(revision(70), [session(1)]);
+        assert!(
+            report.workers[0]
+                .detail
+                .ends_with(&unread(59).replace("12", "70")),
+            "{:?}",
+            report.workers[0].detail
+        );
+
+        // The next result inherits none of it.
+        barrier.announced(session(1), &[revision(71)]);
+        assert!(barrier.acknowledge_announced(
+            session(1),
+            binding,
+            revision(71),
+            evidence(Vec::new(), Vec::new()),
+        ));
+        let report = barrier.report(revision(71), [session(1)]);
+        assert!(
+            !report.workers[0].detail.contains("not read"),
+            "{:?}",
+            report.workers[0].detail
+        );
+    }
+
+    /// KR-REQ-09.13: a notice in the middle of an announcement reads the revisions announced
+    /// before the announcement that no result had taken in, as the last notice does: its fence
+    /// starts where theirs ended.
+    #[test]
+    fn a_middle_notice_reads_the_revisions_announced_before_its_announcement() {
+        let barrier = barrier();
+        let binding = barrier.bind(session(1));
+        // 4 was announced and not answered; 5 and 6 are told in one announcement.
+        barrier.announced(session(1), &[revision(4)]);
+        barrier.announced(session(1), &told(5, 6));
+        assert!(barrier.acknowledge_announced(
+            session(1),
+            binding,
+            revision(6),
+            evidence(Vec::new(), Vec::new()),
+        ));
+        assert!(barrier.acknowledge(
+            session(1),
+            binding,
+            revision(5),
+            evidence(Vec::new(), Vec::new()),
+        ));
+        assert!(barrier.acknowledge(
+            session(1),
+            binding,
+            revision(4),
+            evidence(vec![action(10)], Vec::new()),
+        ));
+        for number in [5, 6] {
+            let report = barrier.report(revision(number), [session(1)]);
+            assert_eq!(
+                report.workers[0].rejected_actions,
+                vec![fenced(10)],
+                "revision {number}: {:?}",
+                report.workers[0]
+            );
+        }
     }
 }

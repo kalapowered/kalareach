@@ -2275,9 +2275,10 @@ afterwards, names nothing under the revision of the announcement that follows. T
 every announcement before it sends it, for any worker it holds, whichever control path the
 announcement travels on, because a fence runs for an announcement that was sent and an answer the
 daemon refuses does not undo it. The record says what the result of each notice reads besides its
-own report: the notices before it in the announcement, and, for the last notice, the revisions
-announced before that no acknowledged announcement has taken in. It is made once and never by an
-acknowledgement, so which acknowledgement the daemon accepts does not change it. The result reads
+own report: the notices before it in the announcement, and the revisions announced before that no
+acknowledged announcement has taken in. It is made once and never by an acknowledgement, so which
+acknowledgement the daemon accepts does not change it, and it stays as long as the report of the
+revision is held, whether or not that report has arrived. The result reads
 those reports with its own, in revision order. A revision the worker has not been asked about is
 asked for, and the result says so until it answers; one the worker answered with nothing about its
 fence is not asked again, and the result says the worker cannot say. A revision the daemon cannot
