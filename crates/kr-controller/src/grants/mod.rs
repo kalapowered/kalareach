@@ -56,7 +56,7 @@ pub use organisation::LeaseRefused;
 pub use policy::{HostPolicy, PolicyIntersection};
 pub use store::{
     ActionClaim, ActionRecord, ClaimHold, GrantDirectory, GrantRecord, GrantRevocation,
-    SessionScope,
+    MAX_GRANTS_PER_TREE,
 };
 pub use vocabulary::{rights_for, unconditional_rights_for};
 

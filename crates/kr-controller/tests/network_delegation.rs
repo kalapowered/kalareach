@@ -183,6 +183,85 @@ async fn kr_req_18_03_a_device_delegates_a_narrower_grant_and_revokes_what_it_de
     host.stop().await;
 }
 
+/// KR-REQ-10.45 and KR-REQ-23.49: a delegation tree holds at most as many grants as one revocation
+/// can name to a worker in one notice. A device delegating from a share it holds is refused the
+/// grant past the limit, with a quota error it can show and the limit in its words; a grant of
+/// another share is not refused; and a grant it withdraws gives its room back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_10_45_a_device_cannot_delegate_past_the_limit_of_a_tree() {
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    let (boss, boss_record) = recipient(&host, &owner).await;
+    let (_friend, friend_record) = recipient(&host, &owner).await;
+    let session_id = SessionId::new(kr_ipc::new_uuid());
+    let (above, boss_connection) = owned_by(&host, session_id, &boss, &boss_record).await;
+    let delegate_to = |lifetime_ms: u64| {
+        delegation(
+            session_id,
+            friend_record.device_id,
+            Some(above.grant.grant_id),
+            RoleSelection::plain(SessionRole::Viewer),
+            lifetime_ms,
+        )
+    };
+
+    // One real delegation, then copies of it written to the store until the tree is one short of
+    // the limit: the share the device holds, the delegation and the copies.
+    let first = create(&host, &boss_connection, &delegate_to(600_000))
+        .await
+        .expect("the device delegates from the grant it holds");
+    let limit = kr_controller::grants::MAX_GRANTS_PER_TREE;
+    for number in 0..(limit - 3) {
+        let mut copy = first.grant.clone();
+        let mut bytes = [0_u8; 16];
+        bytes[..8].copy_from_slice(&u64::try_from(number).expect("fits").to_be_bytes());
+        bytes[15] = 0x55;
+        copy.grant_id = GrantId::new(Uuid::from_bytes(bytes));
+        host.controller()
+            .sharing()
+            .grants()
+            .issue(
+                &kr_controller::grants::GrantRecord {
+                    grant: copy,
+                    session_id: Some(session_id),
+                    issued_at_ms: kr_ipc::now_ms().get(),
+                    activated_at_ms: None,
+                    revoked_at_ms: None,
+                    revoked_by_parent: None,
+                },
+                || Ok(()),
+            )
+            .expect("room in the tree");
+    }
+
+    // The grant that makes the tree hold the limit is delegated; the next is refused.
+    let last = create(&host, &boss_connection, &delegate_to(600_000))
+        .await
+        .expect("the last grant the tree takes");
+    let refused = create(&host, &boss_connection, &delegate_to(600_000))
+        .await
+        .expect_err("the tree is full");
+    assert_eq!(refused.code, ErrorCode::QuotaExceeded, "{refused:?}");
+    assert!(
+        refused.message.contains(&limit.to_string()),
+        "the refusal says what the limit is: {refused:?}"
+    );
+
+    // Withdrawing a grant gives its room back.
+    revoke(
+        &host,
+        &boss_connection,
+        ActionId::new(kr_ipc::new_uuid()),
+        last.grant.grant_id,
+    )
+    .await
+    .expect("the device withdraws what it delegated");
+    create(&host, &boss_connection, &delegate_to(600_000))
+        .await
+        .expect("there is room again");
+    host.stop().await;
+}
+
 /// KR-REQ-18.03 and KR-REQ-23.49: a device delegates nothing it does not hold and nothing wider
 /// than what it holds, and revokes nothing that does not descend from a grant it holds. Each
 /// refusal writes nothing, and the one that exceeds the parent is decided before the session is

@@ -193,57 +193,15 @@ impl Drop for ClaimHold {
     }
 }
 
-/// The sessions some grants cover.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum SessionScope {
-    /// Every session.
-    Every,
-    /// These sessions and no others.
-    These(BTreeSet<SessionId>),
-}
-
-impl SessionScope {
-    /// The sessions none of the grants covers.
-    #[must_use]
-    pub const fn none() -> Self {
-        Self::These(BTreeSet::new())
-    }
-
-    /// Whether a worker of `session_id` can hold input under these.
-    #[must_use]
-    pub fn covers(&self, session_id: SessionId) -> bool {
-        match self {
-            Self::Every => true,
-            Self::These(sessions) => sessions.contains(&session_id),
-        }
-    }
-
-    /// The sessions either covers.
-    #[must_use]
-    pub fn union(self, other: Self) -> Self {
-        match (self, other) {
-            (Self::Every, _) | (_, Self::Every) => Self::Every,
-            (Self::These(mut sessions), Self::These(more)) => {
-                sessions.extend(more);
-                Self::These(sessions)
-            }
-        }
-    }
-
-    /// The sessions one grant covers.
-    fn of(record: &GrantRecord) -> Self {
-        let mut sessions = BTreeSet::new();
-        match &record.grant.session_selector {
-            kr_protocol::grant::SessionSelector::Any => return Self::Every,
-            kr_protocol::grant::SessionSelector::These { session_ids } => {
-                sessions.extend(session_ids.iter().copied());
-            }
-            kr_protocol::grant::SessionSelector::None => {}
-        }
-        sessions.extend(record.session_id);
-        Self::These(sessions)
-    }
-}
+/// How many grants one delegation tree may hold that are not revoked, proposals included.
+///
+/// A revocation reaches at most one tree, and what it reaches is told to each worker by name in
+/// one notice, which holds at most this many names ([`kr_protocol::worker::MAX_REVISION_REACH_NAMES`],
+/// the most one list of a control frame carries). So a tree that cannot grow past it is a tree
+/// whose revocation is always told exactly, to the grant, and one device's revocation of its own
+/// subtree can never need the fence of the whole host. A grant that would be the next one is
+/// refused when it is created and again when it is redeemed.
+pub const MAX_GRANTS_PER_TREE: usize = kr_protocol::worker::MAX_REVISION_REACH_NAMES;
 
 /// What one revocation did.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -252,9 +210,8 @@ pub struct GrantRevocation {
     pub grant_id: GrantId,
     /// Every grant this revocation revoked: the named one and its descendants, in order.
     pub revoked: Vec<GrantId>,
-    /// Every grant of the subtree that can still hold input at a worker, each with the device it
-    /// was issued to (the device that acts under it): the live ones, expired or not, and one that
-    /// was revoked at a moment a fence debt on disk was recorded.
+    /// Every grant of the subtree that can still hold input at a worker: the live ones, expired or
+    /// not, and one that was revoked at a moment a fence debt on disk was recorded at.
     ///
     /// A grant a concurrent revocation withdrew just before this one read the subtree is not in
     /// [`Self::revoked`], and its own change may not have reached its barrier yet, so a fence that
@@ -264,10 +221,10 @@ pub struct GrantRevocation {
     /// its lease at its own deadline on its own clock, and this host's clock is not the judge of
     /// whether that has passed. A proposal nobody redeemed has no holder and is not in here. There
     /// is one whenever [`Self::debt`] is, since the debt is written for a live grant of this list.
-    pub reached: Vec<(GrantId, DeviceId)>,
-    /// The sessions the grants of [`Self::reached`] cover, which are the only workers that can hold
-    /// input under them.
-    pub reached_in: SessionScope,
+    pub reached: Vec<GrantId>,
+    /// The grants of [`Self::reached`] that carry `terminal.input`: the only ones an input lease
+    /// can be held under, so the only ones a worker has to be told.
+    pub reached_with_input: BTreeSet<GrantId>,
     /// The devices that held what this call revoked, which is what a revocation has to fence.
     pub devices: BTreeSet<DeviceId>,
     /// The sessions those grants covered, which is what a revocation has to close subscriptions
@@ -962,7 +919,7 @@ impl GrantDirectory {
                 ),
                 revoked: Vec::new(),
                 reached: Vec::new(),
-                reached_in: SessionScope::none(),
+                reached_with_input: BTreeSet::new(),
                 devices: BTreeSet::new(),
                 sessions: BTreeSet::new(),
                 covers_every_session: false,
@@ -1004,7 +961,7 @@ impl GrantDirectory {
                 )?;
                 merged.revoked.extend(one.revoked);
                 merged.reached.extend(one.reached);
-                merged.reached_in = merged.reached_in.union(one.reached_in);
+                merged.reached_with_input.extend(one.reached_with_input);
                 merged.devices.extend(one.devices);
                 merged.sessions.extend(one.sessions);
                 merged.covers_every_session |= one.covers_every_session;
@@ -1062,12 +1019,20 @@ impl GrantDirectory {
     ) -> Result<GrantRevocation> {
         let mut revoked = Vec::new();
         let mut reached = Vec::new();
-        let mut reached_in = SessionScope::none();
+        let mut reached_with_input = BTreeSet::new();
         let mut devices = BTreeSet::new();
         let mut sessions = BTreeSet::new();
         let mut covers_every_session = false;
-        let moment = i64::try_from(now_ms).unwrap_or(i64::MAX);
         let owed = moments_a_fence_is_owed(connection)?;
+        // A change is told apart from the fences still owed by the moment it revokes at, which is
+        // after every moment a fence on disk was recorded at: a clock stepped back, or a second
+        // change in the same millisecond, would otherwise let an unrelated debt stand for a
+        // grant whose own fence is done.
+        let now_ms = owed
+            .iter()
+            .next_back()
+            .map_or(now_ms, |latest| now_ms.max(latest.saturating_add(1)));
+        let moment = i64::try_from(now_ms).unwrap_or(i64::MAX);
         for record in subtree {
             if record.is_active()
                 && owes_a_fence(&record.grant)
@@ -1075,8 +1040,13 @@ impl GrantDirectory {
                     .revoked_at_ms
                     .is_none_or(|revoked| owed.contains(&revoked))
             {
-                reached.push((record.grant.grant_id, record.grant.recipient_device_id));
-                reached_in = reached_in.union(SessionScope::of(record));
+                reached.push(record.grant.grant_id);
+                if record
+                    .grant
+                    .permits(kr_protocol::rights::ActionRight::TerminalInput)
+                {
+                    reached_with_input.insert(record.grant.grant_id);
+                }
             }
             let is_the_named_one = record.grant.grant_id == grant_id;
             let changed = connection
@@ -1132,7 +1102,7 @@ impl GrantDirectory {
             grant_id,
             revoked,
             reached,
-            reached_in,
+            reached_with_input,
             devices,
             sessions,
             covers_every_session,
@@ -1359,6 +1329,11 @@ impl GrantDirectory {
                 return Ok(Err(self.unanswerable(&grant_bound)));
             }
             still_admitted()?;
+            // A tree that holds more than it may, which only data from before the limit can, takes
+            // no more live grants: this one's proposal is counted in it.
+            if live_in_tree(connection, invitation.grant_id)? > MAX_GRANTS_PER_TREE {
+                return Ok(Err(tree_is_full()));
+            }
             let activated = connection
                 .execute(
                     "UPDATE grants SET activated_at_ms = ?2
@@ -2278,8 +2253,54 @@ fn check_parent(
     Ok(())
 }
 
+/// How many grants of the delegation tree `member` belongs to are not revoked, proposals included.
+///
+/// The tree is everything below the grant that has no parent in this store, found from `member` up
+/// and counted from there down, in the store, without reading a grant.
+fn live_in_tree(connection: &Connection, member: GrantId) -> Result<usize> {
+    let counted: i64 = connection
+        .query_row(
+            "WITH RECURSIVE up(id, parent) AS (
+                 SELECT grant_id, parent_grant_id FROM grants WHERE grant_id = ?1
+                 UNION ALL
+                 SELECT g.grant_id, g.parent_grant_id FROM grants g JOIN up ON g.grant_id = up.parent
+             ),
+             down(id) AS (
+                 SELECT id FROM up
+                  WHERE parent IS NULL OR parent NOT IN (SELECT grant_id FROM grants)
+                 UNION ALL
+                 SELECT g.grant_id FROM grants g JOIN down ON g.parent_grant_id = down.id
+             )
+             SELECT COUNT(*) FROM grants
+              WHERE revoked_at_ms IS NULL AND grant_id IN (SELECT id FROM down)",
+            params![member.get().as_bytes().as_slice()],
+            |row| row.get(0),
+        )
+        .map_err(ControllerError::registry)?;
+    Ok(usize::try_from(counted).unwrap_or(usize::MAX))
+}
+
+/// The refusal of a grant a full delegation tree cannot take.
+fn tree_is_full() -> ControllerError {
+    ControllerError::Refused {
+        code: kr_protocol::error::ErrorCode::QuotaExceeded,
+        detail: format!(
+            "this share already has {MAX_GRANTS_PER_TREE} grants delegated from it, which is the \
+             most one share can hold; withdraw some of them first"
+        ),
+    }
+}
+
 /// Writes one grant row inside a transaction the caller is already holding.
+///
+/// A grant delegated from another is refused when its tree already holds [`MAX_GRANTS_PER_TREE`]
+/// that are not revoked.
 fn write_grant(connection: &Connection, record: &GrantRecord, encoded: &[u8]) -> Result<()> {
+    if let Some(parent) = record.grant.parent_grant_id.as_ref()
+        && live_in_tree(connection, *parent)? >= MAX_GRANTS_PER_TREE
+    {
+        return Err(tree_is_full());
+    }
     let written = connection
         .execute(
             "INSERT OR IGNORE INTO grants (

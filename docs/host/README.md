@@ -4715,21 +4715,20 @@ the input lease of the callers acting under a grant the revocation withdrew, or 
 named. A device that was typing under a grant the revocation did not touch keeps its lease and goes
 on typing at the epoch it holds, though a batch it had in flight when the revision advanced is
 refused and sent again. The host tells each worker whose authority the revisions after the one that
-worker last acknowledged withdrew in that worker's session. It names the grants and devices, and
-when they pass what one notice carries (4,096 names), it names the devices that hold the grants
-instead, the older revisions first. A device named that way loses its input lease under every grant
-it holds in that session, so a device that took part in a withdrawn subtree of more than 4,096
-grants loses the lease it holds under any other grant in the same session. The host keeps this for
-the last 256 revisions, and for no revision that withdrew more than 65,536 names. A worker that was
-refused an announcement because it was inside a dispatch transition keeps what it was refused. It
-joins that to the next announcement it accepts, a repeat of the newest revision it was refused
-included, or fences it on its own at the next maintenance pass, whichever comes first, up to 65,536
-names. The worker takes the input lease of every caller acting under a grant when the host cannot
-say whose authority was withdrawn: when a revision reached the whole host (revoking a device, or
-changing the rights ceiling), when the host restarted since the revision, when the worker last
-acknowledged a revision more than 256 back, when the devices to name outnumber what a notice
-carries, or when the worker missed a revision the notice does not describe. Revoking a device still
-reaches every connection.
+worker last acknowledged withdrew. It names the grants that carry `terminal.input`, and the devices
+a revision withdrew. A share cannot hold more grants than one notice carries (4,096), so the
+revocation of a share, and of everything one device delegated, is named in full: it ends the input
+lease of the callers under those grants and of no other. The host keeps this for the last 256
+revisions. A barrier takes together only the withdrawals that fit one notice, and the rest wait for
+a barrier of their own. A worker that was refused an announcement because it was inside a dispatch
+transition keeps what it was refused. It joins that to the next announcement it accepts, a repeat of
+the newest revision it was refused included, or fences it on its own at the next maintenance pass,
+whichever comes first, up to 65,536 names. The worker takes the input lease of every caller acting
+under a grant when the host cannot say whose authority was withdrawn: when a revision reached the
+whole host (revoking a device, or changing the rights ceiling), when the host restarted since the
+revision, when the worker last acknowledged a revision more than 256 back or missed one the notice
+does not describe, or when a share from before the limit held more grants than one notice carries.
+Revoking a device still reaches every connection.
 
 `grants::decide` takes the intersection in this order:
 
@@ -4906,6 +4905,13 @@ questions, named approvals and lifetime) is decided from the grants alone before
 session is queried for the preview text, so that what a device is shown of a session never exceeds
 what the grant it delegates from reaches. The grant written authorises nothing until the device it
 names redeems it, and it ends with its parent.
+
+A share holds at most 4,096 grants that are not revoked, counting the share itself, everything
+delegated from it however far down, and invitations not yet redeemed. `grant.create` refuses the
+grant after the last with a `QUOTA_EXCEEDED` error that states the limit, and `grant.redeem` refuses
+an invitation into a share that holds more, which only a share from before the limit can.
+Withdrawing a grant gives its room back. The limit lets one revocation tell each worker, grant by
+grant and in one notice, exactly whose input to end.
 
 A device revokes with `grant.revoke` whatever descends from a grant it holds, however far down. The
 revocation is decided under that grant, and a share revoked while the request waits is caught where
