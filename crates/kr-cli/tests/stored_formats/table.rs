@@ -376,16 +376,6 @@ pub fn known() -> Vec<Known> {
         ),
         words(
             "attention",
-            "sources",
-            attention::AttentionSource::ALL
-                .iter()
-                .map(|word| word.as_str().to_owned())
-                .collect(),
-            None,
-            "791ebfa23cf9f7cc8a70383a61166c41b573460ea570d2178bc3a333f387ee25",
-        ),
-        words(
-            "attention",
             "semantic change kinds",
             attention::SemanticChangeKind::ALL
                 .iter()
@@ -487,7 +477,7 @@ pub fn known() -> Vec<Known> {
             // The keys of a document, not the words of an enum: `StoredMessage` and
             // `StoredInterval` above pin the document's shape.
             &[],
-            "dba448ea8bdc6ebb7ccc73c996b729e90ad85bcc030142dc32a784a254caa040",
+            "c8b1404c75a2d5a04b7d230e6ed9ec6725d7d4512fd5471f6a93760f8622a6f2",
         ),
         words_of(
             "delivery",
