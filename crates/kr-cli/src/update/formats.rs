@@ -108,7 +108,7 @@ impl Refusal {
 pub fn refusal(target: &ReleaseManifest, refusals: &[Refusal]) -> CliError {
     let said = Shown::joined(refusals.iter().map(|refusal| refusal.said(target)), "; ");
     CliError::Other(shown!(
-        "the switch to {} was not made, and no store was brought forward, because it cannot read the stores as they are: {}",
+        "the switch to {} was not made, and no store was brought forward, because the stores cannot be checked, or are not ones it reads, as they are: {}",
         crate::shown::release(&target.release),
         said
     ))
@@ -237,7 +237,7 @@ pub fn check(
 ///
 /// The first look moves a place that hangs when it is looked at to before the update has stopped
 /// anything. It is a look at the root and at the directory of each document and no more: a hang
-/// later, in listing the root or reading a record, is not bounded by it.
+/// later, in searching the root or reading a record, is not bounded by it.
 #[must_use]
 pub fn look_ahead(install: &kr_ipc::install::Store) -> Vec<Refusal> {
     let mut refusals = Vec::new();
@@ -271,8 +271,9 @@ pub fn look_ahead(install: &kr_ipc::install::Store) -> Vec<Refusal> {
 }
 
 /// The refusal for records in `roots/` that cannot be read, named by what they record. The error
-/// names the file, and the refusal says what to do: a record is written again by the command or the
-/// daemon that works there next, so removing the one that cannot be read loses nothing.
+/// names the file, and the refusal says what to do: a record that is only wider than owner-only is
+/// made owner-only, and any other is removed and written again by the command or the daemon that
+/// works there next. Until it is written again, the update does not look at the root it named.
 fn unreadable_records(
     what: &str,
     install: &kr_ipc::install::Store,
@@ -283,8 +284,8 @@ fn unreadable_records(
         environment: None,
         place: install.roots(),
         why: Why::Unreadable(shown!(
-            "{}; remove the record it names, which the command or daemon that works there next \
-             writes again",
+            "{}; make the record it names owner-only, or remove it: the command or daemon that works \
+             there next writes it again",
             super::said(error)
         )),
     }
@@ -342,14 +343,14 @@ fn registered(
         // whether the root can be searched, not whether it can be listed. A root that cannot be
         // searched holds nothing that can be looked at: named, and left whole. Asking for a name no
         // store uses answers "not there" for a root that can be searched.
-        if let Err(error) = std::fs::symlink_metadata(roots.state_root.join(".looked-at")) {
-            if error.kind() != std::io::ErrorKind::NotFound {
-                unreached.push(not_reached(shown!(
-                    "it could not be searched: {}",
-                    Shown::io(&error)
-                )));
-                continue;
-            }
+        if let Err(error) = std::fs::symlink_metadata(roots.state_root.join(".looked-at"))
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            unreached.push(not_reached(shown!(
+                "it could not be searched: {}",
+                Shown::io(&error)
+            )));
+            continue;
         }
         let Ok(host) = kr_ipc::paths::HostPaths::new(&roots.runtime_root, &roots.state_root) else {
             unreached.push(not_reached(Shown::said("its roots cannot be resolved")));
