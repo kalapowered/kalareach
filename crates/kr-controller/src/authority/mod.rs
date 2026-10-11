@@ -365,10 +365,12 @@ struct WorkerFences {
     carries: BTreeMap<AuthorityRevision, Carries>,
     /// The highest revision whose association was forgotten for room before its report arrived.
     forgotten_through: Option<AuthorityRevision>,
-    /// How many revisions went from `told` for want of room since a result last took the rest in,
-    /// and the highest of them: those are not announced again, and a result that takes in the rest
-    /// says how many it did not follow.
-    dropped: u64,
+    /// The revisions that went from `told` for want of room and have not been taken in since: they
+    /// are not announced again, and a result that takes in the rest says how many it did not
+    /// follow. Past [`MAX_TOLD_REVISIONS`] of them the oldest are counted in `dropped_older`.
+    dropped: BTreeSet<AuthorityRevision>,
+    dropped_older: u64,
+    /// The highest revision that went from `told`.
     dropped_through: AuthorityRevision,
 }
 
@@ -453,7 +455,9 @@ impl WorkerFences {
                 .copied()
                 .filter(|read| *read > floor && *read < *revision)
                 .collect();
-            carries.dropped = carries.dropped.max(self.dropped);
+            carries.dropped = carries
+                .dropped
+                .max(self.dropped.len() as u64 + self.dropped_older);
             carries.revisions.extend(reads.into_iter().filter(|read| {
                 carries
                     .forgotten_through
@@ -474,7 +478,12 @@ impl WorkerFences {
         while self.told.len() > MAX_TOLD_REVISIONS {
             if let Some(oldest) = self.told.pop_first() {
                 self.dropped_through = self.dropped_through.max(oldest);
-                self.dropped = self.dropped.saturating_add(1);
+                self.dropped.insert(oldest);
+            }
+        }
+        while self.dropped.len() > MAX_TOLD_REVISIONS {
+            if self.dropped.pop_first().is_some() {
+                self.dropped_older = self.dropped_older.saturating_add(1);
             }
         }
         // Associations of results no report is held for are bounded; the oldest of those go first,
@@ -501,8 +510,11 @@ impl WorkerFences {
             self.told = self
                 .told
                 .split_off(&AuthorityRevision::new(revision.get().saturating_add(1)));
+            self.dropped = self
+                .dropped
+                .split_off(&AuthorityRevision::new(revision.get().saturating_add(1)));
             if self.dropped_through <= revision {
-                self.dropped = 0;
+                self.dropped_older = 0;
             }
         }
     }
@@ -3427,11 +3439,12 @@ mod tests {
             revision(last),
             evidence(Vec::new(), Vec::new()),
         ));
-        // The tracked revisions are the newest `followed`; 99 went before them; of the tracked
-        // ones the result remembers 64 and reads 7.
+        // The tracked revisions are the newest `followed`; 99 went before them, one of which is
+        // revision 6, which a result took in; of the tracked ones the result remembers 64 and
+        // reads 7.
         let remembered = u64::try_from(MAX_REMEMBERED_REVISIONS).expect("fits");
         let read = u64::try_from(MAX_CARRIED_REVISIONS).expect("fits");
-        let expected = (followed - remembered) + 99 + (remembered - read);
+        let expected = (followed - remembered) + 98 + (remembered - read);
         let report = barrier.report(revision(last), [session(1)]);
         let detail = &report.workers[0].detail;
         assert!(
