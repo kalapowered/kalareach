@@ -479,7 +479,9 @@ impl OwnedProcesses {
             forced: false,
             left: std::sync::atomic::AtomicBool::new(false),
         });
-        self.forget_ended();
+        if self.seen.len() >= self.cap {
+            self.forget_ended();
+        }
     }
 
     /// Returns whether `identity` is a backend root.
@@ -2061,6 +2063,49 @@ mod tests {
         assert!(
             !owned.is_backend(&identities[2]),
             "a server that ended with nothing below it is forgotten"
+        );
+        for child in &mut children {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+
+    /// KR-REQ-07.60: starting a server drops nothing from a record that has room, so the closure
+    /// still names the processes that ended of their own accord.
+    #[test]
+    fn a_server_added_to_a_record_with_room_drops_nothing_that_ended() {
+        use std::process::Command;
+        let mut owned = OwnedProcesses::establish(
+            OwnershipBoundary::TerminalGroup {
+                group: 1,
+                terminal: None,
+            },
+            kr_ipc::identity::ended_process_identity(4_000_007),
+        );
+        let mut children: Vec<std::process::Child> = (0..2)
+            .map(|_| {
+                Command::new("sleep")
+                    .arg("120")
+                    .spawn()
+                    .expect("starts a process")
+            })
+            .collect();
+        let identities: Vec<ProcessStartIdentity> = children
+            .iter()
+            .map(|child| {
+                kr_ipc::identity::process_start_identity(child.id()).expect("its identity")
+            })
+            .collect();
+        owned.take([identities[0].clone()]);
+        let _ = children[0].kill();
+        let _ = children[0].wait();
+        owned.add_backend(identities[1].clone());
+        assert!(
+            owned
+                .terminated()
+                .iter()
+                .any(|ended| ended.identity == identities[0]),
+            "what ended before the server started is still named"
         );
         for child in &mut children {
             let _ = child.kill();
