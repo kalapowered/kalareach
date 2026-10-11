@@ -1210,6 +1210,10 @@ mod a_descriptor_beside_a_closure;
 #[cfg(test)]
 mod a_publication_that_outlives_its_request;
 
+/// What this daemon tells a session worker about its host's local owner, and when.
+#[cfg(test)]
+mod a_worker_the_host_tells;
+
 /// A create whose session closed after its worker reported itself.
 #[cfg(test)]
 mod a_create_whose_session_closed;
