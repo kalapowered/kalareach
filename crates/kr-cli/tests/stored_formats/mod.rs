@@ -997,7 +997,9 @@ fn held_in_store(
                 for said in why {
                     problems.push(format!(
                         "{item} ({file}), which the store {store} keeps, holds what cannot be followed ({said}): \
-                         the detection does not skip it; declare the type it holds or list it as known"
+                         the detection does not skip it, and no entry of the table clears it: change the source so \
+                         the type can be followed, for example by writing an alias out or by naming the type in a \
+                         `use` line of its own"
                     ));
                 }
             }

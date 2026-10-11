@@ -20,7 +20,9 @@
 //! capitalised word in a macro call at the top of a file (a macro may define the type), a name an
 //! external glob might bring in (it is taken to be that crate's), and the protocol's scalars.
 //! Where the code is legal Rust and this refuses it (a glob of an enum's variants, a cycle of
-//! globs), the detection reports it, and the table names the type another way.
+//! globs), the detection reports it. No entry of the table clears that, because the table names
+//! what a store keeps and not what this can follow: only a change to the source does, such as
+//! writing an alias out or naming the type in a `use` line of its own.
 //!
 //! What it does not see, and the documents say so: a serde attribute (`from`, `into`, `with`,
 //! `remote`) or a hand-written `Serialize` that changes the stored form of a field without
