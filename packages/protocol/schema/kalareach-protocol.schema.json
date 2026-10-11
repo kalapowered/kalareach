@@ -8186,6 +8186,13 @@
           },
           "description": "The two settings an owner has for session descriptions.\n\nApplied as soon as they are written: turning descriptions off stops the work in flight\nand ends the description process, and no restart is needed for either. No environment\nvariable reaches them."
         },
+        "level": {
+          "default": 1,
+          "description": "The highest level among the sections this document holds that arrived with a level.\n\nA writer stamps it, so a release that reads up to this level reads the document\nstrictly, and a release that reads less ignores the sections it does not know, applies\nthe rest, and refuses to edit the document. A document that states none is at the base\nlevel.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
         "network": {
           "$ref": "#/$defs/NetworkSelection",
           "default": {
@@ -8251,7 +8258,7 @@
           "description": "The managed storage service this host uploads its backups to.\n\nRead when the daemon starts, so a change applies at the next start. No environment\nvariable reaches it."
         },
         "version": {
-          "default": 2,
+          "default": 3,
           "description": "The schema version this document is written against.",
           "format": "uint64",
           "minimum": 0,
