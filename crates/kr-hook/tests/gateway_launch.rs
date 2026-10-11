@@ -874,6 +874,59 @@ fn kr_req_11_33_a_credential_a_terminal_signs_in_with_is_kept_nowhere() {
     );
 }
 
+/// KR-REQ-11.35: a fault in the broker's ledger in the middle of live traffic does not stop the
+/// terminal's session: the terminal's answer to an approval still reaches the server and the turn
+/// completes, the gateway reads `native_only_volatile` with the gap open, and rich work is refused
+/// as unavailable rather than carried out without a record.
+#[test]
+fn kr_req_11_35_a_ledger_fault_in_live_traffic_keeps_the_session_and_fences_rich_work() {
+    use kr_protocol::gateway::GatewayMode;
+
+    let shell = Gateway::with_ledger_on_disk();
+    let answer = shell
+        .establish(&["codex"])
+        .expect("a backend is established");
+    let release = shell.placed.host.root().join("answer");
+    let mut launched = shell.launch(
+        &answer,
+        "fault",
+        &[
+            ("KR_STAND_IN", "stay,answer-when-released"),
+            ("KR_STAND_IN_COMMAND", COMMAND),
+            (
+                "KR_STAND_IN_RELEASE",
+                release.to_str().expect("a text path"),
+            ),
+        ],
+    );
+    launched.prints("TUI: the server asks for item/commandExecution/requestApproval");
+    assert_eq!(shell.broker.mode(), GatewayMode::Normal, "healthy before");
+    assert!(shell.broker.gap().is_none());
+    shell
+        .broker
+        .refuse_ledger_writes(true)
+        .expect("the ledger stops taking writes");
+
+    // The terminal answers, and the session goes on to its end.
+    std::fs::write(&release, b"answer").expect("the terminal is released");
+    launched.prints("TUI: turn/completed");
+    assert_eq!(shell.broker.mode(), GatewayMode::NativeOnlyVolatile);
+    let gap = shell.broker.gap().expect("the gap is open");
+    assert!(gap.is_open(), "{gap:?}");
+    assert!(
+        gap.native_responses.get() >= 1,
+        "the answer was arbitrated in memory: {gap:?}"
+    );
+    let fenced = shell
+        .broker
+        .require_rich_work()
+        .expect_err("rich work is fenced");
+    assert_eq!(
+        fenced.code(),
+        kr_protocol::error::ErrorCode::UpstreamUnavailable
+    );
+}
+
 /// KR-REQ-07.60: a program that was started and never connects, as one that ran as typed does not,
 /// ends the instance and the server at the bound, and the program is left to run.
 #[test]
