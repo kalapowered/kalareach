@@ -273,7 +273,7 @@ pub fn look_ahead(install: &kr_ipc::install::Store) -> Vec<Refusal> {
 /// The refusal for records in `roots/` that cannot be read, named by what they record. The error
 /// names the file, and the refusal says what to do: a record that is only wider than owner-only is
 /// made owner-only, and any other is removed and written again by the command or the daemon that
-/// works there next. Until it is written again, the update does not look at the root it named.
+/// works there next. Until it is written again, the update does not look at what it named.
 fn unreadable_records(
     what: &str,
     install: &kr_ipc::install::Store,
@@ -285,7 +285,7 @@ fn unreadable_records(
         place: install.roots(),
         why: Why::Unreadable(shown!(
             "{}; make the record it names owner-only, or remove it: until the command or daemon \
-             that works there next writes it again, the update does not look at the root it named",
+             that works there next writes it again, the update does not look at what it named",
             super::said(error)
         )),
     }
