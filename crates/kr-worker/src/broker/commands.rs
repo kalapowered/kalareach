@@ -1300,6 +1300,13 @@ impl CommandBackends {
                 )
             })
             .transpose()?;
+        #[cfg_attr(
+            windows,
+            expect(
+                unused_mut,
+                reason = "only a Unix backend names a gateway in its record"
+            )
+        )]
         let mut record = serde_json::json!({
             "endpoint": gateway.address().for_diagnostics(),
             "credential": credential_path.display().to_string(),
