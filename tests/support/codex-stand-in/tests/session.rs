@@ -142,16 +142,23 @@ async fn the_server_runs_a_turn_and_ends_its_commands_with_its_input() {
             break pid.trim().to_owned();
         }
     };
-    let group = loop {
-        let members = status_of("/usr/bin/pgrep", &["-g", &started]);
-        if members
-            .as_deref()
-            .is_some_and(|members| members.lines().count() >= 2)
-        {
-            break members.expect("members");
+    // The command's group is ended by this guard if the test stops before the server has ended it,
+    // since the server can end it only while its input is open.
+    let mut ending = EndsGroup(Some(started.clone()));
+    let group = tokio::time::timeout(WAIT, async {
+        loop {
+            let members = status_of("/usr/bin/pgrep", &["-g", &started]);
+            if members
+                .as_deref()
+                .is_some_and(|members| members.lines().count() >= 2)
+            {
+                return members.expect("members");
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        tokio::task::yield_now().await;
-    };
+    })
+    .await
+    .expect("the command's group holds the command and a process of its own");
     assert!(group.lines().any(|member| member == started), "{group}");
     assert_eq!(
         status_of("/bin/ps", &["-o", "pgid=", "-p", &started]),
@@ -163,11 +170,31 @@ async fn the_server_runs_a_turn_and_ends_its_commands_with_its_input() {
         .expect("the server ends with its input")
         .expect("waited");
     assert!(status.success());
-    assert_eq!(
-        status_of("/usr/bin/pgrep", &["-g", &started]),
-        None,
-        "and nothing of the command's group is left"
-    );
+    // An ended process is collected by whatever adopted it, which is not at the same moment.
+    tokio::time::timeout(WAIT, async {
+        while status_of("/usr/bin/pgrep", &["-g", &started]).is_some() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("nothing of the command's group is left");
+    ending.0 = None;
+}
+
+/// Ends the process group a test names, when the test stops before it has been ended.
+struct EndsGroup(Option<String>);
+
+impl Drop for EndsGroup {
+    fn drop(&mut self) {
+        let group = self
+            .0
+            .take()
+            .and_then(|group| group.parse::<i32>().ok())
+            .and_then(rustix::process::Pid::from_raw);
+        if let Some(group) = group {
+            let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
+        }
+    }
 }
 
 /// The server keeps the order the pinned release requires: nothing before `initialize`, no second
