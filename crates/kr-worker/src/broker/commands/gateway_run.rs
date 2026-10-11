@@ -17,10 +17,18 @@
 //! * **End.** The program exiting, the connection ending, the backend being retired, or no
 //!   connection within the bound ends the server through one operation (see
 //!   [`crate::broker::server`]), run in a task of its own that retiring the backend does not abort.
+//!   A session that is closing ends its servers after the acceptance of its close is delivered, so
+//!   until then none of those ends the server: the connection ending leaves the server running with
+//!   its input open and its output read and discarded.
 
+use std::pin::Pin;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, PoisonError, Weak};
+use std::task::{Context, Poll};
 use std::time::Duration;
+
+use tokio::io::{AsyncRead, ReadBuf};
+use tokio::process::ChildStdout;
 
 use crate::broker::Broker;
 use crate::broker::attach::PresentedEnvironment;
@@ -42,6 +50,41 @@ pub(super) const CONNECTION_DEADLINE: Duration = Duration::from_secs(30);
 /// the two seconds the launcher waits for the commitment, so the launch is given back before the
 /// launcher gives up on it.
 const START_DEADLINE: Duration = Duration::from_millis(1700);
+
+/// The server's output as the program's connection reads it.
+///
+/// When the connection lets go of it, it is not closed: it is read and discarded until the server
+/// ends. A server whose output is closed fails its next write, and an application server is right
+/// to end its commands then; one of them may be what asked the session to close.
+struct LentOutput {
+    output: Option<ChildStdout>,
+}
+
+impl AsyncRead for LentOutput {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        match self.output.as_mut() {
+            Some(output) => Pin::new(output).poll_read(cx, buffer),
+            None => Poll::Ready(Ok(())),
+        }
+    }
+}
+
+impl Drop for LentOutput {
+    fn drop(&mut self) {
+        let (Some(mut output), Ok(runtime)) =
+            (self.output.take(), tokio::runtime::Handle::try_current())
+        else {
+            return;
+        };
+        runtime.spawn(async move {
+            let _ = tokio::io::copy(&mut output, &mut tokio::io::sink()).await;
+        });
+    }
+}
 
 /// What a session recorded below a server, as the ending reads and changes it.
 ///
@@ -389,6 +432,9 @@ async fn handle(
         return;
     };
     let (client_reader, client_writer) = tokio::io::split(lines);
+    let output = LentOutput {
+        output: Some(output),
+    };
     let Ok(mut attached) = backend.gateway.serve(
         connection,
         tables.framing,

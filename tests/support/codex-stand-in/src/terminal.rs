@@ -137,7 +137,8 @@ pub async fn run(contract: Contract, variants: Variants, socket: &str, prompt: &
             }
         };
         if message.is_close() {
-            println!("Error: remote app server closed the connection");
+            let code = message.as_close().map_or(0, |(code, _)| u16::from(code));
+            println!("Error: remote app server closed the connection (close code {code})");
             return 1;
         }
         if message.is_ping() || message.is_pong() {
