@@ -706,6 +706,10 @@ async fn kr_req_24_09_a_report_made_while_the_daemon_is_down_is_recorded_when_it
 /// between the read of the draft and the claim, the action is rejected, and a report that the offer
 /// failed waits for the claim's deadline and is then made, whatever the daemon did with the claim.
 /// Here it made none, so the binding is still `recorded` and the report ends.
+///
+/// The daemon stops only once the worker has the draft. A daemon that is gone before the worker
+/// asks for the draft fails the read, so the worker asks for no claim and owes no report; that is a
+/// different outcome, and the test would wait for a report that nothing makes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn kr_req_24_09_a_claim_the_daemon_did_not_answer_is_settled_by_a_report() {
     let Some((mut acting, draft, handle)) = offering().await else {
@@ -713,6 +717,13 @@ async fn kr_req_24_09_a_claim_the_daemon_did_not_answer_is_settled_by_a_report()
     };
     let mut watcher = acting.client().await;
     let mut asking = acting.client().await;
+    let (read, go_on) = acting
+        .hosted
+        .controller
+        .as_ref()
+        .expect("a daemon")
+        .transfer()
+        .pause_after_a_read();
     let mutation = acting.offering(&asking, "attach.photo", draft.draft_id, handle.transfer_id);
     let action_id = mutation.action_id;
     let host = acting.stop_host();
@@ -725,7 +736,11 @@ async fn kr_req_24_09_a_claim_the_daemon_did_not_answer_is_settled_by_a_report()
         .expect("writes the mutation");
     until_receipt(&mut watcher, action_id, ReceiptState::Accepted).await;
 
-    // The draft was read; the daemon goes away before the component answers.
+    // The daemon is serving the worker's read of the draft. It is let go only once the exchange it
+    // is serving has ended, so the worker has the draft when the daemon goes away, and the
+    // component, which is stopped, has not answered.
+    until_the_daemon_holds(read).await;
+    go_on.send(()).expect("lets the answer go");
     acting.hosted.stop_daemon().await;
     signal(&host, rustix::process::Signal::CONT);
     let finished = answer(&mut asking, Some(1)).await;
