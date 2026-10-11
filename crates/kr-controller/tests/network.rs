@@ -2368,11 +2368,20 @@ impl Exclusive {
     /// The owner makes the host exclusively organisation-managed, on an owner device's
     /// confirmation, and is answered once the barrier has run.
     async fn make_exclusive(&self) {
+        self.set_exclusive(true).await;
+    }
+
+    /// The owner ends exclusive organisation management, on an owner device's confirmation.
+    async fn make_open(&self) {
+        self.set_exclusive(false).await;
+    }
+
+    async fn set_exclusive(&self, exclusive: bool) {
         let mut local = self.host.client().await;
         pairing_calls::confirm_subject(
             self.host.environment_id,
             &mut local,
-            ConfirmationSubject::SetExclusiveManagement { exclusive: true },
+            ConfirmationSubject::SetExclusiveManagement { exclusive },
             &pairing_calls::Signer::OwnerDevice(&self.owner),
         )
         .await
@@ -2383,10 +2392,10 @@ impl Exclusive {
                 &mut local,
                 ActionId::new(kr_ipc::new_uuid()),
                 Method::OrganisationExclusiveSet,
-                &kr_protocol::organisation::OrganisationExclusiveSetParams { exclusive: true },
+                &kr_protocol::organisation::OrganisationExclusiveSetParams { exclusive },
             )
             .await
-            .expect("the host becomes exclusively organisation-managed");
+            .expect("the host takes the owner's change");
     }
 
     /// A new connection to the worker of `display`, as `kr attach` makes one.
@@ -2585,6 +2594,70 @@ async fn an_exclusive_host_holds_its_local_owner_to_a_lease_at_the_worker_and_at
     .await;
 
     drop(local);
+    world.finish().await;
+}
+
+/// KR-REQ-17.54: ending exclusive management serves the local owner again with no lease, at both
+/// doors, and turning it on again closes both again.
+///
+/// Each change is answered once every worker holds the bound it makes, so the first read after
+/// either, on a connection made before it, is answered with no wait.
+#[ignore = "launches a worker process; run through scripts/end-to-end.sh"]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ending_exclusive_management_serves_the_local_owner_without_a_lease_and_turning_it_on_closes_it_again()
+ {
+    let world = Exclusive::start().await;
+    let mut window = world.worker_of(world.display).await;
+    world.make_exclusive().await;
+    refused_for_the_owners_lease(&worker_read(&mut window, world.session_id).await);
+
+    world.make_open().await;
+    worker_read(&mut window, world.session_id)
+        .await
+        .expect("the connection that was refused is served with no lease");
+    let mut local = world.local().await;
+    let created = create(&mut local, &world.host).await;
+    let mut other = world.worker_of(created.session.display_number).await;
+    worker_read(&mut other, created.session.session_id)
+        .await
+        .expect("a session made at the open host's door is served");
+
+    world.make_exclusive().await;
+    refused_for_the_owners_lease(&worker_read(&mut window, world.session_id).await);
+    refused_for_the_owners_lease(&worker_read(&mut other, created.session.session_id).await);
+    drop(local);
+    world.make_open().await;
+    let mut local = world.local().await;
+    close_session(&mut local, &world.host, created.session.session_id).await;
+    drop(local);
+    world.finish().await;
+}
+
+/// KR-REQ-17.54: a lease the owner presents that ends sooner than the one before it ends the local
+/// owner's access at the worker when the new lease does.
+///
+/// The host's own clocks decide it, and the worker's decide it again: nothing waits for the
+/// longer lease the shorter one replaced.
+#[ignore = "launches a worker process; run through scripts/end-to-end.sh"]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_shorter_renewal_ends_the_local_owners_access_at_the_worker_when_the_new_lease_does() {
+    let world = Exclusive::start().await;
+    let mut window = world.worker_of(world.display).await;
+    world.make_exclusive().await;
+
+    world.present(10 * SHORT_LEASE_MS).await;
+    eventually("the long lease serves the worker", async || {
+        worker_read(&mut window, world.session_id).await.is_ok()
+    })
+    .await;
+    // Eight seconds is three past the host's five-second margin.
+    world.present(8_000).await;
+    eventually("the shorter lease ends at the worker", async || {
+        worker_read(&mut window, world.session_id)
+            .await
+            .is_err_and(|error| error.message.contains("lease has ended"))
+    })
+    .await;
     world.finish().await;
 }
 
