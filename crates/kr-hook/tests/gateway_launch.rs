@@ -464,6 +464,14 @@ fn kr_req_11_32_only_the_registered_process_reaches_the_gateway() {
     other
         .set_read_timeout(Some(LIVENESS))
         .expect("a read timeout");
+    // A plain upgrade, the kind the program itself sends: it is the process that is refused, so
+    // an upgrade that would be answered if the program had sent it is closed without a word.
+    std::io::Write::write_all(
+        &mut other,
+        b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\
+          Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
+    )
+    .expect("the request is written");
     let mut heard = [0_u8; 16];
     assert_eq!(
         std::io::Read::read(&mut other, &mut heard).expect("the connection is closed, not held"),
