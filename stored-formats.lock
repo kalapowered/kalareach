@@ -139,10 +139,10 @@
           "member": "version",
           "absent": 1
         },
-        "version": 2,
+        "version": 3,
         "migrates_from": 1
       },
-      "digest": "3ab5cb547eb0cc1a0de8e94452f5094b985c5fe86b8d564ceb55cdad3b0761e6",
+      "digest": "c342cb3cc4391e4029491a3f300190ea752edc941bf351d199d400da21c8865d",
       "kept": [
         "ConfigurationDocument"
       ]
@@ -371,10 +371,10 @@
           "kind": "sqlite_table",
           "table": "schema_version"
         },
-        "version": 9,
+        "version": 10,
         "migrates_from": 1
       },
-      "digest": "40f57d367b542f15250c11b897cc931d55cefcec030269e9b6f66a71d43e9a78",
+      "digest": "981c5928adf26bb0248aee2de17a41c45c8de93856490ab4431b39146e867966",
       "kept": [
         "SessionCreateParams",
         "ClosureRecord",
@@ -391,6 +391,10 @@
         "PairingSecurityEvent",
         "OwnerConfirmationRequest",
         "OwnerConfirmationProof",
+        "SessionRenameResult",
+        "DeliveryDestinationSecretSetResult",
+        "EnvironmentEnrolResult",
+        "HostUpdateHandoverResult",
         "StoredPolicy, StoredFeed, StoredEnrolment, StoredBinding, StoredLeaseRecord, StoredRevocation (crates/kr-controller/src/grants/durable.rs)",
         "StoredCommitment (crates/kr-controller/src/net/invitations.rs)",
         "KeyDeclaration (crates/kr-controller/src/net/devices.rs)",

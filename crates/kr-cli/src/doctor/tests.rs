@@ -881,8 +881,14 @@ fn a_document_the_release_before_wrote_is_read_and_the_next_edit_writes_it_forwa
     )
     .expect("JSON");
     assert_eq!(
-        written["version"], 2,
+        written["version"],
+        kr_protocol::hostinfo::configuration::VERSION,
         "written at the version this build writes"
+    );
+    assert_eq!(
+        written["level"],
+        kr_protocol::hostinfo::configuration::BASE_LEVEL,
+        "at the level of the sections it holds"
     );
     assert_eq!(written["revision"], 5);
     assert_eq!(written["preferences"]["sleep_inhibition"], "off");

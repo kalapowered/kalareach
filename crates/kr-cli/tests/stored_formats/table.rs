@@ -134,6 +134,16 @@ pub fn table() -> Vec<Store> {
                 protocol::<invitation::PairingSecurityEvent>("PairingSecurityEvent"),
                 protocol::<pairing::OwnerConfirmationRequest>("OwnerConfirmationRequest"),
                 protocol::<pairing::OwnerConfirmationProof>("OwnerConfirmationProof"),
+                // Answers the registry keeps that the list above did not name, declared by the raise
+                // that carries the configuration document to version 3.
+                protocol::<kr_protocol::describe::SessionRenameResult>("SessionRenameResult"),
+                protocol::<kr_protocol::delivery::DeliveryDestinationSecretSetResult>(
+                    "DeliveryDestinationSecretSetResult",
+                ),
+                protocol::<kr_protocol::identity::EnvironmentEnrolResult>("EnvironmentEnrolResult"),
+                protocol::<kr_protocol::update::HostUpdateHandoverResult>(
+                    "HostUpdateHandoverResult",
+                ),
                 Kept::Source(
                     "crates/kr-controller/src/grants/durable.rs",
                     &[

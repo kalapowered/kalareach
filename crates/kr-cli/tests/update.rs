@@ -5456,8 +5456,8 @@ async fn a_rollback_is_refused_naming_a_store_the_older_release_cannot_read() {
 }
 
 /// KR-REQ-26.10: a rollback is refused, naming the document, when the configuration document is at a
-/// version the older release does not read: the document this build writes is at version 2, and a release
-/// that reads version 1 only cannot take it. Nothing is switched, and the document is left as it was; a
+/// version the older release does not read: the document this build writes is at version 3, and a release
+/// that reads versions 1 to 2 cannot take it. Nothing is switched, and the document is left as it was; a
 /// document at the older release's own version is no obstacle.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_rollback_is_refused_naming_a_configuration_document_the_older_release_cannot_read() {
@@ -5465,7 +5465,7 @@ async fn a_rollback_is_refused_naming_a_configuration_document_the_older_release
     let one = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1).reading(reading_a_store_at(
         "configuration",
         1,
-        1,
+        2,
     ));
     let two = Assembled::at_this_level("0.2.0+bbbbbbbbbbbb", 2);
     host.install(&one);
@@ -5512,8 +5512,8 @@ async fn a_rollback_is_refused_naming_a_configuration_document_the_older_release
     let message = said["message"].as_str().unwrap_or_default().to_owned();
     assert!(
         message.contains(&document.display().to_string())
-            && message.contains("records version 2")
-            && message.contains("reads versions 1 to 1"),
+            && message.contains("records version 3")
+            && message.contains("reads versions 1 to 2"),
         "{said}"
     );
     assert_eq!(
@@ -5533,7 +5533,7 @@ async fn a_rollback_is_refused_naming_a_configuration_document_the_older_release
     );
 
     // The control: a document at the version the older release reads goes back.
-    kr_ipc::paths::write_owner_only_file(&document, br#"{"version": 1}"#).expect("a document");
+    kr_ipc::paths::write_owner_only_file(&document, br#"{"version": 2}"#).expect("a document");
     let (output, said) = host.kr_json(&["host", "rollback", "--json"]);
     assert!(
         output.status.success(),
@@ -8584,7 +8584,7 @@ async fn an_update_whose_writers_lock_cannot_be_used_stops_nothing_for_good() {
 
 /// KR-REQ-26.10: a command that waited through an update's switch is judged by the release the
 /// switch made current. The release switched to reads the configuration document at version 1 only,
-/// this `kr` writes version 2, and the command that was waiting is refused: the document is never at
+/// this `kr` writes version 3, and the command that was waiting is refused: the document is never at
 /// a version the release switched to cannot read.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_command_that_waited_through_a_switch_is_judged_by_the_release_switched_to() {
@@ -8676,7 +8676,7 @@ async fn every_command_that_writes_a_stored_record_is_refused_a_version_current_
 /// the configuration document at version 1 is held inside its classification of the registry's workers
 /// by a worker that withholds its proof: the stores have been checked and `current` has not changed.
 /// A command started then says it waits; the worker then proves itself, the rollback switches, and
-/// the command is refused: the document was never at version 2 while the rollback was under way.
+/// the command is refused: the document was never at version 3 while the rollback was under way.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_command_that_tries_between_the_check_and_the_switch_of_a_real_rollback_waits_and_is_refused()
  {
@@ -8789,37 +8789,46 @@ async fn an_update_that_cannot_take_the_writers_lock_stops_nothing_for_good() {
 /* A configuration document the daemon cannot use                                                */
 /* -------------------------------------------------------------------------------------------- */
 
+/// A document at the first version this build does not read.
+fn the_next_version() -> Vec<u8> {
+    format!(
+        r#"{{"version": {}}}"#,
+        kr_protocol::hostinfo::configuration::VERSION + 1
+    )
+    .into_bytes()
+}
+
 /// The ways a configuration document is unusable, each with the bytes that make it so and a word
 /// its remedy must carry.
-fn unusable_documents() -> Vec<(&'static str, &'static [u8], u32, &'static str)> {
+fn unusable_documents() -> Vec<(&'static str, Vec<u8>, u32, &'static str)> {
     vec![
         (
             "the next version",
-            br#"{"version": 3}"#,
+            the_next_version(),
             0o600,
             "use a release that reads",
         ),
         (
             "the highest version",
-            br#"{"version": 4294967295}"#,
+            br#"{"version": 4294967295}"#.to_vec(),
             0o600,
             "use a release that reads",
         ),
         (
             "a version below the oldest",
-            br#"{"version": 0}"#,
+            br#"{"version": 0}"#.to_vec(),
             0o600,
             "rewrite the document",
         ),
         (
             "a member the schema lacks",
-            br#"{"version": 2, "not_a_member": 1}"#,
+            br#"{"version": 2, "not_a_member": 1}"#.to_vec(),
             0o600,
             "valid against its schema",
         ),
         (
             "permissions wider than owner-only",
-            br#"{"version": 2}"#,
+            br#"{"version": 2}"#.to_vec(),
             0o644,
             "only you can read and write",
         ),
@@ -8920,7 +8929,7 @@ async fn a_session_is_refused_over_a_document_the_daemon_cannot_read_and_made_ag
     let (kept, _) = host.new_session(&kr);
 
     for (what, contents, mode, remedy) in unusable_documents() {
-        host.write_the_configuration_as(contents, mode);
+        host.write_the_configuration_as(&contents, mode);
         let report = host.doctor();
         let found = report["configuration"]["status"]["detail"]
             .as_str()
@@ -9002,7 +9011,7 @@ async fn a_session_is_refused_over_a_document_the_daemon_cannot_read_and_made_ag
     }
 
     // The session made before any of it is still served: closed here, with the document unusable.
-    host.write_the_configuration_as(br#"{"version": 3}"#, 0o600);
+    host.write_the_configuration_as(&the_next_version(), 0o600);
     host.doctor();
     host.close(&kr, &kept);
 }
@@ -9044,7 +9053,7 @@ async fn a_create_repeated_after_the_document_breaks_is_answered_and_a_new_one_i
         .expect("the host answers")
         .expect("the first create is made");
 
-    host.write_the_configuration_as(br#"{"version": 3}"#, 0o600);
+    host.write_the_configuration_as(&the_next_version(), 0o600);
     host.doctor();
     let again = client
         .repeat(&created)
@@ -9094,7 +9103,7 @@ async fn a_create_made_right_after_the_document_is_put_right_takes_what_it_now_s
     host.install(&one);
     let controller = host.store.stable(Program::Controller);
     host.start_daemon(&controller).await;
-    host.write_the_configuration_as(br#"{"version": 3}"#, 0o600);
+    host.write_the_configuration_as(&the_next_version(), 0o600);
     host.doctor();
 
     let endpoint = host
@@ -9162,7 +9171,7 @@ async fn kr_new_with_no_daemon_over_an_unusable_document_names_the_way_out() {
     let one = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1);
     host.install(&one);
     for (what, contents, mode, remedy) in unusable_documents() {
-        host.write_the_configuration_as(contents, mode);
+        host.write_the_configuration_as(&contents, mode);
         let (output, said) = host.kr_new();
         assert!(!output.status.success(), "{what}: {said}");
         let message = said["message"].as_str().unwrap_or_default();
