@@ -23,10 +23,10 @@ pub const MAX_CLIENT_IDENTIFIER_BYTES: usize = 256;
 /// A request the terminal sends is forwarded under an identifier this host gives it, and the
 /// reply comes back under the terminal's own. The longest identifier this host gives is a quoted
 /// `kr-` and twenty digits, 25 bytes, in place of one that may be a single character; the longest
-/// the terminal gives is a string of [`MAX_CLIENT_IDENTIFIER_BYTES`] and its quotes, in place of
-/// one this host gave that may be six bytes. A body is read at the limit its connector states and
+/// the terminal gives is [`MAX_CLIENT_IDENTIFIER_BYTES`] with its quotes, in place of one this
+/// host gave that may be six bytes, 250 more. A body is read at the limit its connector states and
 /// may be written that many bytes longer, so a frame at the limit is not carried in one direction
-/// and refused in the other.
+/// and refused in the other; the allowance is the bound and two bytes over, which covers both.
 pub const IDENTIFIER_ALLOWANCE: usize = MAX_CLIENT_IDENTIFIER_BYTES + 2;
 
 /// Reads and writes one connector's frames, as its qualified table describes them.
