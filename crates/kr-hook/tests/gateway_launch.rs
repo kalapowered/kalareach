@@ -220,6 +220,20 @@ impl Gateway {
     /// variable and the person's own variables, in the group every launch of this test runs in.
     /// Standard output goes to a file the test reads, for it is what the terminal prints.
     fn launch(&self, answer: &CommandBackend, name: &str, own: &[(&str, &str)]) -> Launched {
+        let own: Vec<(&std::ffi::OsStr, &std::ffi::OsStr)> = own
+            .iter()
+            .map(|(variable, value)| (variable.as_ref(), value.as_ref()))
+            .collect();
+        self.launch_with(answer, name, &own)
+    }
+
+    /// The same, with variables that need not be text.
+    fn launch_with(
+        &self,
+        answer: &CommandBackend,
+        name: &str,
+        own: &[(&std::ffi::OsStr, &std::ffi::OsStr)],
+    ) -> Launched {
         use std::os::unix::process::CommandExt as _;
 
         let printed = self.outputs.join(name);
@@ -522,6 +536,43 @@ fn kr_req_12_07_a_launch_that_cannot_have_a_server_runs_the_program_as_typed() {
             shell.broker.live_bindings().is_empty(),
             "{case}: and so was the binding"
         );
+    }
+}
+
+/// KR-REQ-12.07: a launcher whose environment a backend cannot be shown, because it holds more
+/// than a backend takes or a variable that is not text, runs the program as typed, and no server
+/// is started for it.
+#[test]
+fn kr_req_12_07_an_environment_that_cannot_be_presented_runs_the_program_as_typed() {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let filler: Vec<(String, String)> = (0..40)
+        .map(|number| (format!("KR_FILLER_{number}"), "x".repeat(8000)))
+        .collect();
+    let oversize: Vec<(&std::ffi::OsStr, &std::ffi::OsStr)> = filler
+        .iter()
+        .map(|(variable, value)| (variable.as_ref(), value.as_ref()))
+        .collect();
+    let not_text = [(
+        std::ffi::OsStr::new("KR_NOT_TEXT"),
+        std::ffi::OsStr::from_bytes(b"\xff\xfe"),
+    )];
+    for (case, own) in [
+        ("more than a backend takes", &oversize[..]),
+        ("a variable that is not text", &not_text[..]),
+    ] {
+        let shell = Gateway::new();
+        let answer = shell
+            .establish(&["codex"])
+            .expect("a backend is established");
+        let mut launched = shell.launch_with(&answer, "environment", own);
+        let status = launched.ends();
+        assert_eq!(status.code(), Some(2), "{case}: {}", launched.said());
+        assert!(
+            launched.said().contains("serves `app-server"),
+            "{case}: it ran with the arguments it was typed with"
+        );
+        assert!(shell.servers().is_empty(), "{case}: no server was started");
     }
 }
 
