@@ -14,7 +14,7 @@
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
 use kr_ipc::identity::{ProcessState, current_process_start_identity, process_state};
@@ -34,29 +34,46 @@ const STUBBORN: &str = r#"["/bin/sh", "-c", "trap '' TERM; sleep 120 & wait"]"#;
 const PLAIN: &str = r#"["/bin/sh", "-c", "sleep 120 & wait"]"#;
 
 /// The stand-in as a session would run it: a copy on the internal disk, and what its digest is.
-fn stand_in() -> &'static (PathBuf, Digest256) {
-    static COPY: OnceLock<(PathBuf, Digest256)> = OnceLock::new();
-    COPY.get_or_init(|| {
-        let tests = std::env::current_exe().expect("this test's path");
-        let built = tests
-            .parent()
-            .and_then(Path::parent)
-            .expect("the directory the programs are built in")
-            .join("codex-stand-in");
-        assert!(
-            built.is_file(),
-            "{} is not built; run `cargo build -p kr-codex-stand-in` first",
-            built.display()
-        );
-        let directory = std::env::temp_dir().join(format!("kr-server-{}", std::process::id()));
-        std::fs::create_dir_all(&directory).expect("a directory");
-        let copy = directory.join("codex");
-        std::fs::copy(&built, &copy).expect("the program is copied");
-        let digest = Digest256::from_bytes(
-            Sha256::digest(std::fs::read(&copy).expect("the copy is read")).into(),
-        );
-        (copy, digest)
-    })
+/// The directory is removed when the last test that holds the copy ends.
+struct StandIn {
+    directory: tempfile::TempDir,
+    executable: PathBuf,
+    digest: Digest256,
+}
+
+fn stand_in() -> Arc<StandIn> {
+    static SHARED: Mutex<Weak<StandIn>> = Mutex::new(Weak::new());
+    let mut shared = SHARED.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(copy) = shared.upgrade() {
+        return copy;
+    }
+    let tests = std::env::current_exe().expect("this test's path");
+    let built = tests
+        .parent()
+        .and_then(Path::parent)
+        .expect("the directory the programs are built in")
+        .join("codex-stand-in");
+    assert!(
+        built.is_file(),
+        "{} is not built; run `cargo build -p kr-codex-stand-in` first",
+        built.display()
+    );
+    let directory = tempfile::Builder::new()
+        .prefix("kr-server-")
+        .tempdir()
+        .expect("a directory");
+    let executable = directory.path().join("codex");
+    std::fs::copy(&built, &executable).expect("the program is copied");
+    let digest = Digest256::from_bytes(
+        Sha256::digest(std::fs::read(&executable).expect("the copy is read")).into(),
+    );
+    let copy = Arc::new(StandIn {
+        directory,
+        executable,
+        digest,
+    });
+    *shared = Arc::downgrade(&copy);
+    copy
 }
 
 fn presented(variants: &str, command: &str) -> Vec<(OsString, OsString)> {
@@ -71,23 +88,17 @@ fn presented(variants: &str, command: &str) -> Vec<(OsString, OsString)> {
     .collect()
 }
 
-fn work_directory() -> PathBuf {
-    let (copy, _) = stand_in();
-    copy.parent().expect("a directory").to_path_buf()
-}
-
-async fn start(variants: &str, command: &str) -> Server {
-    let (copy, digest) = stand_in();
+async fn start(stand_in: &StandIn, variants: &str, command: &str) -> Server {
     let environment = presented(variants, command);
     Server::start(&ServerSpec {
-        executable: copy,
-        digest,
+        executable: &stand_in.executable,
+        digest: &stand_in.digest,
         arguments: &[
             "app-server".to_owned(),
             "--listen".to_owned(),
             "stdio://".to_owned(),
         ],
-        directory: &work_directory(),
+        directory: stand_in.directory.path(),
         presented: &environment,
     })
     .await
@@ -229,7 +240,8 @@ fn gone(process: &ProcessStartIdentity) -> bool {
 /// A server ends with its input, and its command with it: nothing is forced or left.
 #[tokio::test]
 async fn kr_req_07_60_a_server_that_ends_with_its_input_leaves_nothing() {
-    let server = start("", PLAIN).await;
+    let stand_in = stand_in();
+    let server = start(&stand_in, "", PLAIN).await;
     let record = Record::of(&server);
     let _session = to_the_approval(&server).await;
     let command = command_of(&server, &record).await;
@@ -245,7 +257,8 @@ async fn kr_req_07_60_a_server_that_ends_with_its_input_leaves_nothing() {
 /// A server that ignores the end of its input is asked to terminate, and ends its command itself.
 #[tokio::test]
 async fn kr_req_07_60_a_server_that_ignores_its_input_ends_when_asked_to_terminate() {
-    let server = start("ignore-eof", PLAIN).await;
+    let stand_in = stand_in();
+    let server = start(&stand_in, "ignore-eof", PLAIN).await;
     let record = Record::of(&server);
     let _session = to_the_approval(&server).await;
     let command = command_of(&server, &record).await;
@@ -260,7 +273,8 @@ async fn kr_req_07_60_a_server_that_ignores_its_input_ends_when_asked_to_termina
 /// ignores a terminate too: both are noted as forced.
 #[tokio::test]
 async fn kr_req_07_66_a_server_and_a_command_that_ignore_a_terminate_are_ended_by_force() {
-    let server = start("ignore-eof,ignore-term", STUBBORN).await;
+    let stand_in = stand_in();
+    let server = start(&stand_in, "ignore-eof,ignore-term", STUBBORN).await;
     let record = Record::of(&server);
     let _session = to_the_approval(&server).await;
     let command = command_of(&server, &record).await;
@@ -282,7 +296,8 @@ async fn kr_req_07_66_a_server_and_a_command_that_ignore_a_terminate_are_ended_b
 /// ends it from what the session recorded while the server ran.
 #[tokio::test]
 async fn kr_req_07_60_a_command_that_outlives_a_server_that_died_is_ended_by_what_was_recorded() {
-    let server = start("die-first", STUBBORN).await;
+    let stand_in = stand_in();
+    let server = start(&stand_in, "die-first", STUBBORN).await;
     let record = Record::of(&server);
     let mut session = to_the_approval(&server).await;
     let command = command_of(&server, &record).await;
@@ -316,7 +331,8 @@ async fn kr_req_07_60_a_command_that_outlives_a_server_that_died_is_ended_by_wha
 #[tokio::test]
 async fn kr_req_07_60_a_server_that_floods_its_error_stream_goes_on_and_only_its_last_part_is_kept()
 {
-    let server = start("flood-stderr", PLAIN).await;
+    let stand_in = stand_in();
+    let server = start(&stand_in, "flood-stderr", PLAIN).await;
     let record = Record::of(&server);
     let _session = to_the_approval(&server).await;
     let started = Instant::now();
@@ -338,8 +354,8 @@ async fn kr_req_07_60_a_server_that_floods_its_error_stream_goes_on_and_only_its
 /// with the presented environment less the two variables of the launch, in the directory asked.
 #[tokio::test]
 async fn kr_req_07_60_a_server_is_started_only_as_the_record_names_it_and_as_a_session_runs_it() {
-    let (copy, _) = stand_in();
-    let directory = work_directory();
+    let stand_in = stand_in();
+    let directory = stand_in.directory.path();
     let environment = presented("", PLAIN);
     let arguments = [
         "app-server".to_owned(),
@@ -348,10 +364,10 @@ async fn kr_req_07_60_a_server_is_started_only_as_the_record_names_it_and_as_a_s
     ];
     let wrong = Digest256::from_bytes([1; 32]);
     let refused = Server::start(&ServerSpec {
-        executable: copy,
+        executable: &stand_in.executable,
         digest: &wrong,
         arguments: &arguments,
-        directory: &directory,
+        directory,
         presented: &environment,
     })
     .await
@@ -367,7 +383,7 @@ async fn kr_req_07_60_a_server_is_started_only_as_the_record_names_it_and_as_a_s
         executable: env,
         digest: &env_digest,
         arguments: &[],
-        directory: &directory,
+        directory,
         presented: &with,
     })
     .await
@@ -394,7 +410,7 @@ async fn kr_req_07_60_a_server_is_started_only_as_the_record_names_it_and_as_a_s
     );
 
     // The server leads a group of its own.
-    let server = start("", PLAIN).await;
+    let server = start(&stand_in, "", PLAIN).await;
     let pid = server.identity().pid.get().to_string();
     let group = std::process::Command::new("/bin/ps")
         .args(["-o", "pgid=", "-p", &pid])
