@@ -1242,10 +1242,10 @@ impl Store {
             };
             let document = bytes_path(&contents[split + 1..]);
             if let Some(why) = unusable_path(&document) {
-                return Err(malformed(if why == "is empty" {
-                    "it names no document path"
-                } else {
-                    "its document path is not an absolute path"
+                return Err(malformed(match why {
+                    "is empty" => "it names no document path",
+                    "is not an absolute path" => "its document path is not an absolute path",
+                    _ => "its document path holds a byte no path holds",
                 }));
             }
             recorded.push(RecordedDocument {
@@ -1353,8 +1353,12 @@ fn bytes_path(bytes: &[u8]) -> PathBuf {
 /// command worked, and an empty or relative path names nowhere an update can look.
 #[cfg(unix)]
 fn unusable_path(path: &Path) -> Option<&'static str> {
+    use std::os::unix::ffi::OsStrExt as _;
+
     if path.as_os_str().is_empty() {
         Some("is empty")
+    } else if path.as_os_str().as_bytes().contains(&0) {
+        Some("holds a byte no path holds")
     } else if !path.is_absolute() {
         Some("is not an absolute path")
     } else {

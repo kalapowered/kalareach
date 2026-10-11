@@ -9620,6 +9620,80 @@ async fn a_command_that_writes_a_state_root_record_in_a_root_no_daemon_recorded_
     assert!(output.status.success(), "the control: {said}");
 }
 
+/// KR-REQ-26.10: a registered root is looked at when its records can be opened by name, whether or
+/// not the root can be listed, and is named, with the switch going ahead, when it cannot be
+/// searched. The records of a root are opened by name, so a root a person can search but not list
+/// still has its records checked.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_registered_root_is_looked_at_when_it_can_be_searched_and_named_when_it_cannot() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let host = Host::create();
+    let one = Assembled::at_this_level("0.1.0+aaaaaaaaaaaa", 1).reading(reading_a_store_at(
+        "shell-entries",
+        0,
+        0,
+    ));
+    let two = Assembled::at_this_level("0.2.0+bbbbbbbbbbbb", 2);
+    let directory = host.put(&two);
+    host.switch(two.name());
+    std::fs::set_permissions(host.store.record(), std::fs::Permissions::from_mode(0o600))
+        .expect("the record is owner-only");
+    write_zsh_package(&directory.join("shells"));
+    host.put(&one);
+    let other = teardown::Tree::create();
+    let home = host.scratch("home");
+    let runtime = other.paths().runtime_root().as_os_str().to_owned();
+    let state = other.paths().state_root().as_os_str().to_owned();
+    let (output, _) = host.kr_json_with(
+        &[
+            ("HOME", home.as_os_str()),
+            ("KR_RUNTIME_DIR", &runtime),
+            ("KR_STATE_DIR", &state),
+        ],
+        &["shell", "install", "--shell", "zsh"],
+    );
+    assert!(
+        output.status.success(),
+        "kr shell install: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let root = other.paths().state_root().to_path_buf();
+    let record = root.join("shell-entries.json");
+    assert!(record.exists(), "the command recorded its entries");
+
+    // Searchable and not listable: the record is opened by name, found, and the switch refused.
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o300)).expect("not listable");
+    let (output, said) = host.roll_back_to(&one);
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).expect("restored");
+    assert_eq!(output.status.code(), Some(1), "{said}");
+    assert!(
+        said["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("shell-entries.json"),
+        "the refusal names the record: {said}"
+    );
+
+    // Listable and not searchable: nothing in it can be looked at; the root is named, and the
+    // switch goes ahead.
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o600))
+        .expect("not searchable");
+    let (output, said) = host.roll_back_to(&one);
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).expect("restored");
+    assert!(
+        output.status.success(),
+        "a root that cannot be searched is named and left: {said} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        said["not_reached"]
+            .to_string()
+            .contains(&root.display().to_string()),
+        "the root nobody could search is named: {said}"
+    );
+}
+
 /// KR-REQ-26.10: a command that registers before an update takes the install lock is found by the
 /// update's survey under it. The rollback is held by the test at the step before the lock; the
 /// command runs to its end meanwhile; the rollback then finds the root and refuses.
@@ -9790,6 +9864,7 @@ async fn a_registration_that_cannot_be_read_refuses_the_switch_until_it_is_remov
         b"\0/state".as_slice(),
         b"run\0/state".as_slice(),
         b"/run\0state".as_slice(),
+        b"/run\0/state\0extra".as_slice(),
     ] {
         std::fs::write(&damaged, contents).expect("a registration that names no usable roots");
         let (output, said) = host.roll_back_to(&one);
@@ -9805,7 +9880,7 @@ async fn a_registration_that_cannot_be_read_refuses_the_switch_until_it_is_remov
     std::fs::remove_file(&damaged).expect("removed");
     let document = host.store.roots().join("fedcba9876543210.document");
     let environment = host.tree.environment_id().to_string();
-    for path in ["", "relative/config.json"] {
+    for path in ["", "relative/config.json", "/etc/x\0y/config.json"] {
         std::fs::write(&document, format!("{environment}\0{path}")).expect("a document record");
         std::fs::set_permissions(&document, std::fs::Permissions::from_mode(0o600))
             .expect("owner-only");
