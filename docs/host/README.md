@@ -5475,8 +5475,9 @@ a refusal.
 A delegation that closes a session runs on a task that outlives the connection it arrived on. The
 task keeps the claim and records the worker's answer before it lets go, so a retry after a dropped
 connection is given the receipt and the session is closed once. A voice grant withdrawn while a
-worker can still take its close up writes a fence debt for the device that holds the call, and the
-barrier that retires it withdraws that device's connections and no others. See [Closing a session by
+worker can still take its close up writes a fence debt. The barrier that retires it advances the
+revision for the workers and withdraws no connection, because no connection decides a request under
+a call's grant. The withdrawal is answered once that barrier has run. See [Closing a session by
 voice](../voice/README.md#closing-a-session-by-voice).
 
 The fence this daemon takes withdraws the registrations the change reaches, and the connections that

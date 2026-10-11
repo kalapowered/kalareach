@@ -245,8 +245,9 @@ signed delegation comes back, and no amount of provider text stands in for the s
 then sends the close to the session's worker the way that device's own close goes: as that device,
 over a link opened for the close, under the action identifier of the delegation, carrying the right
 to close and no voice right. It checks the grants once more just before it sends, and sends nothing
-if either the call's voice grant or the device's own grant no longer reaches that session. The call
-keeps running, and only the session it named is closed.
+if the call's voice grant or the device's own grant no longer reaches that session, or if this
+host's configuration has taken the right to close away from every grant. The call keeps running, and
+only the session it named is closed.
 
 The worker's answer is the receipt. A session that is closing or already closed is reported as done,
 and a worker that refuses is reported as refusing. A worker that does not answer in time leaves the
@@ -254,12 +255,19 @@ outcome uncertain, and the close is then not sent again.
 
 A close runs on a task of its own, so a connection that goes away does not call it back. The task
 records what the worker answered under the delegation's claim, and a device that asks again is given
-that receipt. While a worker can still take a close up, withdrawing the voice grant it was sent
-under owes a fence for the device that holds the call: the host advances the authority revision,
-withdraws that device's connections and leaves every other connection admitted. A worker that has
-installed the new revision refuses a close it had not started. Once the worker has answered, or the
-deadline the close was sent with has passed, stopping the call owes nothing and withdraws no
-connection.
+that receipt.
+
+While a worker can still take a close up, withdrawing the voice grant it was sent under owes a
+fence. The host advances the authority revision, and a worker that has installed it refuses a close
+it had not started. A close can still be taken up from the moment the host sets out to send it until
+the worker accepts it. After any other end, including a refusal, it can be taken up until the
+deadline it was sent with. Once the worker has accepted the close, or that deadline has passed,
+stopping the call owes no fence.
+
+The fence withdraws no connection. Nothing a connection holds comes from a call's grant, so the stop
+that withdrew the grant is answered on the link it arrived on, and so is every other request on that
+link. The answer is written once the workers that answer hold the new revision. A worker that does
+not answer within the time a revocation allows stays pending, as it does for any revocation.
 
 ## The rate a call runs under
 
