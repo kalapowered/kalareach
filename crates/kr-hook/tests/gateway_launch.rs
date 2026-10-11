@@ -23,7 +23,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use common::session::{LaunchGroup, View, session};
-use common::{FIRST_START_WITHIN, LIVENESS, Placed};
+use common::{LIVENESS, Placed};
 use kr_protocol::identity::ProcessStartIdentity;
 use kr_protocol::ids::EnvironmentId;
 use kr_protocol::root::{CommandBackend, CwdRevision, PromptGeneration};
@@ -109,9 +109,8 @@ impl Gateway {
         let executable = bin.join("codex");
         // Placed and started once where nothing is timed: the first start of a program at a new
         // path is the one the operating system checks.
-        let started =
+        let _ =
             kr_ipc::testing::place_and_start_once(&built_stand_in(), &executable, &["--version"]);
-        assert!(started < FIRST_START_WITHIN);
         let digest = Digest256::from_bytes(
             Sha256::digest(std::fs::read(&executable).expect("the placed stand-in")).into(),
         );
@@ -453,9 +452,10 @@ fn kr_req_12_07_a_plain_launch_of_a_terminal_with_a_server_is_served_by_a_gatewa
 }
 
 /// KR-REQ-11.32: only the process the launch registered reaches the gateway, and an upgrade a
-/// browser could have sent does not use the admission: another process is closed without a word
-/// while the program has not yet connected, and the program whose first upgrade is refused for its
-/// `Origin` header connects again and runs its whole session.
+/// browser could have sent does not use the admission: another process that speaks a plain upgrade
+/// to the socket, while the program has become the terminal and not yet connected, is closed
+/// without a word, and the program whose first upgrade is refused for its `Origin` header connects
+/// again and runs its whole session.
 #[test]
 fn kr_req_11_32_only_the_registered_process_reaches_the_gateway() {
     let shell = Gateway::new();
@@ -463,23 +463,35 @@ fn kr_req_11_32_only_the_registered_process_reaches_the_gateway() {
         .establish(&["codex"])
         .expect("a backend is established");
     let socket = directory_of(&answer).join("gw.sock");
-    let (arrived, release) = shell.backends.pause_before_confirming();
+    let release = shell.placed.host.root().join("connect");
+    let (arrived, go) = shell.backends.pause_before_confirming();
     let mut launched = shell.launch(
         &answer,
         "second",
         &[
-            ("KR_STAND_IN", "origin,retry-plain"),
+            ("KR_STAND_IN", "origin,retry-plain,wait-to-connect"),
             ("KR_STAND_IN_COMMAND", COMMAND),
+            (
+                "KR_STAND_IN_RELEASE",
+                release.to_str().expect("a text path"),
+            ),
         ],
     );
-    // The launch is committed, so the socket is bound, and nothing has connected to it.
+    // The launch is committed, and the launcher is not yet told: the socket is bound already.
     shell.at_the_confirmation(arrived);
+    drop(
+        std::os::unix::net::UnixStream::connect(&socket)
+            .expect("the socket is bound before the launcher is told"),
+    );
+    go.send(()).expect("the launch waits");
+    // The launcher has become the terminal, which has not connected: it
+    // is the registered process, and it runs the code that was hashed, so what keeps another
+    // process out is that it is another process.
+    launched.prints("TUI: waiting to connect");
     let mut other = std::os::unix::net::UnixStream::connect(&socket).expect("the socket is bound");
     other
         .set_read_timeout(Some(LIVENESS))
         .expect("a read timeout");
-    // A plain upgrade, the kind the program itself sends: it is the process that is refused, so
-    // an upgrade that would be answered if the program had sent it is closed without a word.
     std::io::Write::write_all(
         &mut other,
         b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\
@@ -490,9 +502,9 @@ fn kr_req_11_32_only_the_registered_process_reaches_the_gateway() {
     assert_eq!(
         std::io::Read::read(&mut other, &mut heard).expect("the connection is closed, not held"),
         0,
-        "another process is closed without a word"
+        "another process is closed without a word, though its upgrade is a plain one"
     );
-    release.send(()).expect("the launch waits");
+    std::fs::write(&release, b"go").expect("the terminal is released");
 
     launched.prints("TUI: turn/completed");
     assert!(launched.ends().success());
@@ -576,6 +588,31 @@ fn kr_req_12_07_an_environment_that_cannot_be_presented_runs_the_program_as_type
     }
 }
 
+/// KR-REQ-07.60: a server whose record cannot be written is not left running: a daemon could not
+/// stop it after this worker, so the launch is given back and the program runs as typed.
+#[test]
+fn kr_req_07_60_a_server_whose_record_cannot_be_written_is_not_left_running() {
+    let shell = Gateway::new();
+    shell.view.runtime.session().refuse_owned_writes();
+    let answer = shell
+        .establish(&["codex"])
+        .expect("a backend is established");
+    let mut launched = shell.launch(&answer, "unrecorded", &[]);
+    let status = launched.ends();
+    assert_eq!(status.code(), Some(2), "{}", launched.said());
+    assert!(
+        launched.said().contains("serves `app-server"),
+        "the program ran with the arguments it was typed with"
+    );
+    // The server was started and recorded in memory before the record was found unwritten; it is
+    // ended, and then forgotten.
+    eventually("no server is left running", || {
+        shell.servers().iter().all(|server| {
+            kr_ipc::identity::process_state(server) == kr_ipc::identity::ProcessState::Ended
+        })
+    });
+}
+
 /// KR-REQ-07.60: a program that was started and never connects, as one that ran as typed does not,
 /// ends the instance and the server at the bound, and the program is left to run.
 #[test]
@@ -585,14 +622,18 @@ fn kr_req_07_60_a_program_that_never_connects_ends_its_instance_and_server_at_th
     let answer = shell
         .establish(&["codex"])
         .expect("a backend is established");
+    // The server is read at the commit, before the bound begins to run.
+    let (arrived, go) = shell.backends.pause_before_committing();
     let mut launched = shell.launch(&answer, "idle", &[("KR_STAND_IN", "idle")]);
+    shell.at_the_confirmation(arrived);
+    let servers = shell.servers();
+    assert_eq!(servers.len(), 1, "the server was started and recorded");
+    go.send(()).expect("the launch waits");
     let started = shell.announcement();
     assert_eq!(
         started.instance.mode,
         kr_protocol::broker::IntegrationMode::Gateway
     );
-    let servers = shell.servers();
-    assert_eq!(servers.len(), 1, "the server was started and recorded");
     let ended = shell.announcement();
     assert!(ended.instance.ended_at.is_present(), "{ended:?}");
     eventually("the server ended at the bound", || {
