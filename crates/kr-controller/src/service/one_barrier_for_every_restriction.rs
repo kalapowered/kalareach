@@ -638,12 +638,12 @@ async fn a_worker_that_missed_a_revision_is_told_each_in_order_by_name() {
     drop(controller);
 }
 
-/// KR-REQ-10.45: a worker that missed more revisions than the daemon keeps reports for is told one
-/// revision of the whole host's, and not the notices a result could not read: it takes the lease of
+/// KR-REQ-10.45: a worker that missed revisions in more groups than the daemon keeps reports for is
+/// told one revision of the whole host's, and not the notices a result could not read: it takes the lease of
 /// every caller under a grant, which is safe, and its fence files its names under the revision the
 /// result is for.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_worker_that_missed_more_revisions_than_a_result_reads_is_told_the_host() {
+async fn a_worker_told_more_notices_than_a_result_reads_is_told_the_host() {
     use kr_protocol::worker::RevisionReach;
 
     let temp = kr_ipc::testing::TempHost::create();

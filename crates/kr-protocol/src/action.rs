@@ -475,10 +475,12 @@ pub struct WorkerBarrier {
     pub possibly_executed: Vec<PossiblyExecutedAction>,
     /// How many actions had already won the serial race, counted before the list above was cut.
     pub possibly_executed_total: U64,
-    /// How many affected actions the worker could hold no name for.
+    /// How many affected actions this result cannot name.
     ///
     /// Nought in every ordinary case, because the names are kept in the worker's journal and
-    /// delivered a page at a time. Anything else is a worker that could not record a name at all.
+    /// delivered a page at a time. Anything else is names that went before they reached this
+    /// daemon: ones the worker no longer held when it was asked, and ones this daemon let go for
+    /// room.
     pub omitted_actions: U64,
     /// How many names this worker holds that have not reached this daemon yet.
     ///

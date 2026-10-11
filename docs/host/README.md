@@ -2272,17 +2272,20 @@ different question's answer. The exception is one announcement. A worker's fence
 under the revision it ran for and starts from where the fence before it ended, so a worker told
 several revisions in one announcement, or one that refused an announcement and fenced it by itself
 afterwards, names nothing under the revision of the announcement that follows. The daemon records
-every revision it announces to a worker before it sends it. When the worker acknowledges the last
-notice of an announcement, that acknowledgement takes into its result, in the step that records it,
-the other revisions of that announcement and the revisions announced before it that no result has
-taken in, and the result reads their reports with its own, in revision order. A revision the worker has not said anything about is asked for, and the result says so until
-it answers. A revision the daemon cannot read, because its report went for room or the worker
-answered none of too many announcements, is counted in the result as names that are no longer held
-or revisions that are not read. A worker that missed more revisions than the daemon keeps reports
-for is told one revision of the whole host's. The daemon also asks again for the pages an older
-revocation still owes: the revision in force comes first, then the revisions the result carries
-that were not answered, and the unfinished older ones after them, out of one page budget per
-announcement.
+every revision it announces to a worker before it sends it, whichever control path the announcement
+travels on, because a fence runs for an announcement that was sent and an answer the daemon refuses
+does not undo it. When the worker acknowledges a notice, that acknowledgement takes into its result,
+in the step that records it, the notices before it in the same announcement; and when it is the
+last notice, also the revisions announced before it that no result has taken in. The result reads
+their reports with its own, in revision order. A revision the worker has not been asked about is
+asked for, and the result says so until it answers; one the worker answered with nothing about its
+fence is not asked again, and the result says the worker cannot say. A revision the daemon cannot
+read, because its report went for room or the worker answered none of too many announcements, is
+counted in the result as names that are no longer held or as revisions that are not read. A worker
+that missed revisions in more groups than the daemon keeps reports for is told one revision of the
+whole host's. The daemon also asks again for the pages an older revocation still owes: the revision
+in force comes first, then the revisions the result carries that were not asked about, and the
+unfinished older ones after them, out of one page budget per announcement.
 
 A rejection and its name are one transaction. A rejection committed without its name would be an
 action the result owes and cannot produce, and the next pass would not find it: a pass selects

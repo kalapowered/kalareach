@@ -576,11 +576,10 @@ impl Controller {
         let mut budget = self.evidence_budget();
         self.collect_fence_evidence(session_id, binding, revision, &mut budget, false)
             .await;
-        // The revisions announced to the worker with this one or before it, that its result reads
+        // The revisions announced to the worker with this one or before it that its result reads
         // and the worker has said nothing about, because the announcement was refused or lost. Its
         // fence may have run for them since, and what it named is part of this revision's result:
-        // each is asked for its first page, and the pages that follow come with the older
-        // revocations' below.
+        // each is asked for, its pages as well as its first, out of the same budget.
         for earlier in self.leases.unasked_before(session_id, revision) {
             if budget.pages == 0 {
                 return;
@@ -641,19 +640,16 @@ impl Controller {
             0,
             &link.client().acknowledgement().capabilities,
         );
-        self.leases.announced(
-            session_id,
-            binding,
-            notices.iter().map(|notice| notice.revision),
-        );
+        self.leases
+            .announced(session_id, notices.iter().map(|notice| notice.revision));
         let last = notices.pop().expect("an announcement is made");
         let earlier: Vec<AuthorityRevision> =
             notices.iter().map(|notice| notice.revision).collect();
-        for notice in notices {
+        for (at, notice) in notices.into_iter().enumerate() {
             #[cfg(feature = "testing")]
             self.record_announcement(session_id, &notice);
             let ack = Self::exchange(bound, link.client().announce_revision(notice)).await?;
-            self.note_earlier_acknowledgement(session_id, binding, ack)
+            self.note_earlier_acknowledgement(session_id, binding, ack, &earlier[..at])
                 .await;
         }
         #[cfg(feature = "testing")]
@@ -953,18 +949,20 @@ impl Controller {
 
     /// Takes the acknowledgement of a revision older than the one a barrier waits on, which a worker
     /// that missed it gave while it was told the revisions in order: it is news about that
-    /// revision and nothing else, as an acknowledgement of an older revision is.
+    /// revision, with the notices before it in the same announcement, `earlier`, and nothing else,
+    /// as an acknowledgement of an older revision is.
     pub(crate) async fn note_earlier_acknowledgement(
         &self,
         session_id: SessionId,
         binding: WorkerBinding,
         ack: kr_protocol::worker::AuthorityRevisionAck,
+        earlier: &[AuthorityRevision],
     ) {
         let evidenced = ack.fence.is_some();
         let revision = ack.revision;
         if self
             .leases
-            .acknowledge(session_id, binding, revision, ack.fence)
+            .acknowledge_in_announcement(session_id, binding, revision, ack.fence, earlier)
             && evidenced
         {
             let _ = self
@@ -1040,7 +1038,8 @@ impl Controller {
         }
         groups.push((revision, within(since, group)));
         // More notices than reports kept would have the reports of the first let go before the
-        // result of the last reads them, and a worker that far behind is fenced as the whole host's.
+        // result of the last reads them, and a worker that far behind is fenced as the whole
+        // host's.
         if groups.len() > crate::authority::MAX_HELD_FENCE_REPORTS {
             return host();
         }
