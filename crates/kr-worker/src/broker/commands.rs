@@ -408,14 +408,10 @@ impl GatewayRun {
 #[cfg(unix)]
 fn starts_with_interpreter_line(path: &Path) -> bool {
     use std::io::Read as _;
-    use std::os::unix::fs::OpenOptionsExt as _;
     // Opened without waiting and read only if it is a regular file: this runs with the session
-    // held, and a FIFO or a stalled mount in the executable's place must not hold it.
+    // held, and a FIFO in the executable's place must not hold it.
     let mut first = [0_u8; 2];
-    std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NONBLOCK)
-        .open(path)
+    crate::broker::image::open_without_waiting(path)
         .and_then(|mut file| {
             if !file.metadata()?.is_file() {
                 return Ok(false);
