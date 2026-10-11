@@ -610,12 +610,12 @@ mod tests {
     use crate::shown::marker::MARKER;
     use kr_shell_integration::host::startup::Placement;
 
-    /// Holds `record` as a program outside a store does, which holds nothing else.
     /// The roots a test works in: none is a store's, so nothing is registered.
     fn host_paths() -> HostPaths {
         HostPaths::new(std::env::temp_dir(), std::env::temp_dir()).expect("roots")
     }
 
+    /// Holds `record` as a program outside a store does, which holds nothing else.
     fn hold_the_record(
         record: &EntryRecord,
     ) -> std::result::Result<startup::HeldRecord<'_>, RecordError> {
