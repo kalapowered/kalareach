@@ -320,8 +320,8 @@ pub struct Instance {
     pub application_instance_id: ApplicationInstanceId,
     /// The process, where this host launched one.
     pub process: Option<ManagedProcess>,
-    /// The application server this host started for the process, where it started one: the
-    /// instance ends with the process, and the server is then the one to be ended.
+    /// The application server this host started for the process, where it started one: a process
+    /// below it is placed under this instance, as one below the process is.
     pub backend: Option<ProcessStartIdentity>,
     /// The process an adoption found running this instance, where one did.
     ///
@@ -1370,8 +1370,8 @@ impl Broker {
         })
     }
 
-    /// Records the application server this host started for one instance, which the instance's
-    /// end names as the backend to stop.
+    /// Records the application server this host started for one instance, so that what the server
+    /// starts is placed under the instance.
     ///
     /// # Errors
     ///
