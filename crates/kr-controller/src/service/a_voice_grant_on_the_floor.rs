@@ -204,6 +204,53 @@ fn refuse_expiry_records(temp: &kr_ipc::testing::TempHost, table: &str) -> rusql
     registry
 }
 
+/// KR-REQ-26.16: the device's grant a spoken action runs under is chosen among the grants the host
+/// lets be used. A paired grant that needs a lease this host holds none for is refused, and a grant
+/// shared with the device that needs none is the one that answers; neither the widest grant by its
+/// rights before the policy nor the first refusal decides.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_grant_the_host_refuses_does_not_stand_in_the_way_of_one_it_allows() {
+    let temp = kr_ipc::testing::TempHost::create();
+    let (_continuous, _wall, clocks) = manual_clocks();
+    let controller = daemon_on(&temp, clocks).await;
+    let device = paired_needing_a_lease(
+        &controller,
+        64,
+        &[ActionRight::SessionView, ActionRight::SessionClose],
+    );
+    let shared = Grant {
+        issuer_device_id: controller.sharing().host_device_id(),
+        ..grant(
+            device.device_id,
+            &[ActionRight::SessionView],
+            None,
+            controller.policy().authority_revision(),
+        )
+    };
+    controller
+        .sharing()
+        .grants()
+        .issue(
+            &GrantRecord {
+                grant: shared.clone(),
+                session_id: None,
+                issued_at_ms: 1,
+                activated_at_ms: Some(1),
+                revoked_at_ms: None,
+                revoked_by_parent: None,
+            },
+            || Ok(()),
+        )
+        .expect("a grant shared with the device");
+
+    let read = authority(&controller)
+        .device_grant(device.device_id, None)
+        .expect("the host answers")
+        .expect("a grant the host lets be used");
+
+    assert_eq!(read.grant_id, shared.grant_id);
+}
+
 /// A voice grant that ran out stays out when this host's wall clock is wound back, for the grant
 /// asked for by identity and for the device's standing one: the lapse is decided on the reading
 /// this host's floor holds and not on the raw clock. The control is the same grant before it ran

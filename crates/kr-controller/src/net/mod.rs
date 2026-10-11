@@ -1909,30 +1909,42 @@ impl Controller {
                 beside: Vec::new(),
             }),
         };
-        if matches!(
-            &decided,
-            Err(crate::config::ceilings::CeilingRefusal::Refused(refusal))
-                if refusal.is_clock_decided()
-        ) {
-            // A refusal the clock decided (an expiry, a lapsed offline bound, a lapsed lease) is
-            // answered only once the floor it stood on is on disk,
-            // as a workflow's is: before that, a clock wound back before the next start would
-            // decide the other way, so the answer states no lapse. An expiry found here still
-            // stops the connection's frames, which records nothing ([`Refusal::ExpiryUnrecorded`]).
-            let floor = policy.utc_floor_ms();
-            self.sharing.grants().record_floor(&policy);
-            if self.utc_floor.written() < floor {
-                return Err(crate::config::ceilings::CeilingRefusal::Refused(
-                    match decided {
-                        Err(crate::config::ceilings::CeilingRefusal::Refused(
-                            crate::grants::Refusal::Expired { expired_at_ms },
-                        )) => crate::grants::Refusal::ExpiryUnrecorded { expired_at_ms },
-                        _ => crate::grants::Refusal::FloorUnrecorded,
-                    },
-                ));
+        match decided {
+            Err(crate::config::ceilings::CeilingRefusal::Refused(refusal)) => {
+                Err(crate::config::ceilings::CeilingRefusal::Refused(
+                    self.recorded_before_a_clock_refusal(&policy, refusal),
+                ))
             }
+            decided => decided,
         }
-        decided
+    }
+
+    /// `refusal`, or the refusal that says the floor it stands on is not on disk yet.
+    ///
+    /// A refusal the clock decided (an expiry, a lapsed offline bound, a lapsed lease) is answered
+    /// only once the floor it stood on is on disk, as a workflow's is: before that, a clock wound
+    /// back before the next start would decide the other way, so the answer states no lapse. An
+    /// expiry found here still stops the connection's frames, which records nothing
+    /// ([`crate::grants::Refusal::ExpiryUnrecorded`]).
+    fn recorded_before_a_clock_refusal(
+        &self,
+        policy: &std::sync::MutexGuard<'_, crate::grants::HostPolicy>,
+        refusal: crate::grants::Refusal,
+    ) -> crate::grants::Refusal {
+        if !refusal.is_clock_decided() {
+            return refusal;
+        }
+        let floor = policy.utc_floor_ms();
+        self.sharing.grants().record_floor(policy);
+        if self.utc_floor.written() < floor {
+            return match refusal {
+                crate::grants::Refusal::Expired { expired_at_ms } => {
+                    crate::grants::Refusal::ExpiryUnrecorded { expired_at_ms }
+                }
+                _ => crate::grants::Refusal::FloorUnrecorded,
+            };
+        }
+        refusal
     }
 
     /// A paired device's grant as this host lets it be used: its rights as the host's policy leaves
@@ -1966,6 +1978,9 @@ impl Controller {
             .policy
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // A floor still owed its record is written before anything is decided on it, as a typed
+        // request's decision does.
+        self.write_owed_floor(&policy);
         let now_ms = policy.settled_now(self.wall_now_ms());
         let request = crate::grants::AccessRequest {
             method: kr_protocol::method::Method::VoiceDelegate,
@@ -1977,19 +1992,24 @@ impl Controller {
             now_ms,
             continuous_now: self.clock.now(),
         };
-        let intersection = policy.intersect(&narrowed, &request, now_ms)?;
+        let intersection = policy
+            .intersect(&narrowed, &request, now_ms)
+            .map_err(|refusal| self.recorded_before_a_clock_refusal(&policy, refusal))?;
         // The offline bound is held to its continuous end as well, as a typed request's is.
         if self.lifetimes.offline_bound_ended(
             intersection.offline.as_ref(),
             self.clock.now(),
             &policy,
         ) {
-            return Err(crate::grants::Refusal::OfflineValidityLapsed {
-                last_synchronised_at_ms: policy
-                    .offline_validity()
-                    .and_then(|offline| offline.last_synchronised_at_ms.as_ref())
-                    .map(|at| at.get()),
-            });
+            return Err(self.recorded_before_a_clock_refusal(
+                &policy,
+                crate::grants::Refusal::OfflineValidityLapsed {
+                    last_synchronised_at_ms: policy
+                        .offline_validity()
+                        .and_then(|offline| offline.last_synchronised_at_ms.as_ref())
+                        .map(|at| at.get()),
+                },
+            ));
         }
         Ok(kr_protocol::grant::Grant {
             actions: intersection.rights,

@@ -218,23 +218,47 @@ impl VoiceAuthority for GrantAuthority {
                 },
             )
             .transpose()?;
-        let widest = paired
+        let candidates = paired
             .into_iter()
             .chain(standing.records.iter().map(|record| record.grant.clone()))
             .filter(|grant| !grant.permits(ActionRight::VoiceUse))
-            .filter(|grant| session_id.is_none_or(|id| grant.session_selector.admits(id)))
-            .max_by_key(|grant| grant.actions.len());
+            .filter(|grant| session_id.is_none_or(|id| grant.session_selector.admits(id)));
         // As this host lets it be used: a right the rights ceiling takes away from every grant, or
         // that an organisation's lease does not give, is not one a spoken action may use, whichever
-        // grant it was written in. The coordinator reads the device's authority here before it asks
-        // for a confirmation, and the host reads it again immediately before a close is forwarded,
-        // so both are under what is in force when they read.
+        // grant it was written in. Each candidate is read that way before the widest is chosen, so
+        // a grant the host's policy refuses does not stand in the way of one it allows, and one the
+        // policy narrows is not chosen for rights it no longer has. The coordinator reads the
+        // device's authority here before it asks for a confirmation, and the host reads it again
+        // immediately before a close is forwarded, so both are under what is in force when they
+        // read.
         let daemon = self.daemon()?;
-        let usable = widest
-            .map(|grant| daemon.as_this_host_lets_it_be_used(grant))
-            .transpose()
-            .map_err(|refusal| VoiceError::Host(refusal.to_protocol_error()))?;
-        standing.answer(usable)
+        let mut widest: Option<Grant> = None;
+        let mut refused = None;
+        for candidate in candidates {
+            match daemon.as_this_host_lets_it_be_used(candidate) {
+                Ok(usable) => {
+                    if widest
+                        .as_ref()
+                        .is_none_or(|held| usable.actions.len() >= held.actions.len())
+                    {
+                        widest = Some(usable);
+                    }
+                }
+                Err(refusal) => {
+                    let error = refusal.to_protocol_error();
+                    // A refusal that says the host cannot decide yet is not one another grant
+                    // answers for.
+                    if error.code != kr_protocol::error::ErrorCode::PermissionDenied {
+                        return Err(VoiceError::Host(error));
+                    }
+                    refused.get_or_insert(error);
+                }
+            }
+        }
+        match (widest, refused) {
+            (None, Some(error)) => Err(VoiceError::Host(error)),
+            (widest, _) => standing.answer(widest),
+        }
     }
 
     fn grant(&self, grant_id: GrantId) -> kr_voice::Result<Option<Grant>> {
