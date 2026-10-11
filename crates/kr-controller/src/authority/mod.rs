@@ -205,7 +205,7 @@ struct Carries {
     revisions: BTreeSet<AuthorityRevision>,
     /// The highest revision forgotten in favour of `unread`, which a recording of the same
     /// announcement again does not count again.
-    forgotten_through: AuthorityRevision,
+    forgotten_through: Option<AuthorityRevision>,
     /// How many names went with a report of one of the revisions that was let go for room.
     lost: u64,
     /// How many revisions announced to this worker this result cannot read: those forgotten, and
@@ -364,7 +364,7 @@ struct WorkerFences {
     /// What the result of each announced revision reads besides its own report.
     carries: BTreeMap<AuthorityRevision, Carries>,
     /// The highest revision whose association was forgotten for room before its report arrived.
-    forgotten_through: AuthorityRevision,
+    forgotten_through: Option<AuthorityRevision>,
     /// How many revisions went from `told` for want of room since a result last took the rest in,
     /// and the highest of them: those are not announced again, and a result that takes in the rest
     /// says how many it did not follow.
@@ -454,14 +454,14 @@ impl WorkerFences {
                 .filter(|read| *read > floor && *read < *revision)
                 .collect();
             carries.dropped = carries.dropped.max(self.dropped);
-            carries.revisions.extend(
-                reads
-                    .into_iter()
-                    .filter(|read| *read > carries.forgotten_through),
-            );
+            carries.revisions.extend(reads.into_iter().filter(|read| {
+                carries
+                    .forgotten_through
+                    .is_none_or(|through| *read > through)
+            }));
             while carries.revisions.len() > MAX_REMEMBERED_REVISIONS {
                 if let Some(oldest) = carries.revisions.pop_first() {
-                    carries.forgotten_through = carries.forgotten_through.max(oldest);
+                    carries.forgotten_through = carries.forgotten_through.max(Some(oldest));
                     carries.unread = carries.unread.saturating_add(1);
                 }
             }
@@ -489,7 +489,7 @@ impl WorkerFences {
                 break;
             };
             self.carries.remove(&forgotten);
-            self.forgotten_through = self.forgotten_through.max(forgotten);
+            self.forgotten_through = self.forgotten_through.max(Some(forgotten));
         }
     }
 
@@ -583,10 +583,15 @@ impl WorkerFences {
     fn told_at(&self, revision: AuthorityRevision) -> Option<Told> {
         let carries = match self.carries.get(&revision) {
             Some(carries) => carries.clone(),
-            None if revision <= self.forgotten_through => Carries {
-                unread: 1,
-                ..Carries::default()
-            },
+            None if self
+                .forgotten_through
+                .is_some_and(|through| revision <= through) =>
+            {
+                Carries {
+                    unread: 1,
+                    ..Carries::default()
+                }
+            }
             None => Carries::default(),
         };
         if self.at(revision).is_none() && carries == Carries::default() {
@@ -3456,5 +3461,20 @@ mod tests {
         let worker = &report.workers[0];
         assert_eq!(worker.state, BarrierState::Ended, "{worker:?}");
         assert_eq!(worker.rejected_actions, vec![fenced(10)]);
+    }
+
+    /// KR-REQ-09.13: a worker nothing was announced to has no association forgotten: its result
+    /// at the first revision says nothing of revisions not read.
+    #[test]
+    fn a_result_nothing_was_announced_for_says_nothing_of_revisions_not_read() {
+        let barrier = AuthorityBarrier::new(ControllerGeneration::new(7), revision(0));
+        let _binding = barrier.bind(session(1));
+        barrier.worker_ended(session(1));
+        let report = barrier.report(revision(0), [session(1)]);
+        assert!(
+            !report.workers[0].detail.contains("not read"),
+            "{:?}",
+            report.workers[0].detail
+        );
     }
 }
