@@ -939,8 +939,11 @@
   min-block-size: var(--target);
   padding: var(--gap-1) var(--gap-3);
   border: 1px solid var(--line);
-  /* A rounded end that does not grow with the chip, which wraps to many rows at a large text size. */
-  border-radius: calc(var(--target) / 2);
+  /*
+   * Half the height of a chip of one row (its control, its padding and its border), so a short chip
+   * is a pill and a chip that wraps to many rows at a large text size keeps the same rounded end.
+   */
+  border-radius: calc(var(--target) / 2 + var(--gap-1) + 1px);
   background: var(--surface);
   font-size: 0.8125rem;
 }
