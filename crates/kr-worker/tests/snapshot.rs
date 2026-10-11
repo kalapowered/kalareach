@@ -3223,6 +3223,49 @@ async fn an_attachment_is_drawn_the_screen_its_grant_allows() {
     }
 }
 
+/// A hyperlink of exactly the length the grid admits is carried: a terminal that attaches after it
+/// is handed the stream. A Windows pseudo-console passes a hyperlink on under an identifier it
+/// writes itself, which makes the link longer than the grid admits, so the grid refuses it and a
+/// terminal that attaches afterwards is drawn the screen and told the stream cannot be carried. The
+/// host's guide states the limit; this case shows it, and shows when a pseudo-console stops
+/// lengthening the link.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_link_of_the_longest_length_is_carried_unless_a_pseudo_console_lengthens_it() {
+    // `id=`, the identifier, `;` and the target are 2,048 bytes together, as long as a link may be.
+    let identifier = "i".repeat(2_026);
+    let session = Dimensions::new(CANONICAL.0, CANONICAL.1);
+    let host = host_with(
+        &format!(
+            "stty -echo -echonl || exit 1; \
+             printf '\\033]8;id={identifier};https://e.invalid/\\033\\134a linked word\\033]8;;\\033\\134 and plain text\\n'; \
+             read -r _"
+        ),
+        session,
+        None,
+        1024 * 1024,
+    )
+    .await;
+    produced(&host.runtime, b"and plain text\r\n").await;
+
+    let attached = attach(&host, session, Some("xterm-256color")).await;
+    let mut reader = LocalClient::connect(&host.endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects");
+    let expected = if cfg!(windows) {
+        (
+            Some(TerminalPresentationMode::Viewport),
+            Some(PresentationReason::StreamNotCarryable),
+        )
+    } else {
+        (Some(TerminalPresentationMode::Direct), None)
+    };
+    assert_eq!(
+        reported(&host, &mut reader, attached.attachment_id).await,
+        expected,
+        "a terminal of the session's own size, shown a link of the longest length"
+    );
+}
+
 /// KR-REQ-08.18 and KR-REQ-08.82: a soft reset from the alternate buffer is a redraw like any
 /// other. The canonical screen returns to the primary buffer, the terminal that was being handed
 /// the stream never reads the reset, and the screen it is drawn instead puts it on that buffer and
