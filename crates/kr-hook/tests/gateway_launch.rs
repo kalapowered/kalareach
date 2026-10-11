@@ -18,6 +18,7 @@
 //! | KR-REQ-11.32 | only the process the launch registered reaches the gateway, and a plain upgrade from another is closed without a word; a message at the connector's limit is carried both ways and one above it ends the connection and the server; a terminal that stops reading loses its connection |
 //! | KR-REQ-11.33 | the key a terminal signs in with reaches the server and is kept nowhere |
 //! | KR-REQ-11.35 | a ledger fault in live traffic keeps the session going and fences rich work |
+//! | KR-REQ-11.27 | an approval's resource is recorded before the request reaches the terminal, and the terminal's one answer resolves it once |
 //! | KR-REQ-12.13 | an approval is an opaque pending resource of the instance before the terminal answers, and its one answer resolves it once, under an identifier one side shares with the other's |
 
 #![cfg(unix)]
@@ -738,7 +739,7 @@ fn kr_req_11_32_a_message_above_the_limit_ends_the_connection_and_the_server() {
     assert_eq!(launched.ends().code(), Some(1), "{}", launched.printed());
     assert!(
         launched.printed().contains("Error: remote app server"),
-        "the terminal was told: {}",
+        "the terminal was told the connection was gone: {}",
         launched.printed()
     );
     let servers = shell.servers();
@@ -1048,19 +1049,24 @@ fn kr_req_07_60_a_close_ends_the_server_and_what_it_started_after_the_acceptance
     let requester = serde_json::json!([
         "/bin/sh",
         "-c",
-        "while [ ! -e \"$0\" ]; do sleep 0.05; done; : > \"$1\"; sleep 120",
+        "while [ ! -e \"$0\" ]; do sleep 0.25; done; : > \"$1\"; sleep 120",
         delivered,
         alive
     ])
     .to_string();
     let ask = shell.placed.host.root().join("ask");
+    let speak = shell.placed.host.root().join("speak");
     let mut launched = shell.launch(
         &answer,
         "closure",
         &[
-            ("KR_STAND_IN", "stay,request-when-released"),
+            (
+                "KR_STAND_IN",
+                "stay,request-when-released,write-when-released",
+            ),
             ("KR_STAND_IN_COMMAND", &requester),
             ("KR_STAND_IN_RELEASE", ask.to_str().expect("a text path")),
+            ("KR_STAND_IN_SPEAK", speak.to_str().expect("a text path")),
         ],
     );
     launched.prints("TUI: turn/completed");
@@ -1081,6 +1087,16 @@ fn kr_req_07_60_a_close_ends_the_server_and_what_it_started_after_the_acceptance
     std::fs::write(&ask, b"ask").expect("the terminal is released");
     let status = launched.ends();
     assert_eq!(status.code(), Some(1), "{}", launched.printed());
+    // The server writes now, with nobody to carry what it says. Its write has to go, or it would
+    // end its commands; the file beside the one that released it says it did.
+    std::fs::write(&speak, b"speak").expect("the server is released");
+    let spoke = shell.placed.host.root().join("speak.spoke");
+    eventually("the server wrote", || spoke.exists());
+    assert_eq!(
+        std::fs::read_to_string(&spoke).expect("what the server said"),
+        "wrote",
+        "the server's write failed, so it ended its commands"
+    );
     // The acceptance is delivered, and the command that asked for the close is still there to read
     // it: nothing has been signalled.
     std::fs::write(&delivered, b"delivered").expect("the acceptance is delivered");
