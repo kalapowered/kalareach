@@ -1,11 +1,11 @@
 //! An HTTP `CONNECT` tunnel through the proxy a host's configuration document selects.
 //!
-//! A host that selects a proxy reaches every outbound connection through it, and a connection that
-//! is not HTTP itself, such as the rendezvous room's TLS or a mail submission's, goes as a
-//! tunnel: the proxy is asked for `CONNECT host:port`, and once it agrees the connection's own TLS
-//! runs inside the tunnel, so the proxy sees where the connection goes and nothing that travels on
-//! it. A proxy that cannot be reached or refuses the tunnel ends the attempt: nothing goes around
-//! it.
+//! A host that selects a proxy reaches the services it names through it, and a connection that is
+//! not HTTP itself, such as the rendezvous room's TLS or a mail submission's, goes as a tunnel: the
+//! proxy is asked for `CONNECT host:port`, and once it agrees the connection's own TLS runs inside
+//! the tunnel, so the proxy sees where the connection goes and, once TLS has started, nothing that
+//! travels on it. A proxy that cannot be reached or refuses the tunnel ends the attempt: nothing
+//! goes around it.
 //!
 //! [`Carrier`] is the connection TLS runs over, directly or through a tunnel, and [`through`]
 //! opens a tunnel. A failure ([`TunnelFailure`]) is said in this client's words and the proxy's
@@ -24,6 +24,8 @@ use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 use tokio_rustls::rustls::ClientConfig;
 use tokio_rustls::rustls::pki_types::ServerName;
+
+use crate::shown::{Said, Shown};
 
 /// The most of a proxy's answer to a tunnel request that is read before its head is complete.
 ///
@@ -72,6 +74,10 @@ pub(crate) const REASONS: [&str; 9] = [
 ///
 /// It has no `Debug`, because a socket prints the address of its peer, and a proxy's address is its
 /// owner's configuration.
+///
+/// A failure of the TLS to the proxy, once it was established, is the proxy's and not the server's:
+/// it reaches the TLS inside the tunnel as an input error that names no certificate, so a caller
+/// never reads it as one the server presented.
 pub enum Carrier {
     /// A connection in the clear: the server's own, or a tunnel through an `http` proxy.
     Plain(TcpStream),
@@ -87,7 +93,9 @@ impl AsyncRead for Carrier {
     ) -> Poll<io::Result<()>> {
         match self.get_mut() {
             Self::Plain(stream) => Pin::new(stream).poll_read(cx, buf),
-            Self::Tls(stream) => Pin::new(stream.as_mut()).poll_read(cx, buf),
+            Self::Tls(stream) => Pin::new(stream.as_mut())
+                .poll_read(cx, buf)
+                .map_err(of_the_proxy),
         }
     }
 }
@@ -100,22 +108,55 @@ impl AsyncWrite for Carrier {
     ) -> Poll<io::Result<usize>> {
         match self.get_mut() {
             Self::Plain(stream) => Pin::new(stream).poll_write(cx, buf),
-            Self::Tls(stream) => Pin::new(stream.as_mut()).poll_write(cx, buf),
+            Self::Tls(stream) => Pin::new(stream.as_mut())
+                .poll_write(cx, buf)
+                .map_err(of_the_proxy),
         }
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         match self.get_mut() {
             Self::Plain(stream) => Pin::new(stream).poll_flush(cx),
-            Self::Tls(stream) => Pin::new(stream.as_mut()).poll_flush(cx),
+            Self::Tls(stream) => Pin::new(stream.as_mut())
+                .poll_flush(cx)
+                .map_err(of_the_proxy),
         }
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         match self.get_mut() {
             Self::Plain(stream) => Pin::new(stream).poll_shutdown(cx),
-            Self::Tls(stream) => Pin::new(stream.as_mut()).poll_shutdown(cx),
+            Self::Tls(stream) => Pin::new(stream.as_mut())
+                .poll_shutdown(cx)
+                .map_err(of_the_proxy),
         }
+    }
+}
+
+/// The TLS to the proxy failed after it was established.
+struct ProxyTlsFailed;
+
+impl Said for ProxyTlsFailed {
+    fn said(&self) -> Shown {
+        Shown::said("the TLS to the proxy failed")
+    }
+}
+
+crate::display_as_said!(ProxyTlsFailed);
+crate::debug_as_display!(ProxyTlsFailed);
+
+impl std::error::Error for ProxyTlsFailed {}
+
+/// An error of the TLS to the proxy, with what TLS says of a certificate or a record taken out of
+/// it: the TLS inside the tunnel reads that as the server's failure, and it is not.
+fn of_the_proxy(error: io::Error) -> io::Error {
+    if error
+        .get_ref()
+        .is_some_and(|inner| inner.is::<tokio_rustls::rustls::Error>())
+    {
+        io::Error::new(error.kind(), ProxyTlsFailed)
+    } else {
+        error
     }
 }
 
