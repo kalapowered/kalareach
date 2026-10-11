@@ -160,7 +160,6 @@ fn managed(instance: ApplicationInstanceId, pid: u64) -> ManagedProcess {
             process: process(pid),
         },
         Credential::from_bytes([9; 32]),
-        true,
         TimestampMs::new(1),
     )
 }

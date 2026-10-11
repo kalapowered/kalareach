@@ -700,21 +700,10 @@ jobs:
         if: ${{ !cancelled() && matrix.part == 'second' }}
         run: cargo test --locked -p kr-worker --test connectors
 
-      # A vendor's own sandbox under the session's job. A sandbox that nests a job of its own, limited
-      # in processes, memory and the user interface, launches under the session's job, a try at breaking
-      # away is refused, and the closure ends every process the vendor made and reads its coverage as
-      # complete. Under a session job that restricts desktops the launch is refused by name and starts
-      # nothing; the profile the configuration selected for that agent starts it in a job of its own,
-      # ended by the closure and by a worker that dies, and its coverage never reads complete.
-      - name: Test a vendor's own sandbox under the session's job
-        if: ${{ !cancelled() && matrix.part == 'second' }}
-        run: cargo test --locked -p kr-worker --test windows_vendor
-
-      # What a launch reads of its application's mode. The declared diagnostic is run in the launch's own
-      # directory with no input and no shell, a nonzero exit is not a failure, and one that prints too
-      # much, never finishes or cannot start records no mode and is ended with everything it started. A
-      # mode the package refuses in a service session, or one its probe does not finish reading, is a named
-      # launch failure where the worker is in one.
+      # What a package's launch probe reads of its application's mode. The declared diagnostic is run
+      # in the launch's own directory with no input and no shell, a nonzero exit is not a failure, and
+      # one that prints too much, never finishes or cannot start records no mode and is ended with
+      # everything it started.
       - name: Test what a launch reads of its application's mode
         if: ${{ !cancelled() && matrix.part == 'second' }}
         run: cargo test --locked -p kr-worker --test launch_probe

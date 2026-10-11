@@ -2394,7 +2394,6 @@ impl Served {
                         process: launched(),
                     },
                     kr_worker::broker::Credential::from_bytes([9; 32]),
-                    false,
                     TimestampMs::new(1),
                 )),
             )
