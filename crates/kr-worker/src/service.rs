@@ -8797,7 +8797,7 @@ async fn write_frame_held(
     };
     // Cleared when the frame has been replaced by a refusal, which is then written whatever the
     // lease says by then.
-    let mut hold = writable.local.as_ref();
+    let mut hold = writable.local.as_ref().filter(|local| local.is_local());
     // One frame at a time on this connection. A frame the peer had no room for is retained by the
     // writer until it is finished, so a second writer starting one in between would interleave two
     // frames on a stream that carries them whole. This is where a writer waits for its turn, and a
