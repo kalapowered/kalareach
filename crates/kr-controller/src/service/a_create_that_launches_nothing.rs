@@ -1340,15 +1340,27 @@ async fn a_retry_of_an_admitted_create_is_not_refused_because_the_document_broke
         retried.to_string().contains("already recorded"),
         "and the answer is the recorded one: {retried}"
     );
+    let fresh = create_request(environment_id);
     let refused = controller
         .session_create(
             &actor_id,
-            &create_request(environment_id),
+            &fresh,
             carried(&controller, connection_id, half_a_minute(&controller)),
         )
         .await
         .expect_err("a token with no outcome yet is refused");
     assert_eq!(refused.code(), ErrorCode::HostNotConfigured, "{refused}");
+    // And a repeat of the refused token is refused the same way, by the document, before a
+    // reservation that would answer it as a failed create.
+    let again = controller
+        .session_create(
+            &actor_id,
+            &fresh,
+            carried(&controller, connection_id, half_a_minute(&controller)),
+        )
+        .await
+        .expect_err("the refused token is refused again");
+    assert_eq!(again.code(), ErrorCode::HostNotConfigured, "{again}");
     assert!(
         asked.lock().expect("the record is not poisoned").is_empty(),
         "and nothing was started for either"
