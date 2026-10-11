@@ -144,6 +144,42 @@ impl AccountHttp for ManagedTransport {
     }
 }
 
+/// The account service's transport while the host's outbound route is closed: it connects to
+/// nothing and turns every request away, so the account the host keeps can still be read and
+/// ended locally, and what is owed to the service waits for the route.
+#[derive(Debug)]
+pub struct ClosedTransport;
+
+impl ClosedTransport {
+    fn refuse() -> ClientError {
+        ClientError::refusal(
+            ErrorCode::UpstreamUnavailable,
+            Shown::said(
+                "no request is sent: this host's configuration document cannot be used, so its \
+                 outbound route is closed until its daemon starts over one it can use",
+            ),
+        )
+    }
+}
+
+impl AccountHttp for ClosedTransport {
+    fn post_form<'a>(
+        &'a self,
+        _url: &'a str,
+        _body: &'a [u8],
+    ) -> ServiceFuture<'a, ServiceHttpAnswer> {
+        Box::pin(async move { Err(Self::refuse()) })
+    }
+
+    fn get<'a>(
+        &'a self,
+        _url: &'a str,
+        _headers: &'a [(&'a str, &'a str)],
+    ) -> ServiceFuture<'a, ServiceHttpAnswer> {
+        Box::pin(async move { Err(Self::refuse()) })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -71,8 +71,11 @@ pub struct AccountReport {
     /// service and names no voice broker, selects none and names a broker that is another service
     /// than the account service, or the host could not set up how to reach the account service. For
     /// the first two, a grant the host already keeps still shows in `state`, and `account.sign_out`
-    /// ends it, whatever the broker is; for the third the host reaches no account service, shows
-    /// `signed_out` and refuses to sign out.
+    /// ends it, whatever the broker is. For the third, a configuration document the host cannot
+    /// use closes its outbound route: a grant it keeps still shows and `account.sign_out` removes
+    /// it and keeps its revocation until the daemon starts over a document it can use; for any
+    /// other cause the host reaches no account service, shows `signed_out` and refuses to sign
+    /// out.
     pub unavailable: Nullable<SignInUnavailable>,
     /// The account this host is signed in as, or what stands in its way.
     pub state: AccountState,

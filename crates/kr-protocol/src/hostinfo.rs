@@ -1372,7 +1372,7 @@ impl ComposedBundle {
 /// Descriptions are off, no new session is created (the two worker profiles differ in kind, and
 /// the owner's choice between them is in the document), and the network, voice, storage and proxy
 /// selections are closed from the next start of the control daemon, so nothing goes around a proxy
-/// the owner chose. A restriction the host accepted from the document before stays in force. A
+/// the owner chose. The restrictions the host accepted from the document before stay in force. A
 /// document that cannot be used for being damaged or unreadable, not only for being newer, is
 /// treated the same way. Absent is not unusable: it is the ordinary first run, with the product
 /// defaults.
@@ -2375,12 +2375,13 @@ pub mod configuration {
         /// The HTTP proxy this host's outbound HTTPS goes through, as an absolute `http` or
         /// `https` origin such as `http://proxy.example.com:3128`: the network endpoint's relays
         /// and Pkarr servers, the rendezvous, delivery and webhooks, the managed voice broker and
-        /// account service, plugin repositories and the managed storage service. Nothing goes
-        /// around it, so an address it cannot reach fails, and a daemon that started over a
-        /// document it could not use sends nothing through these routes until it starts again
-        /// over one it can. Name lookups and mail submission do not use it. It is this
-        /// machine's own choice: no invitation or host bundle carries it. It names no user and
-        /// no password, because a proxy that needs credentials is not supported.
+        /// account service, uploads of backups to the managed storage service, the model's files,
+        /// and plugin repositories. Nothing goes around it, so an address it cannot reach fails,
+        /// and a daemon that started over a document it could not use sends nothing through these
+        /// routes until it starts again over one it can. Name lookups and mail submission do not
+        /// use it. It is this machine's own choice: no invitation or host bundle carries it. It
+        /// names no user and no password, because a proxy that needs credentials is not
+        /// supported.
         pub proxy_url: Nullable<String>,
     }
 
@@ -4136,8 +4137,8 @@ pub mod configuration {
     pub const NETWORK_PROXY_URL: Selection = Selection {
         key: "network.proxy_url",
         about: "the HTTP proxy this host's outbound HTTPS goes through: the network endpoint's \
-                relays and Pkarr servers, the rendezvous, delivery, the managed voice broker, \
-                plugin repositories and the managed storage service",
+                relays and Pkarr servers, the rendezvous, delivery, the managed voice broker and \
+                account service, backups, the model's files and plugin repositories",
     };
 
     /// The managed voice broker this host starts its devices' calls at.

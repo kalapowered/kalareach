@@ -92,6 +92,9 @@ pub struct Service {
     pub scopes: Vec<&'static str>,
     /// The account service at that origin.
     pub account: Arc<dyn AccountService>,
+    /// Why every request to it is turned away, when the host's outbound route is closed: the
+    /// account it keeps can be read and ended, and nothing is sent until the route is open.
+    pub closed: Option<String>,
 }
 
 /// What a finished attempt shows a person's browser.
@@ -161,6 +164,8 @@ struct Held {
 struct Inner {
     held: Option<Held>,
     unavailable: Option<SignInUnavailable>,
+    /// The refusal of a closed outbound route, which a refusal for `NotUsable` then carries.
+    closed: Option<String>,
     state: Mutex<State>,
     running: tokio::sync::Mutex<Option<Running>>,
     /// Settled once, before the first token is handed out: a grant whose own revocation was queued
@@ -229,7 +234,7 @@ impl HostAccount {
                 "kr-controller: could not remove the account token this host had imported: {error}"
             ),
         }
-        let (held, unavailable) = match service {
+        let (held, unavailable, closed) = match service {
             Ok(service) => {
                 // Everything kept for the sign-in lives under the service that issued it.
                 let scope = format!(
@@ -247,14 +252,16 @@ impl HostAccount {
                         signed_in,
                     }),
                     refused,
+                    service.closed,
                 )
             }
-            Err(unavailable) => (None, Some(unavailable)),
+            Err(unavailable) => (None, Some(unavailable), None),
         };
         let account = Self {
             inner: Arc::new(Inner {
                 held,
                 unavailable,
+                closed,
                 state: Mutex::new(State::default()),
                 running: tokio::sync::Mutex::new(None),
                 recovered: tokio::sync::OnceCell::new(),
@@ -572,7 +579,7 @@ impl Inner {
     /// The account service, when this host could set up how to reach it, or why it could not.
     fn service(&self) -> Result<&Held> {
         self.held.as_ref().ok_or_else(|| {
-            Self::not_configured(self.unavailable.unwrap_or(SignInUnavailable::NotUsable))
+            self.not_configured(self.unavailable.unwrap_or(SignInUnavailable::NotUsable))
         })
     }
 
@@ -581,29 +588,33 @@ impl Inner {
     fn presenting(&self) -> Result<&Held> {
         let held = self.service()?;
         match self.unavailable {
-            Some(reason) => Err(Self::not_configured(reason)),
+            Some(reason) => Err(self.not_configured(reason)),
             None => Ok(held),
         }
     }
 
-    fn not_configured(reason: SignInUnavailable) -> ControllerError {
-        ControllerError::NotConfigured(
-            match reason {
-                SignInUnavailable::BrokerIsAnotherService => {
-                    "this host's voice.broker_origin names another service than the managed \
-                     account service it signs in at, so there is nothing to sign in to"
-                }
-                SignInUnavailable::NotUsable => {
-                    "this host cannot reach the managed account service the way its \
-                     configuration says: see the daemon's log"
-                }
-                SignInUnavailable::NoManagedService => {
-                    "this host names no managed service: set voice.broker_origin or storage.origin \
-                     in its configuration document to the managed account service's origin"
-                }
+    fn not_configured(&self, reason: SignInUnavailable) -> ControllerError {
+        ControllerError::NotConfigured(match (reason, &self.closed) {
+            (SignInUnavailable::NotUsable, Some(closed)) => format!(
+                "{closed}; this host reaches the managed account service again when its daemon \
+                 starts over a document it can use"
+            ),
+            (SignInUnavailable::BrokerIsAnotherService, _) => {
+                "this host's voice.broker_origin names another service than the managed \
+                 account service it signs in at, so there is nothing to sign in to"
+                    .to_owned()
             }
-            .to_owned(),
-        )
+            (SignInUnavailable::NotUsable, None) => {
+                "this host cannot reach the managed account service the way its \
+                 configuration says: see the daemon's log"
+                    .to_owned()
+            }
+            (SignInUnavailable::NoManagedService, _) => {
+                "this host names no managed service: set voice.broker_origin or storage.origin \
+                 in its configuration document to the managed account service's origin"
+                    .to_owned()
+            }
+        })
     }
 
     /// Begins changing the account: a request for a token waits until the returned gate is dropped.

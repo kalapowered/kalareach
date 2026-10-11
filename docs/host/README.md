@@ -142,8 +142,9 @@ restriction that only the unusable document holds is not applied. `kr doctor` an
 say what was found and how to put it right: use a release that reads the version, rewrite the
 document, or, for a file this host may not read, make it a regular file that only you can read and
 write, within the size bound. The refusal and the descriptions follow the document at the next
-acceptance, which `kr doctor` and `kr new` make, and a create makes while the document is unusable. When the problem is fixed, descriptions
-and new sessions return then, and the closed selections return at the next start of the daemon.
+acceptance, which `kr doctor` and `kr new` make, and a create makes while the document is unusable.
+When the problem is fixed, descriptions and new sessions return then, and the closed selections
+return at the next start of the daemon.
 
 Editing is validated before a revision is applied, and one writer edits at a time: a writer takes an
 operating-system lock on `.config.lock` in the environment's state directory, reads, validates,
@@ -218,7 +219,7 @@ variables an older build read joins nothing because of them.
 | `network.relay_only` | every packet through the relay, and no direct path | `true` or `false`; `true` needs at least one relay |
 | `network.local_discovery` | discovery of peers on the local network | `true` or `false` |
 | `network.mainline_dht` | the public Mainline DHT, which carries no KalaReach service guarantee | `true` or `false` |
-| `network.proxy_url` | the HTTP proxy this host's outbound HTTPS goes through: the endpoint's relays and Pkarr servers, the rendezvous, delivery and webhooks, the managed voice broker and account service, plugin repositories and the managed storage service; name lookups and mail submission do not use it, and absent everything goes directly | an absolute `http` or `https` origin, with no user information, no path and no trailing slash |
+| `network.proxy_url` | the HTTP proxy this host's outbound HTTPS goes through: the endpoint's relays and Pkarr servers, the rendezvous, delivery and webhooks, the managed voice broker and account service, backups to the managed storage service, the model's files, and plugin repositories; name lookups and mail submission do not use it, and absent everything goes directly | an absolute `http` or `https` origin, with no user information, no path and no trailing slash |
 | `voice.broker_origin` | the managed broker this host starts a device's voice session at, through the proxy `network.proxy_url` selects | an absolute `https` origin, or an `http` origin on `localhost`, `127.0.0.1` or `[::1]`, of at most 128 bytes, in lower case, with no path and no port its scheme already implies; a plain-HTTP origin cannot be combined with `network.proxy_url`, because the proxy would carry the account token in clear text |
 | `storage.origin` | the managed storage service this host uploads its backups to | an `https` origin, or an `http` origin on a loopback address, in the spelling a gateway origin has, with no path and no trailing slash; the daemon refuses to start unless it is the managed account service |
 
@@ -241,16 +242,15 @@ carries it.
 One rule covers the proxy. Every outbound HTTPS connection this host makes goes through it when the
 document names one: the endpoint's relays and Pkarr servers, the rendezvous it reserves a code's
 locator at and opens the room at, delivery to the push gateway and to webhook addresses, the
-managed voice broker and the account service it signs in at, plugin repositories, and the managed
-storage service the backup carrier uploads to (`storage.origin`). Nothing goes around it, so an
-address the proxy cannot reach fails, a webhook included. Mail submission is SMTP and connects
-directly, and name lookups go directly too. Without
+managed voice broker and the account service it signs in at, backups to the managed storage service
+(`storage.origin`), the model's files, and plugin repositories. Nothing goes around it, so an address the proxy cannot reach fails, a webhook included. Mail submission is SMTP
+and connects directly, and name lookups go directly too. Without
 a proxy every one of those connections goes directly, apart from iroh's relay latency probe and
 captive-portal check, which then follow `HTTP_PROXY`, `HTTPS_PROXY` and `ALL_PROXY` when those are
 set. The daemon reads the proxy when it starts, like the rest of the section, and every client takes
-that one reading. A daemon that starts over a document it cannot use makes no connection through
-delivery, plugin repositories, the model's files or the managed account service until it starts
-again over one it can use.
+that one reading. A daemon that starts over a document it cannot use makes no HTTPS connection to
+the push gateway or a webhook address, a plugin repository, the model's files or the managed
+account service, and uploads no backup, until it starts again over one it can use.
 
 The daemon reads both sections once, when it starts, because that is when its endpoint and its
 voice service are built. `kr doctor` prints each field with its value, its source
@@ -287,7 +287,11 @@ the host has no storage service selected and is either talking to another voice 
 broker at all, then it won't sign in anywhere and won't present an account to any service, and `kr
 account sign-in` will tell the person so. It still reaches the account service for what it holds, so
 a grant it was signed in with while its broker was the managed one is shown by `kr account show`,
-revoked when a revocation waits, and ended by `kr account sign-out`. What the store holds is kept
+revoked when a revocation waits, and ended by `kr account sign-out`. A host that started over a
+configuration document it cannot use sends the account service nothing, so the same holds without
+the sending: `kr account show` still shows the grant, `kr account sign-out` removes it and keeps its
+revocation until the daemon next starts over a document it can use, and `kr account sign-in` is
+refused, naming the document. What the store holds is kept
 under the service's name, so a grant, and a revocation that waits to be sent, are reached only
 through the service that issued them.
 
