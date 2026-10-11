@@ -8916,6 +8916,12 @@ async fn write_frame_held(
                     }
                 }
             }
+            // A frame an earlier writer offered and none of whose bytes went (its write was given
+            // up while it waited for room) is nobody's to finish: this writer holds the turn, so it
+            // takes the frame back and goes on.
+            if !offered && sender.is_mid_frame() && !sender.has_sent_any() {
+                sender.withdraw_unstarted();
+            }
             // A frame that was cut in half left its beginning with the peer. Writing anything else
             // now would push the rest of it out first, so this connection is finished instead:
             // what the host stopped sending stays stopped.
@@ -8974,7 +8980,10 @@ async fn write_frame_held(
         if protected {
             tokio::select! {
                 biased;
-                () = withdrawn.wait() => return false,
+                // The next look under the writer decides: it takes back a frame none of which
+                // went, so the refusal the fenced caller is owed can be written, and ends the
+                // connection over a frame the peer has part of.
+                () = withdrawn.wait() => {}
                 () = abandon => {}
                 ready = writable.readiness.ready() => {
                     if ready.is_err() {
@@ -10282,6 +10291,146 @@ mod tests {
         assert!(
             writable.turn.try_lock().is_ok(),
             "and the connection's turn is free for whoever writes next"
+        );
+    }
+
+    /// Waits until the peer's socket is full and a frame waits whole for room: offered to the
+    /// writer, with none of it sent.
+    async fn until_a_frame_waits_whole(writer: &Arc<Mutex<kr_ipc::framed::FrameWriter>>) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            {
+                let sender = writer
+                    .lock()
+                    .expect("the connection writer is not poisoned");
+                if sender.is_mid_frame() && !sender.has_sent_any() {
+                    return;
+                }
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the peer's socket filled and a frame is waiting for room with none of it sent"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Writes the refusal a caller is owed on a connection whose peer has not been reading, then
+    /// reads until it arrives: the read is what gives the refusal the room it waits for. Returns
+    /// whether the write reported success, once the refusal has arrived whole.
+    async fn the_refusal_arrives(
+        writable: &Writing,
+        writer: &Arc<Mutex<kr_ipc::framed::FrameWriter>>,
+        withdrawn: &Arc<Withdrawal>,
+        reader: &mut kr_ipc::framed::FrameReader,
+    ) -> bool {
+        use kr_protocol::envelope::ControlFrame;
+
+        let owed = super::failure(
+            super::RequestId::new(7),
+            &crate::error::WorkerError::PermissionDenied {
+                detail: "this connection's authority was withdrawn".to_owned(),
+            }
+            .to_protocol_error(),
+        );
+        let writing = tokio::spawn({
+            let writable = writable.clone();
+            let writer = Arc::clone(writer);
+            let withdrawn = Arc::clone(withdrawn);
+            async move { write_frame(&writable, &writer, &owed, &withdrawn, false).await }
+        });
+        let arrived = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let ControlFrame::Response(response) = reader
+                    .read_message::<ControlFrame>()
+                    .await
+                    .expect("what the host sends arrives whole")
+                {
+                    return response.request_id;
+                }
+            }
+        })
+        .await
+        .expect("the refusal reaches a peer that reads");
+        assert_eq!(arrived, super::RequestId::new(7));
+        writing.await.expect("the writing task")
+    }
+
+    /// A fenced caller is told why its next request failed, and not left with a socket that
+    /// closed: the withdrawal takes back a frame that was waiting for room with none of it sent, so
+    /// the refusal that follows is written.
+    #[cfg_attr(
+        windows,
+        ignore = "a Windows named pipe does not fill the way this test's own setup needs"
+    )]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_refusal_a_fenced_caller_is_owed_is_written_after_the_withdrawal_ended_a_waiting_frame()
+     {
+        let (_temp, writable, writer, mut reader) = connected().await;
+        let withdrawn = Arc::new(Withdrawal::default());
+        let filling = tokio::spawn({
+            let writable = writable.clone();
+            let writer = Arc::clone(&writer);
+            let withdrawn = Arc::clone(&withdrawn);
+            async move {
+                let frame = output_frame(16);
+                while write_frame(&writable, &writer, &frame, &withdrawn, true).await {}
+            }
+        });
+        until_a_frame_waits_whole(&writer).await;
+
+        // The withdrawal, exactly as the service performs it: the latch set with the writer held.
+        {
+            let _sender = writer
+                .lock()
+                .expect("the connection writer is not poisoned");
+            withdrawn.set();
+        }
+        tokio::time::timeout(Duration::from_secs(5), filling)
+            .await
+            .expect("the waiting frame stops at the withdrawal")
+            .expect("the writing task");
+
+        assert!(
+            the_refusal_arrives(&writable, &writer, &withdrawn, &mut reader).await,
+            "the refusal was written, and not refused for a frame the withdrawal left behind"
+        );
+    }
+
+    /// A write that is given up while it waits for room, as a bound on an acceptance's write does,
+    /// leaves nothing of its frame behind that a later frame would find part written.
+    #[cfg_attr(
+        windows,
+        ignore = "a Windows named pipe does not fill the way this test's own setup needs"
+    )]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_write_given_up_while_it_waited_for_room_leaves_the_stream_clean_for_the_next_frame()
+    {
+        let (_temp, writable, writer, mut reader) = connected().await;
+        let withdrawn = Arc::new(Withdrawal::default());
+        let filling = tokio::spawn({
+            let writable = writable.clone();
+            let writer = Arc::clone(&writer);
+            let withdrawn = Arc::clone(&withdrawn);
+            async move {
+                let frame = output_frame(16);
+                while write_frame(&writable, &writer, &frame, &withdrawn, true).await {}
+            }
+        });
+        until_a_frame_waits_whole(&writer).await;
+
+        filling.abort();
+        assert!(
+            filling
+                .await
+                .expect_err("the task was ended")
+                .is_cancelled(),
+            "the write was given up while it waited"
+        );
+
+        assert!(
+            the_refusal_arrives(&writable, &writer, &withdrawn, &mut reader).await,
+            "the next frame was written, and not refused for a frame the ended write left behind"
         );
     }
 
