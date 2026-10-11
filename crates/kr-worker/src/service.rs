@@ -963,7 +963,22 @@ impl WorkerService {
             .take();
         if let Some((arrived, go)) = armed {
             let _ = arrived.send(());
-            let _ = go.recv();
+            // The wait holds a thread of the runtime this worker runs on. A task that thread has
+            // just spawned waits in a slot only that thread runs from, so a wait that simply
+            // blocked would leave that task, and whatever needs it, behind the release. The thread
+            // hands what it holds to another before it blocks. A runtime that has one thread has
+            // nothing to hand it to, and there the wait only blocks.
+            let wait = move || {
+                let _ = go.recv();
+            };
+            let several = tokio::runtime::Handle::try_current().is_ok_and(|runtime| {
+                runtime.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread
+            });
+            if several {
+                tokio::task::block_in_place(wait);
+            } else {
+                wait();
+            }
         }
     }
 

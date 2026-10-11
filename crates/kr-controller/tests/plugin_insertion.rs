@@ -971,17 +971,26 @@ async fn an_offer_while_its_client(how: Client) {
     let mutation = acting.offering(&asking, "attach.photo", draft.draft_id, handle.transfer_id);
     let action_id = mutation.action_id;
     let host = acting.stop_host();
-    write(&mut asking, mutation.clone()).await;
-    until_receipt(&mut watcher, action_id, ReceiptState::Accepted).await;
 
-    // A repeat of the offer holds the connection's loop inside the dispatch boundary. The loop
-    // waits on a thread of this runtime, which may be the one that reads its sockets and fires its
-    // timers, so the runtime is kept polling for as long as the loop is held.
+    // The offer is held inside the dispatch boundary, and its repeat is written behind it and left
+    // unread. When the offer is let go it is accepted and its preparation is started, and the
+    // connection's loop goes straight on to the repeat, which holds it inside the boundary again.
+    // That is the order a loop meets when it is slow to come back to its reader, made certain
+    // instead of left to a slow moment: the preparation has to go on although the loop that started
+    // it is held. A held loop holds a thread of this runtime, which may be the one that reads its
+    // sockets and fires its timers, so the runtime is kept polling for as long as it is held.
     let _awake = Awake::start(tokio::runtime::Handle::current());
+    let (first_inside, let_first_go) = service.pause_inside_boundary();
+    write(&mut asking, mutation.clone()).await;
+    tokio::task::spawn_blocking(move || first_inside.recv_timeout(PATIENCE))
+        .await
+        .expect("the waiting thread finishes")
+        .expect("the offer reached the dispatch boundary");
     let (arrived, release) = service.pause_inside_boundary();
     let mut repeat = mutation;
     repeat.request_id = RequestId::new(2);
     write(&mut asking, repeat).await;
+    let_first_go.send(()).expect("lets the offer go");
     tokio::task::spawn_blocking(move || arrived.recv_timeout(PATIENCE))
         .await
         .expect("the waiting thread finishes")
