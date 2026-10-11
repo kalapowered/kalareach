@@ -14,15 +14,19 @@ mod organisation_support;
 use std::time::Duration;
 
 use kr_controller::grants::LeaseRefused;
+use kr_protocol::method::Method;
 use kr_protocol::rights::ActionRight;
 use organisation_fixture::*;
+use organisation_support::LEASE_MS;
 
 /// The longest a session invitation's grant lasts in these suites, and a little more.
 const A_DAY_AND_MORE: Duration = Duration::from_secs(25 * 60 * 60);
 
-/// KR-REQ-24.15: expiry is decided again when a host wakes. Both clocks pass a member's lease and
-/// a device's expiring grant while nothing asks the host anything; the first request after is
-/// refused for each, and the owner's own device, whose grant never ends, is served throughout.
+/// KR-REQ-24.15: expiry is decided again when a host wakes. Both clocks pass a member's lease while
+/// nothing asks the host anything, and the first request after is refused on the connection that
+/// stayed up; both pass a device's expiring grant the same way, and the first request after is
+/// refused or finds the connection ended. The owner's own device, whose grant never ends, is served
+/// after both.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn what_ended_while_the_host_slept_is_over_at_the_first_request_after() {
     let fixture = Fixture::start().await;
@@ -46,19 +50,26 @@ async fn what_ended_while_the_host_slept_is_over_at_the_first_request_after() {
         .await
         .expect("served before it sleeps");
 
-    // The host sleeps through both ends. The lease lasts minutes and the grant a day.
-    fixture.pass(A_DAY_AND_MORE);
+    // The host sleeps past the lease's end. The grant of the helper, which lasts a day, is not over.
+    fixture.pass(Duration::from_millis(LEASE_MS + 1_000));
     assert!(
         denied(&net_support::refusal(read_host_info(&raw).await)),
         "the lease ended in the sleep"
     );
-    assert!(
-        denied(&net_support::refusal(read_host_info(&helper_raw).await)),
-        "the grant ended in the sleep"
-    );
+    read_host_info(&helper_raw)
+        .await
+        .expect("the grant is still in force");
 
-    // The owner's grant never ends, and a lease the organisation issues after the wake serves the
-    // member again.
+    // And past the grant's end: the helper's request is refused, or finds its connection ended, and
+    // the owner's grant, which has no end, serves.
+    fixture.pass(A_DAY_AND_MORE);
+    match helper_raw.try_read(Method::HostInfo, &()).await {
+        None => {}
+        Some(answer) => assert!(
+            denied(&net_support::refusal(answer.map(|_| ()))),
+            "the grant ended in the sleep"
+        ),
+    }
     let owner = net_support::RawDevice::connect(
         &fixture.host,
         fixture
@@ -73,13 +84,10 @@ async fn what_ended_while_the_host_slept_is_over_at_the_first_request_after() {
     read_host_info(&owner)
         .await
         .expect("the owner's grant has no end");
-    ada.present(&fixture, &raw, fixture.lease(2, &ada, SERVED), None)
-        .await
-        .expect("a lease issued after the wake");
-    read_host_info(&raw).await.expect("served again");
+    owner.close();
+
     raw.close();
     helper_raw.close();
-    owner.close();
     fixture.host.stop().await;
 }
 

@@ -1452,6 +1452,9 @@ async fn a_lapsed_owner_device_is_neither_shown_nor_allowed_to_answer_a_members_
         .set_exclusive(&mut client, ActionId::new(kr_ipc::new_uuid()), true)
         .await
         .expect("the owner makes the host exclusive");
+    // Making the host exclusive fences it, which withdraws the connection it was asked on.
+    drop(client);
+    let mut client = fixture.host.client().await;
     let proposed = ProposedGrant {
         organisation: Nullable::some(OrganisationRequirement {
             organisation_id: fixture.organisation.organisation_id,
@@ -1591,6 +1594,9 @@ async fn a_refused_write_ends_exclusive_management_in_neither_the_policy_nor_the
         .set_exclusive(&mut client, ActionId::new(kr_ipc::new_uuid()), true)
         .await
         .expect("the owner makes the host exclusive");
+    // Making the host exclusive fences it, which withdraws the connection it was asked on.
+    drop(client);
+    let mut client = fixture.host.client().await;
 
     let end = async |client: &mut kr_ipc::client::LocalClient| {
         calls::mutate::<_, OrganisationExclusiveSetResult>(

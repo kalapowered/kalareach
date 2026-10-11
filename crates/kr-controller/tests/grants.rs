@@ -2644,7 +2644,7 @@ fn a_stored_policy_is_read_back_with_its_restrictions_and_its_floors() {
         .stored_policy()
         .expect("readable")
         .expect("present");
-    let mut restored = HostPolicy::restore(
+    let restored = HostPolicy::restore(
         &stored,
         AuthorityRevision::new(3),
         Arc::new(UtcFloor::at(stored.utc_floor_ms.get())),
