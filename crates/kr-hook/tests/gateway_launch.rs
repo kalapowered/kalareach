@@ -668,6 +668,98 @@ fn kr_req_12_07_a_launch_lost_to_a_retirement_ends_its_server() {
     });
 }
 
+/// KR-REQ-12.07: a close ends a backend's instance before it takes down what the backend
+/// published, so whoever finds the registration gone finds nothing of the launch held.
+#[test]
+fn kr_req_12_07_a_close_ends_the_instance_before_it_takes_down_the_registration() {
+    let shell = Gateway::new();
+    let answer = shell
+        .establish(&["codex"])
+        .expect("a backend is established");
+    let registration = PathBuf::from(&answer.environment[0].value);
+    let mut launched = shell.launch(
+        &answer,
+        "closing",
+        &[("KR_STAND_IN", "stay"), ("KR_STAND_IN_COMMAND", COMMAND)],
+    );
+    launched.prints("TUI: turn/completed");
+    let instance = shell.announcement().instance.application_instance_id;
+    assert!(shell.broker.binding_state(instance).is_ok(), "bound");
+    assert!(registration.exists(), "published");
+    let (arrived, go_on) = shell.backends.pause_before_removing_files();
+    let backends = Arc::clone(&shell.backends);
+    let closing = std::thread::spawn(move || backends.close());
+    arrived
+        .recv_timeout(LIVENESS)
+        .expect("the close reaches the files");
+    assert!(
+        shell.broker.binding_state(instance).is_err(),
+        "the instance and its bindings are gone before anything is taken down"
+    );
+    assert!(registration.exists(), "and the registration is still there");
+    go_on.send(()).expect("the close goes on");
+    let _ = closing.join().expect("the close finishes");
+    assert!(!registration.exists(), "and then it is taken down");
+}
+
+/// KR-REQ-07.60: a session's closure ends the server of a backend after the acceptance of the close
+/// is delivered, and what the server started with it: until the gate is released the server and its
+/// command run, and when the closure is over both have ended, the server among the processes the
+/// closure names as terminated.
+#[test]
+fn kr_req_07_60_a_close_ends_the_server_and_what_it_started_after_the_acceptance() {
+    let shell = Gateway::new();
+    let answer = shell
+        .establish(&["codex"])
+        .expect("a backend is established");
+    let mut launched = shell.launch(
+        &answer,
+        "closure",
+        &[("KR_STAND_IN", "stay"), ("KR_STAND_IN_COMMAND", COMMAND)],
+    );
+    launched.prints("TUI: turn/completed");
+    eventually("the session recorded what the server started", || {
+        !shell.started_by_servers().is_empty()
+    });
+    let server = shell.servers().remove(0);
+    let started = shell.started_by_servers();
+    let _entered = shell.runtime.enter();
+    let (acceptance, gate) = shell
+        .view
+        .runtime
+        .close(kr_protocol::session::ClosureReason::CloseRequested);
+    assert!(acceptance.initiated);
+    // The acceptance is out and nothing has been signalled: the server and its command run, since
+    // the requester of a close may be a command the server started.
+    for process in std::iter::once(&server).chain(&started) {
+        assert_ne!(
+            kr_ipc::identity::process_state(process),
+            kr_ipc::identity::ProcessState::Ended,
+            "{process:?} runs until the acceptance has been delivered"
+        );
+    }
+    gate.release();
+    let closure = shell
+        .runtime
+        .block_on(async { tokio::time::timeout(LIVENESS, shell.view.runtime.wait_closed()).await })
+        .expect("the session closes");
+    for process in std::iter::once(&server).chain(&started) {
+        assert_eq!(
+            kr_ipc::identity::process_state(process),
+            kr_ipc::identity::ProcessState::Ended,
+            "{process:?} ended with the session"
+        );
+    }
+    assert!(
+        closure
+            .terminated
+            .iter()
+            .any(|terminated| terminated.identity == server && !terminated.forced),
+        "the closure names the server, ended without force: {:?}",
+        closure.terminated
+    );
+}
+
 /// KR-REQ-07.60: a server that ignores both the end of its input and a terminate, with a command
 /// that ignores a terminate too, is ended by force with the command when the program ends.
 #[test]

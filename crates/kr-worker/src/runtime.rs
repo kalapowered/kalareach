@@ -81,6 +81,15 @@ pub const WRITE_WAIT: std::time::Duration = std::time::Duration::from_millis(20)
 /// How often a closing session is asked whether its processes have stopped.
 pub const STOP_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
 
+/// How long the closure waits, after it has forced what was left, for the servers of its backends
+/// to be ended.
+///
+/// A server that ignores the end of its input and a terminate is ended by force within about five
+/// seconds of the closure's release, so a server still running after this is one that cannot be
+/// ended: the closure goes on, and its receipt names what survived.
+#[cfg(unix)]
+const SERVERS_ENDING_BOUND: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// The current lease's share of the queued input, and the epoch it belongs to, in one word.
 ///
 /// The two have to move together. A lease change hands the count to the takeover receipt and leaves
@@ -1673,6 +1682,14 @@ impl CloseGate {
         }
         let runtime = self.runtime;
         tokio::spawn(async move {
+            // The servers of the session's backends end beside the processes it owns, now that the
+            // acceptance has been delivered: a server is asked with the end of its input, which
+            // lets it end its commands, and is not forced unless it will not go.
+            #[cfg(unix)]
+            let servers = {
+                let backends = runtime.session().command_backends();
+                backends.map(|backends| tokio::spawn(async move { backends.end_servers().await }))
+            };
             {
                 let _observed = runtime.observing.lock().await;
                 let mut session = runtime.session();
@@ -1702,6 +1719,12 @@ impl CloseGate {
                 let _ = session.force_close();
             }
             tokio::time::sleep(DRAIN_PERIOD).await;
+            #[cfg(unix)]
+            if let Some(servers) = servers {
+                // Not under the session's lock: each step of an ending reads or changes the
+                // record of the processes the session owns.
+                let _ = tokio::time::timeout(SERVERS_ENDING_BOUND, servers).await;
+            }
             #[cfg(feature = "testing")]
             runtime.progress.pauses.drain_ended();
             // The drain bounds how long the terminal is read, not how much of what was read
