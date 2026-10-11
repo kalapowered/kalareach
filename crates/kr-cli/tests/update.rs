@@ -234,10 +234,10 @@ fn built_from_another_tree(program: &Path, name: &str, repository: &Path) -> Opt
         Ok(built) => built,
         Err(error) => return Some(format!("its time cannot be read: {error}")),
     };
-    // A list written before the program was is the list of an earlier build. The few seconds are the
-    // time a build takes between writing one and the other.
+    // A list written before the program was is the list of an earlier build: Cargo writes the list
+    // after the program it describes, so the list of the same build is never the older of the two.
     let listed = std::fs::metadata(&listing).and_then(|about| about.modified());
-    if listed.is_ok_and(|listed| listed + Duration::from_secs(5) < built) {
+    if listed.is_ok_and(|listed| listed < built) {
         return None;
     }
     // Makefile syntax: the program, a colon, then each source, a space escaped with a backslash.
@@ -421,9 +421,11 @@ fn module_tree() -> [(&'static str, &'static str); 2] {
 /// A program that is older than a source it was built from, one built from another checkout's sources,
 /// and one whose list names a source that is gone are each refused by name, and a program newer than
 /// every source it lists, one with no list and one with a list older than itself are not. This is the
-/// check the suite makes before it assembles a release from the daemons found in a target directory:
-/// one left there by an earlier run wrote a wrong digest into the lock on the box, and passed every
-/// other check.
+/// check the suite makes before it assembles a release from the daemons found in a target directory,
+/// for a program built by name (`cargo build -p ...`), which writes its list with it. A program a
+/// workspace test run made has no list of its own to judge it by, and is used as it is: the box and
+/// core-ci build every program first, and a package-scoped run builds them by the command the
+/// refusal names.
 #[test]
 fn a_program_not_built_from_this_tree_is_refused() {
     let directory = tempfile::tempdir().expect("a directory");
