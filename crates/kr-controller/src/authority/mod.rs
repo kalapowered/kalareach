@@ -3292,6 +3292,7 @@ mod tests {
         for number in 4..=70 {
             barrier.announced(session(1), &[revision(number)]);
         }
+        barrier.announced(session(1), &[revision(70)]);
         assert!(barrier.acknowledge_announced(
             session(1),
             binding,
@@ -3360,5 +3361,100 @@ mod tests {
                 report.workers[0]
             );
         }
+    }
+
+    /// KR-REQ-09.13: an announcement recorded again, after a result has taken part of it in, adds
+    /// to what was stored for it and takes nothing away: the result of its last revision still
+    /// reads the notices it was told with.
+    #[test]
+    fn an_announcement_recorded_again_leaves_what_was_stored_for_it() {
+        let barrier = barrier();
+        let binding = barrier.bind(session(1));
+        barrier.announced(session(1), &told(4, 6));
+        assert!(barrier.acknowledge(
+            session(1),
+            binding,
+            revision(4),
+            evidence(vec![action(10)], Vec::new()),
+        ));
+        // Another announcement tells 5 alone, and its result takes 5 in.
+        barrier.announced(session(1), &[revision(5)]);
+        assert!(barrier.acknowledge_announced(
+            session(1),
+            binding,
+            revision(5),
+            evidence(Vec::new(), Vec::new()),
+        ));
+        // The first announcement is recorded again, by a retry that read the record before.
+        barrier.announced(session(1), &told(4, 6));
+        assert!(barrier.acknowledge_announced(
+            session(1),
+            binding,
+            revision(6),
+            evidence(Vec::new(), Vec::new()),
+        ));
+        let report = barrier.report(revision(6), [session(1)]);
+        assert_eq!(report.workers[0].rejected_actions, vec![fenced(10)]);
+    }
+
+    /// KR-REQ-09.13: a result is counted exactly for the revisions the daemon stopped following
+    /// for room, and a settlement of a revision below them does not forget them.
+    #[test]
+    fn a_result_counts_the_revisions_the_daemon_stopped_following_exactly() {
+        let barrier = barrier();
+        let binding = barrier.bind(session(1));
+        let followed = u64::try_from(MAX_TOLD_REVISIONS).expect("fits");
+        let last = 6 + followed + 99 - 1 + 1;
+        for number in 6..last {
+            barrier.announced(session(1), &[revision(number)]);
+        }
+        // Revision 6 was among those the daemon stopped following, and is taken in all the same.
+        assert!(barrier.acknowledge_announced(
+            session(1),
+            binding,
+            revision(6),
+            evidence(Vec::new(), Vec::new()),
+        ));
+        barrier.announced(session(1), &[revision(last)]);
+        assert!(barrier.acknowledge_announced(
+            session(1),
+            binding,
+            revision(last),
+            evidence(Vec::new(), Vec::new()),
+        ));
+        // The tracked revisions are the newest `followed`; 99 went before them; of the tracked
+        // ones the result remembers 64 and reads 7.
+        let remembered = u64::try_from(MAX_REMEMBERED_REVISIONS).expect("fits");
+        let read = u64::try_from(MAX_CARRIED_REVISIONS).expect("fits");
+        let expected = (followed - remembered) + 99 + (remembered - read);
+        let report = barrier.report(revision(last), [session(1)]);
+        let detail = &report.workers[0].detail;
+        assert!(
+            detail.contains(&format!(
+                "{expected} of the revisions announced to this worker before revision {last}"
+            )),
+            "{expected} expected: {detail:?}"
+        );
+    }
+
+    /// KR-REQ-09.13: a worker that ended before the report of a revision arrived is still named
+    /// what the revisions announced with it named.
+    #[test]
+    fn a_result_that_has_no_report_of_its_own_reads_what_its_announcement_named() {
+        let barrier = barrier();
+        let binding = barrier.bind(session(1));
+        barrier.announced(session(1), &told(4, 5));
+        assert!(barrier.acknowledge(
+            session(1),
+            binding,
+            revision(4),
+            evidence(vec![action(10)], Vec::new()),
+        ));
+        // The worker ends during the exchange of revision 5.
+        barrier.worker_ended(session(1));
+        let report = barrier.report(revision(5), [session(1)]);
+        let worker = &report.workers[0];
+        assert_eq!(worker.state, BarrierState::Ended, "{worker:?}");
+        assert_eq!(worker.rejected_actions, vec![fenced(10)]);
     }
 }
