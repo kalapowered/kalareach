@@ -244,13 +244,13 @@ document names one: the endpoint's relays and Pkarr servers, the rendezvous it r
 locator at and opens the room at, delivery to the push gateway, to webhook addresses and to chat
 services, the managed voice broker and the account service it signs in at, backups to the managed
 storage service (`storage.origin`), the model's files, and plugin repositories. Nothing goes around
-it, so an address the proxy cannot reach fails, a webhook included. Mail submission is SMTP and connects directly, and
-name lookups go directly too. Without a proxy every one of those connections goes directly, apart
-from iroh's relay latency probe and captive-portal check, which then follow `HTTP_PROXY`,
-`HTTPS_PROXY` and `ALL_PROXY` when those are set. The daemon reads the proxy when it starts, like
-the rest of the section, and every client takes that one reading. A daemon that starts over a
-document it cannot use makes no HTTPS connection to the push gateway, a webhook address or a chat
-service, a plugin repository, the model's files or the managed account service, and uploads no
+it, so an address the proxy cannot reach fails, a webhook included. Mail submission is SMTP and
+connects directly, and name lookups go directly too. Without a proxy every one of those connections
+goes directly, apart from iroh's relay latency probe and captive-portal check, which then follow
+`HTTP_PROXY`, `HTTPS_PROXY` and `ALL_PROXY` when those are set. The daemon reads the proxy when it
+starts, like the rest of the section, and every client takes that one reading. A daemon that starts
+over a document it cannot use makes no HTTPS connection to the push gateway, a webhook address or a
+chat service, a plugin repository, the model's files or the managed account service, and uploads no
 backup, until it starts again over one it can use.
 
 The daemon reads both sections once, when it starts, because that is when its endpoint and its
@@ -357,9 +357,10 @@ the host's answer.
 management) ends the sign-in: it ends a sign-in that is waiting, removes the grant from the secret
 store and asks the service to end it. It is refused while a call is open, for the reason a sign-in
 is. A service that cannot be told leaves the grant gone from this host and the revocation queued;
-the daemon sends it again at a later start that can reach the service, and the command says so. A host with no account
-answers that there was none. Recovery at start and before the first token is tried again by the next
-request when the store fails it, and no token goes out until it has succeeded.
+the daemon sends it again at a later start that can reach the service, and the command says so. A
+host with no account answers that there was none. Recovery at start and before the first token is
+tried again by the next request when the store fails it, and no token goes out until it has
+succeeded.
 
 ### How the daemon is started
 
