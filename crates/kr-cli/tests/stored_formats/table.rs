@@ -75,7 +75,14 @@ pub fn known() -> Vec<Known> {
         is: KnownIs::Words(words, anchor, enums),
         pinned,
     };
-    let words = |store, name, words: Vec<String>, anchor, pinned| {
+    // A set whose words are taken from the code itself (an `ALL` and `as_str`) has nothing to anchor
+    // and no enum to hold beside it: the words are the enum's. Every set typed in the table says
+    // which file writes its words and which enum it stands for, with `&[]` where it has none.
+    let words = |store, name, words: Vec<String>, anchor: Option<&'static str>, pinned| {
+        assert!(
+            anchor.is_none(),
+            "{name}: a set with an anchor names its enum: use words_of"
+        );
         words_of(store, name, words, anchor, &[], pinned)
     };
     let literal = |words: &[&str]| {
@@ -308,12 +315,13 @@ pub fn known() -> Vec<Known> {
             &[("crates/kr-protocol/src/attention.rs", "ReviewSubject")],
             "caadb9f56cfaf54422e1e9b605c0a25be659299f99c01eb892864eb51e477297",
         ),
-        words(
+        words_of(
             "attention",
             "text kinds",
             literal(&["host", "record"]),
             Some("crates/kr-attention/src/store.rs"),
-            "aaa2de43a1c54f7fb5d9ab9da825dfcaf92ba293500b7b9da06448a5e6d2177d",
+            &[("crates/kr-attention/src/engine.rs", "Text")],
+            "dfc35cf97fb6509566f2c0684824f8cd2a51698f272a510457848a25fbf8ac29",
         ),
         words_of(
             "attention",
@@ -386,12 +394,13 @@ pub fn known() -> Vec<Known> {
             None,
             "61c6654c47ba6b0a774eb233be4c99d8aeec089608bc720e6deb1fd33a17eb9c",
         ),
-        words(
+        words_of(
             "attention",
             "origin words",
             literal(&["environment"]),
             Some("crates/kr-attention/src/store.rs"),
-            "ec8be9268cae84494a7b8dc38475e5022b70f371f30f117f0e5a8042d999b400",
+            &[("crates/kr-attention/src/event.rs", "Origin")],
+            "e799e9f01ab42d78a4fd7dcc2d4611e41cfbd1900a5e2c0b620ae7490bfb955c",
         ),
         // The registry's columns of words, and the consumed reasons it stores by their protocol
         // names.
@@ -461,7 +470,7 @@ pub fn known() -> Vec<Known> {
             "crates/kr-controller/src/push/client.rs",
             "14747dd6a7c6ca6f67e5d2a1d29b6f41750cba354750ec6b57ecefc7b7a16fdf",
         ),
-        words(
+        words_of(
             "delivery",
             "queued message keys",
             literal(&[
@@ -475,6 +484,9 @@ pub fn known() -> Vec<Known> {
                 "withheld",
             ]),
             Some("crates/kr-delivery/src/producer.rs"),
+            // The keys of a document, not the words of an enum: `StoredMessage` and
+            // `StoredInterval` above pin the document's shape.
+            &[],
             "dba448ea8bdc6ebb7ccc73c996b729e90ad85bcc030142dc32a784a254caa040",
         ),
         words_of(
