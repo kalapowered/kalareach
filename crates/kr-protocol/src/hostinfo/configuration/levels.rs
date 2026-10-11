@@ -55,6 +55,23 @@ pub struct Levelled {
 ///
 /// A section is added here, with a typed field on the document, in the change that adds it, and
 /// that change raises [`LEVEL`] to the section's level.
+///
+/// A section has one form, which the stored-format lock checks as far as a schema and a probe
+/// can show:
+///
+/// - a struct with derived `Serialize`, `Deserialize` and `JsonSchema`, and no `flatten`,
+///   `serialize_with`, `deserialize_with`, `with` or schema override, that is
+///   `#[serde(deny_unknown_fields, default)]` and has only `Nullable` fields, so that absent and
+///   all null are the same and mean the section is not used;
+/// - on the document, `#[serde(default, skip_serializing_if = "is_unused")]`, and never an
+///   `Option`, so that an unused section is not written and a release that reads less reads the
+///   document strictly;
+/// - a written statement of what a release that does not know it does without it, a test of that
+///   downgrade, and a round trip of an active value through the file and the registry's copy.
+///
+/// A section may not restrict, redirect or reinterpret anything an older release already does:
+/// what narrows a host stays in the ceilings and raises the version. A change to what a section
+/// accepts, including checks the code runs that its schema does not show, raises the version.
 pub const LEVELLED: &[Levelled] = &[];
 
 /// What a release reads and writes: its level and the sections that arrived with one.
