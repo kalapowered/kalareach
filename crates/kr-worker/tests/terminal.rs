@@ -1566,10 +1566,14 @@ async fn kr_req_10_50_a_screen_larger_than_a_preview_comes_back_marked_cut() {
 /// grid stops the row at its bound after fewer cells than a preview line holds.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_10_50_a_row_the_grid_cut_is_a_screen_the_preview_says_was_cut() {
-    let identifier = "i".repeat(2_026);
+    // A Windows pseudo-console passes the link on under an identifier of its own making: the
+    // application's behind a prefix and followed by a hash, up to twenty-three characters more.
+    // The link as the pseudo-console writes it has to be no longer than a link may be, or the grid
+    // refuses it and has no copy of it to bound the row by.
+    let identifier = "i".repeat(if cfg!(windows) { 2_026 - 23 } else { 2_026 });
     let host = host_sized(
         &format!(
-            "printf '\\033]8;id={identifier};https://e.invalid/\\033\\\\'; \
+            "printf '\\033]8;id={identifier};https://e.invalid/\\033\\134'; \
              i=0; while [ $i -lt 1000 ]; do printf 'a\\033[1mb\\033[0m'; i=$((i+1)); done; \
              printf 'END\\n'; read -r _"
         ),
