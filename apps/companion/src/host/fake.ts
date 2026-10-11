@@ -40,7 +40,8 @@ import type {
   VoicePrepareResult,
   VoiceRate,
   TerminalPresentationMode,
-  VoiceSessionDescriptor
+  VoiceSessionDescriptor,
+  VoiceStopResult
 } from '@kalareach/protocol'
 
 import type { LaunchSurface, RetainedArtefacts } from '../model/pending'
@@ -426,6 +427,11 @@ export interface FakeHostControls {
   holdBackOnNextVoiceAllow(actions: readonly VoiceAction[]): void
   /** Has the next allowance of voice end without the host confirming it, as a lost answer does. */
   leaveNextVoiceAllowUnconfirmed(): void
+  /**
+   * Has the next allowance of voice, or the next end of a call, come back with the fence it owed
+   * not yet held by the worker of `sessionId`, as a host does while that worker has not answered.
+   */
+  leaveNextVoiceChangePendingAt(sessionId: string): void
   /** What the next paste from the clipboard finds. */
   setPasteboard(result: PasteView): void
   /** The codes the page started pairing with, in order. */
@@ -697,6 +703,32 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
   let voiceAllowFailure: string | null = null
   let voiceHeldBack: readonly VoiceAction[] = []
   let voiceAllowUnconfirmed = false
+  /** The session whose worker the next voice change leaves pending, or none. */
+  let voiceFencePendingAt: string | null = null
+  /** The barrier the next voice change carries: none, or one worker that has not held. */
+  const voiceBarrier = (): VoiceStopResult['barrier'] => {
+    const sessionId = voiceFencePendingAt
+    voiceFencePendingAt = null
+    if (sessionId === null) return null
+    return {
+      authority_revision: '2',
+      workers: [
+        {
+          session_id: sessionId,
+          state: 'pending',
+          acknowledged_revision: null,
+          rejected_actions: [],
+          rejected_actions_total: '0',
+          possibly_executed: [],
+          possibly_executed_total: '0',
+          omitted_actions: '0',
+          names_pending: '0',
+          detail: 'the worker has not acknowledged the revision'
+        }
+      ],
+      workers_total: '1'
+    }
+  }
 
   let accountView: AccountView = { state: 'signed_out', outcome: null }
   let accountUsage: UsageView = { state: 'signed_out' }
@@ -1494,7 +1526,8 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
             ),
             unlocked_screen_actions: []
           },
-          not_held_by_device: notHeld
+          not_held_by_device: notHeld,
+          barrier: voiceBarrier()
         } satisfies VoiceAllowed
       }))
     },
@@ -1604,7 +1637,7 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
             revoked_at_ms: String(VOICE_NOW_MS),
             broker_notified: true,
             sessions_left_running: [SESSION_MAIN],
-            barrier: null
+            barrier: voiceBarrier()
           }
         },
         host_failure: null
@@ -1771,6 +1804,9 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
     },
     leaveNextVoiceAllowUnconfirmed() {
       voiceAllowUnconfirmed = true
+    },
+    leaveNextVoiceChangePendingAt(sessionId) {
+      voiceFencePendingAt = sessionId
     },
     sessionCreates,
     describe(sessionId, change) {

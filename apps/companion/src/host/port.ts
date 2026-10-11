@@ -448,16 +448,20 @@ export interface VoiceScope {
 }
 
 /**
- * What allowing voice came to: the sentences the grant states and what it could not carry. The
- * device the grant is for is not in it; native code holds that identity. Neither is the barrier the
- * host's answer carries when replacing the grant ended a call whose close could still reach a
- * worker: this screen is shown while the page holds no call, and it says what the new grant
- * permits.
+ * What allowing voice came to: the sentences the grant states, what it could not carry, and the
+ * barrier of the fence that replacing the grant owed. The device the grant is for is not in it;
+ * native code holds that identity.
  */
 export interface VoiceAllowed {
   readonly statement: VoiceGrantResult['statement']
   /** The actions asked for that this device's own access to the host does not include. */
   readonly not_held_by_device: readonly VoiceAction[]
+  /**
+   * The workers' status for the calls the replacement ended: null when it owed no fence, and
+   * otherwise the barrier as the host's wait for it left it. A worker still `pending` may yet take
+   * up what one of those calls sent.
+   */
+  readonly barrier: VoiceGrantResult['barrier']
 }
 
 /** What the page asks when the person allows voice for some of a host's sessions. */

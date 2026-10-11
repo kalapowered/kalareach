@@ -22,10 +22,30 @@ import type {
   VoiceManagedTerms,
   VoicePrepareResult,
   VoiceRate,
-  VoiceSessionDescriptor
+  VoiceSessionDescriptor,
+  VoiceStopResult
 } from '@kalareach/protocol'
 
 import type { VoiceCallState } from '../host/port'
+
+/**
+ * How many sessions' workers a host's answer to ending a call, or to replacing what voice may do,
+ * names as not yet confirmed.
+ *
+ * The answer carries the barrier of the fence the withdrawal owed, and a worker whose barrier has
+ * not held may still take up something the call sent. The grant is withdrawn either way, so this
+ * is not a failure: it is what the person is told the host has still to confirm.
+ */
+export function sessionsToConfirm(barrier: VoiceStopResult['barrier'] | undefined): number {
+  return barrier?.workers.filter((worker) => worker.state === 'pending').length ?? 0
+}
+
+/** The words that say how many sessions are still to confirm. */
+export function toConfirmWords(sessions: number): string {
+  return `The host has not yet confirmed that nothing the call sent can still run in ${
+    sessions === 1 ? '1 session' : `${sessions} sessions`
+  }.`
+}
 
 /** What the microphone is doing, as the native layer reports it. */
 export type CaptureState =

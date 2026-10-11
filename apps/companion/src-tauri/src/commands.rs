@@ -1280,14 +1280,13 @@ struct VoiceAllow {
     actions: Option<Vec<kr_protocol::voice::VoiceAction>>,
 }
 
-/// What allowing voice came to: the sentences the grant states, and what it could not carry. The
-/// device the grant is for is not in it, and neither is the barrier the host's answer may carry.
+/// What allowing voice came to: the sentences the grant states, what it could not carry, and the
+/// barrier of the fence that replacing the grant owed. The device the grant is for is not in it.
 ///
-/// Replacing the standing grant ends the calls under it, and when a close sent under one of them can
-/// still reach a worker the host's answer carries the barrier of the fence that owes, naming the
-/// workers that have not acknowledged it. This answer does not pass that on: the screen that
-/// allows voice is shown while the page holds no call, it says what the new grant permits, and the
-/// grant it replaces is withdrawn whether or not that barrier holds.
+/// Replacing the standing grant ends the calls under it, and when a close sent under one of them
+/// can still reach a worker the host's answer names the workers that have not acknowledged the
+/// fence. That is passed on as the host gave it, null when the replacement owed none, so the screen
+/// can say that those workers are still to confirm.
 #[derive(Debug, Serialize)]
 pub struct VoiceAllowed {
     /// What the grant permits, each action in the sentence that states it.
@@ -1295,6 +1294,8 @@ pub struct VoiceAllowed {
     /// The actions the person asked for that this device's own grant does not carry, so the grant
     /// does not either.
     pub not_held_by_device: kr_protocol::scalars::CanonicalSet<kr_protocol::voice::VoiceAction>,
+    /// The per-worker status of the fence the replacement owed, or null when it owed none.
+    pub barrier: kr_protocol::scalars::Nullable<kr_protocol::action::RevocationBarrier>,
 }
 
 /// Lets the person allow what a voice call on this device may do, for the host it is paired with.
@@ -1351,6 +1352,7 @@ pub async fn voice_allow(
                 value: Some(encode(&VoiceAllowed {
                     statement: granted.statement,
                     not_held_by_device: granted.not_held_by_device,
+                    barrier: granted.barrier,
                 })?),
             })
         }

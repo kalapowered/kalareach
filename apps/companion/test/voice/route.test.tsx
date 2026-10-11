@@ -16,6 +16,9 @@ import { fakeHost, type FakeHostControls } from '../../src/host/fake'
 import type { HostPort } from '../../src/host/port'
 import { VoiceRoute } from '../../src/voice/VoiceRoute'
 
+/** The session the fake host's workers answer for. */
+const SESSION_MAIN = '8a7b6c50-22bb-4c3d-8e4f-000000000101'
+
 /** The voice calls this screen made, watched from before it was rendered. */
 type Watched = Record<
   'voicePrepare' | 'voiceStart' | 'voiceContext' | 'voiceDelegate' | 'voiceSetMuted',
@@ -212,6 +215,30 @@ describe('while a call is running', () => {
         'true'
       )
     })
+  })
+
+  // Section 9: ending a call is complete for the host once its workers hold the revision that
+  // refuses what the call sent. The grant is withdrawn either way, and the screen says which
+  // sessions the host has still to confirm instead of reporting a complete stop.
+  it('says how many sessions the host has still to confirm when the call ends', async () => {
+    const person = userEvent.setup()
+    const { controls } = start()
+    await waitForChoice()
+    await person.click(screen.getByRole('button', { name: 'Start voice session' }))
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'End session' })).toBeInTheDocument()
+    })
+
+    controls.leaveNextVoiceChangePendingAt(SESSION_MAIN)
+    await person.click(screen.getByRole('button', { name: 'End session' }))
+
+    await waitFor(() => {
+      expect(
+        screen.getByText(/has not yet confirmed that nothing the call sent can still run in 1 session/)
+      ).toBeInTheDocument()
+    })
+    expect(screen.getByText(/its grant withdrawn/)).toBeInTheDocument()
+    expect(screen.queryByRole('heading', { name: 'Voice session' })).not.toBeInTheDocument()
   })
 
   // KR-REQ-15.17: transport closure survives a host that cannot be told about it, and the screen

@@ -19,6 +19,8 @@ import {
   choiceWithRate,
   requestedSeconds,
   runningCallFrom,
+  sessionsToConfirm,
+  toConfirmWords,
   type ContextRequest,
   type Delegation,
   type ProviderChoice,
@@ -419,10 +421,13 @@ export function VoiceRoute({
         void ask(() => port.voiceStop(running.voiceSessionId, {}))
           .then((closure) => {
             if (closure.closed_locally) setCall(null)
+            const toConfirm = sessionsToConfirm(closure.settled?.value?.barrier)
             setNotice(
               closure.host_failure
                 ? `This device's call is closed. The host was not told, so its grant may still be open: ${failureWords(closure.host_failure)}`
-                : null
+                : toConfirm > 0
+                  ? `This device's call is closed and its grant withdrawn. ${toConfirmWords(toConfirm)}`
+                  : null
             )
           })
           .catch((error: unknown) => {

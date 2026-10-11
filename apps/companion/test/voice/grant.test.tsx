@@ -20,6 +20,9 @@ afterEach(() => {
   cleanup()
 })
 
+/** The session the fake host's workers answer for. */
+const SESSION_MAIN = '8a7b6c50-22bb-4c3d-8e4f-000000000101'
+
 function start(setup?: (controls: FakeHostControls) => void): { controls: FakeHostControls } {
   const { port, controls } = fakeHost()
   controls.requireVoiceGrant('PERMISSION_DENIED: name the sessions this voice session may reach')
@@ -129,6 +132,24 @@ describe('allowing voice for the first time', () => {
     expect(screen.getByTestId('voice-grant-continue')).toHaveAccessibleDescription(
       /Allowed, except compose prompt/
     )
+    await userEvent.click(screen.getByTestId('voice-grant-continue'))
+    expect(await screen.findByRole('button', { name: 'Start voice session' })).toBeInTheDocument()
+  })
+
+  // Section 9: a withdrawal is not complete until its barrier holds, so a replacement that ended a
+  // call whose close could still reach a worker says which sessions are still to confirm, and the
+  // person goes on when they have read it.
+  it('says how many sessions the host has still to confirm after replacing the allowance', async () => {
+    const { controls } = start((fake) => {
+      fake.leaveNextVoiceChangePendingAt(SESSION_MAIN)
+    })
+    await screen.findAllByRole('checkbox')
+    await userEvent.click(screen.getByTestId('voice-allow'))
+    const result = await screen.findByTestId('voice-grant-result')
+    expect(result).toHaveTextContent('has not yet confirmed that nothing the call sent can still run in 1 session')
+    expect(result).not.toHaveTextContent('except')
+    expect(controls.voiceAllows).toHaveLength(1)
+    expect(screen.queryByRole('button', { name: 'Start voice session' })).toBeNull()
     await userEvent.click(screen.getByTestId('voice-grant-continue'))
     expect(await screen.findByRole('button', { name: 'Start voice session' })).toBeInTheDocument()
   })

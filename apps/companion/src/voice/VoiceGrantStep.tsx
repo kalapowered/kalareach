@@ -16,6 +16,7 @@ import { useEffect, useId, useRef, useState, type ReactNode } from 'react'
 
 import type { HostPort, VoiceAllowed, VoiceScope } from '../host/port'
 import { failureMessage } from '../host/port'
+import { sessionsToConfirm, toConfirmWords } from './model'
 
 /** A session the person can choose, as the host lists it. */
 interface Choice {
@@ -105,9 +106,13 @@ export function VoiceGrantStep({
           )
           return
         }
-        // What the host could not carry is read before the call is shown, not after: the person
-        // goes on once they have seen it.
-        if (settled.value.not_held_by_device.length === 0) {
+        // What the host could not carry, and what it has still to confirm of the calls this
+        // replaced, is read before the call is shown, not after: the person goes on once they
+        // have seen it.
+        if (
+          settled.value.not_held_by_device.length === 0 &&
+          sessionsToConfirm(settled.value.barrier) === 0
+        ) {
           onAllowed(sessionIds)
           return
         }
@@ -196,11 +201,22 @@ export function VoiceGrantStep({
       {granted === null || allowedIds === null ? null : (
         <div className="kr-voice__panel" role="status" data-testid="voice-grant-result">
           <p className="kr-voice__note" id={`${id}-result`}>
-            {`Allowed, except ${granted.not_held_by_device
-              .map((action) => action.replace(/_/g, ' '))
-              .join(', ')}: this phone’s own access to the host does not include ${
-              granted.not_held_by_device.length === 1 ? 'it' : 'them'
-            }.`}
+            {[
+              granted.not_held_by_device.length === 0
+                ? 'Allowed.'
+                : `Allowed, except ${granted.not_held_by_device
+                    .map((action) => action.replace(/_/g, ' '))
+                    .join(', ')}: this phone’s own access to the host does not include ${
+                    granted.not_held_by_device.length === 1 ? 'it' : 'them'
+                  }.`,
+              sessionsToConfirm(granted.barrier) === 0
+                ? null
+                : `The calls that were running under the earlier allowance have ended. ${toConfirmWords(
+                    sessionsToConfirm(granted.barrier)
+                  )}`
+            ]
+              .filter((words) => words !== null)
+              .join(' ')}
           </p>
           <button
             ref={continueButton}
