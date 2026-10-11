@@ -1109,16 +1109,16 @@ impl CommandBackends {
                     let _ = go.recv();
                 }
             }
-            // Retired first, under its lifecycle lock, so no launch commits under it afterwards;
+            // Marked first: the instance goes next, and what that does to the program's connection
+            // is not a reason to end its server before the acceptance of the close is delivered.
+            #[cfg(unix)]
+            backend.closing.store(true, Ordering::SeqCst);
+            // Retired next, under its lifecycle lock, so no launch commits under it afterwards;
             // then whatever instance it registered is ended, whichever state the launch had
             // reached: a committed one is the session's to end, and one a launch still holds is
             // given back by that launch's guard, for which an ended instance is nothing to undo;
             // and only then its files go, so that whoever finds the registration gone finds
             // nothing of the launch held.
-            // Marked first: the instance goes next, and what that does to the program's connection
-            // is not a reason to end its server before the acceptance of the close is delivered.
-            #[cfg(unix)]
-            backend.closing.store(true, Ordering::SeqCst);
             backend.fence();
             ended.extend(backend.end_at_close(&self.broker));
             #[cfg(feature = "testing")]
@@ -1691,9 +1691,10 @@ impl Backend {
     /// its variable's file name tells it.
     fn retire(&self) {
         self.fence();
-        // The program's connection and the server end with the backend.
+        // The program's connection and the server end with the backend, unless the session is
+        // closing and a retirement that raced its close finds the server the closure's.
         #[cfg(unix)]
-        self.end_gateway();
+        self.end_after_connection();
         self.remove_files();
     }
 
@@ -3058,9 +3059,11 @@ async fn supervise(backend: Arc<Backend>, broker: Arc<Broker>, process: ProcessS
                 backend.application_instance_id,
                 crate::broker::InstanceEnding::NativeExit,
             );
-            // The program is gone: its server is ended too, and the connection with it.
+            // The program is gone: its server is ended too, and the connection with it, unless the
+            // session is closing, whose closure ends the servers once the acceptance of its close
+            // has been delivered.
             #[cfg(unix)]
-            backend.end_gateway();
+            backend.end_after_connection();
             backend.retire();
             backend.announce_ended();
             return;

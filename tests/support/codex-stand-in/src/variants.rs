@@ -16,6 +16,10 @@ pub const COMMAND_VARIABLE: &str = "KR_STAND_IN_COMMAND";
 /// a turn and the server's notification of what the agent said.
 pub const PAD_VARIABLE: &str = "KR_STAND_IN_PAD";
 
+/// The file a server under `write-when-released` waits for before it writes. It then writes the
+/// same name with `.spoke` added to say it has, and whether the write failed.
+pub const SPEAK_VARIABLE: &str = "KR_STAND_IN_SPEAK";
+
 /// The key the terminal signs in with under the `login` variant.
 pub const KEY_VARIABLE: &str = "KR_STAND_IN_API_KEY";
 
@@ -68,6 +72,9 @@ pub struct Variants {
     /// The terminal, once its turn is complete, waits for the file `KR_STAND_IN_RELEASE` names and
     /// then asks the server who the account is.
     pub request_when_released: bool,
+    /// The server, once the file `KR_STAND_IN_SPEAK` names exists, writes a notification, whoever
+    /// is reading, and says whether the write failed. A server whose write fails ends its commands.
+    pub write_when_released: bool,
     /// The terminal does not answer the approval until the file `KR_STAND_IN_RELEASE` names exists.
     pub answer_when_released: bool,
     /// The terminal says it is waiting, and does not connect until the file `KR_STAND_IN_RELEASE`
@@ -108,6 +115,7 @@ impl Variants {
                 "idle" => variants.idle = true,
                 "stop-reading" => variants.stop_reading = true,
                 "request-when-released" => variants.request_when_released = true,
+                "write-when-released" => variants.write_when_released = true,
                 "answer-when-released" => variants.answer_when_released = true,
                 "wait-to-connect" => variants.wait_to_connect = true,
                 other => panic!("{VARIABLE} names a variant this program does not have: {other}"),
