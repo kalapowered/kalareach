@@ -9,7 +9,7 @@
 //!
 //! | Row | What proves it |
 //! | --- | --- |
-//! | KR-REQ-12.07 | a backend's endpoint, credential and launch record exist before the answer; a bypass creates nothing; one line runs one integrated invocation; each session has a root of its own; a backend is established under the longest runtime directory a Mac has by default, and a backend retired by the end of its line leaves no directory; a declared package establishes with its flags, and its variables in the launch record rather than the answer; a session entry whose flags are not the package's, a run that splits the flags and an executable no match rule recognises establish nothing; a bypassed invocation exports nothing; an integration that declares a backend establishes nothing, and says which launch it refuses |
+//! | KR-REQ-12.07 | a backend's endpoint, credential and launch record exist before the answer; a bypass creates nothing; one line runs one integrated invocation; each session has a root of its own; a backend is established under the longest runtime directory a Mac has by default, and a backend retired by the end of its line leaves no directory; a declared package establishes with its flags, and its variables in the launch record rather than the answer; a session entry whose flags are not the package's, a run that splits the flags and an executable no match rule recognises establish nothing; a bypassed invocation exports nothing; an integration that declares a backend establishes nothing where it cannot be served, and says which launch it refuses |
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -1193,11 +1193,11 @@ fn codex_integration() -> CommandIntegration {
     }
 }
 
-/// KR-REQ-12.07: an integration that declares a backend establishes nothing: a launch the package
-/// does not serve (an option typed, a word it does not list) is refused by a reason that names it,
-/// and a plain launch is refused because this host runs no backend, so each invocation runs as
-/// typed and nothing is created. The rule itself is the package contract's, shown in the SDK; this
-/// is the worker's use of it.
+/// KR-REQ-12.07: an integration that declares a backend establishes nothing where it cannot be
+/// served: a launch the package does not serve (an option typed, a word it does not list) is
+/// refused by a reason that names it, and a plain launch is refused where no session holds the
+/// server it would run, so each invocation runs as typed and nothing is created. The rule itself
+/// is the package contract's, shown in the SDK; this is the worker's use of it.
 #[tokio::test]
 async fn kr_req_12_07_an_integration_that_declares_a_backend_establishes_nothing_and_says_why() {
     let setup = Setup::shaped(
@@ -1221,16 +1221,20 @@ async fn kr_req_12_07_an_integration_that_declares_a_backend_establishes_nothing
         why.contains("\"exec\" is not a word the integration applies to"),
         "{why}"
     );
+    // A plain launch is served by a gateway where the host can run the server; these backends
+    // belong to no session that could hold it, or are on a platform that runs none.
     for typed in [
         &["codex"][..],
         &["codex", "resume"],
         &["codex", "fork", "abc"],
     ] {
         let why = refused(typed);
-        assert!(
-            why.contains("declares a backend, and this host runs none"),
-            "{typed:?}: {why}"
-        );
+        let reason = if cfg!(unix) {
+            "keeps no record of its processes"
+        } else {
+            "this platform runs none"
+        };
+        assert!(why.contains(reason), "{typed:?}: {why}");
     }
     assert!(
         setup.established().is_empty(),
