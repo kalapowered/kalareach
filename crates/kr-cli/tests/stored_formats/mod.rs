@@ -20,6 +20,15 @@
 //! The lock also names every other thing the host keeps under the state root with the reason it
 //! has no version, so that a reference run can tell a file nothing names from one something does.
 //!
+//! A store whose document has levels (the configuration document) is locked a little differently.
+//! A section of nullable fields that arrives with a level costs the level and no version, so the
+//! store's digest covers everything except those sections, and the lock records the store's level,
+//! the distance at which a name is taken for a misspelling, and a digest of each such section.
+//! A section may be added at the same version when it has the shape that lets an older release
+//! ignore it, its level is above the store's level before it and no higher than the store's level
+//! now, and no locked section's digest, no level and no distance moves with the version standing
+//! still.
+//!
 //! What it cannot see, and the documentation says so: a hand edit of the lock itself (the same
 //! check against the lock on main sees that), a type that a store keeps and that no type the table
 //! declares holds, and a list of words the code matches by hand that the table does not declare.
@@ -34,6 +43,7 @@ pub mod table;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
+use kr_protocol::hostinfo::configuration::{BASE_LEVEL, Levelled, NEAR_MISS, Release, VERSION};
 use kr_protocol::update::{Recording, ReleaseStore, StoreScope};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -75,6 +85,27 @@ pub struct Locked {
     pub digest: String,
     /// The labels of what it keeps, for the person who reads the lock.
     pub kept: Vec<String>,
+    /// For a store whose document has levels, the level it is read at.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub level: Option<u64>,
+    /// For a store whose document has levels, how many edits apart a name may be from one a
+    /// release knows before that release takes it for a misspelling. It never goes down.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub near_miss: Option<u32>,
+    /// For a store whose document has levels, the sections that arrived with a level.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub members: Vec<LockedMember>,
+}
+
+/// One section of a document that arrived with a level.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LockedMember {
+    /// The section's name in the document.
+    pub member: String,
+    /// The level at which it arrived. It never changes.
+    pub level: u64,
+    /// The digest of the section's schema with every definition it reaches.
+    pub digest: String,
 }
 
 /// One named thing under the state root.
@@ -178,6 +209,16 @@ pub struct Store {
     pub owned: Vec<Claim>,
     /// What it keeps.
     pub kept: Vec<Kept>,
+    /// For a store whose document has levels, how it is read.
+    pub levels: Option<Levels>,
+}
+
+/// How a store's document is read when it has levels.
+pub struct Levels {
+    /// The release whose level and table of sections the lock records for the store.
+    pub release: Release,
+    /// The schema of the whole document, with the sections that arrived with a level in it.
+    pub document: Value,
 }
 
 /// A name a store owns beside its own file.
@@ -235,6 +276,36 @@ pub fn protocol<T: JsonSchema>(name: &'static str) -> Kept {
     Kept::Protocol(
         name,
         kr_protocol::schema::schema_for::<T>(),
+        std::any::type_name::<T>(),
+    )
+}
+
+/// A document schema without the sections that arrived with a level: what the store's version
+/// stands for, and so what a raise of the level alone moves nothing of.
+#[must_use]
+pub fn at_base(schema: &Value, levelled: &[Levelled]) -> Value {
+    let mut base = schema.clone();
+    if let Some(properties) = base.get_mut("properties").and_then(Value::as_object_mut) {
+        for entry in levelled {
+            properties.remove(entry.member);
+        }
+    }
+    if let Some(Value::Array(required)) = base.get_mut("required") {
+        required.retain(|name| {
+            !levelled
+                .iter()
+                .any(|entry| name.as_str() == Some(entry.member))
+        });
+    }
+    base
+}
+
+/// The schema of a type the protocol generates one for, without the sections of `levelled`.
+#[must_use]
+pub fn protocol_at_base<T: JsonSchema>(name: &'static str, levelled: &[Levelled]) -> Kept {
+    Kept::Protocol(
+        name,
+        at_base(&kr_protocol::schema::schema_for::<T>(), levelled),
         std::any::type_name::<T>(),
     )
 }
@@ -609,6 +680,7 @@ pub fn observe(store: &Store, ddl: &[String]) -> Result<Observed, String> {
         entry: store.entry.clone(),
         digest: digest(store, ddl)?,
         kept: store.kept.iter().map(Kept::label).collect(),
+        levels: store.levels.as_ref().map(observe_levels),
     })
 }
 
@@ -620,6 +692,403 @@ pub struct Observed {
     pub digest: String,
     /// The labels of what it keeps.
     pub kept: Vec<String>,
+    /// For a store whose document has levels, what the code says of them.
+    pub levels: Option<ObservedLevels>,
+}
+
+/// What the code says of the levels of a store's document.
+pub struct ObservedLevels {
+    /// The level the document is read at.
+    pub level: u64,
+    /// How many edits apart a name may be from one a release knows before it is taken for a
+    /// misspelling.
+    pub near_miss: u32,
+    /// The sections that arrived with a level, one for each entry of the release's table, in the
+    /// table's order and with a duplicate as many times as it was declared.
+    pub members: Vec<ObservedMember>,
+    /// Every top-level property of the document.
+    pub properties: Vec<Property>,
+    /// What the real reader and writer say of the sections the table lists: the sections that are
+    /// written when they are unused, and the ones that are not closed. Each is `(section, finding)`.
+    pub eligibility: Vec<(String, String)>,
+}
+
+/// One section of the document that arrived with a level.
+pub struct ObservedMember {
+    /// The section's name in the document.
+    pub member: String,
+    /// The level at which it arrived.
+    pub level: u64,
+    /// The digest of its schema with every definition it reaches.
+    pub digest: String,
+}
+
+/// One top-level property of the document.
+pub struct Property {
+    /// Its name.
+    pub name: String,
+    /// The level it arrived at, when it is a section of the release's table.
+    pub level: Option<u64>,
+    /// Its schema with every definition it reaches in place of the reference to it.
+    pub schema: Value,
+    /// Its own name and every name declared below it.
+    pub names: std::collections::BTreeSet<String>,
+    /// The references in it that the document's own definitions do not hold.
+    pub unresolved: Vec<String>,
+}
+
+/// What the code says of the levels of a store's document, with the checks that need the real
+/// reader and writer run: a section of the table is held to what `load_in` and `contents_in` do.
+#[must_use]
+pub fn observe_levels(levels: &Levels) -> ObservedLevels {
+    let mut observed = levels_view(&levels.document, &levels.release);
+    observed.eligibility = eligibility(&levels.release, &observed.properties);
+    observed
+}
+
+/// What the code says of the levels of a document of this schema, from the schema and the
+/// release's table alone.
+#[must_use]
+pub fn levels_view(document: &Value, release: &Release) -> ObservedLevels {
+    let definitions = document.get("$defs").cloned().unwrap_or_else(|| json!({}));
+    let names = kr_protocol::hostinfo::configuration::names_by_member_of(document);
+    let properties: Vec<Property> = document
+        .get("properties")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flatten()
+        .map(|(name, schema)| {
+            let mut unresolved = Vec::new();
+            unresolved_references(
+                schema,
+                &definitions,
+                &mut std::collections::BTreeSet::new(),
+                &mut unresolved,
+            );
+            let mut root = schema.clone();
+            if let Value::Object(members) = &mut root {
+                members.insert("$defs".to_owned(), definitions.clone());
+            }
+            Property {
+                name: name.clone(),
+                level: release
+                    .levelled
+                    .iter()
+                    .find(|entry| entry.member == name)
+                    .map(|entry| entry.level),
+                schema: normalise_schema(&root),
+                names: names.get(name).cloned().unwrap_or_default(),
+                unresolved,
+            }
+        })
+        .collect();
+    let members = release
+        .levelled
+        .iter()
+        .map(|entry| ObservedMember {
+            member: entry.member.to_owned(),
+            level: entry.level,
+            digest: properties
+                .iter()
+                .find(|property| property.name == entry.member)
+                .map_or_else(String::new, |property| {
+                    hex(&kr_cbor::sha256(canonical(&property.schema).as_bytes()))
+                }),
+        })
+        .collect();
+    ObservedLevels {
+        level: release.level,
+        near_miss: u32::try_from(NEAR_MISS).expect("a small number"),
+        members,
+        properties,
+        eligibility: Vec::new(),
+    }
+}
+
+/// Every reference in `schema`, and in each definition it reaches, that is not a reference to a
+/// definition `definitions` holds. The normaliser drops one without a word, so it is found before
+/// the schema is resolved.
+fn unresolved_references(
+    schema: &Value,
+    definitions: &Value,
+    seen: &mut std::collections::BTreeSet<String>,
+    found: &mut Vec<String>,
+) {
+    match schema {
+        Value::Object(members) => {
+            for (key, member) in members {
+                if key == "$ref" {
+                    let Some(reference) = member.as_str() else {
+                        continue;
+                    };
+                    match reference
+                        .strip_prefix("#/$defs/")
+                        .and_then(|name| definitions.get(name).map(|held| (name, held)))
+                    {
+                        Some((name, held)) => {
+                            if seen.insert(name.to_owned()) {
+                                unresolved_references(held, definitions, seen, found);
+                            }
+                        }
+                        None => found.push(reference.to_owned()),
+                    }
+                } else {
+                    unresolved_references(member, definitions, seen, found);
+                }
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                unresolved_references(item, definitions, seen, found);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// What the real reader and writer say of each section the release's table lists. A section that
+/// names no property of the schema is the name rules' to refuse, not this.
+///
+/// An unused section must not be written, so that a document that holds none of the sections of a
+/// level is one a release that reads less reads strictly; and a section must be closed, so that
+/// the release that knows it keeps reading what is in it strictly.
+fn eligibility(release: &Release, properties: &[Property]) -> Vec<(String, String)> {
+    use kr_protocol::hostinfo::configuration::{DocumentState, contents_in, load_in};
+
+    let mut found = Vec::new();
+    for entry in release.levelled {
+        let Some(property) = properties
+            .iter()
+            .find(|property| property.name == entry.member)
+        else {
+            continue;
+        };
+        let version = VERSION;
+        let unused: serde_json::Map<String, Value> = property
+            .schema
+            .get("properties")
+            .and_then(Value::as_object)
+            .into_iter()
+            .flatten()
+            .map(|(field, _)| (field.clone(), Value::Null))
+            .collect();
+        for (what, document) in [
+            ("absent", json!({ "version": version })),
+            (
+                "all null",
+                json!({ "version": version, entry.member: unused }),
+            ),
+        ] {
+            let loaded = load_in(Some(document.to_string().as_bytes()), release);
+            let Some(read) = loaded
+                .document
+                .filter(|_| loaded.status.state == DocumentState::Loaded)
+            else {
+                found.push((
+                    entry.member.to_owned(),
+                    format!(
+                        "a document with the section {what} is not read: {:?}",
+                        loaded.status.state
+                    ),
+                ));
+                continue;
+            };
+            let written: Value =
+                serde_json::from_str(&contents_in(&read, release)).unwrap_or(Value::Null);
+            if written.get(entry.member).is_some() {
+                found.push((
+                    entry.member.to_owned(),
+                    format!(
+                        "the section is written when it is {what}: its field on the document has no \
+                         skip_serializing_if of the predicate for an unused section, so a release \
+                         that reads less would find a member it does not know"
+                    ),
+                ));
+            }
+            if written.get("level").and_then(Value::as_u64) != Some(BASE_LEVEL) {
+                found.push((
+                    entry.member.to_owned(),
+                    format!("a document with the section {what} is not written at the base level"),
+                ));
+            }
+        }
+        let probe = json!({
+            "version": version,
+            "level": entry.level,
+            entry.member: { "unknown_field_the_section_does_not_declare": {} },
+        });
+        if load_in(Some(probe.to_string().as_bytes()), release)
+            .status
+            .state
+            == DocumentState::Loaded
+        {
+            found.push((
+                entry.member.to_owned(),
+                "the section reads a field it does not declare: it is not closed".to_owned(),
+            ));
+        }
+    }
+    found
+}
+
+/// What is wrong with the design of the sections a release lists, whatever the lock holds: the
+/// rules a new section must satisfy so that a release that does not know it can ignore it, and a
+/// release that does can keep reading it strictly.
+#[must_use]
+pub fn design_findings(levels: &ObservedLevels) -> Vec<String> {
+    let mut found = Vec::new();
+    for (index, member) in levels.members.iter().enumerate() {
+        let name = &member.member;
+        if levels.members[..index]
+            .iter()
+            .any(|other| other.member == *name)
+        {
+            found.push(format!("the section {name} is declared more than once"));
+        }
+        let Some(property) = levels
+            .properties
+            .iter()
+            .find(|property| property.name == *name)
+        else {
+            found.push(format!(
+                "the section {name} names no property of the document: a misspelt name would count as a base member, which the writer never leaves out and the level never counts"
+            ));
+            continue;
+        };
+        if member.level <= BASE_LEVEL || member.level > levels.level {
+            found.push(format!(
+                "the section {name} arrives at level {}, which is not above the base level {BASE_LEVEL} and no higher than the level {} the document is read at",
+                member.level, levels.level
+            ));
+        }
+        let snake = name.len() >= 2
+            && name.len() <= 64
+            && name
+                .chars()
+                .next()
+                .is_some_and(|first| first.is_ascii_lowercase())
+            && name.chars().all(|character| {
+                character.is_ascii_lowercase() || character.is_ascii_digit() || character == '_'
+            });
+        if !snake {
+            found.push(format!(
+                "the section {name} is not ASCII snake case, so a doctor could not always show it"
+            ));
+        }
+        // Every other property and every name below one: a release that does not know this section
+        // takes it for a misspelling of one of them when it is within the distance.
+        let others: std::collections::BTreeSet<&str> = levels
+            .properties
+            .iter()
+            .filter(|other| other.name != *name)
+            .flat_map(|other| other.names.iter().map(String::as_str))
+            .collect();
+        for known in others {
+            if kr_protocol::hostinfo::configuration::near_miss(name, known) {
+                found.push(format!(
+                    "the section {name} is within {NEAR_MISS} edits of the name {known}, so a release that does not know it would take it for a misspelling of that name"
+                ));
+            }
+        }
+        found.extend(shape_findings(name, property));
+    }
+    for (member, finding) in &levels.eligibility {
+        found.push(format!("the section {member}: {finding}"));
+    }
+    found
+}
+
+/// The shape a section must have: an object that is not nullable, closed at every depth, whose
+/// every immediate field is nullable with a null default, whose own default is none or all null,
+/// and that refers to nothing outside the document's definitions.
+fn shape_findings(name: &str, property: &Property) -> Vec<String> {
+    let mut found = Vec::new();
+    for reference in &property.unresolved {
+        found.push(format!(
+            "the section {name} refers to {reference}, which the document's definitions do not hold"
+        ));
+    }
+    let schema = &property.schema;
+    let is_object = schema.get("type").and_then(Value::as_str) == Some("object");
+    let alternatives = ["anyOf", "oneOf", "allOf"]
+        .iter()
+        .any(|keyword| schema.get(keyword).is_some());
+    if !is_object || alternatives {
+        found.push(format!(
+            "the section {name} is not an object that cannot be null: a nullable section is omitted when unused but read back as present, so the record differs from the file"
+        ));
+    }
+    open_objects(name, schema, &mut found);
+    let nullable = |field: &Value| -> bool {
+        let alternatives_null = |keyword: &str| {
+            field
+                .get(keyword)
+                .and_then(Value::as_array)
+                .is_some_and(|alternatives| {
+                    alternatives.iter().any(|alternative| {
+                        alternative.get("type").and_then(Value::as_str) == Some("null")
+                    })
+                })
+        };
+        alternatives_null("anyOf")
+            || alternatives_null("oneOf")
+            || field
+                .get("type")
+                .and_then(Value::as_array)
+                .is_some_and(|types| types.iter().any(|kind| kind.as_str() == Some("null")))
+            || field.get("type").and_then(Value::as_str) == Some("null")
+    };
+    for (field, schema) in schema
+        .get("properties")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flatten()
+    {
+        if !nullable(schema) {
+            found.push(format!(
+                "the section {name} has a field, {field}, that cannot be null, so absent would not mean not used"
+            ));
+        }
+        if schema.get("default") != Some(&Value::Null) {
+            found.push(format!(
+                "the section {name} has a field, {field}, whose default is not null"
+            ));
+        }
+    }
+    if let Some(default) = schema.get("default")
+        && !default
+            .as_object()
+            .is_some_and(|members| members.values().all(Value::is_null))
+    {
+        found.push(format!(
+            "the section {name} has a default that is not the all-null value"
+        ));
+    }
+    found
+}
+
+/// Reports every object that declares properties and is not closed.
+fn open_objects(name: &str, schema: &Value, found: &mut Vec<String>) {
+    match schema {
+        Value::Object(members) => {
+            if members.contains_key("properties")
+                && members.get("additionalProperties") != Some(&Value::Bool(false))
+            {
+                found.push(format!(
+                    "the section {name} has an object that declares properties and is not closed (additionalProperties is not false)"
+                ));
+            }
+            for member in members.values() {
+                open_objects(name, member, found);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                open_objects(name, item, found);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// What differs between the code and the lock, in words that say what to do.
@@ -659,6 +1128,13 @@ pub fn findings(lock: &Lock, observed: &[Observed], named: &[Named]) -> Vec<Stri
     }
     for now in observed {
         let name = &now.entry.store;
+        if let Some(levels) = &now.levels {
+            found.extend(
+                design_findings(levels)
+                    .into_iter()
+                    .map(|finding| format!("the store {name}: {finding}")),
+            );
+        }
         let Some(locked) = lock
             .stores
             .iter()
@@ -692,6 +1168,7 @@ pub fn findings(lock: &Lock, observed: &[Observed], named: &[Named]) -> Vec<Stri
                 "what the store {name} keeps has changed and its version is still {code}: raise the version, with the step that brings an earlier store forward, then write the lock"
             ));
         }
+        found.extend(level_findings(name, now, locked));
     }
     for locked in &lock.stores {
         if !observed
@@ -707,11 +1184,89 @@ pub fn findings(lock: &Lock, observed: &[Observed], named: &[Named]) -> Vec<Stri
     found
 }
 
+/// What differs between the code and the lock about the levels of a store's document, and what is
+/// wrong with the design of its sections whatever the lock holds.
+fn level_findings(name: &str, now: &Observed, locked: &Locked) -> Vec<String> {
+    let mut found = Vec::new();
+    let Some(levels) = &now.levels else {
+        if locked.level.is_some() || locked.near_miss.is_some() || !locked.members.is_empty() {
+            found.push(format!(
+                "the lock records levels for the store {name} and the code does not: write the lock"
+            ));
+        }
+        return found;
+    };
+    if locked.level != Some(levels.level) {
+        found.push(format!(
+            "the store {name} is read at level {} in the code and {} in the lock: write the lock",
+            levels.level,
+            locked
+                .level
+                .map_or_else(|| "none".to_owned(), |level| level.to_string())
+        ));
+    }
+    if locked.near_miss != Some(levels.near_miss) {
+        found.push(format!(
+            "the store {name} takes a name within {} edits of a known name for a misspelling in the code and {} in the lock: write the lock",
+            levels.near_miss,
+            locked
+                .near_miss
+                .map_or_else(|| "none".to_owned(), |distance| distance.to_string())
+        ));
+    }
+    let same_version = now.entry.version == locked.entry.version;
+    for member in &levels.members {
+        let Some(kept) = locked
+            .members
+            .iter()
+            .find(|kept| kept.member == member.member)
+        else {
+            found.push(format!(
+                "the section {} of the store {name} is in the code and not in the lock: write the lock",
+                member.member
+            ));
+            continue;
+        };
+        if kept.level != member.level {
+            found.push(format!(
+                "the section {} of the store {name} arrives at level {} in the code and {} in the lock: a section's level never changes",
+                member.member, member.level, kept.level
+            ));
+        } else if kept.digest != member.digest {
+            found.push(if same_version {
+                format!(
+                    "the section {} of the store {name} has changed and its version is still {}: raise the version, then write the lock",
+                    member.member, now.entry.version
+                )
+            } else {
+                format!(
+                    "the section {} of the store {name} differs from the lock's: write the lock",
+                    member.member
+                )
+            });
+        }
+    }
+    for kept in &locked.members {
+        if !levels
+            .members
+            .iter()
+            .any(|member| member.member == kept.member)
+        {
+            found.push(format!(
+                "the lock lists the section {} of the store {name} and the code does not",
+                kept.member
+            ));
+        }
+    }
+    found
+}
+
 /// The lock that brings the committed one up to the code, or why it cannot be.
 ///
 /// A digest that moved while its version stood still, a version that went down, and a store moved
 /// to another place are refused: the lock is not brought up to the code past a version that was
-/// not raised.
+/// not raised. A section that arrives with a level is held to its design whatever the lock holds,
+/// and to its level against the lock's.
 ///
 /// # Errors
 ///
@@ -722,6 +1277,15 @@ pub fn write(
     named: &[Named],
 ) -> Result<Lock, Vec<String>> {
     let mut refused = Vec::new();
+    for now in observed {
+        if let Some(levels) = &now.levels {
+            refused.extend(
+                design_findings(levels)
+                    .into_iter()
+                    .map(|finding| format!("the store {}: {finding}", now.entry.store)),
+            );
+        }
+    }
     if let Some(committed) = committed {
         for locked in &committed.stores {
             if !observed
@@ -760,6 +1324,9 @@ pub fn write(
                     now.entry.version
                 ));
             }
+            if let Some(levels) = &now.levels {
+                refused.extend(level_refusals(name, now, levels, locked));
+            }
         }
     }
     if !refused.is_empty() {
@@ -771,6 +1338,19 @@ pub fn write(
             entry: now.entry.clone(),
             digest: now.digest.clone(),
             kept: now.kept.clone(),
+            level: now.levels.as_ref().map(|levels| levels.level),
+            near_miss: now.levels.as_ref().map(|levels| levels.near_miss),
+            members: now.levels.as_ref().map_or_else(Vec::new, |levels| {
+                levels
+                    .members
+                    .iter()
+                    .map(|member| LockedMember {
+                        member: member.member.clone(),
+                        level: member.level,
+                        digest: member.digest.clone(),
+                    })
+                    .collect()
+            }),
         })
         .collect();
     stores.sort_by(|left, right| left.entry.store.cmp(&right.entry.store));
@@ -783,6 +1363,72 @@ pub fn write(
         stores,
         named: names,
     })
+}
+
+/// Why the levels of a store's document cannot be brought up to the lock's: a level or a distance
+/// that goes down, a section whose level changes, a section dropped or changed with the version
+/// standing still, and a new section whose level is not above the store's level before it and no
+/// higher than the store's level now.
+///
+/// A raise of the version may change or drop a section: what a version stands for is anything the
+/// raise says. It never lowers the level or the distance, because a release that reads the new
+/// version is at or above the level of every document it reads.
+fn level_refusals(
+    name: &str,
+    now: &Observed,
+    levels: &ObservedLevels,
+    locked: &Locked,
+) -> Vec<String> {
+    let mut refused = Vec::new();
+    if let Some(level) = locked.level
+        && levels.level < level
+    {
+        refused.push(format!(
+            "the level of the store {name} would go down, from {level} to {}",
+            levels.level
+        ));
+    }
+    if let Some(distance) = locked.near_miss
+        && levels.near_miss < distance
+    {
+        refused.push(format!(
+            "the distance at which a name is taken for a misspelling in the store {name} would go down, from {distance} to {}: a release in the field keeps the distance it shipped with",
+            levels.near_miss
+        ));
+    }
+    let raised = now.entry.version > locked.entry.version;
+    for kept in &locked.members {
+        match levels.members.iter().find(|member| member.member == kept.member) {
+            None if !raised => refused.push(format!(
+                "the section {} of the store {name} would leave it with the version standing still: raise the version first",
+                kept.member
+            )),
+            Some(member) if member.level != kept.level => refused.push(format!(
+                "the level of the section {} of the store {name} would change from {} to {}",
+                kept.member, kept.level, member.level
+            )),
+            Some(member) if member.digest != kept.digest && !raised => refused.push(format!(
+                "the section {} of the store {name} has changed and its version is still {}: raise it first",
+                kept.member, now.entry.version
+            )),
+            _ => {}
+        }
+    }
+    let before = locked.level.unwrap_or(BASE_LEVEL);
+    for member in &levels.members {
+        if !locked
+            .members
+            .iter()
+            .any(|kept| kept.member == member.member)
+            && (member.level <= before || member.level > levels.level)
+        {
+            refused.push(format!(
+                "the new section {} of the store {name} arrives at level {}, which has to be above the level {before} the store was at and no higher than the level {} it is now",
+                member.member, member.level, levels.level
+            ));
+        }
+    }
+    refused
 }
 
 fn scope_name(scope: StoreScope) -> &'static str {
@@ -1462,3 +2108,6 @@ pub fn ddl_of(path: &Path) -> Result<Vec<String>, String> {
     rows.collect::<Result<_, _>>()
         .map_err(|error| error.to_string())
 }
+
+#[cfg(test)]
+mod levels_tests;
