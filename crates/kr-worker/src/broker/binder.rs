@@ -796,12 +796,15 @@ impl BrokerState {
         self.settle_owed_rows(now);
     }
 
-    /// Forgets every binding of one instance.
+    /// Forgets every binding of one instance, and lets go of the tables pinned for it: both go
+    /// whenever the instance does, whichever way it goes.
     pub(super) fn forget_instance(
         &mut self,
         application_instance_id: ApplicationInstanceId,
         now: TimestampMs,
     ) {
+        self.pinned_tables
+            .retain(|(instance, _), _| *instance != application_instance_id);
         let bindings: Vec<BrokerBindingId> = self
             .bindings
             .values()
