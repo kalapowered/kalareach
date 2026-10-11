@@ -60,6 +60,9 @@ pub(crate) fn host_of(origin: &GatewayOrigin) -> String {
 pub struct SyncService {
     file: PathBuf,
     origin: Mutex<GatewayOrigin>,
+    /// Held from the moment a choice is written to the moment it is the one in memory, so that two
+    /// choices made together leave the file and this run saying the same thing.
+    keeping: Mutex<()>,
 }
 
 impl SyncService {
@@ -85,6 +88,7 @@ impl SyncService {
         Self {
             file,
             origin: Mutex::new(origin),
+            keeping: Mutex::new(()),
         }
     }
 
@@ -121,6 +125,7 @@ impl SyncService {
                  an http one on this computer: {error}"
             ))
         })?;
+        let _keeping = self.keeping.lock().unwrap_or_else(PoisonError::into_inner);
         write_owner_only_file(&self.file, origin.as_str().as_bytes()).map_err(|error| {
             CommandError::local_failure(format!(
                 "the sync service setting could not be kept: {error}"
