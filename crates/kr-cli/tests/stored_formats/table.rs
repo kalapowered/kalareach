@@ -7,7 +7,7 @@
 
 use kr_protocol::update::{Recording, ReleaseStore, StoreScope};
 
-use super::{Claim, Kept, Named, Store, Writers, protocol};
+use super::{Claim, Kept, Levels, Named, Store, Writers, protocol, protocol_at_base};
 
 fn version(number: i64) -> u32 {
     u32::try_from(number).expect("a version is a small number")
@@ -64,6 +64,7 @@ pub fn table() -> Vec<Store> {
     let mut stores = vec![
         // The store of releases itself.
         Store {
+            levels: None,
             writers: Writers::Update,
             entry: entry(
                 "install-record",
@@ -91,6 +92,7 @@ pub fn table() -> Vec<Store> {
         },
         // The startup files an install wrote an entry to, which a removal works from.
         Store {
+            levels: None,
             writers: Writers::Barred(&kr_shell_integration::host::startup::ENTRY_WRITTEN),
             entry: entry(
                 kr_shell_integration::host::startup::ENTRY_WRITTEN.store,
@@ -108,6 +110,7 @@ pub fn table() -> Vec<Store> {
         },
         // The environment's own state directory.
         Store {
+            levels: None,
             writers: Writers::Daemon,
             entry: entry(
                 "registry",
@@ -121,7 +124,10 @@ pub fn table() -> Vec<Store> {
             kept: vec![
                 protocol::<session::SessionCreateParams>("SessionCreateParams"),
                 protocol::<session::ClosureRecord>("ClosureRecord"),
-                protocol::<hostinfo::configuration::ConfigurationDocument>("ConfigurationDocument"),
+                protocol_at_base::<hostinfo::configuration::ConfigurationDocument>(
+                    "ConfigurationDocument",
+                    hostinfo::configuration::LEVELLED,
+                ),
                 protocol::<grant::Grant>("Grant"),
                 protocol::<sharing::InvitationPreview>("InvitationPreview"),
                 protocol::<sharing::GrantCreateResult>("GrantCreateResult"),
@@ -180,6 +186,7 @@ pub fn table() -> Vec<Store> {
             ],
         },
         Store {
+            levels: None,
             writers: Writers::Daemon,
             entry: entry(
                 "attention",
@@ -206,6 +213,7 @@ pub fn table() -> Vec<Store> {
             ],
         },
         Store {
+            levels: None,
             writers: Writers::Daemon,
             entry: entry(
                 "backup",
@@ -219,6 +227,7 @@ pub fn table() -> Vec<Store> {
             kept: vec![protocol::<archive::ArchiveDescriptor>("ArchiveDescriptor")],
         },
         Store {
+            levels: None,
             writers: Writers::Daemon,
             entry: entry(
                 "delivery",
@@ -240,6 +249,7 @@ pub fn table() -> Vec<Store> {
             ],
         },
         Store {
+            levels: None,
             writers: Writers::Daemon,
             entry: entry(
                 "descriptions",
@@ -253,6 +263,7 @@ pub fn table() -> Vec<Store> {
             kept: Vec::new(),
         },
         Store {
+            levels: None,
             writers: Writers::Daemon,
             entry: entry(
                 "privacy",
@@ -266,6 +277,7 @@ pub fn table() -> Vec<Store> {
             kept: Vec::new(),
         },
         Store {
+            levels: None,
             writers: Writers::Daemon,
             entry: entry(
                 "workflows",
@@ -296,6 +308,7 @@ pub fn table() -> Vec<Store> {
             ],
         },
         Store {
+            levels: None,
             writers: Writers::Daemon,
             entry: entry(
                 "catalogue",
@@ -333,6 +346,7 @@ pub fn table() -> Vec<Store> {
             ],
         },
         Store {
+            levels: None,
             writers: Writers::Daemon,
             entry: entry(
                 "changesets",
@@ -359,6 +373,7 @@ pub fn table() -> Vec<Store> {
             ],
         },
         Store {
+            levels: None,
             writers: Writers::Daemon,
             entry: entry(
                 "projects",
@@ -394,6 +409,7 @@ pub fn table() -> Vec<Store> {
             ],
         },
         Store {
+            levels: None,
             writers: Writers::Daemon,
             entry: entry(
                 "transfers",
@@ -421,6 +437,7 @@ pub fn table() -> Vec<Store> {
             ],
         },
         Store {
+            levels: None,
             writers: Writers::Daemon,
             entry: entry(
                 "environments",
@@ -445,6 +462,7 @@ pub fn table() -> Vec<Store> {
             ],
         },
         Store {
+            levels: None,
             writers: Writers::Daemon,
             entry: entry(
                 "machine-group",
@@ -461,6 +479,7 @@ pub fn table() -> Vec<Store> {
             )],
         },
         Store {
+            levels: None,
             writers: Writers::Barred(&kr_shell_integration::host::terminal::PREFERENCE_WRITTEN),
             entry: entry(
                 kr_shell_integration::host::terminal::PREFERENCE_WRITTEN.store,
@@ -483,6 +502,7 @@ pub fn table() -> Vec<Store> {
             )],
         },
         Store {
+            levels: None,
             writers: Writers::Barred(&kr_cli::service_manager::WRITTEN),
             entry: entry(
                 kr_cli::service_manager::WRITTEN.store,
@@ -499,6 +519,7 @@ pub fn table() -> Vec<Store> {
             )],
         },
         Store {
+            levels: None,
             writers: Writers::Daemon,
             entry: entry(
                 "native-bridges",
@@ -532,6 +553,7 @@ pub fn table() -> Vec<Store> {
             ],
         },
         Store {
+            levels: None,
             writers: Writers::Daemon,
             entry: entry(
                 "agent-tools",
@@ -551,6 +573,7 @@ pub fn table() -> Vec<Store> {
             ],
         },
         Store {
+            levels: None,
             writers: Writers::Daemon,
             entry: entry(
                 "agent-tool-actions",
@@ -569,6 +592,7 @@ pub fn table() -> Vec<Store> {
         },
         // The records the client keeps on this device, in the user's state root.
         Store {
+            levels: None,
             writers: Writers::Barred(&kr_client::answers::WRITTEN),
             entry: entry(
                 kr_client::answers::WRITTEN.store,
@@ -586,6 +610,7 @@ pub fn table() -> Vec<Store> {
             ],
         },
         Store {
+            levels: None,
             writers: Writers::Barred(&kr_cli::machine::WRITTEN),
             entry: entry(
                 kr_cli::machine::WRITTEN.store,
@@ -611,6 +636,12 @@ pub fn table() -> Vec<Store> {
         // `version` member is read as the version its reader writes, and the lock counts it as
         // version 1, which every release that reads this document reads.
         Store {
+            levels: Some(Levels {
+                release: hostinfo::configuration::THIS_RELEASE,
+                document: kr_protocol::schema::schema_for::<
+                    hostinfo::configuration::ConfigurationDocument,
+                >(),
+            }),
             writers: Writers::Barred(&kr_cli::doctor::configuration::WRITTEN),
             entry: entry(
                 kr_cli::doctor::configuration::WRITTEN.store,
@@ -621,8 +652,10 @@ pub fn table() -> Vec<Store> {
                 u32::try_from(hostinfo::configuration::OLDEST_VERSION).expect("a small number"),
             ),
             owned: Vec::new(),
-            kept: vec![protocol::<hostinfo::configuration::ConfigurationDocument>(
-                "ConfigurationDocument",
+            kept: vec![protocol_at_base::<
+                hostinfo::configuration::ConfigurationDocument,
+            >(
+                "ConfigurationDocument", hostinfo::configuration::LEVELLED
             )],
         },
     ];

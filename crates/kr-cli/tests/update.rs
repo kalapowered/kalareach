@@ -9695,6 +9695,7 @@ fn the_lock_check_fails_on_a_moved_digest_and_the_writer_refuses_it() {
         },
         digest: digest.to_owned(),
         kept: Vec::new(),
+        levels: None,
     };
     let lock = stored_formats::write(None, &[store(7, "aa", "registry.sqlite")], &[])
         .expect("a first lock is written");

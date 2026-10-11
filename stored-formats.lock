@@ -145,7 +145,9 @@
       "digest": "c342cb3cc4391e4029491a3f300190ea752edc941bf351d199d400da21c8865d",
       "kept": [
         "ConfigurationDocument"
-      ]
+      ],
+      "level": 1,
+      "near_miss": 2
     },
     {
       "entry": {
