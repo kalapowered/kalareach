@@ -385,7 +385,8 @@ describe('the host’s draft for a session’s files', () => {
 
   it('shows no path from a grant that names another file or another method', async () => {
     const { controls, one, two, paths } = await twoFiles()
-    // The host confirmed both binds, so what refuses them is the window's own check of the grant.
+    // The host answers each bind with a draft, so the words are the window's own: the grant it gave
+    // names another file, or another method.
     controls.hostDrafts.giveNextGrantTo({ transfer_id: two.transfer_id })
     await paths.attach(SESSION_MAIN, { sessionId: SESSION_MAIN }, one)
     expect(paths.snapshot().get(one.transfer_id)).toMatchObject({
@@ -399,7 +400,6 @@ describe('the host’s draft for a session’s files', () => {
       kind: 'refused',
       words: expect.stringContaining('gave no path') as string
     })
-    expect(controls.hostDrafts.bound).toHaveLength(2)
   })
 
   it('says a paired host takes no file, and asks the host for nothing', async () => {

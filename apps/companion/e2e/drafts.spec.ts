@@ -154,34 +154,52 @@ for (const surface of ['ios', 'android'] as const) {
       expect(across.page, 'the page is no wider than the screen').toBeLessThanOrEqual(across.screen)
       const outside = await page.evaluate(() => {
         const edge = window.innerWidth
-        const past = (element: Element) => element.getBoundingClientRect().right > edge + 0.5
-        const label = (element: Element) => element.textContent?.slice(0, 40) ?? element.tagName
-        const path = [...document.querySelectorAll('[data-testid="attachment-paths"] *')]
-          .filter(past)
-          .map(label)
-        // Everything in a chip lies inside the chip's own box, and so inside the screen: the name
-        // is an element of its own, so it is among what is checked.
-        const chip = [...document.querySelectorAll('[data-testid="draft-attachments"] > *')].flatMap(
-          (each) => {
-            const box = each.getBoundingClientRect()
-            return [each, ...each.querySelectorAll('*')]
-              .filter((element) => {
-                const inner = element.getBoundingClientRect()
-                return past(element) || inner.left < box.left - 0.5 || inner.right > box.right + 0.5
-              })
-              .map(label)
+        interface Span {
+          readonly left: number
+          readonly right: number
+          readonly what: string
+        }
+        const label = (text: string | null) => (text ?? '').trim().slice(0, 40)
+        // Where everything under a root is drawn: each element's box, and each line of its text,
+        // because a box does not say where its text runs when the text runs out of it.
+        const spans = (root: Element): Span[] => {
+          const found = [root, ...root.querySelectorAll('*')].map((element) => {
+            const box = element.getBoundingClientRect()
+            return { left: box.left, right: box.right, what: label(element.textContent) || element.tagName }
+          })
+          const walk = document.createTreeWalker(root, NodeFilter.SHOW_TEXT)
+          for (let node = walk.nextNode(); node !== null; node = walk.nextNode()) {
+            const range = document.createRange()
+            range.selectNodeContents(node)
+            for (const line of Array.from(range.getClientRects())) {
+              if (line.width > 0) {
+                found.push({ left: line.left, right: line.right, what: label(node.textContent) })
+              }
+            }
           }
+          return found
+        }
+        const beyond = (found: readonly Span[], within: { left: number; right: number }) =>
+          found
+            .filter((one) => one.left < within.left - 0.5 || one.right > within.right + 0.5)
+            .map((one) => one.what)
+        const screen = { left: 0, right: edge }
+        const path = [...document.querySelectorAll('[data-testid="attachment-paths"]')].flatMap(
+          (each) => beyond(spans(each), screen)
+        )
+        // Everything in a chip lies inside the screen and inside the chip's own box, its name and
+        // its lines of text among it.
+        const chip = [...document.querySelectorAll('[data-testid="draft-attachments"] > *')].flatMap(
+          (each) => [...beyond(spans(each), screen), ...beyond(spans(each), each.getBoundingClientRect())]
         )
         return [...path, ...chip]
       })
       expect(outside, 'lines of the chip and the path that run past the screen or their chip').toEqual([])
       // The notice after the upload covers the screen at this size, and the pointer that picked the
-      // file rests on it, which holds it there; it is dismissed from its own control, and the
-      // chip's control can be pressed once it has gone.
-      const notice = page.locator('.toast')
-      await notice.getByRole('button', { name: 'Dismiss' }).focus()
-      await page.keyboard.press('Enter')
-      await expect(notice).toHaveCount(0)
+      // file can rest on it, which holds it there. The pointer moves off it, as a finger lifts, and
+      // the case waits for the notice to go before it presses the chip's control.
+      await page.mouse.move(1, 1)
+      await expect(page.locator('.toast')).toHaveCount(0, { timeout: 10_000 })
       await page
         .getByRole('button', { name: /^Remove .* from this draft$/ })
         .click({ trial: true, timeout: 2_000 })
