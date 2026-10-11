@@ -415,6 +415,7 @@ impl Journal {
                         (4, 5) => self.migrate_4_to_5()?,
                         (5, 6) => self.migrate_5_to_6()?,
                         (6, 7) => self.migrate_6_to_7()?,
+                        (7, 8) => self.migrate_7_to_8()?,
                         _ => {
                             return Err(unavailable_detail_owned(format!(
                                 "no migration is implemented from schema version {} to {}",
@@ -648,6 +649,24 @@ impl Journal {
             let _ = self.connection.execute_batch("ROLLBACK;");
             faulted(&self.health, error)
         })
+    }
+
+    /// Names the servers a session starts in the record of its processes.
+    ///
+    /// The record keeps its table: the servers are a member of what it holds, which a journal
+    /// written before has none of and reads as none. The version rises so that a build that does
+    /// not read the member refuses a journal that has it, rather than reading a record it would
+    /// take for whole.
+    ///
+    /// This serves a journal written under version 7. Remove it, with its entry in the ladder,
+    /// once no supported upgrade starts from a version 7 journal.
+    fn migrate_7_to_8(&self) -> Result<()> {
+        self.connection
+            .execute_batch("BEGIN IMMEDIATE; UPDATE schema_version SET version = 8; COMMIT;")
+            .map_err(|error| {
+                let _ = self.connection.execute_batch("ROLLBACK;");
+                faulted(&self.health, error)
+            })
     }
 
     /// Returns the path of the database this journal is open on, if it is open on a file.
