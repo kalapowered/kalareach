@@ -1355,6 +1355,76 @@ async fn a_retry_of_an_admitted_create_is_not_refused_because_the_document_broke
     );
 }
 
+/// KR-REQ-26.13: a create that waited across the acceptance of a document the host cannot use
+/// launches nothing.
+///
+/// The create is usable when it begins: the document in force is fine, so nothing refuses it at the
+/// start. It then stops between its reservation and its launch, as one queued behind other work
+/// does, and the document breaks and is accepted while it waits. The launch is the last thing it
+/// does, and the document in force then is what decides it: an owner who has put the host in a
+/// state that creates no new session is not given one by a create that began earlier.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_create_that_waited_across_an_unusable_document_launches_nothing() {
+    let (temp, controller, asked) = daemon().await;
+    let environment_id = temp.environment_id();
+    let (connection_id, actor_id) = admitted(&controller).await;
+    let mutation = create_request(environment_id);
+
+    // The create stops here, between its reservation and the transition to `spawned`.
+    let paused_pending = controller.pending.lock().await;
+    let create = tokio::spawn({
+        let controller = Arc::clone(&controller);
+        let actor_id = actor_id.clone();
+        async move {
+            controller
+                .session_create(
+                    &actor_id,
+                    &mutation,
+                    carried(&controller, connection_id, half_a_minute(&controller)),
+                )
+                .await
+        }
+    });
+    reserved(&controller).await;
+
+    // The document breaks and the daemon accepts it, as any `kr doctor` makes it.
+    kr_ipc::paths::write_owner_only_file(
+        &kr_worker::config::document_path(&temp.environment()),
+        br#"{"version": 99}"#,
+    )
+    .expect("a document this build does not read");
+    let _ = controller.effective_configuration().await;
+    assert!(
+        controller.in_force().unusable.is_some(),
+        "the daemon holds a document it cannot use"
+    );
+    drop(paused_pending);
+
+    let refused = create
+        .await
+        .expect("the create finishes")
+        .expect_err("a create that waited across the acceptance starts nothing");
+    assert_eq!(refused.code(), ErrorCode::HostNotConfigured, "{refused}");
+    assert!(
+        asked.lock().expect("the record is not poisoned").is_empty(),
+        "no worker is started for a create the host refused"
+    );
+    let registry = controller.registry.lock().await;
+    assert_eq!(
+        registry
+            .reservations_in(LaunchPhase::Failed)
+            .expect("reads the reservations")
+            .len(),
+        1,
+        "the refused create is resolved rather than left occupying the environment"
+    );
+    assert_eq!(
+        registry.occupancy().expect("counts"),
+        0,
+        "the reservation it made is released"
+    );
+}
+
 /// A create request for a managed session whose shell no package can qualify.
 fn managed_request(environment_id: kr_protocol::ids::EnvironmentId) -> MutationRequest {
     let mut request = create_request(environment_id);
