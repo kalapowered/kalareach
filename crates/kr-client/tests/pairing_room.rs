@@ -568,7 +568,7 @@ async fn a_tunnel_to_an_ipv6_room_names_it_in_brackets() {
 }
 
 /// A proxy whose answer to the tunnel request does not end is read only as far as
-/// `MAX_TUNNEL_ANSWER_BYTES`, and the attempt ends there.
+/// `kr_client::tunnel::MAX_ANSWER_BYTES`, and the attempt ends there.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_tunnel_answer_that_does_not_end_is_refused_at_its_bound() {
     let authority = Authority::new("rendezvous test authority");

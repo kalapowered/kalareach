@@ -24,7 +24,6 @@
 
 use std::future::Future;
 use std::io;
-use std::net::IpAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll, ready};
@@ -39,7 +38,7 @@ use kr_protocol::rendezvous::{
 };
 use kr_protocol::scalars::to_base64url;
 use kr_transport::config::ProxyUrl;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio_rustls::TlsConnector;
@@ -48,6 +47,7 @@ use tokio_rustls::rustls::pki_types::ServerName;
 use tokio_websockets::{ClientBuilder, Limits, Message, WebSocketStream};
 
 use crate::shown::{Said, Shown};
+use crate::tunnel::{self, Carrier};
 
 /// How long opening a room socket may take: the name, the connection, TLS and the upgrade.
 pub const OPEN_DEADLINE: Duration = Duration::from_secs(10);
@@ -62,11 +62,6 @@ const CLOSE_DEADLINE: Duration = Duration::from_secs(1);
 ///
 /// A real answer's head is a few hundred bytes.
 pub const MAX_UPGRADE_ANSWER_BYTES: usize = 16 * 1024;
-
-/// The most of a proxy's answer to a tunnel request that is read before its head is complete.
-///
-/// A real answer is a status line and a few headers.
-pub const MAX_TUNNEL_ANSWER_BYTES: usize = 16 * 1024;
 
 /// How many of the room's pings may arrive while the socket cannot take the answers to them.
 ///
@@ -233,30 +228,8 @@ const WRONG_ACCEPT: &str = "the answer's accept value does not match the key thi
 /// Any other answer that is not an upgrade.
 const NOT_ACCEPTED: &str = "the answer is not an upgrade this client accepts";
 
-/// The proxy's address names no port.
-const PROXY_NO_PORT: &str = "the proxy's address names no port";
-/// The proxy's address names no host.
-const PROXY_NO_HOST: &str = "the proxy's address names no host";
-/// The connection to the proxy failed.
-const PROXY_UNREACHABLE: &str = "the proxy could not be reached";
-/// The proxy's host is not a name TLS can verify.
-const PROXY_NOT_A_TLS_NAME: &str = "the proxy's host is not a name TLS can verify";
-/// The TLS handshake with the proxy failed.
-const PROXY_NO_TLS: &str = "the TLS handshake with the proxy failed";
-/// The tunnel request could not be sent to the proxy.
-const PROXY_REQUEST_FAILED: &str = "the tunnel request to the proxy failed";
-/// The proxy's answer is longer than [`MAX_TUNNEL_ANSWER_BYTES`].
-const PROXY_ANSWER_TOO_LONG: &str =
-    "the proxy's answer to the tunnel request is longer than an answer may be";
-/// The proxy ended the connection before its answer's head was complete.
-const PROXY_ENDED: &str = "the proxy ended the connection before it answered";
-/// The proxy's answer does not begin with a status line.
-const PROXY_NO_STATUS_LINE: &str = "the proxy did not answer the tunnel request with a status line";
-/// The proxy answered the tunnel request with a status other than 2xx, which follows these words.
-const PROXY_REFUSED: &str = "the proxy refused the tunnel with status";
-
 /// The reasons this client gives a room failure, which are the only reasons a failure says.
-const ROOM_REASONS: [&str; 31] = [
+const ROOM_REASONS: [&str; 22] = [
     NO_VERIFIER,
     NOT_HTTPS,
     OPEN_BRACKETS,
@@ -279,15 +252,6 @@ const ROOM_REASONS: [&str; 31] = [
     UNPARSED,
     WRONG_ACCEPT,
     NOT_ACCEPTED,
-    PROXY_NO_PORT,
-    PROXY_NO_HOST,
-    PROXY_UNREACHABLE,
-    PROXY_NOT_A_TLS_NAME,
-    PROXY_NO_TLS,
-    PROXY_REQUEST_FAILED,
-    PROXY_ANSWER_TOO_LONG,
-    PROXY_ENDED,
-    PROXY_NO_STATUS_LINE,
 ];
 
 /// What a room failure says of its origin: the address as a diagnostic names one, or that it
@@ -304,15 +268,16 @@ fn room_origin(origin: &str) -> Shown {
 /// by its three-digit status, and a placeholder for any other.
 fn room_reason(reason: &str) -> Shown {
     let refused = reason
-        .strip_prefix(PROXY_REFUSED)
+        .strip_prefix(tunnel::REFUSED)
         .and_then(|rest| rest.strip_prefix(' '))
         .filter(|status| status.len() == 3 && status.bytes().all(|byte| byte.is_ascii_digit()))
         .and_then(|status| status.parse::<u16>().ok());
     if let Some(status) = refused {
-        return crate::shown!("{} {}", PROXY_REFUSED, status);
+        return crate::shown!("{} {}", tunnel::REFUSED, status);
     }
     ROOM_REASONS
         .iter()
+        .chain(tunnel::REASONS.iter())
         .find(|known| **known == reason)
         .map_or_else(
             || Shown::said("[a reason this client does not give]"),
@@ -446,14 +411,12 @@ async fn open_socket(
                 .await
                 .map_err(|_| unreachable(NO_CONNECTION))?,
         ),
-        Some(proxy) => {
-            tunnel(proxy, host, port, &tls)
-                .await
-                .map_err(|failure| RoomError::Unreachable {
-                    origin: origin.as_str().to_owned(),
-                    reason: failure.reason(),
-                })?
-        }
+        Some(proxy) => tunnel::through(proxy, host, port, &tls)
+            .await
+            .map_err(|failure| RoomError::Unreachable {
+                origin: origin.as_str().to_owned(),
+                reason: failure.reason(),
+            })?,
     };
     let stream = TlsConnector::from(tls)
         .connect(server_name, connection)
@@ -735,164 +698,6 @@ fn host_and_port(authority: &str) -> Result<(&str, u16), &'static str> {
     Ok((host, port))
 }
 
-/// The connection a room's TLS runs over: the room's own, or a tunnel through a proxy, which is
-/// itself TLS when the proxy's address is an `https` one.
-enum Carrier {
-    Plain(TcpStream),
-    Tls(Box<tokio_rustls::client::TlsStream<TcpStream>>),
-}
-
-impl AsyncRead for Carrier {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        match self.get_mut() {
-            Self::Plain(stream) => Pin::new(stream).poll_read(cx, buf),
-            Self::Tls(stream) => Pin::new(stream.as_mut()).poll_read(cx, buf),
-        }
-    }
-}
-
-impl AsyncWrite for Carrier {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        match self.get_mut() {
-            Self::Plain(stream) => Pin::new(stream).poll_write(cx, buf),
-            Self::Tls(stream) => Pin::new(stream.as_mut()).poll_write(cx, buf),
-        }
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        match self.get_mut() {
-            Self::Plain(stream) => Pin::new(stream).poll_flush(cx),
-            Self::Tls(stream) => Pin::new(stream.as_mut()).poll_flush(cx),
-        }
-    }
-
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        match self.get_mut() {
-            Self::Plain(stream) => Pin::new(stream).poll_shutdown(cx),
-            Self::Tls(stream) => Pin::new(stream.as_mut()).poll_shutdown(cx),
-        }
-    }
-}
-
-/// Why a tunnel through a proxy did not open: one of this client's reasons, or the proxy's refusal
-/// with the status it answered. Nothing the proxy wrote beside its status is kept, and neither is
-/// the proxy's address, which its owner configured and a failure does not repeat.
-enum TunnelFailure {
-    Reason(&'static str),
-    Refused(u16),
-}
-
-impl TunnelFailure {
-    /// The reason a room failure carries: this client's words, and for a refusal the status after
-    /// them, which [`room_reason`] says again.
-    fn reason(&self) -> String {
-        match self {
-            Self::Reason(reason) => (*reason).to_owned(),
-            Self::Refused(status) => format!("{PROXY_REFUSED} {status}"),
-        }
-    }
-}
-
-/// Opens a tunnel to `host:port` through `proxy` with HTTP `CONNECT`, and returns it once the
-/// proxy has agreed.
-///
-/// The proxy's own address is reached directly, over TLS verified like a room's when it is an
-/// `https` address. Any 2xx answer is the proxy agreeing (RFC 9110, section 9.3.6); anything else,
-/// and an answer whose head has not ended within [`MAX_TUNNEL_ANSWER_BYTES`], ends the attempt.
-/// The head is read one byte at a time, so nothing that follows it is taken from the room's TLS.
-async fn tunnel(
-    proxy: &ProxyUrl,
-    host: &str,
-    port: u16,
-    tls: &Arc<ClientConfig>,
-) -> Result<Carrier, TunnelFailure> {
-    let address = proxy.as_url();
-    let proxy_port = address
-        .port_or_known_default()
-        .ok_or(TunnelFailure::Reason(PROXY_NO_PORT))?;
-    let (connection, name) = match address.host() {
-        Some(url::Host::Domain(name)) => (
-            TcpStream::connect((name, proxy_port)).await,
-            ServerName::try_from(name.to_owned()).ok(),
-        ),
-        Some(url::Host::Ipv4(ip)) => (
-            TcpStream::connect((ip, proxy_port)).await,
-            Some(ServerName::from(IpAddr::V4(ip))),
-        ),
-        Some(url::Host::Ipv6(ip)) => (
-            TcpStream::connect((ip, proxy_port)).await,
-            Some(ServerName::from(IpAddr::V6(ip))),
-        ),
-        None => return Err(TunnelFailure::Reason(PROXY_NO_HOST)),
-    };
-    let connection = connection.map_err(|_| TunnelFailure::Reason(PROXY_UNREACHABLE))?;
-    let mut carrier = if address.scheme() == "https" {
-        let name = name.ok_or(TunnelFailure::Reason(PROXY_NOT_A_TLS_NAME))?;
-        let stream = TlsConnector::from(Arc::clone(tls))
-            .connect(name, connection)
-            .await
-            .map_err(|_| TunnelFailure::Reason(PROXY_NO_TLS))?;
-        Carrier::Tls(Box::new(stream))
-    } else {
-        Carrier::Plain(connection)
-    };
-
-    let target = if host.contains(':') {
-        format!("[{host}]:{port}")
-    } else {
-        format!("{host}:{port}")
-    };
-    let request = format!("CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n");
-    carrier
-        .write_all(request.as_bytes())
-        .await
-        .map_err(|_| TunnelFailure::Reason(PROXY_REQUEST_FAILED))?;
-    carrier
-        .flush()
-        .await
-        .map_err(|_| TunnelFailure::Reason(PROXY_REQUEST_FAILED))?;
-
-    let mut head = Vec::new();
-    while !head.ends_with(b"\r\n\r\n") {
-        if head.len() >= MAX_TUNNEL_ANSWER_BYTES {
-            return Err(TunnelFailure::Reason(PROXY_ANSWER_TOO_LONG));
-        }
-        let byte = carrier
-            .read_u8()
-            .await
-            .map_err(|_| TunnelFailure::Reason(PROXY_ENDED))?;
-        head.push(byte);
-    }
-    match tunnel_status(&head) {
-        Some(status) if (200..300).contains(&status) => Ok(carrier),
-        Some(status) => Err(TunnelFailure::Refused(status)),
-        None => Err(TunnelFailure::Reason(PROXY_NO_STATUS_LINE)),
-    }
-}
-
-/// The status code of an HTTP/1.x answer's head: the three digits after its version.
-fn tunnel_status(head: &[u8]) -> Option<u16> {
-    let line = head.split(|&byte| byte == b'\r').next()?;
-    let line = std::str::from_utf8(line).ok()?;
-    let (version, rest) = line.split_once(' ')?;
-    if !matches!(version, "HTTP/1.0" | "HTTP/1.1") {
-        return None;
-    }
-    let code = rest.get(..3)?;
-    let ends = rest.len() == 3 || rest.as_bytes()[3] == b' ';
-    (ends && code.bytes().all(|byte| byte.is_ascii_digit()))
-        .then(|| code.parse().ok())
-        .flatten()
-}
-
 /// Starts the task that carries one room socket's frames, and returns the caller's ends of it.
 fn pump<S>(socket: WebSocketStream<S>) -> RoomSocket
 where
@@ -1021,6 +826,8 @@ async fn carry<S>(
 
 #[cfg(test)]
 mod tests {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
     use super::*;
 
     /// The guard trims an accept value as the library's parser does, so a correct digest with
@@ -1069,35 +876,6 @@ mod tests {
         assert_eq!(host_and_port("[::1]"), Ok(("::1", 443)));
         assert!(host_and_port("[::1:8443").is_err());
         assert!(host_and_port("pair.example.org:port").is_err());
-    }
-
-    /// A proxy's answer to a tunnel request is read by its status line, and only a status line of
-    /// HTTP/1.x with three digits is one.
-    #[test]
-    fn a_tunnel_answer_is_read_by_its_status_line() {
-        assert_eq!(
-            tunnel_status(b"HTTP/1.1 200 Connection established\r\n\r\n"),
-            Some(200)
-        );
-        assert_eq!(tunnel_status(b"HTTP/1.0 200\r\n\r\n"), Some(200));
-        assert_eq!(
-            tunnel_status(b"HTTP/1.1 407 Proxy Authentication Required\r\n\r\n"),
-            Some(407)
-        );
-        for refused in [
-            &b"HTTP/2 200\r\n\r\n"[..],
-            b"HTTP/1.1 2000 OK\r\n\r\n",
-            b"HTTP/1.1 20a OK\r\n\r\n",
-            b"HTTP/1.1  200 OK\r\n\r\n",
-            b"\r\n\r\n",
-        ] {
-            assert_eq!(
-                tunnel_status(refused),
-                None,
-                "{}",
-                String::from_utf8_lossy(refused)
-            );
-        }
     }
 
     /// A control token never reaches a rendering of the role that carries it.
@@ -1227,18 +1005,18 @@ mod tests {
             ),
             (
                 format!("{MARKER}\r\n\r\n").into_bytes(),
-                PROXY_NO_STATUS_LINE,
+                tunnel::NO_STATUS_LINE,
             ),
             (
                 marked
                     .iter()
                     .copied()
                     .cycle()
-                    .take(MAX_TUNNEL_ANSWER_BYTES + 1)
+                    .take(tunnel::MAX_ANSWER_BYTES + 1)
                     .collect(),
-                PROXY_ANSWER_TOO_LONG,
+                tunnel::ANSWER_TOO_LONG,
             ),
-            (marked.to_vec(), PROXY_ENDED),
+            (marked.to_vec(), tunnel::ENDED),
         ] {
             // The negative control: what the proxy writes holds the marker.
             assert!(answer.windows(marked.len()).any(|window| window == marked));
@@ -1257,10 +1035,10 @@ mod tests {
         }
 
         for reason in [
-            format!("{PROXY_REFUSED} {MARKER}"),
-            format!("{PROXY_REFUSED} 4031"),
-            format!("{PROXY_REFUSED}  407"),
-            format!("{PROXY_REFUSED} {NEUTRAL}"),
+            format!("{} {MARKER}", tunnel::REFUSED),
+            format!("{} 4031", tunnel::REFUSED),
+            format!("{}  407", tunnel::REFUSED),
+            format!("{} {NEUTRAL}", tunnel::REFUSED),
         ] {
             let failed = RoomError::Unreachable {
                 origin: "https://rendezvous.example".to_owned(),

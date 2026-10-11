@@ -20,6 +20,7 @@
 //! | [`answers`] | Answers kept on this device while the host cannot be reached, and what a reconnect makes of them |
 //! | [`chunks`] | Where one transfer's chunks travel: the attachment-chunk lane, which never shares the control connection |
 //! | [`transport`] | The shape both transports share, and the iroh connection |
+//! | [`tunnel`] | An HTTP `CONNECT` tunnel through the host's proxy, for a connection that is not HTTP itself |
 //! | [`encoder`] | The shared terminal input encoder: keys, modifiers, pointers and pastes |
 //! | [`viewport`] | The clipped window onto the canonical grid, and the presentation switch |
 //! | [`controls`] | What a client shows, and what it lets a person invoke |
@@ -65,6 +66,7 @@ pub mod session;
 pub mod shown;
 pub mod sync;
 pub mod transport;
+pub mod tunnel;
 pub mod uploads;
 pub mod viewport;
 
