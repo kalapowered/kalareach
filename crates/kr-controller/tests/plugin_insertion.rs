@@ -27,8 +27,8 @@ use kr_protocol::transfer::{AttachmentHandle, DraftRecord, InsertionState};
 mod plugin_world;
 
 use plugin_world::acting::{
-    Acting, Change, Upstream, answer, contribution, read_receipt, send, signal, supersede,
-    until_receipt, until_settled,
+    Acting, Change, Upstream, answer, ask_for_receipt, contribution, read_receipt,
+    receipt_answered, send, signal, supersede, until_receipt, until_settled,
 };
 use plugin_world::{PATIENCE, kill, until};
 
@@ -389,19 +389,7 @@ async fn kr_req_23_30_an_action_cancelled_while_prepared_claims_nothing() {
         .expect("writes the mutation");
     until_receipt(&mut watcher, action_id, ReceiptState::Accepted).await;
 
-    let mut cancel = acting.invocation(&watcher, "turn.cancel", b"{}");
-    cancel.method = Method::ActionCancel.into();
-    cancel.action_id = ActionId::new(kr_ipc::new_uuid());
-    cancel.target = kr_protocol::envelope::ActionTarget {
-        environment_id: acting.hosted.environment_id,
-        session_id: Nullable::null(),
-        session_epoch: Nullable::null(),
-        application_instance_id: Nullable::null(),
-        agent_binding_revision: Nullable::null(),
-    };
-    cancel.params =
-        kr_protocol::envelope::ParamsValue::from_typed(&ActionCancelParams { action_id })
-            .expect("encodes");
+    let cancel = cancellation(&acting, &watcher, action_id);
     assert!(matches!(send(&mut watcher, cancel).await, Outcome::Ok(_)));
     signal(&host, rustix::process::Signal::CONT);
     answer(&mut asking, Some(1)).await;
@@ -855,14 +843,48 @@ async fn write(
         .expect("writes the mutation");
 }
 
-/// How the client of an offer goes while the connection's loop is held.
+/// The request that cancels the action `action_id`, as `client` makes it.
+fn cancellation(
+    acting: &Acting,
+    client: &kr_ipc::client::LocalClient,
+    action_id: ActionId,
+) -> kr_protocol::envelope::MutationRequest {
+    let mut cancel = acting.invocation(client, "turn.cancel", b"{}");
+    cancel.request_id = RequestId::new(3);
+    cancel.method = Method::ActionCancel.into();
+    cancel.action_id = ActionId::new(kr_ipc::new_uuid());
+    cancel.target = kr_protocol::envelope::ActionTarget {
+        environment_id: acting.hosted.environment_id,
+        session_id: Nullable::null(),
+        session_epoch: Nullable::null(),
+        application_instance_id: Nullable::null(),
+        agent_binding_revision: Nullable::null(),
+    };
+    cancel.params =
+        kr_protocol::envelope::ParamsValue::from_typed(&ActionCancelParams { action_id })
+            .expect("encodes");
+    cancel
+}
+
+/// How the client of an offer behaves while the connection's loop is held.
 #[derive(Clone, Copy)]
-enum Departure {
+enum Client {
     /// It closes its connection. Where the system says so, the worker's next write to it fails.
     Closed,
     /// It ends what it sends and stays to read: the worker's writes to it still go through, and the
     /// end is a frame the loop has not read yet.
     Ended,
+    /// It asks for the offer's receipt and then ends what it sends and stays to read: the loop finds
+    /// the question unread, and behind it the end.
+    AskedThenEnded,
+    /// It cancels the offer and then ends what it sends and stays to read: the loop finds the
+    /// cancellation unread, and behind it the end.
+    CancelledThenEnded,
+    /// It asks for the offer's receipt and stays, sending nothing more and ending nothing.
+    AskedAndStayed,
+    /// It sends a frame that cannot be read and stays: the loop finds it unread, and the
+    /// connection it ends is the one the reader would have ended.
+    SentAnUnreadableFrame,
 }
 
 /// KR-REQ-23.30: an offer that was prepared and claimed when its connection ended is rejected, its
@@ -876,23 +898,68 @@ enum Departure {
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn kr_req_23_30_an_offer_claimed_when_its_connection_ends_is_rejected_and_its_claim_settled()
 {
-    an_offer_whose_client_goes(Departure::Closed).await;
+    an_offer_while_its_client(Client::Closed).await;
 }
 
 /// KR-REQ-23.30: an offer that was prepared and claimed when its client had ended what it sends is
 /// rejected, its claim is settled, and nothing is written to the upstream.
 ///
 /// The reply to the repeat of the offer still goes through to such a client, so the loop comes
-/// back to its choice with the end of the stream and the finished preparation both waiting, or
-/// with the end not yet told to the runtime. The end wins either way: the stream's end ends the
-/// connection, as the reader ends it, and the action is not dispatched on a connection that is over.
+/// back to its choice with the finished preparation waiting and the end of the stream not yet read.
+/// The loop takes the preparation first, which it may at random: the end is found all the same, as
+/// the reader finds it, and the action is not dispatched on a connection that is over.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn kr_req_23_30_an_offer_claimed_when_its_client_has_ended_its_stream_is_rejected_and_its_claim_settled()
  {
-    an_offer_whose_client_goes(Departure::Ended).await;
+    an_offer_while_its_client(Client::Ended).await;
 }
 
-async fn an_offer_whose_client_goes(departure: Departure) {
+/// KR-REQ-23.30: an offer whose client asked about it and then went is rejected, its claim is
+/// settled, and nothing is written to the upstream.
+///
+/// The question and the end are both unread when the loop comes back to its choice, and it takes
+/// the finished preparation first, which it may at random. The question is answered before the
+/// offer's fate is decided, and the end is found once the question has been read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_23_30_an_offer_whose_client_asked_about_it_and_then_went_is_rejected_after_the_answer()
+ {
+    an_offer_while_its_client(Client::AskedThenEnded).await;
+}
+
+/// KR-REQ-23.30: an offer whose client sent a frame that cannot be read is rejected, its claim is
+/// settled, and nothing is written to the upstream.
+///
+/// The unreadable frame is found waiting when the loop comes back to its choice. The connection it
+/// ends is the one the reader would have ended, and the offer held behind it is settled with it
+/// and not dispatched on a connection that is over.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_23_30_an_offer_whose_client_sent_an_unreadable_frame_is_rejected_with_its_connection()
+ {
+    an_offer_while_its_client(Client::SentAnUnreadableFrame).await;
+}
+
+/// KR-REQ-23.30: an offer that is held for the question its client asked is dispatched when the
+/// client is still there, and the question is answered before it.
+///
+/// The loop reads what was waiting and nothing else, so a client that sends no more and ends
+/// nothing does not keep the offer from being decided.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_23_30_an_offer_held_for_a_question_is_dispatched_when_its_client_stays() {
+    an_offer_while_its_client(Client::AskedAndStayed).await;
+}
+
+/// KR-REQ-23.30: an offer whose client cancelled it and then went is cancelled, its claim is
+/// settled, and nothing is written to the upstream.
+///
+/// The cancellation and the end are both unread when the loop comes back to its choice, and it
+/// takes the finished preparation first, which it may at random. The cancellation is acted on
+/// before the offer is dispatched: the client said so before it went.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_23_30_an_offer_cancelled_by_a_client_that_then_went_is_not_dispatched() {
+    an_offer_while_its_client(Client::CancelledThenEnded).await;
+}
+
+async fn an_offer_while_its_client(how: Client) {
     let Some((acting, draft, handle)) = offering().await else {
         return;
     };
@@ -932,8 +999,8 @@ async fn an_offer_whose_client_goes(departure: Departure) {
     // The client goes, and the loop is let go to find it so. Closing the client's end is not
     // enough to end the connection when a process that another case of this file has started holds
     // a copy of the descriptor until it executes, so the socket is shut down first.
-    let _staying = match departure {
-        Departure::Closed => {
+    let mut staying = match how {
+        Client::Closed => {
             asking
                 .writer()
                 .shut_down(std::net::Shutdown::Both)
@@ -941,22 +1008,92 @@ async fn an_offer_whose_client_goes(departure: Departure) {
             drop(asking);
             None
         }
-        Departure::Ended => {
+        Client::Ended => {
             asking
                 .writer()
                 .shut_down(std::net::Shutdown::Write)
                 .expect("ends what the client sends");
             Some(asking)
         }
+        Client::AskedThenEnded => {
+            ask_for_receipt(&mut asking, action_id).await;
+            asking
+                .writer()
+                .shut_down(std::net::Shutdown::Write)
+                .expect("ends what the client sends");
+            Some(asking)
+        }
+        Client::CancelledThenEnded => {
+            let cancel = cancellation(&acting, &asking, action_id);
+            write(&mut asking, cancel).await;
+            asking
+                .writer()
+                .shut_down(std::net::Shutdown::Write)
+                .expect("ends what the client sends");
+            Some(asking)
+        }
+        Client::AskedAndStayed => {
+            ask_for_receipt(&mut asking, action_id).await;
+            Some(asking)
+        }
+        Client::SentAnUnreadableFrame => {
+            // A whole frame whose payload is not a message.
+            asking
+                .writer()
+                .write_frame(&[0, 0, 0, 3, 0xff, 0xff, 0xff])
+                .await
+                .expect("writes the frame");
+            Some(asking)
+        }
     };
+    if !matches!(how, Client::Closed) {
+        service.take_preparations_before_reading();
+    }
     release.send(()).expect("lets the repeat go");
+    if let (Client::AskedAndStayed, Some(client)) = (how, staying.as_mut()) {
+        // The offer is held for the question, which is answered while the offer waits, and then
+        // dispatched: its client is still there.
+        tokio::time::timeout(PATIENCE, answer(client, Some(2)))
+            .await
+            .expect("the repeat of the offer is answered");
+        let asked = tokio::time::timeout(PATIENCE, receipt_answered(client))
+            .await
+            .expect("the question is answered")
+            .expect("the question is answered with a receipt");
+        assert_eq!(asked.state, ReceiptState::Accepted, "{asked:?}");
+        let outcome = tokio::time::timeout(PATIENCE, answer(client, Some(1)))
+            .await
+            .expect("the offer is dispatched and answered");
+        assert!(matches!(outcome, Outcome::Ok(_)), "{outcome:?}");
+        assert_eq!(acting.frames().len(), 1, "{:?}", acting.frames());
+        until_binding(
+            &acting,
+            draft.draft_id,
+            &handle,
+            InsertionState::AcceptedByAgent,
+        )
+        .await;
+        return;
+    }
     let receipt = until_settled(&mut watcher, action_id).await;
     assert_eq!(receipt.state, ReceiptState::Rejected, "{receipt:?}");
-    assert_eq!(
-        receipt.reason.as_ref(),
-        Some(&kr_protocol::receipt::RejectionReason::AdmissionFailed),
-        "{receipt:?}"
-    );
+    let reason = match how {
+        Client::Closed | Client::Ended | Client::AskedThenEnded | Client::SentAnUnreadableFrame => {
+            kr_protocol::receipt::RejectionReason::AdmissionFailed
+        }
+        Client::CancelledThenEnded => kr_protocol::receipt::RejectionReason::Cancelled,
+        Client::AskedAndStayed => unreachable!("an offer whose client stays is not rejected"),
+    };
+    assert_eq!(receipt.reason.as_ref(), Some(&reason), "{receipt:?}");
+    if let (Client::AskedThenEnded, Some(client)) = (how, staying.as_mut()) {
+        // The repeat's answer came first. The question was answered while the offer was still
+        // waiting: it was read before the offer's fate was decided.
+        answer(client, Some(2)).await;
+        let asked = receipt_answered(client)
+            .await
+            .expect("the question is answered");
+        assert_eq!(asked.state, ReceiptState::Accepted, "{asked:?}");
+    }
     assert!(
         acting.frames().is_empty(),
         "nothing was written to the upstream: {:?}",

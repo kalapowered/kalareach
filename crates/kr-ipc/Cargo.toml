@@ -59,7 +59,8 @@ tokio = { workspace = true, features = ["rt-multi-thread"] }
 # `identity::boot_records` (the kernel's process list and its boot counter),
 # `floor::platform` (the shared mapping of the clock floor's file and the atomics on it, on each
 # platform), `starter::windows` (the launch pipe, a process's facts and a child created
-# suspended) and `framed::pipe_probe` (whether a named pipe's other end has gone). Nothing else in this crate may relax the rule.
+# suspended) and `framed::pipe_probe` (what has become of a named pipe's other end). Nothing else
+# in this crate may relax the rule.
 [lints.rust]
 missing_docs = "warn"
 unsafe_code = "deny"

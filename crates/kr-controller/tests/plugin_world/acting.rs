@@ -671,8 +671,8 @@ pub async fn answer(client: &mut LocalClient, request_id: Option<u64>) -> Outcom
     }
 }
 
-/// Asks for an action's receipt on `client`.
-pub async fn read_receipt(client: &mut LocalClient, action_id: ActionId) -> Option<Receipt> {
+/// Asks for an action's receipt on `client`, and does not wait for the answer.
+pub async fn ask_for_receipt(client: &mut LocalClient, action_id: ActionId) {
     client
         .writer()
         .write_message(&ControlFrame::Request(kr_protocol::envelope::Request {
@@ -687,6 +687,10 @@ pub async fn read_receipt(client: &mut LocalClient, action_id: ActionId) -> Opti
         }))
         .await
         .expect("writes the request");
+}
+
+/// Reads the answer to a request that [`ask_for_receipt`] made.
+pub async fn receipt_answered(client: &mut LocalClient) -> Option<Receipt> {
     match answer(client, Some(900)).await {
         Outcome::Ok(value) => Some(
             value
@@ -696,6 +700,12 @@ pub async fn read_receipt(client: &mut LocalClient, action_id: ActionId) -> Opti
         ),
         Outcome::Error(_) => None,
     }
+}
+
+/// Asks for an action's receipt on `client`.
+pub async fn read_receipt(client: &mut LocalClient, action_id: ActionId) -> Option<Receipt> {
+    ask_for_receipt(client, action_id).await;
+    receipt_answered(client).await
 }
 
 /// Waits until the action's receipt is in any state but `accepted`, and returns it.

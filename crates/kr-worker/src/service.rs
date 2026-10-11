@@ -21,7 +21,7 @@
 use std::sync::{Arc, Mutex};
 
 use kr_ipc::endpoint::{Connection, Listener};
-use kr_ipc::framed::split;
+use kr_ipc::framed::{FrameReader, PeerState, split};
 use kr_ipc::paths::Endpoint;
 use kr_ipc::peer::PeerIdentity;
 use kr_ipc::verify::{GenerationAcceptance, WorkerIdentity, check_generation_token};
@@ -278,6 +278,11 @@ pub struct WorkerService {
             std::sync::mpsc::Receiver<()>,
         )>,
     >,
+    /// Whether a connection's loop takes a finished preparation before it reads what its client
+    /// has sent, which this host's own tests set to meet the order the loop is free to take at
+    /// random. It is compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    prepared_first: std::sync::atomic::AtomicBool,
     /// How many announcements of an authority revision have been refused because the dispatch
     /// boundary was held, for this host's own tests. It is compiled away in every shipped build.
     #[cfg(feature = "testing")]
@@ -537,6 +542,8 @@ impl WorkerService {
             facts_holds_begun: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(feature = "testing")]
             boundary_pause: Mutex::new(None),
+            #[cfg(feature = "testing")]
+            prepared_first: std::sync::atomic::AtomicBool::new(false),
             #[cfg(feature = "testing")]
             refused_for_the_boundary: tokio::sync::watch::Sender::new(0),
             #[cfg(feature = "testing")]
@@ -968,6 +975,47 @@ impl WorkerService {
     )]
     const fn wait_inside_boundary(&self) {}
 
+    /// Makes every connection's loop take a finished preparation before it reads what its client
+    /// has sent, for this host's own tests.
+    ///
+    /// The loop picks between the two at random when both are ready, and a test of what it does
+    /// with a preparation while input is waiting needs the order in which the preparation comes
+    /// first.
+    #[cfg(feature = "testing")]
+    pub fn take_preparations_before_reading(&self) {
+        self.prepared_first
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// A finished preparation the loop takes before it reads, where its tests ask for that order.
+    #[cfg(feature = "testing")]
+    fn prepared_before_reading(
+        &self,
+        prepared: &mut tokio::sync::mpsc::UnboundedReceiver<ReadyPreparation>,
+    ) -> Option<ReadyPreparation> {
+        if self
+            .prepared_first
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            prepared.try_recv().ok()
+        } else {
+            None
+        }
+    }
+
+    /// The same, without the feature: the loop's order is its own.
+    #[cfg(not(feature = "testing"))]
+    #[expect(
+        clippy::unused_self,
+        reason = "it is the shipped form of a method that reads this service's own setting"
+    )]
+    const fn prepared_before_reading(
+        &self,
+        _prepared: &mut tokio::sync::mpsc::UnboundedReceiver<ReadyPreparation>,
+    ) -> Option<ReadyPreparation> {
+        None
+    }
+
     /// Says, once, when the next authority revision announcement holds the dispatch boundary, for
     /// this host's own tests.
     ///
@@ -1358,62 +1406,81 @@ impl WorkerService {
         // is bounded by the outstanding actions the journal allows an actor.
         let (prepared_tx, mut prepared_rx) =
             tokio::sync::mpsc::unbounded_channel::<ReadyPreparation>();
+        // What the client had already sent when a finished preparation was about to be dispatched,
+        // read ahead of that action and acted on first, with the action held until it has been: a
+        // `None` stands for a frame that could not be read, which ends the connection as it does
+        // from the reader.
+        let mut backlog: std::collections::VecDeque<Option<ControlFrame>> =
+            std::collections::VecDeque::new();
+        let mut held: Option<Box<ReadyPreparation>> = None;
         loop {
-            let next: Next = tokio::select! {
-                message = reader.read_message::<ControlFrame>() => match message {
-                    Ok(message) => Next::Frame(message),
-                    Err(_) => break,
-                },
-                // An accepted action whose effect is prepared. It is finished here, with this
-                // connection's state, on the same path every other reply takes.
-                Some(ready) = prepared_rx.recv() => Next::Prepared(Box::new(ready)),
-                // The authority this connection was admitted under has been withdrawn. Whatever
-                // it had already subscribed to stops here: refusing its *next* request would leave
-                // a delivery task streaming this session's output down a connection that no longer
-                // holds authority. The connection itself stays open, so the caller is told why its
-                // next request is refused rather than finding a socket that closed.
-                () = withdrawn.wait(), if !fenced => {
-                    fenced = true;
-                    // The delivery task and the attachments went with the withdrawal itself. What
-                    // is left is this connection's own handle on the task it started.
-                    state.delivery = None;
-                    // The daemon's attention link has no caller to tell why. A withdrawn one is
-                    // closed instead, so the daemon opens the next at once rather than waiting out
-                    // a request this connection will never answer.
-                    if state.controller
-                        && state.controller_role == ControllerConnectionRole::Attention
-                    {
-                        break;
-                    }
-                    continue;
+            let next: Next = if let Some(queued) = backlog.pop_front() {
+                match queued {
+                    Some(message) => Next::Frame(message),
+                    None => break,
                 }
-                // The window is replaced on the live authorised connection, at half its
-                // validity, so an attachment that stays open for hours never has to renew before a
-                // mutation. A connection whose registration has been withdrawn is no longer that:
-                // a replacement window for it would be a freshness resource issued to authority
-                // that has gone, so the renewal stops with the registration.
-                _ = renewal.tick(), if state.negotiated => {
-                    if self.check_authority(&state).is_err() {
+            } else if let Some(ready) = held.take() {
+                Next::Held(ready)
+            } else if let Some(ready) = self.prepared_before_reading(&mut prepared_rx) {
+                Next::Prepared(Box::new(ready))
+            } else {
+                tokio::select! {
+                    message = reader.read_message::<ControlFrame>() => match message {
+                        Ok(message) => Next::Frame(message),
+                        Err(_) => break,
+                    },
+                    // An accepted action whose effect is prepared. It is finished here, with this
+                    // connection's state, on the same path every other reply takes.
+                    Some(ready) = prepared_rx.recv() => Next::Prepared(Box::new(ready)),
+                    // The authority this connection was admitted under has been withdrawn. Whatever
+                    // it had already subscribed to stops here: refusing its *next* request would
+                    // leave a delivery task streaming this session's output down a connection that
+                    // no longer holds authority. The connection itself stays open, so the caller is
+                    // told why its next request is refused rather than finding a socket that
+                    // closed.
+                    () = withdrawn.wait(), if !fenced => {
+                        fenced = true;
+                        // The delivery task and the attachments went with the withdrawal itself.
+                        // What is left is this connection's own handle on the task it started.
+                        state.delivery = None;
+                        // The daemon's attention link has no caller to tell why. A withdrawn one is
+                        // closed instead, so the daemon opens the next at once rather than waiting
+                        // out a request this connection will never answer.
+                        if state.controller
+                            && state.controller_role == ControllerConnectionRole::Attention
+                        {
+                            break;
+                        }
                         continue;
                     }
-                    let Ok(window) = self.issue_window(connection_id) else {
-                        break;
-                    };
-                    let renewed = ControlFrame::Event(ControlEvent::ActionWindowRenewed(window));
-                    // A window is this host's own offer and carries nothing of the session, so it
-                    // is written or it is not; what it must not do is wait for a peer that has
-                    // stopped reading while this connection still holds anything.
-                    if !write_frame(&writable, &writer, &renewed, &withdrawn, !fenced).await {
-                        break;
+                    // The window is replaced on the live authorised connection, at half its
+                    // validity, so an attachment that stays open for hours never has to renew
+                    // before a mutation. A connection whose registration has been withdrawn is no
+                    // longer that: a replacement window for it would be a freshness resource issued
+                    // to authority that has gone, so the renewal stops with the registration.
+                    _ = renewal.tick(), if state.negotiated => {
+                        if self.check_authority(&state).is_err() {
+                            continue;
+                        }
+                        let Ok(window) = self.issue_window(connection_id) else {
+                            break;
+                        };
+                        let renewed = ControlFrame::Event(ControlEvent::ActionWindowRenewed(window));
+                        // A window is this host's own offer and carries nothing of the session, so
+                        // it is written or it is not; what it must not do is wait for a peer that
+                        // has stopped reading while this connection still holds anything.
+                        if !write_frame(&writable, &writer, &renewed, &withdrawn, !fenced).await {
+                            break;
+                        }
+                        continue;
                     }
-                    continue;
-                }
-                _ = keepalive.tick(), if state.negotiated => {
-                    let beat = ControlFrame::Event(ControlEvent::Keepalive);
-                    if !write_frame(&writable, &writer, &beat, &withdrawn, !fenced).await {
-                        break;
+                    _ = keepalive.tick(), if state.negotiated => {
+                        let beat = ControlFrame::Event(ControlEvent::Keepalive);
+                        if !write_frame(&writable, &writer, &beat, &withdrawn, !fenced).await {
+                            break;
+                        }
+                        continue;
                     }
-                    continue;
                 }
             };
             // Whether this connection still held its registration when the answer was *produced*
@@ -1429,16 +1496,49 @@ impl WorkerService {
                     // peer closed only when it next turns its reactor, and whichever of the
                     // reader and the finished preparation the loop picks: an action whose client
                     // has gone is rejected, as one whose connection ended while it was prepared
-                    // is, and is not dispatched to an effect nobody is waiting for. The system
-                    // reports the end only once the bytes the client sent before it have been
-                    // read, so a client that sent a frame and then went is found by the reader.
+                    // is, and is not dispatched to an effect nobody is waiting for. The reader,
+                    // not this, ends the connection: it finds the end of the stream, and acts on
+                    // whatever the runtime still holds of what the client sent, first.
+                    //
+                    // The system reports the end only behind the bytes the client sent before it,
+                    // so a client that sent a frame and then went is not gone until that frame has
+                    // been read. Whatever is waiting is read first, and acted on. On Unix, a
+                    // cancellation the client sent before it went decides the action, and so does
+                    // its end. On Windows, the bytes the runtime already holds are not counted but
+                    // are read first, so the action can be decided before a frame the client sent
+                    // is read: see `PeerState`. Only what had been sent when the system was asked
+                    // is read, so a client that goes on sending cannot keep the action from being
+                    // decided.
+                    let found = writer
+                        .lock()
+                        .expect("the connection writer is not poisoned")
+                        .peer_state();
+                    match found {
+                        PeerState::Gone => {
+                            self.abandon_prepared(*ready);
+                            continue;
+                        }
+                        PeerState::Unread(queued) => {
+                            read_ahead(&mut reader, queued, &mut backlog).await;
+                            held = Some(ready);
+                            continue;
+                        }
+                        PeerState::Quiet => Some(self.dispatch_prepared(&mut state, *ready)),
+                    }
+                }
+                // The action held for what its client had sent, which has been acted on. The
+                // client may have gone since, and then the action is not dispatched; anything it
+                // has sent since is after this choice, as it would be for an action dispatched at
+                // once.
+                Next::Held(ready) => {
                     let gone = writer
                         .lock()
                         .expect("the connection writer is not poisoned")
-                        .peer_is_gone();
+                        .peer_state()
+                        == PeerState::Gone;
                     if gone {
                         self.abandon_prepared(*ready);
-                        break;
+                        continue;
                     }
                     Some(self.dispatch_prepared(&mut state, *ready))
                 }
@@ -1980,6 +2080,9 @@ impl WorkerService {
         // and does the same itself.
         if let Some(pending) = state.pending_preparation.take() {
             self.abandon_pending(&pending);
+        }
+        if let Some(ready) = held.take() {
+            self.abandon_prepared(*ready);
         }
         prepared_rx.close();
         while let Some(ready) = prepared_rx.recv().await {
@@ -8376,6 +8479,32 @@ async fn write_within(
     }
 }
 
+/// Reads the frames a client had already sent, and no more, into `backlog`.
+///
+/// `queued` is how many bytes were waiting when the operating system was asked, so this never
+/// waits for the client to send anything: a frame those bytes only begin is left for the reader to
+/// finish. A frame that cannot be read, and the end of the stream, are put in the backlog as a
+/// `None`, which ends the connection once the frames before it have been acted on.
+async fn read_ahead(
+    reader: &mut FrameReader,
+    mut queued: usize,
+    backlog: &mut std::collections::VecDeque<Option<ControlFrame>>,
+) {
+    loop {
+        match reader
+            .read_message_within::<ControlFrame>(&mut queued)
+            .await
+        {
+            Ok(Some(message)) => backlog.push_back(Some(message)),
+            Ok(None) => return,
+            Err(_) => {
+                backlog.push_back(None);
+                return;
+            }
+        }
+    }
+}
+
 /// Whether a newer request or subscription has replaced the one this belongs to.
 ///
 /// The replacement sends, or drops the sender; either one is a replacement.
@@ -8790,6 +8919,8 @@ enum Next {
     Frame(ControlFrame),
     /// An accepted action whose effect has been prepared.
     Prepared(Box<ReadyPreparation>),
+    /// A prepared action that waited while the frames its client had already sent were acted on.
+    Held(Box<ReadyPreparation>),
 }
 
 /// An accepted action and what its preparation came to.

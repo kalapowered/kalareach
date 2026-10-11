@@ -223,26 +223,53 @@ impl FrameReader {
     /// when the stream ends part way through a frame, or a framing failure when the declared
     /// length is out of bounds.
     pub async fn read_payload(&mut self) -> Result<Vec<u8>> {
+        let mut unlimited = usize::MAX;
+        match self.read_payload_within(&mut unlimited).await? {
+            Some(payload) => Ok(payload),
+            // A budget this large is never spent, so the frame is always finished above.
+            None => Err(IpcError::TruncatedFrame {
+                received: self.payload_filled,
+                expected: self.declared.unwrap_or_default(),
+            }),
+        }
+    }
+
+    /// Reads one frame's payload from the next `budget` bytes of the stream at most, and takes
+    /// what it reads off the budget.
+    ///
+    /// A frame those bytes do not complete is left part read, and the next read continues it; the
+    /// answer is then `None`. A caller that has been told how much is waiting reads exactly that,
+    /// and so never waits for the peer to send more.
+    async fn read_payload_within(&mut self, budget: &mut usize) -> Result<Option<Vec<u8>>> {
         while self.declared.is_none() {
-            let read = self
-                .half
-                .read(&mut self.prefix[self.prefix_filled..])
-                .await
-                .map_err(|error| IpcError::socket("read", error))?;
-            if read == 0 {
-                return if self.prefix_filled == 0 {
-                    // A clean end at a frame boundary is the peer going away, not a broken frame.
-                    Err(IpcError::PeerClosed)
-                } else {
-                    Err(IpcError::TruncatedFrame {
-                        received: self.prefix_filled,
-                        expected: FRAME_LENGTH_PREFIX_LEN,
-                    })
-                };
+            if self.prefix_filled < FRAME_LENGTH_PREFIX_LEN {
+                let room = (*budget).min(FRAME_LENGTH_PREFIX_LEN - self.prefix_filled);
+                if room == 0 {
+                    return Ok(None);
+                }
+                let read = self
+                    .half
+                    .read(&mut self.prefix[self.prefix_filled..self.prefix_filled + room])
+                    .await
+                    .map_err(|error| IpcError::socket("read", error))?;
+                if read == 0 {
+                    return if self.prefix_filled == 0 {
+                        // A clean end at a frame boundary is the peer going away, not a broken
+                        // frame.
+                        Err(IpcError::PeerClosed)
+                    } else {
+                        Err(IpcError::TruncatedFrame {
+                            received: self.prefix_filled,
+                            expected: FRAME_LENGTH_PREFIX_LEN,
+                        })
+                    };
+                }
+                *budget -= read;
+                self.prefix_filled += read;
             }
-            self.prefix_filled += read;
             if self.prefix_filled == FRAME_LENGTH_PREFIX_LEN {
-                // The bound is checked here, before the buffer is grown.
+                // The bound is checked here, before the buffer is grown. A length that is refused
+                // leaves the prefix full, so a later read is refused for it again.
                 let declared = self.codec.decode_length(self.prefix)?;
                 self.payload = vec![0_u8; declared];
                 self.payload_filled = 0;
@@ -251,9 +278,13 @@ impl FrameReader {
         }
         let declared = self.declared.unwrap_or_default();
         while self.payload_filled < declared {
+            let room = (*budget).min(declared - self.payload_filled);
+            if room == 0 {
+                return Ok(None);
+            }
             let read = self
                 .half
-                .read(&mut self.payload[self.payload_filled..])
+                .read(&mut self.payload[self.payload_filled..self.payload_filled + room])
                 .await
                 .map_err(|error| IpcError::socket("read", error))?;
             if read == 0 {
@@ -262,12 +293,13 @@ impl FrameReader {
                     expected: declared,
                 });
             }
+            *budget -= read;
             self.payload_filled += read;
         }
         self.prefix_filled = 0;
         self.payload_filled = 0;
         self.declared = None;
-        Ok(std::mem::take(&mut self.payload))
+        Ok(Some(std::mem::take(&mut self.payload)))
     }
 
     /// Reads one frame and parses it as the protocol message `T`.
@@ -281,8 +313,32 @@ impl FrameReader {
     /// Returns a framing failure, or a CBOR failure when the payload is not a canonical `T`.
     pub async fn read_message<T: WireMessage>(&mut self) -> Result<T> {
         let payload = self.read_payload().await?;
+        self.decode(&payload)
+    }
+
+    /// Reads one frame from the next `budget` bytes of the stream at most, and parses it as the
+    /// protocol message `T`.
+    ///
+    /// It takes what it reads off the budget. A frame those bytes do not complete is left part
+    /// read, and the next read continues it; the answer is then `None`. A caller that has been
+    /// told how much is waiting reads exactly that, and so never waits for the peer to send more.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::read_message`].
+    pub async fn read_message_within<T: WireMessage>(
+        &mut self,
+        budget: &mut usize,
+    ) -> Result<Option<T>> {
+        match self.read_payload_within(budget).await? {
+            Some(payload) => self.decode(&payload).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    fn decode<T: WireMessage>(&self, payload: &[u8]) -> Result<T> {
         let limits = self.codec.kind().cbor_limits();
-        kr_protocol::wire::decode(&payload, &limits)
+        kr_protocol::wire::decode(payload, &limits)
             .map_err(|error| IpcError::Frame(kr_protocol::frame::FrameError::Cbor(error)))
     }
 
@@ -303,6 +359,24 @@ impl FrameReader {
         kr_cbor::from_canonical_slice(&payload, &limits)
             .map_err(|error| IpcError::Frame(kr_protocol::frame::FrameError::Cbor(error)))
     }
+}
+
+/// What the operating system says has become of a connection's peer.
+///
+/// It speaks of the connection itself, and a runtime may hold bytes it has already taken from it.
+/// On Unix the runtime reads straight from the socket and holds none. A Windows pipe's runtime
+/// keeps a read posted into a buffer of its own, so there the peer's bytes can already be the
+/// runtime's: they are not counted as unread, and a pipe whose peer has closed can say so while a
+/// reader still has frames to find.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PeerState {
+    /// The peer has closed, or has ended what it sends, and the connection holds nothing it sent.
+    Gone,
+    /// The peer has sent bytes nobody has read from the connection, this many of them when it was
+    /// asked. It may have gone since, and the system does not say so until they have been read.
+    Unread(usize),
+    /// The peer is there and the connection holds nothing it sent.
+    Quiet,
 }
 
 /// The writing half of a framed connection.
@@ -378,21 +452,20 @@ impl FrameWriter {
             .map_err(|error| IpcError::socket("shut down", error.into()))
     }
 
-    /// Asks the operating system whether the peer has gone, reading nothing and waiting for nothing.
+    /// Asks the operating system what has become of the peer, reading nothing and waiting for
+    /// nothing.
     ///
     /// The answer is the system's own. A runtime learns that a peer closed only when it has turned
     /// its reactor, so a reader polled before that says nothing yet; this says it at once. A peer
-    /// that has ended what it sends, or has closed, is gone; a writer with no descriptor of its own
-    /// can write nothing, so its peer is gone too. Anything else the system cannot say is taken as
-    /// a peer that is still there.
-    ///
-    /// The system reports the end only behind the bytes the peer sent before it: while some are
-    /// unread the peer is not yet gone, and the reader finds the end once it has read them.
+    /// that has ended what it sends, or has closed, is [`PeerState::Gone`] once the bytes it sent
+    /// before then have been read, and not before: the system reports the end only behind them. A
+    /// writer with no descriptor of its own can write nothing, so its peer is gone too. Anything
+    /// else the system cannot say is taken as a peer that is still there.
     #[cfg(unix)]
     #[must_use]
-    pub fn peer_is_gone(&self) -> bool {
+    pub fn peer_state(&self) -> PeerState {
         let Some(descriptor) = self.descriptor.as_ref() else {
-            return true;
+            return PeerState::Gone;
         };
         let mut byte = [0_u8; 1];
         match rustix::net::recv(
@@ -400,23 +473,34 @@ impl FrameWriter {
             &mut byte,
             rustix::net::RecvFlags::PEEK | rustix::net::RecvFlags::DONTWAIT,
         ) {
-            Ok((received, _)) => received == 0,
+            Ok((0, _)) => PeerState::Gone,
+            // The byte just seen is waiting, so at least one is, whatever the count says.
+            Ok(_) => PeerState::Unread(
+                rustix::io::ioctl_fionread(descriptor)
+                    .ok()
+                    .and_then(|waiting| usize::try_from(waiting).ok())
+                    .map_or(1, |waiting| waiting.max(1)),
+            ),
             Err(
                 rustix::io::Errno::PIPE | rustix::io::Errno::CONNRESET | rustix::io::Errno::NOTCONN,
-            ) => true,
-            Err(_) => false,
+            ) => PeerState::Gone,
+            Err(_) => PeerState::Quiet,
         }
     }
 
-    /// Asks the operating system whether the peer has gone, reading nothing and waiting for nothing.
+    /// Asks the operating system what has become of the peer, reading nothing and waiting for
+    /// nothing.
     ///
     /// A named pipe that has lost its other end reports a broken pipe once the bytes the peer sent
-    /// before it have been read. Anything else the system cannot say is taken as a peer that is
-    /// still there.
+    /// before it have been taken out of the pipe, and until then reports how many are waiting. The
+    /// bytes this connection's runtime has already taken into a buffer of its own are not counted,
+    /// though no reader has read them: a pipe can report a closed peer while the runtime still
+    /// holds frames, and a count of bytes waiting is of the pipe's alone. Anything else the system
+    /// cannot say is taken as a peer that is still there.
     #[cfg(windows)]
     #[must_use]
-    pub fn peer_is_gone(&self) -> bool {
-        pipe_probe::peer_is_gone(self.probe)
+    pub fn peer_state(&self) -> PeerState {
+        pipe_probe::peer_state(self.probe)
     }
 
     /// Takes back a frame none of whose bytes the peer has taken, and answers whether it did.
@@ -1110,44 +1194,55 @@ mod tests {
 /// The one place in this file that calls the operating system without a safe interface.
 ///
 /// The crate denies unsafe code and relaxes the rule for the modules that need it, as the clock
-/// does: no safe interface asks a named pipe whether its other end has gone without reading from
-/// it.
+/// does: no safe interface asks a named pipe whether its other end has gone, or how much it has
+/// sent, without reading from it.
 #[cfg(windows)]
 mod pipe_probe {
     #![expect(
         unsafe_code,
-        reason = "a named pipe can be asked whether its peer has gone only through PeekNamedPipe"
+        reason = "a named pipe can be asked what has become of its peer only through PeekNamedPipe"
     )]
 
+    use super::PeerState;
     use windows_sys::Win32::Foundation::{
         ERROR_BROKEN_PIPE, ERROR_NO_DATA, ERROR_PIPE_NOT_CONNECTED,
     };
     use windows_sys::Win32::System::Pipes::PeekNamedPipe;
 
-    /// Whether the pipe `handle` names has lost its other end.
+    /// What has become of the other end of the pipe `handle` names.
     ///
-    /// A peek with no buffer reports only the pipe's state, and fails with a broken or closed pipe
-    /// once the other end is gone. Anything the system cannot say is taken as a peer that is still
-    /// there.
-    pub fn peer_is_gone(handle: isize) -> bool {
+    /// A peek with no buffer reports how many bytes are waiting, and fails with a broken or closed
+    /// pipe once the other end is gone and nothing it sent is left. Anything the system cannot say
+    /// is taken as a peer that is still there.
+    pub fn peer_state(handle: isize) -> PeerState {
+        let mut waiting = 0_u32;
         // SAFETY: the handle is the connection's own pipe, which the writer calling this keeps
-        // alive, and no buffer or count is given: the call writes nothing through a pointer.
+        // alive, and the only pointer given is to `waiting`, a local that outlives the call and
+        // that the call writes one count through.
         let peeked = unsafe {
             PeekNamedPipe(
                 handle as _,
                 std::ptr::null_mut(),
                 0,
                 std::ptr::null_mut(),
-                std::ptr::null_mut(),
+                &raw mut waiting,
                 std::ptr::null_mut(),
             )
         };
         if peeked != 0 {
-            return false;
+            return match usize::try_from(waiting) {
+                Ok(0) | Err(_) => PeerState::Quiet,
+                Ok(waiting) => PeerState::Unread(waiting),
+            };
         }
         let error = std::io::Error::last_os_error().raw_os_error();
-        [ERROR_BROKEN_PIPE, ERROR_NO_DATA, ERROR_PIPE_NOT_CONNECTED]
+        if [ERROR_BROKEN_PIPE, ERROR_NO_DATA, ERROR_PIPE_NOT_CONNECTED]
             .into_iter()
             .any(|gone| error == Some(gone.cast_signed()))
+        {
+            PeerState::Gone
+        } else {
+            PeerState::Quiet
+        }
     }
 }
