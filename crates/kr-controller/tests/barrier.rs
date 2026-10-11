@@ -3806,6 +3806,104 @@ async fn the_actions_a_refused_revision_was_fenced_for_are_named_by_the_next_rev
     );
 }
 
+/// KR-REQ-09.13: the announcement a request makes of the revision in force to the one worker it
+/// needs asks that worker what its fence named for a revision it refused, as the announcement to
+/// every worker does, and the next result names it.
+///
+/// The first revocation is refused whole and fenced afterwards by the worker's own maintenance, and
+/// the second is refused too, so neither result is anything but pending. The worker is then brought
+/// up to date by the one-worker form, which a device's first request makes, and it asks for the
+/// names filed under the first revision. A result taken after that is the one that names them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn the_announcement_a_request_makes_asks_for_what_a_refused_revision_was_fenced_for() {
+    let hosted = hosted_worker_apart().await;
+    let settled = announced_until(
+        &hosted.controller,
+        hosted
+            .controller
+            .revoke_authority()
+            .await
+            .expect("the revocation is recorded"),
+        |barrier| barrier.holds(),
+    )
+    .await;
+    let held = settled.authority_revision.get();
+    let device = actor("device:phone");
+    let rejected = 3;
+    seed_undispatched_intents(&hosted, &device, rejected);
+    let dispatched = a_dispatched_action(&hosted).await;
+
+    let boundary = HeldBoundary::take(&hosted).await;
+    let refused = tokio::time::timeout(
+        Duration::from_secs(60),
+        hosted.controller.revoke_authority(),
+    )
+    .await
+    .expect("the revocation reports")
+    .expect("the revocation is recorded");
+    assert_eq!(refused.pending(), vec![hosted.session_id], "{refused:?}");
+    boundary.release().await;
+    hosted.service.fence_what_is_owed_for_tests();
+
+    let boundary = HeldBoundary::take(&hosted).await;
+    let refused = tokio::time::timeout(
+        Duration::from_secs(60),
+        hosted.controller.revoke_authority(),
+    )
+    .await
+    .expect("the revocation reports")
+    .expect("the revocation is recorded");
+    assert_eq!(refused.pending(), vec![hosted.session_id], "{refused:?}");
+    boundary.release().await;
+    hosted.service.fence_what_is_owed_for_tests();
+
+    let before = hosted.controller.announcements_sent_for_tests().len();
+    let mut brought_up_to_date = false;
+    for _ in 0..50 {
+        hosted
+            .controller
+            .acknowledge_worker_revision_for_tests(hosted.session_id)
+            .await
+            .expect("the worker is announced to");
+        if hosted
+            .controller
+            .revision_pending()
+            .await
+            .expect("the daemon reports what is pending")
+            .is_empty()
+        {
+            brought_up_to_date = true;
+            break;
+        }
+    }
+    assert!(
+        brought_up_to_date,
+        "the worker acknowledged the revision in force"
+    );
+    let asked: Vec<_> = hosted.controller.announcements_sent_for_tests()[before..]
+        .iter()
+        .filter(|sent| sent.session_id == hosted.session_id && sent.evidence_from == 0)
+        .map(|sent| sent.revision)
+        .collect();
+    assert!(
+        asked.contains(&(held + 1)),
+        "the worker is asked what its fence named for the revision it refused: {asked:?}"
+    );
+
+    let next = announced_until(
+        &hosted.controller,
+        hosted
+            .controller
+            .announce_authority_revision()
+            .await
+            .expect("the revision is announced"),
+        |barrier| barrier.holds(),
+    )
+    .await;
+    assert_eq!(next.authority_revision.get(), held + 2);
+    names_the_actions(&next, &hosted, &device, rejected, dispatched);
+}
+
 /// Writes one mutation to this daemon and returns what it answered.
 async fn submit(client: &mut LocalClient, mutation: MutationRequest) -> Outcome {
     client

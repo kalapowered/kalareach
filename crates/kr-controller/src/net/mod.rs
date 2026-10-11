@@ -1630,6 +1630,20 @@ impl Controller {
         crate::service::encode(&reply)
     }
 
+    /// Asks one worker to install the revision in force, as the first request that needs its lease
+    /// does, for this host's own tests.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when [`Self::acknowledge_worker_revision`] does.
+    #[cfg(feature = "testing")]
+    pub async fn acknowledge_worker_revision_for_tests(
+        self: &Arc<Self>,
+        session_id: kr_protocol::ids::SessionId,
+    ) -> Result<()> {
+        self.acknowledge_worker_revision(session_id).await
+    }
+
     /// Asks one worker to install this environment's authority revision.
     ///
     /// A revocation is complete for a worker once that worker has acknowledged the revision that
