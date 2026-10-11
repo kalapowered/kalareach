@@ -52,6 +52,7 @@ export class FakeDraftStore {
   #opens = true
   #unreadable = 0
   #refuseSaves: { code: string; message: string } | null = null
+  #refuseDiscards: { code: string; message: string } | null = null
   readonly #disk: DraftDisk | null
   /** Every save and discard this store was asked for, for a test to read. */
   readonly calls: { readonly kind: 'save' | 'retarget' | 'discard'; readonly text?: string }[] = []
@@ -77,6 +78,11 @@ export class FakeDraftStore {
   /** Makes the store refuse to open, as a device whose store cannot be read does. */
   breakOpening(): void {
     this.#opens = false
+  }
+
+  /** Makes every discard refuse with `code` until it is cleared. */
+  refuseDiscards(refusal: { code: string; message: string } | null): void {
+    this.#refuseDiscards = refusal
   }
 
   /** Makes the store report `count` files it could not read, which it leaves where they are. */
@@ -204,6 +210,7 @@ export class FakeDraftStore {
 
   discard(request: DraftDiscardRequest): { removed: boolean } {
     this.calls.push({ kind: 'discard' })
+    if (this.#refuseDiscards) refuse(this.#refuseDiscards.code, this.#refuseDiscards.message)
     const held = this.#drafts.get(request.id)
     if (held === undefined) return { removed: false }
     if (held.revision !== request.expectedRevision) {

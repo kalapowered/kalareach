@@ -302,6 +302,37 @@ describe('a prompt the host did not take, and the text it was sent from (KR-REQ-
     expect(await screen.findByTestId('composer-input')).toHaveValue('send this')
   })
 
+  it('lists the text of a prompt that is too long to keep, so that it can be copied, and lets it go when asked', async () => {
+    const device = new FakeDraftStore()
+    const person = userEvent.setup()
+    const answer = held<never>()
+    startOver(device, IN_MAIN, (port) => ({
+      ...port,
+      composerSubmit: () => answer.promise
+    }))
+    await person.type(await screen.findByTestId('composer-input'), 'send')
+    await waitFor(() => {
+      expect(device.all()).toHaveLength(1)
+    })
+    // The store takes nothing more for its size: the text that is sent was never stored.
+    device.refuseSaves({ code: 'QUOTA_EXCEEDED', message: 'too large to keep' })
+    await person.type(screen.getByTestId('composer-input'), ' this')
+    await waitFor(() => {
+      expect(screen.getByTestId('drafts-not-kept')).toBeInTheDocument()
+    })
+    await person.click(screen.getByTestId('composer-send'))
+    await person.type(screen.getByTestId('composer-input'), 'the next thing')
+    answer.reject({ code: 'UNAVAILABLE', message: 'The host did not answer.', user_action: 'retry' })
+
+    await person.click(screen.getByRole('button', { name: 'Sessions' }))
+    await person.click(await screen.findByRole('button', { name: 'One kept draft' }))
+    expect(await screen.findByTestId('unstored-prompt-text')).toHaveTextContent('send this')
+    await person.click(screen.getByTestId('unstored-prompt-forget'))
+    await waitFor(() => {
+      expect(screen.queryByTestId('unstored-prompt')).toBeNull()
+    })
+  })
+
   it('gives the text back when the tab it was sent from was closed before the answer', async () => {
     const device = new FakeDraftStore()
     const person = userEvent.setup()

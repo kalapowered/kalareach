@@ -57,7 +57,7 @@ export function KeptDrafts({
 }): ReactNode {
   const { port, say } = useApp()
   const book = useDraftBook()
-  const { kept, status, problem, unreadable } = useBook()
+  const { kept, status, problem, unreadable, unstored } = useBook()
   const [sessions, setSessions] = useState<readonly Session[] | null>(null)
   const [busy, setBusy] = useState<string | null>(null)
 
@@ -147,12 +147,35 @@ export function KeptDrafts({
           another one now. They can still be read and discarded.
         </p>
       ) : null}
-      {kept.length === 0 ? (
+      {kept.length === 0 && unstored.length === 0 ? (
         <p className="muted" data-testid="kept-drafts-empty">
           No drafts are being kept apart.
         </p>
       ) : (
         <ul className="kept-drafts" data-testid="kept-drafts">
+          {unstored.map((each) => (
+            <li className="kept-draft" data-testid="unstored-prompt" key={each.id}>
+              <p className="eyebrow">Not kept on this device</p>
+              <p className="small muted">
+                The host did not take this prompt, and it is too long for this device to keep as a
+                draft. It is held in this window only, so copy it before the window is closed.
+              </p>
+              <pre className="kept-draft-text" data-testid="unstored-prompt-text" tabIndex={0}>
+                {each.text}
+              </pre>
+              <div className="row wrap">
+                <CommitButton
+                  tone="quiet"
+                  data-testid="unstored-prompt-forget"
+                  onCommit={() => {
+                    book.forgetUnstored(each.id)
+                  }}
+                >
+                  I have copied it
+                </CommitButton>
+              </div>
+            </li>
+          ))}
           {kept.map((each) => (
             <KeptRow
               key={each.id}

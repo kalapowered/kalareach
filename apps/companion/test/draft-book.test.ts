@@ -15,7 +15,7 @@ import type {
   DraftSaveRequest,
   HostPort
 } from '../src/host/port'
-import { DraftBook } from '../src/model/draft-book'
+import { DraftBook, keptEntry } from '../src/model/draft-book'
 import { edit, startDraft } from '../src/model/drafts'
 
 const MAIN = '8a7b6c50-22bb-4c3d-8e4f-000000000101'
@@ -963,7 +963,7 @@ describe('a retarget of a draft another window removed', () => {
 })
 
 /** A port whose answer to one call is held until the test lets it go. */
-function holding<K extends 'deviceDraftRetarget' | 'deviceDraftSave' | 'deviceDrafts'>(
+function holding<K extends 'deviceDraftRetarget' | 'deviceDraftSave' | 'deviceDrafts' | 'deviceDraftDiscard'>(
   store: FakeDraftStore,
   call: K
 ): { port: HostPort; reached: Promise<void>; release: () => void } {
@@ -1137,9 +1137,11 @@ describe('a prompt kept apart from the composer', () => {
     await book.hydrate()
     await book.settled()
     expect(store.all().map((draft) => draft.text).sort()).toEqual(['send this', 'the next thing'])
+    // The failure that was reported is cleared by the success that settled it.
+    expect(book.snapshot().problem).toBeNull()
   })
 
-  it('is not held for ever when the text is too long for the store to keep, and the person is told', async () => {
+  it('is not retried when the text is too long for the store to keep, and the person can still reach it', async () => {
     const { store, book, token } = await refusedWithNewText()
     store.refuseSaves({ code: 'QUOTA_EXCEEDED', message: 'too large to keep' })
     const sent = store.all().find((draft) => draft.text === 'send this')
@@ -1150,11 +1152,65 @@ describe('a prompt kept apart from the composer', () => {
     await book.settled()
 
     expect(notices.join(' ')).toMatch(/too long/i)
+    // The text is held for the person to copy, with the kept drafts, after the tab is gone as well.
+    expect(book.snapshot().unstored.map((each) => each.text)).toEqual(['send this'])
+    expect(keptEntry(book.snapshot())?.title).toBe('One kept draft')
     store.refuseSaves(null)
     book.writeAll()
     await book.settled()
     // Retrying would never help, so it is not retried.
     expect(store.all().map((draft) => draft.text)).toEqual(['the next thing'])
+    expect(book.snapshot().unstored.map((each) => each.text)).toEqual(['send this'])
+    expect(book.snapshot().problem).toBeNull()
+
+    book.forgetUnstored(book.snapshot().unstored[0]?.id ?? '')
+    expect(book.snapshot().unstored).toEqual([])
+  })
+
+  it('holds the whole text of a prompt that was never stored and is too long for the store, with new text in the composer', async () => {
+    const store = new FakeDraftStore()
+    const book = await opened(store)
+    type(book, MAIN, 'send')
+    await book.settled()
+    // From here the store refuses what it is given for its size: the prompt's text never reached it.
+    store.refuseSaves({ code: 'QUOTA_EXCEEDED', message: 'too large to keep' })
+    type(book, MAIN, 'send this')
+    await book.settled()
+    const token = book.beginSend(MAIN)
+    type(book, MAIN, '')
+    type(book, MAIN, 'the next thing')
+    await book.settled()
+    book.endSend(token, 'refused')
+    await book.settled()
+
+    // The older version it grew from is still stored, and the whole text is held for the person.
+    expect(book.snapshot().unstored.map((each) => each.text)).toEqual(['send this'])
+    expect(store.all().map((draft) => draft.text)).toEqual(['send'])
+    expect(book.draft(MAIN).text).toBe('the next thing')
+  })
+
+  it('removes a record it could not remove at the first try once the store takes it', async () => {
+    const store = new FakeDraftStore()
+    const book = await opened(store)
+    type(book, MAIN, 'send this')
+    await book.settled()
+    const token = book.beginSend(MAIN)
+    type(book, MAIN, '')
+    await book.settled()
+    store.refuseDiscards({ code: 'STORAGE_UNAVAILABLE', message: 'the disk is full' })
+    book.endSend(token, 'taken')
+    await book.settled()
+    // The record stays, out of every composer and list while it is waiting to go.
+    expect(store.all().map((draft) => draft.text)).toEqual(['send this'])
+    expect(book.draft(MAIN).text).toBe('')
+    expect(book.snapshot().kept).toEqual([])
+    expect(book.snapshot().problem).not.toBeNull()
+
+    store.refuseDiscards(null)
+    book.writeAll()
+    await book.settled()
+    expect(store.all()).toEqual([])
+    expect(book.snapshot().problem).toBeNull()
   })
 })
 
@@ -1231,5 +1287,58 @@ describe('a composer a window makes for itself', () => {
       )
     ])
     expect(book.draft(MAIN).revision).toBeGreaterThan(ended)
+  })
+})
+
+describe('a draft written in while the store answered a move or a discard', () => {
+  it('keeps the text written during a move, and the move keeps what was pressed on', async () => {
+    const store = new FakeDraftStore()
+    const one = await opened(store)
+    type(one, MAIN, 'begun')
+    await one.settled()
+    const gate = holding(store, 'deviceDraftRetarget')
+    const book = new DraftBook(gate.port)
+    await book.hydrate()
+    book.update(MAIN, (draft) => ({ ...draft, state: 'conflicted' }))
+    await book.settled()
+    const row = book.snapshot().kept[0]
+    const moving = book.moveTo(row?.id ?? '', BUILD, row?.revision ?? '')
+    await gate.reached
+    type(book, MAIN, 'written while it was moving')
+    gate.release()
+    await moving
+    await book.settled()
+
+    expect(book.draft(MAIN).text).toBe('written while it was moving')
+    expect(store.all().map((draft) => [draft.sessionId, draft.text]).sort()).toEqual([
+      [MAIN, 'written while it was moving'],
+      [BUILD, 'begun']
+    ])
+    // The next number the composer shows is not one it has shown.
+    const before = book.draft(MAIN).revision
+    type(book, MAIN, 'and more')
+    expect(book.draft(MAIN).revision).toBeGreaterThan(before)
+  })
+
+  it('keeps the text written during a discard', async () => {
+    const store = new FakeDraftStore()
+    const one = await opened(store)
+    type(one, MAIN, 'begun')
+    await one.settled()
+    const gate = holding(store, 'deviceDraftDiscard')
+    const book = new DraftBook(gate.port)
+    await book.hydrate()
+    book.update(MAIN, (draft) => ({ ...draft, state: 'conflicted' }))
+    await book.settled()
+    const row = book.snapshot().kept[0]
+    const discarding = book.discard(row?.id ?? '', row?.revision ?? '')
+    await gate.reached
+    type(book, MAIN, 'written while it was discarded')
+    gate.release()
+    await discarding
+    await book.settled()
+
+    expect(book.draft(MAIN).text).toBe('written while it was discarded')
+    expect(store.all().map((draft) => draft.text)).toEqual(['written while it was discarded'])
   })
 })
