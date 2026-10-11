@@ -11541,6 +11541,15 @@ export interface ConfigurationDocument {
    */
   default_profile?: string | null
   descriptions?: DescriptionsSelection
+  /**
+   * The highest level among the sections this document holds that arrived with a level.
+   *
+   * A writer stamps it, so a release that reads up to this level reads the document
+   * strictly, and a release that reads less ignores the sections it does not know, applies
+   * the rest, and refuses to edit the document. A document that states none is at the base
+   * level.
+   */
+  level?: number
   network?: NetworkSelection
   preferences?: PreferenceSet
   /**
