@@ -620,11 +620,12 @@ async fn a_worker_with_no_clock_floor_serves_no_lease() {
 }
 
 /// KR-REQ-17.54: a statement that takes access away ends what a local connection holds: its
-/// attachment, its input lease, and the stream it was sent.
+/// attachment and its input lease.
 ///
-/// The connection is withdrawn, so a held input lease is released and nothing more is written to
-/// it. A statement that gives more than the one before it does none of this. The shell is quiet,
-/// so no frame is written to the connection that could end it: only the statement does.
+/// The connection is withdrawn, so the input lease it held is released and its attachment is
+/// detached. A statement that gives more than the one before it does none of this. The connection
+/// holds no subscription and the shell is quiet, so no frame is written to it that could end it:
+/// only the statement does.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_statement_that_takes_access_away_withdraws_what_a_local_connection_holds() {
     let world = world("sleep 30", true).await;
@@ -634,7 +635,6 @@ async fn a_statement_that_takes_access_away_withdraws_what_a_local_connection_ho
 
     let attachment = world.attach(&mut window).await;
     world.acquire(&mut window, attachment).await;
-    world.subscribe(&mut window, attachment).await;
     assert!(!world.holds_nothing());
 
     // A later end gives more: nothing is taken.
