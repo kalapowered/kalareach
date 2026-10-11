@@ -505,12 +505,15 @@ fn resolved(
             );
         }
     }
+    // The digest of the executable a shell finds first, where one is found and read.
+    let mut found_digest = None;
     if let Some(command) = report.command.0.as_deref()
         && let Some(executable) = resolve(command, &host.search_path)
     {
         // Read once: the digest names the version a signed record gives it, and a script, which
         // the worker reads no identity for, is the reason an invocation runs as typed.
         let read = connector.map(|_| super::native_bridge::read_executable(&executable));
+        found_digest = read.as_ref().and_then(|read| read.as_ref().ok()).copied();
         report.executable_version = Nullable(connector.and_then(|connector| {
             read.as_ref()
                 .and_then(|read| read.as_ref().ok())
@@ -536,26 +539,40 @@ fn resolved(
             ));
         }
     }
-    // An integration that declares a backend is one this host does not serve, so every invocation
-    // runs as typed, and the owner who turned it on is told, beside the state.
-    if report.state == CommandIntegrationState::On
-        && report.reason.0.is_none()
-        && connector
-            .and_then(|connector| connector.manifest().command_integration.as_ref())
-            .is_some_and(|declared| declared.backend.is_some())
+    // An integration that declares a backend is served by a gateway where this host can run the
+    // server: on a Unix host, for an executable a signed qualification record names whose version
+    // the connector's table is qualified for. Where it cannot, every invocation runs as typed, and
+    // the owner who turned it on is told, beside the state.
+    let declares_backend = connector
+        .and_then(|connector| connector.manifest().command_integration.as_ref())
+        .is_some_and(|declared| declared.backend.is_some());
+    if report.state == CommandIntegrationState::On && report.reason.0.is_none() && declares_backend
     {
-        report.reason = Nullable::some(
-            "its integration declares a backend, and this host runs none, so an invocation runs \
-             as typed"
-                .to_owned(),
-        );
+        if !cfg!(unix) {
+            report.reason = Nullable::some(
+                "its integration declares a backend, and this platform runs none, so an \
+                 invocation runs as typed"
+                    .to_owned(),
+            );
+        } else if let (Some(connector), Some(digest)) = (connector, found_digest.as_ref())
+            && let Err(refusal) = connector.native_tables(digest)
+        {
+            report.reason = Nullable::some(format!(
+                "{}, so an invocation runs as typed",
+                refusal.detail
+            ));
+        }
     }
     // What an integrated launch records as its mode: only an integration a new session can use.
     if report.state == CommandIntegrationState::On
         && report.unavailable.0.is_none()
         && report.reason.0.is_none()
     {
-        report.mode = IntegrationMode::NativeBridge;
+        report.mode = if declares_backend {
+            IntegrationMode::Gateway
+        } else {
+            IntegrationMode::NativeBridge
+        };
     }
     report
 }
