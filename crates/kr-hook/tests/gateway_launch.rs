@@ -93,12 +93,13 @@ struct Launched {
 
 impl Gateway {
     fn new() -> Self {
-        Self::with(true)
+        Self::with(true, "")
     }
 
     /// A session whose signed record names the stand-in's digest, or, with `qualified` false,
-    /// names no executable at all.
-    fn with(qualified: bool) -> Self {
+    /// names no executable at all, and whose backends live in the directory `runtime_name` names under
+    /// the host's root (the root itself when it is empty).
+    fn with(qualified: bool, runtime_name: &str) -> Self {
         let placed = Placed::new();
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
@@ -149,7 +150,13 @@ impl Gateway {
                     session_id: session(),
                     environment_id: EnvironmentId::new(Uuid::from_bytes([4; 16])),
                     os_user: "someone".to_owned(),
-                    runtime_dir: placed.host.root().to_path_buf(),
+                    runtime_dir: if runtime_name.is_empty() {
+                        placed.host.root().to_path_buf()
+                    } else {
+                        let directory = placed.host.root().join(runtime_name);
+                        std::fs::create_dir_all(&directory).expect("a runtime directory");
+                        directory
+                    },
                     sources,
                     launcher: Some(placed.forwarder.clone()),
                     registered_forwarder: Some(placed.forwarder.clone()),
@@ -339,8 +346,9 @@ impl Launched {
                 return;
             }
             if let Ok(Some(status)) = self.child.try_wait() {
+                let said = self.said();
                 panic!(
-                    "the terminal ended with {status} before it printed {line:?}: {}",
+                    "the terminal ended with {status} before it printed {line:?}: {}{said}",
                     self.printed()
                 );
             }
@@ -521,7 +529,7 @@ fn kr_req_11_32_only_the_registered_process_reaches_the_gateway() {
 #[test]
 fn kr_req_12_07_a_launch_that_cannot_have_a_server_runs_the_program_as_typed() {
     for case in ["no record names the executable", "the directory is gone"] {
-        let shell = Gateway::with(case != "no record names the executable");
+        let shell = Gateway::with(case != "no record names the executable", "");
         let work = shell.placed.host.root().join("work");
         std::fs::create_dir_all(&work).expect("a working directory");
         let answer = shell
@@ -611,6 +619,158 @@ fn kr_req_07_60_a_server_whose_record_cannot_be_written_is_not_left_running() {
             kr_ipc::identity::process_state(server) == kr_ipc::identity::ProcessState::Ended
         })
     });
+}
+
+/// KR-REQ-12.13, KR-REQ-11.27 and KR-REQ-11.33: an approval the server asks the terminal for is an
+/// opaque pending resource of the program's instance before the terminal answers it, and the
+/// terminal's answer resolves it once, whether the server's request carries an identifier of its
+/// own or the one the terminal's request to start a turn carries.
+#[test]
+fn kr_req_12_13_an_approval_is_a_pending_resource_before_the_terminal_answers_and_resolved_once() {
+    for (case, variants) in [
+        ("its own identifier", "stay,answer-when-released"),
+        (
+            "the identifier of the terminal's own request",
+            "stay,answer-when-released,colliding-ids",
+        ),
+    ] {
+        let shell = Gateway::new();
+        let answer = shell
+            .establish(&["codex"])
+            .expect("a backend is established");
+        let release = shell.placed.host.root().join("answer");
+        let mut launched = shell.launch(
+            &answer,
+            "approval",
+            &[
+                ("KR_STAND_IN", variants),
+                ("KR_STAND_IN_COMMAND", COMMAND),
+                (
+                    "KR_STAND_IN_RELEASE",
+                    release.to_str().expect("a text path"),
+                ),
+            ],
+        );
+        launched.prints("TUI: the server asks for item/commandExecution/requestApproval");
+        let instance = shell.announcement().instance.application_instance_id;
+        // The terminal has read the request and not answered it: the broker holds it already, as a
+        // request it does not interpret.
+        let pending = shell.broker.pending_resources();
+        assert_eq!(pending.len(), 1, "{case}: {pending:?}");
+        let resource = pending[0].clone();
+        assert_eq!(resource.application_instance_id, instance, "{case}");
+        assert_eq!(resource.state, kr_protocol::gateway::PendingState::Pending);
+        assert!(!resource.interpretation_verified, "{case}: opaque");
+        assert_eq!(
+            resource.method.as_str(),
+            "item/commandExecution/requestApproval"
+        );
+
+        std::fs::write(&release, b"answer").expect("the terminal is released");
+        launched.prints("TUI: turn/completed");
+        eventually(&format!("{case}: the answer resolved the resource"), || {
+            shell
+                .broker
+                .pending(resource.resource_id)
+                .is_some_and(|held| held.state == kr_protocol::gateway::PendingState::Resolved)
+        });
+        assert_eq!(
+            shell.broker.pending_resources().len(),
+            1,
+            "{case}: one request, one resource"
+        );
+    }
+}
+
+/// KR-REQ-11.32: a message at the connector's limit, which the host lowers from the package's
+/// larger statement to its own 1 MiB, is carried both ways through the gateway: the terminal's
+/// request to start a turn, and the server's notification of what the agent said.
+#[test]
+fn kr_req_11_32_a_message_at_the_limit_is_carried_both_ways_through_a_gateway() {
+    let shell = Gateway::new();
+    let answer = shell
+        .establish(&["codex"])
+        .expect("a backend is established");
+    let mut launched = shell.launch(
+        &answer,
+        "limit",
+        &[("KR_STAND_IN", "stay"), ("KR_STAND_IN_PAD", "1048576")],
+    );
+    launched.prints("TUI: item/agentMessage/delta");
+    launched.prints("TUI: the server asks for item/commandExecution/requestApproval");
+}
+
+/// KR-REQ-11.32: a message above the limit ends the connection, and with it the server: the
+/// terminal is told the connection is gone and the server is ended.
+#[test]
+fn kr_req_11_32_a_message_above_the_limit_ends_the_connection_and_the_server() {
+    let shell = Gateway::new();
+    let answer = shell
+        .establish(&["codex"])
+        .expect("a backend is established");
+    let mut launched = shell.launch(
+        &answer,
+        "over",
+        &[("KR_STAND_IN", "stay"), ("KR_STAND_IN_PAD", "1048577")],
+    );
+    assert_eq!(launched.ends().code(), Some(1), "{}", launched.printed());
+    assert!(
+        launched.printed().contains("Error: remote app server"),
+        "the terminal was told: {}",
+        launched.printed()
+    );
+    let servers = shell.servers();
+    eventually("the server ended with the connection", || {
+        servers.iter().all(|server| {
+            kr_ipc::identity::process_state(server) == kr_ipc::identity::ProcessState::Ended
+        })
+    });
+}
+
+/// KR-REQ-11.32: a terminal that stops reading, as one that is stopped does, loses its connection
+/// when a message cannot reach it, and the server it was served by ends; the terminal itself is
+/// left alone.
+#[test]
+fn kr_req_11_32_a_terminal_that_stops_reading_loses_its_connection_and_its_server_ends() {
+    let shell = Gateway::new();
+    let answer = shell
+        .establish(&["codex"])
+        .expect("a backend is established");
+    let mut launched = shell.launch(
+        &answer,
+        "stopped",
+        &[
+            ("KR_STAND_IN", "stop-reading"),
+            ("KR_STAND_IN_PAD", "1048576"),
+        ],
+    );
+    launched.prints("TUI: a turn is running");
+    let servers = shell.servers();
+    assert_eq!(servers.len(), 1, "{servers:?}");
+    eventually("the server ended with the connection", || {
+        kr_ipc::identity::process_state(&servers[0]) == kr_ipc::identity::ProcessState::Ended
+    });
+    assert!(
+        launched.child.try_wait().expect("readable").is_none(),
+        "the stopped terminal is left alone"
+    );
+}
+
+/// KR-REQ-12.07: a backend whose runtime directory has a space in its name is served as any other:
+/// the address the launcher writes is one element of the program's arguments, and the session runs.
+#[test]
+fn kr_req_12_07_a_runtime_directory_with_a_space_is_served_as_any_other() {
+    let shell = Gateway::with(true, "with space");
+    let answer = shell
+        .establish(&["codex"])
+        .expect("a backend is established");
+    let socket = directory_of(&answer).join("gw.sock");
+    assert!(
+        socket.to_string_lossy().contains("with space"),
+        "{socket:?}"
+    );
+    let mut launched = shell.launch(&answer, "spaced", &[("KR_STAND_IN", "stay")]);
+    launched.prints("TUI: turn/completed");
 }
 
 /// KR-REQ-07.60: a program that was started and never connects, as one that ran as typed does not,
