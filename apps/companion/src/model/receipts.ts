@@ -105,7 +105,13 @@ export function sent(submission: Submission, actionId: string): Submission {
   return { ...submission, actionId, state: 'sent' }
 }
 
-/** Records what a receipt said. */
+/**
+ * Records what a receipt said.
+ *
+ * The revision held is the newest one seen: an event can report where an action stands without
+ * saying which revision of the record that is, and it must not make the submission forget the
+ * revision it has, which is what puts an older record in its place.
+ */
 export function settled(submission: Submission, receipt: Receipt): Submission {
   return {
     ...submission,
@@ -114,7 +120,7 @@ export function settled(submission: Submission, receipt: Receipt): Submission {
     error: receipt.error
       ? { code: String(receipt.error.code), message: String(receipt.error.message) }
       : null,
-    revision: receipt.revision
+    revision: receipt.revision ?? submission.revision
   }
 }
 
@@ -184,7 +190,15 @@ export function applyReceipt(submission: Submission, receipt: Receipt): Submissi
   if (isOlder(receipt.revision, submission.revision)) return submission
   const next = settled(submission, receipt)
   if (submission.state === 'unknown' && !isFinal(next.state)) return submission
-  return next
+  // A record that says what the submission already says is not news: the same submission comes
+  // back, so that reading the host's record again changes nothing.
+  return next.state === submission.state &&
+    next.revision === submission.revision &&
+    next.actionId === submission.actionId &&
+    next.error?.code === submission.error?.code &&
+    next.error?.message === submission.error?.message
+    ? submission
+    : next
 }
 
 /** Records a failure the request itself produced. */

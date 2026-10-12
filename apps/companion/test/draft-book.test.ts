@@ -1981,3 +1981,229 @@ describe('a removal the store would not make', () => {
     expect(store.pendingRemovals()).toEqual([])
   })
 })
+
+describe('a prompt the host is said to have applied after nobody knew what became of it', () => {
+  /** A file the person added whose upload has not ended: nothing a store can keep, but theirs. */
+  const UPLOADING = {
+    localId: 'file-uploading',
+    transferId: null,
+    name: 'picture.png',
+    byteLen: 12,
+    mediaType: 'image/png',
+    presentedAsImage: false,
+    upload: 'uploading' as const,
+    acceptedUpstream: false,
+    handle: null
+  }
+
+  /**
+   * Sends 'send this' from a composer and ends the send as of unknown outcome, under the
+   * submission `local-1`: the text is back in the composer, under its stored record.
+   */
+  async function unknownOn(book: DraftBook, after?: () => void): Promise<void> {
+    type(book, MAIN, 'send this')
+    await book.settled()
+    const token = book.beginSend(MAIN)
+    await token.claimed
+    type(book, MAIN, '')
+    after?.()
+    book.endSend(token, 'unknown', 'local-1')
+    await book.settled()
+  }
+
+  it('keeps what is typed while its removal is made, and the text sent goes', async () => {
+    const store = new FakeDraftStore()
+    const gate = holding(store, 'deviceDraftDiscard')
+    const book = new DraftBook(gate.port)
+    await book.hydrate()
+    await unknownOn(book)
+    expect(book.draft(MAIN).text).toBe('send this')
+
+    book.sendSettled('local-1', 'applied')
+    await gate.reached
+    type(book, MAIN, 'send this, and then more')
+    gate.release()
+    await book.settled()
+
+    expect(book.draft(MAIN).text).toBe('send this, and then more')
+    expect(store.all().map((draft) => draft.text)).toEqual(['send this, and then more'])
+  })
+
+  it('keeps a file that is still uploading, and removes only the text that was sent', async () => {
+    const store = new FakeDraftStore()
+    const book = await opened(store)
+    await unknownOn(book)
+    book.update(MAIN, (draft) => ({ ...draft, attachments: [...draft.attachments, UPLOADING] }))
+    await book.settled()
+
+    book.sendSettled('local-1', 'applied')
+    await book.settled()
+
+    expect(book.draft(MAIN).text).toBe('')
+    expect(book.draft(MAIN).attachments.map((file) => file.localId)).toEqual(['file-uploading'])
+    expect(store.all()).toEqual([])
+  })
+
+  it('clears a composer that holds the text in this window only, because the store would not take it', async () => {
+    const store = new FakeDraftStore()
+    const book = await opened(store)
+    store.refuseSaves({ code: 'STORAGE_UNAVAILABLE', message: 'the disk refused it' })
+    await unknownOn(book)
+    expect(book.draft(MAIN).text).toBe('send this')
+    expect(book.draft(MAIN).stored).toBeNull()
+
+    book.sendSettled('local-1', 'applied')
+    await book.settled()
+    store.refuseSaves(null)
+    book.writeAll()
+    await book.settled()
+
+    expect(book.draft(MAIN).text).toBe('')
+    expect(store.all()).toEqual([])
+  })
+
+  describe('whose text was kept apart because the composer held something else', () => {
+    /** The prompt is listed with the kept drafts, and the composer holds 'newer'. */
+    async function keptApart(book: DraftBook): Promise<void> {
+      await unknownOn(book, () => type(book, MAIN, 'newer'))
+      expect(book.snapshot().kept.map((kept) => kept.text)).toEqual(['send this'])
+    }
+
+    it('is removed from the store and from the list', async () => {
+      const store = new FakeDraftStore()
+      const book = await opened(store)
+      await keptApart(book)
+
+      book.sendSettled('local-1', 'applied')
+      await book.settled()
+
+      expect(book.snapshot().kept).toEqual([])
+      expect(store.all().map((draft) => draft.text)).toEqual(['newer'])
+    })
+
+    it('is left alone when another window changed it and this window has read it again', async () => {
+      const store = new FakeDraftStore()
+      const book = await opened(store)
+      await keptApart(book)
+      const kept = book.snapshot().kept[0]
+      store.writeAsAnotherWindow(kept?.id ?? '', { text: 'theirs' })
+      await book.reload()
+
+      book.sendSettled('local-1', 'applied')
+      await book.settled()
+
+      expect(store.all().map((draft) => draft.text).sort()).toEqual(['newer', 'theirs'])
+    })
+
+    it('is removed though the report came while the book was listing it', async () => {
+      const store = new FakeDraftStore()
+      const real = portOver(store)
+      let listing = false
+      let reach: () => void = () => undefined
+      const reached = new Promise<void>((resolve) => {
+        reach = resolve
+      })
+      let release: () => void = () => undefined
+      const held = new Promise<void>((resolve) => {
+        release = resolve
+      })
+      const book = new DraftBook({
+        ...real,
+        deviceDrafts: async () => {
+          const answer = await real.deviceDrafts()
+          if (listing) {
+            listing = false
+            reach()
+            await held
+          }
+          return answer
+        }
+      })
+      await book.hydrate()
+      // The book tells the person the prompt is kept just before it reads the store to list it.
+      book.onNotice(() => {
+        listing = true
+      })
+      type(book, MAIN, 'send this')
+      await book.settled()
+      const token = book.beginSend(MAIN)
+      await token.claimed
+      type(book, MAIN, 'newer')
+      book.endSend(token, 'unknown', 'local-1')
+      await reached
+
+      book.sendSettled('local-1', 'applied')
+      release()
+      await book.settled()
+
+      expect(book.snapshot().kept).toEqual([])
+      expect(store.all().map((draft) => draft.text)).toEqual(['newer'])
+    })
+
+    it('is dropped from this window’s memory when the store could not keep it, and is not stored later', async () => {
+      const store = new FakeDraftStore()
+      const book = await opened(store)
+      type(book, MAIN, 'send this')
+      await book.settled()
+      const token = book.beginSend(MAIN)
+      await token.claimed
+      type(book, MAIN, 'newer')
+      store.breakOpening()
+      book.endSend(token, 'unknown', 'local-1')
+      await book.settled()
+      expect(book.snapshot().problem).not.toBeNull()
+
+      book.sendSettled('local-1', 'applied')
+      await book.settled()
+      store.mendOpening()
+      book.writeAll()
+      await book.reload()
+      await book.settled()
+
+      expect(book.snapshot().kept).toEqual([])
+      expect(book.snapshot().problem).toBeNull()
+      expect(store.all().map((draft) => draft.text)).toEqual(['newer'])
+    })
+  })
+
+  it('is no longer held for a person to copy when the store would never have taken it', async () => {
+    const store = new FakeDraftStore()
+    const book = await opened(store)
+    type(book, MAIN, 'send')
+    await book.settled()
+    // From here the store refuses what it is given for its size: the prompt's text never reached it.
+    store.refuseSaves({ code: 'QUOTA_EXCEEDED', message: 'too large to keep' })
+    type(book, MAIN, 'send this')
+    await book.settled()
+    const token = book.beginSend(MAIN)
+    type(book, MAIN, '')
+    type(book, MAIN, 'the next thing')
+    await book.settled()
+    book.endSend(token, 'unknown', 'local-1')
+    await book.settled()
+    expect(book.snapshot().unstored.map((each) => each.text)).toEqual(['send this'])
+
+    book.sendSettled('local-1', 'applied')
+    await book.settled()
+
+    expect(book.snapshot().unstored).toEqual([])
+    expect(book.draft(MAIN).text).toBe('the next thing')
+  })
+
+  it('is owed at the version it tried to remove, so the next start removes it', async () => {
+    const store = new FakeDraftStore()
+    const book = await opened(store)
+    await unknownOn(book)
+    store.refuseDiscards({ code: 'STORAGE_UNAVAILABLE', message: 'the disk refused it' })
+
+    book.sendSettled('local-1', 'applied')
+    await book.settled()
+    expect(store.pendingRemovals()).toHaveLength(1)
+
+    store.refuseDiscards(null)
+    const restarted = await opened(store)
+    await restarted.settled()
+    expect(store.all()).toEqual([])
+    expect(restarted.draft(MAIN).text).toBe('')
+  })
+})

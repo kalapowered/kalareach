@@ -724,9 +724,10 @@ export function MobileSession({
       lifecycle.setSubmissions((current) =>
         current.map((each) => (each.localId === localId ? applyReceipt(each, receipt) : each))
       )
-      book.sendSettled(localId, after.state)
+      // A run that started after the prompt was sent holds nothing of it but its text.
+      book.sendSettled(localId, after.state, { sessionId, text: before.text })
     },
-    [lifecycle, book]
+    [lifecycle, book, sessionId]
   )
   useReceiptReads({ sessionId, connected, submissions: mine, onReceipt: settleFromRecord })
   const banner = reconnectBanner(connected, mine)

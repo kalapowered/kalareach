@@ -22,7 +22,7 @@ import type { WithheldCount } from './agent'
 import { emptyConversation, type ConversationState } from './conversation'
 import { emptyOutput, type OutputWindow } from './output'
 import { emptyRecording, type Recording } from './recording'
-import type { Submission } from './receipts'
+import { unresolved, type Submission } from './receipts'
 
 /**
  * What the session's own worker last said about its agent.
@@ -139,16 +139,16 @@ export class SessionStates {
   /**
    * Forgets a session, for a tab the person closed.
    *
-   * What the host has not finished with is not forgotten: a prompt it has accepted or whose
-   * outcome nobody knows is still held, so that closing the tab and opening the session again does
-   * not lift the hold on sending it twice, and its record is still read.
+   * What has no outcome yet is not forgotten: a request still on its way to the host, a prompt it
+   * has accepted, and one whose outcome nobody knows are all held, so that closing the tab and
+   * opening the session again does not lift the hold on sending a prompt twice, an answer that
+   * arrives after the tab is gone has the entry it belongs to, and the host's record of the action
+   * is still read.
    */
   forget(sessionId: string): void {
     const held = this.#states.get(sessionId)
     if (held === undefined) return
-    const owed = held.submissions.filter(
-      (submission) => submission.state === 'sent' || submission.state === 'unknown'
-    )
+    const owed = unresolved(held.submissions)
     if (owed.length === 0) this.#states.delete(sessionId)
     else this.#states.set(sessionId, { ...emptySessionState(), submissions: owed })
     for (const listener of this.#listeners) listener()
