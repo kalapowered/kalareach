@@ -5514,6 +5514,39 @@ async fn kr_req_25_10_a_device_given_the_screen_is_shown_it_and_follows_it_until
         .await
         .expect_err("a share nobody redeemed attaches nothing");
     assert_eq!(before.code(), ErrorCode::PermissionDenied);
+
+    // The device is told what it is offered before it accepts, and the offer carries that the
+    // screen is included and none of the text on it: the text the owner was shown goes to no
+    // device until the share is redeemed and the device attaches.
+    let offered: kr_protocol::sharing::GrantHeldResult = session
+        .read(
+            Method::GrantHeld,
+            &kr_protocol::sharing::GrantHeldParams {
+                offers_after: Nullable::null(),
+                shares_after: Nullable::null(),
+            },
+        )
+        .await
+        .expect("the device asks what it is offered");
+    assert_eq!(offered.offers.len(), 1);
+    assert_eq!(
+        offered.offers[0].invitation_id,
+        issued.preview.invitation_id
+    );
+    assert_eq!(offered.offers[0].grant_id, issued.grant.grant_id);
+    assert_eq!(
+        offered.offers[0].display_number,
+        created.session.display_number
+    );
+    assert!(offered.offers[0].includes_live_screen);
+    assert!(offered.shares.is_empty());
+    let on_the_wire = kr_cbor::to_canonical_vec(&offered).expect("the offer encodes");
+    assert!(
+        !on_the_wire
+            .windows(MARKER.len())
+            .any(|window| window == MARKER.as_bytes()),
+        "the offer carries no text of the screen it includes"
+    );
     let _: kr_protocol::sharing::GrantRedeemResult = session
         .mutate(
             Method::GrantRedeem,
@@ -5529,6 +5562,21 @@ async fn kr_req_25_10_a_device_given_the_screen_is_shown_it_and_follows_it_until
         .expect("the invitation is redeemed")
         .to_typed()
         .expect("decodes");
+
+    // Redeemed, the offer has become a share the device holds.
+    let held: kr_protocol::sharing::GrantHeldResult = session
+        .read(
+            Method::GrantHeld,
+            &kr_protocol::sharing::GrantHeldParams {
+                offers_after: Nullable::null(),
+                shares_after: Nullable::null(),
+            },
+        )
+        .await
+        .expect("the device asks what it holds");
+    assert!(held.offers.is_empty());
+    assert_eq!(held.shares.len(), 1);
+    assert_eq!(held.shares[0].grant.grant_id, issued.grant.grant_id);
 
     // Redeemed, it attaches and follows the screen.
     let watching = attach_one(
