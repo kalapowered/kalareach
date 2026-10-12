@@ -254,6 +254,14 @@
   margin-top: 14px;
 }
 
+/* A label that cannot fit on one line at a large text size wraps inside its button, and the button
+   stays inside the question's box. */
+.question .btn {
+  white-space: normal;
+  max-inline-size: 100%;
+  text-align: center;
+}
+
 /* ---- Sessions -------------------------------------------------------------------------------- */
 
 .session-table {

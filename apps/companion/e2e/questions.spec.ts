@@ -10,6 +10,8 @@
 
 import { expect, test, type Page } from '@playwright/test'
 
+import { overrunning, stopWrapping } from './layout'
+
 /** The largest accessibility size's body text, 53 points, against 17 at the default setting. */
 const LARGEST = 53 / 17
 
@@ -54,13 +56,12 @@ for (const surface of ['ios', 'android'] as const) {
       }))
       expect(across.page, 'the page is no wider than the screen').toBeLessThanOrEqual(across.screen)
 
-      const outside = await page.evaluate(() => {
-        const edge = window.innerWidth
-        return [...document.querySelectorAll('[data-testid="question"] *')]
-          .filter((element) => element.getBoundingClientRect().right > edge + 0.5)
-          .map((element) => element.textContent?.slice(0, 40) ?? element.tagName)
-      })
-      expect(outside, 'lines of the question that run past the screen').toEqual([])
+      // Everything in a question, and every line of its text, lies inside the screen and inside
+      // the question's own box.
+      expect(
+        await overrunning(page, '[data-testid="question"]'),
+        'lines of the question that run past the screen or its box'
+      ).toEqual([])
 
       // Each thing a finger presses: a choice is its whole row, and so is Send.
       const small = await page.evaluate((least) => {
@@ -83,6 +84,13 @@ for (const surface of ['ios', 'android'] as const) {
       for (let index = 0; index < count; index += 1) {
         await controls.nth(index).click({ trial: true, timeout: 2_000 })
       }
+
+      // The control: with the text kept from wrapping, the same measure sees it run out of its box.
+      await stopWrapping(page, ['[data-testid="question"]'])
+      expect(
+        await overrunning(page, '[data-testid="question"]'),
+        'the measure sees text that cannot wrap'
+      ).not.toEqual([])
     })
 
     test('sends nothing until Send is pressed after a choice, and keeps an answer given out of contact', async ({

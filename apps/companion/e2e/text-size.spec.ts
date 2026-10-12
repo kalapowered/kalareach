@@ -12,6 +12,8 @@
 
 import { expect, test, type Page } from '@playwright/test'
 
+import { overrunning, stopWrapping } from './layout'
+
 const SESSION = '8a7b6c50-22bb-4c3d-8e4f-000000000101'
 
 /** The largest accessibility size's body text, 53 points, against 17 at the default setting. */
@@ -244,13 +246,14 @@ test.describe('at the largest text size on a screen 320 points wide', () => {
       await page.goto(`/harness.html?surface=${surface}&tab=sessions`)
       const row = page.locator(`.m-row[data-session="${SESSION}"]`)
       await expect(row.getByTestId('description-freshness')).toBeVisible()
-      const outside = await row.evaluate((element) => {
-        const edge = element.getBoundingClientRect().right
-        return [...element.querySelectorAll('span')]
-          .filter((span) => span.getBoundingClientRect().right > edge + 0.5)
-          .map((span) => span.textContent?.slice(0, 40) ?? '')
-      })
-      expect(outside, 'lines of the row that run past its edge').toEqual([])
+      // Everything in the row, and every line of its text, lies inside the screen and inside the
+      // row's own box.
+      const described = `.m-row[data-session="${SESSION}"]`
+      expect(await overrunning(page, described), 'lines of the row that run past the screen or its box').toEqual([])
+
+      // The control: with the text kept from wrapping, the same measure sees it run out of its box.
+      await stopWrapping(page, [described])
+      expect(await overrunning(page, described), 'the measure sees text that cannot wrap').not.toEqual([])
     })
   }
 

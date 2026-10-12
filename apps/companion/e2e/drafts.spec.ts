@@ -11,6 +11,8 @@ import { Buffer } from 'node:buffer'
 
 import { expect, test, type Page } from '@playwright/test'
 
+import { overrunning, stopWrapping } from './layout'
+
 const SESSION = '8a7b6c50-22bb-4c3d-8e4f-000000000101'
 const GONE = 'aaaaaaaa-aaaa-4aaa-8aaa-00000000dead'
 
@@ -99,13 +101,12 @@ for (const surface of ['ios', 'android'] as const) {
         screen: window.innerWidth
       }))
       expect(across.page, 'the page is no wider than the screen').toBeLessThanOrEqual(across.screen)
-      const outside = await page.evaluate(() => {
-        const edge = window.innerWidth
-        return [...document.querySelectorAll('[data-testid="kept-draft"] *')]
-          .filter((element) => element.getBoundingClientRect().right > edge + 0.5)
-          .map((element) => element.textContent?.slice(0, 40) ?? element.tagName)
-      })
-      expect(outside, 'lines of the draft that run past the screen').toEqual([])
+      // Everything in a kept draft, and every line of its text, lies inside the screen and inside
+      // the draft's own box.
+      expect(
+        await overrunning(page, '[data-testid="kept-draft"]'),
+        'lines of the draft that run past the screen or its box'
+      ).toEqual([])
 
       const small = await page.evaluate((least) => {
         const pressed = document.querySelectorAll<HTMLElement>(
@@ -126,6 +127,13 @@ for (const surface of ['ios', 'android'] as const) {
       for (let index = 0; index < count; index += 1) {
         await controls.nth(index).click({ trial: true, timeout: 2_000 })
       }
+
+      // The control: with the text kept from wrapping, the same measure sees it run out of its box.
+      await stopWrapping(page, ['[data-testid="kept-draft"]'])
+      expect(
+        await overrunning(page, '[data-testid="kept-draft"]'),
+        'the measure sees text that cannot wrap'
+      ).not.toEqual([])
     })
 
     test('shows the path of a picked file whole inside the screen at the largest size', async ({
@@ -152,49 +160,12 @@ for (const surface of ['ios', 'android'] as const) {
         screen: window.innerWidth
       }))
       expect(across.page, 'the page is no wider than the screen').toBeLessThanOrEqual(across.screen)
-      const outside = await page.evaluate(() => {
-        const edge = window.innerWidth
-        interface Span {
-          readonly left: number
-          readonly right: number
-          readonly what: string
-        }
-        const label = (text: string | null) => (text ?? '').trim().slice(0, 40)
-        // Where everything under a root is drawn: each element's box, and each line of its text,
-        // because a box does not say where its text runs when the text runs out of it.
-        const spans = (root: Element): Span[] => {
-          const found = [root, ...root.querySelectorAll('*')].map((element) => {
-            const box = element.getBoundingClientRect()
-            return { left: box.left, right: box.right, what: label(element.textContent) || element.tagName }
-          })
-          const walk = document.createTreeWalker(root, NodeFilter.SHOW_TEXT)
-          for (let node = walk.nextNode(); node !== null; node = walk.nextNode()) {
-            const range = document.createRange()
-            range.selectNodeContents(node)
-            for (const line of Array.from(range.getClientRects())) {
-              if (line.width > 0) {
-                found.push({ left: line.left, right: line.right, what: label(node.textContent) })
-              }
-            }
-          }
-          return found
-        }
-        const beyond = (found: readonly Span[], within: { left: number; right: number }) =>
-          found
-            .filter((one) => one.left < within.left - 0.5 || one.right > within.right + 0.5)
-            .map((one) => one.what)
-        const screen = { left: 0, right: edge }
-        const path = [...document.querySelectorAll('[data-testid="attachment-paths"]')].flatMap(
-          (each) => beyond(spans(each), screen)
-        )
-        // Everything in a chip lies inside the screen and inside the chip's own box, its name and
-        // its lines of text among it.
-        const chip = [...document.querySelectorAll('[data-testid="draft-attachments"] > *')].flatMap(
-          (each) => [...beyond(spans(each), screen), ...beyond(spans(each), each.getBoundingClientRect())]
-        )
-        return [...path, ...chip]
-      })
-      expect(outside, 'lines of the chip and the path that run past the screen or their chip').toEqual([])
+      // Everything in a path's card and in a chip lies inside the screen and inside its own box,
+      // its name and its lines of text among it.
+      const PATH_CARD = '[data-testid="attachment-path-row"]'
+      const CHIP = '[data-testid="draft-attachments"] > *'
+      const outside = [...(await overrunning(page, PATH_CARD)), ...(await overrunning(page, CHIP))]
+      expect(outside, 'lines of the chip and the path that run past the screen or their own box').toEqual([])
       // The notice after the upload covers the screen at this size, and the pointer that picked the
       // file can rest on it, which holds it there. The pointer moves off it, as a finger lifts, and
       // the case waits for the notice to go before it presses the chip's control.
@@ -203,6 +174,13 @@ for (const surface of ['ios', 'android'] as const) {
       await page
         .getByRole('button', { name: /^Remove .* from this draft$/ })
         .click({ trial: true, timeout: 2_000 })
+
+      // The controls, one for each root: with its text kept from wrapping, the same measure sees it
+      // run out of its boxes.
+      for (const root of [PATH_CARD, CHIP]) {
+        await stopWrapping(page, [root])
+        expect(await overrunning(page, root), `the measure sees ${root} text that cannot wrap`).not.toEqual([])
+      }
     })
 
     test('is moved to a session the person chooses, and is in that session’s composer after a restart', async ({
