@@ -322,6 +322,16 @@ impl Host {
         origin: &str,
         timer: Arc<dyn kr_controller::quiet::Timer>,
     ) -> Self {
+        Self::start_with_feed_on(owner, origin, timer, Clocks::system()).await
+    }
+
+    /// As [`Self::start_with_feed`], on the clocks a suite gives the daemon.
+    pub async fn start_with_feed_on(
+        owner: &DeviceKeys,
+        origin: &str,
+        timer: Arc<dyn kr_controller::quiet::Timer>,
+        clocks: Clocks,
+    ) -> Self {
         let temp = kr_ipc::testing::TempHost::create();
         write_feed_document(&temp, Some(origin));
         let mut host = Self::start_on(
@@ -333,7 +343,7 @@ impl Host {
             },
             AccountAt::Managed,
             Arc::new(MemoryStore::new()),
-            Clocks::system(),
+            clocks,
             Waits { timer: Some(timer) },
         )
         .await;
@@ -472,7 +482,14 @@ impl Host {
             };
             kr_controller::testing::with_account_origin(account_origin.clone(), async {
                 match &waits.timer {
-                    Some(timer) => Controller::start_on_timer(setup, Arc::clone(timer)).await,
+                    Some(timer) => {
+                        Controller::start_on_clocks_and_timer(
+                            setup,
+                            clocks.clone(),
+                            Arc::clone(timer),
+                        )
+                        .await
+                    }
                     None => Controller::start_on_clocks(setup, clocks.clone()).await,
                 }
             })
