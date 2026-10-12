@@ -1082,3 +1082,10 @@
   min-width: 0;
   overflow-wrap: anywhere;
 }
+
+/* A status that cannot fit on one line at a large text size wraps inside its badge, which stays
+   inside the row. */
+.m-earlier .badge {
+  white-space: normal;
+  max-inline-size: 100%;
+}

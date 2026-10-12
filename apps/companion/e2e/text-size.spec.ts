@@ -265,6 +265,43 @@ test.describe('at the largest text size on a screen 320 points wide', () => {
         expect(await overrunning(page, root), `the measure sees ${root} text that cannot wrap`).not.toEqual([])
       }
     })
+
+    test(`lists the action nobody knows the end of beside the next one, whole, on ${surface}`, async ({ page }) => {
+      await withSystemTextScale(page, LARGEST)
+      await page.setViewportSize({ width: 320, height: 720 })
+      await page.goto(`/harness.html?surface=${surface}&session=${SESSION}`)
+      await page.evaluate(() => {
+        window.krTestHost?.leaveNextSendUnconfirmed()
+      })
+      await page.getByLabel('Message this session').fill('run the migration of a very long database name')
+      await page.getByRole('button', { name: 'Send', exact: true }).click()
+      await page.getByRole('button', { name: 'I checked; send anyway' }).click()
+
+      // The earlier action keeps its own status beside the one sent after it.
+      const earlier = page.getByTestId('earlier-actions')
+      await expect(earlier).toBeVisible()
+      await expect(earlier).toContainText('Outcome unknown')
+      // The start of each part of the entry can be scrolled to, and is not under the bar at the foot
+      // of the screen.
+      for (const part of [earlier.locator('.badge'), earlier.locator('li > span').last()]) {
+        const covered = await part.evaluate((element) => {
+          element.scrollIntoView({ block: 'start' })
+          const box = element.getBoundingClientRect()
+          const top = document.elementFromPoint(box.left + box.width / 2, box.top + 4)
+          return top === null || !element.contains(top)
+        })
+        expect(covered, 'the start of part of the entry is covered').toBe(false)
+      }
+      await page.screenshot({
+        path: `/tmp/kr-text-size-earlier-actions-${surface}-${test.info().project.name}.png`
+      })
+      expect(await overrunning(page, '[data-testid="earlier-actions"]'), 'lines of the list that run past the screen or their box').toEqual([])
+      await stopWrapping(page, ['[data-testid="earlier-actions"]'])
+      expect(
+        await overrunning(page, '[data-testid="earlier-actions"]'),
+        'the measure sees the list text that cannot wrap'
+      ).not.toEqual([])
+    })
   }
 
   // The host's own words are the row's text, and a title or a line can hold a long word: at the
