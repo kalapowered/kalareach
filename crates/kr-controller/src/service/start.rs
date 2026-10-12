@@ -731,10 +731,21 @@ impl Controller {
         // the proxy this daemon started with, the endpoint's own. Nothing runs until the network
         // is up, which is when there is an endpoint to lease and devices to lease for. The record
         // of the leases it holds is opened whether or not a service is selected, and emptied when
-        // the service it was kept for is not the one selected now.
+        // the service and key it was kept for are not the ones in force now. A document that
+        // cannot be used leaves it as it is.
+        let lease_scope = started.relay.origin().map(|origin| {
+            format!(
+                "{origin}\n{}",
+                kr_protocol::scalars::to_base64url(device_keys.authorisation.public().as_bytes())
+            )
+        });
         let lease_record = crate::relay_leases::record::Record::open(
             setup.paths.state_dir(),
-            started.relay.origin(),
+            match (&started.unusable, &lease_scope) {
+                (Some(_), _) => crate::relay_leases::record::Kept::AsFound,
+                (None, Some(scope)) => crate::relay_leases::record::Kept::For(scope),
+                (None, None) => crate::relay_leases::record::Kept::Nothing,
+            },
         )?;
         let relay_keeper =
             match started.relay.origin() {
