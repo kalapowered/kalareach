@@ -142,6 +142,9 @@ pub struct AuthorityFeed {
     owes_synchronisation: bool,
     /// The feed's answer that this host was removed from it.
     removal: Option<Removal>,
+    /// True while what a snapshot would hold differs from what was last written down, so a write
+    /// that failed is made again by the next caller that asks, however little it changed.
+    unwritten: bool,
 }
 
 /// The feed's answer that this host was removed from it.
@@ -170,7 +173,19 @@ impl AuthorityFeed {
             stale: true,
             owes_synchronisation: true,
             removal: None,
+            unwritten: true,
         }
+    }
+
+    /// Whether what this record holds has yet to be written down.
+    #[must_use]
+    pub const fn is_unwritten(&self) -> bool {
+        self.unwritten
+    }
+
+    /// Notes that what this record holds has been written down.
+    pub const fn written(&mut self) {
+        self.unwritten = false;
     }
 
     /// The latest revision this host has accepted.
@@ -181,7 +196,7 @@ impl AuthorityFeed {
 
     /// Enrols a host that must acknowledge this host's revocation records.
     pub fn enrol(&mut self, device_id: DeviceId) {
-        self.enrolled.insert(device_id);
+        self.unwritten |= self.enrolled.insert(device_id);
     }
 
     /// Removes an enrolled host explicitly.
@@ -190,13 +205,15 @@ impl AuthorityFeed {
     /// **or that host is explicitly removed**. This is the second half; the records it was holding
     /// open settle once it is gone.
     pub fn remove_enrolled(&mut self, device_id: DeviceId) {
-        self.enrolled.remove(&device_id);
+        self.unwritten |= self.enrolled.remove(&device_id);
         let enrolled = self.enrolled.clone();
         for record in self.records.values_mut() {
             // The acknowledgement it did make is kept: it is a fact about a host that was enrolled
             // at the time, and the record's job now is only to stop owing delivery to a host that
             // no longer exists.
-            record.settled = enrolled.is_subset(&record.acknowledged_by);
+            let settled = enrolled.is_subset(&record.acknowledged_by);
+            self.unwritten |= settled != record.settled;
+            record.settled = settled;
         }
     }
 
@@ -235,6 +252,7 @@ impl AuthorityFeed {
                 }
             }
             std::collections::btree_map::Entry::Vacant(slot) => {
+                self.unwritten = true;
                 Ok(slot.insert(RetainedRevocation {
                     request,
                     origin: basis.origin.to_owned(),
@@ -260,6 +278,7 @@ impl AuthorityFeed {
             && record.authority_revision.is_none()
         {
             record.authority_revision = Some(revision);
+            self.unwritten = true;
         }
         self.note_revision(revision);
     }
@@ -278,6 +297,7 @@ impl AuthorityFeed {
     pub const fn note_revision(&mut self, revision: AuthorityRevision) {
         if revision.get() > self.accepted.get() {
             self.accepted = revision;
+            self.unwritten = true;
         }
     }
 
@@ -301,28 +321,28 @@ impl AuthorityFeed {
             });
         }
         self.accepted = record.authority_revision;
+        self.unwritten = true;
         Ok(())
     }
 
     /// Notes that `host` refused a request it began to take, before the refusal is sent, so a
     /// refusal that never arrives is made again and a request published again is refused again.
-    /// A request that took effect is not refused: it has a revision. Returns whether the record
-    /// changed.
-    pub fn note_refusal(&mut self, request_id: RevocationRequestId, host: DeviceId) -> bool {
+    /// A request that took effect is not refused: it has a revision.
+    pub fn note_refusal(&mut self, request_id: RevocationRequestId, host: DeviceId) {
         if self
             .records
             .get(&request_id)
             .is_some_and(|record| record.authority_revision.is_none())
         {
-            return self.acknowledge(request_id, host);
+            self.acknowledge(request_id, host);
         }
-        false
     }
 
-    /// Records one enrolled host's acknowledgement of one revocation record, and returns whether
-    /// the record changed. The record is kept either way: what changes when every enrolled host
-    /// has acknowledged it is that this host stops owing its delivery, not that it forgets the
-    /// revocation happened.
+    /// Records one enrolled host's acknowledgement of one revocation record.
+    ///
+    /// Returns whether every enrolled host has now acknowledged it. The record is kept either way:
+    /// what changes when it settles is that this host stops owing its delivery, not that it
+    /// forgets the revocation happened.
     pub fn acknowledge(&mut self, request_id: RevocationRequestId, device_id: DeviceId) -> bool {
         let enrolled = self.enrolled.clone();
         let Some(record) = self.records.get_mut(&request_id) else {
@@ -330,9 +350,9 @@ impl AuthorityFeed {
         };
         let added = record.acknowledged_by.insert(device_id);
         let settled = enrolled.is_subset(&record.acknowledged_by);
-        let changed = added || settled != record.settled;
+        self.unwritten |= added || settled != record.settled;
         record.settled = settled;
-        changed
+        record.settled
     }
 
     /// The revocation records this host is still owed acknowledgements for.
@@ -352,6 +372,7 @@ impl AuthorityFeed {
 
     /// Records a successful synchronisation with the feed.
     pub const fn synchronised(&mut self, at_ms: u64) {
+        self.unwritten |= !matches!(self.last_synchronised_at_ms, Some(last) if last == at_ms);
         self.last_synchronised_at_ms = Some(at_ms);
         self.stale = false;
         self.owes_synchronisation = false;
@@ -512,6 +533,7 @@ impl AuthorityFeed {
             stale: true,
             owes_synchronisation: true,
             removal: None,
+            unwritten: false,
         }
     }
 }

@@ -1252,6 +1252,10 @@ async fn a_device_the_configuration_leaves_no_right_to_manage_the_host_has_no_au
 async fn a_feed_longer_than_a_pass_reads_is_not_a_synchronisation_until_it_is_read_through() {
     let rig = Rig::start().await;
     rig.runtime().read_at_most_pages(1);
+    // A connection waits for the first page to be read and the second to be held, which takes longer
+    // than the default bound on a loaded machine.
+    rig.runtime()
+        .wait_for_a_synchronisation_at_most(Duration::from_secs(120));
     let synchronised = rig.shown().await.list.feed_synchronised_at_ms.0;
     assert!(synchronised.is_some(), "the host has read the feed once");
 
@@ -1566,10 +1570,11 @@ async fn a_document_the_host_cannot_use_leaves_the_removal_in_force() {
         .restarted(false, net_support::write_unusable_document)
         .await;
     refused_for_the_removal(&rig, &phone, &record).await;
-    assert!(
-        rig.shown().await.removal_item.is_some(),
-        "the owner is still told"
-    );
+    let shown = rig.shown().await;
+    assert!(shown.removal_item.is_some(), "the owner is still told");
+    let check = shown.check.expect("the doctor reports the feed");
+    assert_eq!(check.status, DoctorStatus::Warning, "{}", check.detail());
+    assert!(check.detail().contains("removed"), "{}", check.detail());
 
     let origin = rig.served.origin().to_owned();
     let rig = rig
@@ -1865,9 +1870,29 @@ fn the_attention_store_takes_the_feeds_notices(host: &Host) {
         .expect("the fault is lifted");
 }
 
+/// Waits until the task that sees to the notices has tried again after the wait it asked for, which
+/// the test lets end.
+async fn the_notice_task_tries_again(rig: &Rig) {
+    let poll_interval = Duration::from_millis(kr_controller::grants::feed::FEED_POLL_INTERVAL_MS);
+    let (_, release) = within(
+        "the task that sees to the notices backs off from the one it owes",
+        rig.timer.next_wait_under(poll_interval),
+    )
+    .await;
+    let mut attempts = rig.host.controller().feed_notice_attempts();
+    let seen = *attempts.borrow_and_update();
+    release.notify_one();
+    within("the task tries again", async {
+        while *attempts.borrow_and_update() <= seen {
+            attempts.changed().await.expect("the daemon is running");
+        }
+    })
+    .await;
+}
+
 /// The notice that the feed removed the host is owed to the owner until the attention store takes
-/// it. A start that could not give it does not forget it: the carrier gives it again, when the
-/// store can take it, without another start.
+/// it. A start that could not give it does not forget it: the host gives it again, when the store
+/// can take it, without another start.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_removal_notice_the_attention_store_refused_is_given_again_without_a_start() {
     let rig = Rig::start().await;
@@ -1882,21 +1907,7 @@ async fn a_removal_notice_the_attention_store_refused_is_given_again_without_a_s
     assert!(rig.shown().await.removal_item.is_none());
 
     the_attention_store_takes_the_feeds_notices(&rig.host);
-    let poll_interval = Duration::from_millis(kr_controller::grants::feed::FEED_POLL_INTERVAL_MS);
-    let (_, release) = within(
-        "the carrier backs off from the notice it owes",
-        rig.timer.next_wait_under(poll_interval),
-    )
-    .await;
-    let mut passes = rig.runtime().passes();
-    let seen = *passes.borrow_and_update();
-    release.notify_one();
-    within("the carrier gives the notice again", async {
-        while *passes.borrow_and_update() <= seen {
-            passes.changed().await.expect("the carrier is running");
-        }
-    })
-    .await;
+    the_notice_task_tries_again(&rig).await;
     assert!(
         rig.shown().await.removal_item.is_some(),
         "the owner is told once the store can take the notice"
@@ -1904,9 +1915,9 @@ async fn a_removal_notice_the_attention_store_refused_is_given_again_without_a_s
 }
 
 /// The notice that the host reads another feed, or none, is owed until the attention store takes
-/// it, and is given at the next start when the store could not take it at the first.
+/// it, and a host that reads no feed gives it again without another start.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_notice_that_the_owner_acted_the_attention_store_refused_is_given_at_the_next_start() {
+async fn a_notice_that_the_owner_acted_is_given_again_by_a_host_that_reads_no_feed() {
     let rig = Rig::start().await;
     rig.the_feed_removes_the_host().await;
     assert!(rig.shown().await.removal_item.is_some());
@@ -1921,10 +1932,72 @@ async fn a_notice_that_the_owner_acted_the_attention_store_refused_is_given_at_t
     );
 
     the_attention_store_takes_the_feeds_notices(&rig.host);
-    let rig = rig.restarted(false, |_| {}).await;
+    the_notice_task_tries_again(&rig).await;
     assert!(
         rig.shown().await.removal_item.is_none(),
         "the item ends once the store can take the notice"
+    );
+}
+
+/// Whether the attention store holds the notice is the store's own cursor and not a mark the host
+/// kept: a store put back to a copy from before the notice is given the notice again at the next
+/// start.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_notice_the_attention_store_lost_is_given_again_at_the_next_start() {
+    let rig = Rig::start().await;
+    rig.the_feed_removes_the_host().await;
+    assert!(rig.shown().await.removal_item.is_some());
+
+    let rig = rig
+        .restarted(true, |tree| {
+            let store = rusqlite::Connection::open(
+                tree.environment().state_dir().join("attention.sqlite3"),
+            )
+            .expect("opens the attention store");
+            store
+                .execute_batch(
+                    "DELETE FROM attention_items WHERE rule = 'attention.authority_feed_removed';
+                     DELETE FROM attention_consumed WHERE source = 'authority';",
+                )
+                .expect("the store is put back");
+        })
+        .await;
+    assert!(
+        rig.shown().await.removal_item.is_some(),
+        "the store lost the notice, and the host gave it again"
+    );
+}
+
+/// A notice is numbered above every one the attention store has taken, whatever the host kept of
+/// its own: a host that lost its record of the feed's removal cannot number the next notice behind
+/// the store's cursor, which would have the store drop it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_notice_is_numbered_above_what_the_attention_store_took_when_the_hosts_record_is_lost() {
+    let rig = Rig::start().await;
+    rig.the_feed_removes_the_host().await;
+    let rig = rig
+        .restarted(false, |tree| net_support::write_feed_document(tree, None))
+        .await;
+    assert!(
+        rig.shown().await.removal_item.is_none(),
+        "the owner acted, so the item ends"
+    );
+
+    let origin = rig.served.origin().to_owned();
+    let rig = rig
+        .restarted(false, |tree| {
+            let registry = rusqlite::Connection::open(tree.environment().registry_database())
+                .expect("opens the registry");
+            registry
+                .execute("DELETE FROM host_authority WHERE key = 'feed_removal'", [])
+                .expect("the record is lost");
+            net_support::write_feed_document(tree, Some(&origin));
+        })
+        .await;
+    rig.poll().await;
+    assert!(
+        rig.shown().await.removal_item.is_some(),
+        "the feed removes the host again, and the store takes the notice"
     );
 }
 
