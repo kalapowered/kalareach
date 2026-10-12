@@ -8518,3 +8518,508 @@ fn a_revocation_is_asked_for_a_few_times_before_it_is_given_up() {
         at += 7 * HOUR;
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// The encrypted object a preview refers to, placed in the device's mailbox
+// ---------------------------------------------------------------------------------------------
+
+/// A mailbox service a real placer reaches, and the device whose mailbox it holds.
+///
+/// The service is the stand-in that answers as the Worker's mailbox does; nothing between the
+/// delivery module and it is a double.
+struct MailboxService {
+    web: Arc<kr_service_stand_in::ServiceWeb>,
+    device: kr_crypto::keys::StoredEnvelopeKeyPair,
+    _runtime: tokio::runtime::Runtime,
+}
+
+impl MailboxService {
+    /// The route a delivery goes to.
+    const DELIVER: &'static str = "/api/mailbox/deliver";
+
+    /// A service and a device whose mailbox it holds, not yet selected by any delivery module.
+    fn standing() -> (Self, tokio::runtime::Handle) {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("a runtime");
+        let handle = runtime.handle().clone();
+        (
+            Self {
+                web: Arc::new(kr_service_stand_in::ServiceWeb::new()),
+                device: kr_crypto::keys::StoredEnvelopeKeyPair::generate().expect("a keypair"),
+                _runtime: runtime,
+            },
+            handle,
+        )
+    }
+
+    /// Selects the service for the environment's delivery module, the way the daemon does when its
+    /// configuration document names a mailbox service.
+    fn attach(environment: &Environment) -> Self {
+        let (service, runtime) = Self::standing();
+        let placer = kr_controller::push::mailbox::MailboxPlacer::new(
+            kr_protocol::service::GatewayOrigin::new(service.web.origin()).expect("an origin"),
+            Arc::new(OneTransport(
+                Arc::clone(&service.web) as Arc<dyn kr_client::services::ServiceHttp>
+            )),
+            Arc::new(kr_controller::push::sender::HostSigner::new(
+                kr_crypto::keys::AuthorisationKeyPair::generate().expect("a keypair"),
+            )),
+            runtime,
+        );
+        assert!(environment.module.attach_placer(Arc::new(placer)));
+        service
+    }
+
+    /// What the device's mailbox holds.
+    fn held(&self) -> Vec<kr_protocol::mailbox::SealedEnvelope> {
+        self.web.mailbox_envelopes(self.device.public())
+    }
+
+    /// How many deliveries the service was asked for.
+    fn asked(&self) -> usize {
+        self.web.requests_to(Self::DELIVER)
+    }
+}
+
+/// A gateway that records how many objects the device's mailbox held each time a push was
+/// presented, which is how a test sees which came first.
+#[derive(Debug)]
+struct WatchedGateway {
+    inner: GatewayDouble,
+    web: Arc<kr_service_stand_in::ServiceWeb>,
+    device: kr_protocol::scalars::StoredEnvelopeKey,
+    held_at_the_push: Mutex<Vec<usize>>,
+}
+
+impl WatchedGateway {
+    fn over(service: &MailboxService) -> Self {
+        Self {
+            inner: GatewayDouble::queued(),
+            web: Arc::clone(&service.web),
+            device: *service.device.public(),
+            held_at_the_push: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn held_at_the_push(&self) -> Vec<usize> {
+        self.held_at_the_push
+            .lock()
+            .expect("the double is not poisoned")
+            .clone()
+    }
+}
+
+impl PushSender for WatchedGateway {
+    fn send(
+        &self,
+        _credential: &PushDeliveryCredential,
+        request: &PushDeliveryRequest,
+    ) -> SendOutcome {
+        self.held_at_the_push
+            .lock()
+            .expect("the double is not poisoned")
+            .push(self.web.mailbox_envelopes(&self.device).len());
+        self.inner.next(request)
+    }
+}
+
+impl DeliveryStatus for WatchedGateway {
+    fn status(
+        &self,
+        credential: &PushDeliveryCredential,
+        notification_id: NotificationId,
+    ) -> StatusAnswer {
+        self.inner.status(credential, notification_id)
+    }
+}
+
+/// A delivery module whose host mailbox key the test keeps, so that it can open what the host
+/// sealed to a device.
+fn environment_keeping_the_hosts_mailbox_key()
+-> (Environment, kr_protocol::scalars::StoredEnvelopeKey) {
+    let directory = tempfile::tempdir().expect("a directory");
+    let path = directory.path().join("delivery.sqlite3");
+    let host_mailbox = kr_crypto::keys::StoredEnvelopeKeyPair::generate().expect("a keypair");
+    let host_public = *host_mailbox.public();
+    let module = DeliveryModule::open_at(
+        &path,
+        kr_crypto::keys::NotificationPreviewKeyPair::generate().expect("a keypair"),
+        host_mailbox,
+        secrets(),
+    )
+    .expect("a delivery module");
+    (
+        Environment {
+            module,
+            device_preview: kr_crypto::keys::NotificationPreviewKeyPair::generate()
+                .expect("a keypair"),
+            _directory: directory,
+            path,
+        },
+        host_public,
+    )
+}
+
+/// A paired device that wants previews, reachable at `mailbox` and no other mailbox.
+fn phone_at(
+    environment: &Environment,
+    mailbox: kr_protocol::scalars::StoredEnvelopeKey,
+) -> DestinationRecord {
+    let mut destination = push_destination(environment, true);
+    if let Destination::Push(push) = &mut destination.destination {
+        push.mailbox_key = Some(mailbox);
+    }
+    destination
+}
+
+/// The time on this machine's clock, which is the clock the mailbox service judges an item's
+/// expiry by.
+fn real_now() -> u64 {
+    u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("a clock after 1970")
+            .as_millis(),
+    )
+    .expect("a time in range")
+}
+
+/// Queues a notification whose detail does not fit in a push, at `now`, for a device whose mailbox
+/// is `service`'s, and returns the identifier of the object its preview refers to.
+fn queue_an_oversized_notification(
+    environment: &Environment,
+    service: &MailboxService,
+    now: u64,
+) -> kr_protocol::ids::EnvelopeId {
+    let destination = phone_at(environment, *service.device.public());
+    environment
+        .module
+        .configure(&destination)
+        .expect("a destination");
+    let mut notice = notice(1, &"x".repeat(1_400));
+    notice.observed_at_ms = TimestampMs::new(now);
+    notice.expires_at_ms = TimestampMs::new(now + DEFAULT_NOTIFICATION_LIFETIME_MS);
+    notice.audience = Audience::Sessions {
+        sessions: vec![session()],
+        at_ms: now,
+    };
+    environment
+        .module
+        .with(|producer| {
+            let taken = notice.taken(1).expect("an event record");
+            producer
+                .take(EventSource::Attention, "session-1", &[taken], 1, now)
+                .expect("a page");
+            producer
+                .produce(
+                    &notice,
+                    std::slice::from_ref(&destination),
+                    &Granted(BTreeSet::new()),
+                    &[],
+                    now,
+                )
+                .expect("a decision");
+            let record = producer.journal().deliveries().expect("a read").remove(0);
+            let request: PushDeliveryRequest =
+                serde_json::from_slice(record.content.as_ref().expect("a body"))
+                    .expect("a request");
+            let body = kr_delivery::preview::open_preview(
+                &environment.device_preview,
+                producer.preview_public(),
+                request.preview.as_ref().expect("a preview"),
+                now + 1,
+            )
+            .expect("the preview opens");
+            let object = *body.detail_object.as_ref().expect("a reference");
+            assert!(
+                producer.journal().object(object).expect("a read").is_some(),
+                "the object is owed to the mailbox"
+            );
+            Ok(object)
+        })
+        .expect("a read")
+}
+
+/// Runs one pass at `now_ms`, with the push going through `gateway`.
+fn pass_at(environment: &Environment, gateway: &WatchedGateway, now_ms: u64) -> usize {
+    environment
+        .module
+        .run_due(
+            gateway,
+            gateway,
+            &held(now_ms + 30 * 24 * 60 * 60 * 1000),
+            &ExternalDouble::answering(Vec::new()),
+            &Granted(BTreeSet::new()),
+            &move || now_ms,
+        )
+        .expect("a pass")
+}
+
+/// The state the one notification is in.
+fn the_notification_is(environment: &Environment) -> (DeliveryState, String) {
+    environment
+        .module
+        .with(|producer| {
+            let record = producer.journal().deliveries().expect("a read").remove(0);
+            Ok((record.state, record.detail.unwrap_or_default()))
+        })
+        .expect("a read")
+}
+
+/// Whether the host still owes the mailbox the object.
+fn the_object_is_owed(environment: &Environment, object: kr_protocol::ids::EnvelopeId) -> bool {
+    environment
+        .module
+        .with(|producer| Ok(producer.journal().object(object).expect("a read").is_some()))
+        .expect("a read")
+}
+
+/// KR-REQ-09.21: the detail a preview refers to is in the device's mailbox before the push that
+/// refers to it is presented, sealed so that only the device opens it, and the host owes the
+/// mailbox nothing after it.
+#[test]
+fn a_detail_that_does_not_fit_is_in_the_devices_mailbox_before_the_push_that_refers_to_it() {
+    let (environment, host_public) = environment_keeping_the_hosts_mailbox_key();
+    let now = real_now();
+    let service = MailboxService::attach(&environment);
+    let object = queue_an_oversized_notification(&environment, &service, now);
+    let gateway = WatchedGateway::over(&service);
+
+    assert_eq!(pass_at(&environment, &gateway, now), 1);
+
+    assert_eq!(
+        gateway.held_at_the_push(),
+        [1],
+        "the mailbox held the object when the push was presented"
+    );
+    let held = service.held();
+    assert_eq!(held.len(), 1);
+    assert_eq!(held[0].routing.envelope_id, object);
+    let opened = kr_crypto::envelope::open_envelope(
+        &service.device,
+        &host_public,
+        &held[0],
+        now + 1,
+        |_| Ok(()),
+    )
+    .expect("the device opens the object");
+    let body: kr_delivery::preview::PreviewBody =
+        kr_cbor::from_canonical_slice(opened.payload.as_slice(), &kr_cbor::Limits::DEFAULT)
+            .expect("the whole body");
+    assert_eq!(body.summary.len(), 1_400, "nothing was trimmed");
+    assert_eq!(the_notification_is(&environment).0, DeliveryState::Accepted);
+    assert!(
+        !the_object_is_owed(&environment, object),
+        "what is in the mailbox is not owed to it"
+    );
+}
+
+/// KR-REQ-09.21: a mailbox service that cannot take the object holds the push back, and the push
+/// is not presented before the service said it would take requests again; once it has, the object
+/// is placed and then the push is presented.
+#[test]
+fn a_mailbox_service_that_asks_for_later_holds_the_push_back_until_it_has() {
+    let (environment, _) = environment_keeping_the_hosts_mailbox_key();
+    let now = real_now();
+    let service = MailboxService::attach(&environment);
+    let object = queue_an_oversized_notification(&environment, &service, now);
+    let gateway = WatchedGateway::over(&service);
+    service.web.fail(
+        MailboxService::DELIVER,
+        1,
+        kr_service_stand_in::Moment::Refuse {
+            status: 503,
+            code: "SERVICE_UNAVAILABLE",
+            retry_after_seconds: Some(120),
+        },
+    );
+
+    assert_eq!(pass_at(&environment, &gateway, now), 1);
+    assert!(
+        gateway.held_at_the_push().is_empty(),
+        "no push was presented"
+    );
+    assert_eq!(the_notification_is(&environment).0, DeliveryState::Retrying);
+    assert!(the_object_is_owed(&environment, object));
+
+    // Not before the service's delay, though the notification's own backoff is shorter.
+    assert_eq!(pass_at(&environment, &gateway, now + 119_000), 0);
+    assert_eq!(service.asked(), 1);
+
+    assert_eq!(pass_at(&environment, &gateway, now + 121_000), 1);
+    assert_eq!(gateway.held_at_the_push(), [1]);
+    assert_eq!(service.held().len(), 1);
+    assert_eq!(the_notification_is(&environment).0, DeliveryState::Accepted);
+}
+
+/// KR-REQ-09.21: a delivery whose answer was lost is placed again and stored once: the service
+/// recognises the envelope, and the push waits for the answer that tells the host it is there.
+#[test]
+fn a_delivery_whose_answer_was_lost_is_placed_again_and_stored_once() {
+    let (environment, _) = environment_keeping_the_hosts_mailbox_key();
+    let now = real_now();
+    let service = MailboxService::attach(&environment);
+    queue_an_oversized_notification(&environment, &service, now);
+    let gateway = WatchedGateway::over(&service);
+    service.web.fail(
+        MailboxService::DELIVER,
+        1,
+        kr_service_stand_in::Moment::After,
+    );
+
+    assert_eq!(pass_at(&environment, &gateway, now), 1);
+    assert_eq!(service.held().len(), 1, "the service did store it");
+    assert!(
+        gateway.held_at_the_push().is_empty(),
+        "and the host, not knowing, presented nothing"
+    );
+
+    assert_eq!(pass_at(&environment, &gateway, now + 60 * 60 * 1000), 1);
+    assert_eq!(service.asked(), 2);
+    assert_eq!(service.held().len(), 1, "stored once");
+    assert_eq!(gateway.held_at_the_push(), [1]);
+    assert_eq!(the_notification_is(&environment).0, DeliveryState::Accepted);
+}
+
+/// KR-REQ-09.21: a mailbox that will not take the object does not keep a person from being told:
+/// the push is presented without its detail, nothing is dropped silently, and the record says the
+/// mailbox did not take it.
+#[test]
+fn a_mailbox_that_is_full_does_not_hold_the_push_back() {
+    let (environment, _) = environment_keeping_the_hosts_mailbox_key();
+    let now = real_now();
+    let service = MailboxService::attach(&environment);
+    let object = queue_an_oversized_notification(&environment, &service, now);
+    let gateway = WatchedGateway::over(&service);
+    service.web.fail(
+        MailboxService::DELIVER,
+        1,
+        kr_service_stand_in::Moment::Refuse {
+            status: 402,
+            code: "QUOTA_EXHAUSTED",
+            retry_after_seconds: None,
+        },
+    );
+
+    assert_eq!(pass_at(&environment, &gateway, now), 1);
+
+    assert_eq!(
+        gateway.held_at_the_push(),
+        [0],
+        "presented, without its detail"
+    );
+    assert!(service.held().is_empty());
+    let (state, detail) = the_notification_is(&environment);
+    assert_eq!(state, DeliveryState::Accepted);
+    assert!(detail.contains("mailbox"), "the record says why: {detail}");
+    assert!(
+        !the_object_is_owed(&environment, object),
+        "and the host does not ask a mailbox that said no again"
+    );
+    assert_eq!(service.asked(), 1);
+}
+
+/// KR-REQ-09.21: a mailbox service that stays down does not keep a person from being told. The
+/// push waits through the attempts the notification has, and its last attempt is made without the
+/// detail.
+#[test]
+fn a_mailbox_that_stays_down_does_not_keep_a_person_from_being_told() {
+    let (environment, _) = environment_keeping_the_hosts_mailbox_key();
+    let now = real_now();
+    let service = MailboxService::attach(&environment);
+    queue_an_oversized_notification(&environment, &service, now);
+    let gateway = WatchedGateway::over(&service);
+    for nth in 1..=kr_delivery::push::MAX_ATTEMPTS {
+        service.web.fail(
+            MailboxService::DELIVER,
+            u32::try_from(nth).expect("a small count"),
+            kr_service_stand_in::Moment::Refuse {
+                status: 503,
+                code: "SERVICE_UNAVAILABLE",
+                retry_after_seconds: None,
+            },
+        );
+    }
+
+    for attempt in 0..kr_delivery::push::MAX_ATTEMPTS - 1 {
+        assert_eq!(pass_at(&environment, &gateway, now + attempt * 600_000), 1);
+        assert!(gateway.held_at_the_push().is_empty(), "attempt {attempt}");
+        assert_eq!(the_notification_is(&environment).0, DeliveryState::Retrying);
+    }
+    let last = now + (kr_delivery::push::MAX_ATTEMPTS - 1) * 600_000;
+    assert_eq!(pass_at(&environment, &gateway, last), 1);
+
+    assert_eq!(
+        gateway.held_at_the_push(),
+        [0],
+        "presented, without its detail"
+    );
+    assert!(service.held().is_empty());
+    let (state, detail) = the_notification_is(&environment);
+    assert_eq!(state, DeliveryState::Accepted);
+    assert!(detail.contains("mailbox"), "the record says why: {detail}");
+}
+
+/// A host that selects no mailbox service presents the push as it always did and asks nobody.
+#[test]
+fn a_host_that_selects_no_mailbox_service_places_nothing() {
+    let (environment, _) = environment_keeping_the_hosts_mailbox_key();
+    let now = real_now();
+    // The service exists, and no delivery module selects it.
+    let (service, _) = MailboxService::standing();
+    queue_an_oversized_notification(&environment, &service, now);
+    let gateway = WatchedGateway::over(&service);
+
+    assert_eq!(pass_at(&environment, &gateway, now), 1);
+
+    assert_eq!(service.asked(), 0);
+    assert_eq!(gateway.held_at_the_push(), [0]);
+    assert_eq!(the_notification_is(&environment).0, DeliveryState::Accepted);
+}
+
+/// A recipient authority under which nobody may be told anything: every grant has ended.
+#[derive(Debug)]
+struct Nobody;
+
+impl RecipientAuthority for Nobody {
+    fn scope_for(&self, _rule: &DeliveryRule) -> Option<RecipientScope> {
+        None
+    }
+
+    fn device_scope(&self, _destination: &DestinationRecord) -> Option<RecipientScope> {
+        None
+    }
+}
+
+/// KR-REQ-09.21: the object is placed under the authority the push is presented under. A device
+/// whose grant ended after the notification was queued is left nothing in its mailbox, and the host
+/// owes the mailbox nothing for a notification it will not present.
+#[test]
+fn a_recipient_whose_grant_ended_is_left_no_object() {
+    let (environment, _) = environment_keeping_the_hosts_mailbox_key();
+    let now = real_now();
+    let service = MailboxService::attach(&environment);
+    let object = queue_an_oversized_notification(&environment, &service, now);
+    let gateway = WatchedGateway::over(&service);
+
+    let attempted = environment
+        .module
+        .run_due(
+            &gateway,
+            &gateway,
+            &held(now + 30 * 24 * 60 * 60 * 1000),
+            &ExternalDouble::answering(Vec::new()),
+            &Nobody,
+            &at(now),
+        )
+        .expect("a pass");
+
+    assert_eq!(attempted, 0, "nothing was presented");
+    assert_eq!(service.asked(), 0, "and nothing was placed");
+    assert!(gateway.held_at_the_push().is_empty());
+    assert_eq!(the_notification_is(&environment).0, DeliveryState::Revoked);
+    assert!(!the_object_is_owed(&environment, object));
+}

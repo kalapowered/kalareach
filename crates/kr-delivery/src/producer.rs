@@ -772,6 +772,17 @@ impl Producer {
         })
     }
 
+    /// The identifier of the encrypted object that holds the detail one notification's preview
+    /// refers to.
+    ///
+    /// It is derived from the notification and a secret only this journal holds, so the host finds
+    /// the object a notification owes its device without a second key to keep, and no service that
+    /// sees both the notification's identifier and the object's can tell they belong together.
+    #[must_use]
+    pub fn detail_object_of(&self, notification_id: NotificationId) -> EnvelopeId {
+        preview::detail_object_id(&self.collapse_secret, notification_id)
+    }
+
     /// Takes every announcement one attention store is offering, and settles them afterwards.
     ///
     /// The order is the attention store's settlement rule: take, record durably with the cursor,
@@ -1408,7 +1419,7 @@ impl Producer {
                     "this destination has no stored-envelope key, so the excess detail of a \
                      preview has no encrypted object to move into",
                 ))?;
-                let detail_id = EnvelopeId::new(Uuid::from_bytes(*uuid::Uuid::new_v4().as_bytes()));
+                let detail_id = preview::detail_object_id(&self.collapse_secret, notification_id);
                 let detail = kr_crypto::envelope::seal_envelope(
                     &self.mailbox_key,
                     &recipient,

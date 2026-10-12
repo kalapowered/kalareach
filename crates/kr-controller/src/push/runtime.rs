@@ -170,6 +170,9 @@ pub struct DeliveryRuntime {
     signer: Arc<dyn ServiceSigner>,
     adapters: OnceLock<Adapters>,
     attention: OnceLock<Arc<crate::attention::AttentionModule>>,
+    /// The mailbox service this host places the objects of its previews in, when its configuration
+    /// document selects one.
+    mailbox: OnceLock<kr_protocol::service::GatewayOrigin>,
     recovered: AtomicBool,
     /// What each paired device may still ask the gateway about a credential it hands over.
     confirmations: Mutex<std::collections::BTreeMap<kr_protocol::ids::DeviceId, StatusBudget>>,
@@ -209,6 +212,7 @@ impl DeliveryRuntime {
             signer,
             adapters: OnceLock::new(),
             attention: OnceLock::new(),
+            mailbox: OnceLock::new(),
             recovered: AtomicBool::new(false),
             confirmations: Mutex::new(std::collections::BTreeMap::new()),
             nonces: StatusBudget::new(CONFIRMATIONS_PER_HOST),
@@ -257,6 +261,15 @@ impl DeliveryRuntime {
         self.adapters.get().map(|adapters| &adapters.transports)
     }
 
+    /// Names the mailbox service this host places the encrypted objects of its previews in.
+    ///
+    /// Once, and before the transport is attached, which is what builds the placer that reaches
+    /// it: the service is the composition root's decision, made at startup from the configuration
+    /// document. Returns false when one was already named.
+    pub fn select_mailbox(&self, origin: kr_protocol::service::GatewayOrigin) -> bool {
+        self.mailbox.set(origin).is_ok()
+    }
+
     /// Attaches the transport every delivery exchange goes through.
     ///
     /// Once: the transport is the composition root's decision, made at startup, and a second one
@@ -293,6 +306,15 @@ impl DeliveryRuntime {
             .is_ok();
         if attached {
             self.credentials.attach_renewal(senders);
+            if let Some(origin) = self.mailbox.get() {
+                self.module
+                    .attach_placer(Arc::new(super::mailbox::MailboxPlacer::new(
+                        origin.clone(),
+                        transports,
+                        Arc::clone(&self.signer),
+                        self.runtime.clone(),
+                    )));
+            }
         }
         attached
     }
