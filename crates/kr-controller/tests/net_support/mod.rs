@@ -407,9 +407,12 @@ impl Host {
         };
         let controller = kr_controller::testing::taken_over(|| {
             let secrets = environment.secrets_dir();
+            // The daemon's start is a large future. On the heap it does not count against the
+            // 2 MiB stack of the test thread, which a test that restarts a daemon and has a large
+            // body of its own comes close to filling.
             kr_controller::testing::with_account_origin(
                 account_origin.clone(),
-                Controller::start_on_clocks(
+                Box::pin(Controller::start_on_clocks(
                     ControllerSetup {
                         paths: environment.clone(),
                         environment_id,
@@ -435,7 +438,7 @@ impl Host {
                         terminal: Box::new(kr_controller::supervision::NoTerminal),
                     },
                     clocks.clone(),
-                ),
+                )),
             )
         })
         .await
