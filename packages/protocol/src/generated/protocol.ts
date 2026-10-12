@@ -11342,10 +11342,9 @@ export interface NetworkSelection {
    * the model's files, and plugin repositories. Nothing goes around it, so an address it
    * cannot reach fails, and a daemon that started over a document it could not use sends
    * nothing through these routes until it starts again over one it can. Name lookups and
-   * mail submission do not
-   * use it. It is this machine's own choice: no invitation or host bundle carries it. It
-   * names no user and no password, because a proxy that needs credentials is not
-   * supported.
+   * mail submission do not use it. It is this machine's own choice: no invitation or host
+   * bundle carries it. It names no user and no password, because a proxy that needs
+   * credentials is not supported.
    */
   proxy_url?: string | null
   /**

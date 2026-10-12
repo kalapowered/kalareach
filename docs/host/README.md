@@ -261,8 +261,8 @@ plugin repositories. Nothing goes around it, so an address the proxy cannot reac
 included. Mail submission is SMTP and connects directly, and name lookups go directly too. Without a
 proxy every one of those connections goes directly, apart from iroh's relay latency probe and
 captive-portal check, which then follow `HTTP_PROXY`, `HTTPS_PROXY` and `ALL_PROXY` when those are
-set. The daemon reads the proxy when it
-starts, like the rest of the section, and every client takes that one reading. A daemon that starts
+set. The daemon reads the proxy when it starts, like the rest of the section, and every client takes
+that one reading. A daemon that starts
 over a document it cannot use makes no HTTPS connection to the push gateway, a webhook address or a
 chat service, a plugin repository, the model's files or the managed account service, and uploads no
 backup, until it starts again over one it can use.

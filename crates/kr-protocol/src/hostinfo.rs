@@ -2411,10 +2411,9 @@ pub mod configuration {
         /// the model's files, and plugin repositories. Nothing goes around it, so an address it
         /// cannot reach fails, and a daemon that started over a document it could not use sends
         /// nothing through these routes until it starts again over one it can. Name lookups and
-        /// mail submission do not
-        /// use it. It is this machine's own choice: no invitation or host bundle carries it. It
-        /// names no user and no password, because a proxy that needs credentials is not
-        /// supported.
+        /// mail submission do not use it. It is this machine's own choice: no invitation or host
+        /// bundle carries it. It names no user and no password, because a proxy that needs
+        /// credentials is not supported.
         pub proxy_url: Nullable<String>,
     }
 
@@ -4943,9 +4942,9 @@ pub mod configuration {
     /// rendezvous, delivery, plugin repository and mail clients verify a server against the
     /// platform's own store, the network endpoint verifies its relays and discovery servers
     /// against the public anchors and the document's relay trust anchors, and neither reads the
-    /// variables other programs take to name a store
-    /// ([`CERTIFICATE_STORE_VARIABLES`]). No variable names this host's owner: the owner is
-    /// recorded through local IPC, by the pairing that establishes it.
+    /// variables other programs take to name a store ([`CERTIFICATE_STORE_VARIABLES`]). No
+    /// variable names this host's owner: the owner is recorded through local IPC, by the pairing
+    /// that establishes it.
     ///
     /// The list names what this build reads that decides something: a location, the login this
     /// host describes, or where the endpoint's relay checks and lookups go. It is not an inventory

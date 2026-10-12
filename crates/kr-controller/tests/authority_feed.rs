@@ -1252,8 +1252,8 @@ async fn a_device_the_configuration_leaves_no_right_to_manage_the_host_has_no_au
 async fn a_feed_longer_than_a_pass_reads_is_not_a_synchronisation_until_it_is_read_through() {
     let rig = Rig::start().await;
     rig.runtime().read_at_most_pages(1);
-    // A connection waits for the first page to be read and the second to be held, which takes longer
-    // than the default bound on a loaded machine.
+    // A connection waits for the first page to be read and the second to be held, which can take
+    // longer than the default bound on a loaded machine.
     rig.runtime()
         .wait_for_a_synchronisation_at_most(Duration::from_secs(120));
     let synchronised = rig.shown().await.list.feed_synchronised_at_ms.0;
@@ -1870,15 +1870,16 @@ fn the_attention_store_takes_the_feeds_notices(host: &Host) {
         .expect("the fault is lifted");
 }
 
-/// Waits until the task that sees to the notices has tried again after the wait it asked for, which
-/// the test lets end.
-async fn the_notice_task_tries_again(rig: &Rig) {
+/// Waits for the task that sees to the notices to have been refused and to ask for its wait, lets
+/// the store take notices, and waits until the task has tried again after the wait ends.
+async fn the_store_takes_the_notices_the_task_tries_again(rig: &Rig) {
     let poll_interval = Duration::from_millis(kr_controller::grants::feed::FEED_POLL_INTERVAL_MS);
     let (_, release) = within(
         "the task that sees to the notices backs off from the one it owes",
         rig.timer.next_wait_under(poll_interval),
     )
     .await;
+    the_attention_store_takes_the_feeds_notices(&rig.host);
     let mut attempts = rig.host.controller().feed_notice_attempts();
     let seen = *attempts.borrow_and_update();
     release.notify_one();
@@ -1906,8 +1907,7 @@ async fn a_removal_notice_the_attention_store_refused_is_given_again_without_a_s
     let rig = rig.restarted(true, |_| {}).await;
     assert!(rig.shown().await.removal_item.is_none());
 
-    the_attention_store_takes_the_feeds_notices(&rig.host);
-    the_notice_task_tries_again(&rig).await;
+    the_store_takes_the_notices_the_task_tries_again(&rig).await;
     assert!(
         rig.shown().await.removal_item.is_some(),
         "the owner is told once the store can take the notice"
@@ -1931,8 +1931,7 @@ async fn a_notice_that_the_owner_acted_is_given_again_by_a_host_that_reads_no_fe
         "the store refused the notice that ends it"
     );
 
-    the_attention_store_takes_the_feeds_notices(&rig.host);
-    the_notice_task_tries_again(&rig).await;
+    the_store_takes_the_notices_the_task_tries_again(&rig).await;
     assert!(
         rig.shown().await.removal_item.is_none(),
         "the item ends once the store can take the notice"
@@ -1999,6 +1998,115 @@ async fn a_notice_is_numbered_above_what_the_attention_store_took_when_the_hosts
         rig.shown().await.removal_item.is_some(),
         "the feed removes the host again, and the store takes the notice"
     );
+}
+
+/// A record of the removal that is behind the attention store's cursor, as when the registry was put
+/// back to an earlier copy than the store, is numbered again above the cursor at the next start, so
+/// that the notice it holds is given and not taken for one the store has.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_removal_recorded_behind_the_attention_stores_cursor_is_numbered_again_at_the_next_start()
+{
+    let rig = Rig::start().await;
+    rig.the_feed_removes_the_host().await;
+    assert!(rig.shown().await.removal_item.is_some());
+
+    let rig = rig
+        .restarted(true, |tree| {
+            let store = rusqlite::Connection::open(
+                tree.environment().state_dir().join("attention.sqlite3"),
+            )
+            .expect("opens the attention store");
+            store
+                .execute_batch(
+                    "DELETE FROM attention_items WHERE rule = 'attention.authority_feed_removed';
+                     UPDATE attention_consumed SET sequence = 100 WHERE source = 'authority';",
+                )
+                .expect("the store is ahead of the registry");
+        })
+        .await;
+    assert!(
+        rig.shown().await.removal_item.is_some(),
+        "the registry says the feed removed the host, and the owner is told"
+    );
+}
+
+/// A refusal is on disk before it is sent, though its first write failed: the pass that could not
+/// write it sent nothing, and the next pass writes it before it says anything to the feed, though
+/// it has nothing new to record.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refusal_whose_first_write_failed_is_on_disk_before_it_is_sent() {
+    let rig = Rig::start().await;
+    let (_phone, device) = rig.pairs(&[ActionRight::SessionView]).await;
+    rig.owner_publishes(0xe5, devices(device.device_id)).await;
+    rig.poll().await;
+    let again = rig.owner_publishes(0xe6, devices(device.device_id)).await;
+
+    let (arrived, go) = rig
+        .host
+        .controller()
+        .pause_after_a_feed_request_was_carried_out();
+    let registry =
+        rusqlite::Connection::open(rig.host.registry_database()).expect("opens the registry");
+    registry
+        .busy_timeout(Duration::from_secs(5))
+        .expect("waits for the daemon's writes");
+    {
+        let polled = rig.runtime().synchronised_before_serving();
+        tokio::pin!(polled);
+        tokio::select! {
+            () = &mut polled => panic!("the pass stopped where it was held"),
+            reached = arrived => reached.expect("the pass reached the point"),
+        }
+        // The note is written. The refusal it is about to write is not.
+        registry
+            .execute_batch(
+                "CREATE TRIGGER refuse_refusal BEFORE INSERT ON host_authority
+                 WHEN NEW.key = 'feed'
+                 BEGIN SELECT RAISE(ABORT, 'no room'); END;",
+            )
+            .expect("the fault is in place");
+        go.send(()).expect("the pass goes on");
+        polled.await;
+    }
+    assert_eq!(
+        rig.held(&again).await.rejected.0,
+        None,
+        "the refusal could not be written, so it was not sent"
+    );
+
+    registry
+        .execute_batch("DROP TRIGGER refuse_refusal")
+        .expect("the fault is lifted");
+    // The next pass reads (1) and refuses the request (2): the feed holds that answer while the
+    // test looks at what the host has on disk.
+    let before = rig.served.web().requests_to(AUTHORITY);
+    rig.served.web().fail(AUTHORITY, 2, Moment::Hold);
+    rig.timer.release_held();
+    let polled = rig.runtime().synchronised_before_serving();
+    tokio::pin!(polled);
+    tokio::select! {
+        () = &mut polled => panic!("the pass ended before the refusal was held"),
+        () = rig.served.web().requests_reach(AUTHORITY, before + 2) => {}
+    }
+    let stored = rig
+        .host
+        .controller()
+        .sharing()
+        .grants()
+        .stored_feed()
+        .expect("the record reads")
+        .expect("the record exists");
+    let note = stored
+        .records
+        .iter()
+        .find(|record| record.request.request_id == again.request_id)
+        .expect("the request is on disk");
+    assert!(
+        note.acknowledged_by.contains(&rig.host_device()),
+        "the refusal is on disk when the host sends it"
+    );
+    rig.served.web().release_held();
+    polled.await;
 }
 
 /// The notices about the feed are numbered by the order the host gave them in and not by the time
