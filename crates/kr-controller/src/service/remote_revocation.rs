@@ -16,6 +16,7 @@ use kr_protocol::actor::ActorIngress;
 use kr_protocol::ids::{AuthorityRevision, DeviceId, GrantId};
 use kr_protocol::method::Method;
 use kr_protocol::pairing::{KeyPurpose, RevocationCompletion, RevocationRequest, RevocationTarget};
+use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::{KeyId, U64};
 
 use super::Controller;
@@ -122,6 +123,22 @@ impl Controller {
     /// lease, an exclusive management, the ceiling and the clock, is decided as it is for the
     /// device's own request.
     fn standing_to_manage(&self, device: &DeviceRecord, now_ms: u64) -> Standing {
+        let ceiling = self
+            .rights_ceiling
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        // A device whose grant, narrowed by this host's ceiling, holds no right to manage this host
+        // is turned away whatever the clock says. Asking the clock first would leave the pass
+        // unable to say anything about it while the clock is unproven, and stop every request
+        // behind it for a device that could never have been heard.
+        if !device.grant.actions.contains(&ActionRight::HostManage)
+            || ceiling
+                .as_ref()
+                .is_some_and(|ceiling| !ceiling.contains(&ActionRight::HostManage))
+        {
+            return Standing::Not;
+        }
         let record = GrantRecord {
             grant: device.grant.clone(),
             session_id: None,
@@ -140,11 +157,6 @@ impl Controller {
             now_ms: now_ms.max(self.wall_now_ms()),
             continuous_now: self.clock.now(),
         };
-        let ceiling = self
-            .rights_ceiling
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone();
         let live = self
             .policy
             .lock()
