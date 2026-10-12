@@ -8530,46 +8530,83 @@ fn a_revocation_is_asked_for_a_few_times_before_it_is_given_up() {
 struct MailboxService {
     web: Arc<kr_service_stand_in::ServiceWeb>,
     device: kr_crypto::keys::StoredEnvelopeKeyPair,
+    placer: Arc<kr_controller::push::mailbox::MailboxPlacer>,
     _runtime: tokio::runtime::Runtime,
+}
+
+/// What a transport does as a request reaches the mailbox service, before the service answers it.
+type OnRequest = Box<dyn Fn() + Send + Sync>;
+
+/// The mailbox service, reached through a transport that lets a test act as a request arrives.
+struct Reached {
+    web: Arc<kr_service_stand_in::ServiceWeb>,
+    on_request: OnRequest,
+}
+
+impl std::fmt::Debug for Reached {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Reached")
+    }
+}
+
+impl kr_client::services::ServiceHttp for Reached {
+    fn post_json<'a>(
+        &'a self,
+        url: &'a str,
+        body: &'a [u8],
+        headers: &'a [(&'a str, &'a str)],
+    ) -> kr_client::services::ServiceFuture<'a, kr_client::services::ServiceHttpAnswer> {
+        (self.on_request)();
+        self.web.post_json(url, body, headers)
+    }
 }
 
 impl MailboxService {
     /// The route a delivery goes to.
     const DELIVER: &'static str = "/api/mailbox/deliver";
 
-    /// A service and a device whose mailbox it holds, not yet selected by any delivery module.
-    fn standing() -> (Self, tokio::runtime::Handle) {
+    /// A service and a device whose mailbox it holds, with a placer that reaches it, not yet
+    /// selected by any delivery module. `on_request` runs as each request arrives.
+    fn standing(on_request: OnRequest) -> Self {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
             .build()
             .expect("a runtime");
-        let handle = runtime.handle().clone();
-        (
-            Self {
-                web: Arc::new(kr_service_stand_in::ServiceWeb::new()),
-                device: kr_crypto::keys::StoredEnvelopeKeyPair::generate().expect("a keypair"),
-                _runtime: runtime,
-            },
-            handle,
-        )
+        let web = Arc::new(kr_service_stand_in::ServiceWeb::new());
+        let placer = Arc::new(kr_controller::push::mailbox::MailboxPlacer::new(
+            kr_protocol::service::GatewayOrigin::new(web.origin()).expect("an origin"),
+            Arc::new(OneTransport(Arc::new(Reached {
+                web: Arc::clone(&web),
+                on_request,
+            }))),
+            Arc::new(kr_controller::push::sender::HostSigner::new(
+                kr_crypto::keys::AuthorisationKeyPair::generate().expect("a keypair"),
+            )),
+            runtime.handle().clone(),
+        ));
+        Self {
+            web,
+            device: kr_crypto::keys::StoredEnvelopeKeyPair::generate().expect("a keypair"),
+            placer,
+            _runtime: runtime,
+        }
     }
 
     /// Selects the service for the environment's delivery module, the way the daemon does when its
     /// configuration document names a mailbox service.
     fn attach(environment: &Environment) -> Self {
-        let (service, runtime) = Self::standing();
-        let placer = kr_controller::push::mailbox::MailboxPlacer::new(
-            kr_protocol::service::GatewayOrigin::new(service.web.origin()).expect("an origin"),
-            Arc::new(OneTransport(
-                Arc::clone(&service.web) as Arc<dyn kr_client::services::ServiceHttp>
-            )),
-            Arc::new(kr_controller::push::sender::HostSigner::new(
-                kr_crypto::keys::AuthorisationKeyPair::generate().expect("a keypair"),
-            )),
-            runtime,
+        Self::attach_acting(environment, Box::new(|| {}))
+    }
+
+    /// As [`Self::attach`], with `on_request` run as each request arrives.
+    fn attach_acting(environment: &Environment, on_request: OnRequest) -> Self {
+        let service = Self::standing(on_request);
+        assert!(
+            environment
+                .module
+                .attach_placer(Arc::clone(&service.placer) as Arc<_>)
         );
-        assert!(environment.module.attach_placer(Arc::new(placer)));
         service
     }
 
@@ -8581,6 +8618,47 @@ impl MailboxService {
     /// How many deliveries the service was asked for.
     fn asked(&self) -> usize {
         self.web.requests_to(Self::DELIVER)
+    }
+
+    /// Fills the device's mailbox to what one writer may hold of it, with items from the key this
+    /// host signs its requests with, as a host does that has left it as many notifications.
+    fn fill_what_one_writer_may_hold(&self, now: u64) {
+        use kr_controller::push::mailbox::ObjectPlacer as _;
+        let host = kr_crypto::keys::StoredEnvelopeKeyPair::generate().expect("a keypair");
+        let host = &host;
+        for number in 0..128_u8 {
+            let item = kr_crypto::envelope::seal_envelope(
+                host,
+                self.device.public(),
+                &kr_protocol::mailbox::EnvelopePlaintext {
+                    version: kr_protocol::mailbox::EnvelopeVersion::V1,
+                    envelope_id: kr_protocol::ids::EnvelopeId::new(uuid(number)),
+                    sender_key_id: kr_crypto::keys::key_id(
+                        kr_protocol::pairing::KeyPurpose::StoredEnvelope,
+                        host.public().as_bytes(),
+                    ),
+                    recipient_key_id: kr_crypto::keys::key_id(
+                        kr_protocol::pairing::KeyPurpose::StoredEnvelope,
+                        self.device.public().as_bytes(),
+                    ),
+                    payload_type: kr_protocol::mailbox::MailboxPayloadType::StateReference,
+                    created_at_ms: TimestampMs::new(now),
+                    expires_at_ms: TimestampMs::new(now + 60 * 60 * 1000),
+                    grant_id: Nullable::null(),
+                    environment_id: Nullable::null(),
+                    session_id: Nullable::null(),
+                    session_epoch: Nullable::null(),
+                    thread_id: Nullable::null(),
+                    payload: kr_protocol::scalars::Bytes::new(vec![number; 64]),
+                },
+            )
+            .expect("a sealed item");
+            assert_eq!(
+                self.placer.place(self.device.public(), &item),
+                kr_controller::push::mailbox::Placement::Placed,
+                "item {number}"
+            );
+        }
     }
 }
 
@@ -8694,6 +8772,22 @@ fn queue_an_oversized_notification(
     service: &MailboxService,
     now: u64,
 ) -> kr_protocol::ids::EnvelopeId {
+    queue_an_oversized_notification_living(
+        environment,
+        service,
+        now,
+        DEFAULT_NOTIFICATION_LIFETIME_MS,
+    )
+}
+
+/// As [`queue_an_oversized_notification`], for a notification that is worth presenting for
+/// `lifetime_ms`.
+fn queue_an_oversized_notification_living(
+    environment: &Environment,
+    service: &MailboxService,
+    now: u64,
+    lifetime_ms: u64,
+) -> kr_protocol::ids::EnvelopeId {
     let destination = phone_at(environment, *service.device.public());
     environment
         .module
@@ -8701,7 +8795,7 @@ fn queue_an_oversized_notification(
         .expect("a destination");
     let mut notice = notice(1, &"x".repeat(1_400));
     notice.observed_at_ms = TimestampMs::new(now);
-    notice.expires_at_ms = TimestampMs::new(now + DEFAULT_NOTIFICATION_LIFETIME_MS);
+    notice.expires_at_ms = TimestampMs::new(now + lifetime_ms);
     notice.audience = Audience::Sessions {
         sessions: vec![session()],
         at_ms: now,
@@ -8886,32 +8980,25 @@ fn a_delivery_whose_answer_was_lost_is_placed_again_and_stored_once() {
 
 /// KR-REQ-09.21: a mailbox that will not take the object does not keep a person from being told:
 /// the push is presented without its detail, nothing is dropped silently, and the record says the
-/// mailbox did not take it.
+/// mailbox did not take it. The mailbox is full, by what one writer may leave in it.
 #[test]
 fn a_mailbox_that_is_full_does_not_hold_the_push_back() {
     let (environment, _) = environment_keeping_the_hosts_mailbox_key();
     let now = real_now();
     let service = MailboxService::attach(&environment);
+    service.fill_what_one_writer_may_hold(now);
+    let filled = service.held().len();
     let object = queue_an_oversized_notification(&environment, &service, now);
     let gateway = WatchedGateway::over(&service);
-    service.web.fail(
-        MailboxService::DELIVER,
-        1,
-        kr_service_stand_in::Moment::Refuse {
-            status: 402,
-            code: "QUOTA_EXHAUSTED",
-            retry_after_seconds: None,
-        },
-    );
 
     assert_eq!(pass_at(&environment, &gateway, now), 1);
 
     assert_eq!(
         gateway.held_at_the_push(),
-        [0],
+        [filled],
         "presented, without its detail"
     );
-    assert!(service.held().is_empty());
+    assert_eq!(service.held().len(), filled, "and nothing more was stored");
     let (state, detail) = the_notification_is(&environment);
     assert_eq!(state, DeliveryState::Accepted);
     assert!(detail.contains("mailbox"), "the record says why: {detail}");
@@ -8919,12 +9006,12 @@ fn a_mailbox_that_is_full_does_not_hold_the_push_back() {
         !the_object_is_owed(&environment, object),
         "and the host does not ask a mailbox that said no again"
     );
-    assert_eq!(service.asked(), 1);
+    assert_eq!(service.asked(), filled + 1);
 }
 
-/// KR-REQ-09.21: a mailbox service that stays down does not keep a person from being told. The
-/// push waits through the attempts the notification has, and its last attempt is made without the
-/// detail.
+/// KR-REQ-09.21: a mailbox service that stays down does not keep a person from being told. The push
+/// waits through the attempts it may spend on the mailbox, and the next is made without the detail,
+/// with the gateway's attempts still to come.
 #[test]
 fn a_mailbox_that_stays_down_does_not_keep_a_person_from_being_told() {
     let (environment, _) = environment_keeping_the_hosts_mailbox_key();
@@ -8932,6 +9019,7 @@ fn a_mailbox_that_stays_down_does_not_keep_a_person_from_being_told() {
     let service = MailboxService::attach(&environment);
     queue_an_oversized_notification(&environment, &service, now);
     let gateway = WatchedGateway::over(&service);
+    let waiting = kr_delivery::push::MAX_ATTEMPTS - 3;
     for nth in 1..=kr_delivery::push::MAX_ATTEMPTS {
         service.web.fail(
             MailboxService::DELIVER,
@@ -8944,13 +9032,12 @@ fn a_mailbox_that_stays_down_does_not_keep_a_person_from_being_told() {
         );
     }
 
-    for attempt in 0..kr_delivery::push::MAX_ATTEMPTS - 1 {
+    for attempt in 0..waiting {
         assert_eq!(pass_at(&environment, &gateway, now + attempt * 600_000), 1);
         assert!(gateway.held_at_the_push().is_empty(), "attempt {attempt}");
         assert_eq!(the_notification_is(&environment).0, DeliveryState::Retrying);
     }
-    let last = now + (kr_delivery::push::MAX_ATTEMPTS - 1) * 600_000;
-    assert_eq!(pass_at(&environment, &gateway, last), 1);
+    assert_eq!(pass_at(&environment, &gateway, now + waiting * 600_000), 1);
 
     assert_eq!(
         gateway.held_at_the_push(),
@@ -8963,13 +9050,174 @@ fn a_mailbox_that_stays_down_does_not_keep_a_person_from_being_told() {
     assert!(detail.contains("mailbox"), "the record says why: {detail}");
 }
 
+/// KR-REQ-09.21: a mailbox that cannot take the object when the notification has no time to wait
+/// for it does not take the notification with it. The service asks for two minutes and the
+/// notification has one, so the push is presented at once, without its detail, and not lost to the
+/// wait.
+#[test]
+fn a_mailbox_that_asks_for_more_time_than_the_notification_has_is_not_waited_for() {
+    let (environment, _) = environment_keeping_the_hosts_mailbox_key();
+    let now = real_now();
+    let service = MailboxService::attach(&environment);
+    queue_an_oversized_notification_living(&environment, &service, now, 60_000);
+    let gateway = WatchedGateway::over(&service);
+    service.web.fail(
+        MailboxService::DELIVER,
+        1,
+        kr_service_stand_in::Moment::Refuse {
+            status: 503,
+            code: "SERVICE_UNAVAILABLE",
+            retry_after_seconds: Some(120),
+        },
+    );
+
+    assert_eq!(pass_at(&environment, &gateway, now), 1);
+
+    assert_eq!(gateway.held_at_the_push(), [0]);
+    let (state, detail) = the_notification_is(&environment);
+    assert_eq!(state, DeliveryState::Accepted);
+    assert!(detail.contains("mailbox"), "{detail}");
+}
+
+/// KR-REQ-09.21: the deadline is asked again when the placement ends. A notification that expires
+/// while its detail is being placed is not presented; its detail did reach the mailbox, so the
+/// journal keeps it among the copies that left.
+#[test]
+fn a_notification_that_expires_while_its_detail_is_placed_is_not_presented() {
+    let (environment, _) = environment_keeping_the_hosts_mailbox_key();
+    let now = real_now();
+    let time = Arc::new(std::sync::atomic::AtomicU64::new(now));
+    let service = MailboxService::attach_acting(&environment, {
+        let time = Arc::clone(&time);
+        Box::new(move || {
+            time.store(now + 61_000, std::sync::atomic::Ordering::SeqCst);
+        })
+    });
+    queue_an_oversized_notification_living(&environment, &service, now, 60_000);
+    let gateway = WatchedGateway::over(&service);
+
+    let clock = {
+        let time = Arc::clone(&time);
+        move || time.load(std::sync::atomic::Ordering::SeqCst)
+    };
+    environment
+        .module
+        .run_due(
+            &gateway,
+            &gateway,
+            &held(now + 30 * 24 * 60 * 60 * 1000),
+            &ExternalDouble::answering(Vec::new()),
+            &Granted(BTreeSet::new()),
+            &clock,
+        )
+        .expect("a pass");
+
+    assert_eq!(service.held().len(), 1, "the detail did reach the mailbox");
+    assert!(
+        gateway.held_at_the_push().is_empty(),
+        "and the push was not presented"
+    );
+    let (state, _) = the_notification_is(&environment);
+    assert_eq!(
+        state,
+        DeliveryState::OutcomeUnknown,
+        "the notification did not arrive, and a copy of its detail left"
+    );
+    assert_eq!(
+        exported_notifications(&environment),
+        1,
+        "and the journal lists that copy"
+    );
+}
+
+/// A recipient authority that holds until it is told it has ended.
+#[derive(Debug)]
+struct Until(Arc<std::sync::atomic::AtomicBool>);
+
+impl RecipientAuthority for Until {
+    fn scope_for(&self, rule: &DeliveryRule) -> Option<RecipientScope> {
+        (!self.0.load(std::sync::atomic::Ordering::SeqCst))
+            .then(|| Granted(BTreeSet::new()).scope_for(rule))
+            .flatten()
+    }
+
+    fn device_scope(&self, destination: &DestinationRecord) -> Option<RecipientScope> {
+        (!self.0.load(std::sync::atomic::Ordering::SeqCst))
+            .then(|| Granted(BTreeSet::new()).device_scope(destination))
+            .flatten()
+    }
+}
+
+/// How many notifications the journal lists among the copies that left this host.
+fn exported_notifications(environment: &Environment) -> usize {
+    environment
+        .module
+        .with(|producer| Ok(producer.journal().exported().expect("a read").len()))
+        .expect("a read")
+}
+
+/// KR-REQ-09.21: the placement is made under the recipient's authority and the authority is asked
+/// again when it ends. A grant that ends while the object is on the wire leaves the push unsent.
+#[test]
+fn a_grant_that_ends_while_its_detail_is_placed_leaves_the_push_unsent() {
+    let (environment, _) = environment_keeping_the_hosts_mailbox_key();
+    let now = real_now();
+    let ended = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let service = MailboxService::attach_acting(&environment, {
+        let ended = Arc::clone(&ended);
+        Box::new(move || ended.store(true, std::sync::atomic::Ordering::SeqCst))
+    });
+    queue_an_oversized_notification(&environment, &service, now);
+    let gateway = WatchedGateway::over(&service);
+
+    let attempted = environment
+        .module
+        .run_due(
+            &gateway,
+            &gateway,
+            &held(now + 30 * 24 * 60 * 60 * 1000),
+            &ExternalDouble::answering(Vec::new()),
+            &Until(ended),
+            &at(now),
+        )
+        .expect("a pass");
+
+    assert_eq!(attempted, 1);
+    assert_eq!(service.asked(), 1, "the object was placed");
+    assert!(
+        gateway.held_at_the_push().is_empty(),
+        "and the push was not presented to a recipient whose grant had ended"
+    );
+    assert_eq!(
+        the_notification_is(&environment).0,
+        DeliveryState::OutcomeUnknown,
+        "a copy of its detail left, and the notification did not"
+    );
+}
+
+/// KR-REQ-09.21: an object is owed to a mailbox only while a push can refer to it. A notification
+/// that expires unsent, or whose destination is removed, leaves no object behind.
+#[test]
+fn an_object_is_not_kept_for_a_notification_that_will_not_be_presented() {
+    let (environment, _) = environment_keeping_the_hosts_mailbox_key();
+    let now = real_now();
+    let service = MailboxService::standing(Box::new(|| {}));
+    let expiring = queue_an_oversized_notification_living(&environment, &service, now, 60_000);
+    let gateway = WatchedGateway::over(&service);
+
+    // The pass finds it past its expiry, as a host that was stopped does.
+    assert_eq!(pass_at(&environment, &gateway, now + 61_000), 0);
+    assert_eq!(the_notification_is(&environment).0, DeliveryState::Expired);
+    assert!(!the_object_is_owed(&environment, expiring));
+}
+
 /// A host that selects no mailbox service presents the push as it always did and asks nobody.
 #[test]
 fn a_host_that_selects_no_mailbox_service_places_nothing() {
     let (environment, _) = environment_keeping_the_hosts_mailbox_key();
     let now = real_now();
     // The service exists, and no delivery module selects it.
-    let (service, _) = MailboxService::standing();
+    let service = MailboxService::standing(Box::new(|| {}));
     queue_an_oversized_notification(&environment, &service, now);
     let gateway = WatchedGateway::over(&service);
 

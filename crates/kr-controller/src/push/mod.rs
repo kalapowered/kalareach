@@ -1311,10 +1311,27 @@ impl DeliveryModule {
     /// mailbox, when the notification owes one and this host selects a mailbox service.
     ///
     /// A row of the journal's objects is an object still owed: it is forgotten once the service
-    /// has it, and when the service will not take it, since waiting would not change that.
-    fn place_detail(&self, delivery: &ClaimedDelivery, push: &PushDestination) -> Result<Detail> {
+    /// has it and when the service will not take it.
+    ///
+    /// The exchange is made under an admission of the generation the notification was admitted
+    /// under, as the push is, and the admission is let go as soon as the exchange ends: the caller
+    /// asks its questions again before it takes a new one, and a change of privacy mode that came
+    /// in between takes the notification back.
+    fn place_detail(
+        &self,
+        delivery: &ClaimedDelivery,
+        push: &PushDestination,
+        clock: &dyn Clock,
+        now_ms: u64,
+    ) -> Result<Placing> {
+        let nothing = |detail| Placing {
+            detail,
+            asked: false,
+            left: false,
+            at_ms: now_ms,
+        };
         let Some(placer) = self.placer.get() else {
-            return Ok(Detail::Ready);
+            return Ok(nothing(Detail::Ready));
         };
         let (object, sealed) = self.with(|producer| {
             let object = producer.detail_object_of(delivery.notification_id);
@@ -1322,7 +1339,7 @@ impl DeliveryModule {
             Ok((object, sealed))
         })?;
         let Some(sealed) = sealed else {
-            return Ok(Detail::Ready);
+            return Ok(nothing(Detail::Ready));
         };
         let forget = || {
             self.with(|producer| {
@@ -1334,37 +1351,67 @@ impl DeliveryModule {
         };
         let Some(recipient) = push.mailbox_key else {
             forget()?;
-            return Ok(Detail::Missing(
+            return Ok(nothing(Detail::Missing(
                 "the device has registered no stored-envelope key to seal it to".to_owned(),
-            ));
+            )));
         };
         let Ok(envelope) = kr_cbor::from_canonical_slice::<kr_protocol::mailbox::SealedEnvelope>(
             &sealed,
             &kr_cbor::Limits::DEFAULT,
         ) else {
             forget()?;
-            return Ok(Detail::Missing(
+            return Ok(nothing(Detail::Missing(
                 "the object this host kept for it could not be read".to_owned(),
-            ));
+            )));
         };
-        match placer.place(&recipient, &envelope) {
+        let (placement, left) = {
+            let Some(_admission) = self.admitted(delivery) else {
+                return Ok(nothing(Detail::TakenBack));
+            };
+            let placement = placer.place(&recipient, &envelope);
+            let left = matches!(
+                placement,
+                mailbox::Placement::Placed
+                    | mailbox::Placement::Later {
+                        may_have_left: true,
+                        ..
+                    }
+            );
+            // Written while the admission is held, so that a change of privacy mode that waited
+            // for the exchange finds the notification one something has dispatched.
+            if left {
+                self.with(|producer| {
+                    producer
+                        .journal_mut()
+                        .note_detail_left(delivery.notification_id)
+                        .map_err(unavailable)
+                })?;
+            }
+            (placement, left)
+        };
+        let at_ms = clock.now_ms().max(now_ms);
+        let detail = match placement {
             mailbox::Placement::Placed => {
                 forget()?;
-                Ok(Detail::Ready)
+                Detail::Ready
             }
-            // A person's alert does not wait on the mailbox for ever: the last attempt the
-            // notification has is made without the detail rather than not at all.
-            mailbox::Placement::Later { detail, .. }
-                if delivery.attempt >= kr_delivery::push::MAX_ATTEMPTS =>
-            {
-                Ok(Detail::Missing(detail))
-            }
-            mailbox::Placement::Later { detail, after } => Ok(Detail::Later { detail, after }),
             mailbox::Placement::Refused { detail } => {
                 forget()?;
-                Ok(Detail::Missing(detail))
+                Detail::Missing(detail)
             }
-        }
+            mailbox::Placement::Later { detail, after, .. } => {
+                match mailbox_look(delivery, at_ms, after) {
+                    Some(due_ms) => Detail::Later { detail, due_ms },
+                    None => Detail::Missing(detail),
+                }
+            }
+        };
+        Ok(Placing {
+            detail,
+            asked: true,
+            left,
+            at_ms,
+        })
     }
 
     /// Whether the authority a claimed delivery was admitted under is still the authority now.
@@ -1499,7 +1546,8 @@ impl DeliveryModule {
                     next: NextAction::None,
                     detail: Some(detail.to_owned()),
                     suppression: None,
-                    // Nothing was presented, so nothing left this host.
+                    // Nothing was presented, so nothing left this host by this attempt. A detail
+                    // placed in a mailbox is recorded when it is, on the notification.
                     left_this_host: false,
                     reported_by_destination: false,
                 })
@@ -1533,6 +1581,19 @@ impl DeliveryModule {
             delivery,
             DeliveryState::Cancelled,
             "privacy mode took it back before it was presented",
+            now_ms,
+        )
+    }
+
+    /// As [`Self::taken_back`], for a notification whose detail had been placed in its device's
+    /// mailbox before privacy mode came in: a copy of it is out there, and the record says so
+    /// instead of calling the notification unsent.
+    fn taken_back_after_placing(&self, delivery: &ClaimedDelivery, now_ms: u64) -> Result<()> {
+        self.settle(
+            delivery,
+            DeliveryState::OutcomeUnknown,
+            "privacy mode took it back before it was presented, after its detail had been placed \
+             in the device's mailbox",
             now_ms,
         )
     }
@@ -1633,10 +1694,40 @@ impl DeliveryModule {
                 clock.now_ms().max(now_ms),
             );
         }
-        // Presented only under an admission of the generation this was admitted under, taken
-        // after the renewal, which waits on the gateway, and held until the answer is recorded.
-        let Some(_admission) = self.admitted(delivery) else {
+        // The detail the preview refers to is in the device's mailbox before the push that refers
+        // to it is presented. A status question presents nothing and places nothing.
+        let placing = if delivery.next == NextAction::Receipt {
+            Placing {
+                detail: Detail::Ready,
+                asked: false,
+                left: false,
+                at_ms: now_ms,
+            }
+        } else {
+            self.place_detail(delivery, push, clock, now_ms)?
+        };
+        if matches!(placing.detail, Detail::TakenBack) {
             return self.taken_back(delivery, now_ms);
+        }
+        if placing.asked && !self.authority_still_holds(record, delivery, authority) {
+            // The exchange waited, on a service this host does not control, and the recipient's
+            // authority is asked about again. The deadline is read again below, as late as it can
+            // be before the send.
+            return self.settle(
+                delivery,
+                DeliveryState::Revoked,
+                "the recipient's authority is not the one this was admitted under",
+                clock.now_ms().max(placing.at_ms),
+            );
+        }
+        // Presented only under an admission of the generation this was admitted under, taken
+        // after the renewal and the placement, which wait, and held until the answer is recorded.
+        let Some(_admission) = self.admitted(delivery) else {
+            return if placing.left {
+                self.taken_back_after_placing(delivery, now_ms)
+            } else {
+                self.taken_back(delivery, now_ms)
+            };
         };
         // The authority question and the admission both wait, on this host's own locks, and the
         // notification's own deadline is read once more, as late as it can be before the send: an
@@ -1646,12 +1737,13 @@ impl DeliveryModule {
             return self.settle(
                 delivery,
                 DeliveryState::Expired,
-                "the notification expired while its recipient's authority was being asked",
+                "the notification expired while its detail was being placed or its recipient's \
+                 authority was being asked",
                 now_ms,
             );
         }
         let mut detail_missing: Option<String> = None;
-        let mut wait_for_mailbox: Option<std::time::Duration> = None;
+        let mut wait_for_mailbox: Option<u64> = None;
         let outcome =
             if delivery.next == NextAction::Receipt {
                 // The gateway is holding this notification and retrying the provider itself. What is
@@ -1672,25 +1764,29 @@ impl DeliveryModule {
                         operation: "read a queued notification",
                         detail: error.to_string(),
                     })?;
-                // The detail the preview refers to is in the device's mailbox before the push
-                // that refers to it is presented, under the admission and the authority this
-                // attempt already holds.
-                match self.place_detail(delivery, push)? {
+                match placing.detail {
                     Detail::Ready => sender.send(&credential, &request),
                     Detail::Missing(why) => {
                         detail_missing = Some(why);
                         sender.send(&credential, &request)
                     }
-                    Detail::Later { detail, after } => {
-                        wait_for_mailbox = after;
+                    Detail::Later { detail, due_ms } => {
+                        wait_for_mailbox = Some(due_ms);
                         kr_delivery::push::SendOutcome::NotDispatched { detail }
                     }
+                    Detail::TakenBack => unreachable!("a taken-back notification returned above"),
                 }
             };
         // The answer arrived now, not when the pass started. Everything that follows - whether
         // there is time for another attempt, when it is due, what the attempt row is stamped
         // with - is decided from this reading.
-        let answered_at_ms = clock.now_ms().max(now_ms);
+        let answered_at_ms = if wait_for_mailbox.is_some() {
+            // Nothing was presented, so there is no answer to wait for: the look at the mailbox was
+            // judged at this moment, and the next attempt is scheduled from the same one.
+            placing.at_ms.max(now_ms)
+        } else {
+            clock.now_ms().max(now_ms)
+        };
         let mut decision = kr_delivery::push::decide(
             &outcome,
             delivery.notification_id,
@@ -1707,12 +1803,9 @@ impl DeliveryModule {
             decision.next = NextAction::Send;
         }
         // The mailbox service asked to be left alone for a while: the next attempt is not due
-        // before it says it will take requests again, and not past the notification's own end.
-        if let (Some(wait), Some(due)) = (wait_for_mailbox, decision.next_attempt_at_ms) {
-            let asked = answered_at_ms
-                .saturating_add(u64::try_from(wait.as_millis()).unwrap_or(u64::MAX))
-                .min(delivery.expires_at_ms.get().saturating_sub(1));
-            decision.next_attempt_at_ms = Some(TimestampMs::new(due.get().max(asked)));
+        // before it says it will take requests again.
+        if let Some(due_ms) = wait_for_mailbox {
+            decision.next_attempt_at_ms = Some(TimestampMs::new(due_ms));
         }
         if let Some(why) = &detail_missing {
             decision.detail = format!(
@@ -1866,13 +1959,66 @@ impl DeliveryModule {
 enum Detail {
     /// Nothing is owed, or what was owed is in the mailbox.
     Ready,
-    /// The service will not take it. The push is presented without it, and its record says why.
+    /// The service will not take it, or cannot be waited for any longer. The push is presented
+    /// without it, and its record says why.
     Missing(String),
-    /// Nothing was placed, and the push waits for a later attempt.
-    Later {
-        detail: String,
-        after: Option<std::time::Duration>,
-    },
+    /// Nothing was placed, and the push waits for its next attempt, which is due at `due_ms`.
+    Later { detail: String, due_ms: u64 },
+    /// Privacy mode was turned on before anything was asked of the service.
+    TakenBack,
+}
+
+/// What placing a notification's detail did, and what it asks of the attempt after it.
+struct Placing {
+    detail: Detail,
+    /// Whether the service was asked. The exchange waits, so the notification's deadline and its
+    /// recipient's authority are asked about again before anything is presented.
+    asked: bool,
+    /// Whether the detail may have left this host, in a mailbox.
+    left: bool,
+    /// When the exchange ended.
+    at_ms: u64,
+}
+
+/// How many attempts at a notification may be spent waiting for the mailbox. The rest are the
+/// gateway's: a push that has waited this long is presented without its detail, and still has
+/// three attempts at the gateway.
+const MAILBOX_ATTEMPTS: u64 = kr_delivery::push::MAX_ATTEMPTS - 3;
+
+/// The longest wait a mailbox service's request for time is honoured for: the longest wait the
+/// notification's own backoff ever has.
+const MAILBOX_LONGEST_WAIT_MS: u64 = kr_delivery::push::MAX_BACKOFF_MS;
+
+/// When the next attempt at a notification whose detail the mailbox could not take is due, or none
+/// when the push should go without the detail now.
+///
+/// It waits only while the notification has attempts to spend on waiting, a next attempt of its
+/// own before it expires, and room left after the time the service asked for. A person's alert is
+/// worth more than its detail.
+fn mailbox_look(
+    delivery: &ClaimedDelivery,
+    at_ms: u64,
+    after: Option<std::time::Duration>,
+) -> Option<u64> {
+    if delivery.attempt > MAILBOX_ATTEMPTS {
+        return None;
+    }
+    let own = kr_delivery::push::next_attempt(
+        delivery.notification_id,
+        delivery.attempt,
+        at_ms,
+        delivery.expires_at_ms,
+    )?
+    .get();
+    let asked = after.map_or(0, |wait| {
+        at_ms.saturating_add(
+            u64::try_from(wait.as_millis())
+                .unwrap_or(u64::MAX)
+                .min(MAILBOX_LONGEST_WAIT_MS),
+        )
+    });
+    let due = own.max(asked);
+    (due.saturating_add(1) < delivery.expires_at_ms.get()).then_some(due)
 }
 
 /// A status question's place in the pass's share of the gateway's allowance, taken before the

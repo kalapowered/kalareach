@@ -670,13 +670,14 @@ fn an_unused_mailbox_section_is_not_written_and_a_release_at_level_2_reads_the_f
         "a document at the level is read strictly"
     );
     let edited = edit_in(
-        &load_in(Some(written.as_bytes()), &THIS_RELEASE),
+        &load_in(Some(written.as_bytes()), &BEFORE_MAILBOX),
         &Change::SessionLimit(Some(2)),
-        &THIS_RELEASE,
+        &BEFORE_MAILBOX,
     )
-    .expect("an edit");
+    .expect("a release at level 2 still edits it");
     assert!(json(&edited.contents).get("mailbox").is_none());
     assert_eq!(json(&edited.contents)["level"], 2);
+    assert_eq!(json(&edited.contents)["authority"]["origin"], FEED);
 }
 
 /// KR-REQ-26.13: the upgrade half and the round trip of an active value. A document a release at
