@@ -193,7 +193,7 @@
         "version": 10,
         "migrates_from": 6
       },
-      "digest": "ebe7c0394928f22d18024781d64b295250349adfb7cea14dd9972f122835c793",
+      "digest": "1e4145f3929171238eefc093c117cd82e6b99a8ef008b8b333dc0b42512a155a",
       "kept": [
         "PushDeliveryRequest",
         "SealedEnvelope",
