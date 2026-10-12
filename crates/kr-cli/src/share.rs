@@ -29,6 +29,7 @@ use kr_client::attempt::{Armed, Attempt, Found, Kind, Next, Outcome, REPEAT_DELA
 use kr_client::session::ComposedMutation;
 use kr_client::shown;
 use kr_client::shown::Shown;
+use kr_client::transport::Reach;
 use kr_ipc::client::LocalClient;
 use kr_ipc::paths::HostPaths;
 use kr_protocol::confirmation::{
@@ -430,16 +431,21 @@ async fn perform(
         .await
         .map_err(CliError::Ipc)?;
     let window = host.client.action_window().clone();
+    // The host keeps its record of an action under the user it authenticated, and states that user
+    // in its acknowledgement.
+    let reach = Reach {
+        host: host.environment.environment_id.to_string(),
+        actor: format!("local:{}", host.client.acknowledgement().peer.uid.get()),
+    };
     let composed = ComposedMutation::restored(
         request.clone(),
         window.issued_at_ms.get(),
         window.valid_for_ms.get(),
+        Some(reach),
     );
     let mut attempt = Attempt::new(
         kind,
         &composed,
-        host.environment.environment_id.to_string(),
-        "local",
         Some(watch.grant_id),
         kr_ipc::now_ms().get(),
         "kr share",
@@ -498,9 +504,11 @@ async fn perform(
                     ));
                 }
                 tokio::time::sleep(CHECK_EVERY).await;
+                // The moment the read begins is what decides whether it counts.
+                let began = armed.read_begins();
                 let found = found(host, kind, watch).await;
                 next = match found {
-                    Some(found) => attempt.after_read(found, armed.elapsed()),
+                    Some(found) => attempt.after_read(found, began),
                     // A read that fails leaves the attempt as it was.
                     None => Next::Wait,
                 };
