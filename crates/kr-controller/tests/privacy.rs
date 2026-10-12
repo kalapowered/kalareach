@@ -3088,30 +3088,28 @@ fn kr_req_24_27_a_placement_on_the_wire_is_waited_for_before_the_change_is_recor
         "the object did reach the device's mailbox"
     );
 
+    // The push needs an admission of its own, taken after the placement's was let go, and a
+    // change that waited for the placement may be recorded before or after it. Either way the
+    // copy of the detail that left is listed, and the notification's record says only what became
+    // of the notification.
     let presented = gateway.sent.lock().expect("not poisoned").len();
     let state = delivery_state(&subsystems.delivery, notification_id);
     if presented == 1 {
-        assert_eq!(
-            state,
-            DeliveryState::Accepted,
-            "presented before the boundary"
-        );
+        assert_eq!(state, DeliveryState::Accepted);
     } else {
-        assert_eq!(presented, 0, "and never after it");
-        assert_eq!(
-            state,
-            DeliveryState::OutcomeUnknown,
-            "taken back, and a copy of its detail had left"
-        );
-        assert_eq!(
-            subsystems
-                .delivery
-                .with(|producer| Ok(producer.journal().exported().expect("a read").len()))
-                .expect("a read"),
-            1,
-            "and the journal lists that copy"
-        );
+        assert_eq!(presented, 0);
+        assert_eq!(state, DeliveryState::Cancelled, "taken back");
     }
+    let listed = subsystems
+        .delivery
+        .with(|producer| Ok(producer.journal().exported().expect("a read")))
+        .expect("a read");
+    assert_eq!(listed.len(), 1, "the notification is listed once");
+    assert!(
+        listed[0].reference.contains("mailbox"),
+        "with its detail in the device's mailbox: {}",
+        listed[0].reference
+    );
 }
 
 /// KR-REQ-24.27 and KR-REQ-24.28: a send on the wire when privacy mode is turned on is waited for.
