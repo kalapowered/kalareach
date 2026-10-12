@@ -955,6 +955,9 @@ impl InvitationStore for InvitationRows {
         if action.is_some() && matches!(committed, Ok(TransitionOutcome::Written)) {
             self.admission.note_recorded();
         }
+        if matches!(committed, Ok(TransitionOutcome::Written)) {
+            self.directory.note_change();
+        }
         committed.or_else(unwritten)
     }
 
