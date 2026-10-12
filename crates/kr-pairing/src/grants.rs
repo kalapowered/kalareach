@@ -5,8 +5,9 @@
 //! * **Delegation narrows.** A child grant can never extend its parent's lifetime, resources or
 //!   actions. `Grant::narrows` in `kr-protocol` is that rule; [`issue_grant`] refuses to issue a
 //!   grant that fails it.
-//! * **A session invitation defaults to view-only for one hour.** The issuer may choose a shorter
-//!   duration or extend it to at most 30 days. A personal owner grant is the other case: it
+//! * **A guest pairing admits a device and shares nothing.** It carries no action and no session,
+//!   for one day unless the issuer chooses otherwise, and at most 30 days. A session is shared with
+//!   a guest afterwards, one invitation at a time. A personal owner grant is the other case: it
 //!   remains valid until revoked, so independent operation does not depend on a cloud lease.
 //! * **Only the host issues authority revisions.** A remote owner publishes a signed revocation
 //!   *request*, and it carries no revision: a device cannot assign a higher host revision to its
@@ -25,8 +26,8 @@ use kr_protocol::scalars::{AuthorisationKey, CanonicalSet, Nullable, TimestampMs
 
 use crate::error::{PairingError, Result};
 
-/// How long a session invitation lasts when the issuer chooses nothing, in milliseconds.
-pub const DEFAULT_SESSION_INVITATION_MS: u64 = 60 * 60 * 1000;
+/// How long a guest pairing lasts when the issuer chooses nothing, in milliseconds.
+pub const DEFAULT_GUEST_PAIRING_MS: u64 = 24 * 60 * 60 * 1000;
 
 /// The longest a session invitation may last, in milliseconds.
 pub const MAX_SESSION_INVITATION_MS: u64 = 30 * 24 * 60 * 60 * 1000;
@@ -40,7 +41,9 @@ pub enum GrantKind {
     /// A personal owner grant. It never expires, because independent operation must not depend on
     /// a cloud lease. A host owner may still choose a bounded offline-validity policy separately.
     PersonalOwner,
-    /// A session invitation. View-only for an hour unless the issuer says otherwise.
+    /// A guest pairing, which expires and is not the owner's. It reaches no session until one is
+    /// shared with the device. The wire name is `session_invitation`, kept for the records that
+    /// already carry it.
     SessionInvitation,
 }
 
@@ -55,34 +58,43 @@ impl GrantKind {
     }
 }
 
-/// Builds the grant a session invitation proposes by default: `session.view` for one hour.
+/// Builds the grant a guest pairing proposes: no action, no session, this environment, no history.
 ///
-/// `duration_ms` shortens or extends it, up to [`MAX_SESSION_INVITATION_MS`].
+/// It reaches only the reads that need no right (what the host is, which environments it has),
+/// for `duration_ms` from `now_ms`, up to [`MAX_SESSION_INVITATION_MS`]. A session is shared with
+/// the device afterwards, each share with its own end that the device's pairing bounds.
 ///
 /// # Errors
 ///
 /// Returns [`PairingError::GrantNotPermitted`] when the duration is zero or over the limit.
-pub fn session_invitation_grant(
+pub fn guest_grant(
     now_ms: u64,
     duration_ms: u64,
-    history: HistoryScope,
+    environment_id: kr_protocol::ids::EnvironmentId,
 ) -> Result<ProposedGrant> {
     if duration_ms == 0 {
         return Err(PairingError::GrantNotPermitted {
-            reason: "a session invitation lasts at least an instant",
+            reason: "a guest pairing lasts at least an instant",
         });
     }
     if duration_ms > MAX_SESSION_INVITATION_MS {
         return Err(PairingError::GrantNotPermitted {
-            reason: "a session invitation lasts at most 30 days",
+            reason: "a guest pairing lasts at most 30 days",
         });
     }
     Ok(ProposedGrant {
         parent_grant_id: Nullable::null(),
-        environment_selector: EnvironmentSelector::Any,
-        session_selector: SessionSelector::Any,
-        actions: [ActionRight::SessionView].into_iter().collect(),
-        history,
+        environment_selector: EnvironmentSelector::These {
+            environment_ids: [environment_id].into_iter().collect(),
+        },
+        session_selector: SessionSelector::None,
+        actions: CanonicalSet::new(),
+        history: HistoryScope {
+            lower_bound_ms: Nullable::null(),
+            include_live_screen: false,
+            named_questions: CanonicalSet::new(),
+            named_approvals: CanonicalSet::new(),
+        },
         expiry: GrantExpiry::At {
             expires_at_ms: TimestampMs::new(now_ms.saturating_add(duration_ms)),
         },
@@ -397,37 +409,47 @@ mod tests {
         DeviceId::new(Uuid::from_bytes([seed; 16]))
     }
 
+    fn environment() -> kr_protocol::ids::EnvironmentId {
+        kr_protocol::ids::EnvironmentId::new(Uuid::from_bytes([0xe1; 16]))
+    }
+
     #[test]
-    fn a_session_invitation_defaults_to_view_only_for_one_hour() {
-        let proposal = session_invitation_grant(1_000, DEFAULT_SESSION_INVITATION_MS, history())
-            .expect("a proposal");
+    fn a_guest_pairing_carries_no_action_and_reaches_no_session() {
+        let proposal =
+            guest_grant(1_000, DEFAULT_GUEST_PAIRING_MS, environment()).expect("a proposal");
+        assert!(proposal.actions.is_empty());
+        assert_eq!(proposal.session_selector, SessionSelector::None);
         assert_eq!(
-            proposal.actions.iter().collect::<Vec<_>>(),
-            vec![&ActionRight::SessionView]
+            proposal.environment_selector,
+            EnvironmentSelector::These {
+                environment_ids: [environment()].into_iter().collect()
+            }
         );
         assert_eq!(
             proposal.expiry,
             GrantExpiry::At {
-                expires_at_ms: TimestampMs::new(1_000 + DEFAULT_SESSION_INVITATION_MS)
+                expires_at_ms: TimestampMs::new(1_000 + DEFAULT_GUEST_PAIRING_MS)
             }
         );
+        validate_proposal(&proposal, GrantKind::SessionInvitation, 1_000)
+            .expect("the host accepts a pairing with no action");
     }
 
     #[test]
-    fn an_invitation_may_be_shortened_but_not_extended_past_thirty_days() {
-        assert!(session_invitation_grant(0, 60_000, history()).is_ok());
-        assert!(session_invitation_grant(0, MAX_SESSION_INVITATION_MS, history()).is_ok());
+    fn a_guest_pairing_may_be_shortened_but_not_extended_past_thirty_days() {
+        assert!(guest_grant(0, 60_000, environment()).is_ok());
+        assert!(guest_grant(0, MAX_SESSION_INVITATION_MS, environment()).is_ok());
         assert!(matches!(
-            session_invitation_grant(0, MAX_SESSION_INVITATION_MS + 1, history()),
+            guest_grant(0, MAX_SESSION_INVITATION_MS + 1, environment()),
             Err(PairingError::GrantNotPermitted { .. })
         ));
-        assert!(session_invitation_grant(0, 0, history()).is_err());
+        assert!(guest_grant(0, 0, environment()).is_err());
     }
 
     #[test]
     fn a_personal_owner_grant_never_expires_and_an_invitation_always_does() {
-        let mut personal = session_invitation_grant(0, DEFAULT_SESSION_INVITATION_MS, history())
-            .expect("a proposal");
+        let mut personal =
+            guest_grant(0, DEFAULT_GUEST_PAIRING_MS, environment()).expect("a proposal");
         assert!(matches!(
             validate_proposal(&personal, GrantKind::PersonalOwner, 0),
             Err(PairingError::GrantNotPermitted { .. })
@@ -463,17 +485,17 @@ mod tests {
     /// A pairing invitation shows its issuer the rights it proposes and no preview of any named
     /// resource, so a proposal that names a current approval or question is refused, for either
     /// kind, with the reason, and no grant is issued from it. The controls are the proposals this
-    /// host's own surfaces make: the personal owner grant, and the command line's view-only
-    /// invitation with the live screen and nothing named.
+    /// host's own surfaces make: the personal owner grant, and the command line's guest pairing,
+    /// with nothing named.
     #[test]
     fn a_pairing_proposal_that_names_an_approval_or_a_question_is_refused() {
         for (named, question, approval) in [("approval", false, true), ("question", true, false)] {
-            let session = session_invitation_grant(
-                0,
-                DEFAULT_SESSION_INVITATION_MS,
-                naming(history(), question, approval),
-            )
-            .expect("a proposal");
+            let guest =
+                guest_grant(0, DEFAULT_GUEST_PAIRING_MS, environment()).expect("a proposal");
+            let session = ProposedGrant {
+                history: naming(guest.history.clone(), question, approval),
+                ..guest
+            };
             let owner = personal_owner_grant();
             let owner = ProposedGrant {
                 history: naming(owner.history.clone(), question, approval),
@@ -503,21 +525,20 @@ mod tests {
         }
 
         assert!(validate_proposal(&personal_owner_grant(), GrantKind::PersonalOwner, 0).is_ok());
-        let view = session_invitation_grant(
-            0,
-            60 * 60_000,
-            HistoryScope {
+        let guest = guest_grant(0, 60 * 60_000, environment()).expect("a proposal");
+        let view = ProposedGrant {
+            history: HistoryScope {
                 include_live_screen: true,
                 ..history()
             },
-        )
-        .expect("a proposal");
+            ..guest
+        };
         assert!(validate_proposal(&view, GrantKind::SessionInvitation, 0).is_ok());
     }
 
     #[test]
     fn an_invitation_that_has_already_expired_is_refused() {
-        let proposal = session_invitation_grant(0, 1_000, history()).expect("a proposal");
+        let proposal = guest_grant(0, 1_000, environment()).expect("a proposal");
         assert!(validate_proposal(&proposal, GrantKind::SessionInvitation, 999).is_ok());
         assert!(matches!(
             validate_proposal(&proposal, GrantKind::SessionInvitation, 1_000),
@@ -546,11 +567,11 @@ mod tests {
 
     #[test]
     fn a_delegated_grant_narrows_its_parent() {
-        let parent_proposal = session_invitation_grant(0, DEFAULT_SESSION_INVITATION_MS, history())
-            .expect("a proposal");
+        let parent_proposal =
+            guest_grant(0, DEFAULT_GUEST_PAIRING_MS, environment()).expect("a proposal");
         let parent = issue(parent_proposal, None).expect("a grant");
 
-        let mut child = session_invitation_grant(0, 60_000, history()).expect("a proposal");
+        let mut child = guest_grant(0, 60_000, environment()).expect("a proposal");
         child.parent_grant_id = Nullable::some(parent.grant_id);
         let issued = issue_grant(
             child.clone(),
@@ -580,20 +601,19 @@ mod tests {
     #[test]
     fn a_proposal_that_names_a_parent_without_one_is_refused_and_the_reverse_too() {
         let parent = issue(
-            session_invitation_grant(0, DEFAULT_SESSION_INVITATION_MS, history())
-                .expect("a proposal"),
+            guest_grant(0, DEFAULT_GUEST_PAIRING_MS, environment()).expect("a proposal"),
             None,
         )
         .expect("a grant");
 
-        let mut orphan = session_invitation_grant(0, 60_000, history()).expect("a proposal");
+        let mut orphan = guest_grant(0, 60_000, environment()).expect("a proposal");
         orphan.parent_grant_id = Nullable::some(parent.grant_id);
         assert!(matches!(
             issue(orphan, None),
             Err(PairingError::GrantNotPermitted { .. })
         ));
 
-        let rootless = session_invitation_grant(0, 60_000, history()).expect("a proposal");
+        let rootless = guest_grant(0, 60_000, environment()).expect("a proposal");
         assert!(matches!(
             issue(rootless, Some(&parent)),
             Err(PairingError::GrantNotPermitted { .. })

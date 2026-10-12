@@ -509,11 +509,34 @@ const KINDS: [(&str, &[ActionRight]); 15] = [
     ("view sessions", &[ActionRight::SessionView]),
 ];
 
-/// What `rights` let a device do, in the words a person is shown on every surface: the owner's
-/// prompt, the pairing screen and the list of paired hosts.
+/// What a pairing's grant lets a device do, in the words a person is shown on every surface: the
+/// owner's prompt, the pairing screen and the list of paired hosts.
+///
+/// A grant over no session says so, because the rights it carries are of no use on a session until
+/// one is shared with the device: a guest holds none and reaches no session at all.
 #[must_use]
-pub fn describe_rights(rights: &kr_protocol::scalars::CanonicalSet<ActionRight>) -> String {
-    authority(rights).unwrap_or_else(|| "do what the host allows".to_owned())
+pub fn describe_rights(
+    rights: &kr_protocol::scalars::CanonicalSet<ActionRight>,
+    sessions: &kr_protocol::grant::SessionSelector,
+) -> String {
+    authority_over(rights, sessions).unwrap_or_else(|| "do what the host allows".to_owned())
+}
+
+/// The words for what a pairing grant lets a device do, or `None` when a right has no words here.
+fn authority_over(
+    rights: &kr_protocol::scalars::CanonicalSet<ActionRight>,
+    sessions: &kr_protocol::grant::SessionSelector,
+) -> Option<String> {
+    const NONE: &str = "reach no session until one is shared with it";
+    if !matches!(sessions, kr_protocol::grant::SessionSelector::None)
+        || rights.contains(&ActionRight::HostManage)
+    {
+        return authority(rights);
+    }
+    if rights.is_empty() {
+        return Some(NONE.to_owned());
+    }
+    authority(rights).map(|words| format!("{words}, and {NONE}"))
 }
 
 /// What `rights` let a device do, in words, or `None` when a right has no words here.
@@ -705,7 +728,8 @@ pub fn reason(subject: &Subject, host_name: &str, now_ms: u64) -> Result<String,
                 };
                 format!(
                     "issue an invitation from {host}: {offered}, for a device that may {} {}{}",
-                    authority(&proposed_grant.actions).ok_or(CannotCheck::CannotShow)?,
+                    authority_over(&proposed_grant.actions, &proposed_grant.session_selector)
+                        .ok_or(CannotCheck::CannotShow)?,
                     duration(&proposed_grant.expiry, now_ms),
                     membership(proposed_grant, membership_form)
                 )
@@ -717,7 +741,8 @@ pub fn reason(subject: &Subject, host_name: &str, now_ms: u64) -> Result<String,
                 "confirm adding {} ({}) to {host}, which may {} {}{}. {}",
                 shown(candidate.device_name.as_str(), names),
                 platform(candidate.platform),
-                authority(&proposed_grant.actions).ok_or(CannotCheck::CannotShow)?,
+                authority_over(&proposed_grant.actions, &proposed_grant.session_selector)
+                    .ok_or(CannotCheck::CannotShow)?,
                 duration(&proposed_grant.expiry, now_ms),
                 membership(proposed_grant, membership_form),
                 shows_value(&group_verification_value(&candidate.verification_value))
@@ -1305,6 +1330,41 @@ mod tests {
             let rights = [*right].into_iter().collect::<CanonicalSet<_>>();
             assert!(authority(&rights).is_some(), "{right}");
         }
+    }
+
+    /// KR-REQ-25.28: the owner is told that a guest pairing reaches no session until one is shared
+    /// with it, on the prompt that asks for the confirmation and on the words every other surface
+    /// shows, and a pairing over every session says what its rights allow as it always did.
+    #[test]
+    fn a_pairing_over_no_session_says_so() {
+        let guest = ProposedGrant {
+            session_selector: SessionSelector::None,
+            ..grant(&[], an_hour())
+        };
+        let subject = Subject::IssueInvitation {
+            mode: InviteModeKind::Direct,
+            origin: None,
+            grant_kind: InviteGrantKind::SessionInvitation,
+            proposed_grant: guest.clone(),
+        };
+        let line = reason(&subject, "studio", NOW).expect("a line");
+        assert!(
+            line.contains("may reach no session until one is shared with it"),
+            "{line}"
+        );
+        assert_eq!(
+            describe_rights(&guest.actions, &guest.session_selector),
+            "reach no session until one is shared with it"
+        );
+        let wide = grant(&[ActionRight::SessionView], an_hour());
+        assert_eq!(
+            describe_rights(&wide.actions, &wide.session_selector),
+            "view sessions"
+        );
+        assert_eq!(
+            describe_rights(&CanonicalSet::new(), &SessionSelector::Any),
+            "do nothing"
+        );
     }
 
     /// KR-REQ-10.06: a right on its own is named for everything it allows, never for less.

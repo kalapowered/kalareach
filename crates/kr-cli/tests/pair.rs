@@ -672,12 +672,12 @@ async fn the_first_owner_is_not_confirmed_where_a_worker_cannot_establish_member
     );
 }
 
-/// A host with no owner pairs its first owner before anything else: an invitation for a viewer is
+/// A host with no owner pairs its first owner before anything else: an invitation for a guest is
 /// refused before anything is asked.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_host_with_no_owner_pairs_its_owner_first() {
     let host = Host::start().await;
-    let output = host.kr(&["pair", "invite", "--view", "--direct"]);
+    let output = host.kr(&["pair", "invite", "--guest", "--direct"]);
     assert_eq!(output.status.code(), Some(8));
     assert!(
         String::from_utf8_lossy(&output.stderr).contains("kr pair invite --owner"),

@@ -77,6 +77,7 @@ pub mod report;
 pub mod resolve;
 pub mod service_manager;
 pub mod session;
+pub mod share;
 pub mod shell;
 pub mod shown;
 pub mod skill;

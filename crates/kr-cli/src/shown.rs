@@ -906,7 +906,7 @@ mod tests {
             ),
             (
                 "a value that cannot be read",
-                &["kr", "pair", "invite", "--view", "kr-marker-7c1e"],
+                &["kr", "pair", "invite", "--guest", "kr-marker-7c1e"],
             ),
             (
                 "an unknown argument with a value, under --json",

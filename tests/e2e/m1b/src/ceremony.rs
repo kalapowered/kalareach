@@ -232,3 +232,108 @@ pub fn pair_first_owner(
         .unwrap_or_else(|why| panic!("the paired connection: {why}"));
     (paired, remote)
 }
+
+/// The prompt `kr share invite` asks at before it issues a share that carries a consequence or the
+/// live screen.
+const SHARE_PROMPT: &[u8] = b"Type share to issue this invitation: ";
+
+/// Runs `kr share invite` at a terminal outside every session and types `typed` at its question.
+///
+/// `arguments` follow `kr share invite`. Returns what the command showed the person before it
+/// asked, and how it ended.
+///
+/// # Panics
+///
+/// Panics when the command never asks, does not end within [`LIVENESS`], or prints no document.
+#[must_use]
+pub fn share_at_terminal(host: &Host<'_>, arguments: &[&str], typed: &[u8]) -> (String, Answered) {
+    let run = host.run();
+    let mut command = vec!["share", "invite"];
+    command.extend_from_slice(arguments);
+    command.push("--json");
+    let mut window = Window::open(
+        run,
+        "kr share invite",
+        &run.binary("kr"),
+        &command,
+        run.root(),
+        &host.variables(),
+    );
+    let shown = window.wait_for(0, SHARE_PROMPT, "the share asks at the terminal");
+    let shown = String::from_utf8_lossy(&shown).replace('\r', "");
+    let mark = window.mark();
+    let mut line = typed.to_vec();
+    line.push(b'\r');
+    window.type_text(&line);
+    let exit = window.exit_code(LIVENESS);
+    let printed = window.collected().since(mark);
+    let document = first_document(&printed).unwrap_or_else(|| {
+        panic!(
+            "kr share invite printed no document after the question ({} bytes)",
+            printed.len()
+        )
+    });
+    (shown, Answered { exit, document })
+}
+
+/// Pairs `device` as a guest of `host` for `minutes`, by direct QR over loopback, on the
+/// confirmation of the owner device `owner`, and connects it.
+///
+/// # Panics
+///
+/// Panics when any step fails, naming it.
+#[must_use]
+pub fn pair_guest(
+    host: &Host<'_>,
+    owner: &crate::device::Remote,
+    device: &crate::device::Device,
+    runtime: &tokio::runtime::Runtime,
+    minutes: &str,
+) -> (crate::device::PairedHost, crate::device::Remote) {
+    let issuing = issue_waiting(host, &["--guest", minutes, "--direct"]);
+    let _ = runtime
+        .block_on(owner.confirm_pending(|_| true))
+        .unwrap_or_else(|why| panic!("the owner device confirms issuing: {why}"));
+    let issued = finished(issuing, "kr pair invite --guest");
+    assert_eq!(
+        issued.exit,
+        0,
+        "the guest invitation: {}",
+        issued.withheld()
+    );
+    let candidate = runtime
+        .block_on(device.redeem(issued.document["qr_text"].as_str().expect("a QR text")))
+        .unwrap_or_else(|why| panic!("the guest's redemption: {why}"));
+    let approving = approve_waiting(
+        host,
+        issued.document["invitation_id"]
+            .as_str()
+            .expect("an invitation"),
+    );
+    let _ = runtime
+        .block_on(owner.confirm_pending(|_| true))
+        .unwrap_or_else(|why| panic!("the owner device confirms the guest: {why}"));
+    let approved = finished(approving, "kr pair confirm");
+    assert_eq!(
+        approved.exit, 0,
+        "the owner approves: {}",
+        approved.document
+    );
+    let paired = runtime
+        .block_on(candidate.committed(LIVENESS))
+        .unwrap_or_else(|why| panic!("the guest's pairing: {why}"));
+    let remote = runtime
+        .block_on(device.connect(&paired))
+        .unwrap_or_else(|why| panic!("the guest's paired connection: {why}"));
+    (paired, remote)
+}
+
+/// Starts `kr` with `arguments` and `--json` on a host that has an owner, and lets it wait for an
+/// owner device; [`finished`] collects it.
+#[must_use]
+pub fn waiting(host: &Host<'_>, arguments: &[&str]) -> JoinHandle<Result<Output, String>> {
+    let mut command = arguments.to_vec();
+    command.push("--json");
+    let command = host.command(&command);
+    std::thread::spawn(move || output_within(command, LIVENESS))
+}

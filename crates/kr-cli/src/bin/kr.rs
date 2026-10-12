@@ -579,6 +579,7 @@ async fn run(cli: Cli) -> Result<Completion> {
         }
         Command::Diff(command) => kr_cli::diff::run(&paths, command, cli.json).await,
         Command::Device(command) => kr_cli::device::run(&paths, command, cli.json).await,
+        Command::Share(command) => kr_cli::share::run(&paths, command, cli.json).await,
         Command::Privacy(command) => kr_cli::privacy::run(&paths, command, cli.json).await,
         Command::Backup(command) => kr_cli::backup::run(&paths, command, cli.json).await,
         Command::Destination(command) => {

@@ -672,7 +672,7 @@ fn visible(text: &str) -> String {
 /// fillers, the Mongolian selectors, the zero-width and directional marks and overrides, the
 /// invisible operators, the variation selectors, the byte order mark, the interlinear and musical
 /// format characters and the tag characters).
-const fn hides(character: char) -> bool {
+pub(crate) const fn hides(character: char) -> bool {
     matches!(
         character,
         '\u{007f}'..='\u{009f}'

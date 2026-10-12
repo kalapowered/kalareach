@@ -18,6 +18,12 @@ path = "src/bin/origin.rs"
 name = "checkpoint"
 required-features = ["legs"]
 
+[[test]]
+# Sharing a session with a guest, checked with the processes a person runs and a paired device that
+# is this repository's client library, over loopback: no deployment is involved.
+name = "sharing"
+required-features = ["legs"]
+
 [features]
 # The legs, and everything they drive. Without them the package is the product's own reading of an
 # origin, which then builds the protocol crate and little else: a script asks it before it builds

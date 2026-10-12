@@ -92,6 +92,10 @@ pub enum Command {
     /// Inspect the devices paired with this host, or revoke one.
     #[command(subcommand)]
     Device(DeviceCommand),
+    /// Share a session with a paired device, see who holds a share, take one back, or hand a
+    /// session's control to another device.
+    #[command(subcommand)]
+    Share(ShareCommand),
     /// Manage plugin packages, their capabilities and the repositories they come from.
     #[command(subcommand)]
     Plugin(PluginCommand),
@@ -549,6 +553,97 @@ pub struct DeviceRevokeArguments {
     pub selector: EnvironmentSelector,
 }
 
+/// One `kr share` operation.
+#[derive(Subcommand)]
+pub enum ShareCommand {
+    /// Share a session with a paired device: show what the share carries and, for a live screen,
+    /// the lines on it now, then issue a single-use invitation the device accepts.
+    ///
+    /// A share that carries any consequence, or the live screen, is issued only after `share` is
+    /// typed at the controlling terminal, which has to be outside every KalaReach session.
+    Invite(ShareInviteArguments),
+    /// List the shares of a session, or of every session, and who holds them.
+    List(ShareListArguments),
+    /// Take a share back, or withdraw an invitation that has not been accepted.
+    Revoke(ShareRevokeArguments),
+    /// Hand a session's control to another paired device, on an owner device's confirmation.
+    Transfer(ShareTransferArguments),
+}
+
+/// `kr share invite`.
+#[derive(Args)]
+pub struct ShareInviteArguments {
+    /// The session, by display number or identifier.
+    pub session: String,
+    /// The device to share with, by identifier or by its exact name.
+    #[arg(long)]
+    pub to: String,
+    /// What the device may do: `viewer` (watch), `controller` (also type, resize, prompt and
+    /// answer) or `owner` (also manage sharing and close the session).
+    #[arg(long, default_value = "viewer")]
+    pub role: String,
+    /// Include the live screen as it is when the device opens the session. The lines on it now are
+    /// shown first.
+    #[arg(long)]
+    pub live: bool,
+    /// How much earlier activity the device sees: `none`, `1h`, `1d` or `all`.
+    #[arg(long, default_value = "none")]
+    pub history: String,
+    /// Let a viewer answer the agent's questions.
+    #[arg(long)]
+    pub answer_questions: bool,
+    /// How long the share lasts: `15m`, `1h`, `1d`, `7d`, `30d`, or `pairing` for as long as the
+    /// device's pairing. One hour when it fits, else until the pairing ends.
+    #[arg(long = "for")]
+    pub lasts: Option<String>,
+    /// Do not ask for `share` at the terminal. Refused for a share that carries any consequence or
+    /// the live screen.
+    #[arg(long)]
+    pub yes: bool,
+    /// The environment.
+    #[command(flatten)]
+    pub selector: EnvironmentSelector,
+}
+
+/// `kr share list`.
+#[derive(Args)]
+pub struct ShareListArguments {
+    /// The session to list, by display number or identifier. Without it, every session.
+    pub session: Option<String>,
+    /// Include shares that were revoked or ran out.
+    #[arg(long)]
+    pub all: bool,
+    /// The environment.
+    #[command(flatten)]
+    pub selector: EnvironmentSelector,
+}
+
+/// `kr share revoke`.
+#[derive(Args)]
+pub struct ShareRevokeArguments {
+    /// The grant, by identifier, as `kr share list` shows it.
+    pub grant: String,
+    /// The environment.
+    #[command(flatten)]
+    pub selector: EnvironmentSelector,
+}
+
+/// `kr share transfer`.
+#[derive(Args)]
+pub struct ShareTransferArguments {
+    /// The session, by display number or identifier.
+    pub session: String,
+    /// The grant to give up, by identifier, as `kr share list` shows it.
+    #[arg(long)]
+    pub from: String,
+    /// The device that receives the control, by identifier or by its exact name.
+    #[arg(long)]
+    pub to: String,
+    /// The environment.
+    #[command(flatten)]
+    pub selector: EnvironmentSelector,
+}
+
 /// One `kr privacy` operation.
 #[derive(Subcommand)]
 pub enum PrivacyCommand {
@@ -899,11 +994,12 @@ pub enum PairCommand {
 #[derive(Args)]
 pub struct PairInviteArguments {
     /// Pair an owner device: every right over this host, until it is revoked.
-    #[arg(long, conflicts_with = "view")]
+    #[arg(long, conflicts_with = "guest")]
     pub owner: bool,
-    /// Pair a device that may view sessions, for the minutes given (60 when none are).
-    #[arg(long, value_name = "MINUTES", num_args = 0..=1, default_missing_value = "60")]
-    pub view: Option<u64>,
+    /// Pair a guest: a device that reaches no session until one is shared with it
+    /// (`kr share invite`), for the minutes given (one day when none are, 30 days at most).
+    #[arg(long, value_name = "MINUTES", num_args = 0..=1, default_missing_value = "1440")]
+    pub guest: Option<u64>,
     /// Offer a QR code the new device scans on this network, instead of a code.
     #[arg(long)]
     pub direct: bool,

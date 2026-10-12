@@ -102,6 +102,7 @@ impl Invitation {
                 rights: Some(payload.proposed_grant.actions.iter().copied().collect()),
                 authority: Some(super::owner::describe_rights(
                     &payload.proposed_grant.actions,
+                    &payload.proposed_grant.session_selector,
                 )),
                 grant_expires_at_ms: match payload.proposed_grant.expiry {
                     GrantExpiry::Never => None,

@@ -37,7 +37,7 @@ use kr_crypto::keys::AuthorisationKeyPair;
 use kr_ipc::client::LocalClient;
 use kr_ipc::paths::HostPaths;
 use kr_pairing::confirm::sign_confirmation;
-use kr_pairing::grants::{personal_owner_grant, session_invitation_grant};
+use kr_pairing::grants::{DEFAULT_GUEST_PAIRING_MS, guest_grant, personal_owner_grant};
 use kr_protocol::confirmation::{
     ConfirmationDisplay, ConfirmationSubject, HostClockEstablishParams, HostClockEstablishResult,
     OwnerConfirmationCompleteParams, OwnerConfirmationCompleteResult,
@@ -46,7 +46,7 @@ use kr_protocol::confirmation::{
 };
 use kr_protocol::envelope::{ActionTarget, ParamsValue};
 use kr_protocol::error::{ErrorCode, ProtocolError};
-use kr_protocol::grant::{HistoryScope, OrganisationRequirement};
+use kr_protocol::grant::OrganisationRequirement;
 use kr_protocol::ids::{ActionId, BuildId, EnvironmentId, InvitationId, OrganisationId};
 use kr_protocol::invitation::{
     InviteEntry, InviteGrantKind, InviteMode, InviteModeKind, PairCancelParams, PairCandidateView,
@@ -62,7 +62,7 @@ use kr_protocol::pairing::{
     PairingConsumedReason, ProposedGrant, RendezvousOrigin,
 };
 use kr_protocol::preauth::{PairStatusParams, PairStatusResult};
-use kr_protocol::scalars::{CanonicalSet, Nullable};
+use kr_protocol::scalars::Nullable;
 
 use crate::bind;
 use crate::cli::{
@@ -119,9 +119,13 @@ async fn invite(
     json: bool,
     build_id: &BuildId,
 ) -> Result<()> {
-    let (grant_kind, mut proposed_grant) = proposal(arguments, kr_ipc::now_ms().get())?;
-    let (mode, mode_kind, origin) = offer(arguments)?;
     let environment = resolve::select(paths, arguments.environment.as_deref())?;
+    let (grant_kind, mut proposed_grant) = proposal(
+        arguments,
+        kr_ipc::now_ms().get(),
+        environment.environment_id,
+    )?;
+    let (mode, mode_kind, origin) = offer(arguments)?;
     let target = ActionTarget::environment(environment.environment_id);
     let mut client = resolve::open_controller(&environment.paths, build_id.clone()).await?;
     if let Some(text) = &arguments.organisation {
@@ -639,7 +643,7 @@ pub async fn end_exclusive_management(
 
 /// Refuses unless this is where a host with no owner may be confirmed at a terminal: at an
 /// interactive terminal, outside every KalaReach session.
-async fn guard(build_id: &BuildId) -> Result<()> {
+pub(crate) async fn guard(build_id: &BuildId) -> Result<()> {
     if !std::io::stdin().is_terminal() || !output::is_terminal() {
         return Err(CliError::NotATerminal);
     }
@@ -652,14 +656,14 @@ async fn guard(build_id: &BuildId) -> Result<()> {
 
 /// The terminal the person types at, opened as itself rather than through this command's
 /// standard streams.
-struct Terminal {
+pub(crate) struct Terminal {
     input: BufReader<File>,
     output: File,
 }
 
 impl Terminal {
     /// Opens the controlling terminal.
-    fn open() -> Result<Self> {
+    pub(crate) fn open() -> Result<Self> {
         #[cfg(unix)]
         let (input, output) = (
             File::options().read(true).open("/dev/tty"),
@@ -680,7 +684,7 @@ impl Terminal {
     }
 
     /// Writes one line.
-    fn say(&mut self, line: &Line) -> Result<()> {
+    pub(crate) fn say(&mut self, line: &Line) -> Result<()> {
         output::write_line(&mut self.output, line)
             .and_then(|()| self.output.flush())
             .map_err(|error| {
@@ -692,7 +696,7 @@ impl Terminal {
     }
 
     /// Writes `prompt` and reads one line.
-    fn ask(&mut self, prompt: &Line) -> Result<String> {
+    pub(crate) fn ask(&mut self, prompt: &Line) -> Result<String> {
         output::write_prompt(&mut self.output, prompt)
             .and_then(|()| self.output.flush())
             .map_err(|error| {
@@ -716,28 +720,29 @@ impl Terminal {
 }
 
 /// Returns the grant an invitation proposes, and its kind.
+///
+/// An owner device gets the personal owner grant. A guest gets a pairing with no action and no
+/// session, for the minutes named: it reaches nothing of this host until a session is shared with
+/// it, and `kr share invite` shares one.
 fn proposal(
     arguments: &PairInviteArguments,
     now_ms: u64,
+    environment_id: EnvironmentId,
 ) -> Result<(InviteGrantKind, ProposedGrant)> {
-    match (arguments.owner, arguments.view) {
+    match (arguments.owner, arguments.guest) {
         (true, None) => Ok((InviteGrantKind::PersonalOwner, personal_owner_grant())),
         (false, Some(minutes)) => {
-            let history = HistoryScope {
-                lower_bound_ms: Nullable::null(),
-                include_live_screen: true,
-                named_questions: CanonicalSet::new(),
-                named_approvals: CanonicalSet::new(),
-            };
-            let grant = session_invitation_grant(now_ms, minutes.saturating_mul(60_000), history)
+            let grant = guest_grant(now_ms, minutes.saturating_mul(60_000), environment_id)
                 .map_err(|error| {
-                CliError::Usage(shown!("--view {}: {}", minutes, Shown::pairing(&error)))
-            })?;
+                    CliError::Usage(shown!("--guest {}: {}", minutes, Shown::pairing(&error)))
+                })?;
             Ok((InviteGrantKind::SessionInvitation, grant))
         }
-        _ => Err(CliError::Usage(Shown::said(
-            "say what the new device may do: --owner, or --view with the minutes it may view \
-             sessions for",
+        _ => Err(CliError::Usage(shown!(
+            "say what the new device may do: --owner, or --guest with the minutes it stays \
+             paired for ({} by default), and share a session with it afterwards with \
+             `kr share invite`",
+            DEFAULT_GUEST_PAIRING_MS / 60_000
         ))),
     }
 }
@@ -1205,13 +1210,12 @@ mod tests {
     use super::*;
     use kr_protocol::invitation::QrText;
     use kr_protocol::pairing::{CodeQrPayload, QrPayload, ShortCode};
-    use kr_protocol::rights::ActionRight;
     use kr_protocol::scalars::{TimestampMs, Uuid};
 
-    fn arguments(owner: bool, view: Option<u64>) -> PairInviteArguments {
+    fn arguments(owner: bool, guest: Option<u64>) -> PairInviteArguments {
         PairInviteArguments {
             owner,
-            view,
+            guest,
             direct: false,
             origin: None,
             organisation: None,
@@ -1219,21 +1223,28 @@ mod tests {
         }
     }
 
+    fn environment() -> EnvironmentId {
+        EnvironmentId::new(Uuid::from_bytes([0xe1; 16]))
+    }
+
     /// KR-REQ-10.04: an invitation says what the new device may do, and nothing chooses that for
-    /// the owner: an owner device gets the personal owner grant, a viewer `session.view` for the
-    /// minutes named, and a command that names neither is a usage mistake.
+    /// the owner: an owner device gets the personal owner grant, a guest a pairing with no action
+    /// and no session for the minutes named, and a command that names neither is a usage mistake.
     #[test]
     fn an_invitation_names_what_the_device_may_do() {
         let now = 1_764_000_000_000;
-        let (kind, grant) = proposal(&arguments(true, None), now).expect("an owner invitation");
+        let (kind, grant) =
+            proposal(&arguments(true, None), now, environment()).expect("an owner invitation");
         assert_eq!(kind, InviteGrantKind::PersonalOwner);
         assert_eq!(grant, personal_owner_grant());
 
-        let (kind, grant) = proposal(&arguments(false, Some(30)), now).expect("a viewer");
+        let (kind, grant) =
+            proposal(&arguments(false, Some(30)), now, environment()).expect("a guest");
         assert_eq!(kind, InviteGrantKind::SessionInvitation);
+        assert!(grant.actions.is_empty(), "a guest holds no action");
         assert_eq!(
-            grant.actions.iter().copied().collect::<Vec<_>>(),
-            vec![ActionRight::SessionView]
+            grant.session_selector,
+            kr_protocol::grant::SessionSelector::None
         );
         assert_eq!(
             grant.expiry,
@@ -1242,9 +1253,9 @@ mod tests {
             }
         );
 
-        for (owner, view) in [(false, None), (false, Some(0)), (false, Some(60 * 24 * 31))] {
+        for (owner, guest) in [(false, None), (false, Some(0)), (false, Some(60 * 24 * 31))] {
             assert!(matches!(
-                proposal(&arguments(owner, view), now),
+                proposal(&arguments(owner, guest), now, environment()),
                 Err(CliError::Usage(_))
             ));
         }

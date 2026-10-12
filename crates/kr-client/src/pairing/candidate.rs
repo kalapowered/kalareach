@@ -250,7 +250,10 @@ impl HostView {
         Self {
             name: host.name.clone(),
             owner: host.is_owner(),
-            authority: super::owner::describe_rights(&host.proposed_grant.actions),
+            authority: super::owner::describe_rights(
+                &host.proposed_grant.actions,
+                &host.proposed_grant.session_selector,
+            ),
             grant_expires_at_ms: expiry(&host.proposed_grant.expiry),
         }
     }
@@ -1552,7 +1555,10 @@ pub(crate) fn awaiting(pending: &PendingAttempt) -> AttemptState {
         value: group_verification_value(&pending.verification_value),
         expires_at_ms: pending.expires_at_ms,
         rights: pending.proposed_grant.actions.iter().copied().collect(),
-        authority: super::owner::describe_rights(&pending.proposed_grant.actions),
+        authority: super::owner::describe_rights(
+            &pending.proposed_grant.actions,
+            &pending.proposed_grant.session_selector,
+        ),
         grant_expires_at_ms: expiry(&pending.proposed_grant.expiry),
     }
 }

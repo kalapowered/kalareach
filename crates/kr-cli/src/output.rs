@@ -81,6 +81,9 @@ pub enum Request {
     Destinations,
     /// The member accounts an organisation's leases name: `kr organisation`.
     Organisations,
+    /// The lines on a session's screen, shown to the person who is about to share it: `kr share
+    /// invite --live`.
+    Screen,
 }
 
 /// Content the person asked to read.
@@ -614,6 +617,10 @@ impl claim::Claimed for kr_protocol::ids::ActionId {}
 impl claim::Claimed for kr_protocol::ids::AuthorityRevision {}
 impl claim::Claimed for kr_protocol::ids::DeviceId {}
 impl claim::Claimed for kr_protocol::ids::GrantId {}
+impl claim::Claimed for kr_protocol::grant::SessionSelector {}
+impl claim::Claimed for kr_protocol::rights::ActionRight {}
+impl claim::Claimed for kr_protocol::sharing::GrantState {}
+impl claim::Claimed for kr_protocol::sharing::SessionRole {}
 impl claim::Claimed for kr_protocol::ids::SessionId {}
 impl claim::Claimed for kr_protocol::privacy::PrivacyDisabled {}
 impl claim::Claimed for kr_protocol::describe::DescriptionDownload {}
@@ -1324,6 +1331,10 @@ mod tests {
         assert_closed::<kr_protocol::ids::AuthorityRevision>();
         assert_closed::<kr_protocol::ids::DeviceId>();
         assert_closed::<kr_protocol::ids::GrantId>();
+        assert_closed::<kr_protocol::grant::SessionSelector>();
+        assert_closed::<kr_protocol::rights::ActionRight>();
+        assert_closed::<kr_protocol::sharing::GrantState>();
+        assert_closed::<kr_protocol::sharing::SessionRole>();
         assert_closed::<kr_protocol::ids::SessionId>();
         assert_closed::<kr_protocol::action::BarrierState>();
         assert_closed::<kr_protocol::receipt::ReceiptState>();
