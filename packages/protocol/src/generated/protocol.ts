@@ -11762,18 +11762,18 @@ export interface NetworkSelection {
   /**
    * The HTTP proxy this host's connections to services go through, as an absolute `http` or
    * `https` origin such as `http://proxy.example.com:3128`: the network endpoint's relay
-   * connection, relay latency probe, captive-portal check and Pkarr servers, the
-   * rendezvous, delivery and webhooks, mail submission (a `CONNECT` tunnel to the mail
-   * server), the managed voice broker and account service, uploads of backups to the
-   * managed storage service, the model's files, and plugin repositories. Nothing on that
-   * list goes around it, so an address it cannot reach fails, and a daemon that started
-   * over a document it could not use sends nothing through these routes until it starts
-   * again over one it can. The host's own name lookups, the endpoint's direct paths, its
-   * QUIC address discovery (which connects directly to the relays over UDP to learn this
-   * host's public address) and port mapper, local discovery and the Mainline DHT where
-   * those are selected, and the Git operations an owner asks for do not use it. It is this
-   * machine's own choice: no invitation or host bundle carries it. It names no user and no
-   * password, because a proxy that needs credentials is not supported.
+   * connection, relay latency probe, captive-portal check and Pkarr servers, the rendezvous,
+   * delivery and webhooks, mail submission (a `CONNECT` tunnel to the mail server), the
+   * managed voice broker and account service, uploads of backups to the managed storage
+   * service, the authority feed, the model's files, and plugin repositories. Nothing on that
+   * list goes around it, so an address it cannot reach fails, and a daemon that started over
+   * a document it could not use sends nothing through these routes until it starts again
+   * over one it can. The host's own name lookups, the endpoint's direct paths, its QUIC
+   * address discovery (which connects directly to the relays over UDP to learn this host's
+   * public address) and port mapper, local discovery and the Mainline DHT where those are
+   * selected, and the Git operations an owner asks for do not use it. It is this machine's
+   * own choice: no invitation or host bundle carries it. It names no user and no password,
+   * because a proxy that needs credentials is not supported.
    */
   proxy_url?: string | null
   /**
@@ -12797,9 +12797,10 @@ export interface DeviceListResult {
    * True when the feed answered that this host was removed from it.
    *
    * The host then learns no revocation from the feed again. The default non-expiring owner
-   * grants stay usable; organisation leases and grants under a bounded offline-validity policy
-   * are refused until the owner acts at the host. [`Self::feed_synchronised_at_ms`] is the last
-   * time the feed answered before that.
+   * grants stay usable; the grants that rest on the feed are refused until the owner acts at the
+   * host: organisation leases, and personal remote access under a bounded offline-validity
+   * policy or on a host that is exclusively organisation-managed.
+   * [`Self::feed_synchronised_at_ms`] is the last time the feed answered before that.
    */
   feed_removed: boolean
   /**
