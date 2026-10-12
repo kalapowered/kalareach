@@ -38,6 +38,7 @@ worker directly for what a session owns.
 | `kr changeset [capture/read/materialize]` | — | Capture an exact version of a workspace's work, read one, or write one out on its own |
 | `kr diff [read/apply/revert]` | — | Read changes, or apply or revert a change-set version at a destination you name |
 | `kr device [list/revoke]` | — | The devices paired with this host, and revoking one |
+| `kr share [invite/list/revoke/transfer]` | — | Share a session with a paired device, see who holds a share, take one back, or hand a session's control to another device |
 | `kr plugin [list/install/remove/pin/enable/disable]` | — | Plugin packages and what they may do |
 | `kr plugin repo [list/add/sync/pin/remove]` | — | The repositories plugins come from, and the trust placed in them |
 | `kr privacy [on/off/status]` | — | Turn this environment's privacy mode on or off, or show where it stands |
@@ -1277,8 +1278,8 @@ section 10's pairing; the new device runs its own side, in the companion applica
 | Command | What it does |
 | --- | --- |
 | `kr pair invite --owner` | Issue an invitation for an owner device: every right over this host, until it is revoked |
-| `kr pair invite --view [MINUTES]` | Issue an invitation for a device that may view sessions, for the minutes given (60 by default) |
-| `kr pair invite --view [MINUTES] --organisation <id>` | Issue that invitation for a member of an organisation this host is enrolled in, so the device's access answers to the organisation's lease |
+| `kr pair invite --guest [MINUTES]` | Issue an invitation for a guest: a device that reaches no session until one is shared with it, for the minutes given (one day by default) |
+| `kr pair invite --guest [MINUTES] --organisation <id>` | Issue that invitation for a member of an organisation this host is enrolled in, so the device's access answers to the organisation's lease |
 | `kr pair confirm <invitation>` | Approve the device that answered, once it shows its verification value |
 | `kr pair cancel <invitation> [--deny]` | Withdraw the invitation, or deny the device that answered it |
 | `kr pair status <invitation>` | Show where the invitation has reached, and the device that answered it |
@@ -1290,6 +1291,11 @@ needs to reach this host on the same network and contacts no rendezvous service.
 minutes. A code may be guessed at five times before the invitation closes, and `kr pair status`
 says how many guesses are left. The QR code is drawn black on white whatever the terminal's own
 colours are.
+
+Use `kr pair invite --guest [MINUTES]` to pair a guest: a device that stays paired for the minutes
+given, one day by default and at most 30 days, and reaches no session until one is shared with it
+(see `kr share invite <session> --to <device>`). Any share the device receives cannot outlast the
+pairing.
 
 Issuing an invitation and approving a device each need a fresh owner confirmation naming exactly
 that action, and `kr` asks the host for one first. On a host that has an owner, an owner device
@@ -1423,7 +1429,8 @@ document is the host's whole result with the failure's code and status beside it
 
 `kr device list [--include-revoked]` lists the devices paired with this host: each one's
 identifier, its name, whether it is an owner device, and the last authority revision it
-acknowledged. A device that is offline cannot apply a revocation it has not received, and the
+acknowledged. `--json` also gives each device's platform, when its pairing ends, whether the host
+finds the pairing run out and whether the pairing opens every session. A device that is offline cannot apply a revocation it has not received, and the
 acknowledgement is how you see which devices have.
 
 `kr device revoke <device>` revokes a device and every grant it holds. An identifier this host never
@@ -1436,6 +1443,50 @@ waits for with the reason the host gives, and exits with 1 and `RESOURCE_UNAVAIL
 document is the host's whole result with the failure beside it. Running it again reports how far
 the revocation has got. A worker that has fenced it but whose evidence has not all arrived is named
 too, and so is any action a worker could not show did not run before the revocation reached it.
+
+## `kr share`
+
+`kr share` shares a session with a paired device, shows who holds a share, takes one back and hands
+a session's control to another device. The device is a guest, or any device whose pairing does not
+already open every session. An owner device, a device whose pairing opens every session, a device
+whose pairing has run out and a revoked device are refused, each with its reason.
+
+`kr share invite` will tell you what the invitation carries before it exists: the role in words, the
+rights it compiles to, when it ends, what the device will see of the session, and the host's
+sentence for each consequence of the rights. With `--live` it also prints the lines on the session's
+screen now, with anything a terminal would act on written out as an escape, and it refuses a screen
+too large for a preview. The preview is the screen as it is when read. When the device opens the
+session, a resize or a program that switches screens can bring earlier lines into view, and the
+command says so.
+
+An invitation that carries a consequence or the live screen is issued only after `share` is typed at
+the controlling terminal, which has to be outside every KalaReach session. No flag skips that
+question for such an invitation; `--yes` skips it for one that carries neither. The question only
+prevents an accident. It does not stop other code running as the same user from sending the request
+itself.
+
+The device to share with is named by its identifier or by an exact name that only one device has.
+The share lasts one hour by default, or until the device's pairing ends when that comes first, and
+never longer than the pairing. After the host writes the invitation, the command compares the lines
+the host kept with the lines it showed. If they differ, it prints the lines the host kept and the
+command that withdraws the invitation.
+
+If the host's reply is lost, the command asks again with exactly the request it sent, on a
+connection of its own, and then reads the host's state. It prints the identifier of the grant before
+it sends. It reports that an invitation did not happen only once nothing more of it can, and
+otherwise it exits non-zero as unfinished. If the command is interrupted, `kr share list <session>
+--all` shows what the host holds.
+
+`kr share list` shows each share with its state (waiting to be accepted, active, ended or revoked),
+the device it goes to, its role, its session and when it ends. `kr share revoke` takes a share back,
+or withdraws an invitation nobody has accepted. A revocation is complete when every affected
+session's worker has fenced it; until then it is pending, and the command names what it waits for
+and exits with 1. Asking again is a new revocation. What the device already saw stays with it.
+
+`kr share transfer` hands a session's control to another device. The host describes the transfer
+from its own records, an owner device confirms exactly that plan, and the command then sends the
+transfer under the action the confirmation was asked for. Afterwards the receiving device holds the
+session and the giving device's grant is revoked.
 
 ## `kr plugin`
 
@@ -1848,7 +1899,7 @@ To withdraw a host from an organisation, use `kr organisation withdraw <id>`, wh
 
 When exclusive management is on and no owner device is left that could confirm for the host, the host tells `kr organisation exclusive off` that the terminal can confirm it. `kr` then asks the person to type `end` at the controlling terminal, which must be interactive and outside every KalaReach session, as for `kr host clock --establish`. The terminal confirms nothing else in that state. With `--json`, `on` and `off` return `ok`, `exclusive`, `authority_revision` and, for `on`, `barrier_workers_total`.
 
-`kr pair invite --view --organisation <id>` fills in the requirement from the host's enrolment in
+`kr pair invite --guest --organisation <id>` fills in the requirement from the host's enrolment in
 that organisation. The host refuses a proposal that requires an organisation it is not enrolled in,
 names another enrolment revision, or carries a right above what an owner of an organisation may
 hold. The owner device that is asked to confirm the invitation is told that it answers to the

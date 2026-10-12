@@ -187,8 +187,9 @@ already awaiting owner approval.
 
 ## Grants
 
-A session invitation defaults to `session.view` for one hour. The issuer may choose a shorter
-duration or extend it to at most 30 days; persistent co-owner access needs explicit owner pairing.
+A guest pairing is the grant a session invitation proposes. It carries no action and no session,
+lasts one day unless the issuer chooses otherwise and at most 30 days, and a session is shared with
+the guest afterwards. Persistent co-owner access needs explicit owner pairing.
 A personal owner grant is the other kind: valid until revoked, so independent operation does not
 depend on a cloud lease.
 
