@@ -3370,9 +3370,10 @@ pub(crate) mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_grant_that_stands_on_the_clock_is_not_read_while_the_clock_is_in_doubt() {
         let temp = kr_ipc::testing::TempHost::create();
-        let controller = daemon(&temp).await;
+        let (_continuous, wall, clocks) = manual_clocks();
+        let controller = daemon_on(&temp, clocks).await;
         let revision = controller.policy().authority_revision();
-        let now = kr_ipc::now_ms().get();
+        let now = wall.load(std::sync::atomic::Ordering::SeqCst);
         let (lasting, _) = granted(GrantExpiry::Never, revision);
         let (ending, _) = granted(
             GrantExpiry::At {
@@ -3384,7 +3385,8 @@ pub(crate) mod tests {
             .as_this_host_lets_it_be_used(ending.clone())
             .expect("the clock is proven");
 
-        // The floor is owed its record, and storage takes none.
+        // The floor is owed its record at a reading the wall clock has reached, and storage takes
+        // none.
         let registry = refuse_policy_writes(&temp);
         controller
             .policy
@@ -3392,6 +3394,7 @@ pub(crate) mod tests {
             .expect("the policy")
             .utc_floor()
             .owe(now + 1);
+        wall.store(now + 2, std::sync::atomic::Ordering::SeqCst);
         let refused = controller
             .as_this_host_lets_it_be_used(ending.clone())
             .expect_err("the floor it stands on is not on disk");
