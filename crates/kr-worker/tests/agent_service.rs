@@ -1787,8 +1787,8 @@ async fn kr_req_09_a_request_that_went_and_was_never_answered_leaves_an_unknown_
     };
     assert_eq!(
         failure.code,
-        ErrorCode::UpstreamUnavailable,
-        "the transport says the upstream did not answer"
+        ErrorCode::OutcomeUnknown,
+        "the frame went and the upstream did not answer, which is an outcome nobody can establish"
     );
     assert!(
         read.lock()
@@ -2629,7 +2629,7 @@ async fn a_transport_that_blocks_as_it_takes_an_operation_meets_the_upstream_dea
     let Outcome::Error(error) = outcome else {
         panic!("a transmission that never finished is not applied: {outcome:?}");
     };
-    assert_eq!(error.code, ErrorCode::UpstreamUnavailable);
+    assert_eq!(error.code, ErrorCode::OutcomeUnknown);
     assert!(
         waited < deadline + std::time::Duration::from_secs(20),
         "answered after {waited:?}, at a deadline of {deadline:?}"
@@ -2682,7 +2682,7 @@ async fn kr_req_09_an_answer_whose_transport_blocks_is_uncertain_before_its_call
     let Outcome::Error(error) = outcome else {
         panic!("an answer that never finished going is not applied: {outcome:?}");
     };
-    assert_eq!(error.code, ErrorCode::UpstreamUnavailable);
+    assert_eq!(error.code, ErrorCode::OutcomeUnknown);
     assert_eq!(
         when_answered,
         kr_protocol::gateway::PendingState::Uncertain,
@@ -2730,7 +2730,7 @@ async fn kr_req_09_an_answer_never_acknowledged_is_uncertain_before_its_caller_h
     let Outcome::Error(error) = outcome else {
         panic!("an answer nobody acknowledged is not applied: {outcome:?}");
     };
-    assert_eq!(error.code, ErrorCode::UpstreamUnavailable);
+    assert_eq!(error.code, ErrorCode::OutcomeUnknown);
     assert_eq!(
         when_answered,
         kr_protocol::gateway::PendingState::Uncertain,

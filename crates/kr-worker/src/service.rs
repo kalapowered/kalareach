@@ -4569,8 +4569,25 @@ impl WorkerService {
                 request_id: pending.request_id,
                 outcome: Outcome::Ok(value),
             }),
-            Err(error) => failure(pending.request_id, &error.to_protocol_error()),
+            Err(error) => failure(pending.request_id, &Self::upstream_answer(&error)),
         }
+    }
+
+    /// What a caller is told of an admitted operation that failed after its dispatch marker.
+    ///
+    /// The receipt says what the worker could establish ([`Self::settle_upstream`]), and the
+    /// caller is told the same: a refusal the upstream proved is that refusal, and every other end
+    /// is an outcome nobody can establish. The caller must not be given a transient code for the
+    /// second, because a transient code invites the retry that makes an agent do the work twice.
+    fn upstream_answer(error: &WorkerError) -> ProtocolError {
+        let answered = error.to_protocol_error();
+        if matches!(
+            error,
+            WorkerError::Broker(crate::broker::BrokerError::UpstreamRefused { .. })
+        ) {
+            return answered;
+        }
+        ProtocolError::new(ErrorCode::OutcomeUnknown, answered.message)
     }
 
     /// Records the outcome of an admitted operation that was transmitted outside the boundary.
