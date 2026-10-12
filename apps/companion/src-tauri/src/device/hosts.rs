@@ -60,7 +60,10 @@ impl HostRow {
             in_use,
             name: host.name.clone().unwrap_or_else(|| UNNAMED_HOST.to_owned()),
             owner: host.is_owner(),
-            authority: kr_client::pairing::owner::describe_rights(&host.proposed_grant.actions),
+            authority: kr_client::pairing::owner::describe_rights(
+                &host.proposed_grant.actions,
+                &host.proposed_grant.session_selector,
+            ),
             grant_expires_at_ms: match host.proposed_grant.expiry {
                 GrantExpiry::Never => None,
                 GrantExpiry::At { expires_at_ms } => Some(expires_at_ms.get()),
