@@ -227,6 +227,7 @@ pub const NATIVE_METHODS: &[(&str, &[Method])] = &[
     (
         "terminal_view_open",
         &[
+            Method::SessionOpen,
             Method::SessionAttach,
             Method::EventsSubscribe,
             Method::AttachmentViewport,
@@ -2362,24 +2363,92 @@ pub fn connection_state(state: State<'_, AppState>) -> crate::connection::Connec
 /// The view's link, its attachment and its screen are held in native code. The page is sent each
 /// state on `on_state`, the channel it passed, and on nothing else, and the handle comes back
 /// before anything is asked of the host.
+///
+/// On a host this device is paired with the view has a connection of its own, which the host opens
+/// for the session under the grant the screen's opening runs under; the view belongs to that
+/// opening and ends when it does. When the view's connection ends and the opening's link does not,
+/// the host is asked again what the opening allows, and the page is told.
 #[tauri::command]
 pub async fn terminal_view_open<R: tauri::Runtime>(
     webview: tauri::Webview<R>,
-    views: State<'_, crate::terminal::TerminalViews>,
+    state: State<'_, AppState>,
     session_id: String,
     columns: u64,
     rows: u64,
+    opening: Option<String>,
     on_state: tauri::ipc::Channel<crate::terminal::TerminalViewState>,
 ) -> Result<String> {
+    use tauri::{Emitter as _, Manager as _};
+
+    let views = webview.state::<crate::terminal::TerminalViews>();
     let session_id: kr_protocol::ids::SessionId = session_id
         .parse()
         .map_err(|_| CommandError::invalid("that is not a session identifier"))?;
     let dimensions = view_size(columns, rows)?;
-    let publish: crate::terminal::Publish = std::sync::Arc::new(move |state| {
-        // A page that has gone takes nothing; its load ends the view.
-        let _ = on_state.send(state);
-    });
-    Ok(views.open(webview.label(), session_id, dimensions, publish))
+    let Some(context) = state.paired_context() else {
+        let publish: crate::terminal::Publish = std::sync::Arc::new(move |state| {
+            // A page that has gone takes nothing; its load ends the view.
+            let _ = on_state.send(state);
+        });
+        return Ok(views.open(webview.label(), session_id, dimensions, publish));
+    };
+    let Some(opening) = opening else {
+        return Err(CommandError::invalid(
+            "over a host this device is paired with, a view is opened from the session's own screen",
+        ));
+    };
+    let links = std::sync::Arc::clone(state.paired_links());
+    let grant = links.opening_grant(session_id, &opening)?;
+    let dial = crate::standing::Dial::new(context.device, context.host);
+    let shown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let app = webview.app_handle().clone();
+    let publish: crate::terminal::Publish = {
+        let (links, dial, opening) = (std::sync::Arc::clone(&links), dial.clone(), opening.clone());
+        let shown = std::sync::Arc::clone(&shown);
+        std::sync::Arc::new(move |view_state| {
+            let ended = matches!(view_state, crate::terminal::TerminalViewState::Ended { .. });
+            if matches!(
+                view_state,
+                crate::terminal::TerminalViewState::Showing { .. }
+            ) {
+                shown.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            // A page that has gone takes nothing; its load ends the view.
+            let _ = on_state.send(view_state);
+            // A view that drew a screen and then ended on its own may have lost only its
+            // connection. A view that never drew one was refused, and asking again would only
+            // open it again.
+            if ended && shown.load(std::sync::atomic::Ordering::SeqCst) {
+                let (links, dial, opening) =
+                    (std::sync::Arc::clone(&links), dial.clone(), opening.clone());
+                let emitter = app.clone();
+                tauri::async_runtime::spawn(async move {
+                    let emit: crate::standing::Emitter = std::sync::Arc::new(move |event| {
+                        let _ = emitter.emit(crate::standing::STANDING_EVENT, event);
+                    });
+                    links.recheck(&dial, &emit, session_id, &opening).await;
+                });
+            }
+        })
+    };
+    let handle = views.open_paired(
+        webview.label(),
+        dial,
+        grant,
+        session_id,
+        dimensions,
+        publish,
+    );
+    // The view belongs to the opening: leaving or replacing it, or the share ending, closes the
+    // view, which holds the session's input for as long as it lives.
+    if let Err(close) = links.attach_view(session_id, &opening, views.closer(&handle)) {
+        close();
+        return Err(CommandError::stated(
+            kr_protocol::error::ErrorCode::StaleSession,
+            "This screen was replaced by another opening of the session.",
+        ));
+    }
+    Ok(handle)
 }
 
 /// Tells an open view that the page's grid is now `columns` by `rows` cells.

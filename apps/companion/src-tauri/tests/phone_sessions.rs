@@ -777,3 +777,374 @@ async fn kr_req_19_08_the_rights_a_phone_is_told_are_the_hosts_decision() {
     assert_eq!(told, ["agent.prompt", "session.view"], "{standing}");
     adopted.stop().await;
 }
+
+/// The text of the lines a view state shows.
+fn text_of(state: &Value) -> Vec<String> {
+    state["screen"]["lines"]
+        .as_array()
+        .map(|lines| {
+            lines
+                .iter()
+                .map(|line| {
+                    line["pieces"]
+                        .as_array()
+                        .expect("pieces")
+                        .iter()
+                        .map(|piece| piece["text"].as_str().expect("text").to_owned())
+                        .collect::<String>()
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Opens a raw terminal view of `session` from the screen holding `opening`, publishing on
+/// `channel`, and returns its handle.
+fn open_view(
+    companion: &Companion,
+    session: SessionId,
+    opening: &str,
+    channel: u32,
+) -> Result<String, Value> {
+    companion
+        .call(
+            "terminal_view_open",
+            json!({
+                "sessionId": session.to_string(),
+                "columns": 40,
+                "rows": 8,
+                "opening": opening,
+                "onState": format!("__CHANNEL__:{channel}"),
+            }),
+        )
+        .map(|handle| handle.as_str().expect("the view's handle").to_owned())
+}
+
+/// KR-REQ-19.08: a phone draws the terminal of a paired host's session, takes the input lease,
+/// types a line that reaches the shell, and detaches, on a connection of the view's own: the
+/// session's link and the view's are two, and the host shows no attachment once the view is closed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_19_08_a_phone_draws_a_paired_hosts_terminal_and_types_into_it() {
+    let adopted = Adopted::start(1).await;
+    let worker = &adopted.workers[0];
+    let session = worker.session_id;
+    let phone = phone_under(
+        &adopted,
+        pairing(&[
+            ActionRight::SessionView,
+            ActionRight::TerminalInput,
+            ActionRight::AgentPrompt,
+        ]),
+    )
+    .await;
+    let companion = &phone.companion;
+    open(companion, session, None, "terminal-screen").expect("the session opens");
+
+    let view = open_view(companion, session, "terminal-screen", 11).expect("the view opens");
+    companion
+        .state_where(11, |state| state["state"] == "showing")
+        .await;
+    companion
+        .call(
+            "terminal_view_input",
+            json!({ "view": view, "input": { "kind": "take", "number": 1 } }),
+        )
+        .expect("the take is taken");
+    companion
+        .state_where(11, |state| state["control"]["state"] == "controlling")
+        .await;
+    companion
+        .call(
+            "terminal_view_input",
+            json!({ "view": view, "input": { "kind": "text", "take": 1, "text": "kalareach-typed" } }),
+        )
+        .expect("the text is taken");
+    companion
+        .call(
+            "terminal_view_input",
+            json!({ "view": view, "input": {
+                "kind": "key", "take": 1, "key": "Enter", "base": null, "keypad": null,
+                "shift": false, "alt": false, "control": false, "caps_lock": false,
+                "num_lock": false, "event": "press",
+            } }),
+        )
+        .expect("the key is taken");
+    // `cat` is the session's shell: it writes back what reached it.
+    let echoed = companion
+        .state_where(11, |state| {
+            text_of(state)
+                .iter()
+                .any(|line| line.contains("kalareach-typed"))
+        })
+        .await;
+    assert_eq!(echoed["state"], "showing");
+
+    // One attachment, the view's, and it goes with the view.
+    let attachments = || worker.attachments();
+    assert_eq!(attachments(), 1, "the view's attachment");
+    companion
+        .call("terminal_view_close", json!({ "view": view }))
+        .expect("the view closes");
+    let gone = tokio::time::timeout(WATCHDOG, async {
+        while attachments() != 0 {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await;
+    assert!(
+        gone.is_ok(),
+        "the daemon shows no attachment once the view is closed"
+    );
+    adopted.stop().await;
+}
+
+/// KR-REQ-19.08: under a share that includes the live screen and carries no terminal input, a
+/// phone draws the session's terminal and is refused the input lease: the host holds the view to
+/// the grant it was opened under, whatever the page asks.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_19_08_a_viewer_share_draws_the_terminal_and_is_refused_the_lease() {
+    let adopted = Adopted::start(1).await;
+    let session = adopted.workers[0].session_id;
+    let mut grant = pairing(&[ActionRight::SessionView]);
+    grant.session_selector = kr_protocol::grant::SessionSelector::None;
+    let phone = phone_under(&adopted, grant).await;
+    let companion = &phone.companion;
+    let share = shared_with(
+        &adopted,
+        &phone,
+        session,
+        RoleSelection {
+            include_live_screen: true,
+            ..RoleSelection::plain(SessionRole::Viewer)
+        },
+    )
+    .await;
+    open(companion, session, Some(share.grant_id), "viewer-screen").expect("the share opens");
+
+    let view = open_view(companion, session, "viewer-screen", 21).expect("the view opens");
+    companion
+        .state_where(21, |state| state["state"] == "showing")
+        .await;
+    companion
+        .call(
+            "terminal_view_input",
+            json!({ "view": view, "input": { "kind": "take", "number": 1 } }),
+        )
+        .expect("the take is taken by the view");
+    let refused = companion
+        .state_where(21, |state| {
+            state["control"]["number"] == 1 && state["control"]["state"] == "watching"
+        })
+        .await;
+    assert!(
+        refused["control"]["ended"]
+            .as_str()
+            .is_some_and(|words| !words.is_empty()),
+        "the host's refusal is told: {refused}"
+    );
+    companion
+        .call("terminal_view_close", json!({ "view": view }))
+        .expect("the view closes");
+    adopted.stop().await;
+}
+
+/// KR-REQ-19.08: a share that does not include the live screen has no terminal to draw: the view
+/// ends with the host's words and nothing was attached.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_19_08_a_share_without_the_live_screen_opens_no_view() {
+    let adopted = Adopted::start(1).await;
+    let worker = &adopted.workers[0];
+    let session = worker.session_id;
+    let mut grant = pairing(&[ActionRight::SessionView]);
+    grant.session_selector = kr_protocol::grant::SessionSelector::None;
+    let phone = phone_under(&adopted, grant).await;
+    let companion = &phone.companion;
+    let share = shared_with(
+        &adopted,
+        &phone,
+        session,
+        RoleSelection::plain(SessionRole::Viewer),
+    )
+    .await;
+    open(companion, session, Some(share.grant_id), "dark-screen").expect("the share opens");
+
+    open_view(companion, session, "dark-screen", 31).expect("a handle comes back at once");
+    let ended = companion
+        .state_where(31, |state| state["state"] == "ended")
+        .await;
+    assert!(
+        ended["reason"]
+            .as_str()
+            .is_some_and(|words| words.contains("live screen")),
+        "the host's words reach the page: {ended}"
+    );
+    assert_eq!(worker.attachments(), 0, "nothing was attached");
+    adopted.stop().await;
+}
+
+/// KR-REQ-19.08: a share's end ends the view it carried and no other. The phone's view of its own
+/// pairing's session, and that session's link, stand.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_19_08_a_shares_end_ends_its_view_and_not_another() {
+    let adopted = Adopted::start(2).await;
+    let (shared, own) = (&adopted.workers[0], &adopted.workers[1]);
+    let mut grant = pairing(&[ActionRight::SessionView, ActionRight::TerminalInput]);
+    grant.session_selector = kr_protocol::grant::SessionSelector::These {
+        session_ids: [own.session_id].into_iter().collect(),
+    };
+    let phone = phone_under(&adopted, grant).await;
+    let companion = &phone.companion;
+    let share = shared_with(
+        &adopted,
+        &phone,
+        shared.session_id,
+        RoleSelection {
+            include_live_screen: true,
+            ..RoleSelection::plain(SessionRole::Viewer)
+        },
+    )
+    .await;
+    open(
+        companion,
+        shared.session_id,
+        Some(share.grant_id),
+        "share-screen",
+    )
+    .expect("opens");
+    open(companion, own.session_id, None, "own-screen").expect("opens");
+    let under_share = open_view(companion, shared.session_id, "share-screen", 41).expect("opens");
+    let under_pairing = open_view(companion, own.session_id, "own-screen", 42).expect("opens");
+    for channel in [41, 42] {
+        companion
+            .state_where(channel, |state| state["state"] == "showing")
+            .await;
+    }
+    assert_eq!(shared.attachments(), 1);
+
+    revoke(&adopted.host, share.grant_id).await;
+
+    companion
+        .state_where(41, |state| state["state"] == "ended")
+        .await;
+    heard(companion, "share-screen", |standing| {
+        standing["state"] == "ended"
+    })
+    .await;
+    assert_eq!(
+        companion
+            .states(42)
+            .iter()
+            .filter(|state| state["state"] == "ended")
+            .count(),
+        0,
+        "the other view stands"
+    );
+    // The surviving view still takes the lease and types.
+    companion
+        .call(
+            "terminal_view_input",
+            json!({ "view": under_pairing, "input": { "kind": "take", "number": 1 } }),
+        )
+        .expect("taken");
+    companion
+        .state_where(42, |state| state["control"]["state"] == "controlling")
+        .await;
+    let _ = under_share;
+    adopted.stop().await;
+}
+
+/// KR-REQ-19.08: a view whose own connection ends while its session's link and a prompt in flight
+/// on it stand is recovered by the host being asked again on the link: the page is told the screen
+/// is open and opens a new view, with a new attachment, and the prompt is not turned into anything.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_19_08_a_views_lost_connection_leaves_the_link_and_its_prompt_standing() {
+    use tauri::Manager as _;
+
+    let adopted = Adopted::start(1).await;
+    let worker = &adopted.workers[0];
+    let upstream = Arc::new(net_support::worker::HeldUpstream::default());
+    let instance = worker.register_agent_on(Arc::clone(&upstream) as _);
+    let session = worker.session_id;
+    let phone = phone_under(
+        &adopted,
+        pairing(&[
+            ActionRight::SessionView,
+            ActionRight::AgentPrompt,
+            ActionRight::TerminalInput,
+        ]),
+    )
+    .await;
+    let companion = &phone.companion;
+    open(companion, session, None, "recovering-screen").expect("opens");
+    let first = open_view(companion, session, "recovering-screen", 51).expect("opens");
+    companion
+        .state_where(51, |state| state["state"] == "showing")
+        .await;
+
+    let sending = companion.start_call(
+        "agent_prompt_submit",
+        json!({ "params": prompt(session, instance, "survives"), "opening": "recovering-screen" }),
+    );
+    tokio::time::timeout(WATCHDOG, async {
+        while upstream.prompts().is_empty() {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("the prompt reaches the agent's upstream");
+
+    let told = |state: &str| {
+        companion
+            .standing
+            .texts()
+            .iter()
+            .filter(|text| {
+                let event: Value = serde_json::from_str(text).expect("an event");
+                event["opening"] == "recovering-screen" && event["standing"]["state"] == state
+            })
+            .count()
+    };
+    assert_eq!(
+        told("open"),
+        0,
+        "an open that is not told again is not a recovery"
+    );
+
+    companion
+        .app
+        .state::<companion_tauri::terminal::TerminalViews>()
+        .lose_connection(&first);
+    companion
+        .state_where(51, |state| state["state"] == "ended")
+        .await;
+    assert!(
+        !sending.is_finished(),
+        "the view's loss does not end the prompt on the link"
+    );
+
+    // The host answers one request at a time on a connection, so the question the phone asks again
+    // on the live link is answered once the prompt is.
+    upstream.release();
+    let settled = tokio::time::timeout(WATCHDOG, sending)
+        .await
+        .expect("answered")
+        .expect("ran")
+        .expect("the prompt was not turned into a refusal by the view's loss");
+    assert!(
+        settled["value"].is_object() || settled["receipt"].is_object(),
+        "{settled}"
+    );
+    // The host is asked again on the live link and says the screen is open: the page opens a view
+    // again.
+    heard(companion, "recovering-screen", |standing| {
+        standing["state"] == "open"
+    })
+    .await;
+    let second = open_view(companion, session, "recovering-screen", 52).expect("opens again");
+    companion
+        .state_where(52, |state| state["state"] == "showing")
+        .await;
+    assert_ne!(first, second);
+    assert_eq!(told("open"), 1);
+    adopted.stop().await;
+}

@@ -60,6 +60,7 @@ impl Page {
         let published: Arc<Mutex<BTreeMap<u32, Vec<Value>>>> = Arc::default();
         let heard = Arc::clone(&published);
         let builder = tauri::test::mock_builder()
+            .manage(companion_tauri::AppState::new())
             .channel_interceptor(move |_webview, callback, _index, body| {
                 if let tauri::ipc::InvokeResponseBody::Json(json) = body {
                     let state: Value = serde_json::from_str(json).expect("a state the page reads");

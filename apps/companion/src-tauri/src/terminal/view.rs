@@ -20,22 +20,20 @@
 use kr_client::encoder::{self, KeyEventKind, Modifiers};
 use kr_client::projection::{Applied, Projection, decode, is_projection_event};
 use kr_client::shown::Shown;
-use kr_ipc::client::LocalClient;
 use kr_protocol::attachment::{
     AttachMode, AttachmentCapability, AttachmentSummary, AttachmentViewportParams,
     AttachmentViewportResult, SessionAttachParams, SessionAttachResult, SessionDetachParams,
 };
 use kr_protocol::envelope::{
-    ActionTarget, ControlFrame, MutationRequest, Notification, Outcome, ParamsValue, Request,
-    Response,
+    ActionTarget, ControlFrame, Notification, Outcome, ParamsValue, Request, Response,
 };
 use kr_protocol::hello::PACKAGE_VERSION;
-use kr_protocol::ids::{ActionId, BuildId, RequestId, SessionId};
+use kr_protocol::ids::{BuildId, GrantId, RequestId, SessionId};
 use kr_protocol::input::{InputAcquireParams, InputReleaseParams, InputWriteParams};
 use kr_protocol::local::LocalBuild;
 use kr_protocol::method::{Method, MethodVersion};
 use kr_protocol::recovery::{EventStream, EventsSubscribeParams};
-use kr_protocol::scalars::{Bytes, CanonicalSet, DurationMs, Nullable, U64};
+use kr_protocol::scalars::{Bytes, CanonicalSet, Nullable, U64};
 use kr_protocol::session::{Dimensions, SESSION_CLOSED_EVENT};
 use kr_protocol::worker::WorkerDescriptor;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -44,6 +42,7 @@ use super::input::{Input, Lease, Owed, PROFILE, Refused, wheel_reports};
 use super::keys::{self, KeyAction, Keyboard, Pressed, TypedKey};
 use super::screen::{TerminalViewState, state_of};
 use super::window::{Answer, WindowReports};
+use super::wire::{Lost, Paired, Wire};
 use super::{Locate, Publish};
 
 /// What the page asks of a view once it is open.
@@ -54,6 +53,8 @@ pub(super) enum Command {
     Move(super::window::Move),
     /// The person's input, and where to say whether the view took it.
     Input(Input, Taken),
+    /// The connection ends as a lost network would end it, and the page has not asked. For a test.
+    Lose,
     /// The page is done with the view.
     Close,
 }
@@ -72,7 +73,7 @@ const RECOVERIES: u32 = 3;
 ///
 /// Numbered apart from the ones the client library gave the attach and the subscription, so an
 /// answer the loop reads is never taken for an answer to one of those.
-const LOOP_REQUESTS: u64 = 1 << 32;
+pub(super) const LOOP_REQUESTS: u64 = 1 << 32;
 
 /// The event a view is sent when the session asks it to take its screen again.
 const RESYNC_EVENT: &str = "session.resync";
@@ -80,16 +81,25 @@ const RESYNC_EVENT: &str = "session.resync";
 /// The event a view is sent when its attachment was ended somewhere else.
 const DETACHED_EVENT: &str = "session.detached";
 
-/// What the open answered: the link, the worker it reaches, and the attachment.
+/// What the open answered: the link, what a mutation on it is about, and the attachment.
 struct Opened {
-    client: LocalClient,
-    descriptor: WorkerDescriptor,
+    wire: Wire,
+    target: ActionTarget,
     attached: SessionAttachResult,
+}
+
+/// Where a view's session is reached.
+pub(super) enum Reach<'a> {
+    /// The worker on this machine, found by its descriptor.
+    Local(&'a Locate),
+    /// A host this device is paired with, over a connection opened for the view under `grant`
+    /// (the pairing when none).
+    Paired(&'a crate::standing::Dial, Option<GrantId>),
 }
 
 /// Runs one view from its open until it ends or is closed.
 pub(super) async fn run(
-    locate: &Locate,
+    reach: Reach<'_>,
     session_id: SessionId,
     dimensions: Dimensions,
     mut commands: UnboundedReceiver<Command>,
@@ -100,7 +110,7 @@ pub(super) async fn run(
     let mut window = WindowReports::new(dimensions);
     let mut lease = Lease::default();
     let opened = {
-        let opening = open(locate, session_id, dimensions);
+        let opening = open(&reach, session_id, dimensions);
         tokio::pin!(opening);
         loop {
             tokio::select! {
@@ -130,6 +140,12 @@ pub(super) async fn run(
                     // A close while the view opens cancels the open. The link goes with it, and a
                     // closed connection detaches whatever the attach had made.
                     Some(Command::Close) | None => return,
+                    Some(Command::Lose) => {
+                        publish(TerminalViewState::Ended {
+                            reason: "The connection to this session ended.".to_owned(),
+                        });
+                        return;
+                    }
                 },
                 opened = &mut opening => break opened,
             }
@@ -142,13 +158,14 @@ pub(super) async fn run(
             return;
         }
     };
+    let next_request = opened.wire.first_loop_request();
     let mut view = View {
-        client: opened.client,
-        target: target(&opened.descriptor),
+        wire: opened.wire,
+        target: opened.target,
         session_id,
         attachment: opened.attached.attachment,
         projection: Projection::new(),
-        next_request: LOOP_REQUESTS,
+        next_request,
         window,
         lease,
         resubscription: None,
@@ -172,24 +189,19 @@ pub(super) async fn run(
 }
 
 /// Opens the link, has the worker prove who it is, attaches and subscribes.
+///
+/// On a paired host the link is a connection of the view's own, the host opens it for the session
+/// under the grant the screen runs under, and the host's own checks stand in for the worker's
+/// stated build: it refuses an attach to a worker whose frames the grant cannot be held to.
 async fn open(
-    locate: &Locate,
+    reach: &Reach<'_>,
     session_id: SessionId,
     dimensions: Dimensions,
 ) -> Result<Opened, String> {
-    let paths = locate()?;
-    // A descriptor is data on disk. Nothing is sent until the worker behind the endpoint has signed
-    // a challenge only the descriptor's key could answer.
-    let crate::worker::Reached {
-        mut client,
-        descriptor,
-        ..
-    } = crate::worker::reach(&paths, session_id)
-        .await
-        .map_err(crate::worker::Unreached::words)?;
-    // The worker has proved who it is, and it says what it is: the attach waits on its screens, so
-    // a worker whose screens this view cannot read is refused before it is asked for anything.
-    check_build(client.acknowledgement().build.as_ref())?;
+    let (mut wire, target) = match reach {
+        Reach::Local(locate) => open_local(locate, session_id).await?,
+        Reach::Paired(dial, grant_id) => open_paired(dial, *grant_id, session_id).await?,
+    };
     let mut requested = CanonicalSet::new();
     requested.insert(AttachmentCapability::ObserveTerminal);
     // Able to take the input lease, which asking for this does not do: only the person's own take
@@ -205,15 +217,10 @@ async fn open(
         terminal_profile_id: Nullable::some(PROFILE.to_owned()),
         requested,
     };
-    let answer = client
-        .mutate(
-            Method::SessionAttach,
-            ActionId::new(kr_ipc::new_uuid()),
-            target(&descriptor),
-            &params,
-        )
+    let answer = wire
+        .mutate(Method::SessionAttach, target.clone(), &params)
         .await
-        .map_err(|error| lost(&error))?
+        .map_err(|lost| lost_words(&lost))?
         .map_err(|refusal| format!("The session refused this view: {}", refusal.message))?;
     let attached: SessionAttachResult = answer.to_typed().map_err(|error| {
         format!(
@@ -231,10 +238,9 @@ async fn open(
         streams,
         from_cursor: Nullable::some(attached.output_cursor),
     };
-    client
-        .request(Method::EventsSubscribe, &subscribe)
+    wire.request(Method::EventsSubscribe, &subscribe)
         .await
-        .map_err(|error| lost(&error))?
+        .map_err(|lost| lost_words(&lost))?
         .map_err(|refusal| {
             format!(
                 "The session refused this view's screen: {}",
@@ -242,10 +248,83 @@ async fn open(
             )
         })?;
     Ok(Opened {
-        client,
-        descriptor,
+        wire,
+        target,
         attached,
     })
+}
+
+/// Reaches the worker on this machine by its descriptor and has it prove who it is.
+async fn open_local(
+    locate: &Locate,
+    session_id: SessionId,
+) -> Result<(Wire, ActionTarget), String> {
+    let paths = locate()?;
+    // A descriptor is data on disk. Nothing is sent until the worker behind the endpoint has signed
+    // a challenge only the descriptor's key could answer.
+    let crate::worker::Reached {
+        client, descriptor, ..
+    } = crate::worker::reach(&paths, session_id)
+        .await
+        .map_err(crate::worker::Unreached::words)?;
+    // The worker has proved who it is, and it says what it is: the attach waits on its screens, so
+    // a worker whose screens this view cannot read is refused before it is asked for anything.
+    check_build(client.acknowledgement().build.as_ref())?;
+    let target = target(&descriptor);
+    Ok((Wire::Local(Box::new(client)), target))
+}
+
+/// Reaches a paired host on a connection of the view's own and has it open the session for the
+/// view, under the share the screen runs under.
+async fn open_paired(
+    dial: &crate::standing::Dial,
+    grant_id: Option<GrantId>,
+    session_id: SessionId,
+) -> Result<(Wire, ActionTarget), String> {
+    use kr_protocol::session::{SessionOpenParams, SessionOpenResult};
+
+    let transport = dial
+        .transport()
+        .await
+        .map_err(|reason| reason.to_string())?;
+    let mut wire = Wire::Paired(Paired::over(transport, grant_id).map_err(|lost| lost.0)?);
+    let opened = wire
+        .request(
+            Method::SessionOpen,
+            &SessionOpenParams {
+                session_id: Nullable::some(session_id),
+                grant_id: Nullable(grant_id),
+            },
+        )
+        .await
+        .map_err(|lost| lost_words(&lost))?
+        .map_err(|refusal| format!("The host refused this view: {}", refusal.message))?;
+    let opened: SessionOpenResult = opened.to_typed().map_err(|error| {
+        format!(
+            "The host's answer could not be read: {}",
+            Shown::cbor(&error)
+        )
+    })?;
+    match opened {
+        SessionOpenResult::InForce {
+            session,
+            environment_id,
+            ..
+        } => {
+            let Some(summary) = session.0 else {
+                return Err("The host opened a connection for no session.".to_owned());
+            };
+            let target = ActionTarget {
+                environment_id,
+                session_id: Nullable::some(summary.session_id),
+                session_epoch: Nullable::some(summary.session_epoch),
+                application_instance_id: Nullable::null(),
+                agent_binding_revision: Nullable::null(),
+            };
+            Ok((wire, target))
+        }
+        SessionOpenResult::Ended { .. } => Err("This share has ended.".to_owned()),
+    }
 }
 
 /// Refuses a worker whose screens this build cannot be sure to read, before the session is asked
@@ -314,11 +393,8 @@ fn build_name(build_id: &BuildId) -> &str {
 }
 
 /// What a link that failed part way says.
-fn lost(error: &kr_ipc::IpcError) -> String {
-    format!(
-        "The connection to this session ended: {}",
-        Shown::ipc(error)
-    )
+fn lost_words(lost: &Lost) -> String {
+    format!("The connection to this session ended: {}", lost.0)
 }
 
 /// The action target that names the worker's session.
@@ -372,7 +448,7 @@ impl Ending {
 
 /// One open, attached view.
 struct View {
-    client: LocalClient,
+    wire: Wire,
     target: ActionTarget,
     session_id: SessionId,
     attachment: AttachmentSummary,
@@ -405,7 +481,7 @@ struct View {
 /// What the loop reads next.
 enum Next {
     Command(Option<Command>),
-    Frame(Result<ControlFrame, kr_ipc::IpcError>),
+    Frame(Result<ControlFrame, Lost>),
 }
 
 impl View {
@@ -421,7 +497,7 @@ impl View {
                 // The page first: a close is answered before anything more is read or drawn.
                 biased;
                 command = commands.recv() => Next::Command(command),
-                frame = self.client.recv() => Next::Frame(frame),
+                frame = self.wire.recv() => Next::Frame(frame),
             };
             let ended = match next {
                 Next::Command(Some(Command::Resize(size))) => {
@@ -433,6 +509,7 @@ impl View {
                     None
                 }
                 Next::Command(Some(Command::Input(input, taken))) => self.input(input, taken).await,
+                Next::Command(Some(Command::Lose)) => Some(Ending::lost()),
                 Next::Command(Some(Command::Close) | None) => Some(Ending::CLOSED),
                 Next::Frame(Ok(ControlFrame::Notification(notification))) => {
                     self.notification(notification).await
@@ -591,13 +668,7 @@ impl View {
             method_version: MethodVersion::V1,
             params,
         };
-        if self
-            .client
-            .writer()
-            .write_message(&ControlFrame::Request(request))
-            .await
-            .is_err()
-        {
+        if !self.wire.send(&ControlFrame::Request(request)).await {
             return Some(Ending::lost());
         }
         self.resubscription = Some(request_id);
@@ -906,13 +977,7 @@ impl View {
             method_version: MethodVersion::V1,
             params,
         };
-        if self
-            .client
-            .writer()
-            .write_message(&ControlFrame::Request(request))
-            .await
-            .is_err()
-        {
+        if !self.wire.send(&ControlFrame::Request(request)).await {
             return Some(Ending::lost());
         }
         self.lease.written(request_id, writing.epoch);
@@ -954,26 +1019,15 @@ impl View {
         method: Method,
         params: &T,
     ) -> bool {
-        let Ok(params) = ParamsValue::from_typed(params) else {
+        let Ok(mutation) = self
+            .wire
+            .mutation(request_id, method, self.target.clone(), params)
+        else {
             return false;
         };
-        let mutation = MutationRequest {
-            request_id,
-            method: method.into(),
-            method_version: MethodVersion::V1,
-            action_id: ActionId::new(kr_ipc::new_uuid()),
-            grant_id: Nullable::null(),
-            target: self.target.clone(),
-            expected: ParamsValue::empty(),
-            action_window_id: self.client.action_window().action_window_id.clone(),
-            requested_ttl_ms: DurationMs::new(kr_protocol::limits::DEFAULT_MUTATION_TTL.get()),
-            params,
-        };
-        self.client
-            .writer()
-            .write_message(&ControlFrame::Mutation(Box::new(mutation)))
+        self.wire
+            .send(&ControlFrame::Mutation(Box::new(mutation)))
             .await
-            .is_ok()
     }
 
     fn next_id(&mut self) -> RequestId {

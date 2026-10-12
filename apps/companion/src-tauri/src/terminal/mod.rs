@@ -24,6 +24,7 @@ mod keys;
 pub mod screen;
 mod view;
 mod window;
+mod wire;
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -45,6 +46,15 @@ pub type Locate = Arc<dyn Fn() -> Result<EnvironmentPaths, String> + Send + Sync
 
 /// Where one view's states go: the page's channel for it.
 pub type Publish = Arc<dyn Fn(TerminalViewState) + Send + Sync>;
+
+/// Where a view's session is reached from, owned by the view's task.
+enum Source {
+    Local(Locate),
+    Paired(
+        Box<crate::standing::Dial>,
+        Option<kr_protocol::ids::GrantId>,
+    ),
+}
 
 /// One view whose task is running, as the registry holds it.
 ///
@@ -97,6 +107,43 @@ impl TerminalViews {
         dimensions: Dimensions,
         publish: Publish,
     ) -> String {
+        self.start(
+            page,
+            Source::Local(Arc::clone(&self.locate)),
+            session_id,
+            dimensions,
+            publish,
+        )
+    }
+
+    /// Opens a view of `session_id` of a host this device is paired with, on a connection of its
+    /// own opened under `grant` (the pairing when none), for the page `page`.
+    pub fn open_paired(
+        &self,
+        page: &str,
+        dial: crate::standing::Dial,
+        grant: Option<kr_protocol::ids::GrantId>,
+        session_id: SessionId,
+        dimensions: Dimensions,
+        publish: Publish,
+    ) -> String {
+        self.start(
+            page,
+            Source::Paired(Box::new(dial), grant),
+            session_id,
+            dimensions,
+            publish,
+        )
+    }
+
+    fn start(
+        &self,
+        page: &str,
+        source: Source,
+        session_id: SessionId,
+        dimensions: Dimensions,
+        publish: Publish,
+    ) -> String {
         let id = self.next.fetch_add(1, Ordering::Relaxed);
         let (commands, receiver) = tokio::sync::mpsc::unbounded_channel();
         let (ending, ended) = tokio::sync::watch::channel(false);
@@ -110,9 +157,12 @@ impl TerminalViews {
             },
         );
         let held = Arc::clone(&self.held);
-        let locate = Arc::clone(&self.locate);
         tauri::async_runtime::spawn(async move {
-            view::run(&locate, session_id, dimensions, receiver, &publish).await;
+            let reach = match &source {
+                Source::Local(locate) => view::Reach::Local(locate),
+                Source::Paired(dial, grant) => view::Reach::Paired(dial, *grant),
+            };
+            view::run(reach, session_id, dimensions, receiver, &publish).await;
             // Not held once it has ended, and only then is every close waiting for it told.
             held.lock()
                 .unwrap_or_else(PoisonError::into_inner)
@@ -120,6 +170,34 @@ impl TerminalViews {
             let _ = ending.send(true);
         });
         id.to_string()
+    }
+
+    /// What closes a view without waiting for it: the same close the page's own makes, for a holder
+    /// that cannot wait. Closing a view that has ended does nothing.
+    #[must_use]
+    pub fn closer(&self, view: &str) -> Box<dyn FnOnce() + Send> {
+        let held = Arc::clone(&self.held);
+        let id = view.parse::<u64>().ok();
+        Box::new(move || {
+            let Some(id) = id else {
+                return;
+            };
+            if let Some(entry) = held.lock().unwrap_or_else(PoisonError::into_inner).get(&id) {
+                let _ = entry.commands.send(view::Command::Close);
+            }
+        })
+    }
+
+    /// Ends a view's connection as a lost network would, without telling it to close. For a test of
+    /// what follows a view's connection ending alone.
+    #[doc(hidden)]
+    pub fn lose_connection(&self, view: &str) {
+        let Ok(id) = view.parse::<u64>() else {
+            return;
+        };
+        if let Some(entry) = self.lock().get(&id) {
+            let _ = entry.commands.send(view::Command::Lose);
+        }
     }
 
     /// Tells a view the page's grid is now `dimensions`. A view that has ended takes nothing.

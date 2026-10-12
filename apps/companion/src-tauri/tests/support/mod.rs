@@ -414,6 +414,8 @@ pub struct Companion {
     pub answered: Arc<Capture>,
     /// Each change of an opened session's standing, as its event reached the page.
     pub standing: Arc<Capture>,
+    /// Every state each channel a command was given was sent.
+    pub channels: Arc<Mutex<std::collections::BTreeMap<u32, Vec<serde_json::Value>>>>,
 }
 
 impl Companion {
@@ -429,9 +431,25 @@ impl Companion {
 
         let state = companion_tauri::AppState::new();
         state.keep_under(data);
-        let app = tauri::test::mock_builder()
+        let channels: Arc<Mutex<std::collections::BTreeMap<u32, Vec<serde_json::Value>>>> =
+            Arc::default();
+        let heard_on_channels = Arc::clone(&channels);
+        let builder = tauri::test::mock_builder()
             .manage(state)
             .manage(companion_tauri::agent::WorkerLinks::local())
+            .channel_interceptor(move |_webview, callback, _index, body| {
+                if let tauri::ipc::InvokeResponseBody::Json(json) = body {
+                    let state: serde_json::Value =
+                        serde_json::from_str(json).expect("a state the page reads");
+                    heard_on_channels
+                        .lock()
+                        .expect("the record")
+                        .entry(callback.0)
+                        .or_default()
+                        .push(state);
+                }
+                true
+            })
             .invoke_handler(tauri::generate_handler![
                 companion_tauri::commands::question_read,
                 companion_tauri::commands::question_answer,
@@ -453,6 +471,11 @@ impl Companion {
                 companion_tauri::commands::session_close,
                 companion_tauri::commands::session_open,
                 companion_tauri::commands::session_leave,
+                companion_tauri::commands::terminal_view_open,
+                companion_tauri::commands::terminal_view_resize,
+                companion_tauri::commands::terminal_view_move,
+                companion_tauri::commands::terminal_view_input,
+                companion_tauri::commands::terminal_view_close,
                 companion_tauri::commands::session_agents,
                 companion_tauri::commands::agent_capabilities,
                 companion_tauri::commands::agent_snapshot,
@@ -478,9 +501,13 @@ impl Companion {
                 companion_tauri::commands::voice_prepare,
                 companion_tauri::commands::voice_allow,
                 companion_tauri::commands::voice_scope,
-            ])
-            .build(tauri::test::mock_context(tauri::test::noop_assets()))
-            .expect("an application");
+            ]);
+        let app = companion_tauri::terminal::install(
+            builder,
+            companion_tauri::terminal::TerminalViews::local(),
+        )
+        .build(tauri::test::mock_context(tauri::test::noop_assets()))
+        .expect("an application");
         let window = tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
             .build()
             .expect("a window");
@@ -510,6 +537,7 @@ impl Companion {
             heard,
             answered: Arc::new(Capture::default()),
             standing,
+            channels,
         }
     }
 
@@ -597,6 +625,39 @@ impl Companion {
                 Ok(answer) => Ok(answer.deserialize().expect("an answer the page can read")),
                 Err(refusal) => Err(refusal),
             }
+        })
+    }
+
+    /// Every state `channel` has been sent so far.
+    pub fn states(&self, channel: u32) -> Vec<serde_json::Value> {
+        self.channels
+            .lock()
+            .expect("the record")
+            .get(&channel)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Waits until a state `channel` was sent satisfies `until`, and returns it.
+    pub async fn state_where(
+        &self,
+        channel: u32,
+        until: impl Fn(&serde_json::Value) -> bool,
+    ) -> serde_json::Value {
+        tokio::time::timeout(WATCHDOG, async {
+            loop {
+                if let Some(state) = self.states(channel).iter().find(|state| until(state)) {
+                    return state.clone();
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "no state on channel {channel} within the watchdog; it was sent {:?}",
+                self.states(channel)
+            )
         })
     }
 

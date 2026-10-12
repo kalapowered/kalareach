@@ -137,7 +137,7 @@ pub struct StandingEvent {
 }
 
 /// Tells the page about a change of standing.
-type Emitter = Arc<dyn Fn(StandingEvent) + Send + Sync>;
+pub(crate) type Emitter = Arc<dyn Fn(StandingEvent) + Send + Sync>;
 
 /// A count of the mutations in flight on a link, so a leave can wait for them to answer before it
 /// closes the link under them.
@@ -181,11 +181,22 @@ impl Drop for InFlight {
 
 /// How reaching a host, or having it open a session, did not give a link.
 #[derive(Debug)]
-enum Failure {
+pub(crate) enum Failure {
     /// The host answered with a refusal.
     Refused(ProtocolError),
     /// The host could not be reached, or the connection to it ended.
     Unreached(String),
+}
+
+impl std::fmt::Display for Failure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Refused(refusal) => write!(formatter, "The host refused: {}", refusal.message),
+            Self::Unreached(reason) => {
+                write!(formatter, "The host could not be reached: {reason}")
+            }
+        }
+    }
 }
 
 impl Failure {
@@ -219,15 +230,14 @@ impl Dial {
         Self { device, host }
     }
 
-    /// Reaches the host on a connection of its own and has it open `session_id` under `grant_id`.
-    async fn open(
+    /// Reaches the host on a connection of its own, as the device it paired as, and returns the
+    /// connection's transport with nothing yet said on it.
+    pub(crate) async fn transport(
         &self,
-        session_id: SessionId,
-        grant_id: Option<GrantId>,
-    ) -> std::result::Result<Opening, Failure> {
+    ) -> std::result::Result<Arc<dyn kr_client::transport::ControlTransport>, Failure> {
         let pairing = self.device.pairing();
         let identity = pairing.candidate.paired_identity(self.host.device_id);
-        let transport = tokio::time::timeout(
+        tokio::time::timeout(
             OPEN_WITHIN,
             pairing.link.connect_paired_transport(&self.host, &identity),
         )
@@ -236,7 +246,16 @@ impl Dial {
         .map_err(|error| match error {
             LinkError::Refused(refusal) => Failure::Refused(refusal),
             other => Failure::Unreached(other.said().into_string()),
-        })?;
+        })
+    }
+
+    /// Reaches the host on a connection of its own and has it open `session_id` under `grant_id`.
+    async fn open(
+        &self,
+        session_id: SessionId,
+        grant_id: Option<GrantId>,
+    ) -> std::result::Result<Opening, Failure> {
+        let transport = self.transport().await?;
         let session = Session::start(transport)
             .map_err(|error| Failure::Unreached(error.said().into_string()))?;
         let opened = tokio::time::timeout(
@@ -387,6 +406,9 @@ struct Opened {
     link: Arc<Link>,
     standing: SessionStanding,
     watch: Option<tauri::async_runtime::JoinHandle<()>>,
+    /// What closes the raw terminal views opened under this opening, each on a connection of its
+    /// own, when the opening ends.
+    views: Vec<Box<dyn FnOnce() + Send>>,
 }
 
 #[derive(Default)]
@@ -575,6 +597,7 @@ impl PairedLinks {
                         link,
                         standing: standing.clone(),
                         watch,
+                        views: Vec::new(),
                     },
                 );
                 drop(inner);
@@ -767,6 +790,123 @@ impl PairedLinks {
             return Ok(Leased {
                 link,
                 _busy: Some(claim),
+            });
+        }
+    }
+
+    /// The share an opening runs under, for a raw terminal view opened under it, or the words for
+    /// why the opening is not the session's.
+    ///
+    /// # Errors
+    ///
+    /// Refuses a token that is not the session's current opening.
+    pub(crate) fn opening_grant(
+        &self,
+        session_id: SessionId,
+        opening: &str,
+    ) -> Result<Option<GrantId>> {
+        Ok(self.opened_link(session_id, opening)?.grant_id)
+    }
+
+    /// Ties a raw terminal view to an opening: `close` runs when the opening is left, replaced or
+    /// ends. Returns `close` back when the opening is no longer the session's, so the caller ends
+    /// the view itself.
+    pub(crate) fn attach_view(
+        &self,
+        session_id: SessionId,
+        opening: &str,
+        close: Box<dyn FnOnce() + Send>,
+    ) -> std::result::Result<(), Box<dyn FnOnce() + Send>> {
+        let mut inner = self.lock();
+        match inner
+            .opened
+            .get_mut(&session_id)
+            .filter(|held| held.opening == opening)
+        {
+            Some(held) => {
+                held.views.push(close);
+                Ok(())
+            }
+            None => Err(close),
+        }
+    }
+
+    /// Asks the host again, on the opening's live link, what it allows, and tells the page: a view
+    /// on a connection of its own ended while the link did not, so the host's answer says whether
+    /// the share still stands. An answer that it does is `open`, which the page opens a view again
+    /// on; the host ending the share is `ended`.
+    pub async fn recheck(
+        self: &Arc<Self>,
+        dial: &Dial,
+        emit: &Emitter,
+        session_id: SessionId,
+        opening: &str,
+    ) {
+        let link = {
+            let inner = self.lock();
+            inner
+                .opened
+                .get(&session_id)
+                .filter(|held| held.opening == opening)
+                .map(|held| (Arc::clone(&held.link), held.link.grant_id))
+        };
+        let Some((link, grant_id)) = link else {
+            return;
+        };
+        if !live(&link).await {
+            // The link is gone too, and its watch is already reaching the host again.
+            return;
+        }
+        let asked = tokio::time::timeout(
+            OPEN_WITHIN,
+            link.session.read::<_, SessionOpenResult>(
+                Method::SessionOpen,
+                &SessionOpenParams {
+                    session_id: Nullable::some(session_id),
+                    grant_id: Nullable(grant_id),
+                },
+            ),
+        )
+        .await;
+        let _ = dial;
+        let standing = match asked {
+            Ok(Ok(SessionOpenResult::Ended { reason })) => SessionStanding::Ended {
+                reason: end_reason(reason),
+            },
+            Ok(Ok(SessionOpenResult::InForce {
+                via,
+                grant_id,
+                actions,
+                includes_live_screen,
+                history_from_ms,
+                ends_at_ms,
+                ..
+            })) => SessionStanding::Open {
+                via: match via {
+                    OpenedVia::Pairing => "pairing",
+                    OpenedVia::Share => "share",
+                },
+                grant_id: grant_id.to_string(),
+                actions: actions.iter().copied().collect(),
+                includes_live_screen,
+                history_from_ms: history_from_ms.0.map(|at| at.get()),
+                ends_at_ms: ends_at_ms.0.map(|at| at.get()),
+            },
+            Ok(Err(ClientError::Host(refusal))) if !transient(refusal.code) => {
+                SessionStanding::Refused {
+                    code: refusal.code,
+                    message: refusal.message,
+                }
+            }
+            // The link failed or the host could not answer now: the link's own watch tells the
+            // page what it learns.
+            _ => return,
+        };
+        if self.set_standing(session_id, opening, standing.clone()) {
+            emit(StandingEvent {
+                session_id: session_id.to_string(),
+                opening: opening.to_owned(),
+                standing,
             });
         }
     }
@@ -970,6 +1110,10 @@ impl Opened {
     fn end(mut self) {
         if let Some(watch) = self.watch.take() {
             watch.abort();
+        }
+        // The views hold the terminal's input lease for as long as they live.
+        for close in std::mem::take(&mut self.views) {
+            close();
         }
         let link = self.link;
         tauri::async_runtime::spawn(async move {

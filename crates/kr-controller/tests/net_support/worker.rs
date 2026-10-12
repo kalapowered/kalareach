@@ -181,6 +181,11 @@ impl Worker {
         }
     }
 
+    /// How many attachments the session holds now.
+    pub fn attachments(&self) -> usize {
+        self._runtime.session().attachments().len()
+    }
+
     /// The action target of this session.
     pub fn target(&self, environment_id: EnvironmentId) -> ActionTarget {
         ActionTarget {
