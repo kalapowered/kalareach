@@ -3120,7 +3120,7 @@ fn a_removal_the_feed_answered_is_shown_settles_what_was_owed_and_is_kept_apart(
         !restored.is_removed(),
         "a removal is written down apart from the record"
     );
-    restored.restore_removal(&feed.removal().expect("a removal"));
+    restored.restore_removal("https://feed.example", 6_000);
     assert!(restored.is_removed_from("https://feed.example"));
     assert_eq!(
         restored.status().removed_at_ms,

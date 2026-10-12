@@ -946,6 +946,9 @@ async fn the_keys_that_may_remove_the_feed_are_the_owners_the_host_is_paired_wit
             retry_after_seconds: None,
         },
     );
+    // Read before the revocation that wakes the pass, which can end before this test looks.
+    let mut passes = rig.runtime().passes();
+    let seen = *passes.borrow_and_update();
     let mut local = rig.host.client().await;
     let _: kr_protocol::sharing::RevocationResult = net_support::pairing::mutate(
         rig.host.environment_id,
@@ -957,8 +960,6 @@ async fn the_keys_that_may_remove_the_feed_are_the_owners_the_host_is_paired_wit
     )
     .await
     .expect("the owner at the machine revokes the device");
-    let mut passes = rig.runtime().passes();
-    let seen = *passes.borrow_and_update();
     within("the pass that was turned back", async {
         while *passes.borrow_and_update() <= seen {
             passes.changed().await.expect("the carrier is running");
@@ -1284,17 +1285,24 @@ async fn a_feed_longer_than_a_pass_reads_is_not_a_synchronisation_until_it_is_re
             .expect("the feed stores the request");
     }
     // The first pass reads (1) and refuses 64 records (2 to 65); the scan then goes on at once with
-    // a second read (66), which the feed turns back.
-    rig.served.web().fail(
-        AUTHORITY,
-        66,
-        Moment::Refuse {
-            status: 503,
-            code: "SERVICE_UNAVAILABLE",
-            retry_after_seconds: None,
-        },
+    // a second read (66), which the feed holds open. A connection that asked for a synchronisation
+    // is not given one by the first page, and what the host shows is not current while the scan is
+    // under way.
+    let before = rig.served.web().requests_to(AUTHORITY);
+    rig.served.web().fail(AUTHORITY, 66, Moment::Hold);
+    let waiting = rig.runtime().synchronised_before_serving();
+    tokio::pin!(waiting);
+    tokio::select! {
+        () = &mut waiting => panic!("the first page of a feed is no synchronisation"),
+        () = rig.served.web().requests_reach(AUTHORITY, before + 66) => {}
+    }
+    assert!(
+        rig.shown().await.list.feed_stale,
+        "a scan under way is not current"
     );
-    rig.poll().await;
+    // The feed lets the read go unanswered, and the scan has stopped half way.
+    rig.served.web().release_held();
+    within("the connection is served once the read ended", waiting).await;
     let shown = rig.shown().await;
     assert_eq!(
         shown.list.feed_synchronised_at_ms.0, synchronised,
@@ -1520,6 +1528,57 @@ async fn the_synchronisation_the_host_shows_is_dated_by_the_clock_the_daemon_hol
         synchronised > kr_ipc::now_ms().get() + 30 * 60 * 1000,
         "dated by the daemon's clock, an hour ahead of the machine's: {synchronised}"
     );
+}
+
+/// What a host that has been removed from its feed refuses a device that holds a grant resting on
+/// the feed: here the device's request for its own diagnostics.
+async fn refused_for_the_removal(
+    rig: &Rig,
+    phone: &Device,
+    record: &kr_controller::service::net::devices::DeviceRecord,
+) {
+    let session = connect(&rig.host, phone, record).await;
+    let refused = session
+        .read::<_, HostDoctorResult>(Method::HostDoctor, &())
+        .await
+        .expect_err("the grant rests on a feed that removed the host");
+    assert_eq!(refused.code(), ErrorCode::PermissionDenied, "{refused}");
+    assert!(
+        refused.to_string().contains("was removed"),
+        "refused for the feed's removal and not for something else: {refused}"
+    );
+    session.close();
+}
+
+/// A configuration document this host cannot use is no choice of another feed: the removal and
+/// what it refuses stand, and the item that told the owner stays, until a start reads a document
+/// that selects another feed or none. Put right, the document names the feed that removed the
+/// host, and a start with that feed unreachable still finds the removal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_document_the_host_cannot_use_leaves_the_removal_in_force() {
+    let rig = Rig::start().await;
+    rig.the_owner_bounds_offline_validity();
+    let (phone, record) = rig.pairs(&[ActionRight::SessionView]).await;
+    rig.the_feed_removes_the_host().await;
+    assert!(rig.shown().await.removal_item.is_some());
+
+    let rig = rig
+        .restarted(false, net_support::write_unusable_document)
+        .await;
+    refused_for_the_removal(&rig, &phone, &record).await;
+    assert!(
+        rig.shown().await.removal_item.is_some(),
+        "the owner is still told"
+    );
+
+    let origin = rig.served.origin().to_owned();
+    let rig = rig
+        .restarted(true, |tree| {
+            net_support::write_feed_document(tree, Some(&origin));
+        })
+        .await;
+    refused_for_the_removal(&rig, &phone, &record).await;
+    assert!(rig.shown().await.removal_item.is_some());
 }
 
 /// A request taken from one feed does not hold up another the host is pointed at: the revisions a
@@ -1765,5 +1824,139 @@ async fn a_start_does_not_write_the_feed_down_again_for_each_settled_record_it_r
         writes <= 2,
         "the start writes the record once and the synchronisation once, not once for each of \
          four records it read again: {writes}"
+    );
+}
+
+/// The attention store refuses a notice about the feed that it has not taken yet, as a store does
+/// whose disk is full. What it holds stays as it is, so the daemon opens it.
+fn the_attention_store_refuses_the_feeds_notices(host: &Host) {
+    let store =
+        rusqlite::Connection::open(host.attention_database()).expect("opens the attention store");
+    store
+        .busy_timeout(Duration::from_secs(5))
+        .expect("waits for the daemon's writes");
+    store
+        .execute_batch(
+            "CREATE TABLE notices_taken (n INTEGER);
+             INSERT INTO notices_taken
+               SELECT COALESCE(MAX(sequence), 0) FROM attention_consumed WHERE source = 'authority';
+             CREATE TRIGGER refuse_notice_insert BEFORE INSERT ON attention_consumed
+             WHEN NEW.source = 'authority' AND NEW.sequence > (SELECT n FROM notices_taken)
+             BEGIN SELECT RAISE(ABORT, 'no room'); END;
+             CREATE TRIGGER refuse_notice_update BEFORE UPDATE ON attention_consumed
+             WHEN NEW.source = 'authority' AND NEW.sequence > (SELECT n FROM notices_taken)
+             BEGIN SELECT RAISE(ABORT, 'no room'); END;",
+        )
+        .expect("the fault is in place");
+}
+
+fn the_attention_store_takes_the_feeds_notices(host: &Host) {
+    let store =
+        rusqlite::Connection::open(host.attention_database()).expect("opens the attention store");
+    store
+        .busy_timeout(Duration::from_secs(5))
+        .expect("waits for the daemon's writes");
+    store
+        .execute_batch(
+            "DROP TRIGGER refuse_notice_insert;
+             DROP TRIGGER refuse_notice_update;
+             DROP TABLE notices_taken;",
+        )
+        .expect("the fault is lifted");
+}
+
+/// The notice that the feed removed the host is owed to the owner until the attention store takes
+/// it. A start that could not give it does not forget it: the carrier gives it again, when the
+/// store can take it, without another start.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_removal_notice_the_attention_store_refused_is_given_again_without_a_start() {
+    let rig = Rig::start().await;
+    the_attention_store_refuses_the_feeds_notices(&rig.host);
+    rig.the_feed_removes_the_host().await;
+    assert!(
+        rig.shown().await.removal_item.is_none(),
+        "the store refused the notice"
+    );
+
+    let rig = rig.restarted(true, |_| {}).await;
+    assert!(rig.shown().await.removal_item.is_none());
+
+    the_attention_store_takes_the_feeds_notices(&rig.host);
+    let poll_interval = Duration::from_millis(kr_controller::grants::feed::FEED_POLL_INTERVAL_MS);
+    let (_, release) = within(
+        "the carrier backs off from the notice it owes",
+        rig.timer.next_wait_under(poll_interval),
+    )
+    .await;
+    let mut passes = rig.runtime().passes();
+    let seen = *passes.borrow_and_update();
+    release.notify_one();
+    within("the carrier gives the notice again", async {
+        while *passes.borrow_and_update() <= seen {
+            passes.changed().await.expect("the carrier is running");
+        }
+    })
+    .await;
+    assert!(
+        rig.shown().await.removal_item.is_some(),
+        "the owner is told once the store can take the notice"
+    );
+}
+
+/// The notice that the host reads another feed, or none, is owed until the attention store takes
+/// it, and is given at the next start when the store could not take it at the first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_notice_that_the_owner_acted_the_attention_store_refused_is_given_at_the_next_start() {
+    let rig = Rig::start().await;
+    rig.the_feed_removes_the_host().await;
+    assert!(rig.shown().await.removal_item.is_some());
+
+    the_attention_store_refuses_the_feeds_notices(&rig.host);
+    let rig = rig
+        .restarted(false, |tree| net_support::write_feed_document(tree, None))
+        .await;
+    assert!(
+        rig.shown().await.removal_item.is_some(),
+        "the store refused the notice that ends it"
+    );
+
+    the_attention_store_takes_the_feeds_notices(&rig.host);
+    let rig = rig.restarted(false, |_| {}).await;
+    assert!(
+        rig.shown().await.removal_item.is_none(),
+        "the item ends once the store can take the notice"
+    );
+}
+
+/// The notices about the feed are numbered by the order the host gave them in and not by the time
+/// they were recorded: a clock put right after it ran ahead does not put the notice that the owner
+/// acted behind the one it ends, nor a later removal behind the notice that the owner acted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_notices_about_the_feed_keep_their_order_when_the_clock_is_put_back() {
+    let wall = MovedWall::new();
+    let rig = Rig::start_on(wall.clocks()).await;
+    wall.advance(Duration::from_secs(2 * 60 * 60));
+    rig.the_feed_removes_the_host().await;
+    assert!(rig.shown().await.removal_item.is_some());
+
+    wall.rewind(Duration::from_secs(2 * 60 * 60));
+    let rig = rig
+        .restarted(false, |tree| net_support::write_feed_document(tree, None))
+        .await;
+    assert!(
+        rig.shown().await.removal_item.is_none(),
+        "the owner acted, so the item that told them ends"
+    );
+
+    let origin = rig.served.origin().to_owned();
+    let rig = rig
+        .restarted(false, |tree| {
+            net_support::write_feed_document(tree, Some(&origin));
+        })
+        .await;
+    rig.poll().await;
+    assert!(
+        rig.shown().await.removal_item.is_some(),
+        "the feed removes the host again, and the owner is told again"
     );
 }
