@@ -80,8 +80,8 @@ impl core::fmt::Display for Origin {
 ///
 /// It is, for every source that numbers each of its records. It is not for the workflow journal's
 /// outbox, which numbers every event it holds and hands the attention store only its own types, nor
-/// for the host's record of its authority feed, which numbers a notice by the moment it was
-/// recorded.
+/// for the host's record of its authority feed, which numbers a notice by the order the host
+/// recorded it in and leaves a gap where a notice was superseded before it was given.
 #[must_use]
 pub const fn numbers_every_record(source: AttentionSource) -> bool {
     !matches!(
