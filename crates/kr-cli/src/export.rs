@@ -31,6 +31,7 @@
 
 use std::path::Path;
 
+use kr_client::session_export::{self, Bounds, PageSource, Stop};
 use kr_client::shown;
 use kr_client::shown::{Said, Shown};
 use kr_protocol::envelope::ParamsValue;
@@ -38,28 +39,20 @@ use kr_protocol::error::ErrorCode;
 use kr_protocol::ids::SessionId;
 use kr_protocol::method::Method;
 use kr_protocol::privacy::{PrivacyReport, PrivacyStatusParams};
-use kr_protocol::recovery::{HistoryGap, HistoryPageParams, HistoryPageResult};
+use kr_protocol::recovery::{HistoryPageParams, HistoryPageResult};
 use kr_protocol::scalars::{Nullable, U64};
-use kr_protocol::session::{
-    ClosureRecord, Dimensions, SessionListParams, SessionListResult, SessionState, SessionSummary,
-};
-use kr_term::budget::GridSize;
-use kr_term::diag::DiagnosticKind;
-use kr_term::engine::{Engine, EngineConfig, FeedOutcome};
-use kr_term::lane::{LaneGate, LaneLimits};
-use kr_term::sideeffect::SideEffectKind;
-use kr_term::span::ByteSpan;
-use serde::Serialize;
+use kr_protocol::session::{SessionListParams, SessionListResult, SessionState, SessionSummary};
 
 use crate::bridge::link::Link;
 use crate::error::{CliError, Result};
 use crate::resolve::SessionSelector;
 
-/// The format the file declares, so a reader knows what it has.
-pub const FORMAT: &str = "kalareach-session-export/1";
-
 /// How much retained output an export reads unless the person says otherwise.
 pub const DEFAULT_MAX_BYTES: u64 = 16 * 1024 * 1024;
+
+/// The most the file may hold: 192 MiB. An export that would pass it keeps the start of the output
+/// and says it left the rest.
+pub const MAX_FILE_BYTES: u64 = 192 * 1024 * 1024;
 
 /// What a read of one session produced, before any file exists.
 pub struct Exported {
@@ -83,7 +76,7 @@ pub struct Summary {
     pub bytes_carried: u64,
     /// How many ranges of output the archive no longer holds.
     pub gaps: usize,
-    /// Whether the read stopped at the byte bound with output left.
+    /// Whether the read stopped at a bound, the bytes read or the size of the file, with output left.
     pub truncated: bool,
     /// What the file declares it does not hold, by kind.
     pub omissions: Vec<&'static str>,
@@ -154,7 +147,30 @@ pub async fn read<L: Link>(
     let before: PrivacyReport = ask(link, Method::PrivacyStatus, &PrivacyStatusParams {}).await?;
     fence(&before, &session)?;
 
-    let read = pages(link, &session, max_bytes).await?;
+    let composed = session_export::compose(
+        &mut Pages {
+            link,
+            session_id: session.session_id,
+        },
+        &session,
+        Bounds {
+            max_read_bytes: max_bytes,
+            max_document_bytes: MAX_FILE_BYTES,
+            max_chunks: session_export::MAX_CHUNKS,
+        },
+        0,
+        exported_at_ms,
+    )
+    .await
+    .map_err(|stop| match stop {
+        Stop::Source(error) => error,
+        Stop::Engine => CliError::Other(Shown::said(
+            "the terminal engine could not be made for the session's size",
+        )),
+        Stop::Document => CliError::Other(Shown::said(
+            "the export could not be written out as a document",
+        )),
+    })?;
 
     let after: PrivacyReport = ask(link, Method::PrivacyStatus, &PrivacyStatusParams {}).await?;
     fence(&after, &session)?;
@@ -168,7 +184,18 @@ pub async fn read<L: Link>(
         });
     }
 
-    compose(&session, read, exported_at_ms)
+    Ok(Exported {
+        document: composed.document,
+        summary: Summary {
+            session_id: session.session_id,
+            display_number: session.display_number.get(),
+            bytes_read: composed.bytes_read,
+            bytes_carried: composed.bytes_carried,
+            gaps: composed.gaps,
+            truncated: composed.truncated,
+            omissions: composed.omissions,
+        },
+    })
 }
 
 /// Refuses a session privacy mode keeps from an export.
@@ -202,109 +229,18 @@ fn refused(message: Shown) -> CliError {
     CliError::refused_in_its_own_words(ErrorCode::PermissionDenied, message)
 }
 
-/// What reading a session's pages found.
-struct Read {
-    chunks: Vec<Chunk>,
-    gaps: Vec<HistoryGap>,
-    /// Where the first page began, after any gap before it.
-    from_cursor: u64,
-    oldest_retained: u64,
-    next_cursor: u64,
-    bytes_read: u64,
-    truncated: bool,
-    tally: Tally,
+/// The pages of one session's retained output, asked of the daemon over a link.
+struct Pages<'a, L> {
+    link: &'a mut L,
+    session_id: SessionId,
 }
 
-/// One piece of output the engine cleared, and the cursor it starts at.
-struct Chunk {
-    cursor: u64,
-    bytes: Vec<u8>,
-}
+impl<L: Link> PageSource for Pages<'_, L> {
+    type Error = CliError;
 
-/// Reads every page of the session's retained output from its start, through the engine.
-async fn pages<L: Link>(link: &mut L, session: &SessionSummary, max_bytes: u64) -> Result<Read> {
-    let session_id = session.session_id;
-    let size = grid_size(session);
-    let mut read = Read {
-        chunks: Vec::new(),
-        gaps: Vec::new(),
-        from_cursor: 0,
-        oldest_retained: 0,
-        next_cursor: 0,
-        bytes_read: 0,
-        truncated: false,
-        tally: Tally::default(),
-    };
-    let mut run: Option<Run> = None;
-    let mut cursor = 0_u64;
-    let mut first = true;
-    loop {
-        let remaining = max_bytes.saturating_sub(read.bytes_read);
-        if remaining == 0 {
-            // The bound is met. One more byte says whether anything was left behind.
-            let more = page(link, session_id, cursor, 1).await?;
-            read.truncated = !more.bytes.is_empty();
-            break;
-        }
-        let page = page(
-            link,
-            session_id,
-            cursor,
-            remaining.min(kr_protocol::recovery::MAX_HISTORY_PAGE_BYTES),
-        )
-        .await?;
-        if first {
-            read.from_cursor = page.from_cursor.get();
-            read.oldest_retained = page.oldest_retained_cursor.get();
-            first = false;
-        }
-        if let Some(gap) = page.gap.0
-            && !read.gaps.contains(&gap)
-        {
-            read.gaps.push(gap);
-        }
-        let from = page.from_cursor.get();
-        let next = page.next_cursor.get();
-        // Output that does not continue from where the last page ended: a range the archive no
-        // longer holds came between. What follows it is not a continuation of what came before, so a
-        // control string cut by the gap does not swallow the output after it, and what follows
-        // begins somewhere in the stream that is not known, which is the start of the first
-        // sequence the output is read from. A page that reports a gap it did not skip, because the
-        // archive cannot say where its output got to, is a continuation.
-        if from != cursor
-            && let Some(ended) = run.take()
-        {
-            ended.finish(&mut read);
-        }
-        let bytes = page.bytes.into_vec();
-        read.bytes_read += bytes.len() as u64;
-        if !bytes.is_empty() {
-            let current = match run.as_mut() {
-                Some(current) => current,
-                None => run.insert(Run::start(from, size, from != 0)?),
-            };
-            current.feed(from, &bytes, &mut read.tally);
-        }
-        read.next_cursor = read.next_cursor.max(next);
-        if next <= cursor && bytes.is_empty() {
-            break;
-        }
-        cursor = next;
+    async fn page(&mut self, from_cursor: u64, max_bytes: u64) -> Result<HistoryPageResult> {
+        page(self.link, self.session_id, from_cursor, max_bytes).await
     }
-    if let Some(ended) = run.take() {
-        ended.finish(&mut read);
-    }
-    Ok(read)
-}
-
-/// The size the session's output is read at: its last one, or the engine's default where that is
-/// not a size a screen can have, as it is for a session whose own record is gone.
-fn grid_size(session: &SessionSummary) -> GridSize {
-    let size = GridSize::new(
-        u32::try_from(session.dimensions.columns()).unwrap_or(0),
-        u32::try_from(session.dimensions.rows()).unwrap_or(0),
-    );
-    size.validate().unwrap_or(kr_term::budget::DEFAULT_SIZE)
 }
 
 /// Asks for one page of retained output.
@@ -343,492 +279,6 @@ fn decode<T: kr_protocol::wire::WireMessage>(answer: crate::bridge::link::Answer
             "the daemon's answer could not be read: {}",
             Shown::cbor(&error)
         ))
-    })
-}
-
-/// One unbroken stretch of retained output, read by an engine of its own.
-struct Run {
-    /// Where the bytes the engine was fed begin in the session's output.
-    start: u64,
-    /// Set where the stretch begins somewhere in the stream that is not known, so that its first
-    /// bytes may be the end of a sequence the output before it began: nothing is read until the
-    /// point [`Skipping`] finds, and then this is clear.
-    skipping: Option<Skipping>,
-    /// Every byte fed to the engine, so the spans it clears can be cut out.
-    fed: Vec<u8>,
-    engine: Engine,
-    /// What the engine cleared, merged where one span ends where the next begins.
-    spans: Vec<ByteSpan>,
-}
-
-impl Run {
-    /// Starts a stretch at `start`, read by an engine whose screen is the session's last size.
-    ///
-    /// The clock does not change which bytes are cleared for a terminal, so it never moves.
-    fn start(start: u64, size: GridSize, resuming: bool) -> Result<Self> {
-        let engine = Engine::new(EngineConfig {
-            size,
-            // The replies are written to nobody, so a bound on how fast a terminal is answered
-            // would only stop the count of the questions asked.
-            lane: LaneLimits {
-                responses_per_second: u32::MAX,
-                ..LaneLimits::DEFAULT
-            },
-            ..EngineConfig::DEFAULT
-        })
-        .map_err(|_| {
-            CliError::Other(Shown::said(
-                "the terminal engine could not be made for the session's size",
-            ))
-        })?;
-        Ok(Self {
-            start,
-            skipping: resuming.then(Skipping::default),
-            fed: Vec::new(),
-            engine,
-            spans: Vec::new(),
-        })
-    }
-
-    /// Feeds the bytes of one page, which begin at `from` in the session's output.
-    fn feed(&mut self, from: u64, bytes: &[u8], tally: &mut Tally) {
-        let mut bytes = bytes;
-        let mut from = from;
-        if let Some(skipping) = &mut self.skipping {
-            let Some(skipped) = skipping.point(bytes) else {
-                // Nothing in this page is somewhere reading can begin, so the next page is asked
-                // the same.
-                tally.bytes_resumed += bytes.len() as u64;
-                self.start = from + bytes.len() as u64;
-                return;
-            };
-            tally.bytes_resumed += skipped as u64;
-            bytes = &bytes[skipped..];
-            from += skipped as u64;
-            self.start = from;
-            // Reading has begun, even where the point was the last byte of the page.
-            self.skipping = None;
-            if bytes.is_empty() {
-                return;
-            }
-        }
-        self.fed.extend_from_slice(bytes);
-        let outcome = self.engine.feed(bytes, 0);
-        self.take(&outcome, tally);
-        self.discard_replies();
-    }
-
-    /// Throws away the replies the engine queued, which nothing is waiting for.
-    fn discard_replies(&mut self) {
-        let _ = self
-            .engine
-            .lane_mut()
-            .drain(LaneGate::default(), usize::MAX, 0);
-    }
-
-    fn take(&mut self, outcome: &FeedOutcome, tally: &mut Tally) {
-        for span in &outcome.forward {
-            match self.spans.last_mut() {
-                Some(last) if last.adjoins(*span) => *last = last.join(*span),
-                _ => self.spans.push(*span),
-            }
-        }
-        tally.absorb(outcome);
-        // A reply the lane refused for want of room is a question all the same, and the record of
-        // those refusals is read once and cleared, so the next outcome has its own.
-        let refused = self.engine.lane().degradation();
-        tally.replies += refused.dropped + refused.over_budget + refused.oversized;
-        self.engine.lane_mut().clear_degradation();
-    }
-
-    /// Ends the stretch: what the engine held back is released, and what it cleared is cut out.
-    fn finish(mut self, read: &mut Read) {
-        let tail = self.engine.quiesce(0);
-        self.take(&tail, &mut read.tally);
-        self.discard_replies();
-        let closing = self.engine.close(0);
-        self.take(&closing, &mut read.tally);
-        for (kind, count) in self.engine.diagnostic_totals() {
-            *read.tally.diagnostics.entry(kind).or_insert(0) += count;
-        }
-        read.tally.bytes_fed += self.fed.len() as u64;
-        for span in &self.spans {
-            let (Ok(from), Ok(to)) = (usize::try_from(span.start()), usize::try_from(span.end()))
-            else {
-                continue;
-            };
-            let Some(bytes) = self.fed.get(from..to) else {
-                continue;
-            };
-            read.tally.bytes_carried += bytes.len() as u64;
-            read.chunks.push(Chunk {
-                cursor: self.start + span.start(),
-                bytes: bytes.to_vec(),
-            });
-        }
-    }
-}
-
-/// Finds where output that begins somewhere in the stream can first be read, a page at a time.
-///
-/// Output that begins after a range the archive no longer holds can begin inside any state the
-/// terminal's lexer keeps a sequence in: the rest of a clipboard write, a title or a notification
-/// looks like text, and what ends it can look like a bell. A point where reading can begin has to
-/// end every one of those states, so it is one of two things:
-///
-/// * a cancel or a substitute, which end every string and every sequence;
-/// * a string terminator, an escape and a backslash, that follows a byte of the output's own and
-///   that byte is not an escape. A multiplexer's pass-through string doubles the escapes inside it,
-///   so an escape that follows another is not the one that ends it, and the first byte of the output
-///   may follow the escape the gap took.
-///
-/// A bell is not such a point, because it ends an operating-system command and is payload in the
-/// other strings. An escape alone is not, because a string thrown away for its size keeps an escape
-/// and what follows it. A line ending is not, because a string carries carriage returns and line
-/// feeds, as a clipboard write wrapped at a fixed width does. Everything before the point is counted
-/// as not carried, and output with no such point is not read at all.
-#[derive(Default)]
-struct Skipping {
-    /// The last two bytes skipped, the earlier first.
-    last: [Option<u8>; 2],
-}
-
-impl Skipping {
-    /// How many of `bytes`, which follow what was skipped before, are not read: those up to and
-    /// including the point reading begins after. None when there is no such point in them.
-    fn point(&mut self, bytes: &[u8]) -> Option<usize> {
-        for (at, &byte) in bytes.iter().enumerate() {
-            let [before, previous] = self.last;
-            let ends = match byte {
-                0x18 | 0x1a => true,
-                b'\\' => previous == Some(0x1b) && before.is_some_and(|before| before != 0x1b),
-                _ => false,
-            };
-            if ends {
-                return Some(at + 1);
-            }
-            self.last = [previous, Some(byte)];
-        }
-        None
-    }
-}
-
-/// What the engines found in the output that the file does not carry.
-#[derive(Default)]
-struct Tally {
-    bytes_fed: u64,
-    bytes_carried: u64,
-    /// Bytes at the start of output that began after a gap, which were not read.
-    bytes_resumed: u64,
-    clipboard_writes: u64,
-    notifications: u64,
-    progress_reports: u64,
-    bells: u64,
-    refused_effects: u64,
-    /// What the engine answered itself where the program asked the terminal something, among them
-    /// reads of the clipboard.
-    replies: u64,
-    diagnostics: std::collections::BTreeMap<DiagnosticKind, u64>,
-}
-
-impl Tally {
-    fn absorb(&mut self, outcome: &FeedOutcome) {
-        for effect in &outcome.side_effects {
-            match effect.kind {
-                SideEffectKind::Bell => self.bells += 1,
-                SideEffectKind::Notification { .. } => self.notifications += 1,
-                SideEffectKind::Progress { .. } => self.progress_reports += 1,
-                SideEffectKind::ClipboardWrite { .. } => self.clipboard_writes += 1,
-                // The engine's own policy answers a read itself, so it routes none.
-                SideEffectKind::ClipboardRead { .. } => self.replies += 1,
-            }
-        }
-        self.refused_effects += outcome.refusals.len() as u64;
-        self.replies += outcome.responses as u64;
-    }
-
-    fn diagnosed(&self, kind: DiagnosticKind) -> u64 {
-        self.diagnostics.get(&kind).copied().unwrap_or(0)
-    }
-}
-
-/// One thing the file does not carry.
-struct Omission {
-    kind: &'static str,
-    detail: String,
-    count: Option<u64>,
-}
-
-impl Omission {
-    fn said(kind: &'static str, detail: &str) -> Self {
-        Self {
-            kind,
-            detail: detail.to_owned(),
-            count: None,
-        }
-    }
-
-    fn counted(kind: &'static str, detail: &str, count: u64) -> Option<Self> {
-        (count > 0).then(|| Self {
-            kind,
-            detail: detail.to_owned(),
-            count: Some(count),
-        })
-    }
-}
-
-/// The omissions of one read, in the order they are declared.
-fn omissions(session: &SessionSummary, read: &Read) -> Vec<Omission> {
-    let tally = &read.tally;
-    let mut declared = vec![
-        Omission::said(
-            "output_timestamps",
-            "the archive keeps no time for any piece of output, so the file carries none, and no \
-             asciicast recording can be made from it",
-        ),
-        Omission::said(
-            "earlier_dimensions",
-            "the archive keeps the session's last size and not the sizes it had before, so the \
-             file names that one",
-        ),
-        Omission::said(
-            "archive_completeness",
-            "whether the archive lost output beyond the ranges listed under gaps is not reported \
-             by the host, so the file does not say",
-        ),
-    ];
-    if session_record_unavailable(session) {
-        declared.push(Omission::said(
-            "session_record_unavailable",
-            "the session's own record is gone, so its shell, directory, size, mode and creation \
-             time are not known",
-        ));
-    }
-    if !read.gaps.is_empty() {
-        declared.push(Omission {
-            kind: "history_gap",
-            detail: "ranges of output the archive no longer holds, each listed under gaps with \
-                     its cause"
-                .to_owned(),
-            count: Some(read.gaps.len() as u64),
-        });
-    }
-    if read.truncated {
-        declared.push(Omission::said(
-            "output_truncated",
-            "the read stopped at the byte bound with output left; the start of what the archive \
-             retains is kept and the rest is not",
-        ));
-    }
-    let diagnosed = |kind| tally.diagnosed(kind);
-    declared.extend(
-        [
-            Omission::counted(
-                "output_resumed_mid_stream",
-                "bytes at the start of output that began after a range the archive no longer \
-                 holds, which are not read: they may be the end of a control string, such as a \
-                 clipboard write, whose start is gone",
-                tally.bytes_resumed,
-            ),
-            Omission::counted(
-                "clipboard_write",
-                "requests to write the clipboard, which a replay would perform",
-                tally.clipboard_writes,
-            ),
-            Omission::counted(
-                "notification",
-                "requests to raise a notification",
-                tally.notifications,
-            ),
-            Omission::counted(
-                "progress_report",
-                "progress reports for a window's title bar or taskbar",
-                tally.progress_reports,
-            ),
-            Omission::counted("bell", "bells", tally.bells),
-            Omission::counted(
-                "side_effect_refused",
-                "requests of a terminal that the terminal engine refused whole, such as a clipboard \
-                 write past its bound or one that was not well formed",
-                tally.refused_effects,
-            ),
-            Omission::counted(
-                "terminal_query",
-                "questions the program asked the terminal, among them reads of the clipboard, \
-                 which the terminal engine answers itself and a replay would be asked again",
-                tally.replies,
-            ),
-            Omission::counted(
-                "image_sequence",
-                "image and raster-graphics sequences",
-                diagnosed(DiagnosticKind::ImageSequenceDisabled),
-            ),
-            Omission::counted(
-                "window_request",
-                "requests to change the physical window",
-                diagnosed(DiagnosticKind::PhysicalWindowRequest),
-            ),
-            Omission::counted(
-                "unclassified_sequence",
-                "sequences the terminal engine has no class for",
-                diagnosed(DiagnosticKind::UnclassifiedSequence),
-            ),
-            Omission::counted(
-                "control_string_dropped",
-                "control strings that passed their bound or were never ended",
-                diagnosed(DiagnosticKind::OversizedControlString)
-                    + diagnosed(DiagnosticKind::AbandonedControlString),
-            ),
-            Omission::counted(
-                "malformed_utf8",
-                "malformed text, which is not carried",
-                diagnosed(DiagnosticKind::MalformedUtf8),
-            ),
-            Omission::counted(
-                "bytes_not_carried",
-                "bytes of the retained output that are not carried. The kinds above are the ones \
-                 that are counted; the rest, such as raw eight-bit controls, hyperlinks and titles \
-                 the terminal engine refused, and the controls inside a sequence, are counted only \
-                 here, with those that need the screen drawn again",
-                tally.bytes_fed.saturating_sub(tally.bytes_carried),
-            ),
-        ]
-        .into_iter()
-        .flatten(),
-    );
-    declared
-}
-
-/// Whether the daemon built this summary from the closure alone, because the session's own record
-/// was gone. A session that ran always had a shell, so an empty one is not a real value.
-fn session_record_unavailable(session: &SessionSummary) -> bool {
-    session.shell_path.is_empty()
-}
-
-/// The file, as it is written. Every 64-bit value is a [`U64`], which the protocol writes as a
-/// decimal string.
-#[derive(Serialize)]
-struct File<'a> {
-    format: &'static str,
-    exported_at_ms: U64,
-    environment_id: kr_protocol::ids::EnvironmentId,
-    session: SessionPart<'a>,
-    closure: Option<&'a ClosureRecord>,
-    dimensions: Option<DimensionsPart>,
-    output: OutputPart<'a>,
-    omissions: Vec<OmissionPart<'a>>,
-}
-
-/// What the file says of the session, each member null where the session's own record is gone.
-#[derive(Serialize)]
-struct SessionPart<'a> {
-    session_id: SessionId,
-    display_number: U64,
-    created_at_ms: Option<U64>,
-    shell_mode: Option<&'static str>,
-    shell: Option<&'a str>,
-    cwd: Option<&'a str>,
-    worker_profile: Option<&'static str>,
-}
-
-/// The session's last size.
-#[derive(Serialize)]
-struct DimensionsPart {
-    #[serde(flatten)]
-    size: Dimensions,
-    as_of: &'static str,
-}
-
-/// The retained output the file carries.
-#[derive(Serialize)]
-struct OutputPart<'a> {
-    from_cursor: U64,
-    next_cursor: U64,
-    oldest_retained_cursor: U64,
-    chunks: Vec<ChunkPart>,
-    gaps: &'a [HistoryGap],
-    truncated: bool,
-}
-
-/// One piece of output, and where in the session's output it begins.
-#[derive(Serialize)]
-struct ChunkPart {
-    cursor: U64,
-    base64url: String,
-}
-
-/// One thing the file does not hold.
-#[derive(Serialize)]
-struct OmissionPart<'a> {
-    kind: &'static str,
-    detail: &'a str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    count: Option<U64>,
-}
-
-/// Composes the file from what was read.
-fn compose(session: &SessionSummary, read: Read, exported_at_ms: u64) -> Result<Exported> {
-    let unknown = session_record_unavailable(session);
-    let declared = omissions(session, &read);
-    let file = File {
-        format: FORMAT,
-        exported_at_ms: U64::new(exported_at_ms),
-        environment_id: session.environment_id,
-        session: SessionPart {
-            session_id: session.session_id,
-            display_number: U64::new(session.display_number.get()),
-            created_at_ms: (!unknown).then(|| U64::new(session.created_at_ms.get())),
-            shell_mode: (!unknown).then(|| session.shell_mode.as_str()),
-            shell: (!unknown).then_some(session.shell_path.as_str()),
-            cwd: (!unknown).then_some(session.cwd.as_str()),
-            worker_profile: (!unknown).then(|| session.worker_profile.as_str()),
-        },
-        closure: session.closure.as_ref(),
-        dimensions: (!unknown).then_some(DimensionsPart {
-            size: session.dimensions,
-            as_of: "the session's last size",
-        }),
-        output: OutputPart {
-            from_cursor: U64::new(read.from_cursor),
-            next_cursor: U64::new(read.next_cursor),
-            oldest_retained_cursor: U64::new(read.oldest_retained),
-            chunks: read
-                .chunks
-                .iter()
-                .map(|chunk| ChunkPart {
-                    cursor: U64::new(chunk.cursor),
-                    base64url: kr_protocol::scalars::to_base64url(&chunk.bytes),
-                })
-                .collect(),
-            gaps: &read.gaps,
-            truncated: read.truncated,
-        },
-        omissions: declared
-            .iter()
-            .map(|omission| OmissionPart {
-                kind: omission.kind,
-                detail: &omission.detail,
-                count: omission.count.map(U64::new),
-            })
-            .collect(),
-    };
-    let mut bytes = serde_json::to_vec(&file).map_err(|_| {
-        CliError::Other(Shown::said(
-            "the export could not be written out as a document",
-        ))
-    })?;
-    bytes.push(b'\n');
-    Ok(Exported {
-        document: bytes,
-        summary: Summary {
-            session_id: session.session_id,
-            display_number: session.display_number.get(),
-            bytes_read: read.bytes_read,
-            bytes_carried: read.tally.bytes_carried,
-            gaps: read.gaps.len(),
-            truncated: read.truncated,
-            omissions: declared.iter().map(|omission| omission.kind).collect(),
-        },
     })
 }
 

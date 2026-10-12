@@ -7,6 +7,7 @@
 
 use std::collections::VecDeque;
 
+use kr_client::session_export::FORMAT;
 use kr_protocol::envelope::{ActionTarget, ParamsValue};
 use kr_protocol::error::ProtocolError;
 use kr_protocol::ids::{ActionId, ActionWindowId, EnvironmentId, SessionEpoch, SessionId};
@@ -14,7 +15,7 @@ use kr_protocol::local::LocalBuild;
 use kr_protocol::privacy::{
     PrivacyCompletion, PrivacyReport, PrivacySession, PrivacySessionStanding,
 };
-use kr_protocol::recovery::{HistoryGapCause, HistoryPageParams};
+use kr_protocol::recovery::{HistoryGap, HistoryGapCause, HistoryPageParams};
 use kr_protocol::scalars::{Bytes, TimestampMs, Uuid};
 use kr_protocol::session::{
     ClosureReason, ClosureRecord, Dimensions, DisplayNumber, Durability, OwnershipCoverage,
@@ -1156,5 +1157,30 @@ async fn a_write_that_fails_leaves_nothing_behind() {
         std::fs::read_dir(directory.path()).expect("lists").count(),
         0,
         "nothing was made"
+    );
+}
+
+/// The document is a format other tools read, so its bytes are fixed: the same session read the same
+/// way gives the same file. This one holds a drawn line, a clipboard write the engine dropped, a
+/// bell, a gap in the archive and the output that follows it, and the closure, so each part of the
+/// format is in it.
+#[tokio::test]
+async fn the_document_is_the_same_bytes_for_the_same_session() {
+    let after = b"\x18\x1b[32mafter the gap\r\n";
+    let mut daemon = Scripted::new(vec![
+        listing(vec![closed(1)]),
+        privacy(false, 4, &[]),
+        page(0, WITH_SIDE_EFFECTS),
+        page_with(1_000, after, Some(WITH_SIDE_EFFECTS.len() as u64)),
+        end(1_000 + after.len() as u64),
+        privacy(false, 4, &[]),
+    ]);
+    let exported = export(&mut daemon, DEFAULT_MAX_BYTES)
+        .await
+        .expect("exports");
+    assert_eq!(
+        exported.document,
+        include_bytes!("golden/session-export.json"),
+        "the document differs from the one a reader has"
     );
 }

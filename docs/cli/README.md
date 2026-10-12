@@ -737,6 +737,8 @@ set to null, and `omissions` says they are not known.
 
 `--max-bytes` bounds how much retained output is read, 16 MiB by default, and must be at least one.
 The start of what is retained is kept, and when output is left behind the file says `truncated`. The
+file holds at most 192 MiB. A read that would take it near that size stops at a page, keeps the
+start of the output and says `truncated`, whatever `--max-bytes` is. The
 file is created new. Something already at the name, a link included, is refused before the output is
 read and again where the file is made, and is left as it was. The bytes go into a file beside the
 final name, which is given its name without replacing anything, so a failed export leaves no partial

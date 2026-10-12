@@ -1725,7 +1725,8 @@ pub struct ExportArguments {
     /// WSL distribution or container, by label or identifier, which an export never starts.
     #[arg(long)]
     pub environment: Option<String>,
-    /// The most retained output to read, in bytes. The start of what is retained is kept.
+    /// The most retained output to read, in bytes. The start of what is retained is kept. The file
+    /// holds at most 192 MiB whatever this is, and keeps the start of the output the same way.
     #[arg(long, default_value_t = crate::export::DEFAULT_MAX_BYTES)]
     pub max_bytes: u64,
 }

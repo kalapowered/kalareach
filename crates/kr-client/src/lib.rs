@@ -29,6 +29,7 @@
 //! | [`pairing`] | Pairing from a device's side: the room socket, the invitation reader, both candidate modes, the paired hosts and the owner's confirmations |
 //! | [`projection`] | The screen a projected client holds, and the renderer that draws it |
 //! | [`session`] | Requests, receipts, events and the action window |
+//! | `session_export` | With the `terminal` feature: a closed session's retained output, composed into the document `kr export` writes and the host's backup packs |
 //! | [`mod@shown`] | The one type of text a diagnostic may show, and the only ways input becomes it |
 //! | [`sync`] | Encrypted settings sync, its compare-and-swap client and its privacy hook |
 //! | [`cursors`] | Cursors, receipts and the order state is restored in |
@@ -64,6 +65,8 @@ pub mod recovery;
 pub mod retry;
 pub mod services;
 pub mod session;
+#[cfg(feature = "terminal")]
+pub mod session_export;
 pub mod shown;
 pub mod sync;
 pub mod transport;

@@ -1555,7 +1555,7 @@ async fn export(
                     "path",
                     shown!("{}", kr_cli::shown::named(&arguments.output)),
                 )
-                .with("format", kr_cli::export::FORMAT)
+                .with("format", kr_client::session_export::FORMAT)
                 .with("bytes_read", summary.bytes_read)
                 .with("bytes_carried", summary.bytes_carried)
                 .with("gaps", summary.gaps)
@@ -1572,7 +1572,7 @@ async fn export(
             summary.bytes_read,
             summary.gaps,
             if summary.truncated {
-                ", and the read stopped at the byte bound with output left"
+                ", and the read stopped at a bound with output left"
             } else {
                 ""
             },
