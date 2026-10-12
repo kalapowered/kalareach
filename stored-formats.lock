@@ -49,10 +49,10 @@
           "kind": "sqlite_table",
           "table": "attention_schema"
         },
-        "version": 11,
+        "version": 12,
         "migrates_from": 9
       },
-      "digest": "4027328c5f9f69b041eb7a1eee70a302ad6435dd9f0930b25f2ca9650a09c062",
+      "digest": "125a652397773ab5bcf42eeaacc2762e8208ef1cb200e448137593577637f497",
       "kept": [
         "AttentionAcknowledgeResult",
         "AttentionQuietHoursResult",
@@ -381,10 +381,10 @@
           "kind": "sqlite_table",
           "table": "schema_version"
         },
-        "version": 11,
+        "version": 12,
         "migrates_from": 1
       },
-      "digest": "0fe10d4864e6c2ff73b67e0e110b95f5738ae6655d2907a9d595d8a24b3389b8",
+      "digest": "e3095e8c775ae194439f06c6086d0391fb816ab3d372c1f24a977bafc1c832f2",
       "kept": [
         "SessionCreateParams",
         "ClosureRecord",
