@@ -140,10 +140,10 @@
           "member": "version",
           "absent": 1
         },
-        "version": 2,
+        "version": 3,
         "migrates_from": 1
       },
-      "digest": "3ab5cb547eb0cc1a0de8e94452f5094b985c5fe86b8d564ceb55cdad3b0761e6",
+      "digest": "c342cb3cc4391e4029491a3f300190ea752edc941bf351d199d400da21c8865d",
       "kept": [
         "ConfigurationDocument"
       ],
@@ -374,10 +374,10 @@
           "kind": "sqlite_table",
           "table": "schema_version"
         },
-        "version": 13,
+        "version": 14,
         "migrates_from": 1
       },
-      "digest": "6ee232c25130b7a5f1119271bd234ff5f667328c179e92145836eded7aa4f0ce",
+      "digest": "8425715dbc309273fdc95f8b2d4706ba75d027020887a8c5b0fd1f4f71277f56",
       "kept": [
         "SessionCreateParams",
         "ClosureRecord",
