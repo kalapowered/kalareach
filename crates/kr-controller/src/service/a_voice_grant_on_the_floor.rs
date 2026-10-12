@@ -297,6 +297,62 @@ async fn a_pairing_grant_the_host_refuses_leaves_no_share_to_answer() {
     );
 }
 
+/// KR-REQ-15.11: a device paired as an owner, with every right the voice right included, is given
+/// a voice grant over its ordinary grant. The voice right in the grant it was paired under is not
+/// what makes a grant a voice grant, and the ordinary grant a call narrows carries the rights it
+/// does not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_device_paired_with_every_right_is_read_without_the_voice_right() {
+    let temp = kr_ipc::testing::TempHost::create();
+    let (_continuous, _wall, clocks) = manual_clocks();
+    let controller = daemon_on(&temp, clocks).await;
+    let owner = paired_holding(&controller, 67, ActionRight::ALL, None);
+
+    let read = authority(&controller)
+        .device_grant(owner.device_id, None)
+        .expect("the host answers")
+        .expect("the pairing grant is the device's ordinary grant");
+
+    assert_eq!(read.grant_id, owner.grant.grant_id);
+    assert!(read.permits(ActionRight::SessionClose));
+    assert!(!read.permits(ActionRight::VoiceUse));
+}
+
+/// KR-REQ-26.16 and 09.16: a pairing grant that has run out leaves no share to answer for the
+/// device, as a typed request under a share is refused when the grant it was paired under does not
+/// stand.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pairing_grant_that_has_run_out_leaves_no_share_to_answer() {
+    let temp = kr_ipc::testing::TempHost::create();
+    let (_continuous, wall, clocks) = manual_clocks();
+    let controller = daemon_on(&temp, clocks).await;
+    let now = wall.load(Ordering::SeqCst);
+    let device = paired_holding(
+        &controller,
+        68,
+        &[ActionRight::SessionView],
+        Some(now + 60_000),
+    );
+    shared_with(&controller, &device, &[ActionRight::SessionView], false);
+    assert!(
+        authority(&controller)
+            .device_grant(device.device_id, None)
+            .expect("the host answers")
+            .is_some(),
+        "the control: while the pairing grant stands, the device has a grant"
+    );
+
+    wall.store(now + 120_000, Ordering::SeqCst);
+
+    assert!(
+        authority(&controller)
+            .device_grant(device.device_id, None)
+            .expect("the host answers")
+            .is_none(),
+        "the share does not answer for a device whose pairing grant has run out"
+    );
+}
+
 /// KR-REQ-26.16 and 09.16: a share the host cannot yet decide on, because the clock it reads is not
 /// proven, does not take a pairing grant that reads no clock from the device. Section 9 keeps usable
 /// what does not depend on the clock.

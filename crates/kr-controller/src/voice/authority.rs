@@ -199,25 +199,38 @@ impl VoiceAuthority for GrantAuthority {
         // in one transaction; the grant store holds what has been shared with the device since. A
         // host that looked only at the store would find nothing for a device that has only ever
         // been paired, which is every device before anything is shared with it.
-        let mut standing = self.standing_records(device_id)?;
+        let standing = self.standing_records(device_id)?;
         let lifetimes = self.lifetimes()?;
-        let paired = self
+        // The grant a device was paired under, while it stands. A request under a share needs this
+        // grant to stand, so a pairing grant that has run out, or whose end is not on record yet,
+        // leaves no grant for the device. It may carry the voice right (an owner is paired with every
+        // right), which is a voice grant's marker everywhere else and is taken out of it here, as
+        // the door takes it out before it decides a request: the voice right comes from a voice
+        // grant alone.
+        let paired = match self
             .devices
             .record_for_device(device_id)
             .map_err(store)?
             .filter(super::authority::DeviceRecordExt::is_paired_record)
-            .and_then(
-                |record| match lifetimes.paired_standing(&record).map_err(store) {
-                    Ok(GrantStanding::InForce) => Some(Ok(record.grant)),
-                    Ok(GrantStanding::OutOfForce) => None,
-                    Ok(GrantStanding::Unrecorded) => {
-                        standing.unrecorded = true;
-                        None
-                    }
-                    Err(error) => Some(Err(error)),
-                },
-            )
-            .transpose()?;
+        {
+            None => None,
+            Some(record) => match lifetimes.paired_standing(&record).map_err(store)? {
+                GrantStanding::InForce => Some(Grant {
+                    actions: record
+                        .grant
+                        .actions
+                        .iter()
+                        .copied()
+                        .filter(|right| *right != ActionRight::VoiceUse)
+                        .collect(),
+                    ..record.grant
+                }),
+                GrantStanding::OutOfForce => return Ok(None),
+                GrantStanding::Unrecorded => {
+                    return Err(store(crate::grants::store::unrecorded()));
+                }
+            },
+        };
         // As this host lets it be used: a right the rights ceiling takes away from every grant, or
         // that an organisation's lease does not give, is not one a spoken action may use, whichever
         // grant it was written in. A request under a share needs the grant the device was paired
