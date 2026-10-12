@@ -1703,10 +1703,12 @@ impl CloseGate {
                 let mut session = runtime.session();
                 let _ = session.request_stop();
             }
-            // The graceful stop has begun: every process the session owns, the ones below its
-            // servers among them, has been asked. The five seconds are counted from here, for the
-            // session's own forcing and for the servers' ending alike, so nothing is forced
-            // before five seconds after the request that reached it.
+            // The graceful stop has begun: every process the session owns but a server's root,
+            // the ones below its servers among them, has been asked. The five seconds are counted
+            // from here, for the session's own forcing and for the servers' ending alike, so
+            // nothing the request reached is forced before five seconds after it. A server's root
+            // is asked a moment later, when its input closes, after the first reading of its
+            // ending; its window is counted from here too.
             let begun = tokio::time::Instant::now();
             // The servers end beside the processes the session owns, now that the acceptance has
             // been delivered: a server is asked with the end of its input, which lets it end its
