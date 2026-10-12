@@ -1466,17 +1466,16 @@ async fn an_open_automation_module_dispatches_nothing_until_it_is_started() {
 
     module.start();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    while dispatched_to(module.journal()).is_none_or(|position| position < pending) {
+    // The pass counts when it ends, which is after it has read the event, so both are waited for.
+    while dispatched_to(module.journal()).is_none_or(|position| position < pending)
+        || module.dispatch_passes() == 0
+    {
         assert!(
             std::time::Instant::now() < deadline,
             "a started module dispatches the trigger a stopped daemon left"
         );
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
-    assert!(
-        module.dispatch_passes() > 0,
-        "and it was a pass of the started module that read it"
-    );
     drop(module);
     host.clients.abort();
 }

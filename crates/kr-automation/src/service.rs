@@ -124,6 +124,7 @@ impl Executing {
             .then(|| Executes {
                 executing: Arc::clone(self),
                 run_id,
+                quietly: false,
             })
     }
 
@@ -142,6 +143,17 @@ impl Executing {
 struct Executes {
     executing: Arc<Executing>,
     run_id: WorkflowRunId,
+    /// Whether the place goes back without an execution having ended, which wakes nobody.
+    quietly: bool,
+}
+
+impl Executes {
+    /// Gives the place back for a run that was held and not executed, because there was nothing
+    /// to take up. Nothing is woken: no execution ended, and the pass that held it is the one that
+    /// would be woken, to find the same thing again.
+    fn give_back_quietly(mut self) {
+        self.quietly = true;
+    }
 }
 
 impl Drop for Executes {
@@ -152,7 +164,9 @@ impl Drop for Executes {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(&self.run_id);
         // After the place is given back, so the pass this wakes finds it free.
-        self.executing.ended.notify_one();
+        if !self.quietly {
+            self.executing.ended.notify_one();
+        }
     }
 }
 
@@ -875,9 +889,13 @@ impl AutomationService {
                  its outcome is not known",
                 now_ms,
             )? {
+                executes.give_back_quietly();
                 continue;
             }
+            // A run that names a revision the journal does not hold cannot be executed, and is
+            // found again by every pass.
             let Some(installed) = self.store.get_definition(run.workflow_id, run.revision)? else {
+                executes.give_back_quietly();
                 continue;
             };
             resumed.push(StartedRun {
