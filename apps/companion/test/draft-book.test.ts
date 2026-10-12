@@ -2188,6 +2188,9 @@ describe('a prompt the host is said to have applied after nobody knew what becam
 
     expect(book.snapshot().unstored).toEqual([])
     expect(book.draft(MAIN).text).toBe('the next thing')
+    // The older version the prompt grew from said less than the prompt, and goes with it.
+    expect(store.all()).toEqual([])
+    expect(book.snapshot().kept).toEqual([])
   })
 
   it('leaves nothing stored when the text was sent again by a person who checked, and the first send is the one applied', async () => {
@@ -2213,6 +2216,87 @@ describe('a prompt the host is said to have applied after nobody knew what becam
     await book.settled()
     expect(book.draft(MAIN).text).toBe('')
     expect(store.all()).toEqual([])
+  })
+
+  it('is not listed any more when the store cannot be read after its removal', async () => {
+    const store = new FakeDraftStore()
+    const book = await opened(store)
+    await unknownOn(book, () => type(book, MAIN, 'newer'))
+    expect(book.snapshot().kept.map((kept) => kept.text)).toEqual(['send this'])
+    store.breakOpening()
+
+    book.sendSettled('local-1', 'applied')
+    await book.settled()
+
+    expect(book.snapshot().kept).toEqual([])
+  })
+
+  it('is not stored by a recovery that was on its way when the host said it was applied', async () => {
+    const store = new FakeDraftStore()
+    const gate = holding(store, 'deviceDraftSave')
+    const book = new DraftBook(gate.port)
+    await book.hydrate()
+    // The store refuses, so the prompt's text is held in this window and listed nowhere.
+    store.refuseSaves({ code: 'STORAGE_UNAVAILABLE', message: 'the disk refused it' })
+    type(book, MAIN, 'send this')
+    await book.settled()
+    const token = book.beginSend(MAIN)
+    await token.claimed
+    type(book, MAIN, 'newer')
+    book.endSend(token, 'unknown', 'local-1')
+    await book.settled()
+
+    // The store takes writes again, and the recovery of the prompt's text is on its way when the
+    // host says the prompt was applied.
+    store.refuseSaves(null)
+    book.writeAll()
+    await gate.reached
+    book.sendSettled('local-1', 'applied')
+    // The late end is made while the save of the recovery has not answered.
+    for (let tick = 0; tick < 100; tick += 1) await Promise.resolve()
+    gate.release()
+    await book.settled()
+
+    expect(book.snapshot().kept).toEqual([])
+    expect(store.all().map((draft) => draft.text)).toEqual(['newer'])
+  })
+
+  describe('and a file the person added since', () => {
+    /** A file whose upload finished, which a store can keep. */
+    const UPLOADED = {
+      localId: 'file-1',
+      transferId: '2',
+      name: 'diagram.png',
+      byteLen: 4096,
+      mediaType: 'image/png',
+      presentedAsImage: false,
+      upload: 'uploaded' as const,
+      acceptedUpstream: false,
+      handle: {
+        transfer_id: '2',
+        original_file_name: 'diagram.png',
+        byte_len: '4096',
+        declared_media_type: 'image/png',
+        presented_as_image: false,
+        preview: null
+      } as unknown as import('@kalareach/protocol').AttachmentHandle
+    }
+
+    it('stays, finished or not, and the text sent goes from the composer and the store', async () => {
+      const store = new FakeDraftStore()
+      const book = await opened(store)
+      await unknownOn(book)
+      book.update(MAIN, (draft) => ({ ...draft, attachments: [UPLOADED] }))
+      await book.settled()
+
+      book.sendSettled('local-1', 'applied')
+      await book.settled()
+
+      expect(book.draft(MAIN).text).toBe('')
+      expect(book.draft(MAIN).attachments.map((file) => file.localId)).toEqual(['file-1'])
+      // The file is kept with the composer's own draft, and none of the text that was sent is.
+      expect(store.all().map((draft) => [draft.text, draft.attachments.length])).toEqual([['', 1]])
+    })
   })
 
   it('is owed at the version it tried to remove, so the next start removes it', async () => {

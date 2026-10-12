@@ -196,6 +196,14 @@ interface Flight {
    * of it in the meantime is dealt with after that.
    */
   apart?: boolean
+  /**
+   * The older version the prompt grew from, when the store would never take the prompt itself: it
+   * stays stored, listed, because nothing stands for the prompt's text. It goes if the prompt is
+   * then said to have been applied.
+   */
+  older?: StoredRef
+  /** True once the prompt was said to have been applied after nobody knew: nothing of it is to be stored. */
+  consumed?: boolean
 }
 
 /** How a write of a draft ended. */
@@ -285,6 +293,16 @@ function unkeptFileAdvice(draft: Draft): string {
 function holdsWhatWasSent(composer: Draft | undefined, sent: Draft): boolean {
   const files = (draft: Draft): string => storable(draft).map((handle) => handle.transfer_id).join(' ')
   return composer !== undefined && composer.text === sent.text && files(composer) === files(sent)
+}
+
+/**
+ * Whether a composer holds the text of a prompt that was sent, and every file that went with it.
+ * Files it holds besides are the person's, whatever state their uploads are in.
+ */
+function holdsTextSent(composer: Draft | undefined, sent: Draft): boolean {
+  if (composer === undefined || composer.text !== sent.text) return false
+  const held = new Set(storable(composer).map((handle) => handle.transfer_id))
+  return storable(sent).every((handle) => held.has(handle.transfer_id))
 }
 
 /** What a write of this draft would store: two drafts with one key need no write between them. */
@@ -726,13 +744,16 @@ export class DraftBook {
    * turn of its own.
    */
   async #takenLate(flight: Flight): Promise<void> {
+    // A recovery that is storing the prompt's text meanwhile finds this and removes what it made.
+    flight.consumed = true
     const composer = this.#find(flight.composer)
     const cleared =
-      composer !== undefined && holdsWhatWasSent(composer, flight.sent)
+      composer !== undefined && holdsTextSent(composer, flight.sent)
         ? await this.#clearSentFrom(composer, flight)
         : null
     await this.#dropKept(flight, cleared)
     await this.#dropEarlier(flight)
+    await this.#dropOlder(flight)
     // The text is not to be stored after all, nor listed for a person to copy.
     this.#unsettled = this.#unsettled.filter((each) => each !== flight)
     this.#unstored = this.#unstored.filter((each) => each !== flight)
@@ -746,12 +767,26 @@ export class DraftBook {
    * it, or none because the store would not take it.
    *
    * A record the store would not remove stays owed, at the version it was asked to remove. What the
-   * person wrote in the composer while the store was answering, and a file that has not finished
-   * uploading, are theirs and stay. Answers the record it removed, if any.
+   * person wrote in the composer while the store was answering, and every file they added since, are
+   * theirs and stay: a prompt carries no file, so a file on the composer is never what was sent. A
+   * file the store keeps stays with the composer's own record, and the text goes from it by a write.
+   * Answers the record it removed or kept, if any.
    */
   async #clearSentFrom(composer: Draft, flight: Flight): Promise<string | null> {
     const key = composer.draftId
     const stored = composer.stored
+    const sentFiles = new Set(storable(flight.sent).map((handle) => handle.transfer_id))
+    const theirs = composer.attachments.filter(
+      (file) => !(file.handle !== null && file.upload === 'uploaded' && sentFiles.has(file.handle.transfer_id))
+    )
+    if (theirs.some((file) => file.upload === 'uploaded' && file.handle !== null)) {
+      this.#retire(composer)
+      this.#mutate(key, (draft) => ({ ...draft, revision: draft.revision + 1, text: '', attachments: theirs }))
+      this.#track(key).savedKey = null
+      this.#schedule(key)
+      this.#clearFailure(key)
+      return stored?.id ?? null
+    }
     if (stored !== null && !(await this.#dropRecord(stored, flight.id))) this.#owe(stored, flight.id)
     const now = this.#find(key)
     if (now !== undefined && writtenSince(composer, now)) {
@@ -760,15 +795,12 @@ export class DraftBook {
       return stored?.id ?? null
     }
     this.#retire(now ?? composer)
-    const sentFiles = new Set(storable(flight.sent).map((handle) => handle.transfer_id))
     this.#mutate(key, (draft) => ({
       ...draft,
       revision: draft.revision + 1,
       text: '',
       // A file the person added since the press is theirs, finished or not.
-      attachments: draft.attachments.filter(
-        (file) => !(file.handle !== null && file.upload === 'uploaded' && sentFiles.has(file.handle.transfer_id))
-      ),
+      attachments: theirs,
       stored: null,
       state: 'bound',
       target: { sessionId: draft.target.sessionId, applicationInstanceId: null, agentBindingRevision: null }
@@ -805,6 +837,19 @@ export class DraftBook {
     if (ref === null) return
     this.#sentRecords.delete(ref.id)
     if (!(await this.#dropRecord(ref, flight.id))) this.#owe(ref, flight.id)
+  }
+
+  /** Whether a prompt was said to have been applied: read again after each wait, as it can change in one. */
+  #consumed(flight: Flight): boolean {
+    return flight.consumed === true
+  }
+
+  /** Removes the older version a prompt grew from, which stayed stored because the prompt itself could not be. */
+  async #dropOlder(flight: Flight): Promise<void> {
+    const older = flight.older
+    if (older === undefined) return
+    delete flight.older
+    if (!(await this.#dropRecord(older, flight.id))) this.#owe(older, flight.id)
   }
 
   /** A composer whose draft was removed from the store is empty, as if it had never been written in. */
@@ -863,6 +908,12 @@ export class DraftBook {
     try {
       await this.#port.deviceDraftDiscard({ id: record.id, expectedRevision: record.revision })
       this.#moves += 1
+      // It is gone, so the list does not show it, whether or not the store can be read again.
+      const listed = this.#others.filter((other) => other.id !== record.id)
+      if (listed.length !== this.#others.length) {
+        this.#others = listed
+        this.#changed()
+      }
       return true
     } catch (failure) {
       if (failureCode(failure) === 'DRAFT_CONFLICT') {
@@ -984,7 +1035,7 @@ export class DraftBook {
     }
     this.#sentRecords.add(listed.id)
     this.#say(
-      'The prompt that was sent is kept in Kept drafts, because you have written something new here since.'
+      'The prompt is kept in Kept drafts, because you have written something new here since.'
     )
     // Its text is decided: the older version goes and the record is no longer set apart, so that
     // the list shows it.
@@ -1011,6 +1062,7 @@ export class DraftBook {
 
   /** Holds the text of a prompt the store will not keep, and says so. */
   #hold_unstored(flight: Flight): void {
+    if (flight.earlier !== null) flight.older = flight.earlier
     flight.earlier = null
     this.#unstored = [...this.#unstored, flight]
     this.#say('The prompt that was sent is too long to keep as a draft. Its text is listed in Kept drafts so that you can copy it.')
@@ -1119,7 +1171,17 @@ export class DraftBook {
         }
       }
       for (const flight of [...this.#unsettled]) {
+        if (this.#consumed(flight)) continue
         const stored = await this.#storeSent(flight)
+        if (this.#consumed(flight)) {
+          // The host said the prompt was applied while the store was answering: what it stored is
+          // not kept.
+          this.#clearFailure(flight.id)
+          if (stored !== null) await this.#dropSent(flight)
+          this.#unsettled = this.#unsettled.filter((each) => each !== flight)
+          await this.reload()
+          continue
+        }
         if (stored === null) {
           if (this.#failed.get(flight.id)?.code === 'QUOTA_EXCEEDED') {
             this.#clearFailure(flight.id)
