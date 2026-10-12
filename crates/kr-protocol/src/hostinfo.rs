@@ -2373,16 +2373,19 @@ pub mod configuration {
         /// KalaReach service guarantee, which is why it is never on unless chosen.
         pub mainline_dht: Nullable<bool>,
         /// The HTTP proxy this host's connections to services go through, as an absolute `http` or
-        /// `https` origin such as `http://proxy.example.com:3128`: the network endpoint's relays
-        /// and Pkarr servers, the rendezvous, delivery and webhooks, mail submission (a `CONNECT`
-        /// tunnel to the mail server), the managed voice broker and account service, uploads of
-        /// backups to the managed storage service, the model's files, and plugin repositories.
-        /// Nothing on that list goes around it, so an address it cannot reach fails, and a daemon
-        /// that started over a document it could not use sends nothing through these routes until
-        /// it starts again over one it can. The host's own name lookups, the endpoint's direct
-        /// paths and the Git operations an owner asks for do not use it. It is this machine's own
-        /// choice: no invitation or host bundle carries it. It names no user and no password,
-        /// because a proxy that needs credentials is not supported.
+        /// `https` origin such as `http://proxy.example.com:3128`: the network endpoint's relay
+        /// connection, relay latency probe, captive-portal check and Pkarr servers, the
+        /// rendezvous, delivery and webhooks, mail submission (a `CONNECT` tunnel to the mail
+        /// server), the managed voice broker and account service, uploads of backups to the
+        /// managed storage service, the model's files, and plugin repositories. Nothing on that
+        /// list goes around it, so an address it cannot reach fails, and a daemon that started
+        /// over a document it could not use sends nothing through these routes until it starts
+        /// again over one it can. The host's own name lookups, the endpoint's direct paths, its
+        /// QUIC address discovery (which connects directly to the relays over UDP to learn this
+        /// host's public address) and port mapper, local discovery and the Mainline DHT where
+        /// those are selected, and the Git operations an owner asks for do not use it. It is this
+        /// machine's own choice: no invitation or host bundle carries it. It names no user and no
+        /// password, because a proxy that needs credentials is not supported.
         pub proxy_url: Nullable<String>,
     }
 
@@ -4138,9 +4141,9 @@ pub mod configuration {
     pub const NETWORK_PROXY_URL: Selection = Selection {
         key: "network.proxy_url",
         about: "the HTTP proxy this host's connections to services go through: the network \
-                endpoint's relays and Pkarr servers, the rendezvous, delivery and mail, the \
-                managed voice broker and account service, backups, the model's files and plugin \
-                repositories",
+                endpoint's relay connection, relay latency probe, captive-portal check and Pkarr \
+                servers, the rendezvous, delivery and mail, the managed voice broker and account \
+                service, backups, the model's files and plugin repositories",
     };
 
     /// The managed voice broker this host starts its devices' calls at.

@@ -103,9 +103,14 @@ to the second are final for that credential. A bare status, a missing route, a s
 `data` or with an error beside it, and any answer that is not the gateway's say nothing either way,
 and the device is told it may try again.
 
-A device whose registration answer was lost repeats it with the same action, on any later
-connection, and is told what it was told: the host answers from its record and does not ask the
-gateway again.
+If the answer to the registration request was lost, and the device tries to register again with the
+same action, after connecting again with the host, the following cases are possible: If the host
+stored the answer (the registration took effect or was refused for good) the device is informed of
+it again and the gateway is not asked again. If the host stored no information about the answer (the
+answer was to try again later, or the registration attempt did not finish because the connection to
+the host closed or the daemon stopped), the device is informed that the outcome of the registration
+with this action is not known, so the device can try to register again, but with a new action. If
+the first registration attempt is not yet finished, the device is informed that it should ask again.
 
 Both questions come out of the gateway's allowances for this host, so the host rations them. One
 device may have a credential confirmed three times in a burst and then six times an hour. The status
@@ -519,11 +524,13 @@ operating system's own verifier, the one the managed HTTPS transport uses, and n
 off. The host signs in with AUTH PLAIN, or AUTH LOGIN where the server offers only that.
 
 The request for submission departs the host using the same route as for the other service
-connections. Here, this involves asking the proxy configured in the host’s configuration to open a
+connections. When the host's configuration names a proxy, this involves asking the proxy to open a
 `CONNECT` tunnel to the server and port and, if successful, carrying on the conversation above
-(including the TLS negotiation) over that tunnel. If the proxy is not available or does not open the
-tunnel, or if the daemon is started with a configuration document it cannot use, the message is not
-sent. The result of the attempt is reported; here, that it was not possible to connect at all.
+(including the TLS negotiation) over that tunnel; with no proxy, the submission connects to the
+server directly. If the proxy is not available or does not open the tunnel, or if the daemon is
+started with a configuration document it cannot use, the message is not sent. The result of the
+attempt is reported; here, that the mail server could not be reached, or that no connection was
+made.
 
 The addresses and the subject are checked before they are written, and none may carry a line break,
 so nothing a destination or an event supplies can add a header or a mail command. The body is

@@ -219,7 +219,7 @@ variables an older build read joins nothing because of them.
 | `network.relay_only` | every packet through the relay, and no direct path | `true` or `false`; `true` needs at least one relay |
 | `network.local_discovery` | discovery of peers on the local network | `true` or `false` |
 | `network.mainline_dht` | the public Mainline DHT, which carries no KalaReach service guarantee | `true` or `false` |
-| `network.proxy_url` | the HTTP proxy this host's connections to services go through: the endpoint's relays and Pkarr servers, the rendezvous, delivery and webhooks, mail submission, the managed voice broker and account service, backups to the managed storage service, the model's files, and plugin repositories; the host's own name lookups do not use it, and absent everything goes directly | an absolute `http` or `https` origin, with no user information, no path and no trailing slash |
+| `network.proxy_url` | the HTTP proxy this host's connections to services go through: the endpoint's relay connection, relay latency probe, captive-portal check and Pkarr servers, the rendezvous, delivery and webhooks, mail submission, the managed voice broker and account service, backups to the managed storage service, the model's files, and plugin repositories; the host's own name lookups do not use it, and absent everything goes directly, apart from the relay latency probe and captive-portal check, which then follow `HTTPS_PROXY`, `HTTP_PROXY` and `ALL_PROXY` when those are set | an absolute `http` or `https` origin, with no user information, no path and no trailing slash |
 | `voice.broker_origin` | the managed broker this host starts a device's voice session at, through the proxy `network.proxy_url` selects | an absolute `https` origin, or an `http` origin on `localhost`, `127.0.0.1` or `[::1]`, of at most 128 bytes, in lower case, with no path and no port its scheme already implies; a plain-HTTP origin cannot be combined with `network.proxy_url`, because the proxy would carry the account token in clear text |
 | `storage.origin` | the managed storage service this host uploads its backups to | an `https` origin, or an `http` origin on a loopback address, in the spelling a gateway origin has, with no path and no trailing slash; the daemon refuses to start unless it is the managed account service |
 
@@ -239,28 +239,35 @@ whole document invalid, as it would in any other section: the host fails closed,
 the document is fixed. The proxy is this machine's own choice, and no invitation or host bundle
 carries it.
 
-Only one rule, and that is that all connections to the endpoint’s relays, Pkarr servers, the
-rendezvous (both for reserving a code’s locator and for opening the room), push gateway, webhooks,
-chat services, mail (submission), managed voice broker, account service (sign in), managed storage
-service (`storage.origin`, for backups), the model (its files) and plugin repositories shall be made
-through a proxy if one is specified in the document. Nothing on that list goes around it. This also
-means that if the proxy does not allow connections to the webhook’s address for some reason, then it
-will not work. Regarding mail: Submission uses the SMTP protocol, which in turn will be tunneled
-through the proxy using an HTTP `CONNECT` request to the mail server specified for submission on the
-specified port. As the connection’s own TLS will run inside the tunnel, the proxy will not be able
-to read what travels once TLS has started. However, if STARTTLS is used, the proxy will be able to
-read the initial greeting and the `EHLO` and `STARTTLS` exchange, which come before TLS starts. It
-will still not be able to read any credentials or the message itself though. Also note that the
-proxy will know which server and port is being connected to. If the proxy for some reason refuses to
-open a tunnel to the specified mail server and port, the message will not be sent. All names
-resolved locally on the host will go directly, as will all direct connections from the endpoint, and
-Git operations initiated by an owner. Without a proxy every connection on that list goes directly,
-apart from iroh's relay latency probe and captive-portal check, which then follow `HTTP_PROXY`,
-`HTTPS_PROXY` and `ALL_PROXY` when those are set. The daemon reads the proxy when it starts, like
-the rest of the section, and every client takes that one reading. A daemon that starts over a
-document it cannot use makes no HTTPS connection to the push gateway, a webhook address or a chat
-service, a plugin repository, the model's files or the managed account service, submits no mail, and
-uploads no backup, until it starts again over one it can use.
+One rule covers the proxy: if a proxy is specified in the document, that proxy will be used for
+connecting to the endpoint’s relay connection, relay latency probe, captive-portal check and Pkarr
+servers, to the rendezvous when reserving a code’s locator and opening its room, to the push
+gateway, to webhooks, to chat services, to mail servers when sending mail via the mail submission
+port, to the managed voice broker, to the managed account service when signing in, to the managed
+storage service (`storage.origin`) when backing up, to the model’s files, and to plugin
+repositories. Nothing on that list goes around it.
+
+An address the proxy cannot reach fails, a webhook included. Mail submission is SMTP, so it goes as
+an HTTP `CONNECT` tunnel to the submission server and its port, and the connection’s own TLS runs
+inside the tunnel. Mail will not be sent via a proxy that does not allow tunneling (using HTTP
+`CONNECT`) to the submission port of the mail server. The proxy will be able to see the destination
+server and port, and, with STARTTLS, it will also see the plaintext greeting from the mail server,
+the `EHLO` command and response, the `STARTTLS` command and response, and then the connection will
+be encrypted and the proxy won’t be able to see the mail credentials or content.
+
+Direct connections will be made for name lookups from the host computer, for direct connections from
+the endpoint to other endpoints, for the endpoint’s QUIC address discovery, which connects directly
+to the relays over UDP to learn this host’s public address, for connecting to the UDP port mapper,
+for local discovery and for connecting to nodes in the Mainline DHT where those are selected in the
+endpoint, and for Git operations requested by the owner.
+
+Without a proxy every connection on that list goes directly, apart from iroh's relay latency probe
+and captive-portal check, which then follow `HTTP_PROXY`, `HTTPS_PROXY` and `ALL_PROXY` when those
+are set. The daemon reads the proxy when it starts, like the rest of the section, and every client
+takes that one reading. A daemon that starts over a document it cannot use makes no HTTPS connection
+to the push gateway, a webhook address or a chat service, a plugin repository, the model's files or
+the managed account service, submits no mail, and uploads no backup, until it starts again over one
+it can use.
 
 The daemon reads both sections once, when it starts, because that is when its endpoint and its
 voice service are built. `kr doctor` prints each field with its value, its source
