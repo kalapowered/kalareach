@@ -1154,6 +1154,12 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
       return Promise.resolve(hostDrafts.bind(read))
     },
 
+    // The scripted host keeps no record of the actions it answered; a test that needs one
+    // gives the port its own.
+    actionRead: () => {
+      requireConnection()
+      return refuse('NOT_FOUND', 'The host holds no receipt for that action.')
+    },
     historyPage: (params) =>
       reading('historyPage', () => {
         requireConnection()

@@ -100,11 +100,16 @@ import {
   outcomeTone,
   queued,
   reconnectBanner,
+  sendOutcomeOf,
   settled,
-  wasRefused
+  unconfirmedReason,
+  wasRefused,
+  type Submission
 } from '../model/receipts'
+import { OpenSends } from '../model/sends'
 import type { LaunchSurface } from '../model/pending'
 import { useBook, useSessionDraft } from '../app/drafts'
+import { useReceiptReads } from '../app/receipts'
 import { ApprovalRequests } from './Approvals'
 import { KeptAnswers, QuestionRequests } from './Questions'
 
@@ -159,6 +164,15 @@ export function Conversation({
   const { problem: draftsProblem, status: draftsStatus } = useBook()
   const { unread, refresh } = useSessionAgent(sessionId)
   const [insertion, setInsertion] = useState<string | null>(null)
+  // The prompts the host has accepted and not yet applied or refused: each ends when a receipt says
+  // how, and one still open when this view goes ends as of unknown outcome.
+  const sends = useMemo(() => new OpenSends(), [])
+  useEffect(
+    () => () => {
+      sends.endAll()
+    },
+    [sends]
+  )
   // Why the host's event stream could not be followed, under the visit it was opened in: a failure
   // from an earlier visit to this session is not shown on a return to it.
   const visit = useMemo(() => ({ sessionId }), [sessionId])
@@ -227,18 +241,21 @@ export function Conversation({
           }
           if (body.kind === 'receipt' && body.receipt) {
             const receipt = body.receipt as Parameters<typeof settled>[1]
-            let refused: string | null = null
+            const reached: Submission[] = []
             update((current) => ({
               ...current,
               submissions: current.submissions.map((submission) => {
                 if (submission.actionId !== receipt.action_id) return submission
                 const next = settled(submission, receipt)
-                if (wasRefused(next.state)) refused = next.localId
+                reached.push(next)
                 return next
               })
             }))
-            // A refusal that arrives later is the same refusal: the text comes back then too.
-            if (refused) returnRefusedText(refused)
+            for (const next of reached) {
+              // A refusal that arrives later is the same refusal: the text comes back then too.
+              if (wasRefused(next.state)) returnRefusedText(next.localId)
+              sends.settled(next.localId, next.state)
+            }
           }
         })
       ],
@@ -251,7 +268,37 @@ export function Conversation({
       watching.stop()
       batcher.discard()
     }
-  }, [port, sessionId, visit, batcher, update, returnRefusedText])
+  }, [port, sessionId, visit, batcher, update, returnRefusedText, sends])
+
+  // An action the host never confirmed is asked about, so it ends even when no event says how.
+  const settleFromRecord = useCallback(
+    (localId: string, receipt: Parameters<typeof settled>[1]) => {
+      const reached: Submission[] = []
+      update((current) => ({
+        ...current,
+        submissions: current.submissions.map((submission) => {
+          if (submission.localId !== localId) return submission
+          const next = settled(submission, receipt)
+          reached.push(next)
+          return next
+        })
+      }))
+      for (const next of reached) {
+        if (wasRefused(next.state)) returnRefusedText(next.localId)
+        sends.settled(next.localId, next.state)
+      }
+    },
+    [update, returnRefusedText, sends]
+  )
+  useReceiptReads({
+    sessionId,
+    connected,
+    submissions: state.submissions,
+    onReceipt: settleFromRecord
+  })
+  // Nothing more is sent while an action has no confirmed outcome: the text came back to the
+  // composer, and sending it again could run it twice.
+  const unconfirmed = unconfirmedReason(state.submissions)
 
   const offers = useMemo(
     () =>
@@ -324,7 +371,7 @@ export function Conversation({
       // they wrote it at: the host refuses it if that conversation has moved on since. Only an
       // interruption, which carries no text, names the conversation as it is now.
       const draft = presented
-      if (action !== 'interrupt' && !submittable(draft)) return
+      if (action !== 'interrupt' && (unconfirmed !== null || !submittable(draft))) return
       const written = draft.target
       if (
         action !== 'interrupt' &&
@@ -390,7 +437,10 @@ export function Conversation({
           if (outcome === 'unknown') {
             say('The host could not confirm what became of that.', 'danger')
           }
-          end(wasRefused(outcome) ? 'refused' : outcome === 'unknown' ? 'unknown' : 'taken')
+          // A prompt the host has only accepted is not yet taken: it ends when a receipt says how.
+          const final = sendOutcomeOf(outcome)
+          if (final !== null) end(final)
+          else if (sending !== null) sends.hold(local.localId, end)
         })
         .catch((error: unknown) => {
           const code = failureCode(error) ?? 'UNKNOWN'
@@ -419,7 +469,9 @@ export function Conversation({
       book,
       say,
       returnRefusedText,
-      refresh
+      refresh,
+      sends,
+      unconfirmed
     ]
   )
 
@@ -849,6 +901,7 @@ export function Conversation({
         draft={presented}
         opening={!draftsOpen}
         connected={connected}
+        held={unconfirmed}
         offers={offers}
         commands={agent.commands}
         insertion={insertion}
@@ -1459,6 +1512,7 @@ function Composer({
   draft,
   opening,
   connected,
+  held,
   offers,
   commands,
   insertion,
@@ -1474,6 +1528,8 @@ function Composer({
   /** True while the drafts kept on this device are being read: nothing typed yet could be kept. */
   readonly opening: boolean
   readonly connected: boolean
+  /** Why nothing is sent for now, when an earlier action has no confirmed outcome. */
+  readonly held: string | null
   readonly offers: ComposerOffers
   readonly commands: readonly AgentCommand[]
   readonly insertion: string | null
@@ -1492,9 +1548,9 @@ function Composer({
   // The draft's own reason comes first: a detached, conflicted or empty draft says so whatever the
   // agent offers. Then why the agent will not take one as it stands.
   const reason =
-    notSubmittableBecause(draft) ?? (offers.submit.offered ? null : offers.submit.reason)
-  const canSubmit = offers.submit.offered && submittable(draft) && connected
-  const canWrite = submittable(draft) && connected
+    held ?? notSubmittableBecause(draft) ?? (offers.submit.offered ? null : offers.submit.reason)
+  const canSubmit = offers.submit.offered && submittable(draft) && connected && held === null
+  const canWrite = submittable(draft) && connected && held === null
 
   if (opening) {
     // Typing before the kept drafts are read would be typing over them, so the field waits.

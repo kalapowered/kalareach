@@ -11,6 +11,8 @@
  */
 
 import type {
+  ActionReadParams,
+  ActionReadResult,
   ActionRight,
   AgentApprovalInspectParams,
   AgentApprovalInspectResult,
@@ -890,6 +892,13 @@ export interface HostPort {
    * archive.
    */
   historyPage(params: HistoryPageParams): Promise<HistoryPageResult>
+  /**
+   * The receipt an action stands at now.
+   *
+   * A request whose answer never came, or came as only its identity, is not asked again: what the
+   * host recorded of it is read, under the same authority, and no request is dispatched twice.
+   */
+  actionRead(params: ActionReadParams): Promise<ActionReadResult>
   attentionRead(params: AttentionReadParams): Promise<AttentionReadResult>
   /** Records that items were seen, each at the revision shown. An environment's, not a session's. */
   attentionAcknowledge(params: AttentionAcknowledgeParams): Promise<Settled<AttentionAcknowledgeResult>>

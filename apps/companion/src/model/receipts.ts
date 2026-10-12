@@ -115,6 +115,43 @@ export function settled(submission: Submission, receipt: Receipt): Submission {
   }
 }
 
+/**
+ * What a settled submission means for the prompt it carried: whether the host took it, did not,
+ * or nobody knows. Null while the host still has it, because a prompt the host has only accepted is
+ * not yet a prompt it took.
+ */
+export function sendOutcomeOf(state: InputState): 'taken' | 'refused' | 'unknown' | null {
+  switch (state) {
+    case 'applied':
+      return 'taken'
+    case 'refused':
+    case 'rejected':
+      return 'refused'
+    case 'unknown':
+      return 'unknown'
+    case 'queued':
+    case 'sent':
+      return null
+  }
+}
+
+/**
+ * Why nothing more is sent while an outcome is unknown, or null when none is.
+ *
+ * An action whose outcome nobody knows may have been dispatched, and the person's text comes back to
+ * the composer: sending it again could run it twice. A later receipt settles it, or the host's
+ * record of it when the interface asks.
+ */
+export function unconfirmedReason(submissions: readonly Submission[]): string | null {
+  const count = submissions.filter((submission) => submission.state === 'unknown').length
+  return count === 0 ? null : unconfirmedWords(count)
+}
+
+/** The sentence for `count` actions that have no confirmed outcome. */
+export function unconfirmedWords(count: number): string {
+  return `${count === 1 ? 'One action has' : `${String(count)} actions have`} no confirmed outcome yet. Sending again could run it twice.`
+}
+
 /** Records a failure the request itself produced. */
 export function failed(
   submission: Submission,

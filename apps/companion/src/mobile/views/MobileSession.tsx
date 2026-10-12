@@ -53,10 +53,16 @@ import {
   describeState,
   queued,
   reconnectBanner,
+  sendOutcomeOf,
+  settled,
+  stateOfReceipt,
+  unconfirmedWords,
   unresolved,
   wasRefused,
   failed
 } from '../../model/receipts'
+import { OpenSends } from '../../model/sends'
+import { useReceiptReads } from '../../app/receipts'
 import { renderMarkdown } from '../../markdown/render'
 import type { TerminalGrid, TerminalRoom, TerminalScreen, TerminalWheel } from '../../host/port'
 import { leftBlankOnPhone, stretchesOf, styleOf } from '../../terminal/cells'
@@ -161,6 +167,15 @@ export function MobileSession({
   readonly connected: boolean | null
 }): ReactNode {
   const { port, say, drafts: book, paths } = useApp()
+  // The prompts the host has accepted and not yet applied or refused: each ends when a receipt says
+  // how, and one still open when this screen goes ends as of unknown outcome.
+  const sends = useMemo(() => new OpenSends(), [])
+  useEffect(
+    () => () => {
+      sends.endAll()
+    },
+    [sends]
+  )
   const shown = useBook()
   const { drafts: composers, status: draftsStatus, problem: draftsProblem } = shown
   const keptEntryLine = keptEntry(shown)
@@ -638,7 +653,10 @@ export function MobileSession({
                 : each
             )
           )
-          end(state === 'unknown' ? 'unknown' : 'taken')
+          // A prompt the host has only accepted is not yet taken: it ends when a receipt says how.
+          const final = sendOutcomeOf(state)
+          if (final !== null) end(final)
+          else sends.hold(submission.localId, end)
         })
         .catch((failure: unknown) => {
           lifecycle.setSubmissions((current) =>
@@ -660,7 +678,7 @@ export function MobileSession({
           setBusy(false)
         })
     },
-    [draft, lifecycle, book, port, say, sessionId]
+    [draft, lifecycle, book, port, say, sessionId, sends]
   )
 
   // Focus that a terminal key, the program's keyboard or the mode button held when control or the
@@ -684,13 +702,25 @@ export function MobileSession({
   const mine = lifecycle.state.submissions.filter((submission) =>
     isForSession(submission.localId, sessionId)
   )
+  // An action the host never confirmed is asked about, so it ends even though nothing here hears
+  // the host's events.
+  const settleFromRecord = useCallback(
+    (localId: string, receipt: Parameters<typeof settled>[1]) => {
+      lifecycle.setSubmissions((current) =>
+        current.map((each) => (each.localId === localId ? settled(each, receipt) : each))
+      )
+      sends.settled(localId, stateOfReceipt(receipt))
+    },
+    [lifecycle, sends]
+  )
+  useReceiptReads({ sessionId, connected, submissions: mine, onReceipt: settleFromRecord })
   const banner = reconnectBanner(connected, mine)
   // A submission whose outcome nobody knows is the one case where sending again could run the
   // same thing twice. Until a receipt settles it, this session sends nothing more.
   const waiting = unresolved(mine)
   const blocked =
     waiting.length > 0
-      ? `${waiting.length === 1 ? 'One action has' : `${waiting.length} actions have`} no confirmed outcome yet. Sending again could run it twice.`
+      ? unconfirmedWords(waiting.length)
       : (notSubmittableBecause(draft) ?? (submitOffer.offered ? null : submitOffer.reason))
   // The composer is its line, the field with Send beside it, while the terminal shows and on a
   // session too short for the whole composer under the conversation's floor.
