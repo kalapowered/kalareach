@@ -402,6 +402,8 @@ impl WorkerLinks {
         session_id: SessionId,
         opening: Option<&str>,
     ) -> Result<Leased> {
+        // Read before the host in use is: a host change between the two moves it on.
+        let generation = state.paired_links().generation();
         if let Some(context) = state.paired_context() {
             return match opening {
                 Some(opening) => state.paired_links().opened_link(session_id, opening),
@@ -411,6 +413,7 @@ impl WorkerLinks {
                         .ambient_link(
                             &crate::standing::Dial::new(context.device, context.host),
                             session_id,
+                            generation,
                         )
                         .await
                 }

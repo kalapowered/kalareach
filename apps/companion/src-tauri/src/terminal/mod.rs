@@ -333,6 +333,13 @@ pub fn install<R: tauri::Runtime>(
         if let Some(views) = webview.try_state::<TerminalViews>() {
             views.page_load(webview.label(), payload.event());
         }
+        // A page that loads again has lost the openings it made, and its screens make new ones: the
+        // links, their watches and their places among the eight are not kept for tokens nobody holds.
+        if payload.event() == tauri::webview::PageLoadEvent::Started
+            && let Some(state) = webview.try_state::<crate::AppState>()
+        {
+            state.paired_links().leave_all();
+        }
     })
 }
 

@@ -2371,3 +2371,42 @@ async fn kr_req_19_08_a_kept_answer_is_settled_and_sent_on_the_screens_link() {
     assert_eq!(sent["outcome"], "taken", "{sent}");
     adopted.stop().await;
 }
+
+/// KR-REQ-19.08: a page that loads again has lost the openings it made, and native code lets each
+/// go, so its places among the eight and its watches are not kept for tokens nobody holds. The
+/// screens of the new page open the sessions again with tokens of their own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_19_08_a_page_that_loads_again_leaves_its_openings() {
+    use tauri::Manager as _;
+
+    let adopted = Adopted::start(2).await;
+    let first = adopted.workers[0].session_id;
+    let second = adopted.workers[1].session_id;
+    let phone = phone_under(&adopted, pairing(&[ActionRight::SessionView])).await;
+    let companion = &phone.companion;
+    open(companion, first, None, "before-1").expect("opens");
+    open(companion, second, None, "before-2").expect("opens");
+    let state = companion.app.state::<companion_tauri::AppState>();
+    let links = state.paired_links();
+    assert_eq!(links.opened(), 2);
+
+    links.leave_all();
+
+    assert_eq!(links.opened(), 0);
+    let stale = companion
+        .call(
+            "session_agents",
+            json!({ "sessionId": first.to_string(), "opening": "before-1" }),
+        )
+        .expect_err("the page's earlier opening is over");
+    assert_eq!(code(&stale), "STALE_SESSION", "{stale}");
+    // The new page opens the session again with a token of its own, and is served.
+    open(companion, first, None, "after-1").expect("opens again");
+    companion
+        .call(
+            "session_agents",
+            json!({ "sessionId": first.to_string(), "opening": "after-1" }),
+        )
+        .expect("served");
+    adopted.stop().await;
+}

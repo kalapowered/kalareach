@@ -93,10 +93,11 @@ impl AppState {
         if let Some(before) = supervision.task.replace(task) {
             before.abort();
         }
-        // The sessions opened on the host before are let go with it, and the tokens that opened
-        // them are forgotten.
-        self.paired_links.close_all();
+        // The host in use is told as changed first, and the sessions opened on the host before are
+        // let go with it, and the tokens that opened them are forgotten, after: a call that read the
+        // host before the change then finds the generation moved when it hands its link over.
         self.disconnected(reason);
+        self.paired_links.close_all();
         Ok(())
     }
 
@@ -122,8 +123,8 @@ impl AppState {
             if let Some(task) = supervision.task.take() {
                 task.abort();
             }
-            self.paired_links.close_all();
             self.disconnected(reason);
+            self.paired_links.close_all();
         }
         Ok(())
     }

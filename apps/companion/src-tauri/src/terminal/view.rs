@@ -344,6 +344,16 @@ async fn open_paired(
             reason: format!("The host could not be reached for this view: {reason}"),
             lost: true,
         },
+        // A host that cannot answer now has not refused the view: the opening's link asks again.
+        crate::standing::Failure::Refused(refusal) if crate::standing::transient(refusal.code) => {
+            OpenFailure {
+                reason: format!(
+                    "The host could not answer for this view now: {}",
+                    refusal.message
+                ),
+                lost: true,
+            }
+        }
         refused @ crate::standing::Failure::Refused(_) => OpenFailure::refused(refused.to_string()),
     })?;
     let mut wire =

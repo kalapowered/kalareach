@@ -509,13 +509,33 @@ fn well_formed(token: &str) -> bool {
 /// Whether a refusal says the host is only unable to answer now, so that asking again may be
 /// answered differently: the protocol's own transient category, and a clock the host does not
 /// trust yet, which it trusts again later.
-fn transient(code: ErrorCode) -> bool {
+pub(crate) fn transient(code: ErrorCode) -> bool {
     code.retry_category() == RetryCategory::Transient || code == ErrorCode::ClockUntrusted
 }
 
 impl PairedLinks {
     fn lock(&self) -> MutexGuard<'_, Inner> {
         self.inner.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// How many times the host in use has changed. A call reads it before it reads the host, and
+    /// hands its link over only while it has not moved.
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::SeqCst)
+    }
+
+    /// Leaves every opening: the page that made them is gone, and it will make its own again with
+    /// tokens of its own. What is in flight on each link answers first.
+    pub fn leave_all(&self) {
+        let opened = {
+            let mut inner = self.lock();
+            inner.current.clear();
+            std::mem::take(&mut inner.opened)
+        };
+        for (_, opened) in opened {
+            opened.end();
+        }
     }
 
     /// How many sessions have an opened link.
@@ -797,7 +817,12 @@ impl PairedLinks {
     /// # Errors
     ///
     /// Returns the host's refusal, `UNKNOWN_SESSION` among it, or why it could not be reached.
-    pub(crate) async fn ambient_link(&self, dial: &Dial, session_id: SessionId) -> Result<Leased> {
+    pub(crate) async fn ambient_link(
+        &self,
+        dial: &Dial,
+        session_id: SessionId,
+        generation: u64,
+    ) -> Result<Leased> {
         {
             let inner = self.lock();
             if let Some(held) = inner.opened.get(&session_id)
@@ -808,7 +833,6 @@ impl PairedLinks {
                 return Ok(Leased::of(Arc::clone(link)));
             }
         }
-        let generation = self.generation.load(Ordering::SeqCst);
         let host_changed =
             || CommandError::unavailable("The host in use changed while this was being asked.");
         loop {
@@ -972,8 +996,8 @@ impl PairedLinks {
     /// the host answers one request at a time. When the link goes, its watch takes over.
     pub async fn recheck(self: &Arc<Self>, emit: &Emitter, session_id: SessionId, opening: &str) {
         // Paced by the views of this opening that lost their connections without drawing: the
-        // first is asked about at once, and each one after waits longer, so a view that cannot hold
-        // a connection is not opened again as fast as the network goes.
+        // first is asked about after the shortest pause, and each one after waits longer, so a view
+        // that cannot hold a connection is not opened again as fast as the network goes.
         let losses = self.note_loss(session_id, opening);
         tokio::time::sleep(pause(losses.saturating_sub(1))).await;
         let mut failures: u32 = 0;
@@ -1207,6 +1231,9 @@ impl PairedLinks {
     /// and nothing has ended it: an opening that has ended, been refused, closed or replaced stays
     /// so. The change and its telling are one step under the lock, so a standing is never told
     /// after one that came later.
+    ///
+    /// Telling posts the event to the window and waits for nothing. No listener on this side hears
+    /// it, and nothing a listener could do here takes this lock again.
     fn tell_standing(
         &self,
         emit: &Emitter,
