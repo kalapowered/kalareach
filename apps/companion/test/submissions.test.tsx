@@ -813,12 +813,17 @@ describe('on the phone', () => {
       const storage = fakeStorage()
       const device = new FakeDraftStore()
       const person = userEvent.setup()
-      const run = (answer: Settled<AgentMutationResult> | 'never', recorded: Recorded) => {
+      const run = (answer: Settled<AgentMutationResult> | Promise<Settled<AgentMutationResult>> | 'never', recorded: Recorded) => {
         const host = fakeHost({ drafts: device })
-        const port = answering(host.port, answer === 'never' ? UNCONFIRMED : answer, recorded)
+        const waiting = answer === 'never' || answer instanceof Promise
+        const port = answering(host.port, waiting ? UNCONFIRMED : answer, recorded)
         return render(
           <AppProvider
-            port={answer === 'never' ? { ...port, composerSubmit: () => new Promise(() => undefined) } : port}
+            port={
+              waiting
+                ? { ...port, composerSubmit: () => (answer === 'never' ? new Promise(() => undefined) : answer) }
+                : port
+            }
           >
             <MobileApp surface="ios" storage={storage} />
           </AppProvider>
@@ -875,6 +880,46 @@ describe('on the phone', () => {
       // The earlier prompt was applied; the newer draft is not that prompt's.
       expect(screen.getByLabelText('Message this session')).toHaveValue('continue')
       expect(device.all().map((draft) => draft.text)).toEqual(['continue'])
+    })
+
+    it('removes the draft the text was stored under after the send ended, once the host says it was applied', async () => {
+      const { device, person, run, open } = runs()
+      // The store cannot be used while the prompt is on its way, so nothing stores its text.
+      device.breakOpening()
+      let answer: (value: Settled<AgentMutationResult>) => void = () => undefined
+      const host = new Promise<Settled<AgentMutationResult>>((resolve) => {
+        answer = resolve
+      })
+      const first = run(host, { state: 'unknown' })
+      await person.type(await open(), 'run the migration')
+      await person.click(screen.getByRole('button', { name: 'Send' }))
+      // The person writes something else before the host answers, so the prompt's text cannot go back
+      // to the composer when the send ends.
+      await person.clear(screen.getByLabelText('Message this session'))
+      await person.type(screen.getByLabelText('Message this session'), 'something newer')
+      await act(async () => {
+        answer(UNCONFIRMED)
+        await Promise.resolve()
+      })
+      await screen.findByText(/no confirmed outcome yet/)
+      // The store is mended and read again, and keeps the prompt's text apart from the composer's.
+      device.mendOpening()
+      await person.click(await screen.findByTestId('drafts-retry'))
+      await waitFor(() => {
+        expect(device.all().map((draft) => draft.text).sort()).toEqual(['run the migration', 'something newer'])
+      })
+      first.unmount()
+
+      run(UNCONFIRMED, { state: 'applied' })
+      await open()
+
+      // The draft the phone was told of is the one that goes, and the newer text stays.
+      await waitFor(
+        () => {
+          expect(device.all().map((draft) => draft.text)).toEqual(['something newer'])
+        },
+        { timeout: 3_000 }
+      )
     })
 
     it('removes the text of a prompt, once the host says it was applied', async () => {
