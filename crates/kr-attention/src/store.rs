@@ -112,7 +112,9 @@ use crate::visit::{Change, Omitted, SessionLog, Visit};
 /// the anchor each of its intervals is measured from, and a row that predates those columns
 /// carries none. Version 11 adds the approvals source to the values a row's `source` or
 /// `record_source` holds, which a build that does not know it reads as a row it cannot read.
-pub const SCHEMA_VERSION: i64 = 11;
+/// Version 12 adds the authority source and the rule that tells the owner an authority feed
+/// removed the host, which a build that does not know them reads the same way.
+pub const SCHEMA_VERSION: i64 = 12;
 
 /// The oldest schema this build brings forward rather than refusing: see `migrate_forward`.
 pub const OLDEST_SCHEMA_VERSION: i64 = 9;
@@ -547,7 +549,7 @@ fn file_control<T>(connection: &Connection, question: i32, answer: *mut T) -> Re
     })
 }
 
-/// Brings a store written under schema 9 or 10 forward to this build's, in one transaction.
+/// Brings a store written under schema 9, 10 or 11 forward to this build's, in one transaction.
 ///
 /// From schema 9, what changed is three columns on the items: the time the announcement an item
 /// last made was first decided, and the privacy generation and mode it was decided under, none of
@@ -559,6 +561,10 @@ fn file_control<T>(connection: &Connection, question: i32, answer: *mut T) -> Re
 ///
 /// From schema 10, nothing in the tables changes: the approvals source has no cursor until the
 /// first page of a session's approval transitions is taken, which reads them from the start.
+///
+/// From schema 11, nothing in the tables changes: the authority source has no cursor until the
+/// host first notes its feed having removed it, and no row names the rule that tells the owner so
+/// until then.
 ///
 /// Remove the step from schema 9, with its column check, once no supported upgrade starts from a
 /// store written under schema 9; `OLDEST_SCHEMA_VERSION` then moves up to 10.
