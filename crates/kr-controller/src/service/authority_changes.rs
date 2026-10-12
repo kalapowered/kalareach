@@ -8,7 +8,7 @@ use kr_protocol::broker::{DecoderLedgerEntry, MAX_PROJECTION_SUMMARY_LEN};
 use kr_protocol::envelope::{ControlFrame, MutationRequest, ParamsValue};
 use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::gateway::{PendingKind, PendingResource};
-use kr_protocol::grant::GrantExpiry;
+use kr_protocol::grant::{Grant, GrantExpiry};
 use kr_protocol::ids::{ActorId, PendingResourceId, SessionId};
 use kr_protocol::method::Method;
 use kr_protocol::projection::AgentResourceSnapshotContinuation;
@@ -614,23 +614,13 @@ impl Controller {
     /// Returns [`ControllerError::PermissionDenied`] for a recipient this host does not pair with
     /// and [`ControllerError::InvalidArgument`] for a share that would outlast its recipient's
     /// pairing or whose lifetime is out of bounds.
-    fn check_recipient_pairing(
+    pub(super) fn check_recipient_pairing(
         &self,
         caller: AuthorityCaller,
         request: &crate::sharing::ShareRequest,
-    ) -> Result<()> {
+    ) -> Result<Grant> {
         let delegating = matches!(caller, AuthorityCaller::Device(_));
-        let recipient = |detail: &str| {
-            if delegating {
-                ControllerError::PermissionDenied {
-                    detail: DELEGATED_SHARE_REFUSAL.to_owned(),
-                }
-            } else {
-                ControllerError::PermissionDenied {
-                    detail: detail.to_owned(),
-                }
-            }
-        };
+        let recipient = |detail: &str| recipient_refusal(delegating, detail);
         let record = self
             .devices
             .record_for_device(request.recipient_device_id)?
@@ -675,7 +665,31 @@ impl Controller {
                 how_long(pairing_ends.saturating_sub(request.now_ms))
             )));
         }
-        Ok(())
+        Ok(record.grant)
+    }
+
+    /// Whether the recipient's pairing is still in force now, from memory alone, for the check made
+    /// inside the transaction that writes a share.
+    ///
+    /// [`Self::check_recipient_pairing`] decides before the session's worker is asked and before
+    /// the waits for the registry and the grant store, and a pairing that runs out during them is
+    /// one a share written after would have been written to a device that can no longer use it.
+    /// It anchored the pairing's lifetime, so this reads the clocks and nothing else, as a check
+    /// inside a transaction on the grant store's connection has to.
+    pub(super) fn recipient_still_paired(
+        &self,
+        caller: AuthorityCaller,
+        recipient_device_id: kr_protocol::ids::DeviceId,
+        pairing: &Grant,
+    ) -> Result<()> {
+        if self.lifetimes().in_force_now(recipient_device_id, pairing) {
+            return Ok(());
+        }
+        Err(recipient_refusal(
+            matches!(caller, AuthorityCaller::Device(_)),
+            "that device's pairing has run out; it has to be paired again before a session is \
+             shared with it",
+        ))
     }
 
     /// Lists the paired devices, with each one's last authority acknowledgement.
@@ -1200,7 +1214,7 @@ impl Controller {
             self.settle_floor();
             allowed?;
         }
-        self.check_recipient_pairing(caller, &request)?;
+        let pairing = self.check_recipient_pairing(caller, &request)?;
         let named = self
             .named_previews(params.session_id, &params.selection)
             .await?;
@@ -1220,9 +1234,10 @@ impl Controller {
         // by the time the write happens.
         let registry = self.registry.lock().await;
         self.check_admission(&registry, &carried)?;
-        let result = self
-            .sharing
-            .share(&request, || self.check_admission(&registry, &carried));
+        let result = self.sharing.share(&request, || {
+            self.check_admission(&registry, &carried)?;
+            self.recipient_still_paired(caller, request.recipient_device_id, &pairing)
+        });
         drop(registry);
         self.settle_floor();
         encode(&result?)
@@ -2354,6 +2369,18 @@ pub(crate) struct PairingFacts {
     pub(crate) in_force: bool,
     /// Whether the pairing admits every session of this environment.
     pub(crate) all_sessions: bool,
+}
+
+/// The refusal of a share its recipient cannot carry. A paired device that delegates is given one
+/// sentence whatever the reason, because the reasons would tell it of another device's pairing.
+fn recipient_refusal(delegating: bool, detail: &str) -> ControllerError {
+    ControllerError::PermissionDenied {
+        detail: if delegating {
+            DELEGATED_SHARE_REFUSAL.to_owned()
+        } else {
+            detail.to_owned()
+        },
+    }
 }
 
 /// A span in words a person reads in a refusal: whole days, hours or minutes, rounded down.

@@ -1193,6 +1193,10 @@ mod a_revocation_answered_to_a_device;
 #[cfg(test)]
 mod a_transfer_to_a_device_revoked_since;
 
+/// A share whose recipient's pairing ran out between the check made before the write and the write.
+#[cfg(test)]
+mod a_share_whose_recipient_ran_out_since;
+
 /// An action an earlier build claimed in the grant store alone, as the route check finds it.
 #[cfg(test)]
 mod a_voice_receipt_from_an_earlier_build;
