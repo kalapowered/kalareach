@@ -294,6 +294,9 @@ that means, and each rule is a fact about a file here rather than a convention:
   grouped value both devices show, and a confirmation's description. It is never sent an
   invitation's text or secret, a key, a transcript, a challenge or a proof, and it cannot complete
   a confirmation: `owner.confirmation.complete` is a method only native code calls.
+- **A hand-over's plan stays native.** The page holds a reference and nothing else.
+  `owner.confirmation.request` and `grant.transfer` are methods only native code calls, and the
+  transfer only after an owner device has answered.
 
 `src-tauri/tests/boundary.rs` reads those files and holds them to those sentences.
 
@@ -403,6 +406,16 @@ dismissed and the answer is "not confirmed". Nothing on the page can answer the 
 that desktop automation synthesises can start a review and cannot finish one. While a review runs,
 the watcher does not connect to another host whose configuration shares the reviewed host's relay,
 because that connection would close the endpoint the answer goes over.
+
+## Sharing a session
+
+The Sharing tab of a session's settings lists who has access and then offers the form. The list is the grants the host holds for the session, each with the device's name, the role in words, the end the host gives (the earlier of the share's and the device's pairing's) and what can be done to it: Withdraw for an invitation nobody has accepted, Revoke for an active share, and Hand over control for an active share that carries `session.share`. Owner devices are listed as having access whatever is done to a share. A revocation keeps a line of its own, because the list drops resolved grants: it says when the share was revoked and how many session workers have not yet confirmed it, and Check again sends a new revocation, which asks each worker again.
+
+The form offers only what the host would take. A device that is an owner, whose pairing opens every session, or whose pairing has ended is not offered, and the row says why. The lifetimes offered are the ones that fit inside the device's pairing, with ten seconds in hand for the time the host takes the request, and "until its pairing ends" when that is sooner. Reviewer is not offered. A role that carries a consequence, or an answer to the agent's questions, asks for a tick before Invite is enabled, and the tick is cleared when the device or the role changes. With the live view on, the page reads the lines on the session's screen through the session's own worker and shows them in a box that scrolls both ways, with control and direction characters made visible. A screen the preview had to cut cannot be shared. If the screen has changed by the time the host writes the invitation, the page shows the lines the host kept and offers Withdraw.
+
+The four actions that change who holds a session (an invitation, an acceptance, a withdrawal or revocation, and a hand-over of control) are attempts, and native code keeps its word about each one. It composes the request and writes it, with the host and the actor it is for, to a directory for each host under `kept-attempts` in the application's data directory, and only then sends it. An answer the host gave comes back to the page as the method's own result and leaves no record. When the answer is lost, the command returns the attempt as unfinished and native code carries on in the background: it asks the host again with the same request on a connection opened for the purpose, up to three times, and then reads the host's state. The page lists an attempt that is not over as unfinished, says until when it can still happen, and offers Ask the host, which is always the person's choice and sends nothing but an exact repeat, and Hide, which takes the row out of view and releases nothing. A second invitation of the same session to the same device, or a second hand-over of the same session, is refused for as long as the first can still happen, whatever was done to its row and across a restart. After a restart nothing is repeated until the person asks. An attempt that did not happen is said to have not happened as far as the host shows, only after the bound that the window sets has passed, and an attempt whose outcome cannot be told is shown as unknown.
+
+A hand-over asks the host to describe the plan and put it to the owner devices, and sends nothing that changes who holds the session. The page holds a reference to it, and the plan, the action and the parameters stay in native code. It asks every second whether an owner device has answered, and when one has, native code checks that the plan the host described names the session, the grant and the receiving device that were asked for, and sends the transfer once. A hand-over that has not been answered when its challenge runs out is shown as that, and Ask again starts a new one.
 
 ## The design system
 
