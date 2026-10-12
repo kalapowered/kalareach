@@ -504,7 +504,9 @@ impl Controller {
         }
         let policy = Arc::new(std::sync::Mutex::new(policy));
         let mut feed = match sharing.grants().stored_feed()? {
-            Some(stored) => crate::grants::AuthorityFeed::restore(&stored),
+            Some(stored) => {
+                crate::grants::AuthorityFeed::restore(&stored, started.authority.origin())
+            }
             None => crate::grants::AuthorityFeed::new(host_device_id, authority_revision),
         };
         // The registry is the allocator. A feed restored below it would number its next entry with

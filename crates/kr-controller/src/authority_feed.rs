@@ -71,7 +71,7 @@ use kr_transport::reconnect::Backoff;
 use tokio::task::JoinHandle;
 
 use crate::error::{ControllerError, Result};
-use crate::grants::feed::{Beginning, FEED_POLL_INTERVAL_MS, RetainedRevocation};
+use crate::grants::feed::{FEED_POLL_INTERVAL_MS, RetainedRevocation};
 use crate::quiet::{Quiet, Timer};
 use crate::service::Controller;
 use crate::service::remote_revocation::Judged;
@@ -735,12 +735,14 @@ async fn settle(
             Judged::Apply(plan) => plan,
         },
     };
-    let beginning = controller
+    let held = controller
         .authority_feed_begin(
             request.clone(),
+            &shared.origin,
             AuthorityRevision::new(latest.revision),
             now,
         )
+        .await
         .map_err(Stopped::local)?;
     let applied = CARRYING_OUT
         .scope((), controller.apply_feed_plan(&plan))
@@ -748,18 +750,19 @@ async fn settle(
         .map_err(Stopped::local)?;
     #[cfg(feature = "testing")]
     controller.feed_request_was_carried_out().await;
-    if beginning == Beginning::New && !applied.changed {
-        // The owner at this machine had already withdrawn what it names. There is no revision to
-        // issue for a request that changed nothing, and the registry is the one allocator.
+    // A request is numbered when it takes effect. One not numbered yet that left the registry
+    // where it stood when the host began to take it withdrew nothing: the owner at this machine,
+    // or an earlier request, had already withdrawn what it names. There is no revision to issue
+    // for it, and the registry is the one allocator. This holds however the host was interrupted
+    // since it began, because it compares the registry with what it was then.
+    let numbered = held.authority_revision.is_some();
+    if !numbered && applied.revision <= held.registry_revision {
         return refuse(shared, controller, id, RejectionReason::Superseded, latest).await;
     }
     // This host numbers what it issues from the registry, and the feed takes only a number above
     // the one it holds. A request not numbered yet therefore needs the registry past the feed; a
     // request already numbered is issued again under its own number, and needs only that the
     // registry has not fallen behind the feed.
-    let numbered = noted
-        .as_ref()
-        .is_some_and(|held| held.authority_revision.is_some());
     let behind = if numbered {
         latest.revision > applied.revision.get()
     } else {
@@ -773,11 +776,11 @@ async fn settle(
     // A request is numbered once, by the registry's revision when it took effect, and issued under
     // that number whatever the feed has been issued since: the feed takes the same record again as
     // the revision that already stands.
-    let held = controller
+    let taken = controller
         .authority_feed_took_effect(id, applied.revision)
         .map_err(Stopped::local)?;
-    let number = held.authority_revision.unwrap_or(applied.revision);
-    let revision = revision_record(shared, &held, number, id)?;
+    let number = taken.authority_revision.unwrap_or(applied.revision);
+    let revision = revision_record(shared, &taken, number, id)?;
     let state = shared
         .client
         .revise(&revision, None)
