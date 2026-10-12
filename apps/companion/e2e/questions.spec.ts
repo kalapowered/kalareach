@@ -113,6 +113,10 @@ for (const surface of ['ios', 'android'] as const) {
       expect(await widerThanItself(), 'the measure sees a title that cannot wrap').toBe(true)
       await page.addStyleTag({ content: '.dialog-header h2, .dialog-header p { white-space: normal !important }' })
       expect(await widerThanItself(), 'with the title wrapping again, the sheet holds everything').toBe(false)
+      // A label long enough to be wider than any face makes it, kept from wrapping.
+      await page.locator('.dialog-footer .btn').evaluate((button) => {
+        button.textContent = 'Open the session and read everything it has said so far in full'
+      })
       await page.addStyleTag({ content: '.dialog-footer .btn { white-space: nowrap !important }' })
       expect(await widerThanItself(), 'the measure sees a footer label that cannot wrap').toBe(true)
     })
