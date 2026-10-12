@@ -46,7 +46,7 @@ use kr_protocol::error::RetryCategory;
 use kr_protocol::ids::{ActionId, GrantId};
 use kr_protocol::method::Method;
 use kr_protocol::scalars::{Nullable, TimestampMs};
-use kr_protocol::sharing::GrantState;
+use kr_protocol::sharing::{GrantState, GrantTransferParams};
 use serde::{Deserialize, Serialize};
 
 use crate::error::ClientError;
@@ -309,15 +309,26 @@ impl Attempt {
         }
     }
 
-    /// Shortens the bound to what is left of a challenge's lifetime, for a transfer: the host
-    /// refuses an expired confirmation inside the transaction, so once the challenge has run out
-    /// nothing can commit, whatever the window says.
+    /// Shortens the bound to what is left of a challenge's lifetime, for a transfer a client
+    /// sends in one process: the host refuses an expired confirmation inside the transaction, so
+    /// once the challenge has run out nothing can commit, whatever the window says.
     ///
-    /// The bound is counted from the moment the attempt's clock is armed, which is when the
-    /// transfer is composed, so `left` is what the challenge has left *at that moment*: its
-    /// lifetime less the time since its reply arrived. Counted from any earlier moment the bound
-    /// would end before the challenge does.
-    pub fn bound_by_challenge(&mut self, left: Duration) {
+    /// `challenge_answered` is the clock the caller started when the challenge's reply arrived,
+    /// and the bound counts what is left of the challenge's lifetime on it. The bound itself is
+    /// counted from the moment the attempt's clock is armed, which is when the transfer is
+    /// composed, after the reply, so the bound never ends before the challenge does. A caller
+    /// cannot give a duration of its own: the lifetime is the host's own.
+    pub fn bound_by_challenge(&mut self, challenge_answered: Armed) {
+        self.shortened_to(Self::challenge_left(challenge_answered.elapsed()));
+    }
+
+    /// What a challenge has left, `since_challenge` after its reply arrived.
+    fn challenge_left(since_challenge: Duration) -> Duration {
+        Duration::from_millis(kr_pairing::confirm::CONFIRMATION_LIFETIME_MS)
+            .saturating_sub(since_challenge)
+    }
+
+    fn shortened_to(&mut self, left: Duration) {
         let by_challenge = u64::try_from(left.as_millis())
             .unwrap_or(u64::MAX)
             .saturating_add(MARGIN_MS);
@@ -365,7 +376,9 @@ impl Attempt {
     /// counted from before the challenge existed.
     ///
     /// Returns false, changing nothing, for an attempt that is not a hand-over being asked for, for
-    /// a request that is not a `grant.transfer` under this record's action, and for a plan that
+    /// a request that is not a `grant.transfer` under this record's action, for one whose
+    /// parameters or target name another session, grant or device than the plan the owner
+    /// confirmed, for one that states another host or actor than the record's, and for a plan that
     /// would write another grant than this record looks for.
     #[must_use]
     pub fn confirmed(
@@ -388,11 +401,15 @@ impl Attempt {
             || transfer.action_id() != self.action_id
             || transfer.request().method != Method::GrantTransfer.into()
             || self.grant_id != Nullable::some(plan.new_grant_id)
+            || !Self::is_the_plan(transfer.request(), &plan)
+            || self
+                .reach()
+                .zip(transfer.reach())
+                .is_some_and(|(was, is)| was != *is)
         {
             return false;
         }
-        let left = Duration::from_millis(kr_pairing::confirm::CONFIRMATION_LIFETIME_MS)
-            .saturating_sub(since_challenge);
+        let left = Self::challenge_left(since_challenge);
         self.request = transfer.request().clone();
         self.window_issued_at_ms = transfer.window_issued_at_ms();
         self.window_valid_for_ms = transfer.window_valid_for_ms();
@@ -402,11 +419,26 @@ impl Attempt {
         self.host = host;
         self.standing = standing;
         self.bound_ms = transfer.window_valid_for_ms().saturating_add(MARGIN_MS);
-        self.bound_by_challenge(left);
+        self.shortened_to(left);
         self.plan = Nullable::some(plan);
         self.repeats = 0;
         self.phase = Phase::Composed;
         true
+    }
+
+    /// Whether a `grant.transfer` request is for exactly what the owner confirmed: its target and
+    /// its parameters name the plan's environment, session, giving grant and receiving device.
+    fn is_the_plan(request: &MutationRequest, plan: &TransferControlPlan) -> bool {
+        request.target.environment_id == plan.environment_id
+            && request.target.session_id == Nullable::some(plan.session_id)
+            && request
+                .params
+                .to_typed::<GrantTransferParams>()
+                .is_ok_and(|params| {
+                    params.session_id == plan.session_id
+                        && params.from_grant_id == plan.source_grant_id
+                        && params.to_device_id == plan.to_device_id
+                })
     }
 
     /// The request, to send again.
@@ -567,19 +599,36 @@ impl Attempt {
 /// It is not kept. A restart arms a new one, so the whole bound runs again from the restart, which
 /// can only make a read that finds nothing wait longer.
 #[derive(Clone, Copy, Debug)]
-pub struct Armed(Instant);
+pub struct Armed {
+    from: Instant,
+    /// Time added to what the clock reads, by a caller that has to pass a bound without waiting.
+    ahead: Duration,
+}
 
 impl Armed {
     /// Arms a clock now.
     #[must_use]
     pub fn now() -> Self {
-        Self(Instant::now())
+        Self {
+            from: Instant::now(),
+            ahead: Duration::ZERO,
+        }
+    }
+
+    /// The same clock reading `by` more than it does. It only ever adds time, which waiting adds
+    /// as well; a test that has to pass a bound without waiting is the one caller that needs it.
+    #[must_use]
+    pub fn skewed(self, by: Duration) -> Self {
+        Self {
+            ahead: self.ahead.saturating_add(by),
+            ..self
+        }
     }
 
     /// The time since it was armed.
     #[must_use]
     pub fn elapsed(&self) -> Duration {
-        self.0.elapsed()
+        self.from.elapsed().saturating_add(self.ahead)
     }
 
     /// The moment a read of the host is about to be sent. Take it before the read leaves, and give
@@ -953,7 +1002,7 @@ mod tests {
             );
         }
         let mut challenge = attempt(Kind::Transfer);
-        challenge.bound_by_challenge(Duration::from_secs(120));
+        challenge.shortened_to(Duration::from_secs(120));
         assert_eq!(challenge.bound(), Duration::from_secs(150));
         assert_eq!(
             challenge.after_read(Found::Absent, at(150)),
@@ -1238,14 +1287,25 @@ mod tests {
         }
     }
 
-    /// A request for `method` under `action`, as the tests below compose them.
+    /// A request for `method` under `action`, as the tests below compose them. A transfer is for
+    /// what `plan()` describes.
     fn request_of(method: Method, action: ActionId) -> MutationRequest {
-        MutationRequest {
+        let mut request = MutationRequest {
             method: method.into(),
             method_version: method.entry().version,
             action_id: action,
             ..request()
+        };
+        if method == Method::GrantTransfer {
+            request.target.session_id = Nullable::some(plan().session_id);
+            request.params = ParamsValue::from_typed(&GrantTransferParams {
+                session_id: plan().session_id,
+                from_grant_id: plan().source_grant_id,
+                to_device_id: plan().to_device_id,
+            })
+            .expect("parameters");
         }
+        request
     }
 
     /// A hand-over still asking for its confirmation has nothing to send, so no answer moves it;
@@ -1322,24 +1382,67 @@ mod tests {
             other_plan,
             waited
         ));
+        // A transfer, validly encoded, of another session, another giving grant or another
+        // receiving device than the plan the owner confirmed.
+        let of_the_params = |change: &dyn Fn(&mut GrantTransferParams)| {
+            let mut request = request_of(Method::GrantTransfer, transfer_action);
+            let mut params = request
+                .params
+                .to_typed::<GrantTransferParams>()
+                .expect("params");
+            change(&mut params);
+            request.params = ParamsValue::from_typed(&params).expect("parameters");
+            ComposedMutation::restored(request, 5_000, 300_000, None)
+        };
+        for other in [
+            of_the_params(&|params| {
+                params.session_id = SessionId::new(Uuid::from_bytes([0x77; 16]))
+            }),
+            of_the_params(&|params| {
+                params.from_grant_id = GrantId::new(Uuid::from_bytes([0x78; 16]))
+            }),
+            of_the_params(&|params| {
+                params.to_device_id = DeviceId::new(Uuid::from_bytes([0x79; 16]))
+            }),
+        ] {
+            assert!(!asking.confirmed_after(&other, plan(), waited));
+        }
+        let mut elsewhere = request_of(Method::GrantTransfer, transfer_action);
+        elsewhere.target.session_id = Nullable::some(SessionId::new(Uuid::from_bytes([0x7a; 16])));
+        assert!(!asking.confirmed_after(
+            &ComposedMutation::restored(elsewhere, 5_000, 300_000, None),
+            plan(),
+            waited
+        ));
+        // One that states a host or an actor other than the confirmation's.
+        assert!(!asking.confirmed_after(
+            &ComposedMutation::restored(
+                request_of(Method::GrantTransfer, transfer_action),
+                5_000,
+                300_000,
+                Some(Reach {
+                    host: "host-1".to_owned(),
+                    actor: "device:another".to_owned(),
+                }),
+            ),
+            plan(),
+            waited
+        ));
         assert_eq!(asking, before);
 
         // The challenge, 120 seconds long, was answered 50 seconds before the transfer was
         // composed, so 70 seconds of it are left then. A transfer that states a reach is repeated
         // as that reach.
-        let host = Reach {
-            host: "host-2".to_owned(),
-            actor: "local:501".to_owned(),
-        };
+        let stated_reach = reach();
         let transfer = ComposedMutation::restored(
             request_of(Method::GrantTransfer, transfer_action),
             5_000,
             300_000,
-            Some(host.clone()),
+            Some(stated_reach.clone()),
         );
         let mut stated = asking.clone();
         assert!(stated.confirmed_after(&transfer, plan(), waited));
-        assert_eq!(stated.reach(), Some(host));
+        assert_eq!(stated.reach(), Some(stated_reach));
         assert!(asking.confirmed_after(
             &composed(Method::GrantTransfer, transfer_action),
             plan(),
@@ -1414,6 +1517,21 @@ mod tests {
         assert!(asking.confirmed(&transfer, plan(), Armed::now()));
         assert!(asking.bound() <= Duration::from_secs(150));
         assert!(asking.bound() > Duration::from_secs(149));
+    }
+
+    /// A transfer a client sends in one process is bounded by what is left of the challenge on the
+    /// clock started when its reply arrived, and the lifetime is the host's own.
+    #[test]
+    fn a_transfer_sent_in_one_process_is_bounded_by_the_challenge_on_the_clock_it_is_given() {
+        let mut transfer = attempt(Kind::Transfer);
+        assert_eq!(transfer.bound(), Duration::from_secs(330));
+        transfer.bound_by_challenge(Armed::now());
+        assert!(transfer.bound() <= Duration::from_secs(150));
+        assert!(transfer.bound() > Duration::from_secs(149));
+        // A challenge answered long ago leaves only the margin.
+        let mut late = attempt(Kind::Transfer);
+        late.bound_by_challenge(Armed::now().skewed(Duration::from_secs(500)));
+        assert_eq!(late.bound(), Duration::from_secs(30));
     }
 
     /// A hand-over still asking is kept under the transfer's action and read back as it was,
@@ -1632,7 +1750,7 @@ mod tests {
     fn a_closed_hand_over_with_its_plan_is_the_format_too() {
         let mut kept = attempt(Kind::Transfer);
         kept.plan = Nullable::some(plan());
-        kept.bound_by_challenge(Duration::from_secs(70));
+        kept.shortened_to(Duration::from_secs(70));
         kept.after_first_send(Reply::Lost);
         kept.after_repeat(Reply::Refused(RetryCategory::Transient));
         kept.after_read(Found::Present, at(0));
