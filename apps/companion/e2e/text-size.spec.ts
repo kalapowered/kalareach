@@ -281,11 +281,13 @@ test.describe('at the largest text size on a screen 320 points wide', () => {
       const earlier = page.getByTestId('earlier-actions')
       await expect(earlier).toBeVisible()
       await expect(earlier).toContainText('Outcome unknown')
-      // The start of each part of the entry can be scrolled to, and is not under the bar at the foot
-      // of the screen.
+      // The start of each part of the entry can be scrolled to, as a person scrolls the composer, and
+      // is not under the bar at the foot of the screen.
       for (const part of [earlier.locator('.badge'), earlier.locator('li > span').last()]) {
         const covered = await part.evaluate((element) => {
-          element.scrollIntoView({ block: 'start' })
+          const composer = element.closest('.m-composer')
+          if (composer === null) return true
+          composer.scrollTop += element.getBoundingClientRect().top - composer.getBoundingClientRect().top
           const box = element.getBoundingClientRect()
           const top = document.elementFromPoint(box.left + box.width / 2, box.top + 4)
           return top === null || !element.contains(top)
