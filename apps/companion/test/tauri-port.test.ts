@@ -588,3 +588,64 @@ describe('the desktop port and a host that changed', () => {
     expect(heard).toEqual(['1'])
   })
 })
+
+describe('the desktop port and a host being chosen', () => {
+  const at = (host: string, sequence: string) => ({
+    payload: { host, stream_id: 'session_state', sequence, event_type: 'x', payload: null }
+  })
+  const connection = (environment: string | null) => ({
+    payload: { connected: environment !== null, environment_id: environment, reason: null, rights: [], paired: true }
+  })
+
+  it('takes no event of the host it is leaving until the connection names the new one', async () => {
+    const port = tauriPort()
+    const heard: string[] = []
+    await port.subscribe((event) => {
+      heard.push(event.sequence)
+    })
+    await port.onConnection(() => undefined)
+    shell.handlers.get(CONNECTION_EVENT)?.(connection('env-a'))
+    shell.handlers.get(HOST_EVENT)?.(at('env-a', '1'))
+
+    // The host is chosen: the connection says nothing yet, and the old host's events are not heard.
+    let answer: (state: unknown) => void = () => undefined
+    shell.answers.set(
+      'hosts_use',
+      new Promise((resolve) => {
+        answer = resolve
+      })
+    )
+    const choosing = port.hostsUse('host-b')
+    shell.handlers.get(HOST_EVENT)?.(at('env-a', '2'))
+    shell.handlers.get(CONNECTION_EVENT)?.(connection('env-b'))
+    shell.handlers.get(HOST_EVENT)?.(at('env-b', '3'))
+    answer(connection('env-b').payload)
+    await choosing
+    expect(heard).toEqual(['1', '3'])
+  })
+
+  it('keeps what the connection said when a read made before it answers after it', async () => {
+    const port = tauriPort()
+    const heard: string[] = []
+    await port.subscribe((event) => {
+      heard.push(event.sequence)
+    })
+    await port.onConnection(() => undefined)
+    let answer: (state: unknown) => void = () => undefined
+    shell.answers.set(
+      'connection_state',
+      new Promise((resolve) => {
+        answer = resolve
+      })
+    )
+    const reading = port.connectionState()
+    // The connection names the next host while the read is on its way, and the read then answers with
+    // the host before.
+    shell.handlers.get(CONNECTION_EVENT)?.(connection('env-b'))
+    answer(connection('env-a').payload)
+    await reading
+    shell.handlers.get(HOST_EVENT)?.(at('env-a', '1'))
+    shell.handlers.get(HOST_EVENT)?.(at('env-b', '2'))
+    expect(heard).toEqual(['2'])
+  })
+})

@@ -182,7 +182,7 @@ describe('what a screen may do is what the host decided for its opening', () => 
     })
   })
 
-  it('offers what a share holds although the pairing holds less, and what the host removes from a pairing at once', async () => {
+  it('offers what a share holds although the pairing holds less', async () => {
     const { port, controls } = fakeHost()
     controls.setRights(['session.view'])
     controls.standings.answerOpens(SESSION_MAIN, share(['session.view', 'agent.prompt']))
@@ -295,7 +295,7 @@ describe('an opening that is over', () => {
     })
     const banner = await screen.findByTestId('standing-banner')
     expect(banner).toHaveTextContent('This share ended')
-    expect(banner).toHaveTextContent('It was scheduled to end at')
+    expect(banner).toHaveTextContent('It was scheduled to end on')
   })
 
   it('says a closed session in its own words', async () => {
@@ -514,5 +514,333 @@ describe('an answer that comes after the screen opened the session again', () =>
     expect(
       host.controls.standings.carried.filter((call) => call.command === 'composerSubmit')
     ).toEqual([{ command: 'composerSubmit', sessionId: SESSION_MAIN, opening: stale }])
+  })
+})
+
+describe('what a refused read does to what was read', () => {
+  it('shows the refusal above the entries it did not hide, and drops it once the opening is over', async () => {
+    const { port, controls } = fakeHost()
+    let refusing = false
+    render(
+      screenOn({
+        ...port,
+        agentSnapshot: (params, opening) =>
+          refusing
+            ? Promise.reject({ code: 'RESOURCE_UNAVAILABLE', message: 'The link failed as it closed.' })
+            : port.agentSnapshot(params, opening)
+      })
+    )
+    await screen.findByText(FIRST_ENTRY)
+
+    refusing = true
+    act(() => {
+      controls.setConnected(true)
+    })
+    expect(await screen.findByText('This conversation could not be read')).toBeInTheDocument()
+    expect(screen.getByText(FIRST_ENTRY)).toBeInTheDocument()
+
+    // The share ends while that read is the newest: what was read stays, and nothing says it could not be.
+    act(() => {
+      controls.standings.say(SESSION_MAIN, { state: 'ended', reason: 'revoked' })
+    })
+    await screen.findByTestId('standing-banner')
+    expect(screen.getByText(FIRST_ENTRY)).toBeInTheDocument()
+    expect(screen.queryByText('This conversation could not be read')).toBeNull()
+  })
+
+  it('shows nothing of an earlier opening’s refusal under the opening that replaced it', async () => {
+    const { port, controls } = fakeHost()
+    const known: { first?: string } = {}
+    let refusing = false
+    const asking: HostPort = {
+      ...port,
+      sessionAgents: (sessionId, opening) => {
+        if (opening !== undefined && opening === known.first && refusing) {
+          return Promise.reject({ code: 'RESOURCE_UNAVAILABLE', message: 'The link failed as it closed.' })
+        }
+        // The second opening's own read does not answer, so nothing it read can replace the refusal.
+        if (known.first !== undefined && opening !== known.first) return new Promise(() => undefined)
+        return port.sessionAgents(sessionId, opening)
+      }
+    }
+    const view = render(screenOn(asking))
+    await screen.findByText(FIRST_ENTRY)
+    known.first = controls.standings.tokenOf(SESSION_MAIN)
+    refusing = true
+    act(() => {
+      controls.setConnected(true)
+    })
+    expect(await screen.findByText('This conversation could not be read')).toBeInTheDocument()
+
+    controls.standings.answerOpens(SESSION_MAIN, share(['session.view']))
+    view.rerender(screenOn(asking, SHARE))
+    await waitFor(() => {
+      expect(controls.standings.opens).toHaveLength(2)
+    })
+    await waitFor(() => {
+      expect(controls.standings.tokenOf(SESSION_MAIN)).not.toBe(known.first)
+    })
+    expect(screen.queryByText('This conversation could not be read')).toBeNull()
+  })
+})
+
+describe('contact with a session being taken up again', () => {
+  it('says contact was lost, not that the connection came back, while an action is unresolved', async () => {
+    const person = userEvent.setup()
+    const { port, controls } = fakeHost()
+    render(screenOn(port))
+    await screen.findByText(FIRST_ENTRY)
+    controls.holdMutation()
+    await person.type(screen.getByLabelText('Message this session'), 'hold')
+    await person.click(screen.getByRole('button', { name: 'Send' }))
+    await waitFor(() => {
+      expect(controls.submissions).toBe(1)
+    })
+
+    act(() => {
+      controls.standings.say(SESSION_MAIN, { state: 'reconnecting', reason: 'lost' })
+    })
+    expect(await screen.findByText('Not in contact with this host')).toBeInTheDocument()
+    expect(screen.queryByText('Connected again')).toBeNull()
+  })
+})
+
+describe('the terminal under an opening', () => {
+  it('says no terminal is shown, and not that it is attaching, once the opening is over', async () => {
+    const person = userEvent.setup()
+    const { port, controls } = fakeHost()
+    controls.standings.answerOpens(SESSION_MAIN, share(['session.view']))
+    render(screenOn(port, SHARE))
+    await screen.findByText(FIRST_ENTRY)
+    act(() => {
+      controls.standings.say(SESSION_MAIN, { state: 'ended', reason: 'revoked' })
+    })
+    await screen.findByTestId('standing-banner')
+    await person.click(screen.getByRole('tab', { name: 'Terminal' }))
+    expect(await screen.findByTestId('terminal-unavailable')).toHaveTextContent(
+      'no longer open here'
+    )
+    expect(screen.queryByTestId('terminal-presentation')).toBeNull()
+    expect(controls.terminalViews).toHaveLength(0)
+  })
+
+  it('shows nothing of another opening’s screen under the new opening', async () => {
+    const person = userEvent.setup()
+    const { port, controls } = fakeHost()
+    controls.standings.answerOpens(SESSION_MAIN, share(['session.view', 'terminal.input']))
+    const view = render(screenOn(port, SHARE))
+    await screen.findByText(FIRST_ENTRY)
+    await person.click(screen.getByRole('tab', { name: 'Terminal' }))
+    await waitFor(() => {
+      expect(screen.getAllByTestId('mobile-terminal-line').length).toBeGreaterThan(0)
+    })
+
+    // Another opening of the session, whose own view has not drawn yet.
+    controls.holdTerminalViews()
+    controls.standings.answerOpens(SESSION_MAIN, share(['session.view', 'terminal.input']))
+    view.rerender(screenOn(port, null))
+    await waitFor(() => {
+      expect(controls.standings.opens).toHaveLength(2)
+    })
+    await waitFor(() => {
+      expect(controls.terminalViews.length).toBeGreaterThan(1)
+    })
+    expect(screen.queryAllByTestId('mobile-terminal-line')).toHaveLength(0)
+  })
+
+  it('gives back control the opening no longer lets the person use, and stops what the keys send', async () => {
+    const person = userEvent.setup()
+    const { port, controls } = fakeHost()
+    controls.standings.answerOpens(SESSION_MAIN, share(['session.view', 'terminal.input']))
+    render(screenOn(port, SHARE))
+    await screen.findByText(FIRST_ENTRY)
+    await person.click(screen.getByRole('tab', { name: 'Terminal' }))
+    await waitFor(() => {
+      expect(screen.getAllByTestId('mobile-terminal-line').length).toBeGreaterThan(0)
+    })
+    await person.click(screen.getByRole('button', { name: 'Take control' }))
+    act(() => {
+      controls.terminalViews[0]?.grantControl()
+    })
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'Escape' })).toBeEnabled()
+    })
+
+    // The host's decision changes under a lease the person holds.
+    act(() => {
+      controls.standings.say(SESSION_MAIN, share(['session.view']))
+    })
+    // The keys are off as soon as the standing changes.
+    expect(screen.getByRole('button', { name: 'Escape' })).toBeDisabled()
+    await waitFor(() => {
+      expect(controls.terminalViews[0]?.inputs.at(-1)?.kind).toBe('release')
+    })
+  })
+})
+
+describe('the rights a pairing and a share hold', () => {
+  it('gives a pairing what the connection holds and a share what the share holds', async () => {
+    const { rightsOf } = await import('../../src/model/openings')
+    const open = (via: 'pairing' | 'share', actions: ActionRight[]) => ({
+      token: 't',
+      grantId: null,
+      standing: { ...share(actions), via } as SessionStanding,
+      held: null,
+      heardAtMs: 0,
+      told: 1
+    })
+    const narrow: readonly ActionRight[] = ['session.view']
+    const wide: readonly ActionRight[] = ['session.view', 'agent.prompt']
+    // A pairing's opening is narrowed by the connection, and unknown while the connection is.
+    expect(rightsOf(open('pairing', ['session.view', 'agent.prompt']), narrow)).toEqual(['session.view'])
+    expect(rightsOf(open('pairing', ['session.view', 'agent.prompt']), null)).toBeNull()
+    // A share's rights are its own, whatever the connection holds.
+    expect(rightsOf(open('share', ['session.view', 'agent.prompt']), narrow)).toEqual(wide)
+    expect(rightsOf(open('share', ['session.view', 'agent.prompt']), null)).toEqual(wide)
+  })
+})
+
+describe('answers that arrive out of order', () => {
+  it('takes no answer to an open of an opening it has replaced', async () => {
+    const { port, controls } = fakeHost()
+    controls.standings.answerOpens(SESSION_MAIN, { state: 'ended', reason: 'revoked' })
+    const held = controls.hold('openSession')
+    const view = render(screenOn(port, SHARE))
+    await waitFor(() => {
+      expect(held.count).toBe(1)
+    })
+    // The screen opens the session again while the first answer is on its way.
+    controls.standings.answerOpens(SESSION_MAIN, share(['session.view', 'agent.prompt']))
+    view.rerender(screenOn(port, null))
+    await waitFor(() => {
+      expect(held.count).toBe(2)
+    })
+    // The second answers first and the first, which says the share ended, after it.
+    await act(async () => {
+      held.answer(1)
+      await new Promise((resolve) => {
+        setTimeout(resolve, 0)
+      })
+    })
+    await screen.findByText(FIRST_ENTRY)
+    await act(async () => {
+      held.answer(0)
+      await new Promise((resolve) => {
+        setTimeout(resolve, 0)
+      })
+    })
+    expect(screen.queryByTestId('standing-banner')).toBeNull()
+  })
+
+  it('takes an event heard before the answer as newer than it', async () => {
+    const { port, controls } = fakeHost()
+    const held = controls.hold('openSession')
+    render(screenOn(port))
+    await waitFor(() => {
+      expect(held.count).toBe(1)
+    })
+    act(() => {
+      controls.standings.say(SESSION_MAIN, { state: 'closed' })
+    })
+    await screen.findByTestId('standing-banner')
+    // The open's own answer, made before the event, comes after it and says the session is open.
+    await act(async () => {
+      held.release()
+      await new Promise((resolve) => {
+        setTimeout(resolve, 0)
+      })
+    })
+    expect(screen.getByTestId('standing-banner')).toHaveTextContent('This session has closed')
+  })
+})
+
+describe('a terminal that ended while its opening stayed open', () => {
+  it('attaches again when the host says the session is open again', async () => {
+    const person = userEvent.setup()
+    const { port, controls } = fakeHost()
+    render(screenOn(port))
+    await screen.findByText(FIRST_ENTRY)
+    await person.click(screen.getByRole('tab', { name: 'Terminal' }))
+    await waitFor(() => {
+      expect(screen.getAllByTestId('mobile-terminal-line').length).toBeGreaterThan(0)
+    })
+    act(() => {
+      controls.terminalViews[0]?.end('The connection to this session ended.')
+    })
+    await screen.findByText('This terminal has ended')
+    expect(controls.terminalViews).toHaveLength(1)
+
+    // Native code asked the host again on the screen's link, and the host says the session is open.
+    act(() => {
+      controls.standings.say(SESSION_MAIN, {
+        state: 'open',
+        via: 'owner',
+        grant_id: '',
+        actions: ['session.view', 'agent.prompt', 'terminal.input'],
+        includes_live_screen: true,
+        history_from_ms: null,
+        ends_at_ms: null
+      })
+    })
+    await waitFor(() => {
+      expect(controls.terminalViews).toHaveLength(2)
+    })
+  })
+})
+
+describe('a result that comes after the screen opened the session again', () => {
+  /** A port whose prompt answers are held by the fake host until the test releases them. */
+  async function sentUnderTheFirst(): Promise<{
+    readonly person: ReturnType<typeof userEvent.setup>
+    readonly view: ReturnType<typeof render>
+    readonly port: HostPort
+    readonly held: ReturnType<ReturnType<typeof fakeHost>['controls']['holdMutation']>
+  }> {
+    const person = userEvent.setup()
+    const host = fakeHost()
+    host.controls.standings.answerOpens(SESSION_MAIN, share(['session.view', 'agent.prompt']))
+    const view = render(screenOn(host.port, SHARE))
+    await screen.findByText(FIRST_ENTRY)
+    const held = host.controls.holdMutation()
+    await person.type(screen.getByLabelText('Message this session'), 'first')
+    await person.click(screen.getByRole('button', { name: 'Send' }))
+    await waitFor(() => {
+      expect(host.controls.submissions).toBe(1)
+    })
+    return { person, view, port: host.port, held }
+  }
+
+  it('clears the draft that still holds what was sent, and labels the record as sent earlier', async () => {
+    const { view, port, held } = await sentUnderTheFirst()
+    view.rerender(screenOn(port, null))
+    await screen.findByText(FIRST_ENTRY)
+    // The first opening's send is taken, late; the composer still holds exactly what was sent.
+    await act(async () => {
+      held.release()
+      await new Promise((resolve) => {
+        setTimeout(resolve, 0)
+      })
+    })
+    await waitFor(() => {
+      expect(screen.getByLabelText('Message this session')).toHaveValue('')
+    })
+    expect(screen.getByTestId('sent-earlier')).toBeInTheDocument()
+    expect(screen.getByTestId('said')).not.toHaveTextContent(/refused/)
+  })
+
+  it('keeps what the person wrote since', async () => {
+    const { person, view, port, held } = await sentUnderTheFirst()
+    view.rerender(screenOn(port, null))
+    await screen.findByText(FIRST_ENTRY)
+    const field = screen.getByLabelText('Message this session')
+    await person.clear(field)
+    await person.type(field, 'second')
+    await act(async () => {
+      held.release()
+      await new Promise((resolve) => {
+        setTimeout(resolve, 0)
+      })
+    })
+    expect(field).toHaveValue('second')
   })
 })

@@ -111,15 +111,31 @@ interface PublishedEvent {
 
 /** Builds the desktop port. */
 export function tauriPort(): HostPort {
-  // The environment of the host the connection last said it was to. An event that names another
-  // host is one that was on its way when the host changed, and is not the new host's.
-  let host: string | null = null
-  const following = (state: ConnectionState): ConnectionState => {
+  // The environment of the host the connection last said it was to: undefined before it has said
+  // anything, null while there is no host, as when one is being chosen. An event that names another
+  // host, or one that comes while there is none, was on its way when the host changed, and is not the
+  // new host's.
+  let host: string | null | undefined
+  // How many times the connection has said something. An answer to a read made before that does not
+  // overwrite what the connection said since.
+  let said = 0
+  const heard = (state: ConnectionState): ConnectionState => {
+    said += 1
     host = state.environment_id
     return state
   }
+  const learned = (at: number) => (state: ConnectionState): ConnectionState => {
+    if (said === at) host = state.environment_id
+    return state
+  }
   const ofThisHost = (published: { readonly host?: string }): boolean =>
-    published.host === undefined || host === null || published.host === host
+    published.host === undefined || host === undefined || published.host === host
+  /** The host is being chosen: nothing the old one sent is the new one's. */
+  const choosing = (): number => {
+    said += 1
+    host = null
+    return said
+  }
 
   const call = <T,>(command: string, args: Record<string, unknown>): Promise<T> =>
     invoke<T>(command, args)
@@ -144,13 +160,15 @@ export function tauriPort(): HostPort {
 
   return {
     // Native code's reason can arrive blank; it is taken in as none, from a read and a change alike.
-    connectionState: () =>
-      call<ConnectionState>('connection_state', {})
+    connectionState: () => {
+      const at = said
+      return call<ConnectionState>('connection_state', {})
         .then(receivedConnection)
-        .then(following),
+        .then(learned(at))
+    },
     onConnection: (listener) =>
       listening<ConnectionState>(CONNECTION_EVENT, (state) => {
-        listener(following(receivedConnection(state)))
+        listener(heard(receivedConnection(state)))
       }),
 
     openSession: (request: OpenRequest) =>
@@ -311,10 +329,18 @@ export function tauriPort(): HostPort {
     voiceSetMuted: (what, muted) => call<VoiceCallState>('voice_set_muted', { what, muted }),
     voiceCallState: () => call<VoiceCallState>('voice_call_state', {}),
 
-    hostsUse: (reference) =>
-      call<ConnectionState>('hosts_use', { reference }).then(receivedConnection).then(following),
-    hostsForget: (reference) =>
-      call<ConnectionState>('hosts_forget', { reference }).then(receivedConnection).then(following),
+    hostsUse: (reference) => {
+      const at = choosing()
+      return call<ConnectionState>('hosts_use', { reference })
+        .then(receivedConnection)
+        .then(learned(at))
+    },
+    hostsForget: (reference) => {
+      const at = choosing()
+      return call<ConnectionState>('hosts_forget', { reference })
+        .then(receivedConnection)
+        .then(learned(at))
+    },
     pairingView: () => call<PairingView>('pairing_view', {}),
     pairingSetOrigin: (origin) => call<PairingOrigin>('pairing_set_origin', { origin }),
     pairingStartCode: (code) => call<undefined>('pairing_start_code', { code }),

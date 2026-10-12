@@ -270,7 +270,13 @@ export function MobileSession({
   }, [port, sessionId])
   const { rights: connectionRights, paired } = useHeldConnection()
   // What this screen may do is what the host decided for its opening.
-  const rights = useMemo(() => rightsOf(opened, connectionRights), [opened, connectionRights])
+  // Nothing is offered before the screen has an opening to ask the host about.
+  const rights = useMemo(
+    () => (opened === undefined ? null : rightsOf(opened, connectionRights)),
+    [opened, connectionRights]
+  )
+  // Taking the program's input is the right the host checks for it; the host decides again.
+  const canControl = rights?.includes('terminal.input') === true
   // A file needs the host on this phone's own computer and the rights, and nothing of the agent.
   const fileOffer = useMemo(
     () => attachOffer({ connected: connected === true, paired, rights: rights === null ? null : new Set(rights) }),
@@ -461,14 +467,24 @@ export function MobileSession({
     controlTake,
     refuse,
     unsent
-  } = useTerminalView(port, sessionId, measure, pane === 'terminal' && showsLiveScreen, token)
+  } = useTerminalView(
+    port,
+    sessionId,
+    measure,
+    pane === 'terminal' && showsLiveScreen,
+    token,
+    canControl
+  )
   const mode = modeOf(control)
   const controlling = control?.state === 'controlling'
-  // Taking the program's input is the right the host checks for it; the host decides again.
-  const canControl = rights?.includes('terminal.input') === true
   const cannotControl = rights !== null && !canControl && !over
+  // A lease the person holds is given back when the opening no longer lets them type: the keys, the
+  // program's keyboard and the wheel all stop with it, and the view says so.
+  useEffect(() => {
+    if (controlling && rights !== null && !rights.includes('terminal.input')) lookAround()
+  }, [controlling, rights, lookAround])
   // While the view controls the program, the field's place holds the program's keyboard.
-  const typingToProgram = pane === 'terminal' && controlling
+  const typingToProgram = pane === 'terminal' && controlling && canControl
 
   // What the terminal keys hold for the next key, which that key takes: a modifier held for one key
   // is let go as it does. Kept at each commit and as each key takes it, so no key reads it stale.
@@ -638,7 +654,9 @@ export function MobileSession({
         sentTo: {
           applicationInstanceId: draft.target.applicationInstanceId,
           agentBindingRevision: draft.target.agentBindingRevision
-        }
+        },
+        opening,
+        grantId: openings.get(sessionId)?.grantId ?? null
       }
       // The revision the person submitted. Anything typed after it is a newer draft, and a late
       // answer about the older one must not take it away.
@@ -784,7 +802,12 @@ export function MobileSession({
       element?.matches('[data-program-keyboard]') === true ||
       element?.id === modeButtonId ||
       attachAgain.held(element),
-    destination: () => document.getElementById(terminalEnded ? attachAgainId : modeButtonId)
+    // An opening that is over has turned the terminal's controls off: the banner that says so is
+    // where the focus goes.
+    destination: () =>
+      over
+        ? document.querySelector<HTMLElement>('[data-testid="standing-banner"]')
+        : document.getElementById(terminalEnded ? attachAgainId : modeButtonId)
   })
 
   const mine = lifecycle.state.submissions.filter((submission) =>
@@ -820,13 +843,15 @@ export function MobileSession({
   // the connection to the host still up, says the same, in the same words, and, as the connection's
   // do, nothing before the shell has answered whether the host is in contact.
   const contact =
-    reconnectBanner(connected, mine) ??
-    (standing?.state === 'reconnecting' && connected !== null ? reconnectBanner(false, mine) : null)
+    standing?.state === 'reconnecting' && connected !== null
+      ? reconnectBanner(false, mine)
+      : reconnectBanner(connected, mine)
   // A submission whose outcome nobody knows is the one case where sending again could run the
   // same thing twice. Until a receipt settles it, this session sends nothing more.
   const waiting = unresolved(mine)
-  const blocked =
-    waiting.length > 0
+  const blocked = over
+    ? 'Nothing more can be sent to this session from here.'
+    : waiting.length > 0
       ? unconfirmedWords(waiting.length)
       : (notSubmittableBecause(draft) ?? (submitOffer.offered ? null : submitOffer.reason))
   // The composer is its line, the field with Send beside it, while the terminal shows and on a
@@ -954,14 +979,22 @@ export function MobileSession({
       </ul>
     )
   const lastState = mine.slice(-1).map((submission) => (
-    <Badge
-      key={submission.localId}
-      tone={
-        submission.state === 'applied' ? 'success' : submission.state === 'queued' ? 'neutral' : 'accent'
-      }
-    >
-      {describeState(submission.state)}
-    </Badge>
+    <span key={submission.localId} className="row" style={{ flexWrap: 'wrap' }}>
+      <Badge
+        tone={
+          submission.state === 'applied' ? 'success' : submission.state === 'queued' ? 'neutral' : 'accent'
+        }
+      >
+        {describeState(submission.state)}
+      </Badge>
+      {submission.opening !== undefined && submission.opening !== token ? (
+        // The result of a send made before the screen opened the session again: it settles its own
+        // record, and says it was sent under the earlier opening.
+        <span className="small muted" data-testid="sent-earlier">
+          Sent under an earlier opening of this session.
+        </span>
+      ) : null}
+    </span>
   ))
 
   return (
@@ -993,8 +1026,14 @@ export function MobileSession({
           record={opened}
           screen={sessionRef}
           target={target}
+          settled={`${terminal?.state ?? ''}|${control?.state ?? ''}|${String(canControl)}`}
           onBack={onBack}
-          onRetry={retry}
+          onRetry={() => {
+            // The banner goes with the retry, and the focus that was on it goes to the pane: a keyboard
+            // is not left on a button that is no longer there.
+            retry()
+            paneRef.current?.focus({ preventScroll: true })
+          }}
         />
         {draftsStatus !== 'memory-only' && draftsProblem === null && lifecycle.durable ? null : (
           <Banner
@@ -1029,7 +1068,7 @@ export function MobileSession({
         />
       </div>
 
-      <div className="m-pane" ref={paneRef} onScroll={remember}>
+      <div className="m-pane" ref={paneRef} tabIndex={-1} onScroll={remember}>
         {pane === 'semantic' ? (
           <div className="m-stream" data-testid="mobile-conversation">
             {historyNotes.length > 0 ? (
@@ -1045,16 +1084,19 @@ export function MobileSession({
                 title="This conversation could not be read"
                 detail={read.refusal}
               />
-            ) : nodes.length === 0 ? (
-              // Before the first answer the conversation is being read, which is not the same as
-              // empty: the view says which it knows.
-              <p className="m-empty">
-                {read
-                  ? 'Nothing in this conversation yet.'
-                  : over
-                    ? 'None of this conversation was read.'
-                    : 'Reading the conversation…'}
-              </p>
+            ) : null}
+            {nodes.length === 0 ? (
+              read !== null && read.refusal !== null ? null : (
+                // Before the first answer the conversation is being read, which is not the same as
+                // empty: the view says which it knows.
+                <p className="m-empty">
+                  {read
+                    ? 'Nothing in this conversation yet.'
+                    : over
+                      ? 'None of this conversation was read.'
+                      : 'Reading the conversation…'}
+                </p>
+              )
             ) : (
               nodes.map((node) => (
                 <div key={node.id} className="m-node" data-kind={node.kind}>
@@ -1083,6 +1125,11 @@ export function MobileSession({
         ) : liveScreen === false ? (
           <p className="m-empty" data-testid="no-live-screen">
             This share does not include the live screen.
+          </p>
+        ) : !showsLiveScreen ? (
+          // No view is attached until the host says the session is open, and none is once it is not.
+          <p className="m-empty" data-testid="terminal-unavailable">
+            {over ? 'The terminal is not shown: this session is no longer open here.' : 'Reaching the session…'}
           </p>
         ) : (
           <>
@@ -1148,7 +1195,7 @@ export function MobileSession({
             lastFocused.current = event.target
           }}
         >
-          {pane === 'terminal' && liveScreen !== false ? (
+          {pane === 'terminal' && liveScreen !== false && showsLiveScreen ? (
             <>
               <div className="m-terminal-hud">
                 <div className="m-terminal-controls">
@@ -1243,7 +1290,7 @@ export function MobileSession({
               <AccessoryRow
                 surface={surface}
                 latch={latch}
-                disabled={!controlling}
+                disabled={!controlling || !canControl}
                 onKey={(key, locks) => {
                   const modifier = key.modifier
                   if (modifier !== undefined) {

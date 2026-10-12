@@ -36,11 +36,17 @@ export function StandingBanner({
   record,
   screen,
   target,
+  settled,
   onBack,
   onRetry
 }: {
   readonly record: OpeningRecord | undefined
   readonly screen: RefObject<HTMLElement | null>
+  /**
+   * Something that changes when the controls the opening's end turns off have been turned off, which
+   * can be a commit after the standing changed: the focus is looked at again then.
+   */
+  readonly settled?: string
   /** The least a finger can be asked to hit, in CSS pixels, for the surface. */
   readonly target: number
   readonly onBack: () => void
@@ -61,8 +67,9 @@ export function StandingBanner({
       lastFocus.current = event.target instanceof Element ? event.target : null
     }
     const dropped = (event: FocusEvent) => {
-      // Focus that moved to something else is that something else's.
-      if (event.relatedTarget !== null) lastFocus.current = null
+      // Focus that the person moved, or let go of, is theirs. Only a control that was turned off
+      // under the focus keeps it here, because a browser may drop the focus from that.
+      if (!turnedOff(event.target instanceof Element ? event.target : null)) lastFocus.current = null
     }
     root.addEventListener('focusin', held)
     root.addEventListener('focusout', dropped)
@@ -83,11 +90,13 @@ export function StandingBanner({
     setShown(true)
     const active = document.activeElement
     const root = screen.current
+    // The banner already has the focus, or the person has gone into it.
+    if (active !== null && element.contains(active)) return
     const was = active === null || active === document.body ? lastFocus.current : active
     if (root !== null && was !== null && root.contains(was) && turnedOff(was)) {
       element.focus({ preventScroll: false })
     }
-  }, [over, record?.standing?.state, screen])
+  }, [over, record?.standing?.state, screen, settled])
 
   return (
     <>

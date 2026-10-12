@@ -196,8 +196,13 @@ export function useTerminalView(
   sessionId: string,
   measure: () => TerminalGrid,
   showing = true,
-  token: string | undefined = undefined
+  token: string | undefined = undefined,
+  mayControl = true
 ): TerminalViewing {
+  // What a view's state belongs to: the session, and under a paired host the opening it runs under.
+  // The last frame, the moves waiting and the control asked for are an opening's: another opening of
+  // the session, under another grant, starts from nothing.
+  const scope = token === undefined ? sessionId : `${sessionId}#${token}`
   const [attempt, setAttempt] = useState(0)
   // Each state with the opening it came from: the session and the attempt.
   const [held, setHeld] = useState<{
@@ -240,13 +245,13 @@ export function useTerminalView(
     readonly take: number
     readonly words: string
   } | null>(null)
-  const ownMoves = waitingMoves?.sessionId === sessionId && waitingMoves.attempt === attempt
+  const ownMoves = waitingMoves?.sessionId === scope && waitingMoves.attempt === attempt
   const pending = ownMoves ? waitingMoves.moves : NO_MOVES
   const movingSince = ownMoves ? waitingMoves.since : null
 
-  const state = held?.sessionId === sessionId && held.attempt === attempt ? held.state : null
-  const stamp = held?.sessionId === sessionId && held.attempt === attempt ? held.stamp : 0
-  const frame = framed?.sessionId === sessionId ? framed.screen : null
+  const state = held?.sessionId === scope && held.attempt === attempt ? held.state : null
+  const stamp = held?.sessionId === scope && held.attempt === attempt ? held.stamp : 0
+  const frame = framed?.sessionId === scope ? framed.screen : null
   const frameNow = useRef(frame)
   useEffect(() => {
     frameNow.current = frame
@@ -266,7 +271,7 @@ export function useTerminalView(
       grid: measuring.current(),
       view: null,
       owed: false,
-      sessionId,
+      sessionId: scope,
       attempt,
       number: 0,
       pending: [],
@@ -284,11 +289,11 @@ export function useTerminalView(
         (next) => {
           if (!current) return
           stamps.current += 1
-          setHeld({ sessionId, attempt, stamp: stamps.current, state: next })
+          setHeld({ sessionId: scope, attempt, stamp: stamps.current, state: next })
           if (next.state === 'showing') {
             // Held at once as well, so a move made before the next render measures from this frame.
             frameNow.current = next.screen
-            setFramed({ sessionId, screen: next.screen })
+            setFramed({ sessionId: scope, screen: next.screen })
           }
           // What native code has settled goes, with the frame that holds it; an end settles all, and
           // the view takes no move after it.
@@ -313,7 +318,7 @@ export function useTerminalView(
           open.ended = true
           stamps.current += 1
           setHeld({
-            sessionId,
+            sessionId: scope,
             attempt,
             stamp: stamps.current,
             state: { state: 'ended', reason: failureMessage(failure) }
@@ -334,7 +339,7 @@ export function useTerminalView(
       setAskedControl(null)
       setUnsentInput(null)
     }
-  }, [port, sessionId, attempt, showing, keepMoves, token])
+  }, [port, sessionId, scope, attempt, showing, keepMoves, token])
 
   const resize = useCallback((grid: TerminalGrid) => {
     const open = opening.current
@@ -398,7 +403,15 @@ export function useTerminalView(
     })
   }, [])
 
+  // Whether the opening this view runs under lets the person take and use control now, kept at each
+  // commit: a lease taken before the rights went is not used after.
+  const mayNow = useRef(mayControl)
+  useLayoutEffect(() => {
+    mayNow.current = mayControl
+  }, [mayControl])
+
   const takeControl = useCallback(() => {
+    if (!mayNow.current) return
     // Control mode shows the program's live screen: a window in the history comes back first.
     live()
     ask(true)
@@ -410,7 +423,7 @@ export function useTerminalView(
 
   const published = state?.state === 'waiting' || state?.state === 'showing' ? state.control : null
   const asked =
-    askedControl?.sessionId === sessionId && askedControl.attempt === attempt ? askedControl.asked : NOTHING_ASKED
+    askedControl?.sessionId === scope && askedControl.attempt === attempt ? askedControl.asked : NOTHING_ASKED
   const control = published === null ? null : shownControl(published, asked)
   // Kept at each commit, so no event after it reads the control before it.
   const controlNow = useRef(control)
@@ -421,6 +434,7 @@ export function useTerminalView(
   const controlTake = useCallback((): number | null => {
     const open = opening.current
     const shown = controlNow.current
+    if (!mayNow.current) return null
     if (open?.view == null || open.ended || shown?.state !== 'controlling') return null
     return shown.number === open.asked.number && open.asked.take ? open.asked.number : null
   }, [])
@@ -471,7 +485,7 @@ export function useTerminalView(
 
   const unsent =
     unsentInput !== null &&
-    unsentInput.sessionId === sessionId &&
+    unsentInput.sessionId === scope &&
     unsentInput.attempt === attempt &&
     control?.state === 'controlling' &&
     control.number === unsentInput.take
@@ -538,7 +552,7 @@ export function useTerminalView(
     slow: waitingOnAFrame && slowStamp === stamp,
     resize,
     again,
-    openingKey: `${sessionId}:${attempt}`,
+    openingKey: `${scope}:${attempt}`,
     shift: frame === null ? STILL : replay(frame, pending),
     room: frame === null || state?.state === 'ended' ? null : roomLeft(frame, pending),
     moving,

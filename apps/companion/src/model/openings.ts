@@ -169,6 +169,11 @@ function clock(ms: number): string {
   return new Date(ms).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })
 }
 
+/** The day and time a share was scheduled to end, as a person reads it. */
+function scheduledFor(ms: number): string {
+  return new Date(ms).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' })
+}
+
 /**
  * The words for a standing that is over, or null for one that is not.
  *
@@ -186,7 +191,7 @@ export function wordsFor(record: OpeningRecord): StandingWords | null {
           ? 'The person who shared it stopped sharing it.'
           : scheduled === null
             ? 'It reached its end.'
-            : `It was scheduled to end at ${clock(scheduled)}.`
+            : `It was scheduled to end on ${scheduledFor(scheduled)}.`
       return {
         tone: 'warning',
         title: 'This share ended',

@@ -30,6 +30,14 @@ export interface Submission {
    * back, and the label above is a trimmed thing to show rather than the text itself.
    */
   readonly text: string
+  /**
+   * The opening of its session the submission was made under, when it was made under one: a result
+   * that comes after the screen opened the session again settles this record, and is told apart from
+   * the current opening's by this.
+   */
+  readonly opening?: string
+  /** The share that opening ran under, or null for the pairing. */
+  readonly grantId?: string | null
   /** Its current state. */
   readonly state: InputState
   /** The revision of the newest receipt this has taken, so that an older one never replaces it. */

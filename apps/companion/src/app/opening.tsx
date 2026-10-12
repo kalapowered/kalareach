@@ -88,6 +88,21 @@ export function useSessionOpening(sessionId: string, grantId: string | null): Op
         )
       })
       .catch(() => undefined)
+    // A listener that could not be registered leaves nothing to hear the host with: the screen says so
+    // and does not wait on words that cannot come.
+    listening.catch(() => {
+      if (!live || heard) return
+      openings.apply(
+        sessionId,
+        token,
+        {
+          state: 'refused',
+          code: 'REQUEST_FAILED',
+          message: 'This device could not listen for what the host says of this session.'
+        },
+        Date.now()
+      )
+    })
     return () => {
       live = false
       void listening.then((stop) => {
