@@ -2422,8 +2422,9 @@ impl kr_transport::clock::ContinuousClock for WatchedClock {
 /// offline bound runs out during that wait, so the decision that follows it is a refusal rather
 /// than the permission the clock gave before the wait. The daemon runs on clocks this test moves
 /// by hand: the continuous clock moves once the decision has taken its reading and before storage
-/// is let go, so no real time bears on any step, however slow the machine is. Nothing here reads
-/// the machine's clocks and nothing sleeps.
+/// is let go, so the machine's speed bears on no step but one. The daemon's write waits at most
+/// five seconds for storage, and the test lets storage go within one wake of moving the clock.
+/// Nothing here reads the machine's clocks and nothing sleeps.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_deadline_that_passes_while_the_floor_is_written_is_decided_after_the_write() {
     use kr_automation::{AuthoritySource, AutomationError};
