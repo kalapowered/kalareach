@@ -7,14 +7,19 @@
 //! the service has not yet answered.
 //!
 //! A row is written before the request that may create its lease is sent, with no lease identifier
-//! in it. The service answers a request for a pair that already holds a lease with that lease, so
-//! asking again after a restart is how the host learns the identifier a lost answer carried.
+//! in it and the time it was written. The service answers a request for a pair that already holds a
+//! lease with that lease, so asking again after a restart is how the host learns the identifier a
+//! lost answer carried. Such a row is kept until the longest a lease can live has passed since it
+//! was written, because until then the pair may still hold a lease the host has not been told of.
 //!
-//! Everything in the record belongs to one service. The record names the origin it was kept for,
-//! and a daemon started against another origin, or against none, discards what it holds: a lease
-//! identifier is meaningful only to the service that issued it, and the leases left behind run out
-//! by themselves. The file is made at every start, whether or not a service is selected, so the
-//! environment's stored formats do not depend on the configuration.
+//! Everything in the record belongs to one service and one host key. The record names the scope it
+//! was kept for, and a daemon started for another scope, or for none, discards what it holds: a lease
+//! identifier is meaningful only to the service that issued it, and an ending can be answered only
+//! for the key that asked for the lease. The leases left behind run out by themselves. A daemon that
+//! cannot use its configuration document opens the record as it finds it, so a document that is
+//! broken for a day does not cost the host an ending it owes. The file is made at every start,
+//! whether or not a service is selected, so the environment's stored formats do not depend on the
+//! configuration.
 
 use std::path::Path;
 use std::sync::{Mutex, PoisonError};
@@ -35,6 +40,18 @@ pub const SCHEMA_VERSION: i64 = 1;
 /// The oldest schema version this build opens: it reads no other.
 pub const OLDEST_SCHEMA_VERSION: i64 = SCHEMA_VERSION;
 
+/// What the record is kept for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kept<'a> {
+    /// The service and host key named by this text. A record kept for another scope is emptied.
+    For(&'a str),
+    /// No service is selected. A record kept for a service is emptied.
+    Nothing,
+    /// The configuration could not be read, so what is selected is not known. The record is left as
+    /// it is.
+    AsFound,
+}
+
 /// What the host holds for one paired device.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Row {
@@ -52,6 +69,9 @@ pub struct Row {
     pub consumed: u64,
     /// When the lease stops being valid, in UTC milliseconds on the service's clock.
     pub expires_at_ms: u64,
+    /// When a request that may have issued a lease was first written down, in UTC milliseconds on
+    /// this host's clock. Meaningful only while the row names no lease.
+    pub written_at_ms: u64,
 }
 
 /// A lease the host owes the service an ending for.
@@ -69,18 +89,25 @@ pub struct Record {
     connection: Mutex<Connection>,
 }
 
+/// The words an ending's reason is stored as, which the record matches stored text against.
+pub const REASONS: [&str; 3] = [UNPAIRED, PAYER_WITHDREW, FINISHED];
+
+const UNPAIRED: &str = "unpaired";
+const PAYER_WITHDREW: &str = "payer_withdrew";
+const FINISHED: &str = "finished";
+
 fn text_of(reason: LeaseEndReason) -> &'static str {
     match reason {
-        LeaseEndReason::Unpaired => "unpaired",
-        LeaseEndReason::PayerWithdrew => "payer_withdrew",
-        LeaseEndReason::Finished => "finished",
+        LeaseEndReason::Unpaired => UNPAIRED,
+        LeaseEndReason::PayerWithdrew => PAYER_WITHDREW,
+        LeaseEndReason::Finished => FINISHED,
     }
 }
 
 fn reason_of(text: &str) -> LeaseEndReason {
     match text {
-        "payer_withdrew" => LeaseEndReason::PayerWithdrew,
-        "finished" => LeaseEndReason::Finished,
+        PAYER_WITHDREW => LeaseEndReason::PayerWithdrew,
+        FINISHED => LeaseEndReason::Finished,
         _ => LeaseEndReason::Unpaired,
     }
 }
@@ -106,21 +133,48 @@ fn counter_of(value: i64) -> u64 {
 }
 
 impl Record {
-    /// Opens the record in `state_dir`, kept for the service at `origin`, when one is selected.
+    /// Opens the record in `state_dir`, kept for `kept`.
     ///
-    /// A record kept for another origin, or for none, is emptied: nothing in it means anything to
-    /// this one.
+    /// A database that holds a schema this build does not read is refused before anything is
+    /// written to it.
     ///
     /// # Errors
     ///
     /// Returns an error when the file cannot be opened, or holds a schema this build does not read.
-    pub fn open(state_dir: &Path, origin: Option<&str>) -> Result<Self> {
+    pub fn open(state_dir: &Path, kept: Kept<'_>) -> Result<Self> {
         std::fs::create_dir_all(state_dir).map_err(ControllerError::registry)?;
         let connection = Connection::open(state_dir.join(RELAY_LEASE_RECORD))
             .map_err(ControllerError::registry)?;
         connection
             .busy_timeout(std::time::Duration::from_secs(5))
             .map_err(ControllerError::registry)?;
+        // The version is read before anything is written, so a database of a newer build is left
+        // exactly as it is.
+        let has_version_table: bool = connection
+            .query_row(
+                "SELECT count(*) > 0 FROM sqlite_master
+                 WHERE type = 'table' AND name = 'relay_lease_schema'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(ControllerError::registry)?;
+        let version: Option<i64> = if has_version_table {
+            connection
+                .query_row("SELECT version FROM relay_lease_schema", [], |row| {
+                    row.get(0)
+                })
+                .optional()
+                .map_err(ControllerError::registry)?
+        } else {
+            None
+        };
+        if let Some(found) = version
+            && found != SCHEMA_VERSION
+        {
+            return Err(ControllerError::registry(format!(
+                "the relay lease record is at schema {found} and this build reads {SCHEMA_VERSION}"
+            )));
+        }
         // Every change is one transaction and is on the disk before it is reported: a lease the
         // host asked for and did not write down is one it could not end.
         connection
@@ -128,9 +182,9 @@ impl Record {
                 "PRAGMA journal_mode = WAL;
                  PRAGMA synchronous = FULL;
                  CREATE TABLE IF NOT EXISTS relay_lease_schema (version INTEGER NOT NULL);
-                 CREATE TABLE IF NOT EXISTS relay_lease_service (
-                     id     INTEGER PRIMARY KEY CHECK (id = 0),
-                     origin TEXT
+                 CREATE TABLE IF NOT EXISTS relay_lease_scope (
+                     id    INTEGER PRIMARY KEY CHECK (id = 0),
+                     scope TEXT
                  );
                  CREATE TABLE IF NOT EXISTS relay_leases (
                      destination   BLOB PRIMARY KEY CHECK (length(destination) = 32),
@@ -139,7 +193,8 @@ impl Record {
                      payer         TEXT,
                      ceiling       INTEGER NOT NULL CHECK (ceiling >= 0),
                      consumed      INTEGER NOT NULL CHECK (consumed >= 0),
-                     expires_at_ms INTEGER NOT NULL CHECK (expires_at_ms >= 0)
+                     expires_at_ms INTEGER NOT NULL CHECK (expires_at_ms >= 0),
+                     written_at_ms INTEGER NOT NULL CHECK (written_at_ms >= 0)
                  );
                  CREATE TABLE IF NOT EXISTS relay_endings (
                      lease_id TEXT PRIMARY KEY,
@@ -147,50 +202,43 @@ impl Record {
                  );",
             )
             .map_err(ControllerError::registry)?;
-        let version: Option<i64> = connection
-            .query_row("SELECT version FROM relay_lease_schema", [], |row| {
-                row.get(0)
-            })
-            .optional()
-            .map_err(ControllerError::registry)?;
-        match version {
-            None => {
-                connection
-                    .execute(
-                        "INSERT INTO relay_lease_schema (version) VALUES (?1)",
-                        params![SCHEMA_VERSION],
-                    )
-                    .map_err(ControllerError::registry)?;
-            }
-            Some(SCHEMA_VERSION) => {}
-            Some(found) => {
-                return Err(ControllerError::registry(format!(
-                    "the relay lease record is at schema {found} and this build reads \
-                     {SCHEMA_VERSION}"
-                )));
-            }
+        if version.is_none() {
+            connection
+                .execute(
+                    "INSERT INTO relay_lease_schema (version) VALUES (?1)",
+                    params![SCHEMA_VERSION],
+                )
+                .map_err(ControllerError::registry)?;
         }
-        let kept_for: Option<Option<String>> = connection
-            .query_row("SELECT origin FROM relay_lease_service", [], |row| {
+        let wanted: Option<&str> = match kept {
+            Kept::For(scope) => Some(scope),
+            Kept::Nothing => None,
+            Kept::AsFound => {
+                return Ok(Self {
+                    connection: Mutex::new(connection),
+                });
+            }
+        };
+        let found: Option<Option<String>> = connection
+            .query_row("SELECT scope FROM relay_lease_scope", [], |row| {
                 row.get::<_, Option<String>>(0)
             })
             .optional()
             .map_err(ControllerError::registry)?;
-        if kept_for.as_ref().map(Option::as_deref) != Some(origin) {
-            connection
-                .execute_batch(
-                    "BEGIN IMMEDIATE; DELETE FROM relay_leases; DELETE FROM relay_endings;",
-                )
+        if found.as_ref().map(Option::as_deref) != Some(wanted) {
+            let transaction = connection
+                .unchecked_transaction()
                 .map_err(ControllerError::registry)?;
-            connection
+            transaction
+                .execute_batch("DELETE FROM relay_leases; DELETE FROM relay_endings;")
+                .map_err(ControllerError::registry)?;
+            transaction
                 .execute(
-                    "INSERT OR REPLACE INTO relay_lease_service (id, origin) VALUES (0, ?1)",
-                    params![origin],
+                    "INSERT OR REPLACE INTO relay_lease_scope (id, scope) VALUES (0, ?1)",
+                    params![wanted],
                 )
                 .map_err(ControllerError::registry)?;
-            connection
-                .execute_batch("COMMIT;")
-                .map_err(ControllerError::registry)?;
+            transaction.commit().map_err(ControllerError::registry)?;
         }
         Ok(Self {
             connection: Mutex::new(connection),
@@ -211,9 +259,20 @@ impl Record {
     ///
     /// Returns an error when the record cannot be read.
     pub fn rows(&self) -> Result<Vec<Row>> {
-        let rows = self.with(|connection| {
+        type Stored = (
+            EndpointKey,
+            EndpointKey,
+            Option<String>,
+            Option<String>,
+            i64,
+            i64,
+            i64,
+            i64,
+        );
+        let rows: Vec<Stored> = self.with(|connection| {
             let mut statement = connection.prepare(
-                "SELECT source, destination, lease_id, payer, ceiling, consumed, expires_at_ms
+                "SELECT source, destination, lease_id, payer, ceiling, consumed, expires_at_ms,
+                        written_at_ms
                  FROM relay_leases ORDER BY rowid",
             )?;
             let rows = statement
@@ -221,11 +280,12 @@ impl Record {
                     Ok((
                         endpoint_of(row.get(0)?)?,
                         endpoint_of(row.get(1)?)?,
-                        row.get::<_, Option<String>>(2)?,
-                        row.get::<_, Option<String>>(3)?,
-                        row.get::<_, i64>(4)?,
-                        row.get::<_, i64>(5)?,
-                        row.get::<_, i64>(6)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
                     ))
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -233,7 +293,7 @@ impl Record {
         })?;
         rows.into_iter()
             .map(
-                |(source, destination, lease, payer, ceiling, consumed, expires)| {
+                |(source, destination, lease, payer, ceiling, consumed, expires, written)| {
                     Ok(Row {
                         source,
                         destination,
@@ -242,6 +302,7 @@ impl Record {
                         ceiling: counter_of(ceiling),
                         consumed: counter_of(consumed),
                         expires_at_ms: counter_of(expires),
+                        written_at_ms: counter_of(written),
                     })
                 },
             )
@@ -257,8 +318,9 @@ impl Record {
         self.with(|connection| {
             connection.execute(
                 "INSERT OR REPLACE INTO relay_leases
-                     (destination, source, lease_id, payer, ceiling, consumed, expires_at_ms)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                     (destination, source, lease_id, payer, ceiling, consumed, expires_at_ms,
+                      written_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params![
                     row.destination.as_bytes().as_slice(),
                     row.source.as_bytes().as_slice(),
@@ -267,6 +329,7 @@ impl Record {
                     counter(row.ceiling),
                     counter(row.consumed),
                     counter(row.expires_at_ms),
+                    counter(row.written_at_ms),
                 ],
             )?;
             Ok(())
@@ -302,25 +365,16 @@ impl Record {
         reason: LeaseEndReason,
     ) -> Result<()> {
         self.with(|connection| {
-            connection.execute_batch("BEGIN IMMEDIATE;")?;
-            let done = connection
-                .execute(
-                    "INSERT OR IGNORE INTO relay_endings (lease_id, reason) VALUES (?1, ?2)",
-                    params![lease.get().to_string(), text_of(reason)],
-                )
-                .and_then(|_| {
-                    connection.execute(
-                        "DELETE FROM relay_leases WHERE destination = ?1",
-                        params![destination.as_bytes().as_slice()],
-                    )
-                });
-            match done {
-                Ok(_) => connection.execute_batch("COMMIT;"),
-                Err(error) => {
-                    let _ = connection.execute_batch("ROLLBACK;");
-                    Err(error)
-                }
-            }
+            let transaction = connection.unchecked_transaction()?;
+            transaction.execute(
+                "INSERT OR IGNORE INTO relay_endings (lease_id, reason) VALUES (?1, ?2)",
+                params![lease.get().to_string(), text_of(reason)],
+            )?;
+            transaction.execute(
+                "DELETE FROM relay_leases WHERE destination = ?1",
+                params![destination.as_bytes().as_slice()],
+            )?;
+            transaction.commit()
         })
     }
 

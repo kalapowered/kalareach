@@ -346,13 +346,37 @@ impl ServiceWeb {
             .advance_clock(u64::try_from(by.as_millis()).unwrap_or(u64::MAX));
     }
 
-    /// The service ends one lease on its own, as it does when the relay carrying it is retired.
+    /// The relay carrying one lease is retired: the service can no longer bill through it, so a
+    /// refill of that lease is answered that it should be revoked and another asked for.
+    pub fn retire_relay_of(&self, lease_id: &str) {
+        self.state
+            .lock()
+            .expect("the state")
+            .relay
+            .retire_relay_of(lease_id);
+    }
+
+    /// The service ends one lease on its own, as it does when its record of the lease is lost.
     pub fn end_relay_lease(&self, lease_id: &str) {
         self.state
             .lock()
             .expect("the state")
             .relay
             .end_by_the_service(lease_id);
+    }
+
+    /// A lease's deadline cannot be moved later, as at the end of a billing period.
+    pub fn freeze_relay_deadlines(&self, frozen: bool) {
+        self.state
+            .lock()
+            .expect("the state")
+            .relay
+            .freeze_deadlines(frozen);
+    }
+
+    /// The service has no record of one lease any more.
+    pub fn forget_relay_lease(&self, lease_id: &str) {
+        self.state.lock().expect("the state").relay.forget(lease_id);
     }
 
     /// The relay counts `bytes` more for the reservation of one lease.

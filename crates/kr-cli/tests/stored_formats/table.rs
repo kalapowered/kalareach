@@ -824,7 +824,13 @@ pub fn table() -> Vec<Store> {
                 version(kr_controller::relay_leases::record::OLDEST_SCHEMA_VERSION),
             ),
             owned: Vec::new(),
-            kept: Vec::new(),
+            kept: vec![Kept::Words(
+                "the reasons an ending is stored with",
+                kr_controller::relay_leases::record::REASONS
+                    .iter()
+                    .map(|reason| (*reason).to_owned())
+                    .collect(),
+            )],
         },
         Store {
             levels: None,
