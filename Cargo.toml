@@ -270,6 +270,42 @@ unsafe_code = "forbid"
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
 
+# The session worker's code is built for size. A host holds one worker process for each session, all
+# of them mapping the same program, and the sum of the processes' resident sizes counts every page of
+# that program once for each process, so the program's size is about half of what an idle host's
+# memory figure is made of. The packages named here make up most of the code a worker runs: the
+# worker itself, the protocol and the wire formats it reads and writes, the command line parser and
+# the schema generator that start-up runs, the runtime, and SQLite. Code that is generic is compiled
+# in the package that uses it, so the standard library's containers and futures that the worker
+# instantiates follow the worker's setting.
+#
+# That puts the worker's own paths in the size build: input forwarding, the recogniser, attach and
+# the delivery of output. The performance scripts take their figures for them in a release build,
+# and they are far inside their bounds. The packages that are not named keep the release default,
+# among them the terminal engine's parsing, the transport and its encryption, the model runtime, the
+# plugin engine, the digests the host checks programs with, and the controller.
+[profile.release.package]
+kr-worker = { opt-level = "s" }
+kr-protocol = { opt-level = "s" }
+kr-cbor = { opt-level = "s" }
+kr-ipc = { opt-level = "s" }
+kr-plugin-sdk = { opt-level = "s" }
+kr-plugin-service = { opt-level = "s" }
+kr-shell-integration = { opt-level = "s" }
+ciborium = { opt-level = "s" }
+ciborium-ll = { opt-level = "s" }
+ciborium-io = { opt-level = "s" }
+serde = { opt-level = "s" }
+serde_core = { opt-level = "s" }
+serde_json = { opt-level = "s" }
+schemars = { opt-level = "s" }
+clap = { opt-level = "s" }
+clap_builder = { opt-level = "s" }
+clap_lex = { opt-level = "s" }
+tokio = { opt-level = "s" }
+rusqlite = { opt-level = "s" }
+libsqlite3-sys = { opt-level = "s" }
+
 # Digests and compression run over whole files in debug and test builds, where they are slow. The
 # host hashes every program it launches before it admits the launch, under a deadline set for an
 # optimised hash, and a debug build hashes about seventeen times slower than that. The update tests
