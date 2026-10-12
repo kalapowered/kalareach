@@ -4184,6 +4184,11 @@
           "const": "attention.automation_paused",
           "description": "A workflow revision or a causal chain was paused by one of its own limits.",
           "type": "string"
+        },
+        {
+          "const": "attention.authority_feed_removed",
+          "description": "The authority feed this host reads removed it, so it learns no revocation from it.",
+          "type": "string"
         }
       ]
     },
@@ -4218,6 +4223,11 @@
         {
           "const": "automation",
           "description": "The environment's workflow journal and the alerts it keeps.",
+          "type": "string"
+        },
+        {
+          "const": "authority",
+          "description": "The host's own record of the authority feed it reads.",
           "type": "string"
         }
       ]
@@ -4522,6 +4532,17 @@
           ],
           "description": "The last successful synchronisation, when there has been one."
         },
+        "removed_at_ms": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TimestampMs"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "When the feed answered that this host was removed from it, when it did."
+        },
         "stale": {
           "description": "True when the feed could not be reached, so what is shown is stale.",
           "type": "boolean"
@@ -4537,6 +4558,7 @@
         "accepted_revision",
         "last_synchronised_at_ms",
         "stale",
+        "removed_at_ms",
         "unacknowledged_records"
       ],
       "type": "object"
@@ -4681,7 +4703,7 @@
     },
     "AuthoritySelection": {
       "additionalProperties": false,
-      "description": "The authority feed this host reads its remote revocations from.\n\nA provider origin, so it is this document's to choose and no inherited variable's. The\ndaemon reads it when it starts, so a change applies at the next start. An owner whose host\nlost its feed points it at another service, or at none. Absent means this host has no feed:\nit takes revocations from the owners who reach it directly, and a remote owner's revocation\ncannot reach it.\n\nThe section arrived with level 2. A release that reads level 1 does not know it: it\napplies the rest of the document, counts the section among the members it ignores, and\ndoes not edit the document, so a host rolled back to such a release has no feed until it\nis brought forward again.",
+      "description": "The authority feed this host reads its remote revocations from.\n\nA provider origin, so it is this document's to choose and no inherited variable's. The\ndaemon reads it when it starts, so a change applies at the next start. An owner whose host\nlost its feed points it at another service, or at none. Absent means this host has no feed:\na remote owner's revocation cannot reach it, and only the owner at the machine revokes a\ndevice.\n\nThe section arrived with level 2. A release that reads level 1 does not know it: it\napplies the rest of the document, counts the section among the members it ignores, and\ndoes not edit the document.",
       "properties": {
         "origin": {
           "anyOf": [
@@ -12153,6 +12175,10 @@
           },
           "type": "array"
         },
+        "feed_removed": {
+          "description": "True when the feed answered that this host was removed from it.\n\nThe host then learns no revocation from the feed again. The default non-expiring owner\ngrants stay usable; the grants that rest on the feed are refused until the owner acts at the\nhost: organisation leases, and personal remote access under a bounded offline-validity\npolicy or on a host that is exclusively organisation-managed.\n[`Self::feed_synchronised_at_ms`] is the last time the feed answered before that.",
+          "type": "boolean"
+        },
         "feed_stale": {
           "description": "True when the feed is unreachable, so the revocation status shown is stale.",
           "type": "boolean"
@@ -12173,7 +12199,8 @@
         "devices",
         "authority_revision",
         "feed_synchronised_at_ms",
-        "feed_stale"
+        "feed_stale",
+        "feed_removed"
       ],
       "type": "object"
     },
@@ -12353,30 +12380,8 @@
     },
     "DeviceSummary": {
       "additionalProperties": false,
-      "description": "One paired device as `device.list` reports it.\n\nSection 10 puts each host's last acknowledgement in the device list, because an offline host\ncannot apply a revocation it has not received and the person has to be able to see that.",
+      "description": "One paired device as `device.list` reports it.",
       "properties": {
-        "acknowledged_at_ms": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/TimestampMs"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "When that acknowledgement arrived."
-        },
-        "acknowledged_revision": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/AuthorityRevision"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "The last authority revision this device acknowledged."
-        },
         "all_sessions": {
           "description": "Whether the pairing admits every session of this environment. Such a device holds every\nsession through its pairing already, so a share to it adds nothing the transport can use.",
           "type": "boolean"
@@ -12441,8 +12446,6 @@
         "display_name",
         "grant_id",
         "paired_at_ms",
-        "acknowledged_revision",
-        "acknowledged_at_ms",
         "revoked",
         "keys",
         "manages_host",
@@ -22280,7 +22283,7 @@
             }
           ],
           "default": null,
-          "description": "The HTTP proxy this host's connections to services go through, as an absolute `http` or\n`https` origin such as `http://proxy.example.com:3128`: the network endpoint's relay\nconnection, relay latency probe, captive-portal check and Pkarr servers, the\nrendezvous, delivery and webhooks, mail submission (a `CONNECT` tunnel to the mail\nserver), the managed voice broker and account service, uploads of backups to the\nmanaged storage service, the model's files, and plugin repositories. Nothing on that\nlist goes around it, so an address it cannot reach fails, and a daemon that started\nover a document it could not use sends nothing through these routes until it starts\nagain over one it can. The host's own name lookups, the endpoint's direct paths, its\nQUIC address discovery (which connects directly to the relays over UDP to learn this\nhost's public address) and port mapper, local discovery and the Mainline DHT where\nthose are selected, and the Git operations an owner asks for do not use it. It is this\nmachine's own choice: no invitation or host bundle carries it. It names no user and no\npassword, because a proxy that needs credentials is not supported."
+          "description": "The HTTP proxy this host's connections to services go through, as an absolute `http` or\n`https` origin such as `http://proxy.example.com:3128`: the network endpoint's relay\nconnection, relay latency probe, captive-portal check and Pkarr servers, the rendezvous,\ndelivery and webhooks, mail submission (a `CONNECT` tunnel to the mail server), the\nmanaged voice broker and account service, uploads of backups to the managed storage\nservice, the authority feed, the model's files, and plugin repositories. Nothing on that\nlist goes around it, so an address it cannot reach fails, and a daemon that started over\na document it could not use sends nothing through these routes until it starts again\nover one it can. The host's own name lookups, the endpoint's direct paths, its QUIC\naddress discovery (which connects directly to the relays over UDP to learn this host's\npublic address) and port mapper, local discovery and the Mainline DHT where those are\nselected, and the Git operations an owner asks for do not use it. It is this machine's\nown choice: no invitation or host bundle carries it. It names no user and no password,\nbecause a proxy that needs credentials is not supported."
         },
         "relay_only": {
           "anyOf": [

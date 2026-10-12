@@ -5932,7 +5932,8 @@ export interface AttentionGap {
   /**
    * Which source the range belongs to.
    */
-  source: 'receipts' | 'questions' | 'approvals' | 'host_events' | 'semantic' | 'automation'
+  source:
+    'receipts' | 'questions' | 'approvals' | 'host_events' | 'semantic' | 'automation' | 'authority'
   /**
    * The first sequence that is present again, or null when nothing after the range can be read.
    *
@@ -6072,6 +6073,7 @@ export interface AttentionItem {
     | 'attention.host_contact_lost'
     | 'attention.application_notice'
     | 'attention.automation_paused'
+    | 'attention.authority_feed_removed'
   /**
    * The session it belongs to, when it belongs to one.
    */
@@ -6082,7 +6084,8 @@ export interface AttentionItem {
    * It is what a gap is weighed against: a range that retention took from this source is a
    * range that could have resolved this item, and a range taken from another source is not.
    */
-  source: 'receipts' | 'questions' | 'approvals' | 'host_events' | 'semantic' | 'automation'
+  source:
+    'receipts' | 'questions' | 'approvals' | 'host_events' | 'semantic' | 'automation' | 'authority'
   /**
    * One line naming the subject, when this caller may be served it.
    *
@@ -6299,7 +6302,8 @@ export interface AttentionRecordRef {
   /**
    * Its source: the question ledger or the host events.
    */
-  source: 'receipts' | 'questions' | 'approvals' | 'host_events' | 'semantic' | 'automation'
+  source:
+    'receipts' | 'questions' | 'approvals' | 'host_events' | 'semantic' | 'automation' | 'authority'
 }
 /**
  * One record's text, as the session serves it now.
@@ -6312,7 +6316,8 @@ export interface AttentionRecordText {
   /**
    * Its source.
    */
-  source: 'receipts' | 'questions' | 'approvals' | 'host_events' | 'semantic' | 'automation'
+  source:
+    'receipts' | 'questions' | 'approvals' | 'host_events' | 'semantic' | 'automation' | 'authority'
   /**
    * Its text, clipped to [`MAX_ATTENTION_SUMMARY_LEN`], or null when the session does not serve
    * it now or no longer holds the record.
@@ -6495,6 +6500,10 @@ export interface AuthorityFeedStatus {
    * The last successful synchronisation, when there has been one.
    */
   last_synchronised_at_ms: TimestampMs | null
+  /**
+   * When the feed answered that this host was removed from it, when it did.
+   */
+  removed_at_ms: TimestampMs | null
   /**
    * True when the feed could not be reached, so what is shown is stale.
    */
@@ -11753,18 +11762,18 @@ export interface NetworkSelection {
   /**
    * The HTTP proxy this host's connections to services go through, as an absolute `http` or
    * `https` origin such as `http://proxy.example.com:3128`: the network endpoint's relay
-   * connection, relay latency probe, captive-portal check and Pkarr servers, the
-   * rendezvous, delivery and webhooks, mail submission (a `CONNECT` tunnel to the mail
-   * server), the managed voice broker and account service, uploads of backups to the
-   * managed storage service, the model's files, and plugin repositories. Nothing on that
-   * list goes around it, so an address it cannot reach fails, and a daemon that started
-   * over a document it could not use sends nothing through these routes until it starts
-   * again over one it can. The host's own name lookups, the endpoint's direct paths, its
-   * QUIC address discovery (which connects directly to the relays over UDP to learn this
-   * host's public address) and port mapper, local discovery and the Mainline DHT where
-   * those are selected, and the Git operations an owner asks for do not use it. It is this
-   * machine's own choice: no invitation or host bundle carries it. It names no user and no
-   * password, because a proxy that needs credentials is not supported.
+   * connection, relay latency probe, captive-portal check and Pkarr servers, the rendezvous,
+   * delivery and webhooks, mail submission (a `CONNECT` tunnel to the mail server), the
+   * managed voice broker and account service, uploads of backups to the managed storage
+   * service, the authority feed, the model's files, and plugin repositories. Nothing on that
+   * list goes around it, so an address it cannot reach fails, and a daemon that started over
+   * a document it could not use sends nothing through these routes until it starts again
+   * over one it can. The host's own name lookups, the endpoint's direct paths, its QUIC
+   * address discovery (which connects directly to the relays over UDP to learn this host's
+   * public address) and port mapper, local discovery and the Mainline DHT where those are
+   * selected, and the Git operations an owner asks for do not use it. It is this machine's
+   * own choice: no invitation or host bundle carries it. It names no user and no password,
+   * because a proxy that needs credentials is not supported.
    */
   proxy_url?: string | null
   /**
@@ -12785,6 +12794,16 @@ export interface DeviceListResult {
    */
   devices: DeviceSummary[]
   /**
+   * True when the feed answered that this host was removed from it.
+   *
+   * The host then learns no revocation from the feed again. The default non-expiring owner
+   * grants stay usable; the grants that rest on the feed are refused until the owner acts at the
+   * host: organisation leases, and personal remote access under a bounded offline-validity
+   * policy or on a host that is exclusively organisation-managed.
+   * [`Self::feed_synchronised_at_ms`] is the last time the feed answered before that.
+   */
+  feed_removed: boolean
+  /**
    * True when the feed is unreachable, so the revocation status shown is stale.
    */
   feed_stale: boolean
@@ -12795,19 +12814,8 @@ export interface DeviceListResult {
 }
 /**
  * One paired device as `device.list` reports it.
- *
- * Section 10 puts each host's last acknowledgement in the device list, because an offline host
- * cannot apply a revocation it has not received and the person has to be able to see that.
  */
 export interface DeviceSummary {
-  /**
-   * When that acknowledgement arrived.
-   */
-  acknowledged_at_ms: TimestampMs | null
-  /**
-   * The last authority revision this device acknowledged.
-   */
-  acknowledged_revision: AuthorityRevision | null
   /**
    * Whether the pairing admits every session of this environment. Such a device holds every
    * session through its pairing already, so a share to it adds nothing the transport can use.
