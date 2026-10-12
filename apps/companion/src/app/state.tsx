@@ -24,6 +24,7 @@ import type { HostPort } from '../host/port'
 import type { ToastAction, ToastMessage } from '../components/ui'
 import { DraftBook } from '../model/draft-book'
 import { ManualPaths } from '../model/manual-paths'
+import { QuestionForms } from '../model/question-forms'
 import { SessionStates, type SessionState } from '../model/sessions'
 import { ConfirmationStore } from '../pairing/confirmationStore'
 
@@ -55,6 +56,8 @@ interface AppValue {
   readonly drafts: DraftBook
   /** The paths the host gave for the files attached to drafts, for the person to give to an agent. */
   readonly paths: ManualPaths
+  /** The answers people have begun to give, which outlive the screen that showed each. */
+  readonly questionForms: QuestionForms
   /**
    * The rights the connection last reported, kept while contact is out and for a screen that opens
    * after it ended. The shell writes it as it hears the connection; a control that only keeps what
@@ -115,6 +118,7 @@ export function AppProvider({
   const [sessions] = useState(() => new SessionStates())
   const [drafts] = useState(() => new DraftBook(port))
   const [paths] = useState(() => new ManualPaths(port))
+  const [questionForms] = useState(() => new QuestionForms())
   const [lastRights, setLastRights] = useState<readonly ActionRight[] | null>(null)
   const rememberRights = useCallback((rights: readonly ActionRight[]) => {
     setLastRights((held) =>
@@ -206,6 +210,7 @@ export function AppProvider({
       sessions,
       drafts,
       paths,
+      questionForms,
       lastRights,
       rememberRights,
       place,
@@ -227,6 +232,7 @@ export function AppProvider({
       sessions,
       drafts,
       paths,
+      questionForms,
       lastRights,
       rememberRights,
       place,

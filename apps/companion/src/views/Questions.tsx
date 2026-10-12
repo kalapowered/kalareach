@@ -12,7 +12,7 @@
  * moved is kept, with what became of the question, until the person dismisses it.
  */
 
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore, type ReactNode } from 'react'
 
 import type { Question } from '@kalareach/protocol'
 
@@ -90,7 +90,11 @@ export function QuestionRequests({
   const [failure, setFailure] = useState<{ readonly visit: object; readonly words: string } | null>(
     null
   )
-  const [forms, setForms] = useState<Readonly<Record<string, Form>>>({})
+  // The forms are the window's, not this panel's: the row that holds the panel can go, and the
+  // person can leave the screen, with an answer half made.
+  const { questionForms } = useApp()
+  const forms = useSyncExternalStore(questionForms.subscribe, questionForms.snapshot)
+  const setForms = questionForms.update
   const [refusals, setRefusals] = useState<Readonly<Record<string, string>>>({})
   const [answering, setAnswering] = useState<string | null>(null)
   // Questions that ended under a person's answer. Once the worker stops listing them, what they
@@ -152,7 +156,7 @@ export function QuestionRequests({
         if (!current()) return
         setFailure({ visit, words: failureMessage(error) })
       })
-  }, [port, sessionId, visit])
+  }, [port, sessionId, visit, setForms])
 
   useEffect(() => {
     const cadence = readOnCadence(load, AGENT_READ_CADENCE_MS)

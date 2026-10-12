@@ -88,6 +88,37 @@ describe('the inbox lists a session’s questions once', () => {
   })
 })
 
+describe('an answer half made', () => {
+  it('is still there when the person leaves the inbox for another screen and comes back', async () => {
+    start()
+    const person = userEvent.setup()
+    const question = await questionAbout(WHICH_BRANCH)
+    await person.click(within(question).getByRole('radio', { name: 'release/2026-09' }))
+    expect(within(question).getByRole('radio', { name: 'release/2026-09' })).toBeChecked()
+
+    await person.click(screen.getByRole('button', { name: 'Sessions' }))
+    await screen.findByTestId('session-row-1')
+    expect(screen.queryByTestId('question')).toBeNull()
+    await person.click(screen.getByRole('button', { name: 'Attention' }))
+
+    const again = await questionAbout(WHICH_BRANCH)
+    expect(within(again).getByRole('radio', { name: 'release/2026-09' })).toBeChecked()
+  })
+
+  it('is the same answer in the conversation of the session it is for', async () => {
+    start()
+    const person = userEvent.setup()
+    const question = await questionAbout(WHICH_BRANCH)
+    await person.click(within(question).getByRole('radio', { name: 'release/2026-09' }))
+
+    const row = question.closest<HTMLElement>('[data-testid^="attention-"]')
+    if (row === null) throw new Error('the question is not in an inbox row')
+    await person.click(within(row).getByRole('button', { name: 'Open session' }))
+    const inSession = await questionAbout(WHICH_BRANCH)
+    expect(within(inSession).getByRole('radio', { name: 'release/2026-09' })).toBeChecked()
+  })
+})
+
 describe('answering on a completed press (KR-REQ-13.07)', () => {
   it('sends nothing on pointer-down, and one answer naming the revision shown on the release', async () => {
     const { controls } = start()
