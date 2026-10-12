@@ -352,7 +352,8 @@ impl Drop for Gateway {
         // What a session's closure does for the servers its backends ran, so that none is left
         // running, and nothing it started, when the test ends.
         let _entered = self.runtime.enter();
-        self.runtime.block_on(self.backends.end_servers());
+        self.runtime
+            .block_on(self.backends.end_servers(tokio::time::Instant::now()));
     }
 }
 
@@ -991,7 +992,9 @@ fn kr_req_12_07_a_launch_lost_to_a_retirement_ends_its_server() {
     assert_eq!(launched.ends().code(), Some(2), "the program ran as typed");
     // The server belongs to the closure now, which ends it once the acceptance is delivered.
     let _entered = shell.runtime.enter();
-    shell.runtime.block_on(shell.backends.end_servers());
+    shell
+        .runtime
+        .block_on(shell.backends.end_servers(tokio::time::Instant::now()));
     eventually("the server ended", || {
         kr_ipc::identity::process_state(&servers[0]) == kr_ipc::identity::ProcessState::Ended
     });
@@ -1129,7 +1132,8 @@ fn kr_req_07_60_a_close_ends_the_server_and_what_it_started_after_the_acceptance
 
 /// KR-REQ-07.60 and KR-REQ-07.53: a server that ignores both the end of its input and a terminate,
 /// with a command that ignores a terminate too, is ended by force with the command when the program
-/// ends, and not before five seconds after the program's end began the ending.
+/// ends, and neither is forced before five seconds after the program's end began the ending. Each
+/// is watched from the moment the program is killed, so a command forced early is seen to be.
 #[test]
 fn kr_req_07_60_a_stubborn_server_and_its_command_end_by_force_with_the_program() {
     let shell = Gateway::new();
@@ -1145,24 +1149,42 @@ fn kr_req_07_60_a_stubborn_server_and_its_command_end_by_force_with_the_program(
         ],
     );
     launched.prints("TUI: turn/completed");
-    // The command is recorded below the server while it runs: the frames the session carried had
-    // it look.
+    // The command is recorded below the server while it runs, and has started a process of its own,
+    // which a shell does once it has set up what it ignores: the frames the session carried had it
+    // look.
     eventually("the session recorded what the server started", || {
-        !shell.started_by_servers().is_empty()
+        shell.started_by_servers().len() >= 2
     });
     let server = shell.servers().remove(0);
     let started = shell.started_by_servers();
-    let killed = std::time::Instant::now();
+    let processes: Vec<ProcessStartIdentity> = std::iter::once(server).chain(started).collect();
+    let killed = Instant::now();
+    let watching = {
+        let processes = processes.clone();
+        std::thread::spawn(move || {
+            let mut seen: Vec<Option<Duration>> = vec![None; processes.len()];
+            while seen.iter().any(Option::is_none) && killed.elapsed() < LIVENESS {
+                for (process, at) in processes.iter().zip(seen.iter_mut()) {
+                    if at.is_none()
+                        && kr_ipc::identity::process_state(process)
+                            == kr_ipc::identity::ProcessState::Ended
+                    {
+                        *at = Some(killed.elapsed());
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            seen
+        })
+    };
     let _ = launched.child.kill();
     let _ = launched.ends();
-    for process in std::iter::once(&server).chain(&started) {
-        eventually("everything the server started ended with it", || {
-            kr_ipc::identity::process_state(process) == kr_ipc::identity::ProcessState::Ended
-        });
+    let seen = watching.join().expect("the watch is joined");
+    for (process, went) in processes.iter().zip(seen) {
+        let went = went.unwrap_or_else(|| panic!("{process:?} ended with the program"));
         assert!(
-            killed.elapsed() >= std::time::Duration::from_secs(5),
-            "{process:?} was forced {:?} after the program was killed",
-            killed.elapsed()
+            went >= Duration::from_secs(5),
+            "{process:?} was forced {went:?} after the program was killed"
         );
     }
 }
