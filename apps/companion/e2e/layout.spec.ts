@@ -46,13 +46,15 @@ test.describe('the measure of text that runs out of its box', () => {
     expect((await overrunning(page, '#card')).length).toBeGreaterThan(0)
   })
 
-  test('reports a line a button cuts off inside a box that sets only its vertical overflow', async ({ page }) => {
+  test('reports a box drawn past its root inside a box that sets only its vertical overflow', async ({ page }) => {
     // Setting only the vertical overflow makes the horizontal one auto as well, but the box has
-    // nothing to scroll across: a label that runs out of its button is not drawn where it can be reached.
+    // nothing to scroll across: what lies past its root is not drawn where it can be reached. The
+    // positioned box adds nothing to what the scroller could scroll, so only a measure that asks
+    // whether it really scrolls sideways sees it.
     await page.setContent(
-      '<div id="card" style="width:600px"><div style="max-height:60px;overflow-y:auto"><button style="width:60px;white-space:nowrap;overflow:visible">a-label-that-is-longer-than-the-button</button></div></div>'
+      '<div id="card" style="width:300px"><div style="max-height:60px;overflow-y:auto"><span style="position:absolute;left:500px;top:0;width:50px;height:20px">x</span></div></div>'
     )
-    expect((await overrunning(page, '#card')).some((each) => each.endsWith('past the box that holds it'))).toBe(true)
+    expect((await overrunning(page, '#card')).some((each) => each.endsWith('past its box'))).toBe(true)
   })
 
   test('reports a line a button cuts off inside a row that really scrolls sideways', async ({ page }) => {
