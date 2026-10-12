@@ -344,12 +344,41 @@ async fn a_pairing_grant_that_has_run_out_leaves_no_share_to_answer() {
 
     wall.store(now + 120_000, Ordering::SeqCst);
 
+    // The read that finds the pairing grant out of force writes its end down; the reads after it
+    // find a device recorded as having expired. Neither is answered by the share.
+    for read in ["the first", "the next", "and the one after it"] {
+        assert!(
+            authority(&controller)
+                .device_grant(device.device_id, None)
+                .expect("the host answers")
+                .is_none(),
+            "the share does not answer for a device whose pairing grant has run out: {read}"
+        );
+    }
+}
+
+/// KR-REQ-26.16: a share does not answer for a device that has been revoked, whatever the share
+/// still carries.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_revoked_device_is_given_no_grant_by_a_share_that_remains() {
+    let temp = kr_ipc::testing::TempHost::create();
+    let (_continuous, wall, clocks) = manual_clocks();
+    let controller = daemon_on(&temp, clocks).await;
+    let device = paired_holding(&controller, 69, &[ActionRight::SessionView], None);
+    shared_with(&controller, &device, &[ActionRight::SessionView], false);
+    controller
+        .devices()
+        .revoke(
+            device.device_id,
+            TimestampMs::new(wall.load(Ordering::SeqCst) + 1),
+        )
+        .expect("the device is revoked");
+
     assert!(
         authority(&controller)
             .device_grant(device.device_id, None)
             .expect("the host answers")
-            .is_none(),
-        "the share does not answer for a device whose pairing grant has run out"
+            .is_none()
     );
 }
 

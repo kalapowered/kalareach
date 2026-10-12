@@ -202,18 +202,17 @@ impl VoiceAuthority for GrantAuthority {
         let standing = self.standing_records(device_id)?;
         let lifetimes = self.lifetimes()?;
         // The grant a device was paired under, while it stands. A request under a share needs this
-        // grant to stand, so a pairing grant that has run out, or whose end is not on record yet,
-        // leaves no grant for the device. It may carry the voice right (an owner is paired with every
-        // right), which is a voice grant's marker everywhere else and is taken out of it here, as
-        // the door takes it out before it decides a request: the voice right comes from a voice
-        // grant alone.
-        let paired = match self
-            .devices
-            .record_for_device(device_id)
-            .map_err(store)?
-            .filter(super::authority::DeviceRecordExt::is_paired_record)
-        {
+        // grant to stand, so a device that has been revoked, or whose pairing grant has run out and
+        // is recorded as having, has no grant, and neither has one whose pairing grant runs out as
+        // it is read; one whose end is not on record yet is refused with the host's reason. It may
+        // carry the voice right (an owner is paired with every right), which is a voice grant's
+        // marker everywhere else and is taken out of it here, as the door takes it out before it
+        // decides a request: the voice right comes from a voice grant alone.
+        let paired = match self.devices.record_for_device(device_id).map_err(store)? {
             None => None,
+            Some(record) if !super::authority::DeviceRecordExt::is_paired_record(&record) => {
+                return Ok(None);
+            }
             Some(record) => match lifetimes.paired_standing(&record).map_err(store)? {
                 GrantStanding::InForce => Some(Grant {
                     actions: record
