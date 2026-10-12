@@ -17,37 +17,23 @@
 
 mod net_support;
 
-use std::sync::Arc;
 use std::time::Duration;
 
-use kr_controller::registry::{Registry, WorkerRecord};
 use kr_controller::service::net::devices::DeviceRecord;
 use kr_crypto::keys::DeviceKeys;
-use kr_crypto::store::open_store_in;
-use kr_ipc::endpoint::Listener;
-use kr_ipc::verify::{ControllerIdentity, WorkerIdentity};
 use kr_protocol::envelope::{ActionTarget, ParamsValue};
 use kr_protocol::error::ErrorCode;
-use kr_protocol::hello::PROTOCOL_VERSION;
-use kr_protocol::identity::{DesktopBinding, WorkerProfile};
-use kr_protocol::ids::{
-    ActionId, AuthorityRevision, BuildId, ConnectionId, ControllerGeneration, EnvironmentId,
-    SessionEpoch, SessionId,
-};
+use kr_protocol::ids::{ActionId, BuildId, EnvironmentId};
 use kr_protocol::method::Method;
 use kr_protocol::question::{
-    Question, QuestionAnswer, QuestionAnswerParams, QuestionCancelParams, QuestionCreateParams,
-    QuestionKind, QuestionResolveResult, QuestionState,
+    Question, QuestionAnswer, QuestionAnswerParams, QuestionCancelParams, QuestionResolveResult,
+    QuestionState,
 };
 use kr_protocol::receipt::{ActionReadParams, ActionReadResult, ReceiptState};
 use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::{Nullable, TimestampMs};
-use kr_protocol::session::{Dimensions, DisplayNumber, SessionState, ShellMode};
-use kr_protocol::worker::WorkerDescriptor;
-use kr_worker::runtime::SessionRuntime;
-use kr_worker::service::{ServiceBinding, WorkerService};
-use kr_worker::session::{Session, SessionConfig};
 
+use net_support::worker::Worker;
 use net_support::{Device, Host, RawDevice, pair_with, proposal};
 
 /// How long a test waits for the daemon to reach the worker.
@@ -62,191 +48,8 @@ fn now() -> TimestampMs {
 }
 
 // ---------------------------------------------------------------------------------------------
-// A worker in this process, and the daemon that adopts it
+// The daemon that adopts a worker in this process
 // ---------------------------------------------------------------------------------------------
-
-/// A worker for one session, in this process, on an environment tree a daemon of it serves.
-struct Worker {
-    service: Arc<WorkerService>,
-    session_id: SessionId,
-    _runtime: Arc<SessionRuntime>,
-}
-
-impl Worker {
-    /// Starts a worker for one session and records it the way a daemon records one it adopts: a
-    /// registry row and a published descriptor. A daemon started afterwards reaches it at its
-    /// start. No daemon may be running on the tree while this runs.
-    async fn start(tree: &kr_ipc::testing::TempHost) -> Self {
-        let environment = tree.environment();
-        let environment_id = tree.environment_id();
-        let boot = kr_ipc::identity::boot_identity().expect("a boot identity");
-        let controller_key = {
-            let store = open_store_in(&environment.secrets_dir()).expect("a secret store");
-            *ControllerIdentity::open(store.store.as_ref(), environment_id, false)
-                .expect("the daemon's identity")
-                .public_key()
-        };
-        let session_id = SessionId::new(kr_ipc::new_uuid());
-        let display_number = DisplayNumber::new(1);
-        let process =
-            kr_ipc::identity::current_process_start_identity().expect("a process identity");
-        let identity = Arc::new(
-            WorkerIdentity::generate(
-                session_id,
-                SessionEpoch::V1,
-                boot.clone(),
-                process.clone(),
-                PROTOCOL_VERSION,
-            )
-            .expect("a session key"),
-        );
-        let journal_path = environment.journal_database(session_id);
-        if let Some(parent) = journal_path.parent() {
-            std::fs::create_dir_all(parent).expect("the journal directory");
-        }
-        let config = SessionConfig {
-            session_id,
-            session_epoch: SessionEpoch::V1,
-            environment_id,
-            display_number,
-            shell: kr_worker::testing::posix_script("exec cat"),
-            shell_mode: ShellMode::NativeCompat,
-            worker_profile: WorkerProfile::HeadlessUser,
-            desktop: DesktopBinding::none(),
-            dimensions: Dimensions::new(80, 24),
-            journal_path: Some(journal_path.clone()),
-            spool_directory: Some(environment.session_spool(session_id)),
-            worker_endpoint: None,
-            send_queue_bytes: 1024 * 1024,
-            resident_bytes: 64 * 1024,
-            time: kr_worker::action::time::TimeSources::system(),
-            launch_profile: kr_protocol::session::LaunchProfile::default(),
-        };
-        let mut session = Session::open(config).expect("opens the session");
-        session.launch().expect("launches the shell");
-        let runtime = Arc::new(
-            SessionRuntime::start(session, Arc::new(kr_ipc::clock::SystemSharedClock))
-                .expect("starts the runtime"),
-        );
-        let endpoint = environment
-            .worker_endpoint(display_number)
-            .expect("an endpoint");
-        let listener = Listener::bind(&endpoint).expect("binds the endpoint");
-        let public_key = *identity.public_key();
-        let service = Arc::new(
-            WorkerService::new(
-                Arc::clone(&runtime),
-                identity,
-                endpoint.clone(),
-                ServiceBinding {
-                    environment_id,
-                    boot_identity: boot.clone(),
-                    controller_public_key: controller_key,
-                    controller_generation: ControllerGeneration::new(1),
-                    journal_path: Some(journal_path),
-                    build_id: build(),
-                },
-            )
-            .expect("a worker service"),
-        );
-        tokio::spawn(Arc::clone(&service).serve(listener));
-        let mut registry =
-            Registry::open(environment.registry_database(), environment_id).expect("the registry");
-        registry
-            .adopt_worker(
-                &WorkerRecord {
-                    session_id,
-                    display_number,
-                    public_key,
-                    process_identity: process.clone(),
-                    endpoint: endpoint.as_text(),
-                    profile: WorkerProfile::HeadlessUser,
-                    state: SessionState::Live,
-                    acknowledged_revision: AuthorityRevision::new(0),
-                },
-                // A headless worker is bound to no desktop.
-                Some(&kr_protocol::identity::DesktopBinding::none()),
-            )
-            .expect("the worker is recorded");
-        drop(registry);
-        kr_ipc::descriptor::publish(
-            &environment,
-            &WorkerDescriptor {
-                session_id,
-                session_epoch: SessionEpoch::V1,
-                environment_id,
-                display_number,
-                boot_identity: boot,
-                process_start_identity: process,
-                protocol_version: PROTOCOL_VERSION,
-                endpoint: endpoint.as_text(),
-                worker_public_key: public_key,
-                worker_profile: WorkerProfile::HeadlessUser,
-                published_at_ms: now(),
-            },
-        )
-        .expect("the worker's descriptor is published");
-        Self {
-            service,
-            session_id,
-            _runtime: runtime,
-        }
-    }
-
-    /// The action target of this session.
-    fn target(&self, environment_id: EnvironmentId) -> ActionTarget {
-        ActionTarget {
-            environment_id,
-            session_id: Nullable::some(self.session_id),
-            session_epoch: Nullable::some(SessionEpoch::V1),
-            application_instance_id: Nullable::null(),
-            agent_binding_revision: Nullable::null(),
-        }
-    }
-
-    /// Asks a question from inside the session, as a verified source bound to it does.
-    fn ask(&self, request: &str) -> Question {
-        self.service
-            .questions()
-            .create(
-                &kr_worker::questions::VerifiedSource {
-                    process: kr_ipc::identity::current_process_start_identity()
-                        .expect("a process identity"),
-                    executable: Some("/bin/agent".to_owned()),
-                    session_member: true,
-                    ancestry: true,
-                    launch_channel: true,
-                    connection_id: ConnectionId::new(kr_ipc::new_uuid()),
-                },
-                &QuestionCreateParams {
-                    session_id: self.session_id,
-                    request_id: request.to_owned(),
-                    agent_name: Nullable::some("an agent".to_owned()),
-                    context: "the release is tagged".to_owned(),
-                    question: format!("Publish the release ({request})?"),
-                    kind: QuestionKind::Confirm,
-                    choices: Vec::new(),
-                    requested_expiry_ms: Nullable::null(),
-                    wait_ms: Nullable::null(),
-                },
-                kr_worker::questions::Now {
-                    utc_ms: kr_ipc::now_ms(),
-                    boot_ms: kr_ipc::clock::boot_elapsed_ms(),
-                },
-            )
-            .expect("a verified source asks")
-            .0
-            .question
-    }
-
-    /// What the worker's ledger holds of a question, whatever any caller was shown.
-    fn held(&self, question: &Question) -> Question {
-        self.service
-            .questions()
-            .question(question.question_id)
-            .expect("the question is in the ledger")
-    }
-}
 
 /// A daemon on the network with one adopted worker, and the keys of the environment's owner.
 struct Environment {
@@ -262,7 +65,7 @@ impl Environment {
         let owner = DeviceKeys::generate().expect("owner keys");
         let host = Host::start(&owner).await;
         let stopped = host.shut_down().await;
-        let worker = Worker::start(stopped.tree()).await;
+        let worker = Worker::start(stopped.tree(), 1).await;
         let settings = stopped.settings().clone();
         let host = stopped.start(settings).await;
         let environment = Self {

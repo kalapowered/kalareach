@@ -2,8 +2,9 @@
 //!
 //! What this gives a suite is the pair of doors: the environment's owner on a local socket, and a
 //! paired device on an authorised iroh connection, both speaking to the same daemon. It starts no
-//! worker, so it serves the methods the daemon answers itself and nothing more; a suite that needs
-//! a session needs a worker process and belongs with the suites `scripts/end-to-end.sh` runs.
+//! worker of its own, so it serves the methods the daemon answers itself; a suite that needs a
+//! session starts a worker in this process ([`worker`]) or a worker process, and a worker process
+//! belongs with the suites `scripts/end-to-end.sh` runs.
 //!
 //! Everything here is on the internal disk: the environment is a temporary host tree and the
 //! repositories a project test builds live in a temporary directory beside it.
@@ -12,6 +13,7 @@
 
 pub mod pairing;
 pub mod room;
+pub mod worker;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
