@@ -147,6 +147,24 @@ describe('a lost connection', () => {
   })
 })
 
+describe('a store opened again while it is being read', () => {
+  it('is read once for the presses that came before the first read answered', async () => {
+    const store = new FakeDraftStore()
+    let reads = 0
+    const book = new DraftBook({
+      ...portOver(store),
+      deviceDrafts: async () => {
+        reads += 1
+        return store.list()
+      }
+    })
+
+    await Promise.all([book.hydrate(), book.hydrate()])
+
+    expect(reads).toBe(1)
+  })
+})
+
 describe('a store that cannot be opened', () => {
   it('leaves the drafts in this window and says nothing is kept', async () => {
     const store = new FakeDraftStore()
@@ -2282,7 +2300,7 @@ describe('a prompt the host is said to have applied after nobody knew what becam
       } as unknown as import('@kalareach/protocol').AttachmentHandle
     }
 
-    it('stays, finished or not, and the text sent goes from the composer and the store', async () => {
+    it('stays when its upload finished, and the text sent goes from the composer and the store', async () => {
       const store = new FakeDraftStore()
       const book = await opened(store)
       await unknownOn(book)
@@ -2297,6 +2315,129 @@ describe('a prompt the host is said to have applied after nobody knew what becam
       // The file is kept with the composer's own draft, and none of the text that was sent is.
       expect(store.all().map((draft) => [draft.text, draft.attachments.length])).toEqual([['', 1]])
     })
+
+    it('stays when its upload finishes while the removal is being made, and the text sent still goes', async () => {
+      const store = new FakeDraftStore()
+      const gate = holding(store, 'deviceDraftDiscard')
+      const book = new DraftBook(gate.port)
+      await book.hydrate()
+      await unknownOn(book)
+      const uploading = { ...UPLOADED, upload: 'uploading' as const, handle: null, transferId: null }
+      book.update(MAIN, (draft) => ({ ...draft, attachments: [uploading] }))
+      await book.settled()
+
+      book.sendSettled('local-1', 'applied')
+      await gate.reached
+      // The upload finishes while the store is answering: that is not the person writing.
+      book.update(MAIN, (draft) => ({ ...draft, attachments: [UPLOADED] }))
+      gate.release()
+      await book.settled()
+
+      expect(book.draft(MAIN).text).toBe('')
+      expect(book.draft(MAIN).attachments.map((file) => file.localId)).toEqual(['file-1'])
+      expect(store.all().map((draft) => [draft.text, draft.attachments.length])).toEqual([['', 1]])
+    })
+  })
+
+  it('does not give the record a recovery stored to an empty composer, while the host said it was applied', async () => {
+    const store = new FakeDraftStore()
+    const gate = holding(store, 'deviceDraftSave')
+    const book = new DraftBook(gate.port)
+    await book.hydrate()
+    store.refuseSaves({ code: 'STORAGE_UNAVAILABLE', message: 'the disk refused it' })
+    type(book, MAIN, 'send this')
+    await book.settled()
+    const token = book.beginSend(MAIN)
+    await token.claimed
+    type(book, MAIN, 'newer')
+    book.endSend(token, 'unknown', 'local-1')
+    await book.settled()
+    // The person clears the composer, and the store takes writes again.
+    type(book, MAIN, '')
+    store.refuseSaves(null)
+    book.writeAll()
+    await gate.reached
+
+    book.sendSettled('local-1', 'applied')
+    for (let tick = 0; tick < 100; tick += 1) await Promise.resolve()
+    gate.release()
+    await book.settled()
+
+    // Nothing of the prompt is in the composer or the store.
+    expect(book.draft(MAIN).text).toBe('')
+    expect(store.all()).toEqual([])
+    expect(book.snapshot().kept).toEqual([])
+  })
+
+  it('leaves the older version in a composer that took it', async () => {
+    const store = new FakeDraftStore()
+    const book = await opened(store)
+    type(book, MAIN, 'send')
+    await book.settled()
+    // From here the store refuses what it is given for its size: the prompt's text never reached it.
+    store.refuseSaves({ code: 'QUOTA_EXCEEDED', message: 'too large to keep' })
+    type(book, MAIN, 'send this')
+    await book.settled()
+    const token = book.beginSend(MAIN)
+    type(book, MAIN, '')
+    type(book, MAIN, 'the next thing')
+    await book.settled()
+    book.endSend(token, 'unknown', 'local-1')
+    await book.settled()
+    // The person clears the composer, so a read gives it the older version, which is theirs now.
+    type(book, MAIN, '')
+    await book.settled()
+    await book.reload()
+    expect(book.draft(MAIN).text).toBe('send')
+
+    book.sendSettled('local-1', 'applied')
+    await book.settled()
+
+    expect(book.draft(MAIN).text).toBe('send')
+    expect(store.all().map((draft) => draft.text)).toEqual(['send'])
+  })
+
+  it('leaves a kept prompt the person moved to another session', async () => {
+    const store = new FakeDraftStore()
+    const book = await opened(store)
+    await unknownOn(book, () => type(book, MAIN, 'newer'))
+    // The other session's composer holds something, so the moved prompt is listed beside it.
+    type(book, BUILD, 'in build')
+    await book.settled()
+    const kept = book.snapshot().kept[0]
+    await book.moveTo(kept?.id ?? '', BUILD, kept?.revision ?? '')
+    expect(book.snapshot().kept.map((each) => [each.sessionId, each.text])).toEqual([[BUILD, 'send this']])
+    const stored = () =>
+      store
+        .all()
+        .map((draft) => `${draft.sessionId === BUILD ? 'build' : 'main'}: ${draft.text}`)
+        .sort()
+    expect(stored()).toEqual(['build: in build', 'build: send this', 'main: newer'])
+
+    book.sendSettled('local-1', 'applied')
+    await book.settled()
+
+    // It is another session's draft now, and not the prompt that was sent from this one.
+    expect(stored()).toEqual(['build: in build', 'build: send this', 'main: newer'])
+  })
+
+  it('keeps the warning that nothing is kept while the store cannot be opened', async () => {
+    const store = new FakeDraftStore()
+    store.breakOpening()
+    const book = new DraftBook(portOver(store))
+    await book.hydrate()
+    expect(book.snapshot().problem).not.toBeNull()
+    type(book, MAIN, 'send this')
+    const token = book.beginSend(MAIN)
+    type(book, MAIN, 'newer')
+    book.endSend(token, 'unknown', 'local-1')
+    await book.settled()
+
+    book.sendSettled('local-1', 'applied')
+    await book.settled()
+
+    expect(book.snapshot().status).toBe('memory-only')
+    expect(book.snapshot().problem).not.toBeNull()
   })
 
   describe('that an earlier run of the application sent', () => {

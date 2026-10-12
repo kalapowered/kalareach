@@ -411,6 +411,12 @@ export class DraftBook {
   #cached: BookSnapshot | null = null
   #inflight = 0
   #idle: (() => void)[] = []
+  /** The read of the store that [`hydrate`] is making, while it is. */
+  #hydrating: Promise<void> | null = null
+  /** The failure to open the store, kept while the store is not open. */
+  #openFailure: string | null = null
+  /** The prompts a recovery is storing the text of right now: their records are set apart until it has decided. */
+  readonly #storing = new Set<Flight>()
   /** Prompts of earlier runs that were said to have been applied before the store was read. */
   #earlier: { localId: string; sessionId: string; text: string; storedDraftId: string }[] = []
 
@@ -459,7 +465,16 @@ export class DraftBook {
    * A store that cannot be opened leaves the book in memory only: nothing is lost that was in
    * memory, and the person is told that nothing is kept.
    */
-  async hydrate(): Promise<void> {
+  hydrate(): Promise<void> {
+    // A second press of "try again" while the store is being read waits for that read: two answers
+    // merged one after the other would give a composer a draft the first one's cleanup had removed.
+    this.#hydrating ??= this.#hydrate().finally(() => {
+      this.#hydrating = null
+    })
+    return this.#hydrating
+  }
+
+  async #hydrate(): Promise<void> {
     try {
       const stored = await this.#port.deviceDrafts()
       this.#unreadable = stored.unreadable
@@ -468,9 +483,11 @@ export class DraftBook {
       this.#merge(stored.drafts)
       this.#status = 'ready'
       this.#problem = null
+      this.#openFailure = null
     } catch (failure) {
       this.#status = 'memory-only'
       this.#problem = failureMessage(failure)
+      this.#openFailure = this.#problem
     }
     this.#changed()
     if (this.#status === 'ready') {
@@ -816,23 +833,34 @@ export class DraftBook {
     }
     if (stored !== null && !(await this.#dropRecord(stored, flight.id))) this.#owe(stored, flight.id)
     const now = this.#find(key)
-    if (now !== undefined && writtenSince(composer, now)) {
+    // What the person typed while the store was answering is theirs. An upload that went on or ended
+    // meanwhile is not the person writing: the files are taken as they are now.
+    if (now !== undefined && (now.text !== composer.text || now.revision !== composer.revision)) {
       this.#say('The composer keeps what you wrote while this was being done.')
       this.#letGo(key)
       return stored?.id ?? null
     }
     this.#retire(now ?? composer)
-    this.#mutate(key, (draft) => ({
-      ...draft,
-      revision: draft.revision + 1,
-      text: '',
+    let kept = false
+    this.#mutate(key, (draft) => {
       // A file the person added since the press is theirs, finished or not.
-      attachments: theirs,
-      stored: null,
-      state: 'bound',
-      target: { sessionId: draft.target.sessionId, applicationInstanceId: null, agentBindingRevision: null }
-    }))
-    this.#track(key).savedKey = contentKey(this.#find(key) ?? composer)
+      const files = draft.attachments.filter(
+        (file) => !(file.handle !== null && file.upload === 'uploaded' && sentFiles.has(file.handle.transfer_id))
+      )
+      kept = files.some((file) => file.upload === 'uploaded' && file.handle !== null)
+      return {
+        ...draft,
+        revision: draft.revision + 1,
+        text: '',
+        attachments: files,
+        stored: null,
+        state: 'bound',
+        target: { sessionId: draft.target.sessionId, applicationInstanceId: null, agentBindingRevision: null }
+      }
+    })
+    // A file that finished meanwhile has no record to stay in now, and is stored by a write.
+    this.#track(key).savedKey = kept ? null : contentKey(this.#find(key) ?? composer)
+    if (kept) this.#schedule(key)
     // A failure kept for this composer's text is over: there is nothing left to keep.
     this.#clearFailure(key)
     return stored?.id ?? null
@@ -858,7 +886,12 @@ export class DraftBook {
     let ref: StoredRef | null = record
     if (listed !== undefined) {
       const files = (handles: readonly AttachmentHandle[]) => handles.map((handle) => handle.transfer_id).join(' ')
-      const sameText = listed.text === flight.sent.text && files(listed.attachments) === files(storable(flight.sent))
+      // Another window may have put it in its composer and changed it, and the person may have moved
+      // it to another session: either way it is not the prompt that was sent from this composer.
+      const sameText =
+        listed.sessionId === flight.sent.target.sessionId &&
+        listed.text === flight.sent.text &&
+        files(listed.attachments) === files(storable(flight.sent))
       ref = sameText ? { id: listed.id, revision: listed.revision } : null
     }
     if (ref === null) return
@@ -876,6 +909,8 @@ export class DraftBook {
     const older = flight.older
     if (older === undefined) return
     delete flight.older
+    // A composer that took it is the person's: it is theirs now, and it stays.
+    if (this.#drafts.some((draft) => draft.stored?.id === older.id)) return
     if (!(await this.#dropRecord(older, flight.id))) this.#owe(older, flight.id)
   }
 
@@ -1199,16 +1234,19 @@ export class DraftBook {
       }
       for (const flight of [...this.#unsettled]) {
         if (this.#consumed(flight)) continue
+        this.#storing.add(flight)
         const stored = await this.#storeSent(flight)
         if (this.#consumed(flight)) {
           // The host said the prompt was applied while the store was answering: what it stored is
-          // not kept.
+          // not kept. Its record stays set apart until it is gone, so no read hands it to a composer.
           this.#clearFailure(flight.id)
           if (stored !== null) await this.#dropSent(flight)
+          this.#storing.delete(flight)
           this.#unsettled = this.#unsettled.filter((each) => each !== flight)
           await this.reload()
           continue
         }
+        this.#storing.delete(flight)
         if (stored === null) {
           if (this.#failed.get(flight.id)?.code === 'QUOTA_EXCEEDED') {
             this.#clearFailure(flight.id)
@@ -1740,6 +1778,7 @@ export class DraftBook {
   #recompute(): void {
     this.#problem =
       [...this.#failed.values()][0]?.message ??
+      (this.#status === 'memory-only' ? this.#openFailure : null) ??
       (this.#unsettled.length > 0
         ? 'The text of a prompt that was sent is held in this window only.'
         : null)
@@ -1765,6 +1804,9 @@ export class DraftBook {
     const chosen = new Set<string>()
     const sessions = new Set(list.map((stored) => stored.sessionId))
     for (const sessionId of sessions) {
+      // While a recovery is storing the text of a prompt, the record it makes is not known yet, so
+      // no composer takes a draft from a read: the next read, once it has decided, does.
+      if (this.#storing.size > 0) break
       const index = next.findIndex((draft) => draft.target.sessionId === sessionId)
       const mine = index === -1 ? undefined : next[index]
       if (mine !== undefined && !(isEmpty(mine) && mine.stored === null)) continue
@@ -1792,7 +1834,7 @@ export class DraftBook {
   /** The records set apart for prompts that have not ended or whose text is not stored yet. */
   #reserved(): readonly string[] {
     return [
-      ...[...this.#flights.values(), ...this.#unsettled]
+      ...[...this.#flights.values(), ...this.#unsettled, ...this.#storing]
         .filter((flight) => flight.apart !== true)
         .flatMap((flight) => [
         ...(flight.record === null ? [] : [flight.record.id]),
