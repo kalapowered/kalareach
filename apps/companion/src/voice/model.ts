@@ -26,7 +26,7 @@ import type {
   VoiceStopResult
 } from '@kalareach/protocol'
 
-import type { VoiceCallState } from '../host/port'
+import type { VoiceCallState, VoiceFence } from '../host/port'
 
 /** What the screen says when the host's answer gave no status for its workers that could be read. */
 export const FENCE_UNREADABLE_WORDS =
@@ -72,6 +72,24 @@ export function toConfirmWords(
   const named = pending.sessions.map((session) => names[session] ?? `session ${session.slice(0, 8)}`)
   const where = named.join(', ') + (pending.more ? ', and possibly others' : '')
   return `The host has not yet confirmed that nothing the ${ended} sent can still run in ${where}.`
+}
+
+/**
+ * What the screen says of the fence a call's end owed, or null when there is nothing to say: the
+ * host owed none, or every worker holds. A fence status this build does not know is read as one it
+ * could not read, never as one the host did not owe.
+ */
+export function fenceWords(fence: VoiceFence, names: Readonly<Record<string, string>>): string | null {
+  switch (fence.kind) {
+    case 'not_owed':
+      return null
+    case 'barrier': {
+      const pending = toConfirm(fence.barrier)
+      return pending.sessions.length > 0 ? toConfirmWords(pending, names, 'call') : null
+    }
+    default:
+      return FENCE_UNREADABLE_WORDS
+  }
 }
 
 /** What the microphone is doing, as the native layer reports it. */

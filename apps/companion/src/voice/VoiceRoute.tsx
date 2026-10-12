@@ -17,11 +17,9 @@ import {
   asCaptureState,
   choiceFromPreparation,
   choiceWithRate,
-  FENCE_UNREADABLE_WORDS,
+  fenceWords,
   requestedSeconds,
   runningCallFrom,
-  toConfirm,
-  toConfirmWords,
   type ContextRequest,
   type Delegation,
   type ProviderChoice,
@@ -422,15 +420,14 @@ export function VoiceRoute({
         void ask(() => port.voiceStop(running.voiceSessionId, {}))
           .then((closure) => {
             if (closure.closed_locally) setCall(null)
-            const pending = toConfirm(closure.fence?.kind === 'barrier' ? closure.fence.barrier : null)
+            const unconfirmed =
+              closure.fence === null ? null : fenceWords(closure.fence, choice?.sessionNames ?? {})
             setNotice(
               closure.host_failure
                 ? `This device's call is closed. The host was not told, so its grant may still be open: ${failureWords(closure.host_failure)}`
-                : pending.sessions.length > 0
-                  ? `This device's call is closed and its grant withdrawn. ${toConfirmWords(pending, choice?.sessionNames ?? {}, 'call')}`
-                  : closure.fence?.kind === 'unreadable'
-                    ? `This device's call is closed and its grant withdrawn. ${FENCE_UNREADABLE_WORDS}`
-                    : null
+                : unconfirmed === null
+                  ? null
+                  : `This device's call is closed and its grant withdrawn. ${unconfirmed}`
             )
           })
           .catch((error: unknown) => {

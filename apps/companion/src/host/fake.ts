@@ -1641,7 +1641,7 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
         fence: unreadable
           ? { kind: 'unreadable' }
           : barrier === null
-            ? { kind: 'none' }
+            ? { kind: 'not_owed' }
             : { kind: 'barrier', barrier },
         host_failure: null
       })

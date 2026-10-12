@@ -1,0 +1,78 @@
+[
+  {
+    "name": "the host owed no fence",
+    "closure": {
+      "closed_locally": false,
+      "fence": { "kind": "not_owed" },
+      "host_failure": null
+    },
+    "notice": "none"
+  },
+  {
+    "name": "every worker holds",
+    "closure": {
+      "closed_locally": false,
+      "fence": {
+        "kind": "barrier",
+        "barrier": {
+          "authority_revision": "5",
+          "workers": [
+            {
+              "session_id": "8a7b6c50-22bb-4c3d-8e4f-000000000101",
+              "state": "acknowledged",
+              "acknowledged_revision": null,
+              "rejected_actions": [],
+              "rejected_actions_total": "1",
+              "possibly_executed": [],
+              "possibly_executed_total": "0",
+              "omitted_actions": "0",
+              "names_pending": "0",
+              "detail": ""
+            }
+          ],
+          "workers_total": "1"
+        }
+      },
+      "host_failure": null
+    },
+    "notice": "none"
+  },
+  {
+    "name": "a worker has not held",
+    "closure": {
+      "closed_locally": false,
+      "fence": {
+        "kind": "barrier",
+        "barrier": {
+          "authority_revision": "5",
+          "workers": [
+            {
+              "session_id": "8a7b6c50-22bb-4c3d-8e4f-000000000101",
+              "state": "pending",
+              "acknowledged_revision": null,
+              "rejected_actions": [],
+              "rejected_actions_total": "1",
+              "possibly_executed": [],
+              "possibly_executed_total": "0",
+              "omitted_actions": "0",
+              "names_pending": "0",
+              "detail": ""
+            }
+          ],
+          "workers_total": "1"
+        }
+      },
+      "host_failure": null
+    },
+    "notice": "pending"
+  },
+  {
+    "name": "the host's status could not be read",
+    "closure": {
+      "closed_locally": false,
+      "fence": { "kind": "unreadable" },
+      "host_failure": null
+    },
+    "notice": "unconfirmed"
+  }
+]

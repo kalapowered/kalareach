@@ -1250,7 +1250,8 @@ pub enum VoiceFence {
 pub struct VoiceClosure {
     /// Whether a call of this process's own was closed. It holds none, so this is false.
     pub closed_locally: bool,
-    /// What the host's answer showed of its fence, when the host could be told.
+    /// What the host's answer showed of its fence; none when there was no answer to read: the host
+    /// could not be told, or what it answered was not a stop's result.
     pub fence: Option<VoiceFence>,
     /// Why the host could not be told, or its answer not read, when it could not.
     pub host_failure: Option<CommandError>,
@@ -2130,17 +2131,20 @@ mod tests {
         }
     }
 
-    /// The barrier of a fence that named the device's own close, with one worker that has not held.
-    fn a_barrier_with_a_pending_worker() -> kr_protocol::action::RevocationBarrier {
-        use kr_protocol::action::{BarrierState, FencedAction, RevocationBarrier, WorkerBarrier};
-        use kr_protocol::ids::{ActionId, ActorId, AuthorityRevision, SessionId};
+    /// The barrier of a fence that named the device's own close, with one worker in this state.
+    fn a_barrier_with(
+        state: kr_protocol::action::BarrierState,
+        session: kr_protocol::ids::SessionId,
+    ) -> kr_protocol::action::RevocationBarrier {
+        use kr_protocol::action::{FencedAction, RevocationBarrier, WorkerBarrier};
+        use kr_protocol::ids::{ActionId, ActorId, AuthorityRevision};
         use kr_protocol::scalars::{Nullable, U64, Uuid};
 
         RevocationBarrier::new(
             AuthorityRevision::new(5),
             vec![WorkerBarrier {
-                session_id: SessionId::new(Uuid::from_bytes([9; 16])),
-                state: BarrierState::Pending,
+                session_id: session,
+                state,
                 acknowledged_revision: Nullable::null(),
                 rejected_actions: vec![FencedAction {
                     actor_id: ActorId::new("device:phone").expect("a principal"),
@@ -2153,6 +2157,14 @@ mod tests {
                 names_pending: U64::new(0),
                 detail: String::new(),
             }],
+        )
+    }
+
+    /// The barrier of a fence that named the device's own close, with one worker that has not held.
+    fn a_barrier_with_a_pending_worker() -> kr_protocol::action::RevocationBarrier {
+        a_barrier_with(
+            kr_protocol::action::BarrierState::Pending,
+            kr_protocol::ids::SessionId::new(kr_protocol::scalars::Uuid::from_bytes([9; 16])),
         )
     }
 
@@ -2185,7 +2197,7 @@ mod tests {
     }
 
     /// A stop's answer as the client gives it: the result the host sends, as a map the test may add
-    /// a member to, and the barrier of a fence that named the device's own close.
+    /// a member to, with the barrier the caller gives in place of the typed one, or none.
     fn a_stop_answered_with(barrier: Option<kr_cbor::CanonicalValue>) -> kr_cbor::CanonicalMap {
         use kr_protocol::ids::GrantId;
         use kr_protocol::scalars::{CanonicalSet, Nullable, TimestampMs, Uuid};
@@ -2223,7 +2235,11 @@ mod tests {
     /// What the page is given for a stop answered with this result, as the command encodes it.
     fn the_closure_for(result: kr_cbor::CanonicalMap) -> serde_json::Value {
         let answered = kr_client::Settled::Result(kr_cbor::CanonicalValue::Map(result).into());
-        serde_json::to_value(VoiceClosure::of(true, fence_of(&answered))).expect("it encodes")
+        serde_json::to_value(VoiceClosure::of(
+            crate::audio::stop_active_call(),
+            fence_of(&answered),
+        ))
+        .expect("it encodes")
     }
 
     /// Section 9: a stop answered with a worker that has not held reaches the page as pending, with
@@ -2311,8 +2327,11 @@ mod tests {
             );
             assert_eq!(closure["fence"].as_object().map(|each| each.len()), Some(1));
         }
-        let closure =
-            serde_json::to_value(VoiceClosure::of(true, fence_of(&not_a_map))).expect("it encodes");
+        let closure = serde_json::to_value(VoiceClosure::of(
+            crate::audio::stop_active_call(),
+            fence_of(&not_a_map),
+        ))
+        .expect("it encodes");
         assert_eq!(closure["fence"]["kind"], "unreadable", "{closure}");
     }
 
@@ -2338,7 +2357,7 @@ mod tests {
         };
 
         let closure = serde_json::to_value(VoiceClosure::of(
-            true,
+            crate::audio::stop_active_call(),
             fence_of(&kr_client::Settled::Receipt(Box::new(receipt))),
         ))
         .expect("it encodes");
@@ -2350,6 +2369,62 @@ mod tests {
             "{closure}"
         );
         assert!(!closure.to_string().contains("device:phone"), "{closure}");
+    }
+
+    /// The closures the page is given for a stop are the ones the page is tested with: the cases
+    /// of the fixture the page's tests read are built here from the answers a host sends, and
+    /// encoded as the command encodes them, so a name or a shape that native code gives and the page
+    /// does not read fails here.
+    #[test]
+    fn the_closures_the_page_is_given_for_a_stop_are_the_ones_the_page_is_tested_with() {
+        use kr_protocol::action::BarrierState;
+
+        let cases: Vec<serde_json::Value> =
+            serde_json::from_str(include_str!("../../test/fixtures/voice-stop-closures.json"))
+                .expect("the cases");
+        let session: kr_protocol::ids::SessionId = "8a7b6c50-22bb-4c3d-8e4f-000000000101"
+            .parse()
+            .expect("a session");
+        let barrier = |state| {
+            kr_cbor::to_canonical_value(&a_barrier_with(state, session)).expect("it encodes")
+        };
+        let mut unreadable = match barrier(BarrierState::Pending) {
+            kr_cbor::CanonicalValue::Map(barrier) => barrier,
+            other => panic!("a barrier is a map: {other:?}"),
+        };
+        unreadable
+            .insert(
+                "a_member_a_later_host_adds".to_owned(),
+                kr_cbor::CanonicalValue::Bool(true),
+            )
+            .expect("a new key");
+        let answers = [
+            (
+                "the host owed no fence",
+                a_stop_answered_with(Some(kr_cbor::CanonicalValue::Null)),
+            ),
+            (
+                "every worker holds",
+                a_stop_answered_with(Some(barrier(BarrierState::Acknowledged))),
+            ),
+            (
+                "a worker has not held",
+                a_stop_answered_with(Some(barrier(BarrierState::Pending))),
+            ),
+            (
+                "the host's status could not be read",
+                a_stop_answered_with(Some(kr_cbor::CanonicalValue::Map(unreadable))),
+            ),
+        ];
+
+        assert_eq!(cases.len(), answers.len(), "every case has an answer");
+        for (name, answer) in answers {
+            let case = cases
+                .iter()
+                .find(|case| case["name"] == name)
+                .unwrap_or_else(|| panic!("no case is named {name}"));
+            assert_eq!(the_closure_for(answer), case["closure"], "{name}");
+        }
     }
 
     /// A fence names an action by the principal that submitted it, which for a call's own close is

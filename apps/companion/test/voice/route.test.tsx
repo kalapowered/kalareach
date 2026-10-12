@@ -11,9 +11,11 @@ import { act, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { describe, expect, it, vi } from 'vitest'
 
+import closures from '../fixtures/voice-stop-closures.json'
+
 import { AppProvider } from '../../src/app/state'
 import { fakeHost, type FakeHostControls } from '../../src/host/fake'
-import type { HostPort } from '../../src/host/port'
+import type { HostPort, VoiceClosure } from '../../src/host/port'
 import { VoiceRoute } from '../../src/voice/VoiceRoute'
 
 /** The session the fake host's workers answer for. */
@@ -263,6 +265,60 @@ describe('while a call is running', () => {
     expect(screen.getByText(/its grant withdrawn/)).toBeInTheDocument()
     expect(screen.queryByText(/has not yet confirmed/)).not.toBeInTheDocument()
     expect(screen.queryByRole('heading', { name: 'Voice session' })).not.toBeInTheDocument()
+  })
+
+  // Section 9: the closures native code gives the page, as native code builds them (the same
+  // fixture is read by the native test that builds them), are shown as each says: nothing for a
+  // fence the host did not owe or whose workers all hold, the sessions that have not held, and that
+  // the app cannot confirm when the host's status could not be read.
+  it.each(closures)('shows $name as native code gives it', async ({ closure, notice }) => {
+    const person = userEvent.setup()
+    const { port } = start()
+    await waitForChoice()
+    await person.click(screen.getByRole('button', { name: 'Start voice session' }))
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'End session' })).toBeInTheDocument()
+    })
+    const stopped = vi.spyOn(port, 'voiceStop').mockResolvedValue(closure as unknown as VoiceClosure)
+
+    await person.click(screen.getByRole('button', { name: 'End session' }))
+
+    if (notice === 'none') {
+      await waitFor(() => {
+        expect(stopped).toHaveBeenCalled()
+      })
+      // The answer has been taken when the screen has settled after the call returned.
+      await act(async () => {})
+      expect(screen.queryByText(/its grant withdrawn/)).not.toBeInTheDocument()
+      expect(screen.queryByText(/cannot confirm/)).not.toBeInTheDocument()
+      expect(screen.queryByText(/has not yet confirmed/)).not.toBeInTheDocument()
+    } else {
+      await waitFor(() => {
+        expect(screen.getByText(/its grant withdrawn/)).toBeInTheDocument()
+      })
+      const said = notice === 'pending' ? /still run in Session 1\./ : /cannot confirm that nothing/
+      expect(screen.getByText(said)).toBeInTheDocument()
+    }
+  })
+
+  // Section 9: a fence status this build does not know is not a fence the host did not owe. The
+  // screen says it cannot confirm the host's workers, as it does for a status it could not read.
+  it('says it cannot confirm the host\'s workers for a fence status it does not know', async () => {
+    const person = userEvent.setup()
+    const { port } = start()
+    await waitForChoice()
+    await person.click(screen.getByRole('button', { name: 'Start voice session' }))
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'End session' })).toBeInTheDocument()
+    })
+    const unknown = { closed_locally: false, fence: { kind: 'a_status_a_later_build_adds' }, host_failure: null }
+    vi.spyOn(port, 'voiceStop').mockResolvedValue(unknown as unknown as VoiceClosure)
+
+    await person.click(screen.getByRole('button', { name: 'End session' }))
+
+    await waitFor(() => {
+      expect(screen.getByText(/cannot confirm that nothing/)).toBeInTheDocument()
+    })
   })
 
   // Section 9: a host that says it owed no fence leaves nothing to confirm, and the screen adds no
