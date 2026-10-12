@@ -308,25 +308,24 @@ The mailbox service stores the object like any other item: it is encrypted and i
 more than a day. The mailbox service sees the key with which the request was signed, the key to
 which the object is addressed, and the routing record (the key identifiers of the host and the
 device, the payload type, the size and the expiry time), and the arrival time, but it does not see
-the content of the object. Although the object's identifier is derived from the notification's
-identifier, it includes a secret known only to this host, so the identifier does not link the object
-to the push. However, because the two have the same expiry time and arrive close together, a mailbox
-service operated by the same party as the push gateway can match them.
+the content of the object. The object's identifier is derived from the notification's identifier
+with a secret known only to this host, so the identifier does not link the object to the push.
+However, because the two have the same expiry time and arrive close together, a mailbox service
+operated by the same party as the push gateway can match them.
 
 Placing an object is safe to repeat, because the service recognises a second delivery of the same
 envelope and stores one item. The mailbox is asked only while the notification has more life left
-than the longest wait of its own schedule, which is five minutes; one with less goes at once without
-its detail. If the service cannot be reached, asks for later or does not answer, the push is not
-sent. It is tried again on its usual schedule, and not before the time the service named. The
-mailbox gets at most the notification's first five attempts. The push goes at once, without its
-detail, when the service asks for more than five minutes, when waiting would leave less than five
-minutes before the notification expires, and when the five attempts are spent, so that the gateway
-keeps the last three. Once a push has gone without its detail, a later attempt at it does not ask
-the mailbox again. A service that refuses the object, because the device's mailbox is full, is not
-waited for either. The notification is a person's alert, and the push is what brings the device to
-read its mailbox, so it goes without its detail and its record says the mailbox did not take the
-object. A host whose document names no mailbox service places nothing and sends the push as it
-always did.
+than the longest wait of its own schedule, which is five minutes; one with five minutes or less goes
+at once without its detail. If the service cannot be reached, asks for later or does not answer, the
+push is not sent. It is tried again on its usual schedule, and not before the time the service
+named. The mailbox gets at most the notification's first five attempts. The push goes at once,
+without its detail, when the service asks for more than five minutes, when waiting would leave five
+minutes or less before the notification expires, and when the five attempts are spent, so that the
+gateway keeps the last three. Once a push has gone without its detail, a later attempt at it does
+not ask the mailbox again. A service that refuses the object, because the device's mailbox is full,
+is not waited for either. The notification is a person's alert, and the push is what brings the
+device to read its mailbox, so it goes without its detail and its record says why. A host whose
+document names no mailbox service places nothing and sends the push as it always did.
 
 ## Sending, and not sending twice
 
