@@ -8678,8 +8678,14 @@ struct WatchedGateway {
 
 impl WatchedGateway {
     fn over(service: &MailboxService) -> Self {
+        Self::over_answering(service, Vec::new())
+    }
+
+    /// A gateway that answers the pushes it is presented with as `answers` say, and takes the
+    /// ones after them.
+    fn over_answering(service: &MailboxService, answers: Vec<SendOutcome>) -> Self {
         Self {
-            inner: GatewayDouble::queued(),
+            inner: GatewayDouble::answering(answers),
             web: Arc::clone(&service.web),
             device: *service.device.public(),
             held_at_the_push: Mutex::new(Vec::new()),
@@ -9055,15 +9061,15 @@ fn a_mailbox_that_stays_down_does_not_keep_a_person_from_being_told() {
 }
 
 /// KR-REQ-09.21: a mailbox that cannot take the object when the notification has no time to wait
-/// for it does not take the notification with it. The service asks for two minutes and the
-/// notification has one, so the push is presented at once, without its detail, and not lost to the
-/// expiry.
+/// for it does not take the notification with it. The service asks for five minutes, which is as
+/// long as a wait is honoured, and the notification has six: waiting would leave it less than the
+/// longest wait of its own schedule, so the push is presented at once, without its detail.
 #[test]
 fn a_mailbox_that_asks_for_more_time_than_the_notification_has_is_not_waited_for() {
     let (environment, _) = environment_keeping_the_hosts_mailbox_key();
     let now = real_now();
     let service = MailboxService::attach(&environment);
-    queue_an_oversized_notification_living(&environment, &service, now, 60_000);
+    queue_an_oversized_notification_living(&environment, &service, now, 6 * 60_000);
     let gateway = WatchedGateway::over(&service);
     service.web.fail(
         MailboxService::DELIVER,
@@ -9071,7 +9077,7 @@ fn a_mailbox_that_asks_for_more_time_than_the_notification_has_is_not_waited_for
         kr_service_stand_in::Moment::Refuse {
             status: 503,
             code: "SERVICE_UNAVAILABLE",
-            retry_after_seconds: Some(120),
+            retry_after_seconds: Some(300),
         },
     );
 
@@ -9083,9 +9089,10 @@ fn a_mailbox_that_asks_for_more_time_than_the_notification_has_is_not_waited_for
     assert!(detail.contains("mailbox"), "{detail}");
 }
 
-/// KR-REQ-09.21: the deadline is asked again when the placement ends. A notification that expires
-/// while its detail is being placed is not presented; its detail did reach the mailbox, so the
-/// journal keeps it among the copies that left.
+/// KR-REQ-09.21: the deadline is asked again when the placement ends. A notification whose
+/// placement takes far longer than a request may, so that it has expired when the exchange ends,
+/// is not presented; its detail did reach the mailbox, so the journal keeps it among the copies
+/// that left.
 #[test]
 fn a_notification_that_expires_while_its_detail_is_placed_is_not_presented() {
     let (environment, _) = environment_keeping_the_hosts_mailbox_key();
@@ -9094,10 +9101,10 @@ fn a_notification_that_expires_while_its_detail_is_placed_is_not_presented() {
     let service = MailboxService::attach_acting(&environment, {
         let time = Arc::clone(&time);
         Box::new(move || {
-            time.store(now + 61_000, std::sync::atomic::Ordering::SeqCst);
+            time.store(now + 7 * 60_000, std::sync::atomic::Ordering::SeqCst);
         })
     });
-    queue_an_oversized_notification_living(&environment, &service, now, 60_000);
+    queue_an_oversized_notification_living(&environment, &service, now, 6 * 60_000);
     let gateway = WatchedGateway::over(&service);
 
     let clock = {
@@ -9220,30 +9227,24 @@ fn an_object_is_not_kept_for_a_notification_that_will_not_be_presented() {
     assert!(!the_object_is_owed(&environment, expiring));
 }
 
-/// KR-REQ-09.21: a wait for the mailbox that would leave no room for the next attempt before the
-/// notification expires is not made. The notification has two and a half seconds and the service
-/// asks for two, so the next pass could not come in time, and the push goes now.
+/// KR-REQ-09.21: a notification with less life left than the longest wait of its own schedule is
+/// presented without its detail, and the mailbox is not asked: the exchange and a wait could each
+/// cost it the push.
 #[test]
-fn a_mailbox_that_answers_in_the_last_seconds_does_not_cost_the_push() {
+fn a_notification_with_little_life_left_is_sent_without_asking_the_mailbox() {
     let (environment, _) = environment_keeping_the_hosts_mailbox_key();
     let now = real_now();
     let service = MailboxService::attach(&environment);
-    queue_an_oversized_notification_living(&environment, &service, now, 2_500);
+    queue_an_oversized_notification_living(&environment, &service, now, 4 * 60_000);
     let gateway = WatchedGateway::over(&service);
-    service.web.fail(
-        MailboxService::DELIVER,
-        1,
-        kr_service_stand_in::Moment::Refuse {
-            status: 503,
-            code: "SERVICE_UNAVAILABLE",
-            retry_after_seconds: Some(2),
-        },
-    );
 
     assert_eq!(pass_at(&environment, &gateway, now), 1);
 
+    assert_eq!(service.asked(), 0);
     assert_eq!(gateway.held_at_the_push(), [0]);
-    assert_eq!(the_notification_is(&environment).0, DeliveryState::Accepted);
+    let (state, detail) = the_notification_is(&environment);
+    assert_eq!(state, DeliveryState::Accepted);
+    assert!(detail.contains("mailbox"), "the record says why: {detail}");
 }
 
 /// KR-REQ-09.21: a service that asks to be left alone for longer than the longest wait the
@@ -9268,6 +9269,40 @@ fn a_mailbox_that_asks_for_an_hour_is_not_waited_for() {
     assert_eq!(pass_at(&environment, &gateway, now), 1);
 
     assert_eq!(gateway.held_at_the_push(), [0]);
+    assert_eq!(the_notification_is(&environment).0, DeliveryState::Accepted);
+}
+
+/// KR-REQ-09.21: a push that goes without its detail does not ask the mailbox again at its next
+/// attempt. The service asks for an hour, the push goes, the gateway does not take it, and the
+/// next attempt goes to the gateway alone.
+#[test]
+fn a_push_that_went_without_its_detail_does_not_ask_the_mailbox_again() {
+    let (environment, _) = environment_keeping_the_hosts_mailbox_key();
+    let now = real_now();
+    let service = MailboxService::attach(&environment);
+    queue_an_oversized_notification(&environment, &service, now);
+    let gateway = WatchedGateway::over_answering(
+        &service,
+        vec![SendOutcome::NotDispatched {
+            detail: "the gateway could not be reached".to_owned(),
+        }],
+    );
+    service.web.fail(
+        MailboxService::DELIVER,
+        1,
+        kr_service_stand_in::Moment::Refuse {
+            status: 503,
+            code: "SERVICE_UNAVAILABLE",
+            retry_after_seconds: Some(3_600),
+        },
+    );
+
+    assert_eq!(pass_at(&environment, &gateway, now), 1);
+    assert_eq!(the_notification_is(&environment).0, DeliveryState::Retrying);
+    assert_eq!(pass_at(&environment, &gateway, now + 10 * 60_000), 1);
+
+    assert_eq!(gateway.held_at_the_push(), [0, 0], "two pushes, no detail");
+    assert_eq!(service.asked(), 1, "and the mailbox was asked once");
     assert_eq!(the_notification_is(&environment).0, DeliveryState::Accepted);
 }
 
@@ -9304,15 +9339,16 @@ fn a_notification_that_expires_before_its_detail_is_placed_asks_the_mailbox_noth
     let (environment, _) = environment_keeping_the_hosts_mailbox_key();
     let now = real_now();
     let service = MailboxService::attach(&environment);
-    queue_an_oversized_notification_living(&environment, &service, now, 60_000);
+    queue_an_oversized_notification_living(&environment, &service, now, 6 * 60_000);
     let gateway = WatchedGateway::over(&service);
     let time = Arc::new(std::sync::atomic::AtomicU64::new(now));
     let authority = Slow {
         asked: std::sync::atomic::AtomicU64::new(0),
-        // The question before the claim is the first; the one in the attempt is the second.
+        // The question the pass puts after the claim is the first; the one in the attempt is the
+        // second.
         nth: 2,
         time: Arc::clone(&time),
-        to: now + 61_000,
+        to: now + 7 * 60_000,
     };
     let clock = {
         let time = Arc::clone(&time);

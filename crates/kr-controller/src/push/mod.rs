@@ -1377,6 +1377,17 @@ impl DeliveryModule {
                     at_ms: before,
                 });
             }
+            if before.saturating_add(MAILBOX_ROOM_MS) >= delivery.expires_at_ms.get() {
+                forget()?;
+                return Ok(Placing {
+                    detail: Detail::Missing(
+                        "it has too little life left to ask the mailbox service about its detail"
+                            .to_owned(),
+                    ),
+                    asked: false,
+                    at_ms: before,
+                });
+            }
             let placement = placer.place(&recipient, &envelope);
             // Written while the admission is held, so that a change of privacy mode that waited
             // for the exchange finds the copy that may have left.
@@ -1412,6 +1423,18 @@ impl DeliveryModule {
             detail,
             asked: true,
             at_ms: clock.now_ms().max(now_ms),
+        })
+    }
+
+    /// Forgets the encrypted object a claimed notification's preview refers to, because the push
+    /// goes without it.
+    fn forget_detail(&self, delivery: &ClaimedDelivery) -> Result<()> {
+        self.with(|producer| {
+            let object = producer.detail_object_of(delivery.notification_id);
+            producer
+                .journal_mut()
+                .forget_object(object)
+                .map_err(unavailable)
         })
     }
 
@@ -1772,6 +1795,9 @@ impl DeliveryModule {
                         kr_delivery::push::SendOutcome::NotDispatched { detail }
                     }
                     None => {
+                        // The detail is given up for good: a later attempt at the push does not
+                        // ask the mailbox again.
+                        self.forget_detail(delivery)?;
                         detail_missing = Some(detail);
                         sender.send(&credential, &request)
                     }
@@ -1813,7 +1839,7 @@ impl DeliveryModule {
         }
         if let Some(why) = &detail_missing {
             decision.detail = format!(
-                "{}; its detail is not in the device's mailbox: {why}",
+                "{}; its detail may not be in the device's mailbox: {why}",
                 decision.detail
             );
         }
@@ -1963,10 +1989,12 @@ impl DeliveryModule {
 enum Detail {
     /// Nothing is owed, or what was owed is in the mailbox.
     Ready,
-    /// The service will not take it. The push is presented without it, and its record says why.
+    /// The detail is not placed: the service will not take it, the device has no key to seal it to,
+    /// or the notification has too little life left to ask. The push is presented without it, and
+    /// its record says why.
     Missing(String),
-    /// Nothing was placed. Whether the push waits for the mailbox is judged by the caller, at the
-    /// reading it decides on, with the time the service asked for.
+    /// Nothing is known to be placed. Whether the push waits for the mailbox is judged by the
+    /// caller, at the reading it decides on, with the time the service asked for.
     Later {
         detail: String,
         after: Option<std::time::Duration>,
@@ -1996,10 +2024,12 @@ const MAILBOX_ATTEMPTS: u64 = kr_delivery::push::MAX_ATTEMPTS - 3;
 /// notification's own backoff ever has. A service that asks for more is not waited for.
 const MAILBOX_LONGEST_WAIT_MS: u64 = kr_delivery::push::MAX_BACKOFF_MS;
 
-/// What the next attempt needs before the notification expires: the delivery loop's pass, which
-/// comes once a second, and an exchange with the mailbox, which can take as long as a request's
-/// deadline. A wait that leaves less than this would lose the push to the expiry.
-const MAILBOX_ROOM_MS: u64 = 30_000;
+/// What a notification needs left before this host asks a mailbox about it, or waits for one: the
+/// longest wait its own schedule makes. A pass can be held up by other deliveries and by a slow
+/// renewal, so a shorter room would be spent before the next attempt came. A notification with
+/// less left than this is presented without its detail at once, and never loses the push to the
+/// wait or to the exchange, which can take as long as a request's deadline.
+const MAILBOX_ROOM_MS: u64 = kr_delivery::push::MAX_BACKOFF_MS;
 
 /// When the next attempt at a notification whose detail the mailbox could not take is due, or none
 /// when the push should go now without the detail.
