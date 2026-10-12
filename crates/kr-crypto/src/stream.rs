@@ -134,9 +134,74 @@ pub const fn encrypted_len(plaintext_len: usize) -> usize {
     HEADER_LEN + plaintext_len + records * RECORD_OVERHEAD
 }
 
+/// Returns the plaintext length an encrypted object of `encrypted_len` bytes holds, or nothing when
+/// no plaintext encrypts to that length.
+///
+/// It is the inverse of [`encrypted_len`], so a size can be bounded from a manifest's stored length
+/// before a byte of the object is read.
+#[must_use]
+pub const fn plaintext_len(encrypted_len: u64) -> Option<u64> {
+    let Some(body) = encrypted_len.checked_sub(HEADER_LEN as u64) else {
+        return None;
+    };
+    let records = body / FULL_RECORD_LEN as u64;
+    let rest = body % FULL_RECORD_LEN as u64;
+    let full = records * RECORD_LEN as u64;
+    if records == 0 {
+        // An empty object is one empty final record, so even the shortest object has a record.
+        return if rest >= RECORD_OVERHEAD as u64 {
+            Some(rest - RECORD_OVERHEAD as u64)
+        } else {
+            None
+        };
+    }
+    if rest == 0 {
+        return Some(full);
+    }
+    // A partial record after full ones holds at least one byte, or the object would have ended at
+    // the last full record.
+    if rest > RECORD_OVERHEAD as u64 {
+        Some(full + rest - RECORD_OVERHEAD as u64)
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_plaintext_length_of_a_stored_length_is_the_inverse_of_the_stored_length_of_a_plaintext()
+    {
+        for len in [
+            0usize,
+            1,
+            100,
+            RECORD_LEN - 1,
+            RECORD_LEN,
+            RECORD_LEN + 1,
+            2 * RECORD_LEN,
+            2 * RECORD_LEN + 7,
+            192 << 20,
+        ] {
+            assert_eq!(
+                plaintext_len(encrypted_len(len) as u64),
+                Some(len as u64),
+                "plaintext of {len} bytes"
+            );
+        }
+        // Lengths no object has: too short for a header and a record, and a partial record that
+        // would be empty.
+        for stored in [
+            0u64,
+            HEADER_LEN as u64,
+            (HEADER_LEN + RECORD_OVERHEAD - 1) as u64,
+            (HEADER_LEN + FULL_RECORD_LEN + RECORD_OVERHEAD) as u64,
+        ] {
+            assert_eq!(plaintext_len(stored), None, "stored length {stored}");
+        }
+    }
 
     #[test]
     fn an_object_round_trips() {

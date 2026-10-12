@@ -50,6 +50,7 @@
 
 mod generations;
 mod material;
+mod members;
 mod produce;
 mod recipients;
 mod restore;
@@ -66,6 +67,11 @@ pub use crate::backup::generations::{
 pub use crate::backup::material::{
     Admission, Material, RestoreAdmissions, RestoreLimits, admit_for_restore, may_back_up,
     may_restore,
+};
+pub use crate::backup::members::{
+    CONFIGURATION_MEMBER, MAX_CONFIGURATION_MEMBER_BYTES, MAX_RESTORED_BYTES,
+    MAX_SESSION_MEMBER_BYTES, SESSION_MEMBER_PREFIX, SESSION_MEMBER_SUFFIX, member_cap,
+    member_material,
 };
 pub use crate::backup::produce::{
     ArchivePlan, ObjectSource, RECIPIENTS_WITHIN_DESCRIPTOR_LIMIT, ResumeDecision, ResumedObject,
