@@ -5,10 +5,11 @@
 //! screen, and a client that dialled out at startup would be making a decision the person has not
 //! made.
 //!
-//! When the connection cannot be made the application stays unconnected and says so. That is a
-//! state the interface has to have anyway, because a host that stops answering produces it, and it
-//! is the state section 13 is most specific about: a host that cannot be contacted is
-//! disconnected, and nothing about elapsed time makes its processes failed.
+//! When the connection cannot be made the application is unconnected and says so, and it tries
+//! again, after a pause that grows while the host does not answer. That is a state the interface
+//! has to have anyway, because a host that stops answering produces it, and it is the state
+//! section 13 is most specific about: a host that cannot be contacted is disconnected, and nothing
+//! about elapsed time makes its processes failed.
 
 use std::sync::Arc;
 
@@ -261,6 +262,99 @@ fn absent_host(error: kr_client::error::ClientError) -> CommandError {
     CommandError::from(error)
 }
 
+/// What one attempt to reach a host came to.
+#[derive(Debug)]
+pub enum Attempt {
+    /// The host answered, and this is the connection to it.
+    Reached(Connection),
+    /// The host did not answer, and why.
+    Failed(CommandError),
+    /// There is nothing to keep a connection to, so the task that keeps it ends.
+    Nothing,
+}
+
+/// Keeps a connection to a host for `choice`: reaches it with `attempt`, forwards what it
+/// publishes, and when it ends, or the host does not answer, reaches it again.
+///
+/// The pause between attempts is the client library's reconnect backoff (section 23): jittered
+/// exponential from 250 ms to 30 seconds, starting over once a connection has been stable. `first`
+/// is told once the first attempt has ended either way. The task ends as soon as another host is
+/// chosen: it installs a connection, or records that it has none, only while its own choice is the
+/// one in force.
+pub async fn keep<R, A, F>(
+    app: AppHandle<R>,
+    choice: u64,
+    mut first: Option<tokio::sync::oneshot::Sender<()>>,
+    mut attempt: A,
+) where
+    R: Runtime,
+    A: FnMut() -> F + Send,
+    F: std::future::Future<Output = Attempt> + Send,
+{
+    let mut backoff = kr_client::reconnect::ReconnectLoop::new();
+    loop {
+        let state = app.state::<AppState>();
+        match attempt().await {
+            Attempt::Nothing => return,
+            Attempt::Reached(connection) => {
+                let session = connection.session();
+                if !state.connected_for(choice, connection) {
+                    return;
+                }
+                let _ = app.emit(CONNECTION_EVENT, state.connection_state());
+                if let Some(first) = first.take() {
+                    let _ = first.send(());
+                }
+                // A connection that did not last is not a recovery: a host that accepts and then
+                // closes is waited for as one that does not answer.
+                backoff.connected();
+                forward_events(app.clone(), session).await;
+            }
+            Attempt::Failed(error) => {
+                if !state.disconnected_for(choice, error.message) {
+                    return;
+                }
+                let _ = app.emit(CONNECTION_EVENT, state.connection_state());
+                if let Some(first) = first.take() {
+                    let _ = first.send(());
+                }
+            }
+        }
+        tokio::time::sleep(backoff.disconnected()).await;
+    }
+}
+
+/// Keeps the connection to the host on this machine, as the application's host: it is reached, and
+/// reached again when it ends, until another host is chosen.
+///
+/// # Errors
+///
+/// Returns why the choice could not be made.
+pub fn reach_host_on_this_machine<R, A, F>(app: &AppHandle<R>, attempt: A) -> Result<()>
+where
+    R: Runtime,
+    A: FnMut() -> F + Send + 'static,
+    F: std::future::Future<Output = Attempt> + Send + 'static,
+{
+    let handle = app.clone();
+    app.state::<AppState>().choose_host(
+        "this application is reaching the host on this machine",
+        |choice| {
+            Ok(tauri::async_runtime::spawn(keep(
+                handle, choice, None, attempt,
+            )))
+        },
+    )
+}
+
+/// One attempt to reach the controller on this machine.
+pub async fn this_machines_host() -> Attempt {
+    match connect_local().await {
+        Ok(connection) => Attempt::Reached(connection),
+        Err(error) => Attempt::Failed(error),
+    }
+}
+
 /// One host notification, in the shape the interface reads.
 #[derive(Clone, Debug, Serialize)]
 pub struct PublishedEvent {
@@ -340,11 +434,6 @@ pub async fn forward_events<R: Runtime>(app: AppHandle<R>, session: Arc<Session>
             Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
         }
     }
-}
-
-/// Publishes the session's events to the window in a task of their own.
-pub fn publish_events<R: Runtime>(app: AppHandle<R>, session: Arc<Session>) {
-    tauri::async_runtime::spawn(forward_events(app, session));
 }
 
 #[cfg(test)]

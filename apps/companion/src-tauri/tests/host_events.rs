@@ -186,7 +186,10 @@ mod macos {
         // The connection is the application's to hold, as its state holds the host's: the
         // publisher only listens on it.
         let session = Arc::new(session);
-        companion_tauri::connection::publish_events(app.clone(), Arc::clone(&session));
+        tauri::async_runtime::spawn(companion_tauri::connection::forward_events(
+            app.clone(),
+            Arc::clone(&session),
+        ));
 
         runtime.block_on(async {
             link.push(

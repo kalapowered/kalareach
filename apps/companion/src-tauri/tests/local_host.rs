@@ -342,6 +342,21 @@ fn typed<T: serde::de::DeserializeOwned>(answer: Value) -> T {
     serde_json::from_value(answer).expect("the answer is the method's own result")
 }
 
+/// Waits until `found` gives a value, or the watchdog runs out.
+async fn eventually<T>(what: &str, mut found: impl FnMut() -> Option<T>) -> T {
+    let deadline = tokio::time::Instant::now() + WATCHDOG;
+    loop {
+        if let Some(value) = found() {
+            return value;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{what} did not happen"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+}
+
 /// The words a refusal carries, which say whether it was the host's or the command's own parse.
 fn refused_by_the_host(refusal: &Value) -> bool {
     let message = refusal["message"].as_str().unwrap_or_default();
@@ -753,6 +768,103 @@ async fn a_created_sessions_identifier_is_one_the_page_can_open() {
     )
     .await
     .expect("the host closes the session");
+}
+
+/// Ends the task that keeps a connection to the host, when it is dropped: another choice of host
+/// ends the task of the choice before it, so nothing tries a removed daemon's endpoint afterwards.
+struct EndsTheKeeper<'a>(tauri::State<'a, companion_tauri::AppState>);
+
+impl Drop for EndsTheKeeper<'_> {
+    fn drop(&mut self) {
+        let _ = self.0.choose_host("a case is over", |_| {
+            Ok(tauri::async_runtime::spawn(async {}))
+        });
+    }
+}
+
+/// KR-REQ-23.22: a host that does not answer at first is reached when it does, and a
+/// connection that ends is taken up again, as a new connection, after a pause that grows. The
+/// application's state says "not connected" while there is none, and says "connected" again once
+/// the host answers.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_connection_to_the_host_is_taken_up_again_when_it_ends() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use companion_tauri::connection::{Attempt, Connection, build_id, reach_host_on_this_machine};
+
+    let host = Host::start().await;
+    let state = host.app.state::<companion_tauri::AppState>();
+    // However the case ends, the task that keeps the connection ends with it.
+    let _ends = EndsTheKeeper(host.app.state::<companion_tauri::AppState>());
+    let endpoint = host
+        .tree
+        .environment()
+        .controller_endpoint()
+        .expect("an endpoint");
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&attempts);
+    // The application's own entry for reaching the host on its machine, with this daemon's endpoint
+    // in place of the user's.
+    reach_host_on_this_machine(host.app.handle(), move || {
+        let endpoint = endpoint.clone();
+        let attempts = Arc::clone(&counted);
+        async move {
+            // The host does not answer the first two times.
+            if attempts.fetch_add(1, Ordering::SeqCst) < 2 {
+                return Attempt::Failed(companion_tauri::CommandError::unavailable(
+                    "the host did not answer",
+                ));
+            }
+            let reached =
+                match IpcTransport::connect(&endpoint, build_id().expect("a build identity")).await
+                {
+                    Ok(transport) => Connection::over(transport),
+                    Err(error) => Err(companion_tauri::CommandError::from(error)),
+                };
+            match reached {
+                Ok(connection) => Attempt::Reached(connection),
+                Err(error) => Attempt::Failed(error),
+            }
+        }
+    })
+    .expect("the choice of the host is made");
+    assert!(
+        !state.connection_state().connected,
+        "nothing is connected before the host has answered"
+    );
+
+    let first = eventually("the host is reached after it did not answer", || {
+        state
+            .session()
+            .ok()
+            .filter(|_| attempts.load(Ordering::SeqCst) >= 3)
+    })
+    .await;
+    assert!(state.connection_state().connected);
+
+    // The connection ends, as a host that went away ends it.
+    first.close();
+    eventually("the application says the connection ended", || {
+        (!state.connection_state().connected).then_some(())
+    })
+    .await;
+    let second = eventually(
+        "the host is reached again, on a connection of its own",
+        || {
+            state
+                .session()
+                .ok()
+                .filter(|session| !Arc::ptr_eq(session, &first))
+        },
+    )
+    .await;
+    assert!(state.connection_state().connected);
+    // The new connection works: the host answers a read on it.
+    let read: kr_protocol::hostinfo::HostInfoResult = second
+        .read(kr_protocol::method::Method::HostInfo, &json!({}))
+        .await
+        .expect("the host answers on the new connection");
+    assert_eq!(read.environment_id.to_string(), host.environment_id());
 }
 
 /// KR-REQ-13.14: a file the page hands over is given a path on the host through the commands the

@@ -101,10 +101,10 @@ pub fn run() {
             // the paired host it was last told to use, once its pairing records are open below.
             #[cfg(desktop)]
             {
-                let handle = app.handle().clone();
-                tauri::async_runtime::spawn(async move {
-                    reach_local_host(handle).await;
-                });
+                let _ = connection::reach_host_on_this_machine(
+                    app.handle(),
+                    connection::this_machines_host,
+                );
             }
             // The account is built off the thread the platform starts the application on: opening
             // the secure store on a phone asks the native half, which runs on that thread.
@@ -358,23 +358,3 @@ pub fn start_pairing<R: tauri::Runtime>(
 
 /// The event the backend publishes the paths of dropped files on.
 pub const DROPPED_EVENT: &str = "kr://dropped";
-
-/// Connects to the controller on this machine and starts publishing its events.
-#[cfg(desktop)]
-async fn reach_local_host(app: tauri::AppHandle) {
-    use tauri::{Emitter as _, Manager as _};
-
-    let state = app.state::<AppState>();
-    match connection::connect_local().await {
-        Ok(connection) => {
-            let session = connection.session();
-            state.connected(connection);
-            connection::publish_events(app.clone(), session);
-            let _ = app.emit(connection::CONNECTION_EVENT, state.connection_state());
-        }
-        Err(error) => {
-            state.disconnected(error.message.clone());
-            let _ = app.emit(connection::CONNECTION_EVENT, state.connection_state());
-        }
-    }
-}
