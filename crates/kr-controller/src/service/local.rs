@@ -107,8 +107,9 @@ pub const RETAINED_MACHINE_ANSWERS: [Method; 3] = [
 
 /// What the local door answers a mutation with, and so how the answer is written.
 pub(super) enum DoorReply {
-    /// A refusal made before anything ran or was looked up. No result exists, so nothing is
-    /// withheld and the refusal is written as it is.
+    /// A refusal that carries no result: the connection's registration was withdrawn, no lease is
+    /// live, the freshness window admits nothing, or the authority an answer already held is
+    /// asked again and refuses it. Nothing is withheld, and the refusal is written as it is.
     Refused(ControlFrame),
     /// What the mutation produced, or the answer its action already had. A held method's answer is
     /// a result and is written only while the local owner's lease holds.
