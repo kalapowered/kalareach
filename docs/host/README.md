@@ -5628,11 +5628,12 @@ allocated, and acknowledged with the completion the barrier reports. A host that
 that finishes the same request the same way and takes it once. A request is numbered once: when the
 feed holds the same request again after it dropped the original, the host acknowledges it under the
 revision it first issued, however many revisions came after. A request for what the owner at the
-machine, or an earlier request, had already withdrawn changes nothing, so it is refused as covered,
-however the host was interrupted while it took it: there is no revision to issue for it. The host
-writes a refusal down before it sends it. A refusal that never reached the feed is made again by the
-next pass, and a request the host refused after it began to take it is refused again when it is
-published again.
+machine, or an earlier request, had already withdrawn changes nothing, so it is refused as covered
+when the registry has not moved since the host began to take the request, however the host was
+interrupted meanwhile: there is no revision to issue for it. If something else moved the registry in
+between, the host numbers the request with the revision then in force. The host writes a refusal
+down before it sends it. A refusal that never reached the feed is made again by the next pass, and a
+request the host refused after it began to take it is refused again when it is published again.
 
 A pass reads the feed in pages, at most 32. When the feed holds more, the scan goes on at its
 cursor at once. Until it has read the feed through, nothing is shown as read and what is shown is
@@ -5674,8 +5675,9 @@ configuration document the host cannot use points it nowhere, so a start over on
 as it was. Only a document that selects another feed or none ends the removal. The notice that tells
 the owner about a removal, or that the owner acted, is numbered in the order the host recorded it,
 and each number is higher than the one before. The notice is written down before it is given, and
-given again until the attention store takes it. Setting a clock back will not make any numbers be
-lower than any previous number.
+given again until the attention store takes it, by a task that runs whether or not the host reads a
+feed. The store's own cursor says whether it holds a notice, so a store that was reset is given the
+notice again. Setting a clock back will not make any numbers be lower than any previous number.
 
 ### What the host policy holds
 
