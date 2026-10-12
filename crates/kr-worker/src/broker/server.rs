@@ -23,8 +23,9 @@
 //! more seconds to be gone, after which the survivors are recorded. What the session recorded is
 //! read before the server is asked anything, again and again while the processes below it are
 //! ending, and before it is ended, since a command whose parent has gone can no longer be found by
-//! its parentage; a process first shown while the others are ending is asked, with the same
-//! grace. A process the ending forces is noted as forced.
+//! its parentage; a process first shown while the others are ending is asked, with the rest of the
+//! window, and every force waits for the window to be over. A process the ending forces is noted
+//! as forced.
 //!
 //! **A limit.** On Linux the worker is the child subreaper, so a command the server leaves behind
 //! and the ladder then ends is a child of the worker's that nothing collects: it stays in the
@@ -590,17 +591,18 @@ fn ask_below(
 /// How often the record is read again while the processes below the server are ending.
 const RECORD_REREAD: Duration = Duration::from_millis(200);
 
-/// How long the ending waits, when nothing it knows of is running, before it reads the record once
-/// more: what a command that has just ended started is recorded a moment later.
-const RECORD_SETTLE: Duration = Duration::from_millis(50);
-
 /// Ends each process recorded below `server` that is running, by its identity.
 ///
 /// Until `window_over` the record is read again and again, and every process it shows is asked to
 /// terminate once, so that one that a command started while the others were ending has its grace
-/// too; the window ends early only when two readings, a moment apart, find nothing running. Then
-/// what is still running is ended by force, a few rounds, each reading the record for what the
-/// last one left. Returns the processes still running at the end.
+/// too; the window ends early only when a reading finds nothing running. Then what is still running
+/// is ended by force, a few rounds, each reading the record for what the last one left.
+///
+/// **Nothing is forced before `window_over`, by construction:** every round of force first asks
+/// what it has not asked and waits for it until `window_over`, so a process that a reading shows
+/// for the first time at any moment, the one after the window's last, has the rest of the window
+/// and is forced only if it is still there when the window is over. Returns the processes still
+/// running at the end.
 async fn end_below(
     server: &ProcessStartIdentity,
     mut known: BTreeSet<ProcessStartIdentity>,
@@ -615,33 +617,27 @@ async fn end_below(
             .cloned()
             .collect()
     };
-    let mut settled = false;
     let mut remaining;
     loop {
         known.extend(owned.below(server));
         ask_below(&known, &mut asked, owned);
         remaining = running(&known);
         let now = tokio::time::Instant::now();
-        if now >= window_over {
+        if remaining.is_empty() || now >= window_over {
             break;
         }
-        if remaining.is_empty() {
-            if settled {
-                break;
-            }
-            settled = true;
-            tokio::time::sleep_until((now + RECORD_SETTLE).min(window_over)).await;
-        } else {
-            settled = false;
-            wait_until_ended(&mut remaining, (now + RECORD_REREAD).min(window_over)).await;
-        }
+        wait_until_ended(&mut remaining, (now + RECORD_REREAD).min(window_over)).await;
     }
     for _ in 0..KILL_ROUNDS {
         known.extend(owned.below(server));
+        ask_below(&known, &mut asked, owned);
         remaining = running(&known);
         if remaining.is_empty() {
             break;
         }
+        // The one place a process is forced: not before the window is over, whatever the readings
+        // showed and whenever they showed it.
+        wait_until_ended(&mut remaining, window_over).await;
         for process in &remaining {
             if signal(process, Stop::Kill, owned) {
                 owned.forced(process);
