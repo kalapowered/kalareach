@@ -25,9 +25,11 @@ function hidden(): boolean {
 /**
  * Reads with `read` every `cadenceMs` while the page is shown, starting at the first `now()`.
  *
- * `read` settles once its read has answered or failed; how it shows either is its own affair.
+ * `read` settles once its read has answered or failed; how it shows either is its own affair. A
+ * cadence that is a function is asked how long to wait each time a read has answered, so a caller
+ * can read less often the longer nothing changes.
  */
-export function readOnCadence(read: () => Promise<unknown>, cadenceMs: number): Cadence {
+export function readOnCadence(read: () => Promise<unknown>, cadenceMs: number | (() => number)): Cadence {
   let running = false
   let owed = false
   let started = false
@@ -60,7 +62,7 @@ export function readOnCadence(read: () => Promise<unknown>, cadenceMs: number): 
           now()
           return
         }
-        timer = setTimeout(now, cadenceMs)
+        timer = setTimeout(now, typeof cadenceMs === 'function' ? cadenceMs() : cadenceMs)
       })
   }
 
