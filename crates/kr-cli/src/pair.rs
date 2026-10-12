@@ -1239,6 +1239,28 @@ mod tests {
         EnvironmentId::new(Uuid::from_bytes([0xe1; 16]))
     }
 
+    /// `--guest` with no minutes asks for the guest pairing's default lifetime. The command line
+    /// spells that default as a number of its own, so what it parses to is checked against the
+    /// constant the guest grant and the guide give.
+    #[test]
+    fn a_guest_named_with_no_minutes_is_paired_for_the_default_time() {
+        use crate::cli::{Cli, Command, PairCommand};
+        use clap::Parser as _;
+
+        let cli = Cli::try_parse_from(["kr", "pair", "invite", "--guest"]).expect("it parses");
+        let Command::Pair(PairCommand::Invite(invite)) = cli.command else {
+            panic!("a pair invitation");
+        };
+        let now = 1_764_000_000_000;
+        let (_, grant) = proposal(&invite, now, environment()).expect("a guest");
+        assert_eq!(
+            grant.expiry,
+            kr_protocol::grant::GrantExpiry::At {
+                expires_at_ms: TimestampMs::new(now + DEFAULT_GUEST_PAIRING_MS)
+            }
+        );
+    }
+
     /// KR-REQ-10.04: an invitation says what the new device may do, and nothing chooses that for
     /// the owner: an owner device gets the personal owner grant, a guest a pairing with no action
     /// and no session for the minutes named, and a command that names neither is a usage mistake.
