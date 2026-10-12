@@ -1733,6 +1733,34 @@ pub fn undeclared_in(stores: &[Store], known: &[Known]) -> Result<Vec<String>, S
     Ok(found)
 }
 
+/// The record types a source file defines for a store to write, `Stored…` by their names, that no
+/// store lists among the types it keeps from that file. A record the daemon writes under a name of
+/// its own is a stored format as much as a table is, and the lock sees only what the table lists.
+///
+/// # Errors
+///
+/// Returns what stops the file being read.
+pub fn records_unlisted(stores: &[Store], file: &str) -> Result<Vec<String>, String> {
+    let source = std::fs::read_to_string(repository().join(file))
+        .map_err(|error| format!("{file} cannot be read: {error}"))?;
+    let listed: BTreeSet<&str> = stores
+        .iter()
+        .flat_map(|store| &store.kept)
+        .filter_map(|kept| match kept {
+            Kept::Source(listed_in, items) if *listed_in == file => Some(items.iter().copied()),
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    Ok(source
+        .lines()
+        .filter_map(|line| line.strip_prefix("pub struct "))
+        .filter_map(|rest| rest.split(|c: char| !c.is_alphanumeric()).next())
+        .filter(|name| name.starts_with("Stored") && !listed.contains(name))
+        .map(|name| format!("{name} is a record {file} defines and no store lists it as kept"))
+        .collect())
+}
+
 /// Each known type whose pinned digest is not the digest it has now, each that its store declares
 /// (its line is to be deleted), each that no store keeps, and each that nothing its store keeps holds
 /// any more and that is not named in `stored_elsewhere`: the answers of the methods the registry
