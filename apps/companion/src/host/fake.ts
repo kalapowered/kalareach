@@ -325,6 +325,11 @@ export interface FakeHostControls {
    * nothing until the test releases it.
    */
   holdMutation(): HeldMutations
+  /**
+   * Has the host answer the next composer send with only the action's identity, as a host does
+   * that took the request and lost the receipt: nobody knows what became of the action.
+   */
+  leaveNextSendUnconfirmed(): void
   /** How many composer sends the host has received, answered or held. */
   readonly submissions: number
   /** Hands the window a set of dropped files. */
@@ -745,6 +750,7 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
   /** The composer sends the host has received, and the ones whose answer a test is holding. */
   let submissions = 0
   let heldSends: (() => void)[] | null = null
+  let nextSendUnconfirmed = false
   const answeredWhenReleased = <T>(answer: T): Promise<T> => {
     const waiting = heldSends
     return waiting === null
@@ -1067,7 +1073,12 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
     composerSubmit: (params) => {
       requireConnection()
       submissions += 1
-      return answeredWhenReleased(records.prompt(params, false))
+      const answer = records.prompt(params, false)
+      if (nextSendUnconfirmed) {
+        nextSendUnconfirmed = false
+        return answeredWhenReleased({ ...answer, receipt: null, value: null })
+      }
+      return answeredWhenReleased(answer)
     },
     composerQueue: (params) => {
       requireConnection()
@@ -1827,6 +1838,9 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
           for (let index = 0; index < waiting.length; index += 1) answer(index)
         }
       }
+    },
+    leaveNextSendUnconfirmed() {
+      nextSendUnconfirmed = true
     },
     holdMutation() {
       const waiting: (() => void)[] = []

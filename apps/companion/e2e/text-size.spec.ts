@@ -161,6 +161,18 @@ test.describe('at the largest text size on a screen 320 points wide', () => {
     ['the account', '&tab=account', null],
     ['a session’s conversation', `&session=${SESSION}`, null],
     [
+      'a session after an action nobody knows the end of',
+      `&session=${SESSION}`,
+      async (page) => {
+        await page.evaluate(() => {
+          window.krTestHost?.leaveNextSendUnconfirmed()
+        })
+        await page.getByLabel('Message this session').fill('run the migration')
+        await page.getByRole('button', { name: 'Send', exact: true }).click()
+        await expect(page.getByRole('button', { name: 'I checked; send anyway' })).toBeVisible()
+      }
+    ],
+    [
       'a session’s terminal',
       `&session=${SESSION}`,
       async (page) => {
@@ -221,6 +233,38 @@ test.describe('at the largest text size on a screen 320 points wide', () => {
         expect(unreachable, 'controls a touch cannot reach').toEqual([])
       })
     }
+  }
+
+  // The reason an action has no confirmed outcome, and the way past it, are long for their screen:
+  // at the largest size on the narrowest one they wrap, and the button stays inside the composer.
+  for (const surface of ['ios', 'android'] as const) {
+    test(`keeps the reason nothing is sent, and the way past it, whole on ${surface}`, async ({ page }) => {
+      await withSystemTextScale(page, LARGEST)
+      await page.setViewportSize({ width: 320, height: 720 })
+      await page.goto(`/harness.html?surface=${surface}&session=${SESSION}`)
+      await page.evaluate(() => {
+        window.krTestHost?.leaveNextSendUnconfirmed()
+      })
+      await page.getByLabel('Message this session').fill('run the migration')
+      await page.getByRole('button', { name: 'Send', exact: true }).click()
+      const release = page.getByRole('button', { name: 'I checked; send anyway' })
+      await expect(release).toBeVisible()
+      await expect(release).toBeEnabled()
+
+      await release.scrollIntoViewIfNeeded()
+      await page.screenshot({
+        path: `/tmp/kr-text-size-send-anyway-${surface}-${test.info().project.name}.png`
+      })
+      const roots = ['.m-hint', '[data-testid="composer-send-anyway"]']
+      for (const root of roots) {
+        expect(await overrunning(page, root), `lines of ${root} that run past the screen or their box`).toEqual([])
+      }
+      // The controls: with the text kept from wrapping, the same measure sees each run out.
+      await stopWrapping(page, roots)
+      for (const root of roots) {
+        expect(await overrunning(page, root), `the measure sees ${root} text that cannot wrap`).not.toEqual([])
+      }
+    })
   }
 
   // The host's own words are the row's text, and a title or a line can hold a long word: at the

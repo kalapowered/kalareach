@@ -22,6 +22,8 @@ import { MobileApp } from '../src/mobile/MobileApp'
 
 const SESSION_MAIN = '8a7b6c50-22bb-4c3d-8e4f-000000000101'
 const ACTION = '00000000-0000-4000-8000-00000000abcd'
+/** The action of a prompt sent a second time, a new action of its own. */
+const ANOTHER_ACTION = '00000000-0000-4000-8000-00000000abce'
 
 afterEach(cleanup)
 
@@ -144,7 +146,7 @@ describe('on the desktop', () => {
     await waitFor(() => {
       expect(screen.getByTestId('composer-reason')).toHaveTextContent(/no confirmed outcome yet/)
     })
-    expect(screen.getByTestId('composer-reason')).toHaveTextContent(/Sending again could run it twice/)
+    expect(screen.getByTestId('composer-reason')).toHaveTextContent(/may still run/)
     expect(screen.getByTestId('composer-send')).toBeDisabled()
     expect(screen.getByTestId('composer-queue')).toBeDisabled()
     expect(sent).toHaveLength(1)
@@ -449,6 +451,59 @@ describe('on the desktop', () => {
     })
   })
 
+  describe('whose outcome nobody knows', () => {
+    /** The first prompt has no confirmed outcome; the one sent after it is accepted. */
+    const SECOND: Settled<AgentMutationResult> = {
+      receipt: receiptAt('dispatching', ANOTHER_ACTION),
+      value: null,
+      action_id: ANOTHER_ACTION
+    }
+    const answers = (attempt: number) => (attempt === 1 ? UNCONFIRMED : SECOND)
+
+    it('can be sent again by a person who checked, as a new action, and stays listed as unknown', async () => {
+      const recorded: Recorded = { state: 'unknown', byAction: { [ANOTHER_ACTION]: 'dispatching' } }
+      const sent: unknown[] = []
+      const { person } = await sentOnce(answers, recorded, [], sent)
+
+      // The risk is named beside the way past it, and the plain Send stays off.
+      const release = await screen.findByTestId('composer-send-anyway')
+      expect(release).toBeEnabled()
+      expect(release).toHaveTextContent(/I checked; send anyway/)
+      expect(screen.getByTestId('composer-reason')).toHaveTextContent(/may still run/)
+      expect(screen.getByTestId('composer-reason')).toHaveTextContent(/twice/)
+      expect(screen.getByTestId('composer-send')).toBeDisabled()
+      expect(sent).toHaveLength(1)
+
+      await person.click(release)
+      await waitFor(() => {
+        expect(sent).toHaveLength(2)
+      })
+      expect(sent[1]).toMatchObject({ text: 'run the migration' })
+      const states = () =>
+        [...screen.getByTestId('pending-actions').querySelectorAll('li')].map((each) => each.dataset.state)
+      await waitFor(() => {
+        expect(states()).toEqual(['unknown', 'sent'])
+      })
+
+      // The earlier action still has no confirmed outcome, so the plain Send is still off.
+      await waitFor(() => {
+        expect(screen.getByTestId('composer-input')).toHaveValue('')
+      })
+      await person.type(screen.getByTestId('composer-input'), 'and then the next')
+      expect(screen.getByTestId('composer-send')).toBeDisabled()
+      expect(screen.getByTestId('composer-send-anyway')).toBeEnabled()
+    })
+
+    it('is not offered a way past while the host merely has the action', async () => {
+      const recorded = { state: 'dispatching' as Receipt['state'] }
+      await sentOnce(WITH_THE_HOST, recorded)
+      await waitFor(() => {
+        expect(screen.getByTestId('pending-actions')).toBeInTheDocument()
+      })
+      expect(screen.queryByTestId('composer-send-anyway')).toBeNull()
+    })
+  })
+
   it('does not call a prompt taken while the host has only accepted it', async () => {
     const recorded = { state: 'dispatching' as Receipt['state'] }
     const { device, controls } = await sentOnce(WITH_THE_HOST, recorded)
@@ -547,6 +602,41 @@ describe('on the phone', () => {
     )
     // The host's record still says dispatching: the stored draft is exactly what was sent.
     expect(device.all().map((draft) => draft.text)).toEqual(['run the migration'])
+  })
+
+  it('can be sent again by a person who checked an outcome nobody knows, as a new action', async () => {
+    const recorded: Recorded = { state: 'unknown', byAction: { [ANOTHER_ACTION]: 'applied' } }
+    const sent: unknown[] = []
+    const second: Settled<AgentMutationResult> = {
+      receipt: receiptAt('dispatching', ANOTHER_ACTION),
+      value: null,
+      action_id: ANOTHER_ACTION
+    }
+    const { person } = await sentOnce((attempt) => (attempt === 1 ? UNCONFIRMED : second), recorded, [], sent)
+
+    const release = await screen.findByRole('button', { name: 'I checked; send anyway' })
+    expect(release).toBeEnabled()
+    expect(screen.getByText(/may still run/)).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Send' })).toBeDisabled()
+
+    await person.click(release)
+    await waitFor(() => {
+      expect(sent).toHaveLength(2)
+    })
+    expect(sent[1]).toMatchObject({ text: 'run the migration' })
+    // The second action is applied, and the first, which nobody knows, still holds the session.
+    expect(await screen.findByText('Applied', {}, { timeout: 3_000 })).toBeInTheDocument()
+    expect(screen.getByText(/One action has no confirmed outcome yet/)).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Send' })).toBeDisabled()
+  })
+
+  it('is not offered a way past while the host merely has the action', async () => {
+    const recorded = { state: 'dispatching' as Receipt['state'] }
+    await sentOnce(WITH_THE_HOST, recorded)
+    await waitFor(() => {
+      expect(screen.getByLabelText('Message this session')).toHaveValue('')
+    })
+    expect(screen.queryByRole('button', { name: 'I checked; send anyway' })).toBeNull()
   })
 
   it('removes the text of a prompt that nobody knew the end of when the application had started again, once the host says it was applied', async () => {

@@ -53,6 +53,7 @@ import {
   queued,
   reconnectBanner,
   applyReceipt,
+  SEND_ANYWAY_WORDS,
   sendOutcomeOf,
   unconfirmedWords,
   unresolved,
@@ -750,6 +751,23 @@ export function MobileSession({
       {hint}
     </p>
   ) : null
+  // When every action that holds the session is one nobody knows the end of, a person who checked
+  // can send anyway: that is a new action, and the earlier ones stay listed as they are.
+  const release =
+    !typingToProgram && waiting.length > 0 && waiting.every((each) => each.state === 'unknown') ? (
+      <Button
+        data-testid="composer-send-anyway"
+        data-wraps
+        aria-describedby={hint ? `composer-why-${sessionId}` : undefined}
+        disabled={!submittable(draft) || !submitOffer.offered || busy}
+        style={{ minBlockSize: target }}
+        onClick={() => {
+          send(draft.text)
+        }}
+      >
+        {SEND_ANYWAY_WORDS}
+      </Button>
+    ) : null
   // Send changes place when the composer changes form, and focus that was on it goes with it: a
   // control taken away from under the focus would leave a keyboard nowhere.
   const lastFocused = useRef<Element | null>(null)
@@ -1169,7 +1187,12 @@ export function MobileSession({
            * Under the terminal the composer keeps its bottom in view, so the reason sits above the
            * field's line: however long it runs, the line keeps the composer's floor.
            */}
-          {pane === 'terminal' ? reason : null}
+          {pane === 'terminal' ? (
+            <>
+              {reason}
+              {release}
+            </>
+          ) : null}
           {typingToProgram && unsent !== null ? (
             // Why an input did not reach the program stands above the program's keyboard, where it
             // stays in view with a software keyboard up, until an input reaches it. The field's own
@@ -1198,6 +1221,7 @@ export function MobileSession({
           {pane === 'semantic' ? (
             <>
               {reason}
+              {release}
               {draft.state === 'conflicted' && currentTarget !== null ? (
                 <Button
                   data-testid="composer-retarget"

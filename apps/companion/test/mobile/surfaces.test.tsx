@@ -517,7 +517,7 @@ describe('what a build must not let happen twice (KR-ACC-012)', () => {
       expect(screen.getByText(/no confirmed outcome yet/)).toBeInTheDocument()
     })
     expect(screen.getByRole('button', { name: 'Send' })).toBeDisabled()
-    expect(screen.getByText(/Sending again could run it twice/)).toBeInTheDocument()
+    expect(screen.getByText(/may still run/)).toBeInTheDocument()
     // And what was written is still there: an uncertain outcome is not a reason to lose it.
     expect(screen.getByLabelText('Message this session')).toHaveValue('run the migration')
   })

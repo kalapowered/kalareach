@@ -20,6 +20,7 @@ import {
   memo,
   useCallback,
   useEffect,
+  useId,
   useLayoutEffect,
   useMemo,
   useRef,
@@ -102,6 +103,7 @@ import {
   outcomeTone,
   queued,
   reconnectBanner,
+  SEND_ANYWAY_WORDS,
   sendOutcomeOf,
   settled,
   unconfirmedReason,
@@ -289,7 +291,7 @@ export function Conversation({
     onReceipt: settleFromRecord
   })
   // Nothing more is sent while an action has no confirmed outcome: the text came back to the
-  // composer, and sending it again could run it twice.
+  // composer, and sending it again could run it twice, unless the person says they checked.
   const unconfirmed = unconfirmedReason(state.submissions)
 
   const offers = useMemo(
@@ -355,7 +357,7 @@ export function Conversation({
   )
 
   const send = useCallback(
-    (action: ComposerAction) => {
+    (action: ComposerAction, anyway = false) => {
       const binding = agent.binding
       const instance = agent.instance
       if (binding === null || instance === null) return
@@ -363,7 +365,9 @@ export function Conversation({
       // they wrote it at: the host refuses it if that conversation has moved on since. Only an
       // interruption, which carries no text, names the conversation as it is now.
       const draft = presented
-      if (action !== 'interrupt' && (unconfirmed !== null || !submittable(draft))) return
+      // A person who checked what became of an earlier action sends anyway: that is a new action,
+      // and the earlier one stays listed with the outcome it has.
+      if (action !== 'interrupt' && ((unconfirmed !== null && !anyway) || !submittable(draft))) return
       const written = draft.target
       if (
         action !== 'interrupt' &&
@@ -932,6 +936,9 @@ export function Conversation({
           setInsertion(null)
         }}
         onAction={send}
+        onSendAnyway={() => {
+          send('submit', true)
+        }}
       />
     </div>
   )
@@ -1526,7 +1533,8 @@ function Composer({
   onRetarget,
   onPasteFiles,
   onRemoveAttachment,
-  onAction
+  onAction,
+  onSendAnyway
 }: {
   readonly sessionId: string
   readonly subject: SessionSubject
@@ -1546,8 +1554,11 @@ function Composer({
   readonly onPasteFiles: (files: readonly File[]) => void
   readonly onRemoveAttachment: (localId: string) => void
   readonly onAction: (action: ComposerAction) => void
+  /** Sends the draft as a new action though an earlier one has no confirmed outcome. */
+  readonly onSendAnyway: () => void
 }): ReactNode {
   const [showCommands, setShowCommands] = useState(false)
+  const reasonId = useId()
   const typed = draft.text.startsWith('/') ? draft.text.slice(1).toLowerCase() : null
   const offered =
     typed === null ? [] : commands.filter((command) => command.name.toLowerCase().startsWith(typed))
@@ -1557,6 +1568,8 @@ function Composer({
     held ?? notSubmittableBecause(draft) ?? (offers.submit.offered ? null : offers.submit.reason)
   const canSubmit = offers.submit.offered && submittable(draft) && connected && held === null
   const canWrite = submittable(draft) && connected && held === null
+  // The one way past the hold on an unconfirmed action: the person says they checked it.
+  const canSendAnyway = offers.submit.offered && submittable(draft) && connected
 
   if (opening) {
     // Typing before the kept drafts are read would be typing over them, so the field waits.
@@ -1669,8 +1682,21 @@ function Composer({
       ) : null}
 
       <div className="composer-note between">
-        <span className="faint small" data-testid="composer-reason">
-          {reason ?? 'Command-Enter sends it.'}
+        <span className="composer-why">
+          <span className="faint small" data-testid="composer-reason" id={reasonId}>
+            {reason ?? 'Command-Enter sends it.'}
+          </span>
+          {held === null ? null : (
+            <Button
+              data-testid="composer-send-anyway"
+              data-wraps
+              aria-describedby={reasonId}
+              disabled={!canSendAnyway}
+              onClick={onSendAnyway}
+            >
+              {SEND_ANYWAY_WORDS}
+            </Button>
+          )}
         </span>
         <span className="row">
           {offers.interrupt.offered ? (

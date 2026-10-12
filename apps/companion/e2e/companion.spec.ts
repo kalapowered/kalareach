@@ -15,6 +15,7 @@ import { RECORD_VERSION, SUBMISSIONS_KEY } from '../src/mobile/model/store'
 import type { Submission } from '../src/model/receipts'
 
 import { PRESENTATION_DEADLINE } from './bounds'
+import { overrunning, stopWrapping } from './layout'
 
 /** Where a screenshot for the evidence goes. */
 function shot(name: string): string {
@@ -446,6 +447,35 @@ test.describe('the semantic view', () => {
     await page.getByRole('tab', { name: 'Conversation' }).click()
     await expect(page.getByTestId('composer-input')).toHaveValue('half a thought')
     await page.screenshot({ path: shot('conversation-13.03'), fullPage: true })
+  })
+
+  test('offers a way past an action nobody knows the end of, and fits a narrow window', async ({ page }) => {
+    await openSession(page)
+    await page.setViewportSize({ width: 360, height: 720 })
+    await page.evaluate(() => {
+      window.krTestHost?.leaveNextSendUnconfirmed()
+    })
+    await page.getByTestId('composer-input').fill('run the migration')
+    await page.getByTestId('composer-send').click()
+    const release = page.getByTestId('composer-send-anyway')
+    await expect(release).toBeVisible()
+    await expect(page.getByTestId('composer-send')).toBeDisabled()
+    await expect(page.getByTestId('composer-reason')).toContainText('may still run')
+
+    const roots = ['[data-testid="composer-reason"]', '[data-testid="composer-send-anyway"]']
+    for (const root of roots) {
+      expect(await overrunning(page, root), `lines of ${root} that run past the window or their box`).toEqual([])
+    }
+    // The passing message that says the host could not confirm lies over the foot of the window.
+    await page.locator('.toast').getByRole('button', { name: 'Dismiss' }).click()
+    await still(page, 'send-anyway')
+    // The control: with the reason kept from wrapping, the same measure sees it run out.
+    await stopWrapping(page, [roots[0] ?? ''])
+    expect(await overrunning(page, roots[0] ?? ''), 'the measure sees a reason that cannot wrap').not.toEqual([])
+
+    // Pressing it sends the text again, as an action of its own.
+    await release.click()
+    await expect.poll(() => page.evaluate(() => window.krTestHost?.submissions)).toBe(2)
   })
 
   test('a markdown link opens through the backend and never navigates the page', async ({

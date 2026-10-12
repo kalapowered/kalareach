@@ -733,6 +733,16 @@
   flex-wrap: wrap;
 }
 
+/* The reason nothing is sent, and the way past it when there is one, stacked. */
+.composer-why {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 8px;
+  flex: 1 1 14rem;
+  min-inline-size: 0;
+}
+
 .attachment-name {
   min-inline-size: 0;
   overflow-wrap: anywhere;

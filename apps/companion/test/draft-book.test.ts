@@ -2190,6 +2190,31 @@ describe('a prompt the host is said to have applied after nobody knew what becam
     expect(book.draft(MAIN).text).toBe('the next thing')
   })
 
+  it('leaves nothing stored when the text was sent again by a person who checked, and the first send is the one applied', async () => {
+    const store = new FakeDraftStore()
+    const book = await opened(store)
+    await unknownOn(book)
+    // The person checked, and sends the text again: a new prompt, ended as of unknown outcome too.
+    const again = book.beginSend(MAIN)
+    await again.claimed
+    type(book, MAIN, '')
+    book.endSend(again, 'unknown', 'local-2')
+    await book.settled()
+    expect(book.draft(MAIN).text).toBe('send this')
+
+    book.sendSettled('local-1', 'applied')
+    await book.settled()
+
+    // The words were done once: they are not in the composer or the store to be sent a third time.
+    expect(book.draft(MAIN).text).toBe('')
+    expect(store.all()).toEqual([])
+    // The second prompt has not been heard of, and what the host says of it later changes nothing.
+    book.sendSettled('local-2', 'refused')
+    await book.settled()
+    expect(book.draft(MAIN).text).toBe('')
+    expect(store.all()).toEqual([])
+  })
+
   it('is owed at the version it tried to remove, so the next start removes it', async () => {
     const store = new FakeDraftStore()
     const book = await opened(store)

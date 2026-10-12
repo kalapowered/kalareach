@@ -264,6 +264,14 @@ main {
   transform: scale(0.97);
 }
 
+/* A button whose label can be long wraps it inside the button at a large text size, and the button
+   stays inside the box that holds it. */
+.btn[data-wraps] {
+  white-space: normal;
+  max-inline-size: 100%;
+  text-align: center;
+}
+
 .btn:disabled:active,
 .icon-btn:disabled:active {
   transform: none;

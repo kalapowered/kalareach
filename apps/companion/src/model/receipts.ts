@@ -149,7 +149,8 @@ export function sendOutcomeOf(state: InputState): 'taken' | 'refused' | 'unknown
  *
  * An action whose outcome nobody knows may have been dispatched, and the person's text comes back to
  * the composer: sending it again could run it twice. A later receipt settles it, or the host's
- * record of it when the interface asks.
+ * record of it when the interface asks, or a person who has checked sends it anyway, as an action of
+ * its own that leaves this one listed as it is.
  */
 export function unconfirmedReason(submissions: readonly Submission[]): string | null {
   const count = submissions.filter((submission) => submission.state === 'unknown').length
@@ -158,8 +159,11 @@ export function unconfirmedReason(submissions: readonly Submission[]): string | 
 
 /** The sentence for `count` actions that have no confirmed outcome. */
 export function unconfirmedWords(count: number): string {
-  return `${count === 1 ? 'One action has' : `${String(count)} actions have`} no confirmed outcome yet. Sending again could run it twice.`
+  return `${count === 1 ? 'One action has' : `${String(count)} actions have`} no confirmed outcome yet. ${count === 1 ? 'It' : 'They'} may still run, so sending again could make the work happen twice.`
 }
+
+/** What the way past that hold is called: the person has looked, and takes the risk. */
+export const SEND_ANYWAY_WORDS = 'I checked; send anyway'
 
 /** Whether the host will not change what it said of an action: applied, refused or rejected. */
 function isFinal(state: InputState): boolean {
