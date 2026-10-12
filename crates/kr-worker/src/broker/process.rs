@@ -33,8 +33,8 @@ const HEX: [u8; 16] = *b"0123456789abcdef";
 
 /// A per-launch secret the broker holds.
 ///
-/// It is generated once per launch, written into an owner-only registration file for the process
-/// the broker is about to start, and used to authenticate that process when it connects.
+/// It is generated once per launch, written into an owner-only file for the process the launch
+/// starts, and used to authenticate that process when it connects.
 ///
 /// What this type guarantees, exactly: there is no accessor that returns the bytes, `Debug`
 /// redacts, the value leaves the broker only through [`Credential::write_file`], and
@@ -278,12 +278,12 @@ pub struct ManagedProcess {
     pub handle: TransportHandle,
     /// The credential the process authenticates with. It stays here.
     credential: Credential,
-    /// When the broker started it.
+    /// When the broker registered it.
     pub started_at: TimestampMs,
 }
 
 impl ManagedProcess {
-    /// Records a process the broker has launched.
+    /// Records a process a launch started.
     #[must_use]
     pub const fn new(
         application_instance_id: ApplicationInstanceId,
