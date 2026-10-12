@@ -3303,13 +3303,12 @@ const WITH_AN_AUTHORITY_FEED: &[u8] = br#"{
   "level": 2,
   "revision": 5,
   "preferences": { "sleep_inhibition": "battery_too" },
-  "authority": { "origin": "https://reach.example.com" }
+  "authority": { "origin": "http://127.0.0.1:9" }
 }"#;
 
 /// KR-REQ-26.13: a daemon over a document that selects an authority feed reads it as a section of
 /// the level it reads, accepts it, and keeps in the registry the document as it read it, with the
-/// section and its level; the report an owner reads shows the selection, and the next start accepts
-/// nothing again.
+/// section and its level; the report an owner reads shows the selection.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_document_that_selects_an_authority_feed_is_accepted_with_its_section() {
     let owner = DeviceKeys::generate().expect("owner keys");
@@ -3333,7 +3332,7 @@ async fn a_document_that_selects_an_authority_feed_is_accepted_with_its_section(
         .iter()
         .find(|value| value.key == "authority.origin")
         .expect("the selection is reported");
-    assert_eq!(row.value(), "https://reach.example.com", "{row:?}");
+    assert_eq!(row.value(), "http://127.0.0.1:9", "{row:?}");
     let ignored = result
         .configuration
         .values
@@ -3355,7 +3354,7 @@ async fn a_document_that_selects_an_authority_feed_is_accepted_with_its_section(
     assert_eq!(accepted.level, 2);
     assert_eq!(
         accepted.authority.origin(),
-        Some("https://reach.example.com"),
+        Some("http://127.0.0.1:9"),
         "the registry's copy states the selection"
     );
     let file = std::fs::read(kr_worker::config::document_path(&environment)).expect("the file");
