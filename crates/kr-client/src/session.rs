@@ -239,7 +239,6 @@ pub struct ComposedMutation {
 
 crate::debug_fields!(ComposedMutation {
     composed_on,
-    reach,
     window_issued_at_ms,
     window_valid_for_ms
 });

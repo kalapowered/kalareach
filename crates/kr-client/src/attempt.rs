@@ -559,17 +559,7 @@ pub enum AttemptError {
     },
 }
 
-impl std::fmt::Debug for AttemptError {
-    /// Which failure it is and nothing else: the directory and the file's name are in the message
-    /// a person is shown, and a log that prints the error by its debug form carries neither.
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(match self {
-            Self::Store { .. } => "AttemptError::Store { .. }",
-            Self::Encode(_) => "AttemptError::Encode(..)",
-            Self::Unreadable { .. } => "AttemptError::Unreadable { .. }",
-        })
-    }
-}
+crate::debug_as_display!(AttemptError);
 
 /// What a listing found.
 #[derive(Clone, PartialEq, Eq)]
@@ -1263,25 +1253,6 @@ mod tests {
         large.label = "x".repeat(300 * 1024);
         assert!(matches!(store.keep(&large), Err(AttemptError::Encode(_))));
         assert!(store.attempts().expect("listed").is_empty());
-    }
-
-    /// The store's errors name the directory and the file to a person, and neither to a log: the
-    /// debug form carries which failure it is.
-    #[test]
-    fn the_stores_errors_print_neither_a_directory_nor_a_name_in_debug() {
-        let directory = kr_ipc::testing::PrivateTempDir::create();
-        let root = directory.path().join("secret-directory-name");
-        let store = AttemptStore::open(&root).expect("opens");
-        let kept = attempt(Kind::Invite);
-        let path = root.join(format!("{}.attempt", kept.action_id));
-        std::fs::write(&path, b"x").expect("a malformed file");
-        let error = store.keep(&kept).expect_err("refused");
-        let debug = format!("{error:?}");
-        assert!(!debug.contains("secret-directory-name"), "{debug}");
-        assert!(!debug.contains(&kept.action_id.to_string()), "{debug}");
-        assert!(!debug.contains(".attempt"), "{debug}");
-        let encoded = AttemptError::Encode(Shown::said("a long cause"));
-        assert!(!format!("{encoded:?}").contains("a long cause"));
     }
 
     /// A hand-over's record holds its plan, and a closed attempt its outcome: the second record

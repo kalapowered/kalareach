@@ -49,7 +49,7 @@ pub struct Reach {
     pub actor: String,
 }
 
-crate::debug_fields!(Reach { host, actor });
+crate::debug_as_name!(Reach);
 
 /// What a client needs from whichever transport it connected over.
 ///
