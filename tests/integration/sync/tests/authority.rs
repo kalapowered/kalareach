@@ -30,7 +30,7 @@ use kr_client::services::authority::{
 };
 use kr_client::services::http::ExchangePhase;
 use kr_client::services::signed::SignedService;
-use kr_controller::grants::feed::{AuthorityFeed, FeedRefusal};
+use kr_controller::grants::feed::{AuthorityFeed, Basis, FeedRefusal};
 use kr_crypto::envelope::{PairedSenders, ReplayLedger, open_delivered_envelope, seal_envelope};
 use kr_crypto::keys::StoredEnvelopeKeyPair;
 use kr_pairing::grants::{
@@ -197,7 +197,15 @@ impl Feed {
         // draw on; here the next number stands for it.
         let previous = record.accepted_revision();
         record
-            .begin(request.clone(), previous, now_ms)
+            .begin(
+                request.clone(),
+                Basis {
+                    origin: "https://feed.example",
+                    previous,
+                    registry: previous,
+                    at_ms: now_ms,
+                },
+            )
             .map_err(|refusal| format!("{refusal:?}"))?;
         let revision = AuthorityRevision::new(previous.get() + 1);
         record.took_effect(request.request_id, revision);
@@ -648,7 +656,7 @@ async fn kr_req_10_46_a_revision_that_does_not_follow_the_accepted_one_is_reject
         // same revision and refuses that revision again, and it owes a synchronisation because what
         // it knew before it stopped is not evidence about the feed now. Writing that snapshot down
         // and reading it back is the controller's own store, which this leg does not reach.
-        let mut restarted = AuthorityFeed::restore(&held.snapshot());
+        let mut restarted = AuthorityFeed::restore(&held.snapshot(), None);
         assert_eq!(restarted.accepted_revision(), AuthorityRevision::new(6));
         assert!(restarted.synchronisation_owed());
         assert!(restarted.status().stale);
@@ -893,7 +901,7 @@ async fn kr_req_10_46_an_unreachable_feed_is_stale_and_still_shows_the_last_ackn
                 .expect("the last acknowledgement")
                 .authority_revision,
             revision,
-            "the device list still shows the last acknowledgement"
+            "the feed still holds the last acknowledgement"
         );
         assert_eq!(stale.accepted_revision, revision);
 

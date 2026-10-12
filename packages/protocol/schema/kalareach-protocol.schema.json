@@ -4703,7 +4703,7 @@
     },
     "AuthoritySelection": {
       "additionalProperties": false,
-      "description": "The authority feed this host reads its remote revocations from.\n\nA provider origin, so it is this document's to choose and no inherited variable's. The\ndaemon reads it when it starts, so a change applies at the next start. An owner whose host\nlost its feed points it at another service, or at none. Absent means this host has no feed:\nit takes revocations from the owners who reach it directly, and a remote owner's revocation\ncannot reach it.\n\nThe section arrived with level 2. A release that reads level 1 does not know it: it\napplies the rest of the document, counts the section among the members it ignores, and\ndoes not edit the document, so a host rolled back to such a release has no feed until it\nis brought forward again.",
+      "description": "The authority feed this host reads its remote revocations from.\n\nA provider origin, so it is this document's to choose and no inherited variable's. The\ndaemon reads it when it starts, so a change applies at the next start. An owner whose host\nlost its feed points it at another service, or at none. Absent means this host has no feed:\nit takes revocations from the owners who reach it directly, and a remote owner's revocation\ncannot reach it.\n\nThe section arrived with level 2. A release that reads level 1 does not know it: it\napplies the rest of the document, counts the section among the members it ignores, and\ndoes not edit the document.",
       "properties": {
         "origin": {
           "anyOf": [
@@ -12800,7 +12800,7 @@
           "type": "array"
         },
         "feed_removed": {
-          "description": "True when the feed answered that this host was removed from it.\n\nThe host then learns no revocation from the feed again. The default non-expiring owner\ngrants stay usable; organisation leases and grants under a bounded offline-validity policy\nare refused until the owner acts at the host. [`Self::feed_synchronised_at_ms`] is the last\ntime the feed answered before that.",
+          "description": "True when the feed answered that this host was removed from it.\n\nThe host then learns no revocation from the feed again. The default non-expiring owner\ngrants stay usable; the grants that rest on the feed are refused until the owner acts at the\nhost: organisation leases, and personal remote access under a bounded offline-validity\npolicy or on a host that is exclusively organisation-managed.\n[`Self::feed_synchronised_at_ms`] is the last time the feed answered before that.",
           "type": "boolean"
         },
         "feed_stale": {
@@ -22917,7 +22917,7 @@
             }
           ],
           "default": null,
-          "description": "The HTTP proxy this host's connections to services go through, as an absolute `http` or\n`https` origin such as `http://proxy.example.com:3128`: the network endpoint's relay\nconnection, relay latency probe, captive-portal check and Pkarr servers, the\nrendezvous, delivery and webhooks, mail submission (a `CONNECT` tunnel to the mail\nserver), the managed voice broker and account service, uploads of backups to the\nmanaged storage service, the model's files, and plugin repositories. Nothing on that\nlist goes around it, so an address it cannot reach fails, and a daemon that started\nover a document it could not use sends nothing through these routes until it starts\nagain over one it can. The host's own name lookups, the endpoint's direct paths, its\nQUIC address discovery (which connects directly to the relays over UDP to learn this\nhost's public address) and port mapper, local discovery and the Mainline DHT where\nthose are selected, and the Git operations an owner asks for do not use it. It is this\nmachine's own choice: no invitation or host bundle carries it. It names no user and no\npassword, because a proxy that needs credentials is not supported."
+          "description": "The HTTP proxy this host's connections to services go through, as an absolute `http` or\n`https` origin such as `http://proxy.example.com:3128`: the network endpoint's relay\nconnection, relay latency probe, captive-portal check and Pkarr servers, the rendezvous,\ndelivery and webhooks, mail submission (a `CONNECT` tunnel to the mail server), the\nmanaged voice broker and account service, uploads of backups to the managed storage\nservice, the authority feed, the model's files, and plugin repositories. Nothing on that\nlist goes around it, so an address it cannot reach fails, and a daemon that started over\na document it could not use sends nothing through these routes until it starts again\nover one it can. The host's own name lookups, the endpoint's direct paths, its QUIC\naddress discovery (which connects directly to the relays over UDP to learn this host's\npublic address) and port mapper, local discovery and the Mainline DHT where those are\nselected, and the Git operations an owner asks for do not use it. It is this machine's\nown choice: no invitation or host bundle carries it. It names no user and no password,\nbecause a proxy that needs credentials is not supported."
         },
         "relay_only": {
           "anyOf": [
