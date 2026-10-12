@@ -16712,6 +16712,74 @@
         }
       ]
     },
+    "GrantHeldParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `grant.held`.\n\nNothing names a device: the device that asks is the one the connection authenticated as.",
+      "properties": {
+        "offers_after": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/OfferKey"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Resume the offers after this key. Null begins at the first."
+        },
+        "shares_after": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ShareKey"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Resume the shares after this key. Null begins at the first."
+        }
+      },
+      "required": [
+        "offers_after",
+        "shares_after"
+      ],
+      "type": "object"
+    },
+    "GrantHeldResult": {
+      "additionalProperties": false,
+      "description": "The result of `grant.held`.",
+      "properties": {
+        "offers": {
+          "description": "Offers, in key order, at most [`GRANT_HELD_PAGE`].",
+          "items": {
+            "$ref": "#/$defs/ShareOffer"
+          },
+          "type": "array"
+        },
+        "offers_more": {
+          "description": "Whether more offers follow the last one listed.",
+          "type": "boolean"
+        },
+        "shares": {
+          "description": "Shares, in key order, at most [`GRANT_HELD_PAGE`].",
+          "items": {
+            "$ref": "#/$defs/HeldShare"
+          },
+          "type": "array"
+        },
+        "shares_more": {
+          "description": "Whether more shares follow the last one listed.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "offers",
+        "offers_more",
+        "shares",
+        "shares_more"
+      ],
+      "type": "object"
+    },
     "GrantId": {
       "description": "One host-issued authority object.",
       "format": "uuid",
@@ -16950,6 +17018,42 @@
           "type": "string"
         }
       ]
+    },
+    "HeldShare": {
+      "additionalProperties": false,
+      "description": "One share the asking device holds: an active, unrevoked grant over a session still open.",
+      "properties": {
+        "display_number": {
+          "$ref": "#/$defs/DisplayNumber",
+          "description": "The session's number on the host."
+        },
+        "ends_at_ms": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TimestampMs"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "When access under it ends: the earlier of its expiry and the end of the device's pairing."
+        },
+        "grant": {
+          "$ref": "#/$defs/Grant",
+          "description": "The grant."
+        },
+        "issued_at_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When the grant was issued; the key a next page resumes after."
+        }
+      },
+      "required": [
+        "grant",
+        "display_number",
+        "issued_at_ms",
+        "ends_at_ms"
+      ],
+      "type": "object"
     },
     "HelloReply": {
       "description": "The host's answer to a `hello` offer.\n\nA major mismatch answers [`ErrorCode::UnsupportedSchema`] here and the connection carries no\nsession data. Every other refusal before device authorisation answers here too, so a client\nnever has to distinguish a closed stream from a rejected offer.",
@@ -21333,6 +21437,11 @@
           "type": "string"
         },
         {
+          "const": "grant.held",
+          "description": "List what is offered to this device and what it holds, a page at a time: the invitations that name it and the active shares of sessions still open. The device asking is the one the connection authenticated as, and the answer carries none of the text the issuer was shown.",
+          "type": "string"
+        },
+        {
           "const": "grant.transfer",
           "description": "Hand a session's control to another paired device: the receiving device is given an active grant over the session and the transferring device's grant is revoked with its descendants, in one commit. The person at this machine asks for it, and it spends the owner confirmation an owner device recorded for exactly this transfer, once.",
           "type": "string"
@@ -22622,6 +22731,25 @@
           "type": "string"
         }
       ]
+    },
+    "OfferKey": {
+      "additionalProperties": false,
+      "description": "Where a page of `grant.held` offers resumes: the key of the last offer already read.\n\nOffers are ordered by this key, so a page ends at one and the next begins after it, and an\noffer that is redeemed or withdrawn between two pages moves nothing the reader has not seen.",
+      "properties": {
+        "invitation_id": {
+          "$ref": "#/$defs/InvitationId",
+          "description": "The invitation."
+        },
+        "issued_at_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When the invitation was issued."
+        }
+      },
+      "required": [
+        "issued_at_ms",
+        "invitation_id"
+      ],
+      "type": "object"
     },
     "OfferedDecision": {
       "additionalProperties": false,
@@ -35193,6 +35321,104 @@
       ],
       "type": "object"
     },
+    "ShareKey": {
+      "additionalProperties": false,
+      "description": "Where a page of `grant.held` shares resumes: the key of the last share already read.",
+      "properties": {
+        "grant_id": {
+          "$ref": "#/$defs/GrantId",
+          "description": "The grant."
+        },
+        "issued_at_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When the grant was issued."
+        }
+      },
+      "required": [
+        "issued_at_ms",
+        "grant_id"
+      ],
+      "type": "object"
+    },
+    "ShareOffer": {
+      "additionalProperties": false,
+      "description": "One invitation that names the device asking, as the host tells that device before it redeems.\n\nNamed fields only, so no question or approval text, and no part of the screen its issuer was\nshown, can leave the host through it.",
+      "properties": {
+        "actions": {
+          "description": "The actions the grant carries.",
+          "items": {
+            "$ref": "#/$defs/ActionRight"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "display_number": {
+          "$ref": "#/$defs/DisplayNumber",
+          "description": "That session's number on the host."
+        },
+        "ends_at_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When access under it would end if redeemed now: the earlier of the invitation's end and the\nend of the asking device's pairing. Revocation and policy can end it sooner."
+        },
+        "grant_id": {
+          "$ref": "#/$defs/GrantId",
+          "description": "The grant that redeeming it activates."
+        },
+        "history_from_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "The earliest content the share reaches: the moment its history begins."
+        },
+        "includes_live_screen": {
+          "description": "Whether the live screen is included.",
+          "type": "boolean"
+        },
+        "invitation_id": {
+          "$ref": "#/$defs/InvitationId",
+          "description": "The invitation. Redeeming it is `grant.redeem` with this identity."
+        },
+        "issued_at_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When the invitation was issued."
+        },
+        "notices": {
+          "description": "The notices the actions carry.",
+          "items": {
+            "$ref": "#/$defs/AuthorityNotice"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "role": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SessionRole"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The widest role the actions cover, for a person reading the offer. The host decides from\nthe actions and never from this."
+        },
+        "session_id": {
+          "$ref": "#/$defs/SessionId",
+          "description": "The session it shares."
+        }
+      },
+      "required": [
+        "invitation_id",
+        "grant_id",
+        "session_id",
+        "display_number",
+        "role",
+        "actions",
+        "history_from_ms",
+        "includes_live_screen",
+        "notices",
+        "issued_at_ms",
+        "ends_at_ms"
+      ],
+      "type": "object"
+    },
     "ShellCommandParams": {
       "additionalProperties": false,
       "description": "Parameters of a `shell_command` node.\n\nThe command runs in the node's declared execution environment, and only under a broad shell\ngrant that admits that environment.",
@@ -41177,6 +41403,12 @@
     "grant_create_result": {
       "$ref": "#/$defs/GrantCreateResult"
     },
+    "grant_held_params": {
+      "$ref": "#/$defs/GrantHeldParams"
+    },
+    "grant_held_result": {
+      "$ref": "#/$defs/GrantHeldResult"
+    },
     "grant_list_params": {
       "$ref": "#/$defs/GrantListParams"
     },
@@ -41200,6 +41432,9 @@
     },
     "grant_transfer_result": {
       "$ref": "#/$defs/GrantTransferResult"
+    },
+    "held_share": {
+      "$ref": "#/$defs/HeldShare"
     },
     "hello_reply": {
       "$ref": "#/$defs/HelloReply"
@@ -41644,6 +41879,9 @@
     },
     "observed_path": {
       "$ref": "#/$defs/ObservedPath"
+    },
+    "offer_key": {
+      "$ref": "#/$defs/OfferKey"
     },
     "offline_validity_policy": {
       "$ref": "#/$defs/OfflineValidityPolicy"
@@ -42232,6 +42470,12 @@
     },
     "session_summary": {
       "$ref": "#/$defs/SessionSummary"
+    },
+    "share_key": {
+      "$ref": "#/$defs/ShareKey"
+    },
+    "share_offer": {
+      "$ref": "#/$defs/ShareOffer"
     },
     "shell_command_params": {
       "$ref": "#/$defs/ShellCommandParams"

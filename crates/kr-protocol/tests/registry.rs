@@ -613,6 +613,41 @@ fn the_required_methods_of_the_specification_table_are_all_listed() {
         );
     }
 
+    // A recipient is told, before it redeems, what it was offered and what it holds, from a paired
+    // connection only. The device that asks is the one the connection authenticated as, so the
+    // basis is the caller's own resources and no right in a grant stands for it; and the answer
+    // names fields, never the text its issuer was shown, so no history filter applies.
+    let held = [("grant.held", EffectClass::Read)];
+    for (name, effect) in held {
+        let entry = lookup(name).unwrap_or_else(|| panic!("{name} is missing from the registry"));
+        assert_eq!(entry.effect, effect, "{name} carries its own effect class");
+        assert_eq!(
+            entry.group,
+            MethodGroup::Sharing,
+            "{name} is a sharing method"
+        );
+        assert_eq!(
+            entry.ingress,
+            &[ActorIngress::PairedDevice],
+            "{name} is the recipient's alone"
+        );
+        assert_eq!(
+            entry.required_rights,
+            &[RequiredRight::basis(RequiredAuthority::ResourceOwner)],
+            "{name} is answered to the device about its own offers and shares"
+        );
+        assert_eq!(
+            entry.history_filter,
+            HistoryFilter::NotApplicable,
+            "{name} answers named fields and no session text"
+        );
+        assert_eq!(
+            entry.confirmation,
+            ConfirmationRequirement::None,
+            "{name} reads"
+        );
+    }
+
     // Section 18 lists transfer of control beside scoped invitations and delegation, section 23's
     // sharing row names no method that makes one, and a transfer is not a delegation: it moves who
     // holds a session, so the owner confirms it every time and the person at this machine asks for
@@ -948,6 +983,7 @@ fn the_required_methods_of_the_specification_table_are_all_listed() {
             + descriptions.len()
             + machines.len()
             + redemptions.len()
+            + held.len()
             + transfers.len()
             + previews.len()
             + policy.len()

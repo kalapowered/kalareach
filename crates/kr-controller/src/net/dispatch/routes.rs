@@ -99,6 +99,10 @@ pub(super) enum DeviceRead {
     /// the set its own delegation authority reaches. The registry requires `session.share`; the
     /// issuer this host lists for is the device itself.
     Grants,
+    /// `grant.held`: what is offered to this device and what it holds, from the grant store. The
+    /// device is the one this connection authenticated as, and nothing in the request names a
+    /// device.
+    Held,
     /// `session.describe`: the session's name from the environment's metadata store, filtered for
     /// this device. Generated text is answered only when the grant's history reaches back to the
     /// session's start, because a description can summarise anything the session did.
@@ -150,6 +154,7 @@ impl DeviceRead {
             Method::VoiceContext | Method::VoicePrepare => Self::Voice,
             Method::PairStatus | Method::OwnerConfirmationPending => Self::Pairing,
             Method::GrantList => Self::Grants,
+            Method::GrantHeld => Self::Held,
             Method::SessionDescribe => Self::Description,
             Method::UploadStatus | Method::DownloadBegin | Method::DownloadChunk => {
                 Self::Refused(Unserved::Transfer)
@@ -408,6 +413,19 @@ impl RemoteConnection {
                 match self
                     .controller
                     .grant_list(self.device.device_id, &request.params)
+                {
+                    Ok(value) => ControlFrame::Response(Response {
+                        request_id: request.request_id,
+                        outcome: Outcome::Ok(value),
+                    }),
+                    Err(error) => failure(request.request_id, error.to_protocol_error()),
+                }
+            }
+            DeviceRead::Held => {
+                match self
+                    .controller
+                    .grant_held(self.device.device_id, &request.params)
+                    .await
                 {
                     Ok(value) => ControlFrame::Response(Response {
                         request_id: request.request_id,

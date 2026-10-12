@@ -57,31 +57,14 @@ async fn try_share(
     recipient: DeviceId,
     lifetime_ms: Option<u64>,
 ) -> Result<GrantCreateResult, ProtocolError> {
-    let selection = RoleSelection::plain(SessionRole::Viewer);
-    let params = GrantCreateParams {
+    net_support::share_with(
+        host,
         session_id,
-        recipient_device_id: recipient,
-        parent_grant_id: Nullable::null(),
-        accepted_notices: AuthorityNotice::for_actions(&selection.actions()),
-        selection,
-        lifetime_ms: Nullable(lifetime_ms.map(kr_protocol::scalars::DurationMs::new)),
-        owner_confirmation: Nullable::null(),
-    };
-    host.client()
-        .await
-        .mutate(
-            Method::GrantCreate,
-            ActionId::new(kr_ipc::new_uuid()),
-            ActionTarget {
-                session_id: Nullable::some(session_id),
-                session_epoch: Nullable::some(kr_protocol::ids::SessionEpoch::V1),
-                ..on_the_host(host)
-            },
-            &params,
-        )
-        .await
-        .expect("the call reaches the daemon")
-        .map(|answer| answer.to_typed().expect("decodes"))
+        recipient,
+        RoleSelection::plain(SessionRole::Viewer),
+        lifetime_ms,
+    )
+    .await
 }
 
 /// Whether the host holds `grant_id` as active.

@@ -1265,6 +1265,76 @@ pub async fn recipient_ending_in(
     (device, record)
 }
 
+/// Shares `session_id` with `recipient` under `selection`, as the person at this machine does, for
+/// `lifetime_ms` when it names one; the host's refusal when it refuses.
+pub async fn share_with(
+    host: &Host,
+    session_id: SessionId,
+    recipient: DeviceId,
+    selection: RoleSelection,
+    lifetime_ms: Option<u64>,
+) -> Result<GrantCreateResult, ProtocolError> {
+    host.client()
+        .await
+        .mutate(
+            Method::GrantCreate,
+            ActionId::new(kr_ipc::new_uuid()),
+            on_the_session(host, session_id),
+            &GrantCreateParams {
+                session_id,
+                recipient_device_id: recipient,
+                parent_grant_id: Nullable::null(),
+                accepted_notices: AuthorityNotice::for_actions(&selection.actions()),
+                selection,
+                lifetime_ms: Nullable(lifetime_ms.map(kr_protocol::scalars::DurationMs::new)),
+                owner_confirmation: Nullable::null(),
+            },
+        )
+        .await
+        .expect("the call reaches the daemon")
+        .map(|answer| answer.to_typed().expect("decodes"))
+}
+
+/// A session this host's registry holds as open, with no worker behind it: what a share, an offer
+/// and a list of them are about. Returns the session and its number.
+pub fn an_open_session(host: &Host) -> (SessionId, kr_protocol::session::DisplayNumber) {
+    use kr_controller::registry::{LaunchPhase, Registry};
+
+    let mut registry = Registry::open(host.registry_database(), host.environment_id)
+        .expect("the registry opens beside the daemon's own handle");
+    let admitted = registry
+        .reserve(
+            &kr_protocol::ids::ActorId::new("local:501").expect("an actor"),
+            kr_ipc::new_uuid(),
+            kr_protocol::scalars::Digest256::from_bytes([0x5e; 32]),
+            &[0xa0],
+            kr_protocol::scalars::TimestampMs::new(kr_ipc::now_ms().get()),
+        )
+        .expect("the session is reserved");
+    registry
+        .set_phase(admitted.reservation.reservation_id, LaunchPhase::Live)
+        .expect("the session is live");
+    (
+        admitted.reservation.session_id,
+        admitted.reservation.display_number,
+    )
+}
+
+/// Ends a session made by [`an_open_session`], as the registry records an ended one.
+pub fn end_session(host: &Host, session_id: SessionId) {
+    use kr_controller::registry::{LaunchPhase, Registry};
+
+    let mut registry = Registry::open(host.registry_database(), host.environment_id)
+        .expect("the registry opens beside the daemon's own handle");
+    let reservation = registry
+        .reservation_for_session(session_id)
+        .expect("readable")
+        .expect("the session is reserved");
+    registry
+        .set_phase(reservation.reservation_id, LaunchPhase::Closed)
+        .expect("the session is closed");
+}
+
 /// Shares `session_id` with the device `record` names as an owner of it, as the person at this
 /// machine does, and has that device redeem it on a connection of its own, which is returned.
 pub async fn owned_by(

@@ -1087,6 +1087,14 @@ export type AuthorityNotice =
  */
 export type DurationMs = string
 /**
+ * One of the four default roles.
+ *
+ * The order is the order of increasing authority, so a comparison reads the way a person expects.
+ * It is a display and composition order only: no check anywhere compares two roles to decide a
+ * request.
+ */
+export type SessionRole = 'viewer' | 'reviewer' | 'controller' | 'owner'
+/**
  * The host's answer to a `hello` offer.
  *
  * A major mismatch answers [`ErrorCode::UnsupportedSchema`] here and the connection carries no
@@ -2434,6 +2442,8 @@ export interface KalaReachProtocol {
   grant?: Grant
   grant_create_params?: GrantCreateParams
   grant_create_result?: GrantCreateResult
+  grant_held_params?: GrantHeldParams
+  grant_held_result?: GrantHeldResult
   grant_list_params?: GrantListParams
   grant_list_result?: GrantListResult
   grant_redeem_params?: GrantRedeemParams
@@ -2442,6 +2452,7 @@ export interface KalaReachProtocol {
   grant_summary?: GrantSummary
   grant_transfer_params?: GrantTransferParams
   grant_transfer_result?: GrantTransferResult
+  held_share?: HeldShare
   hello_reply?: HelloReply
   history_page_params?: HistoryPageParams
   history_page_result?: HistoryPageResult
@@ -2593,6 +2604,7 @@ export interface KalaReachProtocol {
   node_status?: NodeStatus
   notification?: Notification
   observed_path?: ObservedPath
+  offer_key?: OfferKey
   offline_validity_policy?: OfflineValidityPolicy
   operation_record?: OperationRecord
   organisation_enrol_params?: OrganisationEnrolParams
@@ -2789,6 +2801,8 @@ export interface KalaReachProtocol {
   session_screen_preview_params?: SessionScreenPreviewParams
   session_screen_preview_result?: SessionScreenPreviewResult
   session_summary?: SessionSummary2
+  share_key?: ShareKey
+  share_offer?: ShareOffer
   shell_command_params?: ShellCommandParams
   shell_launch_params?: ShellLaunchParams
   shell_launch_result?: ShellLaunchResult
@@ -15601,6 +15615,216 @@ export interface NamedQuestionPreview {
   revision: string
 }
 /**
+ * Parameters of `grant.held`.
+ *
+ * Nothing names a device: the device that asks is the one the connection authenticated as.
+ */
+export interface GrantHeldParams {
+  /**
+   * Resume the offers after this key. Null begins at the first.
+   */
+  offers_after: OfferKey | null
+  /**
+   * Resume the shares after this key. Null begins at the first.
+   */
+  shares_after: ShareKey | null
+}
+/**
+ * Where a page of `grant.held` offers resumes: the key of the last offer already read.
+ *
+ * Offers are ordered by this key, so a page ends at one and the next begins after it, and an
+ * offer that is redeemed or withdrawn between two pages moves nothing the reader has not seen.
+ */
+export interface OfferKey {
+  /**
+   * The invitation.
+   */
+  invitation_id: string
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  issued_at_ms: string
+}
+/**
+ * Where a page of `grant.held` shares resumes: the key of the last share already read.
+ */
+export interface ShareKey {
+  /**
+   * One host-issued authority object.
+   */
+  grant_id: string
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  issued_at_ms: string
+}
+/**
+ * The result of `grant.held`.
+ */
+export interface GrantHeldResult {
+  /**
+   * Offers, in key order, at most [`GRANT_HELD_PAGE`].
+   */
+  offers: ShareOffer[]
+  /**
+   * Whether more offers follow the last one listed.
+   */
+  offers_more: boolean
+  /**
+   * Shares, in key order, at most [`GRANT_HELD_PAGE`].
+   */
+  shares: HeldShare[]
+  /**
+   * Whether more shares follow the last one listed.
+   */
+  shares_more: boolean
+}
+/**
+ * One invitation that names the device asking, as the host tells that device before it redeems.
+ *
+ * Named fields only, so no question or approval text, and no part of the screen its issuer was
+ * shown, can leave the host through it.
+ */
+export interface ShareOffer {
+  /**
+   * The actions the grant carries.
+   */
+  actions: ActionRight[]
+  /**
+   * That session's number on the host.
+   */
+  display_number: string
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  ends_at_ms: string
+  /**
+   * One host-issued authority object.
+   */
+  grant_id: string
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  history_from_ms: string
+  /**
+   * Whether the live screen is included.
+   */
+  includes_live_screen: boolean
+  /**
+   * The invitation. Redeeming it is `grant.redeem` with this identity.
+   */
+  invitation_id: string
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  issued_at_ms: string
+  /**
+   * The notices the actions carry.
+   */
+  notices: AuthorityNotice[]
+  /**
+   * The widest role the actions cover, for a person reading the offer. The host decides from
+   * the actions and never from this.
+   */
+  role: SessionRole | null
+  /**
+   * One KalaReach terminal session.
+   */
+  session_id: string
+}
+/**
+ * One share the asking device holds: an active, unrevoked grant over a session still open.
+ */
+export interface HeldShare {
+  /**
+   * The session's number on the host.
+   */
+  display_number: string
+  /**
+   * When access under it ends: the earlier of its expiry and the end of the device's pairing.
+   */
+  ends_at_ms: TimestampMs | null
+  grant: Grant2
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  issued_at_ms: string
+}
+/**
+ * The grant.
+ */
+export interface Grant2 {
+  /**
+   * The actions it permits.
+   */
+  actions: ActionRight[]
+  /**
+   * The host's ordered authority revision. Only the host issues its own revisions.
+   */
+  authority_revision: string
+  /**
+   * Which environments it covers.
+   */
+  environment_selector:
+    | 'any'
+    | {
+        these: {
+          /**
+           * The permitted environments.
+           */
+          environment_ids: EnvironmentId[]
+        }
+      }
+  /**
+   * When it stops being valid.
+   */
+  expiry:
+    | 'never'
+    | {
+        at: {
+          /**
+           * A UTC timestamp in milliseconds, as a decimal string in JSON.
+           */
+          expires_at_ms: string
+        }
+      }
+  /**
+   * One host-issued authority object.
+   */
+  grant_id: string
+  history: HistoryScope1
+  /**
+   * One paired device.
+   */
+  issuer_device_id: string
+  /**
+   * An optional organisation membership requirement.
+   */
+  organisation: OrganisationRequirement | null
+  /**
+   * The grant this one was delegated from. Revoking a parent revokes its descendants.
+   */
+  parent_grant_id: GrantId | null
+  /**
+   * One paired device.
+   */
+  recipient_device_id: string
+  /**
+   * Which sessions it covers.
+   */
+  session_selector:
+    | 'any'
+    | {
+        these: {
+          /**
+           * The permitted sessions.
+           */
+          session_ids: SessionId[]
+        }
+      }
+    | 'none'
+}
+/**
  * Parameters of `grant.list`.
  */
 export interface GrantListParams {
@@ -15632,7 +15856,7 @@ export interface GrantSummary {
    * the device does. Null when neither ever ends.
    */
   ends_at_ms: TimestampMs | null
-  grant: Grant2
+  grant: Grant3
   /**
    * When it was revoked, when it was.
    */
@@ -15649,7 +15873,7 @@ export interface GrantSummary {
 /**
  * The grant itself.
  */
-export interface Grant2 {
+export interface Grant3 {
   /**
    * The actions it permits.
    */
@@ -15734,7 +15958,7 @@ export interface GrantRedeemParams {
  * The result of `grant.redeem`.
  */
 export interface GrantRedeemResult {
-  grant: Grant3
+  grant: Grant4
   /**
    * The invitation that was redeemed.
    */
@@ -15744,7 +15968,7 @@ export interface GrantRedeemResult {
  * The grant it carried, now active. It names the session it covers and what it reaches; the
  * text the issuer was shown stays with the issuer.
  */
-export interface Grant3 {
+export interface Grant4 {
   /**
    * The actions it permits.
    */
@@ -15849,13 +16073,13 @@ export interface GrantTransferParams {
  * The result of `grant.transfer`.
  */
 export interface GrantTransferResult {
-  replacement: Grant4
+  replacement: Grant5
   revoked: RevocationResult
 }
 /**
  * The grant the receiving device now holds, active from the moment of the transfer.
  */
-export interface Grant4 {
+export interface Grant5 {
   /**
    * The actions it permits.
    */
@@ -17704,6 +17928,7 @@ export interface MethodEntry {
     | 'grant.revoke'
     | 'grant.list'
     | 'grant.redeem'
+    | 'grant.held'
     | 'grant.transfer'
     | 'push.installation.register'
     | 'push.sender.issue'
@@ -26574,6 +26799,7 @@ export interface ServiceRequestPayload {
     | 'grant.revoke'
     | 'grant.list'
     | 'grant.redeem'
+    | 'grant.held'
     | 'grant.transfer'
     | 'push.installation.register'
     | 'push.sender.issue'

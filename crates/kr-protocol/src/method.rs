@@ -1486,6 +1486,15 @@ methods! {
           the invitation names redeems it, and a withdrawn, expired or already redeemed \
           invitation activates nothing. The answer is the grant and carries no session text.";
 
+    GrantHeld = "grant.held", Sharing,
+    effect: Read, ingress: [PairedDevice], rights: [basis(ResourceOwner)], selectors: [Host],
+    history: NotApplicable, capability: NO_CAPABILITY, freshness: CurrentAuthority,
+    confirmation: None, idempotency: READ,
+    doc: "List what is offered to this device and what it holds, a page at a time: the \
+          invitations that name it and the active shares of sessions still open. The device \
+          asking is the one the connection authenticated as, and the answer carries none of \
+          the text the issuer was shown.";
+
     GrantTransfer = "grant.transfer", Sharing,
     effect: Write, ingress: [LocalIpc], rights: [req(SessionShare), basis(IssuerDelegation)],
     selectors: [Session, Grant, Device],

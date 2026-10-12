@@ -382,6 +382,177 @@ impl Controller {
         encode(&result)
     }
 
+    /// Tells a paired device what is offered to it and what it holds, a page at a time.
+    ///
+    /// The device is the one its connection authenticated as; nothing in the request names one, so
+    /// a device cannot ask about another. An offer is an open invitation that names the device,
+    /// for a session still open and not run out on the host's clocks; a share is an active,
+    /// unrevoked grant over such a session. The query reads the columns an offer needs and never
+    /// the preview, so no text its issuer was shown, and no question or approval text, can leave
+    /// through it. Every filter is applied before a page is cut, so a page is full whenever more
+    /// follow it, and the key a next page resumes after is the last entry listed.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when the grants or the registry cannot be read, and a
+    /// `STORAGE_UNAVAILABLE` refusal when a grant's standing cannot be decided until the clock
+    /// floor it would stand on is written down.
+    pub(crate) async fn grant_held(
+        &self,
+        device_id: kr_protocol::ids::DeviceId,
+        params: &ParamsValue,
+    ) -> Result<ParamsValue> {
+        use kr_protocol::sharing::{
+            GRANT_HELD_PAGE, GrantHeldParams, GrantHeldResult, HeldShare, OfferKey, ShareKey,
+            ShareOffer,
+        };
+        /// How many rows one read of the store takes before the filters that need the registry.
+        const CHUNK: usize = 128;
+
+        let params: GrantHeldParams = parse(params)?;
+        let pairing_ends =
+            self.devices
+                .record_for_device(device_id)?
+                .and_then(|record| match record.grant.expiry {
+                    GrantExpiry::At { expires_at_ms } => Some(expires_at_ms),
+                    GrantExpiry::Never => None,
+                });
+        let sooner = |own: kr_protocol::scalars::TimestampMs| {
+            pairing_ends.map_or(own, |pairing| own.min(pairing))
+        };
+        let grants = self.sharing.grants();
+        let lifetimes = self.lifetimes();
+        let in_force = |record: &crate::grants::GrantRecord| -> Result<bool> {
+            match lifetimes.stored_standing(grants, record)? {
+                net::lifetimes::GrantStanding::InForce => Ok(true),
+                net::lifetimes::GrantStanding::OutOfForce => Ok(false),
+                net::lifetimes::GrantStanding::Unrecorded => {
+                    Err(crate::grants::store::unrecorded())
+                }
+            }
+        };
+        let mut offers = Vec::new();
+        let mut offers_more = false;
+        let mut cursor = params
+            .offers_after
+            .as_ref()
+            .map(|key: &OfferKey| (key.issued_at_ms.get(), key.invitation_id));
+        'offers: loop {
+            let chunk = grants.offers_after(device_id, cursor, CHUNK)?;
+            let exhausted = chunk.len() < CHUNK;
+            for offer in chunk {
+                cursor = Some((offer.issued_at_ms, offer.invitation_id));
+                let record = &offer.grant;
+                let Some(session_id) = record.session_id else {
+                    continue;
+                };
+                let Some(display_number) = self.open_session_number(session_id).await? else {
+                    continue;
+                };
+                if !in_force(record)? {
+                    continue;
+                }
+                let GrantExpiry::At { expires_at_ms } = record.grant.expiry else {
+                    continue;
+                };
+                if offers.len() == GRANT_HELD_PAGE {
+                    offers_more = true;
+                    break 'offers;
+                }
+                offers.push(ShareOffer {
+                    invitation_id: offer.invitation_id,
+                    grant_id: record.grant.grant_id,
+                    session_id,
+                    display_number,
+                    role: Nullable(crate::sharing::roles::describes(&record.grant.actions)),
+                    actions: record.grant.actions.clone(),
+                    history_from_ms: record
+                        .grant
+                        .history
+                        .lower_bound_ms
+                        .as_ref()
+                        .copied()
+                        .unwrap_or(kr_protocol::scalars::TimestampMs::new(offer.issued_at_ms)),
+                    includes_live_screen: record.grant.history.include_live_screen,
+                    notices: kr_protocol::sharing::AuthorityNotice::for_actions(
+                        &record.grant.actions,
+                    ),
+                    issued_at_ms: kr_protocol::scalars::TimestampMs::new(offer.issued_at_ms),
+                    ends_at_ms: sooner(expires_at_ms),
+                });
+            }
+            if exhausted {
+                break;
+            }
+        }
+
+        let mut shares = Vec::new();
+        let mut shares_more = false;
+        let mut cursor = params
+            .shares_after
+            .as_ref()
+            .map(|key: &ShareKey| (key.issued_at_ms.get(), key.grant_id));
+        'shares: loop {
+            let chunk = grants.shares_after(device_id, cursor, CHUNK)?;
+            let exhausted = chunk.len() < CHUNK;
+            for record in chunk {
+                cursor = Some((record.issued_at_ms, record.grant.grant_id));
+                let Some(session_id) = record.session_id else {
+                    continue;
+                };
+                let Some(display_number) = self.open_session_number(session_id).await? else {
+                    continue;
+                };
+                if !in_force(&record)? {
+                    continue;
+                }
+                if shares.len() == GRANT_HELD_PAGE {
+                    shares_more = true;
+                    break 'shares;
+                }
+                let ends_at_ms = match record.grant.expiry {
+                    GrantExpiry::At { expires_at_ms } => Some(sooner(expires_at_ms)),
+                    GrantExpiry::Never => pairing_ends,
+                };
+                shares.push(HeldShare {
+                    issued_at_ms: kr_protocol::scalars::TimestampMs::new(record.issued_at_ms),
+                    grant: record.grant,
+                    display_number,
+                    ends_at_ms: Nullable(ends_at_ms),
+                });
+            }
+            if exhausted {
+                break;
+            }
+        }
+        encode(&GrantHeldResult {
+            offers,
+            offers_more,
+            shares,
+            shares_more,
+        })
+    }
+
+    /// The number of a session that is still open, and none for one that is not.
+    ///
+    /// A session is open while its reservation is neither closed nor failed. A session this host
+    /// has no reservation for is not one it can tell a device about.
+    async fn open_session_number(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Option<kr_protocol::session::DisplayNumber>> {
+        let registry = self.registry.lock().await;
+        Ok(registry
+            .reservation_for_session(session_id)?
+            .filter(|reservation| {
+                !matches!(
+                    reservation.phase,
+                    crate::registry::LaunchPhase::Closed | crate::registry::LaunchPhase::Failed
+                )
+            })
+            .map(|reservation| reservation.display_number))
+    }
+
     /// How one device's pairing stands, as this host decides it.
     ///
     /// Whether a pairing has run out is decided as admission decides it, on both clocks: the

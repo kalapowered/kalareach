@@ -568,6 +568,105 @@ pub struct GrantRedeemParams {
     pub invitation_id: InvitationId,
 }
 
+/// Where a page of `grant.held` offers resumes: the key of the last offer already read.
+///
+/// Offers are ordered by this key, so a page ends at one and the next begins after it, and an
+/// offer that is redeemed or withdrawn between two pages moves nothing the reader has not seen.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct OfferKey {
+    /// When the invitation was issued.
+    pub issued_at_ms: TimestampMs,
+    /// The invitation.
+    pub invitation_id: crate::ids::InvitationId,
+}
+
+/// Where a page of `grant.held` shares resumes: the key of the last share already read.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ShareKey {
+    /// When the grant was issued.
+    pub issued_at_ms: TimestampMs,
+    /// The grant.
+    pub grant_id: GrantId,
+}
+
+/// Parameters of `grant.held`.
+///
+/// Nothing names a device: the device that asks is the one the connection authenticated as.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct GrantHeldParams {
+    /// Resume the offers after this key. Null begins at the first.
+    pub offers_after: Nullable<OfferKey>,
+    /// Resume the shares after this key. Null begins at the first.
+    pub shares_after: Nullable<ShareKey>,
+}
+
+/// The most entries one page of `grant.held` carries in each of its lists.
+pub const GRANT_HELD_PAGE: usize = 64;
+
+/// One invitation that names the device asking, as the host tells that device before it redeems.
+///
+/// Named fields only, so no question or approval text, and no part of the screen its issuer was
+/// shown, can leave the host through it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ShareOffer {
+    /// The invitation. Redeeming it is `grant.redeem` with this identity.
+    pub invitation_id: crate::ids::InvitationId,
+    /// The grant that redeeming it activates.
+    pub grant_id: GrantId,
+    /// The session it shares.
+    pub session_id: SessionId,
+    /// That session's number on the host.
+    pub display_number: crate::session::DisplayNumber,
+    /// The widest role the actions cover, for a person reading the offer. The host decides from
+    /// the actions and never from this.
+    pub role: Nullable<SessionRole>,
+    /// The actions the grant carries.
+    pub actions: CanonicalSet<ActionRight>,
+    /// The earliest content the share reaches: the moment its history begins.
+    pub history_from_ms: TimestampMs,
+    /// Whether the live screen is included.
+    pub includes_live_screen: bool,
+    /// The notices the actions carry.
+    pub notices: CanonicalSet<AuthorityNotice>,
+    /// When the invitation was issued.
+    pub issued_at_ms: TimestampMs,
+    /// When access under it would end if redeemed now: the earlier of the invitation's end and the
+    /// end of the asking device's pairing. Revocation and policy can end it sooner.
+    pub ends_at_ms: TimestampMs,
+}
+
+/// One share the asking device holds: an active, unrevoked grant over a session still open.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HeldShare {
+    /// The grant.
+    pub grant: Grant,
+    /// The session's number on the host.
+    pub display_number: crate::session::DisplayNumber,
+    /// When the grant was issued; the key a next page resumes after.
+    pub issued_at_ms: TimestampMs,
+    /// When access under it ends: the earlier of its expiry and the end of the device's pairing.
+    pub ends_at_ms: Nullable<TimestampMs>,
+}
+
+/// The result of `grant.held`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct GrantHeldResult {
+    /// Offers, in key order, at most [`GRANT_HELD_PAGE`].
+    pub offers: Vec<ShareOffer>,
+    /// Whether more offers follow the last one listed.
+    pub offers_more: bool,
+    /// Shares, in key order, at most [`GRANT_HELD_PAGE`].
+    pub shares: Vec<HeldShare>,
+    /// Whether more shares follow the last one listed.
+    pub shares_more: bool,
+}
+
 /// Parameters of `grant.transfer`.
 ///
 /// The owner's confirmation is not carried here. It is asked for beforehand, through

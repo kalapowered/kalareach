@@ -115,6 +115,18 @@ impl GrantRecord {
     }
 }
 
+/// One open invitation as the store holds it for the device it names: the invitation's identity
+/// and issue time, and the grant that redeeming it activates.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OfferRecord {
+    /// The invitation.
+    pub invitation_id: InvitationId,
+    /// When it was issued, in UTC milliseconds.
+    pub issued_at_ms: u64,
+    /// The grant it carries.
+    pub grant: GrantRecord,
+}
+
 /// What a claim on one action found.
 ///
 /// The attempt that writes an action's claim is the one attempt that may ever perform it. Section
@@ -948,6 +960,135 @@ impl GrantDirectory {
             Ok(rows)
         })?;
         rows.into_iter().collect()
+    }
+
+    /// Returns the open invitations that name `device_id`, with the grants they carry, in key
+    /// order after `after`, at most `limit` of them.
+    ///
+    /// The key is the invitation's issue time and then its identity, and the database does both the
+    /// ordering and the comparison, so identifiers have one order. The query reads the columns an
+    /// offer needs and never the preview, which holds the text its issuer was shown. A grant
+    /// already revoked is not an offer; whether one has run out is for the caller to decide on the
+    /// host's clocks ([`Self::lapsed`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the rows cannot be read.
+    pub fn offers_after(
+        &self,
+        device_id: DeviceId,
+        after: Option<(u64, InvitationId)>,
+        limit: usize,
+    ) -> Result<Vec<OfferRecord>> {
+        let device = device_id.get().as_bytes().to_vec();
+        let (after_ms, after_id) = after.map_or((-1_i64, vec![0_u8; 16]), |(issued, id)| {
+            (
+                i64::try_from(issued).unwrap_or(i64::MAX),
+                id.get().as_bytes().to_vec(),
+            )
+        });
+        let rows: Vec<(Row, Option<Vec<u8>>, i64)> = self.with(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT g.grant, g.session_id, g.issued_at_ms, g.revoked_at_ms, g.revoked_by_parent,
+                        g.activated_at_ms, g.grant_id, i.invitation_id, i.issued_at_ms
+                 FROM session_invitations i JOIN grants g ON g.grant_id = i.grant_id
+                 WHERE i.recipient_device_id = ?1 AND i.state = 'open'
+                   AND g.revoked_at_ms IS NULL AND g.activated_at_ms IS NULL
+                   AND (i.issued_at_ms > ?2 OR (i.issued_at_ms = ?2 AND i.invitation_id > ?3))
+                 ORDER BY i.issued_at_ms, i.invitation_id
+                 LIMIT ?4",
+            )?;
+            let rows = statement
+                .query_map(
+                    params![
+                        device,
+                        after_ms,
+                        after_id,
+                        i64::try_from(limit).unwrap_or(i64::MAX)
+                    ],
+                    |row| Ok((read_row(row), row.get(7)?, row.get(8)?)),
+                )?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })?;
+        rows.into_iter()
+            .map(|(grant, invitation, issued)| {
+                Ok(OfferRecord {
+                    invitation_id: invitation
+                        .as_deref()
+                        .and_then(uuid_of)
+                        .map(InvitationId::new)
+                        .ok_or_else(|| {
+                            ControllerError::InvalidArgument(
+                                "an invitation row names no readable identity".to_owned(),
+                            )
+                        })?,
+                    issued_at_ms: u64::try_from(issued).unwrap_or_default(),
+                    grant: grant?,
+                })
+            })
+            .collect()
+    }
+
+    /// Returns the active, unrevoked grants over a session that `device_id` holds, in key order
+    /// after `after`, at most `limit` of them.
+    ///
+    /// The key is the grant's issue time and then its identity, ordered and compared by the
+    /// database. A grant that carries `voice.use` is a voice grant, which the voice coordinator
+    /// selects for itself, and is not listed. Whether a grant has run out is for the caller to
+    /// decide on the host's clocks ([`Self::lapsed`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the rows cannot be read.
+    pub fn shares_after(
+        &self,
+        device_id: DeviceId,
+        after: Option<(u64, GrantId)>,
+        limit: usize,
+    ) -> Result<Vec<GrantRecord>> {
+        let device = device_id.get().as_bytes().to_vec();
+        let (after_ms, after_id) = after.map_or((-1_i64, vec![0_u8; 16]), |(issued, id)| {
+            (
+                i64::try_from(issued).unwrap_or(i64::MAX),
+                id.get().as_bytes().to_vec(),
+            )
+        });
+        let rows: Vec<Row> = self.with(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT grant, session_id, issued_at_ms, revoked_at_ms, revoked_by_parent,
+                        activated_at_ms, grant_id
+                 FROM grants
+                 WHERE recipient_device_id = ?1 AND session_id IS NOT NULL
+                   AND activated_at_ms IS NOT NULL AND revoked_at_ms IS NULL
+                   AND (issued_at_ms > ?2 OR (issued_at_ms = ?2 AND grant_id > ?3))
+                 ORDER BY issued_at_ms, grant_id
+                 LIMIT ?4",
+            )?;
+            let rows = statement
+                .query_map(
+                    params![
+                        device,
+                        after_ms,
+                        after_id,
+                        i64::try_from(limit).unwrap_or(i64::MAX)
+                    ],
+                    |row| Ok(read_row(row)),
+                )?
+                .collect::<rusqlite::Result<Vec<Row>>>()?;
+            Ok(rows)
+        })?;
+        let mut records = Vec::new();
+        for row in rows {
+            let record = row?;
+            if !record
+                .grant
+                .permits(kr_protocol::rights::ActionRight::VoiceUse)
+            {
+                records.push(record);
+            }
+        }
+        Ok(records)
     }
 
     /// Revokes a grant and every grant delegated from it, however deep.
