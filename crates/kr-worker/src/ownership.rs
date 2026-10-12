@@ -2575,7 +2575,51 @@ mod tests {
                      first: {daemon_first}): {record:?}"
                 );
             }
+            assert!(
+                record.contains(&tree.server),
+                "the server is still the session's (the daemon asked first: {daemon_first}): \
+                 {record:?}"
+            );
         }
+    }
+
+    /// KR-REQ-07.13: the closure does not report as ended by the session a process that ended below
+    /// one in a control daemon's own scope. Control: without the scope the process is reported.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_closure_does_not_report_what_ended_below_a_process_in_a_daemons_scope() {
+        let tree = fan_tree();
+        let mut owned = session_with(&tree.server);
+        owned.observe_backends();
+        let ended = &tree.children[0];
+        let _ = kr_ipc::identity::stop_process(ended, kr_ipc::identity::Stop::Kill);
+        let waited = std::time::Instant::now();
+        while !matches!(
+            kr_ipc::identity::process_state(ended),
+            kr_ipc::identity::ProcessState::Ended
+        ) {
+            assert!(
+                waited.elapsed() < std::time::Duration::from_secs(60),
+                "the process did not end"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let reported = |owned: &OwnedProcesses| {
+            owned
+                .terminated()
+                .iter()
+                .any(|process| process.identity == *ended)
+        };
+        assert!(
+            reported(&owned),
+            "the control: a process that ended is reported as ended"
+        );
+
+        owned.in_a_scope.insert(key(&tree.daemon));
+        assert!(
+            !reported(&owned),
+            "a process that ended below one in a daemon's scope was not ended by the session"
+        );
     }
 
     /// KR-REQ-07.60: reading whether the processes below a server have left reads each process's
@@ -2656,8 +2700,10 @@ mod tests {
         let tree = chain_tree_of(std::process::Command::new("python3").args([
             "-I",
             "-c",
-            "import ctypes, os; \
-             os._exit(3) if ctypes.CDLL(None).prctl(36, 1, 0, 0, 0) != 0 else None; \
+            "import ctypes, os, sys; \
+             r = ctypes.CDLL(None).prctl(36, 1, 0, 0, 0); \
+             r == 0 or (sys.stderr.write('the kernel refused to make the server a child \
+             subreaper\\n'), os._exit(3)); \
              os.execvp('sh', ['sh', '-c', \
              '( ( sleep 601 & echo started; wait ) & wait; exec sleep 600 ) & wait'])",
         ]));
