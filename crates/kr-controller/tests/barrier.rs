@@ -3540,6 +3540,26 @@ fn names_the_actions(
     assert_eq!(reported.omitted_actions.get(), 0);
 }
 
+/// Whether a result already carries every name a worker's fence produced: its barrier holds and no
+/// name is still on its way.
+///
+/// A worker's first answer to an announcement can be pending whatever the case does. The worker
+/// refuses the announcement while anything else holds its dispatch boundary, and the daemon cuts
+/// off an exchange that takes longer than its bound, which a fence that commits every rejection by
+/// itself can, on a disk that is slow to flush. Either way the daemon asks again, so a case that
+/// needs the whole result announces again until this accepts it ([`announced_until`]) and never
+/// reads the first answer as the last.
+fn named_in_full(
+    barrier: &kr_protocol::action::RevocationBarrier,
+    hosted: &Hosted,
+    rejected: usize,
+) -> bool {
+    barrier.holds() && {
+        let reported = worker_report(barrier, hosted.session_id);
+        reported.names_pending.get() == 0 && reported.rejected_actions.len() == rejected
+    }
+}
+
 /// A daemon and a worker that has fenced the revision in force and told the daemon so, with a lease
 /// the worker holds under a grant of a share no case revokes.
 async fn a_worker_at_the_revision_in_force() -> (Hosted, u64) {
@@ -3618,7 +3638,11 @@ async fn a_worker_told_two_revisions_by_name_has_the_actions_of_both_in_each_res
     .expect("the second revocation reports")
     .expect("the second revocation is recorded");
     assert_eq!(answered.authority_revision.get(), held + 2);
-    names_the_actions(&answered.barrier, &hosted, &device, rejected, dispatched);
+    let answered = announced_until(&hosted.controller, answered.barrier, |barrier| {
+        named_in_full(barrier, &hosted, rejected)
+    })
+    .await;
+    names_the_actions(&answered, &hosted, &device, rejected, dispatched);
 
     go.send(()).expect("the first revocation waits at its stop");
     let late = tokio::time::timeout(Duration::from_secs(120), stopped)
@@ -3627,11 +3651,19 @@ async fn a_worker_told_two_revisions_by_name_has_the_actions_of_both_in_each_res
         .expect("the revoking task finishes")
         .expect("the first revocation is recorded");
     assert_eq!(late.authority_revision.get(), held + 2);
-    names_the_actions(&late.barrier, &hosted, &device, rejected, dispatched);
+    let late = announced_until(&hosted.controller, late.barrier, |barrier| {
+        named_in_full(barrier, &hosted, rejected)
+    })
+    .await;
+    names_the_actions(&late, &hosted, &device, rejected, dispatched);
 
+    // The order the worker was first told them in: an announcement the worker answered late is
+    // made again, and the repeat is not another revision.
+    let mut first_told = std::collections::BTreeSet::new();
     let told: Vec<_> = hosted.controller.announcements_sent_for_tests()[before..]
         .iter()
         .filter(|sent| sent.session_id == hosted.session_id && sent.evidence_from == 0)
+        .filter(|sent| first_told.insert(sent.revision))
         .map(|sent| match &sent.reach {
             RevisionReach::Within { since, grants, .. } => {
                 (sent.revision, Some((since.get(), grants.len())))
@@ -3708,7 +3740,11 @@ async fn a_worker_told_a_revision_of_the_host_and_then_one_by_name_has_the_actio
     .expect("the second revocation reports")
     .expect("the second revocation is recorded");
     assert_eq!(answered.authority_revision.get(), held + 2);
-    names_the_actions(&answered.barrier, &hosted, &device, rejected, dispatched);
+    let answered = announced_until(&hosted.controller, answered.barrier, |barrier| {
+        named_in_full(barrier, &hosted, rejected)
+    })
+    .await;
+    names_the_actions(&answered, &hosted, &device, rejected, dispatched);
 
     go.send(()).expect("the first revocation waits at its stop");
     let late = tokio::time::timeout(Duration::from_secs(60), stopped)
@@ -3717,11 +3753,19 @@ async fn a_worker_told_a_revision_of_the_host_and_then_one_by_name_has_the_actio
         .expect("the revoking task finishes")
         .expect("the first revocation is recorded");
     assert_eq!(late.authority_revision, AuthorityRevision::new(held + 2));
+    let late = announced_until(&hosted.controller, late, |barrier| {
+        named_in_full(barrier, &hosted, rejected)
+    })
+    .await;
     names_the_actions(&late, &hosted, &device, rejected, dispatched);
 
+    // The order the worker was first told them in: an announcement the worker answered late is
+    // made again, and the repeat is not another revision.
+    let mut first_told = std::collections::BTreeSet::new();
     let told: Vec<_> = hosted.controller.announcements_sent_for_tests()[before..]
         .iter()
         .filter(|sent| sent.session_id == hosted.session_id && sent.evidence_from == 0)
+        .filter(|sent| first_told.insert(sent.revision))
         .map(|sent| (sent.revision, sent.reach.clone()))
         .collect();
     assert_eq!(told[0], (held + 1, RevisionReach::Host), "{told:?}");
