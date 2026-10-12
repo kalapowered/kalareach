@@ -235,6 +235,21 @@ describe('the desktop port and the published methods', () => {
     await port.grantNotices(selection)
     await port.grantCreate(grant, { sessionId: SESSION })
     await port.grantList({ session_id: SESSION, include_resolved: false })
+    await port.sessionScreenPreview({ session_id: SESSION, selection })
+    await port.grantRevoke({ grant_id: 'grant-1' })
+    await port.grantRedeem({ invitation_id: 'invitation-1' })
+    await port.grantHeld()
+    await port.transferAsk(
+      { session_id: SESSION, from_grant_id: 'grant-1', to_device_id: 'device-2' },
+      { sessionId: SESSION }
+    )
+    await port.transferAnswered('reference-1')
+    await port.transferFinish('reference-1')
+    await port.transferCancel('reference-1')
+    await port.attemptsList()
+    await port.attemptAsk('action-1')
+    await port.attemptHide('action-1')
+    await port.attemptRemove('action-1')
     await port.pluginList({ environment_id: environment })
     await port.catalogueList({ environment_id: environment })
     await port.changesetRead({ change_set_id: 'change-1', version: null })
@@ -247,6 +262,18 @@ describe('the desktop port and the published methods', () => {
       'grant_notices',
       'grant_create',
       'grant_list',
+      'session_screen_preview',
+      'grant_revoke',
+      'grant_redeem',
+      'grant_held',
+      'transfer_ask',
+      'transfer_answered',
+      'transfer_finish',
+      'transfer_cancel',
+      'attempts_list',
+      'attempt_ask',
+      'attempt_hide',
+      'attempt_remove',
       'plugin_list',
       'catalogue_list',
       'changeset_read'
@@ -260,6 +287,17 @@ describe('the desktop port and the published methods', () => {
     expect(shell.invoked[3]?.args).toEqual({ params: review, subject: {} })
     expect(shell.invoked[5]?.args).toEqual({ selection })
     expect(shell.invoked[6]?.args).toEqual({ params: grant, subject: { sessionId: SESSION } })
+    // A hand-over names its session and the references it is later asked about by; an attempt is
+    // named by its action alone, and nothing here names a method.
+    const named = (command: string) => shell.invoked.find((each) => each.command === command)?.args
+    expect(named('transfer_ask')).toEqual({
+      params: { session_id: SESSION, from_grant_id: 'grant-1', to_device_id: 'device-2' },
+      subject: { sessionId: SESSION }
+    })
+    expect(named('transfer_answered')).toEqual({ reference: 'reference-1' })
+    expect(named('attempt_ask')).toEqual({ actionId: 'action-1' })
+    expect(named('grant_revoke')).toEqual({ params: { grant_id: 'grant-1' } })
+    expect(named('grant_held')).toEqual({})
   })
 })
 

@@ -21,6 +21,7 @@ const INSTANCE_BUILD = 'a1a1a1a1-0000-4000-8000-000000000002'
 const APPROVAL = 'b2b2b2b2-0000-4000-8000-000000000001'
 const PHONE = 'd4d4d4d4-0000-4000-8000-000000000001'
 const RETIRED_PHONE = 'd4d4d4d4-0000-4000-8000-000000000002'
+const SHORT_TABLET = 'd4d4d4d4-0000-4000-8000-000000000005'
 const ENVIRONMENT = '3f1a2c40-11aa-4b2c-9d3e-000000000001'
 
 const main: AgentSubject = { session_id: SESSION_MAIN, application_instance_id: INSTANCE_MAIN }
@@ -351,6 +352,61 @@ describe('the scripted host and attention, review and sharing', () => {
       await expect(
         port.grantCreate(invitation({ recipient_device_id: RETIRED_PHONE }), {})
       ).rejects.toMatchObject({ code: 'PERMISSION_DENIED' })
+    })
+
+    it('is refused when it would outlast the pairing of the device it is for', async () => {
+      const { port } = fakeHost()
+      await expect(
+        port.grantCreate(
+          invitation({
+            recipient_device_id: SHORT_TABLET,
+            lifetime_ms: String(2 * 3_600_000),
+            accepted_notices: [],
+            selection: { ...invitation().selection, include_question_respond: false }
+          }),
+          {}
+        )
+      ).rejects.toMatchObject({ code: 'INVALID_ARGUMENT' })
+    })
+
+    it('is answered with the host’s result at once, and leaves no record of the attempt', async () => {
+      const { port } = fakeHost()
+      const issued = await port.grantCreate(invitation(), {})
+      expect(issued.attempt.phase).toBe('closed')
+      expect(issued.attempt.outcome).toBe('happened')
+      expect((await port.attemptsList()).attempts).toEqual([])
+    })
+
+    it('is kept as an attempt when the host’s answer is lost, and answered from the host’s record when asked', async () => {
+      const { port, controls } = fakeHost()
+      controls.sharing.loseNextAnswer()
+      const lost = await port.grantCreate(invitation(), {})
+      expect(lost.value).toBeNull()
+      expect(lost.attempt.phase).toBe('unfinished')
+      expect(controls.sharing.grants()).toHaveLength(1)
+
+      // A second invitation of the same session to the same device waits for the first.
+      await expect(port.grantCreate(invitation(), {})).rejects.toMatchObject({
+        code: 'PERMISSION_DENIED'
+      })
+      const asked = await port.attemptAsk(lost.attempt.action_id)
+      expect(asked.value).not.toBeNull()
+      expect((await port.attemptsList()).attempts).toEqual([])
+      expect(controls.sharing.grants()).toHaveLength(1)
+    })
+
+    it('is not reported as done when the host never saw it, and is closed as not done only past the bound', async () => {
+      const { port, controls } = fakeHost()
+      controls.sharing.loseNextRequest()
+      const lost = await port.grantCreate(invitation(), {})
+      expect(controls.sharing.grants()).toHaveLength(0)
+      const asked = await port.attemptAsk(lost.attempt.action_id)
+      expect(asked.attempt.phase).toBe('checking')
+      controls.sharing.passTheBound()
+      const kept = (await port.attemptsList()).attempts
+      expect(kept.map((each) => [each.phase, each.outcome])).toEqual([['closed', 'not_done']])
+      await port.attemptRemove(lost.attempt.action_id)
+      expect((await port.attemptsList()).attempts).toEqual([])
     })
 
     it('is used once and expires an hour after it is issued unless the issuer chose otherwise', async () => {

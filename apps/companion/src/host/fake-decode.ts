@@ -225,6 +225,15 @@ export const GRANT_CREATE_PARAMS = object({
   owner_confirmation: { kind: 'nullable', of: { kind: 'object', fields: {} } }
 })
 export const GRANT_LIST_PARAMS = object({ session_id: nullable(uuid), include_resolved: bool })
+export const GRANT_REVOKE_PARAMS = object({ grant_id: uuid })
+export const GRANT_REDEEM_PARAMS = object({ invitation_id: uuid })
+export const GRANT_TRANSFER_PARAMS = object({
+  session_id: uuid,
+  from_grant_id: uuid,
+  to_device_id: uuid
+})
+/** What the preview of a session's screen is asked for: the session, and the choices it follows. */
+export const PREVIEW_PARAMS = object({ session_id: uuid, selection: ROLE_SELECTION })
 
 export const ENVIRONMENT_PARAMS = object({ environment_id: uuid })
 

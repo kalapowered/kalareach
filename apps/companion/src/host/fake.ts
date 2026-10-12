@@ -91,6 +91,7 @@ import {
 import { FakeDraftStore } from './fake-drafts'
 import { EVERY_RIGHT, ScriptedRecords } from './fake-state'
 import { ScriptedQuestions, type FakeQuestions } from './fake-questions'
+import { ScriptedSharing, type FakeSharing } from './fake-sharing'
 
 const ENVIRONMENT = '3f1a2c40-11aa-4b2c-9d3e-000000000001'
 const VOICE_SESSION = '6c5d4e30-33cc-4d4e-9f5a-000000000201'
@@ -259,6 +260,8 @@ export interface FakeHostControls {
   readonly records: ScriptedRecords
   /** The questions the agents asked, and what can happen to them while a person decides. */
   readonly questions: FakeQuestions
+  /** The grants the host holds, the attempts native code keeps, and what can happen to them. */
+  readonly sharing: FakeSharing
   /** The drafts this device keeps, which another window can write to. */
   readonly drafts: FakeDraftStore
   /** Moves the prompt generation on, which disables the launch buttons. */
@@ -669,6 +672,14 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
     sessions: { main: SESSION_MAIN, build: SESSION_BUILD, offline: SESSION_OFFLINE },
     nowMs: Date.now()
   })
+  const sharing = new ScriptedSharing(
+    { environment: ENVIRONMENT, nowMs: Date.now(), issuer: 'e8e8e8e8-0000-4000-8000-000000000001' },
+    () => records.deviceList({ include_revoked: true }).devices,
+    (sessionId) => {
+      // A session the host does not have is refused as the host refuses it.
+      records.agentOf(sessionId)
+    }
+  )
   /** The raw terminal views the page has opened, oldest first. */
   const terminalViews: FakeTerminalView[] = []
   let holdingTerminalViews = false
@@ -758,6 +769,16 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
   const requireConnection = () => {
     if (!connected) {
       refuse('RESOURCE_UNAVAILABLE', 'This host cannot be contacted right now.')
+    }
+  }
+
+  /** Runs one command's work and answers with what it gave, or refuses as the command does. */
+  const attempting = <T,>(work: () => T): Promise<T> => {
+    try {
+      return Promise.resolve(work())
+    } catch (failure) {
+      // eslint-disable-next-line @typescript-eslint/prefer-promise-reject-errors -- a command's failure crosses as data
+      return Promise.reject(failure)
     }
   }
 
@@ -1266,15 +1287,67 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
     // What an invitation would carry is native code's own reading of the protocol's table, and it
     // reaches no host.
     grantNotices: (selection) => Promise.resolve(records.grantNotices(selection)),
+    sessionScreenPreview: (params) => {
+      requireConnection()
+      return attempting(() => sharing.sessionScreenPreview(params))
+    },
     grantCreate: (params) => {
       requireConnection()
-      return Promise.resolve(records.grantCreate(params))
+      return attempting(() => sharing.grantCreate(params))
     },
     grantList: (params) =>
       reading('grantList', () => {
         requireConnection()
-        return records.grantList(params)
+        return sharing.grantList(params)
       }),
+    grantRevoke: (params) => {
+      requireConnection()
+      return attempting(() => sharing.grantRevoke(params))
+    },
+    grantRedeem: (params) => {
+      requireConnection()
+      return attempting(() => sharing.grantRedeem(params))
+    },
+    grantHeld: () => {
+      requireConnection()
+      return attempting(() => sharing.grantHeld())
+    },
+    transferAsk: (params, subject) => {
+      requireConnection()
+      return attempting(() => sharing.transferAsk(params, subject))
+    },
+    transferAnswered: (reference) => {
+      requireConnection()
+      return attempting(() => sharing.transferAnswered(reference))
+    },
+    transferFinish: (reference) => {
+      requireConnection()
+      return attempting(() => sharing.transferFinish(reference))
+    },
+    transferCancel: (reference) => {
+      requireConnection()
+      return attempting(() => {
+        sharing.transferCancel(reference)
+      })
+    },
+    attemptsList: () => {
+      requireConnection()
+      return attempting(() => sharing.attemptsList())
+    },
+    attemptAsk: (actionId) => {
+      requireConnection()
+      return attempting(() => sharing.attemptAsk(actionId))
+    },
+    attemptHide: (actionId) => {
+      requireConnection()
+      return attempting(() => sharing.attemptHide(actionId))
+    },
+    attemptRemove: (actionId) => {
+      requireConnection()
+      return attempting(() => {
+        sharing.attemptRemove(actionId)
+      })
+    },
 
     pluginList: (params) =>
       reading('pluginList', () => {
@@ -1767,6 +1840,7 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
     },
     records,
     questions,
+    sharing,
     drafts,
     changePromptGeneration() {
       promptGeneration += 1

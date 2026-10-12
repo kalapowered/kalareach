@@ -50,11 +50,6 @@ import type {
   DeviceListParams,
   DeviceListResult,
   DeviceSummary,
-  GrantCreateParams,
-  GrantCreateResult,
-  GrantListParams,
-  GrantListResult,
-  GrantSummary,
   HistoryPageParams,
   HistoryPageResult,
   InstanceCapabilityRecord,
@@ -83,8 +78,6 @@ import {
   CHANGESET_READ_PARAMS,
   DEVICE_LIST_PARAMS,
   ENVIRONMENT_PARAMS,
-  GRANT_CREATE_PARAMS,
-  GRANT_LIST_PARAMS,
   HISTORY_PAGE_PARAMS,
   REVIEW_ACKNOWLEDGE_PARAMS,
   REVIEW_READ_PARAMS,
@@ -217,7 +210,7 @@ const ROLE_ACTIONS: Readonly<Record<RoleSelection['role'], readonly ActionRight[
 }
 
 /** The notices a set of actions carries, in the host's order. */
-function noticesFor(actions: readonly ActionRight[]): AuthorityNotice[] {
+export function noticesFor(actions: readonly ActionRight[]): AuthorityNotice[] {
   const carried = new Set<AuthorityNotice>()
   for (const action of actions) {
     if (action === 'terminal.input') carried.add('account_access')
@@ -249,7 +242,7 @@ function noticesFor(actions: readonly ActionRight[]): AuthorityNotice[] {
 }
 
 /** The actions a selection compiles to: the role's, plus the explicit option when asked. */
-function actionsOf(selection: RoleSelection): ActionRight[] {
+export function actionsOf(selection: RoleSelection): ActionRight[] {
   const actions = new Set<ActionRight>(ROLE_ACTIONS[selection.role])
   if (selection.include_question_respond) actions.add('question.respond')
   return EVERY_RIGHT.filter((right) => actions.has(right))
@@ -266,7 +259,7 @@ function digestOf(seed: number): string {
 }
 
 /** An identifier in the form the protocol writes one, from a small number. */
-function idOf(prefix: string, value: number): string {
+export function idOf(prefix: string, value: number): string {
   return `${prefix}-0000-4000-8000-${String(value).padStart(12, '0')}`
 }
 
@@ -274,8 +267,12 @@ const INSTANCE_MAIN = idOf('a1a1a1a1', 1)
 const INSTANCE_BUILD = idOf('a1a1a1a1', 2)
 const APPROVAL = idOf('b2b2b2b2', 1)
 const CHANGE_SET = idOf('c3c3c3c3', 1)
-const PHONE = idOf('d4d4d4d4', 1)
+export const PHONE = idOf('d4d4d4d4', 1)
 const RETIRED_PHONE = idOf('d4d4d4d4', 2)
+export const OWNER_MAC = idOf('d4d4d4d4', 3)
+export const WIDE_TABLET = idOf('d4d4d4d4', 4)
+export const SHORT_TABLET = idOf('d4d4d4d4', 5)
+export const ENDED_TABLET = idOf('d4d4d4d4', 6)
 
 /** What the main session's agent has said so far. */
 const MAIN_HISTORY: readonly (readonly [string, string])[] = [
@@ -328,7 +325,6 @@ export class ScriptedRecords {
   #revision = 10
   #reviews: ReviewState[]
   readonly #devices: DeviceSummary[]
-  readonly #grants: GrantSummary[] = []
   #actions = 0
   #restarts = 0
 
@@ -391,6 +387,66 @@ export class ScriptedRecords {
         platform: 'android',
         grant_expires_at_ms: null,
         // The host counts a revoked device's pairing as run out.
+        grant_expired: true,
+        all_sessions: false
+      },
+      {
+        device_id: OWNER_MAC,
+        display_name: "Ricky's Mac",
+        grant_id: idOf('e5e5e5e5', 3),
+        paired_at_ms: String(ids.nowMs - 30 * 86_400_000),
+        acknowledged_revision: '4',
+        acknowledged_at_ms: String(ids.nowMs - 30_000),
+        revoked: false,
+        keys: null,
+        manages_host: true,
+        platform: 'macos',
+        grant_expires_at_ms: null,
+        grant_expired: false,
+        all_sessions: true
+      },
+      {
+        device_id: WIDE_TABLET,
+        display_name: "Sam's iPad",
+        grant_id: idOf('e5e5e5e5', 4),
+        paired_at_ms: String(ids.nowMs - 5 * 86_400_000),
+        acknowledged_revision: '4',
+        acknowledged_at_ms: String(ids.nowMs - 90_000),
+        revoked: false,
+        keys: null,
+        manages_host: false,
+        platform: 'ios',
+        grant_expires_at_ms: null,
+        grant_expired: false,
+        all_sessions: true
+      },
+      {
+        device_id: SHORT_TABLET,
+        display_name: 'Guest tablet',
+        grant_id: idOf('e5e5e5e5', 5),
+        paired_at_ms: String(ids.nowMs - 600_000),
+        acknowledged_revision: '4',
+        acknowledged_at_ms: String(ids.nowMs - 60_000),
+        revoked: false,
+        keys: null,
+        manages_host: false,
+        platform: 'android',
+        grant_expires_at_ms: String(ids.nowMs + 40 * 60_000),
+        grant_expired: false,
+        all_sessions: false
+      },
+      {
+        device_id: ENDED_TABLET,
+        display_name: 'Lapsed laptop',
+        grant_id: idOf('e5e5e5e5', 6),
+        paired_at_ms: String(ids.nowMs - 3 * 86_400_000),
+        acknowledged_revision: '4',
+        acknowledged_at_ms: String(ids.nowMs - 3_600_000),
+        revoked: false,
+        keys: null,
+        manages_host: false,
+        platform: 'windows',
+        grant_expires_at_ms: String(ids.nowMs - 60_000),
         grant_expired: true,
         all_sessions: false
       }
@@ -1172,109 +1228,6 @@ export class ScriptedRecords {
     return {
       actions,
       notices: noticesFor(actions).map((notice) => ({ notice, sentence: NOTICE_SENTENCES[notice] }))
-    }
-  }
-
-  grantCreate(params: unknown): Settled<GrantCreateResult> {
-    const read = decodeParams<GrantCreateParams>(params, GRANT_CREATE_PARAMS)
-    if (read.owner_confirmation !== null) {
-      refuse(
-        'INVALID_ARGUMENT',
-        'an owner confirmation is completed through the owner-confirmation methods'
-      )
-    }
-    if (read.selection.include_live_screen) {
-      refuse(
-        'INVALID_ARGUMENT',
-        'this host cannot preview the screen this invitation would share, so it does not share it'
-      )
-    }
-    const recipient = this.#devices.find((device) => device.device_id === read.recipient_device_id)
-    if (recipient === undefined || recipient.revoked) {
-      refuse('PERMISSION_DENIED', 'this host has no paired device with that identity')
-    }
-    this.#agentOf(read.session_id)
-    const actions = actionsOf(read.selection)
-    const notices = noticesFor(actions)
-    const accepted = [...new Set(read.accepted_notices)].sort()
-    if (JSON.stringify(accepted) !== JSON.stringify([...notices].sort())) {
-      refuse(
-        'PERMISSION_DENIED',
-        'the issuer accepted a different set of consequences from the ones this grant carries'
-      )
-    }
-    const lifetime = read.lifetime_ms === null ? 3_600_000 : Number(read.lifetime_ms)
-    if (lifetime > 30 * 24 * 3_600_000) {
-      refuse('INVALID_ARGUMENT', 'a session invitation lasts at most 30 days')
-    }
-    this.#actions += 1
-    const history = {
-      lower_bound_ms: read.selection.history_from_cursor_ms,
-      include_live_screen: false,
-      named_questions: [],
-      named_approvals: []
-    }
-    const expiresAt = String(this.#ids.nowMs + lifetime)
-    const grant: GrantSummary['grant'] = {
-      grant_id: idOf('e7e7e7e7', this.#actions),
-      parent_grant_id: null,
-      issuer_device_id: idOf('e8e8e8e8', 1),
-      recipient_device_id: read.recipient_device_id,
-      authority_revision: '5',
-      environment_selector: { these: { environment_ids: [this.#ids.environment] } },
-      session_selector: { these: { session_ids: [read.session_id] } },
-      actions,
-      history,
-      expiry: { at: { expires_at_ms: expiresAt } },
-      organisation: null
-    }
-    this.#grants.push({
-      grant,
-      state: 'pending',
-      revoked_at_ms: null,
-      revoked_by_parent: null,
-      ends_at_ms: expiresAt
-    })
-    return {
-      receipt: null,
-      value: {
-        grant,
-        authority_revision: '5',
-        preview: {
-          invitation_id: idOf('e9e9e9e9', this.#actions),
-          session_id: read.session_id,
-          environment_id: this.#ids.environment,
-          role: read.selection.role,
-          actions,
-          history,
-          expires_at_ms: expiresAt,
-          live_screen: null,
-          named_questions: [],
-          named_approvals: [],
-          notices,
-          historical_attachment_keys: false,
-          single_use: true
-        }
-      },
-      action_id: null
-    }
-  }
-
-  grantList(params: unknown): GrantListResult {
-    const read = decodeParams<GrantListParams>(params, GRANT_LIST_PARAMS)
-    const names = (summary: GrantSummary): boolean => {
-      const selector = summary.grant.session_selector
-      return (
-        read.session_id === null ||
-        (typeof selector === 'object' && selector.these.session_ids.includes(read.session_id))
-      )
-    }
-    return {
-      grants: this.#grants.filter(
-        (summary) =>
-          names(summary) &&
-          (read.include_resolved || summary.state === 'pending' || summary.state === 'active')
-      )
     }
   }
 

@@ -55,6 +55,12 @@ import type {
   GrantCreateResult,
   GrantListParams,
   GrantListResult,
+  GrantRedeemParams,
+  GrantRedeemResult,
+  GrantRevokeParams,
+  GrantTransferParams,
+  GrantTransferResult,
+  HeldShare,
   HistoryPageParams,
   HistoryPageResult,
   HostInfoResult,
@@ -81,6 +87,9 @@ import type {
   SessionDescribeResult,
   SessionListResult,
   SessionReadResult,
+  SessionScreenPreviewResult,
+  RevocationResult,
+  ShareOffer,
   ShellLaunchResult,
   VoiceContextResult,
   VoiceAction,
@@ -738,6 +747,108 @@ export interface GrantNotices {
   readonly notices: readonly { readonly notice: AuthorityNotice; readonly sentence: string }[]
 }
 
+/** What an attempt to share, accept, take back or hand over does. */
+export type AttemptKind = 'invite' | 'redeem' | 'revoke' | 'transfer'
+
+/** Where an attempt stands. */
+export type AttemptPhase = 'asking' | 'composed' | 'unfinished' | 'checking' | 'closed'
+
+/** How an attempt ended. */
+export type AttemptOutcome =
+  | 'happened'
+  | 'refused'
+  | 'not_done'
+  | 'not_accepted'
+  | 'had_ended'
+  | 'unknown'
+
+/**
+ * One attempt to share, accept, take back or hand over, as native code keeps it.
+ *
+ * The record exists from before the request is sent until the page removes it, and survives a
+ * restart, so an action whose answer was lost is still one the person can ask the host about.
+ */
+export interface AttemptView {
+  /** The action, which names the attempt. */
+  readonly action_id: string
+  readonly kind: AttemptKind
+  readonly phase: AttemptPhase
+  /** How it ended, once it has. */
+  readonly outcome: AttemptOutcome | null
+  /** One line that says what it was. */
+  readonly label: string
+  /** Whether the person hid it. Hiding releases nothing. */
+  readonly hidden: boolean
+  /** Whether it closed without the host's result and the person may still ask the host for it. */
+  readonly follow_up: boolean
+  readonly session_id: string | null
+  /** The device invited, or the one that receives control. */
+  readonly device_id: string | null
+  /** The grant it writes, revokes or accepts. */
+  readonly grant_id: string | null
+  /** When it was composed, by this computer's clock. For display only. */
+  readonly composed_at_ms: string
+  /**
+   * The earliest moment, by this computer's clock, at which a read of the host that finds nothing
+   * can close it. Null once it is over.
+   */
+  readonly can_happen_until_ms: string | null
+  /** How many times the host has been asked again. */
+  readonly repeats: number
+  /** What the host said when it refused, in its words, while that is known. */
+  readonly refusal: string | null
+  /**
+   * The host's result, in the method's own shape, for an attempt that was carried on after the
+   * command that sent it returned and ended with the result. Null after a restart.
+   */
+  readonly result: unknown
+}
+
+/** What a command that sends one of the four actions answers with. */
+export interface Attempted<T = unknown> {
+  readonly attempt: AttemptView
+  /** The host's own result, when the host gave it. */
+  readonly value: T | null
+}
+
+/** The attempts kept for the host this application is connected to. */
+export interface Attempts {
+  readonly attempts: readonly AttemptView[]
+  /** Files the application keeps that this build does not read. They are never changed. */
+  readonly unreadable: number
+}
+
+/** What the sheet is told once the host has put a hand-over to the owner devices. */
+export interface HandoverAsked {
+  /** Names the hand-over in the commands that follow. */
+  readonly reference: string
+  readonly expires_at_ms: string
+  /** The attempt that holds the hand-over's place. */
+  readonly attempt: AttemptView
+  readonly from_device_id: string
+  readonly from_device_name: string
+  readonly to_device_id: string
+  readonly to_device_name: string
+  readonly session_number: number | null
+}
+
+/** Where a hand-over stands: waiting for an owner device, answered, or gone. */
+export interface HandoverState {
+  readonly state: 'waiting' | 'answered' | 'gone'
+  readonly expires_at_ms: string
+  /** The names the host's description of the plan carries, once it has been read. */
+  readonly plan: {
+    readonly from_device_name: string
+    readonly to_device_name: string
+  } | null
+}
+
+/** What this device is offered and holds. */
+export interface Held {
+  readonly offers: readonly ShareOffer[]
+  readonly shares: readonly HeldShare[]
+}
+
 /** One event the host pushed. */
 export interface HostEvent {
   /** The stream it belongs to. */
@@ -967,8 +1078,51 @@ export interface HostPort {
    * and every notice those actions carry in the one sentence that states it. It reaches nothing.
    */
   grantNotices(selection: RoleSelection): Promise<GrantNotices>
-  grantCreate(params: GrantCreateParams, subject: SessionSubject): Promise<Settled<GrantCreateResult>>
+  /**
+   * The lines on a session's screen, as an invitation that includes the live view would carry
+   * them. It reaches the session's own worker, on the machine that runs it.
+   */
+  sessionScreenPreview(params: {
+    readonly session_id: string
+    readonly selection: RoleSelection
+  }): Promise<SessionScreenPreviewResult>
+  /**
+   * Issues an invitation. The request is kept before it is sent, so an answer the host gave and
+   * the connection lost is something to ask the host about, never something to send again.
+   */
+  grantCreate(
+    params: GrantCreateParams,
+    subject: SessionSubject
+  ): Promise<Attempted<GrantCreateResult>>
   grantList(params: GrantListParams): Promise<GrantListResult>
+  /** Takes a share back, or withdraws an invitation nobody has accepted. */
+  grantRevoke(params: GrantRevokeParams): Promise<Attempted<RevocationResult>>
+  /** Accepts an invitation that names this device. */
+  grantRedeem(params: GrantRedeemParams): Promise<Attempted<GrantRedeemResult>>
+  /** What this device is offered and holds, every page of both lists. */
+  grantHeld(): Promise<Held>
+  /**
+   * Asks the owner devices to confirm handing a session's control to another device. Nothing that
+   * changes who holds the session is sent.
+   */
+  transferAsk(params: GrantTransferParams, subject: SessionSubject): Promise<HandoverAsked>
+  /** Whether an owner device has answered the confirmation a hand-over waits for. */
+  transferAnswered(reference: string): Promise<HandoverState>
+  /** Sends the hand-over an owner device confirmed, once. */
+  transferFinish(reference: string): Promise<Attempted<GrantTransferResult>>
+  /** Stops waiting for an owner device's confirmation. */
+  transferCancel(reference: string): Promise<void>
+  /** The attempts kept for the host this application is connected to. */
+  attemptsList(): Promise<Attempts>
+  /**
+   * Asks the host what became of an attempt, once, with the exact request that was sent. It is the
+   * person's choice and is never made by the application itself.
+   */
+  attemptAsk(actionId: string): Promise<Attempted>
+  /** Takes an attempt out of view. It releases nothing. */
+  attemptHide(actionId: string): Promise<AttemptView>
+  /** Deletes the record of an attempt that is over. */
+  attemptRemove(actionId: string): Promise<void>
 
   pluginList(params: PluginListParams): Promise<PluginListResult>
   catalogueList(params: CatalogueListParams): Promise<CatalogueListResult>
