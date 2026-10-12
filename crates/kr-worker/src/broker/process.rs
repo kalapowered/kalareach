@@ -267,7 +267,7 @@ pub struct TransportHandle {
     pub process: ProcessStartIdentity,
 }
 
-/// One upstream process the broker launched and owns.
+/// One process a launch started, which the broker registered and owns.
 #[derive(Debug)]
 pub struct ManagedProcess {
     /// The instance the process is.
