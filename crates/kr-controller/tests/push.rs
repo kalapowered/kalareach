@@ -9020,8 +9020,8 @@ fn a_mailbox_that_is_full_does_not_hold_the_push_back() {
 }
 
 /// KR-REQ-09.21: a mailbox service that stays down does not keep a person from being told. The push
-/// waits through the attempts it may spend on the mailbox, and the next is made without the detail,
-/// with the gateway's attempts still to come.
+/// waits through four attempts, the fifth asks the mailbox once more and goes without the detail,
+/// and the gateway keeps its last attempts.
 #[test]
 fn a_mailbox_that_stays_down_does_not_keep_a_person_from_being_told() {
     let (environment, _) = environment_keeping_the_hosts_mailbox_key();
@@ -9042,12 +9042,15 @@ fn a_mailbox_that_stays_down_does_not_keep_a_person_from_being_told() {
         );
     }
 
-    for attempt in 0..waiting {
+    for attempt in 0..waiting - 1 {
         assert_eq!(pass_at(&environment, &gateway, now + attempt * 600_000), 1);
         assert!(gateway.held_at_the_push().is_empty(), "attempt {attempt}");
         assert_eq!(the_notification_is(&environment).0, DeliveryState::Retrying);
     }
-    assert_eq!(pass_at(&environment, &gateway, now + waiting * 600_000), 1);
+    assert_eq!(
+        pass_at(&environment, &gateway, now + (waiting - 1) * 600_000),
+        1
+    );
 
     assert_eq!(
         gateway.held_at_the_push(),
@@ -9475,6 +9478,68 @@ impl RecipientAuthority for Armed {
         }
         Granted(BTreeSet::new()).device_scope(destination)
     }
+}
+
+/// KR-REQ-09.21: the room is exclusive at its edge. A notification with exactly the longest wait of
+/// its own schedule left is not asked about; the push goes at once without its detail.
+#[test]
+fn a_notification_with_exactly_the_room_left_is_sent_without_asking_the_mailbox() {
+    let (environment, _) = environment_keeping_the_hosts_mailbox_key();
+    let now = real_now();
+    let service = MailboxService::attach(&environment);
+    queue_an_oversized_notification_living(&environment, &service, now, 300_000);
+    let gateway = WatchedGateway::over(&service);
+
+    assert_eq!(pass_at(&environment, &gateway, now), 1);
+
+    assert_eq!(service.asked(), 0);
+    assert_eq!(gateway.held_at_the_push(), [0]);
+    assert_eq!(the_notification_is(&environment).0, DeliveryState::Accepted);
+}
+
+/// KR-REQ-09.21: an expiry seen when the placement ends is not undone by a clock set back
+/// afterwards. The clock reads the notification's end once, right after the exchange, and an
+/// earlier time after it.
+#[test]
+fn a_clock_set_back_after_a_placement_saw_the_expiry_does_not_undo_it() {
+    let (environment, _) = environment_keeping_the_hosts_mailbox_key();
+    let now = real_now();
+    let armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let service = MailboxService::attach_acting(&environment, {
+        let armed = Arc::clone(&armed);
+        Box::new(move || armed.store(true, std::sync::atomic::Ordering::SeqCst))
+    });
+    queue_an_oversized_notification_living(&environment, &service, now, 6 * 60_000);
+    let gateway = WatchedGateway::over(&service);
+    let clock = {
+        let armed = Arc::clone(&armed);
+        move || {
+            if armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                now + 7 * 60_000
+            } else {
+                now
+            }
+        }
+    };
+
+    environment
+        .module
+        .run_due(
+            &gateway,
+            &gateway,
+            &held(now + 30 * 24 * 60 * 60 * 1000),
+            &ExternalDouble::answering(Vec::new()),
+            &Granted(BTreeSet::new()),
+            &clock,
+        )
+        .expect("a pass");
+
+    assert_eq!(service.asked(), 1, "the object was placed");
+    assert!(
+        gateway.held_at_the_push().is_empty(),
+        "and nothing was presented"
+    );
+    assert_eq!(the_notification_is(&environment).0, DeliveryState::Expired);
 }
 
 /// A host that selects no mailbox service presents the push as it always did and asks nobody.
