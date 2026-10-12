@@ -193,6 +193,10 @@ fn list_document(listed: &DeviceListResult) -> Document {
                         .with("revoked", device.revoked)
                         .with("keys", closed(&device.keys))
                         .with("manages_host", device.manages_host)
+                        .with("platform", closed(&device.platform))
+                        .with("grant_expires_at_ms", closed(&device.grant_expires_at_ms))
+                        .with("grant_expired", device.grant_expired)
+                        .with("all_sessions", device.all_sessions)
                 })
                 .collect::<Vec<_>>(),
         )
