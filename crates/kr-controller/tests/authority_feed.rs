@@ -22,6 +22,7 @@ use std::time::Duration;
 use kr_client::services::authority::{AuthorityFeedClient, AuthorityFeedState, RejectionReason};
 use kr_client::services::{HttpDeadlines, HttpService, ServiceHttp, managed_response_limits};
 use kr_controller::authority_feed::FeedRuntime;
+use kr_controller::service::Clocks;
 use kr_controller::testing::HeldTimer;
 use kr_crypto::keys::{AuthorisationKeyPair, DeviceKeys};
 use kr_crypto::sign::{SigningTranscript, sign};
@@ -36,7 +37,7 @@ use kr_protocol::scalars::{AuthorisationKey, CanonicalSet, KeyId, Nullable, Sign
 use kr_protocol::service::{GatewayOrigin, ServiceRequestSigner};
 use kr_protocol::sharing::{DeviceListParams, DeviceListResult, OfflineValidityPolicy};
 use kr_service_stand_in::{Moment, Served, serve};
-use net_support::{Device, Host, connect, pair_with, proposal};
+use net_support::{Device, Host, MovedWall, connect, pair_with, proposal};
 
 const AUTHORITY: &str = "/api/authority/sync";
 
@@ -89,10 +90,17 @@ fn client_for(origin: &str, key: AuthorisationKeyPair) -> AuthorityFeedClient {
 
 impl Rig {
     async fn start() -> Self {
+        Self::start_on(Clocks::system()).await
+    }
+
+    /// As [`Self::start`], on the clocks a test gives the daemon.
+    async fn start_on(clocks: Clocks) -> Self {
         let served = serve().await;
         let timer = HeldTimer::held();
         let owner = DeviceKeys::generate().expect("owner keys");
-        let host = Host::start_with_feed(&owner, served.origin(), Arc::clone(&timer) as _).await;
+        let host =
+            Host::start_with_feed_on(&owner, served.origin(), Arc::clone(&timer) as _, clocks)
+                .await;
         let remote = client_for(served.origin(), owner.authorisation.clone());
         let rig = Self {
             host,
@@ -1431,5 +1439,28 @@ async fn a_request_from_an_issuer_under_a_lapsed_offline_bound_is_carried_out_in
         named,
         vec![rig.owner.authorisation.key_id()],
         "the owner is named, and a device that may only view a session is not, whatever its bound"
+    );
+}
+
+/// The host dates what it shows of the feed by the clock the daemon holds, as it dates every other
+/// record of time, and not by a second reading of the machine's own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_synchronisation_the_host_shows_is_dated_by_the_clock_the_daemon_holds() {
+    let wall = MovedWall::new();
+    let rig = Rig::start_on(wall.clocks()).await;
+    wall.advance(Duration::from_secs(60 * 60));
+    rig.poll().await;
+
+    let synchronised = rig
+        .shown()
+        .await
+        .list
+        .feed_synchronised_at_ms
+        .0
+        .expect("the host has synchronised the feed")
+        .get();
+    assert!(
+        synchronised > kr_ipc::now_ms().get() + 30 * 60 * 1000,
+        "dated by the daemon's clock, an hour ahead of the machine's: {synchronised}"
     );
 }
