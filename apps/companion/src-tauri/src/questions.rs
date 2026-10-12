@@ -779,14 +779,16 @@ pub async fn answer(
 /// Keeps an answer the host did not confirm, under the writers' lock and the leave to write a kept
 /// answer, the way the command line does.
 ///
-/// An update of the host that is switching releases holds the lock, and a write waits for it for up
-/// to [`kr_ipc::install::WRITERS_WAIT_SECONDS`] seconds. When it still cannot write, no copy of the
-/// answer is kept, and the page is told that; what the person wrote stays in the form.
+/// In a program of a host's store, an update that is switching releases holds the lock, and a write
+/// waits for it for up to [`kr_ipc::install::WRITERS_WAIT_SECONDS`] seconds. When it still cannot
+/// write, no copy of the answer is kept, and the page is told that; what the person wrote stays in
+/// the form.
 ///
-/// `root` is the directory the answers are kept in, which is the only place this writes, and so the
-/// place the writer names as its roots. The application is not a program of a host's store, so the
-/// hold is nothing and nothing is registered with a store; the roots say where the write is, for a
-/// store that did register it.
+/// No release of the host ships this application, so it runs outside every store: the hold
+/// registers nothing, holds nothing and permits every record, and the roots it is given are never
+/// read. They are `root`, the directory the answers are kept in. An update would not find the
+/// answers by them if it did: it looks for `kept-answers/*.answer` directly under a state root,
+/// and the answers here are kept as `kept-answers/<environment>/*.answer`.
 async fn keep(store: AnswerDrafts, draft: AnswerDraft, root: PathBuf) -> Result<Answer> {
     tokio::task::spawn_blocking(move || {
         let not_kept = |why: String| {
