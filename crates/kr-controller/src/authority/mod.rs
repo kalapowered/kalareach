@@ -154,8 +154,8 @@ const MAX_CARRIED_REVISIONS: usize = MAX_HELD_FENCE_REPORTS - 1;
 const MAX_TOLD_REVISIONS: usize = 4096;
 
 /// How many revisions one result remembers it reads, and how many it remembers it was told not to
-/// read again. The newest it can read are read ([`MAX_CARRIED_REVISIONS`]); the rest are not read,
-/// and the result says so.
+/// read again. It reads at most [`MAX_CARRIED_REVISIONS`] of them; the rest are not read, and the
+/// result says so.
 const MAX_REMEMBERED_REVISIONS: usize = 64;
 
 /// How many results' associations are held for revisions no report is held for yet.
@@ -202,15 +202,21 @@ struct FenceReport {
 /// or, for a result no report is held for, until more than [`MAX_ASSOCIATIONS`] are held.
 ///
 /// What it cannot read it says so: `unread` is a statement that some revision announced to the
-/// worker before this one is not read, and no number, so that recording an announcement again, or
-/// in another order, cannot make it wrong.
+/// worker before this one may not be read, and no number. It is only ever set, so no order of
+/// recordings takes it away; past the bounds on what the daemon follows it may be set where every
+/// revision was read.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct Carries {
     /// The revisions, oldest first: at most [`MAX_REMEMBERED_REVISIONS`], the newest.
     revisions: BTreeSet<AuthorityRevision>,
     /// The revisions whose reports went while this result read them, which a recording of the
-    /// announcement again does not add back: their names are in `lost`.
+    /// announcement again does not add back: their names are in `lost`. At most
+    /// [`MAX_REMEMBERED_REVISIONS`]; the lowest go into `gone_through`.
     gone: BTreeSet<AuthorityRevision>,
+    /// The highest revision let go from `gone` for room. A revision at or below it is not read
+    /// again, so its names are charged to this result once however often the announcement is
+    /// recorded; the result says that some revisions are not read.
+    gone_through: Option<AuthorityRevision>,
     /// How many names went with a report of one of the revisions that was let go for room.
     lost: u64,
     /// Whether some revision announced to this worker before this one is not read: forgotten for
@@ -367,10 +373,10 @@ struct WorkerFences {
     carries: BTreeMap<AuthorityRevision, Carries>,
     /// The highest revision whose association was forgotten for room before its report arrived.
     forgotten_through: Option<AuthorityRevision>,
-    /// The lowest and the highest revision that went from `told` for room. A result recorded
-    /// after, for a revision above the lowest and above what an acknowledged announcement took in,
-    /// says that some revisions are not read: it would have read them.
-    unfollowed: Option<(AuthorityRevision, AuthorityRevision)>,
+    /// The highest revision that went from `told` for room. A result recorded after, while that
+    /// revision is above what an acknowledged announcement took in, says that some revisions may
+    /// not be read: it may have read it.
+    unfollowed_through: Option<AuthorityRevision>,
 }
 
 impl WorkerFences {
@@ -429,7 +435,9 @@ impl WorkerFences {
                 }
                 carries.gone.insert(gone.revision);
                 while carries.gone.len() > MAX_REMEMBERED_REVISIONS {
-                    carries.gone.pop_first();
+                    if let Some(oldest) = carries.gone.pop_first() {
+                        carries.gone_through = carries.gone_through.max(Some(oldest));
+                    }
                     carries.unread = true;
                 }
             }
@@ -453,12 +461,12 @@ impl WorkerFences {
             if *revision <= floor {
                 continue;
             }
-            // A result that would have read what the daemon let go says that some revisions are not
+            // A result that may have read what the daemon let go says that some revisions are not
             // read: a revision that went from `told` is not read by a result recorded after, and
             // what an association forgotten for room read is not read by the one made again.
             let unfollowed = self
-                .unfollowed
-                .is_some_and(|(lowest, highest)| lowest < *revision && highest > floor);
+                .unfollowed_through
+                .is_some_and(|through| through > floor);
             let forgotten = !self.carries.contains_key(revision)
                 && self
                     .forgotten_through
@@ -471,11 +479,10 @@ impl WorkerFences {
                 .copied()
                 .filter(|read| *read > floor && *read < *revision)
                 .collect();
-            carries.revisions.extend(
-                reads
-                    .into_iter()
-                    .filter(|read| !carries.gone.contains(read)),
-            );
+            carries.revisions.extend(reads.into_iter().filter(|read| {
+                !carries.gone.contains(read)
+                    && carries.gone_through.is_none_or(|through| *read > through)
+            }));
             while carries.revisions.len() > MAX_REMEMBERED_REVISIONS {
                 carries.revisions.pop_first();
                 carries.unread = true;
@@ -490,8 +497,7 @@ impl WorkerFences {
         // [`MAX_REMEMBERED_REVISIONS`] of them, and says that some are not read.
         while self.told.len() > MAX_TOLD_REVISIONS {
             if let Some(oldest) = self.told.pop_first() {
-                let (lowest, highest) = self.unfollowed.unwrap_or((oldest, oldest));
-                self.unfollowed = Some((lowest.min(oldest), highest.max(oldest)));
+                self.unfollowed_through = self.unfollowed_through.max(Some(oldest));
             }
         }
         // Associations of results no report is held for are bounded; the oldest of those go first,
@@ -2966,9 +2972,9 @@ mod tests {
     }
 
     /// KR-REQ-09.13: a worker that answered none of a great many announcements is read as far as
-    /// the daemon follows it, and the result says how many it does not.
+    /// the daemon follows it, and the result says that it does not read the rest.
     #[test]
-    fn a_result_says_how_many_earlier_revisions_it_does_not_read() {
+    fn a_result_says_that_earlier_revisions_are_not_read() {
         let barrier = barrier();
         let binding = barrier.bind(session(1));
         barrier.announced(session(1), &told(4, 100));
@@ -3075,7 +3081,7 @@ mod tests {
     /// KR-REQ-09.13: a carried report that said nothing, and goes for room, leaves the result
     /// saying a revision is not read.
     #[test]
-    fn a_result_counts_a_carried_report_that_said_nothing_as_unread_when_it_goes() {
+    fn a_result_says_a_carried_report_that_said_nothing_is_not_read_when_it_goes() {
         let barrier = barrier();
         let binding = barrier.bind(session(1));
         barrier.announced(session(1), &told(4, 5));
@@ -3358,21 +3364,70 @@ mod tests {
         );
     }
 
+    /// KR-REQ-09.13: the daemon stops following revisions one after another with an acknowledged
+    /// announcement between, and a result recorded after the later one still says that revisions
+    /// are not read.
+    #[test]
+    fn a_result_recorded_after_a_later_trim_says_that_revisions_are_not_read() {
+        let followed = u64::try_from(MAX_TOLD_REVISIONS).expect("fits");
+        let barrier = barrier();
+        let binding = barrier.bind(session(1));
+        // Revision 8 is left out. The daemon stops following revision 6.
+        for number in (6..=(7 + followed)).filter(|number| *number != 8) {
+            barrier.announced(session(1), &[revision(number)]);
+        }
+        // An acknowledged announcement takes revision 6 in, and then the daemon stops following
+        // revision 7.
+        assert!(barrier.acknowledge_announced(
+            session(1),
+            binding,
+            revision(6),
+            evidence(Vec::new(), Vec::new()),
+        ));
+        barrier.announced(session(1), &[revision(8 + followed)]);
+        // Room for one more association.
+        for number in 9..=17 {
+            assert!(barrier.acknowledge(
+                session(1),
+                binding,
+                revision(number),
+                evidence(Vec::new(), Vec::new()),
+            ));
+        }
+        // Revision 8, announced now, was announced after revision 7, which no result took in.
+        barrier.announced(session(1), &[revision(8)]);
+        let report = barrier.report(revision(8), [session(1)]);
+        assert!(
+            report.workers[0].detail.contains(
+                "some of the revisions announced to this worker before revision 8 are not read"
+            ),
+            "{:?}",
+            report.workers[0].detail
+        );
+    }
+
     /// KR-REQ-09.13: an announcement recorded again after the daemon forgot what its result read
-    /// says that some revisions are not read.
+    /// says that some revisions are not read: the new record cannot read what the first one did.
     #[test]
     fn a_result_whose_association_was_forgotten_and_is_recorded_again_says_so() {
         let followed = u64::try_from(MAX_TOLD_REVISIONS).expect("fits");
         let barrier = barrier();
         let binding = barrier.bind(session(1));
+        // Revision 6 reads revision 5, which an acknowledged announcement then takes in.
+        barrier.announced(session(1), &told(5, 6));
+        assert!(barrier.acknowledge_announced(
+            session(1),
+            binding,
+            revision(5),
+            evidence(Vec::new(), Vec::new()),
+        ));
         // One more association than the daemon holds for results with no report: revision 6, the
-        // oldest, is forgotten.
-        for number in 6..=(6 + followed) {
+        // oldest of them, is forgotten.
+        for number in 7..=(5 + followed) {
             barrier.announced(session(1), &[revision(number)]);
         }
-        // Nine reports: the report of revision 7 goes, and its association with it, which leaves
-        // room for the association of revision 6 to be made again.
-        for number in 7..=15 {
+        // Room for one more: the report of revision 5 goes with its association.
+        for number in 7..=14 {
             assert!(barrier.acknowledge(
                 session(1),
                 binding,
@@ -3385,6 +3440,69 @@ mod tests {
         assert!(
             report.workers[0].detail.contains(
                 "some of the revisions announced to this worker before revision 6 are not read"
+            ),
+            "{:?}",
+            report.workers[0].detail
+        );
+    }
+
+    /// KR-REQ-09.13: a name that went with a report is charged to a result once, though the result
+    /// lost the reports of more revisions than it remembers by name and its announcement is
+    /// recorded again.
+    #[test]
+    fn a_name_is_charged_once_to_a_result_that_lost_more_reports_than_it_remembers() {
+        let barrier = barrier();
+        let binding = barrier.bind(session(1));
+        for number in 4..=76 {
+            barrier.announced(session(1), &[revision(number), revision(100)]);
+            let named = if number == 4 {
+                vec![action(10)]
+            } else {
+                Vec::new()
+            };
+            assert!(barrier.acknowledge(
+                session(1),
+                binding,
+                revision(number),
+                evidence(named, Vec::new()),
+            ));
+        }
+        let once = barrier.report(revision(100), [session(1)]).workers[0].clone();
+        assert_eq!(once.omitted_actions.get(), 1, "{once:?}");
+        // The announcement is recorded again, and the worker answers for revision 4 again.
+        barrier.announced(session(1), &[revision(100)]);
+        assert!(barrier.acknowledge(
+            session(1),
+            binding,
+            revision(4),
+            evidence(vec![action(10)], Vec::new()),
+        ));
+        let again = barrier.report(revision(100), [session(1)]).workers[0].clone();
+        assert_eq!(again.omitted_actions.get(), 1, "{again:?}");
+    }
+
+    /// KR-REQ-09.13: a result that remembers fewer revisions than it was told, because it could
+    /// not remember them all, says that some are not read though it has since lost the reports of
+    /// every one it remembers.
+    #[test]
+    fn a_result_says_that_revisions_are_not_read_after_the_reports_it_reads_have_gone() {
+        let barrier = barrier();
+        let binding = barrier.bind(session(1));
+        for number in 4..=76 {
+            barrier.announced(session(1), &[revision(number)]);
+        }
+        for number in 5..=76 {
+            assert!(barrier.acknowledge(
+                session(1),
+                binding,
+                revision(number),
+                evidence(Vec::new(), Vec::new()),
+            ));
+        }
+        let report = barrier.report(revision(69), [session(1)]);
+        assert!(
+            report.workers[0].detail.contains(
+                "some of the revisions announced to this worker before revision 69 are not read"
             ),
             "{:?}",
             report.workers[0].detail

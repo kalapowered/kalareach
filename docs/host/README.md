@@ -2278,16 +2278,16 @@ daemon refuses does not undo it. The record says what the result of each notice 
 own report: the notices before it in the announcement, and the revisions announced before that no
 acknowledged announcement has taken in. It is made once and never by an acknowledgement, so which
 acknowledgement the daemon accepts does not change it. It stays until the report of the revision
-goes for room, whether or not that report has arrived, and for a revision no report has arrived
-for until more than 4,096 such records are held; a report that arrives after its record went says
-that some revisions are not read. The result reads the reports of the revisions in its record with
-its own, in revision order: the ones the worker has answered for first, then the newest of the
-others, seven in all. A revision the worker has not been asked about is asked for, and the result
-says so until it answers; one the worker answered with nothing about its fence is not asked again,
-and the result says the worker cannot say. A revision the daemon cannot read, because its report
-went for room, because the record remembers only the newest 64, or because the worker answered none
-of more than 4,096 announcements, is said in the result as names that are no longer held or as
-revisions that are not read, never as a number of them. A worker that missed revisions in more
+goes for room, and, while the report has not arrived, until more than 4,096 records are held; a
+report that arrives after its record went says that some revisions are not read. The result reads
+the reports of the revisions in its record with its own, in revision order: the ones the worker has
+answered for first, then the newest of the others, seven in all. A revision the worker has not been
+asked about is asked for, and the result says so until it answers; one the worker answered with
+nothing about its fence is not asked again, and the result says the worker cannot say. A revision
+the daemon cannot read, because its report went for room, because the record remembers only the
+newest 64, or because more than 4,096 revisions were announced to the worker and no acknowledged
+announcement took them in, is said in the result as names that are no longer held or as revisions
+that may not be read, never as a number of them. A worker that missed revisions in more
 groups than the daemon keeps reports for is told one revision of the whole host's. The daemon also
 asks again for the pages an older revocation still owes: the revision in force comes first, then the
 revisions that any result it holds a report for reads and the worker has not been asked about, and
