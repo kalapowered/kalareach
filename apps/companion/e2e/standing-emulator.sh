@@ -1,6 +1,9 @@
 #!/bin/bash
 # Holds, on the Android emulator's Chrome, that a session screen whose opening the host ended says so
-# inside the screen at the default font scale and at a large one, with its buttons a finger tall.
+# inside the screen at the default font scale and at a large one, with its buttons a finger tall (48 dp,
+# Android's own minimum). A reading counts only while the page is in front: Chrome's own questions
+# (its account, notifications and ad privacy screens) are answered first, at the start and after each
+# change of scale, and a picture is taken only when the page is visible and no question is on the screen.
 #
 # The harness bundle is served on this machine and opened in Chrome on the emulator, through a reverse of
 # the server's port, inside a frame of a wrapper page. The wrapper makes the scripted host end
@@ -87,7 +90,7 @@ const SESSION = '8a7b6c50-22bb-4c3d-8e4f-000000000101'
 
 /** The font scales held: the default and a large one. */
 const SCALES = ['1.0', '2.0']
-const FINGER = 44
+const FINGER = 48
 
 const wrapper = `<!doctype html><meta name="viewport" content="width=device-width, initial-scale=1">
 <style>html,body{margin:0;height:100%}iframe{border:0;width:100%;height:100%}</style>
@@ -125,7 +128,8 @@ const send = () => {
     status: (doc.querySelector('[data-testid="standing-status"]') || {}).textContent || '',
     send: (() => { const b = [...doc.querySelectorAll('button')].find((each) => each.textContent === 'Send'); return b ? b.disabled : null })(),
     wide: doc.documentElement.scrollWidth,
-    screen: view.innerWidth
+    screen: view.innerWidth,
+    visible: document.visibilityState === 'visible'
   }
   fetch('/report', { method: 'POST', body: JSON.stringify(body) })
 }
@@ -145,7 +149,7 @@ const server = createServer((request, response) => {
     let text = ''
     request.on('data', (chunk) => (text += chunk))
     request.on('end', () => {
-      latest = JSON.parse(text)
+      latest = { ...JSON.parse(text), at: Date.now() }
       response.end('ok')
     })
     return
@@ -188,37 +192,51 @@ try {
   run('reverse', `tcp:${port}`, `tcp:${port}`)
   run('shell', 'pm', 'clear', 'com.android.chrome')
   run('shell', 'am', 'start', '-a', 'android.intent.action.VIEW', '-d', `http://localhost:${port}/wrapper.html`, 'com.android.chrome')
-  // Chrome's first start asks questions before it shows a page: the answers that decline an account,
-  // sync and notifications are tapped until the page speaks.
+  // Chrome asks questions before it shows a page, and again after some changes of the system: the
+  // answers that decline an account, sync, notifications and ad privacy are tapped until the page
+  // is in front. A reading counts only when the page said it is visible after the check began and
+  // no question is on the screen, so a page behind one of Chrome's own screens is never read.
   const DECLINE = ['Use without an account', 'No thanks', 'Not now', 'Got it', 'Accept & continue']
-  const decline = () => {
+  // The ad privacy screen shows "More" until it has been read to its end; the page has a control of
+  // that name too, so it is tapped only on that screen.
+  const labelsOf = (xml) => (xml.includes('ad privacy in Chrome') ? [...DECLINE, 'More'] : DECLINE)
+  const screen = () => {
     try {
       run('shell', 'uiautomator', 'dump', '/sdcard/kr-ui.xml')
-      const xml = run('shell', 'cat', '/sdcard/kr-ui.xml')
-      for (const label of DECLINE) {
-        const node = xml.match(new RegExp(`text="${label}"[^>]*bounds="\\[(\\d+),(\\d+)\\]\\[(\\d+),(\\d+)\\]"`))
-        if (node) {
-          const [x1, y1, x2, y2] = node.slice(1).map(Number)
-          run('shell', 'input', 'tap', String(Math.round((x1 + x2) / 2)), String(Math.round((y1 + y2) / 2)))
-          return
-        }
-      }
+      return run('shell', 'cat', '/sdcard/kr-ui.xml')
     } catch {
-      // The screen was not ready to be read; it is read again.
+      return null
     }
   }
-  await waitFor('the page to say the share ended', () => {
-    if (latest !== null && latest.banner !== null && latest.shown === 'true') return true
-    decline()
-    return false
-  })
+  const question = (xml) =>
+    xml === null
+      ? null
+      : labelsOf(xml).map((label) => ({ label, node: xml.match(new RegExp(`text="${label}"[^>]*bounds="\\[(\\d+),(\\d+)\\]\\[(\\d+),(\\d+)\\]"`)) })).find((each) => each.node) ?? null
+  const answer = (asked) => {
+    const [x1, y1, x2, y2] = asked.node.slice(1).map(Number)
+    run('shell', 'input', 'tap', String(Math.round((x1 + x2) / 2)), String(Math.round((y1 + y2) / 2)))
+  }
+  const inFront = async (what, extra = () => true) => {
+    const mark = Date.now()
+    await waitFor(what, () => {
+      const xml = screen()
+      const asked = question(xml)
+      if (asked) {
+        answer(asked)
+        return false
+      }
+      return xml !== null && latest !== null && latest.at > mark && latest.visible === true && extra()
+    })
+  }
+  await inFront('the page to say the share ended', () => latest.banner !== null && latest.shown === 'true')
   for (const scale of SCALES) {
     run('shell', 'settings', 'put', 'system', 'font_scale', scale)
     wantedScale = String(Number(scale))
-    // The page, still open, is what is asked: it lays out again at the new scale.
-    await waitFor(
+    // The page, still open, is what is asked: it lays out again at the new scale. A change of the
+    // system's settings can bring one of Chrome's own screens, which is answered before the page is read.
+    await inFront(
       `the page to lay out at font scale ${scale}`,
-      () => latest !== null && latest.banner !== null && Math.abs(latest.root - 16 * Number(scale)) < 0.05
+      () => latest.banner !== null && Math.abs(latest.root - 16 * Number(scale)) < 0.05
     ).catch((failure) => {
       console.log(`FAIL: ${failure.message}; the page said ${JSON.stringify(latest)}`)
       failures += 1
@@ -234,6 +252,8 @@ try {
       seen !== null && seen.buttons.length > 0 && seen.buttons.every((height) => height + 0.5 >= FINGER),
       `font scale ${scale}: the banner's buttons are ${seen?.buttons.map((height) => height.toFixed(1)).join(', ')}px tall, at least ${FINGER}`
     )
+    // The picture is taken only with the page in front and nothing asked of the person.
+    await inFront(`the page to be in front for the picture at font scale ${scale}`)
     const png = execFileSync(adb, ['-s', serial, 'exec-out', 'screencap', '-p'], { maxBuffer: 64 * 1024 * 1024, timeout: 60_000 })
     writeFileSync(join(shots, `kr-standing-android-${scale}.png`), png)
   }

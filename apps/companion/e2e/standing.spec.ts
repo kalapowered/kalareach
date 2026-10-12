@@ -184,40 +184,59 @@ for (const size of SIZES) {
 }
 
 test.describe('how the banner arrives', () => {
-  /** The transition the banner has once it is on screen, as the engine computes it. */
-  async function transition(page: Page): Promise<{ property: string; duration: string }> {
-    return page.getByTestId('standing-banner').evaluate((element) => {
-      const style = getComputedStyle(element)
-      return { property: style.transitionProperty, duration: style.transitionDuration }
+  /** Starts counting the transitions that run, so a test can say whether the banner's was one. */
+  async function watchTransitions(page: Page): Promise<void> {
+    await page.evaluate(() => {
+      const ran: string[] = []
+      ;(window as unknown as { krRan: string[] }).krRan = ran
+      document.addEventListener(
+        'transitionrun',
+        (event) => {
+          if ((event.target as Element).getAttribute('data-testid') === 'standing-banner') {
+            ran.push(event.propertyName)
+          }
+        },
+        true
+      )
     })
   }
+
+  const ran = (page: Page): Promise<string[]> =>
+    page.evaluate(() => (window as unknown as { krRan: string[] }).krRan)
 
   test('fades in over 150 ms after a pointer press', async ({ page }) => {
     await openSession(page, 1, shareOf())
     await expect(page.getByText('Find why the reconnect test is flaky.')).toBeVisible()
     await page.mouse.click(10, 10)
+    await watchTransitions(page)
     await say(page, { state: 'closed' })
     await expect(page.getByTestId('standing-banner')).toBeVisible()
-    expect(await transition(page)).toEqual({ property: 'opacity', duration: '0.15s' })
     await expect(page.getByTestId('standing-banner')).toHaveCSS('opacity', '1')
+    // The opacity change ran, and it is the declared one.
+    expect(await ran(page)).toEqual(['opacity'])
+    await expect(page.getByTestId('standing-banner')).toHaveCSS('transition-duration', '0.15s')
   })
 
   test('arrives at once under a request for less motion', async ({ page }) => {
     await page.emulateMedia({ reducedMotion: 'reduce' })
     await openSession(page, 1, shareOf())
     await expect(page.getByText('Find why the reconnect test is flaky.')).toBeVisible()
+    await watchTransitions(page)
     await say(page, { state: 'closed' })
     await expect(page.getByTestId('standing-banner')).toBeVisible()
-    expect((await transition(page)).duration).toBe('0s')
+    await expect(page.getByTestId('standing-banner')).toHaveCSS('opacity', '1')
+    expect(await ran(page)).toEqual([])
   })
 
   test('arrives at once after a key', async ({ page }) => {
     await openSession(page, 1, shareOf())
     await expect(page.getByText('Find why the reconnect test is flaky.')).toBeVisible()
     await page.getByLabel('Message this session').press('a')
+    await watchTransitions(page)
     await say(page, { state: 'closed' })
     await expect(page.getByTestId('standing-banner')).toBeVisible()
-    expect((await transition(page)).duration).toBe('0s')
+    await expect(page.getByTestId('standing-banner')).toHaveCSS('opacity', '1')
+    expect(await ran(page)).toEqual([])
   })
 })
 
@@ -238,6 +257,48 @@ test.describe('where the focus goes', () => {
     const send = page.getByRole('button', { name: 'Send' })
     await send.focus()
     await expect(send).toBeFocused()
+    await say(page, { state: 'ended', reason: 'revoked' })
+    await expect(page.getByTestId('standing-banner')).toBeFocused()
+  })
+
+  test('moves from Try again to the screen it opens, and not to nothing', async ({ page }) => {
+    await openSession(page, 1, {
+      code: 'PERMISSION_DENIED',
+      message: 'This device holds no share of that session.'
+    })
+    const banner = page.getByTestId('standing-banner')
+    await expect(banner).toBeVisible()
+    await page.evaluate((session) => {
+      window.krTestHost?.standings.answerOpens(session, {
+        state: 'open',
+        via: 'owner',
+        grant_id: '',
+        actions: ['session.view'],
+        includes_live_screen: true,
+        history_from_ms: null,
+        ends_at_ms: null
+      })
+    }, SESSION)
+    const retry = banner.getByRole('button', { name: 'Try again' })
+    await retry.focus()
+    await page.keyboard.press('Enter')
+    await expect(page.getByText('Find why the reconnect test is flaky.')).toBeVisible()
+    await expect(page.locator('.m-pane')).toBeFocused()
+  })
+
+  test('moves to the banner when the share ends under a key of the terminal the person is typing with', async ({
+    page
+  }) => {
+    await openSession(page, 1, shareOf())
+    await expect(page.getByText('Find why the reconnect test is flaky.')).toBeVisible()
+    await page.getByRole('tab', { name: 'Terminal' }).click()
+    await expect(page.getByRole('button', { name: 'Take control' })).toBeEnabled()
+    await page.getByRole('button', { name: 'Take control' }).click()
+    const escape = page.getByRole('button', { name: 'Escape' })
+    await expect(escape).toBeEnabled()
+    await escape.focus()
+    await expect(escape).toBeFocused()
+
     await say(page, { state: 'ended', reason: 'revoked' })
     await expect(page.getByTestId('standing-banner')).toBeFocused()
   })
