@@ -1348,15 +1348,16 @@ impl ComposedBundle {
 ///   },
 ///   "voice": { "broker_origin": "https://voice.example.com" },
 ///   "storage": { "origin": "https://reach.example.com" },
-///   "authority": { "origin": "https://reach.example.com" }
+///   "authority": { "origin": "https://reach.example.com" },
+///   "mailbox": { "origin": "https://reach.example.com" }
 /// }
 /// ```
 ///
-/// The `network`, `voice`, `storage` and `authority` sections are the only place a network
-/// selection, the voice broker's origin, the managed storage service's origin or the authority
-/// feed's origin is chosen, and the daemon reads them when it starts ([`NetworkSelection`],
-/// [`VoiceSelection`], [`StorageSelection`], [`AuthoritySelection`]). No environment variable
-/// reaches any of them.
+/// The `network`, `voice`, `storage`, `authority` and `mailbox` sections are the only place a
+/// network selection, the voice broker's origin, the managed storage service's origin, the
+/// authority feed's origin or the mailbox service's origin is chosen, and the daemon reads them
+/// when it starts ([`NetworkSelection`], [`VoiceSelection`], [`StorageSelection`],
+/// [`AuthoritySelection`], [`MailboxSelection`]). No environment variable reaches any of them.
 ///
 /// Its numbers are ordinary JSON numbers rather than the decimal strings the wire types use. This
 /// is a file a person may open and edit, not a message a JavaScript consumer parses, and the
@@ -1407,6 +1408,7 @@ impl ComposedBundle {
 /// [`VoiceSelection`]: configuration::VoiceSelection
 /// [`StorageSelection`]: configuration::StorageSelection
 /// [`AuthoritySelection`]: configuration::AuthoritySelection
+/// [`MailboxSelection`]: configuration::MailboxSelection
 /// [`resolve`]: configuration::resolve
 /// [`ALLOWLIST`]: configuration::ALLOWLIST
 pub mod configuration {
@@ -1965,6 +1967,13 @@ pub mod configuration {
         /// at the next start. No environment variable reaches it.
         #[serde(default, skip_serializing_if = "levels::is_unused")]
         pub authority: AuthoritySelection,
+        /// The mailbox service this host places the encrypted objects of its notifications in.
+        ///
+        /// A section of level 3: written only when it selects something, and ignored, with a
+        /// count, by a release that reads level 2. Read when the daemon starts, so a change applies
+        /// at the next start. No environment variable reaches it.
+        #[serde(default, skip_serializing_if = "levels::is_unused")]
+        pub mailbox: MailboxSelection,
         /// How this environment's control daemon is started when a command finds none running.
         ///
         /// Read by `kr new` when it finds no daemon to ask, so a change applies at the next start.
@@ -2017,6 +2026,7 @@ pub mod configuration {
                 voice: VoiceSelection::default(),
                 storage: StorageSelection::default(),
                 authority: AuthoritySelection::default(),
+                mailbox: MailboxSelection::default(),
                 startup: StartupSelection::default(),
                 descriptions: DescriptionsSelection::default(),
                 agents: BTreeMap::new(),
@@ -2555,6 +2565,36 @@ pub mod configuration {
     }
 
     impl AuthoritySelection {
+        /// The service's origin, when one is chosen.
+        #[must_use]
+        pub fn origin(&self) -> Option<&str> {
+            self.origin.as_ref().map(String::as_str)
+        }
+    }
+
+    /// The mailbox service this host places the encrypted objects of its notifications in.
+    ///
+    /// A notification whose detail does not fit in a push moves the detail into an encrypted
+    /// object sealed to the paired device. With a service selected here, the host places that
+    /// object in the device's mailbox before it presents the push that refers to it. A provider
+    /// origin, so it is this document's to choose and no inherited variable's. The daemon reads it
+    /// when it starts, so a change applies at the next start. Absent means this host places
+    /// nothing: the push is presented as it always was, and a device that looks for the object
+    /// finds none.
+    ///
+    /// The section arrived with level 3. A release that reads level 2 does not know it: it applies
+    /// the rest of the document, counts the section among the members it ignores, and does not
+    /// edit the document, so a host rolled back to such a release places nothing until it is
+    /// brought forward again.
+    #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields, default)]
+    pub struct MailboxSelection {
+        /// The service's origin: an `https` origin, or an `http` origin on a loopback address,
+        /// spelled as a gateway origin is, with no path and no trailing slash.
+        pub origin: Nullable<String>,
+    }
+
+    impl MailboxSelection {
         /// The service's origin, when one is chosen.
         #[must_use]
         pub fn origin(&self) -> Option<&str> {
@@ -3385,6 +3425,20 @@ pub mod configuration {
             problems.push(
                 Sentence::new()
                     .stated("authority.origin (")
+                    .withheld(super::export::ContentClass::Location, origin)
+                    .stated(
+                        ") is not an https origin, or an http origin on a loopback address, in \
+                         the canonical spelling a gateway origin has, with no path and no \
+                         trailing slash",
+                    ),
+            );
+        }
+        if let Some(origin) = document.mailbox.origin()
+            && crate::service::GatewayOrigin::new(origin).is_err()
+        {
+            problems.push(
+                Sentence::new()
+                    .stated("mailbox.origin (")
                     .withheld(super::export::ContentClass::Location, origin)
                     .stated(
                         ") is not an https origin, or an http origin on a loopback address, in \
@@ -4331,8 +4385,8 @@ pub mod configuration {
         about: "the HTTP proxy this host's connections to services go through: the network \
                 endpoint's relay connection, relay latency probe, captive-portal check and Pkarr \
                 servers, the rendezvous, delivery and mail, the managed voice broker and account \
-                service, backups, the authority feed, the model's files and plugin \
-                repositories",
+                service, backups, the authority feed, the mailbox service, the model's files and \
+                plugin repositories",
     };
 
     /// The managed voice broker this host starts its devices' calls at.
@@ -4353,6 +4407,12 @@ pub mod configuration {
         about: "the authority feed this host reads its remote revocations from",
     };
 
+    /// The mailbox service this host places the encrypted objects of its notifications in.
+    pub const MAILBOX_ORIGIN: Selection = Selection {
+        key: "mailbox.origin",
+        about: "the mailbox service this host places the encrypted objects of its notifications in",
+    };
+
     /// How this environment's control daemon is started when a command finds none running.
     pub const STARTUP_CONTROLLER: Selection = Selection {
         key: "startup.controller",
@@ -4361,7 +4421,7 @@ pub mod configuration {
     };
 
     /// Every selection this host reads when it starts, in the order `kr doctor` prints them.
-    pub const SELECTIONS: [Selection; 15] = [
+    pub const SELECTIONS: [Selection; 16] = [
         NETWORK_ENABLED,
         NETWORK_BIND_ADDRESS,
         NETWORK_RELAY_URLS,
@@ -4376,6 +4436,7 @@ pub mod configuration {
         VOICE_BROKER_ORIGIN,
         STORAGE_ORIGIN,
         AUTHORITY_ORIGIN,
+        MAILBOX_ORIGIN,
         STARTUP_CONTROLLER,
     ];
 
@@ -4785,6 +4846,11 @@ pub mod configuration {
                 location(document.authority.origin()),
             ),
             row(
+                MAILBOX_ORIGIN,
+                document.mailbox.origin.is_present(),
+                location(document.mailbox.origin()),
+            ),
+            row(
                 STARTUP_CONTROLLER,
                 document.startup.controller.is_present(),
                 Declared::term(
@@ -4941,9 +5007,10 @@ pub mod configuration {
     /// the captive-portal check; they choose no relay, no service and no trust.
     ///
     /// Every network selection, the proxy included, the voice broker's origin, the managed
-    /// storage service's origin and the authority feed's origin are this host's configuration
-    /// document's ([`NetworkSelection`], [`VoiceSelection`], [`StorageSelection`],
-    /// [`AuthoritySelection`]), and nothing reads them from the environment. The managed-service,
+    /// storage service's origin, the authority feed's origin and the mailbox service's origin are
+    /// this host's configuration document's ([`NetworkSelection`], [`VoiceSelection`],
+    /// [`StorageSelection`], [`AuthoritySelection`], [`MailboxSelection`]), and nothing reads
+    /// them from the environment. The managed-service,
     /// rendezvous, delivery, plugin repository and mail clients verify a server against the
     /// platform's own store, the network endpoint verifies its relays and discovery servers
     /// against the public anchors and the document's relay trust anchors, and neither reads the
@@ -8540,7 +8607,8 @@ mod tests {
         document.voice.broker_origin = Nullable::some("https://voice.example.com".to_owned());
         document.storage.origin = Nullable::some("https://reach.example.com".to_owned());
         document.authority.origin = Nullable::some("https://reach.example.com".to_owned());
-        document.level = 2;
+        document.mailbox.origin = Nullable::some("https://reach.example.com".to_owned());
+        document.level = 3;
         configuration::validate(&document).expect("a complete selection");
         let written = configuration::contents(&document);
         let loaded = configuration::load(Some(written.as_bytes()));
@@ -8830,6 +8898,27 @@ mod tests {
         }
         let mut document = ConfigurationDocument::empty();
         document.authority.origin = Nullable::some("http://127.0.0.1:8787".to_owned());
+        configuration::validate(&document).expect("a loopback origin is usable");
+
+        // And so is the mailbox service's.
+        for origin in [
+            "reach.example.com",
+            "http://reach.example.com",
+            "https://reach.example.com/",
+            "",
+        ] {
+            let mut document = ConfigurationDocument::empty();
+            document.mailbox.origin = Nullable::some(origin.to_owned());
+            let problems = configuration::validate(&document).expect_err("an origin it refuses");
+            assert!(
+                problems
+                    .iter()
+                    .any(|problem| problem.as_str().contains("mailbox.origin")),
+                "{origin}: {problems:?}"
+            );
+        }
+        let mut document = ConfigurationDocument::empty();
+        document.mailbox.origin = Nullable::some("http://127.0.0.1:8787".to_owned());
         configuration::validate(&document).expect("a loopback origin is usable");
 
         // A document whose network section does not validate is not this host's to rewrite, so an

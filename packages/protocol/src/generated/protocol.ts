@@ -12038,6 +12038,7 @@ export interface ConfigurationDocument {
    * level.
    */
   level?: number
+  mailbox?: MailboxSelection
   network?: NetworkSelection
   preferences?: PreferenceSet
   /**
@@ -12197,6 +12198,20 @@ export interface DescriptionsSelection {
    * Whether inference may run while the host is on battery.
    */
   on_battery?: boolean | null
+}
+/**
+ * The mailbox service this host places the encrypted objects of its notifications in.
+ *
+ * A section of level 3: written only when it selects something, and ignored, with a
+ * count, by a release that reads level 2. Read when the daemon starts, so a change applies
+ * at the next start. No environment variable reaches it.
+ */
+export interface MailboxSelection {
+  /**
+   * The service's origin: an `https` origin, or an `http` origin on a loopback address,
+   * spelled as a gateway origin is, with no path and no trailing slash.
+   */
+  origin?: string | null
 }
 /**
  * Whether this host joins the network, and every service it selects there.

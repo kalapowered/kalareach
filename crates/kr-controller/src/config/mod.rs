@@ -407,11 +407,11 @@ impl Outbound {
 
 /// The selections this daemon read when it started, which are what it acts on until it next starts.
 ///
-/// The network endpoint, the voice service, the backup uploader and the authority feed are built
-/// once, at startup, from the document on disk then. A later edit applies at the next start, and
-/// `kr doctor` compares the two so an owner who changed one can see that it is not in force yet.
-/// Two readings are equal when they select the same and both leave the outbound route open or both
-/// close it: why a document could not be used is not a selection.
+/// The network endpoint, the voice service, the backup uploader, the authority feed and the mailbox
+/// placement are built once, at startup, from the document on disk then. A later edit applies at
+/// the next start, and `kr doctor` compares the two so an owner who changed one can see that it is
+/// not in force yet. Two readings are equal when they select the same and both leave the outbound
+/// route open or both close it: why a document could not be used is not a selection.
 #[derive(Clone, Debug, Default)]
 pub struct Started {
     /// The network section this daemon joined, or did not join, the network under.
@@ -422,6 +422,8 @@ pub struct Started {
     pub storage: configuration::StorageSelection,
     /// The authority feed this daemon reads its remote revocations from.
     pub authority: configuration::AuthoritySelection,
+    /// The mailbox service this daemon places the encrypted objects of its notifications in.
+    pub mailbox: configuration::MailboxSelection,
     /// Why every outbound route the proxy governs is closed, when the document could not be used.
     pub unusable: Option<Unusable>,
 }
@@ -432,6 +434,7 @@ impl PartialEq for Started {
             && self.voice == other.voice
             && self.storage == other.storage
             && self.authority == other.authority
+            && self.mailbox == other.mailbox
             && self.unusable.is_some() == other.unusable.is_some()
     }
 }
@@ -454,6 +457,7 @@ impl Started {
                 voice: document.voice.clone(),
                 storage: document.storage.clone(),
                 authority: document.authority.clone(),
+                mailbox: document.mailbox.clone(),
                 unusable: None,
             },
         )
@@ -1324,8 +1328,8 @@ pub fn network_check(
              proxy governs open at the next start"
         } else {
             "; the configuration document now selects a different network, voice broker, storage \
-             service or authority feed from the one this host started with, which applies at the \
-             next start"
+             service, authority feed or mailbox service from the one this host started with, \
+             which applies at the next start"
         });
     }
     DoctorCheck::new(
