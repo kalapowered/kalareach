@@ -107,6 +107,13 @@ impl Owned for SessionOwned {
             .unwrap_or_default()
     }
 
+    fn left(&self, process: &kr_protocol::identity::ProcessStartIdentity) -> bool {
+        self.0
+            .as_ref()
+            .and_then(Weak::upgrade)
+            .is_some_and(|runtime| runtime.session().process_has_left(process))
+    }
+
     fn forced(&self, process: &kr_protocol::identity::ProcessStartIdentity) {
         if let Some(runtime) = self.0.as_ref().and_then(Weak::upgrade) {
             runtime.session().note_process_forced(process);
