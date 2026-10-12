@@ -12,8 +12,8 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use kr_client::recovery::{
-    FilesRestore, MemberRefusal, MemberRole, MemberVerdict, PublicationRefusal, RestoreError,
-    RestoreSource, SourceService, SourceSignIn, fresh_locator,
+    CandidateState, FilesRestore, MemberRefusal, MemberRole, MemberVerdict, PublicationRefusal,
+    RestoreError, RestoreSource, SignInCause, SourceService, SourceSignIn, fresh_locator,
 };
 use kr_client::services::{ServiceFuture, SyncFetched, SyncPosition};
 use kr_crypto::backup::{
@@ -347,6 +347,8 @@ struct Scripted {
     generations: Mutex<BTreeMap<ArchiveId, BackupGenerationPublication>>,
     objects: Mutex<BTreeMap<(ArchiveId, BackupObjectId), Vec<u8>>>,
     asked: Mutex<Vec<String>>,
+    /// Answer every object read with no bytes, as a service that has lost the object might.
+    serves_empty_ranges: bool,
 }
 
 impl Scripted {
@@ -361,6 +363,7 @@ impl Scripted {
             generations: Mutex::default(),
             objects: Mutex::default(),
             asked: Mutex::default(),
+            serves_empty_ranges: false,
         }
     }
 
@@ -457,6 +460,9 @@ impl RestoreSource for Scripted {
             .expect("asked")
             .push(format!("object {object:?} at {offset}"));
         Box::pin(async move {
+            if self.serves_empty_ranges {
+                return Ok(Vec::new());
+            }
             let objects = self.objects.lock().expect("objects");
             let bytes = objects
                 .get(&(archive_id, object))
@@ -520,10 +526,16 @@ async fn an_archive_the_bundle_vouches_for_restores_its_session_and_configuratio
     assert!(plan.refused().next().is_none());
     // Nothing but the manifest object was read to make the plan.
     assert_eq!(source.object_reads(), 1);
-    let first = prepared.member(&plan.members[0]).await.expect("a member");
-    assert_eq!(first.plaintext.expose(), b"what the session did");
-    let second = prepared.member(&plan.members[1]).await.expect("a member");
-    assert_eq!(second.plaintext.expose(), b"{\"storage\":{}}");
+    let first = prepared
+        .member(plan.members[0].object_id)
+        .await
+        .expect("a member");
+    assert_eq!(first.expose(), b"what the session did");
+    let second = prepared
+        .member(plan.members[1].object_id)
+        .await
+        .expect("a member");
+    assert_eq!(second.expose(), b"{\"storage\":{}}");
 }
 
 /// A plan's digest is what a person confirms, so it changes with anything the person is
@@ -543,7 +555,10 @@ async fn the_digest_a_person_confirms_changes_with_the_destination_the_environme
         let source =
             Arc::new(Scripted::serving(world, world.bundle(&Shape::default())).publishing(sealed));
         let prepared = restore(world, &source, None).await.expect("a restore");
-        prepared.plan().digest(environment, destination)
+        prepared
+            .plan()
+            .digest(environment, destination)
+            .expect("a digest")
     }
     let base = digest(&world, &first, "env-1", "/restore/a").await;
     assert_eq!(
@@ -621,6 +636,10 @@ async fn a_restore_trusts_the_writers_and_the_generation_the_authenticated_bundl
         claimed.signing_key = *impostor.public();
         claimed
     };
+    // The publication names the writer's identifier and is signed by the key the bundle carries
+    // under it, so only the identifier check can refuse it.
+    let mut confusing = world.seal(4, &members);
+    confusing.publication = resign(confusing.publication.payload.clone(), &impostor);
     let source = Arc::new(
         Scripted::serving(
             &world,
@@ -629,12 +648,27 @@ async fn a_restore_trusts_the_writers_and_the_generation_the_authenticated_bundl
                 ..Shape::default()
             }),
         )
-        .publishing(&honest),
+        .publishing(&confusing),
     );
     assert!(matches!(
         restore(&world, &source, None).await.expect_err("refused"),
         RestoreError::Publication(PublicationRefusal::WriterKeyMismatch)
     ));
+    assert_eq!(source.object_reads(), 0);
+
+    // A descriptor the protocol refuses, validly signed by the trusted writer, is refused before
+    // an object is read.
+    let mut invalid = world.seal(4, &members);
+    let mut payload = invalid.publication.payload.clone();
+    payload.descriptor.version = U64::new(2);
+    invalid.publication = resign(payload, &world.writer);
+    let source =
+        Arc::new(Scripted::serving(&world, world.bundle(&Shape::default())).publishing(&invalid));
+    assert!(matches!(
+        restore(&world, &source, None).await.expect_err("refused"),
+        RestoreError::Publication(PublicationRefusal::Structure(_))
+    ));
+    assert_eq!(source.object_reads(), 0);
 
     // The publication's writer is not the manifest's: both are trusted, each signed its own.
     let second = AuthorisationKeyPair::generate().expect("a key");
@@ -873,6 +907,20 @@ async fn a_kit_that_names_no_service_this_host_reaches_is_refused_by_name() {
         .expect_err("refused");
     assert!(matches!(refused, RestoreError::OriginNotConfigured));
 
+    // A locator that is not an identifier in its canonical spelling is wrong before it is sent.
+    let mut odd = world.kit();
+    odd.bundle_locator = "not/an-identifier".to_owned();
+    let source =
+        Arc::new(Scripted::serving(&world, world.bundle(&Shape::default())).publishing(&sealed));
+    let refused = FilesRestore::prepare(odd, Arc::clone(&source) as _, None)
+        .await
+        .expect_err("refused");
+    assert!(matches!(
+        refused,
+        RestoreError::Recovery(kr_client::recovery::RecoveryError::MalformedKit { .. })
+    ));
+    assert!(!source.asked().iter().any(|call| call == "bundle"));
+
     // A mistyped kit stops before the service is asked anything.
     let mut mistyped = world.kit();
     mistyped.seed_checksum = kr_protocol::scalars::Bytes::new(vec![0; 4]);
@@ -889,10 +937,7 @@ async fn a_kit_that_names_no_service_this_host_reaches_is_refused_by_name() {
 
     // A host with no usable sign-in is told so, and nothing is sent.
     let mut signed_out = Scripted::serving(&world, world.bundle(&Shape::default()));
-    signed_out.service.sign_in = SourceSignIn::Unusable {
-        why: "no account is signed in on this host".to_owned(),
-        remedy: "Sign this host in.".to_owned(),
-    };
+    signed_out.service.sign_in = SourceSignIn::Unusable(SignInCause::SignedOut);
     let signed_out = Arc::new(signed_out);
     assert!(matches!(
         restore(&world, &signed_out, None)
@@ -975,25 +1020,54 @@ async fn the_archive_is_one_the_authenticated_bundle_lists_at_the_configured_ser
         )
         .publishing(&sealed),
     );
-    match restore(&world, &source, None).await.expect_err("refused") {
-        RestoreError::SeveralArchives(candidates) => {
-            assert_eq!(candidates.len(), 2);
-            let held = candidates
-                .iter()
-                .find(|candidate| candidate.archive_id == archive())
-                .expect("the first archive");
-            let newest = held.newest.as_ref().expect("a generation");
-            assert_eq!(newest.generation.get(), 4);
-            assert_eq!(newest.published_at_ms.get(), 5_000);
-            assert_eq!(newest.writer, world.writer.key_id());
-            let none = candidates
-                .iter()
-                .find(|candidate| candidate.archive_id == second)
-                .expect("the second archive");
-            assert!(none.newest.is_none(), "the service holds nothing of it");
+    let candidates_of = |error: RestoreError| match error {
+        RestoreError::SeveralArchives { count, candidates } => {
+            assert_eq!(count, 2);
+            candidates
         }
         other => panic!("several archives are listed, not chosen: {other:?}"),
-    }
+    };
+    let candidates = candidates_of(restore(&world, &source, None).await.expect_err("refused"));
+    let held = candidates
+        .iter()
+        .find(|candidate| candidate.archive_id == archive())
+        .expect("the first archive");
+    let CandidateState::Newest(newest) = &held.newest else {
+        panic!("the first archive has a generation");
+    };
+    assert_eq!(newest.generation.get(), 4);
+    assert_eq!(newest.published_at_ms.get(), 5_000);
+    assert_eq!(newest.writer, world.writer.key_id());
+    let none = candidates
+        .iter()
+        .find(|candidate| candidate.archive_id == second)
+        .expect("the second archive");
+    assert!(
+        matches!(none.newest, CandidateState::Nothing),
+        "the service holds nothing of it"
+    );
+
+    // A candidate whose publication a restore would refuse is shown as refused, apart from one the
+    // service holds nothing of.
+    let impostor = AuthorisationKeyPair::generate().expect("a key");
+    let forged = world.seal_with(
+        4,
+        &honest_members(),
+        &impostor,
+        &impostor,
+        &world.recipients(),
+    );
+    source
+        .generations
+        .lock()
+        .expect("generations")
+        .insert(second, forged.publication.clone());
+    let candidates = candidates_of(restore(&world, &source, None).await.expect_err("refused"));
+    let other = candidates
+        .iter()
+        .find(|candidate| candidate.archive_id == second)
+        .expect("the second archive");
+    assert!(matches!(other.newest, CandidateState::Refused(_)));
 }
 
 /// What a member is called decides what a restore does with it, and nothing it is not told about
@@ -1200,14 +1274,19 @@ async fn a_corrupted_manifest_or_member_is_an_error_and_not_a_file() {
     let source =
         Arc::new(Scripted::serving(&world, world.bundle(&Shape::default())).publishing(&sealed));
     let prepared = restore(&world, &source, None).await.expect("a plan");
-    let member = prepared.plan().members[0].clone();
-    source.corrupt(member.object_id);
+    let member = prepared.plan().members[0].object_id;
+    source.corrupt(member);
     assert!(matches!(
-        prepared.member(&member).await,
+        prepared.member(member).await,
         Err(RestoreError::Member(_))
     ));
     // The other member is untouched.
-    assert!(prepared.member(&prepared.plan().members[1]).await.is_ok());
+    assert!(
+        prepared
+            .member(prepared.plan().members[1].object_id)
+            .await
+            .is_ok()
+    );
 }
 
 /// The record a restore leaves holds the plan and the refusals and none of the kit.
@@ -1226,7 +1305,7 @@ async fn the_record_says_what_was_written_and_what_was_refused_and_holds_nothing
         Arc::new(Scripted::serving(&world, world.bundle(&Shape::default())).publishing(&sealed));
     let prepared = restore(&world, &source, None).await.expect("a plan");
     let plan = prepared.plan();
-    let digest = plan.digest("env-1", "/restore/a");
+    let digest = plan.digest("env-1", "/restore/a").expect("a digest");
     let written = vec![plan.members[0].object_id];
     let record = plan.record(&digest, &written).to_string();
     assert!(record.contains("kalareach-restore/1"));
@@ -1234,7 +1313,8 @@ async fn the_record_says_what_was_written_and_what_was_refused_and_holds_nothing
     assert!(record.contains("material_never_restored"));
     assert!(record.contains("session-0001.json"));
     let kit = world.kit();
-    for secret in [world.locator.as_str(), &format!("{:?}", kit.seed.expose())] {
+    let seed_text = serde_json::to_string(&kit.seed).expect("the seed as the kit writes it");
+    for secret in [world.locator.as_str(), seed_text.trim_matches('"')] {
         assert!(!record.contains(secret), "the record holds a kit value");
     }
     assert!(!format!("{prepared:?}").contains(&world.locator));
@@ -1248,4 +1328,80 @@ async fn the_record_says_what_was_written_and_what_was_refused_and_holds_nothing
         assert!(!shown.contains(&world.locator), "{shown}");
         assert!(!shown.contains("checksum"), "{shown}");
     }
+}
+
+/// What a restore writes is a prefix of what fits: once one member would pass the total, it and
+/// every member after it are refused, small ones included.
+#[tokio::test]
+async fn once_a_member_would_pass_the_total_every_later_member_is_refused() {
+    let world = World::new();
+    let stored = |plaintext: u64| 24 + plaintext + plaintext.div_ceil(1 << 20).max(1) * 17;
+    let session = |n: u32| format!("sessions/0a1b2c3d-0000-4000-8000-{n:012}.json");
+    let big = 190_u64 << 20;
+    let names: Vec<String> = (1..=9).map(session).collect();
+    let mut members: Vec<(&str, u64)> = names
+        .iter()
+        .map(|name| (name.as_str(), stored(big)))
+        .collect();
+    // 8 x 190 MiB is 1,520 MiB, so the ninth session passes the 1,536 MiB total and the
+    // configuration after it, which alone would fit, is refused with it.
+    members.push(("host/configuration.json", stored(1 << 20)));
+    let sealed = world.seal_declared(4, &members);
+    let source =
+        Arc::new(Scripted::serving(&world, world.bundle(&Shape::default())).publishing(&sealed));
+    let prepared = restore(&world, &source, None).await.expect("a plan");
+    let plan = prepared.plan();
+    assert_eq!(plan.restored().count(), 8);
+    assert!(matches!(
+        plan.members[8].verdict,
+        MemberVerdict::Refused(MemberRefusal::OverTotal { .. })
+    ));
+    assert!(matches!(
+        plan.members[9].verdict,
+        MemberVerdict::Refused(MemberRefusal::OverTotal { .. })
+    ));
+}
+
+/// A member is asked for by the plan's own entry: a refused one, or an object the manifest never
+/// named, is not read.
+#[tokio::test]
+async fn only_a_member_the_plan_writes_can_be_read() {
+    let world = World::new();
+    let stored = kr_crypto::stream::encrypted_len(100) as u64;
+    let sealed = world.seal_declared(
+        4,
+        &[
+            ("sessions/0a1b2c3d-0000-4000-8000-000000000001.json", stored),
+            ("keys/control/host", stored),
+        ],
+    );
+    let source =
+        Arc::new(Scripted::serving(&world, world.bundle(&Shape::default())).publishing(&sealed));
+    let prepared = restore(&world, &source, None).await.expect("a plan");
+    let reads = source.object_reads();
+    for object in [
+        prepared.plan().members[1].object_id,
+        BackupObjectId::new(id(0x99)),
+    ] {
+        assert!(matches!(
+            prepared.member(object).await,
+            Err(RestoreError::NotInPlan)
+        ));
+    }
+    assert_eq!(source.object_reads(), reads, "nothing was read for either");
+}
+
+/// A service that answers a read with no bytes cannot hold a restore in a loop.
+#[tokio::test]
+async fn a_service_that_answers_a_read_with_nothing_stops_the_restore() {
+    let world = World::new();
+    let sealed = world.seal(4, &honest_members());
+    let mut source = Scripted::serving(&world, world.bundle(&Shape::default())).publishing(&sealed);
+    source.serves_empty_ranges = true;
+    assert!(matches!(
+        restore(&world, &Arc::new(source), None)
+            .await
+            .expect_err("stopped"),
+        RestoreError::Range
+    ));
 }

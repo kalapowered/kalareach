@@ -985,7 +985,7 @@ mod tests {
     }
 
     #[test]
-    fn a_recovery_kit_redacts_its_seed() {
+    fn a_recovery_kit_renders_without_its_seed_its_checksum_or_its_locator() {
         let kit = RecoveryKit {
             profile_version: U64::new(RECOVERY_KIT_PROFILE_VERSION),
             seed: SecretBytes32::from_bytes([7; 32]),
@@ -994,8 +994,14 @@ mod tests {
             bundle_locator: "opaque-locator".to_owned(),
         };
         let rendered = format!("{kit:?}");
-        assert!(rendered.contains("SecretBytes32(redacted)"));
         assert!(!rendered.contains(&crate::scalars::to_base64url(&[7u8; 32])));
+        assert!(!rendered.contains("opaque-locator"));
+        assert!(!rendered.contains("checksum"));
+        let context = RecoveryContext {
+            service_origin: "https://reach.kala.to".to_owned(),
+            bundle_locator: "opaque-locator".to_owned(),
+        };
+        assert!(!format!("{context:?}").contains("opaque-locator"));
     }
 
     #[test]

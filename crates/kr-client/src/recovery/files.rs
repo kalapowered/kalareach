@@ -35,10 +35,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use kr_crypto::backup::{
     ArchiveExpectation, ArchiveReader, CheckpointSource, GenerationExpectation, Material,
-    OpenArchive, RestoreGeneration, RestoredObject, admit_for_restore, member_cap, member_material,
-    open_archive,
+    OpenArchive, RestoreGeneration, admit_for_restore, member_cap, member_material, open_archive,
 };
 use kr_crypto::kdf::{RecoveryRecipient, RecoverySeed};
+use kr_crypto::secret::SecretVec;
 use kr_crypto::sign::SigningTranscript;
 use kr_crypto::stream;
 use kr_protocol::archive::{
@@ -79,28 +79,73 @@ pub const RESTORE_RECORD_FORMAT: &str = "kalareach-restore/1";
 /* Where the ciphertext comes from                                             */
 /* -------------------------------------------------------------------------- */
 
+/// Why the host holds no account token a bundle read may carry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SignInCause {
+    /// No account is signed in on this host.
+    SignedOut,
+    /// A sign-in is waiting for the person's browser.
+    Waiting,
+    /// The service ended the sign-in.
+    Ended,
+    /// The account is signed in and its grant lacks the scope backup storage needs.
+    WithoutScope,
+    /// The sign-in looks whole and no token could be had from it just now.
+    NotRenewed,
+}
+
+impl SignInCause {
+    /// Why no token is usable, in this program's words.
+    #[must_use]
+    pub const fn why(self) -> &'static str {
+        match self {
+            Self::SignedOut => "no account is signed in on this host",
+            Self::Waiting => "a sign-in on this host is waiting to finish",
+            Self::Ended => "the service ended the sign-in on this host",
+            Self::WithoutScope => "the account signed in on this host lacks the backup.write scope",
+            Self::NotRenewed => {
+                "this host could not renew the token of the account signed in on this host"
+            }
+        }
+    }
+
+    /// What a person does about it.
+    #[must_use]
+    pub const fn remedy(self) -> &'static str {
+        match self {
+            Self::SignedOut | Self::Ended => "Sign this host in with `kr account sign-in`.",
+            Self::Waiting => "Finish the sign-in at the address `kr account sign-in` printed.",
+            Self::WithoutScope => {
+                "Sign this host in again with `kr account sign-in`, which asks for backup \
+                 storage because storage.origin is set."
+            }
+            Self::NotRenewed => {
+                "This host asks again by itself. Check that the account service is reachable, or \
+                 sign this host in again with `kr account sign-in`."
+            }
+        }
+    }
+}
+
 /// Whether the host holds an account token a bundle read may carry.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SourceSignIn {
     /// A token is usable now.
     Usable,
-    /// None is, for this reason, and this is what mends it. Both are the host's own words.
-    Unusable {
-        /// Why no token is usable.
-        why: String,
-        /// What a person does about it.
-        remedy: String,
-    },
+    /// None is, for this reason.
+    Unusable(SignInCause),
 }
 
 /// The service a source reaches, as the host is configured for it.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct SourceService {
     /// The configured storage origin.
     pub origin: String,
     /// Whether a bundle read may be sent.
     pub sign_in: SourceSignIn,
 }
+
+crate::debug_as_name!(SourceService);
 
 /// Where a restore reads ciphertext and public records from.
 ///
@@ -202,8 +247,11 @@ impl SyncBackupService for BundleReader {
         Box::pin(async move {
             // The collection is `recovery_bundle/<locator>`; the source is asked for the locator.
             let locator = collection
-                .rsplit_once('/')
-                .map_or(collection, |(_, locator)| locator);
+                .strip_prefix(&format!(
+                    "{}/",
+                    kr_protocol::sync::SyncObjectKind::RecoveryBundle
+                ))
+                .unwrap_or(collection);
             let fetched = self.source.bundle(locator).await?;
             if matches!(fetched, SyncFetched::Absent { .. }) {
                 self.answered_absent.store(true, Ordering::Relaxed);
@@ -226,11 +274,11 @@ impl SyncBackupService for BundleReader {
 /* -------------------------------------------------------------------------- */
 
 /// Why the publication of a generation is not one a restore opens.
-#[derive(Debug, thiserror::Error)]
+#[derive(Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum PublicationRefusal {
     /// The descriptor breaks a rule the protocol states for one.
-    #[error("the published descriptor is not one this build reads: {0}")]
+    #[error("the published descriptor is not one this build reads")]
     Structure(kr_protocol::archive::DescriptorError),
     /// The archive it describes is not the one chosen.
     #[error("the publication is for another archive than the one being restored")]
@@ -244,22 +292,24 @@ pub enum PublicationRefusal {
     /// The signature does not verify under the bundle's key for the writer.
     #[error("the publication's signature does not verify under the bundle's writer key")]
     BadSignature,
-    /// The checkpoint refuses the generation.
-    #[error("{0}")]
-    Generation(String),
+    /// The checkpoint refuses the generation; the standing says how.
+    #[error("the recovery bundle's checkpoint refuses that generation")]
+    Generation(RestoreGeneration),
 }
 
+crate::debug_as_display!(PublicationRefusal);
+
 /// Why a restore stopped, before it wrote anything.
-#[derive(Debug, thiserror::Error)]
+#[derive(thiserror::Error)]
 #[non_exhaustive]
 pub enum RestoreError {
     /// The host holds no account token a bundle read may carry.
     #[error("{why}")]
     NotSignedIn {
-        /// Why no token is usable.
-        why: String,
-        /// What a person does about it.
-        remedy: String,
+        /// Why no token is usable, and so what mends it.
+        cause: SignInCause,
+        /// The same, in words.
+        why: Shown,
     },
     /// The kit names no service this host is configured for.
     ///
@@ -280,8 +330,13 @@ pub enum RestoreError {
     #[error("the recovery bundle names no such archive at this service")]
     ArchiveNotListed,
     /// The bundle names more than one archive at the configured service and none was chosen.
-    #[error("the recovery bundle names {} archives at this service; choose one", .0.len())]
-    SeveralArchives(Vec<Candidate>),
+    #[error("the recovery bundle names {count} archives at this service; choose one")]
+    SeveralArchives {
+        /// How many it names.
+        count: usize,
+        /// Each, with the newest generation the service holds of it.
+        candidates: Vec<Candidate>,
+    },
     /// The service holds nothing as new as the generation the bundle's checkpoint records.
     #[error(
         "the service holds no generation as new as the bundle's checkpoint, generation {checkpoint}"
@@ -312,7 +367,7 @@ pub enum RestoreError {
     NoProducer,
     /// The archive did not open.
     #[error("the archive did not open: {0}")]
-    Archive(kr_crypto::CryptoError),
+    Archive(Shown),
     /// The manifest was signed by another writer than the publication.
     #[error("the manifest was signed by another writer than the publication")]
     ManifestWriter,
@@ -332,11 +387,19 @@ pub enum RestoreError {
     Read(ClientError),
     /// A member did not open.
     #[error("a member did not open: {0}")]
-    Member(kr_crypto::CryptoError),
+    Member(Shown),
     /// The recovery recipient could not be derived from the seed.
     #[error("the recovery recipient could not be derived: {0}")]
-    Seed(kr_crypto::CryptoError),
+    Seed(Shown),
+    /// A member was asked for that the plan does not restore.
+    #[error("that member is not one this restore's plan writes")]
+    NotInPlan,
+    /// The plan could not be encoded to make its digest.
+    #[error("the restore plan could not be encoded")]
+    Unencodable,
 }
+
+crate::debug_as_display!(RestoreError);
 
 impl From<ClientError> for RestoreError {
     fn from(error: ClientError) -> Self {
@@ -345,16 +408,31 @@ impl From<ClientError> for RestoreError {
 }
 
 /// One archive a bundle names, with the newest generation the service holds of it.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Candidate {
     /// The archive.
     pub archive_id: ArchiveId,
     /// What the service holds of it.
-    pub newest: Option<CandidateGeneration>,
+    pub newest: CandidateState,
 }
 
+crate::debug_as_name!(Candidate);
+
+/// What the service held of a candidate archive.
+#[derive(Clone, PartialEq, Eq)]
+pub enum CandidateState {
+    /// Nothing, or nothing as new as the bundle's checkpoint.
+    Nothing,
+    /// A publication that a restore would refuse, and why.
+    Refused(PublicationRefusal),
+    /// The newest generation, after its publication was verified as a restore does.
+    Newest(CandidateGeneration),
+}
+
+crate::debug_as_name!(CandidateState);
+
 /// The newest generation of a candidate, after its publication was verified as a restore does.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct CandidateGeneration {
     /// The generation.
     pub generation: BackupGeneration,
@@ -363,6 +441,8 @@ pub struct CandidateGeneration {
     /// The identifier of the writer's key.
     pub writer: KeyId,
 }
+
+crate::debug_as_name!(CandidateGeneration);
 
 /* -------------------------------------------------------------------------- */
 /* The plan                                                                    */
@@ -424,7 +504,7 @@ impl MemberRefusal {
 }
 
 /// What a restore does with one member.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum MemberVerdict {
     /// It is written, to this file name, which the member's role and number make and the archive
     /// never supplies.
@@ -439,7 +519,7 @@ pub enum MemberVerdict {
 }
 
 /// One member of the manifest, as the plan treats it.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct PlannedMember {
     /// The object.
     pub object_id: BackupObjectId,
@@ -452,7 +532,7 @@ pub struct PlannedMember {
 }
 
 /// What a restore would do, and what it was shown for the person to confirm.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct RestorePlan {
     /// The configured service origin.
     pub origin: String,
@@ -473,6 +553,8 @@ pub struct RestorePlan {
     /// Every member, in manifest order.
     pub members: Vec<PlannedMember>,
 }
+
+crate::debug_as_name!(MemberVerdict, PlannedMember, RestorePlan);
 
 /// What a plan's digest covers.
 #[derive(Serialize)]
@@ -531,8 +613,12 @@ impl RestorePlan {
     ///
     /// A generation published between the preview and the confirmation changes it, so the
     /// confirmation is for the archive that was shown.
-    #[must_use]
-    pub fn digest(&self, environment: &str, destination: &str) -> String {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RestoreError::Unencodable`] when the plan cannot be encoded, which no plan this
+    /// module makes is.
+    pub fn digest(&self, environment: &str, destination: &str) -> Result<String, RestoreError> {
         let input = DigestInput {
             environment,
             destination,
@@ -562,17 +648,17 @@ impl RestorePlan {
                 })
                 .collect(),
         };
-        let encoded = kr_cbor::to_canonical_vec(&input).expect("a digest input encodes");
+        let encoded = kr_cbor::to_canonical_vec(&input).map_err(|_| RestoreError::Unencodable)?;
         let mut bytes = Vec::with_capacity(PLAN_DOMAIN.len() + encoded.len());
         bytes.extend_from_slice(PLAN_DOMAIN);
         bytes.extend_from_slice(&encoded);
-        kr_cbor::sha256(&bytes)
+        Ok(kr_cbor::sha256(&bytes)
             .iter()
             .fold(String::with_capacity(64), |mut text, byte| {
                 use fmt::Write as _;
                 let _ = write!(text, "{byte:02x}");
                 text
-            })
+            }))
     }
 
     /// The record left beside the files once every member is written.
@@ -639,6 +725,9 @@ fn plan_members(manifest_members: &[(BackupObjectId, String, u64)]) -> Vec<Plann
     };
     let mut sessions = 0_u32;
     let mut total = 0_u64;
+    // Once one member would pass the total, it and every member after it are refused, so what a
+    // restore writes is always a prefix of what the manifest lists that fits.
+    let mut full = false;
     let mut planned = Vec::with_capacity(manifest_members.len());
     for (at, (object_id, _, stored_len)) in manifest_members.iter().enumerate() {
         let plaintext_len = stream::plaintext_len(*stored_len);
@@ -657,29 +746,38 @@ fn plan_members(manifest_members: &[(BackupObjectId, String, u64)]) -> Vec<Plann
                     .map_or("a restore does not put this back", |(_, because)| *because);
                 return MemberVerdict::Refused(MemberRefusal::Kind { material, because });
             }
+            // The two kinds a host archive carries; any other material the table allowed is still
+            // not one this convention writes.
+            let role = match material {
+                Material::SessionData => MemberRole::Session,
+                Material::DeviceConfiguration => MemberRole::Configuration,
+                _ => return MemberVerdict::Refused(MemberRefusal::UnknownKind),
+            };
             let (Some(cap), Some(size)) = (member_cap(material), plaintext_len) else {
                 return MemberVerdict::Refused(MemberRefusal::BadStoredLength);
             };
             if size > cap {
                 return MemberVerdict::Refused(MemberRefusal::OverMemberCap { size, cap });
             }
-            if total.saturating_add(size) > MAX_RESTORED_BYTES {
+            if full || total.saturating_add(size) > MAX_RESTORED_BYTES {
+                full = true;
                 return MemberVerdict::Refused(MemberRefusal::OverTotal {
                     cap: MAX_RESTORED_BYTES,
                 });
             }
             total += size;
-            if material == Material::SessionData {
-                sessions += 1;
-                MemberVerdict::Restore {
-                    role: MemberRole::Session,
-                    file: format!("session-{sessions:04}.json"),
+            match role {
+                MemberRole::Session => {
+                    sessions += 1;
+                    MemberVerdict::Restore {
+                        role,
+                        file: format!("session-{sessions:04}.json"),
+                    }
                 }
-            } else {
-                MemberVerdict::Restore {
-                    role: MemberRole::Configuration,
+                MemberRole::Configuration => MemberVerdict::Restore {
+                    role,
                     file: "configuration.json".to_owned(),
-                }
+                },
             }
         })();
         planned.push(PlannedMember {
@@ -729,39 +827,41 @@ impl PreparedRestore {
 
     /// Reads one admitted member's ciphertext, opens it and hands over its plaintext.
     ///
-    /// The ciphertext is checked against the manifest's length and hash before it is decrypted,
-    /// and its final authenticated record is required, so a cut or altered object is an error and
-    /// never a shorter file.
+    /// The member is looked up in this restore's own plan, and its verdict and stored length are
+    /// the plan's. The ciphertext is checked against the manifest's length and hash before it is
+    /// decrypted, and its final authenticated record is required, so a cut or altered object is an
+    /// error and never a shorter file. Only the plaintext is handed over: the name the manifest
+    /// recorded is archive text, and the plan names the file.
     ///
     /// # Errors
     ///
-    /// Returns [`RestoreError::Read`] or [`RestoreError::Range`] when the service fails, and
+    /// Returns [`RestoreError::NotInPlan`] for an object the plan does not write,
+    /// [`RestoreError::Read`] or [`RestoreError::Range`] when the service fails, and
     /// [`RestoreError::Member`] when the object does not open.
-    ///
-    /// # Panics
-    ///
-    /// Panics when `member` is not one this restore's plan admits: a caller asks only for the
-    /// members the plan lists as restored.
-    pub async fn member(&self, member: &PlannedMember) -> Result<RestoredObject, RestoreError> {
-        assert!(
-            matches!(member.verdict, MemberVerdict::Restore { .. }),
-            "a refused member is never read"
-        );
+    pub async fn member(&self, object: BackupObjectId) -> Result<SecretVec, RestoreError> {
+        let planned = self
+            .plan
+            .members
+            .iter()
+            .find(|member| member.object_id == object)
+            .filter(|member| matches!(member.verdict, MemberVerdict::Restore { .. }))
+            .ok_or(RestoreError::NotInPlan)?;
         let bytes = read_whole(
             self.source.as_ref(),
             self.plan.archive_id,
-            member.object_id,
-            member.stored_len,
+            planned.object_id,
+            planned.stored_len,
         )
         .await?;
         self.open
             .restore_object(
                 &ArchiveReader::Recovery(&self.recipient),
                 &self.sender,
-                member.object_id,
+                planned.object_id,
                 &bytes,
             )
-            .map_err(RestoreError::Member)
+            .map(|restored| restored.plaintext)
+            .map_err(|error| RestoreError::Member(Shown::crypto(&error)))
     }
 }
 
@@ -804,10 +904,20 @@ impl FilesRestore {
         let seed = RecoverySeed::from_kit(&kit)
             .map_err(|_| RestoreError::Recovery(RecoveryError::MistypedKit))?;
         let service = source.service().await?;
-        if let SourceSignIn::Unusable { why, remedy } = service.sign_in {
-            return Err(RestoreError::NotSignedIn { why, remedy });
+        if let SourceSignIn::Unusable(cause) = service.sign_in {
+            return Err(RestoreError::NotSignedIn {
+                cause,
+                why: Shown::said(cause.why()),
+            });
         }
         let origin = kit_origin_for(&kit, &service.origin)?;
+        // The locator is an identifier in its canonical spelling, and the service refuses
+        // anything else, so a kit that carries another is wrong before it is used.
+        if !is_an_identifier(&kit.bundle_locator) {
+            return Err(RestoreError::Recovery(RecoveryError::MalformedKit {
+                what: "a bundle locator that is not an identifier",
+            }));
+        }
 
         // 2. The bundle, through a reader that cannot write.
         let reader = Arc::new(BundleReader {
@@ -872,7 +982,9 @@ impl FilesRestore {
         }
 
         // 5. The manifest, then the plan.
-        let recipient = seed.recipient().map_err(RestoreError::Seed)?;
+        let recipient = seed
+            .recipient()
+            .map_err(|error| RestoreError::Seed(Shown::crypto(&error)))?;
         drop(seed);
         let reader_key_id = ArchiveReader::Recovery(&recipient).key_id();
         let wrap = kr_crypto::archive::manifest_wrap_for(descriptor, &reader_key_id)
@@ -901,7 +1013,7 @@ impl FilesRestore {
             &descriptor_bytes,
             &encrypted_manifest,
         )
-        .map_err(RestoreError::Archive)?;
+        .map_err(|error| RestoreError::Archive(Shown::crypto(&error)))?;
         if open.manifest().writer_key_id != publication.payload.writer_key_id {
             return Err(RestoreError::ManifestWriter);
         }
@@ -943,6 +1055,15 @@ impl FilesRestore {
             source,
         })
     }
+}
+
+/// Whether `text` is an identifier in its canonical lowercase spelling.
+fn is_an_identifier(text: &str) -> bool {
+    text.len() == 36
+        && text.char_indices().all(|(at, character)| match at {
+            8 | 13 | 18 | 23 => character == '-',
+            _ => character.is_ascii_digit() || ('a'..='f').contains(&character),
+        })
 }
 
 /// The kit's own text for the configured origin.
@@ -993,7 +1114,7 @@ async fn choose_archive(
             for archive_id in several {
                 let checkpoint = material.checkpoint(*archive_id);
                 let newest = match source.generation(*archive_id, checkpoint).await? {
-                    None => None,
+                    None => CandidateState::Nothing,
                     Some(publication) => {
                         let expectation =
                             checkpoint.map_or(GenerationExpectation::Unverified, |checkpoint| {
@@ -1002,18 +1123,19 @@ async fn choose_archive(
                                     checkpoint,
                                 )
                             });
-                        verify_publication(
+                        match verify_publication(
                             &publication,
                             *archive_id,
                             &material.trusted_writers,
                             expectation,
-                        )
-                        .ok()
-                        .map(|_| CandidateGeneration {
-                            generation: publication.payload.descriptor.backup_generation,
-                            published_at_ms: publication.payload.published_at_ms,
-                            writer: publication.payload.writer_key_id,
-                        })
+                        ) {
+                            Ok(_) => CandidateState::Newest(CandidateGeneration {
+                                generation: publication.payload.descriptor.backup_generation,
+                                published_at_ms: publication.payload.published_at_ms,
+                                writer: publication.payload.writer_key_id,
+                            }),
+                            Err(refusal) => CandidateState::Refused(refusal),
+                        }
                     }
                 };
                 candidates.push(Candidate {
@@ -1021,7 +1143,10 @@ async fn choose_archive(
                     newest,
                 });
             }
-            Err(RestoreError::SeveralArchives(candidates))
+            Err(RestoreError::SeveralArchives {
+                count: candidates.len(),
+                candidates,
+            })
         }
     }
 }
@@ -1064,7 +1189,7 @@ fn verify_publication(
         .map_err(|_| PublicationRefusal::BadSignature)?;
     let standing = RestoreGeneration::against(&payload.descriptor, expectation);
     if !standing.is_admissible() {
-        return Err(PublicationRefusal::Generation(standing.describe()));
+        return Err(PublicationRefusal::Generation(standing));
     }
     Ok(standing)
 }

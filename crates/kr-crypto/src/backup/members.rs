@@ -8,10 +8,12 @@
 //! * `sessions/<uuid>.json` is one session export, the document `kr export` writes. The producer
 //!   cuts it at [`MAX_SESSION_MEMBER_BYTES`] and says that it did.
 //! * `host/configuration.json` is the host's configuration document.
-//! * The reserved prefixes name material no archive carries ([`may_back_up`] refuses all of it).
-//!   A restore shows the table's reason for such a member instead of calling it unknown.
+//! * The reserved prefixes name material no restore puts back ([`may_restore`] refuses all of it,
+//!   and [`may_back_up`] all of it but a revoked grant). A restore shows the table's reason for such
+//!   a member instead of calling it unknown.
 //!
 //! [`may_back_up`]: crate::backup::may_back_up
+//! [`may_restore`]: crate::backup::may_restore
 
 use crate::backup::Material;
 
@@ -33,7 +35,7 @@ pub const MAX_CONFIGURATION_MEMBER_BYTES: u64 = 1 << 20;
 /// The most plaintext one restore accepts across all its members: 1.5 GiB.
 pub const MAX_RESTORED_BYTES: u64 = 3 << 29;
 
-/// The names under which an archive never carries anything, and the material each would be.
+/// The names under which a restore puts nothing back, and the material each would be.
 const RESERVED: [(&str, Material); 7] = [
     ("keys/endpoint/", Material::EndpointPrivateKey),
     ("keys/control/", Material::ControlSigningPrivateKey),

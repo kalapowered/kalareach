@@ -56,10 +56,10 @@ pub use crate::recovery::bundle::{
     bundle_collection, fresh_locator,
 };
 pub use crate::recovery::files::{
-    Candidate, CandidateGeneration, FilesRestore, MAX_CONFIGURATION_MEMBER_BYTES, MAX_RANGE_BYTES,
-    MAX_RESTORED_BYTES, MAX_SESSION_MEMBER_BYTES, MemberRefusal, MemberRole, MemberVerdict,
-    PlannedMember, PreparedRestore, PublicationRefusal, RESTORE_RECORD_FORMAT, RestoreError,
-    RestorePlan, RestoreSource, SourceService, SourceSignIn,
+    Candidate, CandidateGeneration, CandidateState, FilesRestore, MAX_CONFIGURATION_MEMBER_BYTES,
+    MAX_RANGE_BYTES, MAX_RESTORED_BYTES, MAX_SESSION_MEMBER_BYTES, MemberRefusal, MemberRole,
+    MemberVerdict, PlannedMember, PreparedRestore, PublicationRefusal, RESTORE_RECORD_FORMAT,
+    RestoreError, RestorePlan, RestoreSource, SignInCause, SourceService, SourceSignIn,
 };
 pub use crate::recovery::kit::{
     MAX_RECOVERY_KIT_BYTES, RECOVERY_KIT_FORMAT, parse_kit, qr_payload, render_kit,
