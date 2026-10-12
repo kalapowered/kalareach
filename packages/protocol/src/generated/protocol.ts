@@ -352,6 +352,167 @@ export type AttentionAutomationSubject =
  */
 export type RevocationRequestId = string
 /**
+ * The recovery bundle at a locator, as the service answered it.
+ *
+ * The two answers are kept apart because they mean different things to a restore: a bundle that is
+ * held is ciphertext to authenticate, and one that is not is a locator nobody wrote, written
+ * wrongly, or read by an account that does not own it.
+ */
+export type BackupBundle =
+  | {
+      /**
+       * The sealed bundle, which only the recovery seed opens.
+       */
+      ciphertext: string
+      /**
+       * The history the place is in: the recovery the answer named, or null for a service never
+       * put back.
+       */
+      recovery: Uuid | null
+      /**
+       * The name the service gave this write, or null where the write was a removal.
+       */
+      revision: Uuid | null
+      state: 'held'
+      /**
+       * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+       */
+      write_sequence: string
+    }
+  | {
+      /**
+       * The history that holds none.
+       */
+      recovery: Uuid | null
+      state: 'absent'
+    }
+/**
+ * A 128-bit identifier. On the wire it is a 16-byte string; in JSON it is the canonical hyphenated lower-case text form.
+ */
+export type Uuid = string
+/**
+ * Parameters of `backup.read`: exactly one read.
+ */
+export type BackupReadParams =
+  | {
+      read: 'service'
+    }
+  | {
+      /**
+       * A 128-bit identifier. On the wire it is a 16-byte string; in JSON it is the canonical hyphenated lower-case text form.
+       */
+      locator: string
+      read: 'bundle'
+    }
+  | {
+      /**
+       * The archive.
+       */
+      archive_id: string
+      /**
+       * The checkpoint the caller holds for it, from the authenticated bundle. A service that
+       * holds nothing as new answers that rather than an older generation.
+       */
+      checkpoint: ArchiveCheckpoint | null
+      read: 'generation'
+    }
+  | {
+      /**
+       * The archive the object belongs to.
+       */
+      archive_id: string
+      /**
+       * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+       */
+      length: string
+      /**
+       * The object.
+       */
+      object_id: string
+      /**
+       * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+       */
+      offset: string
+      read: 'object'
+    }
+/**
+ * What `backup.read` answers: the read asked for, or a wait.
+ */
+export type BackupReadResult =
+  | {
+      /**
+       * The storage origin this host is configured for.
+       */
+      origin: string
+      read: 'service'
+      /**
+       * Whether a read may be sent.
+       */
+      sign_in: 'usable' | 'signed_out' | 'waiting' | 'ended' | 'without_scope' | 'not_renewed'
+    }
+  | {
+      /**
+       * The bundle, or its absence.
+       */
+      bundle:
+        | {
+            /**
+             * The sealed bundle, which only the recovery seed opens.
+             */
+            ciphertext: string
+            /**
+             * The history the place is in: the recovery the answer named, or null for a service never
+             * put back.
+             */
+            recovery: Uuid | null
+            /**
+             * The name the service gave this write, or null where the write was a removal.
+             */
+            revision: Uuid | null
+            state: 'held'
+            /**
+             * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+             */
+            write_sequence: string
+          }
+        | {
+            /**
+             * The history that holds none.
+             */
+            recovery: Uuid | null
+            state: 'absent'
+          }
+      read: 'bundle'
+    }
+  | {
+      /**
+       * The newest generation the service holds as new as the checkpoint asked for, or null when
+       * it holds none. Null is an answer, kept apart from a failure.
+       */
+      publication: BackupGenerationPublication | null
+      read: 'generation'
+    }
+  | {
+      /**
+       * The ciphertext of the range asked for, shorter than asked only at the end of the
+       * object.
+       */
+      bytes: string
+      read: 'object'
+    }
+  | {
+      read: 'wait'
+      /**
+       * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+       */
+      retry_after_seconds: string
+    }
+/**
+ * Why this host holds no account token a read may carry, or that it does.
+ */
+export type BackupSignIn =
+  'usable' | 'signed_out' | 'waiting' | 'ended' | 'without_scope' | 'not_renewed'
+/**
  * One frame on a bridge's standard input or output.
  *
  * Standard error stays diagnostic: nothing a person or a log reads there is part of this union,
@@ -943,10 +1104,6 @@ export type HelloReply =
  * Why a session created now could not launch through a command integration on this host.
  */
 export type CommandIntegrationUnavailable = 'platform' | 'no_launcher' | 'too_large'
-/**
- * A 128-bit identifier. On the wire it is a 16-byte string; in JSON it is the canonical hyphenated lower-case text form.
- */
-export type Uuid = string
 /**
  * One release of the host: its version and the first twelve hexadecimal digits of its commit.
  */
@@ -2137,7 +2294,11 @@ export interface KalaReachProtocol {
   authority_revision_ack?: AuthorityRevisionAck
   authority_revision_notice?: AuthorityRevisionNotice
   authority_revision_record?: AuthorityRevisionRecord
+  backup_bundle?: BackupBundle
   backup_generation_publication?: BackupGenerationPublication
+  backup_read_params?: BackupReadParams
+  backup_read_result?: BackupReadResult
+  backup_sign_in?: BackupSignIn
   backup_writer_record?: BackupWriterRecord
   bridge_frame?: BridgeFrame
   bridge_hello?: BridgeHello
@@ -6447,6 +6608,30 @@ export interface ArchiveDescriptor1 {
    * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   version: string
+}
+/**
+ * The latest generation an owner has verified for one archive.
+ *
+ * A fresh client needs this to detect a service replaying an older valid backup. A recovery-only
+ * restore still shows its checkpoint and cannot prove that no newer archive exists.
+ */
+export interface ArchiveCheckpoint {
+  /**
+   * The archive.
+   */
+  archive_id: string
+  /**
+   * The latest generation the owner verified.
+   */
+  backup_generation: string
+  /**
+   * A 32-byte SHA-256 digest. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
+   */
+  encrypted_manifest_hash: string
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  verified_at_ms: string
 }
 /**
  * One collection's writer enrolment, signed by the collection owner's authorisation key.
@@ -17362,6 +17547,7 @@ export interface MethodEntry {
     | 'account.sign_in'
     | 'account.sign_out'
     | 'account.status'
+    | 'backup.read'
     | 'host.update.handover'
     | 'description.setup'
     | 'description.configure'
@@ -24545,30 +24731,6 @@ export interface RecoveryBundle {
   written_at_ms: string
 }
 /**
- * The latest generation an owner has verified for one archive.
- *
- * A fresh client needs this to detect a service replaying an older valid backup. A recovery-only
- * restore still shows its checkpoint and cannot prove that no newer archive exists.
- */
-export interface ArchiveCheckpoint {
-  /**
-   * The archive.
-   */
-  archive_id: string
-  /**
-   * The latest generation the owner verified.
-   */
-  backup_generation: string
-  /**
-   * A 32-byte SHA-256 digest. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
-   */
-  encrypted_manifest_hash: string
-  /**
-   * A UTC timestamp in milliseconds, as a decimal string in JSON.
-   */
-  verified_at_ms: string
-}
-/**
  * One collection a recovery bundle can find.
  */
 export interface CollectionLocator {
@@ -24631,8 +24793,9 @@ export interface TrustedWriter1 {
  * A seed with no way to find the encrypted bundle is not a complete kit, so the kit names the
  * configured service origins and the stable bundle locator alongside the seed.
  *
- * `Debug` is derived, and the seed redacts itself, so a kit can be logged without publishing the
- * owner's recovery authority.
+ * `Debug` is written, not derived: it shows the profile and how many origins the kit names, and
+ * nothing of the seed, its checksum or the locator, so a kit can be logged without publishing the
+ * owner's recovery authority or the address of the bundle.
  */
 export interface RecoveryKit {
   /**
@@ -26254,6 +26417,7 @@ export interface ServiceRequestPayload {
     | 'account.sign_in'
     | 'account.sign_out'
     | 'account.status'
+    | 'backup.read'
     | 'host.update.handover'
     | 'description.setup'
     | 'description.configure'

@@ -422,6 +422,26 @@ fn the_required_methods_of_the_specification_table_are_all_listed() {
         );
     }
 
+    // A restore reads what the managed storage service holds through the host's own account: one
+    // read, served on the local socket alone and asking for host management. A paired device does
+    // not read a backup through the host.
+    let backup: [(&str, EffectClass); 1] = [("backup.read", EffectClass::Read)];
+    for (name, effect) in backup {
+        let entry = lookup(name).unwrap_or_else(|| panic!("{name} is missing from the registry"));
+        assert_eq!(entry.effect, effect, "{name} carries its own effect class");
+        assert_eq!(entry.group, MethodGroup::HostAndEnvironment);
+        assert_eq!(
+            entry.ingress,
+            &[ActorIngress::LocalIpc],
+            "{name} is the owner's alone"
+        );
+        assert_eq!(
+            entry.required_rights,
+            &[RequiredRight::right(ActionRight::HostManage)],
+            "{name} asks for host management and nothing else"
+        );
+    }
+
     // Section 26 ¶4 has a host inventory its live workers before it replaces a control daemon, and
     // defer the replacement when one of them could not be spoken to; the daemon being replaced
     // must first stop starting sessions and let the ones it is starting settle, or a worker could
@@ -923,6 +943,7 @@ fn the_required_methods_of_the_specification_table_are_all_listed() {
             + delivery.len()
             + privacy.len()
             + account.len()
+            + backup.len()
             + updates.len()
             + descriptions.len()
             + machines.len()

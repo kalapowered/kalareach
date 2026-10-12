@@ -56,6 +56,7 @@ use crate::automation::{
     WorkflowPauseResult, WorkflowReadParams, WorkflowReadResult, WorkflowResourceScope,
     WorkflowRunParams, WorkflowRunResult, WorkflowRunStatus, WorkflowRunSummary, WorkflowTrigger,
 };
+use crate::backup_read::{BackupBundle, BackupReadParams, BackupReadResult, BackupSignIn};
 use crate::broker::{
     ActionToken, ActionTokenClaim, CapabilityMap, DecoderLedgerEntry, DecodingTrust,
     InstanceCapabilityRecord, LaunchProfile, PreparedEffect,
@@ -841,6 +842,12 @@ pub fn protocol_schema() -> Value {
         "account_signed_out" => AccountSignedOut,
         "account_state" => AccountState,
         "account_status_params" => AccountStatusParams,
+        // The relay of a restore's reads of the managed storage service, appended for the same
+        // reason.
+        "backup_bundle" => BackupBundle,
+        "backup_read_params" => BackupReadParams,
+        "backup_read_result" => BackupReadResult,
+        "backup_sign_in" => BackupSignIn,
         // Session descriptions: the setup read and the two writes, the facts a worker keeps per
         // session and the request and page the control daemon reads them with. Appended for the
         // same reason.

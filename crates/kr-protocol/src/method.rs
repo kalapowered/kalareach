@@ -483,6 +483,18 @@ methods! {
     doc: "Where this host's sign-in to the managed account service stands: signed out, waiting for \
           the browser, signed in at which service, or ended, and how the last attempt ended.";
 
+    BackupRead = "backup.read", HostAndEnvironment,
+    effect: Read, ingress: [LocalIpc], rights: [req(HostManage)], selectors: [Environment],
+    history: NotApplicable, capability: NO_CAPABILITY, freshness: CurrentAuthority,
+    confirmation: None, idempotency: READ,
+    doc: "One read of what the managed storage service holds, for a restore that runs in the \
+          command line: which service this host is configured for and whether it may be asked, \
+          the recovery bundle at a locator, the newest generation published for an archive held \
+          to a checkpoint, or one range of a stored object. The host relays ciphertext and public \
+          records with its own account and sees no seed, plaintext, file name or destination. It \
+          answers none of the last three while privacy mode is on, and it sends nothing while the \
+          service has asked to be left alone, answering what is left of the delay instead.";
+
     HostUpdateHandover = "host.update.handover", HostAndEnvironment,
     effect: Write, ingress: [LocalIpc], rights: [req(HostManage)], selectors: [Host, Environment],
     history: NotApplicable, capability: NO_CAPABILITY, freshness: ActionWindow,
@@ -1982,6 +1994,8 @@ mod tests {
         ("account.sign_in", &[ActionRight::HostManage]),
         ("account.sign_out", &[ActionRight::HostManage]),
         ("account.status", &[ActionRight::HostManage]),
+        // Reading what the managed storage service holds for a restore, with this host's account.
+        ("backup.read", &[ActionRight::HostManage]),
         // Session descriptions: reading what is offered, and the two changes an owner makes.
         ("description.setup", &[ActionRight::HostManage]),
         ("description.configure", &[ActionRight::HostManage]),

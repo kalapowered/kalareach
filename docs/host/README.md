@@ -3505,6 +3505,39 @@ stopped, ends such an attempt. For everything still producing there are five ans
   the same identity and hash is the same object, so sending it again is not a second publication;
   the attempt that went is still owed an answer, and it keeps its place until it gets one.
 
+### Reading a backup for a restore
+
+`backup.read` is used by the `kr backup restore` command to read what the storage service holds. The
+command opens the archive and writes the files. The read operations are performed by the daemon on
+the local machine, which holds the account this host is signed in with. The daemon merely fetches
+data from the service and relays it to the command: it never sees the recovery seed, a plaintext, a
+file name or the directory the command writes to. The only information it does see is the archive
+and object identifiers a read names, the bundle's locator and the checkpoint a generation read is
+held to, but this information is already stored on the service.
+
+`backup.read` only accepts connections from the local socket, and requires host management. Each
+request performs a single read operation; all reads are idempotent so may be issued more than once,
+and a read whose answer was lost is asked again. `service` names the service this host is configured
+to use and says whether the host holds an account token a read may carry, and if not, why. `bundle`
+reads the recovery bundle at the given locator. The response indicates whether the service holds the
+bundle, or holds nothing there. `generation` reads the newest generation published for the given
+archive, held to the checkpoint the caller sends. A service that holds nothing as new answers with
+no publication, which is an answer and not an error. `object` reads a range of bytes from the given
+object on the service, at most 512 KiB.
+
+Reading a bundle is signed as an installation, using an ephemeral key generated in memory by the
+daemon (it is never stored). This is because the settings sync route on the service only accepts
+installation signatures, not signatures made by a host's writer key. However the request also
+carries the host's `backup.write` token beside the signature. Bundles larger than 896 KiB are
+rejected outright, as responses must fit in a single control frame.
+
+Reading any of `bundle`, `generation` or `object` is refused while privacy mode is on. An answer
+read under a privacy state that has changed by the time it would be given is not given. If the
+service indicates that it wants to be left alone, then nothing will be sent to the service and a
+response will be sent indicating the length of the remaining delay period. The daemon keeps this
+delay in the same record as the carrier of the host's own backups, so that a restore and an upload
+do not both press on a service that asked for quiet.
+
 ### What a restore checks, and in what order
 
 The caller's own expectation first: the archive it means to restore. Without it, a genuine

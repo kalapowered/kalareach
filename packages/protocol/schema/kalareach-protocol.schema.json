@@ -4634,6 +4634,85 @@
       ],
       "type": "object"
     },
+    "BackupBundle": {
+      "description": "The recovery bundle at a locator, as the service answered it.\n\nThe two answers are kept apart because they mean different things to a restore: a bundle that is\nheld is ciphertext to authenticate, and one that is not is a locator nobody wrote, written\nwrongly, or read by an account that does not own it.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "The service holds a bundle at the locator.",
+          "properties": {
+            "ciphertext": {
+              "$ref": "#/$defs/Bytes",
+              "description": "The sealed bundle, which only the recovery seed opens."
+            },
+            "recovery": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Uuid"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "The history the place is in: the recovery the answer named, or null for a service never\nput back."
+            },
+            "revision": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Uuid"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "The name the service gave this write, or null where the write was a removal."
+            },
+            "state": {
+              "const": "held",
+              "type": "string"
+            },
+            "write_sequence": {
+              "$ref": "#/$defs/U64",
+              "description": "This write's place in the collection's order. The first is one."
+            }
+          },
+          "required": [
+            "state",
+            "write_sequence",
+            "revision",
+            "recovery",
+            "ciphertext"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The service holds none there.",
+          "properties": {
+            "recovery": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Uuid"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "The history that holds none."
+            },
+            "state": {
+              "const": "absent",
+              "type": "string"
+            }
+          },
+          "required": [
+            "state",
+            "recovery"
+          ],
+          "type": "object"
+        }
+      ]
+    },
     "BackupGeneration": {
       "description": "The backup generation an archive belongs to. Only its producer advances it.",
       "pattern": "^(0|[1-9][0-9]*)$",
@@ -4713,6 +4792,256 @@
         "recovery_recipient"
       ],
       "type": "object"
+    },
+    "BackupReadParams": {
+      "description": "Parameters of `backup.read`: exactly one read.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "Which service this host is configured for, and whether a read may be sent.",
+          "properties": {
+            "read": {
+              "const": "service",
+              "type": "string"
+            }
+          },
+          "required": [
+            "read"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The recovery bundle at a locator.",
+          "properties": {
+            "locator": {
+              "$ref": "#/$defs/Uuid",
+              "description": "The locator the recovery kit prints."
+            },
+            "read": {
+              "const": "bundle",
+              "type": "string"
+            }
+          },
+          "required": [
+            "read",
+            "locator"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The newest generation published for an archive.",
+          "properties": {
+            "archive_id": {
+              "$ref": "#/$defs/ArchiveId",
+              "description": "The archive."
+            },
+            "checkpoint": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/ArchiveCheckpoint"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "The checkpoint the caller holds for it, from the authenticated bundle. A service that\nholds nothing as new answers that rather than an older generation."
+            },
+            "read": {
+              "const": "generation",
+              "type": "string"
+            }
+          },
+          "required": [
+            "read",
+            "archive_id",
+            "checkpoint"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "One range of a stored object.",
+          "properties": {
+            "archive_id": {
+              "$ref": "#/$defs/ArchiveId",
+              "description": "The archive the object belongs to."
+            },
+            "length": {
+              "$ref": "#/$defs/U64",
+              "description": "How long it is, at most [`BACKUP_READ_MAX_RANGE_BYTES`]."
+            },
+            "object_id": {
+              "$ref": "#/$defs/BackupObjectId",
+              "description": "The object."
+            },
+            "offset": {
+              "$ref": "#/$defs/U64",
+              "description": "Where the range starts."
+            },
+            "read": {
+              "const": "object",
+              "type": "string"
+            }
+          },
+          "required": [
+            "read",
+            "archive_id",
+            "object_id",
+            "offset",
+            "length"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "BackupReadResult": {
+      "description": "What `backup.read` answers: the read asked for, or a wait.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "The answer to `service`.",
+          "properties": {
+            "origin": {
+              "description": "The storage origin this host is configured for.",
+              "type": "string"
+            },
+            "read": {
+              "const": "service",
+              "type": "string"
+            },
+            "sign_in": {
+              "$ref": "#/$defs/BackupSignIn",
+              "description": "Whether a read may be sent."
+            }
+          },
+          "required": [
+            "read",
+            "origin",
+            "sign_in"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The answer to `bundle`.",
+          "properties": {
+            "bundle": {
+              "$ref": "#/$defs/BackupBundle",
+              "description": "The bundle, or its absence."
+            },
+            "read": {
+              "const": "bundle",
+              "type": "string"
+            }
+          },
+          "required": [
+            "read",
+            "bundle"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The answer to `generation`.",
+          "properties": {
+            "publication": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/BackupGenerationPublication"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "The newest generation the service holds as new as the checkpoint asked for, or null when\nit holds none. Null is an answer, kept apart from a failure."
+            },
+            "read": {
+              "const": "generation",
+              "type": "string"
+            }
+          },
+          "required": [
+            "read",
+            "publication"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The answer to `object`.",
+          "properties": {
+            "bytes": {
+              "$ref": "#/$defs/Bytes",
+              "description": "The ciphertext of the range asked for, shorter than asked only at the end of the\nobject."
+            },
+            "read": {
+              "const": "object",
+              "type": "string"
+            }
+          },
+          "required": [
+            "read",
+            "bytes"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The service asked to be left alone, and nothing was sent: ask again after this long.\n\nThe delay is what is left of one the service named, and no longer than an hour.",
+          "properties": {
+            "read": {
+              "const": "wait",
+              "type": "string"
+            },
+            "retry_after_seconds": {
+              "$ref": "#/$defs/U64",
+              "description": "Seconds until the service may be asked again."
+            }
+          },
+          "required": [
+            "read",
+            "retry_after_seconds"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "BackupSignIn": {
+      "description": "Why this host holds no account token a read may carry, or that it does.",
+      "oneOf": [
+        {
+          "const": "usable",
+          "description": "A token is usable now.",
+          "type": "string"
+        },
+        {
+          "const": "signed_out",
+          "description": "No account is signed in on this host.",
+          "type": "string"
+        },
+        {
+          "const": "waiting",
+          "description": "A sign-in on this host is waiting for the person's browser.",
+          "type": "string"
+        },
+        {
+          "const": "ended",
+          "description": "The service ended the sign-in on this host.",
+          "type": "string"
+        },
+        {
+          "const": "without_scope",
+          "description": "The account is signed in and its grant lacks the scope backup storage needs.",
+          "type": "string"
+        },
+        {
+          "const": "not_renewed",
+          "description": "The sign-in looks whole and no token could be had from it just now.",
+          "type": "string"
+        }
+      ]
     },
     "BackupWriterRecord": {
       "additionalProperties": false,
@@ -20310,6 +20639,11 @@
           "type": "string"
         },
         {
+          "const": "backup.read",
+          "description": "One read of what the managed storage service holds, for a restore that runs in the command line: which service this host is configured for and whether it may be asked, the recovery bundle at a locator, the newest generation published for an archive held to a checkpoint, or one range of a stored object. The host relays ciphertext and public records with its own account and sees no seed, plaintext, file name or destination. It answers none of the last three while privacy mode is on, and it sends nothing while the service has asked to be left alone, answering what is left of the delay instead.",
+          "type": "string"
+        },
+        {
           "const": "host.update.handover",
           "description": "Make way for another installed release: close this control daemon's gate to new sessions, let the creates it started settle, say how it was started, and stop when told to. No session stops.",
           "type": "string"
@@ -30257,7 +30591,7 @@
     },
     "RecoveryKit": {
       "additionalProperties": false,
-      "description": "The printable and QR recovery kit.\n\nA seed with no way to find the encrypted bundle is not a complete kit, so the kit names the\nconfigured service origins and the stable bundle locator alongside the seed.\n\n`Debug` is derived, and the seed redacts itself, so a kit can be logged without publishing the\nowner's recovery authority.",
+      "description": "The printable and QR recovery kit.\n\nA seed with no way to find the encrypted bundle is not a complete kit, so the kit names the\nconfigured service origins and the stable bundle locator alongside the seed.\n\n`Debug` is written, not derived: it shows the profile and how many origins the kit names, and\nnothing of the seed, its checksum or the locator, so a kit can be logged without publishing the\nowner's recovery authority or the address of the bundle.",
       "properties": {
         "bundle_locator": {
           "description": "The stable opaque locator of the recovery bundle.",
@@ -40360,8 +40694,20 @@
     "authority_revision_record": {
       "$ref": "#/$defs/AuthorityRevisionRecord"
     },
+    "backup_bundle": {
+      "$ref": "#/$defs/BackupBundle"
+    },
     "backup_generation_publication": {
       "$ref": "#/$defs/BackupGenerationPublication"
+    },
+    "backup_read_params": {
+      "$ref": "#/$defs/BackupReadParams"
+    },
+    "backup_read_result": {
+      "$ref": "#/$defs/BackupReadResult"
+    },
+    "backup_sign_in": {
+      "$ref": "#/$defs/BackupSignIn"
     },
     "backup_writer_record": {
       "$ref": "#/$defs/BackupWriterRecord"
