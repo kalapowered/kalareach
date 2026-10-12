@@ -33,6 +33,7 @@
 
 import type { AttachmentHandle } from '@kalareach/protocol'
 
+import { sendOutcomeOf, type InputState } from './receipts'
 import {
   failureCode,
   failureMessage,
@@ -156,6 +157,11 @@ export type SendOutcome =
   /** Nobody knows. */
   | 'unknown'
 
+/** Whether a rejection of a send's claim is the loss of it: another window holds the draft. */
+export function claimWasLost(failure: unknown): boolean {
+  return typeof failure === 'object' && failure !== null && 'claimLost' in failure
+}
+
 /** A prompt on its way. */
 export interface SendToken {
   readonly key: string
@@ -182,6 +188,8 @@ interface Flight {
    * less than what was sent, so it goes once the prompt has ended.
    */
   earlier: StoredRef | null
+  /** How the prompt was said to have ended, once it has been: the end itself is made in the composer's turn. */
+  endedAs?: SendOutcome
 }
 
 /** How a write of a draft ended. */
@@ -348,6 +356,10 @@ export class DraftBook {
   readonly #failed = new Map<string, { readonly code: string; readonly message: string }>()
   readonly #tracks = new Map<string, Track>()
   readonly #flights = new Map<string, Flight>()
+  /** The prompt each submission carries, by the submission's local identity, while it is open or its outcome is unknown. */
+  readonly #byLocal = new Map<string, string>()
+  /** Prompts that ended as of unknown outcome, until the host says what became of them. */
+  readonly #unknowns = new Map<string, Flight>()
   /** Prompts that ended without their text stored anywhere, kept here until the store takes it. */
   #unsettled: Flight[] = []
   /** Prompts whose text the store will never take, for its size: held here for a person to copy. */
@@ -600,7 +612,8 @@ export class DraftBook {
           )
           claim.reject({
             code: 'DRAFT_CONFLICT',
-            message: 'Another window of this application holds this draft, so it was not sent.'
+            message: 'Another window of this application holds this draft, so it was not sent.',
+            claimLost: true
           })
         } else {
           claim.resolve()
@@ -618,10 +631,102 @@ export class DraftBook {
     return { key: token, claimed }
   }
 
-  /** Says how a prompt that was sent from a draft ended. */
-  endSend(token: SendToken, outcome: SendOutcome): void {
+  /**
+   * Keeps a prompt open that the host has accepted and not yet applied or refused, under the local
+   * identity of the submission that carries it. It ends when [`sendSettled`] is told how; a view
+   * going away does not end it, because nothing the view knows could.
+   */
+  holdSend(token: Pick<SendToken, 'key'>, localId: string): void {
+    this.#byLocal.set(localId, token.key)
+  }
+
+  /**
+   * Says what a submission came to, for the prompt it carries.
+   *
+   * A prompt still open ends as the state says. A prompt that ended as of unknown outcome and is
+   * then said to have been applied loses its stored draft after all, and the composer that shows
+   * exactly its text is cleared; one that is said to be refused is as it was, kept.
+   */
+  sendSettled(localId: string, state: InputState): void {
+    const outcome = sendOutcomeOf(state)
+    const key = this.#byLocal.get(localId)
+    if (outcome === null || key === undefined) return
+    const flight = this.#flights.get(key)
+    if (flight !== undefined && flight.endedAs === undefined) {
+      this.endSend({ key }, outcome, localId)
+      return
+    }
+    // It has ended, or is ending, as of unknown outcome: what the host now says is dealt with in
+    // the composer's turn, after the end.
+    if (outcome === 'unknown') return
+    const ended = flight ?? this.#unknowns.get(key)
+    if (ended === undefined) return
+    this.#byLocal.delete(localId)
+    this.#enqueue(ended.composer, async () => {
+      this.#unknowns.delete(key)
+      if (outcome === 'taken') await this.#takenLate(ended)
+    })
+  }
+
+  /**
+   * What a prompt that is said to have been applied, after nobody knew, leaves behind: nothing. It
+   * runs in the composer's own turn, so it does not wait on a turn of its own.
+   */
+  async #takenLate(flight: Flight): Promise<void> {
+    const id = flight.record?.id
+    if (id === undefined) return
+    const composer = this.#find(flight.composer)
+    try {
+      if (composer?.stored?.id === id) {
+        // The composer shows the text under that record: both go, unless the person has changed it.
+        if (!holdsWhatWasSent(composer, flight.sent)) return
+        await this.#port.deviceDraftDiscard({
+          id,
+          expectedRevision: composer.stored.revision
+        })
+        this.#moves += 1
+        this.#emptied(composer)
+        await this.reload()
+        return
+      }
+      const listed = this.#others.find((other) => other.id === id)
+      if (listed !== undefined) {
+        await this.#port.deviceDraftDiscard({ id, expectedRevision: listed.revision })
+        this.#moves += 1
+        await this.reload()
+      }
+    } catch (failure) {
+      // Another window changed it: it is theirs now. A store that refuses leaves the removal owed.
+      if (failureCode(failure) !== 'DRAFT_CONFLICT') {
+        const owed = flight.record
+        if (owed !== null) this.#owe(owed, flight.id)
+      }
+    }
+  }
+
+  /** A composer whose draft was removed from the store is empty, as if it had never been written in. */
+  #emptied(composer: Draft): void {
+    const now = this.#find(composer.draftId)
+    this.#retire(now ?? composer)
+    this.#mutate(composer.draftId, (draft) => ({
+      ...draft,
+      revision: draft.revision + 1,
+      text: '',
+      attachments: [],
+      stored: null,
+      state: 'bound',
+      target: { sessionId: draft.target.sessionId, applicationInstanceId: null, agentBindingRevision: null }
+    }))
+    this.#track(composer.draftId).savedKey = contentKey(this.#find(composer.draftId) ?? composer)
+  }
+
+  /** Says how a prompt that was sent from a draft ended; `localId` names its submission, when it has one. */
+  endSend(token: Pick<SendToken, 'key'>, outcome: SendOutcome, localId?: string): void {
     const flight = this.#flights.get(token.key)
     if (flight === undefined) return
+    flight.endedAs = outcome
+    if (localId !== undefined && outcome === 'unknown') this.#byLocal.set(localId, flight.id)
+    else if (localId !== undefined) this.#byLocal.delete(localId)
     this.#enqueue(flight.composer, async () => {
       try {
         if (outcome === 'taken') {
@@ -637,6 +742,9 @@ export class DraftBook {
         } else {
           this.#unsettled.push(flight)
         }
+        // Nobody knows what became of it, and the host may still say: the prompt is remembered
+        // for as long as the window is.
+        if (outcome === 'unknown' && localId !== undefined) this.#unknowns.set(flight.id, flight)
       } finally {
         this.#flights.delete(flight.id)
       }
@@ -1011,17 +1119,7 @@ export class DraftBook {
           this.#say('The composer keeps what you wrote while this was being done.')
           this.#letGo(composer.draftId)
         } else {
-          this.#retire(now ?? composer)
-          this.#mutate(composer.draftId, (draft) => ({
-            ...draft,
-            revision: draft.revision + 1,
-            text: '',
-            attachments: [],
-            stored: null,
-            state: 'bound',
-            target: { sessionId: draft.target.sessionId, applicationInstanceId: null, agentBindingRevision: null }
-          }))
-          this.#track(composer.draftId).savedKey = contentKey(this.#find(composer.draftId) ?? composer)
+          this.#emptied(composer)
         }
       }
       await this.reload()
@@ -1384,9 +1482,12 @@ export class DraftBook {
       state: stricter(current.state, saved.draft.state)
     }))
     if (saved.outcome === 'copied') {
-      this.#say(
-        'Another window of this application changed that draft. What you wrote here is kept as a separate draft.'
-      )
+      // A claim that is lost says so once, in its own words.
+      if (!claim) {
+        this.#say(
+          'Another window of this application changed that draft. What you wrote here is kept as a separate draft.'
+        )
+      }
       this.#hold(this.reload())
     }
     // A draft another window removed is made again under an identity of its own, which for a claim

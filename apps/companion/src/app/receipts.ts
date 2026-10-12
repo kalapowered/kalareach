@@ -11,7 +11,7 @@ import { useEffect, useRef } from 'react'
 
 import type { Receipt } from '@kalareach/protocol'
 
-import { stateOfReceipt, type Submission } from '../model/receipts'
+import { applyReceipt, type Submission } from '../model/receipts'
 import { readOnCadence } from './cadence'
 import { useApp } from './state'
 
@@ -58,7 +58,9 @@ export function useReceiptReads({
         if (each.actionId === null) continue
         try {
           const record = await port.actionRead({ action_id: each.actionId, session_id: sessionId })
-          if (stateOfReceipt(record.receipt) !== each.state) settle.current(each.localId, record.receipt)
+          // Only a record that says more than the submission does is taken, so that a read of the
+          // same answer again changes nothing.
+          if (applyReceipt(each, record.receipt) !== each) settle.current(each.localId, record.receipt)
         } catch {
           // The host is not asked twice as fast for failing: the next read is a cadence away.
         }

@@ -15,6 +15,7 @@ import type { AgentMutationResult, Receipt } from '@kalareach/protocol'
 
 import { App } from '../src/App'
 import { AppProvider } from '../src/app/state'
+import { applyReceipt, type Submission } from '../src/model/receipts'
 import { fakeHost } from '../src/host/fake'
 import { FakeDraftStore } from '../src/host/fake-drafts'
 import type { HostPort, Settled } from '../src/host/port'
@@ -158,6 +159,120 @@ describe('on the desktop', () => {
     )
     expect(screen.getByTestId('composer-send')).toBeDisabled()
     expect(screen.getByTestId('composer-reason')).toHaveTextContent(/no confirmed outcome yet/)
+  })
+
+  it('keeps holding an action the host still records as accepted, until the record says applied', async () => {
+    // The answer carried only the action's identity, and the host has it as dispatching: a record
+    // that is not final does not lift the hold on sending the text again.
+    const recorded = { state: 'dispatching' as Receipt['state'] }
+    const reads: string[] = []
+    await sentOnce(UNCONFIRMED, recorded, reads)
+    await waitFor(
+      () => {
+        expect(reads.length).toBeGreaterThan(0)
+      },
+      { timeout: 3_000 }
+    )
+    expect(screen.getByTestId('composer-send')).toBeDisabled()
+    expect(screen.getByTestId('composer-reason')).toHaveTextContent(/no confirmed outcome yet/)
+  })
+
+  it('removes a prompt’s stored draft and its text when the host says it was applied after nobody knew', async () => {
+    const recorded = { state: 'applied' as Receipt['state'] }
+    const { device } = await sentOnce(UNCONFIRMED, recorded)
+    await waitFor(
+      () => {
+        expect(device.all()).toEqual([])
+      },
+      { timeout: 3_000 }
+    )
+    expect(screen.getByTestId('composer-input')).toHaveValue('')
+  })
+
+  it('keeps holding an action with no confirmed outcome when the tab is closed and the session opened again', async () => {
+    // The host's own record is unknown too, so nothing settles it.
+    const recorded = { state: 'unknown' as Receipt['state'] }
+    const device = new FakeDraftStore()
+    const host = fakeHost({ drafts: device })
+    render(
+      <AppProvider
+        port={answering(host.port, UNCONFIRMED, recorded)}
+        initialPlace={{ view: 'session', sessionId: SESSION_MAIN, pane: 'semantic' }}
+      >
+        <App />
+      </AppProvider>
+    )
+    const person = userEvent.setup()
+    await person.type(await screen.findByTestId('composer-input'), 'run the migration')
+    await waitFor(() => {
+      expect(screen.getByTestId('composer-send')).toBeEnabled()
+    })
+    await person.click(screen.getByTestId('composer-send'))
+    await waitFor(() => {
+      expect(screen.getByTestId('composer-reason')).toHaveTextContent(/no confirmed outcome yet/)
+    })
+
+    // A second session's tab is open, so the first can be closed; closing it and coming back is a
+    // new view of the session, and the hold stays.
+    await person.click(screen.getByRole('button', { name: 'Sessions' }))
+    await person.click(await screen.findByTestId('session-row-1'))
+    await person.click(screen.getByRole('button', { name: 'Sessions' }))
+    await person.click(await screen.findByTestId('session-row-2'))
+    await person.click(await screen.findByRole('button', { name: 'Close the tab for session 01' }))
+    await person.click(screen.getByRole('button', { name: 'Sessions' }))
+    await person.click(await screen.findByTestId('session-row-1'))
+    await waitFor(() => {
+      expect(screen.getByTestId('composer-input')).toHaveValue('run the migration')
+    })
+    expect(screen.getByTestId('composer-send')).toBeDisabled()
+    expect(screen.getByTestId('composer-reason')).toHaveTextContent(/no confirmed outcome yet/)
+  })
+
+  it('ends a prompt the host accepted, though the view that sent it was left before the answer', async () => {
+    const device = new FakeDraftStore()
+    const host = fakeHost({ drafts: device })
+    let answer: (value: Settled<AgentMutationResult>) => void = () => undefined
+    const late = new Promise<Settled<AgentMutationResult>>((resolve) => {
+      answer = resolve
+    })
+    const recorded = { state: 'dispatching' as Receipt['state'] }
+    render(
+      <AppProvider
+        port={{
+          ...answering(host.port, WITH_THE_HOST, recorded),
+          composerSubmit: () => late
+        }}
+        initialPlace={{ view: 'session', sessionId: SESSION_MAIN, pane: 'semantic' }}
+      >
+        <App />
+      </AppProvider>
+    )
+    const person = userEvent.setup()
+    await person.type(await screen.findByTestId('composer-input'), 'run the migration')
+    await waitFor(() => {
+      expect(screen.getByTestId('composer-send')).toBeEnabled()
+    })
+    await person.click(screen.getByTestId('composer-send'))
+    // The Terminal pane takes the view away before the host answers.
+    await person.click(screen.getByRole('tab', { name: 'Terminal' }))
+    await waitFor(() => {
+      expect(screen.queryByTestId('composer-input')).toBeNull()
+    })
+    await act(async () => {
+      answer(WITH_THE_HOST)
+      await Promise.resolve()
+    })
+
+    // The host applies it, and the person comes back: the record is read, and the prompt ends.
+    recorded.state = 'applied'
+    await person.click(screen.getByRole('tab', { name: 'Conversation' }))
+    await waitFor(
+      () => {
+        expect(device.all()).toEqual([])
+      },
+      { timeout: 3_000 }
+    )
+    expect(await screen.findByTestId('composer-input')).toHaveValue('')
   })
 
   it('does not call a prompt taken while the host has only accepted it', async () => {
@@ -310,15 +425,52 @@ describe('two windows of the desktop application that hold one draft', () => {
       expect(device.all()).toEqual([])
     })
 
-    // The second window still shows the draft, and its Send is refused: nothing reaches its host.
+    // The second window still shows the draft, and its Send is refused: nothing reaches its host,
+    // no entry says the host refused anything, and the text stays.
     await person.click(second.within.getByTestId('composer-send'))
     await waitFor(() => {
       expect(second.within.getByTestId('composer-input')).toHaveValue('run the migration')
     })
     await waitFor(() => {
-      expect(second.within.getByText('Refused by the host')).toBeInTheDocument()
+      expect(second.within.queryByTestId('pending-actions')).toBeNull()
     })
     expect(second.controls.submissions).toBe(0)
     expect(first.controls.submissions).toBe(1)
+  })
+})
+
+describe('what a receipt that arrives later does to a submission', () => {
+  const sent = (state: 'sent' | 'unknown' | 'applied', revision: string): Submission => ({
+    localId: 'local-1',
+    actionId: ACTION,
+    label: 'run it',
+    text: 'run it',
+    state,
+    createdAtMs: 0,
+    error: null,
+    revision
+  })
+  const record = (state: Receipt['state'], revision: string): Receipt => ({
+    ...receiptAt(state),
+    revision
+  })
+
+  it('never goes back from a final state', () => {
+    const done = sent('applied', '4')
+    expect(applyReceipt(done, record('unknown', '5'))).toBe(done)
+    expect(applyReceipt(done, record('refused', '5'))).toBe(done)
+  })
+
+  it('never takes a receipt older than the one it has, whichever read or event arrives last', () => {
+    const newer = sent('sent', '3')
+    expect(applyReceipt(newer, record('accepted', '2'))).toBe(newer)
+    expect(applyReceipt(newer, record('applied', '4')).state).toBe('applied')
+  })
+
+  it('stays unknown until the host says applied or refused', () => {
+    const nobody = sent('unknown', '1')
+    expect(applyReceipt(nobody, record('dispatching', '2'))).toBe(nobody)
+    expect(applyReceipt(nobody, record('applied', '3')).state).toBe('applied')
+    expect(applyReceipt(nobody, record('refused', '3')).state).toBe('refused')
   })
 })

@@ -136,9 +136,21 @@ export class SessionStates {
     for (const listener of this.#listeners) listener()
   }
 
-  /** Forgets a session, for a tab the person closed. */
+  /**
+   * Forgets a session, for a tab the person closed.
+   *
+   * What the host has not finished with is not forgotten: a prompt it has accepted or whose
+   * outcome nobody knows is still held, so that closing the tab and opening the session again does
+   * not lift the hold on sending it twice, and its record is still read.
+   */
   forget(sessionId: string): void {
-    if (!this.#states.delete(sessionId)) return
+    const held = this.#states.get(sessionId)
+    if (held === undefined) return
+    const owed = held.submissions.filter(
+      (submission) => submission.state === 'sent' || submission.state === 'unknown'
+    )
+    if (owed.length === 0) this.#states.delete(sessionId)
+    else this.#states.set(sessionId, { ...emptySessionState(), submissions: owed })
     for (const listener of this.#listeners) listener()
   }
 

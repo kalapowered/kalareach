@@ -32,6 +32,8 @@ export interface Submission {
   readonly text: string
   /** Its current state. */
   readonly state: InputState
+  /** The revision of the newest receipt this has taken, so that an older one never replaces it. */
+  readonly revision?: string
   /** When it was created. */
   readonly createdAtMs: number
   /** The failure, when it has one. */
@@ -111,7 +113,8 @@ export function settled(submission: Submission, receipt: Receipt): Submission {
     state: stateOfReceipt(receipt),
     error: receipt.error
       ? { code: String(receipt.error.code), message: String(receipt.error.message) }
-      : null
+      : null,
+    revision: receipt.revision
   }
 }
 
@@ -150,6 +153,38 @@ export function unconfirmedReason(submissions: readonly Submission[]): string | 
 /** The sentence for `count` actions that have no confirmed outcome. */
 export function unconfirmedWords(count: number): string {
   return `${count === 1 ? 'One action has' : `${String(count)} actions have`} no confirmed outcome yet. Sending again could run it twice.`
+}
+
+/** Whether the host will not change what it said of an action: applied, refused or rejected. */
+function isFinal(state: InputState): boolean {
+  return state === 'applied' || state === 'refused' || state === 'rejected'
+}
+
+/** Whether `revision` is a receipt revision older than `held`; a revision that is not one is never older. */
+function isOlder(revision: string | undefined, held: string | undefined): boolean {
+  if (revision === undefined || held === undefined) return false
+  try {
+    return BigInt(revision) < BigInt(held)
+  } catch {
+    return false
+  }
+}
+
+/**
+ * What a receipt that arrives later does to a submission: by an event, or because the host's record
+ * of the action was read.
+ *
+ * It never goes back. A final state is terminal; a receipt older than the one already taken says
+ * less than it, and an answer read before an event may arrive after it; and an outcome nobody knows
+ * stays unknown until the host says it was applied or refused, so that a record that still reads
+ * `accepted` does not lift the hold on sending it again.
+ */
+export function applyReceipt(submission: Submission, receipt: Receipt): Submission {
+  if (isFinal(submission.state)) return submission
+  if (isOlder(receipt.revision, submission.revision)) return submission
+  const next = settled(submission, receipt)
+  if (submission.state === 'unknown' && !isFinal(next.state)) return submission
+  return next
 }
 
 /** Records a failure the request itself produced. */

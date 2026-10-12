@@ -77,6 +77,7 @@ import {
   type Control,
   type ControlState
 } from '../model/controls'
+import { claimWasLost } from '../model/draft-book'
 import { entryLabel } from '../model/entry-label'
 import {
   adoptFirstTarget,
@@ -94,6 +95,7 @@ import { eventIsFor } from '../model/sessions'
 import {
   answered,
   answeredState,
+  applyReceipt,
   describeState,
   failed,
   outcomeMessage,
@@ -106,7 +108,6 @@ import {
   wasRefused,
   type Submission
 } from '../model/receipts'
-import { OpenSends } from '../model/sends'
 import type { LaunchSurface } from '../model/pending'
 import { useBook, useSessionDraft } from '../app/drafts'
 import { useReceiptReads } from '../app/receipts'
@@ -164,15 +165,6 @@ export function Conversation({
   const { problem: draftsProblem, status: draftsStatus } = useBook()
   const { unread, refresh } = useSessionAgent(sessionId)
   const [insertion, setInsertion] = useState<string | null>(null)
-  // The prompts the host has accepted and not yet applied or refused: each ends when a receipt says
-  // how, and one still open when this view goes ends as of unknown outcome.
-  const sends = useMemo(() => new OpenSends(), [])
-  useEffect(
-    () => () => {
-      sends.endAll()
-    },
-    [sends]
-  )
   // Why the host's event stream could not be followed, under the visit it was opened in: a failure
   // from an earlier visit to this session is not shown on a return to it.
   const visit = useMemo(() => ({ sessionId }), [sessionId])
@@ -246,15 +238,15 @@ export function Conversation({
               ...current,
               submissions: current.submissions.map((submission) => {
                 if (submission.actionId !== receipt.action_id) return submission
-                const next = settled(submission, receipt)
-                reached.push(next)
+                const next = applyReceipt(submission, receipt)
+                if (next !== submission) reached.push(next)
                 return next
               })
             }))
             for (const next of reached) {
               // A refusal that arrives later is the same refusal: the text comes back then too.
               if (wasRefused(next.state)) returnRefusedText(next.localId)
-              sends.settled(next.localId, next.state)
+              book.sendSettled(next.localId, next.state)
             }
           }
         })
@@ -268,7 +260,7 @@ export function Conversation({
       watching.stop()
       batcher.discard()
     }
-  }, [port, sessionId, visit, batcher, update, returnRefusedText, sends])
+  }, [port, sessionId, visit, batcher, update, returnRefusedText, book])
 
   // An action the host never confirmed is asked about, so it ends even when no event says how.
   const settleFromRecord = useCallback(
@@ -278,17 +270,17 @@ export function Conversation({
         ...current,
         submissions: current.submissions.map((submission) => {
           if (submission.localId !== localId) return submission
-          const next = settled(submission, receipt)
-          reached.push(next)
+          const next = applyReceipt(submission, receipt)
+          if (next !== submission) reached.push(next)
           return next
         })
       }))
       for (const next of reached) {
         if (wasRefused(next.state)) returnRefusedText(next.localId)
-        sends.settled(next.localId, next.state)
+        book.sendSettled(next.localId, next.state)
       }
     },
-    [update, returnRefusedText, sends]
+    [update, returnRefusedText, book]
   )
   useReceiptReads({
     sessionId,
@@ -395,7 +387,7 @@ export function Conversation({
       const end = (outcome: 'taken' | 'refused' | 'unknown') => {
         if (sending === null || ended.done) return
         ended.done = true
-        book.endSend(sending, outcome)
+        book.endSend(sending, outcome, local.localId)
       }
 
       // Local feedback first: the entry appears as queued and the composer clears. The completion
@@ -443,9 +435,21 @@ export function Conversation({
           // A prompt the host has only accepted is not yet taken: it ends when a receipt says how.
           const final = sendOutcomeOf(outcome)
           if (final !== null) end(final)
-          else if (sending !== null) sends.hold(local.localId, end)
+          else if (sending !== null) book.holdSend(sending, local.localId)
         })
         .catch((error: unknown) => {
+          if (claimWasLost(error)) {
+            // Nothing left this device: another window holds the draft, the book has said so, and
+            // the text is kept. The entry for a send that never happened goes.
+            update((current) => ({
+              ...current,
+              submissions: current.submissions.filter(
+                (submission) => submission.localId !== local.localId
+              )
+            }))
+            end('refused')
+            return
+          }
           const code = failureCode(error) ?? 'UNKNOWN'
           update((current) => ({
             ...current,
@@ -473,7 +477,6 @@ export function Conversation({
       say,
       returnRefusedText,
       refresh,
-      sends,
       unconfirmed
     ]
   )

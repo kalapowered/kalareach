@@ -32,7 +32,7 @@ import { AttachmentPaths } from '../../components/AttachmentPaths'
 import { AttachmentThumb } from '../../components/AttachmentThumb'
 import { attachOffer, composerOffers, subjectOf, withheldTotal } from '../../model/agent'
 import type { ConversationItem } from '../../model/conversation'
-import { keptEntry } from '../../model/draft-book'
+import { claimWasLost, keptEntry } from '../../model/draft-book'
 import { entryLabel, nodeKindLabel } from '../../model/entry-label'
 import { Badge, Banner, Button, Segmented } from '../../components/ui'
 import { failureCode, failureMessage, type SessionSubject } from '../../host/port'
@@ -52,15 +52,13 @@ import {
   describeState,
   queued,
   reconnectBanner,
+  applyReceipt,
   sendOutcomeOf,
-  settled,
-  stateOfReceipt,
   unconfirmedWords,
   unresolved,
   wasRefused,
   failed
 } from '../../model/receipts'
-import { OpenSends } from '../../model/sends'
 import { useReceiptReads } from '../../app/receipts'
 import { renderMarkdown } from '../../markdown/render'
 import type { TerminalGrid, TerminalRoom, TerminalScreen, TerminalWheel } from '../../host/port'
@@ -166,15 +164,6 @@ export function MobileSession({
   readonly connected: boolean | null
 }): ReactNode {
   const { port, say, drafts: book, paths } = useApp()
-  // The prompts the host has accepted and not yet applied or refused: each ends when a receipt says
-  // how, and one still open when this screen goes ends as of unknown outcome.
-  const sends = useMemo(() => new OpenSends(), [])
-  useEffect(
-    () => () => {
-      sends.endAll()
-    },
-    [sends]
-  )
   const shown = useBook()
   const { drafts: composers, status: draftsStatus, problem: draftsProblem } = shown
   const keptEntryLine = keptEntry(shown)
@@ -616,7 +605,7 @@ export function MobileSession({
       const end = (outcome: 'taken' | 'refused' | 'unknown') => {
         if (ended.done) return
         ended.done = true
-        book.endSend(sending, outcome)
+        book.endSend(sending, outcome, submission.localId)
       }
       // Local feedback first, and it says queued rather than sent, because it has not left yet.
       lifecycle.setSubmissions((current) => [...current, submission])
@@ -665,9 +654,18 @@ export function MobileSession({
           // A prompt the host has only accepted is not yet taken: it ends when a receipt says how.
           const final = sendOutcomeOf(state)
           if (final !== null) end(final)
-          else sends.hold(submission.localId, end)
+          else book.holdSend(sending, submission.localId)
         })
         .catch((failure: unknown) => {
+          if (claimWasLost(failure)) {
+            // Nothing left this device: another window holds the draft, the book has said so, and
+            // the text is kept. The entry for a send that never happened goes.
+            lifecycle.setSubmissions((current) =>
+              current.filter((each) => each.localId !== submission.localId)
+            )
+            end('refused')
+            return
+          }
           lifecycle.setSubmissions((current) =>
             current.map((each) =>
               each.localId === submission.localId
@@ -687,7 +685,7 @@ export function MobileSession({
           setBusy(false)
         })
     },
-    [draft, lifecycle, book, port, say, sessionId, sends]
+    [draft, lifecycle, book, port, say, sessionId]
   )
 
   // Focus that a terminal key, the program's keyboard or the mode button held when control or the
@@ -713,14 +711,22 @@ export function MobileSession({
   )
   // An action the host never confirmed is asked about, so it ends even though nothing here hears
   // the host's events.
+  const submissionsNow = useRef(mine)
+  useEffect(() => {
+    submissionsNow.current = mine
+  })
   const settleFromRecord = useCallback(
-    (localId: string, receipt: Parameters<typeof settled>[1]) => {
+    (localId: string, receipt: Parameters<typeof applyReceipt>[1]) => {
+      const before = submissionsNow.current.find((each) => each.localId === localId)
+      if (before === undefined) return
+      const after = applyReceipt(before, receipt)
+      if (after === before) return
       lifecycle.setSubmissions((current) =>
-        current.map((each) => (each.localId === localId ? settled(each, receipt) : each))
+        current.map((each) => (each.localId === localId ? applyReceipt(each, receipt) : each))
       )
-      sends.settled(localId, stateOfReceipt(receipt))
+      book.sendSettled(localId, after.state)
     },
-    [lifecycle, sends]
+    [lifecycle, book]
   )
   useReceiptReads({ sessionId, connected, submissions: mine, onReceipt: settleFromRecord })
   const banner = reconnectBanner(connected, mine)
