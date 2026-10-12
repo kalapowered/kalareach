@@ -892,3 +892,110 @@ fn removals_recorded_at_once_are_all_owed() {
         );
     }
 }
+
+/// KR-REQ-13.13, 24.13: windows that save against one version at the same moment lose nothing. The
+/// store is read and then written by each save, and another window can write between the two, so
+/// of N windows saving at the version they all hold exactly one writes it and the others are each
+/// kept beside it, and a window that removes the version at the same moment takes nothing of what
+/// the others wrote: every window's text is in the store at the end.
+#[test]
+fn windows_that_save_against_one_version_at_once_lose_no_text() {
+    use std::sync::{Arc, Barrier};
+
+    const WINDOWS: usize = 6;
+    const ROUNDS: usize = 12;
+
+    for round in 0..ROUNDS {
+        let data = tempfile::tempdir().expect("a data directory");
+        let made = {
+            let state = companion_tauri::AppState::new();
+            state.keep_under(data.path());
+            let params =
+                serde_json::from_value(save(None, None, SESSION, None, "the version they hold"))
+                    .expect("a save");
+            serde_json::to_value(
+                state
+                    .drafts()
+                    .save(params, kr_protocol::scalars::TimestampMs::new(1))
+                    .expect("the draft is made"),
+            )
+            .expect("an answer")
+        };
+        let id = made["draft"]["id"]
+            .as_str()
+            .expect("an identity")
+            .to_owned();
+        let revision = made["draft"]["revision"]
+            .as_str()
+            .expect("a version")
+            .to_owned();
+        // Every window, and the one that removes the version, start together.
+        let start = Arc::new(Barrier::new(WINDOWS + 1));
+        let saves: Vec<_> = (0..WINDOWS)
+            .map(|window| {
+                let (path, id, revision, start) = (
+                    data.path().to_owned(),
+                    id.clone(),
+                    revision.clone(),
+                    Arc::clone(&start),
+                );
+                std::thread::spawn(move || {
+                    let state = companion_tauri::AppState::new();
+                    state.keep_under(&path);
+                    let params = serde_json::from_value(save(
+                        Some(&id),
+                        Some(&revision),
+                        SESSION,
+                        None,
+                        &format!("window {window}, round {round}"),
+                    ))
+                    .expect("a save");
+                    start.wait();
+                    state
+                        .drafts()
+                        .save(params, kr_protocol::scalars::TimestampMs::new(2))
+                        .expect("a save never loses what it was given");
+                })
+            })
+            .collect();
+        let removing = {
+            let (path, id, revision, start) = (
+                data.path().to_owned(),
+                id.clone(),
+                revision.clone(),
+                Arc::clone(&start),
+            );
+            std::thread::spawn(move || {
+                let state = companion_tauri::AppState::new();
+                state.keep_under(&path);
+                let params =
+                    serde_json::from_value(json!({ "id": id, "expectedRevision": revision }))
+                        .expect("a discard");
+                start.wait();
+                // It removes the version, or finds that a window wrote over it first.
+                let _ = state.drafts().discard(&params);
+            })
+        };
+        for window in saves {
+            window.join().expect("a window finished");
+        }
+        removing.join().expect("the removal finished");
+
+        let state = companion_tauri::AppState::new();
+        state.keep_under(data.path());
+        let read = serde_json::to_value(state.drafts().read().expect("the drafts are read"))
+            .expect("an answer");
+        let kept: Vec<&str> = drafts_of(&read)
+            .iter()
+            .map(|draft| draft["text"].as_str().expect("text"))
+            .collect();
+        for window in 0..WINDOWS {
+            let text = format!("window {window}, round {round}");
+            assert_eq!(
+                kept.iter().filter(|each| **each == text).count(),
+                1,
+                "{text} is in the store once, among {kept:?}"
+            );
+        }
+    }
+}
