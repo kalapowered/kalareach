@@ -40,13 +40,15 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use kr_protocol::confirmation::TransferControlPlan;
+use kr_protocol::confirmation::{
+    ConfirmationSubject, OwnerConfirmationRequestParams, TransferControlPlan,
+};
 use kr_protocol::envelope::MutationRequest;
 use kr_protocol::error::RetryCategory;
-use kr_protocol::ids::{ActionId, GrantId};
+use kr_protocol::ids::{ActionId, DeviceId, GrantId, SessionId};
 use kr_protocol::method::Method;
 use kr_protocol::scalars::{Nullable, TimestampMs};
-use kr_protocol::sharing::{GrantState, GrantTransferParams};
+use kr_protocol::sharing::{GrantCreateParams, GrantState, GrantTransferParams};
 use serde::{Deserialize, Serialize};
 
 use crate::error::ClientError;
@@ -216,6 +218,27 @@ pub enum Found {
     Offered,
     /// Neither the invitation an attempt redeems nor its share is listed.
     Neither,
+}
+
+/// What an attempt that is not over keeps a second one from doing.
+///
+/// A second invitation to the same device for the same session, or a second hand-over of the same
+/// session, while the first can still commit, would leave the person unable to tell which one a
+/// later read finds. The request holds both, so nothing else is kept to say it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Gate {
+    /// An invitation of one session to one device.
+    Invite {
+        /// The device the invitation names.
+        recipient: DeviceId,
+        /// The session it shares.
+        session: SessionId,
+    },
+    /// A hand-over of one session's control.
+    Transfer {
+        /// The session whose control moves.
+        session: SessionId,
+    },
 }
 
 /// One attempt, as a client keeps it.
@@ -478,6 +501,45 @@ impl Attempt {
     #[must_use]
     pub const fn gates_a_second(&self) -> bool {
         !self.is_closed()
+    }
+
+    /// The gate this attempt holds while it is not over, or none for a kind that holds none or a
+    /// request that does not decode.
+    ///
+    /// A hand-over holds its gate from the moment its confirmation is asked for: the request kept
+    /// is the confirmation's until the transfer itself is composed.
+    #[must_use]
+    pub fn gate(&self) -> Option<Gate> {
+        if !self.gates_a_second() {
+            return None;
+        }
+        let method = &self.request.method;
+        let params = &self.request.params;
+        match self.kind {
+            Kind::Invite if *method == Method::GrantCreate.into() => {
+                let invitation: GrantCreateParams = params.to_typed().ok()?;
+                Some(Gate::Invite {
+                    recipient: invitation.recipient_device_id,
+                    session: invitation.session_id,
+                })
+            }
+            Kind::Transfer if *method == Method::GrantTransfer.into() => {
+                let transfer: GrantTransferParams = params.to_typed().ok()?;
+                Some(Gate::Transfer {
+                    session: transfer.session_id,
+                })
+            }
+            Kind::Transfer if *method == Method::OwnerConfirmationRequest.into() => {
+                let asked: OwnerConfirmationRequestParams = params.to_typed().ok()?;
+                match asked.subject {
+                    ConfirmationSubject::TransferControl(subject) => Some(Gate::Transfer {
+                        session: subject.params.session_id,
+                    }),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
     }
 
     /// What a client does after the request was sent for the first time and this came back.
@@ -757,6 +819,34 @@ impl AttemptStore {
     pub fn keep(&self, attempt: &Attempt) -> std::result::Result<(), AttemptError> {
         let _lock = self.locked()?;
         self.write(attempt)
+    }
+
+    /// Keeps a new attempt unless another that is not over holds the same gate, in which case it
+    /// returns that one and keeps nothing.
+    ///
+    /// The check and the write happen under the lock every window holds, so two windows cannot
+    /// each find the gate free. A file this build does not read holds no gate it can see.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::keep`], and [`AttemptError::Store`] when the directory cannot be read.
+    pub fn keep_unless_gated(
+        &self,
+        attempt: &Attempt,
+    ) -> std::result::Result<Option<Box<Attempt>>, AttemptError> {
+        let _lock = self.locked()?;
+        if let Some(gate) = attempt.gate() {
+            for kept in self.attempts()? {
+                if let Kept::Known(other) = kept
+                    && other.action_id != attempt.action_id
+                    && other.gate() == Some(gate)
+                {
+                    return Ok(Some(other));
+                }
+            }
+        }
+        self.write(attempt)?;
+        Ok(None)
     }
 
     fn locked(&self) -> std::result::Result<std::fs::File, AttemptError> {
@@ -1798,6 +1888,156 @@ mod tests {
         a1a1a1a1a1a1a1a1a1a169666f6c6c6f775f7570f46e636f6d706f7365645f61745f6d731907d07377696e646f77\
         5f6973737565645f61745f6d731903e87377696e646f775f76616c69645f666f725f6d731a000493e0\
     ";
+
+    fn invite_request(action: u8, device: u8, session: u8) -> MutationRequest {
+        use kr_protocol::ids::{DeviceId, SessionId};
+        use kr_protocol::scalars::CanonicalSet;
+        use kr_protocol::sharing::{GrantCreateParams, RoleSelection, SessionRole};
+
+        let params = GrantCreateParams {
+            session_id: SessionId::new(Uuid::from_bytes([session; 16])),
+            recipient_device_id: DeviceId::new(Uuid::from_bytes([device; 16])),
+            parent_grant_id: Nullable::null(),
+            selection: RoleSelection {
+                role: SessionRole::Viewer,
+                history_from_cursor_ms: Nullable::null(),
+                include_live_screen: false,
+                include_question_respond: false,
+                named_questions: CanonicalSet::new(),
+                named_approvals: CanonicalSet::new(),
+            },
+            lifetime_ms: Nullable::null(),
+            accepted_notices: CanonicalSet::new(),
+            owner_confirmation: Nullable::null(),
+        };
+        MutationRequest {
+            method: Method::GrantCreate.into(),
+            method_version: Method::GrantCreate.entry().version,
+            action_id: ActionId::new(Uuid::from_bytes([action; 16])),
+            params: ParamsValue::from_typed(&params).expect("encodes"),
+            ..request()
+        }
+    }
+
+    fn transfer_request(action: u8, session: u8, asking: bool) -> MutationRequest {
+        use kr_protocol::confirmation::TransferControlSubject;
+        use kr_protocol::ids::{DeviceId, SessionId};
+
+        let params = GrantTransferParams {
+            session_id: SessionId::new(Uuid::from_bytes([session; 16])),
+            from_grant_id: GrantId::new(Uuid::from_bytes([0x61; 16])),
+            to_device_id: DeviceId::new(Uuid::from_bytes([0x62; 16])),
+        };
+        let (method, params) = if asking {
+            (
+                Method::OwnerConfirmationRequest,
+                ParamsValue::from_typed(&OwnerConfirmationRequestParams {
+                    subject: ConfirmationSubject::TransferControl(Box::new(
+                        TransferControlSubject {
+                            params,
+                            action_id: ActionId::new(Uuid::from_bytes([action; 16])),
+                        },
+                    )),
+                })
+                .expect("encodes"),
+            )
+        } else {
+            (
+                Method::GrantTransfer,
+                ParamsValue::from_typed(&params).expect("encodes"),
+            )
+        };
+        MutationRequest {
+            method: method.into(),
+            method_version: method.entry().version,
+            action_id: ActionId::new(Uuid::from_bytes([action; 16])),
+            params,
+            ..request()
+        }
+    }
+
+    fn kept_attempt(kind: Kind, request: MutationRequest) -> Attempt {
+        let composed = ComposedMutation::restored(request, 1_000, 300_000, Some(reach()));
+        Attempt::new(kind, &composed, None, 2_000, "kept")
+    }
+
+    /// An attempt that is not over holds one gate, read from its request: an invitation of a
+    /// session to a device, or a hand-over of a session, from the confirmation's request until the
+    /// transfer's, and none once it is over or for a kind that holds none.
+    #[test]
+    fn an_open_attempt_holds_the_gate_its_request_names() {
+        let invite = kept_attempt(Kind::Invite, invite_request(1, 7, 8));
+        assert_eq!(
+            invite.gate(),
+            Some(Gate::Invite {
+                recipient: DeviceId::new(Uuid::from_bytes([7; 16])),
+                session: SessionId::new(Uuid::from_bytes([8; 16])),
+            })
+        );
+        let asking = kept_attempt(Kind::Transfer, transfer_request(2, 9, true));
+        let sent = kept_attempt(Kind::Transfer, transfer_request(2, 9, false));
+        assert_eq!(
+            asking.gate(),
+            Some(Gate::Transfer {
+                session: SessionId::new(Uuid::from_bytes([9; 16])),
+            })
+        );
+        assert_eq!(asking.gate(), sent.gate());
+        let mut over = invite.clone();
+        over.phase = Phase::Closed(Outcome::NotDone);
+        assert_eq!(over.gate(), None, "a closed attempt gates nothing");
+        assert_eq!(attempt(Kind::Redeem).gate(), None);
+        assert_eq!(attempt(Kind::Revoke).gate(), None);
+    }
+
+    /// A second invitation of the same session to the same device, or a second hand-over of the
+    /// same session, is refused while the first is not over, whatever hid it, and the refusal
+    /// writes nothing; a different device, a different session, the same action again, or the first
+    /// being over, is not refused.
+    #[test]
+    fn a_second_attempt_for_the_same_gate_is_refused_while_the_first_is_not_over() {
+        let directory = kr_ipc::testing::PrivateTempDir::create();
+        let store = AttemptStore::open(directory.path().join("attempts")).expect("opens");
+        let mut first = kept_attempt(Kind::Invite, invite_request(1, 7, 8));
+        assert!(store.keep_unless_gated(&first).expect("kept").is_none());
+        first.hidden = true;
+        store.keep(&first).expect("hidden");
+
+        let same = kept_attempt(Kind::Invite, invite_request(2, 7, 8));
+        let refused = store.keep_unless_gated(&same).expect("asked");
+        assert_eq!(
+            refused.map(|blocker| blocker.action_id),
+            Some(first.action_id)
+        );
+        assert_eq!(store.attempts().expect("listed").len(), 1);
+
+        for allowed in [
+            kept_attempt(Kind::Invite, invite_request(3, 6, 8)),
+            kept_attempt(Kind::Invite, invite_request(4, 7, 5)),
+            kept_attempt(Kind::Invite, invite_request(1, 7, 8)),
+        ] {
+            assert!(store.keep_unless_gated(&allowed).expect("kept").is_none());
+        }
+        first.phase = Phase::Closed(Outcome::NotDone);
+        store.keep(&first).expect("closed");
+        store
+            .remove(ActionId::new(Uuid::from_bytes([3; 16])))
+            .expect("removed");
+        store
+            .remove(ActionId::new(Uuid::from_bytes([4; 16])))
+            .expect("removed");
+        assert!(store.keep_unless_gated(&same).expect("kept").is_none());
+
+        let handing = kept_attempt(Kind::Transfer, transfer_request(10, 9, true));
+        assert!(store.keep_unless_gated(&handing).expect("kept").is_none());
+        let again = kept_attempt(Kind::Transfer, transfer_request(11, 9, true));
+        assert!(
+            store.keep_unless_gated(&again).expect("asked").is_some(),
+            "a hand-over still being asked for gates a second of the same session"
+        );
+        let other = kept_attempt(Kind::Transfer, transfer_request(12, 4, true));
+        assert!(store.keep_unless_gated(&other).expect("kept").is_none());
+    }
 
     const GOLDEN: &str = "\
         b164686f737466686f73742d31646b696e646672656465656d64706c616ef6656c6162656c7041636365707420\
