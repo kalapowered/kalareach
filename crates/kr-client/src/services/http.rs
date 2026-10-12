@@ -2420,10 +2420,30 @@ mod tests {
             outcome = &mut call => panic!("this gateway never finishes a handshake: {outcome:?}"),
         }
 
+        // The first connection's deadline passes, by the clock being moved past it by hand. The
+        // clock then runs as it ordinarily does until the gateway has the second connection, so
+        // that connection is made in real time and is held to nothing but a deadline a day away.
+        // Letting the clock find the deadline itself would move it on whenever nothing was ready,
+        // including while the second connection was still being made, and end that attempt before
+        // the gateway could see it.
+        tokio::time::pause();
+        tokio::time::advance(deadlines.connect + CLOCK_GRAIN).await;
+        tokio::time::resume();
+        tokio::select! {
+            biased;
+            () = gateway.until("the second connection", |gateway| gateway.connections() >= 2)
+                => {}
+            outcome = &mut call => panic!("this gateway never finishes a handshake: {outcome:?}"),
+        }
+
+        // Both connections are the gateway's. The second one's deadline is the next the exchange
+        // holds, and nothing else is under way, so the clock goes to it. What the test reads is the
+        // advance, which carries no real time.
         tokio::time::pause();
         let from = tokio::time::Instant::now();
         let error = call.await.expect_err("the connect deadline");
-        let advanced = tokio::time::Instant::now() - from;
+        let advanced = deadlines.connect + CLOCK_GRAIN + (tokio::time::Instant::now() - from);
+        tokio::time::resume();
 
         // Each connection was accepted at the transport and never spoke TLS, so nothing of the
         // request was written, and that is the one class that says so. The first ran out and one
@@ -2438,15 +2458,6 @@ mod tests {
             advanced <= deadlines.connect * 2 + CLOCK_GRAIN * 2,
             "{advanced:?}"
         );
-
-        // Back on the ordinary clock, the gateway is waited on for what it saw rather than asked
-        // at once: the second connection was made before its deadline ran out.
-        tokio::time::resume();
-        gateway
-            .until("the second connection", |gateway| {
-                gateway.connections() >= 2
-            })
-            .await;
         assert!(gateway.received().is_empty(), "nothing was sent");
         assert_eq!(gateway.connections(), 2, "one more attempt, and no third");
     }
