@@ -1278,7 +1278,7 @@ impl Controller {
             // entry cannot later claim a revision a local revocation has already used.
             let mut feed = self.authority_feed();
             feed.note_revision(barrier.authority_revision);
-            self.sharing.grants().store_feed(&feed.snapshot())?;
+            self.keep_feed(&mut feed)?;
         }
         match self.sharing.grants().fence_completed(captured) {
             Ok(()) => {

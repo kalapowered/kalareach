@@ -29,6 +29,16 @@ use crate::service::net::devices::DeviceRecord;
 /// The most keys a host may name as permitted to remove its feed.
 pub const MOST_REMOVAL_KEYS: usize = kr_client::services::authority::MAX_REMOVAL_KEYS;
 
+/// A task that ends when the value that holds it is dropped.
+#[derive(Debug)]
+pub(crate) struct EndsWithTheDaemon(tokio::task::JoinHandle<()>);
+
+impl Drop for EndsWithTheDaemon {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// What a request is carried out as: the devices and the grants it names that this host knows.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Plan {
@@ -309,7 +319,7 @@ impl Controller {
 
     /// Writes the feed's record down when anything in it is unwritten, so a host that stops
     /// anywhere finds it as it was, and a write that failed is made again by the next caller.
-    fn keep_feed(&self, feed: &mut crate::grants::AuthorityFeed) -> Result<()> {
+    pub(super) fn keep_feed(&self, feed: &mut crate::grants::AuthorityFeed) -> Result<()> {
         if !feed.is_unwritten() {
             return Ok(());
         }
@@ -501,7 +511,7 @@ impl Controller {
             grants.store_feed_removal(&StoredRemoval {
                 origin: Nullable::some(origin.to_owned()),
                 at_ms: TimestampMs::new(now),
-                notice: self.next_feed_notice(held.as_ref()).await,
+                notice: self.next_feed_notice(held.as_ref()).await?,
             })?;
         }
         self.feed_notice_wake.notify_one();
@@ -511,17 +521,29 @@ impl Controller {
         Ok(())
     }
 
+    /// The number of the newest notice about the feed that the attention store has taken.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the store cannot be read. A notice is not numbered without it: a
+    /// number at or below the store's cursor is a notice the store drops.
+    async fn feed_notice_cursor(&self) -> Result<u64> {
+        let attention = Arc::clone(self.attention());
+        match tokio::task::spawn_blocking(move || attention.authority_cursor()).await {
+            Ok(Ok(taken)) => Ok(taken),
+            _ => Err(crate::error::ControllerError::Storage {
+                operation: "read the notices the attention store has taken",
+                detail: "the attention store could not be read".to_owned(),
+            }),
+        }
+    }
+
     /// The number of the next notice about the feed: above the one this host last recorded and
     /// above every one the attention store has taken, so a registry that lost its row cannot
     /// number a notice behind the store's cursor.
-    async fn next_feed_notice(&self, held: Option<&StoredRemoval>) -> u64 {
-        let attention = Arc::clone(self.attention());
-        let taken = tokio::task::spawn_blocking(move || attention.authority_cursor())
-            .await
-            .ok()
-            .and_then(std::result::Result::ok)
-            .unwrap_or_default();
-        held.map_or(0, |held| held.notice).max(taken) + 1
+    async fn next_feed_notice(&self, held: Option<&StoredRemoval>) -> Result<u64> {
+        let taken = self.feed_notice_cursor().await?;
+        Ok(held.map_or(0, |held| held.notice).max(taken) + 1)
     }
 
     /// Puts the authority feed's removal right at start: kept for the origin that answered it,
@@ -537,9 +559,19 @@ impl Controller {
         unusable: bool,
     ) -> Result<bool> {
         let grants = self.sharing.grants();
-        let Some(held) = grants.stored_feed_removal()? else {
+        let Some(mut held) = grants.stored_feed_removal()? else {
             return Ok(false);
         };
+        // A row behind the store's cursor means the registry was put back to an earlier copy than
+        // the store: it is numbered again above the cursor, so that the notice it holds is given.
+        let taken = self.feed_notice_cursor().await?;
+        if taken > held.notice {
+            held = StoredRemoval {
+                notice: taken + 1,
+                ..held
+            };
+            grants.store_feed_removal(&held)?;
+        }
         let mut removed = false;
         match held.origin.0.as_deref() {
             Some(origin) if unusable || selected == Some(origin) => {
@@ -553,7 +585,7 @@ impl Controller {
             Some(_) => grants.store_feed_removal(&StoredRemoval {
                 origin: Nullable::null(),
                 at_ms: TimestampMs::new(self.wall_now_ms()),
-                notice: self.next_feed_notice(Some(&held)).await,
+                notice: self.next_feed_notice(Some(&held)).await?,
             })?,
             None => {}
         }
@@ -612,11 +644,11 @@ impl Controller {
     /// Starts the task that sees to the notices about the authority feed, which runs for as long
     /// as the daemon does whether or not it reads a feed: it gives the newest notice, and gives it
     /// again after a wait for as long as the attention store refuses it. It holds the daemon
-    /// weakly.
+    /// weakly, and ends with it.
     pub(crate) fn start_feed_notices(self: &Arc<Self>, timer: Arc<dyn crate::quiet::Timer>) {
         let daemon = Arc::downgrade(self);
         let wake = Arc::clone(&self.feed_notice_wake);
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             let mut backoff = kr_transport::reconnect::Backoff::default();
             loop {
                 // Interest is registered before the notice is read, so one recorded in between
@@ -647,6 +679,8 @@ impl Controller {
                 }
             }
         });
+        // The task ends with the daemon that holds it, wherever it is waiting.
+        let _ = self.feed_notice_task.set(EndsWithTheDaemon(task));
     }
 
     /// How many times the task that sees to the notices has tried to give one. For a suite that

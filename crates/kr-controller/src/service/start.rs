@@ -950,6 +950,7 @@ impl Controller {
             backup_production,
             feed_runtime,
             feed_notice_wake: Arc::new(tokio::sync::Notify::new()),
+            feed_notice_task: std::sync::OnceLock::new(),
             feed_notice_attempts: tokio::sync::watch::channel(0).0,
             transfer,
             project,

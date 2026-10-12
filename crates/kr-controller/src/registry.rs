@@ -1486,8 +1486,9 @@ impl Registry {
     /// revision, with the origin of the feed that held it, the revision that feed held and the
     /// revision the registry had reached at that moment. The note that the feed removed the host,
     /// and the number of the newest notice about the feed that the owner's inbox is to hold, are a
-    /// row of their own (`feed_removal`), which a registry that lacks it simply does not have. No release before this one took a request from a feed, so no `feed` row holds a
-    /// record of one, and no row is rewritten.
+    /// row of their own (`feed_removal`), which a registry that lacks it simply does not have. No
+    /// release before this one took a request from a feed, so no `feed` row holds a record of
+    /// one, and no row is rewritten.
     ///
     /// This migration goes in the first release after every install has opened the registry at
     /// this version.
