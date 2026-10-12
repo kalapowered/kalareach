@@ -14,6 +14,7 @@
 //! | KR-REQ-18.14 | `a_lost_reply_is_asked_about_again_and_answered_from_the_hosts_record` |
 //! | KR-REQ-18.13 | `an_accepted_invitation_whose_reply_was_lost_is_found_accepted` |
 //! | KR-REQ-18.15 | `a_hand_over_asks_an_owner_device_and_sends_only_what_it_confirmed` |
+//! | KR-REQ-18.15 | `a_hand_over_whose_challenge_the_host_lost_is_ended_and_can_be_asked_again` |
 //! | KR-REQ-23.49 | `an_application_restarted_after_the_host_committed_asks_the_host_and_is_answered` |
 //! | KR-REQ-23.49 | `a_second_invitation_is_not_started_while_the_first_can_still_happen` |
 //! | KR-REQ-23.49 | `an_action_the_host_never_saw_is_not_done_only_after_the_bound` |
@@ -1347,6 +1348,92 @@ async fn cancelling_a_hand_over_sends_nothing_and_leaves_no_record() {
         .expect("asked again");
     giving.close();
     scene.stop().await;
+}
+
+/// KR-REQ-18.15: a hand-over whose challenge the host no longer has, because the host restarted
+/// while the owner devices were being asked, is ended when the page next reads it. The page is told
+/// it is gone, the record that held the session's place goes with it, and the next hand-over of the
+/// session is not refused as still under way.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_hand_over_whose_challenge_the_host_lost_is_ended_and_can_be_asked_again() {
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    let (device, record) = recipient(&host, &owner).await;
+    let (session_id, _) = an_open_session(&host);
+    let (_share, giving) = owned_by(&host, session_id, &device, &record).await;
+    let (_taker, taker_record) = recipient(&host, &owner).await;
+    let held: GrantListResult = net_support::pairing::read(
+        &mut host.client().await,
+        kr_protocol::method::Method::GrantList,
+        &GrantListParams {
+            session_id: Nullable::some(session_id),
+            include_resolved: true,
+        },
+    )
+    .await
+    .expect("the list is read");
+    let from = held
+        .grants
+        .iter()
+        .find(|summary| summary.state == GrantState::Active)
+        .expect("the device's share")
+        .grant
+        .grant_id;
+    let issuer = Page::start(
+        local_connection(&host, None).await,
+        Arc::new(tempfile::tempdir().expect("a data directory")),
+        WorkerLinks::at(host.tree().environment()),
+    );
+    issuer.state().shares().pace_at(AT_ONCE);
+    let body = json!({
+        "params": serde_json::to_value(&GrantTransferParams {
+            session_id,
+            from_grant_id: from,
+            to_device_id: taker_record.device_id,
+        }).expect("encodes"),
+        "subject": { "sessionId": session_id.to_string(), "sessionEpoch": "1" },
+    });
+    let asked = issuer
+        .call("transfer_ask", body.clone())
+        .await
+        .expect("the owner devices are asked");
+    let reference = asked["reference"].as_str().expect("a reference").to_owned();
+    assert_eq!(issuer.attempts().await.len(), 1, "it holds its place");
+
+    // The challenge lives in the host's memory alone, so a restart ends it.
+    issuer
+        .state()
+        .connection()
+        .expect("connected")
+        .session()
+        .close();
+    giving.close();
+    let host = host.restart().await;
+    issuer
+        .state()
+        .connected(local_connection(&host, None).await);
+    let read = issuer
+        .call("transfer_answered", json!({ "reference": reference }))
+        .await
+        .expect("read");
+    assert_eq!(read["state"], "gone");
+    assert!(
+        issuer.attempts().await.is_empty(),
+        "the record that held the session's place is gone with the hand-over"
+    );
+    issuer
+        .call("transfer_ask", body)
+        .await
+        .expect("a hand-over of the session is not refused as still under way");
+
+    issuer
+        .state()
+        .connection()
+        .expect("connected")
+        .session()
+        .close();
+    drop(issuer);
+    host.stop().await;
 }
 
 /// KR-REQ-23.49: an invitation whose answer was lost and which the host is never asked about again,

@@ -189,16 +189,21 @@ impl ShareDesk {
             });
     }
 
-    /// How long ago the attempt's bound began to be counted.
-    fn elapsed(&self, action_id: ActionId) -> Duration {
+    /// The clock that counts an attempt's bound, on the test's skew when it set one.
+    fn clock(&self, action_id: ActionId) -> Armed {
         self.arm(action_id);
-        let counted = self
+        let armed = self
             .running
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .get(&action_id)
-            .map_or(Duration::ZERO, |running| running.armed.elapsed());
-        counted.saturating_add(*self.skew.lock().unwrap_or_else(PoisonError::into_inner))
+            .map_or_else(Armed::now, |running| running.armed);
+        armed.skewed(*self.skew.lock().unwrap_or_else(PoisonError::into_inner))
+    }
+
+    /// How long ago the attempt's bound began to be counted.
+    fn elapsed(&self, action_id: ActionId) -> Duration {
+        self.clock(action_id).elapsed()
     }
 
     /// Starts counting an attempt's bound afresh, now: a hand-over's clock counts from the moment
@@ -220,7 +225,7 @@ impl ShareDesk {
     /// The moment a read of the host is about to be sent, on the clock that counts the attempt's
     /// bound (and on the test's skew, when it set one).
     fn read_begins(&self, action_id: ActionId) -> ReadAt {
-        ReadAt::after(self.elapsed(action_id))
+        self.clock(action_id).read_begins()
     }
 
     /// Takes the right to carry an attempt on. False when a task of this process has it.
@@ -676,9 +681,6 @@ impl Carry {
         let sent_action = attempt.request.action_id;
         let pace = self.desk.pace();
         let mut reading: Option<Connection> = None;
-        // A first read counts at once when the host's kept answer has ended every chance of a
-        // commit (a redemption refused), so it waits for nothing.
-        let mut waited = false;
         loop {
             match next {
                 Next::Closed(_) => break,
@@ -698,10 +700,7 @@ impl Carry {
                     }
                 }
                 Next::Check | Next::Wait => {
-                    if waited || attempt.bound() > Duration::ZERO {
-                        tokio::time::sleep(pace.check_every).await;
-                    }
-                    waited = true;
+                    tokio::time::sleep(pace.check_every).await;
                     let found = self.found(&attempt, &mut reading).await;
                     next = match found {
                         Some((found, began)) => attempt.after_read(found, began),
@@ -1353,17 +1352,15 @@ pub async fn transfer_ask(
             MUTATION_TTL,
         )
         .await?;
-    let mut attempt = Attempt::new(
-        Kind::Transfer,
+    // The attempt is named for the transfer it will become, and holds the confirmation request
+    // until then.
+    let attempt = Attempt::asking(
         &composed,
-        Some(new_grant_id),
+        transfer_action,
+        new_grant_id,
         kr_ipc::now_ms().get(),
         format!("Handing over {} to {to_name}", session_words(number)),
     );
-    // The attempt is named for the transfer it will become, and holds the confirmation request
-    // until then.
-    attempt.action_id = transfer_action;
-    attempt.phase = Phase::Asking;
     let carry = carry(state, connection)?;
     if let Some(blocker) = carry
         .store
@@ -1510,6 +1507,9 @@ pub async fn transfer_answered(state: &AppState, reference: &str) -> Result<Hand
         .iter()
         .find(|waiting| waiting.request == handover.challenge)
     else {
+        // The challenge is no longer the host's: nothing was sent for it, and the record that holds
+        // the session's place goes, so the person can ask again.
+        end_handover(&desk, reference, &connection, handover.action_id).await;
         return Ok(HandoverState {
             state: "gone",
             expires_at_ms,
@@ -1553,6 +1553,9 @@ pub async fn transfer_answered(state: &AppState, reference: &str) -> Result<Hand
     } else {
         "gone"
     };
+    if state_word == "gone" {
+        end_handover(&desk, reference, &connection, handover.action_id).await;
+    }
     Ok(HandoverState {
         state: state_word,
         expires_at_ms,
@@ -1627,13 +1630,10 @@ pub async fn transfer_finish(state: &AppState, reference: &str) -> Result<Attemp
             MUTATION_TTL,
         )
         .await?;
-    // What the challenge has left when the transfer is composed, which the bound counts from: the
-    // clock is armed anew below, and a bound counted from the confirmation request's would end
-    // before the challenge does.
-    let left = Duration::from_millis(kr_pairing::confirm::CONFIRMATION_LIFETIME_MS)
-        .saturating_sub(handover.received.elapsed());
+    // The bound counts the challenge's life from its reply, on the clock that started then; the
+    // attempt's own clock is armed anew below.
     let mut attempt = *kept;
-    if !attempt.confirmed(&composed, plan, left) {
+    if !attempt.confirmed(&composed, plan, handover.received) {
         return Err(CommandError::local_failure(
             "the record of this hand-over is not one waiting for its confirmation",
         ));
