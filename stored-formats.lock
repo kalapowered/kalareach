@@ -385,7 +385,7 @@
         "version": 13,
         "migrates_from": 1
       },
-      "digest": "79de355660d7e0fff931946b5c0ccee2c87213a24c11aab4f34cf5976abfae50",
+      "digest": "02854abc96c5358bdffa16de7d8a4c83aa1186b44d4bd5382254c10f6fa5b293",
       "kept": [
         "SessionCreateParams",
         "ClosureRecord",

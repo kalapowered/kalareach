@@ -231,7 +231,7 @@ variables an older build read joins nothing because of them.
 | `network.relay_only` | every packet through the relay, and no direct path | `true` or `false`; `true` needs at least one relay |
 | `network.local_discovery` | discovery of peers on the local network | `true` or `false` |
 | `network.mainline_dht` | the public Mainline DHT, which carries no KalaReach service guarantee | `true` or `false` |
-| `network.proxy_url` | the HTTP proxy this host's connections to services go through: the endpoint's relay connection, relay latency probe, captive-portal check and Pkarr servers, the rendezvous, delivery and webhooks, mail submission, the managed voice broker and account service, backups to the managed storage service, the model's files, and plugin repositories; the host's own name lookups do not use it, and absent everything goes directly, apart from the relay latency probe and captive-portal check, which then follow `HTTPS_PROXY`, `HTTP_PROXY` and `ALL_PROXY` when those are set | an absolute `http` or `https` origin, with no user information, no path and no trailing slash |
+| `network.proxy_url` | the HTTP proxy this host's connections to services go through: the endpoint's relay connection, relay latency probe, captive-portal check and Pkarr servers, the rendezvous, delivery and webhooks, mail submission, the managed voice broker and account service, backups to the managed storage service, the authority feed, the model's files, and plugin repositories; the host's own name lookups do not use it, and absent everything goes directly, apart from the relay latency probe and captive-portal check, which then follow `HTTPS_PROXY`, `HTTP_PROXY` and `ALL_PROXY` when those are set | an absolute `http` or `https` origin, with no user information, no path and no trailing slash |
 | `voice.broker_origin` | the managed broker this host starts a device's voice session at, through the proxy `network.proxy_url` selects | an absolute `https` origin, or an `http` origin on `localhost`, `127.0.0.1` or `[::1]`, of at most 128 bytes, in lower case, with no path and no port its scheme already implies; a plain-HTTP origin cannot be combined with `network.proxy_url`, because the proxy would carry the account token in clear text |
 | `storage.origin` | the managed storage service this host uploads its backups to | an `https` origin, or an `http` origin on a loopback address, in the spelling a gateway origin has, with no path and no trailing slash; the daemon refuses to start unless it is the managed account service |
 | `authority.origin` | the authority feed this host reads its remote revocations from; a section of level 2: a release that reads level 1 ignores it, and its host takes revocations only from owners who reach it directly | an `https` origin, or an `http` origin on a loopback address, in the spelling a gateway origin has, with no path and no trailing slash |
@@ -257,8 +257,8 @@ connecting to the endpoint’s relay connection, relay latency probe, captive-po
 servers, to the rendezvous when reserving a code’s locator and opening its room, to the push
 gateway, to webhooks, to chat services, to mail servers when sending mail via the mail submission
 port, to the managed voice broker, to the managed account service when signing in, to the managed
-storage service (`storage.origin`) when backing up, to the model’s files, and to plugin
-repositories. Nothing on that list goes around it.
+storage service (`storage.origin`) when backing up, to the authority feed (`authority.origin`),
+to the model’s files, and to plugin repositories. Nothing on that list goes around it.
 
 An address the proxy cannot reach fails, a webhook included. Mail submission is SMTP, so it goes as
 an HTTP `CONNECT` tunnel to the submission server and its port, and the connection’s own TLS runs
@@ -3523,9 +3523,6 @@ not enrolled and the question that follows is turned back with a delay. The pass
 and the daemon keeps the person's refusal for `kr doctor`. A refusal that names no delay may be about
 one attempt alone, an object the service already holds for example, and the pass goes on to the next.
 
-A publication whose outcome the service says it cannot settle (`OUTCOME_UNKNOWN`) is not such a
-refusal: it stays listed as unanswered, and the next pass asks the service for the manifest to find
-out whether it took effect, and does not send it again.
 A part is 8 MiB and its answer begins only after the whole part has been sent, so storage exchanges
 get 60 seconds to start answering and 90 in all. That is the time the slowest supported uplink needs
 to send one: about 1.1 Mbit/s. The carrier is a task of its own, so a service that never answers
@@ -5375,7 +5372,8 @@ and member binding, an exclusive management) and by the rights ceiling the confi
 force. A bounded offline validity is the one thing left out: it stops personal remote access while
 the feed cannot be reached, and the host has just read the feed. A decision that rests on a clock
 reading this host has not written down, or on a clock it has not proven, is not taken: the pass
-stops and asks again, and no request is refused for it.
+stops and asks again, and no request is refused for it. A device whose grant holds no right to
+manage the host is turned away whatever the clock says.
 
 A request that passes is written down before it takes effect. It is then carried out through the
 same revocation the owner at the machine makes, issued the revision the daemon's registry
@@ -5383,17 +5381,18 @@ allocated, and acknowledged with the completion the barrier reports. A host that
 that finishes the same request the same way and takes it once. A request is numbered once: when the
 feed holds the same request again after it dropped the original, the host acknowledges it under the
 revision it first issued, however many revisions came after. A request for what the owner at the
-machine, or an earlier request, had already withdrawn changes nothing, so it is refused as covered:
-there is no revision to issue for it. The host writes a refusal down before it sends it. A refusal
-that never reached the feed is made again by the next pass, and a request the host refused after it
-began to take it is refused again when it is published again.
+machine, or an earlier request, had already withdrawn changes nothing, so it is refused as covered,
+however the host was interrupted while it took it: there is no revision to issue for it. The host
+writes a refusal down before it sends it. A refusal that never reached the feed is made again by the
+next pass, and a request the host refused after it began to take it is refused again when it is
+published again.
 
 A pass reads the feed in pages, at most 32. When the feed holds more, the scan goes on at its
-cursor at once. Until it has read the feed through, nothing is shown as read, the bounded offline
-validity is not extended, and no connection is released. A pass that stopped for a reason of this
-host's own, such as a record it could not write down, leaves the status stale, as an unreachable
-feed does. The revocations the carrier makes do not wake it, so a pass that failed waits out its
-backoff.
+cursor at once. Until it has read the feed through, nothing is shown as read and what is shown is
+stale, the bounded offline validity is not extended, and no connection is released. A pass that
+stopped for a reason of this host's own, such as a record it could not write down, leaves the status
+stale, as an unreachable feed does. The revocations the carrier makes do not wake it, so a pass that
+failed waits out its backoff.
 
 The host also tells the feed which keys may remove it. These are the paired devices that may manage
 the host by the decision above, the eight oldest pairings if there are more, and `kr doctor` says
@@ -5418,6 +5417,18 @@ that gave it, and restores it before it delivers a push or serves a connection. 
 by changing `authority.origin` in the configuration document to another feed or to none and
 starting the daemon again, which ends the removal and the item; a removal from one origin is no
 removal from another.
+
+A host remembers the origin of any feed that requests were taken from. This is because a feed
+numbers its revisions by its own count and no other feed holds them. When the host is pointed at a
+different feed it will forget about all the requests it has taken from the other feed and will
+decide about each request in the new feed from the start. A request published there again is refused
+as covered when what it names is already withdrawn, and the requests behind it are carried out. A
+configuration document the host cannot use points it nowhere, so a start over one leaves a removal
+as it was. Only a document that selects another feed or none ends the removal. The notice that tells
+the owner about a removal, or that the owner acted, is numbered in the order the host recorded it,
+and each number is higher than the one before. The notice is written down before it is given, and
+given again until the attention store takes it. Setting a clock back will not make any numbers be
+lower than any previous number.
 
 ### What the host policy holds
 
