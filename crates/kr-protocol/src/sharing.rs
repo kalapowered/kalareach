@@ -919,8 +919,9 @@ impl RevocationBarrier {
     /// fields, with no barrier in them) has already spent of the decoder's limits: the workers whose
     /// barrier has not held are taken before any that has, one of them is always kept when there
     /// is one, the lists are cut to prefixes in identity order, and every total is counted before
-    /// anything is cut. What a caller reads of the cut barrier ([`Self::holds`], [`Self::pending`])
-    /// is what it would read of the whole.
+    /// anything is cut. What a caller reads of the cut barrier through [`Self::holds`] is what it
+    /// would read of the whole. [`Self::pending`] names the pending workers that were kept, which
+    /// are all of them unless `workers_total` is above the workers listed.
     #[must_use]
     pub fn bounded_beside<T: Serialize>(self, beside: &T) -> Self {
         let beside = Cost::of(beside).unwrap_or_default();
@@ -929,12 +930,32 @@ impl RevocationBarrier {
     }
 }
 
-/// Whether `answer` decodes inside the decoder's limits, with the frame around it.
+/// The length of the longest array or map in `value`, which the decoder holds to one collection.
+fn widest_collection(value: &kr_cbor::CanonicalValue) -> usize {
+    use kr_cbor::CanonicalValue;
+
+    match value {
+        CanonicalValue::Array(members) => members
+            .iter()
+            .map(widest_collection)
+            .fold(members.len(), usize::max),
+        CanonicalValue::Map(entries) => entries
+            .entries()
+            .iter()
+            .map(|(_, member)| widest_collection(member))
+            .fold(entries.entries().len(), usize::max),
+        _ => 0,
+    }
+}
+
+/// Whether `answer` decodes inside the decoder's limits, with the frame around it: no collection
+/// above the collection bound, and the items and bytes the frame leaves.
 pub(crate) fn fits_a_frame<T: Serialize>(answer: &T) -> bool {
     let limits = kr_cbor::Limits::DEFAULT;
-    Cost::of(answer).is_some_and(|cost| {
-        cost.items <= limits.max_items - FRAME_RESERVE_ITEMS
-            && cost.bytes <= limits.max_message_len - FRAME_RESERVE_BYTES
+    kr_cbor::to_canonical_value(answer).is_ok_and(|value| {
+        widest_collection(&value) <= limits.max_collection_len
+            && items_of(&value) <= limits.max_items - FRAME_RESERVE_ITEMS
+            && kr_cbor::encoded_len(&value) <= limits.max_message_len - FRAME_RESERVE_BYTES
     })
 }
 

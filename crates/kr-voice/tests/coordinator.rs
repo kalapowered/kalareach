@@ -2377,6 +2377,40 @@ async fn replacing_the_standing_grant_waits_for_the_fence_its_withdrawal_owes() 
     assert_eq!(barrier.workers_total.get(), 1);
 }
 
+/// KR-REQ-09.12: a replacement whose fence named more actions than a frame carries is answered with
+/// an answer that decodes, as a stop's is: the barrier is cut with its totals counted first, and the
+/// worker that has not held is still named as pending.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_replacement_whose_fence_named_more_actions_than_a_frame_holds_is_answered_in_a_frame() {
+    let fixture = fixture();
+    let _ = started(&fixture, None).await;
+    let owed = fixture.authority.owes_a_fence_naming(5_000);
+    owed.released.notify_one();
+
+    let replaced = fixture
+        .coordinator
+        .grant(
+            &grant_params(None),
+            AuthorityRevision::new(1),
+            13_000,
+            &kr_voice::Unbounded,
+        )
+        .await
+        .expect("it is made");
+
+    assert!(
+        replaced.fits_a_frame(),
+        "the answer decodes inside the limits, collections included"
+    );
+    let barrier = replaced
+        .barrier
+        .0
+        .expect("the replacement carries its barrier");
+    assert_eq!(barrier.pending(), vec![session(SESSION_A)]);
+    assert_eq!(barrier.workers[0].rejected_actions_total.get(), 5_000);
+    assert!(barrier.workers[0].rejected_actions.len() < 5_000);
+}
+
 /// KR-REQ-15.02: a voice session is not a shell session. Stopping one names the terminal sessions
 /// it reached and closes none of them; nothing in the coordinator can.
 #[tokio::test]
