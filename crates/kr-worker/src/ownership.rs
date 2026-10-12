@@ -627,10 +627,14 @@ impl OwnedProcesses {
         if recorded.left.load(Relaxed) {
             return true;
         }
-        let in_one = self.in_scope(&recorded.identity, scopes)
-            || self
-                .departed_above(&key(&recorded.identity), scopes)
-                .is_some();
+        let this = key(&recorded.identity);
+        let own = self.in_scope(&recorded.identity, scopes);
+        if own {
+            // Kept with everything recorded below it: whichever of them is asked about next, and
+            // whether or not the scope still holds the process by then.
+            self.keep_departure(&this);
+        }
+        let in_one = own || self.departed_above(&this, scopes).is_some();
         if in_one {
             // Kept: the process can end before anything reads it again.
             recorded.left.store(true, Relaxed);
@@ -2382,40 +2386,50 @@ mod tests {
     /// KR-REQ-07.13 and KR-REQ-07.60: a departure found where the record is read through a shared
     /// reference is kept at the process that left, and with everything recorded below it. The
     /// daemon is in a scope for the first process that is asked about and out of it again for the
-    /// second, as when the daemon ends in between; the second is still not the session's, and the
-    /// record no longer names any of them.
+    /// next, as when the daemon ends in between; the next is still not the session's, and the
+    /// record no longer names any of them. The first asked about is a process below the daemon, and
+    /// the daemon itself.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn a_departure_found_by_a_closures_reading_is_kept_for_the_processes_asked_after() {
-        let tree = fan_tree();
-        let mut owned = session_with(&tree.server);
-        owned.observe_backends();
-        let recorded = owned.below_backend(&tree.server);
-        for read in std::iter::once(&tree.daemon).chain(&tree.children) {
-            assert!(
-                recorded.contains(read),
-                "the control: {read:?} is recorded below the server: {recorded:?}"
-            );
-        }
+        for daemon_first in [false, true] {
+            let tree = fan_tree();
+            let mut owned = session_with(&tree.server);
+            owned.observe_backends();
+            let recorded = owned.below_backend(&tree.server);
+            for read in std::iter::once(&tree.daemon).chain(&tree.children) {
+                assert!(
+                    recorded.contains(read),
+                    "the control: {read:?} is recorded below the server: {recorded:?}"
+                );
+            }
 
-        owned.in_a_scope.insert(key(&tree.daemon));
-        let first = &owned.seen[&key(&tree.children[0])];
-        assert!(
-            owned.has_left(first, &Scopes::default()),
-            "the first is below a daemon that is in a scope"
-        );
-        owned.in_a_scope.remove(&key(&tree.daemon));
-        let second = &owned.seen[&key(&tree.children[1])];
-        assert!(
-            owned.has_left(second, &Scopes::default()),
-            "the second is below a daemon that was read in a scope, and is not the session's"
-        );
-        let record = owned.record().processes;
-        for left in std::iter::once(&tree.daemon).chain(&tree.children) {
+            owned.in_a_scope.insert(key(&tree.daemon));
+            let first = if daemon_first {
+                &tree.daemon
+            } else {
+                &tree.children[0]
+            };
             assert!(
-                !record.contains(left),
-                "the record names {left:?}, which is not the session's: {record:?}"
+                owned.has_left(&owned.seen[&key(first)], &Scopes::default()),
+                "{first:?} is in or below a daemon that is in a scope (the daemon asked first: \
+                 {daemon_first})"
             );
+            owned.in_a_scope.remove(&key(&tree.daemon));
+            let next = &owned.seen[&key(&tree.children[1])];
+            assert!(
+                owned.has_left(next, &Scopes::default()),
+                "the next is below a daemon that was read in a scope, and is not the session's \
+                 (the daemon asked first: {daemon_first})"
+            );
+            let record = owned.record().processes;
+            for left in std::iter::once(&tree.daemon).chain(&tree.children) {
+                assert!(
+                    !record.contains(left),
+                    "the record names {left:?}, which is not the session's (the daemon asked \
+                     first: {daemon_first}): {record:?}"
+                );
+            }
         }
     }
 
@@ -2429,7 +2443,7 @@ mod tests {
         use std::os::unix::process::CommandExt as _;
 
         const DEPTH: usize = 24;
-        let mut script = String::from("echo started; sleep 600");
+        let mut script = String::from("sleep 600 & echo started; wait");
         for _ in 0..DEPTH {
             script = format!("( {script} ; : ) & wait");
         }
@@ -2455,12 +2469,29 @@ mod tests {
             "the walk recorded the whole tree: {recorded} below the server"
         );
 
-        let before = owned.scope_reads.load(std::sync::atomic::Ordering::Relaxed);
+        let reads =
+            |owned: &OwnedProcesses| owned.scope_reads.load(std::sync::atomic::Ordering::Relaxed);
+        let bound = 3 * (owned.seen.len() + 1);
+        let before = reads(&owned);
         owned.observe_backends();
-        let reads = owned.scope_reads.load(std::sync::atomic::Ordering::Relaxed) - before;
+        let observed = reads(&owned) - before;
         assert!(
-            reads <= 3 * (recorded + 1),
-            "{reads} scope readings for {recorded} processes below the server"
+            observed <= bound,
+            "{observed} scope readings to observe {recorded} processes below the server"
+        );
+        let before = reads(&owned);
+        let _ = owned.surviving();
+        let surviving = reads(&owned) - before;
+        assert!(
+            surviving <= bound,
+            "{surviving} scope readings to list what survives of {recorded} processes"
+        );
+        let before = reads(&owned);
+        let _ = owned.terminated();
+        let terminated = reads(&owned) - before;
+        assert!(
+            terminated <= bound,
+            "{terminated} scope readings to list what ended of {recorded} processes"
         );
     }
 
@@ -2473,14 +2504,15 @@ mod tests {
     #[test]
     fn a_process_handed_to_another_stays_recorded_where_it_was_first_read() {
         let python = std::process::Command::new("python3").arg("-V").output();
-        if !python.is_ok_and(|output| output.status.success()) {
-            eprintln!("skipped: python3 is not here to make the server a child subreaper");
-            return;
-        }
+        assert!(
+            python.is_ok_and(|output| output.status.success()),
+            "python3 is needed to make the server a child subreaper"
+        );
         let tree = chain_tree_of(std::process::Command::new("python3").args([
             "-I",
             "-c",
-            "import ctypes, os; ctypes.CDLL(None).prctl(36, 1, 0, 0, 0); \
+            "import ctypes, os; \
+             os._exit(3) if ctypes.CDLL(None).prctl(36, 1, 0, 0, 0) != 0 else None; \
              os.execvp('sh', ['sh', '-c', \
              '( ( sleep 601 & echo started; wait ) & wait; exec sleep 600 ) & wait'])",
         ]));
