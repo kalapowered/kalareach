@@ -151,10 +151,13 @@ const MAX_ZONE_LEN: usize = 128;
 /// The largest number this store writes down exactly.
 const MAX_STORED_COUNTER: u64 = i64::MAX as u64;
 
-/// How often the workflow journal is read for its attention records.
+/// How long the store waits before it reads the workflow journal's attention records again after
+/// a pass that failed.
 ///
-/// The automation service wakes one waiter when a run stops, and that is its trigger dispatcher, so
-/// the store reads on a cadence of its own, the same as the dispatcher's.
+/// A pass that finds nothing wrong waits for the journal to change and keeps no timer. One that
+/// failed is made again after this, whatever the journal does meanwhile: a pass that wrote before
+/// it failed has raised the journal's change signal itself, and the cause of a failure can go
+/// without any write.
 const AUTOMATION_EVERY: Duration = Duration::from_secs(2);
 
 /// The workflow journal's attention records one read takes.
@@ -653,6 +656,12 @@ pub struct AttentionModule {
     /// Whether the last pass over the workflow journal stopped short, so a failure that persists is
     /// reported once rather than at every pass.
     automation_failing: AtomicBool,
+    /// The task that reads the workflow journal when it changes, ended with the module.
+    automation_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// How many passes over the workflow journal have finished, which a test reads to see that an
+    /// idle journal costs none.
+    #[cfg(test)]
+    automation_passes: AtomicU64,
     /// Where this host's own tests stop an action once its admission has been asked and stood,
     /// before it takes the store. Compiled away in every shipped build.
     #[cfg(feature = "testing")]
@@ -677,6 +686,19 @@ pub struct AttentionModule {
     /// pass ran on a thread of the runtime that drives the exchanges privacy mode waits for.
     #[cfg(test)]
     decided_on: std::sync::Mutex<Vec<std::thread::ThreadId>>,
+}
+
+impl Drop for AttentionModule {
+    fn drop(&mut self) {
+        let task = self
+            .automation_task
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(task) = task {
+            task.abort();
+        }
+    }
 }
 
 impl std::fmt::Debug for AttentionModule {
@@ -762,6 +784,9 @@ impl AttentionModule {
             privacy: std::sync::OnceLock::new(),
             descriptions: std::sync::OnceLock::new(),
             automation_failing: AtomicBool::new(false),
+            automation_task: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            automation_passes: AtomicU64::new(0),
             #[cfg(feature = "testing")]
             before_store: Pause::default(),
             #[cfg(test)]
@@ -2656,30 +2681,56 @@ impl AttentionModule {
     // ----- The workflow journal's alerts ----------------------------------------------------
 
     /// Reads the workflow journal's attention records for as long as the module is held: one pass
-    /// now, and then one every `AUTOMATION_EVERY`.
+    /// now, and then one each time the journal changes.
     ///
     /// The first pass has run when this returns, so a daemon that waits for it at its start has put
     /// right whatever the last daemon left between the store and the journal before it serves
-    /// anything. A second call starts nothing further.
+    /// anything. After a pass that stopped short the next is made after `AUTOMATION_EVERY`. A
+    /// second call starts nothing further.
     pub async fn consume_automation(self: &Arc<Self>, journal: Arc<WorkflowStore>) {
         if self.automation_started.set(()).is_err() {
             return;
         }
+        // Taken, and marked as seen, before the first pass reads the journal.
+        let mut changes = journal.changes();
+        changes.borrow_and_update();
         let taken = self.take_automation(&journal).await;
+        let mut clean = taken.is_ok();
         self.report_automation(taken);
+        #[cfg(test)]
+        self.automation_passes.fetch_add(1, Ordering::SeqCst);
         let module = Arc::downgrade(self);
-        tokio::spawn(async move {
+        // The journal is held weakly: the module that owns it going ends the channel, and the
+        // task with it.
+        let journal = Arc::downgrade(&journal);
+        let task = tokio::spawn(async move {
             loop {
-                tokio::time::sleep(AUTOMATION_EVERY).await;
+                if clean {
+                    if changes.changed().await.is_err() {
+                        return;
+                    }
+                } else {
+                    tokio::time::sleep(AUTOMATION_EVERY).await;
+                }
                 // Held for one pass and let go of across the wait, so a module its owner has let
                 // go of goes, with its store's claim.
-                let Some(held) = module.upgrade() else {
+                let (Some(held), Some(journal)) = (module.upgrade(), journal.upgrade()) else {
                     return;
                 };
+                // Marked before the pass reads the journal, so what is committed while it runs is
+                // seen by the pass after it.
+                changes.borrow_and_update();
                 let taken = held.take_automation(&journal).await;
+                clean = taken.is_ok();
                 held.report_automation(taken);
+                #[cfg(test)]
+                held.automation_passes.fetch_add(1, Ordering::SeqCst);
             }
         });
+        *self
+            .automation_task
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(task);
     }
 
     /// Makes one pass over the workflow journal's attention records.
@@ -6877,6 +6928,193 @@ pub(crate) mod tests {
                 "attached {attached}"
             );
         }
+    }
+
+    /// KR-PERF-003: the store's reading of the workflow journal keeps no timer. After its first
+    /// passes, which settle what the journal's own registration writes, hours of waiting make none.
+    #[tokio::test(start_paused = true)]
+    async fn an_idle_reader_of_the_workflow_journal_makes_no_pass_while_the_journal_does_not_change()
+     {
+        let temp = kr_ipc::testing::TempHost::create();
+        let module = self::module(&temp);
+        let journal = Arc::new(WorkflowStore::in_memory().expect("a journal"));
+        module.consume_automation(Arc::clone(&journal)).await;
+        let passes = || module.automation_passes.load(Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_secs(60 * 60)).await;
+        let settled = passes();
+        assert!(settled > 0, "the first pass was made");
+        tokio::time::sleep(Duration::from_secs(60 * 60)).await;
+        assert_eq!(passes(), settled, "an hour of waiting made no pass");
+    }
+
+    /// KR-PERF-003: a pass over the workflow journal that writes and then fails, every time, is
+    /// made once in each interval, and when the cause is taken away without a write to the journal
+    /// the next try finds it. The trigger refuses the store's subscription after its consumer's row
+    /// is written, so each pass counts a change in the journal and fails with it rolled back, and
+    /// the change it counted is the signal the pass waits on.
+    #[tokio::test(start_paused = true)]
+    async fn a_pass_over_the_workflow_journal_that_keeps_failing_is_made_once_in_each_interval() {
+        let temp = kr_ipc::testing::TempHost::create();
+        let module = self::module(&temp);
+        let directory = tempfile::tempdir().expect("a directory");
+        let journal = Arc::new(WorkflowStore::open(directory.path()).expect("a journal"));
+        let other = rusqlite::Connection::open(
+            directory
+                .path()
+                .join(kr_automation::store::WORKFLOW_DB_NAME),
+        )
+        .expect("the journal's file opens");
+        other
+            .busy_timeout(Duration::from_secs(10))
+            .expect("a busy timeout");
+        other
+            .execute_batch(
+                "CREATE TRIGGER refuse_subscription BEFORE INSERT ON event_subscriptions
+                 BEGIN SELECT RAISE(ABORT, 'refused'); END;",
+            )
+            .expect("a trigger");
+        module.consume_automation(Arc::clone(&journal)).await;
+        tokio::time::sleep(AUTOMATION_EVERY * 10).await;
+        let made = module.automation_passes.load(Ordering::SeqCst);
+        assert!(
+            (1..=12).contains(&made),
+            "ten intervals of a failure that persists made {made} passes"
+        );
+        assert_eq!(
+            journal
+                .consumer_position(ATTENTION_CONSUMER)
+                .expect("the journal reads"),
+            None,
+            "the store is not registered while the cause stands"
+        );
+        other
+            .execute_batch("DROP TRIGGER refuse_subscription;")
+            .expect("the trigger goes");
+        tokio::time::sleep(AUTOMATION_EVERY * 2).await;
+        assert_eq!(
+            journal
+                .consumer_position(ATTENTION_CONSUMER)
+                .expect("the journal reads"),
+            Some(0),
+            "and is, once the cause is gone"
+        );
+    }
+
+    /// KR-REQ-25.01, KR-REQ-25.03: what the workflow journal records for the attention store, a
+    /// workflow paused by one of its limits, reaches the inbox when it is committed, by the
+    /// journal's own signal and with no timer to find it.
+    #[tokio::test(start_paused = true)]
+    async fn a_pause_the_workflow_journal_records_reaches_the_inbox_without_a_timer() {
+        let temp = kr_ipc::testing::TempHost::create();
+        let module = self::module(&temp);
+        let journal = Arc::new(WorkflowStore::in_memory().expect("a journal"));
+        module.consume_automation(Arc::clone(&journal)).await;
+        tokio::time::sleep(Duration::from_secs(60 * 60)).await;
+        let items = |module: &Arc<AttentionModule>| {
+            module
+                .store()
+                .expect("the store")
+                .inbox(&owner(), &Viewer::Owner, true)
+                .expect("the inbox")
+                .len()
+        };
+        assert_eq!(items(&module), 0, "nothing is paused");
+
+        let admit = || Ok(());
+        let key = kr_automation::ActionKey {
+            actor_id: "local:test".to_owned(),
+            action_id: kr_ipc::new_uuid().to_string(),
+            method: "workflow.run".to_owned(),
+            digest: vec![1],
+        };
+        journal
+            .act(
+                &kr_automation::Submitted {
+                    key: &key,
+                    admission: &admit,
+                    caller_grant: None,
+                },
+                kr_ipc::now_ms().get(),
+                |journal| {
+                    journal.record_event(
+                        &kr_automation::store::JournalEventKind::WorkflowPaused {
+                            workflow_id: kr_protocol::ids::WorkflowId::new(kr_ipc::new_uuid()),
+                            revision: 1,
+                            reason: "max_concurrent_runs".to_owned(),
+                        },
+                        kr_ipc::now_ms().get(),
+                    )?;
+                    Ok((kr_automation::ActionRecord::done(&"paused")?, ()))
+                },
+            )
+            .expect("the journal commits the action");
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(items(&module), 1, "the pause is in the inbox");
+    }
+
+    /// KR-PERF-003: the store reads the workflow journal's records on the journal's signal and has
+    /// no deadline of its own for them. That rests on one property of what those records raise,
+    /// which this holds: once the journal's records have been certified, none of the environment's
+    /// items waits for a time, whichever record was read. An item that did (a reminder, or a
+    /// repeat) would need a timer, and the reader of the journal keeps none.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn no_record_the_workflow_journal_raises_leaves_the_environment_with_a_deadline() {
+        let temp = kr_ipc::testing::TempHost::create();
+        let module = self::module(&temp);
+        let workflow = kr_protocol::attention::AttentionAutomationSubject::Workflow {
+            workflow_id: kr_protocol::ids::WorkflowId::new(kr_ipc::new_uuid()),
+            revision: U64::new(1),
+        };
+        let chain = kr_protocol::attention::AttentionAutomationSubject::CausalChain {
+            causal_root_id: kr_protocol::ids::CausalRootId::new(kr_ipc::new_uuid()),
+        };
+        let kinds = [
+            EventKind::AutomationPaused {
+                subject: workflow.clone(),
+                reason: "max_concurrent_runs".to_owned(),
+                grant_id: None,
+            },
+            EventKind::AutomationPaused {
+                subject: chain,
+                reason: "depth".to_owned(),
+                grant_id: None,
+            },
+            EventKind::AutomationResumed { subject: workflow },
+        ];
+        let events: Vec<_> = kinds
+            .into_iter()
+            .zip(1..)
+            .map(|(kind, sequence)| {
+                SourceEvent::new(
+                    kr_attention::EventCursor::new(AttentionSource::Automation, sequence),
+                    TimestampMs::new(kr_ipc::now_ms().get()),
+                    kind,
+                )
+            })
+            .collect();
+        module
+            .store()
+            .expect("the store")
+            .rebuild(&events, module.reading())
+            .expect("the store reads the records");
+        module
+            .certify_environment(kr_ipc::clock::boot_elapsed_ms())
+            .expect("the certification is recorded");
+        let decided = decisions(&module);
+        assert!(!decided.is_empty(), "the records raised an item");
+        assert!(
+            decided.iter().all(|item| item.0.is_some()),
+            "the certification decided every item: {decided:?}"
+        );
+        assert_eq!(
+            module
+                .store()
+                .expect("the store")
+                .next_deadline_of(&Origin::Environment, module.reading())
+                .expect("the engine answers"),
+            None,
+            "and none of them waits for a time"
+        );
     }
 
     /// The certification of the workflow journal's records decides what an environment item is owed

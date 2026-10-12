@@ -727,7 +727,12 @@ fn materialise_version(
     }
 }
 
-/// How long the trigger dispatcher waits before it looks again for triggers a wake-up missed.
+/// How long the trigger dispatcher waits before it tries again after a pass that failed, stopped
+/// short or took up a run nothing was executing.
+///
+/// Such a pass can be made again by the same cause, and a pass that writes raises the signals it
+/// waits on, so it waits this long whatever those signals say. A cause that goes away without a
+/// write to the journal, a grant source that can be read again, is found by the next try.
 const DISPATCH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// The automation service, as the daemon holds it.
@@ -746,6 +751,8 @@ pub struct AutomationModule {
     resumed: std::sync::Mutex<Option<Vec<kr_automation::StartedRun>>>,
     /// The trigger dispatcher, once execution has started.
     dispatcher: std::sync::OnceLock<tokio::task::JoinHandle<()>>,
+    /// How many passes the dispatcher has finished.
+    passes: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl Drop for AutomationModule {
@@ -759,20 +766,30 @@ impl Drop for AutomationModule {
 /// Runs the trigger dispatcher for as long as the daemon holds the service.
 ///
 /// It first executes the runs a stopped daemon left unfinished, which the module recovered when it
-/// was opened, and then starts the runs the journal's settled-node events trigger,
-/// whenever a run stops and on a timer for anything that did not wake it. Each run executes on a task of its own, so one long run does not hold the rest
-/// of a chain back. Every decision is the journal's: the dispatcher's own position commits with the
-/// runs it starts, so a daemon that stops in the middle neither loses a trigger nor starts one twice.
+/// was opened, and then starts the runs the journal's settled-node events trigger. After a pass
+/// that found nothing wrong it waits for what can give it work: a change to the journal (a run
+/// admitted, a node settled, a workflow enabled) or a run's place being given back. It keeps no
+/// timer then. After a pass that failed, stopped short or took up a run nothing was executing it
+/// waits [`DISPATCH_INTERVAL`] and tries again, whatever is raised meanwhile. Each run executes on
+/// a task of its own, so one long run does not hold the rest of a chain back. Every decision is
+/// the journal's: the dispatcher's own position commits with the runs it starts, so a daemon that
+/// stops in the middle neither loses a trigger nor starts one twice.
 async fn dispatch(
     service: Arc<AutomationService>,
     daemon: Arc<Daemon>,
     resumed: Vec<kr_automation::StartedRun>,
+    passes: Arc<std::sync::atomic::AtomicU64>,
 ) {
     for run in resumed {
         execute_apart(&service, run);
     }
     let woken = service.events();
+    let mut changes = service.store().changes();
     loop {
+        // Marked before the pass reads the journal, so what is committed while it runs is seen by
+        // the pass after it.
+        changes.borrow_and_update();
+        let mut clean = true;
         // A run nothing in this daemon executes any longer, because its execution ended without
         // settling it, is taken up again, so it does not hold one of its workflow's places until
         // the next restart.
@@ -783,13 +800,20 @@ async fn dispatch(
         };
         match taken_up {
             Ok(runs) => {
+                // A run taken up may end the way the last one did, so the pass after this one is
+                // not made at once.
+                clean &= runs.is_empty();
                 for run in runs {
                     execute_apart(&service, run);
                 }
             }
-            Err(error) => eprintln!(
-                "kr-controller: the workflow runs nothing is executing were not taken up: {error}"
-            ),
+            Err(error) => {
+                clean = false;
+                eprintln!(
+                    "kr-controller: the workflow runs nothing is executing were not taken up: \
+                     {error}"
+                );
+            }
         }
         let admitted = {
             let service = Arc::clone(&service);
@@ -803,6 +827,7 @@ async fn dispatch(
             execute_apart(&service, run);
         }
         if let Some(error) = admitted.stopped {
+            clean = false;
             eprintln!(
                 "kr-controller: the workflow trigger dispatcher stopped before its last trigger: \
                  {error}"
@@ -819,6 +844,7 @@ async fn dispatch(
             execute_apart(&service, run);
         }
         if let Some(error) = queued.stopped {
+            clean = false;
             eprintln!(
                 "kr-controller: the workflow runs waiting for a slot were not started: {error}"
             );
@@ -830,12 +856,37 @@ async fn dispatch(
             blocking(move || service.store().prune()).await
         };
         if let Err(error) = pruned {
+            clean = false;
             eprintln!("kr-controller: the workflow journal kept events it no longer owes: {error}");
         }
-        tokio::select! {
-            () = woken.notified() => {}
-            () = tokio::time::sleep(DISPATCH_INTERVAL) => {}
+        passes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        // The journal is gone with the service, which the module holds for as long as it runs
+        // this.
+        if !wait_to_look_again(clean, &woken, &mut changes).await {
+            return;
         }
+    }
+}
+
+/// Waits until the dispatcher has a reason to look at the journal again, and answers whether it
+/// still has one to wait for.
+///
+/// After a clean pass that is a change to the journal or a run's place being given back, with no
+/// timer. After one that was not clean it is [`DISPATCH_INTERVAL`] and nothing else: a pass that
+/// wrote before it failed has raised the journal's signal itself, and that signal must not be what
+/// makes the next pass follow it at once.
+async fn wait_to_look_again(
+    clean: bool,
+    woken: &tokio::sync::Notify,
+    changes: &mut tokio::sync::watch::Receiver<u64>,
+) -> bool {
+    if !clean {
+        tokio::time::sleep(DISPATCH_INTERVAL).await;
+        return true;
+    }
+    tokio::select! {
+        () = woken.notified() => true,
+        changed = changes.changed() => changed.is_ok(),
     }
 }
 
@@ -914,6 +965,7 @@ impl AutomationModule {
             daemon,
             resumed: std::sync::Mutex::new(Some(resumed)),
             dispatcher: std::sync::OnceLock::new(),
+            passes: Arc::default(),
         })
     }
 
@@ -944,8 +996,16 @@ impl AutomationModule {
                 Arc::clone(&self.service),
                 Arc::clone(&self.daemon),
                 resumed,
+                Arc::clone(&self.passes),
             ))
         });
+    }
+
+    /// How many passes the trigger dispatcher has finished. For this host's own tests.
+    #[cfg(any(test, feature = "testing"))]
+    #[must_use]
+    pub fn dispatch_passes(&self) -> u64 {
+        self.passes.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Returns the service itself.
@@ -1260,6 +1320,235 @@ fn encode<T: serde::Serialize>(value: &T) -> Answer<ParamsValue> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An automation service on a journal in `directory`, with no workflow in it.
+    fn idle_service(directory: &std::path::Path) -> Arc<AutomationService> {
+        Arc::new(
+            kr_automation::AutomationService::open(
+                directory,
+                kr_automation::Host {
+                    environment_id: kr_protocol::ids::EnvironmentId::new(kr_ipc::new_uuid()),
+                    runner: Arc::new(kr_automation::MockActionRunner::new()),
+                    authority: Arc::new(kr_automation::GrantTable::new()),
+                    clock: Arc::new(kr_automation::SystemClock),
+                    ceilings: Arc::new(kr_automation::FixedCeilings {
+                        sessions: 8,
+                        managed_spend: 0,
+                    }),
+                },
+            )
+            .expect("the journal opens"),
+        )
+    }
+
+    /// KR-PERF-003: a dispatcher with nothing to do keeps no timer. Its first passes settle what
+    /// the journal's own registration writes; after that, hours of waiting run none.
+    #[tokio::test(start_paused = true)]
+    async fn an_idle_dispatcher_runs_no_pass_while_the_journal_does_not_change() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let passes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let task = tokio::spawn(dispatch(
+            idle_service(directory.path()),
+            Arc::new(Daemon::default()),
+            Vec::new(),
+            Arc::clone(&passes),
+        ));
+        let counted = || passes.load(std::sync::atomic::Ordering::SeqCst);
+        tokio::time::sleep(std::time::Duration::from_secs(60 * 60)).await;
+        let settled = counted();
+        assert!(settled > 0, "the dispatcher made its first pass");
+        tokio::time::sleep(std::time::Duration::from_secs(60 * 60)).await;
+        assert_eq!(counted(), settled, "an hour of waiting made no pass");
+        task.abort();
+    }
+
+    /// KR-REQ-25.19: a node that settles inside a run that has not ended is read by the dispatcher
+    /// when the journal commits it, by the journal's own signal: no run ends here, and the
+    /// dispatcher keeps no timer to find it.
+    #[tokio::test(start_paused = true)]
+    async fn a_settled_node_is_read_when_it_is_committed_and_not_when_its_run_ends() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let service = idle_service(directory.path());
+        let passes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let task = tokio::spawn(dispatch(
+            Arc::clone(&service),
+            Arc::new(Daemon::default()),
+            Vec::new(),
+            Arc::clone(&passes),
+        ));
+        tokio::time::sleep(std::time::Duration::from_secs(60 * 60)).await;
+        let position = || {
+            service
+                .store()
+                .consumer_position(kr_automation::TRIGGER_CONSUMER)
+                .expect("the journal reads")
+        };
+        assert_eq!(
+            position(),
+            Some(0),
+            "the dispatcher is registered and has read nothing"
+        );
+
+        let admit = || Ok(());
+        let key = kr_automation::ActionKey {
+            actor_id: "local:test".to_owned(),
+            action_id: kr_ipc::new_uuid().to_string(),
+            method: "workflow.run".to_owned(),
+            digest: vec![1],
+        };
+        service
+            .store()
+            .act(
+                &kr_automation::Submitted {
+                    key: &key,
+                    admission: &admit,
+                    caller_grant: None,
+                },
+                kr_ipc::now_ms().get(),
+                |journal| {
+                    let sequence = journal.record_event(
+                        &kr_automation::store::JournalEventKind::NodeSettled {
+                            run_id: kr_protocol::ids::WorkflowRunId::new(kr_ipc::new_uuid()),
+                            workflow_id: kr_protocol::ids::WorkflowId::new(kr_ipc::new_uuid()),
+                            revision: 1,
+                            node_id: "tests".to_owned(),
+                            action_id: kr_protocol::ids::ActionId::new(kr_ipc::new_uuid()),
+                            status: kr_protocol::automation::NodeStatus::Failed,
+                            produced: None,
+                            chain: kr_automation::store::EventChain {
+                                causal_root_id: kr_protocol::ids::CausalRootId::new(
+                                    kr_ipc::new_uuid(),
+                                ),
+                                generation: 1,
+                                depth: 0,
+                                parent_run_id: None,
+                                parent_node_id: None,
+                            },
+                        },
+                        kr_ipc::now_ms().get(),
+                    )?;
+                    Ok((kr_automation::ActionRecord::done(&"settled")?, sequence))
+                },
+            )
+            .expect("the journal commits the action");
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        assert!(
+            position().is_some_and(|read| read > 0),
+            "the dispatcher read the event"
+        );
+        task.abort();
+    }
+
+    /// KR-PERF-003: a pass that writes and then fails, every time, is made once in each interval.
+    /// The trigger refuses the dispatcher's subscription after its consumer's row is written, so
+    /// each pass counts a change in the journal and fails with it rolled back, and the change it
+    /// counted is the signal the pass waits on. Taking the cause away with no write to the journal
+    /// is found by the next try.
+    #[tokio::test(start_paused = true)]
+    async fn a_pass_that_keeps_failing_after_it_wrote_is_made_once_in_each_interval() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let service = idle_service(directory.path());
+        let other = rusqlite::Connection::open(
+            directory
+                .path()
+                .join(kr_automation::store::WORKFLOW_DB_NAME),
+        )
+        .expect("the journal's file opens");
+        other
+            .busy_timeout(std::time::Duration::from_secs(10))
+            .expect("a busy timeout");
+        other
+            .execute_batch(
+                "CREATE TRIGGER refuse_subscription BEFORE INSERT ON event_subscriptions
+                 BEGIN SELECT RAISE(ABORT, 'refused'); END;",
+            )
+            .expect("a trigger");
+        let passes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let task = tokio::spawn(dispatch(
+            Arc::clone(&service),
+            Arc::new(Daemon::default()),
+            Vec::new(),
+            Arc::clone(&passes),
+        ));
+        tokio::time::sleep(DISPATCH_INTERVAL * 10).await;
+        let made = passes.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            (1..=12).contains(&made),
+            "ten intervals of a failure that persists made {made} passes"
+        );
+        assert_eq!(
+            service
+                .store()
+                .consumer_position(kr_automation::TRIGGER_CONSUMER)
+                .expect("the journal reads"),
+            None,
+            "the dispatcher is not registered while the cause stands"
+        );
+
+        other
+            .execute_batch("DROP TRIGGER refuse_subscription;")
+            .expect("the trigger goes");
+        tokio::time::sleep(DISPATCH_INTERVAL * 2).await;
+        assert_eq!(
+            service
+                .store()
+                .consumer_position(kr_automation::TRIGGER_CONSUMER)
+                .expect("the journal reads"),
+            Some(0),
+            "and is, once the cause is gone, with no write to the journal to say so"
+        );
+        task.abort();
+    }
+
+    /// After a pass that was not clean the wait is the interval and nothing else: the journal's
+    /// signal, which a pass that wrote before it failed raised itself, and a run's place given
+    /// back, both already waiting, do not end it. After a clean pass a waiting signal ends it at
+    /// once, and with none the wait has no end of its own.
+    #[tokio::test(start_paused = true)]
+    async fn the_wait_after_a_pass_is_the_interval_after_a_failure_and_an_event_after_a_clean_one()
+    {
+        use std::time::Duration;
+        let woken = tokio::sync::Notify::new();
+        woken.notify_one();
+        let (journal, mut changes) = tokio::sync::watch::channel(0_u64);
+        journal.send_modify(|version| *version += 1);
+
+        {
+            let wait = wait_to_look_again(false, &woken, &mut changes);
+            tokio::pin!(wait);
+            assert!(
+                tokio::time::timeout(DISPATCH_INTERVAL - Duration::from_millis(1), &mut wait)
+                    .await
+                    .is_err(),
+                "a failed pass is not followed by the signals it raised"
+            );
+            assert_eq!(
+                tokio::time::timeout(Duration::from_millis(2), &mut wait).await,
+                Ok(true),
+                "and is followed when the interval has gone"
+            );
+        }
+
+        assert_eq!(
+            tokio::time::timeout(
+                Duration::from_millis(1),
+                wait_to_look_again(true, &woken, &mut changes)
+            )
+            .await,
+            Ok(true),
+            "a clean pass is followed by what is waiting"
+        );
+        changes.borrow_and_update();
+        assert!(
+            tokio::time::timeout(
+                Duration::from_secs(60 * 60),
+                wait_to_look_again(true, &woken, &mut changes)
+            )
+            .await
+            .is_err(),
+            "with nothing waiting a clean pass is followed by nothing, however long it waits"
+        );
+    }
 
     /// A workflow's capture is never held still, and the reason given is the workspace's own when
     /// it has one.

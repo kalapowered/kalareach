@@ -99,13 +99,25 @@ pub struct StartedRun {
 ///
 /// A run the journal holds as running and this set does not is one nobody executes, which
 /// [`AutomationService::recover`] takes up.
-#[derive(Debug, Default)]
-struct Executing(std::sync::Mutex<std::collections::HashSet<WorkflowRunId>>);
+#[derive(Debug)]
+struct Executing {
+    held: std::sync::Mutex<std::collections::HashSet<WorkflowRunId>>,
+    /// Woken each time a run's place is given back, which is when a slot it held is free and when
+    /// a run that ended without settling is one nobody executes.
+    ended: Arc<tokio::sync::Notify>,
+}
 
 impl Executing {
+    fn new(ended: Arc<tokio::sync::Notify>) -> Self {
+        Self {
+            held: std::sync::Mutex::default(),
+            ended,
+        }
+    }
+
     /// Takes `run_id`'s place, or answers `None` when something in this process holds it.
     fn hold(self: &Arc<Self>, run_id: WorkflowRunId) -> Option<Executes> {
-        self.0
+        self.held
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(run_id)
@@ -135,10 +147,12 @@ struct Executes {
 impl Drop for Executes {
     fn drop(&mut self) {
         self.executing
-            .0
+            .held
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(&self.run_id);
+        // After the place is given back, so the pass this wakes finds it free.
+        self.executing.ended.notify_one();
     }
 }
 
@@ -260,16 +274,17 @@ impl AutomationService {
         let authority = Arc::clone(&host.authority);
         let ceilings = Arc::clone(&host.ceilings);
         let engine = Arc::new(WorkflowEngine::new(Arc::clone(&store), host));
+        let events = Arc::new(tokio::sync::Notify::new());
 
         Self {
             store,
-            executing: Arc::default(),
+            executing: Arc::new(Executing::new(Arc::clone(&events))),
             ceilings,
             authority,
             environment_id,
             engine,
             source_workflow: Arc::new(SourceWorkflowCoordinator::new()),
-            events: Arc::new(tokio::sync::Notify::new()),
+            events,
         }
     }
 
@@ -292,10 +307,12 @@ impl AutomationService {
     }
 
     /// Woken each time a run this service executed has stopped, which is when its nodes' events
-    /// are all in the journal.
+    /// are all in the journal, and each time a run's place in this process is given back.
     ///
-    /// A host that runs the trigger dispatcher waits on this, as well as on a timer of its own for
-    /// anything a wake-up did not cover.
+    /// A host that runs the trigger dispatcher waits on this and on [`WorkflowStore::changes`]:
+    /// together they cover everything that can give the dispatcher work. After a pass that failed
+    /// or stopped short the host also tries again on a timer, because the cause of a failure can
+    /// go without either of them being raised.
     #[must_use]
     pub fn events(&self) -> Arc<tokio::sync::Notify> {
         Arc::clone(&self.events)
@@ -511,7 +528,6 @@ impl AutomationService {
             .engine
             .execute_run(started.run_id, &started.definition, &started.causal)
             .await;
-        self.events.notify_one();
         Ok(WorkflowRunResult {
             run_id: started.run_id,
             workflow_id: started.definition.workflow_id,

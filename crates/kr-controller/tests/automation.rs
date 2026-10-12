@@ -1458,6 +1458,11 @@ async fn an_open_automation_module_dispatches_nothing_until_it_is_started() {
         None,
         "an open module dispatches nothing"
     );
+    assert_eq!(
+        module.dispatch_passes(),
+        0,
+        "an open module makes no pass over the journal"
+    );
 
     module.start();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
@@ -1468,6 +1473,10 @@ async fn an_open_automation_module_dispatches_nothing_until_it_is_started() {
         );
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
+    assert!(
+        module.dispatch_passes() > 0,
+        "and it was a pass of the started module that read it"
+    );
     drop(module);
     host.clients.abort();
 }

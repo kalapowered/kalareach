@@ -1882,6 +1882,43 @@ impl<'c> Journal<'c> {
 pub struct WorkflowStore {
     conn: Mutex<Connection>,
     path: PathBuf,
+    /// Advanced each time a statement run through [`Self::lock`] changed a row, however the
+    /// transaction around it ended: [`Self::changes`] hands out its receiver.
+    changed: tokio::sync::watch::Sender<u64>,
+}
+
+/// The journal's connection while a caller holds it.
+///
+/// Dropping it, which is after any transaction opened on it has ended, advances the store's change
+/// counter when a statement run meanwhile changed a row. SQLite counts the rows of a statement that
+/// completed and does not take them back when the transaction is rolled back, so a pass that
+/// failed after writing counts too: a reader of the counter must not take its own wake-up for news.
+struct Locked<'a> {
+    connection: MutexGuard<'a, Connection>,
+    changed: &'a tokio::sync::watch::Sender<u64>,
+    changes_before: u64,
+}
+
+impl std::ops::Deref for Locked<'_> {
+    type Target = Connection;
+
+    fn deref(&self) -> &Connection {
+        &self.connection
+    }
+}
+
+impl std::ops::DerefMut for Locked<'_> {
+    fn deref_mut(&mut self) -> &mut Connection {
+        &mut self.connection
+    }
+}
+
+impl Drop for Locked<'_> {
+    fn drop(&mut self) {
+        if self.connection.total_changes() > self.changes_before {
+            self.changed.send_modify(|version| *version += 1);
+        }
+    }
 }
 
 impl std::fmt::Debug for WorkflowStore {
@@ -2010,10 +2047,7 @@ impl WorkflowStore {
     pub fn open(state_dir: impl AsRef<Path>) -> Result<Self> {
         let path = state_dir.as_ref().join(WORKFLOW_DB_NAME);
         let conn = Connection::open(&path)?;
-        let store = Self {
-            conn: Mutex::new(conn),
-            path,
-        };
+        let store = Self::around(conn, path);
         store.init_schema()?;
         Ok(store)
     }
@@ -2025,18 +2059,40 @@ impl WorkflowStore {
     /// Returns a storage error when the schema cannot be created.
     pub fn in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
-        let store = Self {
-            conn: Mutex::new(conn),
-            path: PathBuf::from(":memory:"),
-        };
+        let store = Self::around(conn, PathBuf::from(":memory:"));
         store.init_schema()?;
         Ok(store)
     }
 
-    fn lock(&self) -> MutexGuard<'_, Connection> {
-        self.conn
+    fn around(connection: Connection, path: PathBuf) -> Self {
+        Self {
+            conn: Mutex::new(connection),
+            path,
+            changed: tokio::sync::watch::channel(0).0,
+        }
+    }
+
+    /// Hands out a receiver that sees each change to the journal's rows after it was made.
+    ///
+    /// Every statement the store runs goes through [`Self::lock`], so a write by an action, a
+    /// transaction or a single statement is all seen, and a statement that wrote nothing (a
+    /// registration that was already made) is not. A reader marks the receiver as seen before it
+    /// reads the journal, so a change made while it reads is not lost.
+    #[must_use]
+    pub fn changes(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.changed.subscribe()
+    }
+
+    fn lock(&self) -> Locked<'_> {
+        let connection = self
+            .conn
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Locked {
+            changes_before: connection.total_changes(),
+            connection,
+            changed: &self.changed,
+        }
     }
 
     /// Runs `body` over the journal outside any transaction.
@@ -3592,6 +3648,88 @@ mod tests {
         assert!(matches!(err, AutomationError::DuplicateTrigger { .. }));
     }
 
+    /// KR-PERF-003: whoever waits on the journal is told about every commit that changed a row,
+    /// whichever way it was made, and about nothing else. An action's own transaction, a refusal it
+    /// recorded, a single statement and a registration are all seen; a read, a repeat answered from
+    /// a record and a registration that was already made are not.
+    #[test]
+    fn the_journal_announces_each_commit_that_changed_a_row_and_no_other_statement() {
+        let store = WorkflowStore::in_memory().unwrap();
+        let mut changes = store.changes();
+        let announced = |changes: &mut tokio::sync::watch::Receiver<u64>| {
+            let moved = changes.has_changed().unwrap();
+            changes.borrow_and_update();
+            moved
+        };
+        assert!(
+            !announced(&mut changes),
+            "nothing has happened since the receiver was made"
+        );
+
+        assert_eq!(store.register_consumer("reader", &["t"], 1_000).unwrap(), 0);
+        assert!(announced(&mut changes), "a registration that wrote");
+        store.register_consumer("reader", &["t"], 1_001).unwrap();
+        store.consumer_position("reader").unwrap();
+        store.events_after(0, &["t"], 10).unwrap();
+        store.get_definition(test_wf_id(2), 1).unwrap();
+        assert!(
+            !announced(&mut changes),
+            "a registration made before, and reads, wrote nothing"
+        );
+
+        let def =
+            create_workflow_definition(test_wf_id(2), 1, "seen", test_grant_id(2), vec![], vec![]);
+        let admit = || Ok(());
+        let installing = key("seen-1", "workflow.install");
+        let submit = |key| Submitted {
+            key,
+            admission: &admit,
+            caller_grant: None,
+        };
+        store
+            .act(&submit(&installing), 1_000, |journal| {
+                journal.save_definition(&def, None, 1_000)?;
+                Ok((ActionRecord::done(&"installed")?, ()))
+            })
+            .unwrap();
+        assert!(announced(&mut changes), "an action that was performed");
+        let repeated = store
+            .act(
+                &submit(&installing),
+                1_001,
+                |_| -> Result<(ActionRecord, ())> {
+                    panic!("a recorded action is not performed a second time")
+                },
+            )
+            .unwrap();
+        assert!(matches!(repeated, Acted::Answered(_)));
+        assert!(
+            !announced(&mut changes),
+            "a repeat answered from its record"
+        );
+
+        let refusing = key("seen-2", "workflow.run");
+        let refused = store.act(
+            &submit(&refusing),
+            1_002,
+            |journal| -> Result<(ActionRecord, ())> {
+                journal.record_event(
+                    &JournalEventKind::WorkflowResumed {
+                        workflow_id: test_wf_id(2),
+                        revision: 1,
+                    },
+                    1_002,
+                )?;
+                Err(AutomationError::InvalidArgument("refused".to_owned()))
+            },
+        );
+        assert!(refused.is_err());
+        assert!(
+            announced(&mut changes),
+            "a refusal the host decided is recorded with what it wrote, and is seen"
+        );
+    }
+
     /// An effect and its record are one transaction: an action that was performed always has
     /// its record, and a submission whose admission lapsed leaves neither.
     #[test]
@@ -3858,10 +3996,7 @@ mod tests {
         let keeper = a_journal_at_version_6(directory.path(), "delete");
         {
             let path = directory.path().join(WORKFLOW_DB_NAME);
-            let store = WorkflowStore {
-                conn: Mutex::new(Connection::open(&path).expect("opens")),
-                path,
-            };
+            let store = WorkflowStore::around(Connection::open(&path).expect("opens"), path);
             let error = store
                 .bring_forward_compacting(|_| Err(rusqlite::Error::InvalidQuery))
                 .expect_err("a compaction that fails stops the open");
@@ -4054,10 +4189,7 @@ mod tests {
         let directory = tempfile::tempdir().expect("a directory");
         drop(a_journal_at_version_6(directory.path(), "delete"));
         let path = directory.path().join(WORKFLOW_DB_NAME);
-        let store = WorkflowStore {
-            conn: Mutex::new(Connection::open(&path).expect("opens")),
-            path: path.clone(),
-        };
+        let store = WorkflowStore::around(Connection::open(&path).expect("opens"), path.clone());
         let error = store
             .bring_forward_compacting(|connection| {
                 connection.execute_batch("VACUUM")?;
