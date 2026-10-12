@@ -254,6 +254,21 @@ impl Controller {
         Self::start_with(setup, Clocks::system(), timer).await
     }
 
+    /// Starts the daemon on the clocks a test gives it, with the waits of its carriers in the hands
+    /// of `timer`.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::start`].
+    #[cfg(feature = "testing")]
+    pub async fn start_on_clocks_and_timer(
+        setup: ControllerSetup,
+        clocks: Clocks,
+        timer: Arc<dyn Timer>,
+    ) -> Result<Arc<Self>> {
+        Self::start_with(setup, clocks, timer).await
+    }
+
     async fn start_with(
         setup: ControllerSetup,
         clocks: Clocks,
