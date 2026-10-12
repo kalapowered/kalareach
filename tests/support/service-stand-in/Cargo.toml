@@ -18,6 +18,8 @@ kr-client.workspace = true
 # Verifying the signatures the service verifies.
 kr-crypto.workspace = true
 kr-protocol.workspace = true
+# The relay control plane's request bodies, which the digest a credential covers is rebuilt from.
+serde.workspace = true
 serde_json.workspace = true
 # The loopback listener, and the pause a held request waits in.
 tokio = { workspace = true, features = ["io-util", "net", "rt", "sync"] }
