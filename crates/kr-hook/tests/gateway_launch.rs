@@ -525,16 +525,30 @@ fn kr_req_11_32_only_the_registered_process_reaches_the_gateway() {
     other
         .set_read_timeout(Some(LIVENESS))
         .expect("a read timeout");
-    std::io::Write::write_all(
+    // Closed without a word: the end of the stream, or, where a stream that is closed with unread
+    // bytes resets its peer, a reset at the read, or a broken pipe at the write when the close came
+    // first. A word is a reply, and a held connection is a timeout.
+    let ended = |error: &std::io::Error| {
+        matches!(
+            error.kind(),
+            std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe
+        )
+    };
+    let written = std::io::Write::write_all(
         &mut other,
         b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\
           Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
-    )
-    .expect("the request is written");
+    );
     let mut heard = [0_u8; 16];
-    assert_eq!(
-        std::io::Read::read(&mut other, &mut heard).expect("the connection is closed, not held"),
-        0,
+    let closed_without_a_word = match written {
+        Err(error) => ended(&error),
+        Ok(()) => match std::io::Read::read(&mut other, &mut heard) {
+            Ok(read) => read == 0,
+            Err(error) => ended(&error),
+        },
+    };
+    assert!(
+        closed_without_a_word,
         "another process is closed without a word, though its upgrade is a plain one"
     );
     std::fs::write(&release, b"go").expect("the terminal is released");
