@@ -103,8 +103,9 @@ pub struct StartedRun {
 struct Executing {
     held: std::sync::Mutex<std::collections::HashSet<WorkflowRunId>>,
     /// Woken each time a run's execution ends and its place is given back, which is when a slot it
-    /// held is free and when a run that ended without settling is one nobody executes. A place
-    /// given back without an execution (see [`Executes::give_back_quietly`]) wakes nobody.
+    /// held is free and when a run that ended without settling is one nobody executes. The two
+    /// places [`AutomationService::recover`] holds and finds nothing to take up in are given back
+    /// quietly (see [`Executes::give_back_quietly`]) and wake nobody.
     ended: Arc<tokio::sync::Notify>,
 }
 
