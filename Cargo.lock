@@ -4834,6 +4834,7 @@ dependencies = [
  "kr-client",
  "kr-crypto",
  "kr-protocol",
+ "serde",
  "serde_json",
  "tokio",
 ]

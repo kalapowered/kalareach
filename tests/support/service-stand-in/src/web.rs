@@ -198,6 +198,8 @@ struct State {
     feeds: BTreeMap<String, crate::feed::Feed>,
     /// The mailboxes, by the identifier of each recipient's stored-envelope key.
     mailboxes: BTreeMap<String, crate::mailbox::Mailbox>,
+    /// The relay control plane's authorisations and leases.
+    relay: crate::relay::Relay,
 }
 
 /// What the service did with one request.
@@ -289,6 +291,83 @@ impl ServiceWeb {
             .get(&crate::mailbox::address_of(recipient))
             .map(crate::mailbox::Mailbox::envelopes)
             .unwrap_or_default()
+    }
+
+    /// An account gives the host whose signing key is `host` leave to spend its relay allowance,
+    /// with at most `byte_ceiling` bytes outstanding for one lease, as the account console does.
+    /// Returns the ids a host names to be paid for.
+    pub fn authorise_relay_payer(
+        &self,
+        host: &kr_protocol::scalars::AuthorisationKey,
+        byte_ceiling: u64,
+    ) -> crate::relay::RelayPayerRecord {
+        self.state
+            .lock()
+            .expect("the state")
+            .relay
+            .authorise(host, byte_ceiling)
+    }
+
+    /// The account withdraws an authorisation: the leases issued under it are revoked and no
+    /// request names it again.
+    pub fn withdraw_relay_authorisation(&self, authorisation_id: &str) {
+        self.state
+            .lock()
+            .expect("the state")
+            .relay
+            .withdraw(authorisation_id);
+    }
+
+    /// The relay allowance of every account is spent, or is not.
+    pub fn exhaust_relay_allowance(&self, exhausted: bool) {
+        self.state
+            .lock()
+            .expect("the state")
+            .relay
+            .exhaust(exhausted);
+    }
+
+    /// The service has no relay instance to offer a new lease, or has one again.
+    pub fn withhold_relays(&self, withheld: bool) {
+        self.state
+            .lock()
+            .expect("the state")
+            .relay
+            .withhold_relays(withheld);
+    }
+
+    /// The service's clock runs `by` ahead of the machine's from now on, for the deadlines it
+    /// writes into leases.
+    pub fn advance_relay_clock(&self, by: std::time::Duration) {
+        self.state
+            .lock()
+            .expect("the state")
+            .relay
+            .advance_clock(u64::try_from(by.as_millis()).unwrap_or(u64::MAX));
+    }
+
+    /// The service ends one lease on its own, as it does when the relay carrying it is retired.
+    pub fn end_relay_lease(&self, lease_id: &str) {
+        self.state
+            .lock()
+            .expect("the state")
+            .relay
+            .end_by_the_service(lease_id);
+    }
+
+    /// The relay counts `bytes` more for the reservation of one lease.
+    pub fn relay_counts(&self, lease_id: &str, bytes: u64) {
+        self.state
+            .lock()
+            .expect("the state")
+            .relay
+            .consume(lease_id, bytes);
+    }
+
+    /// Every lease the service has issued, live or ended, in the order of their identifiers.
+    #[must_use]
+    pub fn relay_leases(&self) -> Vec<crate::relay::RelayLeaseView> {
+        self.state.lock().expect("the state").relay.views()
     }
 
     /// `token` expires: from now on it proves no account.
@@ -540,6 +619,16 @@ impl ServiceWeb {
         content: Option<&[u8]>,
         part_write_fails: bool,
     ) -> ServiceHttpAnswer {
+        // The relay's two routes carry a credential the protocol's method registry does not list
+        // yet, so they are read by the relay's own check.
+        if path == "/api/relay/lease" || path == "/api/relay/lease/revoke" {
+            let mut state = self.state.lock().expect("the state");
+            return if path == "/api/relay/lease" {
+                crate::relay::issue(&mut state.relay, &self.origin, document, now_ms())
+            } else {
+                crate::relay::revoke(&mut state.relay, &self.origin, document, now_ms())
+            };
+        }
         let method = match path {
             "/api/storage/status" => "storage.status",
             "/api/storage/retention" => "storage.retention.set",
