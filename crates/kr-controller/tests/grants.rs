@@ -32,6 +32,7 @@ use std::time::Duration;
 mod net_support;
 mod organisation_support;
 
+use kr_controller::grants::feed::Basis;
 use kr_controller::grants::organisation::LeasePresentation;
 use kr_controller::grants::{
     AccessRequest, AuthorityFeed, FeedRefusal, GrantDirectory, GrantRecord, HostPolicy,
@@ -3216,7 +3217,6 @@ fn a_lease_the_pinned_policy_signing_authority_did_not_sign_is_refused() {
 
 #[test]
 fn only_the_host_issues_ordered_revisions_and_records_are_retained_until_acknowledged() {
-    use kr_controller::grants::feed::Beginning;
     use kr_protocol::pairing::{RevocationRequest, RevocationTarget};
 
     let host = device_id(0xf0);
@@ -3240,10 +3240,16 @@ fn only_the_host_issues_ordered_revisions_and_records_are_retained_until_acknowl
 
     // The request carries no revision at all. The daemon's registry allocates the number, from the
     // same sequence its own revocations use, and the feed is told of it as the revocation completes.
-    let held_by_the_feed = AuthorityRevision::new(0);
+    let basis = |at_ms: u64| Basis {
+        origin: "https://feed.example",
+        previous: AuthorityRevision::new(0),
+        registry: AuthorityRevision::new(3),
+        at_ms,
+    };
     assert_eq!(
-        feed.begin(published(1), held_by_the_feed, 2_000),
-        Ok(Beginning::New)
+        feed.begin(published(1), basis(2_000))
+            .map(|held| held.authority_revision),
+        Ok(None)
     );
     assert_eq!(
         feed.record(published(1).request_id)
@@ -3258,14 +3264,10 @@ fn only_the_host_issues_ordered_revisions_and_records_are_retained_until_acknowl
 
     // A republished request is the same revocation, not a second one.
     assert_eq!(
-        feed.begin(published(1), held_by_the_feed, 2_100),
-        Ok(Beginning::Resumed)
-    );
-    assert_eq!(
-        feed.record(published(1).request_id)
-            .expect("taken")
-            .authority_revision,
-        Some(AuthorityRevision::new(4))
+        feed.begin(published(1), basis(2_100))
+            .map(|held| (held.authority_revision, held.applied_at_ms)),
+        Ok((Some(AuthorityRevision::new(4)), 2_000)),
+        "it keeps the revision it took and the basis it was first taken on"
     );
     assert_eq!(feed.accepted_revision(), AuthorityRevision::new(4));
 
@@ -3276,7 +3278,7 @@ fn only_the_host_issues_ordered_revisions_and_records_are_retained_until_acknowl
         ..published(1)
     };
     assert_eq!(
-        feed.begin(impostor, held_by_the_feed, 2_150),
+        feed.begin(impostor, basis(2_150)).map(|_| ()),
         Err(FeedRefusal::AlreadyApplied)
     );
 
@@ -3286,7 +3288,7 @@ fn only_the_host_issues_ordered_revisions_and_records_are_retained_until_acknowl
         ..published(2)
     };
     assert_eq!(
-        feed.begin(elsewhere, held_by_the_feed, 2_200),
+        feed.begin(elsewhere, basis(2_200)).map(|_| ()),
         Err(FeedRefusal::AnotherHost)
     );
 
@@ -3300,20 +3302,25 @@ fn only_the_host_issues_ordered_revisions_and_records_are_retained_until_acknowl
     feed.enrol(device_id(0xd1));
     assert_eq!(feed.retained().len(), 1);
     let request_id = RevocationRequestId::new(Uuid::from_bytes([1; 16]));
-    assert!(!feed.acknowledge(request_id, device_id(0xd0)));
+    assert!(feed.acknowledge(request_id, device_id(0xd0)));
     assert_eq!(feed.retained().len(), 1, "one of two is not every one");
     assert!(feed.acknowledge(request_id, device_id(0xd1)));
     assert!(
         feed.retained().is_empty(),
         "a settled record is no longer owed to anybody"
     );
+    assert!(
+        !feed.acknowledge(request_id, device_id(0xd1)),
+        "an acknowledgement the record already holds changes nothing, so it is not written again"
+    );
 
     // Settling is not forgetting: the identity that stops the request being applied a second time
     // survives it.
     assert_eq!(feed.applied().len(), 1);
     assert_eq!(
-        feed.begin(published(1), held_by_the_feed, 3_000),
-        Ok(Beginning::Resumed),
+        feed.begin(published(1), basis(3_000))
+            .map(|held| held.applied_at_ms),
+        Ok(2_000),
         "a republished request after settlement is not taken as new"
     );
 
@@ -3335,9 +3342,21 @@ fn only_the_host_issues_ordered_revisions_and_records_are_retained_until_acknowl
     // What is written down comes back, and a restarted host owes a synchronisation whatever it
     // last recorded.
     let stored = feed.snapshot();
-    let restored = AuthorityFeed::restore(&stored);
+    let restored = AuthorityFeed::restore(&stored, Some("https://feed.example"));
     assert_eq!(restored.accepted_revision(), feed.accepted_revision());
     assert_eq!(restored.applied().len(), 1);
+    assert_eq!(
+        AuthorityFeed::restore(&stored, Some("https://another.example"))
+            .applied()
+            .len(),
+        0,
+        "what was taken from one feed is left behind by a host that reads another"
+    );
+    assert_eq!(
+        AuthorityFeed::restore(&stored, None).applied().len(),
+        1,
+        "a host that selects none, or cannot say, keeps what it took"
+    );
     assert_eq!(
         restored
             .record(request_id)
@@ -3368,8 +3387,16 @@ fn a_removal_the_feed_answered_is_shown_settles_what_was_owed_and_is_kept_apart(
         issuer_key_id: kr_protocol::scalars::KeyId::from_bytes([7; 32]),
         signature: Signature64::from_bytes([0; 64]),
     };
-    feed.begin(request, AuthorityRevision::new(3), 5_100)
-        .expect("taken");
+    feed.begin(
+        request,
+        Basis {
+            origin: "https://feed.example",
+            previous: AuthorityRevision::new(3),
+            registry: AuthorityRevision::new(3),
+            at_ms: 5_100,
+        },
+    )
+    .expect("taken");
     assert_eq!(
         feed.retained().len(),
         1,
@@ -3403,7 +3430,7 @@ fn a_removal_the_feed_answered_is_shown_settles_what_was_owed_and_is_kept_apart(
         Nullable::some(TimestampMs::new(6_000))
     );
 
-    let mut restored = AuthorityFeed::restore(&feed.snapshot());
+    let mut restored = AuthorityFeed::restore(&feed.snapshot(), None);
     assert!(
         !restored.is_removed(),
         "a removal is written down apart from the record"
@@ -3438,16 +3465,20 @@ fn a_request_the_host_refused_after_it_began_is_still_refused_when_it_is_read_ba
     };
     let refused = request(1);
     let applied = request(2);
-    feed.begin(refused.clone(), AuthorityRevision::new(3), 5_000)
-        .expect("taken");
-    feed.begin(applied.clone(), AuthorityRevision::new(3), 5_000)
-        .expect("taken");
+    let basis = Basis {
+        origin: "https://feed.example",
+        previous: AuthorityRevision::new(3),
+        registry: AuthorityRevision::new(3),
+        at_ms: 5_000,
+    };
+    feed.begin(refused.clone(), basis).expect("taken");
+    feed.begin(applied.clone(), basis).expect("taken");
     feed.took_effect(applied.request_id, AuthorityRevision::new(4));
 
     feed.note_refusal(refused.request_id, host);
     feed.note_refusal(applied.request_id, host);
 
-    let restored = AuthorityFeed::restore(&feed.snapshot());
+    let restored = AuthorityFeed::restore(&feed.snapshot(), None);
     assert!(
         restored
             .record(refused.request_id)
@@ -3488,7 +3519,7 @@ fn a_feed_stored_before_removals_were_kept_reads_back() {
     let stored: kr_controller::grants::StoredFeed =
         kr_cbor::from_canonical_slice(&written, &kr_cbor::Limits::DEFAULT)
             .expect("the earlier record is read by this build");
-    let feed = AuthorityFeed::restore(&stored);
+    let feed = AuthorityFeed::restore(&stored, None);
     assert!(!feed.is_removed());
     assert_eq!(feed.accepted_revision(), AuthorityRevision::new(7));
     assert_eq!(
