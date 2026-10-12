@@ -148,6 +148,10 @@ impl Owned for Record {
         below
     }
 
+    fn left(&self, process: &ProcessStartIdentity) -> bool {
+        self.owned.lock().expect("the record").read_left(process)
+    }
+
     fn forced(&self, process: &ProcessStartIdentity) {
         self.owned.lock().expect("the record").note_forced(process);
         self.forced.lock().expect("the list").push(process.clone());
@@ -561,6 +565,10 @@ impl Owned for LateRecord {
         below
     }
 
+    fn left(&self, process: &ProcessStartIdentity) -> bool {
+        self.inner.left(process)
+    }
+
     fn forced(&self, process: &ProcessStartIdentity) {
         self.inner.forced(process);
     }
@@ -617,6 +625,70 @@ async fn kr_req_07_53_a_process_shown_late_that_ignores_the_request_is_forced_wh
         went.duration_since(begun) >= FIVE_SECONDS,
         "the process was forced {:?} after the ending began",
         went.duration_since(begun)
+    );
+}
+
+/// The session's record, as it is when a command of a server has started a control daemon that
+/// moved to a scope of its own: the record shows the daemon below the server, and says that it has
+/// left the session.
+struct Departed {
+    inner: Record,
+    daemons: Vec<ProcessStartIdentity>,
+}
+
+impl Owned for Departed {
+    fn below(&self, server: &ProcessStartIdentity) -> Vec<ProcessStartIdentity> {
+        let mut below = self.inner.below(server);
+        below.extend(self.daemons.iter().cloned());
+        below
+    }
+
+    fn left(&self, process: &ProcessStartIdentity) -> bool {
+        self.daemons.contains(process)
+    }
+
+    fn forced(&self, process: &ProcessStartIdentity) {
+        self.inner.forced(process);
+    }
+
+    fn unsignalled(&self, process: &ProcessStartIdentity, why: &str) {
+        self.inner.unsignalled(process, why);
+    }
+}
+
+/// A process the session reads as having left for a control daemon's own scope is not the
+/// session's: the ending does not ask it to terminate (one that ends when asked is still running
+/// after), does not force it (one that ignores the request is still running after), and does not
+/// report it as one that is still running, though a reading returned it.
+#[tokio::test]
+async fn kr_req_07_60_a_process_that_left_the_session_is_neither_asked_nor_forced() {
+    let stand_in = stand_in();
+    let server = start(&stand_in, "ignore-eof", PLAIN).await;
+    let (cooperative, stubborn) = (idler(), stubborn_idler());
+    let record = Departed {
+        inner: Record::of(&server),
+        daemons: vec![cooperative.identity.clone(), stubborn.identity.clone()],
+    };
+
+    let retirement = server.retire(&record, Instant::now().into()).await;
+    let still_running = !gone(&cooperative.identity) && !gone(&stubborn.identity);
+    for daemon in [&cooperative, &stubborn] {
+        let _ = kr_ipc::identity::stop_process(&daemon.identity, kr_ipc::identity::Stop::Kill);
+    }
+    assert_eq!(retirement.ended, Ended::Terminate);
+    assert!(
+        retirement.forced.is_empty(),
+        "nothing was forced: {:?}",
+        retirement.forced
+    );
+    assert!(
+        retirement.survivors.is_empty(),
+        "it is not the session's to report: {:?}",
+        retirement.survivors
+    );
+    assert!(
+        still_running,
+        "neither was asked or forced: both were left running"
     );
 }
 

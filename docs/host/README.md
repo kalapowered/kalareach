@@ -3489,7 +3489,12 @@ ends another environment's session.
 A recorded process that is read in a daemon's scope is not stopped. The worker's own closure lists
 it as `left_for_a_daemon`, apart from the processes the session owned and outside the coverage
 decision, while the process is running. A crash closure lists it only while the worker's last record
-still holds it.
+still holds it. The same holds for a process below a server the worker started: one read in a
+daemon's scope is not recorded as below the server, nothing below it is read, and the ending of the
+server neither asks it to terminate nor forces it. A daemon that does not move is the exception
+there too: the walk below a server starts from every process recorded below it, whatever its parent
+is now, so a daemon that did not move stays recorded after its command has ended, and what it starts
+later is recorded with it.
 
 **Who waits for it.** The closure is recorded after the cleanup, so a read, a list, the barrier
 and a daemon that starts beside a crashed session wait for it: about five seconds when a recorded
