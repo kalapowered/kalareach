@@ -274,12 +274,14 @@ impl Controller {
         clocks: Clocks,
         timer: Arc<dyn Timer>,
     ) -> Result<Arc<Self>> {
-        Self::start_passing(
+        // The start is a long chain of steps, and its state is large. It is kept on the heap, so
+        // that a caller that polls it from a small stack, as a test's thread is, does not hold it.
+        Box::pin(Self::start_passing(
             setup,
             clocks,
             PassSchedule::every(DEBT_PASS_INTERVAL),
             timer,
-        )
+        ))
         .await
     }
 
