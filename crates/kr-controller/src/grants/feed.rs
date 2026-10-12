@@ -47,7 +47,7 @@ use kr_protocol::pairing::{AuthorityRevisionRecord, RevocationRequest};
 use kr_protocol::scalars::{Nullable, TimestampMs};
 use kr_protocol::sharing::AuthorityFeedStatus;
 
-use super::durable::{StoredFeed, StoredRemoval, StoredRevocation};
+use super::durable::{StoredFeed, StoredRevocation};
 
 /// How often a host polls the feed while it is online, in milliseconds.
 pub const FEED_POLL_INTERVAL_MS: u64 = 30_000;
@@ -465,23 +465,12 @@ impl AuthorityFeed {
         }
     }
 
-    /// The removal this feed holds, as it is written down.
-    ///
-    /// It is kept beside the feed's own record and not in it, so a host's earlier record stays
-    /// readable.
-    #[must_use]
-    pub fn removal(&self) -> Option<StoredRemoval> {
-        self.removal.as_ref().map(|removal| StoredRemoval {
-            origin: removal.origin.clone(),
-            at_ms: TimestampMs::new(removal.at_ms),
-        })
-    }
-
-    /// Takes back a removal that was written down, when this host starts.
-    pub fn restore_removal(&mut self, stored: &StoredRemoval) {
+    /// Takes back a removal that was written down beside the feed's own record, when this host
+    /// starts.
+    pub fn restore_removal(&mut self, origin: &str, at_ms: u64) {
         self.removal = Some(Removal {
-            origin: stored.origin.clone(),
-            at_ms: stored.at_ms.get(),
+            origin: origin.to_owned(),
+            at_ms,
         });
         self.remove_enrolled(self.host_device_id);
     }

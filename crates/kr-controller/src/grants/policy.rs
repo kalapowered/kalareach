@@ -1108,8 +1108,9 @@ impl HostPolicy {
     /// Records whether the authority feed this host reads answered that it was removed from it.
     ///
     /// Grants whose validity rests on the feed are refused while it is: an organisation's, and
-    /// personal remote access under a bounded offline-validity policy the owner chose. The default
-    /// non-expiring owner grant does not rest on the feed and is not touched.
+    /// personal remote access under a bounded offline-validity policy the owner chose or on a host
+    /// that is exclusively organisation-managed. The default non-expiring owner grant does not rest
+    /// on the feed and is not touched.
     pub const fn set_feed_removed(&mut self, removed: bool) {
         self.feed_removed = removed;
     }
