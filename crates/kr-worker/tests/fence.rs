@@ -1938,7 +1938,11 @@ fn still_there(pid: u32) -> bool {
 ///
 /// The session is desktop-bound on a host with no graphical login, and its login manager is a
 /// program that never answers once the session has opened. The supervision's first reading
-/// therefore stays outstanding for as long as the platform command is given. A launch reserves the
+/// therefore stays outstanding for as long as the platform command is given, which the case
+/// decides: it gives the command an hour, and ends the reading when it has seen what it came for
+/// by giving it none. Left to the deadline the product ordinarily holds a command to, a machine
+/// slow enough to take longer than that deadline over the case's own steps would end the reading
+/// before the keys were released, and the case would show nothing. A launch reserves the
 /// fence, the keys typed while it is in flight are held, and the machine's clock reaches the
 /// hold's deadline: the reader is told the transaction is revoked, the held keys reach the
 /// terminal in the order they were typed, and the reader, which installs nothing, refuses the
@@ -1954,6 +1958,9 @@ async fn a_launch_hold_ends_on_its_own_deadline_while_the_login_manager_never_an
     ) else {
         return;
     };
+    // This process is the case's own, so the deadline it moves is no other case's. The reading
+    // below is outstanding until the case ends it.
+    kr_worker::desktop::platform::set_probe_deadline(Duration::from_secs(60 * 60));
     let clock = Arc::new(kr_transport::clock::ManualClock::new());
     let mut wired = wired_built(
         ShellMode::Managed,
@@ -2087,8 +2094,9 @@ async fn a_launch_hold_ends_on_its_own_deadline_while_the_login_manager_never_an
     );
     assert!(wired.runtime.session().late_installations().is_empty());
 
-    // The reading's own deadline ends it: the command is killed and reaped, so its process is not
-    // in the table at all.
+    // The reading's own deadline ends it, now that the case has seen what it came for: the command
+    // is killed and reaped, so its process is not in the table at all.
+    kr_worker::desktop::platform::set_probe_deadline(Duration::ZERO);
     tokio::time::timeout(Duration::from_secs(60), async {
         while still_there(waiting) {
             tokio::time::sleep(Duration::from_millis(10)).await;

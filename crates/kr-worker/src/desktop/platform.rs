@@ -255,7 +255,7 @@ fn run(program: &str, arguments: &[&str]) -> Printed {
     // The reading has a deadline. A session facility that has stopped answering must not hold this
     // probe open: what a command that did not finish in time establishes is nothing, which is what
     // `NotRun` means, and never that a desktop ended.
-    let deadline = std::time::Instant::now() + PROBE_DEADLINE;
+    let started = std::time::Instant::now();
     let mut ended = false;
     let status = loop {
         match child.try_wait() {
@@ -268,7 +268,7 @@ fn run(program: &str, arguments: &[&str]) -> Printed {
             // below rather than left behind.
             Err(_) => break None,
         }
-        if std::time::Instant::now() >= deadline {
+        if started.elapsed() >= probe_deadline() {
             break None;
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
@@ -371,6 +371,37 @@ fn read_capture(path: &std::path::Path) -> Option<Vec<u8>> {
 /// which has stopped answering is noticed within one watch cadence.
 #[cfg(any(target_os = "macos", target_os = "linux", windows))]
 const PROBE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// What this host's own tests asked the deadline to be, in milliseconds, or [`u64::MAX`] when none
+/// did.
+#[cfg(feature = "testing")]
+static PROBE_DEADLINE_ASKED_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// Holds every platform command to `deadline` from here on, one that is already running included,
+/// for this host's own tests.
+///
+/// A test that needs a reading to stay outstanding while it works, and to end when it says so,
+/// cannot do that with a deadline the clock runs out. The value is the process's, so such a test
+/// runs in a process of its own.
+#[cfg(feature = "testing")]
+pub fn set_probe_deadline(deadline: std::time::Duration) {
+    let millis = u64::try_from(deadline.as_millis()).unwrap_or(u64::MAX - 1);
+    PROBE_DEADLINE_ASKED_MS.store(millis, std::sync::atomic::Ordering::Release);
+}
+
+/// The deadline a platform command is held to now: [`PROBE_DEADLINE`], unless a test moved it.
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
+fn probe_deadline() -> std::time::Duration {
+    #[cfg(feature = "testing")]
+    {
+        let asked = PROBE_DEADLINE_ASKED_MS.load(std::sync::atomic::Ordering::Acquire);
+        if asked != u64::MAX {
+            return std::time::Duration::from_millis(asked);
+        }
+    }
+    PROBE_DEADLINE
+}
 
 /// Returns whether a platform's own words say the thing asked about is not there.
 ///
