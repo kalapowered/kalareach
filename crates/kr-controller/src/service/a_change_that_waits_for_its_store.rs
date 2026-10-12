@@ -801,6 +801,49 @@ async fn an_idle_daemon_s_privacy_tick_waits_for_its_record_until_privacy_mode_i
     );
 }
 
+/// KR-REQ-24.27, KR-PERF-003: privacy mode's tick waits while the record needs nothing of it, so
+/// the record's view of the sessions can be one that has gone stale: it still counts a session as
+/// running that has since closed. Turning privacy mode on brings that view up to date first, on
+/// the registry's evidence and without telling a worker anything, so the closed session does not
+/// become an obligation the enabling reports for good.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn enabling_privacy_mode_after_the_tick_slept_owes_nothing_for_a_session_that_closed() {
+    let (temp, controller, _clock) = daemon().await;
+    until("the tick waits for its record", || {
+        controller.privacy_tick_waits_for_the_record()
+    })
+    .await;
+    // The record was told this session was running by a pass that came before it closed; nothing
+    // has said otherwise since, because the tick has slept.
+    let closed = SessionId::new(kr_ipc::new_uuid());
+    controller
+        .privacy
+        .note_session_live(closed, kr_ipc::now_ms())
+        .expect("the record notes a running session");
+    assert!(
+        controller.privacy.is_dormant(),
+        "a session known to run is not a launch under way"
+    );
+
+    let (_actor, carried) = admitted(&controller).await;
+    let mutation = request(
+        Method::PrivacySet,
+        temp.environment_id(),
+        &PrivacySetParams { enabled: true },
+    );
+    controller
+        .privacy_set(&mutation, carried)
+        .await
+        .expect("privacy mode is turned on");
+    let report = controller.privacy.status(kr_ipc::now_ms());
+    assert!(report.enabled);
+    assert!(
+        report.sessions.iter().all(|owed| owed.session_id != closed),
+        "no obligation is owed for a session with no worker and nothing on disk: {:?}",
+        report.sessions
+    );
+}
+
 /// KR-REQ-24.28: privacy mode's tick takes a session for ended only on the registry's evidence.
 /// Two sessions owe their cleanup and have no worker: one whose launch was claimed, one whose
 /// reservation was fenced after a claim. Through every pass of the tick each may still have a

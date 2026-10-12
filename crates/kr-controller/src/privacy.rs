@@ -1654,12 +1654,10 @@ impl crate::service::Controller {
             .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
         // While the record needs nothing of the tick it is not kept up to date with the workers
         // that run and the launches that are over, and it is asked to oblige the sessions it
-        // follows: this one pass brings it up to date. In that state the pass tells no worker
-        // anything and retries nothing, so the change waits for no worker's answer. In every other
-        // state the tick keeps the record as current as it was.
-        if self.privacy.is_dormant() {
-            self.privacy_pass_now().await;
-        }
+        // follows: this brings it up to date, and only that. It tells no worker anything and
+        // retries nothing, whatever the record becomes while it runs, so the change waits for no
+        // worker. In every other state the tick has kept the record as current as it was.
+        self.see_the_sessions_now().await;
         let mut sessions: Vec<SessionId> = {
             let registry = self.registry_handle().lock().await;
             let mut sessions: Vec<SessionId> = registry

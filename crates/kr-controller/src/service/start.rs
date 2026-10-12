@@ -1211,11 +1211,6 @@ impl Controller {
         });
     }
 
-    /// Makes one pass of privacy mode's tick now, outside its schedule.
-    pub(crate) async fn privacy_pass_now(self: &Arc<Self>) {
-        let _ = privacy_pass(&Arc::downgrade(self)).await;
-    }
-
     /// How many passes privacy mode's tick has finished. For this host's own tests.
     #[cfg(feature = "testing")]
     pub fn privacy_passes(&self) -> u64 {
@@ -1447,16 +1442,41 @@ impl Controller {
     }
 }
 
-/// One pass of privacy mode's tick, or `None` once the daemon has gone.
-///
-/// The record learns which workers are running and which have ended, retries what it owes, and
-/// each worker whose session has not answered for the generation in force is told it, one after
-/// another, and its answer recorded.
-///
-/// Answers whether the record then needs nothing of the tick until it says otherwise: it is
-/// dormant and every session it follows is one the directory or the registry still shows or
-/// the record has let go of.
-async fn privacy_pass(daemon: &std::sync::Weak<Controller>) -> Option<bool> {
+/// What the directory and the registry show of the sessions, and what the registry shows of the
+/// launches the record follows.
+struct SessionsSeen {
+    /// The sessions whose workers the directory verified.
+    live: Vec<SessionId>,
+    /// The sessions the registry records a worker for, or `None` when it cannot be read: a
+    /// registry that cannot be read says nothing about which workers have ended, so nothing is
+    /// taken for ended on that reading.
+    recorded: Option<Vec<SessionId>>,
+    /// The launches the registry shows to be over.
+    launches: Launches,
+    /// The privacy record.
+    privacy: Arc<crate::privacy::EnvironmentPrivacy>,
+}
+
+impl SessionsSeen {
+    /// Brings the record's view of the sessions into line with what was seen. An obligation that
+    /// could not be written is held and written again by the tick. A launch that never produced a
+    /// worker owes nothing; a delete the record refuses leaves it owed, and the next pass tries it
+    /// again. Does nothing when the registry could not be read.
+    fn record(&self, now_ms: kr_protocol::scalars::TimestampMs) {
+        if let Some(recorded) = &self.recorded {
+            let _ = self
+                .privacy
+                .sessions_seen(&self.live, recorded, &self.launches.ended, now_ms);
+            let _ = self
+                .privacy
+                .discharge_unstarted(&self.launches.never_started);
+        }
+    }
+}
+
+/// Reads what the directory and the registry show of the sessions, or `None` once the daemon has
+/// gone.
+async fn see_the_sessions(daemon: &std::sync::Weak<Controller>) -> Option<SessionsSeen> {
     let (live, recorded, privacy) = {
         let controller = daemon.upgrade()?;
         let live: Vec<SessionId> = controller
@@ -1466,8 +1486,6 @@ async fn privacy_pass(daemon: &std::sync::Weak<Controller>) -> Option<bool> {
             .iter()
             .map(|worker| worker.descriptor.session_id)
             .collect();
-        // A registry that cannot be read says nothing about which workers have ended, so nothing
-        // is taken for ended on this pass.
         let recorded: Option<Vec<SessionId>> =
             controller
                 .registry
@@ -1483,7 +1501,6 @@ async fn privacy_pass(daemon: &std::sync::Weak<Controller>) -> Option<bool> {
                 });
         (live, recorded, Arc::clone(&controller.privacy))
     };
-    let now_ms = kr_ipc::now_ms();
     // A session that is neither running nor recorded is not thereby one that has ended: its worker
     // may not have reported yet. The registry, with the creates the daemon is running and the
     // kernel's answer about a launcher, says whether its launch is over, and whether a worker was
@@ -1502,28 +1519,61 @@ async fn privacy_pass(daemon: &std::sync::Weak<Controller>) -> Option<bool> {
         }
         None => Launches::default(),
     };
-    let (notices, dormant) = {
-        let privacy = Arc::clone(&privacy);
-        tokio::task::spawn_blocking(move || {
-            if let Some(recorded) = &recorded {
-                // An obligation that could not be written is held and written again by the tick.
-                let _ = privacy.sessions_seen(&live, recorded, &launches.ended, now_ms);
-                // A launch that never produced a worker owes nothing; a delete the record refuses
-                // leaves it owed, and the next pass tries it again.
-                let _ = privacy.discharge_unstarted(&launches.never_started);
-            }
-            let _ = privacy.tick(now_ms);
-            let notices = privacy.notices_due(now_ms);
-            // Dormant only when the registry could be read, so that what the pass has just
-            // learned of the sessions is what it was told.
-            let dormant = recorded.as_ref().is_some_and(|recorded| {
-                privacy.is_dormant() && privacy.unreached(&live, recorded).is_empty()
-            });
-            (notices, dormant)
-        })
-        .await
-        .unwrap_or_default()
-    };
+    Some(SessionsSeen {
+        live,
+        recorded,
+        launches,
+        privacy,
+    })
+}
+
+impl Controller {
+    /// Brings the record's view of the sessions up to date, outside the tick's schedule, and
+    /// tells no worker anything: a change to privacy mode asks for this before it lists the
+    /// sessions it obliges, while the record has not been kept current by the tick. Done on a
+    /// blocking thread, as every use of the record's lock is.
+    pub(crate) async fn see_the_sessions_now(self: &Arc<Self>) {
+        let privacy = Arc::clone(&self.privacy);
+        let dormant = tokio::task::spawn_blocking(move || privacy.is_dormant())
+            .await
+            .unwrap_or(false);
+        if !dormant {
+            return;
+        }
+        let Some(seen) = see_the_sessions(&Arc::downgrade(self)).await else {
+            return;
+        };
+        let now_ms = kr_ipc::now_ms();
+        let _ = tokio::task::spawn_blocking(move || seen.record(now_ms)).await;
+    }
+}
+
+/// One pass of privacy mode's tick, or `None` once the daemon has gone.
+///
+/// The record learns which workers are running and which have ended, retries what it owes, and
+/// each worker whose session has not answered for the generation in force is told it, one after
+/// another, and its answer recorded.
+///
+/// Answers whether the record then needs nothing of the tick until it says otherwise: it is
+/// dormant and every session it follows is one the directory or the registry still shows or
+/// the record has let go of.
+async fn privacy_pass(daemon: &std::sync::Weak<Controller>) -> Option<bool> {
+    let seen = see_the_sessions(daemon).await?;
+    let now_ms = kr_ipc::now_ms();
+    let privacy = Arc::clone(&seen.privacy);
+    let (notices, dormant) = tokio::task::spawn_blocking(move || {
+        seen.record(now_ms);
+        let _ = seen.privacy.tick(now_ms);
+        let notices = seen.privacy.notices_due(now_ms);
+        // Dormant only when the registry could be read, so that what the pass has just learned of
+        // the sessions is what it was told.
+        let dormant = seen.recorded.as_ref().is_some_and(|recorded| {
+            seen.privacy.is_dormant() && seen.privacy.unreached(&seen.live, recorded).is_empty()
+        });
+        (notices, dormant)
+    })
+    .await
+    .unwrap_or_default();
     for notice in notices {
         let Some(ack) = tell_privacy(daemon, notice).await? else {
             continue;
