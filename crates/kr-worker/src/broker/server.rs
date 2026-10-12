@@ -73,12 +73,13 @@ pub const WITHHELD_VARIABLES: [&str; 2] = kr_protocol::root::LAUNCH_VARIABLES;
 ///
 /// The session implements it over its record of the processes it owns.
 ///
-/// The ending reads the record when it begins, again and again while the processes below the server
-/// end, before each round of force, and once more at its end. The last reading only reports: a
-/// process that it shows for the first time is returned as one that is still running, with no
-/// request to terminate and no force. What the session records cannot show one then, because it
-/// records a process only while its parent runs and is recorded, and the ending reaches its end
-/// after a reading that found nothing running; an implementation that can must expect that.
+/// The ending reads the record when it begins, after the server's input has had its grace, again
+/// and again while the processes below the server end, before each round of force, and once more
+/// at its end. The last reading only reports: a process that it shows for the first time is
+/// returned as one that is still running, with no request to terminate and no force, because the
+/// rounds of force are bounded and the ending cannot wait for another. It happens only below a
+/// process that outlived every round, which is itself returned as running; the session's record
+/// keeps both, so the closure's receipt names them among the survivors.
 pub trait Owned: Send + Sync {
     /// Reads what runs below `server` now, and returns the processes recorded below it, the ones
     /// read earlier included, that have not been read as ended.
