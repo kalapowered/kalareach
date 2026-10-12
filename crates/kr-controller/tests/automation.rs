@@ -2363,25 +2363,90 @@ async fn a_workflow_grant_is_held_to_the_offline_bound_on_the_continuous_clock()
     host.clients.abort();
 }
 
+/// A continuous clock a test moves by hand, which says when one thread has read it.
+///
+/// A decision takes the caller's moment on the continuous clock before it waits for anything. A
+/// test that moves the clock after that reading, and lets storage go only then, has the decision
+/// wait out the time it moved: whichever step of the decision the thread had reached by then, the
+/// time between its first reading and its last is the time the decision waited.
+#[derive(Clone, Debug)]
+struct WatchedClock {
+    clock: kr_transport::clock::ManualClock,
+    watched: Arc<std::sync::Mutex<Option<std::thread::ThreadId>>>,
+    read: Arc<tokio::sync::Notify>,
+}
+
+impl WatchedClock {
+    fn new() -> Self {
+        Self {
+            clock: kr_transport::clock::ManualClock::new(),
+            watched: Arc::new(std::sync::Mutex::new(None)),
+            read: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+
+    /// Has the calling thread's readings of this clock reported.
+    fn watch_this_thread(&self) {
+        *self.watched.lock().expect("the watched thread") = Some(std::thread::current().id());
+    }
+
+    /// Waits until the watched thread has read the clock.
+    ///
+    /// The wait turns on that reading and on nothing else; the bound only ends a test that would
+    /// hang.
+    async fn until_read(&self) {
+        tokio::time::timeout(std::time::Duration::from_secs(60), self.read.notified())
+            .await
+            .expect("the decision read the continuous clock");
+    }
+
+    fn advance(&self, by: std::time::Duration) {
+        self.clock.advance(by);
+    }
+}
+
+impl kr_transport::clock::ContinuousClock for WatchedClock {
+    fn now(&self) -> kr_transport::clock::ContinuousInstant {
+        // The reading is taken before the test is told of it, so a test that moves the clock on
+        // being told moves it after this reading and not before.
+        let at = self.clock.now();
+        if *self.watched.lock().expect("the watched thread") == Some(std::thread::current().id()) {
+            self.read.notify_one();
+        }
+        at
+    }
+}
+
 /// A deadline that passes while a workflow's decision waits for storage is decided after the wait.
 /// A refusal left its clock floor owed, and storage is held while the next decision writes it. The
 /// offline bound runs out during that wait, so the decision that follows it is a refusal rather
-/// than the permission the clock gave before the wait.
+/// than the permission the clock gave before the wait. The daemon runs on clocks this test moves
+/// by hand: the continuous clock moves once the decision has taken its reading and before storage
+/// is let go, so no real time bears on any step, however slow the machine is. Nothing here reads
+/// the machine's clocks and nothing sleeps.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_deadline_that_passes_while_the_floor_is_written_is_decided_after_the_write() {
     use kr_automation::{AuthoritySource, AutomationError};
     use kr_controller::automation::HostGrants;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
-    let host = host().await;
+    const T: u64 = 1_767_225_600_000;
+    let continuous = WatchedClock::new();
+    let wall = Arc::new(AtomicU64::new(T));
+    let host = host_on(Clocks {
+        continuous: Arc::new(continuous.clone()),
+        wall: WallClock::from_fn({
+            let wall = Arc::clone(&wall);
+            move || wall.load(Ordering::SeqCst)
+        }),
+    })
+    .await;
     let environment = host._temp.environment();
-    let synchronised = kr_ipc::now_ms().get();
     host.controller
         .update_policy(|policy| {
             policy.set_offline_validity(Some(kr_protocol::sharing::OfflineValidityPolicy {
                 maximum_offline_ms: kr_protocol::scalars::DurationMs::new(400),
-                last_synchronised_at_ms: Nullable::some(kr_protocol::scalars::TimestampMs::new(
-                    synchronised,
-                )),
+                last_synchronised_at_ms: Nullable::some(kr_protocol::scalars::TimestampMs::new(T)),
             }));
         })
         .expect("the owner chooses an offline bound of 400 milliseconds");
@@ -2398,13 +2463,11 @@ async fn a_deadline_that_passes_while_the_floor_is_written_is_decided_after_the_
         another_device(),
         &[ActionRight::ChangesetCreate],
         GrantExpiry::At {
-            expires_at_ms: kr_protocol::scalars::TimestampMs::new(synchronised - 1),
+            expires_at_ms: kr_protocol::scalars::TimestampMs::new(T - 1),
         },
     );
     let grants = Arc::new(HostGrants::for_daemon(&host.controller));
-    grants
-        .grant(lasting.grant_id, kr_ipc::now_ms().get())
-        .expect("inside the bound");
+    grants.grant(lasting.grant_id, T).expect("inside the bound");
 
     // A grant that has already run out is refused while the host's policy cannot be written, so
     // the floor that refusal stood on is owed.
@@ -2421,7 +2484,7 @@ async fn a_deadline_that_passes_while_the_floor_is_written_is_decided_after_the_
         )
         .expect("the fault is in place");
     let owed = grants
-        .grant(expired.grant_id, kr_ipc::now_ms().get() + 50)
+        .grant(expired.grant_id, T + 50)
         .expect_err("an expired grant is refused");
     assert!(
         matches!(owed, AutomationError::AuthorityUnavailable(_)),
@@ -2429,16 +2492,21 @@ async fn a_deadline_that_passes_while_the_floor_is_written_is_decided_after_the_
     );
 
     // Storage can take the write again, but another writer holds it while the next decision is
-    // taken, for longer than the bound has left.
+    // taken, for longer than the bound has left: the decision has read the clock, and the time
+    // that passes before storage is let go is time it waited.
     registry
         .execute_batch("DROP TRIGGER refuse_policy; BEGIN IMMEDIATE;")
         .expect("storage is held");
     let deciding = {
         let grants = Arc::clone(&grants);
-        let reading = kr_ipc::now_ms().get();
-        std::thread::spawn(move || grants.grant(lasting.grant_id, reading))
+        let continuous = continuous.clone();
+        std::thread::spawn(move || {
+            continuous.watch_this_thread();
+            grants.grant(lasting.grant_id, T)
+        })
     };
-    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+    continuous.until_read().await;
+    continuous.advance(std::time::Duration::from_millis(600));
     registry
         .execute_batch("ROLLBACK;")
         .expect("storage is free");
