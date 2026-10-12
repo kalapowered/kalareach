@@ -2673,6 +2673,17 @@ impl Subsystems {
 
     /// Configures `destination` and produces one notice for it that says `summary`.
     fn produce_saying(&self, destination: &DestinationRecord, summary: &str) -> NotificationId {
+        self.produce_saying_at(destination, summary, NOW)
+    }
+
+    /// As [`Self::produce_saying`], at `now`: a service that judges a notification's expiry by its
+    /// own clock is given a notice that is still worth presenting by it.
+    fn produce_saying_at(
+        &self,
+        destination: &DestinationRecord,
+        summary: &str,
+        now: u64,
+    ) -> NotificationId {
         self.delivery.configure(destination).expect("a destination");
         let notice = Notice {
             event: EventKey::announcement(Some(session()), "attention.pending_approval/~abcdef", 1),
@@ -2682,19 +2693,19 @@ impl Subsystems {
             summary: summary.to_owned(),
             session_id: Some(session()),
             environment_id: None,
-            observed_at_ms: TimestampMs::new(NOW),
+            observed_at_ms: TimestampMs::new(now),
             collapse_group: "a-session/attention.pending_approval".to_owned(),
-            expires_at_ms: TimestampMs::new(NOW + DEFAULT_NOTIFICATION_LIFETIME_MS),
+            expires_at_ms: TimestampMs::new(now + DEFAULT_NOTIFICATION_LIFETIME_MS),
             audience: Audience::Sessions {
                 sessions: vec![session()],
-                at_ms: NOW,
+                at_ms: now,
             },
         };
         self.delivery
             .with(|producer| {
                 let taken = notice.taken(1).expect("an event record");
                 producer
-                    .take(EventSource::Attention, "session-1", &[taken], 1, NOW)
+                    .take(EventSource::Attention, "session-1", &[taken], 1, now)
                     .expect("a page");
                 producer
                     .produce(
@@ -2703,10 +2714,10 @@ impl Subsystems {
                         &Granted,
                         &[kr_delivery::external::ContentLine {
                             session_id: Some(session()),
-                            produced_at_ms: Some(NOW - 1_000),
+                            produced_at_ms: Some(now - 1_000),
                             text: "the build failed".to_owned(),
                         }],
-                        NOW,
+                        now,
                     )
                     .expect("a decision");
                 Ok(())
@@ -2972,14 +2983,22 @@ impl ExternalSender for Taking {
     }
 }
 
-/// KR-REQ-24.27: the encrypted object a preview refers to is placed under the admission the push
-/// that refers to it is presented under. A placement on the wire when privacy mode is turned on is
-/// waited for, and the change is recorded only once the exchange has ended, so nothing is placed
-/// after the boundary.
+/// KR-REQ-24.27: the encrypted object a preview refers to is placed under an admission of the
+/// generation the push that refers to it is presented under. A placement on the wire when privacy
+/// mode is turned on is waited for, and the change is recorded only once the exchange has ended, so
+/// nothing is placed after the boundary. The push needs an admission of its own, so a change that
+/// comes in between takes it back; the detail had left, and the journal lists it among the copies
+/// that did.
 #[test]
 fn kr_req_24_27_a_placement_on_the_wire_is_waited_for_before_the_change_is_recorded() {
     let subsystems = Arc::new(Subsystems::open());
-    let notification_id = subsystems.produce_saying(&subsystems.phone(), &"x".repeat(1_400));
+    let at = now().get();
+    let phone = subsystems.phone();
+    let device_mailbox = phone
+        .as_push()
+        .and_then(|push| push.mailbox_key)
+        .expect("the device's mailbox key");
+    let notification_id = subsystems.produce_saying_at(&phone, &"x".repeat(1_400), at);
     let object = subsystems
         .delivery
         .with(|producer| Ok(producer.detail_object_of(notification_id)))
@@ -3026,7 +3045,7 @@ fn kr_req_24_27_a_placement_on_the_wire_is_waited_for_before_the_change_is_recor
                     &Current,
                     &Taking,
                     &Granted,
-                    &|| NOW,
+                    &move || at,
                 )
                 .expect("a pass")
         }
@@ -3042,7 +3061,7 @@ fn kr_req_24_27_a_placement_on_the_wire_is_waited_for_before_the_change_is_recor
         move || {
             let report = subsystems
                 .privacy
-                .enable(&[], TimestampMs::new(NOW + 10), &|write| write())
+                .enable(&[], TimestampMs::new(at + 10), &|write| write())
                 .expect("privacy mode is turned on");
             let _ = enabled.send(());
             report
@@ -3063,13 +3082,36 @@ fn kr_req_24_27_a_placement_on_the_wire_is_waited_for_before_the_change_is_recor
     assert_eq!(pass.join().expect("the pass ends"), 1);
     turning.join().expect("the change ends");
     assert_eq!(subsystems.recorded_generation(), 1);
-    assert_eq!(mailbox.web.requests_to("/api/mailbox/deliver"), 1);
-
     assert_eq!(
-        gateway.sent.lock().expect("not poisoned").len(),
+        mailbox.web.mailbox_envelopes(&device_mailbox).len(),
         1,
-        "the push that refers to the object was presented under the same admission"
+        "the object did reach the device's mailbox"
     );
+
+    let presented = gateway.sent.lock().expect("not poisoned").len();
+    let state = delivery_state(&subsystems.delivery, notification_id);
+    if presented == 1 {
+        assert_eq!(
+            state,
+            DeliveryState::Accepted,
+            "presented before the boundary"
+        );
+    } else {
+        assert_eq!(presented, 0, "and never after it");
+        assert_eq!(
+            state,
+            DeliveryState::OutcomeUnknown,
+            "taken back, and a copy of its detail had left"
+        );
+        assert_eq!(
+            subsystems
+                .delivery
+                .with(|producer| Ok(producer.journal().exported().expect("a read").len()))
+                .expect("a read"),
+            1,
+            "and the journal lists that copy"
+        );
+    }
 }
 
 /// KR-REQ-24.27 and KR-REQ-24.28: a send on the wire when privacy mode is turned on is waited for.
