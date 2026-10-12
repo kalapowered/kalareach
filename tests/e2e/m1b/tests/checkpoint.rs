@@ -1355,7 +1355,8 @@ fn the_installed_package_is_bound_into_the_session_and_acts_through_its_broker()
         ),
     };
 
-    // The control first: a device whose grant does not carry the action's rights.
+    // The control first: a device that holds a share of the session, whose grant does not carry the
+    // action's rights.
     let viewer = runtime.block_on(Device::create("viewer", &run.root().join("v")));
     let issuing = ceremony::issue_waiting(&host, &["--guest", "60", "--direct"]);
     let _ = runtime
@@ -1381,6 +1382,35 @@ fn the_installed_package_is_bound_into_the_session_and_acts_through_its_broker()
     let watching = runtime
         .block_on(viewer.connect(&paired_viewer))
         .unwrap_or_else(|why| panic!("{why}"));
+    // The guest is shared the session as a viewer and accepts, so what refuses the action is its
+    // grant, which does not carry the action's rights, and not that it has no session.
+    let _ = host.kr_json(&[
+        "share",
+        "invite",
+        &session_id.to_string(),
+        "--to",
+        &paired_viewer.device_id.to_string(),
+        "--yes",
+        "--for",
+        "15m",
+    ]);
+    let offered: kr_protocol::sharing::GrantHeldResult = runtime
+        .block_on(watching.read(
+            Method::GrantHeld,
+            &kr_protocol::sharing::GrantHeldParams {
+                offers_after: Nullable::null(),
+                shares_after: Nullable::null(),
+            },
+        ))
+        .unwrap_or_else(|why| panic!("grant.held: {why}"));
+    let _: kr_protocol::sharing::GrantRedeemResult = runtime
+        .block_on(watching.mutate_environment(
+            Method::GrantRedeem,
+            &kr_protocol::sharing::GrantRedeemParams {
+                invitation_id: offered.offers[0].invitation_id,
+            },
+        ))
+        .unwrap_or_else(|why| panic!("grant.redeem: {why}"));
     let refused = runtime.block_on(watching.mutate::<_, PluginActionInvokeResult>(
         Method::PluginActionInvoke,
         session_target(&watching, session_id),

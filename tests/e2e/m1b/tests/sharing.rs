@@ -9,6 +9,7 @@
 
 use kr_e2e_m1b::device::{Device, Remote};
 use kr_e2e_m1b::host::{Host, HostOptions};
+use kr_e2e_m1b::relay::Relay;
 use kr_e2e_m1b::run::Run;
 use kr_e2e_m1b::view::View;
 use kr_e2e_m1b::{LIVENESS, ceremony};
@@ -67,6 +68,14 @@ fn refused_with<T: std::fmt::Debug>(
             .unwrap_or_else(|| panic!("{what} was not answered with a refusal: {error}")),
         Ok(answered) => panic!("{what} was not refused: {answered:?}"),
     }
+}
+
+/// How many shares of a session the host lists that have not ended or been revoked.
+fn open_shares(host: &Host<'_>, display: &str) -> usize {
+    host.kr_json(&["share", "list", display])["grants"]
+        .as_array()
+        .expect("grants")
+        .len()
 }
 
 /// Creates a headless session on the host and returns its identifier and display number.
@@ -167,8 +176,27 @@ fn a_guest_is_shown_a_session_with_its_screen_and_loses_it_when_the_share_is_tak
     assert!(held(&runtime, &guest).offers.is_empty());
 
     // The invitation is shown, with the screen, before it exists, and is issued only after the
-    // person types `share`.
+    // person types `share`: another word issues nothing.
     let device_id = guest_paired.device_id.to_string();
+    let (_, declined) = ceremony::share_at_terminal(
+        &host,
+        &[&display, "--to", &device_id, "--live", "--for", "15m"],
+        b"yes",
+    );
+    assert_ne!(
+        declined.exit, 0,
+        "another word is not the question's answer"
+    );
+    assert_eq!(
+        declined.refusal(),
+        Some("OWNER_CONFIRMATION_REQUIRED"),
+        "{}",
+        declined.document
+    );
+    assert!(
+        held(&runtime, &guest).offers.is_empty(),
+        "nothing was issued"
+    );
     let (shown, issued) = ceremony::share_at_terminal(
         &host,
         &[&display, "--to", &device_id, "--live", "--for", "15m"],
@@ -251,7 +279,7 @@ fn a_guest_is_shown_a_session_with_its_screen_and_loses_it_when_the_share_is_tak
         input
             .as_ref()
             .err()
-            .is_some_and(|why| why.contains("PERMISSION_DENIED") || why.contains("permission")),
+            .is_some_and(|why| why.contains("PERMISSION_DENIED")),
         "a viewer is refused input: {input:?}"
     );
 
@@ -290,12 +318,17 @@ fn a_guest_is_shown_a_session_with_its_screen_and_loses_it_when_the_share_is_tak
 
     // A share without the live screen reaches no terminal: the offer says so, and the attach is
     // refused after the guest accepts it. It carries no consequence, so `--yes` skips the question.
+    // The host's answer to it is lost on the way back: the command asks again with the same request
+    // on a connection of its own, the host answers from its record, and the share is made once.
+    let relay = Relay::losing_the_answer_to(&host, &runtime, Method::GrantCreate);
     let plain = host.kr_json(&[
         "share", "invite", &display, "--to", &device_id, "--yes", "--for", "15m",
     ]);
-    let plain_grant = plain["grant_id"].as_str().expect("a grant").to_owned();
+    assert!(relay.lost(), "the host's answer was lost on the way back");
+    relay.remove();
+    assert!(plain["grant_id"].as_str().is_some(), "{plain}");
     let offered = held(&runtime, &guest);
-    assert_eq!(offered.offers.len(), 1);
+    assert_eq!(offered.offers.len(), 1, "the share was made once");
     assert!(!offered.offers[0].includes_live_screen);
     let _: GrantRedeemResult = runtime
         .block_on(guest.mutate_environment(
@@ -315,11 +348,12 @@ fn a_guest_is_shown_a_session_with_its_screen_and_loses_it_when_the_share_is_tak
         attach
             .as_ref()
             .err()
-            .is_some_and(|why| why.contains("PERMISSION_DENIED") || why.contains("permission")),
+            .is_some_and(|why| why.contains("PERMISSION_DENIED")),
         "a share without the live screen attaches nothing: {:?}",
         attach.as_ref().err()
     );
     // And a share that carries a consequence is not issued by --yes.
+    let shares_before = open_shares(&host, &display);
     let refused = host.kr(&[
         "share",
         "invite",
@@ -339,7 +373,11 @@ fn a_guest_is_shown_a_session_with_its_screen_and_loses_it_when_the_share_is_tak
         "{}",
         String::from_utf8_lossy(&refused.stderr)
     );
-    let _ = plain_grant;
+    assert_eq!(
+        open_shares(&host, &display),
+        shares_before,
+        "and nothing was issued"
+    );
 
     guest.close();
     owner.close();
@@ -356,8 +394,27 @@ fn a_guest_is_shown_a_session_with_its_screen_and_loses_it_when_the_share_is_tak
 /// is refused where the receiving device now holds the session. KR-REQ-18.03.
 #[test]
 fn a_session_handed_to_another_device_is_held_by_it_and_refused_to_the_giver() {
+    hand_over("sharing-transfer", None);
+}
+
+/// The host's answer to the request for the owner devices' confirmation is lost on the way back:
+/// the command asks again with the same request on a connection of its own, the host gives back the
+/// same challenge, the owner device is shown one plan, and the command goes on, on the connection
+/// that answered, to hand the session over once. KR-REQ-23.49.
+#[test]
+fn a_hand_over_whose_first_answer_was_lost_goes_on_and_is_made_once() {
+    hand_over(
+        "sharing-transfer-lost",
+        Some(Method::OwnerConfirmationRequest),
+    );
+}
+
+/// Hands a session from one guest to another with `kr share transfer`, the owner device confirming
+/// after the command is waiting, with the host's answer to `lose` lost on the way back when one is
+/// named.
+fn hand_over(leg: &str, lose: Option<Method>) {
     let runtime = runtime();
-    let run = Run::start("sharing-transfer");
+    let run = Run::start(leg);
     let host = Host::start(&run, &HostOptions::default());
     let owner_device = runtime.block_on(Device::create("owner", &run.root().join("o")));
     let (_, owner) = ceremony::pair_first_owner(&host, &owner_device, &runtime);
@@ -398,7 +455,35 @@ fn a_session_handed_to_another_device_is_held_by_it_and_refused_to_the_giver() {
         ))
         .unwrap_or_else(|why| panic!("the giver reads under its share: {why}"));
 
+    // A transfer the host refuses before an owner device is asked, because the receiving device's
+    // pairing ends before the access it would be given, is refused in the host's own words, and
+    // takes nothing from the giver.
+    if lose.is_none() {
+        let brief_device = runtime.block_on(Device::create("brief", &run.root().join("b")));
+        let (brief_paired, brief) =
+            ceremony::pair_guest(&host, &owner, &brief_device, &runtime, "2");
+        let brief_id = brief_paired.device_id.to_string();
+        let refused = host.kr(&[
+            "share", "transfer", &display, "--from", &from, "--to", &brief_id, "--json",
+        ]);
+        assert!(
+            !refused.status.success(),
+            "a transfer the host refuses is not done"
+        );
+        let said = String::from_utf8_lossy(&refused.stdout);
+        assert!(said.contains("PERMISSION_DENIED"), "{said}");
+        runtime
+            .block_on(giver.read::<_, kr_protocol::session::SessionReadResult>(
+                Method::SessionRead,
+                &SessionReadParams { session_id },
+            ))
+            .unwrap_or_else(|why| panic!("the giver still holds the session: {why}"));
+        brief.close();
+        runtime.block_on(brief_device.close());
+    }
+
     // The command waits; the owner device answers exactly that plan; the transfer completes.
+    let relay = lose.map(|method| Relay::losing_the_answer_to(&host, &runtime, method));
     let taker_id = taker_paired.device_id.to_string();
     let transferring = ceremony::waiting(
         &host,
@@ -417,6 +502,10 @@ fn a_session_handed_to_another_device_is_held_by_it_and_refused_to_the_giver() {
         }))
         .unwrap_or_else(|why| panic!("the owner device confirms the transfer: {why}"));
     let done = ceremony::finished(transferring, "kr share transfer");
+    if let Some(relay) = relay {
+        assert!(relay.lost(), "the host's answer was lost on the way back");
+        relay.remove();
+    }
     assert!(
         done.exit == 0 || done.exit == 1,
         "the transfer ended: {}",
@@ -429,10 +518,18 @@ fn a_session_handed_to_another_device_is_held_by_it_and_refused_to_the_giver() {
         done.document
     );
 
-    // The taker holds the session; the giver is refused, on a connection of its own, because the
-    // host ended the one that had acted under the share it gave up.
+    // The taker holds the session, under the grant the command named; the giver is refused, on a
+    // connection of its own, because the host ended the one that had acted under the share it gave
+    // up.
     let giver = reconnected(&runtime, &giver_device, &giver_paired);
-    assert_eq!(held(&runtime, &taker).shares.len(), 1);
+    let taken = held(&runtime, &taker);
+    assert_eq!(taken.shares.len(), 1, "the session was handed over once");
+    assert_eq!(
+        done.document["new_grant_id"].as_str(),
+        Some(taken.shares[0].grant.grant_id.to_string().as_str()),
+        "the grant the command names is the one the taker holds: {}",
+        done.document
+    );
     assert!(held(&runtime, &giver).shares.is_empty());
     runtime
         .block_on(taker.read::<_, kr_protocol::session::SessionReadResult>(

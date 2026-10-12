@@ -61,6 +61,8 @@ pub mod device;
 #[cfg(all(unix, feature = "legs"))]
 pub mod host;
 #[cfg(all(unix, feature = "legs"))]
+pub mod relay;
+#[cfg(all(unix, feature = "legs"))]
 pub mod room;
 #[cfg(all(unix, feature = "legs"))]
 pub mod run;

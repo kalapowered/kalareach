@@ -232,6 +232,11 @@ async fn approve(
             "only the owner who issued this invitation approves the device that answers it",
         )
     })?;
+    // A guest reaches only the sessions shared with it, so the person is told how to share one.
+    let guest = matches!(
+        view.proposed_grant.session_selector,
+        kr_protocol::grant::SessionSelector::None
+    );
     let (Some(candidate), Some(approval)) = (view.candidate.0, view.approval.0) else {
         return Err(refused(
             ErrorCode::PermissionDenied,
@@ -274,6 +279,12 @@ async fn approve(
             paired.device_id,
             paired.grant_id
         ));
+        if guest {
+            output::line(&stdout_line!(
+                "Share a session with it: `kr share invite <session> --to {}`.",
+                paired.device_id
+            ));
+        }
     }
     Ok(())
 }
@@ -502,7 +513,11 @@ async fn confirmed(
     };
     if challenge.initial_bootstrap {
         ceremony.bootstrap_permits()?;
-        guard(build_id).await?;
+        guard(
+            build_id,
+            "what a host with no owner confirms is confirmed at a terminal outside every session",
+        )
+        .await?;
         let mut terminal = Terminal::open()?;
         ceremony.confirm_at(&mut terminal, display?.as_ref())?;
         let key = AuthorisationKeyPair::generate().map_err(|error| {
@@ -641,17 +656,14 @@ pub async fn end_exclusive_management(
     crate::organisation::report_exclusive(&ended, json)
 }
 
-/// Refuses unless this is where a host with no owner may be confirmed at a terminal: at an
-/// interactive terminal, outside every KalaReach session.
-pub(crate) async fn guard(build_id: &BuildId) -> Result<()> {
+/// Refuses unless this is where a ceremony at a terminal may be held: at an interactive terminal,
+/// outside every KalaReach session. `because` ends each refusal and says what is held there ("a
+/// share is issued at a terminal outside every session").
+pub(crate) async fn guard(build_id: &BuildId, because: &'static str) -> Result<()> {
     if !std::io::stdin().is_terminal() || !output::is_terminal() {
         return Err(CliError::NotATerminal);
     }
-    bind::require_outside(
-        build_id,
-        "what a host with no owner confirms is confirmed at a terminal outside every session",
-    )
-    .await
+    bind::require_outside(build_id, because).await
 }
 
 /// The terminal the person types at, opened as itself rather than through this command's

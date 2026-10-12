@@ -83,6 +83,15 @@ const CHECK_EVERY: Duration = Duration::from_secs(5);
 /// waited for.
 const POLL_EVERY: Duration = OWNER_DEVICE_POLL;
 
+/// How long one read of the host, with the connection it is made on, is given before it counts as
+/// a read that failed.
+const READ_WITHIN: Duration = Duration::from_secs(10);
+
+/// How long past the time an absent grant counts a command goes on reading a host it cannot read.
+/// A read that reaches the host decides at once once the bound has passed, so only a host that
+/// cannot be read keeps a command waiting, and for this long at the most.
+const READ_PATIENCE: Duration = Duration::from_secs(60);
+
 /// Runs one `kr share` command and prints its result.
 ///
 /// # Errors
@@ -272,15 +281,30 @@ fn visibly(line: &str) -> String {
     out
 }
 
-/// The words for a role, in the order the share form gives them.
-const fn role_words(role: SessionRole) -> &'static str {
-    match role {
-        SessionRole::Viewer => "watch the session",
-        SessionRole::Reviewer => "watch the session and read files",
-        SessionRole::Controller => {
-            "watch the session, type in its terminal, resize it, prompt the agent and answer"
+/// What a role lets a device do, in words, for a share with or without the live screen. Without
+/// the live screen a device is given no terminal and no stream of events, whatever its role.
+const fn role_words(role: SessionRole, live: bool) -> &'static str {
+    match (role, live) {
+        (SessionRole::Viewer, true) => "watch the session and what the agent does",
+        (SessionRole::Viewer, false) => {
+            "see the agent's conversation and questions, with no terminal and no live stream"
         }
-        SessionRole::Owner => "do all of that, and also manage sharing and close the session",
+        (SessionRole::Reviewer, _) => "watch the session and read files",
+        (SessionRole::Controller, true) => {
+            "watch the session, type in its terminal, resize it, prompt the agent and answer it"
+        }
+        (SessionRole::Controller, false) => {
+            "prompt the agent and answer it, and see its conversation, but see no terminal and \
+             no live stream"
+        }
+        (SessionRole::Owner, true) => {
+            "watch the session, type in its terminal, resize it, prompt the agent and answer it, \
+             manage sharing and close the session"
+        }
+        (SessionRole::Owner, false) => {
+            "prompt the agent and answer it, manage sharing and close the session, and see the \
+             agent's conversation, but see no terminal and no live stream"
+        }
     }
 }
 
@@ -405,6 +429,36 @@ struct Watch {
     session_id: Option<SessionId>,
     /// The grant the action would write, or revoke.
     grant_id: GrantId,
+    /// The command that shows what the host holds, for a person whose command ends before it knows.
+    list_command: Shown,
+}
+
+/// What `--environment` says in a command printed for a person to run: nothing when this command
+/// was not given one, since the default is the same for the person's next command.
+fn environment_flag(host: &Host, selector: &EnvironmentSelector) -> Shown {
+    if selector.environment.is_some() {
+        shown!(" --environment {}", host.environment.environment_id)
+    } else {
+        Shown::said("")
+    }
+}
+
+/// `kr share list` for one session, or for every session, with every grant the host wrote and the
+/// environment this command was given.
+fn list_command(session: Option<Shown>, environment: Shown) -> Shown {
+    let session = session.map_or_else(|| Shown::said(""), |session| shown!(" {}", session));
+    shown!("kr share list{} --all{}", session, environment)
+}
+
+/// `kr share revoke` for one grant, in the environment this command was given.
+fn revoke_command(grant_id: GrantId, environment: Shown) -> Shown {
+    shown!("kr share revoke {}{}", grant_id, environment)
+}
+
+/// Whether a command that has waited `elapsed` for the host to show what became of an action, which
+/// it counts as not done only after `bound`, has waited as long as it will.
+fn has_waited_enough(elapsed: Duration, bound: Duration) -> bool {
+    elapsed >= bound.saturating_add(READ_PATIENCE)
 }
 
 /// Sends one mutation and, when its reply is lost, asks the host what became of it.
@@ -423,7 +477,7 @@ async fn perform(
     action_id: ActionId,
     params: &(impl serde::Serialize + ?Sized),
     watch: &Watch,
-    challenge: Option<Duration>,
+    challenge: Option<Armed>,
 ) -> Result<Performed> {
     let request = host
         .client
@@ -450,14 +504,29 @@ async fn perform(
         kr_ipc::now_ms().get(),
         "kr share",
     );
-    if let Some(lifetime) = challenge {
-        attempt.bound_by_challenge(lifetime);
+    if let Some(answered) = challenge {
+        attempt.bound_by_challenge(answered);
     }
     let armed = Armed::now();
+    // Said before anything is sent: a command that ends here has no record of its own, and this is
+    // what a person has to go on. The bound is shown as a moment for the person; the decision is
+    // made on the clock that cannot be stepped.
     report::say(&shown!(
-        "The grant this writes is {}. If this command is interrupted, `kr share list` shows it \
-         once the host has written it.",
-        watch.grant_id
+        "The grant this {} is {}. If this command is interrupted, `{}` shows what the host holds. \
+         The host can still act on this until {}: a grant missing from the list before then does \
+         not mean it will not appear.",
+        if kind == Kind::Revoke {
+            "revokes"
+        } else {
+            "writes"
+        },
+        watch.grant_id,
+        watch.list_command.clone(),
+        crate::shown::utc_moment(
+            kr_ipc::now_ms()
+                .get()
+                .saturating_add(u64::try_from(attempt.bound().as_millis()).unwrap_or(u64::MAX))
+        )
     ));
 
     let first = host.client.repeat(&request).await;
@@ -469,6 +538,7 @@ async fn perform(
     take(&mut performed, &first);
     let mut next = attempt.after_first_send(reply_of(&first));
     let mut waited_notice = false;
+    let mut unreadable_said = false;
     loop {
         match next {
             Next::Closed(outcome) => {
@@ -476,9 +546,7 @@ async fn perform(
                 return Ok(performed);
             }
             Next::NotSent => {
-                return Err(CliError::Other(Shown::said(
-                    "the request was not sent, so nothing happened",
-                )));
+                return Err(CliError::Other(Shown::said("the request was not sent")));
             }
             Next::Repeat => {
                 let index = usize::from(attempt.repeats).min(REPEAT_DELAYS.len() - 1);
@@ -498,7 +566,7 @@ async fn perform(
                     waited_notice = true;
                     report::say(&shown!(
                         "The host did not answer, so its state is read until it shows what \
-                         became of this; an absent grant counts only after {} seconds from the \
+                         became of this; nothing counts as not done before {} seconds from the \
                          first send.",
                         attempt.bound().as_secs()
                     ));
@@ -506,12 +574,28 @@ async fn perform(
                 tokio::time::sleep(CHECK_EVERY).await;
                 // The moment the read begins is what decides whether it counts.
                 let began = armed.read_begins();
-                let found = found(host, kind, watch).await;
-                next = match found {
-                    Some(found) => attempt.after_read(found, began),
-                    // A read that fails leaves the attempt as it was.
-                    None => Next::Wait,
+                let read = tokio::time::timeout(READ_WITHIN, found(host, kind, watch)).await;
+                next = match read {
+                    Ok(Some(found)) => attempt.after_read(found, began),
+                    // A read that fails or does not finish leaves the attempt as it was.
+                    Ok(None) | Err(_) => {
+                        if !unreadable_said {
+                            unreadable_said = true;
+                            report::say(&Shown::said(
+                                "The host could not be read just now; trying again.",
+                            ));
+                        }
+                        Next::Wait
+                    }
                 };
+                // Once the bound has passed every read that reaches the host decides, so a command
+                // still waiting is waiting on a host it cannot read.
+                if matches!(next, Next::Wait | Next::Check)
+                    && has_waited_enough(armed.elapsed(), attempt.bound())
+                {
+                    performed.outcome = Outcome::Unknown;
+                    return Ok(performed);
+                }
             }
         }
     }
@@ -559,7 +643,8 @@ async fn found(host: &Host, kind: Kind, watch: &Watch) -> Option<Found> {
 }
 
 /// What a person is told of an attempt that did not end in the result.
-fn unfinished(outcome: Outcome, what: &'static str, list: &Shown) -> CliError {
+fn unfinished(outcome: Outcome, what: &'static str, list_command: &Shown) -> CliError {
+    let list = shown!("`{}` shows what the host holds.", list_command.clone());
     let message = match outcome {
         Outcome::NotDone | Outcome::NotAccepted => shown!(
             "{} did not happen, as far as the host shows, and nothing more of it can; it is safe \
@@ -568,7 +653,7 @@ fn unfinished(outcome: Outcome, what: &'static str, list: &Shown) -> CliError {
             list.clone()
         ),
         Outcome::HadEnded => shown!(
-            "the grant had already ended when {} was asked, so this did nothing to it. {}",
+            "the grant had already ended when {} was asked. {}",
             what,
             list.clone()
         ),
@@ -606,7 +691,9 @@ async fn invite(
     let devices = host.devices().await?;
     let device = pick_device(&devices.devices, &arguments.to)?.clone();
     let pairing_ends = device.grant_expires_at_ms.as_ref().map(|ends| ends.get());
-    lifetime(asked_lasts, pairing_ends, now_ms)?;
+    // The end the person is shown is the end the host is asked for: it is fixed here, and what the
+    // person's time at the question takes comes out of the share, not out of what was shown.
+    let ends_at_ms = now_ms.saturating_add(lifetime(asked_lasts, pairing_ends, now_ms)?);
 
     let selection = RoleSelection {
         role,
@@ -634,15 +721,18 @@ async fn invite(
              screen; leave it out and type `share` at the terminal",
         )));
     }
+    // What this device already holds of the session: a second share to it is not a replacement.
+    let held_already = device_shares(&mut host, session_id, device.device_id).await?;
     let summary = summary_of(
         &descriptor,
         &device,
         &selection,
         &notices,
-        asked_lasts,
-        now_ms,
+        ends_at_ms,
+        pairing_ends.is_some(),
         shown_lines.as_deref(),
-    )?;
+        &held_already,
+    );
     if arguments.yes {
         // Standard error carries nothing but this program's own words and an export's preview, so
         // the summary is read on standard output, and not at all when that is a document.
@@ -650,7 +740,11 @@ async fn invite(
             output::lines(&summary);
         }
     } else {
-        pair::guard(build_id).await?;
+        pair::guard(
+            build_id,
+            "a share is issued at a terminal outside every session",
+        )
+        .await?;
         let mut terminal = pair::Terminal::open()?;
         for line in &summary {
             terminal.say(line)?;
@@ -667,9 +761,9 @@ async fn invite(
         }
     }
 
-    // Decided now, after the question: the host dates the share when it accepts the action.
-    let now_ms = kr_ipc::now_ms().get();
-    let lifetime_ms = lifetime(asked_lasts, pairing_ends, now_ms)?;
+    // The host dates the share when it accepts the action, so it is asked for what is left of the
+    // time that was shown.
+    let lifetime_ms = remaining_lifetime(ends_at_ms, kr_ipc::now_ms().get())?;
     let action_id = ActionId::new(kr_ipc::new_uuid());
     let uid = host.client.acknowledgement().peer.uid.get();
     let (grant_id, invitation_id) = share_identities(&local_actor(uid), action_id.get());
@@ -683,6 +777,15 @@ async fn invite(
         owner_confirmation: Nullable::null(),
     };
     let target = crate::attach::target(&descriptor);
+    let environment = environment_flag(&host, &arguments.selector);
+    let watch = Watch {
+        session_id: Some(session_id),
+        grant_id,
+        list_command: list_command(
+            Some(shown!("{}", descriptor.display_number.get())),
+            environment.clone(),
+        ),
+    };
     let performed = perform(
         &mut host,
         Kind::Invite,
@@ -690,17 +793,10 @@ async fn invite(
         target,
         action_id,
         &params,
-        &Watch {
-            session_id: Some(session_id),
-            grant_id,
-        },
+        &watch,
         None,
     )
     .await?;
-    let list = shown!(
-        "`kr share list {} --all` shows what the host holds.",
-        descriptor.display_number.get()
-    );
     match performed.outcome {
         Outcome::Refused => {
             return Err(performed.refusal.map_or_else(
@@ -709,7 +805,12 @@ async fn invite(
             ));
         }
         Outcome::Happened => {}
-        other => return Err(unfinished(other, "the invitation", &list)),
+        other => {
+            // What the host shows now of this device's shares of the session, so a person who
+            // runs the command again sees what is already there.
+            say_device_shares(&host, session_id, device.device_id).await;
+            return Err(unfinished(other, "the invitation", &watch.list_command));
+        }
     }
     let created: Option<GrantCreateResult> = performed
         .value
@@ -726,16 +827,18 @@ async fn invite(
         ),
         _ => None,
     };
+    let revoke = revoke_command(grant_id, environment);
     if json {
-        output::document(&invite_document(
+        output::document(&invite_document(&Issued {
             grant_id,
             invitation_id,
             session_id,
-            &device,
+            device: &device,
             role,
-            created.as_ref(),
-            changed,
-        ));
+            created: created.as_ref(),
+            screen_changed: changed,
+            revoke: revoke.clone(),
+        }));
     } else {
         output::lines(&invited_lines(
             &descriptor,
@@ -744,27 +847,99 @@ async fn invite(
             invitation_id,
             created.as_ref(),
         ));
-        match (changed, &created) {
-            (Some(true), Some(created)) => {
-                output::lines(&screen_changed_lines(created));
-                report::say(&shown!(
-                    "The screen changed before the invitation was written. Withdraw it with `kr \
-                     share revoke {}`.",
-                    grant_id
-                ));
-            }
-            (None, _) if arguments.live => {
-                report::say(&shown!(
-                    "The host's answer was not read here, so the lines it kept could not be \
-                     compared with the ones shown. Withdraw the invitation with `kr share revoke \
-                     {}` if the screen has changed.",
-                    grant_id
-                ));
-            }
-            _ => {}
+        if let (Some(true), Some(created)) = (changed, &created) {
+            output::lines(&screen_changed_lines(created));
         }
     }
+    // For the person, in both forms: the document of a script holds the same facts.
+    match (changed, &created) {
+        (Some(true), Some(_)) => report::say(&shown!(
+            "The screen changed before the invitation was written. Withdraw it with `{}`.",
+            revoke
+        )),
+        (None, _) if arguments.live => report::say(&shown!(
+            "The host's answer was not read here, so the lines it kept could not be compared with \
+             the ones shown. Withdraw the invitation with `{}` if the screen has changed.",
+            revoke
+        )),
+        _ => {}
+    }
     Ok(Completion::Done)
+}
+
+/// What the end the person was shown leaves to ask the host for, now that the question is over.
+///
+/// # Errors
+///
+/// Returns a usage mistake when too little is left for a share to begin: the person took so long
+/// at the question that what they were shown has nearly passed.
+fn remaining_lifetime(ends_at_ms: u64, now_ms: u64) -> Result<u64> {
+    let left = ends_at_ms.saturating_sub(now_ms);
+    if left < MIN_LIFETIME_MS {
+        return Err(CliError::Usage(Shown::said(
+            "the end shown for this share has nearly passed while the question was open, so \
+             nothing was shared; ask again",
+        )));
+    }
+    Ok(left)
+}
+
+/// What a device holds, or is offered, of one session: the grants the host lists for it that have
+/// not ended or been revoked.
+async fn device_shares(
+    host: &mut Host,
+    session_id: SessionId,
+    device_id: DeviceId,
+) -> Result<Vec<GrantSummary>> {
+    Ok(host
+        .grants(Some(session_id), false)
+        .await?
+        .grants
+        .into_iter()
+        .filter(|summary| summary.grant.recipient_device_id == device_id)
+        .collect())
+}
+
+/// Says what the host shows of a device's shares of a session, on a connection of its own: for a
+/// command that could not tell what became of its invitation. A host that cannot be read says so.
+async fn say_device_shares(host: &Host, session_id: SessionId, device_id: DeviceId) {
+    let read = async {
+        let mut client = host.another().await?;
+        let listed: GrantListResult = crate::bind::read(
+            &mut client,
+            Method::GrantList,
+            &GrantListParams {
+                session_id: Nullable::some(session_id),
+                include_resolved: false,
+            },
+        )
+        .await?;
+        Ok::<_, CliError>(listed)
+    };
+    match tokio::time::timeout(READ_WITHIN, read).await {
+        Ok(Ok(listed)) => {
+            let held: Vec<&GrantSummary> = listed
+                .grants
+                .iter()
+                .filter(|summary| summary.grant.recipient_device_id == device_id)
+                .collect();
+            if held.is_empty() {
+                report::say(&Shown::said(
+                    "The host shows no open share of this session for that device.",
+                ));
+            }
+            for summary in held {
+                report::say(&shown!(
+                    "The host shows grant {} of this session for that device: {}.",
+                    summary.grant.grant_id,
+                    state_words(summary.state)
+                ));
+            }
+        }
+        _ => report::say(&Shown::said(
+            "The host could not be read, so what it holds of this device's shares is not known.",
+        )),
+    }
 }
 
 /// Reads the lines on the session's screen now, as the share would include them.
@@ -806,35 +981,37 @@ async fn preview_of(
 }
 
 /// The lines a person reads before they decide.
+#[allow(clippy::too_many_arguments)]
 fn summary_of(
     descriptor: &WorkerDescriptor,
     device: &DeviceSummary,
     selection: &RoleSelection,
     notices: &CanonicalSet<AuthorityNotice>,
-    asked_lasts: Option<Lasts>,
-    now_ms: u64,
+    ends_at_ms: u64,
+    ends_with_pairing: bool,
     screen: Option<&[String]>,
-) -> Result<Vec<Line>> {
-    let pairing_ends = device.grant_expires_at_ms.as_ref().map(|ends| ends.get());
-    let lasts = lifetime(asked_lasts, pairing_ends, now_ms)?;
-    let name = Asked::text(Request::Devices, &device.display_name);
+    held_already: &[GrantSummary],
+) -> Vec<Line> {
+    // The name is whatever the device called itself, so it is written out as a screen line is.
+    let name = Asked::text(Request::Devices, &visibly(&device.display_name));
     let mut lines = vec![
         stdout_line!(
-            "Share session {} with {} ({}).",
+            "Share session {} with {} ({}, device {}).",
             descriptor.display_number.get(),
             name,
-            crate::output::closed_word(&device.platform)
+            crate::output::closed_word(&device.platform),
+            device.device_id
         ),
         stdout_line!(
             "  Role: {}, which lets it {}.",
             selection.role.as_str(),
-            role_words(selection.role)
+            role_words(selection.role, selection.include_live_screen)
         ),
         stdout_line!("  Rights: {}.", rights_line(&selection.actions())),
         stdout_line!(
             "  Until {}, used once.{}",
-            crate::shown::utc_moment(now_ms.saturating_add(lasts)),
-            if pairing_ends.is_some() {
+            crate::shown::utc_moment(ends_at_ms),
+            if ends_with_pairing {
                 " The share ends no later than the device's pairing."
             } else {
                 ""
@@ -845,10 +1022,25 @@ fn summary_of(
         None => stdout_line!(
             "  Earlier activity: none; it sees what happens from the moment you invite."
         ),
-        Some(from) => stdout_line!(
-            "  Earlier activity: the agent's conversation, questions and events from {}.",
-            crate::shown::utc_moment(from.get())
-        ),
+        Some(from) => {
+            let scope = if selection.include_live_screen {
+                "the agent's conversation, questions and events"
+            } else {
+                "the agent's conversation and questions"
+            };
+            if from.get() == 0 {
+                stdout_line!(
+                    "  Earlier activity: {} from before, everything the host keeps.",
+                    scope
+                )
+            } else {
+                stdout_line!(
+                    "  Earlier activity: {} from {}.",
+                    scope,
+                    crate::shown::utc_moment(from.get())
+                )
+            }
+        }
     });
     if selection.include_live_screen {
         lines.push(stdout_line!(
@@ -864,6 +1056,21 @@ fn summary_of(
             "  Consequence: {}",
             Shown::said(notice.sentence())
         ));
+    }
+    if !held_already.is_empty() {
+        lines.push(stdout_line!(
+            "That device already has {} open share{} of this session; this one is another, not a \
+             replacement:",
+            held_already.len(),
+            if held_already.len() == 1 { "" } else { "s" }
+        ));
+        for summary in held_already {
+            lines.push(stdout_line!(
+                "  grant {}, {}",
+                summary.grant.grant_id,
+                Shown::said(state_words(summary.state))
+            ));
+        }
     }
     if let Some(screen) = screen {
         lines.push(stdout_line!(
@@ -883,7 +1090,7 @@ fn summary_of(
              This preview shows neither."
         ));
     }
-    Ok(lines)
+    lines
 }
 
 /// What a person is told once the invitation is written.
@@ -932,26 +1139,44 @@ fn screen_changed_lines(created: &GrantCreateResult) -> Vec<Line> {
     lines
 }
 
-/// The invitation, for a script.
-fn invite_document(
+/// What an invitation is, as the command that wrote it knows it.
+struct Issued<'a> {
     grant_id: GrantId,
     invitation_id: InvitationId,
     session_id: SessionId,
-    device: &DeviceSummary,
+    device: &'a DeviceSummary,
     role: SessionRole,
-    created: Option<&GrantCreateResult>,
+    /// The host's answer, when this command was given it.
+    created: Option<&'a GrantCreateResult>,
+    /// Whether the lines the host kept are the ones that were shown, when that could be told.
     screen_changed: Option<bool>,
-) -> Document {
+    /// The command that withdraws it.
+    revoke: Shown,
+}
+
+/// The invitation, for a script.
+fn invite_document(issued: &Issued<'_>) -> Document {
+    let Issued {
+        grant_id,
+        invitation_id,
+        session_id,
+        device,
+        role,
+        created,
+        screen_changed,
+        revoke,
+    } = issued;
+    let (created, screen_changed) = (*created, *screen_changed);
     Document::new()
-        .with("grant_id", closed(&grant_id))
-        .with("invitation_id", closed(&invitation_id))
-        .with("session_id", closed(&session_id))
+        .with("grant_id", closed(grant_id))
+        .with("invitation_id", closed(invitation_id))
+        .with("session_id", closed(session_id))
         .with("device_id", closed(&device.device_id))
         .with(
             "device_name",
             Asked::text(Request::Devices, &device.display_name),
         )
-        .with("role", closed(&role))
+        .with("role", closed(role))
         .with(
             "actions",
             created.map(|created| closed(&created.grant.actions)),
@@ -966,6 +1191,20 @@ fn invite_document(
             }),
         )
         .with("screen_changed", screen_changed)
+        .with(
+            "kept_screen",
+            (screen_changed == Some(true))
+                .then(|| created.and_then(|created| created.preview.live_screen.as_ref()))
+                .flatten()
+                .map(|screen| {
+                    screen
+                        .lines
+                        .iter()
+                        .map(|line| Asked::text(Request::Screen, &visibly(line)))
+                        .collect::<Vec<_>>()
+                }),
+        )
+        .with("revoke_command", revoke.clone())
         .with("ok", true)
 }
 
@@ -1041,13 +1280,18 @@ fn list_line(summary: &GrantSummary, devices: &DeviceListResult) -> Line {
         |ends| shown!("until {}", crate::shown::utc_moment(ends.get())),
     );
     stdout_line!(
-        "{}  {}  {} {}  session {}  {}  {}",
+        "{}  {}  {} {}  session {}  {}{}  {}",
         summary.grant.grant_id,
         output::left(24, &Shown::said(state_words(summary.state))),
         summary.grant.recipient_device_id,
         device.unwrap_or_else(|| Asked::text(Request::Devices, "")),
         session.map_or_else(|| Shown::said("none"), |session| shown!("{}", *session)),
         Shown::said(role),
+        Shown::said(if summary.grant.history.include_live_screen {
+            " with the live screen"
+        } else {
+            ""
+        }),
         ends
     )
 }
@@ -1076,6 +1320,11 @@ fn list_document(listed: &GrantListResult, devices: &DeviceListResult) -> Docume
                         )
                         .with("session_selector", closed(&summary.grant.session_selector))
                         .with("actions", closed(&summary.grant.actions))
+                        .with("live_screen", summary.grant.history.include_live_screen)
+                        .with(
+                            "history_from_ms",
+                            closed(&summary.grant.history.lower_bound_ms),
+                        )
                         .with("ends_at_ms", closed(&summary.ends_at_ms))
                         .with("revoked_at_ms", closed(&summary.revoked_at_ms))
                         .with("revoked_by_parent", closed(&summary.revoked_by_parent))
@@ -1120,6 +1369,14 @@ async fn revoke(
         _ => None,
     };
     let target = host.on_the_host();
+    let watch = Watch {
+        session_id,
+        grant_id,
+        list_command: list_command(
+            session_id.map(|session_id| shown!("{}", session_id)),
+            environment_flag(&host, &arguments.selector),
+        ),
+    };
     let performed = perform(
         &mut host,
         Kind::Revoke,
@@ -1127,14 +1384,10 @@ async fn revoke(
         target,
         ActionId::new(kr_ipc::new_uuid()),
         &GrantRevokeParams { grant_id },
-        &Watch {
-            session_id,
-            grant_id,
-        },
+        &watch,
         None,
     )
     .await?;
-    let list = Shown::said("`kr share list --all` shows what the host holds.");
     match performed.outcome {
         Outcome::Refused => Err(performed.refusal.map_or_else(
             || CliError::Other(Shown::said("the host refused the revocation")),
@@ -1147,7 +1400,7 @@ async fn revoke(
                 .and_then(|value| value.to_typed().ok());
             finish_revocation(grant_id, revoked.as_ref(), json)
         }
-        other => Err(unfinished(other, "the revocation", &list)),
+        other => Err(unfinished(other, "the revocation", &watch.list_command)),
     }
 }
 
@@ -1254,9 +1507,6 @@ fn revocation_lines(grant_id: GrantId, revoked: &RevocationResult) -> Vec<Line> 
 // ---------------------------------------------------------------------------------------------
 // kr share transfer
 // ---------------------------------------------------------------------------------------------
-
-/// How long a confirmation's challenge lasts, which the host's reply bounds the transfer by.
-const CHALLENGE_LIFETIME: Duration = Duration::from_secs(120);
 
 /// `kr share transfer`.
 ///
@@ -1374,8 +1624,15 @@ async fn transfer(
 
     let uid = host.client.acknowledgement().peer.uid.get();
     let new_grant_id = transfer_identity(&local_actor(uid), transfer_action);
-    let lifetime = CHALLENGE_LIFETIME.saturating_sub(received.elapsed());
     let target = crate::attach::target(&descriptor);
+    let watch = Watch {
+        session_id: Some(session_id),
+        grant_id: new_grant_id,
+        list_command: list_command(
+            Some(shown!("{}", descriptor.display_number.get())),
+            environment_flag(&host, &arguments.selector),
+        ),
+    };
     let performed = perform(
         &mut host,
         Kind::Transfer,
@@ -1383,17 +1640,10 @@ async fn transfer(
         target,
         transfer_action,
         &params,
-        &Watch {
-            session_id: Some(session_id),
-            grant_id: new_grant_id,
-        },
-        Some(CHALLENGE_LIFETIME.min(lifetime.max(Duration::from_secs(1)))),
+        &watch,
+        Some(received),
     )
     .await?;
-    let list = shown!(
-        "`kr share list {} --all` shows what the host holds.",
-        descriptor.display_number.get()
-    );
     match performed.outcome {
         Outcome::Refused => Err(performed.refusal.map_or_else(
             || CliError::Other(Shown::said("the host refused the transfer")),
@@ -1413,7 +1663,7 @@ async fn transfer(
                 json,
             )
         }
-        other => Err(unfinished(other, "the transfer", &list)),
+        other => Err(unfinished(other, "the transfer", &watch.list_command)),
     }
 }
 
@@ -1442,9 +1692,15 @@ async fn ask_for_confirmation(
         .map_err(CliError::Ipc)?;
     let mut sent = host.client.repeat(&request).await;
     let mut asked_again = 0;
+    // The connection a repeat was answered on, which the first one no longer is when its reply was
+    // lost: the command goes on on it.
+    let mut answered_on: Option<LocalClient> = None;
     loop {
         match sent {
             Ok(Ok(value)) => {
+                if let Some(connection) = answered_on {
+                    host.client = connection;
+                }
                 return value.to_typed().map_err(|error| {
                     CliError::Other(shown!(
                         "the host's answer could not be read: {}",
@@ -1457,7 +1713,11 @@ async fn ask_for_confirmation(
                 tokio::time::sleep(REPEAT_DELAYS[asked_again]).await;
                 asked_again += 1;
                 sent = match host.another().await {
-                    Ok(mut second) => second.repeat(&request).await,
+                    Ok(mut second) => {
+                        let again = second.repeat(&request).await;
+                        answered_on = Some(second);
+                        again
+                    }
                     Err(error) => Err(match error {
                         CliError::Ipc(error) => error,
                         _ => kr_ipc::IpcError::UnexpectedMessage("the daemon could not be reached"),
@@ -1520,8 +1780,13 @@ fn finish_transfer(
         }
     } else {
         output::line(&stdout_line!(
-            "Session {} is now with {}. Grant {} holds it; grant {} was revoked.",
+            "Session {} {} {}. Grant {} holds it; grant {} was revoked.",
             descriptor.display_number.get(),
+            if result.is_some() {
+                "is now with"
+            } else {
+                "was handed to"
+            },
             Asked::text(Request::Devices, &receiver.display_name),
             new_grant_id,
             from
@@ -1593,6 +1858,43 @@ mod tests {
         ] {
             assert!(matches!(refused, Err(CliError::Usage(_))), "{refused:?}");
         }
+    }
+
+    /// A share is asked for what is left of the end the person was shown, so the time spent at the
+    /// question comes out of the share and not out of what was shown; and too little left to begin
+    /// is refused.
+    #[test]
+    fn a_share_is_asked_for_what_is_left_of_the_end_that_was_shown() {
+        let ends = NOW + 15 * 60_000;
+        assert_eq!(
+            remaining_lifetime(ends, NOW).expect("all of it"),
+            15 * 60_000
+        );
+        assert_eq!(
+            remaining_lifetime(ends, NOW + 40_000).expect("less the time at the question"),
+            15 * 60_000 - 40_000
+        );
+        for now in [ends - 30_000, ends, ends + 1] {
+            assert!(
+                matches!(remaining_lifetime(ends, now), Err(CliError::Usage(_))),
+                "{now}"
+            );
+        }
+    }
+
+    /// A command that cannot read the host stops waiting a set time after the bound it was waiting
+    /// for, and not before: until the bound nothing it reads counts, and every read that reaches
+    /// the host decides after it.
+    #[test]
+    fn a_command_waits_for_a_host_it_cannot_read_only_so_long() {
+        let bound = Duration::from_secs(330);
+        assert!(!has_waited_enough(Duration::ZERO, bound));
+        assert!(!has_waited_enough(bound, bound));
+        assert!(!has_waited_enough(
+            bound + READ_PATIENCE - Duration::from_millis(1),
+            bound
+        ));
+        assert!(has_waited_enough(bound + READ_PATIENCE, bound));
     }
 
     /// The words of `--role`, `--for` and `--history` are the ones the help names, and Reviewer is

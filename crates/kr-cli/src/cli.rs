@@ -560,7 +560,9 @@ pub enum ShareCommand {
     /// the lines on it now, then issue a single-use invitation the device accepts.
     ///
     /// A share that carries any consequence, or the live screen, is issued only after `share` is
-    /// typed at the controlling terminal, which has to be outside every KalaReach session.
+    /// typed at the controlling terminal, which has to be outside every KalaReach session. The
+    /// question prevents an accident. It is not isolation from other code running as the same
+    /// user, which can send the same request itself.
     Invite(ShareInviteArguments),
     /// List the shares of a session, or of every session, and who holds them.
     List(ShareListArguments),
