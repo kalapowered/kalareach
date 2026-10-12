@@ -4,7 +4,9 @@
  * A box does not say where its text is drawn when the text runs out of it, so a check that reads
  * element boxes passes a long word that spills over a card's edge. This reads the page the way the
  * eye does: the box of every element under a root, and every line of every piece of text, each held
- * to the screen and to the root's own box.
+ * to the screen and to the root's own box, and a line of text to the box that lays it out. What lies
+ * inside a box that scrolls sideways is meant to lie outside the screen and the root, so it is held
+ * to the box that lays it out only.
  */
 
 import type { Page } from '@playwright/test'
@@ -56,7 +58,15 @@ export function overrunning(page: Page, roots: string): Promise<string[]> {
     const found: string[] = []
     for (const root of document.querySelectorAll(selector)) {
       const card = root.getBoundingClientRect()
-      const drawn: { left: number; right: number; what: string; within?: { left: number; right: number } }[] = []
+      const drawn: {
+        left: number
+        right: number
+        what: string
+        within?: { left: number; right: number }
+        // True for text inside a box that scrolls sideways: it is meant to lie outside the screen
+        // and the root, but not outside the box that holds it.
+        scrolled?: boolean
+      }[] = []
       for (const element of [root, ...root.querySelectorAll('*')]) {
         const box = element.getBoundingClientRect()
         // An element with no box is not drawn: it has no place to be outside of.
@@ -67,7 +77,8 @@ export function overrunning(page: Page, roots: string): Promise<string[]> {
       }
       const walk = document.createTreeWalker(root, NodeFilter.SHOW_TEXT)
       for (let node = walk.nextNode(); node !== null; node = walk.nextNode()) {
-        if (clippedAway(node.parentElement, root) || scrolledInside(node.parentElement, root)) continue
+        if (clippedAway(node.parentElement, root)) continue
+        const scrolled = scrolledInside(node.parentElement, root)
         const range = document.createRange()
         range.selectNodeContents(node)
         // The box that lays the text out: a label that runs out of its own button or chip has run
@@ -79,15 +90,17 @@ export function overrunning(page: Page, roots: string): Promise<string[]> {
               left: line.left,
               right: line.right,
               what: label(node.textContent, 'text'),
-              within: laid
+              within: laid,
+              scrolled
             })
           }
         }
       }
       for (const one of drawn) {
-        if (one.left < -0.5 || one.right > screen + 0.5) found.push(`${one.what}: past the screen`)
-        else if (one.left < card.left - 0.5 || one.right > card.right + 0.5) found.push(`${one.what}: past its box`)
-        else if (one.within !== undefined && (one.left < one.within.left - 0.5 || one.right > one.within.right + 0.5)) {
+        if (!one.scrolled && (one.left < -0.5 || one.right > screen + 0.5)) found.push(`${one.what}: past the screen`)
+        else if (!one.scrolled && (one.left < card.left - 0.5 || one.right > card.right + 0.5)) {
+          found.push(`${one.what}: past its box`)
+        } else if (one.within !== undefined && (one.left < one.within.left - 0.5 || one.right > one.within.right + 0.5)) {
           found.push(`${one.what}: past the box that holds it`)
         }
       }

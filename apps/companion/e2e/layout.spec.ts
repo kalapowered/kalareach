@@ -46,6 +46,25 @@ test.describe('the measure of text that runs out of its box', () => {
     expect((await overrunning(page, '#card')).length).toBeGreaterThan(0)
   })
 
+  test('reports a line a button cuts off inside a box that sets only its vertical overflow', async ({ page }) => {
+    // Setting only the vertical overflow makes the horizontal one auto as well, but the box has
+    // nothing to scroll across: a label that runs out of its button is not drawn where it can be reached.
+    await page.setContent(
+      '<div id="card" style="width:600px"><div style="max-height:60px;overflow-y:auto"><button style="width:60px;white-space:nowrap;overflow:visible">a-label-that-is-longer-than-the-button</button></div></div>'
+    )
+    expect((await overrunning(page, '#card')).some((each) => each.endsWith('past the box that holds it'))).toBe(true)
+  })
+
+  test('reports a line a button cuts off inside a row that really scrolls sideways', async ({ page }) => {
+    // The row is meant to run on past its edge, but a button in it still has to hold its own label.
+    await page.setContent(
+      '<div id="card" style="width:200px"><div style="display:flex;gap:8px;overflow-x:auto"><button style="flex:none;width:60px;white-space:nowrap;overflow:visible">a-label-that-is-longer-than-the-button</button><span style="flex:none;width:400px">a wide chip</span></div></div>'
+    )
+    const found = await overrunning(page, '#card')
+    expect(found.some((each) => each.endsWith('past the box that holds it'))).toBe(true)
+    expect(found.some((each) => each.endsWith('past its box') || each.endsWith('past the screen'))).toBe(false)
+  })
+
   test('reports nothing for text that wraps inside its card, for text kept for a screen reader, or for text scrolled inside a scroller', async ({
     page
   }) => {
