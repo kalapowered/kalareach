@@ -486,7 +486,7 @@ fn stubborn_idler() -> Idler {
     // The shell has set up what it ignores once it has become `sleep`.
     let started = Instant::now();
     loop {
-        let named = std::process::Command::new("ps")
+        let named = std::process::Command::new("/bin/ps")
             .args(["-o", "comm=", "-p", &idler.identity.pid.get().to_string()])
             .output()
             .expect("ps runs");
@@ -496,6 +496,10 @@ fn stubborn_idler() -> Idler {
         {
             return idler;
         }
+        assert!(
+            !gone(&idler.identity),
+            "the program ended before it set up what it ignores"
+        );
         assert!(
             started.elapsed() < LIVENESS,
             "the program set up what it ignores"
