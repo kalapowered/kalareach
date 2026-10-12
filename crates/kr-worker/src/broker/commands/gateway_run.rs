@@ -20,7 +20,8 @@
 //!   A session that is closing ends its servers after the acceptance of its close is delivered, so
 //!   until then none of the first three ends the server: the connection ending leaves the server
 //!   running with its input open and its output read and discarded. (The bound for a program that
-//!   never connected ends a server nothing ever spoke to, whatever the session is doing.)
+//!   never connected ends a server nothing ever spoke to, and a launch that did not commit ends the
+//!   server it started, whatever the session is doing.)
 
 use std::pin::Pin;
 use std::sync::atomic::Ordering;
@@ -133,6 +134,12 @@ impl Backend {
     /// The ending runs in a task of its own, kept in the backend's list of endings, which retiring
     /// the backend does not abort and [`Backend::endings`] waits for.
     pub(super) fn end_gateway(&self) {
+        self.end_gateway_since(tokio::time::Instant::now());
+    }
+
+    /// The same, for a graceful stop that began at `begun`: a session's closure begins its own
+    /// stop before it asks for the servers to end, and the two keep one clock.
+    pub(super) fn end_gateway_since(&self, begun: tokio::time::Instant) {
         let Some(run) = self.gateway_run.as_ref() else {
             return;
         };
@@ -155,7 +162,7 @@ impl Backend {
         if let Some(server) = server {
             let owned = SessionOwned(self.views.as_ref().map(|(_, runtime)| Weak::clone(runtime)));
             let ending = run.handle.spawn(async move {
-                let retirement = server.retire(&owned).await;
+                let retirement = server.retire(&owned, begun).await;
                 if !retirement.survivors.is_empty() {
                     eprintln!(
                         "kr-worker: {} process(es) a server the session started could not be \

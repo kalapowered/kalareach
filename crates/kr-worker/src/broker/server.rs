@@ -21,9 +21,10 @@
 //! dies; a recorded process is asked as soon as the server is gone when that is sooner. What is
 //! still running when the window is over is ended by force, and a process that was forced has two
 //! more seconds to be gone, after which the survivors are recorded. What the session recorded is
-//! read before the server is asked anything and again before it is ended, since a command whose
-//! parent has gone can no longer be found by its parentage. A process the ending forces is noted
-//! as forced.
+//! read before the server is asked anything, again and again while the processes below it are
+//! ending, and before it is ended, since a command whose parent has gone can no longer be found by
+//! its parentage; a process first shown while the others are ending is asked, with the same
+//! grace. A process the ending forces is noted as forced.
 //!
 //! **A limit.** On Linux the worker is the child subreaper, so a command the server leaves behind
 //! and the ladder then ends is a child of the worker's that nothing collects: it stays in the
@@ -484,10 +485,13 @@ impl Server {
 
     /// Ends the server, and everything the session recorded below it.
     ///
+    /// `begun` is when the graceful stop of the server began: nothing is forced before
+    /// [`GRACE_WINDOW`] after it. A session that is closing passes the moment its own stop began,
+    /// so that its forcing of the processes it owns and this ending keep one clock.
+    ///
     /// What comes back says how the server ended, which processes were ended by force, and which
     /// are still running: the server too, when it would not end.
-    pub async fn retire(&self, owned: &dyn Owned) -> Retirement {
-        let begun = tokio::time::Instant::now();
+    pub async fn retire(&self, owned: &dyn Owned, begun: tokio::time::Instant) -> Retirement {
         let window_over = begun + GRACE_WINDOW;
         let mut known: BTreeSet<ProcessStartIdentity> =
             owned.below(&self.identity).into_iter().collect();
@@ -583,10 +587,20 @@ fn ask_below(
     }
 }
 
-/// Ends each process recorded below `server` that is running, by its identity: asked to terminate
-/// if it has not been, given until `window_over`, then ended by force. The record is read again
-/// after each wait, since a process that was ended may have started another that the session
-/// recorded meanwhile. Returns the processes still running at the end.
+/// How often the record is read again while the processes below the server are ending.
+const RECORD_REREAD: Duration = Duration::from_millis(200);
+
+/// How long the ending waits, when nothing it knows of is running, before it reads the record once
+/// more: what a command that has just ended started is recorded a moment later.
+const RECORD_SETTLE: Duration = Duration::from_millis(50);
+
+/// Ends each process recorded below `server` that is running, by its identity.
+///
+/// Until `window_over` the record is read again and again, and every process it shows is asked to
+/// terminate once, so that one that a command started while the others were ending has its grace
+/// too; the window ends early only when two readings, a moment apart, find nothing running. Then
+/// what is still running is ended by force, a few rounds, each reading the record for what the
+/// last one left. Returns the processes still running at the end.
 async fn end_below(
     server: &ProcessStartIdentity,
     mut known: BTreeSet<ProcessStartIdentity>,
@@ -601,11 +615,27 @@ async fn end_below(
             .cloned()
             .collect()
     };
-    known.extend(owned.below(server));
-    ask_below(&known, &mut asked, owned);
-    let mut remaining = running(&known);
-    wait_until_ended(&mut remaining, window_over).await;
-    // A few rounds: each ends what is running and reads the record for what that left.
+    let mut settled = false;
+    let mut remaining;
+    loop {
+        known.extend(owned.below(server));
+        ask_below(&known, &mut asked, owned);
+        remaining = running(&known);
+        let now = tokio::time::Instant::now();
+        if now >= window_over {
+            break;
+        }
+        if remaining.is_empty() {
+            if settled {
+                break;
+            }
+            settled = true;
+            tokio::time::sleep_until((now + RECORD_SETTLE).min(window_over)).await;
+        } else {
+            settled = false;
+            wait_until_ended(&mut remaining, (now + RECORD_REREAD).min(window_over)).await;
+        }
+    }
     for _ in 0..KILL_ROUNDS {
         known.extend(owned.below(server));
         remaining = running(&known);
