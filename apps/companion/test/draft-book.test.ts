@@ -2155,6 +2155,36 @@ describe('two sends of the same words, the first said to have been applied', () 
     expect(book.snapshot().kept).toEqual([])
   })
 
+  it('take the warning that nothing is kept away when the second send waiting in this window only is ended', async () => {
+    const store = new FakeDraftStore()
+    const book = await opened(store)
+    type(book, MAIN, 'send this')
+    await book.settled()
+    const first = book.beginSend(MAIN)
+    await first.claimed
+    type(book, MAIN, 'other')
+    book.endSend(first, 'unknown', 'local-1')
+    await book.settled()
+    type(book, MAIN, 'send this')
+    await book.settled()
+    const second = book.beginSend(MAIN)
+    await second.claimed
+    type(book, MAIN, 'other')
+    await book.settled()
+    // The store cannot be read when the second send is refused, so its words wait in this window.
+    store.breakOpening()
+    book.endSend(second, 'refused', 'local-2')
+    await book.settled()
+    expect(book.snapshot().problem).not.toBeNull()
+
+    store.mendOpening()
+    book.sendSettled('local-1', 'applied')
+    await book.settled()
+
+    expect(book.snapshot().problem).toBeNull()
+    expect(store.all().map((draft) => draft.text)).toEqual(['other'])
+  })
+
   it('do not end a send to another conversation', async () => {
     const store = new FakeDraftStore()
     const book = await opened(store)
@@ -2872,6 +2902,34 @@ describe('a prompt the host is said to have applied after nobody knew what becam
       // The first send was applied: its words are not left in the store to be sent again.
       expect(store.all().map((draft) => draft.text)).toEqual(['newer'])
       expect(book.snapshot().kept).toEqual([])
+    })
+
+    it('does not wait for a send pressed after the host’s word that takes the draft before the first send’s end is over', async () => {
+      const store = new FakeDraftStore()
+      const { storedDraftId } = await earlierRun(store)
+      const book = await opened(store)
+      const second = book.beginSend(MAIN)
+      await second.claimed
+      type(book, MAIN, '')
+      book.sendSettled('local-1', 'applied', { sessionId: MAIN, text: 'send this', storedDraftId: storedDraftId ?? '' })
+      await book.settled()
+      // The person presses Send again as soon as the refused words are back in the composer.
+      let third: ReturnType<DraftBook['beginSend']> | undefined
+      book.subscribe(() => {
+        if (third === undefined && book.draft(MAIN).text === 'send this') third = book.beginSend(MAIN)
+      })
+
+      book.endSend(second, 'refused', 'local-2')
+      await book.settled()
+      expect(third).toBeDefined()
+      if (third === undefined) return
+      await third.claimed
+      type(book, MAIN, '')
+      book.endSend(third, 'refused')
+      await book.settled()
+
+      // That send is the person's own: the first send's word does not reach it.
+      expect(book.draft(MAIN).text).toBe('send this')
     })
 
     it('follows the text to the draft the send that held it was stored under', async () => {

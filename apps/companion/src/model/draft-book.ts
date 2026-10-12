@@ -1032,6 +1032,8 @@ export class DraftBook {
     await this.#dropEarlier(flight)
     await this.#dropOlder(flight)
     this.#unsettled = this.#unsettled.filter((each) => each !== flight)
+    // What a person is told is wrong follows: nothing is held in this window any more.
+    this.#recompute()
   }
 
   /**
@@ -1127,7 +1129,7 @@ export class DraftBook {
   /**
    * The stored draft that a prompt's text was put under when it came back, or null when it did not:
    * a prompt the host took, or whose words another send was applied for, has no text to keep. The
-   * draft is the one the prompt made, never one the composer holds by chance with the same words.
+   * draft is fixed when the text comes back, and is never looked up again from what a composer holds.
    */
   #holding(flight: Flight): string | null {
     if (flight.endedAs === 'taken' || flight.consumed === true) return null
