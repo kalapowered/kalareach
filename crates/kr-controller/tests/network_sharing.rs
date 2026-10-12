@@ -598,3 +598,84 @@ async fn kr_req_18_03_the_grant_list_carries_the_earlier_of_the_shares_end_and_t
     );
     host.stop().await;
 }
+
+/// KR-REQ-18.03: a paired device that lists what it delegated is told each grant's own end, and
+/// nothing of the end of its recipient's pairing, which only the person at this machine is told:
+/// it would otherwise read another device's pairing from a share that outlasts it, the one thing
+/// the refusal of a delegation is worded to keep from it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_18_03_a_device_that_lists_its_delegations_is_not_told_the_recipients_pairing_end() {
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    let (boss, boss_record) = recipient(&host, &owner).await;
+    let (_short, short_record) =
+        net_support::recipient_ending_in(&host, &owner, Duration::from_secs(30 * 60)).await;
+    let session_id = SessionId::new(kr_ipc::new_uuid());
+    let (above, issuing) = owned_by(&host, session_id, &boss, &boss_record).await;
+
+    // Written below the host's checks, as a delegation was before they existed: the boss issued an
+    // hour to a device that has half of it.
+    let selection = RoleSelection::plain(SessionRole::Viewer);
+    let written = host
+        .controller()
+        .sharing()
+        .share(
+            &ShareRequest {
+                invitation_id: InvitationId::new(kr_ipc::new_uuid()),
+                grant_id: GrantId::new(kr_ipc::new_uuid()),
+                environment_id: host.environment_id,
+                session_id,
+                issuer_device_id: boss_record.device_id,
+                recipient_device_id: short_record.device_id,
+                parent_grant_id: Some(above.grant.grant_id),
+                accepted_notices: AuthorityNotice::for_actions(&selection.actions()),
+                selection,
+                lifetime_ms: Some(60 * 60_000),
+                live_screen: None,
+                named_questions: Vec::new(),
+                named_approvals: Vec::new(),
+                authority_revision: host.controller().policy().authority_revision(),
+                owner_confirmed: false,
+                now_ms: kr_ipc::now_ms().get(),
+            },
+            || Ok(()),
+        )
+        .expect("the delegation is written");
+    let GrantExpiry::At { expires_at_ms } = written.grant.expiry else {
+        panic!("a share ends");
+    };
+
+    let params = GrantListParams {
+        session_id: Nullable::some(session_id),
+        include_resolved: false,
+    };
+    let by_the_device: GrantListResult = issuing
+        .read(Method::GrantList, &params)
+        .await
+        .expect("the device lists what it delegated")
+        .to_typed()
+        .expect("decodes");
+    let by_the_person: GrantListResult =
+        net_support::pairing::read(&mut host.client().await, Method::GrantList, &params)
+            .await
+            .expect("the person lists");
+    let end_in = |list: &GrantListResult| {
+        list.grants
+            .iter()
+            .find(|summary| summary.grant.grant_id == written.grant.grant_id)
+            .expect("the delegation is listed")
+            .ends_at_ms
+    };
+    assert_eq!(
+        end_in(&by_the_device),
+        Nullable::some(expires_at_ms),
+        "the device is told the grant's own end"
+    );
+    assert_eq!(
+        end_in(&by_the_person),
+        Nullable::some(TimestampMs::new(pairing_end(&short_record))),
+        "the person at this machine is told the end it really has"
+    );
+    issuing.close();
+    host.stop().await;
+}

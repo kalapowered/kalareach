@@ -363,8 +363,12 @@ impl Controller {
         )?;
         // A device's pairing bounds everything the device does, so a grant ends no later than its
         // recipient's pairing does, whatever its own expiry says: a share written before this host
-        // refused one that outlasts the pairing is listed with the end it really has.
-        for summary in &mut result.grants {
+        // refused one that outlasts the pairing is listed with the end it really has. Only the
+        // person at this machine is told so. A paired device that delegates is told the grant's own
+        // end and nothing of another device's pairing, as a refusal of a share it makes is worded
+        // the same whichever way the recipient cannot carry it.
+        let local = issuer == self.sharing.host_device_id();
+        for summary in result.grants.iter_mut().filter(|_| local) {
             let Some(record) = self
                 .devices
                 .record_for_device(summary.grant.recipient_device_id)?
