@@ -370,6 +370,11 @@ impl DeviceRecord {
 #[derive(Debug)]
 pub struct DeviceDirectory {
     connection: std::sync::Mutex<Connection>,
+    /// Raised each time the set of paired devices may have changed: a pairing was committed, a
+    /// device was revoked, or a grant was found to have run out. What keeps a lease for each
+    /// paired device waits on it, so a device is given its lease as it is paired and loses it as
+    /// it is unpaired, and not at the next time the keeper happens to look.
+    changed: std::sync::Arc<tokio::sync::Notify>,
 }
 
 impl DeviceDirectory {
@@ -413,6 +418,7 @@ impl DeviceDirectory {
             .map_err(ControllerError::registry)?;
         let directory = Self {
             connection: std::sync::Mutex::new(connection),
+            changed: std::sync::Arc::new(tokio::sync::Notify::new()),
         };
         directory.migrate()?;
         Ok(directory)
@@ -659,7 +665,20 @@ impl DeviceDirectory {
     /// Returns an error when the row cannot be written, including when this endpoint already has a
     /// record: an endpoint identity belongs to one device.
     pub fn commit(&self, record: &DeviceRecord) -> Result<()> {
-        self.transaction(|transaction| insert_record(transaction, record))
+        self.transaction(|transaction| insert_record(transaction, record))?;
+        self.note_change();
+        Ok(())
+    }
+
+    /// The signal raised each time the set of paired devices may have changed.
+    #[must_use]
+    pub fn changed(&self) -> std::sync::Arc<tokio::sync::Notify> {
+        std::sync::Arc::clone(&self.changed)
+    }
+
+    /// Raises the signal that the set of paired devices may have changed.
+    pub(crate) fn note_change(&self) {
+        self.changed.notify_one();
     }
 
     /// Returns the record of one endpoint, paired or revoked.
@@ -839,13 +858,16 @@ impl DeviceDirectory {
     /// Returns an error when the row cannot be written.
     pub fn record_expiry(&self, device_id: DeviceId, now_ms: TimestampMs) -> Result<()> {
         let bytes = device_id.get().as_bytes().to_vec();
-        self.with(|connection| {
+        let changed = self.with(|connection| {
             connection.execute(
                 "UPDATE network_devices SET expired_at_ms = ?2
                  WHERE device_id = ?1 AND expired_at_ms IS NULL",
                 params![bytes, i64::try_from(now_ms.get()).unwrap_or(i64::MAX)],
             )
         })?;
+        if changed > 0 {
+            self.note_change();
+        }
         Ok(())
     }
 
@@ -1334,6 +1356,9 @@ impl DeviceDirectory {
                 params![bytes, i64::try_from(now_ms.get()).unwrap_or(i64::MAX)],
             )
         })?;
+        if changed > 0 {
+            self.note_change();
+        }
         Ok(changed > 0)
     }
 

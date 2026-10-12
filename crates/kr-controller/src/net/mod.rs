@@ -1408,6 +1408,11 @@ pub async fn register(controller: &Arc<Controller>, setup: NetworkSetup) -> Resu
         .listener
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(listener);
+    // The host is reachable now, so the devices it has paired can be given the relay lease they
+    // connect through, and a device paired from here on is given one as it is paired.
+    if let Some(keeper) = controller.relay_keeper() {
+        keeper.run(controller, Arc::clone(&host.devices), endpoint_id);
+    }
     Ok(Network { guard })
 }
 

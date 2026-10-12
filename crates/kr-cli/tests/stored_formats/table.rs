@@ -816,6 +816,20 @@ pub fn table() -> Vec<Store> {
             levels: None,
             writers: Writers::Daemon,
             entry: entry(
+                "relay-leases",
+                StoreScope::Environment,
+                "relay-leases.sqlite3",
+                sqlite_table("relay_lease_schema"),
+                version(kr_controller::relay_leases::record::SCHEMA_VERSION),
+                version(kr_controller::relay_leases::record::OLDEST_SCHEMA_VERSION),
+            ),
+            owned: Vec::new(),
+            kept: Vec::new(),
+        },
+        Store {
+            levels: None,
+            writers: Writers::Daemon,
+            entry: entry(
                 "workflows",
                 StoreScope::Environment,
                 "workflows.db",
