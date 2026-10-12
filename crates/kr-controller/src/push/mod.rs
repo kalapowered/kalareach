@@ -17,6 +17,7 @@
 //! | [`external`] | The sender every external destination is handed to, and delivering to a webhook |
 //! | [`chat`] | Delivering to Slack, Discord and Telegram, and the shape of their credentials |
 //! | [`mail`] | Submitting mail over TLS under the owner's account, and the shape of an address |
+//! | [`mailbox`] | Putting the encrypted object a preview refers to in its device's mailbox |
 //! | [`secrets`] | Keeping an external destination's credential in the host's secret store |
 //! | [`authority`] | What an external destination's grant lets its recipient read |
 //!
@@ -64,6 +65,7 @@ pub mod client;
 pub mod credentials;
 pub mod external;
 pub mod mail;
+pub mod mailbox;
 pub mod runtime;
 pub mod secrets;
 pub mod sender;
@@ -324,6 +326,10 @@ pub struct DeliveryModule {
     /// ([`crate::privacy::EnvironmentPrivacy::open`]); until something does, it is generation 0 with
     /// privacy mode off, which is what an environment that never turned privacy mode on is.
     privacy: crate::privacy::PrivacyState,
+    /// What puts the encrypted object a preview refers to in its device's mailbox, once the
+    /// composition root has one. Until it does, a preview's object is not placed anywhere and the
+    /// push is presented as it always was.
+    placer: std::sync::OnceLock<std::sync::Arc<dyn mailbox::ObjectPlacer>>,
     /// Where this host's own tests stop a key registration before it asks its admission, and
     /// again once the journal has taken it. Compiled away in every shipped build.
     #[cfg(feature = "testing")]
@@ -376,9 +382,18 @@ impl DeliveryModule {
             producer: Mutex::new(producer),
             secrets,
             privacy: crate::privacy::PrivacyState::default(),
+            placer: std::sync::OnceLock::new(),
             #[cfg(feature = "testing")]
             key_write: Default::default(),
         })
+    }
+
+    /// Attaches what places the encrypted objects previews refer to.
+    ///
+    /// Once: the mailbox service is the composition root's decision, made at startup from the
+    /// configuration document. Returns false when one was already attached.
+    pub fn attach_placer(&self, placer: std::sync::Arc<dyn mailbox::ObjectPlacer>) -> bool {
+        self.placer.set(placer).is_ok()
     }
 
     /// Stops the next key registration before it asks its admission. Returns the end that says it
@@ -1292,6 +1307,66 @@ impl DeliveryModule {
         Ok(attempted)
     }
 
+    /// Puts the encrypted object a claimed notification's preview refers to in its device's
+    /// mailbox, when the notification owes one and this host selects a mailbox service.
+    ///
+    /// A row of the journal's objects is an object still owed: it is forgotten once the service
+    /// has it, and when the service will not take it, since waiting would not change that.
+    fn place_detail(&self, delivery: &ClaimedDelivery, push: &PushDestination) -> Result<Detail> {
+        let Some(placer) = self.placer.get() else {
+            return Ok(Detail::Ready);
+        };
+        let (object, sealed) = self.with(|producer| {
+            let object = producer.detail_object_of(delivery.notification_id);
+            let sealed = producer.journal().object(object).map_err(unavailable)?;
+            Ok((object, sealed))
+        })?;
+        let Some(sealed) = sealed else {
+            return Ok(Detail::Ready);
+        };
+        let forget = || {
+            self.with(|producer| {
+                producer
+                    .journal_mut()
+                    .forget_object(object)
+                    .map_err(unavailable)
+            })
+        };
+        let Some(recipient) = push.mailbox_key else {
+            forget()?;
+            return Ok(Detail::Missing(
+                "the device has registered no stored-envelope key to seal it to".to_owned(),
+            ));
+        };
+        let Ok(envelope) = kr_cbor::from_canonical_slice::<kr_protocol::mailbox::SealedEnvelope>(
+            &sealed,
+            &kr_cbor::Limits::DEFAULT,
+        ) else {
+            forget()?;
+            return Ok(Detail::Missing(
+                "the object this host kept for it could not be read".to_owned(),
+            ));
+        };
+        match placer.place(&recipient, &envelope) {
+            mailbox::Placement::Placed => {
+                forget()?;
+                Ok(Detail::Ready)
+            }
+            // A person's alert does not wait on the mailbox for ever: the last attempt the
+            // notification has is made without the detail rather than not at all.
+            mailbox::Placement::Later { detail, .. }
+                if delivery.attempt >= kr_delivery::push::MAX_ATTEMPTS =>
+            {
+                Ok(Detail::Missing(detail))
+            }
+            mailbox::Placement::Later { detail, after } => Ok(Detail::Later { detail, after }),
+            mailbox::Placement::Refused { detail } => {
+                forget()?;
+                Ok(Detail::Missing(detail))
+            }
+        }
+    }
+
     /// Whether the authority a claimed delivery was admitted under is still the authority now.
     ///
     /// The recipient's grant decides what a notification may tell it, for a paired device as for an
@@ -1575,6 +1650,8 @@ impl DeliveryModule {
                 now_ms,
             );
         }
+        let mut detail_missing: Option<String> = None;
+        let mut wait_for_mailbox: Option<std::time::Duration> = None;
         let outcome =
             if delivery.next == NextAction::Receipt {
                 // The gateway is holding this notification and retrying the provider itself. What is
@@ -1595,7 +1672,20 @@ impl DeliveryModule {
                         operation: "read a queued notification",
                         detail: error.to_string(),
                     })?;
-                sender.send(&credential, &request)
+                // The detail the preview refers to is in the device's mailbox before the push
+                // that refers to it is presented, under the admission and the authority this
+                // attempt already holds.
+                match self.place_detail(delivery, push)? {
+                    Detail::Ready => sender.send(&credential, &request),
+                    Detail::Missing(why) => {
+                        detail_missing = Some(why);
+                        sender.send(&credential, &request)
+                    }
+                    Detail::Later { detail, after } => {
+                        wait_for_mailbox = after;
+                        kr_delivery::push::SendOutcome::NotDispatched { detail }
+                    }
+                }
             };
         // The answer arrived now, not when the pass started. Everything that follows - whether
         // there is time for another attempt, when it is due, what the attempt row is stamped
@@ -1615,6 +1705,20 @@ impl DeliveryModule {
         // nothing until a renewal has succeeded.
         if decision.next == NextAction::RenewThenSend && credentials.renew(&credential).is_ok() {
             decision.next = NextAction::Send;
+        }
+        // The mailbox service asked to be left alone for a while: the next attempt is not due
+        // before it says it will take requests again, and not past the notification's own end.
+        if let (Some(wait), Some(due)) = (wait_for_mailbox, decision.next_attempt_at_ms) {
+            let asked = answered_at_ms
+                .saturating_add(u64::try_from(wait.as_millis()).unwrap_or(u64::MAX))
+                .min(delivery.expires_at_ms.get().saturating_sub(1));
+            decision.next_attempt_at_ms = Some(TimestampMs::new(due.get().max(asked)));
+        }
+        if let Some(why) = &detail_missing {
+            decision.detail = format!(
+                "{}; its detail is not in the device's mailbox: {why}",
+                decision.detail
+            );
         }
         if decision.disable_destination {
             self.disable(record)?;
@@ -1756,6 +1860,19 @@ impl DeliveryModule {
             Ok(())
         })
     }
+}
+
+/// What came of putting a notification's detail where its device reads it.
+enum Detail {
+    /// Nothing is owed, or what was owed is in the mailbox.
+    Ready,
+    /// The service will not take it. The push is presented without it, and its record says why.
+    Missing(String),
+    /// Nothing was placed, and the push waits for a later attempt.
+    Later {
+        detail: String,
+        after: Option<std::time::Duration>,
+    },
 }
 
 /// A status question's place in the pass's share of the gateway's allowance, taken before the

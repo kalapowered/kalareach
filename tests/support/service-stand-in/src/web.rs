@@ -214,6 +214,8 @@ struct State {
     feeds: BTreeMap<String, crate::feed::Feed>,
     /// The recovery bundles, by locator.
     bundles: BTreeMap<String, crate::sync::Bundle>,
+    /// The mailboxes, by the identifier of each recipient's stored-envelope key.
+    mailboxes: BTreeMap<String, crate::mailbox::Mailbox>,
 }
 
 /// What the service did with one request.
@@ -343,6 +345,21 @@ impl ServiceWeb {
                 principal: format!("account:{account}"),
             },
         );
+    }
+
+    /// The sealed envelopes the mailbox of the device whose stored-envelope key is `recipient`
+    /// holds, in the order they were stored.
+    #[must_use]
+    pub fn mailbox_envelopes(
+        &self,
+        recipient: &kr_protocol::scalars::StoredEnvelopeKey,
+    ) -> Vec<kr_protocol::mailbox::SealedEnvelope> {
+        let state = self.state.lock().expect("the state");
+        state
+            .mailboxes
+            .get(&crate::mailbox::address_of(recipient))
+            .map(crate::mailbox::Mailbox::envelopes)
+            .unwrap_or_default()
     }
 
     /// `token` expires: from now on it proves no account.
@@ -618,6 +635,7 @@ impl ServiceWeb {
             "/api/backup/manifest" => "backup.manifest",
             "/api/authority/sync" => "authority.sync",
             crate::sync::PATH => "sync.compare_exchange",
+            "/api/mailbox/deliver" => "mailbox.deliver",
             other => panic!("no route at {other}"),
         };
         let Ok(signature) =
@@ -690,6 +708,9 @@ impl ServiceWeb {
         }
         if method == "sync.compare_exchange" {
             return crate::sync::exchange(&state.bundles, &state.tokens, body, token);
+        }
+        if method == "mailbox.deliver" {
+            return crate::mailbox::deliver(&mut state.mailboxes, &signature, body, now_ms());
         }
         if body["installation_id"].as_str() != Some(caller.as_str()) {
             return refusal(

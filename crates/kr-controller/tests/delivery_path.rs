@@ -125,6 +125,8 @@ struct GatewayState {
     bearers_refused: usize,
     /// Every post to an address that is not one of the gateway's routes: an external destination.
     posted: Vec<Posted>,
+    /// How many objects the watched mailbox held each time a push was delivered.
+    held_at_delivery: Vec<usize>,
 }
 
 /// One post an external destination received.
@@ -174,6 +176,11 @@ struct Gateway {
     /// The last time the gateway stamped a credential with, so that two credentials never carry
     /// one time.
     stamped_ms: std::sync::atomic::AtomicU64,
+    /// The mailbox service, which the managed service serves from the same origin as the push
+    /// gateway.
+    mailbox: Arc<kr_service_stand_in::ServiceWeb>,
+    /// The mailbox whose contents are noted each time a push is delivered.
+    watched: Mutex<Option<kr_protocol::scalars::StoredEnvelopeKey>>,
 }
 
 /// An exchange the gateway holds back until the test lets it go: either the request, before the
@@ -492,6 +499,11 @@ impl Gateway {
             state: PushDeliveryState::Queued,
             suppression: Nullable::null(),
         };
+        let watched = *self.watched.lock().expect("the gateway is not poisoned");
+        if let Some(key) = watched {
+            let held = self.mailbox.mailbox_envelopes(&key).len();
+            state.held_at_delivery.push(held);
+        }
         state
             .delivered
             .push((request.sender_record_id, request.clone()));
@@ -727,6 +739,9 @@ impl ServiceHttp for Gateway {
         body: &'a [u8],
         headers: &'a [(&'a str, &'a str)],
     ) -> ServiceFuture<'a, ServiceHttpAnswer> {
+        if url.contains("/api/mailbox/") {
+            return self.mailbox.post_json(url, body, headers);
+        }
         match self.met(url) {
             // Held before the gateway acts: what happens meanwhile happens first.
             Some((held, true)) => Box::pin(async move {
@@ -1015,21 +1030,37 @@ impl Environment {
     /// Starts as [`Self::start`] does, with the daemon delivering through the gateway only when
     /// `attached` says so: a daemon with no transport asks no gateway anything.
     async fn start_attached(attached: bool) -> Self {
-        Self::start_on(attached, None).await
+        Self::start_on(attached, None, None).await
     }
 
     /// Starts as [`Self::start`] does, on clocks the test moves by hand.
     async fn start_on_clocks(clocks: kr_controller::service::Clocks) -> Self {
-        Self::start_on(true, Some(clocks)).await
+        Self::start_on(true, Some(clocks), None).await
     }
 
-    async fn start_on(attached: bool, clocks: Option<kr_controller::service::Clocks>) -> Self {
+    /// Starts as [`Self::start`] does, with a configuration document that selects the mailbox
+    /// service at the gateway's own origin.
+    async fn start_selecting_a_mailbox() -> Self {
+        Self::start_on(true, None, Some(GATEWAY)).await
+    }
+
+    async fn start_on(
+        attached: bool,
+        clocks: Option<kr_controller::service::Clocks>,
+        mailbox: Option<&str>,
+    ) -> Self {
         let owner = DeviceKeys::generate().expect("owner keys");
         let host = match clocks {
             Some(clocks) => Host::start_on_clocks(&owner, clocks).await,
             None => Host::start(&owner).await,
         };
         let stopped = host.shut_down().await;
+        if let Some(origin) = mailbox {
+            let mut document = kr_protocol::hostinfo::configuration::ConfigurationDocument::empty();
+            document.revision = 1;
+            document.mailbox.origin = Nullable::some(origin.to_owned());
+            net_support::write_document(stopped.tree(), &document);
+        }
         let worker = Worker::start(stopped.tree(), 1).await;
         let settings = stopped.settings().clone();
         let host = stopped.start(settings).await;
@@ -1106,6 +1137,21 @@ impl Environment {
         .expect("the daemon made its keys when it started")
         .public_keys()
         .authorisation
+    }
+
+    /// The stored-envelope key the daemon seals the objects it leaves for a device from, which a
+    /// device opens them against.
+    fn host_mailbox_key(&self) -> kr_protocol::scalars::StoredEnvelopeKey {
+        let store = open_store_in(&self.host.tree().environment().secrets_dir())
+            .expect("the daemon's secret store");
+        kr_crypto::store::load_device_keys(
+            store.store.as_ref(),
+            &kr_controller::service::net::device_key_scope(self.environment_id()),
+        )
+        .expect("the host's keys are readable")
+        .expect("the daemon made its keys when it started")
+        .public_keys()
+        .stored_envelope
     }
 
     /// Waits until the daemon serves the worker's session.
@@ -4871,4 +4917,158 @@ async fn removing_a_destination_with_a_message_on_the_wire_counts_the_attempt() 
     assert!(removed.found);
     assert_eq!(removed.fenced.get(), 1, "the attempt on the wire");
     held.release();
+}
+
+/// The authority a notice is produced under: the one the daemon's own delivery asks, so that what
+/// the test queues is judged at the send as what the daemon produced itself is.
+#[derive(Debug)]
+struct LiveAuthority<'a>(&'a kr_controller::push::runtime::DeliveryRuntime);
+
+impl kr_delivery::producer::RecipientAuthority for LiveAuthority<'_> {
+    fn scope_for(
+        &self,
+        rule: &kr_delivery::destination::DeliveryRule,
+    ) -> Option<kr_delivery::producer::RecipientScope> {
+        self.0.recipient_scope(rule)
+    }
+
+    fn device_scope(
+        &self,
+        destination: &kr_delivery::destination::DestinationRecord,
+    ) -> Option<kr_delivery::producer::RecipientScope> {
+        destination
+            .rule
+            .as_ref()
+            .and_then(|rule| self.0.recipient_scope(rule))
+    }
+}
+
+/// KR-REQ-09.21: a daemon whose configuration document selects a mailbox service places the detail
+/// of a notification that does not fit in a push in the paired device's mailbox before it presents
+/// the push that refers to it. The device opens the object with its own key, and it holds the whole
+/// text the preview had to leave out.
+///
+/// The notice is queued through the daemon's own delivery journal, because the product does not
+/// yet make one whose text is longer than a preview holds: the attention store clips what the host
+/// says to 512 bytes and keeps none of a session's text. Everything after the queue is the daemon's
+/// own: it read the document, selected the service, attached it with its transport, claimed the
+/// notification, placed the object and presented the push.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_detail_that_does_not_fit_is_in_the_devices_mailbox_before_the_push_that_refers_to_it() {
+    let environment = Environment::start_selecting_a_mailbox().await;
+    let phone = environment.phone().await;
+    let device_mailbox = &phone.device.keys().stored_envelope;
+    *environment
+        .gateway
+        .watched
+        .lock()
+        .expect("the gateway is not poisoned") = Some(*device_mailbox.public());
+    let sender = PushSenderRecordId::new(uuid(0x93));
+    let credential =
+        environment
+            .gateway
+            .issue(sender, phone.installation(), environment.host_signing_key());
+    phone
+        .register(&environment, &credential)
+        .await
+        .expect("the credential is registered");
+    let destination = environment
+        .destination(phone.device_id())
+        .expect("the device is a destination now");
+
+    let words = "the release is tagged and the migration has run; ".repeat(40);
+    let at = now();
+    let notice = kr_delivery::producer::Notice {
+        event: kr_delivery::journal::EventKey::announcement(
+            Some(environment.worker_session),
+            "attention.pending_question/~abcdef",
+            1,
+        ),
+        alert: PushAlert::QuestionWaiting,
+        urgency: kr_protocol::push::PushUrgency::Attention,
+        rule: "attention.pending_question".to_owned(),
+        summary: words.clone(),
+        session_id: Some(environment.worker_session),
+        environment_id: None,
+        observed_at_ms: TimestampMs::new(at),
+        collapse_group: "a-session/attention.pending_question".to_owned(),
+        expires_at_ms: TimestampMs::new(
+            at + kr_delivery::producer::DEFAULT_NOTIFICATION_LIFETIME_MS,
+        ),
+        audience: kr_delivery::producer::Audience::Sessions {
+            sessions: vec![environment.worker_session],
+            at_ms: at,
+        },
+    };
+    environment
+        .controller()
+        .delivery()
+        .with(|producer| {
+            let taken = notice.taken(1).expect("an event record");
+            producer
+                .take(
+                    kr_delivery::journal::EventSource::Attention,
+                    "session-1",
+                    &[taken],
+                    1,
+                    at,
+                )
+                .expect("a page");
+            producer
+                .produce(
+                    &notice,
+                    std::slice::from_ref(&destination),
+                    &LiveAuthority(environment.controller().delivery_runtime()),
+                    &[],
+                    at,
+                )
+                .expect("a decision");
+            Ok(())
+        })
+        .expect("the daemon's journal");
+    until("the notification being delivered", || {
+        !environment.gateway.delivered().is_empty()
+    })
+    .await;
+
+    assert_eq!(
+        environment.gateway.state().held_at_delivery,
+        [1],
+        "the mailbox held the object when the push was presented"
+    );
+    let held = environment
+        .gateway
+        .mailbox
+        .mailbox_envelopes(device_mailbox.public());
+    assert_eq!(held.len(), 1);
+    let request = environment.gateway.delivered().remove(0);
+    let host_preview = environment
+        .controller()
+        .delivery()
+        .with(|producer| Ok(*producer.preview_public()))
+        .expect("the host's preview key");
+    let preview = kr_delivery::preview::open_preview(
+        &phone.device.keys().notification_preview,
+        &host_preview,
+        request.preview.as_ref().expect("a preview"),
+        now(),
+    )
+    .expect("the device opens its own preview");
+    assert_eq!(
+        preview.detail_object.as_ref().copied(),
+        Some(held[0].routing.envelope_id),
+        "the preview refers to the object the mailbox holds"
+    );
+    let opened = kr_crypto::envelope::open_envelope(
+        device_mailbox,
+        &environment.host_mailbox_key(),
+        &held[0],
+        now(),
+        |_| Ok(()),
+    )
+    .expect("the device opens the object with its own key");
+    let detail: kr_delivery::preview::PreviewBody =
+        kr_cbor::from_canonical_slice(opened.payload.as_slice(), &kr_cbor::Limits::DEFAULT)
+            .expect("the whole body");
+    assert_eq!(detail.summary, words, "nothing was trimmed");
 }

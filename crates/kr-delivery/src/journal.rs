@@ -2363,6 +2363,25 @@ impl DeliveryJournal {
                 i64::from(transition.left_this_host),
             ],
         )?;
+        // The encrypted object a preview refers to is kept for as long as the request that refers
+        // to it, and not longer: a notification that will not be presented again has no use for
+        // the detail it moved out of its preview.
+        if !holds_request {
+            let secret: Option<Vec<u8>> = transaction
+                .query_row(
+                    "SELECT secret FROM delivery_secret WHERE id = 0",
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if let Some(secret) = secret.and_then(|bytes| <[u8; 32]>::try_from(bytes).ok()) {
+                let object = crate::preview::detail_object_id(&secret, transition.notification_id);
+                transaction.execute(
+                    "DELETE FROM delivery_objects WHERE envelope_id = ?1",
+                    params![object.to_string()],
+                )?;
+            }
+        }
         match transition.next_attempt_at_ms {
             Some(due) if !transition.state.is_settled() => {
                 transaction.execute(
@@ -2967,6 +2986,23 @@ impl DeliveryJournal {
                 sealed,
                 as_i64(expires_at_ms.get())
             ],
+        )?;
+        Ok(())
+    }
+
+    /// Forgets one kept object, because it has been placed where its device reads it or because
+    /// nothing will be presented that refers to it.
+    ///
+    /// An object is kept for as long as it is owed to a mailbox: a row here is an object still to
+    /// be placed. Forgetting one that is not kept is not an error.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DeliveryError::JournalUnavailable`] when the write fails.
+    pub fn forget_object(&mut self, envelope_id: kr_protocol::ids::EnvelopeId) -> Result<()> {
+        self.connection.execute(
+            "DELETE FROM delivery_objects WHERE envelope_id = ?1",
+            params![envelope_id.to_string()],
         )?;
         Ok(())
     }
