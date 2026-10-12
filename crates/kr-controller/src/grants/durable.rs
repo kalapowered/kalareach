@@ -130,8 +130,9 @@ pub struct StoredRevocation {
     /// The revision the feed held when this host began to apply the request, which the revision
     /// record it issues for it follows.
     pub previous_revision: AuthorityRevision,
-    /// The revision the registry had reached when this host began to apply the request. A request
-    /// that took effect brought the registry above it, and one that withdrew nothing did not.
+    /// The revision the registry had reached when this host began to apply the request. The host
+    /// refuses a request that took no number while the registry still stands there; a registry
+    /// that something else moved meanwhile numbers the request with the revision in force.
     pub registry_revision: AuthorityRevision,
     /// When this host began to apply it.
     pub applied_at_ms: TimestampMs,
@@ -144,25 +145,25 @@ pub struct StoredRevocation {
     pub settled: bool,
 }
 
-/// What this host has written down about a feed that removed it, and the notice it owes the owner.
+/// What this host has written down about a feed that removed it, and the newest notice about it
+/// that the owner's inbox is to hold.
 ///
 /// It is kept apart from [`StoredFeed`]: a record is read back only if it re-encodes to the bytes
 /// it was read from, so a field added to `StoredFeed` would make every feed an earlier build wrote
-/// unreadable. The row is not deleted when the owner acts: the notice number only rises, and one
-/// the attention store has taken is not given again.
+/// unreadable. The row is not deleted when the owner acts: the notice number only rises. Whether
+/// the attention store holds the notice is read from the store's own cursor, so a store put back
+/// to an earlier copy is given the notice again.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredRemoval {
     /// The origin of the feed that answered that it removed this host, while that stands. A host
     /// pointed at another feed is not removed from it, and the owner pointing it there leaves
     /// this null.
     pub origin: Nullable<String>,
-    /// When this host first read the answer.
+    /// When this host recorded the change the newest notice is about.
     pub at_ms: TimestampMs,
-    /// The number of the newest notice about the feed that this host owes the owner's inbox or has
-    /// given it. It rises by one with each change, apart from any clock.
+    /// The number of the newest notice about the feed. It rises with each change, above every
+    /// number the attention store has taken, and apart from any clock.
     pub notice: u64,
-    /// Whether the attention store has yet to take that notice.
-    pub owed: bool,
 }
 
 /// This host's half of the authority feed, as it is written down.

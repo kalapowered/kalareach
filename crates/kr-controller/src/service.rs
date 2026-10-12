@@ -385,6 +385,10 @@ pub struct Controller {
     backup_runtime: Option<crate::backup::runtime::BackupRuntime>,
     /// The carrier of this host's authority feed, when its configuration document names one.
     feed_runtime: Option<crate::authority_feed::FeedRuntime>,
+    /// Wakes the task that gives the owner's inbox its notices about the authority feed.
+    feed_notice_wake: Arc<tokio::sync::Notify>,
+    /// How many times that task has tried to give one.
+    feed_notice_attempts: tokio::sync::watch::Sender<u64>,
     /// The configuration this daemon has put into force.
     ///
     /// A document is a file a person may also edit by hand, and its effects live outside it: the

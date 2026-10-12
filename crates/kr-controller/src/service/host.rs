@@ -682,7 +682,9 @@ impl Controller {
         });
         checks.push(match &self.feed_runtime {
             Some(runtime) => runtime.doctor_check(self),
-            None => crate::authority_feed::FeedRuntime::unconfigured_check(),
+            None => crate::authority_feed::FeedRuntime::unconfigured_check(
+                self.authority_feed().is_removed(),
+            ),
         });
         checks.push(DoctorCheck::new(
             "configuration-secrets",
