@@ -509,7 +509,6 @@ async fn kr_req_09_08_a_request_is_not_repeated_as_another_device_of_the_same_ho
     let host = Host::start(&owner).await;
     let (first_device, first_record) = recipient(&host, &owner).await;
     let (second_device, second_record) = recipient(&host, &owner).await;
-    let (session_id, _) = an_open_session(&host);
     let first = connect(&host, &first_device, &first_record).await;
     let second = connect(&host, &second_device, &second_record).await;
     let third = connect(&host, &first_device, &first_record).await;
@@ -547,7 +546,6 @@ async fn kr_req_09_08_a_request_is_not_repeated_as_another_device_of_the_same_ho
         matches!(&answered, Err(ClientError::Host(_))),
         "the host has no record of an action never sent, and refuses: {answered:?}"
     );
-    let _ = session_id;
     first.close();
     second.close();
     third.close();

@@ -44,6 +44,7 @@ use kr_protocol::confirmation::TransferControlPlan;
 use kr_protocol::envelope::MutationRequest;
 use kr_protocol::error::RetryCategory;
 use kr_protocol::ids::{ActionId, GrantId};
+use kr_protocol::method::Method;
 use kr_protocol::scalars::{Nullable, TimestampMs};
 use kr_protocol::sharing::GrantState;
 use serde::{Deserialize, Serialize};
@@ -131,8 +132,8 @@ pub enum Reply {
     Result,
     /// The host refused, in this category of retry.
     Refused(RetryCategory),
-    /// The answer was lost: the connection ended, or the host's answer did not arrive, after the
-    /// request was sent.
+    /// The answer was lost: the connection ended, or the host's answer did not arrive. The request
+    /// may have reached the host, and asking about it is what settles that.
     Lost,
     /// The client refused before anything was sent. It is not the host's answer.
     NotSent,
@@ -191,9 +192,10 @@ pub enum Next {
     Check,
     /// Read again later: nothing counts before [`Attempt::bound`].
     Wait,
-    /// The client refused to send, or a call that could not run did not. After a *first* send that
-    /// went out it is never returned: a lost answer is [`Reply::Lost`], and the client reads the
-    /// host. The request is kept, unsent.
+    /// The call did not go out, and the attempt stays as it was. From a first send the request is
+    /// kept, unsent. From a repeat the attempt stays unfinished: the caller asks again on another
+    /// connection, or reads the host. A first send that went out and was not answered is
+    /// [`Reply::Lost`], never this.
     NotSent,
 }
 
@@ -226,7 +228,9 @@ pub struct Attempt {
     pub kind: Kind,
     /// Where it stands.
     pub phase: Phase,
-    /// The action. The host keys its record by this and the actor.
+    /// The action this record is kept under, and the one a caller settles. The host keys its record
+    /// of the request by this and the actor, except while the attempt is [`Phase::Asking`]: the
+    /// request held then is the confirmation request, which the host keys by its own action.
     pub action_id: ActionId,
     /// The request, whole, window included: the host answers a repeat only when it is exactly the
     /// request that was sent. For an attempt still [`Phase::Asking`] it is the confirmation
@@ -246,8 +250,8 @@ pub struct Attempt {
     pub grant_id: Nullable<GrantId>,
     /// How long a read that finds nothing waits to count, in milliseconds of elapsed time.
     pub bound_ms: u64,
-    /// When the request was composed, on this device's wall clock. It is shown to a person and
-    /// decides nothing.
+    /// When the attempt was started, on this device's wall clock. It is shown to a person and
+    /// decides nothing. A hand-over keeps the time it was first asked for, not the transfer's.
     pub composed_at_ms: TimestampMs,
     /// How many repeats have been asked.
     pub repeats: u8,
@@ -324,9 +328,11 @@ impl Attempt {
     ///
     /// The record is named for the transfer's action from the start, because that is the action the
     /// host keys the transfer by and the one the caller settles; what it holds until the owner has
-    /// confirmed is the *confirmation request*, which is another action ([`Self::confirmed`]
-    /// replaces it). While it is asking, nothing can be sent for it, and nothing closes it but
-    /// [`Self::confirmed`].
+    /// confirmed is the *confirmation request*, which is another action. The caller sends and
+    /// repeats that request itself, and the state machine does not judge its answers: while the
+    /// attempt is asking, every call answers [`Next::NotSent`] or [`Next::Wait`], and only
+    /// [`Self::confirmed`] moves it on, to the transfer. `grant_id` is the grant the transfer would
+    /// write, which the host derives from the actor and `transfer_action`.
     #[must_use]
     pub fn asking(
         confirmation: &ComposedMutation,
@@ -349,17 +355,29 @@ impl Attempt {
 
     /// Moves a hand-over from asking for its confirmation to sending the transfer.
     ///
-    /// `transfer` is the transfer composed under the action this record is named for. It replaces
-    /// the confirmation request, with its window and the host and actor it is for (cleared when it
-    /// states none, so a request that cannot say whom it is for is never repeated), and `plan` is
-    /// what the owner confirmed: the grant a read looks for is the one it writes. The bound is the
-    /// window's, shortened to what the challenge has left, which is its lifetime less
-    /// `since_challenge`, the time since its reply arrived, and **the caller arms a new clock now**:
-    /// the one that counted the confirmation's request counted from before the challenge existed.
+    /// `transfer` is the `grant.transfer` request composed under the action this record is named
+    /// for. It replaces the confirmation request, with its window and the host and actor it is for
+    /// (cleared when it states none, so a request that cannot say whom it is for is never
+    /// repeated), and `plan` is what the owner confirmed. `challenge_answered` is the clock the
+    /// caller started when the challenge's reply arrived: the bound is the window's, shortened to
+    /// what the challenge has left, which is its lifetime less the time on that clock. **The caller
+    /// arms a new clock for the attempt now**: the one that counted the confirmation's request
+    /// counted from before the challenge existed.
     ///
-    /// Returns false, changing nothing, for an attempt that is not a hand-over being asked for, and
-    /// for a transfer composed under another action.
+    /// Returns false, changing nothing, for an attempt that is not a hand-over being asked for, for
+    /// a request that is not a `grant.transfer` under this record's action, and for a plan that
+    /// would write another grant than this record looks for.
+    #[must_use]
     pub fn confirmed(
+        &mut self,
+        transfer: &ComposedMutation,
+        plan: TransferControlPlan,
+        challenge_answered: Armed,
+    ) -> bool {
+        self.confirmed_after(transfer, plan, challenge_answered.elapsed())
+    }
+
+    fn confirmed_after(
         &mut self,
         transfer: &ComposedMutation,
         plan: TransferControlPlan,
@@ -368,6 +386,8 @@ impl Attempt {
         if self.kind != Kind::Transfer
             || self.phase != Phase::Asking
             || transfer.action_id() != self.action_id
+            || transfer.request().method != Method::GrantTransfer.into()
+            || self.grant_id != Nullable::some(plan.new_grant_id)
         {
             return false;
         }
@@ -381,7 +401,6 @@ impl Attempt {
         });
         self.host = host;
         self.standing = standing;
-        self.grant_id = Nullable::some(plan.new_grant_id);
         self.bound_ms = transfer.window_valid_for_ms().saturating_add(MARGIN_MS);
         self.bound_by_challenge(left);
         self.plan = Nullable::some(plan);
@@ -446,6 +465,9 @@ impl Attempt {
     ///
     /// An attempt still asking for a confirmation has nothing to send ([`Self::confirmed`]).
     pub fn after_first_send(&mut self, reply: Reply) -> Next {
+        if let Phase::Closed(outcome) = self.phase {
+            return Next::Closed(outcome);
+        }
         if self.phase == Phase::Asking {
             return Next::NotSent;
         }
@@ -473,6 +495,9 @@ impl Attempt {
     /// a fence before it gives back its kept answer, or that the effect is still running. A lost
     /// answer leaves it unfinished until the repeats are used up.
     pub fn after_repeat(&mut self, reply: Reply) -> Next {
+        if let Phase::Closed(outcome) = self.phase {
+            return Next::Closed(outcome);
+        }
         if self.phase == Phase::Asking {
             return Next::NotSent;
         }
@@ -867,7 +892,6 @@ mod tests {
     use kr_protocol::envelope::{ActionTarget, ParamsValue};
     use kr_protocol::ids::{ActionWindowId, EnvironmentId, RequestId};
     use kr_protocol::ids::{DeviceId, SessionId};
-    use kr_protocol::method::Method;
     use kr_protocol::scalars::{DurationMs, Uuid};
 
     fn request() -> MutationRequest {
@@ -1214,19 +1238,30 @@ mod tests {
         }
     }
 
+    /// A request for `method` under `action`, as the tests below compose them.
+    fn request_of(method: Method, action: ActionId) -> MutationRequest {
+        MutationRequest {
+            method: method.into(),
+            method_version: method.entry().version,
+            action_id: action,
+            ..request()
+        }
+    }
+
     /// A hand-over still asking for its confirmation has nothing to send, so no answer moves it;
     /// a confirmed one is sent under the window of the transfer, bounded by what its challenge
     /// had left when the transfer was composed, which is less than its lifetime when the owner
-    /// device was slow.
+    /// device was slow. The transfer takes over the record whole, and what is not the transfer
+    /// leaves it as it was.
     #[test]
     fn a_hand_over_being_asked_for_moves_only_when_it_is_confirmed_and_is_bounded_by_what_is_left()
     {
         let transfer_action = ActionId::new(Uuid::from_bytes([0xc7; 16]));
         let confirmation = ComposedMutation::restored(
-            MutationRequest {
-                action_id: ActionId::new(Uuid::from_bytes([0xc1; 16])),
-                ..request()
-            },
+            request_of(
+                Method::OwnerConfirmationRequest,
+                ActionId::new(Uuid::from_bytes([0xc1; 16])),
+            ),
             1_000,
             300_000,
             Some(reach()),
@@ -1234,7 +1269,7 @@ mod tests {
         let mut asking = Attempt::asking(
             &confirmation,
             transfer_action,
-            GrantId::new(Uuid::from_bytes([0x99; 16])),
+            plan().new_grant_id,
             2_000,
             "Handing over",
         );
@@ -1253,34 +1288,63 @@ mod tests {
             "the challenge is not the transfer"
         );
 
-        // The transfer is composed under the action the record is named for, and a request for
-        // another action is not the transfer.
-        let elsewhere = ComposedMutation::restored(
-            MutationRequest {
-                action_id: ActionId::new(Uuid::from_bytes([0xc2; 16])),
-                ..request()
-            },
-            5_000,
-            300_000,
-            None,
-        );
-        assert!(
-            !asking
-                .clone()
-                .confirmed(&elsewhere, plan(), Duration::from_secs(50))
-        );
-        let transfer = ComposedMutation::restored(
-            MutationRequest {
-                action_id: transfer_action,
-                ..request()
-            },
-            5_000,
-            300_000,
-            None,
-        );
+        // What is not the transfer under this record's action, for this record's plan, changes
+        // nothing: a transfer for another action, a request for another method under this
+        // action (the confirmation request itself among them), and a plan that writes another
+        // grant than the one a read looks for.
+        let before = asking.clone();
+        let composed = |method, action| {
+            ComposedMutation::restored(request_of(method, action), 5_000, 300_000, None)
+        };
+        let someone_elses = ActionId::new(Uuid::from_bytes([0xc2; 16]));
+        let other_plan = TransferControlPlan {
+            new_grant_id: GrantId::new(Uuid::from_bytes([0x15; 16])),
+            ..plan()
+        };
+        let waited = Duration::from_secs(50);
+        assert!(!asking.confirmed_after(
+            &composed(Method::GrantTransfer, someone_elses),
+            plan(),
+            waited
+        ));
+        assert!(!asking.confirmed_after(
+            &composed(Method::GrantRedeem, transfer_action),
+            plan(),
+            waited
+        ));
+        assert!(!asking.confirmed_after(
+            &composed(Method::OwnerConfirmationRequest, transfer_action),
+            plan(),
+            waited
+        ));
+        assert!(!asking.confirmed_after(
+            &composed(Method::GrantTransfer, transfer_action),
+            other_plan,
+            waited
+        ));
+        assert_eq!(asking, before);
+
         // The challenge, 120 seconds long, was answered 50 seconds before the transfer was
-        // composed, so 70 seconds of it are left then.
-        assert!(asking.confirmed(&transfer, plan(), Duration::from_secs(50)));
+        // composed, so 70 seconds of it are left then. A transfer that states a reach is repeated
+        // as that reach.
+        let host = Reach {
+            host: "host-2".to_owned(),
+            actor: "local:501".to_owned(),
+        };
+        let transfer = ComposedMutation::restored(
+            request_of(Method::GrantTransfer, transfer_action),
+            5_000,
+            300_000,
+            Some(host.clone()),
+        );
+        let mut stated = asking.clone();
+        assert!(stated.confirmed_after(&transfer, plan(), waited));
+        assert_eq!(stated.reach(), Some(host));
+        assert!(asking.confirmed_after(
+            &composed(Method::GrantTransfer, transfer_action),
+            plan(),
+            waited
+        ));
         assert_eq!(asking.phase, Phase::Composed);
         assert_eq!(asking.action_id, transfer_action);
         assert_eq!(asking.request.action_id, transfer_action);
@@ -1312,22 +1376,112 @@ mod tests {
             Next::Closed(Outcome::NotDone)
         );
         // Only a hand-over being asked for is confirmed.
+        let again = composed(Method::GrantTransfer, transfer_action);
         let mut other = attempt(Kind::Transfer);
-        assert!(!other.confirmed(&transfer, plan(), Duration::from_secs(50)));
+        assert!(!other.confirmed_after(&again, plan(), waited));
         let mut invite = attempt(Kind::Invite);
         invite.phase = Phase::Asking;
-        assert!(!invite.confirmed(&transfer, plan(), Duration::from_secs(50)));
+        assert!(!invite.confirmed_after(&again, plan(), waited));
     }
 
-    /// What an attempt closed as stays what it closed as: a later read, which another path of the
-    /// client can still make, never closes it again with another outcome.
+    /// The clock the caller hands over is the one that counts the time since the challenge's
+    /// reply: a challenge answered just now has nearly its whole lifetime left.
     #[test]
-    fn a_closed_attempt_stays_as_it_closed() {
+    fn a_confirmed_hand_over_counts_the_time_since_the_challenge_on_the_clock_it_is_given() {
+        let transfer_action = ActionId::new(Uuid::from_bytes([0xc7; 16]));
+        let confirmation = ComposedMutation::restored(
+            request_of(
+                Method::OwnerConfirmationRequest,
+                ActionId::new(Uuid::from_bytes([0xc1; 16])),
+            ),
+            1_000,
+            300_000,
+            Some(reach()),
+        );
+        let mut asking = Attempt::asking(
+            &confirmation,
+            transfer_action,
+            plan().new_grant_id,
+            2_000,
+            "Handing over",
+        );
+        let transfer = ComposedMutation::restored(
+            request_of(Method::GrantTransfer, transfer_action),
+            5_000,
+            300_000,
+            None,
+        );
+        assert!(asking.confirmed(&transfer, plan(), Armed::now()));
+        assert!(asking.bound() <= Duration::from_secs(150));
+        assert!(asking.bound() > Duration::from_secs(149));
+    }
+
+    /// A hand-over still asking is kept under the transfer's action and read back as it was,
+    /// though the request it holds is for another action; once confirmed, it is the same file.
+    #[test]
+    fn a_hand_over_being_asked_for_is_kept_under_the_transfers_action_and_read_back() {
+        let directory = kr_ipc::testing::PrivateTempDir::create();
+        let store = AttemptStore::open(directory.path().join("attempts")).expect("opens");
+        let transfer_action = ActionId::new(Uuid::from_bytes([0xc7; 16]));
+        let confirmation = ComposedMutation::restored(
+            request_of(
+                Method::OwnerConfirmationRequest,
+                ActionId::new(Uuid::from_bytes([0xc1; 16])),
+            ),
+            1_000,
+            300_000,
+            Some(reach()),
+        );
+        let mut asking = Attempt::asking(
+            &confirmation,
+            transfer_action,
+            plan().new_grant_id,
+            2_000,
+            "Handing over",
+        );
+        store.keep(&asking).expect("kept while asking");
+        assert_eq!(
+            store.attempts().expect("listed"),
+            vec![Kept::Known(Box::new(asking.clone()))]
+        );
+        let transfer = ComposedMutation::restored(
+            request_of(Method::GrantTransfer, transfer_action),
+            5_000,
+            300_000,
+            Some(reach()),
+        );
+        assert!(asking.confirmed_after(&transfer, plan(), Duration::from_secs(1)));
+        store.keep(&asking).expect("kept once confirmed");
+        assert_eq!(
+            store.attempts().expect("listed"),
+            vec![Kept::Known(Box::new(asking.clone()))],
+            "one file, under the same action"
+        );
+        store.remove(transfer_action).expect("removed");
+    }
+
+    /// An attempt that is over stays over whatever a late call says: a send, a repeat or a read
+    /// cannot open it again or close it another way, and so cannot gate a second action again.
+    #[test]
+    fn a_closed_attempt_stays_as_it_closed_whatever_is_said_after() {
         let mut closed = attempt(Kind::Invite);
         assert_eq!(
             closed.after_read(Found::Present, at(0)),
             Next::Closed(Outcome::Happened)
         );
+        for reply in [
+            Reply::Result,
+            Reply::Lost,
+            Reply::NotSent,
+            Reply::Refused(RetryCategory::NoRetry),
+            Reply::Refused(RetryCategory::Transient),
+        ] {
+            assert_eq!(
+                closed.after_first_send(reply),
+                Next::Closed(Outcome::Happened)
+            );
+            assert_eq!(closed.after_repeat(reply), Next::Closed(Outcome::Happened));
+        }
         assert_eq!(
             closed.after_read(Found::Absent, at(10_000)),
             Next::Closed(Outcome::Happened)
@@ -1445,6 +1599,30 @@ mod tests {
         large.label = "x".repeat(300 * 1024);
         assert!(matches!(store.keep(&large), Err(AttemptError::Encode(_))));
         assert!(store.attempts().expect("listed").is_empty());
+    }
+
+    /// A record this build could not read back is refused, whatever its size, and the record kept
+    /// for the action before it is left as it was: a request whose parameters hold a list longer
+    /// than the reader's bound encodes in a few kilobytes and would be kept unreadably.
+    #[test]
+    fn a_record_that_does_not_read_back_is_refused_and_leaves_the_earlier_one() {
+        let directory = kr_ipc::testing::PrivateTempDir::create();
+        let store = AttemptStore::open(directory.path().join("attempts")).expect("opens");
+        let kept = attempt(Kind::Redeem);
+        store.keep(&kept).expect("kept");
+
+        let mut unreadable = kept.clone();
+        unreadable.request.params = kr_protocol::envelope::ParamsValue::new(
+            kr_cbor::CanonicalValue::Array(vec![kr_cbor::CanonicalValue::Null; 5_000]),
+        );
+        assert!(matches!(
+            store.keep(&unreadable),
+            Err(AttemptError::Encode(_))
+        ));
+        assert_eq!(
+            store.attempts().expect("listed"),
+            vec![Kept::Known(Box::new(kept))]
+        );
     }
 
     /// A hand-over's record holds its plan, and a closed attempt its outcome: the second record
