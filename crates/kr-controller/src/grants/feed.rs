@@ -57,6 +57,9 @@ pub const FEED_POLL_INTERVAL_MS: u64 = 30_000;
 pub struct RetainedRevocation {
     /// The request a remote owner published.
     pub request: RevocationRequest,
+    /// The origin of the feed that held it. A feed numbers what it holds by its own revisions, so
+    /// a request taken from one feed is nothing to another.
+    pub origin: String,
     /// The revision this host issued for it, once the revocation has taken effect. A request that
     /// was refused, or has not yet taken effect, has none.
     pub authority_revision: Option<AuthorityRevision>,
@@ -64,6 +67,10 @@ pub struct RetainedRevocation {
     /// it issues for it follows this one, so a crash between applying and acknowledging reissues
     /// the same record.
     pub previous_revision: AuthorityRevision,
+    /// The revision the registry had reached when this host began to apply the request. The
+    /// revision the registry holds afterwards says whether the request withdrew anything, however
+    /// the host was interrupted in between.
+    pub registry_revision: AuthorityRevision,
     /// When this host began to apply it, in UTC milliseconds.
     pub applied_at_ms: u64,
     /// The enrolled hosts that have acknowledged it.
@@ -93,13 +100,17 @@ impl RetainedRevocation {
     }
 }
 
-/// What beginning to apply a request found.
+/// What this host knows when it begins to apply a request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Beginning {
-    /// The host had not taken this request before.
-    New,
-    /// The host had taken this very request, and goes on from where that left it.
-    Resumed,
+pub struct Basis<'a> {
+    /// The origin of the feed the request was read from.
+    pub origin: &'a str,
+    /// The revision that feed holds.
+    pub previous: AuthorityRevision,
+    /// The revision the registry has reached.
+    pub registry: AuthorityRevision,
+    /// The moment, in UTC milliseconds.
+    pub at_ms: u64,
 }
 
 /// Why this host would not act on a feed entry.
@@ -189,15 +200,15 @@ impl AuthorityFeed {
         }
     }
 
-    /// Notes that this host begins to apply a validated revocation request, before it does.
+    /// Notes that this host begins to apply a validated revocation request, before it does, and
+    /// returns what it holds of the request.
     ///
     /// The signature and the owner authority behind `request` are checked before this is called;
     /// what is checked here is the host it is addressed to and whether this request, or another
     /// under its identity, has been taken before. The record is written down before the
     /// revocation takes effect, so a host that stops in between finds the request half applied and
-    /// finishes it (the revocation is idempotent) instead of taking it for new.
-    /// `previous` is the revision the feed holds, which the revision record this host issues for
-    /// the request follows.
+    /// finishes it (the revocation is idempotent) instead of taking it for new. A request taken
+    /// again keeps the basis it was first taken on.
     ///
     /// # Errors
     ///
@@ -207,33 +218,35 @@ impl AuthorityFeed {
     pub fn begin(
         &mut self,
         request: RevocationRequest,
-        previous: AuthorityRevision,
-        now_ms: u64,
-    ) -> std::result::Result<Beginning, FeedRefusal> {
+        basis: Basis<'_>,
+    ) -> std::result::Result<&RetainedRevocation, FeedRefusal> {
         if request.host_device_id != self.host_device_id {
             return Err(FeedRefusal::AnotherHost);
         }
-        if let Some(held) = self.records.get(&request.request_id) {
+        match self.records.entry(request.request_id) {
             // Idempotent, but only for the same request. A republished request is the same
             // revocation and keeps its revision; a different request wearing that identity is
             // refused rather than quietly answered with somebody else's result.
-            if held.request == request {
-                return Ok(Beginning::Resumed);
+            std::collections::btree_map::Entry::Occupied(held) => {
+                if held.get().request == request {
+                    Ok(held.into_mut())
+                } else {
+                    Err(FeedRefusal::AlreadyApplied)
+                }
             }
-            return Err(FeedRefusal::AlreadyApplied);
+            std::collections::btree_map::Entry::Vacant(slot) => {
+                Ok(slot.insert(RetainedRevocation {
+                    request,
+                    origin: basis.origin.to_owned(),
+                    authority_revision: None,
+                    previous_revision: basis.previous,
+                    registry_revision: basis.registry,
+                    applied_at_ms: basis.at_ms,
+                    acknowledged_by: BTreeSet::new(),
+                    settled: false,
+                }))
+            }
         }
-        self.records.insert(
-            request.request_id,
-            RetainedRevocation {
-                request,
-                authority_revision: None,
-                previous_revision: previous,
-                applied_at_ms: now_ms,
-                acknowledged_by: BTreeSet::new(),
-                settled: false,
-            },
-        );
-        Ok(Beginning::New)
     }
 
     /// Notes that a request took effect under `revision`, which the daemon's registry allocated.
@@ -293,30 +306,33 @@ impl AuthorityFeed {
 
     /// Notes that `host` refused a request it began to take, before the refusal is sent, so a
     /// refusal that never arrives is made again and a request published again is refused again.
-    /// A request that took effect is not refused: it has a revision.
-    pub fn note_refusal(&mut self, request_id: RevocationRequestId, host: DeviceId) {
+    /// A request that took effect is not refused: it has a revision. Returns whether the record
+    /// changed.
+    pub fn note_refusal(&mut self, request_id: RevocationRequestId, host: DeviceId) -> bool {
         if self
             .records
             .get(&request_id)
             .is_some_and(|record| record.authority_revision.is_none())
         {
-            self.acknowledge(request_id, host);
+            return self.acknowledge(request_id, host);
         }
+        false
     }
 
-    /// Records one enrolled host's acknowledgement of one revocation record.
-    ///
-    /// Returns whether every enrolled host has now acknowledged it. The record is kept either way:
-    /// what changes when it settles is that this host stops owing its delivery, not that it
-    /// forgets the revocation happened.
+    /// Records one enrolled host's acknowledgement of one revocation record, and returns whether
+    /// the record changed. The record is kept either way: what changes when every enrolled host
+    /// has acknowledged it is that this host stops owing its delivery, not that it forgets the
+    /// revocation happened.
     pub fn acknowledge(&mut self, request_id: RevocationRequestId, device_id: DeviceId) -> bool {
         let enrolled = self.enrolled.clone();
         let Some(record) = self.records.get_mut(&request_id) else {
             return false;
         };
-        record.acknowledged_by.insert(device_id);
-        record.settled = enrolled.is_subset(&record.acknowledged_by);
-        record.settled
+        let added = record.acknowledged_by.insert(device_id);
+        let settled = enrolled.is_subset(&record.acknowledged_by);
+        let changed = added || settled != record.settled;
+        record.settled = settled;
+        changed
     }
 
     /// The revocation records this host is still owed acknowledgements for.
@@ -436,8 +452,10 @@ impl AuthorityFeed {
                 .values()
                 .map(|record| StoredRevocation {
                     request: record.request.clone(),
+                    origin: record.origin.clone(),
                     authority_revision: Nullable(record.authority_revision),
                     previous_revision: record.previous_revision,
+                    registry_revision: record.registry_revision,
                     applied_at_ms: TimestampMs::new(record.applied_at_ms),
                     acknowledged_by: record.acknowledged_by.iter().copied().collect(),
                     settled: record.settled,
@@ -468,25 +486,31 @@ impl AuthorityFeed {
         self.remove_enrolled(self.host_device_id);
     }
 
-    /// Rebuilds a feed from what was written down.
+    /// Rebuilds a feed from what was written down, for a host that reads the feed at `selected`,
+    /// or none when its configuration selects none or cannot be used.
     ///
     /// A restarted host owes a synchronisation and its status is stale, whatever it last recorded:
-    /// what it knew before it stopped is not evidence about the feed now.
+    /// what it knew before it stopped is not evidence about the feed now. The requests it took
+    /// from another feed are left behind: that feed numbered them by its own revisions, and the
+    /// one the host reads now holds none of them.
     #[must_use]
-    pub fn restore(stored: &StoredFeed) -> Self {
+    pub fn restore(stored: &StoredFeed, selected: Option<&str>) -> Self {
         Self {
             host_device_id: stored.host_device_id,
             accepted: stored.accepted,
             records: stored
                 .records
                 .iter()
+                .filter(|record| selected.is_none_or(|origin| record.origin == origin))
                 .map(|record| {
                     (
                         record.request.request_id,
                         RetainedRevocation {
                             request: record.request.clone(),
+                            origin: record.origin.clone(),
                             authority_revision: record.authority_revision.0,
                             previous_revision: record.previous_revision,
+                            registry_revision: record.registry_revision,
                             applied_at_ms: record.applied_at_ms.get(),
                             acknowledged_by: record.acknowledged_by.iter().copied().collect(),
                             settled: record.settled,
