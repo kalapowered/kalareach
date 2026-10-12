@@ -213,14 +213,15 @@ struct Carries {
     /// announcement again does not add back: their names are in `lost`. At most
     /// [`MAX_REMEMBERED_REVISIONS`]; the lowest go into `gone_through`.
     gone: BTreeSet<AuthorityRevision>,
-    /// The highest revision let go from `gone` for room. A revision at or below it is not read
-    /// again, so its names are charged to this result once however often the announcement is
-    /// recorded; the result says that some revisions are not read.
+    /// The highest revision let go from `gone` for room. A recording of the announcement again
+    /// does not add a revision at or below it to what this result reads, so its names are charged
+    /// to this result once however often the announcement is recorded; the result says that some
+    /// revisions may not be read.
     gone_through: Option<AuthorityRevision>,
     /// How many names went with a report of one of the revisions that was let go for room.
     lost: u64,
-    /// Whether some revision announced to this worker before this one is not read: forgotten for
-    /// room, no longer followed, or a report that said nothing and went.
+    /// Whether some revision announced to this worker before this one may not be read: forgotten
+    /// for room, no longer followed, let go from `gone`, or a report that said nothing and went.
     unread: bool,
 }
 
@@ -3479,6 +3480,31 @@ mod tests {
         ));
         let again = barrier.report(revision(100), [session(1)]).workers[0].clone();
         assert_eq!(again.omitted_actions.get(), 1, "{again:?}");
+        // The result loses one more report and remembers by name only the seven it reads. A
+        // revision below those it let go is announced, and its name goes with its report at once:
+        // no result is charged it, and the one that left it out says that revisions are not read.
+        assert!(barrier.acknowledge(
+            session(1),
+            binding,
+            revision(77),
+            evidence(Vec::new(), Vec::new()),
+        ));
+        barrier.announced(session(1), &[revision(3)]);
+        barrier.announced(session(1), &[revision(100)]);
+        assert!(barrier.acknowledge(
+            session(1),
+            binding,
+            revision(3),
+            evidence(vec![action(11)], Vec::new()),
+        ));
+        let last = barrier.report(revision(100), [session(1)]).workers[0].clone();
+        assert_eq!(last.omitted_actions.get(), 1, "{last:?}");
+        assert!(
+            last.detail.contains(
+                "some of the revisions announced to this worker before revision 100 are not read"
+            ),
+            "{last:?}"
+        );
     }
 
     /// KR-REQ-09.13: a result that remembers fewer revisions than it was told, because it could
