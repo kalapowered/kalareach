@@ -2655,24 +2655,16 @@ impl GrantDirectory {
         self.stored("feed_removal")
     }
 
-    /// Writes down the feed's answer that this host was removed from it, or, with `None`, forgets
-    /// it.
+    /// Writes down what this host holds about the feed that removed it.
     ///
     /// # Errors
     ///
     /// Returns a storage error when the row cannot be written.
     pub fn store_feed_removal(
         &self,
-        removal: Option<&crate::grants::durable::StoredRemoval>,
+        removal: &crate::grants::durable::StoredRemoval,
     ) -> Result<()> {
-        match removal {
-            Some(removal) => self.store("feed_removal", removal),
-            None => self.with(|connection| {
-                connection
-                    .execute("DELETE FROM host_authority WHERE key = 'feed_removal'", [])
-                    .map(|_| ())
-            }),
-        }
+        self.store("feed_removal", removal)
     }
 
     fn stored<T: serde::de::DeserializeOwned + serde::Serialize>(
