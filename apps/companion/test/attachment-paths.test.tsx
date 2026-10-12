@@ -285,6 +285,71 @@ describe('what the chip and the path say of a file', () => {
   })
 })
 
+describe('a request for a path on a screen that has to read its session first', () => {
+  /** A file already sent to the host, on a draft, with the screen asking for its path. */
+  async function pending(subject: () => Promise<typeof SUBJECT>) {
+    const host = fakeHost()
+    const sent = await host.port.attachmentUpload('/tmp/named.png', SUBJECT)
+    render(
+      <AppProvider port={host.port}>
+        <AttachmentPaths
+          sessionId={SESSION_MAIN}
+          subject={subject}
+          attachments={[
+            {
+              localId: 'file-1',
+              transferId: sent.transfer_id,
+              name: 'named.png',
+              byteLen: 10,
+              mediaType: 'image/png',
+              presentedAsImage: true,
+              upload: 'uploaded',
+              acceptedUpstream: false,
+              handle: sent
+            }
+          ]}
+        />
+      </AppProvider>
+    )
+    return { host, person: userEvent.setup() }
+  }
+
+  it('shows the host being asked while the session is read, and reads it once', async () => {
+    let reads = 0
+    let name: (subject: typeof SUBJECT) => void = () => undefined
+    const naming = new Promise<typeof SUBJECT>((resolve) => {
+      name = resolve
+    })
+    const { person } = await pending(() => {
+      reads += 1
+      return naming
+    })
+
+    await person.click(screen.getByRole('button', { name: 'Get its path' }))
+
+    // Nothing has answered yet, and the person is told so rather than left to press again.
+    expect(screen.getByRole('status')).toHaveTextContent(/Asking the host/)
+    expect(screen.queryByRole('button', { name: 'Get its path' })).toBeNull()
+    await act(async () => {
+      name(SUBJECT)
+      await Promise.resolve()
+    })
+    expect(await screen.findByTestId('attachment-path')).toBeInTheDocument()
+    expect(reads).toBe(1)
+  })
+
+  it('says in its own words that the session could not be read, and can be tried again', async () => {
+    const { person } = await pending(() =>
+      Promise.reject({ code: 'UPSTREAM_UNAVAILABLE', message: 'the host did not answer' })
+    )
+
+    await person.click(screen.getByRole('button', { name: 'Get its path' }))
+
+    expect(await screen.findByTestId('attachment-path-refusal')).toHaveTextContent(/did not answer/)
+    expect(screen.getByRole('button', { name: 'Try again' })).toBeInTheDocument()
+  })
+})
+
 describe('the host’s draft for a session’s files', () => {
   const handle = (transfer: string, over: Partial<AttachmentHandle> = {}): AttachmentHandle => ({
     transfer_id: transfer,

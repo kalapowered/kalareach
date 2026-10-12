@@ -10,7 +10,7 @@
 import { useEffect, useState, useSyncExternalStore, type ReactNode } from 'react'
 
 import { useApp } from '../app/state'
-import { failureMessage, type SessionSubject } from '../host/port'
+import type { SessionSubject } from '../host/port'
 import type { DraftAttachment } from '../model/drafts'
 import type { PathState } from '../model/manual-paths'
 import { Button } from './ui'
@@ -144,7 +144,7 @@ export function AttachmentPaths({
   /** The smallest height of a control a finger presses, on a phone. */
   readonly target?: number
 }): ReactNode {
-  const { paths, say } = useApp()
+  const { paths } = useApp()
   const states = useSyncExternalStore(paths.subscribe, paths.snapshot)
   const sent = attachments.filter(
     (attachment) => attachment.upload === 'uploaded' && attachment.handle !== null
@@ -162,12 +162,7 @@ export function AttachmentPaths({
           onAsk={() => {
             const handle = attachment.handle
             if (handle === null) return
-            const named = typeof subject === 'function' ? subject() : Promise.resolve(subject)
-            named
-              .then((naming) => paths.attach(sessionId, naming, handle))
-              .catch((failure: unknown) => {
-                say(`The host could not be asked for the path: ${failureMessage(failure)}`, 'danger')
-              })
+            void paths.attach(sessionId, subject, handle)
           }}
         />
       ))}

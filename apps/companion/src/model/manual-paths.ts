@@ -132,10 +132,16 @@ export class ManualPaths {
   /**
    * Asks the host for the path of a file of `sessionId`, which is the file's own session.
    *
-   * A file already being asked for is not asked for again. A path that has been given, or a refusal,
-   * is asked for again, which is a new attempt.
+   * A screen that does not hold the session's epoch gives a function that asks the host for it, and
+   * the request is in progress from the moment it is made: the person sees the host being asked and
+   * cannot ask twice while the session is read. A file already being asked for is not asked for
+   * again. A path that has been given, or a refusal, is asked for again, which is a new attempt.
    */
-  attach(sessionId: string, subject: SessionSubject, handle: AttachmentHandle): Promise<void> {
+  attach(
+    sessionId: string,
+    subject: SessionSubject | (() => Promise<SessionSubject>),
+    handle: AttachmentHandle
+  ): Promise<void> {
     const id = handle.transfer_id
     if (this.#states.get(id)?.kind === 'binding') return this.#chain.then(() => undefined)
     this.#set(id, { kind: 'binding' })
@@ -144,7 +150,11 @@ export class ManualPaths {
     return run
   }
 
-  async #bind(sessionId: string, subject: SessionSubject, handle: AttachmentHandle): Promise<void> {
+  async #bind(
+    sessionId: string,
+    named: SessionSubject | (() => Promise<SessionSubject>),
+    handle: AttachmentHandle
+  ): Promise<void> {
     const id = handle.transfer_id
     try {
       const connection = await this.#port.connectionState()
@@ -160,6 +170,7 @@ export class ManualPaths {
         this.#set(id, { kind: 'refused', words: OTHER_SESSION_WORDS })
         return
       }
+      const subject = typeof named === 'function' ? await named() : named
       let anchor = this.#anchors.get(sessionId)
       // A draft that holds as many files as it takes is left, and the next file is bound to another.
       if (anchor !== undefined && !anchor.bound.has(id) && anchor.bound.size >= FILES_PER_DRAFT) {
