@@ -670,7 +670,8 @@ impl Controller {
         };
         // The authority feed this host reads its remote revocations from, when its configuration
         // document selects one. It signs as the host, with the authorisation key its pairings
-        // recorded, which is what the feed is addressed by. Nothing runs yet.
+        // recorded, which is what the feed is addressed by. It goes through the proxy this daemon
+        // started with, the endpoint's own. Nothing runs yet.
         let feed_runtime = match started.authority.origin() {
             None => None,
             Some(origin) => {
@@ -1044,16 +1045,20 @@ impl Controller {
         controller.start_attention().await?;
         // And every session's facts for the descriptions, over the workers the directory holds.
         controller.start_descriptions().await?;
-        // Backup work an earlier daemon left unfinished is resolved before anything can add to it:
-        // what is still authorised goes back in hand, what is not is cancelled, and a publication
         // What the authority feed answered an earlier run, put right for the feed this host reads
         // now: a removal stands for the feed that answered it and for no other, so an owner who
         // pointed the host at another feed, or at none, has the grants that rest on the feed back
         // before anything remote is decided, and a host whose feed removed it refuses them before
-        // delivery decides anything on them.
+        // delivery decides anything on them. A document the host cannot use points it nowhere, so
+        // it leaves the removal as it was.
         let removed = controller
-            .authority_feed_at_start(controller.started.authority.origin())
+            .authority_feed_at_start(
+                controller.started.authority.origin(),
+                controller.started.unusable.is_some(),
+            )
             .await?;
+        // Backup work an earlier daemon left unfinished is resolved before anything can add to it:
+        // what is still authorised goes back in hand, what is not is cancelled, and a publication
         // that left this host and was never answered is recorded as unknown rather than guessed at.
         {
             // What an earlier run sent to the storage service and never saw answered is asked
@@ -1233,8 +1238,9 @@ impl Controller {
     ///
     /// It is the reading the network endpoint was built from, so the endpoint, the rendezvous,
     /// delivery and mail submission, the managed voice broker and account service, backups to the
-    /// managed storage service, the model's files and the plugin catalogue never go through two
-    /// different routes, and an edit applies to all of them at the next start.
+    /// managed storage service, the authority feed, the model's files and the plugin catalogue
+    /// never go through two different routes, and an edit applies to all of them at the next
+    /// start.
     ///
     /// # Errors
     ///

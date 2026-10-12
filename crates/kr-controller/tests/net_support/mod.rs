@@ -58,6 +58,18 @@ pub fn write_document(
     temp: &kr_ipc::testing::TempHost,
     document: &kr_protocol::hostinfo::configuration::ConfigurationDocument,
 ) {
+    write_document_bytes(
+        temp,
+        kr_protocol::hostinfo::configuration::contents(document).as_bytes(),
+    );
+}
+
+/// Writes a configuration document this host cannot use, where the document is kept.
+pub fn write_unusable_document(temp: &kr_ipc::testing::TempHost) {
+    write_document_bytes(temp, b"{ this is not a configuration document");
+}
+
+fn write_document_bytes(temp: &kr_ipc::testing::TempHost, contents: &[u8]) {
     let environment = temp.environment();
     let path = kr_protocol::hostinfo::configuration::document_path(
         environment.state_dir(),
@@ -67,11 +79,7 @@ pub fn write_document(
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).expect("the state directory");
     }
-    kr_ipc::paths::write_owner_only_file(
-        &path,
-        kr_protocol::hostinfo::configuration::contents(document).as_bytes(),
-    )
-    .expect("the configuration document");
+    kr_ipc::paths::write_owner_only_file(&path, contents).expect("the configuration document");
 }
 
 /// Where the managed account service stands for a daemon a suite starts.
@@ -175,6 +183,16 @@ impl MovedWall {
         self.0.fetch_add(
             u64::try_from(by.as_millis()).unwrap_or(u64::MAX),
             std::sync::atomic::Ordering::SeqCst,
+        );
+    }
+
+    /// Moves the clock `by` back, as a clock that was set wrong is put right.
+    pub fn rewind(&self, by: Duration) {
+        let by = u64::try_from(by.as_millis()).unwrap_or(u64::MAX);
+        let _ = self.0.fetch_update(
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+            |moved| Some(moved.saturating_sub(by)),
         );
     }
 
@@ -546,6 +564,14 @@ impl Host {
     /// The daemon's registry database, for a suite that holds a row as an earlier host wrote it.
     pub fn registry_database(&self) -> PathBuf {
         self.temp.environment().registry_database()
+    }
+
+    /// The daemon's attention store, for a suite that puts a fault in it.
+    pub fn attention_database(&self) -> PathBuf {
+        self.temp
+            .environment()
+            .state_dir()
+            .join("attention.sqlite3")
     }
 
     /// Connects one local client on the daemon's own socket.

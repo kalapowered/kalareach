@@ -93,11 +93,11 @@ pub const GATE_WAIT: Duration = Duration::from_secs(5);
 const MOST_PAGES: usize = 32;
 
 tokio::task_local! {
-    /// Set while the carrier carries a request out. The revocation it makes wakes whatever
-    /// watches the owners this host is paired with, and the carrier is one of those; but it names
-    /// the owners itself when its pass ends, and a wake it made for itself would end the wait a
-    /// failed pass asked for.
-    static CARRYING_OUT: ();
+    /// Set while the host carries a request out of the feed (`Controller::apply_feed_plan`). The
+    /// revocation it makes wakes whatever watches the owners this host is paired with, and the
+    /// carrier is one of those; but it names the owners itself when its pass ends, and a wake it
+    /// made for itself would end the wait a failed pass asked for.
+    pub(crate) static CARRYING_OUT: ();
 }
 
 /// The feed's client for `origin`, signing as the host.
@@ -425,7 +425,10 @@ impl FeedRuntime {
             } else if status.stale {
                 (
                     DoctorStatus::Warning,
-                    reads.stated("; it has not been read since this host started"),
+                    reads
+                        .stated("; ")
+                        .sentence(&synchronised)
+                        .stated(", so what is shown of it may be stale"),
                     Some("This host reads the feed by itself shortly."),
                 )
             } else {
@@ -494,6 +497,7 @@ impl Drop for FeedRuntime {
 /// What the carrier does for as long as the daemon lives.
 async fn drive(shared: Arc<Shared>, timer: Arc<dyn Timer>) {
     let mut backoff = Backoff::default();
+    let mut notice_backoff = Backoff::default();
     loop {
         // Every request made before this point is answered by the pass that follows it.
         let target = shared.requested.load(Ordering::SeqCst);
@@ -528,6 +532,18 @@ async fn drive(shared: Arc<Shared>, timer: Arc<dyn Timer>) {
                     )
                 }
             }
+        };
+        // Whatever the pass or the start left owed to the owner's inbox is given now, and asked
+        // again by itself until the attention store takes it.
+        let wait = if chained {
+            wait
+        } else if let Err(error) = controller.tell_the_owner_of_the_feed().await {
+            eprintln!("kr-controller: {error}");
+            let retry = notice_backoff.next_delay();
+            Some(wait.map_or(retry, |wait| wait.min(retry)))
+        } else {
+            notice_backoff = Backoff::default();
+            wait
         };
         drop(controller);
         if chained {
@@ -652,7 +668,9 @@ async fn pass(
     if !read_through {
         // The feed holds more than a pass reads, so this is no synchronisation: nothing is shown
         // as read, the bounded offline validity is not extended from it, and nothing waits for
-        // this pass. The scan goes on at the cursor at once.
+        // this pass. What is shown is stale until the scan has read the feed through, which a feed
+        // that always says there is more never lets it. The scan goes on at the cursor at once.
+        controller.authority_feed_unreachable();
         shared.scan_cursor.store(cursor, Ordering::SeqCst);
         return Ok(Pass::More);
     }
@@ -744,8 +762,8 @@ async fn settle(
         )
         .await
         .map_err(Stopped::local)?;
-    let applied = CARRYING_OUT
-        .scope((), controller.apply_feed_plan(&plan))
+    let applied = controller
+        .apply_feed_plan(&plan)
         .await
         .map_err(Stopped::local)?;
     #[cfg(feature = "testing")]

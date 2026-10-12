@@ -144,17 +144,25 @@ pub struct StoredRevocation {
     pub settled: bool,
 }
 
-/// The feed's answer that this host was removed from it, as it is written down.
+/// What this host has written down about a feed that removed it, and the notice it owes the owner.
 ///
 /// It is kept apart from [`StoredFeed`]: a record is read back only if it re-encodes to the bytes
 /// it was read from, so a field added to `StoredFeed` would make every feed an earlier build wrote
-/// unreadable.
+/// unreadable. The row is not deleted when the owner acts: the notice number only rises, and one
+/// the attention store has taken is not given again.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredRemoval {
-    /// The origin of the feed that answered. A host pointed at another feed is not removed from it.
-    pub origin: String,
+    /// The origin of the feed that answered that it removed this host, while that stands. A host
+    /// pointed at another feed is not removed from it, and the owner pointing it there leaves
+    /// this null.
+    pub origin: Nullable<String>,
     /// When this host first read the answer.
     pub at_ms: TimestampMs,
+    /// The number of the newest notice about the feed that this host owes the owner's inbox or has
+    /// given it. It rises by one with each change, apart from any clock.
+    pub notice: u64,
+    /// Whether the attention store has yet to take that notice.
+    pub owed: bool,
 }
 
 /// This host's half of the authority feed, as it is written down.
