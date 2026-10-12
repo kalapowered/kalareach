@@ -343,6 +343,14 @@ has a number, and a task that keeps the connection of an earlier choice can neit
 connection nor record its loss once a later one is made. The Sessions and Hosts screens read their lists again each time the connection
 comes or goes, and show nothing of a host that is not the one reached.
 
+When a session screen loads on the phone, it opens that session before it asks anything about it: it picks a token and passes it, with the session and the share if it holds one, to `session_open`. The host opens the session on a connection of its own, under that grant, and says what the grant allows. Every command about the session carries the token. A token can be used once, and a command that names an opening another has replaced executes nowhere. The connection kept for the host alone serves the host's own reads, and the host refuses it every command that would reach a worker.
+
+Each opened link is watched. If its connection is lost and the grant has not ended, the application reaches the host again as the same opening, after a pause that grows, and the page is told `reconnecting` and then `open`. If the share ends, the page is told `ended` with the reason, and no connection under another grant takes the link's place. If the host cannot be reached when a screen opens, the opening stands as `reconnecting` and the application keeps trying. A command made outside any screen, such as the inbox's or a kept answer's, goes over one of at most four links that the application opens under the pairing and lets go when they are idle. At most eight sessions are open at once, and leaving a screen closes its link once the mutations in flight on it have answered.
+
+A raw terminal view of a paired host's session has a connection of its own, which the host opens for the session under the grant the screen runs under. The view belongs to its opening and ends with it. When only the view's connection is lost, the application asks the host again, on the opening's live link, what the opening allows, and the page opens a view again. The last screen the view drew stays, and nothing the person typed is sent again.
+
+`src-tauri/tests/phone_sessions.rs` runs these paths against kr-controller's in-process host with a real session worker behind it, a second paired device holding a share, and a link whose connections a test can hold, refuse or drop.
+
 Voice on a phone starts with a question: a host that holds no voice grant for the device refuses a
 preparation, and the voice screen shows the host's words, every action the default grant permits
 in the sentence the protocol states it in, and the sessions to choose. Allowing sends the sessions
