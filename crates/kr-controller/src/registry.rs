@@ -66,7 +66,7 @@ use crate::error::{ControllerError, Result};
 /// opens the other three before it writes the version, at a daemon's start and when an update
 /// brings the file forward alike, so a file that records `N` has all four at the shape `N` stands
 /// for.
-pub const SCHEMA_VERSION: i64 = 14;
+pub const SCHEMA_VERSION: i64 = 15;
 
 /// The oldest schema version this build brings forward. A writer that stops handling an older
 /// shape raises this past the last version that wrote it.
@@ -948,6 +948,7 @@ impl Registry {
                 self.migrate_11_to_12()?;
                 self.migrate_12_to_13()?;
                 self.migrate_13_to_14()?;
+                self.migrate_14_to_15()?;
             }
             Some(2) => {
                 self.migrate_2_to_3()?;
@@ -962,6 +963,7 @@ impl Registry {
                 self.migrate_11_to_12()?;
                 self.migrate_12_to_13()?;
                 self.migrate_13_to_14()?;
+                self.migrate_14_to_15()?;
             }
             Some(3) => {
                 self.migrate_3_to_4()?;
@@ -975,6 +977,7 @@ impl Registry {
                 self.migrate_11_to_12()?;
                 self.migrate_12_to_13()?;
                 self.migrate_13_to_14()?;
+                self.migrate_14_to_15()?;
             }
             Some(4) => {
                 self.migrate_4_to_5()?;
@@ -987,6 +990,7 @@ impl Registry {
                 self.migrate_11_to_12()?;
                 self.migrate_12_to_13()?;
                 self.migrate_13_to_14()?;
+                self.migrate_14_to_15()?;
             }
             Some(5) => {
                 self.migrate_5_to_6()?;
@@ -998,6 +1002,7 @@ impl Registry {
                 self.migrate_11_to_12()?;
                 self.migrate_12_to_13()?;
                 self.migrate_13_to_14()?;
+                self.migrate_14_to_15()?;
             }
             Some(6) => {
                 self.migrate_6_to_7()?;
@@ -1008,6 +1013,7 @@ impl Registry {
                 self.migrate_11_to_12()?;
                 self.migrate_12_to_13()?;
                 self.migrate_13_to_14()?;
+                self.migrate_14_to_15()?;
             }
             Some(7) => {
                 self.migrate_7_to_8()?;
@@ -1017,6 +1023,7 @@ impl Registry {
                 self.migrate_11_to_12()?;
                 self.migrate_12_to_13()?;
                 self.migrate_13_to_14()?;
+                self.migrate_14_to_15()?;
             }
             Some(8) => {
                 self.migrate_8_to_9()?;
@@ -1025,6 +1032,7 @@ impl Registry {
                 self.migrate_11_to_12()?;
                 self.migrate_12_to_13()?;
                 self.migrate_13_to_14()?;
+                self.migrate_14_to_15()?;
             }
             Some(9) => {
                 self.migrate_9_to_10()?;
@@ -1032,23 +1040,31 @@ impl Registry {
                 self.migrate_11_to_12()?;
                 self.migrate_12_to_13()?;
                 self.migrate_13_to_14()?;
+                self.migrate_14_to_15()?;
             }
             Some(10) => {
                 self.migrate_10_to_11()?;
                 self.migrate_11_to_12()?;
                 self.migrate_12_to_13()?;
                 self.migrate_13_to_14()?;
+                self.migrate_14_to_15()?;
             }
             Some(11) => {
                 self.migrate_11_to_12()?;
                 self.migrate_12_to_13()?;
                 self.migrate_13_to_14()?;
+                self.migrate_14_to_15()?;
             }
             Some(12) => {
                 self.migrate_12_to_13()?;
                 self.migrate_13_to_14()?;
+                self.migrate_14_to_15()?;
             }
-            Some(13) => self.migrate_13_to_14()?,
+            Some(13) => {
+                self.migrate_13_to_14()?;
+                self.migrate_14_to_15()?;
+            }
+            Some(14) => self.migrate_14_to_15()?,
             Some(version) => {
                 return Err(ControllerError::RegistryUnavailable {
                     detail: format!(
@@ -1438,6 +1454,26 @@ impl Registry {
     fn migrate_13_to_14(&self) -> Result<()> {
         self.connection
             .execute("UPDATE schema_version SET version = 14", [])
+            .map_err(ControllerError::registry)?;
+        Ok(())
+    }
+
+    /// Version 14 to 15: the host's record of the authority feed it reads.
+    ///
+    /// The configuration document gained its `authority` section, a section of level 2, which
+    /// raises no version of the document; the record the registry keeps of the document it
+    /// accepted is read as version 13 to 14 says. The host's record of its feed (`host_authority`,
+    /// key `feed`) now notes a request from the moment the host begins to take it, before it has a
+    /// revision, and the revision the feed held at that moment. The note that the feed removed the
+    /// host is a row of its own (`feed_removal`), which a registry that lacks it simply does not
+    /// have. No release before this one took a request from a feed, so no `feed` row holds a
+    /// record of one, and no row is rewritten.
+    ///
+    /// This migration goes in the first release after every install has opened the registry at
+    /// this version.
+    fn migrate_14_to_15(&self) -> Result<()> {
+        self.connection
+            .execute("UPDATE schema_version SET version = 15", [])
             .map_err(ControllerError::registry)?;
         Ok(())
     }

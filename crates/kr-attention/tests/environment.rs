@@ -2325,6 +2325,19 @@ fn a_store_from_before_the_time_of_decision_was_kept_is_brought_forward_once() {
         .query_row("SELECT version FROM attention_schema", [], |row| row.get(0))
         .expect("a version");
     assert_eq!(version, kr_attention::store::SCHEMA_VERSION);
+    // So does one from the build before the authority source and its rule were read.
+    raw.execute("UPDATE attention_schema SET version = 11", [])
+        .expect("the schema before the authority source");
+    drop(raw);
+    let attention =
+        Attention::open(&path, reading(2_500), &opener()).expect("the previous schema opens");
+    assert_eq!(only_item(&attention).decided_at_ms, announced);
+    drop(attention);
+    let raw = rusqlite::Connection::open(&path).expect("the file opens");
+    let version: i64 = raw
+        .query_row("SELECT version FROM attention_schema", [], |row| row.get(0))
+        .expect("a version");
+    assert_eq!(version, kr_attention::store::SCHEMA_VERSION);
     // One older than the oldest is refused.
     raw.execute("UPDATE attention_schema SET version = 8", [])
         .expect("an older schema");
