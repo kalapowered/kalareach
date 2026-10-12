@@ -17,13 +17,13 @@ use kr_protocol::ids::{AuthorityRevision, DeviceId, GrantId};
 use kr_protocol::method::Method;
 use kr_protocol::pairing::{KeyPurpose, RevocationCompletion, RevocationRequest, RevocationTarget};
 use kr_protocol::rights::ActionRight;
-use kr_protocol::scalars::{KeyId, U64};
+use kr_protocol::scalars::{KeyId, Nullable, TimestampMs, U64};
 
 use super::Controller;
 use super::revocation::Audience;
 use crate::config::ceilings::CeilingRefusal;
 use crate::error::Result;
-use crate::grants::{AccessRequest, GrantRecord, Refusal};
+use crate::grants::{AccessRequest, GrantRecord, Refusal, StoredRemoval};
 use crate::service::net::devices::DeviceRecord;
 
 /// The most keys a host may name as permitted to remove its feed.
@@ -245,6 +245,14 @@ impl Controller {
     ///
     /// Returns an error when a revocation cannot be written or the barrier cannot be raised.
     pub(crate) async fn apply_feed_plan(&self, plan: &Plan) -> Result<Applied> {
+        // The carrier does not wake itself with the revocations it makes: the scope is the plan's,
+        // so no caller can carry a plan out without it.
+        crate::authority_feed::CARRYING_OUT
+            .scope((), self.apply_feed_plan_unwoken(plan))
+            .await
+    }
+
+    async fn apply_feed_plan_unwoken(&self, plan: &Plan) -> Result<Applied> {
         let mut revision = self.authority_revision().await?;
         let mut pending = 0_u64;
         for device_id in &plan.devices {
@@ -447,9 +455,9 @@ impl Controller {
     }
 
     /// Refuses the grants that rest on the authority feed, from this moment: an organisation's
-    /// lease, and personal remote access under a bounded offline-validity policy. A restriction
-    /// does not wait for its record to be written, so a registry that cannot take a write
-    /// restricts all the same.
+    /// lease, and personal remote access under a bounded offline-validity policy or on a host
+    /// that is exclusively organisation-managed. A restriction does not wait for its record to be
+    /// written, so a registry that cannot take a write restricts all the same.
     fn refuse_the_grants_that_rest_on_the_feed(&self) {
         let mut policy = self
             .policy
@@ -466,13 +474,13 @@ impl Controller {
     ///
     /// # Errors
     ///
-    /// Returns an error when the removal or the notice to the owner could not be written. The
-    /// grants are refused whatever happens, and the caller asks again, so the removal reaches the
-    /// registry when it can take it.
+    /// Returns an error when the removal could not be written. The grants are refused whatever
+    /// happens, and the caller asks again, so the removal reaches the registry when it can take
+    /// it. A notice the attention store cannot take is owed and given again by the carrier.
     pub(crate) async fn authority_feed_removed(&self, origin: &str) -> Result<()> {
         let now = self.wall_now_ms();
         self.refuse_the_grants_that_rest_on_the_feed();
-        let removal = {
+        {
             let mut feed = self.authority_feed();
             feed.removed_from(origin, now);
             if let Err(error) = self.keep_feed(&feed) {
@@ -480,77 +488,128 @@ impl Controller {
                     "kr-controller: could not write the authority feed's record down: {error}"
                 );
             }
-            feed.removal()
+        }
+        self.record_the_removal(origin, now)?;
+        if let Err(error) = self.tell_the_owner_of_the_feed().await {
+            eprintln!("kr-controller: {error}");
+        }
+        Ok(())
+    }
+
+    /// Writes down that the feed at `origin` removed this host, with a notice for the owner's
+    /// inbox owed, unless it is written down already.
+    fn record_the_removal(&self, origin: &str, at_ms: u64) -> Result<()> {
+        let grants = self.sharing.grants();
+        let next = match grants.stored_feed_removal()? {
+            Some(held) if held.origin.0.as_deref() == Some(origin) => return Ok(()),
+            held => StoredRemoval {
+                origin: Nullable::some(origin.to_owned()),
+                at_ms: TimestampMs::new(at_ms),
+                notice: held.map_or(1, |held| held.notice + 1),
+                owed: true,
+            },
         };
-        let Some(removal) = removal else {
-            return Ok(());
-        };
-        self.sharing.grants().store_feed_removal(Some(&removal))?;
-        self.tell_the_owner_of_the_feed(
-            kr_attention::EventKind::AuthorityFeedRemoved,
-            removal.at_ms.get(),
-        )
-        .await
+        grants.store_feed_removal(&next)
     }
 
     /// Puts the authority feed's removal right at start: kept for the origin that answered it,
-    /// forgotten for any other, with the item that told the owner ended with it.
-    pub(crate) async fn authority_feed_at_start(&self, configured: Option<&str>) -> Result<bool> {
-        let Some(removal) = self.sharing.grants().stored_feed_removal()? else {
+    /// forgotten for any other, with the item that told the owner ended with it. `selected` is the
+    /// feed this host's configuration selects, and `unusable` is whether the document could not be
+    /// used: a document that cannot be read is no choice of another feed, so the removal and what
+    /// it refuses stand until a start reads one that selects another feed or none.
+    ///
+    /// Returns whether the feed this host reads removed it.
+    pub(crate) async fn authority_feed_at_start(
+        &self,
+        selected: Option<&str>,
+        unusable: bool,
+    ) -> Result<bool> {
+        let grants = self.sharing.grants();
+        let Some(held) = grants.stored_feed_removal()? else {
             return Ok(false);
         };
-        if configured == Some(removal.origin.as_str()) {
-            self.authority_feed().restore_removal(&removal);
-            self.refuse_the_grants_that_rest_on_the_feed();
-            // A notice the attention store cannot take is not a reason to stop the start; the
-            // item stands in the inbox from the earlier run.
-            if let Err(error) = self
-                .tell_the_owner_of_the_feed(
-                    kr_attention::EventKind::AuthorityFeedRemoved,
-                    removal.at_ms.get(),
-                )
-                .await
-            {
-                eprintln!("kr-controller: {error}");
+        let mut removed = false;
+        match held.origin.0.as_deref() {
+            Some(origin) if unusable || selected == Some(origin) => {
+                self.authority_feed()
+                    .restore_removal(origin, held.at_ms.get());
+                self.refuse_the_grants_that_rest_on_the_feed();
+                removed = true;
             }
-            return Ok(true);
+            // The owner pointed the host at another feed, or at none: the removal is no removal
+            // from that one, and the notice that ends the owner's item is owed.
+            Some(_) => grants.store_feed_removal(&StoredRemoval {
+                origin: Nullable::null(),
+                at_ms: held.at_ms,
+                notice: held.notice + 1,
+                owed: true,
+            })?,
+            None => {}
         }
-        // The owner pointed the host at another feed, or at none: the removal is no removal from
-        // that one.
-        self.sharing.grants().store_feed_removal(None)?;
-        if let Err(error) = self
-            .tell_the_owner_of_the_feed(
+        // A notice the attention store cannot take is not a reason to stop the start: it stays
+        // owed, and is given at the next start or by the carrier.
+        if let Err(error) = self.tell_the_owner_of_the_feed().await {
+            eprintln!("kr-controller: {error}");
+        }
+        Ok(removed)
+    }
+
+    /// Gives the attention store the notice this host owes about its authority feed, if it owes
+    /// one. The notices are numbered by the order they were recorded in and written down before
+    /// they are given, so one the store refused is given again and a clock that moves back puts
+    /// none behind another.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the record cannot be read or written or the attention store cannot
+    /// take the notice. The notice stays owed.
+    pub(crate) async fn tell_the_owner_of_the_feed(&self) -> Result<()> {
+        let grants = self.sharing.grants();
+        let Some(held) = grants.stored_feed_removal()? else {
+            return Ok(());
+        };
+        if !held.owed {
+            return Ok(());
+        }
+        let (kind, at_ms) = if held.origin.0.is_some() {
+            (
+                kr_attention::EventKind::AuthorityFeedRemoved,
+                held.at_ms.get(),
+            )
+        } else {
+            (
                 kr_attention::EventKind::AuthorityFeedLeft,
                 self.wall_now_ms(),
             )
-            .await
-        {
-            eprintln!("kr-controller: {error}");
-        }
-        Ok(false)
-    }
-
-    /// Gives the attention store one notice about the feed, numbered by the moment it concerns.
-    async fn tell_the_owner_of_the_feed(
-        &self,
-        kind: kr_attention::EventKind,
-        at_ms: u64,
-    ) -> Result<()> {
+        };
         let event = kr_attention::SourceEvent::new(
             kr_attention::EventCursor::new(
                 kr_protocol::attention::AttentionSource::Authority,
-                at_ms,
+                held.notice,
             ),
-            kr_protocol::scalars::TimestampMs::new(at_ms),
+            TimestampMs::new(at_ms),
             kind,
         );
         let attention = Arc::clone(self.attention());
-        match tokio::task::spawn_blocking(move || attention.observe(&[event])).await {
-            Ok(Ok(())) => Ok(()),
-            _ => Err(crate::error::ControllerError::Storage {
+        if !matches!(
+            tokio::task::spawn_blocking(move || attention.observe(&[event])).await,
+            Ok(Ok(()))
+        ) {
+            return Err(crate::error::ControllerError::Storage {
                 operation: "tell the owner of the authority feed",
                 detail: "the attention store could not take the notice".to_owned(),
-            }),
+            });
         }
+        // Written as given unless a newer notice was recorded meanwhile.
+        if grants
+            .stored_feed_removal()?
+            .is_some_and(|now| now.notice == held.notice)
+        {
+            grants.store_feed_removal(&StoredRemoval {
+                owed: false,
+                ..held
+            })?;
+        }
+        Ok(())
     }
 }

@@ -161,7 +161,8 @@ pub enum Refusal {
     },
     /// The authority feed this host reads answered that it was removed from it, so a grant whose
     /// validity rests on the feed is refused until the owner acts at the host: an organisation's
-    /// lease, and personal remote access under a bounded offline-validity policy.
+    /// lease, and personal remote access under a bounded offline-validity policy or on a host that
+    /// is exclusively organisation-managed.
     AuthorityFeedRemoved,
     /// The decision reads this host's clock, and the clock floor it would stand on is owed its
     /// record, so it is not taken until the floor is written down
