@@ -2843,6 +2843,20 @@ impl AttentionModule {
         Ok(())
     }
 
+    /// Returns the number of the newest notice about its authority feed that the store has taken.
+    ///
+    /// # Errors
+    ///
+    /// Returns the store's refusal when it cannot be read.
+    pub fn authority_cursor(&self) -> Answer<u64> {
+        Ok(self
+            .store()?
+            .engine()
+            .map_err(refusal)?
+            .consumed(Origin::Environment, AttentionSource::Authority)
+            .unwrap_or_default())
+    }
+
     /// Returns how far the store has read the workflow journal's attention records.
     fn automation_cursor(&self) -> Answer<u64> {
         Ok(self

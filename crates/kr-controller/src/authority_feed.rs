@@ -465,9 +465,28 @@ impl FeedRuntime {
         )
     }
 
-    /// What `kr doctor` says of a host that selects no authority feed.
+    /// What `kr doctor` says of a host that reads no authority feed: one that selects none, or
+    /// whose configuration document cannot be used. `removed` is whether the feed it read before
+    /// removed it, which stands until a document it can use selects another feed or none.
     #[must_use]
-    pub fn unconfigured_check() -> DoctorCheck {
+    pub fn unconfigured_check(removed: bool) -> DoctorCheck {
+        if removed {
+            return DoctorCheck::new(
+                "authority-feed",
+                "This host reads its remote revocations from its authority feed",
+                DoctorStatus::Warning,
+                Sentence::new().stated(
+                    "this host reads no authority feed now, and the one it read before removed it, \
+                     so the grants that rest on the feed are refused and a remote owner's \
+                     revocation cannot reach it",
+                ),
+                Some(
+                    "Revoke any device you did not expect from this host directly. To carry on, \
+                     point `authority.origin` in a configuration document this host can use at \
+                     another feed, or remove it, and start the daemon again.",
+                ),
+            );
+        }
         DoctorCheck::new(
             "authority-feed",
             "This host reads its remote revocations from its authority feed",
@@ -497,7 +516,6 @@ impl Drop for FeedRuntime {
 /// What the carrier does for as long as the daemon lives.
 async fn drive(shared: Arc<Shared>, timer: Arc<dyn Timer>) {
     let mut backoff = Backoff::default();
-    let mut notice_backoff = Backoff::default();
     loop {
         // Every request made before this point is answered by the pass that follows it.
         let target = shared.requested.load(Ordering::SeqCst);
@@ -532,18 +550,6 @@ async fn drive(shared: Arc<Shared>, timer: Arc<dyn Timer>) {
                     )
                 }
             }
-        };
-        // Whatever the pass or the start left owed to the owner's inbox is given now, and asked
-        // again by itself until the attention store takes it.
-        let wait = if chained {
-            wait
-        } else if let Err(error) = controller.tell_the_owner_of_the_feed().await {
-            eprintln!("kr-controller: {error}");
-            let retry = notice_backoff.next_delay();
-            Some(wait.map_or(retry, |wait| wait.min(retry)))
-        } else {
-            notice_backoff = Backoff::default();
-            wait
         };
         drop(controller);
         if chained {
