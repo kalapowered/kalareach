@@ -69,7 +69,7 @@ use crate::queue::{
 use crate::resource::{
     HostConditions, PauseReason, ResourcePolicy, ResourceSettings, ResourceState,
 };
-use crate::store::DescriptionStore;
+use crate::store::{DescriptionStore, RecordMark};
 use crate::summary::{SummaryAsk, SummaryAsked, SummaryRecord, SummaryRefusal, is_wanted};
 use crate::time::Reading;
 use crate::wire::{JobEnd, LoadEnd, Phases};
@@ -443,6 +443,15 @@ pub enum Outcome {
         /// How.
         why: ProcessEnd,
     },
+}
+
+/// How current one published description is, and which description it is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Judgement {
+    /// How current it is.
+    pub freshness: Freshness,
+    /// Which description was judged.
+    pub description: RecordMark,
 }
 
 /// How every job has ended, counted.
@@ -1352,12 +1361,15 @@ impl DescriptionService {
         self.scheduler.standing(session_id, now)
     }
 
-    /// Returns how current a session's published description is.
+    /// Returns how current a session's published description is, and which description that is.
+    ///
+    /// The two come from one reading of the store, so a reader that holds a description can tell
+    /// whether this judgement is of it.
     ///
     /// # Errors
     ///
     /// Returns [`crate::DescribeError::Store`] when the store cannot be read.
-    pub fn freshness(&self, session_id: &SessionId, now: Reading) -> Result<Option<Freshness>> {
+    pub fn freshness(&self, session_id: &SessionId, now: Reading) -> Result<Option<Judgement>> {
         let Some(record) = self.store.generated(session_id)? else {
             return Ok(None);
         };
@@ -1365,7 +1377,10 @@ impl DescriptionService {
             .revision(session_id)
             .unwrap_or(ContextRevision::INITIAL);
         let waiting = self.scheduler.standing(session_id, now).queued_age_ms;
-        Ok(Some(Freshness::of(record.revision, current, waiting)))
+        Ok(Some(Judgement {
+            freshness: Freshness::of(record.revision, current, waiting),
+            description: record.mark(),
+        }))
     }
 
     /// Returns the label to show for one session.

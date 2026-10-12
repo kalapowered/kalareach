@@ -260,6 +260,23 @@ impl DescribeModule {
         self.host().map(|host| host.snapshot().figures)
     }
 
+    /// Arms the pause the host's next turn that has published a description stops at, for this
+    /// crate's own tests: the description is in the store, and the snapshot that judges it is not
+    /// yet published.
+    ///
+    /// Returns none when no host runs, and otherwise the end that says the turn has arrived and the
+    /// end that lets it go. The pause fires once.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn pause_host_before_its_snapshot(
+        &self,
+    ) -> Option<(
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::SyncSender<()>,
+    )> {
+        self.host().map(|host| host.pause_before_snapshot())
+    }
+
     /// Records the settings the daemon started with, which the host was given: the first
     /// acceptance of the configuration after a start compares with them, so that a document that
     /// says descriptions are off, restarted with, does not look like a change to off.
@@ -326,10 +343,18 @@ impl DescribeModule {
 
     /// Waits until the host has taken everything posted to it so far and published the turn that
     /// took it, for this crate's own tests that show something was not asked of it: what was
-    /// posted before is then in its figures. A host that does not run is not waited for.
+    /// posted before is then in its figures. A host that does not run, or that stops while it is
+    /// waited for, is not waited for.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the host does not answer inside the bound, since what a test shows after it
+    /// would then rest on a turn that did not happen.
     #[cfg(feature = "testing")]
     pub async fn until_host_has_taken_what_was_posted(&self) {
-        let _ = self.until_host_turns().await;
+        self.until_host_turns()
+            .await
+            .expect("the host took what was posted");
     }
 
     /// What setup shows: the host's own account of it, or that this host generates nothing.
@@ -562,9 +587,10 @@ impl DescribeModule {
                 decided,
             )
         };
-        // What the host last published, when it runs. Without one this daemon tracks no context
-        // revision and runs no model, so it cannot say that a description it holds is current: it
-        // says the conservative thing rather than implying current text.
+        // What the host last published, when it runs, read after the store so that it is at least
+        // as new as the description read. Without a host this daemon tracks no context revision
+        // and runs no model, so it cannot say that a description it holds is current: it says the
+        // conservative thing rather than implying current text.
         let published = self
             .host()
             .filter(|host| host.runs())
@@ -572,6 +598,23 @@ impl DescribeModule {
         let standing = published
             .as_ref()
             .and_then(|snapshot| snapshot.sessions.get(&session_id).copied());
+        // A description is shown with the host's judgement of that description, and with no other:
+        // one the host tracks the session of and has not yet judged is not shown, and the session
+        // is shown as it is without one until the host has.
+        let (shown, freshness) = match shown.generated.as_ref() {
+            None => (shown, DescriptionFreshness::None),
+            Some(record) => match freshness_of(record, published.as_ref(), standing.as_ref()) {
+                Some(freshness) => (shown, freshness),
+                None => (
+                    Shown {
+                        title: deterministic_title(facts),
+                        source: LabelSource::Metadata,
+                        generated: None,
+                    },
+                    DescriptionFreshness::None,
+                ),
+            },
+        };
         let (state, paused, cadence_ms) = match &published {
             Some(snapshot) => (
                 snapshot.state.unwrap_or(DescriptionState::ResourcePaused),
@@ -584,7 +627,7 @@ impl DescribeModule {
                 Budgets::DEFAULTS.session_cooldown_ms,
             ),
         };
-        let answer_of = |shown: &Shown| {
+        let answer_of = |shown: &Shown, freshness: DescriptionFreshness| {
             let generated = shown.generated.as_ref();
             SessionDescribeResult {
                 session_id,
@@ -593,23 +636,7 @@ impl DescribeModule {
                 activity_text: Nullable(
                     generated.map(|record| record.activity.as_str().to_owned()),
                 ),
-                // A row from before this host started is from an earlier daemon, whose context
-                // revisions say nothing about this one's: it is shown as stale until a newer
-                // description replaces it.
-                freshness: match (generated, standing) {
-                    (Some(record), Some(standing)) => {
-                        let earlier = published.as_ref().is_some_and(|snapshot| {
-                            record.produced_at_ms < snapshot.started_wall_ms
-                        });
-                        if earlier {
-                            DescriptionFreshness::Stale
-                        } else {
-                            standing.freshness
-                        }
-                    }
-                    (Some(_), None) => DescriptionFreshness::Stale,
-                    (None, _) => DescriptionFreshness::None,
-                },
+                freshness,
                 provenance: Nullable(generated.map(|record| DescriptionProvenance {
                     profile_id: record.profile_id.clone(),
                     profile_revision: U64::new(record.profile_revision.get()),
@@ -631,15 +658,18 @@ impl DescribeModule {
                 paused: Nullable(paused),
             }
         };
-        let answer = answer_of(&shown);
+        let answer = answer_of(&shown, freshness);
         // The answer as it is when what a model wrote is not shown. It is the same answer, since
         // nothing else in it is generated text.
         let withheld = if shown.generated.is_some() {
-            answer_of(&Shown {
-                title: deterministic_title(facts),
-                source: LabelSource::Metadata,
-                generated: None,
-            })
+            answer_of(
+                &Shown {
+                    title: deterministic_title(facts),
+                    source: LabelSource::Metadata,
+                    generated: None,
+                },
+                DescriptionFreshness::None,
+            )
         } else {
             answer.clone()
         };
@@ -1183,6 +1213,36 @@ pub const fn serves(method: kr_protocol::method::Method) -> bool {
         kr_protocol::method::Method::DescriptionConfigure
             | kr_protocol::method::Method::DescriptionDownload
     )
+}
+
+/// How current a generated description is, as the host judged that description, or none when the
+/// host has not.
+///
+/// A description from before this host started is from an earlier daemon, whose context revisions
+/// say nothing about this one's: it is stale until a newer description replaces it. So is one of a
+/// session the host does not track, such as a closed one, which it will not judge, and any
+/// description of a daemon with no host, which cannot say that one is current. One of a session the
+/// host tracks is judged only by a reading of the host that names it: a description the host wrote
+/// after its last published reading has no judgement yet, and a judgement of an earlier
+/// description is not borrowed for it.
+fn freshness_of(
+    record: &GeneratedRecord,
+    published: Option<&host::Snapshot>,
+    standing: Option<&host::SessionStanding>,
+) -> Option<DescriptionFreshness> {
+    let Some(snapshot) = published else {
+        return Some(DescriptionFreshness::Stale);
+    };
+    if record.produced_at_ms < snapshot.started_wall_ms {
+        return Some(DescriptionFreshness::Stale);
+    }
+    let Some(standing) = standing else {
+        return Some(DescriptionFreshness::Stale);
+    };
+    standing
+        .judged
+        .filter(|judged| judged.description == record.mark())
+        .map(|judged| judged.freshness)
 }
 
 /// What the diagnostics say when no profile was selected: why, and that titles come from what a

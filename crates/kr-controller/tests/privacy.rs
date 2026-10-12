@@ -725,6 +725,15 @@ impl Environment {
             .expect("the description store")
     }
 
+    /// Waits until the description host has published a turn that began after what a test wrote to
+    /// the store: a description is served only once the host has judged it.
+    async fn until_the_host_has_judged(&self) {
+        self.controller()
+            .descriptions()
+            .until_host_has_taken_what_was_posted()
+            .await;
+    }
+
     /// Admits one backup generation into the daemon's backup service.
     fn admit(
         &self,
@@ -1994,6 +2003,7 @@ async fn kr_req_23_34_the_session_name_is_a_filtered_read_and_a_pinned_write_at_
             now().get(),
         )
         .expect("a generated description");
+    environment.until_the_host_has_judged().await;
 
     // The owner at this machine reaches the whole session.
     let local = environment.describe(session_id).await;
@@ -2121,6 +2131,7 @@ async fn kr_req_23_34_the_session_name_is_a_filtered_read_and_a_pinned_write_at_
     store
         .publish(&session_id, &generated("Private work", 1), now().get())
         .expect("a description of the private generation");
+    environment.until_the_host_has_judged().await;
     for described in [
         environment.describe(session_id).await,
         reaching_device
@@ -2149,6 +2160,7 @@ async fn kr_req_23_34_the_session_name_is_a_filtered_read_and_a_pinned_write_at_
     store
         .publish(&session_id, &generated("Private work", 1), now().get())
         .expect("a description of the private generation");
+    environment.until_the_host_has_judged().await;
     assert_eq!(
         environment.describe(session_id).await.source,
         LabelSource::Metadata,
@@ -2157,6 +2169,7 @@ async fn kr_req_23_34_the_session_name_is_a_filtered_read_and_a_pinned_write_at_
     store
         .publish(&session_id, &generated("Public work", 2), now().get())
         .expect("a description of the generation in force");
+    environment.until_the_host_has_judged().await;
     let local = environment.describe(session_id).await;
     assert_eq!(
         (local.title.as_str(), local.source),

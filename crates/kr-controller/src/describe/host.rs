@@ -47,7 +47,7 @@ use kr_describe::resource::{HostConditions, PauseReason, ResourceSettings, Resou
 use kr_describe::service::{
     DescriptionService, DownloadProgress, Handles, HostPlacement, PublicationGate,
 };
-use kr_describe::store::DescriptionStore;
+use kr_describe::store::{DescriptionStore, RecordMark};
 use kr_describe::summary::SummaryAsk;
 use kr_describe::supervise::{Check, Checked, Driver, Launch, Report, Waker};
 use kr_describe::time::Reading;
@@ -225,8 +225,18 @@ pub struct Figures {
 pub(crate) struct SessionStanding {
     /// How long its queued job has been waiting, when it has one.
     pub queued_age_ms: Option<u64>,
-    /// How current the description is.
+    /// How current the description the host judged is, and which description that was. None when
+    /// the host judged none: the session had no description, or the store could not be read.
+    pub judged: Option<Judged>,
+}
+
+/// How current one generated description is, as the host judged it at a turn's end.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Judged {
+    /// How current it is.
     pub freshness: DescriptionFreshness,
+    /// Which description was judged. A reader that holds another has one the host has not judged.
+    pub description: RecordMark,
 }
 
 /// Where the clocks come from: the machine's, and in this crate's own tests a skew a test moves.
@@ -302,6 +312,10 @@ struct Shared {
     /// The newest reading of the host's own conditions, and when it was taken.
     reading: Mutex<Option<Taken>>,
     files: Files,
+    /// Where this crate's own tests stop a turn that has published a description, before it
+    /// publishes the snapshot that judges it.
+    #[cfg(any(test, feature = "testing"))]
+    before_snapshot: crate::attention::Pause,
 }
 
 /// Where the model's files are kept and what the fetch of them needs of the host.
@@ -422,6 +436,8 @@ impl DescribeHost {
                 stall,
                 next_check: AtomicU64::new(CHECK_IDS_FROM),
             },
+            #[cfg(any(test, feature = "testing"))]
+            before_snapshot: crate::attention::Pause::default(),
         });
         // The conditions are read on a thread of their own: a platform reading can spawn a program,
         // and nothing here waits on one.
@@ -720,6 +736,19 @@ impl DescribeHost {
             + self.shared.purges_owed.load(Ordering::Acquire)
     }
 
+    /// Arms the pause the host's next turn that has published a description stops at, once the
+    /// description is in the store and before the snapshot that judges it is published. Returns
+    /// the end that says the turn has arrived, and the end that lets it go. The pause fires once.
+    #[cfg(feature = "testing")]
+    pub(crate) fn pause_before_snapshot(
+        &self,
+    ) -> (
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::SyncSender<()>,
+    ) {
+        self.shared.before_snapshot.arm()
+    }
+
     /// Returns what the host last published.
     pub(crate) fn snapshot(&self) -> Snapshot {
         self.shared
@@ -850,9 +879,20 @@ impl Thread {
         self.settle_sessions(now);
         let conditions = self.conditions();
         let reports = self.driver.turn(&conditions, now).unwrap_or_default();
+        #[cfg(any(test, feature = "testing"))]
+        let published = reports.iter().any(|report| {
+            matches!(
+                report,
+                Report::Outcome(kr_describe::service::Outcome::Published { .. })
+            )
+        });
         self.answer_checks(reports);
         self.offer_check(now);
         self.sync_marker();
+        #[cfg(any(test, feature = "testing"))]
+        if published {
+            self.shared.before_snapshot.wait();
+        }
         self.publish_snapshot(now);
         for done in std::mem::take(&mut self.held.acks) {
             let _ = done.send(());
@@ -1243,12 +1283,19 @@ impl Thread {
         let mut sessions = BTreeMap::new();
         for session_id in service.live_session_ids() {
             let standing = service.standing(&session_id, now);
-            let freshness = freshness_of(service.freshness(&session_id, now));
+            let judged = service
+                .freshness(&session_id, now)
+                .ok()
+                .flatten()
+                .map(|judgement| Judged {
+                    freshness: freshness_of(judgement.freshness),
+                    description: judgement.description,
+                });
             sessions.insert(
                 session_id,
                 SessionStanding {
                     queued_age_ms: standing.queued_age_ms,
-                    freshness,
+                    judged,
                 },
             );
         }
@@ -1450,14 +1497,12 @@ fn cancelled_check() -> Checked {
     }
 }
 
-/// Maps how current a description is onto the protocol's word for it: none when there is no
-/// description to be current or the store could not say.
-fn freshness_of(freshness: kr_describe::Result<Option<Freshness>>) -> DescriptionFreshness {
+/// Maps how current a description is onto the protocol's word for it.
+const fn freshness_of(freshness: Freshness) -> DescriptionFreshness {
     match freshness {
-        Ok(Some(Freshness::Current)) => DescriptionFreshness::Current,
-        Ok(Some(Freshness::Delayed { .. })) => DescriptionFreshness::Delayed,
-        Ok(Some(Freshness::Stale { .. })) => DescriptionFreshness::Stale,
-        Ok(None) | Err(_) => DescriptionFreshness::None,
+        Freshness::Current => DescriptionFreshness::Current,
+        Freshness::Delayed { .. } => DescriptionFreshness::Delayed,
+        Freshness::Stale { .. } => DescriptionFreshness::Stale,
     }
 }
 
@@ -1603,6 +1648,7 @@ pub(crate) mod tests {
                 profile,
                 ..Files::default()
             },
+            before_snapshot: crate::attention::Pause::default(),
         });
         let mut thread = Thread {
             shared,
@@ -2154,35 +2200,27 @@ pub(crate) mod tests {
     }
 
     /// Each way a description can stand is the word the client is shown: current, delayed while a
-    /// newer job waits at the same revision, stale when the session has moved on, and none when
-    /// there is no description or the store could not say.
+    /// newer job waits at the same revision, and stale when the session has moved on.
     #[test]
     fn each_standing_of_a_description_is_the_word_a_client_is_shown() {
         use kr_describe::context::ContextRevision;
 
         assert_eq!(
-            freshness_of(Ok(Some(Freshness::Current))),
+            freshness_of(Freshness::Current),
             DescriptionFreshness::Current
         );
         assert_eq!(
-            freshness_of(Ok(Some(Freshness::Delayed {
+            freshness_of(Freshness::Delayed {
                 queued_age_ms: 70_000
-            }))),
+            }),
             DescriptionFreshness::Delayed
         );
         assert_eq!(
-            freshness_of(Ok(Some(Freshness::Stale {
+            freshness_of(Freshness::Stale {
                 produced_at: ContextRevision::new(1),
                 current: ContextRevision::new(2),
-            }))),
+            }),
             DescriptionFreshness::Stale
-        );
-        assert_eq!(freshness_of(Ok(None)), DescriptionFreshness::None);
-        assert_eq!(
-            freshness_of(Err(kr_describe::DescribeError::Store {
-                detail: "the store is closed".to_owned()
-            })),
-            DescriptionFreshness::None
         );
     }
 

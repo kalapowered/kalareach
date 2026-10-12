@@ -79,6 +79,34 @@ pub struct GeneratedRecord {
     pub produced_at_ms: u64,
 }
 
+impl GeneratedRecord {
+    /// Returns which description this is, without its text.
+    #[must_use]
+    pub const fn mark(&self) -> RecordMark {
+        RecordMark {
+            revision: self.revision,
+            cursor: self.cursor,
+            profile_revision: self.profile_revision,
+            generation: self.generation,
+            produced_at_ms: self.produced_at_ms,
+        }
+    }
+}
+
+/// Which generated description a reading of a session's standing judged: what tells one
+/// publication from the next, and none of the text.
+///
+/// A reading that carries a mark is about the description the mark names. A reader that holds a
+/// description with another mark has a description that reading did not judge.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RecordMark {
+    revision: ContextRevision,
+    cursor: CursorInterval,
+    profile_revision: ProfileRevision,
+    generation: PrivacyGeneration,
+    produced_at_ms: u64,
+}
+
 /// What removing generated text took out.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RemovedText {

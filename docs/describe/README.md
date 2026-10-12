@@ -185,7 +185,8 @@ runs at. Foreground and attention work waits for the cooldown alone.
 Thirty seconds is a *minimum*, not a promise: when demand exceeds
 capacity, a client is shown how long its job has been queued, when it last succeeded, and whether
 the description it is looking at is current, delayed or stale. There is no state that means
-"probably current".
+"probably current". A description is shown with the host's judgement of it, or as stale when the
+host will not judge it. Until the host judges a new one, the session shows its metadata title.
 
 Queue-wait and execution latency are published separately at 1, 5, 20 and 50 sessions. They answer
 different questions: one is what fairness costs, the other is what the host costs. A single figure

@@ -693,6 +693,30 @@ struct Environment {
     catalogue: kr_describe::Catalogue,
 }
 
+/// The host's turn, armed to stop between a description reaching the store and the snapshot that
+/// judges it.
+struct HostHold {
+    arrived: std::sync::mpsc::Receiver<()>,
+    release: std::sync::mpsc::SyncSender<()>,
+}
+
+impl HostHold {
+    /// Waits until the turn is held, and returns the end that lets it go. Bounded, because the
+    /// host keeps the other end of the channel: a turn that never publishes would leave an
+    /// unbounded wait rather than a failure.
+    async fn reached(self) -> std::sync::mpsc::SyncSender<()> {
+        let Self { arrived, release } = self;
+        tokio::task::spawn_blocking(move || {
+            arrived
+                .recv_timeout(PATIENCE)
+                .expect("the host published a description");
+        })
+        .await
+        .expect("the wait finishes");
+        release
+    }
+}
+
 impl Environment {
     async fn start(setup: Setup) -> Self {
         let owner = DeviceKeys::generate().expect("owner keys");
@@ -810,6 +834,30 @@ impl Environment {
             );
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
+    }
+
+    /// Closes a session as the daemon does when its worker hands over the account of how it ended,
+    /// and waits until the description host has been told and tracks no session.
+    async fn retire(&self, session_id: SessionId) {
+        self.controller()
+            .retire(&kr_protocol::session::ClosureRecord {
+                session_id,
+                session_epoch: SessionEpoch::V1,
+                reason: kr_protocol::session::ClosureReason::RootExit,
+                root_exit_code: Nullable::some(U64::new(0)),
+                root_signal: Nullable::null(),
+                terminated: Vec::new(),
+                surviving: Vec::new(),
+                ownership_coverage: kr_protocol::session::OwnershipCoverage::Incomplete,
+                durability: kr_protocol::session::Durability::Durable,
+                closed_at_ms: now(),
+            })
+            .await
+            .expect("the closure is recorded");
+        until("the host tracking no session", || {
+            self.figures().sessions == 0
+        })
+        .await;
     }
 
     /// Reads one session's name and description at the daemon's local socket.
@@ -1658,29 +1706,8 @@ async fn a_host_with_no_sessions_unloads_its_model_after_fifteen_minutes() {
         .await;
     assert!(environment.figures().pid.is_some(), "the model is loaded");
 
-    // The session closes, as it does when its worker hands over the account of how it ended, and
-    // the host has none.
-    environment
-        .controller()
-        .retire(&kr_protocol::session::ClosureRecord {
-            session_id,
-            session_epoch: SessionEpoch::V1,
-            reason: kr_protocol::session::ClosureReason::RootExit,
-            root_exit_code: Nullable::some(U64::new(0)),
-            root_signal: Nullable::null(),
-            terminated: Vec::new(),
-            surviving: Vec::new(),
-            ownership_coverage: kr_protocol::session::OwnershipCoverage::Incomplete,
-            durability: kr_protocol::session::Durability::Durable,
-            closed_at_ms: now(),
-        })
-        .await
-        .expect("the closure is recorded");
-    // The host has been told, and has none.
-    until("the host tracking no session", || {
-        environment.figures().sessions == 0
-    })
-    .await;
+    // The session closes, and the host has none.
+    environment.retire(session_id).await;
     // Fourteen minutes on: the host has taken a turn at that time, and has unloaded nothing.
     let before = environment.figures().read_at_ms;
     environment.placed.advance(14 * 60 * 1_000);
@@ -2207,6 +2234,27 @@ impl Environment {
             .await;
     }
 
+    /// How many generated descriptions the store holds, read from its file.
+    fn descriptions_held(&self) -> i64 {
+        rusqlite::Connection::open(self.state_dir.join("descriptions.sqlite3"))
+            .expect("the store's file opens")
+            .query_row("SELECT COUNT(*) FROM describe_generated", [], |row| {
+                row.get(0)
+            })
+            .expect("a count")
+    }
+
+    /// Arms the hold on the host's next turn that publishes a description: the turn stops after
+    /// the description is in the store and before the snapshot that judges it is published.
+    fn hold_the_host_before_its_snapshot(&self) -> HostHold {
+        let (arrived, release) = self
+            .controller()
+            .descriptions()
+            .pause_host_before_its_snapshot()
+            .expect("the daemon runs the description host");
+        HostHold { arrived, release }
+    }
+
     /// How many summaries the store holds, read from its file.
     fn summaries_held(&self) -> i64 {
         rusqlite::Connection::open(self.state_dir.join("descriptions.sqlite3"))
@@ -2682,6 +2730,89 @@ async fn a_target_no_profile_lists_is_named_and_starts_no_process() {
 
     assert_eq!(environment.figures().started, 0, "no process was started");
     assert_eq!(environment.stubs_started(), 0);
+    environment.stop().await;
+}
+
+/// KR-REQ-22.14: a description is shown with the judgement the host made of it, and in no other
+/// way. The host is held after a description is in the store and before the snapshot that judges
+/// it is published, and a read there is answered with the title from metadata and no description,
+/// never with the text and a freshness that says there is none. This is so for the first
+/// description of a session and for one that replaces another; once the host goes on, the text is
+/// shown with its freshness. A session that has closed is no longer judged, and keeps its last
+/// description, shown as stale.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_description_is_shown_only_once_the_host_has_judged_it() {
+    let environment = Environment::start(Setup::new()).await;
+    let session_id = environment.workers[0].session_id;
+
+    // The first description: written, and not yet judged.
+    let hold = environment.hold_the_host_before_its_snapshot();
+    environment.workers[0].report("cargo test", "/home/a/kalareach", None);
+    let release = hold.reached().await;
+    assert_eq!(
+        environment.descriptions_held(),
+        1,
+        "the description is stored"
+    );
+    assert_eq!(
+        environment.figures().jobs.published,
+        0,
+        "and the host has not yet published what it makes of it"
+    );
+    let unjudged = environment.describe(session_id).await;
+    assert_eq!(unjudged.source, LabelSource::Metadata, "{unjudged:?}");
+    assert_eq!(unjudged.freshness, DescriptionFreshness::None);
+    assert!(unjudged.activity_text.0.is_none(), "{unjudged:?}");
+    assert!(unjudged.provenance.0.is_none(), "{unjudged:?}");
+
+    // The host goes on: the text is shown, with its freshness.
+    release.send(()).expect("the host is let go");
+    let first = environment
+        .describe_until("the first description", session_id, |described| {
+            described.source == LabelSource::Generated
+        })
+        .await;
+    assert_eq!(first.freshness, DescriptionFreshness::Current);
+    assert!(first.activity_text.0.is_some(), "{first:?}");
+    let succeeded = first.last_success_ms.0.expect("a last success");
+
+    // A description that replaces it: written, and not yet judged. What was judged is not shown
+    // in place of the new text, nor is the new text shown with that judgement.
+    let hold = environment.hold_the_host_before_its_snapshot();
+    environment.workers[0].report("make", "/home/a/other", None);
+    // The job is not eligible until the cadence since the first has passed.
+    environment.placed.advance(first.cadence_ms.get() + 1);
+    environment.controller().descriptions().wake();
+    let release = hold.reached().await;
+    let replaced = environment.describe(session_id).await;
+    assert_eq!(replaced.source, LabelSource::Metadata, "{replaced:?}");
+    assert_eq!(replaced.freshness, DescriptionFreshness::None);
+    assert!(replaced.activity_text.0.is_none(), "{replaced:?}");
+    assert!(replaced.provenance.0.is_none(), "{replaced:?}");
+
+    release.send(()).expect("the host is let go");
+    let second = environment
+        .describe_until("the second description", session_id, |described| {
+            described.source == LabelSource::Generated
+        })
+        .await;
+    assert_eq!(second.freshness, DescriptionFreshness::Current);
+    assert!(
+        second
+            .last_success_ms
+            .0
+            .is_some_and(|moved| moved.get() > succeeded.get()),
+        "{second:?}"
+    );
+
+    // A closed session is no longer judged by the host, and keeps its last description, shown as
+    // stale.
+    environment.retire(session_id).await;
+    let closed = environment.describe(session_id).await;
+    assert_eq!(closed.source, LabelSource::Generated, "{closed:?}");
+    assert_eq!(closed.freshness, DescriptionFreshness::Stale);
+    assert_eq!(closed.activity_text, second.activity_text);
+    assert_eq!(closed.paused.0, None, "the host still runs");
     environment.stop().await;
 }
 
