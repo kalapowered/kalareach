@@ -242,6 +242,10 @@ impl Launch {
         let process =
             kr_ipc::identity::started_process_identity(child.id()).expect("the kernel names it");
         kr_worker::windows::job::keep_agent(process.clone(), job);
+        let credential = Credential::generate().expect("a credential");
+        credential
+            .write_file(&directory.join("credential"))
+            .expect("the credential is written");
         let managed = ManagedProcess::new(
             instance(which),
             process.clone(),
@@ -251,12 +255,9 @@ impl Launch {
                 executable_digest: reservation.profile().binary.digest,
                 process: process.clone(),
             },
-            Credential::generate().expect("a credential"),
+            credential,
             TimestampMs::new(1),
         );
-        managed
-            .write_registration(&directory.join("credential"))
-            .expect("the credential is written");
         let registered = reservation
             .register(IntegrationMode::Gateway, Some(managed))
             .unwrap_or_else(|refused| panic!("the launch is registered: {}", refused.error));
@@ -877,20 +878,9 @@ fn kr_req_11_23_a_registration_directory_must_hold_its_own_protected_list() {
 fn kr_req_11_23_the_credential_file_is_owner_only_and_a_widened_one_is_refused() {
     let directory = private_directory();
     let path = directory.join("credential");
-    let launched = kr_worker::broker::ManagedProcess::new(
-        instance(2),
-        kr_ipc::identity::current_process_start_identity().expect("this process"),
-        kr_worker::broker::TransportHandle {
-            transport: kr_worker::broker::BrokerTransport::PrivateSocket,
-            application_instance_id: instance(2),
-            executable_digest: Digest256::from_bytes([3; 32]),
-            process: kr_ipc::identity::current_process_start_identity().expect("this process"),
-        },
-        kr_worker::broker::Credential::generate().expect("a credential"),
-        TimestampMs::new(1),
-    );
-    launched
-        .write_registration(&path)
+    let credential = kr_worker::broker::Credential::generate().expect("a credential");
+    credential
+        .write_file(&path)
         .expect("the credential is written");
     let stored = kr_ipc::paths::read_owner_only_file(&path, 256)
         .expect("a file the host wrote is the owner's")
@@ -898,7 +888,7 @@ fn kr_req_11_23_the_credential_file_is_owner_only_and_a_widened_one_is_refused()
     assert_eq!(stored.len(), 64, "sixty-four hexadecimal characters");
     assert!(stored.iter().all(u8::is_ascii_hexdigit));
     assert!(
-        launched.write_registration(&path).is_err(),
+        credential.write_file(&path).is_err(),
         "a name that is taken is never written into"
     );
 
@@ -911,9 +901,7 @@ fn kr_req_11_23_the_credential_file_is_owner_only_and_a_widened_one_is_refused()
     let ordinary = std::env::temp_dir().join(format!("kr-we-ordinary-{}", kr_ipc::new_uuid()));
     std::fs::create_dir_all(&ordinary).expect("an ordinary directory");
     assert!(
-        launched
-            .write_registration(&ordinary.join("credential"))
-            .is_err(),
+        credential.write_file(&ordinary.join("credential")).is_err(),
         "nothing is written into a directory the host cannot show is private"
     );
     assert!(!ordinary.join("credential").exists());
