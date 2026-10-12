@@ -75,26 +75,6 @@ impl RemoteConnection {
         *self.scope.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Refuses a request that names a session this connection is not scoped to, before anything
-    /// is decided for it.
-    ///
-    /// Only a session scope refuses: a host scope serves the host's own reads of any session the
-    /// pairing grant admits, and refuses what reaches a worker or a share elsewhere.
-    pub(super) fn check_session_scope(
-        &self,
-        session_id: Option<SessionId>,
-    ) -> std::result::Result<(), ProtocolError> {
-        match (self.scope(), session_id) {
-            (
-                Scope::Session {
-                    session_id: scoped, ..
-                },
-                Some(named),
-            ) if named != scoped => Err(another_session()),
-            _ => Ok(()),
-        }
-    }
-
     /// Refuses a request decided under `acting` on a connection scoped otherwise.
     ///
     /// It refuses and never substitutes: the decision keeps its own grant for the envelope it
@@ -256,7 +236,7 @@ impl RemoteConnection {
             },
         };
         Ok(SessionOpenResult::InForce {
-            session: Nullable(summary),
+            session: Box::new(Nullable(summary)),
             environment_id: self.controller.paths().environment_id(),
             grant_id: acting.grant.grant_id,
             via: match acting.held {

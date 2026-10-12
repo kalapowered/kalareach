@@ -1059,6 +1059,143 @@ mod tests {
         assert!(rebooted.stored_in_force(&store, &lasting).expect("decided"));
     }
 
+    /// A stored grant's end is told only on proof. An expiry is told when it is on record, in any
+    /// boot, whatever the wall clock says now. A revocation is on the grant's record and is read
+    /// before any clock. A clock the host does not trust says nothing about whether a grant has
+    /// run out, so for a grant with no end on record it is a refusal and never an end. The control:
+    /// a grant before its deadlines has no end.
+    #[test]
+    fn a_stored_grants_end_is_told_only_on_proof() {
+        let devices = Arc::new(DeviceDirectory::in_memory().expect("a directory"));
+        let store = GrantDirectory::in_memory().expect("a grant store");
+        let now = kr_ipc::now_ms().get();
+        let wall = Arc::new(AtomicU64::new(now));
+        let clock = ManualClock::new();
+        let boot = kr_ipc::identity::boot_identity().expect("a boot identity");
+        let floor = Arc::new(UtcFloor::default());
+        let first = lifetimes_at(&devices, &clock, &wall, boot.clone(), &floor);
+        let expiring = stored_grant(
+            &store,
+            10,
+            GrantExpiry::At {
+                expires_at_ms: TimestampMs::new(now + 60_000),
+            },
+        );
+
+        // The control: before its deadlines it has no end.
+        assert_eq!(first.stored_end(&store, &expiring).expect("decided"), None);
+
+        // UTC runs past the expiry: the end is written down before it is told.
+        wall.store(now + 61_000, Ordering::SeqCst);
+        assert_eq!(
+            first.stored_end(&store, &expiring).expect("decided"),
+            Some(GrantEnd::Expired)
+        );
+        assert!(
+            store
+                .grant_expired_at(expiring.grant.grant_id)
+                .expect("readable")
+                .is_some(),
+            "the end is on record before it is told"
+        );
+
+        // A new boot, the wall clock wound back before the expiry and distrusted: the end on
+        // record stands, and a revocation is told, while a grant with no end on record is a
+        // refusal.
+        wall.store(now, Ordering::SeqCst);
+        devices
+            .utc_at_least(TimestampMs::new(now + 3_600_000))
+            .expect("the mark");
+        let rebooted = lifetimes_at(
+            &devices,
+            &clock,
+            &wall,
+            BootIdentity {
+                value: kr_protocol::scalars::Bytes::new(vec![0x5a; 16]),
+                ..boot
+            },
+            &Arc::new(UtcFloor::default()),
+        );
+        assert_eq!(
+            rebooted.stored_end(&store, &expiring).expect("decided"),
+            Some(GrantEnd::Expired),
+            "an end on record stands after a clock rollback and a new boot"
+        );
+        let revoked = GrantRecord {
+            revoked_at_ms: Some(now),
+            ..stored_grant(
+                &store,
+                11,
+                GrantExpiry::At {
+                    expires_at_ms: TimestampMs::new(now + 7_200_000),
+                },
+            )
+        };
+        assert_eq!(
+            rebooted.stored_end(&store, &revoked).expect("decided"),
+            Some(GrantEnd::Revoked),
+            "a revocation is told while the clock is distrusted"
+        );
+        let unproven = stored_grant(
+            &store,
+            12,
+            GrantExpiry::At {
+                expires_at_ms: TimestampMs::new(now + 7_200_000),
+            },
+        );
+        assert!(
+            matches!(
+                rebooted.stored_end(&store, &unproven),
+                Err(ControllerError::ClockUntrusted { .. })
+            ),
+            "an untrusted clock proves no end"
+        );
+        assert!(
+            store
+                .grant_expired_at(unproven.grant.grant_id)
+                .expect("readable")
+                .is_none(),
+            "and writes none down"
+        );
+    }
+
+    /// The end a share is scheduled for is the earlier of its own expiry and the pairing's, and
+    /// nothing when neither expires.
+    #[test]
+    fn a_share_is_scheduled_to_end_with_the_earlier_of_itself_and_its_pairing() {
+        let at = |ms| GrantExpiry::At {
+            expires_at_ms: TimestampMs::new(ms),
+        };
+        let record = |expiry| GrantRecord {
+            grant: owner(20, expiry).grant,
+            session_id: None,
+            issued_at_ms: 1,
+            activated_at_ms: Some(1),
+            revoked_at_ms: None,
+            revoked_by_parent: None,
+        };
+        let pairing = |expiry| owner(21, expiry).grant;
+        assert_eq!(
+            GrantLifetimes::effective_end_ms(&record(at(9_000)), &pairing(at(5_000))),
+            Some(5_000)
+        );
+        assert_eq!(
+            GrantLifetimes::effective_end_ms(&record(at(3_000)), &pairing(at(5_000))),
+            Some(3_000)
+        );
+        assert_eq!(
+            GrantLifetimes::effective_end_ms(&record(at(3_000)), &pairing(GrantExpiry::Never)),
+            Some(3_000)
+        );
+        assert_eq!(
+            GrantLifetimes::effective_end_ms(
+                &record(GrantExpiry::Never),
+                &pairing(GrantExpiry::Never)
+            ),
+            None
+        );
+    }
+
     /// An owner device's pairing grant that runs out by UTC while its continuous deadline is still
     /// ahead is out of force for every owner check, the one made inside a transaction included,
     /// and its expiry goes on record. The control: before its expiry it is in force.

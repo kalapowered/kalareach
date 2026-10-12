@@ -449,17 +449,15 @@ impl Adopted {
     }
 }
 
-/// Shares `session_id` with the device `record` names, as the person at this machine does, under
-/// `selection`, and has that device redeem it. Returns the grant.
-pub async fn share(
+/// Offers `session_id` to the device `record` names, as the person at this machine does, under
+/// `selection`, and leaves the invitation for the device to redeem.
+pub async fn offer(
     host: &Host,
     session_id: SessionId,
-    device: &super::Device,
     record: &kr_controller::service::net::devices::DeviceRecord,
     selection: kr_protocol::sharing::RoleSelection,
-) -> kr_protocol::grant::Grant {
-    let created: kr_protocol::sharing::GrantCreateResult = host
-        .client()
+) -> kr_protocol::sharing::GrantCreateResult {
+    host.client()
         .await
         .mutate(
             Method::GrantCreate,
@@ -481,7 +479,19 @@ pub async fn share(
         .expect("the call reaches the daemon")
         .expect("the share is written")
         .to_typed()
-        .expect("decodes");
+        .expect("decodes")
+}
+
+/// Shares `session_id` with the device `record` names, as the person at this machine does, under
+/// `selection`, and has that device redeem it. Returns the grant.
+pub async fn share(
+    host: &Host,
+    session_id: SessionId,
+    device: &super::Device,
+    record: &kr_controller::service::net::devices::DeviceRecord,
+    selection: kr_protocol::sharing::RoleSelection,
+) -> kr_protocol::grant::Grant {
+    let created = offer(host, session_id, record, selection).await;
     let connection = super::RawDevice::connect(host, device, record).await;
     connection
         .mutate(

@@ -1002,7 +1002,7 @@ pub enum SessionOpenResult {
     /// The connection now acts under the grant the host decided.
     InForce {
         /// The session, as `session.read` shows it. Null for the host scope.
-        session: Nullable<SessionSummary>,
+        session: Box<Nullable<SessionSummary>>,
         /// The environment the connection serves.
         environment_id: EnvironmentId,
         /// The grant the connection acts under.

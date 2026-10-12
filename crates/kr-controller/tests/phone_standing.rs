@@ -39,8 +39,10 @@ use kr_protocol::session::{
 };
 use kr_protocol::sharing::{RoleSelection, SessionRole};
 
-use net_support::worker::{Adopted, Upstream, Worker, revoke, share};
-use net_support::{Device, RawDevice, on_the_session, pair_with, proposal, recipient};
+use net_support::worker::{Adopted, Upstream, Worker, offer, revoke, share};
+use net_support::{
+    Device, RawDevice, delegated, on_the_session, owned_by, pair_with, proposal, recipient,
+};
 
 /// How long a test waits for a connection the host has withdrawn to be seen as ended.
 const PATIENCE: Duration = Duration::from_secs(30);
@@ -536,6 +538,22 @@ async fn kr_req_19_08_only_a_proven_end_is_told_as_an_end() {
     ));
     connection.close();
 
+    // A share offered and never redeemed is not held, and is not an end.
+    let (idle, idle_record) = recipient(&adopted.host, &adopted.owner).await;
+    let offered = offer(
+        &adopted.host,
+        session_id,
+        &idle_record,
+        RoleSelection::plain(SessionRole::Viewer),
+    )
+    .await;
+    let connection = RawDevice::connect(&adopted.host, &idle, &idle_record).await;
+    assert_eq!(
+        code(open(&connection, Some(session_id), Some(offered.grant.grant_id)).await),
+        ErrorCode::PermissionDenied
+    );
+    connection.close();
+
     // Another device's share, and a grant nobody issued, read alike.
     let (other, other_record) = recipient(&adopted.host, &adopted.owner).await;
     let theirs = share(
@@ -844,50 +862,88 @@ async fn kr_req_19_08_the_host_scope_serves_the_hosts_reads_and_no_worker() {
     adopted.stop().await;
 }
 
-/// A connection scoped to one share decides nothing under another: a revocation that names a grant
-/// under a second share is refused, and that share stands.
-#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn kr_req_19_08_a_connection_scoped_to_one_share_revokes_nothing_under_another() {
-    let adopted = Adopted::start(1).await;
-    let worker = &adopted.workers[0];
-    let (device, record) = recipient(&adopted.host, &adopted.owner).await;
-    let owned = share(
-        &adopted.host,
-        worker.session_id,
-        &device,
-        &record,
-        RoleSelection::plain(SessionRole::Owner),
-    )
-    .await;
-    let other = share(
-        &adopted.host,
-        worker.session_id,
-        &device,
-        &record,
-        RoleSelection::plain(SessionRole::Owner),
-    )
-    .await;
-
-    let scoped = RawDevice::connect(&adopted.host, &device, &record).await;
-    open(&scoped, Some(worker.session_id), Some(owned.grant_id))
-        .await
-        .expect("the first share opens");
-    let refused = scoped
+/// Sends a revocation of `grant_id` on `connection`, as the person at the device would.
+async fn revoke_on(
+    host: &net_support::Host,
+    connection: &RawDevice,
+    grant_id: GrantId,
+) -> Result<kr_protocol::envelope::ParamsValue, ProtocolError> {
+    connection
         .mutate(
             Method::GrantRevoke,
             ActionId::new(kr_ipc::new_uuid()),
-            net_support::on_the_host(&adopted.host),
-            &kr_protocol::sharing::GrantRevokeParams {
-                grant_id: other.grant_id,
-            },
+            net_support::on_the_host(host),
+            &kr_protocol::sharing::GrantRevokeParams { grant_id },
         )
-        .await;
-    assert!(
-        refused.is_err(),
-        "a revocation under a share the connection is not scoped to is refused"
+        .await
+}
+
+/// A connection scoped to one grant decides nothing under another: a revocation acts under the
+/// share its grant was delegated from, and is served only on the connection scoped to that share.
+/// Scoped to the host, to the pairing or to a different share of the same device, it is refused
+/// and the delegated grant stands; scoped to the share it was delegated from, it is served.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_19_08_a_revocation_is_served_only_on_the_connection_scoped_to_its_share() {
+    let adopted = Adopted::start(1).await;
+    let worker = &adopted.workers[0];
+    let (device, record) = recipient(&adopted.host, &adopted.owner).await;
+    let (colleague, colleague_record) = recipient(&adopted.host, &adopted.owner).await;
+    let (own, issuing) = owned_by(&adopted.host, worker.session_id, &device, &record).await;
+    let (other, _) = owned_by(&adopted.host, worker.session_id, &device, &record).await;
+    let (delegated, _) = delegated(
+        &adopted.host,
+        worker.session_id,
+        &other.grant,
+        &issuing,
+        &colleague,
+        &colleague_record,
+    )
+    .await;
+    let grant_id = delegated.grant_id;
+
+    // The host, the pairing and the device's other share each refuse it.
+    let host_scoped = RawDevice::connect(&adopted.host, &device, &record).await;
+    open(&host_scoped, None, None)
+        .await
+        .expect("the host opens");
+    assert_eq!(
+        code(revoke_on(&adopted.host, &host_scoped, grant_id).await),
+        ErrorCode::InvalidArgument
     );
-    assert!(net_support::holds(&adopted.host, other.grant_id));
-    scoped.close();
+    host_scoped.close();
+    let under_own = RawDevice::connect(&adopted.host, &device, &record).await;
+    open(
+        &under_own,
+        Some(worker.session_id),
+        Some(own.grant.grant_id),
+    )
+    .await
+    .expect("the device's other share opens");
+    assert_eq!(
+        code(revoke_on(&adopted.host, &under_own, grant_id).await),
+        ErrorCode::PermissionDenied
+    );
+    under_own.close();
+    assert!(
+        net_support::holds(&adopted.host, delegated.grant_id),
+        "the delegated grant stands"
+    );
+
+    // The share it was delegated from serves it.
+    let under_other = RawDevice::connect(&adopted.host, &device, &record).await;
+    open(
+        &under_other,
+        Some(worker.session_id),
+        Some(other.grant.grant_id),
+    )
+    .await
+    .expect("the share it was delegated from opens");
+    revoke_on(&adopted.host, &under_other, grant_id)
+        .await
+        .expect("the share it was delegated from revokes it");
+    assert!(!net_support::holds(&adopted.host, delegated.grant_id));
+    under_other.close();
+    issuing.close();
     adopted.stop().await;
 }
 
