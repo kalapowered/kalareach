@@ -58,7 +58,8 @@ import {
   unconfirmedWords,
   unresolved,
   wasRefused,
-  failed
+  failed,
+  type Submission
 } from '../../model/receipts'
 import { useReceiptReads } from '../../app/receipts'
 import { renderMarkdown } from '../../markdown/render'
@@ -595,7 +596,13 @@ export function MobileSession({
     (text: string) => {
       const now = Date.now()
       // The session is in the identity, so one session's outcome is never shown under another.
-      const submission = queued(localId(sessionId, now), text.slice(0, 60), now, text)
+      const submission: Submission = {
+        ...queued(localId(sessionId, now), text.slice(0, 60), now, text),
+        sentTo: {
+          applicationInstanceId: draft.target.applicationInstanceId,
+          agentBindingRevision: draft.target.agentBindingRevision
+        }
+      }
       // The revision the person submitted. Anything typed after it is a newer draft, and a late
       // answer about the older one must not take it away.
       const submittedRevision = draft.revision
@@ -606,7 +613,14 @@ export function MobileSession({
       const end = (outcome: 'taken' | 'refused' | 'unknown') => {
         if (ended.done) return
         ended.done = true
-        book.endSend(sending, outcome, submission.localId)
+        book.endSend(sending, outcome, submission.localId, (storedDraftId) => {
+          // The text may have been stored only by the end (the store would not take it at the press),
+          // so the draft it is kept in is named again: what a restart finds it by.
+          if (storedDraftId === null) return
+          lifecycle.setSubmissions((current) =>
+            current.map((each) => (each.localId === submission.localId ? { ...each, storedDraftId } : each))
+          )
+        })
       }
       // Local feedback first, and it says queued rather than sent, because it has not left yet.
       lifecycle.setSubmissions((current) => [...current, submission])
@@ -735,7 +749,8 @@ export function MobileSession({
       book.sendSettled(localId, after.state, {
         sessionId,
         text: before.text,
-        storedDraftId: before.storedDraftId
+        storedDraftId: before.storedDraftId,
+        sentTo: before.sentTo
       })
     },
     [lifecycle, book, sessionId]
@@ -863,7 +878,7 @@ export function MobileSession({
   // action sent past one nobody knows the end of leaves that one listed, with its own status.
   const earlier = unresolved(mine).filter((submission) => submission !== mine.at(-1))
   const earlierActions =
-    earlier.length === 0 ? null : (
+    earlier.length === 0 || typingToProgram ? null : (
       <ul className="m-earlier" data-testid="earlier-actions">
         {earlier.map((submission) => (
           <li key={submission.localId}>

@@ -502,6 +502,51 @@ describe('on the desktop', () => {
       })
       expect(screen.queryByTestId('composer-send-anyway')).toBeNull()
     })
+
+    it('does not put the text back when the second send is refused after the first was applied', async () => {
+      // Both sends of the same words end with nobody knowing; then the host says the first was
+      // applied, and later that the second was refused.
+      const SECOND_UNKNOWN: Settled<AgentMutationResult> = { receipt: null, value: null, action_id: ANOTHER_ACTION }
+      const recorded: Recorded = { state: 'unknown' }
+      const sent: unknown[] = []
+      const { controls, person } = await sentOnce(
+        (attempt) => (attempt === 1 ? UNCONFIRMED : SECOND_UNKNOWN),
+        recorded,
+        [],
+        sent
+      )
+      await person.click(await screen.findByTestId('composer-send-anyway'))
+      await waitFor(() => {
+        expect(sent).toHaveLength(2)
+      })
+      const states = () =>
+        [...screen.getByTestId('pending-actions').querySelectorAll('li')].map((each) => each.dataset.state)
+      await waitFor(() => {
+        expect(states()).toEqual(['unknown', 'unknown'])
+      })
+      const emit = (sequence: string, receipt: Receipt) => {
+        act(() => {
+          controls.emit({
+            stream_id: `receipts:${SESSION_MAIN}`,
+            sequence,
+            body: { kind: 'receipt', receipt }
+          })
+        })
+      }
+
+      emit('1', receiptAt('applied', ACTION))
+      await waitFor(() => {
+        expect(screen.getByTestId('composer-input')).toHaveValue('')
+      })
+      emit('2', receiptAt('refused', ANOTHER_ACTION))
+      await waitFor(() => {
+        expect(states()).toEqual(['applied', 'refused'])
+      })
+      await flush()
+
+      // The words were done once: nothing puts them back for a third send.
+      expect(screen.getByTestId('composer-input')).toHaveValue('')
+    })
   })
 
   it('does not call a prompt taken while the host has only accepted it', async () => {
@@ -641,6 +686,56 @@ describe('on the phone', () => {
       expect(screen.getByLabelText('Message this session')).toHaveValue('')
     })
     expect(screen.queryByRole('button', { name: 'I checked; send anyway' })).toBeNull()
+  })
+
+  it('does not put the text back when the second send is refused after the first was applied', async () => {
+    const recorded: Recorded = { state: 'unknown', byAction: {} }
+    const device = new FakeDraftStore()
+    const host = fakeHost({ drafts: device })
+    let refuse: (failure: unknown) => void = () => undefined
+    const second = new Promise<Settled<AgentMutationResult>>((_, reject) => {
+      refuse = reject
+    })
+    let attempts = 0
+    const port: HostPort = {
+      ...answering(host.port, UNCONFIRMED, recorded),
+      composerSubmit: () => {
+        attempts += 1
+        return attempts === 1 ? Promise.resolve(UNCONFIRMED) : second
+      }
+    }
+    render(
+      <AppProvider port={port}>
+        <MobileApp surface="ios" storage={null} />
+      </AppProvider>
+    )
+    const person = userEvent.setup()
+    await person.click(await screen.findByRole('button', { name: /^Sessions/ }))
+    await person.click(await screen.findByRole('button', { name: /Session 1/ }))
+    await person.type(await screen.findByLabelText('Message this session'), 'run the migration')
+    await person.click(screen.getByRole('button', { name: 'Send' }))
+    await person.click(await screen.findByRole('button', { name: 'I checked; send anyway' }))
+    await waitFor(() => {
+      expect(attempts).toBe(2)
+    })
+
+    // The host says the first was applied, while the second is still on its way.
+    recorded.byAction = { [ACTION]: 'applied' }
+    await waitFor(
+      () => {
+        expect(screen.getByLabelText('Message this session')).toHaveValue('')
+      },
+      { timeout: 6_000 }
+    )
+    await act(async () => {
+      refuse({ code: 'REFUSED', message: 'The host refused it.' })
+      await Promise.resolve()
+    })
+    await flush()
+
+    // The words were done once: nothing puts them back for a third send.
+    expect(screen.getByLabelText('Message this session')).toHaveValue('')
+    expect(device.all()).toEqual([])
   })
 
   describe('when the application starts again after a prompt nobody knew the end of', () => {

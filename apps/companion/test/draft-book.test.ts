@@ -6,7 +6,7 @@
  * Nothing here sends a prompt, and the book has no means to.
  */
 
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 
 import { FakeDraftStore } from '../src/host/fake-drafts'
 import type {
@@ -1895,6 +1895,30 @@ describe('a composer that holds a file still uploading', () => {
   })
 })
 
+describe('the draft a prompt is kept in once it ended', () => {
+  it('is named by the end when the store would not take the text at the press', async () => {
+    const store = new FakeDraftStore()
+    const book = await opened(store)
+    store.refuseSaves({ code: 'STORAGE_UNAVAILABLE', message: 'the disk refused it' })
+    type(book, MAIN, 'send this')
+    const token = book.beginSend(MAIN)
+    // The claim could not store the text, so it names no draft.
+    await expect(token.claimed).resolves.toBeNull()
+    type(book, MAIN, '')
+    // The store takes writes again before the host says nobody knows what became of the prompt.
+    store.refuseSaves(null)
+    const named = new Promise<string | null>((resolve) => {
+      book.endSend(token, 'unknown', 'local-1', resolve)
+    })
+
+    const id = await named
+    await book.settled()
+
+    expect(id).toBe(store.all()[0]?.id)
+    expect(store.all().map((draft) => draft.text)).toEqual(['send this'])
+  })
+})
+
 describe('two windows that hold the same draft', () => {
   /** Two books over one store, as two windows of the application are, both holding one draft. */
   async function twoHolding(): Promise<{ store: FakeDraftStore; one: DraftBook; two: DraftBook }> {
@@ -2270,8 +2294,11 @@ describe('a prompt the host is said to have applied after nobody knew what becam
     book.writeAll()
     await gate.reached
     book.sendSettled('local-1', 'applied')
-    // The late end is made while the save of the recovery has not answered.
-    for (let tick = 0; tick < 100; tick += 1) await Promise.resolve()
+    // The late end is made while the save of the recovery has not answered: the warning that the
+    // text was held in this window only is gone with it.
+    await vi.waitFor(() => {
+      expect(book.snapshot().problem).toBeNull()
+    })
     gate.release()
     await book.settled()
 
@@ -2359,7 +2386,9 @@ describe('a prompt the host is said to have applied after nobody knew what becam
     await gate.reached
 
     book.sendSettled('local-1', 'applied')
-    for (let tick = 0; tick < 100; tick += 1) await Promise.resolve()
+    await vi.waitFor(() => {
+      expect(book.snapshot().problem).toBeNull()
+    })
     gate.release()
     await book.settled()
 
@@ -2487,6 +2516,43 @@ describe('a prompt the host is said to have applied after nobody knew what becam
       expect(book.snapshot().kept).toEqual([])
       expect(book.draft(MAIN).text).toBe('newer')
       expect(store.all().map((draft) => draft.text)).toEqual(['newer'])
+    })
+
+    it('leaves a draft that was sent to another conversation since, whatever its words', async () => {
+      const store = new FakeDraftStore()
+      const { storedDraftId } = await earlierRun(store)
+      const book = await opened(store)
+      // The person sent the returned draft to another conversation, with the words as they were.
+      book.retarget(MAIN, { sessionId: MAIN, applicationInstanceId: 'another', agentBindingRevision: '9' })
+      await book.settled()
+
+      book.sendSettled('local-1', 'applied', {
+        sessionId: MAIN,
+        text: 'send this',
+        storedDraftId: storedDraftId ?? '',
+        sentTo: { applicationInstanceId: null, agentBindingRevision: null }
+      })
+      await book.settled()
+
+      expect(book.draft(MAIN).text).toBe('send this')
+      expect(store.all().map((draft) => draft.text)).toEqual(['send this'])
+    })
+
+    it('clears the listed draft it was sent from and not a composer that holds the same words', async () => {
+      const store = new FakeDraftStore()
+      const { storedDraftId } = await earlierRun(store, 'newer')
+      const book = await opened(store)
+      // The person writes the same words again in the composer, as a draft of its own.
+      type(book, MAIN, 'send this')
+      await book.settled()
+      expect(book.snapshot().kept.map((kept) => kept.text)).toEqual(['send this'])
+
+      book.sendSettled('local-1', 'applied', { sessionId: MAIN, text: 'send this', storedDraftId: storedDraftId ?? '' })
+      await book.settled()
+
+      expect(book.snapshot().kept).toEqual([])
+      expect(book.draft(MAIN).text).toBe('send this')
+      expect(store.all().map((draft) => draft.text)).toEqual(['send this'])
     })
 
     it('leaves a draft that is not the one it was sent from, whatever its words', async () => {

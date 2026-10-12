@@ -40,6 +40,8 @@ export interface Submission {
    * applied finds the draft that holds its text: the draft, and not any draft with the same words.
    */
   readonly storedDraftId?: string
+  /** The conversation the prompt was sent to: a draft that has been sent to another one is not the prompt's. */
+  readonly sentTo?: { readonly applicationInstanceId: string | null; readonly agentBindingRevision: string | null }
   /** When it was created. */
   readonly createdAtMs: number
   /** The failure, when it has one. */

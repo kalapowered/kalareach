@@ -203,9 +203,14 @@ export function Conversation({
    * The composer may already hold something else by the time a refusal arrives, and overwriting it
    * would lose that instead. So the text goes back when the composer is empty, and when it is not
    * it is offered: the submission keeps its text either way, and nothing the person wrote is gone.
+   *
+   * A refusal that arrives after the prompt's words were done by another send of them (a person who
+   * checked sent them again, and the first was applied) gives nothing back. `token` is the send's own,
+   * for a refusal that arrives with the answer.
    */
   const returnRefusedText = useCallback(
-    (localId: string) => {
+    (localId: string, token?: { readonly key: string } | null) => {
+      if (book.textConsumed(token ?? { localId })) return
       const refused: { text: string | null } = { text: null }
       update((current) => {
         const found = current.submissions.find((submission) => submission.localId === localId)
@@ -218,7 +223,7 @@ export function Conversation({
         current.text.length > 0 ? current : edit(current, returned, Date.now())
       )
     },
-    [update, changeDraft]
+    [update, changeDraft, book]
   )
 
   // The host's event stream carries a package's presentation nodes and late receipts. Each is
@@ -430,7 +435,7 @@ export function Conversation({
             )
           }))
           if (wasRefused(outcome)) {
-            returnRefusedText(local.localId)
+            returnRefusedText(local.localId, sending)
             say('The host did not take that. It is kept here.', 'danger')
           }
           if (outcome === 'unknown') {
@@ -463,7 +468,7 @@ export function Conversation({
                 : submission
             )
           }))
-          returnRefusedText(local.localId)
+          returnRefusedText(local.localId, sending)
           say(failureMessage(error), 'danger')
           end('refused')
         })
