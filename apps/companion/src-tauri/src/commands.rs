@@ -1305,7 +1305,7 @@ struct VoiceAllow {
 /// Replacing the standing grant ends the calls under it, and when a close sent under one of them
 /// can still reach a worker the host's answer names the workers that have not acknowledged the
 /// fence. That is passed on as the host gave it, less the names of the actions the fence named
-/// (see [`without_the_names`]), and null when the replacement owed none, so the screen can say
+/// (see `without_the_names`), and null when the replacement owed none, so the screen can say
 /// that those workers are still to confirm.
 #[derive(Debug, Serialize)]
 pub struct VoiceAllowed {
