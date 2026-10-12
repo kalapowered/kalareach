@@ -10344,8 +10344,8 @@ fn the_detection_of_undeclared_types_finds_a_missing_line_a_changed_type_and_a_s
     let found = stored_formats::retained_unaccounted(
         &table,
         &[],
-        &[(Method::SessionRename, "SessionRenameResult")],
-        &[Method::SessionRename],
+        &[(Method::DevicePushRegister, "DevicePushRegisterResult")],
+        &[Method::DevicePushRegister],
     );
     assert_eq!(found.len(), 1, "{found:?}");
     assert!(found[0].contains("names that type nowhere"), "{found:?}");

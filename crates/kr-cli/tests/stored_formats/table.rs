@@ -160,11 +160,6 @@ pub fn known() -> Vec<Known> {
             "RevocationRequest",
             "9c4f06edcd64ab8b33dc62ae19587459c4ac85394fbf981eb50284d686d0eeef",
         ),
-        known_protocol::<describe::SessionRenameResult>(
-            "registry",
-            "SessionRenameResult",
-            "8647db2b73068c496d6d6fc3a923e0bf3b2838d05c6926b0052c937115003c2b",
-        ),
         known_protocol::<push::DevicePushRegisterResult>(
             "registry",
             "DevicePushRegisterResult",
@@ -180,31 +175,6 @@ pub fn known() -> Vec<Known> {
             "DeliveryDestinationRemoveResult",
             "16a90c0562fa5ae4906d61e674153bf59c316d30abc54ec5ecc79b08e019c443",
         ),
-        known_protocol::<delivery::DeliveryDestinationSecretSetResult>(
-            "registry",
-            "DeliveryDestinationSecretSetResult",
-            "7e42aec33f5a7268d9be57d2d354b4cc851e08a130d89430d98104be3c2c4c53",
-        ),
-        known_protocol::<identity::EnvironmentEnrolResult>(
-            "registry",
-            "EnvironmentEnrolResult",
-            "3eb4302c748c84b5bcab7b7574a679c467c724731e5ca050220b3e4e7c7cb8ea",
-        ),
-        known_protocol::<identity::EnvironmentForgetResult>(
-            "registry",
-            "EnvironmentForgetResult",
-            "e272573f7b9fc996da5193d518004c36cb03bf95545ce1eac3579b89c1d586ed",
-        ),
-        known_protocol::<identity::EnvironmentRefreshResult>(
-            "registry",
-            "EnvironmentRefreshResult",
-            "64d30dbbfe9ee9d78404d2a2f004b683c8d46675a209606032c8341dbad54468",
-        ),
-        known_protocol::<update::HostUpdateHandoverResult>(
-            "registry",
-            "HostUpdateHandoverResult",
-            "b216ad57793ff4fb71dd5829f786381e2498baac9c3b9193b20dae2100949e0e",
-        ),
         known_protocol::<host_account::AccountSignInStarted>(
             "registry",
             "AccountSignInStarted",
@@ -214,16 +184,6 @@ pub fn known() -> Vec<Known> {
             "registry",
             "AccountSignedOut",
             "1c02b8aa44a0f9f364e09cf7cfcb8c9dad9ac89a63d9294a4bd7a4c019f97442",
-        ),
-        known_protocol::<privacy::PrivacyReport>(
-            "registry",
-            "PrivacyReport",
-            "dadfdbb0172fc9bd6a888204d9f6902bb6c3c2b62e9f1746f27c65413b46f070",
-        ),
-        known_protocol::<describe::DescriptionSetup>(
-            "registry",
-            "DescriptionSetup",
-            "8ba498cbe7eb06a54b8574f4228f984cc1639567863034b35b7f8a4176e26f72",
         ),
         // The delivery journal: what a notice holds, and the words it matches stored text against.
         source(
