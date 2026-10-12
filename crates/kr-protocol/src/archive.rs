@@ -52,13 +52,24 @@ pub const RECOVERY_BUNDLE_DOMAIN: &str = "kr-recovery-bundle/1";
 /// that serves a bundle from another origin or another locator serves one that does not
 /// authenticate. Origin or locator substitution fails authentication rather than causing trust in
 /// archive-supplied writer keys.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RecoveryContext {
     /// The configured service origin the bundle is retrieved from.
     pub service_origin: String,
     /// The stable opaque locator of the bundle.
     pub bundle_locator: String,
+}
+
+impl core::fmt::Debug for RecoveryContext {
+    /// The origin the bundle is read from. The locator is what reaches the bundle, so no rendering
+    /// of this value shows it.
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("RecoveryContext")
+            .field("service_origin", &self.service_origin)
+            .finish_non_exhaustive()
+    }
 }
 
 impl RecoveryContext {
@@ -727,9 +738,10 @@ impl RecoveryKit {
 /// A seed with no way to find the encrypted bundle is not a complete kit, so the kit names the
 /// configured service origins and the stable bundle locator alongside the seed.
 ///
-/// `Debug` is derived, and the seed redacts itself, so a kit can be logged without publishing the
-/// owner's recovery authority.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+/// `Debug` is written, not derived: it shows the profile and how many origins the kit names, and
+/// nothing of the seed, its checksum or the locator, so a kit can be logged without publishing the
+/// owner's recovery authority or the address of the bundle.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RecoveryKit {
     /// The kit format and cryptographic profile version.
@@ -743,6 +755,16 @@ pub struct RecoveryKit {
     pub service_origins: Vec<String>,
     /// The stable opaque locator of the recovery bundle.
     pub bundle_locator: String,
+}
+
+impl core::fmt::Debug for RecoveryKit {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("RecoveryKit")
+            .field("profile_version", &self.profile_version)
+            .field("service_origins", &self.service_origins.len())
+            .finish_non_exhaustive()
+    }
 }
 
 #[cfg(test)]

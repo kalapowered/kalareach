@@ -210,12 +210,14 @@ pub fn parse_kit(document: &str) -> Result<RecoveryKit, RecoveryError> {
         });
     }
 
-    let Ok(bytes) = <[u8; 32]>::try_from(&payload[..32]) else {
+    // The seed's bytes are copied once more to build the kit, and this copy is cleared when it
+    // goes out of scope rather than left on the stack.
+    let Ok(bytes) = <[u8; 32]>::try_from(&payload[..32]).map(Zeroizing::new) else {
         unreachable!("the payload is thirty-six bytes");
     };
     let kit = RecoveryKit {
         profile_version: U64::new(RECOVERY_KIT_PROFILE_VERSION),
-        seed: SecretBytes32::from_bytes(bytes),
+        seed: SecretBytes32::from_bytes(*bytes),
         seed_checksum: Bytes::new(payload[32..].to_vec()),
         service_origins: origins,
         bundle_locator: locator,

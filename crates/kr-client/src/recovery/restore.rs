@@ -43,11 +43,13 @@ impl RetrievalPolicy {
 /// The access the configured retrieval policy gave a restore: the reader it reaches one origin
 /// through.
 ///
-/// Under [`RetrievalPolicy::Account`] the reader presents a token from an authorisation the device
-/// made for the restore alone, asking for `backup.restore`; under [`RetrievalPolicy::SelfHosted`]
-/// it presents the credential the owner's own deployment issued. Either way the service decides
-/// what the reader reaches, and a reader it does not admit reaches nothing: a restore reads only
-/// through this, so holding one proves nothing by itself.
+/// Under [`RetrievalPolicy::Account`] the reader presents the account token the device holds: the
+/// bundle accepts `backup.restore` or `backup.write`, and the managed service reads an archive's
+/// objects only for a token that carries `backup.write`, so a device that holds `backup.restore`
+/// alone reads the bundle and no object. Under [`RetrievalPolicy::SelfHosted`] it presents the
+/// credential the owner's own deployment issued. Either way the service decides what the reader
+/// reaches, and a reader it does not admit reaches nothing: a restore reads only through this, so
+/// holding one proves nothing by itself.
 ///
 /// It carries no key, and that half *is* structural. Holding one means a restore can *fetch*
 /// ciphertext; opening that ciphertext needs the seed the kit carries, and section 20 says so in
