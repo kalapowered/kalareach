@@ -211,7 +211,8 @@ proposal as well, with that reason, before anything is written.
 
 A session shared with an already paired device reaches it as an invitation, and the device redeems
 it with `grant.redeem` over its own connection. Redeeming activates the grant the invitation
-carries, once, for the device the invitation names, and for nobody else.
+carries, once, for the device the invitation names, and for nobody else. The device lists what is
+offered to it with `grant.held`, and a share ends no later than the device's pairing does.
 
 Control of a session moves to another paired device with `grant.transfer`. Only the person at this
 machine asks for it. The host describes the transfer, an owner device checks it and signs it, and

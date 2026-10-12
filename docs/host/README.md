@@ -5298,16 +5298,32 @@ most 30 days. A lifetime past the bound is refused rather than clamped, because 
 invitation is one whose issuer believes something untrue about it. Persistent co-owner access is
 explicit owner pairing, not a longer invitation.
 
+The lifetime of a share to a device ends with the end of the corresponding pairing of that device,
+since the pairing defines the boundaries of all its activity. A host shall refuse to share with a
+device that is not paired, that has been revoked, or whose pairing has expired or will expire before
+the requested end of the share. The host shall return the time at which the pairing will end as part
+of the refusal message. The host shall not shorten the share to fit, since the issuer of an
+invitation cut short in silence would believe something untrue about it. The determination that a
+pairing has run out is made on the host's settled clock, as admission makes it. A paired device that
+delegates a share and is refused for any of these reasons is given one sentence that says nothing
+about another device's pairing.
+
 **A grant is a proposal until its invitation is redeemed.** `grant.create` writes the grant and its
-invitation together and the grant authorises nothing. Its answer gives the issuer the invitation's
-identity, which the issuer hands to the recipient by its own means; this host sends it to no device.
-The device the invitation names redeems it with `grant.redeem` over its own paired connection, and
-the redemption activates the grant, once. The activation, the invitation's new state and the answer
-to the redeeming action are one commit, so a repeat of the action is answered as it was even when
-this host stopped before it replied. Any other action finds the work done and is refused. A device
-the invitation does not name is told the same thing whether the invitation exists or not. The
-answer is the grant, which names the session and what it reaches, and none of the text the issuer
-was shown.
+invitation together and the grant authorises nothing. The answer gives the issuer the identity of
+the invitation. The host does not send this to any device. Any device may ask, with `grant.held`,
+what invitations are open for that device, and what shares are currently active to that device on
+sessions that are still open, up to 64 of each at a time. Reading may be resumed by specifying the
+key of the last entry previously read. The device is identified by the authentication of the
+connection, and is not specified in the request. The offer details include the session number, the
+actions, the history start point, whether the live screen is shared, the consequences of the
+actions, and the time at which the access will end. The text displayed to the issuer of the
+invitation is not included. The device the invitation names redeems it with `grant.redeem` over its
+own paired connection, and the redemption activates the grant, once. The activation, the
+invitation's new state and the answer to the redeeming action are one commit, so a repeat of the
+action is answered as it was even when this host stopped before it replied. Any other action finds
+the work done and is refused. A device the invitation does not name is told the same thing whether
+the invitation exists or not. The answer is the grant, which names the session and what it reaches,
+and none of the text the issuer was shown.
 
 An invitation that was withdrawn or has expired activates nothing. Withdrawing one is revoking the
 grant it carries with `grant.revoke`, which settles the invitation as withdrawn in the same commit,
@@ -5332,13 +5348,14 @@ refusal will be stored with the action. A client can tell that the owner device 
 looking for the challenge in `owner.confirmation.pending` with `answered` set to true. An owner
 device builds the plan's digest again from what it is shown and signs it with the receiving device's
 keys and the rights it is given beside it. `grant.transfer` then spends the answer recorded for
-exactly that plan, once. A receiving device that is not paired with all four of its keys held, a
-grant that is not the transferring device's or carries no `session.share`, a transferring device
-that holds a grant this one was delegated from (it would keep control of the session), and a plan
-that hands over more than the grant carries are each refused before the answer is spent. A grant
-that has run out, or a device that was revoked, after the plan was built is refused where the
-transfer writes, after the answer is spent, and the action keeps that refusal. If the action is sent
-again then instead of spending anything it will return the same response as the original response.
+exactly that plan, once. A receiving device that is not paired with all four of its keys held or
+whose pairing has run out or ends before the access it would be given, a grant that is not the
+transferring device's or carries no `session.share`, a transferring device that holds a grant this
+one was delegated from (it would keep control of the session), and a plan that hands over more than
+the grant carries are each refused before the answer is spent. A grant that has run out, or a device
+that was revoked, after the plan was built is refused where the transfer writes, after the answer is
+spent, and the action keeps that refusal. If the action is sent again then instead of spending
+anything it will return the same response as the original response.
 
 A confirmation is accepted only against the expectation this host builds from its own records: its
 device identity and endpoint, the receiving device's public keys, the rights the plan hands over and
@@ -5397,6 +5414,14 @@ A revocation is refused alike whenever no share the device holds is above the gr
 does not exist, a grant the device holds with no share of its own above it, and a grant that
 descends only from another device's share. Paired devices can use `grant.list` to view grants they
 have issued.
+
+`grant.list` is the list of grants, each of which includes its expiry date as well as its effective
+end date, which is the earlier of its expiry date and the end of the pairing of the grantee.
+`device.list` is the list of devices, each of which indicates the platform of the device, the end of
+the pairing of the device, whether the pairing of the device has run out as far as the host is
+concerned and whether the pairing opens all sessions of the environment. Note that sharing a session
+with a device whose pairing opens all sessions is pointless, because that pairing already reaches
+them all.
 
 Each action is associated with the actor that sent it. If two actors send the same action, two
 grants will be written.
