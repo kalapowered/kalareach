@@ -497,9 +497,12 @@ impl<S: Carrier> Drop for TextLines<S> {
             return;
         }
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            // The deadline is counted from the drop, so a task that is slow to start does not
+            // hold the socket longer.
+            let deadline = tokio::time::Instant::now() + CLOSE_DEADLINE;
             runtime.spawn(async move {
-                let _ = tokio::time::timeout(
-                    CLOSE_DEADLINE,
+                let _ = tokio::time::timeout_at(
+                    deadline,
                     std::future::poll_fn(|cx| Pin::new(&mut socket).poll_flush(cx)),
                 )
                 .await;
