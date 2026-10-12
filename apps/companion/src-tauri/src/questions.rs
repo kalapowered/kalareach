@@ -46,6 +46,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::agent::{Link, WorkerLinks, ends_the_link};
 use crate::error::{CommandError, Result};
+use crate::standing::Leased;
 use crate::state::AppState;
 
 /// A question as the page last read it, with the place an answer to it goes.
@@ -347,17 +348,21 @@ struct Host<'a> {
     links: &'a WorkerLinks,
     state: &'a AppState,
     route: Route,
+    /// The session screen the call belongs to, when it comes from one; a call from the inbox or a
+    /// kept answer belongs to none.
+    opening: Option<&'a str>,
     exchange: Duration,
     /// What the worker said of the answer it took, when it took one.
     taken: Mutex<Option<QuestionResolveResult>>,
 }
 
 impl<'a> Host<'a> {
-    fn new(links: &'a WorkerLinks, state: &'a AppState) -> Self {
+    fn new(links: &'a WorkerLinks, state: &'a AppState, opening: Option<&'a str>) -> Self {
         Self {
             links,
             state,
             route: Route::of(state),
+            opening,
             exchange: state.questions().exchange(),
             taken: Mutex::new(None),
         }
@@ -392,7 +397,7 @@ impl<'a> Host<'a> {
             // known to belong to it. With no daemon connection the worker's own descriptor says.
             Route::Local => match self.state.environment_id() {
                 Ok(environment_id) => Ok(environment_id),
-                Err(_) => Ok(self.link(session_id).await?.descriptor.environment_id),
+                Err(_) => Ok(self.link(session_id).await?.ids.environment_id),
             },
             Route::Paired { environment_id, .. } => Ok(*environment_id),
         }
@@ -405,8 +410,8 @@ impl<'a> Host<'a> {
     /// when the daemon's record agrees that the session ended; a worker that is restarting, that
     /// could not be reached or would not prove its key is a connection that ended. Nothing else is
     /// said, so a short failure never reads as the session having gone.
-    async fn link(&self, session_id: SessionId) -> std::result::Result<Arc<Link>, ClientError> {
-        match self.links.link(session_id).await {
+    async fn link(&self, session_id: SessionId) -> std::result::Result<Leased, ClientError> {
+        match self.links.link(self.state, session_id, self.opening).await {
             Ok(link) => Ok(link),
             Err(error) if error.code == ErrorCode::UnknownSession => {
                 match self.session_ended(session_id).await {
@@ -416,6 +421,20 @@ impl<'a> Host<'a> {
                     ))),
                     _ => Err(ClientError::ConnectionEnded),
                 }
+            }
+            // A screen's opening that is no longer the session's, or a share that has ended, is
+            // the application's own refusal and says so. Anything else that kept a link from
+            // being made is a connection that ended.
+            Err(error)
+                if matches!(
+                    error.code,
+                    ErrorCode::StaleSession | ErrorCode::PermissionDenied
+                ) =>
+            {
+                Err(ClientError::Host(ProtocolError::new(
+                    error.code,
+                    error.message,
+                )))
             }
             Err(_) => Err(ClientError::ConnectionEnded),
         }
@@ -430,7 +449,7 @@ impl<'a> Host<'a> {
         if let Err(error) = &answer
             && ends_the_link(error)
         {
-            self.links.forget(session_id, link);
+            self.links.forget(self.state, session_id, link);
         }
         answer
     }
@@ -441,22 +460,17 @@ impl QuestionHost for Host<'_> {
         &self,
         session_id: SessionId,
     ) -> std::result::Result<Vec<Question>, ClientError> {
-        match &self.route {
-            Route::Local => {
-                let link = self.link(session_id).await?;
-                let answer = self
-                    .within(<Session as QuestionHost>::questions(
-                        &link.session,
-                        session_id,
-                    ))
-                    .await;
-                self.settle(session_id, &link, answer)
-            }
-            Route::Paired { session, .. } => {
-                self.within(<Session as QuestionHost>::questions(session, session_id))
-                    .await
-            }
-        }
+        // On either route the questions are the session's worker's, read over the link held for
+        // the session: this machine's descriptor link, or the connection a paired host opened for
+        // the session.
+        let link = self.link(session_id).await?;
+        let answer = self
+            .within(<Session as QuestionHost>::questions(
+                &link.session,
+                session_id,
+            ))
+            .await;
+        self.settle(session_id, link.link(), answer)
     }
 
     async fn answer(
@@ -465,35 +479,24 @@ impl QuestionHost for Host<'_> {
         params: QuestionAnswerParams,
     ) -> std::result::Result<QuestionResolveResult, ClientError> {
         let session_id = params.session_id;
-        let answer = match &self.route {
-            Route::Local => {
-                let link = self.link(session_id).await?;
-                // An answer goes only to the host it was given to, and only to a worker whose
-                // reply this build can be sure to read.
-                if target.environment_id != link.descriptor.environment_id {
-                    return Err(ClientError::ConnectionEnded);
-                }
-                readable_by_this_build(link.build.as_ref(), session_id)?;
-                let answer = self
-                    .within(<Session as QuestionHost>::answer(
-                        &link.session,
-                        target,
-                        params,
-                    ))
-                    .await;
-                self.settle(session_id, &link, answer)
-            }
-            Route::Paired {
-                environment_id,
-                session,
-            } => {
-                if target.environment_id != *environment_id {
-                    return Err(ClientError::ConnectionEnded);
-                }
-                self.within(<Session as QuestionHost>::answer(session, target, params))
-                    .await
-            }
-        };
+        let link = self.link(session_id).await?;
+        // An answer goes only to the host it was given to.
+        if target.environment_id != link.ids.environment_id {
+            return Err(ClientError::ConnectionEnded);
+        }
+        // On this machine, only to a worker whose reply this build can be sure to read. A paired
+        // host's daemon forwards the answer and states no worker build.
+        if matches!(self.route, Route::Local) {
+            readable_by_this_build(link.build.as_ref(), session_id)?;
+        }
+        let answer = self
+            .within(<Session as QuestionHost>::answer(
+                &link.session,
+                target,
+                params,
+            ))
+            .await;
+        let answer = self.settle(session_id, link.link(), answer);
         if let Ok(resolved) = &answer {
             *self.taken.lock().unwrap_or_else(PoisonError::into_inner) = Some(resolved.clone());
         }
@@ -669,35 +672,28 @@ fn failure(error: AnswerError) -> CommandError {
 pub async fn read(
     state: &AppState,
     links: &WorkerLinks,
+    opening: Option<&str>,
     params: QuestionReadParams,
 ) -> Result<QuestionReadResult> {
-    let host = Host::new(links, state);
+    let host = Host::new(links, state, opening);
     let session_id = params.session_id;
-    let (result, target_for): (QuestionReadResult, TargetFor) = match &host.route {
+    let link = host.link(session_id).await.map_err(CommandError::from)?;
+    let answer = host
+        .within(link.session.read(Method::QuestionRead, &params))
+        .await;
+    let result: QuestionReadResult = host
+        .settle(session_id, link.link(), answer)
+        .map_err(CommandError::from)?;
+    // On this machine an answer goes on the session's own target. On a paired host the target is
+    // the session at the epoch the question carries, in the host's environment.
+    let target_for: TargetFor = match &host.route {
         Route::Local => {
-            let link = host.link(session_id).await.map_err(CommandError::from)?;
-            let answer = host
-                .within(link.session.read(Method::QuestionRead, &params))
-                .await;
-            let result: QuestionReadResult = host
-                .settle(session_id, &link, answer)
-                .map_err(CommandError::from)?;
             let target = target_of(&link);
-            (result, Box::new(move |_: &Question| target.clone()))
+            Box::new(move |_: &Question| target.clone())
         }
-        Route::Paired {
-            environment_id,
-            session,
-        } => {
-            let result: QuestionReadResult = host
-                .within(session.read(Method::QuestionRead, &params))
-                .await
-                .map_err(CommandError::from)?;
+        Route::Paired { environment_id, .. } => {
             let environment_id = *environment_id;
-            (
-                result,
-                Box::new(move |question: &Question| target_on(environment_id, question)),
-            )
+            Box::new(move |question: &Question| target_on(environment_id, question))
         }
     };
     state.questions().remember(
@@ -719,6 +715,7 @@ pub async fn read(
 pub async fn answer(
     state: &AppState,
     links: &WorkerLinks,
+    opening: Option<&str>,
     params: QuestionAnswerParams,
 ) -> Result<Answer> {
     let desk = state.questions();
@@ -738,7 +735,7 @@ pub async fn answer(
         ));
     }
     let store = desk.store(shown.target.environment_id).map_err(failure)?;
-    let host = Host::new(links, state);
+    let host = Host::new(links, state, opening);
     // An answer is named by its question and the time it was kept at, and that name is what a send
     // or a dismissal is held to. So a new answer to a question that already has one kept is kept
     // later than that one, whatever the clock says, and an older name never names a newer answer.
@@ -829,10 +826,11 @@ pub fn kept(state: &AppState) -> Kept {
 pub async fn settle(
     state: &AppState,
     links: &WorkerLinks,
+    opening: Option<&str>,
     params: &SettleParams,
 ) -> Result<Vec<Settled>> {
     let desk = state.questions();
-    let host = Host::new(links, state);
+    let host = Host::new(links, state, opening);
     let mine: Vec<AnswerDraft> = desk
         .kept()
         .answers
@@ -898,7 +896,12 @@ pub async fn settle(
 ///
 /// Returns why the answer was not sent: no such kept answer, a question that ended or moved, the
 /// host it was given to being out of reach, or the worker's refusal.
-pub async fn send(state: &AppState, links: &WorkerLinks, which: &KeptRef) -> Result<Answer> {
+pub async fn send(
+    state: &AppState,
+    links: &WorkerLinks,
+    opening: Option<&str>,
+    which: &KeptRef,
+) -> Result<Answer> {
     let desk = state.questions();
     let _turn = desk.turn().await?;
     let Some(draft) = desk.kept_for(which.question_id).map_err(failure)? else {
@@ -912,7 +915,7 @@ pub async fn send(state: &AppState, links: &WorkerLinks, which: &KeptRef) -> Res
             "the answer kept for that question has changed: read the kept answers again",
         ));
     }
-    let host = Host::new(links, state);
+    let host = Host::new(links, state, opening);
     let environment = host
         .environment(draft.session_id)
         .await
@@ -1026,13 +1029,7 @@ pub fn kept_in(data: &Path) -> PathBuf {
 /// The target a session's worker takes a question's answer on: the session at its epoch.
 #[must_use]
 pub(crate) fn target_of(link: &Link) -> ActionTarget {
-    ActionTarget {
-        environment_id: link.descriptor.environment_id,
-        session_id: Nullable::some(link.descriptor.session_id),
-        session_epoch: Nullable::some(link.descriptor.session_epoch),
-        application_instance_id: Nullable::null(),
-        agent_binding_revision: Nullable::null(),
-    }
+    link.target(None, None)
 }
 
 /// The target an answer to a question goes to, for each question a read listed.

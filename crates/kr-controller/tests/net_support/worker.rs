@@ -281,6 +281,11 @@ impl Worker {
     /// transport its operations leave on. The instance is the one the page finds in the session's
     /// snapshot.
     pub fn register_agent(&self, upstream: Arc<Upstream>) -> ApplicationInstanceId {
+        self.register_agent_on(upstream)
+    }
+
+    /// As [`Self::register_agent`], with any upstream a test gives.
+    pub fn register_agent_on(&self, upstream: Arc<dyn UpstreamDispatch>) -> ApplicationInstanceId {
         let instance = ApplicationInstanceId::new(Uuid::from_bytes([2; 16]));
         let broker = self.service.broker();
         let process = ProcessStartIdentity::new(41, ProcessStartSource::MacosProcBsdInfo, 900);
@@ -348,6 +353,149 @@ impl Worker {
                 refusal: Nullable::null(),
             });
         instance
+    }
+
+    /// Has the registered agent ask for one approval a decoder has given meaning to, with
+    /// `upstream` as the transport an answer would leave on, and returns the pending resource it
+    /// became.
+    ///
+    /// This is the native half of an approval: the qualified table, the authenticated connection,
+    /// the transport that carries an answer out, and one request offering a single decision,
+    /// `allow`.
+    pub fn offer_approval(
+        &self,
+        instance: ApplicationInstanceId,
+        upstream: Arc<dyn UpstreamDispatch>,
+    ) -> kr_protocol::ids::PendingResourceId {
+        use kr_protocol::gateway::{
+            DeclarativeEntry, DeclarativeTable, NativeFraming, NativeMethodClass, RichMethodEntry,
+            RichMethodTable, RichOperation,
+        };
+        use kr_protocol::ids::{GatewayConnectionId, MethodTableVersion, UpstreamMethod};
+
+        let broker = self.service.broker();
+        let plugin = PluginId::new("kalareach.codex").expect("valid");
+        let publisher = PublisherId::new("kalareach").expect("valid");
+        let digest = Digest256::from_bytes([5; 32]);
+        let permission = UpstreamMethod::new("session/request_permission").expect("valid");
+        broker
+            .bind_descriptor(
+                BrokerBindingId::new(Uuid::from_bytes([9; 16])),
+                instance,
+                plugin.clone(),
+                publisher.clone(),
+                digest,
+                BrokerGrants::granted([
+                    BrokerGrant::UpstreamAction,
+                    BrokerGrant::ApprovalInterpreter,
+                ]),
+                Some(kr_protocol::broker::DecodingTrust {
+                    plugin_id: plugin.clone(),
+                    publisher_id: publisher.clone(),
+                    package_digest: digest,
+                    methods: [permission.clone()].into_iter().collect(),
+                    schema_versions: ["kr-approval/1".to_owned()].into_iter().collect(),
+                    max_decisions: kr_protocol::scalars::U64::new(4),
+                    may_encode_response: true,
+                    granted_at: TimestampMs::new(1),
+                }),
+                TimestampMs::new(1),
+            )
+            .expect("the binding carries the interpreter grant");
+        broker
+            .record_capability(InstanceCapabilityRecord {
+                capability_id: CapabilityId::new("agent.approval").expect("valid"),
+                capability_version: "1".to_owned(),
+                application_instance_id: instance,
+                identity: InstanceCapabilityIdentity::default(),
+                revision: CapabilityRevision::new(1),
+                state: InstanceCapabilityState::QualifiedAvailable,
+                source: InstanceEvidenceSource::HostProbe,
+                invalidated_by: [InstanceInvalidation::BindingChanged].into_iter().collect(),
+                disabled_reason: Nullable::null(),
+                observed_at: TimestampMs::new(1),
+            })
+            .expect("the evidence is recorded");
+        let mut table = DeclarativeTable {
+            plugin_id: plugin.clone(),
+            publisher_id: publisher.clone(),
+            table_version: MethodTableVersion::new(1),
+            upstream_protocol_version: "1".to_owned(),
+            digest: Digest256::from_bytes([1; 32]),
+            framing: NativeFraming::JsonLines,
+            request_id_field: "id".to_owned(),
+            response_id_field: "id".to_owned(),
+            method_field: "method".to_owned(),
+            params_field: "params".to_owned(),
+            result_field: "result".to_owned(),
+            error_field: "error".to_owned(),
+            entries: vec![DeclarativeEntry {
+                method: permission.clone(),
+                class: NativeMethodClass::Mutation,
+                expects_response: true,
+                approval_option_field: Nullable::some("option_id".to_owned()),
+                reverse: Nullable::null(),
+            }],
+        };
+        table.digest = table.canonical_digest().expect("encodable");
+        broker
+            .pin_table(
+                instance,
+                kr_worker::broker::PackageIdentity {
+                    plugin_id: plugin.clone(),
+                    publisher_id: publisher,
+                    package_digest: digest,
+                },
+                table,
+                RichMethodTable {
+                    table_version: MethodTableVersion::new(1),
+                    upstream_protocol_version: "1".to_owned(),
+                    entries: vec![RichMethodEntry {
+                        method: UpstreamMethod::new("session/cancel").expect("valid"),
+                        class: NativeMethodClass::Mutation,
+                        required_right: kr_protocol::rights::ActionRight::AgentCancel,
+                        operation: Nullable::some(RichOperation::TurnCancel),
+                        provenance: ActionProvenance::UpstreamTypedRpc,
+                    }],
+                },
+            )
+            .expect("the installed tables are pinned");
+        broker
+            .open_native_connection(
+                instance,
+                &[9; 32],
+                &ProcessStartIdentity::new(41, ProcessStartSource::MacosProcBsdInfo, 900),
+                &plugin,
+                "1",
+            )
+            .expect("the native connection is authenticated");
+        broker.bind_connection_dispatch(GatewayConnectionId::new(1), upstream);
+        let opaque = broker
+            .forward_native(
+                GatewayConnectionId::new(1),
+                br#"{"id":11,"method":"session/request_permission"}"#,
+                TimestampMs::new(2),
+            )
+            .expect("forwarded")
+            .1
+            .expect("it expects a response");
+        broker
+            .interpret(
+                BrokerBindingId::new(Uuid::from_bytes([9; 16])),
+                opaque.resource_id,
+                kr_protocol::broker::DecodedProjection {
+                    schema_version: "kr-approval/1".to_owned(),
+                    summary: "the agent wants to write a file".to_owned(),
+                    decisions: vec![kr_protocol::broker::OfferedDecision {
+                        option_id: "allow".to_owned(),
+                        label: "Allow".to_owned(),
+                    }],
+                },
+                None,
+                TimestampMs::new(3),
+            )
+            .expect("interpreted")
+            .resource_id
     }
 
     /// The binding revision a registered agent is at.
@@ -521,4 +669,63 @@ pub async fn revoke(host: &Host, grant_id: kr_protocol::ids::GrantId) {
         .await
         .expect("the call reaches the daemon")
         .expect("the grant is revoked");
+}
+
+/// An upstream that takes every prompt and answers it only once it is released, so a prompt stays
+/// in flight for as long as a test needs it to.
+#[derive(Debug, Default)]
+pub struct HeldUpstream {
+    prompts: std::sync::Mutex<Vec<String>>,
+    released: Arc<tokio::sync::Notify>,
+    open: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl HeldUpstream {
+    /// The text of every prompt the broker handed over, in order.
+    pub fn prompts(&self) -> Vec<String> {
+        self.prompts
+            .lock()
+            .expect("the record is not poisoned")
+            .clone()
+    }
+
+    /// Answers every prompt held, and every one that follows.
+    pub fn release(&self) {
+        self.open.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.released.notify_waiters();
+    }
+}
+
+impl UpstreamDispatch for HeldUpstream {
+    fn admit(&self, _request: &UpstreamRequest) -> Result<(), BrokerError> {
+        Ok(())
+    }
+
+    fn submit(&self, request: &UpstreamRequest) -> Result<PendingTransmission, BrokerError> {
+        if let UpstreamBody::Prompt { text, .. } = &request.body {
+            self.prompts
+                .lock()
+                .expect("the record is not poisoned")
+                .push(text.clone().unwrap_or_default());
+        }
+        let outcome = UpstreamOutcome {
+            upstream_request_id: Some(UpstreamRequestId::new("upstream-1").expect("valid")),
+            turn_id: request.turn_id.clone(),
+            provenance: ActionProvenance::UpstreamTypedRpc,
+        };
+        let released = Arc::clone(&self.released);
+        let open = Arc::clone(&self.open);
+        Ok(PendingTransmission::carried(async move {
+            loop {
+                let waiting = released.notified();
+                tokio::pin!(waiting);
+                waiting.as_mut().enable();
+                if open.load(std::sync::atomic::Ordering::SeqCst) {
+                    break;
+                }
+                waiting.await;
+            }
+            Ok(outcome)
+        }))
+    }
 }

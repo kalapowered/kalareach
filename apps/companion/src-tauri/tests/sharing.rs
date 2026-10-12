@@ -35,12 +35,17 @@ use companion_tauri::sharing::Pace;
 use kr_client::Session;
 use kr_client::error::ClientError;
 use kr_client::ipc::IpcTransport;
+use kr_client::pairing::paired::PairedHost;
 use kr_client::transport::{ControlTransport, Reach, TransportFuture};
 use kr_crypto::keys::DeviceKeys;
 use kr_protocol::envelope::ControlFrame;
+use kr_protocol::grant::{EnvironmentSelector, GrantExpiry, HistoryScope, SessionSelector};
 use kr_protocol::hello::{ActionWindow, ReceiveLimits};
-use kr_protocol::ids::{ConnectionId, DeviceId, GrantId, InvitationId, RequestId, SessionId};
-use kr_protocol::scalars::Nullable;
+use kr_protocol::ids::{
+    ConnectionId, DeviceId, DeviceKeyRevision, GrantId, InvitationId, RequestId, SessionId,
+};
+use kr_protocol::pairing::{NetworkConfig, ProposedGrant};
+use kr_protocol::scalars::{CanonicalSet, Nullable};
 use kr_protocol::sharing::{
     AuthorityNotice, GrantCreateParams, GrantCreateResult, GrantHeldResult, GrantListParams,
     GrantListResult, GrantRedeemParams, GrantRedeemResult, GrantRevokeParams, GrantState,
@@ -191,6 +196,62 @@ async fn local_connection(host: &Host, faults: Option<&Arc<Faults>>) -> Connecti
     )
 }
 
+/// The record a paired device keeps of its host, for a connection these suites assemble by hand.
+/// They open no session of their own, so nothing but its shape is read.
+fn host_record(device_id: DeviceId) -> Box<PairedHost> {
+    let keys = DeviceKeys::generate().expect("keys").public_keys();
+    Box::new(PairedHost {
+        host_device_id: DeviceId::new(kr_ipc::new_uuid()),
+        host_key_revision: DeviceKeyRevision::new(1),
+        host_endpoint_id: keys.transport,
+        host_keys: keys,
+        network_config: NetworkConfig::empty(),
+        device_id,
+        grant_id: GrantId::new(kr_ipc::new_uuid()),
+        proposed_grant: ProposedGrant {
+            parent_grant_id: Nullable::null(),
+            environment_selector: EnvironmentSelector::Any,
+            session_selector: SessionSelector::Any,
+            actions: CanonicalSet::new(),
+            history: HistoryScope {
+                lower_bound_ms: Nullable::null(),
+                include_live_screen: true,
+                named_questions: CanonicalSet::new(),
+                named_approvals: CanonicalSet::new(),
+            },
+            expiry: GrantExpiry::Never,
+            organisation: Nullable::null(),
+        },
+        name: None,
+        paired_at_ms: 0,
+    })
+}
+
+/// Opens a paired connection for the host alone, as the application does when it connects to a host
+/// it is paired with: the host then serves its own reads and the sharing commands on it, and refuses
+/// it every decision under a share and every route to a session's worker.
+///
+/// A host that does not answer ends the test at the watchdog, and a refusal is the connection's
+/// failure, as it is for the application.
+async fn open_for_the_host(session: &Session) -> Result<(), companion_tauri::CommandError> {
+    tokio::time::timeout(
+        WATCHDOG,
+        session.read::<_, kr_protocol::session::SessionOpenResult>(
+            kr_protocol::method::Method::SessionOpen,
+            &kr_protocol::session::SessionOpenParams {
+                session_id: Nullable::null(),
+                grant_id: Nullable::null(),
+            },
+        ),
+    )
+    .await
+    .map_err(|_| {
+        companion_tauri::CommandError::unavailable("the host did not open the connection")
+    })?
+    .map(|_| ())
+    .map_err(companion_tauri::CommandError::from)
+}
+
 /// A connection of a paired device to the host it is paired with, as the application makes one.
 async fn paired_connection(
     host: &Host,
@@ -205,18 +266,26 @@ async fn paired_connection(
         None => shared,
     })
     .expect("a session");
+    open_for_the_host(&session)
+        .await
+        .expect("the host opens the connection for itself");
     let reopen: Reopen = Arc::new(move || {
         let dial = dial.clone();
         Box::pin(async move {
             let session = Session::start(Arc::new(dial.dial().await)).expect("a session");
+            open_for_the_host(&session).await?;
             Ok(Connection::assembled(
                 session,
                 // The environment of a connection that is only read from or repeated on is not
                 // asked of it.
                 kr_protocol::ids::EnvironmentId::new(kr_ipc::new_uuid()),
-                Standing::Paired {
-                    device_id: DeviceId::new(kr_ipc::new_uuid()),
-                    rights: Vec::new(),
+                {
+                    let device_id = DeviceId::new(kr_ipc::new_uuid());
+                    Standing::Paired {
+                        device_id,
+                        rights: Vec::new(),
+                        host: host_record(device_id),
+                    }
                 },
                 None,
                 None,
@@ -229,6 +298,7 @@ async fn paired_connection(
         Standing::Paired {
             device_id: record.device_id,
             rights: Vec::new(),
+            host: host_record(record.device_id),
         },
         None,
         Some(reopen),

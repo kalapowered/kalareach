@@ -27,11 +27,9 @@ mod support;
 use std::sync::Arc;
 use std::time::Duration;
 
-use kr_client::pairing::BoxFuture;
 use kr_client::pairing::candidate::CandidateRoom;
-use kr_client::pairing::owner::{Ceremony, CeremonyKind, CeremonyOutcome};
 use kr_crypto::keys::DeviceKeys;
-use kr_crypto::store::{MemoryStore, SecretStore};
+use kr_crypto::store::MemoryStore;
 use kr_protocol::invitation::{InviteEntry, InviteGrantKind};
 use kr_protocol::method::Method;
 use kr_protocol::rights::ActionRight;
@@ -39,97 +37,7 @@ use kr_protocol::sharing::{DeviceRevokeParams, RevocationResult};
 use net_support::pairing::{self as calls, Signer};
 use net_support::{Host, proposal};
 use serde_json::json;
-use support::{Companion, StubPaste, WATCHDOG};
-
-/// A ceremony nobody is asked: these devices own nothing.
-struct NoOwner;
-
-impl Ceremony for NoOwner {
-    fn kind(&self) -> CeremonyKind {
-        CeremonyKind::TouchId
-    }
-
-    fn verify<'a>(&'a self, _reason: &'a str, _within: Duration) -> BoxFuture<'a, CeremonyOutcome> {
-        Box::pin(async { CeremonyOutcome::NotConfirmed })
-    }
-}
-
-/// This computer as a phone: its backend, the pasteboard the person copies an invitation to, the
-/// secret store its keys live in and the directory its records live in.
-struct Phone {
-    companion: Companion,
-    paste: Arc<StubPaste>,
-    secrets: Arc<dyn SecretStore>,
-    room: Arc<dyn CandidateRoom>,
-    data: tempfile::TempDir,
-}
-
-/// A phone that has paired with nothing.
-fn unpaired_phone(host: &Host) -> Phone {
-    let data = tempfile::tempdir().expect("a directory");
-    let secrets: Arc<dyn SecretStore> = Arc::new(MemoryStore::new());
-    let room: Arc<dyn CandidateRoom> = Arc::new(host.room.clone());
-    let paste = StubPaste::holding("", false);
-    let companion = Companion::start(
-        data.path(),
-        support::parts(Arc::clone(&secrets), Arc::clone(&room)),
-        Arc::new(NoOwner),
-        Arc::clone(&paste) as Arc<dyn companion_tauri::pairing::PastePlatform>,
-    );
-    Phone {
-        companion,
-        paste,
-        secrets,
-        room,
-        data,
-    }
-}
-
-/// `phone` paired with `host` as a device holding `rights`, by a direct invitation the person
-/// pastes and the host's owner approves.
-async fn pair(phone: &Phone, host: &Host, owner: &DeviceKeys, rights: &[ActionRight]) {
-    let mut client = host.client().await;
-    let signer = Signer::OwnerDevice(owner);
-    let invited = calls::invite_direct(
-        host.environment_id,
-        &mut client,
-        InviteGrantKind::SessionInvitation,
-        &proposal(rights),
-        &signer,
-    )
-    .await
-    .expect("a direct invitation");
-    let InviteEntry::Direct { qr_text } = &invited.entry else {
-        panic!("a direct invitation");
-    };
-    phone.paste.copy(qr_text.as_str(), false);
-    let companion = &phone.companion;
-    companion
-        .call("pairing_paste", json!({}))
-        .expect("the invitation is read");
-    companion
-        .call("pairing_start_read", json!({}))
-        .expect("pairing starts");
-    companion
-        .reached(|state| state["state"] == "awaiting_approval")
-        .await;
-    calls::confirm_candidate(
-        host.environment_id,
-        &mut client,
-        invited.invitation_id,
-        &signer,
-    )
-    .await
-    .expect("the owner approves");
-    companion.reached(|state| state["state"] == "paired").await;
-}
-
-/// A phone paired with `host` as a device holding `rights`.
-async fn phone_paired_with(host: &Host, owner: &DeviceKeys, rights: &[ActionRight]) -> Phone {
-    let phone = unpaired_phone(host);
-    pair(&phone, host, owner, rights).await;
-    phone
-}
+use support::{Companion, NoOwner, StubPaste, WATCHDOG, pair, phone_paired_with};
 
 /// This computer paired with `host` as a device holding `rights`, and the data directory its
 /// records live in.

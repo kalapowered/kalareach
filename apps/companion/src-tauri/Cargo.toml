@@ -103,9 +103,10 @@ kr-ipc = { workspace = true, features = ["testing"] }
 kr-transport.workspace = true
 # The registry reader of the shared teardown module, which ends every worker a case's daemon started.
 rusqlite = { workspace = true, features = ["bundled"] }
-# A real session worker, with its question ledger and its admission of every caller, for the suite
-# that answers an agent's questions on one.
-kr-worker.workspace = true
+# A real session worker, with its question ledger, its broker and its admission of every caller, for
+# the suites that answer an agent's questions on one and that read and prompt an agent behind a
+# paired host.
+kr-worker = { workspace = true, features = ["testing"] }
 tempfile.workspace = true
 # Paused time, so the phone session's waits run in a test without taking that long, and the
 # pairing suite's multi-threaded runtime.

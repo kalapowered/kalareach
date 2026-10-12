@@ -727,7 +727,13 @@ pub async fn preview(
         history: params.selection.history(),
     };
     links
-        .read(params.session_id, Method::SessionScreenPreview, &typed)
+        .read(
+            state,
+            params.session_id,
+            None,
+            Method::SessionScreenPreview,
+            &typed,
+        )
         .await
 }
 

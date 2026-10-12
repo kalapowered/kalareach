@@ -14,6 +14,11 @@
 //! correlation, the action identifiers and the receipts on it, exactly as it does on the control
 //! daemon's connection. A link that fails is let go, and the next call opens another: a worker that
 //! restarted has published a new descriptor, and a session that has ended has none.
+//!
+//! A phone has no descriptor to read: a session of the host it is paired with is reached over a
+//! connection to that host, opened for the session under one grant ([`crate::standing`]). The
+//! calls are the same, and a command that names an opening goes over that opening's link. A
+//! mutation under a share names the share.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -21,18 +26,26 @@ use std::time::Duration;
 
 use kr_client::{ClientError, Session};
 use kr_ipc::paths::EnvironmentPaths;
+use kr_protocol::agent::AgentMutationTarget;
 use kr_protocol::envelope::ActionTarget;
 use kr_protocol::error::ErrorCode;
 use kr_protocol::gateway::PendingResource;
-use kr_protocol::ids::{AgentBindingRevision, ApplicationInstanceId, SessionId};
+use kr_protocol::ids::{
+    AgentBindingRevision, ApplicationInstanceId, EnvironmentId, GrantId, SessionEpoch, SessionId,
+};
+use kr_protocol::local::LocalBuild;
 use kr_protocol::method::Method;
 use kr_protocol::projection::{AgentInstanceList, AgentResourceSnapshotContinuation};
-use kr_protocol::recovery::{EventsSnapshotParams, EventsSnapshotResult};
+use kr_protocol::recovery::{
+    AgentInstancesParams, AgentInstancesResult, EventsSnapshotParams, EventsSnapshotResult,
+};
 use kr_protocol::scalars::Nullable;
 use kr_protocol::worker::WorkerDescriptor;
 use serde::Serialize;
 
 use crate::error::{CommandError, Result};
+use crate::standing::{Flight, Leased};
+use crate::state::AppState;
 use crate::terminal::Locate;
 use crate::worker::Unreached;
 
@@ -55,9 +68,69 @@ const MAX_RESOURCE_RESTARTS: usize = 2;
 /// One session's link, and the worker it reaches.
 pub(crate) struct Link {
     pub(crate) session: Session,
-    pub(crate) descriptor: WorkerDescriptor,
+    /// The environment, the session and its epoch: what a mutation on this link is about.
+    pub(crate) ids: crate::standing::LinkIds,
+    /// The share a link opened on a paired host acts under, which every mutation on it names. None
+    /// for a link to a worker on this machine and for one that acts under the device's pairing.
+    pub(crate) grant_id: Option<GrantId>,
     /// The build the worker stated when the link was made, when it stated one.
     pub(crate) build: Option<kr_protocol::local::LocalBuild>,
+    /// The mutations in flight on this link.
+    pub(crate) flight: Flight,
+}
+
+impl Link {
+    /// A link to a worker on this machine, which proved the descriptor's key.
+    fn local(session: Session, descriptor: &WorkerDescriptor, build: Option<LocalBuild>) -> Self {
+        Self {
+            session,
+            ids: crate::standing::LinkIds {
+                environment_id: descriptor.environment_id,
+                session_id: descriptor.session_id,
+                session_epoch: descriptor.session_epoch,
+            },
+            grant_id: None,
+            build,
+            flight: Flight::default(),
+        }
+    }
+
+    /// A link to a session of a host this device is paired with, opened under `grant_id` when that
+    /// is a share.
+    pub(crate) fn paired(
+        session: Session,
+        environment_id: EnvironmentId,
+        session_id: SessionId,
+        session_epoch: SessionEpoch,
+        grant_id: Option<GrantId>,
+    ) -> Self {
+        Self {
+            session,
+            ids: crate::standing::LinkIds {
+                environment_id,
+                session_id,
+                session_epoch,
+            },
+            grant_id,
+            build: None,
+            flight: Flight::default(),
+        }
+    }
+
+    /// The target of a mutation on this link about `instance` at the binding revision `binding`.
+    pub(crate) fn target(
+        &self,
+        instance: Option<ApplicationInstanceId>,
+        binding: Option<AgentBindingRevision>,
+    ) -> ActionTarget {
+        ActionTarget {
+            environment_id: self.ids.environment_id,
+            session_id: Nullable::some(self.ids.session_id),
+            session_epoch: Nullable::some(self.ids.session_epoch),
+            application_instance_id: Nullable(instance),
+            agent_binding_revision: Nullable(binding),
+        }
+    }
 }
 
 /// The place one session's link is held, which the calls for that session take turns with while
@@ -101,25 +174,37 @@ impl WorkerLinks {
 
     /// Calls a read method on `session_id`'s worker.
     ///
+    /// `opening` is the token of the session screen the call belongs to; on a host this device is
+    /// paired with it names the link the call goes over, and a call with none goes over the
+    /// session's ambient link. On this machine's own host it is not used.
+    ///
     /// # Errors
     ///
     /// Returns why the worker could not be reached, or the worker's own refusal.
-    pub async fn read<P, R>(&self, session_id: SessionId, method: Method, params: &P) -> Result<R>
+    pub async fn read<P, R>(
+        &self,
+        state: &AppState,
+        session_id: SessionId,
+        opening: Option<&str>,
+        method: Method,
+        params: &P,
+    ) -> Result<R>
     where
         P: Serialize + ?Sized,
         R: kr_protocol::wire::WireMessage,
     {
-        let link = self.link(session_id).await?;
+        let link = self.link(state, session_id, opening).await?;
         let answer = link.session.read(method, params).await;
-        self.settle(session_id, &link, answer)
+        self.settle(state, session_id, link.link(), answer)
     }
 
-    /// Submits one agent mutation to `session_id`'s worker, about `instance` at the binding
-    /// revision `binding`, and waits for the worker to settle it.
+    /// Submits one agent mutation to the worker of the session `about` names, about its instance at
+    /// the binding revision it names, and waits for the worker to settle it.
     ///
     /// The target is the worker's own: its environment, its session at its epoch, and the instance
     /// and revision the parameters name. The page supplies the parameters and nothing about the
-    /// envelope, so the two can never name different things.
+    /// envelope, so the two can never name different things. A mutation on a link opened under a
+    /// share names the share.
     ///
     /// # Errors
     ///
@@ -127,41 +212,54 @@ impl WorkerLinks {
     /// submission, [`ClientError::SubmissionUncertain`] among it.
     pub async fn mutate<P>(
         &self,
-        session_id: SessionId,
-        instance: ApplicationInstanceId,
-        binding: AgentBindingRevision,
+        state: &AppState,
+        opening: Option<&str>,
+        about: AgentMutationTarget,
         method: Method,
         params: &P,
     ) -> Result<std::result::Result<kr_client::Settled, ClientError>>
     where
         P: Serialize + ?Sized,
     {
-        let link = self.link(session_id).await?;
-        let target = ActionTarget {
-            environment_id: link.descriptor.environment_id,
-            session_id: Nullable::some(link.descriptor.session_id),
-            session_epoch: Nullable::some(link.descriptor.session_epoch),
-            application_instance_id: Nullable::some(instance),
-            agent_binding_revision: Nullable::some(binding),
-        };
+        let session_id = about.subject.session_id;
+        let link = self.link(state, session_id, opening).await?;
+        let target = link.target(
+            Some(about.subject.application_instance_id),
+            Some(about.binding_revision),
+        );
         target
             .validate()
             .map_err(|error| CommandError::invalid(error.to_string()))?;
-        let answer = link
-            .session
+        let answer = self.submit(link.link(), method, target, params).await;
+        if answer.as_ref().is_err_and(ends_the_link) {
+            self.forget(state, session_id, link.link());
+        }
+        Ok(answer)
+    }
+
+    /// Submits one mutation on `link`, counted in flight until the worker has answered, naming the
+    /// share the link acts under.
+    pub(crate) async fn submit<P>(
+        &self,
+        link: &Arc<Link>,
+        method: Method,
+        target: ActionTarget,
+        params: &P,
+    ) -> std::result::Result<kr_client::Settled, ClientError>
+    where
+        P: Serialize + ?Sized,
+    {
+        let _flying = Flight::enter(link);
+        link.session
             .mutate(
                 method,
                 target,
-                None,
+                link.grant_id,
                 &crate::commands::NoPreconditions {},
                 params,
                 crate::commands::MUTATION_TTL,
             )
-            .await;
-        if answer.as_ref().is_err_and(ends_the_link) {
-            self.forget(session_id, &link);
-        }
-        Ok(answer)
+            .await
     }
 
     /// Reads `session_id`'s live agent instances and every resource its broker is arbitrating.
@@ -170,36 +268,89 @@ impl WorkerLinks {
     /// answered, so the answer is one state rather than parts of two. A snapshot the host let go
     /// part way through is started again.
     ///
+    /// On this machine the snapshot is `events.snapshot` on the worker. On a host this device is
+    /// paired with it is `agent.instances`, which carries no screen and so is served to a share
+    /// that does not include the live screen; a worker of an earlier build does not serve it, and
+    /// where the grant includes the screen the snapshot is read instead.
+    ///
     /// # Errors
     ///
     /// Returns why the worker could not be reached, or the worker's own refusal.
-    pub async fn agents(&self, session_id: SessionId) -> Result<SessionAgents> {
+    pub async fn agents(
+        &self,
+        state: &AppState,
+        session_id: SessionId,
+        opening: Option<&str>,
+    ) -> Result<SessionAgents> {
+        let paired = state.paired_context().is_some();
         let mut restarts = 0;
+        // Whether a page of the instances read was refused for an earlier worker, in which case
+        // the snapshot is what is read.
+        let mut snapshot_instead = !paired;
+        let mut fell_back = false;
         'snapshot: loop {
             let mut instances = None;
             let mut resources = Vec::new();
             let mut from = None;
             for _ in 0..MAX_RESOURCE_PAGES {
-                let params = EventsSnapshotParams {
-                    session_id,
-                    agent_resources_from: Nullable(from),
-                };
-                let link = self.link(session_id).await?;
-                let answer: std::result::Result<EventsSnapshotResult, ClientError> =
-                    link.session.read(Method::EventsSnapshot, &params).await;
-                let page = match answer {
+                let link = self.link(state, session_id, opening).await?;
+                let answer: std::result::Result<(AgentInstanceList, _), ClientError> =
+                    if snapshot_instead {
+                        let params = EventsSnapshotParams {
+                            session_id,
+                            agent_resources_from: Nullable(from.clone()),
+                        };
+                        link.session
+                            .read::<_, EventsSnapshotResult>(Method::EventsSnapshot, &params)
+                            .await
+                            .map(|page| (page.agent_instances, page.agent_resources))
+                    } else {
+                        let params = AgentInstancesParams {
+                            session_id,
+                            agent_resources_from: Nullable(from.clone()),
+                        };
+                        link.session
+                            .read::<_, AgentInstancesResult>(Method::AgentInstances, &params)
+                            .await
+                            .map(|page| (page.agent_instances, page.agent_resources))
+                    };
+                let (page_instances, page_resources) = match answer {
                     Err(error)
                         if lets_the_snapshot_go(&error) && restarts < MAX_RESOURCE_RESTARTS =>
                     {
                         restarts += 1;
                         continue 'snapshot;
                     }
-                    other => self.settle(session_id, &link, other)?,
+                    // A worker built before the read existed. Where the grant includes the screen
+                    // the snapshot has the same members; otherwise the person is told.
+                    Err(ClientError::Host(refusal))
+                        if !snapshot_instead
+                            && refusal.code == ErrorCode::UnsupportedCapability =>
+                    {
+                        // Removed once no running worker predates the `agent.instances/1` capability.
+                        snapshot_instead = true;
+                        fell_back = true;
+                        continue 'snapshot;
+                    }
+                    // The snapshot also carries the screen, which a share without it is refused:
+                    // that share can read a conversation only from a worker that serves the
+                    // agents alone.
+                    Err(ClientError::Host(refusal))
+                        if fell_back && refusal.code == ErrorCode::PermissionDenied =>
+                    {
+                        return Err(CommandError::stated(
+                            ErrorCode::UnsupportedCapability,
+                            "This session's worker is of an earlier build than its host, and this \
+                             share does not include the live screen. Update the session to read \
+                             its conversation.",
+                        ));
+                    }
+                    other => self.settle(state, session_id, link.link(), other)?,
                 };
-                // The instances are the snapshot's own, read with its first page.
-                let listed = instances.get_or_insert(page.agent_instances);
-                resources.extend(page.agent_resources.resources);
-                match page.agent_resources.continue_after.0 {
+                // The instances are the read's own, taken with its first page.
+                let listed = instances.get_or_insert(page_instances);
+                resources.extend(page_resources.resources);
+                match page_resources.continue_after.0 {
                     None => {
                         return Ok(SessionAgents {
                             instances: listed.clone(),
@@ -208,7 +359,7 @@ impl WorkerLinks {
                     }
                     Some(after_resource_id) => {
                         from = Some(AgentResourceSnapshotContinuation {
-                            snapshot_id: page.agent_resources.snapshot_id,
+                            snapshot_id: page_resources.snapshot_id,
                             after_resource_id,
                         });
                     }
@@ -231,7 +382,7 @@ impl WorkerLinks {
         crate::worker::publishes(&paths, session_id).map_err(CommandError::unavailable)
     }
 
-    /// How many sessions this application holds a link to.
+    /// How many sessions this application holds a link to on this machine.
     #[must_use]
     pub fn held(&self) -> usize {
         self.lock()
@@ -241,7 +392,35 @@ impl WorkerLinks {
     }
 
     /// The link to `session_id`'s worker: the one held, or a new one.
-    pub(crate) async fn link(&self, session_id: SessionId) -> Result<Arc<Link>> {
+    ///
+    /// On this machine's own host that is the link over the worker's descriptor. On a host this
+    /// device is paired with it is the link of the opening the call names, which is refused when
+    /// it is no longer the session's, or, for a call that names none, the session's ambient link.
+    pub(crate) async fn link(
+        &self,
+        state: &AppState,
+        session_id: SessionId,
+        opening: Option<&str>,
+    ) -> Result<Leased> {
+        if let Some(context) = state.paired_context() {
+            return match opening {
+                Some(opening) => state.paired_links().opened_link(session_id, opening),
+                None => {
+                    state
+                        .paired_links()
+                        .ambient_link(
+                            &crate::standing::Dial::new(context.device, context.host),
+                            session_id,
+                        )
+                        .await
+                }
+            };
+        }
+        self.local_link(session_id).await.map(Leased::of)
+    }
+
+    /// The link to `session_id`'s worker on this machine: the one held, or a new one.
+    async fn local_link(&self, session_id: SessionId) -> Result<Arc<Link>> {
         let slot = Arc::clone(self.lock().entry(session_id).or_default());
         let mut held = slot.lock().await;
         if let Some(link) = held.as_ref() {
@@ -259,11 +438,7 @@ impl WorkerLinks {
             })?;
         let transport = kr_client::ipc::IpcTransport::over(reached.client);
         let session = Session::start(transport.shared())?;
-        let link = Arc::new(Link {
-            session,
-            descriptor: reached.descriptor,
-            build: reached.build,
-        });
+        let link = Arc::new(Link::local(session, &reached.descriptor, reached.build));
         *held = Some(Arc::clone(&link));
         Ok(link)
     }
@@ -272,13 +447,14 @@ impl WorkerLinks {
     /// has ended.
     pub(crate) fn settle<T>(
         &self,
+        state: &AppState,
         session_id: SessionId,
         link: &Arc<Link>,
         answer: std::result::Result<T, ClientError>,
     ) -> Result<T> {
         answer.map_err(|error| {
             if ends_the_link(&error) {
-                self.forget(session_id, link);
+                self.forget(state, session_id, link);
             }
             CommandError::from(error)
         })
@@ -286,7 +462,16 @@ impl WorkerLinks {
 
     /// Lets `link` go, if it is still the one held for `session_id`: a call that failed on an old
     /// link does not take a new one away.
-    pub(crate) fn forget(&self, session_id: SessionId, link: &Arc<Link>) {
+    ///
+    /// A link opened for a session screen is not let go here. Its connection ending is what its
+    /// watch reaches the host again for, and closing it says so.
+    pub(crate) fn forget(&self, state: &AppState, session_id: SessionId, link: &Arc<Link>) {
+        if state.paired_context().is_some() {
+            state.paired_links().forget_ambient(session_id, link);
+            // Closing says the connection is over to whatever watches it.
+            link.session.close();
+            return;
+        }
         let Some(slot) = self.lock().get(&session_id).cloned() else {
             return;
         };

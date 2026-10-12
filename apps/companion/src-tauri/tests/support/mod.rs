@@ -20,7 +20,13 @@ use kr_crypto::keys::DeviceKeys;
 use kr_crypto::store::{MemoryStore, SecretStore, store_device_keys};
 use kr_protocol::ids::DeviceKeyRevision;
 
-use crate::net_support::Host;
+use crate::net_support::pairing::{self as calls, Signer};
+use crate::net_support::{Host, proposal};
+use kr_client::pairing::BoxFuture;
+use kr_client::pairing::owner::{Ceremony, CeremonyKind, CeremonyOutcome};
+use kr_protocol::invitation::{InviteEntry, InviteGrantKind};
+use kr_protocol::rights::ActionRight;
+use serde_json::json;
 
 /// How long a test waits for a step before it fails as stuck.
 pub const WATCHDOG: Duration = Duration::from_secs(60);
@@ -406,6 +412,8 @@ pub struct Companion {
     pub heard: Arc<Capture>,
     /// Each command's answer or refusal, as the page received it.
     pub answered: Arc<Capture>,
+    /// Each change of an opened session's standing, as its event reached the page.
+    pub standing: Arc<Capture>,
 }
 
 impl Companion {
@@ -440,6 +448,32 @@ impl Companion {
                 companion_tauri::commands::hosts_forget,
                 companion_tauri::commands::connection_state,
                 companion_tauri::commands::session_list,
+                companion_tauri::commands::session_read,
+                companion_tauri::commands::session_describe,
+                companion_tauri::commands::session_close,
+                companion_tauri::commands::session_open,
+                companion_tauri::commands::session_leave,
+                companion_tauri::commands::session_agents,
+                companion_tauri::commands::agent_capabilities,
+                companion_tauri::commands::agent_snapshot,
+                companion_tauri::commands::agent_commands,
+                companion_tauri::commands::agent_approval_inspect,
+                companion_tauri::commands::agent_prompt_submit,
+                companion_tauri::commands::agent_prompt_queue,
+                companion_tauri::commands::agent_turn_steer,
+                companion_tauri::commands::agent_turn_cancel,
+                companion_tauri::commands::agent_approval_respond,
+                companion_tauri::commands::action_read,
+                companion_tauri::commands::action_cancel,
+                companion_tauri::commands::history_page,
+                companion_tauri::commands::question_settle,
+                companion_tauri::commands::question_send_kept,
+                companion_tauri::commands::shell_launch,
+                companion_tauri::commands::draft_create,
+                companion_tauri::commands::host_info,
+                companion_tauri::commands::attention_read,
+                companion_tauri::commands::review_read,
+                companion_tauri::commands::changeset_read,
                 companion_tauri::commands::device_list,
                 companion_tauri::commands::voice_prepare,
                 companion_tauri::commands::voice_allow,
@@ -458,6 +492,16 @@ impl Companion {
             let heard = Arc::clone(&heard);
             app.listen_any(event, move |published| heard.keep_text(published.payload()));
         }
+        let standing = Arc::new(Capture::default());
+        {
+            let standing = Arc::clone(&standing);
+            app.listen_any(
+                companion_tauri::standing::STANDING_EVENT,
+                move |published| {
+                    standing.keep_text(published.payload());
+                },
+            );
+        }
         companion_tauri::start_pairing(app.handle(), data, parts, ceremony, paste)
             .expect("this computer opens as a device that pairs");
         Self {
@@ -465,6 +509,7 @@ impl Companion {
             window,
             heard,
             answered: Arc::new(Capture::default()),
+            standing,
         }
     }
 
@@ -526,6 +571,35 @@ impl Companion {
         }
     }
 
+    /// Starts `command` as `call` makes it, and returns at once with what will answer: the call
+    /// goes on while the test does something else, as a page's call does.
+    pub fn start_call(
+        &self,
+        command: &str,
+        body: serde_json::Value,
+    ) -> tokio::task::JoinHandle<Result<serde_json::Value, serde_json::Value>> {
+        let window = self.window.clone();
+        let command = command.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let answered = tauri::test::get_ipc_response(
+                &window,
+                tauri::webview::InvokeRequest {
+                    cmd: command,
+                    callback: tauri::ipc::CallbackFn(0),
+                    error: tauri::ipc::CallbackFn(1),
+                    url: BUNDLE.parse().expect("the bundle's address"),
+                    body: tauri::ipc::InvokeBody::Json(body),
+                    headers: Default::default(),
+                    invoke_key: tauri::test::INVOKE_KEY.to_owned(),
+                },
+            );
+            match answered {
+                Ok(answer) => Ok(answer.deserialize().expect("an answer the page can read")),
+                Err(refusal) => Err(refusal),
+            }
+        })
+    }
+
     /// Asks for the pairing screen's state until `until` accepts it, as the page would read it.
     pub async fn reached(&self, until: impl Fn(&serde_json::Value) -> bool) -> serde_json::Value {
         tokio::time::timeout(WATCHDOG, async {
@@ -573,4 +647,105 @@ pub fn parts(secrets: Arc<dyn SecretStore>, room: Arc<dyn CandidateRoom>) -> Par
         bind: Some(loopback()),
         clock: Arc::new(DeviceClock::current().expect("a clock")),
     }
+}
+
+/// A ceremony nobody is asked: these devices own nothing.
+pub struct NoOwner;
+
+impl Ceremony for NoOwner {
+    fn kind(&self) -> CeremonyKind {
+        CeremonyKind::TouchId
+    }
+
+    fn verify<'a>(&'a self, _reason: &'a str, _within: Duration) -> BoxFuture<'a, CeremonyOutcome> {
+        Box::pin(async { CeremonyOutcome::NotConfirmed })
+    }
+}
+
+/// This computer as a phone: its backend, the pasteboard the person copies an invitation to, the
+/// secret store its keys live in and the directory its records live in.
+pub struct Phone {
+    pub companion: Companion,
+    pub paste: Arc<StubPaste>,
+    pub secrets: Arc<dyn SecretStore>,
+    pub room: Arc<dyn CandidateRoom>,
+    pub data: tempfile::TempDir,
+}
+
+/// A phone that has paired with nothing.
+pub fn unpaired_phone(host: &Host) -> Phone {
+    let data = tempfile::tempdir().expect("a directory");
+    let secrets: Arc<dyn SecretStore> = Arc::new(MemoryStore::new());
+    let room: Arc<dyn CandidateRoom> = Arc::new(host.room.clone());
+    let paste = StubPaste::holding("", false);
+    let companion = Companion::start(
+        data.path(),
+        parts(Arc::clone(&secrets), Arc::clone(&room)),
+        Arc::new(NoOwner),
+        Arc::clone(&paste) as Arc<dyn companion_tauri::pairing::PastePlatform>,
+    );
+    Phone {
+        companion,
+        paste,
+        secrets,
+        room,
+        data,
+    }
+}
+
+/// `phone` paired with `host` as a device holding `rights`, by a direct invitation the person
+/// pastes and the host's owner approves.
+pub async fn pair(phone: &Phone, host: &Host, owner: &DeviceKeys, rights: &[ActionRight]) {
+    pair_under(phone, host, owner, proposal(rights)).await;
+}
+
+/// `phone` paired with `host` under the grant `proposed`, by a direct invitation the person pastes
+/// and the host's owner approves.
+pub async fn pair_under(
+    phone: &Phone,
+    host: &Host,
+    owner: &DeviceKeys,
+    proposed: kr_protocol::pairing::ProposedGrant,
+) {
+    let mut client = host.client().await;
+    let signer = Signer::OwnerDevice(owner);
+    let invited = calls::invite_direct(
+        host.environment_id,
+        &mut client,
+        InviteGrantKind::SessionInvitation,
+        &proposed,
+        &signer,
+    )
+    .await
+    .expect("a direct invitation");
+    let InviteEntry::Direct { qr_text } = &invited.entry else {
+        panic!("a direct invitation");
+    };
+    phone.paste.copy(qr_text.as_str(), false);
+    let companion = &phone.companion;
+    companion
+        .call("pairing_paste", json!({}))
+        .expect("the invitation is read");
+    companion
+        .call("pairing_start_read", json!({}))
+        .expect("pairing starts");
+    companion
+        .reached(|state| state["state"] == "awaiting_approval")
+        .await;
+    calls::confirm_candidate(
+        host.environment_id,
+        &mut client,
+        invited.invitation_id,
+        &signer,
+    )
+    .await
+    .expect("the owner approves");
+    companion.reached(|state| state["state"] == "paired").await;
+}
+
+/// A phone paired with `host` as a device holding `rights`.
+pub async fn phone_paired_with(host: &Host, owner: &DeviceKeys, rights: &[ActionRight]) -> Phone {
+    let phone = unpaired_phone(host);
+    pair(&phone, host, owner, rights).await;
+    phone
 }

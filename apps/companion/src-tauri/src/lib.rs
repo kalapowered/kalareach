@@ -40,6 +40,7 @@ pub mod questions;
 pub mod remote;
 pub mod setup;
 pub mod sharing;
+pub mod standing;
 pub mod state;
 pub mod target;
 pub mod terminal;

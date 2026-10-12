@@ -48,6 +48,11 @@ pub const NAMED_COMMANDS: &[(&str, Option<Method>)] = &[
     ("session_read", Some(Method::SessionRead)),
     ("session_create", Some(Method::SessionCreate)),
     ("session_close", Some(Method::SessionClose)),
+    // A session screen on a host this device is paired with: the host opens the session on a
+    // connection of its own, under the grant the screen runs under, and says what it allows. The
+    // page chooses the opening and passes it with every command about the session.
+    ("session_open", None),
+    ("session_leave", None),
     // What a session is called and doing, for the rows that list sessions: an authorised read of
     // filtered metadata, which takes a session and nothing else.
     ("session_describe", Some(Method::SessionDescribe)),
@@ -270,10 +275,17 @@ pub const NATIVE_METHODS: &[(&str, &[Method])] = &[
             Method::GrantHeld,
         ],
     ),
+    // The host opens a session for a screen and says what the grant it runs under allows. The
+    // page names the session, the share when it holds one, and the opening it chose.
+    ("session_open", &[Method::SessionOpen]),
     // The page names a session; native code reads the snapshot of its agent instances and of every
     // request its broker is arbitrating, following the pages of that one snapshot, on the
-    // session's own worker.
-    ("session_agents", &[Method::EventsSnapshot]),
+    // session's own worker. On a paired host the worker's agents alone are read, which a share
+    // without the live screen is served.
+    (
+        "session_agents",
+        &[Method::EventsSnapshot, Method::AgentInstances],
+    ),
     // A kept answer is settled, sent and dismissed on this device: settling reads the session's
     // questions and, for a session the worker no longer serves, the daemon's record of it; sending
     // reads them again first and then answers. The page names a question, never a method.
@@ -305,6 +317,8 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'static
         session_read,
         session_create,
         session_close,
+        session_open,
+        session_leave,
         session_describe,
         description_setup,
         description_configure,
@@ -590,6 +604,81 @@ macro_rules! mutate_result_command {
     };
 }
 
+/// Opens a session for a screen on a host this device is paired with, and says what the grant it
+/// runs under allows. On the host on this machine it holds every right and opens nothing.
+///
+/// The page names the session, the share when it holds one, and the opening it chose.
+#[tauri::command]
+pub async fn session_open<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    state: State<'_, AppState>,
+    session_id: String,
+    grant_id: Option<String>,
+    opening: String,
+) -> Result<crate::standing::SessionStanding> {
+    crate::standing::open_session(&app, &state, &session_id, grant_id.as_deref(), &opening).await
+}
+
+/// Leaves a screen's opening of a session: its commands are refused from now on, and its link
+/// closes once the mutations in flight on it have answered.
+#[tauri::command]
+pub fn session_leave(
+    state: State<'_, AppState>,
+    session_id: String,
+    opening: String,
+) -> Result<()> {
+    crate::standing::leave_session(&state, &session_id, &opening)
+}
+
+/// Declares a command that performs one mutation about a session.
+///
+/// On the host on this machine it goes over the connection every other command uses. On a host
+/// this device is paired with, the host serves it only on the connection opened for the session,
+/// so it goes over the link of the opening the page names, and a call that names none is refused.
+macro_rules! session_mutate_command {
+    ($(#[$meta:meta])* $name:ident, $method:expr, $params:ty) => {
+        $(#[$meta])*
+        #[tauri::command]
+        pub async fn $name(
+            state: State<'_, AppState>,
+            links: State<'_, crate::agent::WorkerLinks>,
+            subject: Subject,
+            params: Value,
+            opening: Option<String>,
+        ) -> Result<Settled> {
+            let typed: $params = decode(params)?;
+            if state.paired_context().is_none() {
+                let target = subject.target(state.environment_id()?)?;
+                let session = state.session()?;
+                return submitted(
+                    session
+                        .mutate($method, target, None, &NoPreconditions {}, &typed, MUTATION_TTL)
+                        .await,
+                );
+            }
+            let session_id: kr_protocol::ids::SessionId = subject
+                .session_id
+                .as_deref()
+                .ok_or_else(|| CommandError::invalid("this is about a session, and names none"))?
+                .parse()
+                .map_err(|_| CommandError::invalid("that is not a session identifier"))?;
+            let Some(opening) = opening.as_deref() else {
+                return Err(CommandError::invalid(
+                    "over a host this device is paired with, this is asked from the session's \
+                     own screen",
+                ));
+            };
+            let link = links.link(&state, session_id, Some(opening)).await?;
+            let target = subject.target(link.ids.environment_id)?;
+            let answer = links.submit(link.link(), $method, target, &typed).await;
+            if answer.as_ref().is_err_and(crate::agent::ends_the_link) {
+                links.forget(&state, session_id, link.link());
+            }
+            submitted(answer)
+        }
+    };
+}
+
 /// Declares a command that performs one read on the session's own worker.
 ///
 /// The parameters name the session and the exact agent instance, and the read goes to that
@@ -599,12 +688,20 @@ macro_rules! agent_read_command {
         $(#[$meta])*
         #[tauri::command]
         pub async fn $name(
+            state: State<'_, AppState>,
             links: State<'_, crate::agent::WorkerLinks>,
             params: Value,
+            opening: Option<String>,
         ) -> Result<Value> {
             let typed: $params = decode(params)?;
             let answer: $result = links
-                .read(typed.subject.session_id, $method, &typed)
+                .read(
+                    &state,
+                    typed.subject.session_id,
+                    opening.as_deref(),
+                    $method,
+                    &typed,
+                )
                 .await?;
             encode(&answer)
         }
@@ -621,8 +718,10 @@ macro_rules! agent_mutate_command {
         $(#[$meta])*
         #[tauri::command]
         pub async fn $name(
+            state: State<'_, AppState>,
             links: State<'_, crate::agent::WorkerLinks>,
             params: Value,
+            opening: Option<String>,
         ) -> Result<Settled> {
             let typed: $params = decode(params)?;
             let check: fn(&$params) -> std::result::Result<(), &'static str> = $check;
@@ -630,13 +729,7 @@ macro_rules! agent_mutate_command {
             let target = typed.target;
             submitted(
                 links
-                    .mutate(
-                        target.subject.session_id,
-                        target.subject.application_instance_id,
-                        target.binding_revision,
-                        $method,
-                        &typed,
-                    )
+                    .mutate(&state, opening.as_deref(), target, $method, &typed)
                     .await?,
             )
         }
@@ -658,26 +751,34 @@ macro_rules! agent_prompt_command {
             state: State<'_, AppState>,
             links: State<'_, crate::agent::WorkerLinks>,
             params: Value,
+            opening: Option<String>,
         ) -> Result<Settled> {
             let typed: kr_protocol::agent::AgentPromptParams = decode(params)?;
             typed.validate().map_err(CommandError::invalid)?;
             let target = typed.target;
             if typed.draft_id.is_present() {
+                not_on_a_paired_host(&state, "a prompt that names a draft")?;
                 return send_draft_prompt(&state, $method, &typed).await;
             }
             submitted(
                 links
-                    .mutate(
-                        target.subject.session_id,
-                        target.subject.application_instance_id,
-                        target.binding_revision,
-                        $method,
-                        &typed,
-                    )
+                    .mutate(&state, opening.as_deref(), target, $method, &typed)
                     .await?,
             )
         }
     };
+}
+
+/// Refuses what a device paired with a host cannot do: the host serves no file to it, so it keeps
+/// no draft with an attachment there, and a command that reaches the host's desktop or its files
+/// is not made from here.
+fn not_on_a_paired_host(state: &AppState, what: &str) -> Result<()> {
+    if state.paired_context().is_some() {
+        return Err(CommandError::unsupported(format!(
+            "{what} is not offered over a host this device is paired with"
+        )));
+    }
+    Ok(())
 }
 
 /// Sends a prompt that names a draft through the host's control daemon.
@@ -843,9 +944,10 @@ pub async fn question_read(
     links: State<'_, crate::agent::WorkerLinks>,
     state: State<'_, AppState>,
     params: Value,
+    opening: Option<String>,
 ) -> Result<Value> {
     let typed: kr_protocol::question::QuestionReadParams = decode(params)?;
-    encode(&crate::questions::read(&state, &links, typed).await?)
+    encode(&crate::questions::read(&state, &links, opening.as_deref(), typed).await?)
 }
 
 /// Answers a question, or keeps the answer on this device when the host did not confirm that it took it.
@@ -857,9 +959,10 @@ pub async fn question_answer(
     links: State<'_, crate::agent::WorkerLinks>,
     state: State<'_, AppState>,
     params: Value,
+    opening: Option<String>,
 ) -> Result<Value> {
     let typed: kr_protocol::question::QuestionAnswerParams = decode(params)?;
-    let answer = crate::questions::answer(&state, &links, typed).await?;
+    let answer = crate::questions::answer(&state, &links, opening.as_deref(), typed).await?;
     encode(&answer)
 }
 
@@ -876,9 +979,10 @@ pub async fn question_settle(
     links: State<'_, crate::agent::WorkerLinks>,
     state: State<'_, AppState>,
     params: Value,
+    opening: Option<String>,
 ) -> Result<Value> {
     let typed: crate::questions::SettleParams = decode(params)?;
-    encode(&crate::questions::settle(&state, &links, &typed).await?)
+    encode(&crate::questions::settle(&state, &links, opening.as_deref(), &typed).await?)
 }
 
 /// Sends one kept answer, for a person who chose to.
@@ -887,9 +991,10 @@ pub async fn question_send_kept(
     links: State<'_, crate::agent::WorkerLinks>,
     state: State<'_, AppState>,
     params: Value,
+    opening: Option<String>,
 ) -> Result<Value> {
     let typed: crate::questions::KeptRef = decode(params)?;
-    encode(&crate::questions::send(&state, &links, &typed).await?)
+    encode(&crate::questions::send(&state, &links, opening.as_deref(), &typed).await?)
 }
 
 /// Dismisses one kept answer, if it is still the one the person was shown.
@@ -910,11 +1015,36 @@ pub async fn action_read(
     state: State<'_, AppState>,
     links: State<'_, crate::agent::WorkerLinks>,
     params: Value,
+    opening: Option<String>,
 ) -> Result<Value> {
     let typed: kr_protocol::receipt::ActionReadParams = decode(params)?;
+    // Over a host this device is paired with, a receipt is read on the session's own link: the
+    // connection for the host alone resolves no session. A read that names no session or no
+    // opening is refused here, because the host would otherwise resolve the session itself from
+    // the route it recorded, under whichever grant that connection holds.
+    if state.paired_context().is_some() {
+        let (Some(session_id), Some(opening)) = (typed.session_id, opening.as_deref()) else {
+            return Err(CommandError::invalid(
+                "over a host this device is paired with, a receipt is read from the session's own \
+                 screen, naming the session",
+            ));
+        };
+        let answer: kr_protocol::receipt::ActionReadResult = links
+            .read(
+                &state,
+                session_id,
+                Some(opening),
+                Method::ActionRead,
+                &typed,
+            )
+            .await?;
+        return encode(&answer);
+    }
     let answer: kr_protocol::receipt::ActionReadResult = match typed.session_id {
         Some(session_id) if links.serves(session_id)? => {
-            links.read(session_id, Method::ActionRead, &typed).await?
+            links
+                .read(&state, session_id, None, Method::ActionRead, &typed)
+                .await?
         }
         _ => state.session()?.read(Method::ActionRead, &typed).await?,
     };
@@ -934,9 +1064,12 @@ pub async fn history_page(
     params: Value,
 ) -> Result<Value> {
     let typed: kr_protocol::recovery::HistoryPageParams = decode(params)?;
+    // A host does not serve retained output to a paired device: a byte range cannot be narrowed to
+    // the time a grant reaches back to. The page is told so and nothing is asked.
+    not_on_a_paired_host(&state, "a session's retained output")?;
     let page: kr_protocol::recovery::HistoryPageResult = if links.serves(typed.session_id)? {
         links
-            .read(typed.session_id, Method::HistoryPage, &typed)
+            .read(&state, typed.session_id, None, Method::HistoryPage, &typed)
             .await?
     } else {
         state.session()?.read(Method::HistoryPage, &typed).await?
@@ -955,28 +1088,103 @@ mutate_result_command!(
     session_create, Method::SessionCreate, kr_protocol::session::SessionCreateParams
         => kr_protocol::session::SessionCreateResult
 );
-mutate_command!(
+session_mutate_command!(
     /// Closes a session, after the interface has shown what closing does.
+    ///
+    /// On a host this device is paired with, the close goes over the link of the opening the
+    /// screen holds, because the host's connection for the host alone does not close a session.
     session_close, Method::SessionClose, kr_protocol::session::SessionCloseParams
 );
-mutate_command!(
-    /// Launches an installed profile or a named command at a verified empty prompt.
-    shell_launch, Method::ShellLaunch, kr_protocol::root::ShellLaunchParams
-);
-mutate_result_command!(
-    /// Creates a draft on the host, which a file is then bound to.
-    draft_create, Method::DraftCreate, kr_protocol::transfer::DraftCreateParams
-        => kr_protocol::transfer::DraftCreateResult
-);
-mutate_result_command!(
-    /// Binds a completed attachment handle to a draft, and answers with the draft after it and the
-    /// binding, whose read grant names the path the file can be read at.
-    draft_add_attachment, Method::AgentDraftAddAttachment,
-    kr_protocol::transfer::AgentDraftAddAttachmentParams
-        => kr_protocol::transfer::AgentDraftAddAttachmentResult
-);
-mutate_command!(
+
+/// Launches an installed profile or a named command at a verified empty prompt.
+///
+/// Not offered over a host this device is paired with: the host takes a launch only from the
+/// connection that holds the session's input.
+#[tauri::command]
+pub async fn shell_launch(
+    state: State<'_, AppState>,
+    subject: Subject,
+    params: Value,
+) -> Result<Settled> {
+    not_on_a_paired_host(&state, "launching")?;
+    let typed: kr_protocol::root::ShellLaunchParams = decode(params)?;
+    let target = subject.target(state.environment_id()?)?;
+    let session = state.session()?;
+    submitted(
+        session
+            .mutate(
+                Method::ShellLaunch,
+                target,
+                None,
+                &NoPreconditions {},
+                &typed,
+                MUTATION_TTL,
+            )
+            .await,
+    )
+}
+
+/// Creates a draft on the host, which a file is then bound to.
+///
+/// Not offered over a host this device is paired with: that host serves no file to a device, so a
+/// draft there carries no attachment and a prompt sends its text inline.
+#[tauri::command]
+pub async fn draft_create(
+    state: State<'_, AppState>,
+    subject: Subject,
+    params: Value,
+) -> Result<Settled> {
+    not_on_a_paired_host(&state, "a draft")?;
+    let typed: kr_protocol::transfer::DraftCreateParams = decode(params)?;
+    let target = subject.target(state.environment_id()?)?;
+    let session = state.session()?;
+    submitted_as::<kr_protocol::transfer::DraftCreateResult>(
+        session
+            .mutate(
+                Method::DraftCreate,
+                target,
+                None,
+                &NoPreconditions {},
+                &typed,
+                MUTATION_TTL,
+            )
+            .await,
+    )
+}
+
+/// Binds a completed attachment handle to a draft, and answers with the draft after it and the
+/// binding, whose read grant names the path the file can be read at.
+///
+/// Not offered over a host this device is paired with, for the reason a draft is not.
+#[tauri::command]
+pub async fn draft_add_attachment(
+    state: State<'_, AppState>,
+    subject: Subject,
+    params: Value,
+) -> Result<Settled> {
+    not_on_a_paired_host(&state, "an attachment")?;
+    let typed: kr_protocol::transfer::AgentDraftAddAttachmentParams = decode(params)?;
+    let target = subject.target(state.environment_id()?)?;
+    let session = state.session()?;
+    submitted_as::<kr_protocol::transfer::AgentDraftAddAttachmentResult>(
+        session
+            .mutate(
+                Method::AgentDraftAddAttachment,
+                target,
+                None,
+                &NoPreconditions {},
+                &typed,
+                MUTATION_TTL,
+            )
+            .await,
+    )
+}
+
+session_mutate_command!(
     /// Cancels a pending action.
+    ///
+    /// A live session's pending action is its worker's: on a host this device is paired with it is
+    /// cancelled over the link of the opening the screen holds, and the request names the session.
     action_cancel, Method::ActionCancel, kr_protocol::receipt::ActionCancelParams
 );
 
@@ -1036,13 +1244,15 @@ agent_mutate_command!(
 /// requests, not the snapshot's cursors.
 #[tauri::command]
 pub async fn session_agents(
+    state: State<'_, AppState>,
     links: State<'_, crate::agent::WorkerLinks>,
     session_id: String,
+    opening: Option<String>,
 ) -> Result<crate::agent::SessionAgents> {
     let session_id: kr_protocol::ids::SessionId = session_id
         .parse()
         .map_err(|_| CommandError::invalid("that is not a session identifier"))?;
-    links.agents(session_id).await
+    links.agents(&state, session_id, opening.as_deref()).await
 }
 
 read_command!(
@@ -2838,6 +3048,10 @@ mod tests {
                 // The session's agent instances and pending requests, which native code reads on
                 // the session's own worker from a session the page names.
                 "session_agents",
+                // A session screen's opening: the host opens the session for it on a connection of
+                // its own, and the screen leaves it.
+                "session_open",
+                "session_leave",
                 // What an invitation would carry, from the protocol's own table. It reaches
                 // nothing.
                 "grant_notices",

@@ -27,6 +27,7 @@ pub struct AppState {
     drafts: Arc<crate::drafts::DraftDesk>,
     questions: crate::questions::QuestionDesk,
     shares: Arc<crate::sharing::ShareDesk>,
+    paired_links: Arc<crate::standing::PairedLinks>,
     export_destinations: Mutex<Vec<std::path::PathBuf>>,
     dropped_files: Mutex<Vec<std::path::PathBuf>>,
     supervision: Mutex<Supervision>,
@@ -59,6 +60,7 @@ impl AppState {
             drafts: Arc::new(crate::drafts::DraftDesk::default()),
             questions: crate::questions::QuestionDesk::default(),
             shares: Arc::new(crate::sharing::ShareDesk::default()),
+            paired_links: Arc::new(crate::standing::PairedLinks::default()),
             export_destinations: Mutex::new(Vec::new()),
             dropped_files: Mutex::new(Vec::new()),
             supervision: Mutex::new(Supervision::default()),
@@ -91,6 +93,9 @@ impl AppState {
         if let Some(before) = supervision.task.replace(task) {
             before.abort();
         }
+        // The sessions opened on the host before are let go with it, and the tokens that opened
+        // them are forgotten.
+        self.paired_links.close_all();
         self.disconnected(reason);
         Ok(())
     }
@@ -117,6 +122,7 @@ impl AppState {
             if let Some(task) = supervision.task.take() {
                 task.abort();
             }
+            self.paired_links.close_all();
             self.disconnected(reason);
         }
         Ok(())
@@ -249,6 +255,39 @@ impl AppState {
             Standing::Owner => Err(CommandError::refused(
                 "this application is the owner of the host it is connected to, not a paired device",
             )),
+        }
+    }
+
+    /// The sessions this application has opened on a host it is paired with.
+    #[must_use]
+    pub fn paired_links(&self) -> &Arc<crate::standing::PairedLinks> {
+        &self.paired_links
+    }
+
+    /// The device and the host a session of a paired host is opened on, when this application is
+    /// not the owner of the host it is connected to: the host it is connected to, or, while that
+    /// connection is being taken up again, the one it was told to use.
+    ///
+    /// Opened sessions have connections of their own, so they do not wait for the main one. With
+    /// no connection and no host in use the application is on its own machine, where a session's
+    /// worker is reached by its descriptor.
+    #[must_use]
+    pub fn paired_context(&self) -> Option<PairedContext> {
+        let held = self
+            .connection
+            .read()
+            .expect("the state lock is not poisoned");
+        let device = self.device.get()?;
+        match held.as_ref().map(Connection::standing) {
+            Some(Standing::Owner) => None,
+            Some(Standing::Paired { host, .. }) => Some(PairedContext {
+                device: Arc::clone(device),
+                host: (**host).clone(),
+            }),
+            None => device.host_in_use().map(|host| PairedContext {
+                device: Arc::clone(device),
+                host,
+            }),
         }
     }
 
@@ -429,6 +468,15 @@ impl AppState {
     pub fn drafts(&self) -> Arc<crate::drafts::DraftDesk> {
         Arc::clone(&self.drafts)
     }
+}
+
+/// The device and the host a session is opened on.
+#[derive(Clone)]
+pub struct PairedContext {
+    /// This computer as a device that pairs.
+    pub device: Arc<Device>,
+    /// The host it is paired with and uses.
+    pub host: kr_client::pairing::paired::PairedHost,
 }
 
 /// How many save destinations may be waiting for their write at once.

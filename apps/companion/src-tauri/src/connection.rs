@@ -56,8 +56,11 @@ pub enum Standing {
     Paired {
         /// The device identity the host gave this application.
         device_id: DeviceId,
-        /// What its grant carries. The host checks each action against its own record again.
+        /// What the host decided this connection may do, when it opened it for the host. The host
+        /// checks each action against its own record again.
         rights: Vec<ActionRight>,
+        /// The host, which the connections opened for one session are made to.
+        host: Box<PairedHost>,
     },
 }
 
@@ -163,14 +166,20 @@ impl Connection {
         self.local_user.map(kr_protocol::sharing::local_actor)
     }
 
-    /// A connection to a host this device is paired with, as the device the host made it.
+    /// A connection to a host this device is paired with, as the device the host made it, opened
+    /// for the host.
     ///
     /// The environment is the one the host says it is, read over the connection: a paired
-    /// connection carries no environment on its handshake.
+    /// connection carries no environment on its handshake. The connection is opened for the host
+    /// alone: it serves the host's own reads under the pairing, and the host refuses it every
+    /// decision under a share and every route to a session's worker, so no share's end reaches it.
+    /// A session is opened on a connection of its own ([`crate::standing`]). The rights it reports
+    /// are the ones the host decided the open with, not the ones the pairing proposed.
     ///
     /// # Errors
     ///
-    /// Returns the failure when the host cannot be reached or cannot say which environment it is.
+    /// Returns the failure when the host cannot be reached, cannot say which environment it is, or
+    /// refuses to open the connection.
     pub async fn paired(device: &Arc<Device>, host: &PairedHost) -> Result<Self> {
         let connection = Self::paired_once(device, host).await?;
         let (device, host) = (Arc::clone(device), host.clone());
@@ -198,12 +207,14 @@ impl Connection {
         .await
         .map_err(|_| CommandError::unavailable("the host did not say which environment it is"))?
         .map_err(CommandError::from)?;
+        let rights = open_for_the_host(&session).await?;
         Ok(Self {
             session: Arc::new(session),
             environment_id: info.environment_id,
             standing: Standing::Paired {
                 device_id: host.device_id,
-                rights: host.proposed_grant.actions.iter().copied().collect(),
+                rights,
+                host: Box::new(host.clone()),
             },
             local_user: None,
             reopen: None,
@@ -229,6 +240,51 @@ impl Connection {
     #[must_use]
     pub const fn environment_id(&self) -> EnvironmentId {
         self.environment_id
+    }
+}
+
+/// Opens a paired connection for the host alone, and returns the rights the host decided the open
+/// with.
+///
+/// A host of an earlier build does not list the method and refuses it as any unlisted method is
+/// refused, so a refusal that is not a transient one says that.
+async fn open_for_the_host(session: &Session) -> Result<Vec<ActionRight>> {
+    use kr_protocol::scalars::Nullable;
+    use kr_protocol::session::{SessionOpenParams, SessionOpenResult};
+
+    let opened = tokio::time::timeout(
+        CONNECT_WITHIN,
+        session.read::<_, SessionOpenResult>(
+            kr_protocol::method::Method::SessionOpen,
+            &SessionOpenParams {
+                session_id: Nullable::null(),
+                grant_id: Nullable::null(),
+            },
+        ),
+    )
+    .await
+    .map_err(|_| CommandError::unavailable("the host did not open the connection in time"))?
+    .map_err(|error| match error {
+        kr_client::ClientError::Host(refusal)
+            if matches!(
+                refusal.code,
+                kr_protocol::error::ErrorCode::PermissionDenied
+                    | kr_protocol::error::ErrorCode::InvalidArgument
+            ) =>
+        {
+            CommandError::stated(
+                refusal.code,
+                "the host refused to open this connection; it may be of an earlier build than \
+                 this application",
+            )
+        }
+        other => CommandError::from(other),
+    })?;
+    match opened {
+        SessionOpenResult::InForce { actions, .. } => Ok(actions.iter().copied().collect()),
+        SessionOpenResult::Ended { .. } => Err(CommandError::unavailable(
+            "the host answered that this connection has ended",
+        )),
     }
 }
 
