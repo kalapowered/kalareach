@@ -777,7 +777,9 @@ impl Controller {
             #[cfg(feature = "testing")]
             device_watch_looks: std::sync::atomic::AtomicU64::new(0),
             #[cfg(feature = "testing")]
-            privacy_passes: std::sync::atomic::AtomicU64::new(0),
+            privacy_passes: Arc::default(),
+            #[cfg(feature = "testing")]
+            privacy_tick_waiting: Arc::default(),
             #[cfg(feature = "testing")]
             before_presentation_lock: crate::attention::Pause::default(),
             #[cfg(feature = "testing")]
@@ -1184,21 +1186,27 @@ impl Controller {
     fn start_privacy_tick(self: &Arc<Self>) {
         let daemon = Arc::downgrade(self);
         let changed = self.privacy.changed();
+        #[cfg(feature = "testing")]
+        let (passes, waiting) = (
+            Arc::clone(&self.privacy_passes),
+            Arc::clone(&self.privacy_tick_waiting),
+        );
         tokio::spawn(async move {
             let mut ticks = tokio::time::interval(PRIVACY_TICK);
             ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             let mut dormant = false;
             loop {
+                #[cfg(feature = "testing")]
+                waiting.store(dormant, std::sync::atomic::Ordering::SeqCst);
                 wait_for_the_next_pass(dormant, &changed, &mut ticks).await;
+                #[cfg(feature = "testing")]
+                waiting.store(false, std::sync::atomic::Ordering::SeqCst);
                 let Some(quiet) = privacy_pass(&daemon).await else {
                     return;
                 };
                 dormant = quiet;
                 #[cfg(feature = "testing")]
-                if let Some(held) = daemon.upgrade() {
-                    held.privacy_passes
-                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                }
+                passes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             }
         });
     }
@@ -1212,6 +1220,14 @@ impl Controller {
     #[cfg(feature = "testing")]
     pub fn privacy_passes(&self) -> u64 {
         self.privacy_passes
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Whether privacy mode's tick is waiting for its record, which says it needs nothing of the
+    /// tick, rather than for its period. For this host's own tests.
+    #[cfg(feature = "testing")]
+    pub fn privacy_tick_waits_for_the_record(&self) -> bool {
+        self.privacy_tick_waiting
             .load(std::sync::atomic::Ordering::SeqCst)
     }
 

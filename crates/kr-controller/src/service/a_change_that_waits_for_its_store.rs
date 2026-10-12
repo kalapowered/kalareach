@@ -764,6 +764,43 @@ async fn ended(controller: &Controller, sessions: &[SessionId]) {
     }
 }
 
+/// Waits until `condition` holds, and fails the test when it has not within thirty seconds.
+async fn until(what: &str, condition: impl Fn() -> bool) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while !condition() {
+        assert!(std::time::Instant::now() < deadline, "never: {what}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// KR-PERF-003: the tick of a daemon that has never had privacy mode on settles into waiting for
+/// its record, with no period of its own, and turning privacy mode on ends that wait and puts
+/// the tick on its period: its notices and retries are the tick's, and a tick left waiting would
+/// leave them unsent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_idle_daemon_s_privacy_tick_waits_for_its_record_until_privacy_mode_is_turned_on() {
+    let (_temp, controller, _clock) = daemon().await;
+    until("the tick waits for its record", || {
+        controller.privacy_tick_waits_for_the_record()
+    })
+    .await;
+    let passes = controller.privacy_passes();
+
+    let standing = |write: &mut dyn FnMut() -> crate::error::Result<()>| write();
+    controller
+        .privacy
+        .enable(&[], kr_ipc::now_ms(), &standing)
+        .expect("privacy mode is turned on");
+    until("the tick makes the pass the change owes it", || {
+        controller.privacy_passes() > passes
+    })
+    .await;
+    assert!(
+        !controller.privacy_tick_waits_for_the_record(),
+        "and, with privacy mode on, goes back to its period"
+    );
+}
+
 /// KR-REQ-24.28: privacy mode's tick takes a session for ended only on the registry's evidence.
 /// Two sessions owe their cleanup and have no worker: one whose launch was claimed, one whose
 /// reservation was fenced after a claim. Through every pass of the tick each may still have a

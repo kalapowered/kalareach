@@ -102,8 +102,9 @@ pub struct StartedRun {
 #[derive(Debug)]
 struct Executing {
     held: std::sync::Mutex<std::collections::HashSet<WorkflowRunId>>,
-    /// Woken each time a run's place is given back, which is when a slot it held is free and when
-    /// a run that ended without settling is one nobody executes.
+    /// Woken each time a run's execution ends and its place is given back, which is when a slot it
+    /// held is free and when a run that ended without settling is one nobody executes. A place
+    /// given back without an execution (see [`Executes::give_back_quietly`]) wakes nobody.
     ended: Arc<tokio::sync::Notify>,
 }
 
@@ -321,7 +322,8 @@ impl AutomationService {
     }
 
     /// Woken each time a run this service executed has stopped, which is when its nodes' events
-    /// are all in the journal, and each time a run's place in this process is given back.
+    /// are all in the journal, and each time a run's place in this process is given back after an
+    /// execution.
     ///
     /// A host that runs the trigger dispatcher waits on this and on [`WorkflowStore::changes`]:
     /// together they cover everything that can give the dispatcher work. After a pass that failed

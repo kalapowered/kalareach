@@ -443,7 +443,11 @@ pub struct Controller {
     device_watch_looks: std::sync::atomic::AtomicU64,
     /// How many passes privacy mode's tick has finished. Compiled away in every shipped build.
     #[cfg(feature = "testing")]
-    privacy_passes: std::sync::atomic::AtomicU64,
+    privacy_passes: Arc<std::sync::atomic::AtomicU64>,
+    /// Whether privacy mode's tick is waiting for its record rather than for its period. Compiled
+    /// away in every shipped build.
+    #[cfg(feature = "testing")]
+    privacy_tick_waiting: Arc<std::sync::atomic::AtomicBool>,
     /// Where this host's own tests stop a lease presentation that has read the clock, before it
     /// waits for the policy's lock. Compiled away in every shipped build.
     #[cfg(feature = "testing")]
