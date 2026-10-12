@@ -71,12 +71,14 @@ use crate::error::{DeliveryError, Result};
 /// with, and binds a destination to it only when it has one, so every binding version 6 computed
 /// is computed the same way. Version 8 adds the time privacy mode was last turned off, which is
 /// how a decision made while it was on is told from one made after. Version 9 adds the table of
-/// revocations this host owes a gateway. A journal written under version 6, 7 or 8 is brought
-/// forward in place, once, when it is opened (`migrate_forward`); a journal written under a
-/// version below 6 or above 9 is refused rather than read with the columns of another shape,
-/// matched against bindings this build no longer computes the same way, or trusted to hold no
-/// request it should not.
-pub const SCHEMA_VERSION: i64 = 9;
+/// revocations this host owes a gateway. Version 10 adds the mark on a notification whose detail
+/// may have left this host in an object placed in a device's mailbox, which is a copy that left
+/// whether or not the push that refers to it ever did. A journal written under version 6, 7, 8 or 9
+/// is brought forward in place, once, when it is opened (`migrate_forward`); a journal written
+/// under a version below 6 or above 10 is refused rather than read with the columns of another
+/// shape, matched against bindings this build no longer computes the same way, or trusted to hold
+/// no request it should not.
+pub const SCHEMA_VERSION: i64 = 10;
 
 /// The oldest schema this build brings forward rather than refusing.
 pub const OLDEST_SCHEMA_VERSION: i64 = 6;
@@ -2800,10 +2802,11 @@ impl DeliveryJournal {
     pub fn exported(&self) -> Result<Vec<ExportedDelivery>> {
         let mut statement = self.connection.prepare(
             "SELECT n.notification_id, n.destination_id, n.destination_kind, n.state,
-                    COALESCE(MAX(a.settled_at_ms), n.admitted_at_ms)
+                    COALESCE(MAX(a.settled_at_ms), n.admitted_at_ms), n.detail_left
                FROM delivery_notifications n
                LEFT JOIN delivery_attempts a ON a.notification_id = n.notification_id
               WHERE n.state IN ('accepted', 'duplicate', 'duplicate_uncertain', 'outcome_unknown')
+                 OR n.detail_left <> 0
               GROUP BY n.notification_id
               ORDER BY n.admitted_at_ms",
         )?;
@@ -2814,11 +2817,12 @@ impl DeliveryJournal {
                 row.get::<_, String>(2)?,
                 row.get::<_, String>(3)?,
                 row.get::<_, i64>(4)?,
+                row.get::<_, i64>(5)?,
             ))
         })?;
         let mut exported = Vec::new();
         for row in rows {
-            let (identifier, destination, kind, state, left_at) = row?;
+            let (identifier, destination, kind, state, left_at, detail_left) = row?;
             let kind =
                 DestinationKind::from_stored(&kind).ok_or(DeliveryError::JournalUnreadable(
                     "a stored destination kind is not one this build writes",
@@ -2834,7 +2838,14 @@ impl DeliveryJournal {
                     DestinationKind::Push => "notification".to_owned(),
                     other => format!("{other} message"),
                 },
-                reference: format!("{identifier} to {destination} ({state})"),
+                reference: if detail_left == 0 {
+                    format!("{identifier} to {destination} ({state})")
+                } else {
+                    format!(
+                        "{identifier} to {destination} ({state}), with its detail in the device's \
+                         mailbox"
+                    )
+                },
                 left_at_ms: TimestampMs::new(as_u64(left_at)),
                 // A notification a provider queued is on a device this host cannot reach, and an
                 // external message is in somebody else's service. Neither has a removal this host
@@ -2980,17 +2991,16 @@ impl DeliveryJournal {
     /// Records that the detail of a claimed notification may have left this host, in an object
     /// placed in its device's mailbox.
     ///
-    /// The notification is then one something has dispatched: privacy mode that takes it back
-    /// afterwards lists the copy among those that left instead of calling it unsent, and the
-    /// notification keeps whatever its push still has to do.
+    /// It is a copy that left whether or not the push that refers to it ever does, so it is
+    /// recorded as its own fact: the push keeps whatever state and retries it has, and
+    /// [`Self::exported`] lists the notification among the copies that left.
     ///
     /// # Errors
     ///
     /// Returns [`DeliveryError::JournalUnavailable`] when the write fails.
     pub fn note_detail_left(&mut self, notification_id: NotificationId) -> Result<()> {
         self.connection.execute(
-            "UPDATE delivery_notifications SET dispatched = 1
-              WHERE notification_id = ?1 AND state = 'in_flight'",
+            "UPDATE delivery_notifications SET detail_left = 1 WHERE notification_id = ?1",
             params![notification_id.to_string()],
         )?;
         Ok(())
@@ -4069,7 +4079,7 @@ fn insert_notification(
     Ok(())
 }
 
-/// Brings a version 6, 7 or 8 journal forward to version 9, in one transaction.
+/// Brings a version 6, 7, 8 or 9 journal forward to version 10, in one transaction.
 ///
 /// Version 7 added one column, the stamp of the stored credential an external destination sends
 /// with. No destination a version 6 journal holds has one, because version 6 had no way to keep a
@@ -4080,11 +4090,14 @@ fn insert_notification(
 /// build did not record when, so everything decided before this moment may have been decided while
 /// privacy mode was on, and none of it is sent. A journal that is still fenced records the time
 /// when it is lifted. Version 9 adds the table of revocations this host owes a gateway, which no
-/// earlier journal can hold one of: an earlier build revoked nothing at unpairing.
+/// earlier journal can hold one of: an earlier build revoked nothing at unpairing. Version 10 adds
+/// the mark on a notification whose detail may have been placed in a device's mailbox; no earlier
+/// build placed one, so every row gets none.
 /// The version is read again inside the transaction, so two openers cannot both add a column.
 ///
 /// Remove this upgrade, with the arm of the open that calls it, once no supported upgrade starts
-/// from a journal written under version 6, 7 or 8; `OLDEST_SCHEMA_VERSION` then moves up with it.
+/// from a journal written under version 6, 7, 8 or 9; `OLDEST_SCHEMA_VERSION` then moves up with
+/// it.
 fn migrate_forward(connection: &mut Connection) -> Result<()> {
     let transaction =
         connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -4119,6 +4132,12 @@ fn migrate_forward(connection: &mut Connection) -> Result<()> {
                 attempts INTEGER NOT NULL,
                 next_attempt_at_ms INTEGER NOT NULL
             );",
+        )?;
+    }
+    if version <= 9 {
+        transaction.execute_batch(
+            "ALTER TABLE delivery_notifications
+                 ADD COLUMN detail_left INTEGER NOT NULL DEFAULT 0;",
         )?;
     }
     if version < SCHEMA_VERSION {
@@ -4428,6 +4447,10 @@ const SCHEMA: &str = "
         destination_digest TEXT NOT NULL DEFAULT '',
         authority_digest TEXT NOT NULL DEFAULT '',
         dispatched INTEGER NOT NULL DEFAULT 0,
+        -- Whether the encrypted object its preview refers to may have been placed in the device's
+        -- mailbox. It is a copy that left this host whether or not the push ever did, so it is a
+        -- fact of its own and not a reading of `dispatched`, which is about the push.
+        detail_left INTEGER NOT NULL DEFAULT 0,
         -- The kind of destination this was admitted for, written once. A destination row can be
         -- configured again as another kind under the same identifier, and what a settlement means
         -- depends on what this delivery was: a paired device's gateway can be asked and a
@@ -7229,6 +7252,7 @@ mod tests {
                 "ALTER TABLE delivery_destinations DROP COLUMN credential_stamp;
                  ALTER TABLE delivery_privacy DROP COLUMN lifted_at_ms;
                  DROP TABLE delivery_revocations;
+                 ALTER TABLE delivery_notifications DROP COLUMN detail_left;
                  UPDATE delivery_schema SET version = 6;",
             )
             .expect("the version 6 shape");
@@ -7289,6 +7313,61 @@ mod tests {
         );
     }
 
+    /// A version 9 journal is brought forward in place and lists no copy of a detail in a mailbox,
+    /// because no earlier build placed one; a copy marked afterwards is listed whatever became of
+    /// the push that refers to it.
+    #[test]
+    fn a_version_9_journal_is_brought_forward_and_lists_a_detail_left_in_a_mailbox() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let path = directory.path().join("delivery.sqlite3");
+        {
+            let mut journal = DeliveryJournal::open(&path).expect("a journal");
+            journal
+                .register_consumer(&consumer(), 1)
+                .expect("registration");
+            journal
+                .configure_destination(&destination("hook"))
+                .expect("a destination");
+            journal
+                .take_events(&consumer(), &[taken(1, 1)], 1)
+                .expect("a page");
+            journal
+                .admit(&delivery(1, event(1), "hook"))
+                .expect("admitted");
+        }
+        {
+            let connection = rusqlite::Connection::open(&path).expect("a connection");
+            connection
+                .execute_batch(
+                    "ALTER TABLE delivery_notifications DROP COLUMN detail_left;
+                     UPDATE delivery_schema SET version = 9;",
+                )
+                .expect("the version 9 shape");
+        }
+
+        let mut journal = DeliveryJournal::open(&path).expect("brought forward");
+        assert!(journal.exported().expect("a read").is_empty());
+        journal
+            .note_detail_left(NotificationId::new(uuid(1)))
+            .expect("a mark");
+        let exported = journal.exported().expect("a read");
+        assert_eq!(exported.len(), 1, "the copy is listed with the push unsent");
+        assert!(
+            exported[0].reference.contains("mailbox"),
+            "{}",
+            exported[0].reference
+        );
+        assert_eq!(
+            journal
+                .delivery(NotificationId::new(uuid(1)))
+                .expect("a read")
+                .expect("the record")
+                .state,
+            DeliveryState::Admitted,
+            "and the push is as it was"
+        );
+    }
+
     /// A version 7 journal is brought forward in place: its privacy row gains the time privacy mode
     /// was last turned off, which reads as no time at all, and its fence stays where it stood.
     #[test]
@@ -7303,7 +7382,8 @@ mod tests {
             let connection = rusqlite::Connection::open(&path).expect("a connection");
             connection
                 .execute_batch(
-                    "ALTER TABLE delivery_privacy DROP COLUMN lifted_at_ms;
+                    "ALTER TABLE delivery_notifications DROP COLUMN detail_left;
+                     ALTER TABLE delivery_privacy DROP COLUMN lifted_at_ms;
                      UPDATE delivery_schema SET version = 7;",
                 )
                 .expect("the version 7 shape");
@@ -7338,7 +7418,8 @@ mod tests {
                 let connection = rusqlite::Connection::open(&path).expect("a connection");
                 connection
                     .execute_batch(
-                        "ALTER TABLE delivery_privacy DROP COLUMN lifted_at_ms;
+                        "ALTER TABLE delivery_notifications DROP COLUMN detail_left;
+                     ALTER TABLE delivery_privacy DROP COLUMN lifted_at_ms;
                          UPDATE delivery_schema SET version = 7;",
                     )
                     .expect("the version 7 shape");
