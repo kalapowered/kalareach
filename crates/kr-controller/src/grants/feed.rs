@@ -67,9 +67,9 @@ pub struct RetainedRevocation {
     /// it issues for it follows this one, so a crash between applying and acknowledging reissues
     /// the same record.
     pub previous_revision: AuthorityRevision,
-    /// The revision the registry had reached when this host began to apply the request. The
-    /// revision the registry holds afterwards says whether the request withdrew anything, however
-    /// the host was interrupted in between.
+    /// The revision the registry had reached when this host began to apply the request. The host
+    /// refuses a request that took no number while the registry still stands there; a registry
+    /// that something else moved meanwhile numbers the request with the revision in force.
     pub registry_revision: AuthorityRevision,
     /// When this host began to apply it, in UTC milliseconds.
     pub applied_at_ms: u64,
