@@ -91,6 +91,8 @@ struct Lease {
     state: LeaseState,
     /// Why it was ended, when it was.
     ended_for: Option<&'static str>,
+    /// The relay carrying it is no longer one the service can bill through.
+    retired: bool,
 }
 
 /// A lease as a test reads it.
@@ -140,6 +142,8 @@ pub(crate) struct Relay {
     exhausted: bool,
     /// The service has no relay instance to offer.
     no_relay: bool,
+    /// A deadline cannot be moved later, as at the end of a month's period.
+    frozen_deadlines: bool,
     counter: u64,
     issuer: AuthorisationKeyPair,
 }
@@ -153,6 +157,7 @@ impl Default for Relay {
             clock_offset_ms: 0,
             exhausted: false,
             no_relay: false,
+            frozen_deadlines: false,
             counter: 0,
             issuer: AuthorisationKeyPair::generate().expect("an admission key"),
         }
@@ -210,7 +215,7 @@ impl Relay {
         }
     }
 
-    /// The service ends a lease on its own: its relay was retired, or its record was lost.
+    /// The service ends a lease on its own, as when its record of the lease is lost.
     pub(crate) fn end_by_the_service(&mut self, lease_id: &str) {
         if let Some(lease) = self.leases.get_mut(lease_id)
             && lease.state == LeaseState::Installed
@@ -227,6 +232,15 @@ impl Relay {
 
     pub(crate) const fn withhold_relays(&mut self, withheld: bool) {
         self.no_relay = withheld;
+    }
+
+    pub(crate) const fn freeze_deadlines(&mut self, frozen: bool) {
+        self.frozen_deadlines = frozen;
+    }
+
+    /// The service has no record of a lease any more: it never issued it, as far as it can say.
+    pub(crate) fn forget(&mut self, lease_id: &str) {
+        self.leases.remove(lease_id);
     }
 
     pub(crate) const fn advance_clock(&mut self, by_ms: u64) {
@@ -258,17 +272,21 @@ impl Relay {
             .collect()
     }
 
-    /// The bytes an account has outstanding across its live leases, less `except`.
-    fn outstanding(&self, payer: &str, except: Option<&str>) -> u64 {
+    /// The bytes an account has outstanding across its live leases: what each holds beyond what
+    /// the relay has counted for it, which is what the aggregate bound is measured on.
+    fn outstanding(&self, payer: &str) -> u64 {
         self.leases
             .values()
-            .filter(|lease| {
-                lease.state == LeaseState::Installed
-                    && lease.payer == payer
-                    && Some(lease.lease_id.as_str()) != except
-            })
-            .map(|lease| lease.ceiling)
+            .filter(|lease| lease.state == LeaseState::Installed && lease.payer == payer)
+            .map(|lease| lease.ceiling - lease.consumed)
             .sum()
+    }
+
+    /// The relay carrying a lease is retired: the service can no longer bill through it.
+    pub(crate) fn retire_relay_of(&mut self, lease_id: &str) {
+        if let Some(lease) = self.leases.get_mut(lease_id) {
+            lease.retired = true;
+        }
     }
 }
 
@@ -525,7 +543,8 @@ pub(crate) fn issue(
         text_of(&body.destination_endpoint_key),
     );
     // The lease this request is about: the one it named, or the one its pair holds.
-    let found = match &body.lease_id.0 {
+    let service_now = relay.service_now(now_ms);
+    let mut found = match &body.lease_id.0 {
         Some(named) => match relay.leases.get(&named.get().to_string()) {
             Some(lease) if lease.state == LeaseState::Installed => Some(lease.clone()),
             _ => {
@@ -572,48 +591,88 @@ pub(crate) fn issue(
         {
             return invalid("That lease binds another pair, or another direction.");
         }
-    } else if asked > max_bytes {
+        if lease.retired {
+            return refused_answer(
+                relay,
+                &payer,
+                "unavailable",
+                "The relay carrying that lease is no longer one this service can bill through. \
+                 Revoke the lease and ask for another.",
+            );
+        }
+        // A reservation that has passed its deadline has been settled, and there is nothing left to
+        // raise: the lease is fenced and the pair is given a new one, whose figures are the new
+        // reservation's.
+        if service_now >= lease.expires_at_ms {
+            let old = lease.lease_id.clone();
+            if let Some(expired) = relay.leases.get_mut(&old) {
+                expired.state = LeaseState::Revoked;
+                expired.revision += 1;
+                expired.ended_for = Some("expired");
+            }
+            found = None;
+        }
+    }
+    // What the payer authorises is a bound on what a lease holds outstanding: the cumulative
+    // ceiling less what the relay has counted.
+    let counted = found.as_ref().map_or(0, |lease| lease.consumed);
+    if asked.saturating_sub(counted) > max_bytes {
         return invalid(&format!(
             "That payer authorises at most {max_bytes} bytes outstanding for one lease."
         ));
     }
 
-    let service_now = relay.service_now(now_ms);
-    let deadline = service_now + u64::from(body.duration_seconds) * 1000;
     let held = found.as_ref().map_or(0, |lease| lease.ceiling);
-    let ceiling = held.max(asked).min(max_bytes);
-    let others = relay.outstanding(&payer, found.as_ref().map(|lease| lease.lease_id.as_str()));
-    // The ledger refuses a hold that would take the principal past its allowance or past the
-    // aggregate it may hold outstanding; the answer is about capacity, not a failure.
-    let raises = ceiling > held;
-    if raises && (relay.exhausted || others + ceiling > OUTSTANDING_CEILING_BYTES) {
-        return refused_answer(relay, &payer, "exhausted");
+    // A refill that asks for no more than the reservation holds is answered as it stands, deadline
+    // included: the ledger moves a deadline only with a raised ceiling.
+    let raises = asked > held;
+    if let Some(lease) = &found
+        && !raises
+    {
+        return granted(relay, &payer, lease);
     }
     if found.is_none() && relay.no_relay {
-        return refused_answer(relay, &payer, "unavailable");
+        return refused_answer(
+            relay,
+            &payer,
+            "unavailable",
+            "This service has no relay instance to carry that pair right now.",
+        );
+    }
+    // The ledger refuses a hold that would take the principal past its allowance, which is an
+    // exhaustion, or past the aggregate it may hold outstanding, which is a refusal of this request.
+    let addition = asked - held;
+    if relay.exhausted {
+        return refused_answer(
+            relay,
+            &payer,
+            "exhausted",
+            "The relay allowance for this period is used up.",
+        );
+    }
+    if relay.outstanding(&payer) + addition > OUTSTANDING_CEILING_BYTES {
+        return refused_answer(
+            relay,
+            &payer,
+            "unavailable",
+            "That would pass the aggregate outstanding relay-byte ceiling for this principal.",
+        );
     }
 
-    let lease_id = match &found {
-        Some(lease) => lease.lease_id.clone(),
-        None => relay.identifier(3),
-    };
-    let reservation_id = match &found {
-        Some(lease) => lease.reservation_id.clone(),
-        None => relay.identifier(4),
-    };
+    let deadline = service_now + u64::from(body.duration_seconds) * 1000;
+    let frozen = relay.frozen_deadlines;
     let lease = match found {
         Some(mut lease) => {
-            let expires = lease.expires_at_ms.max(deadline);
-            if ceiling != lease.ceiling || expires != lease.expires_at_ms {
-                lease.revision += 1;
+            lease.revision += 1;
+            lease.ceiling = asked;
+            if !frozen {
+                lease.expires_at_ms = lease.expires_at_ms.max(deadline);
             }
-            lease.ceiling = ceiling;
-            lease.expires_at_ms = expires;
             lease
         }
         None => Lease {
-            lease_id,
-            reservation_id,
+            lease_id: relay.identifier(3),
+            reservation_id: relay.identifier(4),
             revision: 1,
             source: pair.0,
             destination: pair.1,
@@ -621,16 +680,22 @@ pub(crate) fn issue(
             requested_by: proof.key,
             payer: payer.clone(),
             authorisation_id,
-            ceiling,
+            ceiling: asked,
             expires_at_ms: deadline,
             consumed: 0,
             state: LeaseState::Installed,
             ended_for: None,
+            retired: false,
         },
     };
-    let signed = signed_lease(relay, &lease);
     relay.leases.insert(lease.lease_id.clone(), lease.clone());
-    let reserved = relay.outstanding(&payer, None);
+    granted(relay, &payer, &lease)
+}
+
+/// The answer that a lease is issued, as the lease stands.
+fn granted(relay: &Relay, payer: &str, lease: &Lease) -> ServiceHttpAnswer {
+    let signed = signed_lease(relay, lease);
+    let reserved = relay.outstanding(payer);
     answered(json!({
         "state": "issued",
         "lease": signed,
@@ -638,7 +703,7 @@ pub(crate) fn issue(
         "relay_instance_id": RELAY_INSTANCE,
         "region": "eu-central",
         "issuer_key_revision": "1",
-        "installed": ack(&lease),
+        "installed": ack(lease),
         "payer": payer,
         "reservation_id": lease.reservation_id,
         "allowance": allowance(relay, reserved),
@@ -658,6 +723,11 @@ fn signed_lease(relay: &Relay, lease: &Lease) -> Value {
     } else {
         json!({ "installation": { "installation_id": "00000007-0000-4000-8000-000000000001" } })
     };
+    // An authorisation the host named without selecting it as its default sponsors the lease.
+    let payer_authorisation = match &lease.authorisation_id {
+        Some(authorisation_id) => json!({ "sponsored": { "authorisation_id": authorisation_id } }),
+        None => Value::String("host_selected".to_owned()),
+    };
     let value = json!({
         "lease_id": lease.lease_id,
         "revision": lease.revision.to_string(),
@@ -666,7 +736,7 @@ fn signed_lease(relay: &Relay, lease: &Lease) -> Value {
         "destination_endpoint_key": lease.destination,
         "direction": lease.direction,
         "payer": principal,
-        "payer_authorisation": "host_selected",
+        "payer_authorisation": payer_authorisation,
         "byte_ceiling": lease.ceiling.to_string(),
         "expires_at_ms": lease.expires_at_ms.to_string(),
         "relay_scope": {
@@ -714,12 +784,7 @@ fn allowance(relay: &Relay, reserved: u64) -> Value {
 }
 
 /// The answer about capacity: an allowance that is spent, or a service with no relay to offer.
-fn refused_answer(relay: &Relay, payer: &str, state: &str) -> ServiceHttpAnswer {
-    let message = if state == "exhausted" {
-        "The relay allowance for this period is used up."
-    } else {
-        "This service has no relay instance to carry that pair right now."
-    };
+fn refused_answer(relay: &Relay, payer: &str, state: &str, message: &str) -> ServiceHttpAnswer {
     answered(json!({
         "state": state,
         "payer": payer,
@@ -728,7 +793,7 @@ fn refused_answer(relay: &Relay, payer: &str, state: &str) -> ServiceHttpAnswer 
             "A direct connection between the devices, which needs no managed relay.",
             "A self-hosted relay configured in the service settings."
         ],
-        "allowance": allowance(relay, relay.outstanding(payer, None)),
+        "allowance": allowance(relay, relay.outstanding(payer)),
         "warnings": [],
         "grace": if state == "exhausted" {
             json!({
