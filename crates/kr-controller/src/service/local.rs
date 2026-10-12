@@ -18,7 +18,6 @@ use kr_transport::window::MAX_WINDOW_VALIDITY;
 use crate::error::{ControllerError, Result};
 
 use super::authority_changes::declaration_answer;
-use super::routes::LOCAL_PRINCIPAL_PREFIX;
 use super::{Controller, error_reply, net, respond};
 
 /// How often the daemon replaces a live connection's action window.
@@ -464,8 +463,7 @@ impl Controller {
         peer: &PeerIdentity,
         kind: StreamKind,
     ) -> Result<()> {
-        let actor_id = ActorId::new(format!("{LOCAL_PRINCIPAL_PREFIX}{}", peer.uid))
-            .unwrap_or_else(|_| ActorId::new("local").expect("a valid principal"));
+        let actor_id = kr_protocol::sharing::local_actor(u64::from(peer.uid));
         let mut negotiated = false;
         // Where this connection's requests originally entered, when it is a process bridge's
         // helper and said so in its hello. Kept for the life of the connection and never replaced:

@@ -1062,6 +1062,20 @@ pub(crate) fn fits_a_frame<T: Serialize>(answer: &T) -> bool {
     })
 }
 
+/// What the host puts before the operating-system user it authenticates a local caller as, to make
+/// the actor that caller's actions are claimed under.
+pub const LOCAL_PRINCIPAL_PREFIX: &str = "local:";
+
+/// The actor a local caller is, from the user identity the host's acknowledgement states it
+/// authenticated. The host builds the actor from the peer it sees, so a client that computes the
+/// identities of an action it lost the answer to ([`share_identities`]) takes the user from that
+/// acknowledgement, and not from its own process, which a bridge's helper does not share.
+#[must_use]
+pub fn local_actor(uid: u64) -> crate::ids::ActorId {
+    crate::ids::ActorId::new(format!("{LOCAL_PRINCIPAL_PREFIX}{uid}"))
+        .unwrap_or_else(|_| crate::ids::ActorId::new("local").expect("a valid principal"))
+}
+
 /// The identities of the grant and of the invitation that carries it, for a share written by
 /// `actor_id` as `action`.
 ///

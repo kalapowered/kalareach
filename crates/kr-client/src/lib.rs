@@ -47,6 +47,7 @@
 #![forbid(unsafe_code)]
 
 pub mod answers;
+pub mod attempt;
 pub mod chunks;
 pub mod controls;
 pub mod cursors;

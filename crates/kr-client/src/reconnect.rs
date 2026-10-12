@@ -29,7 +29,9 @@ pub struct ClientState {
     /// These are exactly the ones a receipt tracker cannot name, because no receipt arrived. Each
     /// carries the intent it was submitted for, so a person can be told which operation is
     /// uncertain rather than which identifier is. The next connection asks the host what became of
-    /// them; it never submits them again.
+    /// them; it never submits them again. Asking is a repeat of the exact request the action was
+    /// sent as ([`Session::repeat`]): the host answers it from the record it kept, never by doing
+    /// the action again, and the library makes none by itself.
     pub submitted: Vec<crate::session::SubmittedAction>,
     /// What the ended connection left uncertain, when it had an input lane.
     pub interruption: Option<InputInterruption>,

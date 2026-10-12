@@ -172,12 +172,20 @@ pub struct SubmittedAction {
     pub params: ParamsValue,
     /// The request it was sent as, which correlates the host's answer.
     pub request_id: RequestId,
+    /// Whether the caller settles this action, and no answer does.
+    ///
+    /// An action sent through [`Session::send`] or [`Session::repeat`] is one whose caller keeps
+    /// its own record of the attempt, and stays unresolved here until the caller says what the
+    /// answer came to ([`Session::settle`]), whatever the answer was: a refusal of any code is not
+    /// a decision about an action whose outcome is being asked after.
+    pub held: bool,
 }
 
 crate::debug_fields!(SubmittedAction {
     action_id,
     method,
-    request_id
+    request_id,
+    held
 });
 
 /// Whose identity a mutation is submitted under.
@@ -209,6 +217,69 @@ impl Continuation {
     }
 }
 
+/// A mutation built and not yet sent: the request, exactly, and the connection it was built on.
+///
+/// It is what a client keeps to ask the host again about an action whose answer it lost. The
+/// request is kept whole, window included, because the host's record of an action is keyed by what
+/// the action was, and a request composed anew under a later window is a different request for the
+/// same action, which the host refuses. It never prints the request.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ComposedMutation {
+    request: MutationRequest,
+    /// The session that composed it, none for one read back from a record kept across a restart.
+    composed_on: Option<u64>,
+    window_issued_at_ms: u64,
+    window_valid_for_ms: u64,
+}
+
+crate::debug_fields!(ComposedMutation {
+    composed_on,
+    window_issued_at_ms,
+    window_valid_for_ms
+});
+
+impl ComposedMutation {
+    /// A composed mutation read back from a record a client kept, for a connection that did not
+    /// compose it. It can be repeated and never sent first.
+    #[must_use]
+    pub const fn restored(
+        request: MutationRequest,
+        window_issued_at_ms: u64,
+        window_valid_for_ms: u64,
+    ) -> Self {
+        Self {
+            request,
+            composed_on: None,
+            window_issued_at_ms,
+            window_valid_for_ms,
+        }
+    }
+
+    /// The request, for a client to keep.
+    #[must_use]
+    pub const fn request(&self) -> &MutationRequest {
+        &self.request
+    }
+
+    /// The action the request carries.
+    #[must_use]
+    pub const fn action_id(&self) -> ActionId {
+        self.request.action_id
+    }
+
+    /// When the host issued the window the request carries, in UTC milliseconds.
+    #[must_use]
+    pub const fn window_issued_at_ms(&self) -> u64 {
+        self.window_issued_at_ms
+    }
+
+    /// How long the host said that window stays valid, in milliseconds.
+    #[must_use]
+    pub const fn window_valid_for_ms(&self) -> u64 {
+        self.window_valid_for_ms
+    }
+}
+
 /// What this client knows about its own mutations.
 ///
 /// `correlations` is what lets the reader settle an action whose caller has gone: a correlated
@@ -222,10 +293,23 @@ struct Outcomes {
 
 impl Outcomes {
     /// Settles the action one correlated answer belongs to, if it is still pending.
+    ///
+    /// An action its caller holds ([`SubmittedAction::held`]) stays: only the caller settles it.
     fn settle(&mut self, request_id: RequestId) {
-        if let Some(action_id) = self.correlations.remove(&request_id) {
+        if let Some(action_id) = self.correlations.remove(&request_id)
+            && !self
+                .submitted
+                .get(&action_id)
+                .is_some_and(|action| action.held)
+        {
             self.submitted.remove(&action_id);
         }
+    }
+
+    /// Settles one action by the caller's word, whatever its answer was.
+    fn settle_action(&mut self, action_id: ActionId) {
+        self.submitted.remove(&action_id);
+        self.correlations.retain(|_, held| *held != action_id);
     }
 
     /// Refuses to reuse an identifier that still stands for something this client must report.
@@ -325,11 +409,16 @@ impl SessionState {
 
 /// A client's connection to one host.
 pub struct Session {
+    /// Which session this is, among every one started in this process.
+    id: u64,
     transport: Arc<dyn ControlTransport>,
     state: Arc<SessionState>,
     next_request_id: AtomicU64,
     reader: tokio::task::JoinHandle<()>,
 }
+
+/// The identity the next session started in this process takes.
+static NEXT_SESSION: AtomicU64 = AtomicU64::new(1);
 
 crate::debug_as_name!(Session);
 
@@ -372,6 +461,7 @@ impl Session {
         });
         let reader = tokio::spawn(read_loop(Arc::clone(&transport), Arc::clone(&state)));
         Ok(Self {
+            id: NEXT_SESSION.fetch_add(1, Ordering::Relaxed),
             transport,
             state,
             next_request_id: AtomicU64::new(1),
@@ -548,7 +638,10 @@ impl Session {
     /// Section 23 permits an automatic retry for idempotent reads, transfer chunks and requests
     /// whose receipt proves no dispatch, and a mutation is none of those until its receipt says so.
     /// The caller decides, with [`ClientError::decision`] for
-    /// [`crate::retry::RequestClass::Dispatchable`] to hand it the policy's answer.
+    /// [`crate::retry::RequestClass::Dispatchable`] to hand it the policy's answer. A caller that
+    /// wants to ask the host what became of an action it lost the answer to composes the request
+    /// first ([`Session::compose`]) and repeats exactly that request ([`Session::repeat`]); an
+    /// exact repeat is a question, answered from the host's record, and not a retry.
     ///
     /// # Errors
     ///
@@ -727,6 +820,7 @@ impl Session {
                 target: target_record,
                 params: params_record,
                 request_id,
+                held: false,
             })?;
         }
         if self.transport.send(&frame).await.is_err() {
@@ -746,6 +840,186 @@ impl Session {
                     Outcome::Ok(value) => Ok(Settled::Result(value)),
                 }
             }
+            Err(_) => Err(ClientError::SubmissionUncertain { action_id }),
+        }
+    }
+
+    /// Builds a mutation and sends nothing.
+    ///
+    /// It takes the connection's current action window, as [`Session::mutate`] does, and returns
+    /// the whole request: the action identifier the caller chose, the window's identity and the
+    /// requested time to live. Nothing is recorded in this session's book and nothing leaves, so a
+    /// caller can write its own record of the attempt first and send afterwards ([`Session::send`]),
+    /// and can ask the host again with exactly this request ([`Session::repeat`]).
+    ///
+    /// The identifier is the caller's because a caller may have to name it before it exists: an
+    /// owner's confirmation of a transfer is asked for the action that will spend it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError::WrongEffect`] for a read method, [`ClientError::NoActionWindow`] when
+    /// the host has issued no usable window, and [`ClientError::Cbor`] when the request does not
+    /// encode or does not fit the connection's frame bound: a request that cannot be sent was never
+    /// sent.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn compose<P, E>(
+        &self,
+        method: Method,
+        action_id: ActionId,
+        target: ActionTarget,
+        grant_id: Option<GrantId>,
+        expected: &E,
+        params: &P,
+        requested_ttl: DurationMs,
+    ) -> Result<ComposedMutation>
+    where
+        P: Serialize + ?Sized,
+        E: Serialize + ?Sized,
+    {
+        let entry = method.entry();
+        if entry.effect != EffectClass::Write {
+            return Err(ClientError::WrongEffect {
+                method,
+                expected: "read",
+                actual: "mutation",
+            });
+        }
+        let window = {
+            let window = self.state.action_window.lock().await;
+            if entry.freshness == FreshnessRequirement::ActionWindow
+                && window.valid_for_ms.get() == 0
+            {
+                return Err(ClientError::NoActionWindow);
+            }
+            window.clone()
+        };
+        let request = MutationRequest {
+            // Replaced by whichever session sends it.
+            request_id: RequestId::new(0),
+            method: method.into(),
+            method_version: entry.version,
+            action_id,
+            grant_id: Nullable(grant_id),
+            target,
+            expected: ParamsValue::from_typed(expected)?,
+            action_window_id: window.action_window_id,
+            requested_ttl_ms: requested_ttl,
+            params: ParamsValue::from_typed(params)?,
+        };
+        self.check_frame(&request)?;
+        Ok(ComposedMutation {
+            request,
+            composed_on: Some(self.id),
+            window_issued_at_ms: window.issued_at_ms.get(),
+            window_valid_for_ms: window.valid_for_ms.get(),
+        })
+    }
+
+    /// Sends a composed mutation for the first time, on the connection that composed it.
+    ///
+    /// The window it carries is bound to this connection, so this is the one connection that can
+    /// admit it. The action is recorded here before the request is sent, as [`Session::mutate`]
+    /// records it, and stays unresolved until the caller settles it ([`Session::settle`]),
+    /// whatever the answer was.
+    ///
+    /// # Errors
+    ///
+    /// Returns a refusal when the mutation was composed on another connection, which cannot admit
+    /// it, or when this client is still accounting for the action; and otherwise as
+    /// [`Session::mutate`].
+    pub async fn send(&self, composed: &ComposedMutation) -> Result<Settled> {
+        if composed.composed_on != Some(self.id) {
+            return Err(ClientError::Misdirected { repeating: false });
+        }
+        self.submit_composed(composed).await
+    }
+
+    /// Asks the host again with exactly the request that was composed, on another connection.
+    ///
+    /// This is how a client asks what became of an action whose answer it lost: the host answers a
+    /// repeat of an action from the record it kept of it, before it looks at the window, and the
+    /// window the request carries admits nothing on a connection other than the one it was issued
+    /// to. So a repeat can only ever be answered from that record, and can never be the first
+    /// admission of the action; the host performs an action at most once however often it is asked.
+    /// A repeat on the connection that composed the request is refused for that reason.
+    ///
+    /// The library never repeats by itself. The action is recorded in this session's book like any
+    /// other and stays unresolved until the caller settles it ([`Session::settle`]), so a second
+    /// lost answer still leaves something to report. A repeat gets no new deadline: the host
+    /// answers it from its record or not at all.
+    ///
+    /// # Errors
+    ///
+    /// Returns a refusal when this is the connection that composed the request, or when this
+    /// client is still accounting for the action; and otherwise as [`Session::mutate`].
+    pub async fn repeat(&self, composed: &ComposedMutation) -> Result<Settled> {
+        if composed.composed_on == Some(self.id) {
+            return Err(ClientError::Misdirected { repeating: true });
+        }
+        self.submit_composed(composed).await
+    }
+
+    /// Settles an action by the caller's word, once it has decided what the answers came to.
+    ///
+    /// Only an action sent through [`Session::send`] or [`Session::repeat`] needs this: the
+    /// library settles every other action itself, as the host answers it.
+    pub async fn settle(&self, action_id: ActionId) {
+        self.state.outcomes.lock().await.settle_action(action_id);
+    }
+
+    /// Checks a request against the negotiated frame bound, before anything is recorded.
+    fn check_frame(&self, request: &MutationRequest) -> Result<()> {
+        let frame = ControlFrame::Mutation(Box::new(request.clone()));
+        // The bound in force is the smaller of the stream kind's ceiling and what the peer
+        // negotiated, which is exactly what the writer will apply.
+        let bound = usize::try_from(self.transport.limits().max_control_frame_len.get())
+            .unwrap_or(usize::MAX)
+            .saturating_sub(kr_protocol::frame::FRAME_LENGTH_PREFIX_LEN)
+            .min(kr_protocol::frame::StreamKind::Control.max_payload_len());
+        kr_cbor::to_canonical_vec_within(
+            &frame,
+            &kr_cbor::Limits::DEFAULT.with_max_message_len(bound),
+        )?;
+        Ok(())
+    }
+
+    /// Records a composed mutation as held by its caller and sends it under a request identifier
+    /// of this session's.
+    async fn submit_composed(&self, composed: &ComposedMutation) -> Result<Settled> {
+        let Some(method) = composed.request.method.method() else {
+            return Err(ClientError::Cbor(crate::shown::Shown::said(
+                "a composed mutation names a method this build lacks",
+            )));
+        };
+        let _permit = MutationPermit::acquire(&self.state)?;
+        let action_id = composed.request.action_id;
+        let request_id = self.next_request_id();
+        let waiter = self.register(request_id)?;
+        let mut request = composed.request.clone();
+        request.request_id = request_id;
+        self.check_frame(&request)?;
+        let frame = ControlFrame::Mutation(Box::new(request));
+        {
+            let mut outcomes = self.state.outcomes.lock().await;
+            outcomes.refuse_replacement(action_id)?;
+            outcomes.submit(SubmittedAction {
+                action_id,
+                method,
+                target: composed.request.target.clone(),
+                params: composed.request.params.clone(),
+                request_id,
+                held: true,
+            })?;
+        }
+        if self.transport.send(&frame).await.is_err() {
+            return Err(ClientError::SubmissionUncertain { action_id });
+        }
+        match waiter.wait().await {
+            Ok(Answer::Receipt(receipt)) => Ok(Settled::Receipt(receipt)),
+            Ok(Answer::Response(response)) => match response.outcome {
+                Outcome::Error(error) => Err(ClientError::from(error)),
+                Outcome::Ok(value) => Ok(Settled::Result(value)),
+            },
             Err(_) => Err(ClientError::SubmissionUncertain { action_id }),
         }
     }
@@ -1037,7 +1311,12 @@ async fn route(state: &Arc<SessionState>, frame: ControlFrame) -> bool {
                 let mut outcomes = state.outcomes.lock().await;
                 outcomes.receipts.record(receipt.clone());
                 outcomes.correlations.remove(&request_id);
-                if receipt.state.is_terminal() {
+                if receipt.state.is_terminal()
+                    && !outcomes
+                        .submitted
+                        .get(&receipt.action_id)
+                        .is_some_and(|action| action.held)
+                {
                     outcomes.submitted.remove(&receipt.action_id);
                 }
             }

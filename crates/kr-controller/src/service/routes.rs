@@ -947,4 +947,4 @@ where
 }
 
 /// How the local listener names the operating-system peer it admitted.
-pub(super) const LOCAL_PRINCIPAL_PREFIX: &str = "local:";
+pub(super) const LOCAL_PRINCIPAL_PREFIX: &str = kr_protocol::sharing::LOCAL_PRINCIPAL_PREFIX;

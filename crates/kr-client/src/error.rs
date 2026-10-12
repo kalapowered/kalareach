@@ -83,6 +83,15 @@ pub enum ClientError {
     },
     /// The host has not issued an action window for this connection.
     NoActionWindow,
+    /// A composed mutation was handed to the wrong connection, and nothing was sent.
+    ///
+    /// The first send belongs to the connection that composed it, whose window admits it, and a
+    /// repeat belongs to any other, which can only be answered from the host's record. Neither is
+    /// the host's answer, and a caller that classifies answers must not take this for one.
+    Misdirected {
+        /// Whether the call was a repeat (otherwise the first send).
+        repeating: bool,
+    },
     /// The connection ended before the request was answered.
     ConnectionEnded,
     /// The connection ended after a mutation was sent, so its outcome is unknown.
@@ -113,7 +122,9 @@ impl ClientError {
             Self::Host(error) | Self::Refused { error, .. } => error.code,
             Self::Transport(error) => error.to_protocol_error().code,
             Self::Ipc(error) => error.to_protocol_error().code,
-            Self::Cbor(_) | Self::WrongEffect { .. } => ErrorCode::InvalidArgument,
+            Self::Cbor(_) | Self::WrongEffect { .. } | Self::Misdirected { .. } => {
+                ErrorCode::InvalidArgument
+            }
             Self::UnsupportedVersion { .. } => ErrorCode::UnsupportedSchema,
             Self::TooManyOutstandingMutations { .. }
             | Self::TooManyUnresolvedActions { .. }
@@ -242,6 +253,12 @@ impl Said for ClientError {
                 crate::shown!("{} actions are already unresolved", *limit)
             }
             Self::NoActionWindow => Shown::said("no action window is current"),
+            Self::Misdirected { repeating: false } => {
+                Shown::said("a composed mutation is sent first on the connection that composed it")
+            }
+            Self::Misdirected { repeating: true } => Shown::said(
+                "a mutation is repeated on a connection other than the one that composed it",
+            ),
             Self::ConnectionEnded => {
                 Shown::said("the connection ended before the request was answered")
             }

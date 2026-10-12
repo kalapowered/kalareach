@@ -1295,6 +1295,19 @@ pub async fn share_with(
         .map(|answer| answer.to_typed().expect("decodes"))
 }
 
+/// A client session on the host's own local socket, with the operating-system user the host
+/// authenticated it as: what the desktop companion and `kr` are to their own machine's host.
+pub async fn local_session(host: &Host) -> (Session, u64) {
+    let transport = kr_client::ipc::IpcTransport::connect(&host.endpoint, build())
+        .await
+        .expect("the local client connects");
+    let uid = transport.context().peer.uid.get();
+    (
+        Session::start(transport.shared()).expect("a session on the socket"),
+        uid,
+    )
+}
+
 /// A session this host's registry holds as open, with no worker behind it: what a share, an offer
 /// and a list of them are about. Returns the session and its number.
 pub fn an_open_session(host: &Host) -> (SessionId, kr_protocol::session::DisplayNumber) {
