@@ -2074,10 +2074,10 @@ impl WorkflowStore {
 
     /// Hands out a receiver that sees each change to the journal's rows after it was made.
     ///
-    /// Every statement the store runs goes through [`Self::lock`], so a write by an action, a
-    /// transaction or a single statement is all seen, and a statement that wrote nothing (a
-    /// registration that was already made) is not. A reader marks the receiver as seen before it
-    /// reads the journal, so a change made while it reads is not lost.
+    /// Every statement the store runs goes through its one lock on the connection, so a write by
+    /// an action, a transaction or a single statement is all seen, and a statement that wrote
+    /// nothing (a registration that was already made) is not. A reader marks the receiver as seen
+    /// before it reads the journal, so a change made while it reads is not lost.
     #[must_use]
     pub fn changes(&self) -> tokio::sync::watch::Receiver<u64> {
         self.changed.subscribe()
