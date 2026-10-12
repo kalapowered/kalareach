@@ -855,10 +855,13 @@ textarea::placeholder {
   line-height: 1.4;
 }
 
-/* The words are bounded by the screen, not by the text size: at the largest size a long message
-   scrolls inside its own box, and the controls below it are never pushed off the screen. */
+/* The words are bounded by the screen, not by the text size or the face they are set in: they
+   take what is left of the toast's half of the screen once the controls beneath them, the padding
+   and the border are counted, so the toast as a whole stays under half of it whatever the words.
+   At the largest size a long message scrolls inside its own box, and the controls below it are
+   never pushed off the screen. */
 .toast-text {
-  max-height: min(12rem, 30dvh);
+  max-height: min(12rem, max(80px, calc(49dvh - var(--target) - 24px)));
   /* Words never scroll sideways: they wrap, and what cannot wrap is cut off, not scrolled to. */
   overflow-x: hidden;
   overflow-y: auto;
