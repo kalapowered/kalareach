@@ -475,10 +475,17 @@ struct Idler {
 }
 
 fn idler() -> Idler {
-    let mut child = std::process::Command::new("/bin/sleep")
-        .arg("120")
-        .spawn()
-        .expect("the program starts");
+    idling(std::process::Command::new("/bin/sleep").arg("120"))
+}
+
+/// The same, for a program that ignores a request to terminate: a shell that sets that up and then
+/// becomes `sleep`, which keeps what was ignored.
+fn stubborn_idler() -> Idler {
+    idling(std::process::Command::new("/bin/sh").args(["-c", "trap '' TERM; exec sleep 120"]))
+}
+
+fn idling(command: &mut std::process::Command) -> Idler {
+    let mut child = command.spawn().expect("the program starts");
     let identity =
         kr_ipc::identity::started_process_identity(child.id()).expect("the kernel names it");
     std::thread::spawn(move || child.wait());
@@ -521,9 +528,9 @@ impl Owned for LateRecord {
 }
 
 /// A process the session records only after the ones it already knew have ended is asked to
-/// terminate and given its grace, and is not forced. The record here is the real one with two
-/// programs of the test's own added, because the moment a command's child is first shown cannot
-/// be placed against the ending's readings by any real process.
+/// terminate and given the rest of the window, and is not forced. The record here is the real one
+/// with two programs of the test's own added, because the moment a command's child is first shown
+/// cannot be placed against the ending's readings by any real process.
 #[tokio::test]
 async fn kr_req_07_53_a_process_recorded_while_the_others_are_ending_is_asked_before_it_is_forced()
 {
@@ -548,6 +555,35 @@ async fn kr_req_07_53_a_process_recorded_while_the_others_are_ending_is_asked_be
     assert!(
         gone(&first.identity) && gone(&late.identity),
         "both ended when asked"
+    );
+}
+
+/// A process shown only after the others have ended, which ignores the request to terminate, is
+/// forced when the window is over and not before: whenever a reading first shows a process, force
+/// waits for the five seconds.
+#[tokio::test]
+async fn kr_req_07_53_a_process_shown_late_that_ignores_the_request_is_forced_when_the_window_is_over()
+ {
+    let stand_in = stand_in();
+    let server = start(&stand_in, "ignore-eof", PLAIN).await;
+    let (first, late) = (idler(), stubborn_idler());
+    let record = LateRecord {
+        inner: Record::of(&server),
+        first: first.identity.clone(),
+        late: late.identity.clone(),
+        readings_after_first_ended: std::sync::atomic::AtomicUsize::new(0),
+    };
+
+    let begun = Instant::now();
+    let watching = watch_until_gone(vec![late.identity.clone()]);
+    let retirement = server.retire(&record, begun.into()).await;
+    assert_eq!(retirement.forced, vec![late.identity.clone()]);
+    assert!(retirement.survivors.is_empty());
+    let went = watching.await.expect("the watch is joined")[0];
+    assert!(
+        went.duration_since(begun) >= FIVE_SECONDS,
+        "the process was forced {:?} after the ending began",
+        went.duration_since(begun)
     );
 }
 
