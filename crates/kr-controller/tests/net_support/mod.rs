@@ -370,6 +370,52 @@ impl Host {
         host
     }
 
+    /// Starts a daemon whose configuration document selects the relay lease service at `origin`,
+    /// when it names one, paying as the account `payer` names, whose carriers wait by `timer`, with
+    /// `owner` as its first owner.
+    ///
+    /// The host's own keys are `host_keys`, put where the daemon finds them when it starts, so a
+    /// suite can have the service's account console authorise the host's key before the daemon
+    /// asks for the first lease.
+    pub async fn start_with_relay(
+        owner: &DeviceKeys,
+        host_keys: &DeviceKeys,
+        origin: Option<&str>,
+        payer: Option<(&str, &str)>,
+        timer: Arc<dyn kr_controller::quiet::Timer>,
+        clocks: Clocks,
+    ) -> Self {
+        let temp = kr_ipc::testing::TempHost::create();
+        let secrets = open_store_in(&temp.environment().secrets_dir())
+            .expect("a secret store for the test environment");
+        kr_crypto::store::store_device_keys(
+            secrets.store.as_ref(),
+            &net::device_key_scope(temp.environment_id()),
+            host_keys,
+        )
+        .expect("the host's keys are stored");
+        drop(secrets);
+        write_relay_document(&temp, origin, payer);
+        let mut host = Self::start_on(
+            temp,
+            room::TestRoom::new(),
+            NetworkSettings {
+                endpoint: loopback(),
+                ..NetworkSettings::default()
+            },
+            AccountAt::Managed,
+            Arc::new(MemoryStore::new()),
+            clocks,
+            None,
+            Waits { timer: Some(timer) },
+        )
+        .await;
+        let (device, record) = bootstrap_owner(&host, owner).await;
+        host.owner = Some(record);
+        host.owner_device = Some(device);
+        host
+    }
+
     /// Starts a daemon whose network selects the services `endpoint` names, with `owner` as its
     /// first owner.
     pub async fn start_with_endpoint(owner: &DeviceKeys, endpoint: EndpointConfig) -> Self {
@@ -772,6 +818,30 @@ pub fn write_feed_document(host: &kr_ipc::testing::TempHost, origin: Option<&str
         .map_or_else(kr_protocol::scalars::Nullable::null, |origin| {
             kr_protocol::scalars::Nullable::some(origin.to_owned())
         });
+    write_document(host, &document);
+}
+
+/// Writes the configuration document that selects the relay lease service at `origin`, or none,
+/// and the account `payer` names as its account id and its authorisation id, into a host tree.
+pub fn write_relay_document(
+    host: &kr_ipc::testing::TempHost,
+    origin: Option<&str>,
+    payer: Option<(&str, &str)>,
+) {
+    let mut document = kr_protocol::hostinfo::configuration::ConfigurationDocument::empty();
+    document.revision = 1;
+    document.relay.origin = origin.map_or_else(kr_protocol::scalars::Nullable::null, |origin| {
+        kr_protocol::scalars::Nullable::some(origin.to_owned())
+    });
+    document.relay.payer = payer.map_or_else(
+        kr_protocol::scalars::Nullable::null,
+        |(account_id, authorisation_id)| {
+            kr_protocol::scalars::Nullable::some(kr_protocol::hostinfo::configuration::RelayPayer {
+                account_id: account_id.to_owned(),
+                authorisation_id: authorisation_id.to_owned(),
+            })
+        },
+    );
     write_document(host, &document);
 }
 

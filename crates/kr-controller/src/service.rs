@@ -393,6 +393,9 @@ pub struct Controller {
     backup_relay: Option<Arc<crate::backup::relay::BackupRelay>>,
     /// The carrier of this host's authority feed, when its configuration document names one.
     feed_runtime: Option<crate::authority_feed::FeedRuntime>,
+    /// What keeps a relay lease for each paired device, when this host's configuration document
+    /// selects a relay lease service.
+    relay_keeper: Option<crate::relay_leases::RelayKeeper>,
     /// Wakes the task that gives the owner's inbox its notices about the authority feed.
     feed_notice_wake: Arc<tokio::sync::Notify>,
     /// That task, which ends when the daemon is dropped.
@@ -1027,6 +1030,13 @@ impl Controller {
     #[must_use]
     pub const fn feed_runtime(&self) -> Option<&crate::authority_feed::FeedRuntime> {
         self.feed_runtime.as_ref()
+    }
+
+    /// What keeps a relay lease for each paired device, when this host's configuration document
+    /// selects a relay lease service.
+    #[must_use]
+    pub const fn relay_keeper(&self) -> Option<&crate::relay_leases::RelayKeeper> {
+        self.relay_keeper.as_ref()
     }
 }
 
