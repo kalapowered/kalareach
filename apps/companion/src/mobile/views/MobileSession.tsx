@@ -35,7 +35,7 @@ import type { ConversationItem } from '../../model/conversation'
 import { keptEntry } from '../../model/draft-book'
 import { entryLabel, nodeKindLabel } from '../../model/entry-label'
 import { Badge, Banner, Button, Segmented } from '../../components/ui'
-import { failureCode, failureMessage } from '../../host/port'
+import { failureCode, failureMessage, type SessionSubject } from '../../host/port'
 import {
   adoptFirstTarget,
   againstCurrent,
@@ -246,6 +246,12 @@ export function MobileSession({
       ),
     [held, sessionId, openedAtMs, currentTarget]
   )
+  // What a mutation about this session names: the session with its epoch, which the host reports
+  // and this screen does not hold, so it is asked for when a file is picked or a path is asked for.
+  const nameSession = useCallback(async (): Promise<SessionSubject> => {
+    const read = await port.sessionRead({ session_id: sessionId })
+    return { sessionId, sessionEpoch: read.session.session_epoch }
+  }, [port, sessionId])
   const { rights, paired } = useHeldConnection()
   // A file needs the host on this phone's own computer and the rights, and nothing of the agent.
   const fileOffer = useMemo(
@@ -357,10 +363,15 @@ export function MobileSession({
         )
       }
       ask(() => file.arrayBuffer())
-        .then((buffer) =>
-          port.attachmentUploadBytes({ name: picked.name, bytes: new Uint8Array(buffer) }, { sessionId })
-        )
-        .then((handle) => {
+        .then(async (buffer) => {
+          const naming = await nameSession()
+          const handle = await port.attachmentUploadBytes(
+            { name: picked.name, bytes: new Uint8Array(buffer) },
+            naming
+          )
+          return { handle, naming }
+        })
+        .then(({ handle, naming }) => {
           settle({
             transferId: handle.transfer_id,
             name: handle.original_file_name,
@@ -372,7 +383,7 @@ export function MobileSession({
           })
           if (removedFiles.current.has(localId)) return
           say(`${handle.original_file_name} is uploaded and kept with this draft.`)
-          void paths.attach(sessionId, { sessionId }, handle)
+          void paths.attach(sessionId, naming, handle)
         })
         .catch((failure: unknown) => {
           settle({ upload: 'failed' })
@@ -380,7 +391,7 @@ export function MobileSession({
           say(`${picked.name} was not uploaded: ${failureMessage(failure)}`, 'danger')
         })
     },
-    [changeFiles, paths, port, say, sessionId]
+    [changeFiles, nameSession, paths, port, say, sessionId]
   )
 
   // A draft written before the agent was read keeps the first conversation it learns, so that a
@@ -1139,7 +1150,7 @@ export function MobileSession({
           ) : null}
           <AttachmentPaths
             sessionId={sessionId}
-            subject={{ sessionId }}
+            subject={nameSession}
             attachments={draft.attachments}
             target={target}
           />

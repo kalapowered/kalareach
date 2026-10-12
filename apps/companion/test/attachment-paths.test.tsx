@@ -22,6 +22,8 @@ import type { AttachmentHandle } from '../src/host/port'
 import { ManualPaths } from '../src/model/manual-paths'
 
 const SESSION_MAIN = '8a7b6c50-22bb-4c3d-8e4f-000000000101'
+/** The subject of a session's mutation: the session with its epoch, as native code requires. */
+const SUBJECT = { sessionId: SESSION_MAIN, sessionEpoch: '1' }
 const SESSION_BUILD = '8a7b6c50-22bb-4c3d-8e4f-000000000102'
 
 afterEach(cleanup)
@@ -238,7 +240,7 @@ describe('what the chip and the path say of a file', () => {
 
   it('shows a file sent for another session no path, whatever the window was given for it before', async () => {
     const host = fakeHost()
-    const sent = await host.port.attachmentUpload('/tmp/moved.png', { sessionId: SESSION_MAIN })
+    const sent = await host.port.attachmentUpload('/tmp/moved.png', SUBJECT)
     const file = (handle: AttachmentHandle) => ({
       localId: 'file-1',
       transferId: sent.transfer_id,
@@ -254,12 +256,12 @@ describe('what the chip and the path say of a file', () => {
     function Primed({ handle }: { readonly handle: AttachmentHandle }) {
       const { paths } = useApp()
       useEffect(() => {
-        void paths.attach(SESSION_MAIN, { sessionId: SESSION_MAIN }, sent)
+        void paths.attach(SESSION_MAIN, SUBJECT, sent)
       }, [paths])
       return (
         <AttachmentPaths
           sessionId={SESSION_MAIN}
-          subject={{ sessionId: SESSION_MAIN }}
+          subject={SUBJECT}
           attachments={[file(handle)]}
         />
       )
@@ -303,28 +305,28 @@ describe('the host’s draft for a session’s files', () => {
   /** A host with the handles of two published files, as an upload leaves them. */
   async function twoFiles() {
     const host = fakeHost()
-    const one = await host.port.attachmentUpload('/tmp/one.png', { sessionId: SESSION_MAIN })
-    const two = await host.port.attachmentUpload('/tmp/two.png', { sessionId: SESSION_MAIN })
+    const one = await host.port.attachmentUpload('/tmp/one.png', SUBJECT)
+    const two = await host.port.attachmentUpload('/tmp/two.png', SUBJECT)
     return { ...host, one, two, paths: new ManualPaths(host.port) }
   }
 
   it('is let go of after any failed call, so the next file starts from another draft', async () => {
     const { controls, one, two, paths } = await twoFiles()
     controls.hostDrafts.refuseBinds({ code: 'QUOTA_EXCEEDED', message: 'the host holds all it will' })
-    await paths.attach(SESSION_MAIN, { sessionId: SESSION_MAIN }, one)
+    await paths.attach(SESSION_MAIN, SUBJECT, one)
     expect(paths.snapshot().get(one.transfer_id)).toMatchObject({ kind: 'refused' })
 
     // A draft only grows and the window cannot read it, so a refusal leaves no draft in use.
     controls.hostDrafts.refuseBinds(null)
-    await paths.attach(SESSION_MAIN, { sessionId: SESSION_MAIN }, one)
+    await paths.attach(SESSION_MAIN, SUBJECT, one)
     expect(paths.snapshot().get(one.transfer_id)).toMatchObject({ kind: 'ready' })
     expect(controls.hostDrafts.made).toHaveLength(2)
 
     // A conflict says the window's view of the draft is wrong; the next attempt starts again too.
     controls.hostDrafts.refuseBinds({ code: 'DRAFT_CONFLICT', message: 'the draft moved' })
-    await paths.attach(SESSION_MAIN, { sessionId: SESSION_MAIN }, two)
+    await paths.attach(SESSION_MAIN, SUBJECT, two)
     controls.hostDrafts.refuseBinds(null)
-    await paths.attach(SESSION_MAIN, { sessionId: SESSION_MAIN }, two)
+    await paths.attach(SESSION_MAIN, SUBJECT, two)
     expect(controls.hostDrafts.made).toHaveLength(3)
     expect(paths.snapshot().get(two.transfer_id)).toMatchObject({ kind: 'ready' })
   })
@@ -333,11 +335,11 @@ describe('the host’s draft for a session’s files', () => {
     const host = fakeHost()
     const handles: AttachmentHandle[] = []
     for (let each = 0; each < 9; each += 1) {
-      handles.push(await host.port.attachmentUpload(`/tmp/file-${String(each)}.png`, { sessionId: SESSION_MAIN }))
+      handles.push(await host.port.attachmentUpload(`/tmp/file-${String(each)}.png`, SUBJECT))
     }
     const paths = new ManualPaths(host.port)
 
-    for (const each of handles) await paths.attach(SESSION_MAIN, { sessionId: SESSION_MAIN }, each)
+    for (const each of handles) await paths.attach(SESSION_MAIN, SUBJECT, each)
 
     for (const each of handles) {
       expect(paths.snapshot().get(each.transfer_id), each.original_file_name).toMatchObject({ kind: 'ready' })
@@ -348,8 +350,8 @@ describe('the host’s draft for a session’s files', () => {
 
   it('gives a file asked for again its own draft’s next revision, not a new draft', async () => {
     const { controls, one, paths } = await twoFiles()
-    await paths.attach(SESSION_MAIN, { sessionId: SESSION_MAIN }, one)
-    await paths.attach(SESSION_MAIN, { sessionId: SESSION_MAIN }, one)
+    await paths.attach(SESSION_MAIN, SUBJECT, one)
+    await paths.attach(SESSION_MAIN, SUBJECT, one)
 
     expect(controls.hostDrafts.made).toHaveLength(1)
     expect(controls.hostDrafts.bound.map((each) => each.expected_revision)).toEqual(['1', '2'])
@@ -358,12 +360,12 @@ describe('the host’s draft for a session’s files', () => {
   it('shows no path from a draft the host made and then did not confirm, and none from an answer with no grant', async () => {
     const { controls, one, two, paths } = await twoFiles()
     controls.hostDrafts.leaveNextUnconfirmed('create')
-    await paths.attach(SESSION_MAIN, { sessionId: SESSION_MAIN }, one)
+    await paths.attach(SESSION_MAIN, SUBJECT, one)
     expect(paths.snapshot().get(one.transfer_id)).toEqual({ kind: 'unconfirmed' })
     expect(controls.hostDrafts.bound).toEqual([])
 
     // The retry makes a draft of its own and binds at its first revision.
-    await paths.attach(SESSION_MAIN, { sessionId: SESSION_MAIN }, one)
+    await paths.attach(SESSION_MAIN, SUBJECT, one)
     expect(controls.hostDrafts.made).toHaveLength(2)
     expect(controls.hostDrafts.bound[0]).toMatchObject({
       draft_id: controls.hostDrafts.made[1]?.draft_id,
@@ -371,10 +373,10 @@ describe('the host’s draft for a session’s files', () => {
     })
 
     controls.hostDrafts.leaveNextGrantless()
-    await paths.attach(SESSION_MAIN, { sessionId: SESSION_MAIN }, two)
+    await paths.attach(SESSION_MAIN, SUBJECT, two)
     expect(paths.snapshot().get(two.transfer_id)).toMatchObject({ kind: 'refused' })
     // The host did confirm the bind, so the retry names the same draft at its next revision.
-    await paths.attach(SESSION_MAIN, { sessionId: SESSION_MAIN }, two)
+    await paths.attach(SESSION_MAIN, SUBJECT, two)
     expect(paths.snapshot().get(two.transfer_id)).toMatchObject({ kind: 'ready' })
     expect(controls.hostDrafts.bound.at(-1)).toMatchObject({
       draft_id: controls.hostDrafts.made[1]?.draft_id,
@@ -388,14 +390,14 @@ describe('the host’s draft for a session’s files', () => {
     // The host answers each bind with a draft, so the words are the window's own: the grant it gave
     // names another file, or another method.
     controls.hostDrafts.giveNextGrantTo({ transfer_id: two.transfer_id })
-    await paths.attach(SESSION_MAIN, { sessionId: SESSION_MAIN }, one)
+    await paths.attach(SESSION_MAIN, SUBJECT, one)
     expect(paths.snapshot().get(one.transfer_id)).toMatchObject({
       kind: 'refused',
       words: expect.stringContaining('gave no path') as string
     })
 
     controls.hostDrafts.giveNextGrantTo({ insertion_method: 'typed_submission' })
-    await paths.attach(SESSION_MAIN, { sessionId: SESSION_MAIN }, two)
+    await paths.attach(SESSION_MAIN, SUBJECT, two)
     expect(paths.snapshot().get(two.transfer_id)).toMatchObject({
       kind: 'refused',
       words: expect.stringContaining('gave no path') as string
@@ -406,7 +408,7 @@ describe('the host’s draft for a session’s files', () => {
     const { controls, one, paths } = await twoFiles()
     controls.reachAsPairedDevice()
 
-    await paths.attach(SESSION_MAIN, { sessionId: SESSION_MAIN }, one)
+    await paths.attach(SESSION_MAIN, SUBJECT, one)
 
     expect(paths.snapshot().get(one.transfer_id)).toMatchObject({
       kind: 'refused',
@@ -419,7 +421,7 @@ describe('the host’s draft for a session’s files', () => {
     const { controls, paths } = await twoFiles()
     const foreign = handle('99999999-9999-4999-8999-0000000000aa', { session_id: SESSION_BUILD })
 
-    await paths.attach(SESSION_MAIN, { sessionId: SESSION_MAIN }, foreign)
+    await paths.attach(SESSION_MAIN, SUBJECT, foreign)
 
     expect(paths.snapshot().get(foreign.transfer_id)).toMatchObject({
       kind: 'refused',
@@ -432,8 +434,8 @@ describe('the host’s draft for a session’s files', () => {
     const { controls, one, two, paths } = await twoFiles()
 
     await Promise.all([
-      paths.attach(SESSION_MAIN, { sessionId: SESSION_MAIN }, one),
-      paths.attach(SESSION_MAIN, { sessionId: SESSION_MAIN }, two)
+      paths.attach(SESSION_MAIN, SUBJECT, one),
+      paths.attach(SESSION_MAIN, SUBJECT, two)
     ])
 
     expect(controls.hostDrafts.bound.map((each) => each.expected_revision)).toEqual(['1', '2'])

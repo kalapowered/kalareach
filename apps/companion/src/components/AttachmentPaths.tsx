@@ -10,7 +10,7 @@
 import { useEffect, useState, useSyncExternalStore, type ReactNode } from 'react'
 
 import { useApp } from '../app/state'
-import type { SessionSubject } from '../host/port'
+import { failureMessage, type SessionSubject } from '../host/port'
 import type { DraftAttachment } from '../model/drafts'
 import type { PathState } from '../model/manual-paths'
 import { Button } from './ui'
@@ -135,12 +135,16 @@ export function AttachmentPaths({
   target
 }: {
   readonly sessionId: string
-  readonly subject: SessionSubject
+  /**
+   * What the request names: the session, with its epoch. A screen that does not hold the epoch gives
+   * a function that asks the host for it, which is called when a path is asked for.
+   */
+  readonly subject: SessionSubject | (() => Promise<SessionSubject>)
   readonly attachments: readonly DraftAttachment[]
   /** The smallest height of a control a finger presses, on a phone. */
   readonly target?: number
 }): ReactNode {
-  const { paths } = useApp()
+  const { paths, say } = useApp()
   const states = useSyncExternalStore(paths.subscribe, paths.snapshot)
   const sent = attachments.filter(
     (attachment) => attachment.upload === 'uploaded' && attachment.handle !== null
@@ -156,8 +160,14 @@ export function AttachmentPaths({
           state={attachment.transferId === null ? undefined : states.get(attachment.transferId)}
           target={target}
           onAsk={() => {
-            if (attachment.handle === null) return
-            void paths.attach(sessionId, subject, attachment.handle)
+            const handle = attachment.handle
+            if (handle === null) return
+            const named = typeof subject === 'function' ? subject() : Promise.resolve(subject)
+            named
+              .then((naming) => paths.attach(sessionId, naming, handle))
+              .catch((failure: unknown) => {
+                say(`The host could not be asked for the path: ${failureMessage(failure)}`, 'danger')
+              })
           }}
         />
       ))}

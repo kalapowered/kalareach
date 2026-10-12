@@ -140,6 +140,16 @@ function requireFields(params: unknown, fields: readonly string[]): Record<strin
   return named
 }
 
+/**
+ * Native code names a mutation's subject the way the target requires: a session comes with its
+ * epoch, and a subject that names one without the other is refused before anything is sent.
+ */
+function requireWholeSubject(subject: { readonly sessionId?: string; readonly sessionEpoch?: string }): void {
+  if (subject.sessionId !== undefined && subject.sessionEpoch === undefined) {
+    refuse('INVALID_ARGUMENT', 'a session is named with its epoch')
+  }
+}
+
 function refuse(code: string, message: string): never {
   // A command's failure arrives as data rather than as an Error, because that is what crosses the
   // boundary from the native backend. A test that saw an Error here would be testing a shape the
@@ -1091,8 +1101,9 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
     deviceDraftRetarget: (request) => Promise.resolve(drafts.retarget(request)),
     deviceDraftDiscard: (request) => Promise.resolve(drafts.discard(request)),
 
-    draftCreate: (params) => {
+    draftCreate: (params, subject) => {
       requireConnection()
+      requireWholeSubject(subject)
       const read = decodeParams<{
         environment_id: string
         session_id: string | null
@@ -1103,8 +1114,9 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
       }
       return Promise.resolve(hostDrafts.create(read.session_id, read.application_instance_id))
     },
-    attachmentUpload: (path) => {
+    attachmentUpload: (path, subject) => {
       requireConnection()
+      requireWholeSubject(subject)
       // What `upload.finish` also says of a handle, which the scripted uploads do not vary.
       const unpublished = { session_id: null, preview: null, published_at_ms: '1', expires_at_ms: '2', submitted: false }
       const name = path.split('/').pop() ?? path
@@ -1123,8 +1135,9 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
       hostDrafts.published(handle)
       return Promise.resolve(handle)
     },
-    attachmentUploadBytes: (file) => {
+    attachmentUploadBytes: (file, subject) => {
       requireConnection()
+      requireWholeSubject(subject)
       const unpublished = { session_id: null, preview: null, published_at_ms: '1', expires_at_ms: '2', submitted: false }
       if (file.bytes.length > MAX_HANDED_BYTES) {
         refuse('QUOTA_EXCEEDED', 'a pasted or picked file is at most 64 MiB; drop a larger one on the window')
@@ -1146,8 +1159,9 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
       hostDrafts.published(handle)
       return Promise.resolve(handle)
     },
-    draftAddAttachment: (params) => {
+    draftAddAttachment: (params, subject) => {
       requireConnection()
+      requireWholeSubject(subject)
       // Native code reads the method's own parameters, the integration's contribution included,
       // before anything reaches a host.
       const read = decodeParams<BindParams>(params, AGENT_DRAFT_ADD_ATTACHMENT_PARAMS)
