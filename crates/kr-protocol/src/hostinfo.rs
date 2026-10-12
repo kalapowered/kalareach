@@ -2632,10 +2632,9 @@ pub mod configuration {
     /// relay its owner runs.
     ///
     /// A host key draws on no allowance of its own, so the service turns away a host that names
-    /// no account. `payer` names the account the console gave this host's key leave to spend, and
-    /// the authorisation it gave: both are shown beside the authorisation in the account console.
-    /// Withdrawing the authorisation there ends the leases issued under it; signing this host out
-    /// of the account does not.
+    /// no account. `payer` names the account that gave this host's key leave to spend its relay
+    /// allowance, and the authorisation it gave. Withdrawing the authorisation ends the leases
+    /// issued under it; signing this host out of the account does not.
     ///
     /// The section arrived with level 4. A release that reads level 3 does not know it: it applies
     /// the rest of the document, counts the section among the members it ignores, and does not
