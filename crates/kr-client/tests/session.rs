@@ -137,6 +137,8 @@ struct HostScript {
     /// That is what a host does when it will not act until it has more: it answers the request it
     /// was sent with what it still needs, rather than with a receipt for work it has accepted.
     answer_mutations_with_result: Mutex<u32>,
+    /// Answer every mutation with a receipt in this state instead of `accepted`.
+    receipt_state: Mutex<Option<ReceiptState>>,
     /// Answer nothing at all to this many of the next mutations.
     ///
     /// A host that took the frame and said nothing is what leaves an action whose outcome nobody
@@ -283,7 +285,8 @@ fn spawn_host(
                                     method: mutation.method.clone(),
                                     method_version: mutation.method_version,
                                     revision: U64::new(1),
-                                    state: ReceiptState::Accepted,
+                                    state: (*script.receipt_state.lock().await)
+                                        .unwrap_or(ReceiptState::Accepted),
                                     reason: Nullable::null(),
                                     payload_digest: Digest256::from_bytes([0; 32]),
                                     accepted_deadline_ms: Nullable::null(),
@@ -1036,6 +1039,64 @@ async fn a_refusal_that_a_retry_cannot_change_comes_straight_back_with_its_actio
     assert_eq!(decision.recovery, Recovery::Stop);
     assert!(!decision.retries_automatically());
 
+    session.close();
+    serving.abort();
+}
+
+/// KR-REQ-09.08: an action its caller holds is not dropped from the unresolved book by a terminal
+/// receipt, whatever the receipt says: only its caller settles it. An ordinary mutation is settled
+/// by the same receipt, as it always has been, so the book does not fill.
+#[tokio::test]
+async fn a_terminal_receipt_does_not_drop_an_action_its_caller_holds() {
+    let host = side(1, true).await;
+    let client = side(2, false).await;
+    let script = Arc::new(HostScript::default());
+    *script.receipt_state.lock().await = Some(ReceiptState::Refused);
+    let serving = spawn_host(&host, client.record, Arc::clone(&script), None);
+    let session = connect(&client, &host).await;
+    let target = ActionTarget::environment(EnvironmentId::new(Uuid::from_bytes([9; 16])));
+
+    let composed = session
+        .compose(
+            Method::SessionCreate,
+            kr_protocol::ids::ActionId::new(Uuid::from_bytes([0x44; 16])),
+            target.clone(),
+            None,
+            &Empty {},
+            &Empty {},
+            DurationMs::new(120_000),
+        )
+        .await
+        .expect("composed");
+    let settled = session.send(&composed).await.expect("the host answers");
+    assert_eq!(
+        settled.receipt().expect("a receipt").state,
+        ReceiptState::Refused
+    );
+    assert_eq!(
+        session.submitted_actions().await.len(),
+        1,
+        "a terminal receipt does not settle what its caller holds"
+    );
+    session.settle(composed.action_id()).await;
+    assert!(session.submitted_actions().await.is_empty());
+
+    // The same receipt settles an ordinary mutation by itself.
+    session
+        .mutate(
+            Method::SessionCreate,
+            target,
+            None,
+            &Empty {},
+            &Empty {},
+            DurationMs::new(120_000),
+        )
+        .await
+        .expect("a settlement");
+    assert!(
+        session.submitted_actions().await.is_empty(),
+        "an ordinary mutation is settled by its terminal receipt"
+    );
     session.close();
     serving.abort();
 }
