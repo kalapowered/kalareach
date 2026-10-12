@@ -152,6 +152,17 @@ async fn kr_req_18_03_an_offer_is_told_to_the_device_it_names_and_to_no_other() 
         nothing.offers.is_empty() && nothing.shares.is_empty(),
         "a device the invitation does not name is told nothing of it: {nothing:?}"
     );
+
+    // The same holds for the share it becomes: the device that redeemed it holds it, and the one
+    // the invitation never named is still told nothing.
+    redeem(&host, &on_named, issued.preview.invitation_id).await;
+    let holding = all_of_it(&on_named).await;
+    assert_eq!(holding.shares.len(), 1, "the device that redeemed holds it");
+    let nothing = all_of_it(&on_other).await;
+    assert!(
+        nothing.offers.is_empty() && nothing.shares.is_empty(),
+        "a device the share is not the grant of is told nothing of it: {nothing:?}"
+    );
     on_named.close();
     on_other.close();
     host.stop().await;
@@ -378,6 +389,82 @@ async fn kr_req_25_10_a_long_list_is_paged_by_its_key_and_survives_a_redemption_
     ids.sort();
     ids.dedup();
     assert_eq!(ids.len(), listed, "no share is listed twice");
+    connection.close();
+    host.stop().await;
+}
+
+/// KR-REQ-25.10: a voice grant a device holds is never listed, and the rows a page leaves out do
+/// not make the page they were read in look like the last: every share after them is still told.
+/// The store is read in chunks of 128 rows, and a chunk whose rows are all left out, a voice grant
+/// and shares that have run out among them, must not end the list while rows follow it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_25_10_rows_left_out_of_the_first_chunk_do_not_hide_the_shares_after_it() {
+    use kr_controller::grants::store::GrantRecord;
+    use kr_protocol::grant::GrantExpiry;
+    use kr_protocol::rights::ActionRight;
+    use kr_protocol::scalars::TimestampMs;
+
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    let (device, record) = recipient(&host, &owner).await;
+    let connection = RawDevice::connect(&host, &device, &record).await;
+    let (session_id, _) = an_open_session(&host);
+    let template = share(&host, session_id, record.device_id).await.grant;
+
+    // A hundred and thirty-one rows the store holds as active shares of the session. The first is a
+    // voice grant, the next hundred and twenty-seven have run out, and three are told: so the
+    // first chunk of 128 rows has nothing to tell, and the three follow it.
+    let base = kr_ipc::now_ms().get();
+    let mut told = Vec::new();
+    for index in 0..131_u64 {
+        let mut grant = template.clone();
+        grant.grant_id = GrantId::new(kr_ipc::new_uuid());
+        if index == 0 {
+            grant.actions.insert(ActionRight::VoiceUse);
+        } else if index < 128 {
+            grant.expiry = GrantExpiry::At {
+                expires_at_ms: TimestampMs::new(base - 1),
+            };
+        } else {
+            told.push(grant.grant_id);
+        }
+        host.controller()
+            .sharing()
+            .grants()
+            .issue(
+                &GrantRecord {
+                    grant,
+                    session_id: Some(session_id),
+                    issued_at_ms: base + index,
+                    activated_at_ms: Some(base + index),
+                    revoked_at_ms: None,
+                    revoked_by_parent: None,
+                },
+                || Ok(()),
+            )
+            .expect("the row is written");
+    }
+
+    let mut listed: Vec<GrantId> = Vec::new();
+    let mut after = None;
+    loop {
+        let page = held(&connection, None, after.take()).await;
+        listed.extend(page.shares.iter().map(|share| share.grant.grant_id));
+        if !page.shares_more {
+            break;
+        }
+        let last = page.shares.last().expect("a full page has a last share");
+        after = Some(ShareKey {
+            issued_at_ms: last.issued_at_ms,
+            grant_id: last.grant.grant_id,
+        });
+    }
+    listed.sort();
+    told.sort();
+    assert_eq!(
+        listed, told,
+        "the three shares after the first chunk are told, and nothing else is"
+    );
     connection.close();
     host.stop().await;
 }

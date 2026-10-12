@@ -497,6 +497,15 @@ impl Controller {
             let exhausted = chunk.len() < CHUNK;
             for record in chunk {
                 cursor = Some((record.issued_at_ms, record.grant.grant_id));
+                // A voice grant is the voice coordinator's own, and is never listed. It is left
+                // out here, after the page was read, so the length of the page still says whether
+                // the store has more.
+                if record
+                    .grant
+                    .permits(kr_protocol::rights::ActionRight::VoiceUse)
+                {
+                    continue;
+                }
                 let Some(session_id) = record.session_id else {
                     continue;
                 };

@@ -1034,9 +1034,11 @@ impl GrantDirectory {
     /// after `after`, at most `limit` of them.
     ///
     /// The key is the grant's issue time and then its identity, ordered and compared by the
-    /// database. A grant that carries `voice.use` is a voice grant, which the voice coordinator
-    /// selects for itself, and is not listed. Whether a grant has run out is for the caller to
-    /// decide on the host's clocks ([`Self::lapsed`]).
+    /// database. Every row the database returns is returned, a voice grant (one that carries
+    /// `voice.use`, which the voice coordinator selects for itself) included: leaving a row out
+    /// after the limit was applied would make a page that is full look like the last one, so
+    /// the caller leaves such a grant out as it reads on. Whether a grant has run out is for the
+    /// caller to decide on the host's clocks ([`Self::lapsed`]).
     ///
     /// # Errors
     ///
@@ -1078,17 +1080,7 @@ impl GrantDirectory {
                 .collect::<rusqlite::Result<Vec<Row>>>()?;
             Ok(rows)
         })?;
-        let mut records = Vec::new();
-        for row in rows {
-            let record = row?;
-            if !record
-                .grant
-                .permits(kr_protocol::rights::ActionRight::VoiceUse)
-            {
-                records.push(record);
-            }
-        }
-        Ok(records)
+        rows.into_iter().collect()
     }
 
     /// Revokes a grant and every grant delegated from it, however deep.
