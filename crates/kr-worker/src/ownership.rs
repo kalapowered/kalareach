@@ -161,10 +161,12 @@ pub struct OwnedProcesses {
     /// session. Each is a root of a tree that [`Self::observe`] reads by parentage.
     backends: BTreeMap<(u64, u64), ProcessStartIdentity>,
     /// Every recorded process that is a backend root or was read below one, with the root it is
-    /// below, that has not been read as ended. It is what the next reading of the trees starts
-    /// from, so a process whose parent has gone is still read for its own children, and it is
-    /// still below the root it was read below.
-    under_backends: BTreeMap<(u64, u64), (ProcessStartIdentity, (u64, u64))>,
+    /// below and the process it was read as a child of (a root's own is itself), that has not been
+    /// read as ended. It is what the next reading of the trees starts from, so a process whose
+    /// parent has gone is still read for its own children, and it is still below the root it was
+    /// read below; and the parent is what lets everything recorded below a process that leaves the
+    /// session leave with it.
+    under_backends: BTreeMap<(u64, u64), ReadBelow>,
     /// The most processes `seen` holds.
     cap: usize,
     /// Whether a process was refused for want of room, and said so.
@@ -260,6 +262,10 @@ pub const LEFT_FOR_A_DAEMON: &str = "left_for_a_daemon";
 /// nothing to say about them; one that is still full refuses to record another and says so. A
 /// server the session starts is always recorded.
 pub const MAX_RECORDED_PROCESSES: usize = 1024;
+
+/// A process read below a backend root: the process, the root it is below, and the process it
+/// was read as a child of (a root's own is itself).
+type ReadBelow = (ProcessStartIdentity, (u64, u64), (u64, u64));
 
 #[derive(Debug)]
 struct Recorded {
@@ -468,7 +474,7 @@ impl OwnedProcesses {
         }
         self.backends.insert(key(&root), root.clone());
         self.under_backends
-            .insert(key(&root), (root.clone(), key(&root)));
+            .insert(key(&root), (root.clone(), key(&root), key(&root)));
         // A server is recorded whatever the record holds: it is the root of a tree that is read
         // from it, so a server left out would be a tree nothing reads, and a record that said it
         // was written would not name the process a later daemon has to stop. A session has few,
@@ -499,9 +505,9 @@ impl OwnedProcesses {
         }
         self.under_backends
             .iter()
-            .filter(|(below, (_, under))| **below != key(root) && *under == key(root))
+            .filter(|(below, (_, under, _))| **below != key(root) && *under == key(root))
             .filter(|(below, _)| self.live.contains_key(*below))
-            .map(|(_, (identity, _))| identity.clone())
+            .map(|(_, (identity, _, _))| identity.clone())
             .collect()
     }
 
@@ -593,6 +599,28 @@ impl OwnedProcesses {
         self.live.remove(&this);
     }
 
+    /// Notes everything recorded below the process `parent`, and below those, as having left the
+    /// session with it, and forgets where it was read: what a process that left started is not
+    /// the session's, and the record would otherwise go on stopping it.
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+    fn leave_below(&mut self, parent: &(u64, u64)) {
+        let mut leaving = vec![*parent];
+        while let Some(above) = leaving.pop() {
+            let below: Vec<(u64, u64)> = self
+                .under_backends
+                .iter()
+                .filter(|(this, (_, _, read_below))| *read_below == above && **this != above)
+                .map(|(this, _)| *this)
+                .collect();
+            for this in below {
+                if let Some((identity, _, _)) = self.under_backends.remove(&this) {
+                    self.note_left(&identity);
+                }
+                leaving.push(this);
+            }
+        }
+    }
+
     /// Reads whether a process has left the session for a control daemon's own scope, and notes it
     /// as having left when it has: it is not the session's to ask to stop or to force, and what it
     /// started is not the session's either. The reading is kept, because the process can end
@@ -648,8 +676,9 @@ impl OwnedProcesses {
     /// root is kept, and so is anything forced, a server that left something running and a process
     /// read as having left the session that still runs.
     ///
-    /// What is not running is what [`Self::read_live`] has just dropped from `live`, so each
-    /// process is read once.
+    /// What is not running is what [`Self::read_live`] has just dropped from `live`; a process read
+    /// as having left is read once more, for whether it still runs, because it stays in the record
+    /// only while it does.
     fn forget_ended(&mut self) {
         self.read_live();
         let root = key(&self.root);
@@ -686,7 +715,7 @@ impl OwnedProcesses {
     /// stays in the record for: the ending of it finds what it left behind through it.
     fn runs_below(&self, root: &(u64, u64)) -> bool {
         self.backends.contains_key(root)
-            && self.under_backends.iter().any(|(below, (_, under))| {
+            && self.under_backends.iter().any(|(below, (_, under, _))| {
                 under == root && below != root && self.live.contains_key(below)
             })
     }
@@ -910,8 +939,26 @@ impl OwnedProcesses {
         }
         #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
         {
-            let mut pending: Vec<(ProcessStartIdentity, (u64, u64))> =
-                self.under_backends.values().cloned().collect();
+            // What is recorded below a process that has left the session leaves with it, before
+            // anything is read: it was recorded while the process was thought to be the session's.
+            let departed: Vec<ProcessStartIdentity> = self
+                .under_backends
+                .iter()
+                .filter(|(below, _)| !self.backends.contains_key(*below))
+                .map(|(_, (identity, _, _))| identity.clone())
+                .collect();
+            let mut read = std::collections::BTreeSet::new();
+            for identity in departed {
+                read.insert(key(&identity));
+                if self.read_left(&identity) {
+                    self.leave_below(&key(&identity));
+                }
+            }
+            let mut pending: Vec<(ProcessStartIdentity, (u64, u64))> = self
+                .under_backends
+                .values()
+                .map(|(identity, under, _)| (identity.clone(), *under))
+                .collect();
             let mut found: Vec<ProcessStartIdentity> = Vec::new();
             let mut walked = std::collections::BTreeSet::new();
             while let Some((parent, under)) = pending.pop() {
@@ -922,7 +969,11 @@ impl OwnedProcesses {
                 // whether it is in the scope now or was read there before: what it started is its
                 // own, not the session's. The reading is applied here, as the walk of the
                 // worker's own tree applies it.
-                if self.read_left(&parent) {
+                if !read.contains(&key(&parent)) && self.read_left(&parent) {
+                    self.leave_below(&key(&parent));
+                    continue;
+                }
+                if self.is_flagged(&key(&parent)) {
                     continue;
                 }
                 let Ok(pid) = u32::try_from(parent.pid.get()) else {
@@ -969,7 +1020,7 @@ impl OwnedProcesses {
                         // and is not walked.
                         if !self.read_left(&identity) {
                             self.under_backends
-                                .insert(key(&identity), (identity.clone(), under));
+                                .insert(key(&identity), (identity.clone(), under, key(&parent)));
                             pending.push((identity.clone(), under));
                         }
                         found.push(identity);
@@ -1895,10 +1946,10 @@ mod tests {
 
     /// Ends a process group when it goes out of scope, so that a test that fails part way leaves
     /// nothing running.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     struct Group(std::process::Child);
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     impl Drop for Group {
         fn drop(&mut self) {
             if let Some(group) = i32::try_from(self.0.id())
@@ -1989,31 +2040,21 @@ mod tests {
         }
     }
 
-    /// KR-REQ-07.13 and KR-REQ-07.60: the walk below a server reads nothing below a process already
-    /// read as having left for a control daemon's own scope, and records neither it nor what it
-    /// started below the server: what it started is its own, and the session would otherwise
-    /// record it and stop it. Control: without the reading the walk records both.
+    /// A server that started a command, which started a process of its own, all running, with
+    /// what the walk below a server meets: the server, the command and the process below it.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    #[test]
-    fn the_walk_below_a_server_reads_nothing_below_a_process_already_read_as_having_left() {
+    struct ServerTree {
+        _group: Group,
+        server: ProcessStartIdentity,
+        command: ProcessStartIdentity,
+        process: ProcessStartIdentity,
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn server_tree() -> ServerTree {
         use std::io::BufRead as _;
         use std::os::unix::process::CommandExt as _;
 
-        struct Tree(std::process::Child);
-        impl Drop for Tree {
-            fn drop(&mut self) {
-                if let Some(group) = i32::try_from(self.0.id())
-                    .ok()
-                    .and_then(rustix::process::Pid::from_raw)
-                {
-                    let _ =
-                        rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
-                }
-                let _ = self.0.wait();
-            }
-        }
-
-        // A server that started a command, which started a process of its own and says so.
         let mut server = std::process::Command::new("sh")
             .args(["-c", "(sleep 600 & echo started; wait) & wait"])
             .process_group(0)
@@ -2021,54 +2062,107 @@ mod tests {
             .spawn()
             .expect("starts a server that starts a command");
         let output = server.stdout.take().expect("its output");
-        let server = Tree(server);
+        let group = Group(server);
         std::io::BufReader::new(output)
             .lines()
             .next()
             .expect("the command says its process started")
             .expect("reads the line");
         let identity = |pid: u32| kr_ipc::identity::process_start_identity(pid).expect("identity");
-        let top = identity(server.0.id());
-        let commands = kr_ipc::identity::children_of(server.0.id()).expect("the server's children");
+        let top = identity(group.0.id());
+        let commands = kr_ipc::identity::children_of(group.0.id()).expect("the server's children");
         assert_eq!(commands.len(), 1, "the server started one command");
-        let grandchildren =
-            kr_ipc::identity::children_of(commands[0]).expect("the command's children");
-        assert_eq!(grandchildren.len(), 1, "the command started one process");
-        let (command, grandchild) = (identity(commands[0]), identity(grandchildren[0]));
+        let below = kr_ipc::identity::children_of(commands[0]).expect("the command's children");
+        assert_eq!(below.len(), 1, "the command started one process");
+        ServerTree {
+            server: top,
+            command: identity(commands[0]),
+            process: identity(below[0]),
+            _group: group,
+        }
+    }
 
-        let record = |flagged: bool| {
-            let mut owned = OwnedProcesses::establish(
-                OwnershipBoundary::TerminalGroup {
-                    group: 1,
-                    terminal: None,
-                },
-                kr_ipc::identity::ended_process_identity(4_000_004),
-            );
-            owned.add_backend(top.clone());
-            if flagged {
-                owned.note_left(&command);
-            }
-            owned.observe_backends();
-            owned.below_backend(&top)
-        };
-        let unflagged = record(false);
-        assert!(
-            unflagged.contains(&command) && unflagged.contains(&grandchild),
-            "the control: the walk records the command and its process: {unflagged:?}"
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn session_with(server: &ProcessStartIdentity) -> OwnedProcesses {
+        let mut owned = OwnedProcesses::establish(
+            OwnershipBoundary::TerminalGroup {
+                group: 1,
+                terminal: None,
+            },
+            kr_ipc::identity::ended_process_identity(4_000_004),
         );
-        let flagged = record(true);
+        owned.add_backend(server.clone());
+        owned
+    }
+
+    /// KR-REQ-07.13 and KR-REQ-07.60: the walk below a server reads nothing below a process already
+    /// read as having left for a control daemon's own scope, and records neither it nor what it
+    /// started below the server: what it started is its own, and the session would otherwise
+    /// record it and stop it. Control: without the reading the walk records both.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn the_walk_below_a_server_reads_nothing_below_a_process_already_read_as_having_left() {
+        let tree = server_tree();
+        let mut unflagged = session_with(&tree.server);
+        unflagged.observe_backends();
+        let recorded = unflagged.below_backend(&tree.server);
         assert!(
-            !flagged.contains(&command) && !flagged.contains(&grandchild),
+            recorded.contains(&tree.command) && recorded.contains(&tree.process),
+            "the control: the walk records the command and its process: {recorded:?}"
+        );
+
+        let mut flagged = session_with(&tree.server);
+        flagged.note_left(&tree.command);
+        flagged.observe_backends();
+        let recorded = flagged.below_backend(&tree.server);
+        assert!(
+            !recorded.contains(&tree.command) && !recorded.contains(&tree.process),
             "a process read as having left, and what it started, are not below the server: \
-             {flagged:?}"
+             {recorded:?}"
         );
         assert!(
             matches!(
-                kr_ipc::identity::process_state(&grandchild),
+                kr_ipc::identity::process_state(&tree.process),
                 kr_ipc::identity::ProcessState::Running
             ),
             "the process below the one that left is still running, so the walk skipped it rather \
              than found it gone"
+        );
+    }
+
+    /// KR-REQ-07.13 and KR-REQ-07.60: what was recorded below a process before it was read as
+    /// having left leaves the session with it: the record stops naming it below the server, and the
+    /// walk does not read it or record what it starts later.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn what_was_recorded_below_a_process_that_then_left_leaves_the_session_with_it() {
+        let tree = server_tree();
+        let mut owned = session_with(&tree.server);
+        owned.observe_backends();
+        let recorded = owned.below_backend(&tree.server);
+        assert!(
+            recorded.contains(&tree.command) && recorded.contains(&tree.process),
+            "the control: both are recorded before the command leaves: {recorded:?}"
+        );
+
+        owned.note_left(&tree.command);
+        owned.observe_backends();
+        let recorded = owned.below_backend(&tree.server);
+        assert!(
+            !recorded.contains(&tree.command) && !recorded.contains(&tree.process),
+            "neither the process that left nor what was recorded below it is below the server: \
+             {recorded:?}"
+        );
+        assert!(
+            owned.is_flagged(&key(&tree.process)),
+            "what was below the process that left is read as having left with it"
+        );
+        assert!(
+            matches!(
+                kr_ipc::identity::process_state(&tree.process),
+                kr_ipc::identity::ProcessState::Running
+            ),
+            "it still runs; it is not the session's to stop"
         );
     }
 
@@ -2115,6 +2209,19 @@ mod tests {
         assert!(
             !owned.seen.contains_key(&key(&identities[2])),
             "the record was full, so the third was refused"
+        );
+        // Once the process that left has ended too, its place is free: the record does not keep a
+        // departure for ever.
+        let _ = children[0].kill();
+        let _ = children[0].wait();
+        owned.take([identities[2].clone()]);
+        assert!(
+            !owned.seen.contains_key(&key(&identities[0])),
+            "a process that left and ended is dropped"
+        );
+        assert!(
+            owned.seen.contains_key(&key(&identities[2])),
+            "the place it held is taken by the third"
         );
         for child in &mut children {
             let _ = child.kill();
