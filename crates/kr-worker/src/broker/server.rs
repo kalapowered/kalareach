@@ -91,6 +91,8 @@ pub trait Owned: Send + Sync {
     /// process is not the session's: the ending neither asks it to terminate nor forces it, and
     /// does not report it as still running. It is asked before every request and every force,
     /// because a reading that returned the process can be older than the one that read it leaving.
+    /// A process recorded below one that left has left too, whichever of the two is asked about
+    /// first.
     fn left(&self, process: &ProcessStartIdentity) -> bool;
 
     /// Notes that `process` was ended by force.
