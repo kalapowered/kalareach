@@ -40,6 +40,8 @@ Questions in a session are owned by that session’s worker. When the host is on
 
 If the host does not confirm that it has taken an answer, either because the connection to it has ended or because the worker has said nothing for twenty seconds, a copy of the answer is kept on this device, in a directory for each environment, and the page says so. Only the person sends a kept answer, and only to the host it was given to. When that host is reachable again, its questions are read and the page says whether each kept answer can still be sent. One whose question ended or changed stays kept, with what became of the question, until the person discards it. Each kept answer names its session and, when the host can say, its question. All operations that change the kept answers take a lock shared among all windows of this application, so a second window cannot lose one or send one twice.
 
+The command line and the application keep the answers they could not deliver in separate stores, and the two share nothing. (On a phone there's no command line and thus no store of answers.) And the host will only ever take the first answer it receives for a question. So when it's answered from one store it won't be answered from the other store.
+
 A failure the page shows says the host's own words and, where its code maps to something the person
 can do, that action after them: pair the device again, sign in, update, wait, refresh, check
 whether it went through, or change a setting. The client library says a host's refusal as its code,
@@ -132,6 +134,12 @@ Drafts are kept on this device as they are typed. The application writes each ch
 A “Kept drafts” section appears under Sessions when there are drafts that no composer shows: one whose session has gone, one whose conversation changed so that the person has to say where it goes, a second draft of a session that already has one, a copy kept beside another window’s draft, and the text of a prompt the host did not take. It appears on both the desktop and the phone, and on the phone the recovery banner leads to it. Each draft can be moved to a session the person chooses. When its own session is listed it can also be put in that session’s composer, and what the composer held stays as a draft of its own. A draft can be discarded. Nothing there sends anything. If there are any drafts that this version cannot read, they will be kept in the draft store and the number of unreadable drafts will be shown in this section. This section will also be shown if the host is not available, although moving a draft to a session will require the host to be available in order to fetch the list of sessions.
 
 If the prompt is too long to be stored, and it wasn't taken by the host (or nobody knows if it was or not), it will be held only in this window. It will appear in the "Kept drafts" list as held in this window only, and it will be lost if the application is closed. However, it can be copied. Also, when its session is listed and its composer is empty, the text can be copied to the composer, to be shortened and sent again. It will remain in the list until the person removes it, as it cannot be stored in the composer due to its length. However, check if the prompt was taken by the agent before sending it again.
+
+Only one of multiple windows holding the same stored draft may send it. Pressing Send saves the stored draft once, at the version the window holds, and only the first window to do so sends the prompt. A window that finds the draft changed or gone is told that another window holds it, sends nothing, and keeps its text. If the store refuses the save for another reason, the window will send the prompt and keep the text in memory. This holds as long as the store is operational.
+
+Until a pending action’s outcome is confirmed, the session will not send any further actions, since doing so risks sending the pending action again. Closing the tab and opening it again does not lift this. However, when the session is open and the host is reached, the application checks with the host what it recorded of the action. If the host records an outcome for an action that was pending, even if only after a delay, then this will resolve the pending action. If the record is not final, then this will not resolve the pending action. In the case of a prompt, the stored draft will remain stored until the host indicates that the prompt has either been applied or refused. If the host indicates that a prompt has been applied after nobody knew what became of it, then the stored draft will be removed, and the composer holding exactly that text will be cleared. Any action that is still pending when the application is closed will not be remembered on the next start up, and (in the case of a prompt) the text of the prompt will re-appear as a stored draft.
+
+If, when the application attempts to remove a prompt’s text from the stored drafts because the prompt has been taken, the store indicates that this was unsuccessful, then the application will write the removal to a ledger beside the drafts. This will be acted upon when the application is next started, ensuring that the text of a taken prompt does not re-appear as a stored draft.
 
 Nothing claims contact, or its loss, before an answer says which. Until the first answer the
 desktop's bar and the phone's say they are checking the connection, with no status dot, and a phone
@@ -322,9 +330,10 @@ The application says what is true at each moment, as `connection_state` and the 
 event: connected, with the rights, or not connected, with why. A connection that ends is taken up
 again after a pause that grows while the host does not answer, a host that accepts a connection and
 then closes it is waited for as one that does not answer, and a command made while there is no
-connection is refused as such. Each choice of host has a number, and a task that keeps the
-connection of an earlier choice can neither install its connection nor record its loss once a
-later one is made. The Sessions and Hosts screens read their lists again each time the connection
+connection is refused as such. The host on a computer's own machine is reached in the same way,
+whether it was not there when the application started or its connection ended. Each choice of host
+has a number, and a task that keeps the connection of an earlier choice can neither install its
+connection nor record its loss once a later one is made. The Sessions and Hosts screens read their lists again each time the connection
 comes or goes, and show nothing of a host that is not the one reached.
 
 Voice on a phone starts with a question: a host that holds no voice grant for the device refuses a
