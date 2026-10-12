@@ -3332,16 +3332,33 @@ fn only_the_host_issues_ordered_revisions_and_records_are_retained_until_acknowl
     feed.enrol(device_id(0xd1));
     assert_eq!(feed.retained().len(), 1);
     let request_id = RevocationRequestId::new(Uuid::from_bytes([1; 16]));
-    assert!(feed.acknowledge(request_id, device_id(0xd0)));
+    assert!(!feed.acknowledge(request_id, device_id(0xd0)));
     assert_eq!(feed.retained().len(), 1, "one of two is not every one");
     assert!(feed.acknowledge(request_id, device_id(0xd1)));
     assert!(
         feed.retained().is_empty(),
         "a settled record is no longer owed to anybody"
     );
+
+    // What is not written down stays to be written until it has been, however little a later call
+    // changes: a write that failed is made again by the next caller that asks. An acknowledgement
+    // the record already holds changes nothing, and asks for no write of its own.
+    assert!(feed.is_unwritten(), "the control: nothing was written yet");
+    feed.acknowledge(request_id, device_id(0xd1));
     assert!(
-        !feed.acknowledge(request_id, device_id(0xd1)),
-        "an acknowledgement the record already holds changes nothing, so it is not written again"
+        feed.is_unwritten(),
+        "a write that did not happen is still owed after a call that changed nothing"
+    );
+    feed.written();
+    feed.acknowledge(request_id, device_id(0xd1));
+    assert!(
+        !feed.is_unwritten(),
+        "an acknowledgement the record already holds is not a reason to write"
+    );
+    feed.note_refusal(request_id, device_id(0xd0));
+    assert!(
+        !feed.is_unwritten(),
+        "nor a refusal of a request that took effect, which has a revision"
     );
 
     // Settling is not forgetting: the identity that stops the request being applied a second time

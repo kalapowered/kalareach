@@ -1483,9 +1483,10 @@ impl Registry {
     /// raises no version of the document; the record the registry keeps of the document it
     /// accepted is read as version 13 to 14 says. The host's record of its feed (`host_authority`,
     /// key `feed`) now notes a request from the moment the host begins to take it, before it has a
-    /// revision, and the revision the feed held at that moment. The note that the feed removed the
-    /// host is a row of its own (`feed_removal`), which a registry that lacks it simply does not
-    /// have. No release before this one took a request from a feed, so no `feed` row holds a
+    /// revision, with the origin of the feed that held it, the revision that feed held and the
+    /// revision the registry had reached at that moment. The note that the feed removed the host,
+    /// and the number of the newest notice about the feed that the owner's inbox is to hold, are a
+    /// row of their own (`feed_removal`), which a registry that lacks it simply does not have. No release before this one took a request from a feed, so no `feed` row holds a
     /// record of one, and no row is rewritten.
     ///
     /// This migration goes in the first release after every install has opened the registry at
