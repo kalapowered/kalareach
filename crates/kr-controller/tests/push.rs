@@ -9057,7 +9057,7 @@ fn a_mailbox_that_stays_down_does_not_keep_a_person_from_being_told() {
 /// KR-REQ-09.21: a mailbox that cannot take the object when the notification has no time to wait
 /// for it does not take the notification with it. The service asks for two minutes and the
 /// notification has one, so the push is presented at once, without its detail, and not lost to the
-/// wait.
+/// expiry.
 #[test]
 fn a_mailbox_that_asks_for_more_time_than_the_notification_has_is_not_waited_for() {
     let (environment, _) = environment_keeping_the_hosts_mailbox_key();
@@ -9124,13 +9124,13 @@ fn a_notification_that_expires_while_its_detail_is_placed_is_not_presented() {
     let (state, _) = the_notification_is(&environment);
     assert_eq!(
         state,
-        DeliveryState::OutcomeUnknown,
-        "the notification did not arrive, and a copy of its detail left"
+        DeliveryState::Expired,
+        "the push did not go, and the record says what it is: expired"
     );
     assert_eq!(
         exported_notifications(&environment),
         1,
-        "and the journal lists that copy"
+        "and the journal lists the copy of its detail that left"
     );
 }
 
@@ -9194,13 +9194,18 @@ fn a_grant_that_ends_while_its_detail_is_placed_leaves_the_push_unsent() {
     );
     assert_eq!(
         the_notification_is(&environment).0,
-        DeliveryState::OutcomeUnknown,
-        "a copy of its detail left, and the notification did not"
+        DeliveryState::Revoked,
+        "the push did not go, and the record says what it is: revoked"
+    );
+    assert_eq!(
+        exported_notifications(&environment),
+        1,
+        "and the journal lists the copy of its detail that left"
     );
 }
 
 /// KR-REQ-09.21: an object is owed to a mailbox only while a push can refer to it. A notification
-/// that expires unsent, or whose destination is removed, leaves no object behind.
+/// that expires unsent leaves no object behind.
 #[test]
 fn an_object_is_not_kept_for_a_notification_that_will_not_be_presented() {
     let (environment, _) = environment_keeping_the_hosts_mailbox_key();
@@ -9213,6 +9218,122 @@ fn an_object_is_not_kept_for_a_notification_that_will_not_be_presented() {
     assert_eq!(pass_at(&environment, &gateway, now + 61_000), 0);
     assert_eq!(the_notification_is(&environment).0, DeliveryState::Expired);
     assert!(!the_object_is_owed(&environment, expiring));
+}
+
+/// KR-REQ-09.21: a wait for the mailbox that would leave no room for the next attempt before the
+/// notification expires is not made. The notification has two and a half seconds and the service
+/// asks for two, so the next pass could not come in time, and the push goes now.
+#[test]
+fn a_mailbox_that_answers_in_the_last_seconds_does_not_cost_the_push() {
+    let (environment, _) = environment_keeping_the_hosts_mailbox_key();
+    let now = real_now();
+    let service = MailboxService::attach(&environment);
+    queue_an_oversized_notification_living(&environment, &service, now, 2_500);
+    let gateway = WatchedGateway::over(&service);
+    service.web.fail(
+        MailboxService::DELIVER,
+        1,
+        kr_service_stand_in::Moment::Refuse {
+            status: 503,
+            code: "SERVICE_UNAVAILABLE",
+            retry_after_seconds: Some(2),
+        },
+    );
+
+    assert_eq!(pass_at(&environment, &gateway, now), 1);
+
+    assert_eq!(gateway.held_at_the_push(), [0]);
+    assert_eq!(the_notification_is(&environment).0, DeliveryState::Accepted);
+}
+
+/// KR-REQ-09.21: a service that asks to be left alone for longer than the longest wait the
+/// notification's own schedule makes is not waited for, whatever is left of the notification.
+#[test]
+fn a_mailbox_that_asks_for_an_hour_is_not_waited_for() {
+    let (environment, _) = environment_keeping_the_hosts_mailbox_key();
+    let now = real_now();
+    let service = MailboxService::attach(&environment);
+    queue_an_oversized_notification(&environment, &service, now);
+    let gateway = WatchedGateway::over(&service);
+    service.web.fail(
+        MailboxService::DELIVER,
+        1,
+        kr_service_stand_in::Moment::Refuse {
+            status: 503,
+            code: "SERVICE_UNAVAILABLE",
+            retry_after_seconds: Some(3_600),
+        },
+    );
+
+    assert_eq!(pass_at(&environment, &gateway, now), 1);
+
+    assert_eq!(gateway.held_at_the_push(), [0]);
+    assert_eq!(the_notification_is(&environment).0, DeliveryState::Accepted);
+}
+
+/// A recipient authority that moves the clock on when it is asked for the `nth` time, as an
+/// authority that takes a while to answer does.
+#[derive(Debug)]
+struct Slow {
+    asked: std::sync::atomic::AtomicU64,
+    nth: u64,
+    time: Arc<std::sync::atomic::AtomicU64>,
+    to: u64,
+}
+
+impl RecipientAuthority for Slow {
+    fn scope_for(&self, rule: &DeliveryRule) -> Option<RecipientScope> {
+        Granted(BTreeSet::new()).scope_for(rule)
+    }
+
+    fn device_scope(&self, destination: &DestinationRecord) -> Option<RecipientScope> {
+        let asked = self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        if asked == self.nth {
+            self.time
+                .store(self.to, std::sync::atomic::Ordering::SeqCst);
+        }
+        Granted(BTreeSet::new()).device_scope(destination)
+    }
+}
+
+/// KR-REQ-09.21: the deadline is read under the admission the exchange is made under, immediately
+/// before it. A notification that expires while its recipient's authority is being asked is not
+/// placed anywhere: no request leaves for the mailbox service.
+#[test]
+fn a_notification_that_expires_before_its_detail_is_placed_asks_the_mailbox_nothing() {
+    let (environment, _) = environment_keeping_the_hosts_mailbox_key();
+    let now = real_now();
+    let service = MailboxService::attach(&environment);
+    queue_an_oversized_notification_living(&environment, &service, now, 60_000);
+    let gateway = WatchedGateway::over(&service);
+    let time = Arc::new(std::sync::atomic::AtomicU64::new(now));
+    let authority = Slow {
+        asked: std::sync::atomic::AtomicU64::new(0),
+        // The question before the claim is the first; the one in the attempt is the second.
+        nth: 2,
+        time: Arc::clone(&time),
+        to: now + 61_000,
+    };
+    let clock = {
+        let time = Arc::clone(&time);
+        move || time.load(std::sync::atomic::Ordering::SeqCst)
+    };
+
+    environment
+        .module
+        .run_due(
+            &gateway,
+            &gateway,
+            &held(now + 30 * 24 * 60 * 60 * 1000),
+            &ExternalDouble::answering(Vec::new()),
+            &authority,
+            &clock,
+        )
+        .expect("a pass");
+
+    assert_eq!(service.asked(), 0, "nothing was asked of the mailbox");
+    assert!(gateway.held_at_the_push().is_empty());
+    assert_eq!(the_notification_is(&environment).0, DeliveryState::Expired);
 }
 
 /// A host that selects no mailbox service presents the push as it always did and asks nobody.
