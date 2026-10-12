@@ -489,7 +489,10 @@ impl Controller {
     ///
     /// Returns an error when the removal could not be written. The grants are refused whatever
     /// happens, and the caller asks again, so the removal reaches the registry when it can take
-    /// it. A notice the attention store cannot take is given again, apart from the carrier.
+    /// it. A notice the attention store cannot take is given again, apart from the carrier. An
+    /// attention store that cannot be read does not keep the removal from being written: the
+    /// notice is numbered without the store's cursor, and the next start numbers it again if the
+    /// cursor stands above it.
     pub(crate) async fn authority_feed_removed(&self, origin: &str) -> Result<()> {
         let now = self.wall_now_ms();
         self.refuse_the_grants_that_rest_on_the_feed();
@@ -508,10 +511,19 @@ impl Controller {
             .as_ref()
             .is_none_or(|held| held.origin.0.as_deref() != Some(origin))
         {
+            // The removal is the one durable record that a restart finds, so it is written whether
+            // or not the attention store can be read.
+            let notice = match self.next_feed_notice(held.as_ref()).await {
+                Ok(notice) => notice,
+                Err(error) => {
+                    eprintln!("kr-controller: {error}");
+                    held.as_ref().map_or(1, |held| held.notice + 1)
+                }
+            };
             grants.store_feed_removal(&StoredRemoval {
                 origin: Nullable::some(origin.to_owned()),
                 at_ms: TimestampMs::new(now),
-                notice: self.next_feed_notice(held.as_ref()).await?,
+                notice,
             })?;
         }
         self.feed_notice_wake.notify_one();
@@ -525,22 +537,46 @@ impl Controller {
     ///
     /// # Errors
     ///
-    /// Returns an error when the store cannot be read. A notice is not numbered without it: a
-    /// number at or below the store's cursor is a notice the store drops.
+    /// Returns an error when the store cannot be read. A notice is not numbered above the cursor
+    /// without it: a number at or below the cursor is a notice the store drops.
     async fn feed_notice_cursor(&self) -> Result<u64> {
+        #[cfg(feature = "testing")]
+        if self
+            .notice_cursor_unreadable
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(crate::error::ControllerError::Storage {
+                operation: "read the notices the attention store has taken",
+                detail: "the attention store could not be read".to_owned(),
+            });
+        }
         let attention = Arc::clone(self.attention());
         match tokio::task::spawn_blocking(move || attention.authority_cursor()).await {
             Ok(Ok(taken)) => Ok(taken),
-            _ => Err(crate::error::ControllerError::Storage {
+            Ok(Err(refusal)) => Err(crate::error::ControllerError::Storage {
                 operation: "read the notices the attention store has taken",
-                detail: "the attention store could not be read".to_owned(),
+                detail: refusal.message,
+            }),
+            Err(error) => Err(crate::error::ControllerError::Storage {
+                operation: "read the notices the attention store has taken",
+                detail: error.to_string(),
             }),
         }
     }
 
+    /// Makes the attention store's cursor unreadable to the numbering of feed notices, as a store
+    /// another owner took or a lock that panicked would. For a suite that checks a removal is
+    /// written down all the same.
+    #[cfg(feature = "testing")]
+    pub fn make_the_notice_cursor_unreadable(&self, unreadable: bool) {
+        self.notice_cursor_unreadable
+            .store(unreadable, std::sync::atomic::Ordering::SeqCst);
+    }
+
     /// The number of the next notice about the feed: above the one this host last recorded and
     /// above every one the attention store has taken, so a registry that lost its row cannot
-    /// number a notice behind the store's cursor.
+    /// number a notice behind the store's cursor. A start numbers again a notice that was numbered
+    /// without the cursor and stands at or below it.
     async fn next_feed_notice(&self, held: Option<&StoredRemoval>) -> Result<u64> {
         let taken = self.feed_notice_cursor().await?;
         Ok(held.map_or(0, |held| held.notice).max(taken) + 1)
