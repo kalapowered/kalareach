@@ -517,6 +517,7 @@ impl Controller {
         // record settles once this host has acknowledged it.
         feed.enrol(host_device_id);
         sharing.grants().store_feed(&feed.snapshot())?;
+        feed.written();
         let attention = Arc::new(crate::attention::AttentionModule::open(
             &setup.paths,
             setup.boot_identity.clone(),
@@ -866,6 +867,8 @@ impl Controller {
             backup,
             backup_runtime,
             feed_runtime,
+            feed_notice_wake: Arc::new(tokio::sync::Notify::new()),
+            feed_notice_attempts: tokio::sync::watch::channel(0).0,
             transfer,
             project,
             qualification: std::sync::RwLock::new(qualification),
@@ -1106,6 +1109,7 @@ impl Controller {
         // client to ask before it looked would leave an enabled setting doing nothing until
         // somebody happened to run a command.
         let _ = controller.power_state().await;
+        controller.start_feed_notices(Arc::clone(&timer));
         // The carrier of the authority feed starts before the network does, so the first
         // connection to arrive finds a synchronisation to wait for.
         if let Some(runtime) = &controller.feed_runtime {
