@@ -203,6 +203,63 @@ impl Rig {
         session.read(Method::HostDoctor, &()).await
     }
 
+    /// Stops the daemon and starts it again on its tree, after `edit` has changed what the tree
+    /// holds, with the feed unreachable for the start's first request when `feed_down`. A suite
+    /// closes its clients before it restarts.
+    async fn restarted(
+        self,
+        feed_down: bool,
+        edit: impl FnOnce(&kr_ipc::testing::TempHost),
+    ) -> Self {
+        let Self {
+            host,
+            served,
+            owner,
+            remote,
+            ..
+        } = self;
+        if feed_down {
+            served.web().fail(
+                AUTHORITY,
+                1,
+                Moment::Refuse {
+                    status: 503,
+                    code: "SERVICE_UNAVAILABLE",
+                    retry_after_seconds: None,
+                },
+            );
+        }
+        let stopped = host.shut_down().await;
+        edit(stopped.tree());
+        let timer = HeldTimer::held();
+        let host = stopped.start_with_timer(Arc::clone(&timer) as _).await;
+        Self {
+            host,
+            served,
+            timer,
+            owner,
+            remote,
+        }
+    }
+
+    /// Stops the daemon and starts it again with its configuration document selecting `feed`, a
+    /// service that holds nothing of this host. A suite closes its clients before it restarts.
+    async fn pointed_at(self, feed: Served) -> Self {
+        let Self { host, owner, .. } = self;
+        let stopped = host.shut_down().await;
+        net_support::write_feed_document(stopped.tree(), Some(feed.origin()));
+        let timer = HeldTimer::held();
+        let host = stopped.start_with_timer(Arc::clone(&timer) as _).await;
+        let remote = client_for(feed.origin(), owner.authorisation.clone());
+        Self {
+            host,
+            served: feed,
+            timer,
+            owner,
+            remote,
+        }
+    }
+
     /// Stops the daemon and starts it again while the feed cannot be reached, so that what it
     /// knows of the feed is what it wrote down. A suite closes its clients before it restarts.
     async fn restarted_while_the_feed_is_down(self) -> (Host, Served) {
@@ -1462,5 +1519,200 @@ async fn the_synchronisation_the_host_shows_is_dated_by_the_clock_the_daemon_hol
     assert!(
         synchronised > kr_ipc::now_ms().get() + 30 * 60 * 1000,
         "dated by the daemon's clock, an hour ahead of the machine's: {synchronised}"
+    );
+}
+
+/// A request taken from one feed does not hold up another the host is pointed at: the revisions a
+/// request was numbered under are the first feed's, and the second holds none of them. The request
+/// published again there is judged afresh, and the one behind it is carried out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_request_taken_from_one_feed_does_not_hold_up_the_feed_the_host_is_pointed_at_next() {
+    let rig = Rig::start().await;
+    let (_first_phone, first) = rig.pairs(&[ActionRight::SessionView]).await;
+    let (_second_phone, second) = rig.pairs(&[ActionRight::SessionView]).await;
+    let (_third_phone, third) = rig.pairs(&[ActionRight::SessionView]).await;
+    rig.owner_publishes(0xb1, devices(first.device_id)).await;
+    let numbered_second = rig.owner_publishes(0xb2, devices(second.device_id)).await;
+    rig.poll().await;
+    assert_eq!(
+        rig.held(&numbered_second)
+            .await
+            .acknowledgement
+            .0
+            .expect("carried out on the first feed")
+            .authority_revision
+            .get(),
+        2,
+        "the second request was numbered after the first"
+    );
+
+    let rig = rig.pointed_at(serve().await).await;
+    rig.remote
+        .publish(rig.feed(), &numbered_second, None)
+        .await
+        .expect("the second feed takes the request");
+    let behind = rig.owner_publishes(0xb3, devices(third.device_id)).await;
+    rig.poll().await;
+
+    assert_eq!(
+        rig.held(&numbered_second).await.rejected.0,
+        Some(RejectionReason::Superseded),
+        "what it names was withdrawn already, so it is refused as covered"
+    );
+    assert_eq!(
+        rig.held(&behind)
+            .await
+            .acknowledgement
+            .0
+            .expect("the request behind it was carried out")
+            .completion,
+        RevocationCompletion::Complete
+    );
+}
+
+/// A request that withdrew nothing is refused however the host was interrupted while it took it:
+/// after it wrote the request down and carried it out and stopped before it refused it, and after
+/// the write of the request failed. The requests behind it are carried out, and none stops the
+/// feed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_host_that_stops_while_taking_a_request_that_withdrew_nothing_refuses_it_after_it_starts()
+{
+    let rig = Rig::start().await;
+    let (_first_phone, first) = rig.pairs(&[ActionRight::SessionView]).await;
+    let (_second_phone, second) = rig.pairs(&[ActionRight::SessionView]).await;
+    rig.owner_publishes(0xb4, devices(first.device_id)).await;
+    rig.poll().await;
+    let again = rig.owner_publishes(0xb5, devices(first.device_id)).await;
+
+    let (arrived, _go) = rig
+        .host
+        .controller()
+        .pause_after_a_feed_request_was_carried_out();
+    {
+        let polled = rig.runtime().synchronised_before_serving();
+        tokio::pin!(polled);
+        tokio::select! {
+            () = &mut polled => panic!("the pass stopped where it was held"),
+            reached = arrived => reached.expect("the pass reached the point"),
+        }
+    }
+    rig.runtime().crash();
+
+    let rig = rig.restarted(false, |_| {}).await;
+    within("the carrier waits between passes", rig.timer.next_wait()).await;
+    assert_eq!(
+        rig.held(&again).await.rejected.0,
+        Some(RejectionReason::Superseded),
+        "refused as covered after the start"
+    );
+    let behind = rig.owner_publishes(0xb6, devices(second.device_id)).await;
+    rig.poll().await;
+    assert_eq!(
+        rig.held(&behind)
+            .await
+            .acknowledgement
+            .0
+            .expect("the request behind it was carried out")
+            .completion,
+        RevocationCompletion::Complete
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_request_that_withdrew_nothing_is_refused_after_the_write_of_its_note_failed() {
+    let rig = Rig::start().await;
+    let (_first_phone, first) = rig.pairs(&[ActionRight::SessionView]).await;
+    let (_second_phone, second) = rig.pairs(&[ActionRight::SessionView]).await;
+    rig.owner_publishes(0xb7, devices(first.device_id)).await;
+    rig.poll().await;
+
+    let registry =
+        rusqlite::Connection::open(rig.host.registry_database()).expect("opens the registry");
+    registry
+        .busy_timeout(Duration::from_secs(5))
+        .expect("waits for the daemon's writes");
+    registry
+        .execute_batch(
+            "CREATE TRIGGER refuse_note BEFORE INSERT ON host_authority
+             WHEN NEW.key = 'feed'
+             BEGIN SELECT RAISE(ABORT, 'no room'); END;",
+        )
+        .expect("the fault is in place");
+    let again = rig.owner_publishes(0xb8, devices(first.device_id)).await;
+    rig.poll().await;
+    assert_eq!(
+        rig.held(&again).await.rejected.0,
+        None,
+        "the note could not be written, so nothing was said"
+    );
+
+    registry
+        .execute_batch("DROP TRIGGER refuse_note")
+        .expect("the fault is lifted");
+    rig.timer.release_held();
+    rig.poll().await;
+    assert_eq!(
+        rig.held(&again).await.rejected.0,
+        Some(RejectionReason::Superseded)
+    );
+    let behind = rig.owner_publishes(0xb9, devices(second.device_id)).await;
+    rig.poll().await;
+    assert_eq!(
+        rig.held(&behind)
+            .await
+            .acknowledgement
+            .0
+            .expect("the request behind it was carried out")
+            .completion,
+        RevocationCompletion::Complete
+    );
+}
+
+/// A pass writes the feed's record down when it changed something and not for each record it reads
+/// that was settled or refused already: a host that starts reads up to a week of them again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_start_does_not_write_the_feed_down_again_for_each_settled_record_it_reads() {
+    let rig = Rig::start().await;
+    let (_first_phone, first) = rig.pairs(&[ActionRight::SessionView]).await;
+    let (_second_phone, second) = rig.pairs(&[ActionRight::SessionView]).await;
+    let (_third_phone, third) = rig.pairs(&[ActionRight::SessionView]).await;
+    rig.owner_publishes(0xd1, devices(first.device_id)).await;
+    rig.owner_publishes(0xd2, devices(second.device_id)).await;
+    rig.owner_publishes(0xd3, devices(third.device_id)).await;
+    rig.owner_publishes(
+        0xd4,
+        devices(DeviceId::new(kr_protocol::scalars::Uuid::from_bytes(
+            [0xdd; 16],
+        ))),
+    )
+    .await;
+    rig.poll().await;
+
+    let registry =
+        rusqlite::Connection::open(rig.host.registry_database()).expect("opens the registry");
+    registry
+        .busy_timeout(Duration::from_secs(5))
+        .expect("waits for the daemon's writes");
+    registry
+        .execute_batch(
+            "CREATE TABLE feed_writes (n INTEGER);
+             CREATE TRIGGER counting AFTER INSERT ON host_authority
+             WHEN NEW.key = 'feed'
+             BEGIN INSERT INTO feed_writes VALUES (1); END;",
+        )
+        .expect("the count is in place");
+    drop(registry);
+    let rig = rig.restarted(false, |_| {}).await;
+    within("the carrier waits between passes", rig.timer.next_wait()).await;
+
+    let registry =
+        rusqlite::Connection::open(rig.host.registry_database()).expect("opens the registry");
+    let writes: i64 = registry
+        .query_row("SELECT COUNT(*) FROM feed_writes", [], |row| row.get(0))
+        .expect("counts the writes");
+    assert!(
+        writes <= 2,
+        "the start writes the record once and the synchronisation once, not once for each of \
+         four records it read again: {writes}"
     );
 }

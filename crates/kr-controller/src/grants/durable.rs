@@ -124,11 +124,17 @@ pub struct StoredPolicy {
 pub struct StoredRevocation {
     /// The request a remote owner published.
     pub request: RevocationRequest,
+    /// The origin of the feed that held the request. The revisions a request was numbered under
+    /// are that feed's, and no other feed holds them.
+    pub origin: String,
     /// The revision this host issued for it, once the revocation has taken effect.
     pub authority_revision: Nullable<AuthorityRevision>,
     /// The revision the feed held when this host began to apply the request, which the revision
     /// record it issues for it follows.
     pub previous_revision: AuthorityRevision,
+    /// The revision the registry had reached when this host began to apply the request. A request
+    /// that took effect brought the registry above it, and one that withdrew nothing did not.
+    pub registry_revision: AuthorityRevision,
     /// When this host began to apply it.
     pub applied_at_ms: TimestampMs,
     /// The enrolled hosts that have acknowledged it.
