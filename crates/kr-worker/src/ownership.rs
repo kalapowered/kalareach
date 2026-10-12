@@ -450,6 +450,18 @@ impl OwnedProcesses {
         self.live.remove(&this);
     }
 
+    /// Reads whether a process has left the session for a control daemon's own scope, and notes it
+    /// as having left when it has: it is not the session's to ask to stop or to force, and what it
+    /// started is not the session's either. The reading is kept, because the process can end
+    /// before anything reads it again.
+    pub fn read_left(&mut self, identity: &ProcessStartIdentity) -> bool {
+        let left = self.left_the_session(identity);
+        if left {
+            self.note_left(identity);
+        }
+        left
+    }
+
     /// Whether a recorded process has been read as having left the session.
     fn is_flagged(&self, this: &(u64, u64)) -> bool {
         self.seen
@@ -490,7 +502,8 @@ impl OwnedProcesses {
 
     /// Drops from the record what a closure has nothing to report about: a process that ended
     /// without being forced, and a server that ended with nothing below it running. The session's
-    /// root is kept, and so is anything forced and a server that left something running.
+    /// root is kept, and so is anything forced, a server that left something running and a process
+    /// read as having left the session that still runs.
     ///
     /// What is not running is what [`Self::read_live`] has just dropped from `live`, so each
     /// process is read once.
@@ -505,6 +518,7 @@ impl OwnedProcesses {
                     && !recorded.forced
                     && !self.live.contains_key(*kept)
                     && !self.runs_below(kept)
+                    && !self.left_and_running(recorded)
             })
             .map(|(kept, _)| *kept)
             .collect();
@@ -513,6 +527,16 @@ impl OwnedProcesses {
             self.backends.remove(&gone);
             self.under_backends.remove(&gone);
         }
+    }
+
+    /// Returns whether a process read as having left the session is still running: its record is
+    /// the only place the reading is kept, and the closure names it while it runs.
+    fn left_and_running(&self, recorded: &Recorded) -> bool {
+        recorded.left.load(std::sync::atomic::Ordering::Relaxed)
+            && !matches!(
+                kr_ipc::identity::process_state(&recorded.identity),
+                kr_ipc::identity::ProcessState::Ended
+            )
     }
 
     /// Returns whether a process is running below the server `root`, which a server that has gone
@@ -751,6 +775,13 @@ impl OwnedProcesses {
                 if !walked.insert(key(&parent)) {
                     continue;
                 }
+                // A process that left for a control daemon's own scope is read about no further,
+                // whether it is in the scope now or was read there before: what it started is its
+                // own, not the session's. The reading is applied here, as the walk of the
+                // worker's own tree applies it.
+                if self.read_left(&parent) {
+                    continue;
+                }
                 let Ok(pid) = u32::try_from(parent.pid.get()) else {
                     continue;
                 };
@@ -791,9 +822,13 @@ impl OwnedProcesses {
                     kr_ipc::identity::ProcessState::Running
                 ) {
                     for identity in batch {
-                        self.under_backends
-                            .insert(key(&identity), (identity.clone(), under));
-                        pending.push((identity.clone(), under));
+                        // One that has left is recorded as having left, not as below the server,
+                        // and is not walked.
+                        if !self.read_left(&identity) {
+                            self.under_backends
+                                .insert(key(&identity), (identity.clone(), under));
+                            pending.push((identity.clone(), under));
+                        }
                         found.push(identity);
                     }
                 }
@@ -1808,6 +1843,139 @@ mod tests {
                 "the process below the one that left is still running, so the walk skipped it \
                  rather than found it gone"
             );
+        }
+    }
+
+    /// KR-REQ-07.13 and KR-REQ-07.60: the walk below a server reads nothing below a process already
+    /// read as having left for a control daemon's own scope, and records neither it nor what it
+    /// started below the server: what it started is its own, and the session would otherwise
+    /// record it and stop it. Control: without the reading the walk records both.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn the_walk_below_a_server_reads_nothing_below_a_process_already_read_as_having_left() {
+        use std::io::BufRead as _;
+        use std::os::unix::process::CommandExt as _;
+
+        struct Tree(std::process::Child);
+        impl Drop for Tree {
+            fn drop(&mut self) {
+                if let Some(group) = i32::try_from(self.0.id())
+                    .ok()
+                    .and_then(rustix::process::Pid::from_raw)
+                {
+                    let _ =
+                        rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
+                }
+                let _ = self.0.wait();
+            }
+        }
+
+        // A server that started a command, which started a process of its own and says so.
+        let mut server = std::process::Command::new("sh")
+            .args(["-c", "(sleep 600 & echo started; wait) & wait"])
+            .process_group(0)
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("starts a server that starts a command");
+        let output = server.stdout.take().expect("its output");
+        let server = Tree(server);
+        std::io::BufReader::new(output)
+            .lines()
+            .next()
+            .expect("the command says its process started")
+            .expect("reads the line");
+        let identity = |pid: u32| kr_ipc::identity::process_start_identity(pid).expect("identity");
+        let top = identity(server.0.id());
+        let commands = kr_ipc::identity::children_of(server.0.id()).expect("the server's children");
+        assert_eq!(commands.len(), 1, "the server started one command");
+        let grandchildren =
+            kr_ipc::identity::children_of(commands[0]).expect("the command's children");
+        assert_eq!(grandchildren.len(), 1, "the command started one process");
+        let (command, grandchild) = (identity(commands[0]), identity(grandchildren[0]));
+
+        let record = |flagged: bool| {
+            let mut owned = OwnedProcesses::establish(
+                OwnershipBoundary::TerminalGroup {
+                    group: 1,
+                    terminal: None,
+                },
+                kr_ipc::identity::ended_process_identity(4_000_004),
+            );
+            owned.add_backend(top.clone());
+            if flagged {
+                owned.note_left(&command);
+            }
+            owned.observe_backends();
+            owned.below_backend(&top)
+        };
+        let unflagged = record(false);
+        assert!(
+            unflagged.contains(&command) && unflagged.contains(&grandchild),
+            "the control: the walk records the command and its process: {unflagged:?}"
+        );
+        let flagged = record(true);
+        assert!(
+            !flagged.contains(&command) && !flagged.contains(&grandchild),
+            "a process read as having left, and what it started, are not below the server: \
+             {flagged:?}"
+        );
+        assert!(
+            matches!(
+                kr_ipc::identity::process_state(&grandchild),
+                kr_ipc::identity::ProcessState::Running
+            ),
+            "the process below the one that left is still running, so the walk skipped it rather \
+             than found it gone"
+        );
+    }
+
+    /// KR-REQ-07.60: a full record keeps the reading of a process that left for a control daemon's
+    /// own scope for as long as the process runs, though the process is not among those that are
+    /// live: the record is the only place the reading is kept, and a process dropped from it would
+    /// be recorded again as the session's.
+    #[test]
+    fn a_full_record_keeps_the_reading_of_a_process_that_left_and_still_runs() {
+        let mut owned = OwnedProcesses::establish(
+            OwnershipBoundary::TerminalGroup {
+                group: 1,
+                terminal: None,
+            },
+            kr_ipc::identity::ended_process_identity(4_000_005),
+        );
+        owned.cap = 3;
+        let mut children: Vec<std::process::Child> = (0..3)
+            .map(|_| {
+                std::process::Command::new("sleep")
+                    .arg("120")
+                    .spawn()
+                    .expect("starts a process")
+            })
+            .collect();
+        let identities: Vec<ProcessStartIdentity> = children
+            .iter()
+            .map(|child| {
+                kr_ipc::identity::process_start_identity(child.id()).expect("its identity")
+            })
+            .collect();
+        // The root and two running processes fill the record, and one of the two is read as having
+        // left.
+        owned.take([identities[0].clone(), identities[1].clone()]);
+        owned.note_left(&identities[0]);
+        assert_eq!(owned.seen.len(), 3);
+        // A third finds the record full: what ended is dropped, and the one that left and runs is
+        // not.
+        owned.take([identities[2].clone()]);
+        assert!(
+            owned.is_flagged(&key(&identities[0])),
+            "the reading of the process that left is kept while it runs"
+        );
+        assert!(
+            !owned.seen.contains_key(&key(&identities[2])),
+            "the record was full, so the third was refused"
+        );
+        for child in &mut children {
+            let _ = child.kill();
+            let _ = child.wait();
         }
     }
 
