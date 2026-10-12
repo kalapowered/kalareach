@@ -3176,11 +3176,11 @@ fn record_unreachable_worker(
     reservation.session_id
 }
 
-/// A document of level 4: a setting this build knows, a ceiling, and two sections of a newer
+/// A document of level 5: a setting this build knows, a ceiling, and two sections of a newer
 /// release, one whose name looks like a credential.
 const AT_A_HIGHER_LEVEL: &[u8] = br#"{
   "version": 3,
-  "level": 4,
+  "level": 5,
   "revision": 5,
   "preferences": { "sleep_inhibition": "battery_too" },
   "ceilings": { "session_limit": 4 },
@@ -3251,7 +3251,7 @@ async fn a_document_at_a_higher_level_applies_its_known_members_and_reports_the_
     assert_eq!(check.status, kr_protocol::hostinfo::DoctorStatus::Warning);
     let said = check.detail();
     assert!(
-        said.contains("level 4") && said.contains("reads level 3") && said.contains("2 members"),
+        said.contains("level 5") && said.contains("reads level 4") && said.contains("2 members"),
         "the levels and the count: {said}"
     );
     assert!(check.remedy().is_some(), "and what to do about it");
@@ -3288,7 +3288,7 @@ async fn a_document_at_a_higher_level_applies_its_known_members_and_reports_the_
         .expect_err("an edit of a document above this build's level is refused");
     let said = format!("{refused}");
     assert!(
-        said.contains("level 4") && said.contains("nothing was written"),
+        said.contains("level 5") && said.contains("nothing was written"),
         "{said}"
     );
     assert_eq!(std::fs::read(&path).expect("the document"), before);
@@ -3424,6 +3424,94 @@ async fn a_document_that_selects_a_mailbox_service_is_accepted_with_its_section(
         accepted.mailbox.origin(),
         Some("http://127.0.0.1:9"),
         "the registry's copy states the selection"
+    );
+    let file = std::fs::read(kr_worker::config::document_path(&environment)).expect("the file");
+    assert_eq!(
+        Some(accepted),
+        kr_protocol::hostinfo::configuration::load(Some(&file)).document,
+        "the copy is the file's reading"
+    );
+}
+
+/// A document of level 4 that selects a relay lease service and the account that pays.
+const WITH_A_RELAY: &[u8] = br#"{
+  "version": 3,
+  "level": 4,
+  "revision": 5,
+  "preferences": { "sleep_inhibition": "battery_too" },
+  "relay": {
+    "origin": "http://127.0.0.1:9",
+    "payer": {
+      "account_id": "0b0c4a1e-2f6a-4a7c-9b7e-5d1f3c2a8e41",
+      "authorisation_id": "7c1d9e52-3b4f-4d86-a0c2-91e5f6b73d08"
+    }
+  }
+}"#;
+
+/// KR-REQ-26.13: a daemon over a document that selects a relay lease service reads it as a section
+/// of the level it reads, accepts it, and keeps in the registry the document as it read it, with
+/// the section and its level; the report an owner reads shows the selection and that a payer is
+/// named, and never the account's identifiers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_document_that_selects_a_relay_lease_service_is_accepted_with_its_section() {
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    let environment = host.tree().environment();
+    write_document_bytes(&environment, WITH_A_RELAY);
+    let host = host.restart().await;
+
+    let mut local = host.client().await;
+    let result: HostDoctorResult = typed(
+        &local
+            .request(Method::HostDoctor, &())
+            .await
+            .expect("the call reaches the daemon")
+            .expect("host.doctor is served on the local socket"),
+    );
+    assert_eq!(result.configuration.status.state, DocumentState::Loaded);
+    let row_of = |key: &str| {
+        result
+            .configuration
+            .values
+            .iter()
+            .find(|value| value.key == key)
+            .unwrap_or_else(|| panic!("{key} is reported"))
+    };
+    assert_eq!(row_of("relay.origin").value(), "http://127.0.0.1:9");
+    assert_eq!(row_of("relay.payer").value(), "true");
+    let report = format!("{result:?}");
+    assert!(
+        !report.contains("0b0c4a1e-2f6a-4a7c-9b7e-5d1f3c2a8e41")
+            && !report.contains("7c1d9e52-3b4f-4d86-a0c2-91e5f6b73d08"),
+        "the report names no account identifier"
+    );
+    let ignored = result
+        .configuration
+        .values
+        .iter()
+        .any(|value| value.key == config_ignored_members());
+    assert!(!ignored, "the section is one this build reads");
+
+    drop(local);
+    let stopped = host.shut_down().await;
+    let database = stopped.tree().environment().registry_database();
+    let connection = rusqlite::Connection::open(&database).expect("the registry file");
+    let record: Option<String> = connection
+        .query_row("SELECT accepted_document FROM environment", [], |row| {
+            row.get(0)
+        })
+        .expect("the accepted document");
+    drop(connection);
+    let accepted = config::from_record(record.as_deref()).expect("accepted");
+    assert_eq!(accepted.level, 4);
+    assert_eq!(accepted.relay.origin(), Some("http://127.0.0.1:9"));
+    assert_eq!(
+        accepted
+            .relay
+            .payer()
+            .map(|payer| payer.account_id.as_str()),
+        Some("0b0c4a1e-2f6a-4a7c-9b7e-5d1f3c2a8e41"),
+        "the registry's copy states the payer"
     );
     let file = std::fs::read(kr_worker::config::document_path(&environment)).expect("the file");
     assert_eq!(
