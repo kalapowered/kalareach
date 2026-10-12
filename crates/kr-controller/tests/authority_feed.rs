@@ -1668,6 +1668,57 @@ async fn a_request_that_withdrew_nothing_is_refused_after_the_write_of_its_note_
     );
 }
 
+/// A device that holds no right to manage the host is turned away whatever the clock, so it cannot
+/// hold up the feed while the clock is unproven: a request from it is refused, and the owner's
+/// behind it is carried out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_device_that_may_not_manage_the_host_does_not_hold_up_the_feed_while_the_clock_is_unproven()
+ {
+    let rig = Rig::start().await;
+    let (viewer, viewer_record) = rig.pairs(&[ActionRight::SessionView]).await;
+    let (_phone, target) = rig.pairs(&[ActionRight::SessionView]).await;
+    rig.poll().await;
+    rig.host.controller().utc_floor().lose_continuity();
+
+    let by_a_viewer = kr_pairing::grants::sign_revocation_request(
+        &viewer.keys().authorisation,
+        RevocationRequestId::new(kr_protocol::scalars::Uuid::from_bytes([0xc1; 16])),
+        viewer_record.device_id,
+        rig.host_device(),
+        devices(target.device_id),
+        kr_protocol::scalars::TimestampMs::new(kr_ipc::now_ms().get()),
+    )
+    .expect("a signed request");
+    client_for(rig.served.origin(), viewer.keys().authorisation.clone())
+        .publish(rig.feed(), &by_a_viewer, None)
+        .await
+        .expect("the feed stores what any key publishes");
+    let by_the_owner = rig.owner_publishes(0xc2, devices(target.device_id)).await;
+    rig.poll().await;
+
+    let seen_by_the_viewer = client_for(rig.served.origin(), viewer.keys().authorisation.clone())
+        .read(rig.feed(), None, false)
+        .await
+        .expect("the viewer reads what it published");
+    assert_eq!(
+        seen_by_the_viewer
+            .record(by_a_viewer.request_id)
+            .expect("the record")
+            .rejected
+            .0,
+        Some(RejectionReason::NoOwnerAuthority)
+    );
+    assert_eq!(
+        rig.held(&by_the_owner)
+            .await
+            .acknowledgement
+            .0
+            .expect("the owner's request was carried out")
+            .completion,
+        RevocationCompletion::Complete
+    );
+}
+
 /// A pass writes the feed's record down when it changed something and not for each record it reads
 /// that was settled or refused already: a host that starts reads up to a week of them again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
