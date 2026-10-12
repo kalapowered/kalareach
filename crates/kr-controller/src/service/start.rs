@@ -782,6 +782,19 @@ impl Controller {
             crate::push::runtime::Cadence::DEFAULT,
             tokio::runtime::Handle::current(),
         );
+        // The mailbox service this host places a preview's encrypted object in, when its
+        // configuration document selects one. It is named before a transport is attached, which
+        // is what builds the placer that reaches it.
+        if let Some(origin) = started.mailbox.origin() {
+            let origin = kr_protocol::service::GatewayOrigin::new(origin).map_err(|error| {
+                ControllerError::NotConfigured(format!(
+                    "{} in this host's configuration document ({}) is not usable: {error}",
+                    kr_protocol::hostinfo::configuration::MAILBOX_ORIGIN.key,
+                    kr_protocol::hostinfo::configuration::FILE_NAME,
+                ))
+            })?;
+            delivery_runtime.select_mailbox(origin);
+        }
         // What the environment's attention store announces is taken on every pass of the runtime,
         // and every announcement it decides is stamped with the privacy state the delivery module
         // publishes its send gate from.

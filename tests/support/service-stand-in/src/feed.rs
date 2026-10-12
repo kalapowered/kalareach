@@ -199,7 +199,7 @@ fn instant(ms: u64) -> String {
     )
 }
 
-fn key_text(key: &AuthorisationKey) -> String {
+pub(crate) fn key_text(key: &AuthorisationKey) -> String {
     serde_json::to_value(key)
         .expect("a key")
         .as_str()
