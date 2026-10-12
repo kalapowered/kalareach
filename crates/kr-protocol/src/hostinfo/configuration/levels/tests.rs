@@ -8,7 +8,7 @@
 
 use serde_json::Value;
 
-use super::{Levelled, Newer, Release};
+use super::{Levelled, Newer, Release, THIS_RELEASE};
 use crate::hostinfo::configuration::{
     BASE_LEVEL, Change, ConfigurationDocument, DocumentState, EditRefused, VERSION, contents_in,
     edit_in, is_known_term, load_in, still_current,
@@ -37,7 +37,19 @@ const R2: Release = Release {
     }],
 };
 
+/// A release that reads level 1 and predates the authority section: it takes the section for a
+/// member of a newer release.
+const BEFORE_AUTHORITY: Release = Release {
+    level: 1,
+    levelled: &[Levelled {
+        member: "authority",
+        level: 2,
+    }],
+};
+
 const BROKER: &str = "https://broker.example.com";
+
+const FEED: &str = "https://reach.example.com";
 
 fn with_a_broker() -> ConfigurationDocument {
     let mut document = ConfigurationDocument::empty();
@@ -429,4 +441,132 @@ fn a_section_is_unused_when_every_field_of_it_is_null() {
     assert!(!is_unused(&StorageSelection {
         origin: Nullable::some("https://storage.example.com".to_owned()),
     }));
+}
+
+/// A document that selects an authority feed, as this build writes it.
+fn with_a_feed() -> ConfigurationDocument {
+    let mut document = ConfigurationDocument::empty();
+    document.authority.origin = Nullable::some(FEED.to_owned());
+    document.ceilings.session_limit = Nullable::some(4);
+    document
+}
+
+/// KR-REQ-26.13: the authority feed's selection is a section of level 2. A document that selects
+/// no feed is written without the section and at level 1, and a release that reads level 1 reads
+/// that file strictly, as it read the file before the section existed.
+#[test]
+fn an_unused_authority_section_is_not_written_and_a_release_at_level_1_reads_the_file_strictly() {
+    let mut document = ConfigurationDocument::empty();
+    document.ceilings.session_limit = Nullable::some(4);
+    let written = contents_in(&document, &THIS_RELEASE);
+    let value = json(&written);
+    assert!(value.get("authority").is_none(), "{written}");
+    assert_eq!(value["level"], 1, "{written}");
+
+    let read = load_in(Some(written.as_bytes()), &BEFORE_AUTHORITY);
+    assert_eq!(
+        read.status.state,
+        DocumentState::Loaded,
+        "{:?}",
+        read.status
+    );
+    assert!(
+        read.newer.is_none(),
+        "a document at the level is read strictly"
+    );
+    assert_eq!(
+        read.document.expect("used").ceilings.session_limit.0,
+        Some(4)
+    );
+
+    // An edit of a document that selects no feed leaves the section out too.
+    let edited = edit_in(
+        &load_in(Some(written.as_bytes()), &THIS_RELEASE),
+        &Change::SessionLimit(Some(2)),
+        &THIS_RELEASE,
+    )
+    .expect("an edit");
+    assert!(json(&edited.contents).get("authority").is_none());
+    assert_eq!(json(&edited.contents)["level"], 1);
+}
+
+/// KR-REQ-26.13: a release that reads level 1 takes the authority section for a section of a newer
+/// release: it applies every member it knows, leaves the section out, counts and names it, does not
+/// fail closed, and does not edit the document. Without the section a host takes revocations only
+/// from the owners who reach it directly.
+#[test]
+fn a_release_at_level_1_ignores_the_authority_section_and_applies_the_rest() {
+    let written = contents_in(&with_a_feed(), &THIS_RELEASE);
+    assert_eq!(json(&written)["level"], 2, "{written}");
+    assert_eq!(json(&written)["authority"]["origin"], FEED, "{written}");
+
+    let loaded = load_in(Some(written.as_bytes()), &BEFORE_AUTHORITY);
+    assert_eq!(
+        loaded.status.state,
+        DocumentState::Loaded,
+        "{:?}",
+        loaded.status
+    );
+    assert!(!loaded.fails_closed());
+    assert_eq!(
+        loaded.newer,
+        Some(Newer {
+            declared: 2,
+            count: 1,
+            names: vec!["authority".to_owned()]
+        })
+    );
+    let document = loaded.document.as_ref().expect("the document is used");
+    assert_eq!(document.ceilings.session_limit.0, Some(4));
+    assert_eq!(document.authority.origin(), None, "the section is left out");
+    assert!(matches!(
+        edit_in(&loaded, &Change::SessionLimit(Some(2)), &BEFORE_AUTHORITY),
+        Err(EditRefused::NotOurs(_))
+    ));
+}
+
+/// KR-REQ-26.13: the upgrade half and the round trip of an active value. A document a release at
+/// level 1 wrote is read by this build as it was; once the owner selects a feed the next write is at
+/// level 2 and keeps every other member; the selection survives the file, the typed document and
+/// the copy the registry keeps, which is the file's reading written again.
+#[test]
+fn a_selected_feed_survives_the_file_and_the_registrys_copy() {
+    let mut earlier = ConfigurationDocument::empty();
+    earlier.ceilings.session_limit = Nullable::some(4);
+    let before = contents_in(&earlier, &R1);
+    let loaded = load_in(Some(before.as_bytes()), &THIS_RELEASE);
+    assert_eq!(loaded.status.state, DocumentState::Loaded);
+    let mut document = loaded.document.expect("used");
+    assert_eq!(document.authority.origin(), None);
+
+    document.authority.origin = Nullable::some(FEED.to_owned());
+    let written = contents_in(&document, &THIS_RELEASE);
+    assert_eq!(json(&written)["level"], 2, "{written}");
+    assert_eq!(json(&written)["ceilings"]["session_limit"], 4, "{written}");
+
+    let read = load_in(Some(written.as_bytes()), &THIS_RELEASE);
+    assert_eq!(
+        read.status.state,
+        DocumentState::Loaded,
+        "{:?}",
+        read.status
+    );
+    let typed = read.document.expect("used");
+    assert_eq!(typed.authority.origin(), Some(FEED));
+    assert_eq!(typed.level, 2);
+
+    let copy = contents_in(&typed, &THIS_RELEASE);
+    let from_the_copy = load_in(Some(copy.as_bytes()), &THIS_RELEASE);
+    assert_eq!(from_the_copy.document.as_ref(), Some(&typed));
+    assert_eq!(
+        copy, written,
+        "the copy is the file's reading written again"
+    );
+
+    // The section is as strict as any other: a field it does not declare refuses the document.
+    let stray = br#"{"version": 3, "level": 2, "authority": {"origin": "https://reach.example.com", "relay": 1}}"#;
+    assert_eq!(
+        load_in(Some(stray), &THIS_RELEASE).status.state,
+        DocumentState::Invalid
+    );
 }

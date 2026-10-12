@@ -3176,11 +3176,11 @@ fn record_unreachable_worker(
     reservation.session_id
 }
 
-/// A document of level 2: a setting this build knows, a ceiling, and two sections of a newer
+/// A document of level 3: a setting this build knows, a ceiling, and two sections of a newer
 /// release, one whose name looks like a credential.
 const AT_A_HIGHER_LEVEL: &[u8] = br#"{
   "version": 3,
-  "level": 2,
+  "level": 3,
   "revision": 5,
   "preferences": { "sleep_inhibition": "battery_too" },
   "ceilings": { "session_limit": 4 },
@@ -3251,7 +3251,7 @@ async fn a_document_at_a_higher_level_applies_its_known_members_and_reports_the_
     assert_eq!(check.status, kr_protocol::hostinfo::DoctorStatus::Warning);
     let said = check.detail();
     assert!(
-        said.contains("level 2") && said.contains("reads level 1") && said.contains("2 members"),
+        said.contains("level 3") && said.contains("reads level 2") && said.contains("2 members"),
         "the levels and the count: {said}"
     );
     assert!(check.remedy().is_some(), "and what to do about it");
@@ -3288,13 +3288,82 @@ async fn a_document_at_a_higher_level_applies_its_known_members_and_reports_the_
         .expect_err("an edit of a document above this build's level is refused");
     let said = format!("{refused}");
     assert!(
-        said.contains("level 2") && said.contains("nothing was written"),
+        said.contains("level 3") && said.contains("nothing was written"),
         "{said}"
     );
     assert_eq!(std::fs::read(&path).expect("the document"), before);
 
     session.close();
     host.stop().await;
+}
+
+/// A document of level 2 that selects an authority feed.
+const WITH_AN_AUTHORITY_FEED: &[u8] = br#"{
+  "version": 3,
+  "level": 2,
+  "revision": 5,
+  "preferences": { "sleep_inhibition": "battery_too" },
+  "authority": { "origin": "https://reach.example.com" }
+}"#;
+
+/// KR-REQ-26.13: a daemon over a document that selects an authority feed reads it as a section of
+/// the level it reads, accepts it, and keeps in the registry the document as it read it, with the
+/// section and its level; the report an owner reads shows the selection, and the next start accepts
+/// nothing again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_document_that_selects_an_authority_feed_is_accepted_with_its_section() {
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    let environment = host.tree().environment();
+    write_document_bytes(&environment, WITH_AN_AUTHORITY_FEED);
+    let host = host.restart().await;
+
+    let mut local = host.client().await;
+    let result: HostDoctorResult = typed(
+        &local
+            .request(Method::HostDoctor, &())
+            .await
+            .expect("the call reaches the daemon")
+            .expect("host.doctor is served on the local socket"),
+    );
+    assert_eq!(result.configuration.status.state, DocumentState::Loaded);
+    let row = result
+        .configuration
+        .values
+        .iter()
+        .find(|value| value.key == "authority.origin")
+        .expect("the selection is reported");
+    assert_eq!(row.value(), "https://reach.example.com", "{row:?}");
+    let ignored = result
+        .configuration
+        .values
+        .iter()
+        .any(|value| value.key == config_ignored_members());
+    assert!(!ignored, "the section is one this build reads");
+
+    drop(local);
+    let stopped = host.shut_down().await;
+    let database = stopped.tree().environment().registry_database();
+    let connection = rusqlite::Connection::open(&database).expect("the registry file");
+    let record: Option<String> = connection
+        .query_row("SELECT accepted_document FROM environment", [], |row| {
+            row.get(0)
+        })
+        .expect("the accepted document");
+    drop(connection);
+    let accepted = config::from_record(record.as_deref()).expect("accepted");
+    assert_eq!(accepted.level, 2);
+    assert_eq!(
+        accepted.authority.origin(),
+        Some("https://reach.example.com"),
+        "the registry's copy states the selection"
+    );
+    let file = std::fs::read(kr_worker::config::document_path(&environment)).expect("the file");
+    assert_eq!(
+        Some(accepted),
+        kr_protocol::hostinfo::configuration::load(Some(&file)).document,
+        "the copy is the file's reading"
+    );
 }
 
 /// The key of the report's row of ignored members.

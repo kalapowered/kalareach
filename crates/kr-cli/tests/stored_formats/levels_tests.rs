@@ -543,9 +543,16 @@ fn the_views_observe_builds_hold_the_names_the_reader_compares() {
             property.name
         );
     }
-    assert!(
-        levels.members.is_empty(),
-        "no section has arrived with a level yet"
+    let sections: Vec<(&str, Option<u64>)> = levels
+        .properties
+        .iter()
+        .filter(|property| property.level.is_some())
+        .map(|property| (property.name.as_str(), property.level))
+        .collect();
+    assert_eq!(
+        sections,
+        [("authority", Some(2))],
+        "the sections that arrived with a level are the production table's"
     );
     assert!(levels.eligibility.is_empty() && super::design_findings(&levels).is_empty());
 }
