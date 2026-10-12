@@ -4495,7 +4495,7 @@ mod tests {
                  INSERT INTO network_clock (id, observed_ms) VALUES (0, 1234);
                  UPDATE schema_version SET version = 7;",
             )
-            .expect("sets the file back to the release before");
+            .expect("sets the file back to an earlier version");
         let columns = |path: &std::path::Path| -> Vec<String> {
             let connection = Connection::open(path).expect("opens");
             let mut statement = connection
@@ -4557,7 +4557,7 @@ mod tests {
         Connection::open(&path)
             .expect("opens")
             .execute("UPDATE schema_version SET version = 7", [])
-            .expect("sets the file back to the release before");
+            .expect("sets the file back to an earlier version");
 
         let carried = Registry::bring_forward(&path, environment()).expect("brings it forward");
         assert_eq!(
@@ -4585,10 +4585,10 @@ mod tests {
         assert_eq!(document.revision, 4);
     }
 
-    /// A release that reads version 9 kept no answer to a redemption or to a transfer of control,
-    /// and the release before this one recorded the configuration document at the version before
-    /// this one's. A registry either left comes forward to this version with no row changed: the
-    /// answers these methods keep are written by a release that writes 10 or later.
+    /// A release that reads version 9 kept no answer to a redemption or to a transfer of control.
+    /// A registry it left, and one left at the version before this one, come forward to this
+    /// version with no row changed: the answers these methods keep are written by a release that
+    /// writes 10 or later.
     #[test]
     fn a_registry_at_an_earlier_version_comes_forward_and_changes_no_row() {
         for from in [9, SCHEMA_VERSION - 1] {
@@ -4598,7 +4598,7 @@ mod tests {
             let connection = Connection::open(&path).expect("opens");
             connection
                 .execute("UPDATE schema_version SET version = ?1", [from])
-                .expect("sets the file back to the release before");
+                .expect("sets the file back to an earlier version");
             let rows = |connection: &Connection| -> i64 {
                 connection
                     .query_row(

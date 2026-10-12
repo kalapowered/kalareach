@@ -841,10 +841,10 @@ fn an_entry_the_format_cannot_carry_is_refused() {
     );
 }
 
-/// KR-REQ-26.10: a document the release before wrote, at version 1, is read as it was, and the next
+/// KR-REQ-26.10: a document written at version 1 is read as it was, and the next
 /// edit writes it at the version this build writes with every choice it held.
 #[test]
-fn a_document_the_release_before_wrote_is_read_and_the_next_edit_writes_it_forward() {
+fn a_document_at_version_1_is_read_and_the_next_edit_writes_it_forward() {
     let temp = kr_ipc::testing::TempHost::create();
     let environment = temp.environment();
     let earlier = br#"{
@@ -855,7 +855,7 @@ fn a_document_the_release_before_wrote_is_read_and_the_next_edit_writes_it_forwa
   "default_profile": "review"
 }"#;
     kr_ipc::paths::write_owner_only_file(&configuration::document_path(&environment), earlier)
-        .expect("writes the document the release before wrote");
+        .expect("writes the document at version 1");
 
     let loaded = configuration::load(&environment);
     assert_eq!(loaded.status.state, DocumentState::Loaded);

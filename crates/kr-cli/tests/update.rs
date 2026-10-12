@@ -10710,8 +10710,8 @@ async fn no_file_of_a_state_root_goes_unnamed() {
 /// holds that, so that a later change which allows such a rollback fails beside this floor. The first
 /// release that lists its stores reads the configuration document at versions 1 and 2, because the
 /// document gained its `storage` section before it, so every release a host can switch to reads
-/// version 2 of it, and a document a command writes at 2 never leaves the range of the release
-/// switched to. Every other record a command writes is at version 1.
+/// version 2 of it, and a command-written record that no barrier holds off may not be raised
+/// past that. Every other record a command writes is at version 1.
 const READ_BY_EVERY_LISTED_RELEASE: [(&str, u32); 1] = [("configuration", 2)];
 
 /// For a record a command writes, the version a release that has no writers' lock writes it at, which
@@ -10932,7 +10932,8 @@ fn broken_by_command_written_records(
 ///   unknown version;
 /// - a test that a rollback is refused naming a document at the current version, as
 ///   `a_rollback_is_refused_naming_a_configuration_document_the_older_release_cannot_read` does,
-///   and the sentence in `docs/host/updates.md` that gives the floor;
+///   and the `version` row of `docs/host/README.md`, which states the version the document is
+///   written at;
 /// - a base that holds the writers' lock and the registration.
 ///
 /// A line of `OPEN_GAPS` goes when its gap is closed for the record, or the limit is accepted for it
@@ -11036,7 +11037,7 @@ fn the_gate_on_command_written_records_refuses_what_it_is_for() {
         exposes: &["configuration"],
     }];
 
-    // The control: the records as they are, at their floors, with the gaps open.
+    // The control: each record at the version its table row gives it, with the gaps open.
     let at_floor = [
         (Writers::Barred(&CONFIGURATION_2), "configuration", 2, 1),
         (Writers::Barred(&ANSWERS_1), "kept-answers", 1, 0),
