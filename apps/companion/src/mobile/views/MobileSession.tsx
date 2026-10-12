@@ -43,7 +43,6 @@ import {
   notSubmittableBecause,
   startDraft,
   submittable,
-  type Draft,
   type DraftAttachment,
   type DraftTarget
 } from '../../model/drafts'
@@ -288,16 +287,6 @@ export function MobileSession({
     [session.agent.instances, liveBinding, capabilities, rights]
   )
 
-  const setDraft = useCallback(
-    (next: Draft) => {
-      book.setDrafts((drafts) => {
-        const without = drafts.filter((each) => each.draftId !== next.draftId)
-        return [...without, next]
-      })
-    },
-    [book]
-  )
-
   /**
    * Records what the person typed on top of the draft as it is stored now.
    *
@@ -396,11 +385,17 @@ export function MobileSession({
 
   // A draft written before the agent was read keeps the first conversation it learns, so that a
   // later move is a conflict rather than a new conversation the text follows.
+  // It is applied to the draft as the book holds it when this runs, not to the copy this render
+  // saw: a write that was answered since has given the draft its stored version, and putting the
+  // older copy back would undo that.
   useEffect(() => {
     if (held === undefined) return
-    const adopted = adoptFirstTarget(held, currentTarget)
-    if (adopted !== held) setDraft(adopted)
-  }, [held, currentTarget, setDraft])
+    book.setDrafts((drafts) =>
+      drafts.map((each) =>
+        each.draftId === held.draftId ? adoptFirstTarget(each, currentTarget) : each
+      )
+    )
+  }, [held, currentTarget, book])
 
   // The terminal's grid: as many cells as its surface shows at the current zoom, a column measured
   // from a probe of the grid's own font and a row as tall as the grid's own lines.
