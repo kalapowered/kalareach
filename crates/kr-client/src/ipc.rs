@@ -159,6 +159,21 @@ impl IpcTransport {
     }
 }
 
+/// The host and the actor a local connection reaches and acts as, when it is to the control
+/// daemon.
+///
+/// Only the control daemon keeps the record of an action that is asked about again. A session
+/// worker's endpoint carries the same environment and user, and has no such record and no grant
+/// method, so a request composed for the daemon is not sent to it. The host builds the actor a
+/// local caller's actions are claimed under from the user it authenticated, and states that user
+/// in its acknowledgement.
+fn reach_of(context: &LocalContext) -> Option<Reach> {
+    (context.role == LocalRole::Controller).then(|| Reach {
+        host: context.environment_id.to_string(),
+        actor: format!("local:{}", context.peer.uid.get()),
+    })
+}
+
 impl ControlTransport for IpcTransport {
     fn connection_id(&self) -> ConnectionId {
         self.connection_id
@@ -173,12 +188,7 @@ impl ControlTransport for IpcTransport {
     }
 
     fn reach(&self) -> Option<Reach> {
-        // The host builds the actor a local caller's actions are claimed under from the user it
-        // authenticated, and states that user in its acknowledgement.
-        Some(Reach {
-            host: self.context.environment_id.to_string(),
-            actor: format!("local:{}", self.context.peer.uid.get()),
-        })
+        reach_of(&self.context)
     }
 
     fn send<'a>(&'a self, frame: &'a ControlFrame) -> TransportFuture<'a, ()> {
@@ -300,6 +310,32 @@ impl Drop for IpcTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A request composed for the control daemon is not repeated on a session worker's endpoint,
+    /// which has the same environment and user and none of the daemon's records.
+    #[test]
+    fn only_the_control_daemon_has_a_reach() {
+        use kr_protocol::identity::{BootIdentity, BootIdentitySource};
+        use kr_protocol::scalars::{Bytes, Nullable, U64};
+
+        let context = |role| LocalContext {
+            role,
+            environment_id: EnvironmentId::new(kr_protocol::scalars::Uuid::from_bytes([7; 16])),
+            boot_identity: BootIdentity {
+                source: BootIdentitySource::BootTime,
+                value: Bytes::new(vec![1]),
+            },
+            peer: LocalPeer {
+                uid: U64::new(501),
+                gid: U64::new(20),
+                pid: Nullable::null(),
+            },
+        };
+        let daemon = reach_of(&context(LocalRole::Controller)).expect("the daemon states one");
+        assert!(daemon.actor.ends_with("501"));
+        assert_eq!(reach_of(&context(LocalRole::Worker)), None);
+        assert_eq!(reach_of(&context(LocalRole::Rendezvous)), None);
+    }
 
     #[test]
     fn a_local_connection_has_no_data_streams_to_revoke() {

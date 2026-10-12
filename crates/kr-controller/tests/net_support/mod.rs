@@ -482,6 +482,12 @@ impl Host {
         self.temp.environment().registry_database()
     }
 
+    /// The daemon's local endpoint, which what runs on the person's machine connects to.
+    #[must_use]
+    pub const fn endpoint(&self) -> &kr_ipc::paths::Endpoint {
+        &self.endpoint
+    }
+
     /// Connects one local client on the daemon's own socket.
     pub async fn client(&self) -> LocalClient {
         LocalClient::connect(&self.endpoint, LocalClientKind::Cli, build())

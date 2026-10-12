@@ -155,12 +155,27 @@ impl Reply {
             Err(
                 ClientError::SubmissionUncertain { .. }
                 | ClientError::Transport(_)
-                | ClientError::Ipc(_),
+                | ClientError::Ipc(_)
+                // A connection that ended before the request was answered ended after it was
+                // sent, or before it could be: the same as a lost answer, which a repeat settles.
+                | ClientError::ConnectionEnded,
             ) => Self::Lost,
-            // A connection that ended before the request was answered ended after it was sent, or
-            // before it could be: the same as a lost answer, which a repeat settles.
-            Err(ClientError::ConnectionEnded) => Self::Lost,
-            Err(_) => Self::NotSent,
+            // Refused here, before anything was sent.
+            Err(
+                ClientError::Cbor(_)
+                | ClientError::WrongEffect { .. }
+                | ClientError::UnsupportedVersion { .. }
+                | ClientError::TooManyOutstandingMutations { .. }
+                | ClientError::TooManyUnresolvedActions { .. }
+                | ClientError::NoActionWindow
+                | ClientError::Misdirected { .. }
+                | ClientError::OtherHost
+                | ClientError::StillAccounting
+                | ClientError::ServiceNotConfigured(_)
+                | ClientError::Draft(_),
+            ) => Self::NotSent,
+            // Anything else may have reached the host, and asking is what settles it.
+            Err(_) => Self::Lost,
         }
     }
 }
@@ -176,7 +191,9 @@ pub enum Next {
     Check,
     /// Read again later: nothing counts before [`Attempt::bound`].
     Wait,
-    /// Nothing was sent. The request is kept, unsent.
+    /// The client refused to send, or a call that could not run did not. After a *first* send that
+    /// went out it is never returned: a lost answer is [`Reply::Lost`], and the client reads the
+    /// host. The request is kept, unsent.
     NotSent,
 }
 
@@ -303,33 +320,70 @@ impl Attempt {
         self.bound_ms = self.bound_ms.min(by_challenge);
     }
 
+    /// A new hand-over, kept before an owner device is asked to confirm it.
+    ///
+    /// The record is named for the transfer's action from the start, because that is the action the
+    /// host keys the transfer by and the one the caller settles; what it holds until the owner has
+    /// confirmed is the *confirmation request*, which is another action ([`Self::confirmed`]
+    /// replaces it). While it is asking, nothing can be sent for it, and nothing closes it but
+    /// [`Self::confirmed`].
+    #[must_use]
+    pub fn asking(
+        confirmation: &ComposedMutation,
+        transfer_action: ActionId,
+        grant_id: GrantId,
+        composed_at_ms: u64,
+        label: impl Into<String>,
+    ) -> Self {
+        let mut attempt = Self::new(
+            Kind::Transfer,
+            confirmation,
+            Some(grant_id),
+            composed_at_ms,
+            label,
+        );
+        attempt.action_id = transfer_action;
+        attempt.phase = Phase::Asking;
+        attempt
+    }
+
     /// Moves a hand-over from asking for its confirmation to sending the transfer.
     ///
-    /// The confirmation request this attempt held is replaced by the transfer, composed under the
-    /// action the confirmation was asked for, with its window, the host and actor it is for and the
-    /// plan the owner confirmed. The bound is the window's, shortened to `challenge_left` as
-    /// [`Self::bound_by_challenge`] says, and **the caller arms a new clock now**: the one that
-    /// counted the confirmation's request counted from before the challenge existed.
+    /// `transfer` is the transfer composed under the action this record is named for. It replaces
+    /// the confirmation request, with its window and the host and actor it is for (cleared when it
+    /// states none, so a request that cannot say whom it is for is never repeated), and `plan` is
+    /// what the owner confirmed: the grant a read looks for is the one it writes. The bound is the
+    /// window's, shortened to what the challenge has left, which is its lifetime less
+    /// `since_challenge`, the time since its reply arrived, and **the caller arms a new clock now**:
+    /// the one that counted the confirmation's request counted from before the challenge existed.
     ///
-    /// Returns false, changing nothing, for an attempt that is not a hand-over being asked for.
+    /// Returns false, changing nothing, for an attempt that is not a hand-over being asked for, and
+    /// for a transfer composed under another action.
     pub fn confirmed(
         &mut self,
-        composed: &ComposedMutation,
+        transfer: &ComposedMutation,
         plan: TransferControlPlan,
-        challenge_left: Duration,
+        since_challenge: Duration,
     ) -> bool {
-        if self.kind != Kind::Transfer || self.phase != Phase::Asking {
+        if self.kind != Kind::Transfer
+            || self.phase != Phase::Asking
+            || transfer.action_id() != self.action_id
+        {
             return false;
         }
-        self.request = composed.request().clone();
-        self.window_issued_at_ms = composed.window_issued_at_ms();
-        self.window_valid_for_ms = composed.window_valid_for_ms();
-        if let Some(reach) = composed.reach() {
-            self.host = reach.host.clone();
-            self.standing = reach.actor.clone();
-        }
-        self.bound_ms = composed.window_valid_for_ms().saturating_add(MARGIN_MS);
-        self.bound_by_challenge(challenge_left);
+        let left = Duration::from_millis(kr_pairing::confirm::CONFIRMATION_LIFETIME_MS)
+            .saturating_sub(since_challenge);
+        self.request = transfer.request().clone();
+        self.window_issued_at_ms = transfer.window_issued_at_ms();
+        self.window_valid_for_ms = transfer.window_valid_for_ms();
+        let (host, standing) = transfer.reach().map_or_else(Default::default, |reach| {
+            (reach.host.clone(), reach.actor.clone())
+        });
+        self.host = host;
+        self.standing = standing;
+        self.grant_id = Nullable::some(plan.new_grant_id);
+        self.bound_ms = transfer.window_valid_for_ms().saturating_add(MARGIN_MS);
+        self.bound_by_challenge(left);
         self.plan = Nullable::some(plan);
         self.repeats = 0;
         self.phase = Phase::Composed;
@@ -383,10 +437,12 @@ impl Attempt {
     /// leaves it unfinished.
     ///
     /// A redemption is the exception: the paired door can replace the result of a redemption that
-    /// committed with a refusal, when the bounds of its decision end before it writes the answer.
-    /// So a kept refusal to a redemption's first send is a reason to read what the host shows, not
-    /// the end: the share the device holds decides. Nothing can commit after the host's kept
-    /// answer, so the read counts at once.
+    /// committed with a refusal, when the bounds of its decision end before it writes the answer,
+    /// and the redemption's effect runs on a task that can outlive the request. So a kept refusal to
+    /// a redemption's first send is a reason to read what the host shows, not the end: a share the
+    /// device holds closes it as happened, and an offer still listed is not accepted only once the
+    /// bound has passed, as for any other absent write. Any paired client's action has the same
+    /// property, and would need the same rule.
     ///
     /// An attempt still asking for a confirmation has nothing to send ([`Self::confirmed`]).
     pub fn after_first_send(&mut self, reply: Reply) -> Next {
@@ -398,7 +454,6 @@ impl Attempt {
             Reply::Refused(RetryCategory::NoRetry | RetryCategory::ConfigurationChange)
                 if self.kind == Kind::Redeem =>
             {
-                self.bound_ms = 0;
                 self.check()
             }
             Reply::Refused(RetryCategory::NoRetry | RetryCategory::ConfigurationChange) => {
@@ -444,6 +499,10 @@ impl Attempt {
     /// judged: a read that began before the bound can have found nothing and been judged after it,
     /// and the action can be admitted and commit in between.
     pub fn after_read(&mut self, found: Found, began: ReadAt) -> Next {
+        if let Phase::Closed(outcome) = self.phase {
+            // What an attempt closed as stays what it closed as.
+            return Next::Closed(outcome);
+        }
         if self.phase == Phase::Asking {
             return Next::Wait;
         }
@@ -510,11 +569,11 @@ impl Armed {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ReadAt(Duration);
 
+#[cfg(test)]
 impl ReadAt {
-    /// A read that began `elapsed` after the clock was armed. A client takes the moment from
-    /// [`Armed::read_begins`]; this is for the one that has to say it by hand, a test among them.
-    #[must_use]
-    pub const fn after(elapsed: Duration) -> Self {
+    /// A read that began `elapsed` after the clock was armed, for a test. A client takes the moment
+    /// from [`Armed::read_begins`], and nothing else makes one.
+    pub(crate) const fn after(elapsed: Duration) -> Self {
         Self(elapsed)
     }
 }
@@ -641,6 +700,15 @@ impl AttemptStore {
                 "the attempt is larger than a kept attempt may be",
             )));
         }
+        // A record that does not read back with this build's own limits is one it must not keep.
+        match kr_cbor::from_canonical_slice::<Attempt>(&bytes, &kr_cbor::Limits::DEFAULT) {
+            Ok(back) if back == *attempt => {}
+            _ => {
+                return Err(AttemptError::Encode(Shown::said(
+                    "the attempt does not read back as it was written",
+                )));
+            }
+        }
         let path = self.path(attempt.action_id);
         self.refuse_unreadable(&path)?;
         let store = |error| AttemptError::Store {
@@ -658,23 +726,6 @@ impl AttemptStore {
             return Err(store(error));
         }
         kr_flush::flush_directory(&self.directory, kr_flush::NameKind::File).map_err(store)
-    }
-
-    /// Refuses to replace or delete a file this build does not read: of a later release, or not an
-    /// attempt at all. Another release may hold it open, and this one cannot tell what it keeps.
-    /// Called with the store's lock held, so a file cannot change between the look and the change.
-    fn refuse_unreadable(&self, path: &Path) -> std::result::Result<(), AttemptError> {
-        match path.try_exists() {
-            Ok(false) => Ok(()),
-            Ok(true) => match read(path) {
-                Kept::Known(_) => Ok(()),
-                Kept::Unknown { .. } => Err(AttemptError::Unreadable { path: stored(path) }),
-            },
-            Err(error) => Err(AttemptError::Store {
-                path: stored(path),
-                fault: IoFault::from(error),
-            }),
-        }
     }
 
     /// Every attempt kept, oldest first, and every file this build does not read.
@@ -730,6 +781,25 @@ impl AttemptStore {
                 path: stored(&path),
                 fault: IoFault::from(error),
             }),
+        }
+    }
+
+    /// Refuses to replace or delete a file this build does not read: of a later release, or not an
+    /// attempt at all. Another release may hold it open, and this one cannot tell what it keeps.
+    /// Called with the store's lock held, so a file cannot change between the look and the change.
+    fn refuse_unreadable(&self, path: &Path) -> std::result::Result<(), AttemptError> {
+        // The entry itself, not what a link points at: a link whose target is gone is an entry
+        // this build does not read, and is left as it is.
+        match std::fs::symlink_metadata(path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(AttemptError::Store {
+                path: stored(path),
+                fault: IoFault::from(error),
+            }),
+            Ok(_) => match read(path) {
+                Kept::Known(_) => Ok(()),
+                Kept::Unknown { .. } => Err(AttemptError::Unreadable { path: stored(path) }),
+            },
         }
     }
 
@@ -1026,6 +1096,28 @@ mod tests {
         assert_eq!(store.attempts().expect("listed").len(), 1);
     }
 
+    /// A link in the store whose target is gone is an entry this build does not read, and is
+    /// neither replaced nor removed: the guard looks at the entry itself.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_with_no_target_is_neither_replaced_nor_removed() {
+        let directory = kr_ipc::testing::PrivateTempDir::create();
+        let root = directory.path().join("attempts");
+        let store = AttemptStore::open(&root).expect("opens");
+        let kept = attempt(Kind::Redeem);
+        let path = root.join(format!("{}.attempt", kept.action_id));
+        std::os::unix::fs::symlink(directory.path().join("nowhere"), &path).expect("a link");
+        assert!(matches!(
+            store.keep(&kept),
+            Err(AttemptError::Unreadable { .. })
+        ));
+        assert!(matches!(
+            store.remove(kept.action_id),
+            Err(AttemptError::Unreadable { .. })
+        ));
+        assert!(path.symlink_metadata().is_ok(), "the link is still there");
+    }
+
     /// The transfer of control a host describes, with keys that do not change between runs.
     fn plan() -> TransferControlPlan {
         use kr_protocol::grant::{EnvironmentSelector, GrantExpiry, HistoryScope};
@@ -1072,12 +1164,12 @@ mod tests {
     }
 
     /// A redemption's kept refusal is not the end of it, since the paired door can replace the
-    /// result of one that committed with a refusal. The share the device holds decides, and it
-    /// decides at once, because nothing can commit after the host's kept answer: a share is
-    /// accepted, an offer still listed is not accepted, and neither is unknown. Every other kind
-    /// still closes as refused.
+    /// result of one that committed with a refusal, and the effect can outlive the request. The
+    /// share the device holds decides: a share closes it as accepted at once, and an offer still
+    /// listed or nothing listed counts only once the bound has passed, as for any absent write.
+    /// Every other kind still closes as refused.
     #[test]
-    fn a_kept_refusal_to_a_redemption_leaves_the_share_to_decide_at_once() {
+    fn a_kept_refusal_to_a_redemption_leaves_the_shares_to_decide_and_the_bound_to_wait() {
         let kept = Reply::Refused(RetryCategory::ConfigurationChange);
         let mut accepted = attempt(Kind::Redeem);
         assert_eq!(accepted.after_first_send(kept), Next::Check);
@@ -1091,12 +1183,18 @@ mod tests {
         offered.after_first_send(kept);
         assert_eq!(
             offered.after_read(Found::Offered, at(0)),
+            Next::Wait,
+            "an offer still listed proves nothing while the effect can still commit"
+        );
+        assert_eq!(
+            offered.after_read(Found::Offered, ReadAt::after(offered.bound())),
             Next::Closed(Outcome::NotAccepted)
         );
         let mut neither = attempt(Kind::Redeem);
         neither.after_first_send(Reply::Refused(RetryCategory::NoRetry));
+        assert_eq!(neither.after_read(Found::Neither, at(0)), Next::Wait);
         assert_eq!(
-            neither.after_read(Found::Neither, at(0)),
+            neither.after_read(Found::Neither, ReadAt::after(neither.bound())),
             Next::Closed(Outcome::Unknown)
         );
         // A refusal in a category that can be retried is unfinished, as for every kind.
@@ -1123,8 +1221,29 @@ mod tests {
     #[test]
     fn a_hand_over_being_asked_for_moves_only_when_it_is_confirmed_and_is_bounded_by_what_is_left()
     {
-        let mut asking = attempt(Kind::Transfer);
-        asking.phase = Phase::Asking;
+        let transfer_action = ActionId::new(Uuid::from_bytes([0xc7; 16]));
+        let confirmation = ComposedMutation::restored(
+            MutationRequest {
+                action_id: ActionId::new(Uuid::from_bytes([0xc1; 16])),
+                ..request()
+            },
+            1_000,
+            300_000,
+            Some(reach()),
+        );
+        let mut asking = Attempt::asking(
+            &confirmation,
+            transfer_action,
+            GrantId::new(Uuid::from_bytes([0x99; 16])),
+            2_000,
+            "Handing over",
+        );
+        assert_eq!(asking.phase, Phase::Asking);
+        assert_eq!(
+            asking.action_id, transfer_action,
+            "the record is named for the transfer"
+        );
+        assert_ne!(asking.request.action_id, transfer_action);
         assert_eq!(asking.after_first_send(Reply::Result), Next::NotSent);
         assert_eq!(asking.after_repeat(Reply::Result), Next::NotSent);
         assert_eq!(asking.after_read(Found::Present, at(10_000)), Next::Wait);
@@ -1134,21 +1253,50 @@ mod tests {
             "the challenge is not the transfer"
         );
 
-        let composed = ComposedMutation::restored(
+        // The transfer is composed under the action the record is named for, and a request for
+        // another action is not the transfer.
+        let elsewhere = ComposedMutation::restored(
             MutationRequest {
-                action_id: asking.request.action_id,
+                action_id: ActionId::new(Uuid::from_bytes([0xc2; 16])),
                 ..request()
             },
             5_000,
             300_000,
-            Some(reach()),
+            None,
+        );
+        assert!(
+            !asking
+                .clone()
+                .confirmed(&elsewhere, plan(), Duration::from_secs(50))
+        );
+        let transfer = ComposedMutation::restored(
+            MutationRequest {
+                action_id: transfer_action,
+                ..request()
+            },
+            5_000,
+            300_000,
+            None,
         );
         // The challenge, 120 seconds long, was answered 50 seconds before the transfer was
         // composed, so 70 seconds of it are left then.
-        assert!(asking.confirmed(&composed, plan(), Duration::from_secs(70)));
+        assert!(asking.confirmed(&transfer, plan(), Duration::from_secs(50)));
         assert_eq!(asking.phase, Phase::Composed);
+        assert_eq!(asking.action_id, transfer_action);
+        assert_eq!(asking.request.action_id, transfer_action);
+        assert_eq!(asking.composed().action_id(), asking.action_id);
         assert_eq!(asking.window_issued_at_ms, 5_000);
         assert_eq!(asking.plan, Nullable::some(plan()));
+        assert_eq!(
+            asking.grant_id,
+            Nullable::some(plan().new_grant_id),
+            "a read looks for the grant the plan writes"
+        );
+        assert_eq!(
+            asking.reach(),
+            None,
+            "a request that states no reach is never repeated, not repeated as the confirmation was"
+        );
         assert_eq!(
             asking.bound(),
             Duration::from_secs(100),
@@ -1165,14 +1313,58 @@ mod tests {
         );
         // Only a hand-over being asked for is confirmed.
         let mut other = attempt(Kind::Transfer);
-        assert!(!other.confirmed(&composed, plan(), Duration::from_secs(70)));
+        assert!(!other.confirmed(&transfer, plan(), Duration::from_secs(50)));
         let mut invite = attempt(Kind::Invite);
         invite.phase = Phase::Asking;
-        assert!(!invite.confirmed(&composed, plan(), Duration::from_secs(70)));
+        assert!(!invite.confirmed(&transfer, plan(), Duration::from_secs(50)));
+    }
+
+    /// What an attempt closed as stays what it closed as: a later read, which another path of the
+    /// client can still make, never closes it again with another outcome.
+    #[test]
+    fn a_closed_attempt_stays_as_it_closed() {
+        let mut closed = attempt(Kind::Invite);
+        assert_eq!(
+            closed.after_read(Found::Present, at(0)),
+            Next::Closed(Outcome::Happened)
+        );
+        assert_eq!(
+            closed.after_read(Found::Absent, at(10_000)),
+            Next::Closed(Outcome::Happened)
+        );
+        assert_eq!(closed.phase, Phase::Closed(Outcome::Happened));
+    }
+
+    /// What the host answered, and what the client refused to send, are told apart for every
+    /// error: a variant that may have reached the host is a lost answer, which a repeat settles.
+    #[test]
+    fn each_error_is_told_as_the_host_s_answer_a_lost_answer_or_a_refusal_made_here() {
+        use kr_protocol::error::ErrorCode;
+        let reply = |error: ClientError| Reply::of(&Err(error));
+        assert_eq!(reply(ClientError::ConnectionEnded), Reply::Lost);
+        assert_eq!(reply(ClientError::ResyncRequired), Reply::Lost);
+        for local in [
+            ClientError::NoActionWindow,
+            ClientError::OtherHost,
+            ClientError::StillAccounting,
+            ClientError::Misdirected { repeating: true },
+            ClientError::TooManyUnresolvedActions { limit: 1 },
+        ] {
+            assert_eq!(reply(local), Reply::NotSent);
+        }
+        assert_eq!(
+            reply(ClientError::Host(kr_protocol::error::ProtocolError::new(
+                ErrorCode::PermissionDenied,
+                "no"
+            ))),
+            Reply::Refused(ErrorCode::PermissionDenied.retry_category())
+        );
     }
 
     /// The moment a read began is read off the clock when the read is about to be sent, and it
-    /// moves on as time does: a read begun later is judged as begun later.
+    /// moves on as time does. What a read began at is all `after_read` is given: it reads no clock
+    /// of its own, so an answer that arrives long after the bound judges a read that began before it
+    /// as one that did (`a_read_that_finds_nothing_waits_for_the_window_and_the_margin`).
     #[test]
     fn a_read_begins_when_it_is_taken_and_not_when_it_is_judged() {
         let armed = Armed::now();

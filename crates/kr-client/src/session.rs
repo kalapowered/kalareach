@@ -980,8 +980,11 @@ impl Session {
     ///
     /// # Errors
     ///
-    /// Returns a refusal when this is the connection that composed the request, or when this
-    /// client is still accounting for the action; and otherwise as [`Session::mutate`].
+    /// Returns a refusal when this is the connection that composed the request or was issued its
+    /// window ([`ClientError::Misdirected`]), when it reaches another host or acts as another actor
+    /// than the request was composed for ([`ClientError::OtherHost`]), or when this client is still
+    /// accounting for the action ([`ClientError::StillAccounting`]); and otherwise as
+    /// [`Session::mutate`].
     pub async fn repeat(&self, composed: &ComposedMutation) -> Result<Settled> {
         // Whether this connection composed the request is decided by the window it carries as well
         // as by the record of it: a request read back from a kept record names no session, and its

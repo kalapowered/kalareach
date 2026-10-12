@@ -499,3 +499,57 @@ async fn kr_req_23_49_a_second_send_of_a_held_action_is_refused_locally_and_is_n
     first.close();
     host.stop().await;
 }
+
+/// KR-REQ-09.08: a repeat is refused when it would be made as another actor on the same host. Two
+/// paired devices reach one host, so their reach differs in the actor alone: a request composed by
+/// one is not repeated by the other, though the other holds a connection to the same daemon.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_09_08_a_request_is_not_repeated_as_another_device_of_the_same_host() {
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    let (first_device, first_record) = recipient(&host, &owner).await;
+    let (second_device, second_record) = recipient(&host, &owner).await;
+    let (session_id, _) = an_open_session(&host);
+    let first = connect(&host, &first_device, &first_record).await;
+    let second = connect(&host, &second_device, &second_record).await;
+    let third = connect(&host, &first_device, &first_record).await;
+
+    let composed = first
+        .compose(
+            Method::GrantRedeem,
+            ActionId::new(kr_ipc::new_uuid()),
+            on_the_host(&host),
+            None,
+            &ParamsValue::empty(),
+            &GrantRedeemParams {
+                invitation_id: kr_protocol::ids::InvitationId::new(kr_ipc::new_uuid()),
+            },
+            TTL,
+        )
+        .await
+        .expect("composed");
+    let kept = Attempt::new(Kind::Redeem, &composed, None, 0, "Accept");
+    let restored = kept.composed();
+    assert_eq!(
+        first.reach().map(|reach| reach.host),
+        second.reach().map(|reach| reach.host)
+    );
+    assert_ne!(first.reach(), second.reach(), "the actor is the device");
+
+    // Another device of the same host is not the actor the request was composed for.
+    assert!(matches!(
+        second.repeat(&restored).await,
+        Err(ClientError::OtherHost)
+    ));
+    // The same device on another connection is, and the host's record is what answers it.
+    let answered = third.repeat(&restored).await;
+    assert!(
+        matches!(&answered, Err(ClientError::Host(_))),
+        "the host has no record of an action never sent, and refuses: {answered:?}"
+    );
+    let _ = session_id;
+    first.close();
+    second.close();
+    third.close();
+    host.stop().await;
+}

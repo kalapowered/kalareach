@@ -456,8 +456,8 @@ async fn kr_req_23_49_a_lost_reply_to_the_confirmation_request_is_repeated_and_o
         )
         .await
         .expect("composed");
-    // The reply to the first send is lost: this client takes it as the library gives it, and never
-    // reads it.
+    // The first send's reply is read here only to compare it with the repeat's: a client whose
+    // reply was lost would not have it, and asks again with the same request.
     let sent = first.send(&composed).await;
     assert_eq!(Reply::of(&sent), Reply::Result);
     let sent: OwnerConfirmationRequestResult = sent.expect("answered").to_typed().expect("typed");

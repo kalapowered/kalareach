@@ -680,3 +680,97 @@ async fn kr_req_18_03_a_device_that_lists_its_delegations_is_not_told_the_recipi
     issuing.close();
     host.stop().await;
 }
+
+/// KR-REQ-25.10: a pairing that runs out while the share waits for the store is found where the
+/// share is written. The request was checked while the pairing stood, and is held after that check
+/// and before the transaction; the pairing ends while it is held; the write finds it and refuses,
+/// and no share is written. The control is the same request released with the pairing still
+/// standing, which is written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_25_10_a_pairing_that_runs_out_while_the_share_waits_takes_no_share() {
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let wall = MovedWall::new();
+    let host = Host::start_on_clocks(&owner, wall.clocks()).await;
+    // Seventy seconds of pairing, for a share of thirty, in a request whose time to live is two
+    // minutes: the pairing ends while the request is held, and the request's own deadline does not.
+    let (_device, record) =
+        net_support::recipient_ending_in(&host, &owner, Duration::from_secs(70)).await;
+    let session_id = SessionId::new(kr_ipc::new_uuid());
+    let selection = RoleSelection::plain(SessionRole::Viewer);
+    let params = GrantCreateParams {
+        session_id,
+        recipient_device_id: record.device_id,
+        parent_grant_id: Nullable::null(),
+        accepted_notices: AuthorityNotice::for_actions(&selection.actions()),
+        selection,
+        lifetime_ms: Nullable::some(kr_protocol::scalars::DurationMs::new(30_000)),
+        owner_confirmation: Nullable::null(),
+    };
+    let target = net_support::on_the_session(&host, session_id);
+    let held_request = |host: &Host| {
+        let endpoint = host.endpoint().clone();
+        let (params, target) = (params.clone(), target.clone());
+        async move {
+            let mut client = kr_ipc::client::LocalClient::connect(
+                &endpoint,
+                kr_protocol::local::LocalClientKind::Cli,
+                net_support::build(),
+            )
+            .await
+            .expect("connects to the control endpoint");
+            client
+                .mutate(
+                    Method::GrantCreate,
+                    ActionId::new(kr_ipc::new_uuid()),
+                    target,
+                    &params,
+                )
+                .await
+                .expect("the call reaches the daemon")
+        }
+    };
+
+    // Released with the pairing still standing: written.
+    let (arrived, go) = host.controller().sharing().grants().pause_before_effect();
+    let standing = tokio::spawn(held_request(&host));
+    tokio::task::spawn_blocking(move || arrived.recv_timeout(Duration::from_secs(60)))
+        .await
+        .expect("the wait ran")
+        .expect("the request is held at the store");
+    go.send(()).expect("the request is let go");
+    standing
+        .await
+        .expect("the request ran")
+        .expect("a pairing that still stands takes the share");
+
+    // Held, and the pairing ends while it is held: refused where the share is written.
+    let (arrived, go) = host.controller().sharing().grants().pause_before_effect();
+    let ending = tokio::spawn(held_request(&host));
+    tokio::task::spawn_blocking(move || arrived.recv_timeout(Duration::from_secs(60)))
+        .await
+        .expect("the wait ran")
+        .expect("the request is held at the store");
+    wall.advance(Duration::from_secs(100));
+    go.send(()).expect("the request is let go");
+    let refused = ending
+        .await
+        .expect("the request ran")
+        .expect_err("a pairing that ran out while the request waited takes no share");
+    assert_eq!(refused.code, ErrorCode::PermissionDenied, "{refused:?}");
+    assert!(
+        refused.message.contains("pairing has run out"),
+        "{refused:?}"
+    );
+    let listed: GrantListResult = net_support::pairing::read(
+        &mut host.client().await,
+        Method::GrantList,
+        &GrantListParams {
+            session_id: Nullable::some(session_id),
+            include_resolved: true,
+        },
+    )
+    .await
+    .expect("the list is read");
+    assert_eq!(listed.grants.len(), 1, "only the first share was written");
+    host.stop().await;
+}
