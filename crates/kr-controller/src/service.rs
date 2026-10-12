@@ -388,6 +388,8 @@ pub struct Controller {
     feed_runtime: Option<crate::authority_feed::FeedRuntime>,
     /// Wakes the task that gives the owner's inbox its notices about the authority feed.
     feed_notice_wake: Arc<tokio::sync::Notify>,
+    /// That task, which ends when the daemon is dropped.
+    feed_notice_task: std::sync::OnceLock<remote_revocation::EndsWithTheDaemon>,
     /// How many times that task has tried to give one.
     feed_notice_attempts: tokio::sync::watch::Sender<u64>,
     /// The configuration this daemon has put into force.
