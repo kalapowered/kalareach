@@ -106,6 +106,39 @@ fn in_force(opened: SessionOpenResult) -> Standing {
     }
 }
 
+/// Attaches `connection` to a session's terminal as a viewer, under the grant it was opened for.
+async fn attach(
+    adopted: &Adopted,
+    connection: &RawDevice,
+    session_id: SessionId,
+) -> Result<kr_protocol::envelope::ParamsValue, ProtocolError> {
+    connection
+        .mutate(
+            Method::SessionAttach,
+            ActionId::new(kr_ipc::new_uuid()),
+            on_the_session(&adopted.host, session_id),
+            &kr_protocol::attachment::SessionAttachParams {
+                session_id,
+                mode: kr_protocol::attachment::AttachMode::Terminal,
+                claim_geometry: false,
+                dimensions: Nullable::some(kr_protocol::session::Dimensions::new(80, 24)),
+                terminal_profile_id: Nullable::some("xterm-256color".to_owned()),
+                requested: [kr_protocol::attachment::AttachmentCapability::ObserveTerminal]
+                    .into_iter()
+                    .collect(),
+            },
+        )
+        .await
+}
+
+/// When a grant expires, in UTC milliseconds.
+fn expiry_of(grant: &kr_protocol::grant::Grant) -> u64 {
+    match grant.expiry {
+        kr_protocol::grant::GrantExpiry::At { expires_at_ms } => expires_at_ms.get(),
+        kr_protocol::grant::GrantExpiry::Never => panic!("this grant does not expire"),
+    }
+}
+
 fn sorted(rights: &[ActionRight]) -> Vec<ActionRight> {
     let mut rights = rights.to_vec();
     rights.sort();
@@ -283,9 +316,10 @@ async fn kr_req_19_08_an_open_reports_the_rights_the_host_decided_and_not_the_pr
         "the host's ceiling took terminal.input away"
     );
     assert!(standing.live);
-    assert!(
-        standing.ends_at_ms.is_some(),
-        "a session invitation's pairing expires"
+    assert_eq!(
+        standing.ends_at_ms,
+        Some(expiry_of(&record.grant)),
+        "the end is the pairing's own"
     );
 
     connection.close();
@@ -326,7 +360,37 @@ async fn kr_req_19_08_a_share_opens_as_named_and_is_never_chosen_for_the_device(
     assert_eq!(standing.via, OpenedVia::Share);
     assert_eq!(standing.actions, sorted(&carried));
     assert!(!standing.live, "a plain share carries no live screen");
-    assert!(standing.ends_at_ms.is_some());
+    assert_eq!(
+        standing.ends_at_ms,
+        Some(expiry_of(&grant)),
+        "the share ends before the pairing it is held through"
+    );
+    // The same share, held through a pairing that ends sooner, is scheduled to end with the
+    // pairing.
+    let mut short = proposal(&[ActionRight::SessionView]);
+    short.session_selector = kr_protocol::grant::SessionSelector::None;
+    short.expiry = kr_protocol::grant::GrantExpiry::At {
+        expires_at_ms: TimestampMs::new(kr_ipc::now_ms().get() + 600_000),
+    };
+    let sooner = Device::create().await;
+    let sooner_record = pair_with(&adopted.host, &sooner, &adopted.owner, short).await;
+    let held = share(
+        &adopted.host,
+        session_id,
+        &sooner,
+        &sooner_record,
+        RoleSelection::plain(SessionRole::Viewer),
+    )
+    .await;
+    assert!(expiry_of(&held) > expiry_of(&sooner_record.grant));
+    let through_it = RawDevice::connect(&adopted.host, &sooner, &sooner_record).await;
+    let standing = in_force(
+        open(&through_it, Some(session_id), Some(held.grant_id))
+            .await
+            .expect("the share opens"),
+    );
+    assert_eq!(standing.ends_at_ms, Some(expiry_of(&sooner_record.grant)));
+    through_it.close();
     connection.close();
     adopted.stop().await;
 }
@@ -376,6 +440,11 @@ async fn kr_req_19_08_a_share_without_the_live_view_finds_its_agent_and_not_the_
         code(without.read(Method::EventsSnapshot, &snapshot).await),
         ErrorCode::PermissionDenied
     );
+    assert_eq!(
+        code(attach(&adopted, &without, worker.session_id).await),
+        ErrorCode::PermissionDenied,
+        "and cannot attach to a screen it does not include"
+    );
     let found: AgentInstancesResult = without
         .read(Method::AgentInstances, &instances)
         .await
@@ -400,6 +469,9 @@ async fn kr_req_19_08_a_share_without_the_live_view_finds_its_agent_and_not_the_
             .expect("the share opens"),
     );
     assert!(standing.live);
+    attach(&adopted, &with, worker.session_id)
+        .await
+        .expect("a share that includes the live screen attaches");
     let drawn: EventsSnapshotResult = with
         .read(Method::EventsSnapshot, &snapshot)
         .await
@@ -538,7 +610,8 @@ async fn kr_req_19_08_only_a_proven_end_is_told_as_an_end() {
     ));
     connection.close();
 
-    // A share offered and never redeemed is not held, and is not an end.
+    // A share offered and never redeemed is not held, and is not an end, even when it has been
+    // withdrawn: the device never held it.
     let (idle, idle_record) = recipient(&adopted.host, &adopted.owner).await;
     let offered = offer(
         &adopted.host,
@@ -547,6 +620,7 @@ async fn kr_req_19_08_only_a_proven_end_is_told_as_an_end() {
         RoleSelection::plain(SessionRole::Viewer),
     )
     .await;
+    revoke(&adopted.host, offered.grant.grant_id).await;
     let connection = RawDevice::connect(&adopted.host, &idle, &idle_record).await;
     assert_eq!(
         code(open(&connection, Some(session_id), Some(offered.grant.grant_id)).await),
@@ -554,7 +628,7 @@ async fn kr_req_19_08_only_a_proven_end_is_told_as_an_end() {
     );
     connection.close();
 
-    // Another device's share, and a grant nobody issued, read alike.
+    // Another device's share, withdrawn, and a grant nobody issued, read alike.
     let (other, other_record) = recipient(&adopted.host, &adopted.owner).await;
     let theirs = share(
         &adopted.host,
@@ -564,10 +638,12 @@ async fn kr_req_19_08_only_a_proven_end_is_told_as_an_end() {
         RoleSelection::plain(SessionRole::Viewer),
     )
     .await;
+    revoke(&adopted.host, theirs.grant_id).await;
     let connection = RawDevice::connect(&adopted.host, &device, &record).await;
     assert_eq!(
         code(open(&connection, Some(session_id), Some(theirs.grant_id)).await),
-        ErrorCode::PermissionDenied
+        ErrorCode::PermissionDenied,
+        "a revoked share of another device is not this device's to be told of"
     );
     assert_eq!(
         code(
@@ -649,9 +725,15 @@ async fn kr_req_19_08_an_opened_connection_serves_its_session_and_grant_alone() 
     let (first, second) = (&adopted.workers[0], &adopted.workers[1]);
     first.ask("one");
     second.ask("two");
+    let upstream = Arc::new(Upstream::default());
+    let instance = first.register_agent(Arc::clone(&upstream));
     let (device, record) = viewer(
         &adopted,
-        &[ActionRight::SessionView, ActionRight::QuestionRespond],
+        &[
+            ActionRight::SessionView,
+            ActionRight::QuestionRespond,
+            ActionRight::AgentPrompt,
+        ],
     )
     .await;
 
@@ -690,6 +772,39 @@ async fn kr_req_19_08_an_opened_connection_serves_its_session_and_grant_alone() 
             .expect("decodes");
         assert_eq!(listed.questions.len(), 1);
     }
+
+    // An action performed on the first session is read, by its identifier alone, on the
+    // connection opened for it, and is not read on the one opened for the second.
+    let subject = kr_worker::broker::subject(first.session_id, instance);
+    let action = ActionId::new(kr_ipc::new_uuid());
+    for_first
+        .mutate(
+            Method::AgentPromptSubmit,
+            action,
+            target(&adopted, first, instance),
+            &AgentPromptParams {
+                target: AgentMutationTarget {
+                    subject,
+                    binding_revision: AgentBindingRevision::new(1),
+                },
+                draft_id: Nullable::null(),
+                text: Nullable::some(PromptText::new("once").expect("a prompt")),
+            },
+        )
+        .await
+        .expect("the prompt is performed");
+    let by_identifier = kr_protocol::receipt::ActionReadParams {
+        action_id: action,
+        session_id: None,
+    };
+    for_first
+        .read(Method::ActionRead, &by_identifier)
+        .await
+        .expect("the connection opened for the session reads its action");
+    assert_eq!(
+        code(for_second.read(Method::ActionRead, &by_identifier).await),
+        ErrorCode::InvalidArgument
+    );
 
     // Another session, by a worker-bound read and by a daemon-served one, is refused.
     assert_eq!(
@@ -761,7 +876,7 @@ async fn kr_req_19_08_the_host_scope_serves_the_hosts_reads_and_no_worker() {
         session_ids: [admitted.session_id].into_iter().collect(),
     };
     let record = pair_with(&adopted.host, &device, &adopted.owner, grant).await;
-    share(
+    let held = share(
         &adopted.host,
         shared.session_id,
         &device,
@@ -840,7 +955,7 @@ async fn kr_req_19_08_the_host_scope_serves_the_hosts_reads_and_no_worker() {
         ErrorCode::InvalidArgument
     );
     // Nothing was closed, and the connection is still served.
-    connection
+    let read: kr_protocol::session::SessionReadResult = connection
         .read(
             Method::SessionRead,
             &SessionReadParams {
@@ -848,7 +963,35 @@ async fn kr_req_19_08_the_host_scope_serves_the_hosts_reads_and_no_worker() {
             },
         )
         .await
-        .expect("the host scope stands");
+        .expect("the host scope stands")
+        .to_typed()
+        .expect("decodes");
+    assert_eq!(read.session.state, kr_protocol::session::SessionState::Live);
+
+    // The share this connection was refused a read under ends. A connection that is not opened
+    // for anything reads under it as the host has always let it, and is ended with it; the host
+    // scope decided nothing under it, so it stands.
+    let unopened = net_support::connect(&adopted.host, &device, &record).await;
+    unopened
+        .read::<_, kr_protocol::session::SessionReadResult>(
+            Method::SessionRead,
+            &SessionReadParams {
+                session_id: shared.session_id,
+            },
+        )
+        .await
+        .expect("a connection nothing has opened reads under the share");
+    revoke(&adopted.host, held.grant_id).await;
+    assert!(
+        tokio::time::timeout(PATIENCE, unopened.closed())
+            .await
+            .is_ok(),
+        "the connection that read under the share ends with it"
+    );
+    connection
+        .read(Method::SessionList, &listing())
+        .await
+        .expect("the host scope stands after the share ended");
     connection.close();
 
     // A guest pairing holds no action, and the host scope needs none.
@@ -881,11 +1024,13 @@ async fn revoke_on(
 /// A connection scoped to one grant decides nothing under another: a revocation acts under the
 /// share its grant was delegated from, and is served only on the connection scoped to that share.
 /// Scoped to the host, to the pairing or to a different share of the same device, it is refused
-/// and the delegated grant stands; scoped to the share it was delegated from, it is served.
+/// and records nothing: when that other share is withdrawn afterwards, the connection that was
+/// refused stands. Scoped to the share the grant was delegated from, it is served.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn kr_req_19_08_a_revocation_is_served_only_on_the_connection_scoped_to_its_share() {
     let adopted = Adopted::start(1).await;
     let worker = &adopted.workers[0];
+    worker.ask("one");
     let (device, record) = recipient(&adopted.host, &adopted.owner).await;
     let (colleague, colleague_record) = recipient(&adopted.host, &adopted.owner).await;
     let (own, issuing) = owned_by(&adopted.host, worker.session_id, &device, &record).await;
@@ -900,8 +1045,9 @@ async fn kr_req_19_08_a_revocation_is_served_only_on_the_connection_scoped_to_it
     )
     .await;
     let grant_id = delegated.grant_id;
+    issuing.close();
 
-    // The host, the pairing and the device's other share each refuse it.
+    // The host, the pairing's own session and the device's other share each refuse it.
     let host_scoped = RawDevice::connect(&adopted.host, &device, &record).await;
     open(&host_scoped, None, None)
         .await
@@ -910,7 +1056,6 @@ async fn kr_req_19_08_a_revocation_is_served_only_on_the_connection_scoped_to_it
         code(revoke_on(&adopted.host, &host_scoped, grant_id).await),
         ErrorCode::InvalidArgument
     );
-    host_scoped.close();
     let under_own = RawDevice::connect(&adopted.host, &device, &record).await;
     open(
         &under_own,
@@ -923,9 +1068,8 @@ async fn kr_req_19_08_a_revocation_is_served_only_on_the_connection_scoped_to_it
         code(revoke_on(&adopted.host, &under_own, grant_id).await),
         ErrorCode::PermissionDenied
     );
-    under_own.close();
     assert!(
-        net_support::holds(&adopted.host, delegated.grant_id),
+        net_support::holds(&adopted.host, grant_id),
         "the delegated grant stands"
     );
 
@@ -941,9 +1085,157 @@ async fn kr_req_19_08_a_revocation_is_served_only_on_the_connection_scoped_to_it
     revoke_on(&adopted.host, &under_other, grant_id)
         .await
         .expect("the share it was delegated from revokes it");
-    assert!(!net_support::holds(&adopted.host, delegated.grant_id));
+    assert!(!net_support::holds(&adopted.host, grant_id));
+
+    // The refusals recorded nothing: the share they were refused under is withdrawn, and the
+    // connections that were refused stand while the one opened under it goes.
+    revoke(&adopted.host, other.grant.grant_id).await;
+    under_own
+        .read(Method::QuestionRead, &questions(worker.session_id))
+        .await
+        .expect("the connection opened for the other share stands");
+    host_scoped
+        .read(Method::SessionList, &listing())
+        .await
+        .expect("the host-scoped connection stands");
     under_other.close();
+    under_own.close();
+    host_scoped.close();
+    adopted.stop().await;
+}
+
+/// The same refusal on a connection scoped to the device's pairing: it holds no share, so a
+/// revocation that acts under one is not served on it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_19_08_a_connection_scoped_to_the_pairing_revokes_nothing_under_a_share() {
+    let adopted = Adopted::start(1).await;
+    let worker = &adopted.workers[0];
+    let (holder, holder_record) = viewer(&adopted, &[ActionRight::SessionView]).await;
+    let (colleague, colleague_record) = recipient(&adopted.host, &adopted.owner).await;
+    let (shared, issuing) =
+        owned_by(&adopted.host, worker.session_id, &holder, &holder_record).await;
+    let (delegated, _) = delegated(
+        &adopted.host,
+        worker.session_id,
+        &shared.grant,
+        &issuing,
+        &colleague,
+        &colleague_record,
+    )
+    .await;
     issuing.close();
+
+    let pairing = RawDevice::connect(&adopted.host, &holder, &holder_record).await;
+    let standing = in_force(
+        open(&pairing, Some(worker.session_id), None)
+            .await
+            .expect("the pairing opens the session"),
+    );
+    assert_eq!(standing.via, OpenedVia::Pairing);
+    assert_eq!(
+        code(revoke_on(&adopted.host, &pairing, delegated.grant_id).await),
+        ErrorCode::PermissionDenied
+    );
+    assert!(net_support::holds(&adopted.host, delegated.grant_id));
+    pairing.close();
+    adopted.stop().await;
+}
+
+/// A connection that already acts for something is not opened for another thing. One that decided
+/// a request under a share, with no worker link, is not opened for the host or for another share;
+/// one that holds a link under the pairing is not opened for the host. The same session under
+/// another grant is refused on a connection opened for it. Each has its control: a fresh
+/// connection opens the same thing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_19_08_a_connection_that_already_acts_for_something_is_not_opened_for_another_thing()
+{
+    let adopted = Adopted::start(1).await;
+    let worker = &adopted.workers[0];
+    worker.ask("one");
+
+    // A share noted on a connection that holds no link: a daemon-served read decided under it.
+    let (device, record) = recipient(&adopted.host, &adopted.owner).await;
+    let first = share(
+        &adopted.host,
+        worker.session_id,
+        &device,
+        &record,
+        RoleSelection::plain(SessionRole::Controller),
+    )
+    .await;
+    let noted = net_support::connect(&adopted.host, &device, &record).await;
+    noted
+        .read::<_, kr_protocol::session::SessionReadResult>(
+            Method::SessionRead,
+            &SessionReadParams {
+                session_id: worker.session_id,
+            },
+        )
+        .await
+        .expect("a connection nothing has opened reads under the one share that admits it");
+    let second = share(
+        &adopted.host,
+        worker.session_id,
+        &device,
+        &record,
+        RoleSelection::plain(SessionRole::Controller),
+    )
+    .await;
+    for (session, grant) in [
+        (Some(worker.session_id), Some(second.grant_id)),
+        (None, None),
+    ] {
+        let refused = noted
+            .read::<_, SessionOpenResult>(
+                Method::SessionOpen,
+                &SessionOpenParams {
+                    session_id: Nullable(session),
+                    grant_id: Nullable(grant),
+                },
+            )
+            .await
+            .expect_err("a connection that acts under a share is not opened for something else");
+        assert_eq!(refused.code(), ErrorCode::InvalidArgument, "{refused}");
+    }
+    noted.close();
+    let fresh = RawDevice::connect(&adopted.host, &device, &record).await;
+    open(&fresh, Some(worker.session_id), Some(second.grant_id))
+        .await
+        .expect("the control: a fresh connection opens the same share");
+    // On it, the same session under another grant is refused, and the same grant again is safe.
+    assert_eq!(
+        code(open(&fresh, Some(worker.session_id), Some(first.grant_id)).await),
+        ErrorCode::PermissionDenied
+    );
+    open(&fresh, Some(worker.session_id), Some(second.grant_id))
+        .await
+        .expect("the same open again");
+    fresh.close();
+
+    // A link under the pairing: a worker-bound read opens it.
+    let (holder, holder_record) = viewer(
+        &adopted,
+        &[ActionRight::SessionView, ActionRight::QuestionRespond],
+    )
+    .await;
+    let linked = RawDevice::connect(&adopted.host, &holder, &holder_record).await;
+    linked
+        .read(Method::QuestionRead, &questions(worker.session_id))
+        .await
+        .expect("the read opens the link");
+    assert_eq!(
+        code(open(&linked, None, None).await),
+        ErrorCode::InvalidArgument
+    );
+    open(&linked, Some(worker.session_id), None)
+        .await
+        .expect("it may be opened for the session it already serves");
+    linked.close();
+    let fresh = RawDevice::connect(&adopted.host, &holder, &holder_record).await;
+    open(&fresh, None, None)
+        .await
+        .expect("the control: a fresh connection opens the host");
+    fresh.close();
     adopted.stop().await;
 }
 

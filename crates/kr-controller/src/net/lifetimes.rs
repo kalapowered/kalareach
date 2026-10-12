@@ -496,6 +496,9 @@ impl GrantLifetimes {
                 if store.grant_expired_at(grant_id)?.is_some() {
                     Ok(Some(GrantEnd::Expired))
                 } else {
+                    // A clock that cannot be trusted says nothing about the grant, whether it
+                    // went backwards or lost its continuity; the refusal says which.
+                    self.provable(record.grant.expiry)?;
                     Err(ControllerError::ClockUntrusted {
                         detail: format!(
                             "{}, so it cannot say whether this grant has run out",
@@ -1157,42 +1160,92 @@ mod tests {
                 .is_none(),
             "and writes none down"
         );
+
+        // The owner establishes the clock: the same grant, asked again, is in force, so the
+        // refusal was never an end.
+        rebooted
+            .clock_trust()
+            .establish(&devices)
+            .expect("the owner establishes the clock");
+        assert_eq!(
+            rebooted.stored_end(&store, &unproven).expect("decided"),
+            None,
+            "once the clock is trusted again the grant is still in force"
+        );
     }
 
-    /// The end a share is scheduled for is the earlier of its own expiry and the pairing's, and
-    /// nothing when neither expires.
+    /// A stored grant whose continuous deadline passes while UTC has not is ended by that, and the
+    /// end is told once it is written down. An end the host cannot write down is not told: the
+    /// refusal is the transient storage one, the end stays owed, and the next ask, once the store
+    /// takes the write, tells it.
     #[test]
-    fn a_share_is_scheduled_to_end_with_the_earlier_of_itself_and_its_pairing() {
-        let at = |ms| GrantExpiry::At {
-            expires_at_ms: TimestampMs::new(ms),
-        };
-        let record = |expiry| GrantRecord {
-            grant: owner(20, expiry).grant,
-            session_id: None,
-            issued_at_ms: 1,
-            activated_at_ms: Some(1),
-            revoked_at_ms: None,
-            revoked_by_parent: None,
-        };
-        let pairing = |expiry| owner(21, expiry).grant;
-        assert_eq!(
-            GrantLifetimes::effective_end_ms(&record(at(9_000)), &pairing(at(5_000))),
-            Some(5_000)
+    fn a_stored_grants_end_that_cannot_be_written_down_is_not_told() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let path = directory.path().join("grants.db");
+        let store = GrantDirectory::open(&path).expect("a grant store");
+        let devices = Arc::new(DeviceDirectory::in_memory().expect("a directory"));
+        let now = kr_ipc::now_ms().get();
+        let wall = Arc::new(AtomicU64::new(now));
+        let clock = ManualClock::new();
+        let boot = kr_ipc::identity::boot_identity().expect("a boot identity");
+        let lifetimes = lifetimes_at(
+            &devices,
+            &clock,
+            &wall,
+            boot,
+            &Arc::new(UtcFloor::default()),
+        );
+        let record = stored_grant(
+            &store,
+            13,
+            GrantExpiry::At {
+                expires_at_ms: TimestampMs::new(now + 60_000),
+            },
         );
         assert_eq!(
-            GrantLifetimes::effective_end_ms(&record(at(3_000)), &pairing(at(5_000))),
-            Some(3_000)
-        );
-        assert_eq!(
-            GrantLifetimes::effective_end_ms(&record(at(3_000)), &pairing(GrantExpiry::Never)),
-            Some(3_000)
-        );
-        assert_eq!(
-            GrantLifetimes::effective_end_ms(
-                &record(GrantExpiry::Never),
-                &pairing(GrantExpiry::Never)
-            ),
+            lifetimes.stored_end(&store, &record).expect("decided"),
             None
+        );
+
+        // The store refuses the write of an end, as a full disk or a damaged file would.
+        let faulty = rusqlite::Connection::open(&path).expect("a second connection");
+        faulty
+            .execute_batch(
+                "CREATE TRIGGER refuse_the_end BEFORE UPDATE OF expired_at_ms ON grants
+                 BEGIN SELECT RAISE(ABORT, 'no room'); END;",
+            )
+            .expect("the fault is in place");
+
+        // The continuous deadline passes while UTC has not moved.
+        clock.advance(Duration::from_secs(61));
+        let refused = lifetimes
+            .stored_end(&store, &record)
+            .expect_err("an end not written down is not told");
+        assert!(
+            matches!(
+                refused,
+                ControllerError::Refused {
+                    code: kr_protocol::error::ErrorCode::StorageUnavailable,
+                    ..
+                }
+            ),
+            "{refused:?}"
+        );
+        assert!(lifetimes.stored_expiry_owed(record.grant.grant_id));
+
+        faulty
+            .execute_batch("DROP TRIGGER refuse_the_end;")
+            .expect("the fault is gone");
+        assert_eq!(
+            lifetimes.stored_end(&store, &record).expect("decided"),
+            Some(GrantEnd::Expired),
+            "the end is told once it is on record"
+        );
+        assert!(
+            store
+                .grant_expired_at(record.grant.grant_id)
+                .expect("readable")
+                .is_some()
         );
     }
 

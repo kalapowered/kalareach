@@ -926,6 +926,81 @@ async fn kr_req_19_08_the_agent_instances_are_the_snapshots_two_members_under_th
     );
 }
 
+/// `agent.instances` pages the resources as `events.snapshot` does: a reader that declared the
+/// smallest frame is sent pages that fit it, a continuation names the copy the first page was cut
+/// from, and following the continuations under a device's scope reads each resource its grant
+/// reaches once and none it does not. A continuation after the copy has ended is refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_19_08_the_agent_instances_are_paged_to_their_readers_frame_under_the_scope() {
+    let host = host().await;
+    let early: BTreeSet<PendingResourceId> =
+        (0..20).map(|index| arrive(&host, 1_000 + index)).collect();
+    let late: BTreeSet<PendingResourceId> =
+        (0..60).map(|index| arrive(&host, 5_000 + index)).collect();
+    let mut daemon = daemon_receiving(&host, smallest()).await;
+
+    let mut from = None;
+    let mut seen = Vec::new();
+    let mut pages = 0;
+    loop {
+        let answer = forwarded(
+            &mut daemon,
+            Some(reaching_back_to(3_000)),
+            Method::AgentInstances,
+            &AgentInstancesParams {
+                session_id: host.session_id,
+                agent_resources_from: Nullable(from.clone()),
+            },
+        )
+        .await
+        .expect("a page of the agent instances");
+        fits(&answer, FRAME);
+        let page: AgentInstancesResult = answer.to_typed().expect("decodes");
+        pages += 1;
+        seen.extend(
+            page.agent_resources
+                .resources
+                .iter()
+                .map(|resource| resource.resource_id),
+        );
+        match page.agent_resources.continue_after.0 {
+            Some(after_resource_id) => {
+                from = Some(AgentResourceSnapshotContinuation {
+                    snapshot_id: page.agent_resources.snapshot_id,
+                    after_resource_id,
+                });
+            }
+            None => break,
+        }
+    }
+    assert!(
+        pages > 1,
+        "sixty resources are more than one frame this small carries"
+    );
+    assert_eq!(seen.len(), late.len(), "each resource is read once");
+    let seen: BTreeSet<_> = seen.into_iter().collect();
+    assert_eq!(seen, late, "and only the ones the grant reaches");
+    assert!(early.is_disjoint(&seen));
+
+    // The copy ended with its last page, so the continuation of a finished read is refused.
+    let refused = forwarded(
+        &mut daemon,
+        Some(reaching_back_to(3_000)),
+        Method::AgentInstances,
+        &AgentInstancesParams {
+            session_id: host.session_id,
+            agent_resources_from: Nullable(from),
+        },
+    )
+    .await
+    .expect_err("the copy has ended");
+    assert_eq!(
+        refused.code,
+        kr_protocol::error::ErrorCode::ResyncRequired,
+        "{refused:?}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_23_48_a_receipt_answers_only_the_actor_whose_action_it_is() {
     // A receipt is keyed by the actor and the action together, so an action identifier is not a

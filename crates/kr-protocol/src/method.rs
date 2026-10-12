@@ -885,9 +885,9 @@ methods! {
     history: NotApplicable, capability: NO_CAPABILITY, freshness: CurrentAuthority,
     confirmation: None, idempotency: READ,
     doc: "Open a paired connection for one session under one grant, or for the host alone. The \
-          connection then serves that session and grant, or the host's own reads, and nothing \
-          else; the answer carries the rights the host decided the open with, or says the share \
-          has ended.";
+          connection then refuses a request for another session or under another grant, or, \
+          opened for the host, serves the host's own reads and no worker; the answer carries the \
+          rights the host decided the open with, or says the share has ended.";
 
     SessionClose = "session.close", Sessions,
     effect: Write, ingress: [LocalIpc, PairedDevice, Workflow], rights: [req(SessionClose)],

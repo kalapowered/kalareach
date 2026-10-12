@@ -129,7 +129,7 @@ links to its document.
 | `session.list` | read | `local_ipc`, `paired_device`, `workflow` | List the sessions this actor may observe. |  |
 | `session.create` | write | `local_ipc`, `paired_device`, `workflow` | Create a session. Deduplication happens in the controller before a worker exists. |  |
 | `session.read` | read | `local_ipc`, `paired_device`, `workflow` | Read one session's filtered metadata and current state. |  |
-| `session.open` | read | `paired_device` | Open a paired connection for one session under one grant, or for the host alone. The connection then serves that session and grant, or the host's own reads, and nothing else; the answer carries the rights the host decided the open with, or says the share has ended. | [Host: Grants, sharing and revocation](../host/README.md) |
+| `session.open` | read | `paired_device` | Open a paired connection for one session under one grant, or for the host alone. The connection then refuses a request for another session or under another grant, or, opened for the host, serves the host's own reads and no worker; the answer carries the rights the host decided the open with, or says the share has ended. | [Host: Grants, sharing and revocation](../host/README.md) |
 | `session.close` | write | `local_ipc`, `paired_device`, `workflow` | Close a session and hand its final metadata to the archive service. |  |
 | `session.describe` | read | `local_ipc`, `paired_device`, `workflow` | An authorised read of filtered session metadata, not arbitrary model control. |  |
 | `session.rename` | write | `local_ipc`, `paired_device`, `workflow` | Set a session's pinned label. |  |

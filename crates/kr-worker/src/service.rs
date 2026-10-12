@@ -6584,9 +6584,10 @@ impl WorkerService {
     ///
     /// The instances and the resources are the two parts of [`Self::events_snapshot`] a view of an
     /// agent's conversation needs. They are paged and filtered exactly as that read pages and
-    /// filters them, so a continuation names the copy a first page was cut from. The read replaces
-    /// nothing a subscription holds: it is a read of present state and takes no part in the
-    /// subscription's moment.
+    /// filters them, so a continuation names the copy a first page was cut from. A first page
+    /// replaces the connection's one copy, as a first page of `events.snapshot` does. The read
+    /// changes nothing a subscription holds or is shown: it is a read of present state and takes
+    /// no part in the subscription's moment.
     ///
     /// A caller that is not the local owner and arrives with no history scope is refused, as every
     /// read narrowed to a grant's scope is, because an unfiltered resource page would show it

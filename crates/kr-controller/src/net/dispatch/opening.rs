@@ -1,19 +1,19 @@
 //! What a paired connection is opened for.
 //!
 //! A paired connection starts unscoped and behaves as it always did. `session.open` scopes it
-//! once: to the host alone, or to one session under one grant. After that the connection serves
-//! exactly that and refuses everything else, before the request is decided, so a connection can
-//! neither be tied to a share by a read nor carry a share's end to the requests of another
-//! session.
+//! once: to the host alone, or to one session under one grant. After that the host refuses what
+//! the connection was not opened for, before the request is decided, so a connection can neither
+//! be tied to a share by a read nor carry a share's end to the requests of another session.
 //!
-//! * A **session scope** serves one session under one grant. A request that names another
-//!   session is refused, and so is one that names the session under another grant.
+//! * A **session scope** serves one session under one grant. A request that names another session
+//!   is refused as `INVALID_ARGUMENT`, a request that names the session under another grant as
+//!   `PERMISSION_DENIED`, and a request that names no session is decided under the pairing grant.
 //! * A **host scope** serves the host's own reads, decided under the pairing grant. It refuses
-//!   every decision under a share and every route that reaches a worker, so no worker link, and
-//!   no share, can end it. It ends with the pairing.
+//!   every decision under a share and every route that reaches a worker, as `INVALID_ARGUMENT`, so
+//!   no worker link and no share can end it. It ends with the pairing.
 //!
-//! The device's pairing grant decides what a scoped connection may do with the session, as it does
-//! for any request, and `session.open` returns what that decision allows.
+//! The grant a connection is opened under decides what it may do with the session, as it does for
+//! any request, and `session.open` returns what that decision allows.
 
 use std::sync::PoisonError;
 
