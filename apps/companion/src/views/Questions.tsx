@@ -69,6 +69,40 @@ interface Closed {
   readonly chosen: string
 }
 
+/**
+ * Who asked: the program the worker verified, with its process and its path, and the name the
+ * program gave itself, which nothing verified. The person reads it before they answer, or send an
+ * answer that was kept.
+ */
+function Asker({
+  asker,
+  id
+}: {
+  readonly asker: ReturnType<typeof askerOf>
+  /** What the test names of this block begin with. */
+  readonly id: 'question' | 'kept-answer'
+}): ReactNode {
+  return (
+    <>
+      <p className="small muted" data-testid={`${id}-asker`}>
+        Asked by <strong>{asker.executable ?? 'a program the host could not name'}</strong>{' '}
+        ({asker.process})
+        {asker.label !== null ? (
+          <>
+            {' '}
+            · calls itself “{asker.label}” (not verified)
+          </>
+        ) : null}
+      </p>
+      {asker.path !== null ? (
+        <p className="small faint question-path" data-testid={`${id}-asker-path`}>
+          {asker.path}
+        </p>
+      ) : null}
+    </>
+  )
+}
+
 /** The questions waiting in one session. */
 export function QuestionRequests({
   sessionId,
@@ -304,22 +338,7 @@ export function QuestionRequests({
             data-testid="question"
           >
             <p className="eyebrow">Waiting for your answer</p>
-            <p className="small muted" data-testid="question-asker">
-              Asked by{' '}
-              <strong>{asker.executable ?? 'a program the host could not name'}</strong>{' '}
-              ({asker.process})
-              {asker.label !== null ? (
-                <>
-                  {' '}
-                  · calls itself “{asker.label}” (not verified)
-                </>
-              ) : null}
-            </p>
-            {asker.path !== null ? (
-              <p className="small faint question-path" data-testid="question-asker-path">
-                {asker.path}
-              </p>
-            ) : null}
+            <Asker asker={asker} id="question" />
             <h3 data-testid="question-text">{question.question}</h3>
             {question.context.length > 0 ? (
               <p className="small muted question-context" data-testid="question-context">
@@ -482,10 +501,19 @@ function KeptRow({
         {where ?? 'A session this device cannot name now'}
       </p>
       {question !== null ? (
-        <p data-testid="kept-answer-question">
-          The question: <strong>{question.question}</strong>
+        <>
+          <Asker asker={askerOf(question)} id="kept-answer" />
+          <p data-testid="kept-answer-question">
+            The question: <strong>{question.question}</strong>
+          </p>
+        </>
+      ) : (
+        <p className="small muted" data-testid="kept-answer-asker">
+          {settled === null
+            ? 'Who asked is shown once this session has been checked.'
+            : 'Who asked cannot be shown: the session no longer lists this question.'}
         </p>
-      ) : null}
+      )}
       <p data-testid="kept-answer-text">
         You answered {answerWords(kept.answer, question ?? undefined)}
         {question === null ? ' to a question in this session' : ''}, and the host did not confirm it

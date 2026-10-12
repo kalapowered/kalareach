@@ -311,6 +311,15 @@ describe('an answer given while the worker cannot be reached (KR-REQ-11.63)', ()
       expect(screen.getByTestId('kept-answer')).toHaveAttribute('data-standing', 'offered')
     })
     expect(controls.questions.sent).toHaveLength(0)
+    // Before the person sends it, the row names who asked: the program the worker verified, its
+    // process and its path, and the name it gave itself as its own and not verified.
+    const asker = within(screen.getByTestId('kept-answer')).getByTestId('kept-answer-asker')
+    expect(asker).toHaveTextContent('claude')
+    expect(asker).toHaveTextContent(/process \d+/)
+    expect(asker).toHaveTextContent('calls itself “Claude Code” (not verified)')
+    expect(within(screen.getByTestId('kept-answer')).getByTestId('kept-answer-asker-path')).toHaveTextContent(
+      '/usr/local/bin/claude'
+    )
     await person.click(screen.getByRole('button', { name: 'Send it now' }))
     await waitFor(() => {
       expect(controls.questions.sent).toHaveLength(1)
