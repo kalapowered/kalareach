@@ -2307,6 +2307,10 @@ fn launched_forwarder(
         &reservation.profile().arguments,
         &registration,
     );
+    let credential = Credential::generate().expect("a credential");
+    credential
+        .write_file(&directory.join("credential"))
+        .expect("the credential is written");
     let process = ManagedProcess::new(
         instance(),
         forwarder.process.clone(),
@@ -2316,12 +2320,9 @@ fn launched_forwarder(
             executable_digest: reservation.profile().binary.digest,
             process: forwarder.process.clone(),
         },
-        Credential::generate().expect("a credential"),
+        credential,
         TimestampMs::new(1),
     );
-    process
-        .write_registration(&directory.join("credential"))
-        .expect("the credential is written");
     let registered = reservation
         .register(IntegrationMode::Gateway, Some(process))
         .unwrap_or_else(|refused| panic!("the launch is registered: {}", refused.error));

@@ -574,6 +574,9 @@ impl Launch {
         );
         let mut child = started.child;
         let credential = Credential::generate().expect("a credential");
+        credential
+            .write_file(&credential_file)
+            .expect("the credential is written");
         let process = ManagedProcess::new(
             instance(),
             started.identity.clone(),
@@ -586,9 +589,6 @@ impl Launch {
             credential,
             TimestampMs::new(1),
         );
-        process
-            .write_registration(&credential_file)
-            .expect("the credential is written");
         let registered = reservation
             .register(IntegrationMode::NativeBridge, Some(process))
             .unwrap_or_else(|refused| panic!("the launch is registered: {}", refused.error));
