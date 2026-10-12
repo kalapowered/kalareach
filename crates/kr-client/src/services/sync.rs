@@ -1160,6 +1160,18 @@ impl ManagedSyncService {
         self
     }
 
+    /// The same client, leaving a delay the service names to the caller.
+    ///
+    /// By default a request answered that the service is unavailable for a stated time waits that
+    /// time inside the call and goes once more. A caller that keeps one record of the delays its
+    /// service names, and waits them out for everything it sends, builds the client this way so
+    /// that the refusal comes back with its delay and nothing waits in here.
+    #[must_use]
+    pub fn leaving_delays_to_the_caller(mut self) -> Self {
+        self.call = self.call.leaving_delays_to_the_caller();
+        self
+    }
+
     /// The gateway this client addresses.
     #[must_use]
     pub const fn origin(&self) -> &GatewayOrigin {

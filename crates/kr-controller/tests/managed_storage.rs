@@ -41,9 +41,12 @@ use kr_ipc::client::LocalClient;
 use kr_ipc::endpoint::Listener;
 use kr_ipc::verify::ControllerIdentity;
 use kr_protocol::archive::{
-    BACKUP_WRITER_DOMAIN, BackupWriterRecord, BackupWriterRecordPayload, TrustedWriter,
+    ArchiveCheckpoint, BACKUP_WRITER_DOMAIN, BackupWriterRecord, BackupWriterRecordPayload,
+    TrustedWriter,
 };
+use kr_protocol::backup_read::{BackupBundle, BackupReadParams, BackupReadResult, BackupSignIn};
 use kr_protocol::envelope::ActionTarget;
+use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::host_account::{
     AccountReport, AccountSignInParams, AccountState, AccountStatusParams,
 };
@@ -56,13 +59,15 @@ use kr_protocol::method::Method;
 use kr_protocol::privacy::PrivacySetParams;
 use kr_protocol::scalars::{AuthorisationKey, Nullable, Signature64, TimestampMs, Uuid};
 use kr_protocol::service::{GatewayOrigin, ServiceRequestSigner};
-use kr_service_stand_in::{Moment, Served, TOKEN, serve};
+use kr_service_stand_in::{ACCOUNT, Moment, Served, TOKEN, serve};
 
 const CREATE: &str = "/api/storage/upload/create";
 const PART: &str = "/api/storage/upload/part";
 const ABORT: &str = "/api/storage/upload/abort";
 const STATUS: &str = "/api/storage/status";
 const MANIFEST: &str = "/api/backup/manifest";
+const OBJECT_READ: &str = "/api/storage/object/read";
+const SYNC: &str = "/api/sync/exchange";
 
 /// A failure guard for a test that waits on a condition: the tests decide on what the daemon did,
 /// and this only keeps one that went wrong from hanging.
@@ -2351,4 +2356,448 @@ async fn a_daemon_publishes_to_a_local_worker() {
     );
     assert_eq!(fetched.publication.payload.writer_key_id, writer.key_id());
     eprintln!("a daemon published generation 1 of an archive at the Worker on {origin}");
+}
+
+/* -------------------------------------------------------------------------- */
+/* A restore's reads, relayed                                                  */
+/* -------------------------------------------------------------------------- */
+
+/// Asks the daemon for one read of what the storage service holds, as `kr backup restore` does.
+async fn relay_read(
+    endpoint: &kr_ipc::paths::Endpoint,
+    params: &BackupReadParams,
+) -> Result<BackupReadResult, ProtocolError> {
+    let mut client = LocalClient::connect(endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects");
+    client
+        .request(Method::BackupRead, params)
+        .await
+        .expect("the call reaches the daemon")
+        .map(|value| value.to_typed().expect("a result of the declared shape"))
+}
+
+impl Rig {
+    async fn read(&self, params: &BackupReadParams) -> Result<BackupReadResult, ProtocolError> {
+        relay_read(&self.client_endpoint, params).await
+    }
+
+    /// A read of `length` bytes of the first member object of the archive, from `offset`.
+    fn object_read(offset: u64, length: u64) -> BackupReadParams {
+        BackupReadParams::Object {
+            archive_id: archive_id(),
+            object_id: object_id(1),
+            offset: kr_protocol::scalars::U64::new(offset),
+            length: kr_protocol::scalars::U64::new(length),
+        }
+    }
+}
+
+fn locator() -> Uuid {
+    Uuid::from_bytes([0x61; 16])
+}
+
+fn sealed_bundle_bytes() -> Vec<u8> {
+    plaintext(2048)
+}
+
+/// KR-REQ-24.16, 20.19 and KR-ACC-033: a restore's reads reach the service through the daemon's
+/// account, and the bundle read is signed by a key of its own that is neither the daemon's writer
+/// nor anything the daemon stores. The daemon relays what the service held, and keeps apart a
+/// bundle that is held, one that is not, a generation that is not there, and an error.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restores_reads_reach_the_service_through_the_daemons_account_and_a_key_of_its_own() {
+    let rig = Rig::start(Arrangement::NORMAL, HeldTimer::automatic()).await;
+    rig.admit(1, &[(1, plaintext(1_300_000)), (2, plaintext(2048))]);
+    rig.until("generation 1 is published", |rig| rig.published(1))
+        .await;
+    let web = Arc::clone(rig.served.web());
+
+    // The service this host is configured for, and that a token is usable.
+    match rig.read(&BackupReadParams::Service {}).await {
+        Ok(BackupReadResult::Service { origin, sign_in }) => {
+            assert_eq!(origin, rig.served.origin());
+            assert_eq!(sign_in, BackupSignIn::Usable);
+        }
+        other => panic!("the service read: {other:?}"),
+    }
+
+    // A bundle the service holds, with its place in the order, and one it does not.
+    let ciphertext = sealed_bundle_bytes();
+    web.put_bundle(&locator().to_string(), ACCOUNT, ciphertext.clone());
+    match rig
+        .read(&BackupReadParams::Bundle { locator: locator() })
+        .await
+    {
+        Ok(BackupReadResult::Bundle {
+            bundle:
+                BackupBundle::Held {
+                    write_sequence,
+                    revision,
+                    recovery,
+                    ciphertext: held,
+                },
+        }) => {
+            assert_eq!(write_sequence.get(), 1);
+            assert!(revision.0.is_some());
+            assert!(recovery.0.is_none());
+            assert_eq!(held.as_slice(), ciphertext.as_slice());
+        }
+        other => panic!("a held bundle: {other:?}"),
+    }
+    let nobody = Uuid::from_bytes([0x62; 16]);
+    match rig
+        .read(&BackupReadParams::Bundle { locator: nobody })
+        .await
+    {
+        Ok(BackupReadResult::Bundle {
+            bundle: BackupBundle::Absent { recovery },
+        }) => assert!(recovery.0.is_none()),
+        other => panic!("an absent bundle: {other:?}"),
+    }
+    // A collection put back from an export names its history, held or not.
+    let history = Uuid::from_bytes([0x63; 16]);
+    web.put_bundle_back(&nobody.to_string(), &history.to_string());
+    match rig
+        .read(&BackupReadParams::Bundle { locator: nobody })
+        .await
+    {
+        Ok(BackupReadResult::Bundle {
+            bundle: BackupBundle::Absent { recovery },
+        }) => assert_eq!(recovery.0, Some(history)),
+        other => panic!("an absent bundle in a put-back history: {other:?}"),
+    }
+    // A locator another account owns is told as an absent one is.
+    web.put_bundle(
+        &Uuid::from_bytes([0x64; 16]).to_string(),
+        "account-two",
+        ciphertext,
+    );
+    assert!(matches!(
+        rig.read(&BackupReadParams::Bundle {
+            locator: Uuid::from_bytes([0x64; 16])
+        })
+        .await,
+        Ok(BackupReadResult::Bundle {
+            bundle: BackupBundle::Absent { .. }
+        })
+    ));
+
+    // The bundle read was signed as an installation, by a key that is not the daemon's writer, and
+    // carried the host's token; the control is that the writer's own requests are signed as a host.
+    let writer = rig
+        .controller
+        .backup_runtime()
+        .expect("a carrier")
+        .writer_public_key();
+    let arrived = web.arrived();
+    let bundle_reads: Vec<_> = arrived.iter().filter(|got| got.path == SYNC).collect();
+    assert_eq!(bundle_reads.len(), 4);
+    let keys: Vec<_> = bundle_reads
+        .iter()
+        .map(|got| got.signed_by.expect("signed"))
+        .collect();
+    assert!(
+        keys.iter()
+            .all(|(signer, key)| *signer == ServiceRequestSigner::Installation && *key != writer)
+    );
+    assert!(
+        keys.windows(2).all(|pair| pair[0].1 == pair[1].1),
+        "one key for the process, made in memory"
+    );
+    assert!(
+        bundle_reads
+            .iter()
+            .all(|got| got.token.as_deref() == Some(TOKEN))
+    );
+    assert!(
+        arrived
+            .iter()
+            .filter(|got| got.path == "/api/storage/upload/create")
+            .all(|got| got.signed_by.expect("signed").0 == ServiceRequestSigner::Host),
+        "the carrier signs as a host, which the sync route refuses"
+    );
+
+    // The newest generation, and none as new as a checkpoint the service has not reached.
+    match rig
+        .read(&BackupReadParams::Generation {
+            archive_id: archive_id(),
+            checkpoint: Nullable::null(),
+        })
+        .await
+    {
+        Ok(BackupReadResult::Generation { publication }) => {
+            let publication = publication.0.expect("the generation the carrier published");
+            assert_eq!(
+                publication.payload.descriptor.backup_generation,
+                BackupGeneration::new(1)
+            );
+            assert_eq!(publication.payload.writer_key_id, rig.writer.key_id());
+        }
+        other => panic!("the generation read: {other:?}"),
+    }
+    let ahead = ArchiveCheckpoint {
+        archive_id: archive_id(),
+        backup_generation: BackupGeneration::new(9),
+        encrypted_manifest_hash: kr_protocol::scalars::Digest256::from_bytes([7; 32]),
+        verified_at_ms: TimestampMs::new(1),
+    };
+    match rig
+        .read(&BackupReadParams::Generation {
+            archive_id: archive_id(),
+            checkpoint: Nullable::some(ahead),
+        })
+        .await
+    {
+        Ok(BackupReadResult::Generation { publication }) => assert!(
+            publication.0.is_none(),
+            "nothing as new as the checkpoint is an answer, not an error"
+        ),
+        other => panic!("a generation held to a checkpoint ahead of it: {other:?}"),
+    }
+
+    // The ciphertext of an object, in ranges that join to what the service stores; a range past
+    // the bound, or an empty one, is refused before anything is sent.
+    let stored = web
+        .stored(&archive_id().to_string(), &object_id(1).to_string())
+        .expect("the object the carrier uploaded");
+    let mut joined = Vec::new();
+    while joined.len() < stored.len() {
+        let want = u64::try_from(stored.len() - joined.len())
+            .expect("a length")
+            .min(512 * 1024);
+        match rig.read(&Rig::object_read(joined.len() as u64, want)).await {
+            Ok(BackupReadResult::Object { bytes }) => joined.extend_from_slice(bytes.as_slice()),
+            other => panic!("an object read: {other:?}"),
+        }
+    }
+    assert_eq!(joined, stored);
+    for length in [0, 512 * 1024 + 1] {
+        let refused = rig
+            .read(&Rig::object_read(0, length))
+            .await
+            .expect_err("an unreasonable range is refused");
+        assert_eq!(refused.code, ErrorCode::InvalidArgument);
+    }
+}
+
+/// What the doctor tells a person of the sign-in is what a restore is told, apart from any
+/// request: a host that cannot present a token sends nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_host_that_cannot_present_a_token_says_why_and_sends_a_restore_nothing() {
+    for (token, expected) in [
+        (Token::None, BackupSignIn::SignedOut),
+        (Token::WithoutTheScope, BackupSignIn::WithoutScope),
+        (Token::NotRenewable, BackupSignIn::NotRenewed),
+    ] {
+        let rig = Rig::start(
+            Arrangement {
+                token,
+                ..Arrangement::NORMAL
+            },
+            HeldTimer::automatic(),
+        )
+        .await;
+        match rig.read(&BackupReadParams::Service {}).await {
+            Ok(BackupReadResult::Service { sign_in, .. }) => assert_eq!(sign_in, expected),
+            other => panic!("{token:?}: {other:?}"),
+        }
+        let sent = rig.served.web().arrived().len();
+        let refused = rig
+            .read(&BackupReadParams::Bundle { locator: locator() })
+            .await
+            .expect_err("no token, no bundle read");
+        assert_ne!(refused.code, ErrorCode::InvalidArgument);
+        assert_eq!(
+            rig.served.web().requests_to(SYNC),
+            0,
+            "{token:?}: nothing about a bundle left the host"
+        );
+        assert!(rig.served.web().arrived().len() >= sent);
+    }
+}
+
+/// The host is configured for no storage service: a read says so.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_host_that_selects_no_storage_service_has_nothing_to_read() {
+    let rig = Rig::start(
+        Arrangement {
+            selects_the_service: false,
+            enrolled: false,
+            ..Arrangement::NORMAL
+        },
+        HeldTimer::automatic(),
+    )
+    .await;
+    let refused = rig
+        .read(&BackupReadParams::Service {})
+        .await
+        .expect_err("no service to read");
+    assert_eq!(refused.code, ErrorCode::HostNotConfigured);
+}
+
+/// KR-REQ-24.27: while privacy mode is on the daemon reads nothing for a restore, and an answer
+/// read under a state that has changed by the time it is given is not given.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restores_reads_are_refused_while_privacy_mode_is_on_and_held_to_the_state_they_were_read_under()
+ {
+    let rig = Rig::start(Arrangement::NORMAL, HeldTimer::automatic()).await;
+    rig.admit(1, &[(1, plaintext(2048))]);
+    rig.until("generation 1 is published", |rig| rig.published(1))
+        .await;
+    let web = Arc::clone(rig.served.web());
+    web.put_bundle(&locator().to_string(), ACCOUNT, sealed_bundle_bytes());
+    let reads = || {
+        [
+            BackupReadParams::Bundle { locator: locator() },
+            BackupReadParams::Generation {
+                archive_id: archive_id(),
+                checkpoint: Nullable::null(),
+            },
+            Rig::object_read(0, 1024),
+        ]
+    };
+
+    // The control: with privacy mode off every read answers.
+    for read in reads() {
+        assert!(rig.read(&read).await.is_ok(), "{read:?}");
+    }
+
+    // On: all three are refused, nothing is sent for them, and the service question still answers.
+    assert!(rig.set_privacy(true).await);
+    rig.until("the fence ended the work in hand", Rig::every_attempt_ended)
+        .await;
+    let sent = web.arrived().len();
+    for read in reads() {
+        let refused = rig.read(&read).await.expect_err("refused while private");
+        assert_eq!(refused.code, ErrorCode::PermissionDenied, "{read:?}");
+    }
+    assert_eq!(
+        web.arrived().len(),
+        sent,
+        "nothing was sent for a refused read"
+    );
+    assert!(matches!(
+        rig.read(&BackupReadParams::Service {}).await,
+        Ok(BackupReadResult::Service { .. })
+    ));
+
+    // Off again, and a read in flight when it turns on is not given: the service answers after
+    // privacy mode was enabled, and the daemon holds the answer back.
+    assert!(rig.set_privacy(false).await);
+    web.fail(OBJECT_READ, 1, Moment::Slow);
+    let endpoint = rig.client_endpoint.clone();
+    let in_flight =
+        tokio::spawn(async move { relay_read(&endpoint, &Rig::object_read(0, 1024)).await });
+    within(
+        "the read reaches the service",
+        web.requests_reach(OBJECT_READ, 1),
+    )
+    .await;
+    assert!(rig.set_privacy(true).await);
+    web.release_held();
+    let held = within("the held read ends", in_flight)
+        .await
+        .expect("the read task");
+    assert_eq!(
+        held.expect_err("an answer read before privacy mode was enabled is not given")
+            .code,
+        ErrorCode::PermissionDenied
+    );
+}
+
+/// KR-REQ-23.12 and the carrier's own rule: a delay the service names to a restore's read is
+/// owed to everything that asks next, the relay sends nothing inside it and answers what is left,
+/// an hour is the most it is held to, and the carrier of the host's own backups waits it out too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_delay_the_service_names_to_a_restores_read_is_owed_to_every_read_and_to_the_carrier() {
+    let timer = HeldTimer::held();
+    let rig = Rig::start(Arrangement::NORMAL, Arc::clone(&timer)).await;
+    let web = Arc::clone(rig.served.web());
+    rig.admit(1, &[(1, plaintext(4096))]);
+    rig.controller.backup_runtime().expect("a carrier").wake();
+    let _ = &rig;
+    // The first generation is published with the timer held, so the passes are released by hand.
+    timer.run_by_itself();
+    rig.until("generation 1 is published", |rig| rig.published(1))
+        .await;
+    drop(timer.asked_for());
+
+    let busy = |seconds| Moment::Refuse {
+        status: 429,
+        code: "RATE_LIMITED",
+        retry_after_seconds: Some(seconds),
+    };
+    web.fail(OBJECT_READ, 1, busy(30));
+    let wait_of = |answer: Result<BackupReadResult, ProtocolError>| match answer {
+        Ok(BackupReadResult::Wait {
+            retry_after_seconds,
+        }) => retry_after_seconds.get(),
+        other => panic!("a wait: {other:?}"),
+    };
+    assert_eq!(wait_of(rig.read(&Rig::object_read(0, 1024)).await), 30);
+    let sent = web.requests_to(OBJECT_READ);
+
+    // Inside the delay no read of any kind leaves the host, and each answers what is left.
+    timer.advance(Duration::from_secs(10));
+    assert_eq!(wait_of(rig.read(&Rig::object_read(0, 1024)).await), 20);
+    assert_eq!(
+        wait_of(
+            rig.read(&BackupReadParams::Bundle { locator: locator() })
+                .await
+        ),
+        20
+    );
+    assert_eq!(web.requests_to(OBJECT_READ), sent);
+    assert_eq!(web.requests_to(SYNC), 0);
+    assert!(matches!(
+        rig.read(&BackupReadParams::Service {}).await,
+        Ok(BackupReadResult::Service { .. })
+    ));
+
+    // Past it, a read goes through (the control).
+    timer.advance(Duration::from_secs(21));
+    assert!(matches!(
+        rig.read(&Rig::object_read(0, 1024)).await,
+        Ok(BackupReadResult::Object { .. })
+    ));
+
+    // A delay longer than an hour is held to an hour.
+    web.fail(OBJECT_READ, 1, busy(7200));
+    assert_eq!(wait_of(rig.read(&Rig::object_read(0, 1024)).await), 3600);
+    timer.advance(Duration::from_secs(3601));
+    assert!(rig.read(&Rig::object_read(0, 1024)).await.is_ok());
+}
+
+/// A service's refusal can repeat what it was asked, the locator among it, so the daemon answers a
+/// refusal with its code and a sentence of its own, and the locator is nowhere in the answer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refusal_the_service_words_with_the_locator_reaches_the_restore_without_it() {
+    let rig = Rig::start(Arrangement::NORMAL, HeldTimer::automatic()).await;
+    let web = Arc::clone(rig.served.web());
+    web.put_bundle(&locator().to_string(), ACCOUNT, sealed_bundle_bytes());
+    web.fail(
+        SYNC,
+        1,
+        Moment::Echo {
+            status: 500,
+            code: "INTERNAL",
+        },
+    );
+    let refused = rig
+        .read(&BackupReadParams::Bundle { locator: locator() })
+        .await
+        .expect_err("the service refused");
+    assert!(
+        !refused.message.contains(&locator().to_string()),
+        "the locator is not in what the daemon says"
+    );
+    assert!(!refused.message.contains("locator"), "{}", refused.message);
+    // The control: the request the service refused did carry the locator.
+    let arrived = web.arrived();
+    let sent = arrived
+        .iter()
+        .find(|got| got.path == SYNC)
+        .expect("a bundle read");
+    assert!(sent.body.to_string().contains(&locator().to_string()));
 }

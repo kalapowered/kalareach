@@ -274,6 +274,7 @@ impl Controller {
             Method::OrganisationList => self.organisation_list().await,
             Method::PrivacyStatus => self.privacy_status().await,
             Method::AccountStatus => self.account_status(&request.params),
+            Method::BackupRead => self.backup_read(&request.params).await,
             Method::DescriptionSetup => self.description_setup(),
             _ => Err(ControllerError::InvalidArgument(format!(
                 "{} is not a read this daemon serves",

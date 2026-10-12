@@ -88,6 +88,14 @@ pub enum Moment {
         /// The seconds the refusal asks the caller to wait, when it asks.
         retry_after_seconds: Option<u64>,
     },
+    /// The service refuses the request as stated, without acting on it, and its words repeat the
+    /// request it was sent, as a service's error text can.
+    Echo {
+        /// The HTTP status.
+        status: u16,
+        /// The service's error code.
+        code: &'static str,
+    },
     /// Storage does not confirm the write of a part, so the service answers `INTERNAL` and closes
     /// the upload, as it does when a part's write cannot be confirmed.
     PartWriteFails,
@@ -126,6 +134,8 @@ pub struct Arrived {
     pub token: Option<String>,
     /// The content beside it, for a part.
     pub content: Option<Vec<u8>>,
+    /// The kind of key that signed it and that key's public half, when it carried a signature.
+    pub signed_by: Option<(ServiceRequestSigner, kr_protocol::scalars::AuthorisationKey)>,
     /// Whether the service saw it.
     pub reached: bool,
 }
@@ -505,6 +515,11 @@ impl ServiceWeb {
                 body: document["body"].clone(),
                 token: token.map(str::to_owned),
                 content: content.map(<[u8]>::to_vec),
+                signed_by: serde_json::from_value::<ServiceRequestSignature>(
+                    document["signature"].clone(),
+                )
+                .ok()
+                .map(|signature| (signature.signer, signature.public_key)),
                 reached,
             });
             arrived.len()
@@ -540,6 +555,13 @@ impl ServiceWeb {
                     code,
                     "The service refuses that request for now.",
                     retry_after_seconds,
+                ));
+            }
+            Some(Moment::Echo { status, code }) => {
+                return Handled::Answer(refusal(
+                    status,
+                    code,
+                    &format!("That request, {}, is refused.", document["body"]),
                 ));
             }
             _ => {}

@@ -636,8 +636,8 @@ impl Controller {
         // time one is needed and loaded after that. They go through the proxy this daemon started
         // with, the endpoint's own. Nothing runs yet: settling comes before the store is
         // reconciled, and the carrier starts after it.
-        let backup_runtime = match started.storage.origin() {
-            None => None,
+        let (backup_runtime, backup_relay) = match started.storage.origin() {
+            None => (None, None),
             Some(origin) => {
                 let origin = kr_protocol::service::GatewayOrigin::new(origin).map_err(|error| {
                     ControllerError::NotConfigured(format!(
@@ -657,14 +657,24 @@ impl Controller {
                     &writer,
                     &account.tokens_for(origin.as_str()),
                 )?;
-                Some(crate::backup::runtime::BackupRuntime::new(
+                let runtime = crate::backup::runtime::BackupRuntime::new(
                     Arc::clone(&backup),
                     &clients,
-                    writer,
+                    writer.clone(),
                     &origin,
                     Arc::clone(&account),
                     timer,
-                )?)
+                )?;
+                // A restore's reads of the same service go through the same proxy and answer to
+                // the same record of the delays the service has named.
+                let relay = Arc::new(crate::backup::relay::BackupRelay::new(
+                    &origin,
+                    Self::outbound_of(&started)?.proxy()?,
+                    &writer,
+                    Arc::clone(&account),
+                    runtime.quiet(),
+                )?);
+                (Some(runtime), Some(relay))
             }
         };
         // External destinations' credentials are kept in the same store as this host's own keys,
@@ -840,6 +850,7 @@ impl Controller {
             plugin_runtime,
             backup,
             backup_runtime,
+            backup_relay,
             transfer,
             project,
             qualification: std::sync::RwLock::new(qualification),

@@ -52,6 +52,7 @@ mod account_actions;
 mod admission;
 mod attention_reach;
 pub(crate) mod authority_changes;
+mod backup_actions;
 mod barrier;
 mod capabilities;
 mod close;
@@ -385,6 +386,9 @@ pub struct Controller {
     /// What carries the backup outbox to the managed storage service, when this host's
     /// configuration document selects one.
     backup_runtime: Option<crate::backup::runtime::BackupRuntime>,
+    /// What reads the storage service for a restore, when this host's configuration document
+    /// selects one.
+    backup_relay: Option<Arc<crate::backup::relay::BackupRelay>>,
     /// The configuration this daemon has put into force.
     ///
     /// A document is a file a person may also edit by hand, and its effects live outside it: the

@@ -129,7 +129,7 @@ impl ServiceSigner for WriterSigner {
 
 /// What this host holds for the account token it presents, as the doctor words it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum TokenState {
+pub(crate) enum TokenState {
     /// No account is signed in.
     Absent,
     /// A sign-in is waiting for the person's browser, and nothing is signed in yet.
@@ -184,7 +184,7 @@ impl TokenState {
 ///
 /// Whether a request may carry the token is decided by asking the [`AccountTokenSource`], which is
 /// what the clients ask. This only says why, and it is read for no other purpose.
-fn describe_token(account: &HostAccount) -> TokenState {
+pub(crate) fn describe_token(account: &HostAccount) -> TokenState {
     match account.report().state {
         AccountState::SignedIn { scopes, .. } => {
             if scopes.iter().any(|scope| scope == BACKUP_WRITE_SCOPE) {
@@ -242,19 +242,18 @@ enum Wait {
     Owed { until: Instant, duration: Duration },
 }
 
-/// The clients a host with a storage service builds, and the key it signs them with.
+/// The transport every request to the storage service goes through: the endpoint's own proxy and
+/// the deadlines storage exchanges get.
 ///
 /// # Errors
 ///
 /// Returns [`ControllerError::NotConfigured`] when the transport cannot be built, which is a fault
 /// in this machine's TLS configuration rather than in the service.
-pub fn managed_clients(
+pub fn managed_transport(
     origin: &GatewayOrigin,
     proxy: Option<&ProxyUrl>,
-    writer: &AuthorisationKeyPair,
-    tokens: &Arc<dyn AccountTokenSource>,
-) -> Result<ServiceClients> {
-    let http: Arc<dyn ServiceHttp> = Arc::new(
+) -> Result<Arc<dyn ServiceHttp>> {
+    Ok(Arc::new(
         HttpService::through(
             origin.clone(),
             STORAGE_DEADLINES,
@@ -269,7 +268,22 @@ pub fn managed_clients(
                 kr_protocol::hostinfo::configuration::FILE_NAME,
             ))
         })?,
-    );
+    ))
+}
+
+/// The clients a host with a storage service builds, and the key it signs them with.
+///
+/// # Errors
+///
+/// Returns [`ControllerError::NotConfigured`] when the transport cannot be built, which is a fault
+/// in this machine's TLS configuration rather than in the service.
+pub fn managed_clients(
+    origin: &GatewayOrigin,
+    proxy: Option<&ProxyUrl>,
+    writer: &AuthorisationKeyPair,
+    tokens: &Arc<dyn AccountTokenSource>,
+) -> Result<ServiceClients> {
+    let http = managed_transport(origin, proxy)?;
     let signer: Arc<dyn ServiceSigner> = Arc::new(WriterSigner {
         key: writer.clone(),
     });
@@ -671,6 +685,13 @@ impl BackupRuntime {
             uploader: Mutex::new(Some(uploader)),
             task: Mutex::new(None),
         })
+    }
+
+    /// What the service asked to be left alone for, which a restore's reads honour as the carrier
+    /// does.
+    #[must_use]
+    pub fn quiet(&self) -> Arc<Quiet> {
+        Arc::clone(&self.shared.quiet)
     }
 
     /// The public half of the key this host publishes as, which an owner enrols at the service as
