@@ -725,6 +725,10 @@ impl Controller {
                 self.authority_feed().is_removed(),
             ),
         });
+        checks.push(match &self.relay_keeper {
+            Some(keeper) => keeper.doctor_check(self),
+            None => crate::relay_leases::RelayKeeper::unconfigured_check(),
+        });
         checks.push(DoctorCheck::new(
             "configuration-secrets",
             "Secrets are named references, never configuration exports",

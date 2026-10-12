@@ -59,6 +59,7 @@ pub mod project;
 pub mod push;
 pub mod quiet;
 pub mod registry;
+pub mod relay_leases;
 pub mod service;
 pub mod sharing;
 pub mod singleton;
