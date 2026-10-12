@@ -3365,6 +3365,74 @@ async fn a_document_that_selects_an_authority_feed_is_accepted_with_its_section(
     );
 }
 
+/// A document of level 3 that selects a mailbox service.
+const WITH_A_MAILBOX: &[u8] = br#"{
+  "version": 3,
+  "level": 3,
+  "revision": 5,
+  "preferences": { "sleep_inhibition": "battery_too" },
+  "mailbox": { "origin": "http://127.0.0.1:9" }
+}"#;
+
+/// KR-REQ-26.13: a daemon over a document that selects a mailbox service reads it as a section of
+/// the level it reads, accepts it, and keeps in the registry the document as it read it, with the
+/// section and its level; the report an owner reads shows the selection.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_document_that_selects_a_mailbox_service_is_accepted_with_its_section() {
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    let environment = host.tree().environment();
+    write_document_bytes(&environment, WITH_A_MAILBOX);
+    let host = host.restart().await;
+
+    let mut local = host.client().await;
+    let result: HostDoctorResult = typed(
+        &local
+            .request(Method::HostDoctor, &())
+            .await
+            .expect("the call reaches the daemon")
+            .expect("host.doctor is served on the local socket"),
+    );
+    assert_eq!(result.configuration.status.state, DocumentState::Loaded);
+    let row = result
+        .configuration
+        .values
+        .iter()
+        .find(|value| value.key == "mailbox.origin")
+        .expect("the selection is reported");
+    assert_eq!(row.value(), "http://127.0.0.1:9", "{row:?}");
+    let ignored = result
+        .configuration
+        .values
+        .iter()
+        .any(|value| value.key == config_ignored_members());
+    assert!(!ignored, "the section is one this build reads");
+
+    drop(local);
+    let stopped = host.shut_down().await;
+    let database = stopped.tree().environment().registry_database();
+    let connection = rusqlite::Connection::open(&database).expect("the registry file");
+    let record: Option<String> = connection
+        .query_row("SELECT accepted_document FROM environment", [], |row| {
+            row.get(0)
+        })
+        .expect("the accepted document");
+    drop(connection);
+    let accepted = config::from_record(record.as_deref()).expect("accepted");
+    assert_eq!(accepted.level, 3);
+    assert_eq!(
+        accepted.mailbox.origin(),
+        Some("http://127.0.0.1:9"),
+        "the registry's copy states the selection"
+    );
+    let file = std::fs::read(kr_worker::config::document_path(&environment)).expect("the file");
+    assert_eq!(
+        Some(accepted),
+        kr_protocol::hostinfo::configuration::load(Some(&file)).document,
+        "the copy is the file's reading"
+    );
+}
+
 /// The key of the report's row of ignored members.
 fn config_ignored_members() -> &'static str {
     kr_protocol::hostinfo::configuration::IGNORED_MEMBERS_KEY

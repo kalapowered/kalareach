@@ -272,9 +272,9 @@ impl DeliveryRuntime {
     ///
     /// Once, and before the transport is attached, which is what builds the placer that reaches
     /// it: the service is the composition root's decision, made at startup from the configuration
-    /// document. Returns false when one was already named.
+    /// document. Returns false when one was already named or the transport is attached.
     pub fn select_mailbox(&self, origin: kr_protocol::service::GatewayOrigin) -> bool {
-        self.mailbox.set(origin).is_ok()
+        self.adapters.get().is_none() && self.mailbox.set(origin).is_ok()
     }
 
     /// Attaches the transport every delivery exchange goes through.
@@ -288,6 +288,20 @@ impl DeliveryRuntime {
             Arc::clone(&self.signer),
             self.runtime.clone(),
         ));
+        // The placer is attached before the adapters are published: a pass starts to present as
+        // soon as they are, and a push that went out before the placer was there would go without
+        // the detail it refers to and with no reason in its record.
+        if self.adapters.get().is_none()
+            && let Some(origin) = self.mailbox.get()
+        {
+            self.module
+                .attach_placer(Arc::new(super::mailbox::MailboxPlacer::new(
+                    origin.clone(),
+                    Arc::clone(&transports),
+                    Arc::clone(&self.signer),
+                    self.runtime.clone(),
+                )));
+        }
         let attached = self
             .adapters
             .set(Adapters {
@@ -313,15 +327,6 @@ impl DeliveryRuntime {
             .is_ok();
         if attached {
             self.credentials.attach_renewal(senders);
-            if let Some(origin) = self.mailbox.get() {
-                self.module
-                    .attach_placer(Arc::new(super::mailbox::MailboxPlacer::new(
-                        origin.clone(),
-                        transports,
-                        Arc::clone(&self.signer),
-                        self.runtime.clone(),
-                    )));
-            }
         }
         attached
     }
