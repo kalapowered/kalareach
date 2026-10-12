@@ -335,9 +335,8 @@ async fn kr_req_25_10_a_long_list_is_paged_by_its_key_and_survives_a_redemption_
     for created in &issued {
         let id = created.preview.invitation_id;
         let redeemed = id == second_page[0] || id == first.offers[0].invitation_id;
-        assert_eq!(
+        assert!(
             seen.contains(&id) || redeemed,
-            true,
             "no offer is lost between pages"
         );
     }
