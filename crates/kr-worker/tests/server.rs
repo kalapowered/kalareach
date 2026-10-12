@@ -7,7 +7,7 @@
 //!
 //! | Row | What proves it |
 //! | --- | --- |
-//! | KR-REQ-07.60 | a server is started in a group of its own with the presented environment less the two variables that name the launch, in the directory asked, only when the executable is the one the record names; an ending that needs no more than the end of its input, one that needs a terminate, and one that needs force each end the server and what the session recorded below it, a command that outlived a server that died included; the server's error stream is read and only its last part kept |
+//! | KR-REQ-07.60 | a server is started in a group of its own with the presented environment less the two variables that name the launch, in the directory asked, only when the executable is the one the record names; an ending that needs no more than the end of its input, one that needs a terminate, and one that needs force each end the server and what the session recorded below it, a command that outlived a server that died included; the server's error stream is read and only its last part kept; a process the session reads as having left for a control daemon's own scope is neither asked, nor forced, nor reported, whether it is read so before the ending asks it or while the ending waits to force |
 //! | KR-REQ-07.53 | an ending forces nothing before five seconds from its beginning: a server and a command that ignore everything they are asked are still there just before it and are forced after it, a command that outlives a server that ended is too, and one that ends when it is asked within the five seconds is not forced |
 //! | KR-REQ-07.66 | a process the ladder ends by force is noted as forced, and none that ended when it was asked is |
 
@@ -689,6 +689,85 @@ async fn kr_req_07_60_a_process_that_left_the_session_is_neither_asked_nor_force
     assert!(
         still_running,
         "neither was asked or forced: both were left running"
+    );
+}
+
+/// The session's record, as it is when a process the ending is waiting to force leaves the
+/// session for a control daemon's own scope during the wait: it shows `late` as `LateRecord` does,
+/// and says that `late` is the session's until the ending has asked about it `until` times (in the
+/// round of force that first shows it: once to ask it, once to count it as running, and once
+/// before the force), and has left from then on.
+struct LeavesInTheWait {
+    inner: LateRecord,
+    late: ProcessStartIdentity,
+    asked: std::sync::atomic::AtomicUsize,
+    until: usize,
+}
+
+impl Owned for LeavesInTheWait {
+    fn below(&self, server: &ProcessStartIdentity) -> Vec<ProcessStartIdentity> {
+        self.inner.below(server)
+    }
+
+    fn left(&self, process: &ProcessStartIdentity) -> bool {
+        use std::sync::atomic::Ordering::SeqCst;
+
+        if *process == self.late {
+            self.asked.fetch_add(1, SeqCst) + 1 >= self.until
+        } else {
+            self.inner.left(process)
+        }
+    }
+
+    fn forced(&self, process: &ProcessStartIdentity) {
+        self.inner.forced(process);
+    }
+
+    fn unsignalled(&self, process: &ProcessStartIdentity, why: &str) {
+        self.inner.unsignalled(process, why);
+    }
+}
+
+/// A process that the session reads as having left while the ending waits for the window to be
+/// over, after the ending asked it and counted it as running, is not forced when the window is
+/// over, and is not reported: the reading that showed it was older than the one that read it
+/// leaving. The record shows the program first in the round of force, so the ending asks about it
+/// three times in that round (asking, counting, and before the force), and it leaves at the third.
+#[tokio::test]
+async fn kr_req_07_60_a_process_that_leaves_while_the_ending_waits_is_not_forced() {
+    let stand_in = stand_in();
+    let server = start(&stand_in, "ignore-eof", PLAIN).await;
+    let (first, late) = (idler(), stubborn_idler());
+    let record = LeavesInTheWait {
+        late: late.identity.clone(),
+        inner: LateRecord::of(&server, Record::of(&server), &first, &late),
+        asked: std::sync::atomic::AtomicUsize::new(0),
+        until: 3,
+    };
+
+    let begun = Instant::now();
+    let retirement = server.retire(&record, begun.into()).await;
+    let ended_at = begun.elapsed();
+    let still_running = !gone(&late.identity);
+    let _ = kr_ipc::identity::stop_process(&late.identity, kr_ipc::identity::Stop::Kill);
+    assert!(
+        retirement.forced.is_empty(),
+        "a process that left was forced: {:?}",
+        retirement.forced
+    );
+    assert!(
+        retirement.survivors.is_empty(),
+        "it is not the session's to report: {:?}",
+        retirement.survivors
+    );
+    assert!(still_running, "it was left running, not ended");
+    assert!(
+        ended_at >= FIVE_SECONDS,
+        "the ending waited for the window to be over: {ended_at:?}"
+    );
+    assert!(
+        record.asked.load(std::sync::atomic::Ordering::SeqCst) >= 3,
+        "the process was asked about three times, the third after the wait"
     );
 }
 
