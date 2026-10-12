@@ -181,35 +181,39 @@ jobs:
       # lifted, and each check fails rather than passes where it cannot make one, so the workspace
       # test above leaves them out. This step lifts the restriction for itself on this runner and
       # puts it back however the step ends, shows the namespace refused before and given after,
-      # and runs the twenty by name. A name that matched no test would run nothing and still exit
-      # 0, so the step counts the twenty it saw pass.
+      # and runs the twenty by name, one command each. A name that matched no test would run
+      # nothing and still exit 0, so the step counts the twenty it saw pass. A check passed when
+      # its command exited 0 and its summary says one test passed: every check starts the test
+      # binary again inside the namespace with the same output, so the lines of several checks
+      # run side by side can run into each other, and a check's own line is not a verdict to read.
       - name: Mount checks inside a mount namespace of this account's own
         # Whatever the steps before it did, like the boundary step above.
         if: ${{ !cancelled() }}
         run: |
           set -euo pipefail
           restriction=kernel.apparmor_restrict_unprivileged_userns
+          # Each check is its package, its test target (`lib` for the unit tests) and its name.
           checks=(
-            a_file_mounted_inside_this_repository_s_own_data_is_not_captured_around
-            a_tree_reached_on_another_mount_is_not_taken_for_this_one
-            two_views_of_one_directory_are_both_looked_through
-            a_mount_placed_while_reads_resolve_never_reaches_the_other_tree
-            a_removal_stops_before_a_directory_mounted_into_the_tree
-            bind_mount_and_cross_device_grafts_are_refused
-            recursive_removal_refuses_a_grafted_mount
-            a_staging_directory_on_another_filesystem_is_refused_whatever_its_numbers
-            a_scope_on_another_filesystem_is_refused_whatever_its_numbers
-            a_directory_on_another_filesystem_is_not_the_recorded_one_whatever_its_numbers
-            a_registered_repository_on_another_filesystem_is_refused_whatever_its_numbers
-            a_workspace_tree_on_another_filesystem_is_not_removed_whatever_its_numbers
-            owner_cleanup_does_not_remove_a_staging_directory_on_another_filesystem
-            git::tests::a_directory_on_another_filesystem_is_not_taken_away_as_the_one_this_host_made
-            a_workspace_on_another_filesystem_is_not_opened_whatever_its_numbers
-            a_materialisation_on_another_filesystem_is_not_read_or_emptied_whatever_its_numbers
-            a_staged_name_on_another_filesystem_is_left_where_it_is_whatever_its_numbers
-            a_workspace_tree_on_another_filesystem_is_not_read_whatever_its_numbers
-            a_filesystem_mounted_over_a_registered_subdirectory_is_not_read_as_it
-            a_directory_bound_over_a_registered_subdirectorys_parent_is_not_read_as_it
+            "kr-changeset capture a_file_mounted_inside_this_repository_s_own_data_is_not_captured_around"
+            "kr-changeset capture a_tree_reached_on_another_mount_is_not_taken_for_this_one"
+            "kr-changeset capture two_views_of_one_directory_are_both_looked_through"
+            "kr-transfer authority a_mount_placed_while_reads_resolve_never_reaches_the_other_tree"
+            "kr-transfer authority a_removal_stops_before_a_directory_mounted_into_the_tree"
+            "kr-project locations bind_mount_and_cross_device_grafts_are_refused"
+            "kr-project locations recursive_removal_refuses_a_grafted_mount"
+            "kr-transfer filesystems a_staging_directory_on_another_filesystem_is_refused_whatever_its_numbers"
+            "kr-transfer filesystems a_scope_on_another_filesystem_is_refused_whatever_its_numbers"
+            "kr-transfer filesystems a_directory_on_another_filesystem_is_not_the_recorded_one_whatever_its_numbers"
+            "kr-project workspaces a_registered_repository_on_another_filesystem_is_refused_whatever_its_numbers"
+            "kr-project workspaces a_workspace_tree_on_another_filesystem_is_not_removed_whatever_its_numbers"
+            "kr-project locations owner_cleanup_does_not_remove_a_staging_directory_on_another_filesystem"
+            "kr-project lib git::tests::a_directory_on_another_filesystem_is_not_taken_away_as_the_one_this_host_made"
+            "kr-changeset filesystems a_workspace_on_another_filesystem_is_not_opened_whatever_its_numbers"
+            "kr-changeset filesystems a_materialisation_on_another_filesystem_is_not_read_or_emptied_whatever_its_numbers"
+            "kr-changeset apply a_staged_name_on_another_filesystem_is_left_where_it_is_whatever_its_numbers"
+            "kr-project workspaces a_workspace_tree_on_another_filesystem_is_not_read_whatever_its_numbers"
+            "kr-project workspaces a_filesystem_mounted_over_a_registered_subdirectory_is_not_read_as_it"
+            "kr-project workspaces a_directory_bound_over_a_registered_subdirectorys_parent_is_not_read_as_it"
           )
           log="$RUNNER_TEMP/mount-checks.log"
           : >"$log"
@@ -238,28 +242,20 @@ jobs:
           fi
           echo "after the change: unshare -r -m was given"
           failed=0
-          cargo test --locked -p kr-changeset --test capture -- --ignored --exact --color never \
-            "${checks[@]:0:3}" 2>&1 | tee -a "$log" || failed=1
-          cargo test --locked -p kr-transfer --test authority -- --ignored --exact --color never \
-            "${checks[@]:3:2}" 2>&1 | tee -a "$log" || failed=1
-          cargo test --locked -p kr-project --test locations -- --ignored --exact --color never \
-            "${checks[@]:5:2}" "${checks[@]:12:1}" 2>&1 | tee -a "$log" || failed=1
-          cargo test --locked -p kr-transfer --test filesystems -- --ignored --exact --color never \
-            "${checks[@]:7:3}" 2>&1 | tee -a "$log" || failed=1
-          cargo test --locked -p kr-project --test workspaces -- --ignored --exact --color never \
-            "${checks[@]:10:2}" "${checks[@]:17:3}" 2>&1 | tee -a "$log" || failed=1
-          cargo test --locked -p kr-project --lib -- --ignored --exact --color never \
-            "${checks[@]:13:1}" 2>&1 | tee -a "$log" || failed=1
-          cargo test --locked -p kr-changeset --test filesystems -- --ignored --exact --color never \
-            "${checks[@]:14:2}" 2>&1 | tee -a "$log" || failed=1
-          cargo test --locked -p kr-changeset --test apply -- --ignored --exact --color never \
-            "${checks[@]:16:1}" 2>&1 | tee -a "$log" || failed=1
           passed=0
-          for check in "${checks[@]}"; do
-            if grep -q -F -x "test $check ... ok" "$log"; then
+          for entry in "${checks[@]}"; do
+            read -r package target check <<<"$entry"
+            selector=(--test "$target")
+            if [ "$target" = lib ]; then selector=(--lib); fi
+            : >"$log"
+            ran=0
+            cargo test --locked -p "$package" "${selector[@]}" -- --ignored --exact --color never \
+              "$check" 2>&1 | tee "$log" || ran=1
+            if [ "$ran" -eq 0 ] && grep -q -E '^test result: ok\. 1 passed; 0 failed' "$log"; then
               passed=$((passed + 1))
             else
               echo "$check did not pass" >&2
+              failed=1
             fi
           done
           echo "$passed of the ${#checks[@]} mount checks passed"
