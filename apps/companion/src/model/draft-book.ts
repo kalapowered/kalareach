@@ -1316,6 +1316,8 @@ export class DraftBook {
       }
     } finally {
       this.#settling = false
+      // A run makes one prompt's store at a time and ends them all, whatever ended it.
+      this.#storing.clear()
     }
     this.#recompute()
   }
