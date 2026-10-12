@@ -56,8 +56,8 @@ fn entry(
 #[must_use]
 pub fn known() -> Vec<Known> {
     use kr_protocol::{
-        account, attention, automation, delivery, describe, error, host_account, identity, pairing,
-        privacy, push, sharing, skill, update,
+        account, attention, automation, delivery, error, host_account, identity, pairing, push,
+        sharing, skill,
     };
 
     let source = |store, name, file, pinned| Known {

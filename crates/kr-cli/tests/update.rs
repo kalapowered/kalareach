@@ -10344,7 +10344,7 @@ fn the_detection_of_undeclared_types_finds_a_missing_line_a_changed_type_and_a_s
     let found = stored_formats::retained_unaccounted(
         &table,
         &[],
-        &[(Method::DevicePushRegister, "DevicePushRegisterResult")],
+        &[(Method::DevicePushRegister, "NoSuchAnswer")],
         &[Method::DevicePushRegister],
     );
     assert_eq!(found.len(), 1, "{found:?}");
