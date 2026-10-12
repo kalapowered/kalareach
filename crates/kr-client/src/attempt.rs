@@ -456,7 +456,7 @@ pub enum AttemptError {
 crate::debug_as_display!(AttemptError);
 
 /// What a listing found.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum Kept {
     /// An attempt this build reads.
     Known(Box<Attempt>),
@@ -468,11 +468,23 @@ pub enum Kept {
     },
 }
 
+impl std::fmt::Debug for Kept {
+    /// Which kind of file it is and, for an attempt, what its own rendering says; never a name.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Known(attempt) => formatter.debug_tuple("Known").field(attempt).finish(),
+            Self::Unknown { .. } => formatter.write_str("Unknown { .. }"),
+        }
+    }
+}
+
 /// The attempts one host's clients keep on this device.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct AttemptStore {
     directory: PathBuf,
 }
+
+crate::debug_as_name!(AttemptStore);
 
 impl AttemptStore {
     /// Opens the store, creating its directory, readable only by its owner, when it is missing.
