@@ -1316,9 +1316,8 @@ impl DeliveryModule {
     /// The exchange is made under an admission of the generation the notification was admitted
     /// under, as the push is, and the admission is let go as soon as the exchange ends. The
     /// deadline is read under it, immediately before the exchange, and the service is asked only
-    /// of a notification with more life left than the longest wait of its own schedule and only
-    /// in the attempts the notification may spend on the mailbox, so nothing is placed for one
-    /// that has expired, that the exchange could cost its push, or that has used them. The caller
+    /// of a notification with more life left than the longest wait of its own schedule, so nothing
+    /// is placed for one that has expired or that the exchange could cost its push. The caller
     /// asks its questions again before it takes a new admission for the send, and a change of
     /// privacy mode that came in between takes the notification back.
     fn place_detail(
@@ -1373,24 +1372,13 @@ impl DeliveryModule {
             };
             let before = clock.now_ms().max(now_ms);
             // A notification that has expired has less than the room left, and the deadline read
-            // before the send settles it; one that has the room or less is not asked about, and
-            // neither is one that has spent the attempts it may wait for the mailbox.
+            // before the send settles it; one that has the room or less is not asked about.
             if before.saturating_add(MAILBOX_ROOM_MS) >= delivery.expires_at_ms.get() {
                 forget()?;
                 return Ok(Placing {
                     detail: Detail::Missing(
                         "it has too little life left to ask the mailbox service about its detail"
                             .to_owned(),
-                    ),
-                    asked: false,
-                    at_ms: before,
-                });
-            }
-            if delivery.attempt > MAILBOX_ATTEMPTS {
-                forget()?;
-                return Ok(Placing {
-                    detail: Detail::Missing(
-                        "it has spent the attempts it may wait for the mailbox service".to_owned(),
                     ),
                     asked: false,
                     at_ms: before,
@@ -1991,8 +1979,8 @@ enum Detail {
     Ready,
     /// The detail is not confirmed placed and is not asked for again: the service will not take
     /// it, the device has no key to seal it to, the object this host kept for it could not be
-    /// read, or the notification has too little life left, or too few attempts, to ask. The push
-    /// is presented without it, and its record says why.
+    /// read, the notification has too little life left to ask, or the mailbox has had the attempts
+    /// the push may wait for it. The push is presented without it, and its record says why.
     Missing(String),
     /// Nothing is known to be placed. Whether the push waits for the mailbox is judged by the
     /// caller, at the reading it decides on, with the time the service asked for.
@@ -2015,10 +2003,10 @@ struct Placing {
     at_ms: u64,
 }
 
-/// How many attempts at a notification may ask the mailbox. The push waits for the mailbox in all
-/// of them but the last, which sends without the detail if the mailbox still cannot take it, so
-/// the gateway keeps at least the last three attempts. An attempt spent on something else, such
-/// as a renewal that did not happen, counts: one that comes after them does not ask.
+/// How many attempts at a notification may wait for the mailbox, counting the one that gives up on
+/// it: the push waits in all of them but the last, which sends without the detail if the mailbox
+/// still cannot take it, so the gateway keeps at least the last three attempts. An attempt spent
+/// on something else, such as a renewal that did not happen, counts.
 const MAILBOX_ATTEMPTS: u64 = kr_delivery::push::MAX_ATTEMPTS - 3;
 
 /// The longest wait a mailbox service's request for time is honoured for: the longest wait the
