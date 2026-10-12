@@ -18,10 +18,10 @@
 //!   connection within the bound ends the server through one operation (see
 //!   [`crate::broker::server`]), run in a task of its own that retiring the backend does not abort.
 //!   A session that is closing ends its servers after the acceptance of its close is delivered, so
-//!   until then none of the first three ends the server: the connection ending leaves the server
-//!   running with its input open and its output read and discarded. (The bound for a program that
-//!   never connected ends a server nothing ever spoke to, and a launch that did not commit ends the
-//!   server it started, whatever the session is doing.)
+//!   until then none of these ends the server: the connection ending leaves the server running
+//!   with its input open and its output read and discarded. (A launch that did not commit ends
+//!   the server it started at once, whatever the session is doing: no program has connected to
+//!   it, so no command of the program can be asking for the close.)
 
 use std::pin::Pin;
 use std::sync::atomic::Ordering;
