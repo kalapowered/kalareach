@@ -3915,6 +3915,10 @@ fn share_params(
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_share_whose_record_was_never_written_is_answered_from_what_it_wrote_after_a_restart() {
     let host = Serving::start().await;
+    host.controller
+        .devices()
+        .commit(&paired_record(device_id(0xf3)))
+        .expect("the recipient is paired");
     let mut client = host.client().await;
     let action_id = kr_protocol::ids::ActionId::new(Uuid::from_bytes([0x61; 16]));
     let mutation = client
@@ -4594,6 +4598,10 @@ async fn a_delegation_is_not_refused_as_expired_on_a_reading_this_host_could_not
         )
         .expect("the fault is in place");
 
+    host.controller
+        .devices()
+        .commit(&paired_record(device_id(0xf3)))
+        .expect("the recipient is paired");
     let mut client = host.client().await;
     let refusal = client
         .mutate(

@@ -357,6 +357,17 @@ pub(super) async fn world(
     let holding = Arc::new(Mutex::new(holding));
     let world = fake::fake_world(serving(Arc::clone(&holding), stated)).await;
     fake::acknowledged(&world.controller, world.session_id);
+    // The device a test shares with is one this host pairs with, for a day, as a share to any other
+    // is refused.
+    let (mut pairing, _) = crate::service::net::tests::granted(
+        kr_protocol::grant::GrantExpiry::At {
+            expires_at_ms: TimestampMs::new(kr_ipc::now_ms().get() + 24 * 3_600_000),
+        },
+        world.controller.policy().authority_revision(),
+    );
+    pairing.recipient_device_id = recipient();
+    pairing.issuer_device_id = recipient();
+    holding_grant(&world.controller, 0xd1, pairing);
     (world, holding)
 }
 
@@ -2662,6 +2673,16 @@ async fn kr_req_10_51_a_device_reads_the_decisions_its_grant_names_while_they_ar
     tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     let bound = kr_ipc::now_ms().get();
 
+    // The device is paired under a grant of its own that reaches no session, as a share to it
+    // requires; what it reads of this one it reads under the share it redeems.
+    let (mut pairing, _) = crate::service::net::tests::granted(
+        kr_protocol::grant::GrantExpiry::Never,
+        served.controller.policy().authority_revision(),
+    );
+    pairing.recipient_device_id = recipient();
+    pairing.session_selector = kr_protocol::grant::SessionSelector::None;
+    let device = holding_grant(&served.controller, 31, pairing);
+
     // What the issuer is shown: the question's text and moment, and the request as the channel's
     // upstream wrote it, with the moment the broker recorded it.
     let issued = served
@@ -2701,15 +2722,6 @@ async fn kr_req_10_51_a_device_reads_the_decisions_its_grant_names_while_they_ar
             None,
         )
         .expect("the invitation is redeemed");
-    // The device is paired under a grant of its own that reaches no session; what it reads of this
-    // one it reads under the share it redeemed.
-    let (mut pairing, _) = crate::service::net::tests::granted(
-        kr_protocol::grant::GrantExpiry::Never,
-        served.controller.policy().authority_revision(),
-    );
-    pairing.recipient_device_id = redeemed.recipient_device_id;
-    pairing.session_selector = kr_protocol::grant::SessionSelector::None;
-    let device = holding_grant(&served.controller, 31, pairing);
     let connection = super::RemoteConnection::for_test(&served.controller, device);
     let questions = |request_id: u64| {
         device_read(
