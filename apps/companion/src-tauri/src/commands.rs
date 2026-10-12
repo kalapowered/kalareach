@@ -72,6 +72,7 @@ pub const NAMED_COMMANDS: &[(&str, Option<Method>)] = &[
     ("device_draft_save", None),
     ("device_draft_retarget", None),
     ("device_draft_discard", None),
+    ("device_draft_mark_removal", None),
     // Drafts and attachments.
     ("draft_create", Some(Method::DraftCreate)),
     (
@@ -273,6 +274,7 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'static
         device_draft_save,
         device_draft_retarget,
         device_draft_discard,
+        device_draft_mark_removal,
         draft_create,
         draft_add_attachment,
         attachment_upload,
@@ -761,6 +763,15 @@ pub async fn device_draft_discard(state: State<'_, AppState>, params: Value) -> 
     let typed: crate::drafts::DiscardParams = decode(params)?;
     let drafts = state.drafts();
     encode(&blocking(move || drafts.discard(&typed)).await?)
+}
+
+/// Records a removal of a draft that could not be made, so that the next start makes it.
+#[tauri::command]
+pub async fn device_draft_mark_removal(state: State<'_, AppState>, params: Value) -> Result<Value> {
+    let typed: crate::drafts::DiscardParams = decode(params)?;
+    let drafts = state.drafts();
+    blocking(move || drafts.mark_removal(typed)).await?;
+    encode(&())
 }
 
 /// Reads a session's questions.
@@ -2218,6 +2229,7 @@ mod tests {
                 "device_draft_save",
                 "device_draft_retarget",
                 "device_draft_discard",
+                "device_draft_mark_removal",
             ])
         );
     }

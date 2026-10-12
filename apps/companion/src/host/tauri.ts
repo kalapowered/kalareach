@@ -159,6 +159,7 @@ export function tauriPort(): HostPort {
     deviceDraftSave: (request) => read('device_draft_save', request),
     deviceDraftRetarget: (request) => read('device_draft_retarget', request),
     deviceDraftDiscard: (request) => read('device_draft_discard', request),
+    deviceDraftMarkRemoval: (request) => read('device_draft_mark_removal', request),
     draftCreate: (params, subject) => mutate<Settled>('draft_create', params, subject),
     // The upload belongs to the same session the subject names; sending the subject without it
     // would reserve the transfer against no session while the action targeted one.

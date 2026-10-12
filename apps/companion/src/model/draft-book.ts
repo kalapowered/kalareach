@@ -419,6 +419,8 @@ export class DraftBook {
     try {
       const stored = await this.#port.deviceDrafts()
       this.#unreadable = stored.unreadable
+      // Before the drafts are read into composers: a record owed for removal is no draft's.
+      this.#oweFrom(stored.pendingRemovals)
       this.#merge(stored.drafts)
       this.#status = 'ready'
       this.#problem = null
@@ -449,6 +451,7 @@ export class DraftBook {
         // never merged, so after the last attempt the book is left as it was.
         if (this.#moves !== seen) continue
         this.#unreadable = stored.unreadable
+        this.#oweFrom(stored.pendingRemovals)
         this.#merge(stored.drafts)
         this.#changed()
       } catch (failure) {
@@ -666,7 +669,7 @@ export class DraftBook {
   async #dropSent(flight: Flight): Promise<void> {
     const record = flight.record
     if (record === null) return
-    if (!(await this.#dropRecord(record, flight.id))) this.#cleanups.push({ ref: record, key: flight.id })
+    if (!(await this.#dropRecord(record, flight.id))) this.#owe(record, flight.id)
   }
 
   /** Removes the older version a prompt grew from, now that its text stands elsewhere. */
@@ -675,8 +678,33 @@ export class DraftBook {
     if (earlier === null) return
     // The record stays on the flight, and so out of reach of every read, until it is gone or the
     // cleanups hold it; a read that merged in between would show a ghost of it.
-    if (!(await this.#dropRecord(earlier, flight.id))) this.#cleanups.push({ ref: earlier, key: flight.id })
+    if (!(await this.#dropRecord(earlier, flight.id))) this.#owe(earlier, flight.id)
     flight.earlier = null
+  }
+
+  /**
+   * Holds a removal the store would not make, here and in the store's own ledger, so that a start
+   * after this one makes it: the text of a prompt the host took does not come back as a draft.
+   */
+  #owe(ref: StoredRef, key: string): void {
+    this.#cleanups.push({ ref, key })
+    this.#hold(
+      Promise.resolve()
+        .then(() => this.#port.deviceDraftMarkRemoval({ id: ref.id, expectedRevision: ref.revision }))
+        // A ledger that cannot be written leaves the removal owed in this window only.
+        .catch(() => undefined)
+    )
+  }
+
+  /** Takes up the removals an earlier run began and did not finish. */
+  #oweFrom(pending: readonly { readonly id: string; readonly expectedRevision: string }[]): void {
+    for (const removal of pending) {
+      if (this.#cleanups.some((each) => each.ref.id === removal.id)) continue
+      this.#cleanups.push({
+        ref: { id: removal.id, revision: removal.expectedRevision },
+        key: `removal-${removal.id}`
+      })
+    }
   }
 
   /**

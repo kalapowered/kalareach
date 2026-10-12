@@ -1100,6 +1100,7 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
     deviceDraftSave: (request) => Promise.resolve(drafts.save(request)),
     deviceDraftRetarget: (request) => Promise.resolve(drafts.retarget(request)),
     deviceDraftDiscard: (request) => Promise.resolve(drafts.discard(request)),
+    deviceDraftMarkRemoval: (request) => Promise.resolve(drafts.markRemoval(request)),
 
     draftCreate: (params, subject) => {
       requireConnection()

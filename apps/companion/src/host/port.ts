@@ -608,6 +608,8 @@ export interface StoredDraft {
 export interface StoredDrafts {
   readonly drafts: readonly StoredDraft[]
   readonly unreadable: number
+  /** The removals an earlier run began and could not finish, each naming the version to remove. */
+  readonly pendingRemovals: readonly DraftDiscardRequest[]
 }
 
 /** A save: a new draft when `id` is null, else a replacement of the version `expectedRevision`. */
@@ -867,6 +869,11 @@ export interface HostPort {
   deviceDraftRetarget(request: DraftRetargetRequest): Promise<StoredDraft>
   /** Throws away a draft, if it is still the version the request names. */
   deviceDraftDiscard(request: DraftDiscardRequest): Promise<{ readonly removed: boolean }>
+  /**
+   * Records a removal that could not be made, so that the next start makes it: a prompt the host
+   * took does not return as a draft because the store refused once.
+   */
+  deviceDraftMarkRemoval(request: DraftDiscardRequest): Promise<void>
 
   draftCreate(params: unknown, subject: SessionSubject): Promise<Settled>
   /**

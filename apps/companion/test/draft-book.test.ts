@@ -27,7 +27,10 @@ function portOver(store: FakeDraftStore): HostPort {
     deviceDrafts: async () => store.list(),
     deviceDraftSave: async (request: DraftSaveRequest) => store.save(request),
     deviceDraftRetarget: async (request: DraftRetargetRequest) => store.retarget(request),
-    deviceDraftDiscard: async (request: DraftDiscardRequest) => store.discard(request)
+    deviceDraftDiscard: async (request: DraftDiscardRequest) => store.discard(request),
+    deviceDraftMarkRemoval: async (request: DraftDiscardRequest) => {
+      store.markRemoval(request)
+    }
   } as unknown as HostPort
 }
 
@@ -1929,5 +1932,32 @@ describe('two windows that hold the same draft', () => {
     await book.settled()
     const second = book.beginSend(MAIN)
     await expect(second.claimed).resolves.toBeUndefined()
+  })
+})
+
+describe('a removal the store would not make', () => {
+  it('is made by the next start, and the text of a prompt the host took does not come back', async () => {
+    const store = new FakeDraftStore()
+    const book = await opened(store)
+    type(book, MAIN, 'send this')
+    await book.settled()
+    const sending = book.beginSend(MAIN)
+    await sending.claimed
+    type(book, MAIN, '')
+    store.refuseDiscards({ code: 'STORAGE_UNAVAILABLE', message: 'the disk refused it' })
+    book.endSend(sending, 'taken')
+    await book.settled()
+    // The prompt was taken and its record could not be removed: it is owed, in the store's ledger.
+    expect(store.all().map((draft) => draft.text)).toEqual(['send this'])
+    expect(store.pendingRemovals()).toHaveLength(1)
+
+    // The application starts again, with the disk working: the new book finishes the removal.
+    store.refuseDiscards(null)
+    const restarted = await opened(store)
+    await restarted.settled()
+    expect(store.all()).toEqual([])
+    expect(store.pendingRemovals()).toEqual([])
+    expect(restarted.draft(MAIN).text).toBe('')
+    expect(restarted.snapshot().kept).toEqual([])
   })
 })

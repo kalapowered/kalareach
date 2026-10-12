@@ -32,6 +32,7 @@ impl Window {
                 companion_tauri::commands::device_draft_save,
                 companion_tauri::commands::device_draft_retarget,
                 companion_tauri::commands::device_draft_discard,
+                companion_tauri::commands::device_draft_mark_removal,
                 companion_tauri::commands::question_kept,
             ])
             .build(tauri::test::mock_context(tauri::test::noop_assets()))
@@ -729,4 +730,165 @@ fn the_application_gives_its_answers_and_its_drafts_a_place_under_its_data_direc
     );
     assert_eq!(window.read()["drafts"], json!([]));
     assert!(data.path().join("drafts").is_dir());
+}
+
+/// KR-REQ-13.13: a removal the page could not make is kept beside the drafts and read back with
+/// them, so that a start after it finishes it; a discard that ends takes its entry out, whether the
+/// draft was removed or another window had changed it first, and the entry of a draft that is
+/// still stored stays when the discard fails for another reason.
+#[test]
+fn a_removal_the_page_could_not_make_is_read_back_after_the_application_starts_again() {
+    let data = tempfile::tempdir().expect("a data directory");
+    let first = Window::over(data.path());
+    let saved = first.write("the text of a prompt the host took");
+    let id = saved["draft"]["id"]
+        .as_str()
+        .expect("an identity")
+        .to_owned();
+    let revision = saved["draft"]["revision"]
+        .as_str()
+        .expect("a version")
+        .to_owned();
+    first
+        .call(
+            "device_draft_mark_removal",
+            json!({ "id": id, "expectedRevision": revision }),
+        )
+        .expect("the removal is recorded");
+    assert_eq!(first.read()["pendingRemovals"][0]["id"], json!(id));
+    drop(first);
+
+    // The application starts again: the draft is still stored, and the removal is still owed.
+    let second = Window::over(data.path());
+    let read = second.read();
+    assert_eq!(drafts_of(&read).len(), 1);
+    assert_eq!(
+        read["pendingRemovals"],
+        json!([{ "id": id, "expectedRevision": revision }])
+    );
+    // Finishing it takes the draft and the entry.
+    second
+        .call(
+            "device_draft_discard",
+            json!({ "id": id, "expectedRevision": revision }),
+        )
+        .expect("the draft is removed");
+    let done = second.read();
+    assert!(drafts_of(&done).is_empty());
+    assert_eq!(done["pendingRemovals"], json!([]));
+
+    // Another window changed a draft first: the removal is not this window's to make, and the
+    // entry goes with the refusal.
+    let third = second.write("another prompt");
+    let third_id = third["draft"]["id"]
+        .as_str()
+        .expect("an identity")
+        .to_owned();
+    second
+        .call(
+            "device_draft_mark_removal",
+            json!({ "id": third_id, "expectedRevision": "1" }),
+        )
+        .expect("the removal is recorded");
+    second
+        .call(
+            "device_draft_save",
+            save(Some(&third_id), Some("1"), SESSION, None, "changed since"),
+        )
+        .expect("another window saves");
+    let refused = second
+        .call(
+            "device_draft_discard",
+            json!({ "id": third_id, "expectedRevision": "1" }),
+        )
+        .expect_err("the draft moved on");
+    assert_eq!(code_of(&refused), "DRAFT_CONFLICT");
+    assert_eq!(second.read()["pendingRemovals"], json!([]));
+}
+
+/// KR-REQ-13.13: a refused discard of an older version does not take out the entry of a removal of
+/// a newer one, which is still owed.
+#[test]
+fn a_stale_discard_leaves_the_removal_of_a_newer_version_owed() {
+    let data = tempfile::tempdir().expect("a data directory");
+    let window = Window::over(data.path());
+    let saved = window.write("the text of a prompt the host took");
+    let id = saved["draft"]["id"]
+        .as_str()
+        .expect("an identity")
+        .to_owned();
+    // Another window changed the draft, so the version this window removes is the second.
+    window
+        .call(
+            "device_draft_save",
+            save(Some(&id), Some("1"), SESSION, None, "changed since"),
+        )
+        .expect("the draft is changed");
+    window
+        .call(
+            "device_draft_mark_removal",
+            json!({ "id": id, "expectedRevision": "2" }),
+        )
+        .expect("the removal of the second version is recorded");
+
+    let refused = window
+        .call(
+            "device_draft_discard",
+            json!({ "id": id, "expectedRevision": "1" }),
+        )
+        .expect_err("the first version is no longer the stored one");
+    assert_eq!(code_of(&refused), "DRAFT_CONFLICT");
+    assert_eq!(
+        window.read()["pendingRemovals"],
+        json!([{ "id": id, "expectedRevision": "2" }])
+    );
+}
+
+/// KR-REQ-13.13: removals recorded at the same moment by windows of one application are all owed
+/// afterwards: the ledger is read, changed and put back as one step, so no writer's entry is lost to
+/// another's.
+#[test]
+fn removals_recorded_at_once_are_all_owed() {
+    use std::sync::{Arc, Barrier};
+
+    const WINDOWS: usize = 8;
+    const ROUNDS: usize = 12;
+
+    for _ in 0..ROUNDS {
+        let data = tempfile::tempdir().expect("a data directory");
+        let start = Arc::new(Barrier::new(WINDOWS));
+        let windows: Vec<_> = (0..WINDOWS)
+            .map(|window| {
+                let (path, start) = (data.path().to_owned(), Arc::clone(&start));
+                std::thread::spawn(move || {
+                    let state = companion_tauri::AppState::new();
+                    state.keep_under(&path);
+                    let id = format!("00000000-0000-4000-8000-{window:012}");
+                    let removal = serde_json::from_value(json!({
+                        "id": id,
+                        "expectedRevision": "1"
+                    }))
+                    .expect("a removal");
+                    start.wait();
+                    state
+                        .drafts()
+                        .mark_removal(removal)
+                        .expect("the removal is recorded");
+                })
+            })
+            .collect();
+        for window in windows {
+            window.join().expect("a window finished");
+        }
+        let state = companion_tauri::AppState::new();
+        state.keep_under(data.path());
+        let read = serde_json::to_value(state.drafts().read().expect("the drafts are read"))
+            .expect("an answer");
+        let owed = read["pendingRemovals"].as_array().expect("a list");
+        assert_eq!(
+            owed.len(),
+            WINDOWS,
+            "every window's removal is owed: {owed:?}"
+        );
+    }
 }

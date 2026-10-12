@@ -12,7 +12,9 @@
  * - a save of a draft that is no longer stored makes it again, under an identity of its own;
  * - a save keeps the draft's session, never takes it back to open, and moves the conversation it
  *   was written for only while it is empty or has none yet;
- * - a retarget names the version it was shown and is the one way back to open.
+ * - a retarget names the version it was shown and is the one way back to open;
+ * - a removal that could not be made is kept beside the drafts, and ends with the discard that
+ *   finds its draft gone or changed.
  */
 
 import type { AttachmentHandle } from '@kalareach/protocol'
@@ -47,6 +49,7 @@ export const FAKE_DRAFTS_KEY = 'kr.fake.device-drafts'
 /** A store of a device's drafts. */
 export class FakeDraftStore {
   #drafts = new Map<string, StoredDraft>()
+  #removals = new Map<string, DraftDiscardRequest>()
   #counter = 0
   #clock = 0
   #opens = true
@@ -64,10 +67,12 @@ export class FakeDraftStore {
     try {
       const parsed = JSON.parse(found) as {
         drafts: StoredDraft[]
+        removals?: DraftDiscardRequest[]
         counter: number
         clock: number
       }
       this.#drafts = new Map(parsed.drafts.map((draft) => [draft.id, draft]))
+      this.#removals = new Map((parsed.removals ?? []).map((removal) => [removal.id, removal]))
       this.#counter = parsed.counter
       this.#clock = parsed.clock
     } catch {
@@ -127,7 +132,18 @@ export class FakeDraftStore {
     if (!this.#opens) {
       refuse('STORAGE_UNAVAILABLE', 'the drafts kept on this device could not be opened')
     }
-    return { drafts: this.all(), unreadable: this.#unreadable }
+    return { drafts: this.all(), unreadable: this.#unreadable, pendingRemovals: this.pendingRemovals() }
+  }
+
+  /** The removals still to be made, as a test reads them. */
+  pendingRemovals(): readonly DraftDiscardRequest[] {
+    return [...this.#removals.values()]
+  }
+
+  /** Records a removal the page could not make. */
+  markRemoval(request: DraftDiscardRequest): void {
+    this.#removals.set(request.id, request)
+    this.#write()
   }
 
   save(request: DraftSaveRequest): DraftSaved {
@@ -212,13 +228,23 @@ export class FakeDraftStore {
     this.calls.push({ kind: 'discard' })
     if (this.#refuseDiscards) refuse(this.#refuseDiscards.code, this.#refuseDiscards.message)
     const held = this.#drafts.get(request.id)
-    if (held === undefined) return { removed: false }
+    if (held === undefined) {
+      this.#endRemoval(request.id)
+      return { removed: false }
+    }
     if (held.revision !== request.expectedRevision) {
+      // A draft that another window changed is theirs: no removal of it is left to make.
+      this.#endRemoval(request.id)
       refuse('DRAFT_CONFLICT', `draft ${request.id} is at version ${held.revision}, not ${request.expectedRevision}: another window changed it`)
     }
     this.#drafts.delete(request.id)
+    this.#endRemoval(request.id)
     this.#write()
     return { removed: true }
+  }
+
+  #endRemoval(id: string): void {
+    if (this.#removals.delete(id)) this.#write()
   }
 
   #make(request: DraftSaveRequest, files: readonly AttachmentHandle[], copyOf: string | null = null): StoredDraft {
@@ -252,7 +278,12 @@ export class FakeDraftStore {
   #write(): void {
     this.#disk?.setItem(
       FAKE_DRAFTS_KEY,
-      JSON.stringify({ drafts: [...this.#drafts.values()], counter: this.#counter, clock: this.#clock })
+      JSON.stringify({
+        drafts: [...this.#drafts.values()],
+        removals: [...this.#removals.values()],
+        counter: this.#counter,
+        clock: this.#clock
+      })
     )
   }
 }

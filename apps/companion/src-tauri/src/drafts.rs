@@ -25,6 +25,10 @@
 //!   is bounded, and a preview can fill it.
 //! * **A save is stored whole or refused.** A new draft whose text fits and whose files do not is
 //!   not stored at all, so what the page is told is stored is stored.
+//! * **A removal that could not be made is not forgotten.** The page records the version it still
+//!   has to remove, in a ledger beside the store, and the next start reads it back with the
+//!   drafts: a prompt the host took does not return as a draft because the disk refused once.
+//!   A discard that ends, even in another window's change, takes its entry out.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
@@ -50,6 +54,19 @@ pub fn drafts_in(data: &Path) -> PathBuf {
 /// The file that says which device owns the drafts, under an application data directory.
 fn owner_file(data: &Path) -> PathBuf {
     data.join("drafts-owner")
+}
+
+/// The ledger of removals still to be made, under an application data directory.
+fn removals_file(data: &Path) -> PathBuf {
+    data.join("drafts-removals")
+}
+
+/// What a ledger file holds: nothing when it is not there or cannot be read.
+fn read_removals(file: &Path) -> Vec<DiscardParams> {
+    std::fs::read(file)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
 }
 
 /// The drafts of this device, and the place they are kept.
@@ -104,7 +121,103 @@ impl DraftDesk {
         Ok(Stored {
             drafts: listing.drafts.iter().map(StoredDraft::of).collect(),
             unreadable: listing.unreadable.len(),
+            pending_removals: self.removals(),
         })
+    }
+
+    /// The removals the page recorded and has not finished. A ledger that cannot be read is an
+    /// empty one: it only ever names drafts that are still stored, and nothing is lost by it.
+    fn removals(&self) -> Vec<DiscardParams> {
+        let Some(data) = self
+            .data
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+        else {
+            return Vec::new();
+        };
+        read_removals(&removals_file(&data))
+    }
+
+    /// Changes the ledger as one step that no other writer, in this application or in another
+    /// window of it, can come between: the ledger is read, `change` is made to it, and it is
+    /// written whole under a name of its own and then put in place, so that a crash leaves the one
+    /// before or the one after and never half of one. Nothing is written when `change` says it
+    /// changed nothing.
+    fn change_removals(&self, change: impl FnOnce(&mut Vec<DiscardParams>) -> bool) -> Result<()> {
+        use std::io::Write as _;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static STAGED: AtomicU64 = AtomicU64::new(0);
+
+        let data = self
+            .data
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+            .ok_or_else(|| {
+                CommandError::unsupported("removals cannot be kept: there is no place for them")
+            })?;
+        let unavailable = |error: std::io::Error| {
+            CommandError::local_failure(format!(
+                "the removals still to be made cannot be kept: {error}"
+            ))
+        };
+        std::fs::create_dir_all(&data).map_err(unavailable)?;
+        // The lock is on a file of its own, held until this returns: a lock on the ledger itself
+        // would go with the name it is renamed over.
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(data.join("drafts-removals.lock"))
+            .map_err(unavailable)?;
+        lock.lock().map_err(unavailable)?;
+        let file = removals_file(&data);
+        let mut removals = read_removals(&file);
+        if !change(&mut removals) {
+            return Ok(());
+        }
+        let bytes = serde_json::to_vec(&removals)
+            .map_err(|error| CommandError::local_failure(error.to_string()))?;
+        let staged = file.with_extension(format!(
+            "staged-{}-{}",
+            std::process::id(),
+            STAGED.fetch_add(1, Ordering::Relaxed)
+        ));
+        let mut written = std::fs::File::create(&staged).map_err(unavailable)?;
+        written.write_all(&bytes).map_err(unavailable)?;
+        written.sync_all().map_err(unavailable)?;
+        std::fs::rename(&staged, &file).map_err(unavailable)
+    }
+
+    /// Records a removal the page could not make, so that a start after it finishes it.
+    ///
+    /// # Errors
+    ///
+    /// Returns why the ledger cannot be written.
+    pub fn mark_removal(&self, removal: DiscardParams) -> Result<()> {
+        self.change_removals(|removals| {
+            removals.retain(|held| held.id != removal.id);
+            removals.push(removal);
+            true
+        })
+    }
+
+    /// Takes a draft's entry out of the ledger, because the removal it names is over.
+    ///
+    /// With a `version`, only an entry that names that version goes: a removal of a later version
+    /// of the same draft is still owed. Without one, the draft is gone and so is every entry for it.
+    fn clear_removal(&self, id: DraftId, version: Option<DraftRevision>) {
+        // A ledger that cannot be written keeps an entry whose draft is gone, which the next
+        // discard finds already removed and clears.
+        let _ = self.change_removals(|removals| {
+            let before = removals.len();
+            removals.retain(|held| {
+                held.id != id || version.is_some_and(|named| held.expected_revision != named)
+            });
+            removals.len() != before
+        });
     }
 
     /// Saves a draft: creates it when it has no identity yet, else replaces the version it names.
@@ -224,11 +337,21 @@ impl DraftDesk {
     /// Returns a revision conflict when the draft moved since, or the store's failure. A draft that
     /// is not there is already removed.
     pub fn discard(&self, params: &DiscardParams) -> Result<Discarded> {
-        let removed = self
-            .store()?
-            .remove_at(params.id, params.expected_revision)
-            .map_err(failure)?;
-        Ok(Discarded { removed })
+        let removed = self.store()?.remove_at(params.id, params.expected_revision);
+        match removed {
+            Ok(removed) => {
+                self.clear_removal(params.id, None);
+                Ok(Discarded { removed })
+            }
+            Err(error) => {
+                // A draft that another window changed is theirs now: the removal of the version
+                // this named is over, and one of a later version is still owed.
+                if is_revision_conflict(&error) {
+                    self.clear_removal(params.id, Some(params.expected_revision));
+                }
+                Err(failure(error))
+            }
+        }
     }
 }
 
@@ -407,6 +530,8 @@ pub struct Stored {
     pub drafts: Vec<StoredDraft>,
     /// How many files in the store could not be read. They are left where they are.
     pub unreadable: usize,
+    /// The removals the page began and could not finish, each naming the version to remove.
+    pub pending_removals: Vec<DiscardParams>,
 }
 
 /// One stored draft, as the page reads it.
@@ -525,8 +650,8 @@ pub struct RetargetParams {
     pub agent_binding_revision: Option<AgentBindingRevision>,
 }
 
-/// The parameters of a discard.
-#[derive(Debug, Deserialize)]
+/// The parameters of a discard, and of a removal still to be made.
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct DiscardParams {
     /// The draft.
