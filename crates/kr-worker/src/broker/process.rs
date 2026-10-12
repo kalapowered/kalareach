@@ -37,7 +37,7 @@ const HEX: [u8; 16] = *b"0123456789abcdef";
 /// the broker is about to start, and used to authenticate that process when it connects.
 ///
 /// What this type guarantees, exactly: there is no accessor that returns the bytes, `Debug`
-/// redacts, the value leaves the broker only through [`ManagedProcess::write_registration`], and
+/// redacts, the value leaves the broker only through [`Credential::write_file`], and
 /// the bytes live in the host's own zeroising secret buffer, so the wipe on drop is the one the
 /// cryptography crate performs rather than ordinary stores an optimiser may remove.
 pub struct Credential {
@@ -81,14 +81,22 @@ impl Credential {
         }
     }
 
-    /// Writes the credential to a new owner-only file inside an owner-only directory.
+    /// Writes the credential to a new owner-only file inside an owner-only directory, for the
+    /// launched process to read.
+    ///
+    /// The host's own owner-only publication is what writes it: the contents are complete before
+    /// the name exists, and the create refuses to replace a name already there, so a file another
+    /// writer planted is never written into and never read as though this host had written it.
+    /// The directory is checked first ([`check_private_directory`]), and a platform that cannot
+    /// establish that a file holding a secret is closed to other accounts refuses the publication
+    /// instead of writing it.
     ///
     /// # Errors
     ///
     /// Returns [`BrokerError::UnsupportedCapability`] on a platform without verifiable owner-only
     /// files, and [`BrokerError::LedgerUnavailable`] when the directory is not private or the file
     /// cannot be created or written.
-    pub(crate) fn write_file(&self, path: &std::path::Path) -> Result<()> {
+    pub fn write_file(&self, path: &std::path::Path) -> Result<()> {
         if !ManagedProcess::publishes_credential_file() {
             return Err(BrokerError::UnsupportedCapability {
                 detail: "this platform cannot prove a file is closed to other accounts, so the \
@@ -368,25 +376,6 @@ impl ManagedProcess {
     pub fn runs_command_backends() -> bool {
         Self::command_backends_failure().is_none()
     }
-
-    /// Writes the registration file the launched process reads its credential from.
-    ///
-    /// The host's own owner-only publication is what writes it: the contents are complete before
-    /// the name exists, and the create refuses to replace a name already there, so a file another
-    /// writer planted is never written into and never read as though this host had written it.
-    ///
-    /// The directory it goes in is checked first ([`check_private_directory`]), and a platform that
-    /// cannot establish that a file holding a secret is closed to other accounts refuses the
-    /// publication instead of writing it.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`BrokerError::UnsupportedCapability`] on a platform without verifiable owner-only
-    /// files, and [`BrokerError::LedgerUnavailable`] when the directory is not private or the file
-    /// cannot be created or written.
-    pub fn write_registration(&self, path: &std::path::Path) -> Result<()> {
-        self.credential.write_file(path)
-    }
 }
 
 /// Checks that a directory is the owning user's and closed to everybody else.
@@ -621,9 +610,9 @@ mod tests {
         std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))
             .expect("the directory is made private");
         let path = directory.join("registration");
-        let managed = managed(Credential::from_bytes([9; CREDENTIAL_BYTES]));
-        managed
-            .write_registration(&path)
+        let credential = Credential::from_bytes([9; CREDENTIAL_BYTES]);
+        credential
+            .write_file(&path)
             .expect("the registration is written");
         let mode = std::fs::metadata(&path)
             .expect("the file is there")
@@ -631,7 +620,7 @@ mod tests {
             .mode();
         assert_eq!(mode & 0o777, 0o600);
         assert!(
-            managed.write_registration(&path).is_err(),
+            credential.write_file(&path).is_err(),
             "a registration file another writer planted is never written into"
         );
         let open = std::env::temp_dir().join(format!("kr-broker-{}", kr_ipc::new_uuid()));
@@ -639,9 +628,7 @@ mod tests {
         std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o755))
             .expect("the directory is made readable by others");
         assert!(
-            managed
-                .write_registration(&open.join("registration"))
-                .is_err(),
+            credential.write_file(&open.join("registration")).is_err(),
             "a credential is never written into a directory other users can read"
         );
         let _ = std::fs::remove_dir_all(&open);
@@ -683,18 +670,18 @@ mod tests {
         assert!(ManagedProcess::publishes_credential_file());
         let ordinary = std::env::temp_dir().join(format!("kr-broker-{}", kr_ipc::new_uuid()));
         std::fs::create_dir_all(&ordinary).expect("the directory is created");
-        let managed = managed(Credential::from_bytes([9; CREDENTIAL_BYTES]));
+        let credential = Credential::from_bytes([9; CREDENTIAL_BYTES]);
         assert!(
-            managed
-                .write_registration(&ordinary.join("registration"))
+            credential
+                .write_file(&ordinary.join("registration"))
                 .is_err()
         );
         assert!(!ordinary.join("registration").exists());
 
         let private = std::env::temp_dir().join(format!("kr-broker-{}", kr_ipc::new_uuid()));
         kr_ipc::paths::create_private_directory(&private).expect("a private directory is made");
-        managed
-            .write_registration(&private.join("registration"))
+        credential
+            .write_file(&private.join("registration"))
             .expect("a directory the host made takes it");
         let _ = std::fs::remove_dir_all(&ordinary);
         let _ = std::fs::remove_dir_all(&private);
