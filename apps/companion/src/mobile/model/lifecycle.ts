@@ -73,7 +73,8 @@ export function persist(store: DurableStore, state: DurableState): boolean {
  * Reads what the last run left, and puts it in the state a fresh process is actually in.
  *
  * Nothing is connected yet, so every submission that was in flight is of unknown outcome. That is a
- * recovery, not a failure, and not a claim.
+ * recovery, not a failure, and not a claim. A submission that was still queued is one too: the phone
+ * keeps it queued from the press until the host answers, so its request may have left.
  */
 export function restore(store: DurableStore): DurableState {
   const submissions = readList<Submission>(
@@ -85,9 +86,7 @@ export function restore(store: DurableStore): DurableState {
       typeof each.state === 'string'
   )
   return {
-    submissions: submissions.map((submission) =>
-      submission.state === 'queued' ? submission : { ...submission, state: 'unknown' as const }
-    )
+    submissions: submissions.map((submission) => ({ ...submission, state: 'unknown' as const }))
   }
 }
 

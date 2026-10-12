@@ -34,6 +34,12 @@ export interface Submission {
   readonly state: InputState
   /** The revision of the newest receipt this has taken, so that an older one never replaces it. */
   readonly revision?: string
+  /**
+   * The stored draft the prompt was sent from, when the device kept one for it. A phone keeps its
+   * unresolved submissions across a restart, and this is how a prompt that is then said to have been
+   * applied finds the draft that holds its text: the draft, and not any draft with the same words.
+   */
+  readonly storedDraftId?: string
   /** When it was created. */
   readonly createdAtMs: number
   /** The failure, when it has one. */

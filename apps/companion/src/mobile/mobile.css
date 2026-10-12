@@ -1058,3 +1058,27 @@
   line-height: 1.5;
   color: var(--faint);
 }
+
+/* The actions that are not finished, besides the newest: each with its own status, and the text it
+   sent wrapping under it at a large text size. */
+.m-earlier {
+  list-style: none;
+  margin: var(--gap-2) 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--gap-2);
+}
+
+.m-earlier li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--gap-2);
+  min-width: 0;
+}
+
+.m-earlier li > span:last-child {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}

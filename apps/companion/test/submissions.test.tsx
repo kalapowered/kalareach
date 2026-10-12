@@ -624,8 +624,12 @@ describe('on the phone', () => {
       expect(sent).toHaveLength(2)
     })
     expect(sent[1]).toMatchObject({ text: 'run the migration' })
-    // The second action is applied, and the first, which nobody knows, still holds the session.
+    // The second action is applied, and the first, which nobody knows, is listed with its own
+    // status and still holds the session.
     expect(await screen.findByText('Applied', {}, { timeout: 3_000 })).toBeInTheDocument()
+    const earlier = screen.getByTestId('earlier-actions')
+    expect(within(earlier).getByText('Outcome unknown')).toBeInTheDocument()
+    expect(within(earlier).getByText('run the migration')).toBeInTheDocument()
     expect(screen.getByText(/One action has no confirmed outcome yet/)).toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Send' })).toBeDisabled()
   })
@@ -639,42 +643,99 @@ describe('on the phone', () => {
     expect(screen.queryByRole('button', { name: 'I checked; send anyway' })).toBeNull()
   })
 
-  it('removes the text of a prompt that nobody knew the end of when the application had started again, once the host says it was applied', async () => {
-    const storage = fakeStorage()
-    const device = new FakeDraftStore()
-    const person = userEvent.setup()
-    const run = (recorded: Recorded) => {
-      const host = fakeHost({ drafts: device })
-      return render(
-        <AppProvider port={answering(host.port, UNCONFIRMED, recorded)}>
-          <MobileApp surface="ios" storage={storage} />
-        </AppProvider>
-      )
+  describe('when the application starts again after a prompt nobody knew the end of', () => {
+    /** One phone's storage and device store, and the person, over any number of runs. */
+    function runs() {
+      const storage = fakeStorage()
+      const device = new FakeDraftStore()
+      const person = userEvent.setup()
+      const run = (answer: Settled<AgentMutationResult> | 'never', recorded: Recorded) => {
+        const host = fakeHost({ drafts: device })
+        const port = answering(host.port, answer === 'never' ? UNCONFIRMED : answer, recorded)
+        return render(
+          <AppProvider
+            port={answer === 'never' ? { ...port, composerSubmit: () => new Promise(() => undefined) } : port}
+          >
+            <MobileApp surface="ios" storage={storage} />
+          </AppProvider>
+        )
+      }
+      const open = async () => {
+        await person.click(await screen.findByRole('button', { name: /^Sessions/ }))
+        await person.click(await screen.findByRole('button', { name: /Session 1/ }))
+        return await screen.findByLabelText('Message this session')
+      }
+      return { device, person, run, open }
     }
-    // The first run sends a prompt and is never told what became of it, and then ends.
-    const first = run({ state: 'unknown' })
-    await person.click(await screen.findByRole('button', { name: /^Sessions/ }))
-    await person.click(await screen.findByRole('button', { name: /Session 1/ }))
-    await person.type(await screen.findByLabelText('Message this session'), 'run the migration')
-    await person.click(screen.getByRole('button', { name: 'Send' }))
-    await screen.findByText(/no confirmed outcome yet/)
-    first.unmount()
 
-    // The next run finds the text under its stored draft, held: nobody knows yet what became of it.
-    run({ state: 'applied' })
-    await person.click(await screen.findByRole('button', { name: /^Sessions/ }))
-    await person.click(await screen.findByRole('button', { name: /Session 1/ }))
-    expect(await screen.findByLabelText('Message this session')).toBeInTheDocument()
+    it('keeps the session held, and offers the way past, for a prompt that was on its way when it ended', async () => {
+      const { person, run, open } = runs()
+      // The first run presses Send and the application ends before the host answers.
+      const first = run('never', { state: 'unknown' })
+      await person.type(await open(), 'run the migration')
+      await person.click(screen.getByRole('button', { name: 'Send' }))
+      first.unmount()
 
-    // The host's record says it was applied: the text goes, and the store keeps nothing of it.
-    await waitFor(
-      () => {
-        expect(screen.getByLabelText('Message this session')).toHaveValue('')
-      },
-      { timeout: 3_000 }
-    )
-    await waitFor(() => {
-      expect(device.all()).toEqual([])
+      run(UNCONFIRMED, { state: 'unknown' })
+      await open()
+
+      // The request may have left, so it is an action nobody knows the end of, which a person who
+      // checked can send past.
+      expect(await screen.findByRole('button', { name: 'I checked; send anyway' })).toBeInTheDocument()
+      expect(screen.getByRole('button', { name: 'Send' })).toBeDisabled()
+    })
+
+    it('does not clear a newer draft that holds the same words', async () => {
+      const { device, person, run, open } = runs()
+      const first = run(UNCONFIRMED, { state: 'unknown' })
+      const field = await open()
+      await person.type(field, 'continue')
+      await person.click(screen.getByRole('button', { name: 'Send' }))
+      await screen.findByText(/no confirmed outcome yet/)
+      // The person throws the returned text away and writes the same words again: a draft of its own.
+      await person.clear(screen.getByLabelText('Message this session'))
+      await person.type(screen.getByLabelText('Message this session'), 'continue')
+      await waitFor(() => {
+        expect(device.all().map((draft) => draft.text)).toEqual(['continue'])
+      })
+      first.unmount()
+
+      run(UNCONFIRMED, { state: 'applied' })
+      await open()
+      await waitFor(
+        () => {
+          expect(screen.queryByText(/no confirmed outcome yet/)).toBeNull()
+        },
+        { timeout: 3_000 }
+      )
+      // The earlier prompt was applied; the newer draft is not that prompt's.
+      expect(screen.getByLabelText('Message this session')).toHaveValue('continue')
+      expect(device.all().map((draft) => draft.text)).toEqual(['continue'])
+    })
+
+    it('removes the text of a prompt, once the host says it was applied', async () => {
+      const { device, person, run, open } = runs()
+      // The first run sends a prompt and is never told what became of it, and then ends.
+      const first = run(UNCONFIRMED, { state: 'unknown' })
+      await person.type(await open(), 'run the migration')
+      await person.click(screen.getByRole('button', { name: 'Send' }))
+      await screen.findByText(/no confirmed outcome yet/)
+      first.unmount()
+
+      // The next run finds the text under its stored draft, held: nobody knows yet what became of it.
+      run(UNCONFIRMED, { state: 'applied' })
+      expect(await open()).toBeInTheDocument()
+
+      // The host's record says it was applied: the text goes, and the store keeps nothing of it.
+      await waitFor(
+        () => {
+          expect(screen.getByLabelText('Message this session')).toHaveValue('')
+        },
+        { timeout: 3_000 }
+      )
+      await waitFor(() => {
+        expect(device.all()).toEqual([])
+      })
     })
   })
 

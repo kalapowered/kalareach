@@ -1892,7 +1892,7 @@ describe('two windows that hold the same draft', () => {
   it('let only the first claim it to send: the second is refused while the first is on its way', async () => {
     const { one, two } = await twoHolding()
     const first = one.beginSend(MAIN)
-    await expect(first.claimed).resolves.toBeUndefined()
+    await expect(first.claimed).resolves.toEqual(expect.any(String))
 
     const second = two.beginSend(MAIN)
     await expect(second.claimed).rejects.toMatchObject({ code: 'DRAFT_CONFLICT' })
@@ -1931,7 +1931,7 @@ describe('two windows that hold the same draft', () => {
     type(book, MAIN, 'two')
     await book.settled()
     const second = book.beginSend(MAIN)
-    await expect(second.claimed).resolves.toBeUndefined()
+    await expect(second.claimed).resolves.toEqual(expect.any(String))
   })
 })
 
@@ -2296,6 +2296,72 @@ describe('a prompt the host is said to have applied after nobody knew what becam
       expect(book.draft(MAIN).attachments.map((file) => file.localId)).toEqual(['file-1'])
       // The file is kept with the composer's own draft, and none of the text that was sent is.
       expect(store.all().map((draft) => [draft.text, draft.attachments.length])).toEqual([['', 1]])
+    })
+  })
+
+  describe('that an earlier run of the application sent', () => {
+    /** An earlier run sends 'send this' from its composer and is never told how it ended. */
+    async function earlierRun(
+      store: FakeDraftStore,
+      composerAfter?: string
+    ): Promise<{ readonly storedDraftId: string | null }> {
+      const book = await opened(store)
+      type(book, MAIN, 'send this')
+      await book.settled()
+      const token = book.beginSend(MAIN)
+      const storedDraftId = await token.claimed
+      type(book, MAIN, composerAfter ?? '')
+      book.endSend(token, 'unknown', 'local-1')
+      await book.settled()
+      return { storedDraftId }
+    }
+
+    it('is removed with its draft when the store could not be opened at the start and is opened later', async () => {
+      const store = new FakeDraftStore()
+      const { storedDraftId } = await earlierRun(store)
+      expect(storedDraftId).not.toBeNull()
+
+      store.breakOpening()
+      const book = new DraftBook(portOver(store))
+      await book.hydrate()
+      book.sendSettled('local-1', 'applied', { sessionId: MAIN, text: 'send this', storedDraftId: storedDraftId ?? '' })
+      await book.settled()
+      store.mendOpening()
+      await book.hydrate()
+      await book.settled()
+
+      expect(book.draft(MAIN).text).toBe('')
+      expect(store.all()).toEqual([])
+    })
+
+    it('is removed from the list of kept drafts when the person had written something else since', async () => {
+      const store = new FakeDraftStore()
+      const { storedDraftId } = await earlierRun(store, 'newer')
+      const book = await opened(store)
+      expect(book.snapshot().kept.map((kept) => kept.text)).toEqual(['send this'])
+
+      book.sendSettled('local-1', 'applied', { sessionId: MAIN, text: 'send this', storedDraftId: storedDraftId ?? '' })
+      await book.settled()
+
+      expect(book.snapshot().kept).toEqual([])
+      expect(book.draft(MAIN).text).toBe('newer')
+      expect(store.all().map((draft) => draft.text)).toEqual(['newer'])
+    })
+
+    it('leaves a draft that is not the one it was sent from, whatever its words', async () => {
+      const store = new FakeDraftStore()
+      await earlierRun(store)
+      const book = await opened(store)
+
+      book.sendSettled('local-1', 'applied', {
+        sessionId: MAIN,
+        text: 'send this',
+        storedDraftId: '00000000-0000-4000-8000-0000000000ff'
+      })
+      await book.settled()
+
+      expect(book.draft(MAIN).text).toBe('send this')
+      expect(store.all().map((draft) => draft.text)).toEqual(['send this'])
     })
   })
 

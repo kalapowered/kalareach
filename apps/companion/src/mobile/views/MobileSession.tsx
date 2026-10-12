@@ -617,7 +617,13 @@ export function MobileSession({
       ask(async () => {
         // The prompt is sent only once the stored draft is this window's to send: another window
         // that holds the same draft claims it first, and the other one sends nothing.
-        await sending.claimed
+        const storedDraftId = await sending.claimed
+        // What this submission is kept with across a restart names the draft its text is in.
+        if (storedDraftId !== null) {
+          lifecycle.setSubmissions((current) =>
+            current.map((each) => (each.localId === submission.localId ? { ...each, storedDraftId } : each))
+          )
+        }
         if (instance === null || revision === null) {
           // eslint-disable-next-line @typescript-eslint/only-throw-error -- refused as a command's failure is: data
           throw { code: 'UNSUPPORTED_CAPABILITY', message: 'No agent is running in this session.' }
@@ -726,7 +732,11 @@ export function MobileSession({
         current.map((each) => (each.localId === localId ? applyReceipt(each, receipt) : each))
       )
       // A run that started after the prompt was sent holds nothing of it but its text.
-      book.sendSettled(localId, after.state, { sessionId, text: before.text })
+      book.sendSettled(localId, after.state, {
+        sessionId,
+        text: before.text,
+        storedDraftId: before.storedDraftId
+      })
     },
     [lifecycle, book, sessionId]
   )
@@ -849,6 +859,20 @@ export function MobileSession({
       Send
     </Button>
   )
+  // The actions that are not finished, other than the newest, which the badge beside Send shows: an
+  // action sent past one nobody knows the end of leaves that one listed, with its own status.
+  const earlier = unresolved(mine).filter((submission) => submission !== mine.at(-1))
+  const earlierActions =
+    earlier.length === 0 ? null : (
+      <ul className="m-earlier" data-testid="earlier-actions">
+        {earlier.map((submission) => (
+          <li key={submission.localId}>
+            <Badge tone="accent">{describeState(submission.state)}</Badge>
+            <span className="small muted">{submission.label}</span>
+          </li>
+        ))}
+      </ul>
+    )
   const lastState = mine.slice(-1).map((submission) => (
     <Badge
       key={submission.localId}
@@ -1190,6 +1214,7 @@ export function MobileSession({
           {pane === 'terminal' ? (
             <>
               {reason}
+              {earlierActions}
               {release}
             </>
           ) : null}
@@ -1221,6 +1246,7 @@ export function MobileSession({
           {pane === 'semantic' ? (
             <>
               {reason}
+              {earlierActions}
               {release}
               {draft.state === 'conflicted' && currentTarget !== null ? (
                 <Button

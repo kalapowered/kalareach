@@ -168,9 +168,10 @@ export interface SendToken {
   /**
    * Settles once the stored draft is this window's to send, and rejects when it is not: another
    * window of the application changed it or sent it first, and this window sends nothing. The
-   * rejection is a command's failure, with the code `DRAFT_CONFLICT`.
+   * rejection is a command's failure, with the code `DRAFT_CONFLICT`. It settles with the identity
+   * of the stored draft the prompt was sent from, or null when the store holds none for it.
    */
-  readonly claimed: Promise<void>
+  readonly claimed: Promise<string | null>
 }
 
 /** A prompt sent from a draft, from the press to the host's answer. */
@@ -204,6 +205,11 @@ interface Flight {
   older?: StoredRef
   /** True once the prompt was said to have been applied after nobody knew: nothing of it is to be stored. */
   consumed?: boolean
+  /**
+   * True for a prompt of an earlier run, known by the stored draft it was sent from and by nothing
+   * else: a composer is cleared only when it holds that draft.
+   */
+  keyed?: boolean
 }
 
 /** How a write of a draft ended. */
@@ -405,15 +411,11 @@ export class DraftBook {
   #cached: BookSnapshot | null = null
   #inflight = 0
   #idle: (() => void)[] = []
-  /** Settles once the store has been read, or could not be: what an earlier run left is in the composers by then. */
-  readonly #read: Promise<void>
-  #hasRead: () => void = () => undefined
+  /** Prompts of earlier runs that were said to have been applied before the store was read. */
+  #earlier: { localId: string; sessionId: string; text: string; storedDraftId: string }[] = []
 
   constructor(port: HostPort) {
     this.#port = port
-    this.#read = new Promise<void>((resolve) => {
-      this.#hasRead = resolve
-    })
   }
 
   /** Subscribes to every change; the returned function unsubscribes. */
@@ -471,10 +473,10 @@ export class DraftBook {
       this.#problem = failureMessage(failure)
     }
     this.#changed()
-    this.#hasRead()
     if (this.#status === 'ready') {
       this.#scheduleAll()
       this.#hold(this.#settleAgain())
+      this.#settleEarlier()
     }
   }
 
@@ -621,11 +623,11 @@ export class DraftBook {
     const token = `send-${String(this.#sends)}`
     const flight: Flight = { id: token, composer: key, sent, record: null, earlier: null }
     this.#flights.set(token, flight)
-    let claim: { resolve: () => void; reject: (failure: unknown) => void } = {
+    let claim: { resolve: (stored: string | null) => void; reject: (failure: unknown) => void } = {
       resolve: () => undefined,
       reject: () => undefined
     }
-    const claimed = new Promise<void>((resolve, reject) => {
+    const claimed = new Promise<string | null>((resolve, reject) => {
       claim = { resolve, reject }
     })
     // A caller that sends nothing more has no use for the rejection, and it is not an unhandled one.
@@ -647,10 +649,10 @@ export class DraftBook {
             claimLost: true
           })
         } else {
-          claim.resolve()
+          claim.resolve(flight.record?.id ?? null)
         }
       } else {
-        claim.resolve()
+        claim.resolve(null)
       }
       // The composer lets go of the record: the next thing written is a draft of its own, and a
       // composer that still holds what was sent (a phone keeps it until the answer) needs no write.
@@ -679,13 +681,14 @@ export class DraftBook {
    * exactly its text is cleared; one that is said to be refused is as it was, kept.
    *
    * A submission this book knows nothing of was sent by an earlier run of the application, which a
-   * phone keeps the unresolved submissions of. `earlier` names its session and its text: when it is
-   * said to have been applied, a composer that shows exactly that text is cleared as above.
+   * phone keeps the unresolved submissions of. `earlier` names its session, its text and the stored
+   * draft it was sent from: when it is said to have been applied, that draft goes as above, if it
+   * still holds exactly that text.
    */
   sendSettled(
     localId: string,
     state: InputState,
-    earlier?: { readonly sessionId: string; readonly text: string }
+    earlier?: { readonly sessionId: string; readonly text: string; readonly storedDraftId?: string }
   ): void {
     const outcome = sendOutcomeOf(state)
     const key = this.#byLocal.get(localId)
@@ -712,26 +715,48 @@ export class DraftBook {
   }
 
   /**
-   * What the host's saying that a prompt of an earlier run was applied leaves behind: a composer
-   * that holds exactly its text, once the stored drafts have been read into the composers, is
-   * cleared with its record. A composer that holds a file, or other text, is the person's.
+   * What the host's saying that a prompt of an earlier run was applied leaves behind: the stored
+   * draft the prompt was sent from, if it still holds exactly the prompt's text, wherever it is by
+   * now: in a composer, or listed apart. A draft that is another one, whatever its words, is the
+   * person's. It waits until the store has been read, however long that takes.
    */
-  #takenEarlier(localId: string, earlier: { readonly sessionId: string; readonly text: string }): void {
-    const key = composerKey(earlier.sessionId)
-    void this.#read.then(() => {
+  #takenEarlier(
+    localId: string,
+    earlier: { readonly sessionId: string; readonly text: string; readonly storedDraftId?: string }
+  ): void {
+    // A prompt the store held no draft for left nothing to come back.
+    if (earlier.storedDraftId === undefined || earlier.text === '') return
+    if (this.#earlier.some((each) => each.localId === localId)) return
+    this.#earlier.push({ localId, sessionId: earlier.sessionId, text: earlier.text, storedDraftId: earlier.storedDraftId })
+    this.#settleEarlier()
+  }
+
+  /** Makes the late end of every prompt of an earlier run that is waiting, once the store has been read. */
+  #settleEarlier(): void {
+    if (this.#status !== 'ready') return
+    const waiting = this.#earlier
+    this.#earlier = []
+    for (const each of waiting) {
+      const key = composerKey(each.sessionId)
       this.#enqueue(key, async () => {
         const composer = this.#find(key)
-        if (composer === undefined || earlier.text === '' || composer.text !== earlier.text) return
-        const flight: Flight = {
-          id: `earlier-${localId}`,
-          composer: key,
-          sent: { ...composer, attachments: [] },
-          record: composer.stored,
-          earlier: null
+        let record: StoredRef | null = null
+        if (composer?.stored?.id === each.storedDraftId && composer.text === each.text) {
+          record = composer.stored
+        } else {
+          const listed = this.#others.find((other) => other.id === each.storedDraftId)
+          if (listed !== undefined && listed.text === each.text) {
+            record = { id: listed.id, revision: listed.revision }
+          }
         }
-        await this.#takenLate(flight)
+        if (record === null) return
+        const sent: Draft = {
+          ...startDraft(key, { sessionId: each.sessionId, applicationInstanceId: null, agentBindingRevision: null }, Date.now()),
+          text: each.text
+        }
+        await this.#takenLate({ id: `earlier-${each.localId}`, composer: key, sent, record, earlier: null, keyed: true })
       })
-    })
+    }
   }
 
   /**
@@ -748,7 +773,9 @@ export class DraftBook {
     flight.consumed = true
     const composer = this.#find(flight.composer)
     const cleared =
-      composer !== undefined && holdsTextSent(composer, flight.sent)
+      composer !== undefined &&
+      holdsTextSent(composer, flight.sent) &&
+      (flight.keyed !== true || composer.stored?.id === flight.record?.id)
         ? await this.#clearSentFrom(composer, flight)
         : null
     await this.#dropKept(flight, cleared)
