@@ -3540,24 +3540,19 @@ fn names_the_actions(
     assert_eq!(reported.omitted_actions.get(), 0);
 }
 
-/// Whether a result already carries every name a worker's fence produced: its barrier holds and no
-/// name is still on its way.
+/// Whether a result says nothing more of the worker than that its barrier holds: it is
+/// acknowledged, no name is on its way and none is left unasked or unread.
 ///
 /// A worker's first answer to an announcement can be pending whatever the case does. The worker
 /// refuses the announcement while anything else holds its dispatch boundary, and the daemon cuts
 /// off an exchange that takes longer than its bound, which a fence that commits every rejection by
-/// itself can, on a disk that is slow to flush. Either way the daemon asks again, so a case that
-/// needs the whole result announces again until this accepts it ([`announced_until`]) and never
-/// reads the first answer as the last.
-fn named_in_full(
-    barrier: &kr_protocol::action::RevocationBarrier,
-    hosted: &Hosted,
-    rejected: usize,
-) -> bool {
-    barrier.holds() && {
-        let reported = worker_report(barrier, hosted.session_id);
-        reported.names_pending.get() == 0 && reported.rejected_actions.len() == rejected
-    }
+/// itself can, on a disk that is slow to flush. Either way the next announcement asks again, so a
+/// case that needs the whole result announces again until this accepts it ([`announced_until`])
+/// and never reads the first answer as the last. What the settled result names is then the case's
+/// to assert ([`names_the_actions`]), so that a result that is complete and names too little fails
+/// there and not as a wait that did not end.
+fn named_in_full(barrier: &kr_protocol::action::RevocationBarrier, hosted: &Hosted) -> bool {
+    barrier.holds() && worker_report(barrier, hosted.session_id).detail.is_empty()
 }
 
 /// A daemon and a worker that has fenced the revision in force and told the daemon so, with a lease
@@ -3639,9 +3634,10 @@ async fn a_worker_told_two_revisions_by_name_has_the_actions_of_both_in_each_res
     .expect("the second revocation is recorded");
     assert_eq!(answered.authority_revision.get(), held + 2);
     let answered = announced_until(&hosted.controller, answered.barrier, |barrier| {
-        named_in_full(barrier, &hosted, rejected)
+        named_in_full(barrier, &hosted)
     })
     .await;
+    assert_eq!(answered.authority_revision.get(), held + 2);
     names_the_actions(&answered, &hosted, &device, rejected, dispatched);
 
     go.send(()).expect("the first revocation waits at its stop");
@@ -3652,9 +3648,10 @@ async fn a_worker_told_two_revisions_by_name_has_the_actions_of_both_in_each_res
         .expect("the first revocation is recorded");
     assert_eq!(late.authority_revision.get(), held + 2);
     let late = announced_until(&hosted.controller, late.barrier, |barrier| {
-        named_in_full(barrier, &hosted, rejected)
+        named_in_full(barrier, &hosted)
     })
     .await;
+    assert_eq!(late.authority_revision.get(), held + 2);
     names_the_actions(&late, &hosted, &device, rejected, dispatched);
 
     // The order the worker was first told them in: an announcement the worker answered late is
@@ -3741,9 +3738,10 @@ async fn a_worker_told_a_revision_of_the_host_and_then_one_by_name_has_the_actio
     .expect("the second revocation is recorded");
     assert_eq!(answered.authority_revision.get(), held + 2);
     let answered = announced_until(&hosted.controller, answered.barrier, |barrier| {
-        named_in_full(barrier, &hosted, rejected)
+        named_in_full(barrier, &hosted)
     })
     .await;
+    assert_eq!(answered.authority_revision.get(), held + 2);
     names_the_actions(&answered, &hosted, &device, rejected, dispatched);
 
     go.send(()).expect("the first revocation waits at its stop");
@@ -3754,9 +3752,10 @@ async fn a_worker_told_a_revision_of_the_host_and_then_one_by_name_has_the_actio
         .expect("the first revocation is recorded");
     assert_eq!(late.authority_revision, AuthorityRevision::new(held + 2));
     let late = announced_until(&hosted.controller, late, |barrier| {
-        named_in_full(barrier, &hosted, rejected)
+        named_in_full(barrier, &hosted)
     })
     .await;
+    assert_eq!(late.authority_revision, AuthorityRevision::new(held + 2));
     names_the_actions(&late, &hosted, &device, rejected, dispatched);
 
     // The order the worker was first told them in: an announcement the worker answered late is
