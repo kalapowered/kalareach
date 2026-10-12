@@ -219,8 +219,6 @@ async fn kr_req_23_49_a_repeat_while_the_action_runs_is_told_so_and_a_later_repe
     let mut attempt = Attempt::new(
         Kind::Redeem,
         &composed,
-        "host",
-        "device",
         Some(issued.grant.grant_id),
         0,
         "Accept",
@@ -336,5 +334,168 @@ async fn kr_req_23_49_a_repeat_while_the_action_runs_is_told_so_and_a_later_repe
     first.close();
     second.close();
     third.close();
+    host.stop().await;
+}
+
+/// KR-REQ-09.08: a request read back from a kept record is repeated nowhere it could be admitted
+/// for the first time, and nowhere the host's record of the action is not. The window it carries
+/// admits it on the connection that was issued the window, whether or not that connection composed
+/// it in this run, so a repeat there is refused before anything is sent; the host keeps its record
+/// under the actor that sent the request, so a repeat to another host, or as another actor, is
+/// refused before anything is sent too, and none of them wrote a share.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_09_08_a_request_from_a_record_is_repeated_only_where_the_hosts_record_can_answer() {
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    let (device, record) = recipient(&host, &owner).await;
+    let (session_id, _) = an_open_session(&host);
+    let (first, _) = local_session(&host).await;
+    let (second, _) = local_session(&host).await;
+    let action = ActionId::new(kr_ipc::new_uuid());
+    let params = share_params(session_id, &record);
+    let composed = first
+        .compose(
+            Method::GrantCreate,
+            action,
+            on_the_session(&host, session_id),
+            None,
+            &ParamsValue::empty(),
+            &params,
+            TTL,
+        )
+        .await
+        .expect("composed, nothing sent");
+
+    // What a client keeps and reads back: the request, its window, and the host and actor.
+    let kept = Attempt::new(Kind::Invite, &composed, None, 0, "Invite");
+    let restored = kept.composed();
+    assert_eq!(restored.request(), composed.request());
+    assert_eq!(restored.reach(), composed.reach());
+    assert!(
+        restored.reach().is_some(),
+        "a local connection says who it is"
+    );
+
+    // The connection that was issued the window refuses the repeat, though it is the same run and
+    // nothing was ever sent: the window would admit it there.
+    assert!(matches!(
+        first.repeat(&restored).await,
+        Err(ClientError::Misdirected { repeating: true })
+    ));
+    // And a restored request is never a first send.
+    assert!(matches!(
+        second.send(&restored).await,
+        Err(ClientError::Misdirected { repeating: false })
+    ));
+    assert!(
+        listed(&host, session_id).await.grants.is_empty(),
+        "neither sent anything"
+    );
+
+    // Another host: a second daemon, with a local connection of its own.
+    let elsewhere = Host::start(&owner).await;
+    let (other_host, _) = local_session(&elsewhere).await;
+    assert!(matches!(
+        other_host.repeat(&restored).await,
+        Err(ClientError::OtherHost)
+    ));
+    assert!(
+        listed(&elsewhere, session_id).await.grants.is_empty(),
+        "nothing was sent to the other host"
+    );
+
+    // Another actor on the same host: a paired device's connection acts as the device, not as the
+    // user the local socket authenticated.
+    let as_device = connect(&host, &device, &record).await;
+    assert!(matches!(
+        as_device.repeat(&restored).await,
+        Err(ClientError::OtherHost)
+    ));
+    assert!(
+        listed(&host, session_id).await.grants.is_empty(),
+        "and nothing was sent as another actor"
+    );
+    assert_eq!(
+        Reply::of(&as_device.repeat(&restored).await),
+        Reply::NotSent,
+        "a refusal made here is not the host's answer"
+    );
+
+    // A connection that cannot say who it is, or a record that does not, is not repeated to.
+    let mut anonymous = kept.clone();
+    anonymous.host = String::new();
+    assert!(anonymous.composed().reach().is_none());
+    assert!(matches!(
+        second.repeat(&anonymous.composed()).await,
+        Err(ClientError::OtherHost)
+    ));
+
+    // The same connection as before, a fresh one of the same user, asks and the host answers from
+    // nothing: it has no record of an action never sent, and writes nothing.
+    let unsent = second.repeat(&restored).await;
+    assert!(
+        matches!(&unsent, Err(ClientError::Host(_))),
+        "the host refuses what it never saw: {unsent:?}"
+    );
+    assert!(
+        listed(&host, session_id).await.grants.is_empty(),
+        "and a repeat is never a first admission"
+    );
+    first.close();
+    second.close();
+    other_host.close();
+    as_device.close();
+    elsewhere.stop().await;
+    host.stop().await;
+}
+
+/// KR-REQ-23.49: the library refuses a second send of an action it is still accounting for, and
+/// says so as its own refusal and not as the host's: a client that took it for a refusal of the
+/// action would close an attempt whose first send was committed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_23_49_a_second_send_of_a_held_action_is_refused_locally_and_is_not_the_hosts_answer()
+ {
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    let (_device, record) = recipient(&host, &owner).await;
+    let (session_id, _) = an_open_session(&host);
+    let (first, _) = local_session(&host).await;
+    let action = ActionId::new(kr_ipc::new_uuid());
+    let composed = first
+        .compose(
+            Method::GrantCreate,
+            action,
+            on_the_session(&host, session_id),
+            None,
+            &ParamsValue::empty(),
+            &share_params(session_id, &record),
+            TTL,
+        )
+        .await
+        .expect("composed");
+    let sent = first.send(&composed).await;
+    assert_eq!(Reply::of(&sent), Reply::Result);
+    assert_eq!(
+        first.submitted_actions().await.len(),
+        1,
+        "the action is held until its caller settles it"
+    );
+    let again = first.send(&composed).await;
+    assert!(
+        matches!(again, Err(ClientError::StillAccounting)),
+        "{again:?}"
+    );
+    assert_eq!(
+        Reply::of(&again),
+        Reply::NotSent,
+        "nothing the host said, so nothing that closes the attempt"
+    );
+    assert_eq!(
+        listed(&host, session_id).await.grants.len(),
+        1,
+        "and the share was written once"
+    );
+    first.settle(action).await;
+    first.close();
     host.stop().await;
 }

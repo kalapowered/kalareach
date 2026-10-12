@@ -92,6 +92,19 @@ pub enum ClientError {
         /// Whether the call was a repeat (otherwise the first send).
         repeating: bool,
     },
+    /// A composed mutation was handed to a connection to another host, or acting as another user,
+    /// than the one it was composed for, and nothing was sent.
+    ///
+    /// The host keeps its record of an action under the actor that sent it, so a repeat to
+    /// another host or as another actor finds no record, and what it finds instead is a first
+    /// admission or a refusal that says nothing of the action. It is not sent.
+    OtherHost,
+    /// This client is still accounting for the action, so it cannot carry another request, and
+    /// nothing was sent.
+    ///
+    /// It is not the host's answer: the earlier request can still be in flight or have been
+    /// answered, and a caller that classifies answers must not take this for a refusal of it.
+    StillAccounting,
     /// The connection ended before the request was answered.
     ConnectionEnded,
     /// The connection ended after a mutation was sent, so its outcome is unknown.
@@ -122,9 +135,11 @@ impl ClientError {
             Self::Host(error) | Self::Refused { error, .. } => error.code,
             Self::Transport(error) => error.to_protocol_error().code,
             Self::Ipc(error) => error.to_protocol_error().code,
-            Self::Cbor(_) | Self::WrongEffect { .. } | Self::Misdirected { .. } => {
-                ErrorCode::InvalidArgument
-            }
+            Self::Cbor(_)
+            | Self::WrongEffect { .. }
+            | Self::Misdirected { .. }
+            | Self::OtherHost
+            | Self::StillAccounting => ErrorCode::InvalidArgument,
             Self::UnsupportedVersion { .. } => ErrorCode::UnsupportedSchema,
             Self::TooManyOutstandingMutations { .. }
             | Self::TooManyUnresolvedActions { .. }
@@ -258,6 +273,14 @@ impl Said for ClientError {
             }
             Self::Misdirected { repeating: true } => Shown::said(
                 "a mutation is repeated on a connection other than the one that composed it",
+            ),
+            Self::OtherHost => Shown::said(
+                "a composed mutation is repeated only to the host, and as the user, it was composed \
+                 for",
+            ),
+            Self::StillAccounting => Shown::said(
+                "that action is one this client is still accounting for, so it cannot carry \
+                 another request",
             ),
             Self::ConnectionEnded => {
                 Shown::said("the connection ended before the request was answered")

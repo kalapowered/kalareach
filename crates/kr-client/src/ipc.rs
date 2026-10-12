@@ -31,7 +31,7 @@ use kr_protocol::local::{LocalClientKind, LocalPeer, LocalRole};
 use tokio::sync::Mutex;
 
 use crate::error::{ClientError, Result};
-use crate::transport::{ControlTransport, TransportFuture};
+use crate::transport::{ControlTransport, Reach, TransportFuture};
 
 /// What the host stamped on a local connection, in place of a device proof.
 ///
@@ -170,6 +170,15 @@ impl ControlTransport for IpcTransport {
 
     fn initial_action_window(&self) -> ActionWindow {
         self.initial_action_window.clone()
+    }
+
+    fn reach(&self) -> Option<Reach> {
+        // The host builds the actor a local caller's actions are claimed under from the user it
+        // authenticated, and states that user in its acknowledgement.
+        Some(Reach {
+            host: self.context.environment_id.to_string(),
+            actor: format!("local:{}", self.context.peer.uid.get()),
+        })
     }
 
     fn send<'a>(&'a self, frame: &'a ControlFrame) -> TransportFuture<'a, ()> {

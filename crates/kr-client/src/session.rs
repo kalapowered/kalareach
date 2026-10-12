@@ -35,7 +35,7 @@ use tokio::sync::{Mutex, broadcast, oneshot};
 use crate::cursors::{Delivery, ReceiptTracker, StreamCursors};
 use crate::error::{ClientError, Result};
 use crate::retry::{Attempts, Failure, Recovery, RequestClass};
-use crate::transport::ControlTransport;
+use crate::transport::{ControlTransport, Reach};
 
 /// How many events the session buffers for each subscriber.
 ///
@@ -217,39 +217,51 @@ impl Continuation {
     }
 }
 
-/// A mutation built and not yet sent: the request, exactly, and the connection it was built on.
+/// A mutation built and not yet sent: the request, exactly, the connection it was built on, and the
+/// host and actor it is for.
 ///
 /// It is what a client keeps to ask the host again about an action whose answer it lost. The
 /// request is kept whole, window included, because the host's record of an action is keyed by what
 /// the action was, and a request composed anew under a later window is a different request for the
-/// same action, which the host refuses. It never prints the request.
+/// same action, which the host refuses. The host keys that record by the actor that sent the
+/// request too, so a repeat is sent only to the host, and as the actor, it was composed for. It
+/// never prints the request.
 #[derive(Clone, PartialEq, Eq)]
 pub struct ComposedMutation {
     request: MutationRequest,
     /// The session that composed it, none for one read back from a record kept across a restart.
     composed_on: Option<u64>,
+    /// The host and actor it was composed for, none when the transport could not say.
+    reach: Option<Reach>,
     window_issued_at_ms: u64,
     window_valid_for_ms: u64,
 }
 
 crate::debug_fields!(ComposedMutation {
     composed_on,
+    reach,
     window_issued_at_ms,
     window_valid_for_ms
 });
 
 impl ComposedMutation {
     /// A composed mutation read back from a record a client kept, for a connection that did not
-    /// compose it. It can be repeated and never sent first.
+    /// compose it. It can be repeated and never sent first, and not at all by a connection whose
+    /// host and actor are not `reach`.
+    ///
+    /// Whether a connection issued the window it carries is decided by the window, so a restored
+    /// request is not repeated on the connection that was issued it either.
     #[must_use]
     pub const fn restored(
         request: MutationRequest,
         window_issued_at_ms: u64,
         window_valid_for_ms: u64,
+        reach: Option<Reach>,
     ) -> Self {
         Self {
             request,
             composed_on: None,
+            reach,
             window_issued_at_ms,
             window_valid_for_ms,
         }
@@ -265,6 +277,12 @@ impl ComposedMutation {
     #[must_use]
     pub const fn action_id(&self) -> ActionId {
         self.request.action_id
+    }
+
+    /// The host and actor the request is for, for a client to keep.
+    #[must_use]
+    pub const fn reach(&self) -> Option<&Reach> {
+        self.reach.as_ref()
     }
 
     /// When the host issued the window the request carries, in UTC milliseconds.
@@ -362,6 +380,10 @@ pub const MAX_UNRESOLVED_ACTIONS: usize = 1024;
 struct SessionState {
     waiters: std::sync::Mutex<Waiters>,
     action_window: Mutex<ActionWindow>,
+    /// Every action window the host issued to this connection, the current one included. A window
+    /// admits a request on the connection it was issued to and on no other, so a request carrying
+    /// one of these is one this connection could admit.
+    issued_windows: std::sync::Mutex<Vec<kr_protocol::ids::ActionWindowId>>,
     cursors: Mutex<StreamCursors>,
     /// What each action's receipt last said, and which actions were sent without a settled outcome.
     ///
@@ -449,9 +471,11 @@ impl Session {
         transport.claim_receiver()?;
         let (events, _) = broadcast::channel(EVENT_BUFFER);
         let limits = transport.limits();
+        let initial = transport.initial_action_window();
         let state = Arc::new(SessionState {
             waiters: std::sync::Mutex::new(Waiters::default()),
-            action_window: Mutex::new(transport.initial_action_window()),
+            issued_windows: std::sync::Mutex::new(vec![initial.action_window_id.clone()]),
+            action_window: Mutex::new(initial),
             cursors: Mutex::new(cursors),
             outcomes: Mutex::new(Outcomes::default()),
             events,
@@ -467,6 +491,12 @@ impl Session {
             next_request_id: AtomicU64::new(1),
             reader,
         })
+    }
+
+    /// The host this connection reaches and the actor it acts as, when the transport can say.
+    #[must_use]
+    pub fn reach(&self) -> Option<Reach> {
+        self.transport.reach()
     }
 
     /// Returns the transport, for opening data streams.
@@ -910,6 +940,7 @@ impl Session {
         Ok(ComposedMutation {
             request,
             composed_on: Some(self.id),
+            reach: self.transport.reach(),
             window_issued_at_ms: window.issued_at_ms.get(),
             window_valid_for_ms: window.valid_for_ms.get(),
         })
@@ -953,8 +984,25 @@ impl Session {
     /// Returns a refusal when this is the connection that composed the request, or when this
     /// client is still accounting for the action; and otherwise as [`Session::mutate`].
     pub async fn repeat(&self, composed: &ComposedMutation) -> Result<Settled> {
-        if composed.composed_on == Some(self.id) {
+        // Whether this connection composed the request is decided by the window it carries as well
+        // as by the record of it: a request read back from a kept record names no session, and its
+        // window still admits it here when the host has not seen it.
+        if composed.composed_on == Some(self.id)
+            || self
+                .state
+                .issued_windows
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains(&composed.request.action_window_id)
+        {
             return Err(ClientError::Misdirected { repeating: true });
+        }
+        // The host keeps its record under the actor that sent the request. Sent to another host or
+        // as another actor it would find none, which is a first admission or a refusal that says
+        // nothing of the action; it is not sent.
+        match (&composed.reach, self.transport.reach()) {
+            (Some(composed_for), Some(this)) if *composed_for == this => {}
+            _ => return Err(ClientError::OtherHost),
         }
         self.submit_composed(composed).await
     }
@@ -1001,7 +1049,9 @@ impl Session {
         let frame = ControlFrame::Mutation(Box::new(request));
         {
             let mut outcomes = self.state.outcomes.lock().await;
-            outcomes.refuse_replacement(action_id)?;
+            outcomes
+                .refuse_replacement(action_id)
+                .map_err(|_| ClientError::StillAccounting)?;
             outcomes.submit(SubmittedAction {
                 action_id,
                 method,
@@ -1333,6 +1383,15 @@ async fn route(state: &Arc<SessionState>, frame: ControlFrame) -> bool {
             }
         }
         ControlFrame::Event(ControlEvent::ActionWindowRenewed(window)) => {
+            {
+                let mut issued = state
+                    .issued_windows
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if !issued.contains(&window.action_window_id) {
+                    issued.push(window.action_window_id.clone());
+                }
+            }
             *state.action_window.lock().await = window;
         }
         ControlFrame::Event(ControlEvent::Keepalive) => {}

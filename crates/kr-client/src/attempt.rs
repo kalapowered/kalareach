@@ -22,8 +22,12 @@
 //!   admission check, and one that passed it earlier holds the store's lock until it commits, which
 //!   every read of the store waits for. A read of the host that finds nothing therefore counts only
 //!   after [`Attempt::bound`] has passed, measured as time elapsed on a clock that cannot be
-//!   stepped, never on the wall clock; after a restart, when no such clock survives, the whole
-//!   bound runs again from the restart. A read that blocks or fails leaves the attempt as it was.
+//!   stepped, never on the wall clock, and measured when the read *began* ([`Armed::read_begins`]):
+//!   the host takes the store's lock for a read when it reads the request, which is no earlier
+//!   than the client sent it, so a read that began after the bound was read after any commit of
+//!   the action, whatever the client did while it waited for the answer. After a restart, when no
+//!   such clock survives, the whole bound runs again from the restart. A read that blocks or
+//!   fails leaves the attempt as it was.
 //! * **A found grant is proof, an absent one is not.** What a read finds closes the attempt as
 //!   happened. What it does not find closes it as not done only where nothing but the action could
 //!   have put it there and taken it away: an invitation or a transfer. A revocation whose grant is
@@ -47,6 +51,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::ClientError;
 use crate::session::{ComposedMutation, Settled};
 use crate::shown::{IoFault, Shown};
+use crate::transport::Reach;
 
 /// The format of an attempt this build writes, recorded in it as `version`. An attempt of a later
 /// format is shown as unknown and never sent or changed.
@@ -249,18 +254,19 @@ crate::debug_fields!(Attempt {
 impl Attempt {
     /// A new attempt for a composed request, kept before the request is sent.
     ///
-    /// `grant_id` is what a read looks for, `host` and `standing` what the request was composed
-    /// for, and `composed_at_ms` the wall clock's reading, for display.
+    /// The host and the actor the request is for are the composed request's own. `grant_id` is
+    /// what a read looks for, and `composed_at_ms` the wall clock's reading, for display.
     #[must_use]
     pub fn new(
         kind: Kind,
         composed: &ComposedMutation,
-        host: impl Into<String>,
-        standing: impl Into<String>,
         grant_id: Option<GrantId>,
         composed_at_ms: u64,
         label: impl Into<String>,
     ) -> Self {
+        let (host, standing) = composed.reach().map_or_else(Default::default, |reach| {
+            (reach.host.clone(), reach.actor.clone())
+        });
         Self {
             version: ATTEMPT_FORMAT,
             kind,
@@ -269,8 +275,8 @@ impl Attempt {
             request: composed.request().clone(),
             window_issued_at_ms: composed.window_issued_at_ms(),
             window_valid_for_ms: composed.window_valid_for_ms(),
-            host: host.into(),
-            standing: standing.into(),
+            host,
+            standing,
             grant_id: Nullable(grant_id),
             bound_ms: composed.window_valid_for_ms().saturating_add(MARGIN_MS),
             composed_at_ms: TimestampMs::new(composed_at_ms),
@@ -282,14 +288,52 @@ impl Attempt {
         }
     }
 
-    /// Shortens the bound to a challenge's lifetime, for a transfer: the host refuses an expired
-    /// confirmation inside the transaction, so after the challenge's lifetime from the moment its
-    /// reply was received nothing can commit, whatever the window says.
-    pub fn bound_by_challenge(&mut self, lifetime: Duration) {
-        let by_challenge = u64::try_from(lifetime.as_millis())
+    /// Shortens the bound to what is left of a challenge's lifetime, for a transfer: the host
+    /// refuses an expired confirmation inside the transaction, so once the challenge has run out
+    /// nothing can commit, whatever the window says.
+    ///
+    /// The bound is counted from the moment the attempt's clock is armed, which is when the
+    /// transfer is composed, so `left` is what the challenge has left *at that moment*: its
+    /// lifetime less the time since its reply arrived. Counted from any earlier moment the bound
+    /// would end before the challenge does.
+    pub fn bound_by_challenge(&mut self, left: Duration) {
+        let by_challenge = u64::try_from(left.as_millis())
             .unwrap_or(u64::MAX)
             .saturating_add(MARGIN_MS);
         self.bound_ms = self.bound_ms.min(by_challenge);
+    }
+
+    /// Moves a hand-over from asking for its confirmation to sending the transfer.
+    ///
+    /// The confirmation request this attempt held is replaced by the transfer, composed under the
+    /// action the confirmation was asked for, with its window, the host and actor it is for and the
+    /// plan the owner confirmed. The bound is the window's, shortened to `challenge_left` as
+    /// [`Self::bound_by_challenge`] says, and **the caller arms a new clock now**: the one that
+    /// counted the confirmation's request counted from before the challenge existed.
+    ///
+    /// Returns false, changing nothing, for an attempt that is not a hand-over being asked for.
+    pub fn confirmed(
+        &mut self,
+        composed: &ComposedMutation,
+        plan: TransferControlPlan,
+        challenge_left: Duration,
+    ) -> bool {
+        if self.kind != Kind::Transfer || self.phase != Phase::Asking {
+            return false;
+        }
+        self.request = composed.request().clone();
+        self.window_issued_at_ms = composed.window_issued_at_ms();
+        self.window_valid_for_ms = composed.window_valid_for_ms();
+        if let Some(reach) = composed.reach() {
+            self.host = reach.host.clone();
+            self.standing = reach.actor.clone();
+        }
+        self.bound_ms = composed.window_valid_for_ms().saturating_add(MARGIN_MS);
+        self.bound_by_challenge(challenge_left);
+        self.plan = Nullable::some(plan);
+        self.repeats = 0;
+        self.phase = Phase::Composed;
+        true
     }
 
     /// The request, to send again.
@@ -299,7 +343,17 @@ impl Attempt {
             self.request.clone(),
             self.window_issued_at_ms,
             self.window_valid_for_ms,
+            self.reach(),
         )
+    }
+
+    /// The host and the actor the request was composed for, when the record says.
+    #[must_use]
+    pub fn reach(&self) -> Option<Reach> {
+        (!self.host.is_empty() && !self.standing.is_empty()).then(|| Reach {
+            host: self.host.clone(),
+            actor: self.standing.clone(),
+        })
     }
 
     /// How long, measured on a clock that cannot be stepped, a read that finds nothing waits to
@@ -327,9 +381,26 @@ impl Attempt {
     /// change is the host's kept answer to the action (nothing committed, because every failure
     /// after a commit in these methods is a transient one), and closes it as refused. Anything else
     /// leaves it unfinished.
+    ///
+    /// A redemption is the exception: the paired door can replace the result of a redemption that
+    /// committed with a refusal, when the bounds of its decision end before it writes the answer.
+    /// So a kept refusal to a redemption's first send is a reason to read what the host shows, not
+    /// the end: the share the device holds decides. Nothing can commit after the host's kept
+    /// answer, so the read counts at once.
+    ///
+    /// An attempt still asking for a confirmation has nothing to send ([`Self::confirmed`]).
     pub fn after_first_send(&mut self, reply: Reply) -> Next {
+        if self.phase == Phase::Asking {
+            return Next::NotSent;
+        }
         match reply {
             Reply::Result => self.close(Outcome::Happened),
+            Reply::Refused(RetryCategory::NoRetry | RetryCategory::ConfigurationChange)
+                if self.kind == Kind::Redeem =>
+            {
+                self.bound_ms = 0;
+                self.check()
+            }
             Reply::Refused(RetryCategory::NoRetry | RetryCategory::ConfigurationChange) => {
                 self.close(Outcome::Refused)
             }
@@ -347,6 +418,9 @@ impl Attempt {
     /// a fence before it gives back its kept answer, or that the effect is still running. A lost
     /// answer leaves it unfinished until the repeats are used up.
     pub fn after_repeat(&mut self, reply: Reply) -> Next {
+        if self.phase == Phase::Asking {
+            return Next::NotSent;
+        }
         match reply {
             Reply::Result => self.close(Outcome::Happened),
             Reply::Refused(_) => self.check(),
@@ -363,13 +437,17 @@ impl Attempt {
         }
     }
 
-    /// What a client concludes from a read of the host, `elapsed` after the attempt's clock was
-    /// armed.
+    /// What a client concludes from a read of the host that began `began` after the attempt's clock
+    /// was armed.
     ///
-    /// `elapsed` is measured on a clock that cannot be stepped, from the moment the request was
-    /// composed, or from the restart that read the record back.
-    pub fn after_read(&mut self, found: Found, elapsed: Duration) -> Next {
-        let counts = elapsed >= self.bound();
+    /// `began` is when the read was *sent* ([`Armed::read_begins`]), not when its answer was
+    /// judged: a read that began before the bound can have found nothing and been judged after it,
+    /// and the action can be admitted and commit in between.
+    pub fn after_read(&mut self, found: Found, began: ReadAt) -> Next {
+        if self.phase == Phase::Asking {
+            return Next::Wait;
+        }
+        let counts = began.0 >= self.bound();
         let outcome = match (self.kind, found) {
             (Kind::Invite | Kind::Transfer, Found::Present) | (Kind::Redeem, Found::Present) => {
                 Some(Outcome::Happened)
@@ -419,6 +497,26 @@ impl Armed {
     pub fn elapsed(&self) -> Duration {
         self.0.elapsed()
     }
+
+    /// The moment a read of the host is about to be sent. Take it before the read leaves, and give
+    /// it to [`Attempt::after_read`] with what the read found.
+    #[must_use]
+    pub fn read_begins(&self) -> ReadAt {
+        ReadAt(self.elapsed())
+    }
+}
+
+/// When a read of the host began, counted from the moment the attempt's clock was armed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReadAt(Duration);
+
+impl ReadAt {
+    /// A read that began `elapsed` after the clock was armed. A client takes the moment from
+    /// [`Armed::read_begins`]; this is for the one that has to say it by hand, a test among them.
+    #[must_use]
+    pub const fn after(elapsed: Duration) -> Self {
+        Self(elapsed)
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -451,9 +549,27 @@ pub enum AttemptError {
     /// An attempt could not be encoded to be kept.
     #[error("the attempt cannot be kept: {0}")]
     Encode(Shown),
+    /// The file kept for an action is one this build does not read, and is left as it is.
+    #[error(
+        "the attempt kept at {path} is of a later release, or cannot be read, and is left as it is"
+    )]
+    Unreadable {
+        /// The file.
+        path: Shown,
+    },
 }
 
-crate::debug_as_display!(AttemptError);
+impl std::fmt::Debug for AttemptError {
+    /// Which failure it is and nothing else: the directory and the file's name are in the message
+    /// a person is shown, and a log that prints the error by its debug form carries neither.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Store { .. } => "AttemptError::Store { .. }",
+            Self::Encode(_) => "AttemptError::Encode(..)",
+            Self::Unreadable { .. } => "AttemptError::Unreadable { .. }",
+        })
+    }
+}
 
 /// What a listing found.
 #[derive(Clone, PartialEq, Eq)]
@@ -505,25 +621,42 @@ impl AttemptStore {
     ///
     /// It is written to a file of its own, flushed and renamed over the name, and the directory
     /// flushed after, under a lock every window of the application holds, so a reader never sees
-    /// half of one.
+    /// half of one. A file kept for the action that this build does not read is left as it is.
     ///
     /// # Errors
     ///
-    /// Returns [`AttemptError::Store`] when it cannot be written and [`AttemptError::Encode`] when
-    /// it does not encode.
+    /// Returns [`AttemptError::Store`] when it cannot be written, [`AttemptError::Encode`] when it
+    /// does not encode or is larger than a kept attempt may be, and [`AttemptError::Unreadable`]
+    /// when the file already kept for the action is not one this build reads.
     pub fn keep(&self, attempt: &Attempt) -> std::result::Result<(), AttemptError> {
+        let _lock = self.locked()?;
+        self.write(attempt)
+    }
+
+    fn locked(&self) -> std::result::Result<std::fs::File, AttemptError> {
+        let lock_path = self.directory.join(LOCK_NAME);
+        lock(&lock_path).map_err(|error| AttemptError::Store {
+            path: stored(&lock_path),
+            fault: IoFault::from(error),
+        })
+    }
+
+    /// Writes an attempt, with the store's lock held.
+    fn write(&self, attempt: &Attempt) -> std::result::Result<(), AttemptError> {
         let bytes = kr_cbor::to_canonical_vec(attempt)
             .map_err(|error| AttemptError::Encode(Shown::cbor(&error)))?;
+        // A record this build could not read back is one it must not keep.
+        if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > KEPT_LIMIT {
+            return Err(AttemptError::Encode(Shown::said(
+                "the attempt is larger than a kept attempt may be",
+            )));
+        }
         let path = self.path(attempt.action_id);
+        self.refuse_unreadable(&path)?;
         let store = |error| AttemptError::Store {
             path: stored(&path),
             fault: IoFault::from(error),
         };
-        let lock_path = self.directory.join(LOCK_NAME);
-        let _lock = lock(&lock_path).map_err(|error| AttemptError::Store {
-            path: stored(&lock_path),
-            fault: IoFault::from(error),
-        })?;
         let unique = crate::drafts::fresh_uuid()
             .map_err(|error| store(std::io::Error::other(crate::shown!("{}", error))))?;
         let partial = self
@@ -535,6 +668,23 @@ impl AttemptStore {
             return Err(store(error));
         }
         kr_flush::flush_directory(&self.directory, kr_flush::NameKind::File).map_err(store)
+    }
+
+    /// Refuses to replace or delete a file this build does not read: of a later release, or not an
+    /// attempt at all. Another release may hold it open, and this one cannot tell what it keeps.
+    /// Called with the store's lock held, so a file cannot change between the look and the change.
+    fn refuse_unreadable(&self, path: &Path) -> std::result::Result<(), AttemptError> {
+        match path.try_exists() {
+            Ok(false) => Ok(()),
+            Ok(true) => match read(path) {
+                Kept::Known(_) => Ok(()),
+                Kept::Unknown { .. } => Err(AttemptError::Unreadable { path: stored(path) }),
+            },
+            Err(error) => Err(AttemptError::Store {
+                path: stored(path),
+                fault: IoFault::from(error),
+            }),
+        }
     }
 
     /// Every attempt kept, oldest first, and every file this build does not read.
@@ -567,18 +717,17 @@ impl AttemptStore {
         Ok(kept)
     }
 
-    /// Forgets the attempt kept for one action, when there is one.
+    /// Forgets the attempt kept for one action, when there is one. A file kept for the action that
+    /// this build does not read is left as it is.
     ///
     /// # Errors
     ///
-    /// Returns [`AttemptError::Store`] when it cannot be removed.
+    /// Returns [`AttemptError::Store`] when it cannot be removed and [`AttemptError::Unreadable`]
+    /// when the file kept for the action is not one this build reads.
     pub fn remove(&self, action_id: ActionId) -> std::result::Result<(), AttemptError> {
         let path = self.path(action_id);
-        let lock_path = self.directory.join(LOCK_NAME);
-        let _lock = lock(&lock_path).map_err(|error| AttemptError::Store {
-            path: stored(&lock_path),
-            fault: IoFault::from(error),
-        })?;
+        let _lock = self.locked()?;
+        self.refuse_unreadable(&path)?;
         match std::fs::remove_file(&path) {
             Ok(()) => kr_flush::flush_directory(&self.directory, kr_flush::NameKind::File).map_err(
                 |error| AttemptError::Store {
@@ -615,7 +764,14 @@ fn read(path: &Path) -> Kept {
         return Kept::Unknown { name };
     };
     match kr_cbor::from_canonical_slice::<Attempt>(&bytes, &kr_cbor::Limits::DEFAULT) {
-        Ok(attempt) if attempt.version == ATTEMPT_FORMAT => Kept::Known(Box::new(attempt)),
+        // A file is the attempt its name says it is: one that holds another action's is not read,
+        // so a change made to the name's action never lands on it.
+        Ok(attempt)
+            if attempt.version == ATTEMPT_FORMAT
+                && name == format!("{}.{EXTENSION}", attempt.action_id) =>
+        {
+            Kept::Known(Box::new(attempt))
+        }
         _ => Kept::Unknown { name },
     }
 }
@@ -650,6 +806,7 @@ mod tests {
     use super::*;
     use kr_protocol::envelope::{ActionTarget, ParamsValue};
     use kr_protocol::ids::{ActionWindowId, EnvironmentId, RequestId};
+    use kr_protocol::ids::{DeviceId, SessionId};
     use kr_protocol::method::Method;
     use kr_protocol::scalars::{DurationMs, Uuid};
 
@@ -674,13 +831,23 @@ mod tests {
         }
     }
 
+    fn reach() -> Reach {
+        Reach {
+            host: "host-1".to_owned(),
+            actor: "device:phone".to_owned(),
+        }
+    }
+
+    /// A read that began `secs` after the attempt's clock was armed.
+    fn at(secs: u64) -> ReadAt {
+        ReadAt::after(Duration::from_secs(secs))
+    }
+
     fn attempt(kind: Kind) -> Attempt {
-        let composed = ComposedMutation::restored(request(), 1_000, 300_000);
+        let composed = ComposedMutation::restored(request(), 1_000, 300_000, Some(reach()));
         Attempt::new(
             kind,
             &composed,
-            "host-1",
-            "device:phone",
             Some(GrantId::new(Uuid::from_bytes([0xb2; 16]))),
             2_000,
             "Accept session 3",
@@ -694,13 +861,10 @@ mod tests {
     fn a_read_that_finds_nothing_waits_for_the_window_and_the_margin() {
         for kind in [Kind::Invite, Kind::Transfer] {
             let mut waiting = attempt(kind);
-            assert_eq!(
-                waiting.after_read(Found::Absent, Duration::from_secs(329)),
-                Next::Wait
-            );
+            assert_eq!(waiting.after_read(Found::Absent, at(329)), Next::Wait);
             assert!(!waiting.is_closed());
             assert_eq!(
-                waiting.after_read(Found::Absent, Duration::from_secs(330)),
+                waiting.after_read(Found::Absent, at(330)),
                 Next::Closed(Outcome::NotDone)
             );
         }
@@ -708,7 +872,7 @@ mod tests {
         challenge.bound_by_challenge(Duration::from_secs(120));
         assert_eq!(challenge.bound(), Duration::from_secs(150));
         assert_eq!(
-            challenge.after_read(Found::Absent, Duration::from_secs(150)),
+            challenge.after_read(Found::Absent, at(150)),
             Next::Closed(Outcome::NotDone)
         );
     }
@@ -717,8 +881,8 @@ mod tests {
     /// revocation or a redemption: the grant can have been revoked, or redeemed, and ended since.
     #[test]
     fn what_a_read_finds_closes_the_attempt_and_an_absent_grant_proves_nothing_of_a_revocation() {
-        let late = Duration::from_secs(10_000);
-        let early = Duration::ZERO;
+        let late = at(10_000);
+        let early = at(0);
         let mut invite = attempt(Kind::Invite);
         assert_eq!(
             invite.after_read(Found::Present, early),
@@ -871,6 +1035,307 @@ mod tests {
         store.remove(kept.action_id).expect("removed");
         assert_eq!(store.attempts().expect("listed").len(), 1);
     }
+
+    /// The transfer of control a host describes, with keys that do not change between runs.
+    fn plan() -> TransferControlPlan {
+        use kr_protocol::grant::{EnvironmentSelector, GrantExpiry, HistoryScope};
+        use kr_protocol::ids::DeviceKeyRevision;
+        use kr_protocol::pairing::{DeviceName, DevicePublicKeys};
+        use kr_protocol::rights::ActionRight;
+        use kr_protocol::scalars::{
+            AuthorisationKey, CanonicalSet, EndpointKey, NotificationPreviewKey, StoredEnvelopeKey,
+        };
+
+        TransferControlPlan {
+            environment_id: EnvironmentId::new(Uuid::from_bytes([0xe1; 16])),
+            session_id: SessionId::new(Uuid::from_bytes([10; 16])),
+            source_grant_id: GrantId::new(Uuid::from_bytes([11; 16])),
+            parent_grant_id: Nullable::null(),
+            issuer_device_id: DeviceId::new(Uuid::from_bytes([1; 16])),
+            from_device_id: DeviceId::new(Uuid::from_bytes([12; 16])),
+            from_device_name: DeviceName::new("laptop").expect("a name"),
+            to_device_id: DeviceId::new(Uuid::from_bytes([13; 16])),
+            to_device_name: DeviceName::new("phone").expect("a name"),
+            to_keys: DevicePublicKeys {
+                transport: EndpointKey::from_bytes([21; 32]),
+                authorisation: AuthorisationKey::from_bytes([22; 32]),
+                stored_envelope: StoredEnvelopeKey::from_bytes([23; 32]),
+                notification_preview: NotificationPreviewKey::from_bytes([24; 32]),
+            },
+            to_key_revision: DeviceKeyRevision::new(1),
+            new_grant_id: GrantId::new(Uuid::from_bytes([14; 16])),
+            environment_selector: EnvironmentSelector::Any,
+            actions: [ActionRight::SessionView, ActionRight::SessionShare]
+                .into_iter()
+                .collect(),
+            history: HistoryScope {
+                lower_bound_ms: Nullable::null(),
+                include_live_screen: false,
+                named_questions: CanonicalSet::new(),
+                named_approvals: CanonicalSet::new(),
+            },
+            expiry: GrantExpiry::At {
+                expires_at_ms: TimestampMs::new(4_000_000),
+            },
+            organisation: Nullable::null(),
+        }
+    }
+
+    /// A redemption's kept refusal is not the end of it, since the paired door can replace the
+    /// result of one that committed with a refusal. The share the device holds decides, and it
+    /// decides at once, because nothing can commit after the host's kept answer: a share is
+    /// accepted, an offer still listed is not accepted, and neither is unknown. Every other kind
+    /// still closes as refused.
+    #[test]
+    fn a_kept_refusal_to_a_redemption_leaves_the_share_to_decide_at_once() {
+        let kept = Reply::Refused(RetryCategory::ConfigurationChange);
+        let mut accepted = attempt(Kind::Redeem);
+        assert_eq!(accepted.after_first_send(kept), Next::Check);
+        assert_eq!(accepted.phase, Phase::Checking);
+        assert_eq!(
+            accepted.after_read(Found::Present, at(0)),
+            Next::Closed(Outcome::Happened),
+            "a share the device holds shows the redemption happened, whatever the refusal said"
+        );
+        let mut offered = attempt(Kind::Redeem);
+        offered.after_first_send(kept);
+        assert_eq!(
+            offered.after_read(Found::Offered, at(0)),
+            Next::Closed(Outcome::NotAccepted)
+        );
+        let mut neither = attempt(Kind::Redeem);
+        neither.after_first_send(Reply::Refused(RetryCategory::NoRetry));
+        assert_eq!(
+            neither.after_read(Found::Neither, at(0)),
+            Next::Closed(Outcome::Unknown)
+        );
+        // A refusal in a category that can be retried is unfinished, as for every kind.
+        let mut transient = attempt(Kind::Redeem);
+        assert_eq!(
+            transient.after_first_send(Reply::Refused(RetryCategory::Transient)),
+            Next::Repeat
+        );
+        assert!(transient.bound() > Duration::from_secs(300));
+        for other in [Kind::Invite, Kind::Revoke, Kind::Transfer] {
+            let mut refused = attempt(other);
+            assert_eq!(
+                refused.after_first_send(kept),
+                Next::Closed(Outcome::Refused),
+                "{other:?}"
+            );
+        }
+    }
+
+    /// A hand-over still asking for its confirmation has nothing to send, so no answer moves it;
+    /// a confirmed one is sent under the window of the transfer, bounded by what its challenge
+    /// had left when the transfer was composed, which is less than its lifetime when the owner
+    /// device was slow.
+    #[test]
+    fn a_hand_over_being_asked_for_moves_only_when_it_is_confirmed_and_is_bounded_by_what_is_left()
+    {
+        let mut asking = attempt(Kind::Transfer);
+        asking.phase = Phase::Asking;
+        assert_eq!(asking.after_first_send(Reply::Result), Next::NotSent);
+        assert_eq!(asking.after_repeat(Reply::Result), Next::NotSent);
+        assert_eq!(asking.after_read(Found::Present, at(10_000)), Next::Wait);
+        assert_eq!(
+            asking.phase,
+            Phase::Asking,
+            "the challenge is not the transfer"
+        );
+
+        let composed = ComposedMutation::restored(
+            MutationRequest {
+                action_id: asking.request.action_id,
+                ..request()
+            },
+            5_000,
+            300_000,
+            Some(reach()),
+        );
+        // The challenge, 120 seconds long, was answered 50 seconds before the transfer was
+        // composed, so 70 seconds of it are left then.
+        assert!(asking.confirmed(&composed, plan(), Duration::from_secs(70)));
+        assert_eq!(asking.phase, Phase::Composed);
+        assert_eq!(asking.window_issued_at_ms, 5_000);
+        assert_eq!(asking.plan, Nullable::some(plan()));
+        assert_eq!(
+            asking.bound(),
+            Duration::from_secs(100),
+            "what the challenge has left, and the margin, from the moment the clock is armed"
+        );
+        assert_eq!(
+            asking.after_read(Found::Absent, at(99)),
+            Next::Wait,
+            "a read that began before the challenge could no longer commit proves nothing"
+        );
+        assert_eq!(
+            asking.after_read(Found::Absent, at(100)),
+            Next::Closed(Outcome::NotDone)
+        );
+        // Only a hand-over being asked for is confirmed.
+        let mut other = attempt(Kind::Transfer);
+        assert!(!other.confirmed(&composed, plan(), Duration::from_secs(70)));
+        let mut invite = attempt(Kind::Invite);
+        invite.phase = Phase::Asking;
+        assert!(!invite.confirmed(&composed, plan(), Duration::from_secs(70)));
+    }
+
+    /// The moment a read began is read off the clock when the read is about to be sent, and it
+    /// moves on as time does: a read begun later is judged as begun later.
+    #[test]
+    fn a_read_begins_when_it_is_taken_and_not_when_it_is_judged() {
+        let armed = Armed::now();
+        let first = armed.read_begins();
+        std::thread::sleep(Duration::from_millis(5));
+        let second = armed.read_begins();
+        assert!(second.0 > first.0);
+        let mut waiting = attempt(Kind::Invite);
+        waiting.bound_ms = 1_000;
+        assert_eq!(
+            waiting.after_read(Found::Absent, first),
+            Next::Wait,
+            "a read begun a moment after the clock was armed is long before the bound, however \
+             late its answer is judged"
+        );
+    }
+
+    /// A file this build does not read is neither replaced nor deleted, whatever else is asked of
+    /// the store: a later release may hold it open. A file that holds another action's attempt
+    /// under this action's name is such a file, and so is one larger than a kept attempt may be.
+    #[test]
+    fn a_file_the_store_does_not_read_is_neither_replaced_nor_deleted() {
+        let directory = kr_ipc::testing::PrivateTempDir::create();
+        let root = directory.path().join("attempts");
+        let store = AttemptStore::open(&root).expect("opens");
+        let kept = attempt(Kind::Redeem);
+        let path = root.join(format!("{}.attempt", kept.action_id));
+
+        // A later release's file for the action.
+        let later = Attempt {
+            version: ATTEMPT_FORMAT + 1,
+            ..kept.clone()
+        };
+        let bytes = kr_cbor::to_canonical_vec(&later).expect("encodes");
+        std::fs::write(&path, &bytes).expect("a later release's file");
+        assert!(matches!(
+            store.keep(&kept),
+            Err(AttemptError::Unreadable { .. })
+        ));
+        assert!(matches!(
+            store.remove(kept.action_id),
+            Err(AttemptError::Unreadable { .. })
+        ));
+        assert_eq!(std::fs::read(&path).expect("still there"), bytes);
+
+        // A file that is not an attempt at all.
+        std::fs::write(&path, b"not an attempt").expect("a malformed file");
+        assert!(store.keep(&kept).is_err());
+        assert!(store.remove(kept.action_id).is_err());
+        assert_eq!(
+            std::fs::read(&path).expect("still there"),
+            b"not an attempt"
+        );
+
+        // Another action's attempt under this action's name is not read either.
+        let elsewhere = Attempt {
+            action_id: ActionId::new(Uuid::from_bytes([0xa7; 16])),
+            ..kept.clone()
+        };
+        std::fs::write(
+            &path,
+            kr_cbor::to_canonical_vec(&elsewhere).expect("encodes"),
+        )
+        .expect("a misnamed file");
+        assert!(matches!(
+            store.attempts().expect("listed").as_slice(),
+            [Kept::Unknown { .. }]
+        ));
+        assert!(store.remove(kept.action_id).is_err());
+
+        // With the file gone the action's attempt is kept and removed as usual.
+        std::fs::remove_file(&path).expect("removed by hand");
+        store.keep(&kept).expect("kept");
+        store.remove(kept.action_id).expect("removed");
+
+        // One larger than a kept attempt may be is refused rather than kept unreadably.
+        let mut large = kept.clone();
+        large.label = "x".repeat(300 * 1024);
+        assert!(matches!(store.keep(&large), Err(AttemptError::Encode(_))));
+        assert!(store.attempts().expect("listed").is_empty());
+    }
+
+    /// The store's errors name the directory and the file to a person, and neither to a log: the
+    /// debug form carries which failure it is.
+    #[test]
+    fn the_stores_errors_print_neither_a_directory_nor_a_name_in_debug() {
+        let directory = kr_ipc::testing::PrivateTempDir::create();
+        let root = directory.path().join("secret-directory-name");
+        let store = AttemptStore::open(&root).expect("opens");
+        let kept = attempt(Kind::Invite);
+        let path = root.join(format!("{}.attempt", kept.action_id));
+        std::fs::write(&path, b"x").expect("a malformed file");
+        let error = store.keep(&kept).expect_err("refused");
+        let debug = format!("{error:?}");
+        assert!(!debug.contains("secret-directory-name"), "{debug}");
+        assert!(!debug.contains(&kept.action_id.to_string()), "{debug}");
+        assert!(!debug.contains(".attempt"), "{debug}");
+        let encoded = AttemptError::Encode(Shown::said("a long cause"));
+        assert!(!format!("{encoded:?}").contains("a long cause"));
+    }
+
+    /// A hand-over's record holds its plan, and a closed attempt its outcome: the second record
+    /// pins both, with the first, so a member added to the plan changes these bytes and raises
+    /// the version instead of leaving kept hand-overs unreadable.
+    #[test]
+    fn a_closed_hand_over_with_its_plan_is_the_format_too() {
+        let mut kept = attempt(Kind::Transfer);
+        kept.plan = Nullable::some(plan());
+        kept.bound_by_challenge(Duration::from_secs(70));
+        kept.after_first_send(Reply::Lost);
+        kept.after_repeat(Reply::Refused(RetryCategory::Transient));
+        kept.after_read(Found::Present, at(0));
+        assert_eq!(kept.phase, Phase::Closed(Outcome::Happened));
+        let bytes = kr_cbor::to_canonical_vec(&kept).expect("encodes");
+        let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+        assert_eq!(
+            hex, GOLDEN_HAND_OVER,
+            "the record's bytes changed: raise ATTEMPT_FORMAT"
+        );
+        let read = kr_cbor::from_canonical_slice::<Attempt>(&bytes, &kr_cbor::Limits::DEFAULT)
+            .expect("reads back");
+        assert_eq!(read, kept);
+    }
+
+    const GOLDEN_HAND_OVER: &str = "\
+        b164686f737466686f73742d31646b696e64687472616e7366657264706c616eb166657870697279a1626174a16d\
+        657870697265735f61745f6d731a003d090067616374696f6e73826d73657373696f6e2e73686172656c73657373\
+        696f6e2e7669657767686973746f7279a46e6c6f7765725f626f756e645f6d73f66f6e616d65645f617070726f76\
+        616c73806f6e616d65645f7175657374696f6e738073696e636c7564655f6c6976655f73637265656ef467746f5f\
+        6b657973a4697472616e73706f727458201515151515151515151515151515151515151515151515151515151515\
+        1515156d617574686f7269736174696f6e5820161616161616161616161616161616161616161616161616161616\
+        16161616166f73746f7265645f656e76656c6f706558201717171717171717171717171717171717171717171717\
+        171717171717171717746e6f74696669636174696f6e5f7072657669657758201818181818181818181818181818\
+        1818181818181818181818181818181818186a73657373696f6e5f6964500a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a\
+        6c6e65775f6772616e745f6964500e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e6c6f7267616e69736174696f6ef66c74\
+        6f5f6465766963655f6964500d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d6e656e7669726f6e6d656e745f696450e1e1\
+        e1e1e1e1e1e1e1e1e1e1e1e1e1e16e66726f6d5f6465766963655f6964500c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c\
+        6e746f5f6465766963655f6e616d656570686f6e656f706172656e745f6772616e745f6964f66f736f757263655f\
+        6772616e745f6964500b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b6f746f5f6b65795f7265766973696f6e017066726f\
+        6d5f6465766963655f6e616d65666c6170746f70706973737565725f6465766963655f6964500101010101010101\
+        010101010101010174656e7669726f6e6d656e745f73656c6563746f7263616e79656c6162656c70416363657074\
+        2073657373696f6e2033657068617365a166636c6f7365646868617070656e65646668696464656ef46772657065\
+        617473006772657175657374aa666d6574686f646c6772616e742e72656465656d66706172616d73a06674617267\
+        6574a56a73657373696f6e5f6964f66d73657373696f6e5f65706f6368f66e656e7669726f6e6d656e745f696450\
+        e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1766167656e745f62696e64696e675f7265766973696f6ef6776170706c69\
+        636174696f6e5f696e7374616e63655f6964f6686578706563746564a0686772616e745f6964f669616374696f6e\
+        5f696450a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a16a726571756573745f6964006e6d6574686f645f76657273696f\
+        6e0170616374696f6e5f77696e646f775f69646877696e646f772d31707265717565737465645f74746c5f6d731a\
+        0001d4c06776657273696f6e0168626f756e645f6d731a000186a0686772616e745f696450b2b2b2b2b2b2b2b2b2\
+        b2b2b2b2b2b2b2687374616e64696e676c6465766963653a70686f6e6569616374696f6e5f696450a1a1a1a1a1a1\
+        a1a1a1a1a1a1a1a1a1a169666f6c6c6f775f7570f46e636f6d706f7365645f61745f6d731907d07377696e646f77\
+        5f6973737565645f61745f6d731903e87377696e646f775f76616c69645f666f725f6d731a000493e0\
+    ";
 
     const GOLDEN: &str = "\
         b164686f737466686f73742d31646b696e646672656465656d64706c616ef6656c6162656c7041636365707420\

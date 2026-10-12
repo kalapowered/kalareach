@@ -24,7 +24,8 @@ use kr_protocol::scalars::Nullable;
 use kr_protocol::sharing::{GrantTransferParams, GrantTransferResult};
 use net_support::pairing::{self as calls, Signer};
 use net_support::{
-    Host, RawDevice, delegated, holds, on_the_host, on_the_session, owned_by, recipient,
+    Host, RawDevice, delegated, holds, local_session, on_the_host, on_the_session, owned_by,
+    recipient,
 };
 
 /// The subject an owner confirmation is asked for.
@@ -401,5 +402,113 @@ async fn kr_req_18_03_a_transfer_to_a_device_whose_pairing_ends_first_is_not_des
             .is_empty(),
         "no owner device was asked"
     );
+    host.stop().await;
+}
+
+/// KR-REQ-23.49: the reply to the request for an owner's confirmation is lost, and the client asks
+/// again with the same request on another connection. The host keeps its answer to the action, so it
+/// gives back the same challenge, and the owner device is asked to confirm one request, not two: a
+/// second request would be a second plan with a second grant to write.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_23_49_a_lost_reply_to_the_confirmation_request_is_repeated_and_one_request_is_listed()
+ {
+    use kr_client::attempt::Reply;
+    use kr_protocol::confirmation::OwnerConfirmationRequestResult;
+    use kr_protocol::envelope::ParamsValue;
+
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    let (boss, boss_record) = recipient(&host, &owner).await;
+    let (giver, giver_record) = recipient(&host, &owner).await;
+    let (_taker, taker_record) = recipient(&host, &owner).await;
+    let session_id = SessionId::new(kr_ipc::new_uuid());
+    let (above, above_connection) = owned_by(&host, session_id, &boss, &boss_record).await;
+    let (held, giving) = delegated(
+        &host,
+        session_id,
+        &above.grant,
+        &above_connection,
+        &giver,
+        &giver_record,
+    )
+    .await;
+    let params = GrantTransferParams {
+        session_id,
+        from_grant_id: held.grant_id,
+        to_device_id: taker_record.device_id,
+    };
+    let transfer_action = ActionId::new(kr_ipc::new_uuid());
+    let asking = OwnerConfirmationRequestParams {
+        subject: subject(&params, transfer_action),
+    };
+    let (first, _) = local_session(&host).await;
+    let (second, _) = local_session(&host).await;
+    let ask_action = ActionId::new(kr_ipc::new_uuid());
+    let composed = first
+        .compose(
+            Method::OwnerConfirmationRequest,
+            ask_action,
+            on_the_host(&host),
+            None,
+            &ParamsValue::empty(),
+            &asking,
+            kr_protocol::scalars::DurationMs::new(120_000),
+        )
+        .await
+        .expect("composed");
+    // The reply to the first send is lost: this client takes it as the library gives it, and never
+    // reads it.
+    let sent = first.send(&composed).await;
+    assert_eq!(Reply::of(&sent), Reply::Result);
+    let sent: OwnerConfirmationRequestResult = sent.expect("answered").to_typed().expect("typed");
+
+    let repeated = second.repeat(&composed).await;
+    assert_eq!(Reply::of(&repeated), Reply::Result);
+    let repeated: OwnerConfirmationRequestResult =
+        repeated.expect("answered").to_typed().expect("typed");
+    assert_eq!(
+        repeated, sent,
+        "the host gives back the challenge it issued, not another"
+    );
+    let mut client = host.client().await;
+    let waiting = calls::pending(&mut client).await.expect("readable").pending;
+    assert_eq!(
+        waiting.len(),
+        1,
+        "the owner device is asked to confirm one request"
+    );
+    assert_eq!(waiting[0].request, sent.request);
+
+    // Asked anew under another action, it is another plan with another challenge.
+    let anew = first
+        .compose(
+            Method::OwnerConfirmationRequest,
+            ActionId::new(kr_ipc::new_uuid()),
+            on_the_host(&host),
+            None,
+            &ParamsValue::empty(),
+            &OwnerConfirmationRequestParams {
+                subject: subject(&params, ActionId::new(kr_ipc::new_uuid())),
+            },
+            kr_protocol::scalars::DurationMs::new(120_000),
+        )
+        .await
+        .expect("composed");
+    first
+        .send(&anew)
+        .await
+        .expect("another request is another plan");
+    assert_eq!(
+        calls::pending(&mut client)
+            .await
+            .expect("readable")
+            .pending
+            .len(),
+        2
+    );
+    first.settle(ask_action).await;
+    first.close();
+    second.close();
+    giving.close();
     host.stop().await;
 }

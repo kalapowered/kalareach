@@ -33,6 +33,24 @@ use crate::error::{ClientError, Result};
 /// A boxed future, so the transport stays usable behind a trait object.
 pub type TransportFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
 
+/// The host a connection reaches and the user or device it acts as, as the transport authenticated
+/// them.
+///
+/// The host keeps its record of an action under the actor that sent it, so an action can be asked
+/// about again only to the same host and as the same actor. Whoever composed a request keeps this
+/// with it, and a connection with another one refuses to send it. Neither member is a secret.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Reach {
+    /// The host: an environment identifier for a local host, the host's device identity for a
+    /// paired one.
+    pub host: String,
+    /// The actor: the operating-system user a local host authenticated, or this device's
+    /// identity on a paired host.
+    pub actor: String,
+}
+
+crate::debug_fields!(Reach { host, actor });
+
 /// What a client needs from whichever transport it connected over.
 ///
 /// The trait is narrow on purpose: everything above it works in control frames and data streams,
@@ -46,6 +64,12 @@ pub trait ControlTransport: Send + Sync + std::fmt::Debug {
 
     /// Returns the action window the connection started with.
     fn initial_action_window(&self) -> ActionWindow;
+
+    /// Returns the host this connection reaches and the actor it acts as, or none for a transport
+    /// that cannot say, whose requests are never asked about again.
+    fn reach(&self) -> Option<Reach> {
+        None
+    }
 
     /// Sends one control frame.
     fn send<'a>(&'a self, frame: &'a ControlFrame) -> TransportFuture<'a, ()>;
@@ -83,6 +107,7 @@ pub struct NetworkTransport {
     /// Set once a session has claimed the receive side.
     claimed: std::sync::atomic::AtomicBool,
     streams: Arc<StreamRegistry>,
+    reach: Reach,
 }
 
 crate::debug_fields!(NetworkTransport { connection_id });
@@ -128,6 +153,10 @@ impl NetworkTransport {
             reader: Mutex::new(Some(authorised.control_reader)),
             claimed: std::sync::atomic::AtomicBool::new(false),
             streams,
+            reach: Reach {
+                host: format!("host:{}", host_record.device_id),
+                actor: format!("device:{}", identity.device_id),
+            },
         })
     }
 
@@ -175,6 +204,10 @@ impl ControlTransport for NetworkTransport {
 
     fn initial_action_window(&self) -> ActionWindow {
         self.initial_action_window.clone()
+    }
+
+    fn reach(&self) -> Option<Reach> {
+        Some(self.reach.clone())
     }
 
     fn send<'a>(&'a self, frame: &'a ControlFrame) -> TransportFuture<'a, ()> {
