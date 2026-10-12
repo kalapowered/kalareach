@@ -52,14 +52,15 @@
         "version": 12,
         "migrates_from": 9
       },
-      "digest": "125a652397773ab5bcf42eeaacc2762e8208ef1cb200e448137593577637f497",
+      "digest": "c1f7a7d3b4d65fd3e36644d92957928b76b0d24c25257c09f129a5e599e3e45b",
       "kept": [
         "AttentionAcknowledgeResult",
         "AttentionQuietHoursResult",
         "ReviewAcknowledgeResult",
         "VisitAcknowledgeResult",
         "HostTimeState",
-        "words of attention sources"
+        "words of attention sources",
+        "words of attention rules"
       ]
     },
     {
@@ -384,7 +385,7 @@
         "version": 13,
         "migrates_from": 1
       },
-      "digest": "4a489a77d5d1b179244c03f10d98d60f297c12fa9a4622e5712eba884c3850dc",
+      "digest": "79de355660d7e0fff931946b5c0ccee2c87213a24c11aab4f34cf5976abfae50",
       "kept": [
         "SessionCreateParams",
         "ClosureRecord",
@@ -403,7 +404,7 @@
         "PairingSecurityEvent",
         "OwnerConfirmationRequest",
         "OwnerConfirmationProof",
-        "StoredPolicy, StoredFeed, StoredEnrolment, StoredBinding, StoredLeaseRecord, StoredRevocation (crates/kr-controller/src/grants/durable.rs)",
+        "StoredPolicy, StoredFeed, StoredEnrolment, StoredBinding, StoredLeaseRecord, StoredRevocation, StoredRemoval (crates/kr-controller/src/grants/durable.rs)",
         "StoredCommitment (crates/kr-controller/src/net/invitations.rs)",
         "KeyDeclaration (crates/kr-controller/src/net/devices.rs)",
         "words of methods a recorded pairing action names",
