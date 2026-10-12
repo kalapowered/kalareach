@@ -3511,9 +3511,9 @@ stopped, ends such an attempt. For everything still producing there are five ans
 command opens the archive and writes the files. The read operations are performed by the daemon on
 the local machine, which holds the account this host is signed in with. The daemon merely fetches
 data from the service and relays it to the command: it never sees the recovery seed, a plaintext, a
-file name or the directory the command writes to. The only information it does see is the archive
-and object identifiers a read names, the bundle's locator and the checkpoint a generation read is
-held to, but this information is already stored on the service.
+file name or the directory the command writes to. Of what the command holds, the daemon sees only
+the archive and object identifiers a read names, the bundle's locator and the checkpoint a
+generation read is held to, and the service holds all of it already.
 
 `backup.read` only accepts connections from the local socket, and requires host management. Each
 request performs a single read operation; all reads are idempotent so may be issued more than once,
@@ -3531,8 +3531,11 @@ installation signatures, not signatures made by a host's writer key. However the
 carries the host's `backup.write` token beside the signature. Bundles larger than 896 KiB are
 rejected outright, as responses must fit in a single control frame.
 
-Reading any of `bundle`, `generation` or `object` is refused while privacy mode is on. An answer
-read under a privacy state that has changed by the time it would be given is not given. If the
+Reading any of `bundle`, `generation` or `object` is refused while privacy mode is on. The daemon
+checks the privacy state when a read begins, again where the request leaves the host, and once more
+when the service has answered, and an answer whose read ended under another state than it began
+under is not given. A request already on its way when privacy mode comes on cannot be recalled, so
+its answer is dropped, and the command reads privacy mode again after the last answer. If the
 service indicates that it wants to be left alone, then nothing will be sent to the service and a
 response will be sent indicating the length of the remaining delay period. The daemon keeps this
 delay in the same record as the carrier of the host's own backups, so that a restore and an upload

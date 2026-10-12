@@ -636,7 +636,7 @@ impl Controller {
         // time one is needed and loaded after that. They go through the proxy this daemon started
         // with, the endpoint's own. Nothing runs yet: settling comes before the store is
         // reconciled, and the carrier starts after it.
-        let (backup_runtime, backup_relay) = match started.storage.origin() {
+        let (backup_runtime, relay_parts) = match started.storage.origin() {
             None => (None, None),
             Some(origin) => {
                 let origin = kr_protocol::service::GatewayOrigin::new(origin).map_err(|error| {
@@ -666,15 +666,10 @@ impl Controller {
                     timer,
                 )?;
                 // A restore's reads of the same service go through the same proxy and answer to
-                // the same record of the delays the service has named.
-                let relay = Arc::new(crate::backup::relay::BackupRelay::new(
-                    &origin,
-                    Self::outbound_of(&started)?.proxy()?,
-                    &writer,
-                    Arc::clone(&account),
-                    runtime.quiet(),
-                )?);
-                (Some(runtime), Some(relay))
+                // the same record of the delays the service has named. The relay is built once
+                // privacy mode's state is published, which every read of it is held to.
+                let quiet = runtime.quiet();
+                (Some(runtime), Some((origin, writer, quiet)))
             }
         };
         // External destinations' credentials are kept in the same store as this host's own keys,
@@ -745,6 +740,19 @@ impl Controller {
             .map_err(|_| ControllerError::RegistryUnavailable {
                 detail: "the privacy record could not be opened".to_owned(),
             })??
+        };
+        let backup_relay = match relay_parts {
+            None => None,
+            Some((origin, writer, quiet)) => {
+                Some(Arc::new(crate::backup::relay::BackupRelay::new(
+                    &origin,
+                    Self::outbound_of(&started)?.proxy()?,
+                    &writer,
+                    Arc::clone(&account),
+                    quiet,
+                    privacy.state(),
+                )?))
+            }
         };
         // What a read of the changes since a visit is answered with, when it asks for a summary,
         // is the descriptions module's to keep.

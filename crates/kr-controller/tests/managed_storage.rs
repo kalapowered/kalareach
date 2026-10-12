@@ -2490,6 +2490,17 @@ async fn a_restores_reads_reach_the_service_through_the_daemons_account_and_a_ke
         .backup_runtime()
         .expect("a carrier")
         .writer_public_key();
+    let host_authorisation = {
+        let store = open_store_in(&rig.host.environment().secrets_dir()).expect("the secret store");
+        *kr_crypto::store::load_device_keys(
+            store.store.as_ref(),
+            &kr_controller::service::net::device_key_scope(rig.host.environment_id()),
+        )
+        .expect("the store reads")
+        .expect("the daemon made its device keys")
+        .authorisation
+        .public()
+    };
     let arrived = web.arrived();
     let bundle_reads: Vec<_> = arrived.iter().filter(|got| got.path == SYNC).collect();
     assert_eq!(bundle_reads.len(), 4);
@@ -2497,10 +2508,11 @@ async fn a_restores_reads_reach_the_service_through_the_daemons_account_and_a_ke
         .iter()
         .map(|got| got.signed_by.expect("signed"))
         .collect();
-    assert!(
-        keys.iter()
-            .all(|(signer, key)| *signer == ServiceRequestSigner::Installation && *key != writer)
-    );
+    assert!(keys.iter().all(|(signer, key)| {
+        *signer == ServiceRequestSigner::Installation
+            && *key != writer
+            && *key != host_authorisation
+    }));
     assert!(
         keys.windows(2).all(|pair| pair[0].1 == pair[1].1),
         "one key for the process, made in memory"
@@ -2581,10 +2593,10 @@ async fn a_restores_reads_reach_the_service_through_the_daemons_account_and_a_ke
     }
 }
 
-/// What the doctor tells a person of the sign-in is what a restore is told, apart from any
-/// request: a host that cannot present a token sends nothing.
+/// What a restore is told of the sign-in is what the doctor tells a person: a host that cannot
+/// present a token says why, and a read of the bundle, which needs one, sends nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_host_that_cannot_present_a_token_says_why_and_sends_a_restore_nothing() {
+async fn a_host_that_cannot_present_a_token_says_why_and_sends_no_bundle_read() {
     for (token, expected) in [
         (Token::None, BackupSignIn::SignedOut),
         (Token::WithoutTheScope, BackupSignIn::WithoutScope),
@@ -2602,18 +2614,22 @@ async fn a_host_that_cannot_present_a_token_says_why_and_sends_a_restore_nothing
             Ok(BackupReadResult::Service { sign_in, .. }) => assert_eq!(sign_in, expected),
             other => panic!("{token:?}: {other:?}"),
         }
-        let sent = rig.served.web().arrived().len();
         let refused = rig
             .read(&BackupReadParams::Bundle { locator: locator() })
             .await
             .expect_err("no token, no bundle read");
         assert_ne!(refused.code, ErrorCode::InvalidArgument);
+        // The failure is this host's, and the words say so rather than blaming the service.
+        assert!(
+            !refused.message.contains("storage service"),
+            "{token:?}: {}",
+            refused.message
+        );
         assert_eq!(
             rig.served.web().requests_to(SYNC),
             0,
             "{token:?}: nothing about a bundle left the host"
         );
-        assert!(rig.served.web().arrived().len() >= sent);
     }
 }
 
@@ -2685,13 +2701,14 @@ async fn a_restores_reads_are_refused_while_privacy_mode_is_on_and_held_to_the_s
     // Off again, and a read in flight when it turns on is not given: the service answers after
     // privacy mode was enabled, and the daemon holds the answer back.
     assert!(rig.set_privacy(false).await);
+    let reads_before = web.requests_to(OBJECT_READ);
     web.fail(OBJECT_READ, 1, Moment::Slow);
     let endpoint = rig.client_endpoint.clone();
     let in_flight =
         tokio::spawn(async move { relay_read(&endpoint, &Rig::object_read(0, 1024)).await });
     within(
         "the read reaches the service",
-        web.requests_reach(OBJECT_READ, 1),
+        web.requests_reach(OBJECT_READ, reads_before + 1),
     )
     .await;
     assert!(rig.set_privacy(true).await);
@@ -2704,24 +2721,25 @@ async fn a_restores_reads_are_refused_while_privacy_mode_is_on_and_held_to_the_s
             .code,
         ErrorCode::PermissionDenied
     );
+    assert_eq!(
+        web.requests_to(OBJECT_READ),
+        reads_before + 1,
+        "the read did reach the service: it was the answer that was held back, not the request"
+    );
 }
 
-/// KR-REQ-23.12 and the carrier's own rule: a delay the service names to a restore's read is
-/// owed to everything that asks next, the relay sends nothing inside it and answers what is left,
-/// an hour is the most it is held to, and the carrier of the host's own backups waits it out too.
+/// A delay the service names to a restore's read is owed to everything that asks next: the relay
+/// sends nothing inside it and answers what is left, and an hour is the most it is held to.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_delay_the_service_names_to_a_restores_read_is_owed_to_every_read_and_to_the_carrier() {
+async fn a_delay_the_service_names_to_a_restores_read_is_owed_to_every_later_read() {
     let timer = HeldTimer::held();
     let rig = Rig::start(Arrangement::NORMAL, Arc::clone(&timer)).await;
     let web = Arc::clone(rig.served.web());
     rig.admit(1, &[(1, plaintext(4096))]);
-    rig.controller.backup_runtime().expect("a carrier").wake();
-    let _ = &rig;
-    // The first generation is published with the timer held, so the passes are released by hand.
+    // The first generation is published with the timer let go, so the passes need no hand.
     timer.run_by_itself();
     rig.until("generation 1 is published", |rig| rig.published(1))
         .await;
-    drop(timer.asked_for());
 
     let busy = |seconds| Moment::Refuse {
         status: 429,
@@ -2800,4 +2818,164 @@ async fn a_refusal_the_service_words_with_the_locator_reaches_the_restore_withou
         .find(|got| got.path == SYNC)
         .expect("a bundle read");
     assert!(sent.body.to_string().contains(&locator().to_string()));
+}
+
+/// The delay is one record for the whole host. A delay a restore's read meets holds the carrier of
+/// the host's own backups, and a delay the carrier met holds a restore's read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_relay_and_the_carrier_owe_the_service_one_delay_between_them() {
+    let busy = Moment::Refuse {
+        status: 429,
+        code: "RATE_LIMITED",
+        retry_after_seconds: Some(600),
+    };
+
+    // A restore's read meets the delay; work that reaches the carrier afterwards waits it out and
+    // sends nothing in the meantime.
+    let timer = HeldTimer::held();
+    let rig = Rig::start(Arrangement::NORMAL, Arc::clone(&timer)).await;
+    let web = Arc::clone(rig.served.web());
+    within("the first status read", web.requests_reach(STATUS, 1)).await;
+    web.put_bundle(&locator().to_string(), ACCOUNT, sealed_bundle_bytes());
+    web.fail(SYNC, 1, busy);
+    assert!(matches!(
+        rig.read(&BackupReadParams::Bundle { locator: locator() })
+            .await,
+        Ok(BackupReadResult::Wait { .. })
+    ));
+    let sent = web.arrived().len();
+    rig.admit(1, &[(1, plaintext(2048))]);
+    rig.controller.backup_runtime().expect("a carrier").wake();
+    let (waited, _) = within("the carrier waits out the delay", timer.next_wait()).await;
+    assert_eq!(waited, Duration::from_secs(600));
+    assert_eq!(
+        web.arrived().len(),
+        sent,
+        "the carrier sent nothing inside a delay a restore's read met"
+    );
+    rig.fence().await;
+    drop(rig);
+
+    // The carrier meets the delay at its first question; a restore's read then sends nothing.
+    let timer = HeldTimer::held();
+    let rig = Rig::start(
+        Arrangement {
+            first_status: Some(busy),
+            ..Arrangement::NORMAL
+        },
+        Arc::clone(&timer),
+    )
+    .await;
+    let web = Arc::clone(rig.served.web());
+    let (waited, _) = within("the carrier waits out the delay", timer.next_wait()).await;
+    assert!(waited >= Duration::from_secs(600), "{waited:?}");
+    web.put_bundle(&locator().to_string(), ACCOUNT, sealed_bundle_bytes());
+    match rig
+        .read(&BackupReadParams::Bundle { locator: locator() })
+        .await
+    {
+        Ok(BackupReadResult::Wait {
+            retry_after_seconds,
+        }) => assert_eq!(retry_after_seconds.get(), 600),
+        other => panic!("a read inside a delay the carrier met: {other:?}"),
+    }
+    assert_eq!(web.requests_to(SYNC), 0);
+}
+
+/// A short delay on the bundle route comes back to the caller at once, and nothing in the daemon
+/// waits it out and sends the request again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_short_delay_on_a_bundle_read_is_the_callers_to_wait_out() {
+    let rig = Rig::start(Arrangement::NORMAL, HeldTimer::automatic()).await;
+    let web = Arc::clone(rig.served.web());
+    web.put_bundle(&locator().to_string(), ACCOUNT, sealed_bundle_bytes());
+    web.fail(
+        SYNC,
+        1,
+        Moment::Refuse {
+            status: 503,
+            code: "SERVICE_UNAVAILABLE",
+            retry_after_seconds: Some(2),
+        },
+    );
+    match rig
+        .read(&BackupReadParams::Bundle { locator: locator() })
+        .await
+    {
+        Ok(BackupReadResult::Wait {
+            retry_after_seconds,
+        }) => assert_eq!(retry_after_seconds.get(), 2),
+        other => panic!("a short delay is a wait: {other:?}"),
+    }
+    assert_eq!(web.requests_to(SYNC), 1, "the request was not sent again");
+}
+
+/// A sealed bundle is at most 128 KiB, so a service that answers with more is not behaving, and
+/// the daemon says so in its own words rather than passing the bytes on or calling it the
+/// service's refusal. The control is a bundle of exactly the most.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_bundle_larger_than_any_sealed_bundle_is_refused_by_name_and_one_at_the_limit_is_not() {
+    let rig = Rig::start(Arrangement::NORMAL, HeldTimer::automatic()).await;
+    let web = Arc::clone(rig.served.web());
+    let most = kr_protocol::backup_read::BACKUP_READ_MAX_BUNDLE_BYTES;
+    web.put_bundle(&locator().to_string(), ACCOUNT, plaintext(most));
+    match rig
+        .read(&BackupReadParams::Bundle { locator: locator() })
+        .await
+    {
+        Ok(BackupReadResult::Bundle {
+            bundle: BackupBundle::Held { ciphertext, .. },
+        }) => assert_eq!(ciphertext.len(), most),
+        other => panic!("a bundle at the limit: {other:?}"),
+    }
+    let over = Uuid::from_bytes([0x65; 16]);
+    web.put_bundle(&over.to_string(), ACCOUNT, plaintext(most + 1));
+    let refused = rig
+        .read(&BackupReadParams::Bundle { locator: over })
+        .await
+        .expect_err("a bundle over the limit");
+    assert_eq!(refused.code, ErrorCode::ResourceUnavailable);
+    assert!(
+        refused.message.contains(&most.to_string()),
+        "the limit is named: {}",
+        refused.message
+    );
+    assert!(!refused.message.contains(&over.to_string()));
+}
+
+/// An object the account owns reads; one another account owns is told as no object is, and neither
+/// is a refusal in the service's words.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_object_another_account_stored_is_told_as_no_object_is() {
+    let rig = Rig::start(Arrangement::NORMAL, HeldTimer::automatic()).await;
+    let web = Arc::clone(rig.served.web());
+    let (mine, theirs) = (object_id(0x41), object_id(0x42));
+    let archive = archive_id().to_string();
+    web.put_object(&archive, &mine.to_string(), ACCOUNT, plaintext(4096));
+    web.put_object(
+        &archive,
+        &theirs.to_string(),
+        "account-two",
+        plaintext(4096),
+    );
+    let read = |object: BackupObjectId| BackupReadParams::Object {
+        archive_id: archive_id(),
+        object_id: object,
+        offset: kr_protocol::scalars::U64::new(0),
+        length: kr_protocol::scalars::U64::new(1024),
+    };
+    assert!(matches!(
+        rig.read(&read(mine)).await,
+        Ok(BackupReadResult::Object { .. })
+    ));
+    let theirs = rig
+        .read(&read(theirs))
+        .await
+        .expect_err("not this account's");
+    let nothing = rig
+        .read(&read(object_id(0x43)))
+        .await
+        .expect_err("no such object");
+    assert_eq!(theirs.code, nothing.code);
+    assert_eq!(theirs.message, nothing.message);
 }

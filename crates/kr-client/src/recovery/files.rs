@@ -67,7 +67,7 @@ pub use kr_crypto::backup::{
 
 /// The most ciphertext one object read asks for, which a daemon's reply carries inside one control
 /// frame.
-pub const MAX_RANGE_BYTES: u64 = 512 * 1024;
+pub const MAX_RANGE_BYTES: u64 = kr_protocol::backup_read::BACKUP_READ_MAX_RANGE_BYTES;
 
 /// The domain a plan's digest is made under.
 const PLAN_DOMAIN: &[u8] = b"kr-backup-restore-plan/1\0";

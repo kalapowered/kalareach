@@ -12,10 +12,12 @@ impl Controller {
     ///
     /// Everything but the question of which service this host is configured for reads content that
     /// a restore writes outside the host's retention, so it follows privacy mode as `kr export`
-    /// does: it is refused while privacy mode is on, and an answer read under a state that has
-    /// changed by the time it would be given is not given. The decision is the published state
-    /// before the read and the published state after it; the answer is held, not delivered, when
-    /// they differ.
+    /// does. It is refused while privacy mode is on. The state is read as the read begins, checked
+    /// again where the request leaves the host (after the wait for an account token, which can be
+    /// long), and read once more when the service has answered: an answer whose read ended under
+    /// another state than it began under is not given. A request already on its way when privacy
+    /// mode is turned on cannot be recalled; what it returns is dropped here, and the command
+    /// reads privacy mode again after the last answer.
     ///
     /// # Errors
     ///
@@ -39,7 +41,7 @@ impl Controller {
                 detail: "privacy mode is on, and a restore reads nothing while it is".to_owned(),
             });
         }
-        let answer: BackupReadResult = relay.read(read).await?;
+        let answer: BackupReadResult = relay.read(read, before).await?;
         if held && self.privacy.state().now() != before {
             return Err(ControllerError::PermissionDenied {
                 detail: "privacy mode changed while that was read, so the answer is not given"

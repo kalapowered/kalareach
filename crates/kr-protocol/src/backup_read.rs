@@ -16,8 +16,9 @@
 //! * `generation` reads the newest generation published for an archive, held to a checkpoint.
 //! * `object` reads one range of a stored object.
 //!
-//! While privacy mode is on the daemon answers none of the last three, and an answer read under a
-//! privacy state that has changed by the time it is given is not given.
+//! While privacy mode is on the daemon answers none of the last three. It checks the privacy state
+//! when a read begins, again where the request leaves the host, and once more when the service has
+//! answered: an answer whose read ended under another state than it began under is not given.
 //!
 //! When the service asks to be left alone, the daemon answers [`BackupReadResult::Wait`] with what
 //! is left of the delay, and sends nothing until it has passed. The same record holds the
@@ -36,9 +37,11 @@ use crate::scalars::{Bytes, Nullable, U64, Uuid};
 /// The most ciphertext one `object` read asks for: it and its framing fit one control frame.
 pub const BACKUP_READ_MAX_RANGE_BYTES: u64 = 512 * 1024;
 
-/// The most ciphertext a `bundle` answer carries. A bundle larger than a control frame is refused
-/// by name rather than cut.
-pub const BACKUP_READ_MAX_BUNDLE_BYTES: usize = 896 * 1024;
+/// The most ciphertext a `bundle` answer carries: the most a sealed recovery bundle may be, which
+/// fits one control frame. A larger answer is a service that is not behaving, and is refused by
+/// name rather than cut.
+pub const BACKUP_READ_MAX_BUNDLE_BYTES: usize =
+    crate::sync::MAX_SEALED_RECOVERY_BUNDLE_BYTES as usize;
 
 /// Parameters of `backup.read`: exactly one read.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

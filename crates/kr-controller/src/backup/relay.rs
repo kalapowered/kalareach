@@ -17,18 +17,27 @@
 //!   and the carrier's alike. While one is owed the relay sends nothing and answers what is left of
 //!   it, and a delay a read meets is recorded for everything that asks next. The record bounds a
 //!   delay at an hour.
-//! * **The service's words stay out.** A refusal reaches the person as the service's code with a
-//!   sentence of this program's own, never as the service's text, which can repeat what was asked.
+//! * **A read is held to the state it began under, and checked again where it leaves.** A request
+//!   waits for an account token first, and that wait can last: the sign-in may be renewed or
+//!   changed meanwhile. So the relay's token source checks privacy mode and the record of quiet
+//!   once the token is in hand, which is the last point before a request is signed and sent, and a
+//!   read that finds privacy mode on, or changed since the read began, or a delay owed, sends
+//!   nothing. A request already on its way when privacy mode is turned on cannot be recalled; its
+//!   answer is not given (`Controller::backup_read` compares the state after the read).
+//! * **The service's words stay out.** A refusal by the service reaches the person as its code with
+//!   a sentence of this program's own, never as the service's text, which can repeat what was
+//!   asked. A failure on this host says what it is in this program's words.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use kr_client::error::ClientError;
 use kr_client::recovery::bundle_collection;
-use kr_client::services::account::{AccountTokenSource, BACKUP_WRITE_SCOPE};
+use kr_client::retry::UserAction;
+use kr_client::services::account::{AccountToken, AccountTokenSource, BACKUP_WRITE_SCOPE};
 use kr_client::services::{
-    BackupManifestService, ManagedSyncService, ServiceSigner, StorageService, SyncBackupService,
-    SyncFetched,
+    BackupManifestService, ManagedSyncService, ServiceFuture, ServiceSigner, StorageService,
+    SyncBackupService, SyncFetched,
 };
 use kr_crypto::keys::AuthorisationKeyPair;
 use kr_crypto::sign::{SigningTranscript, sign};
@@ -47,7 +56,78 @@ use crate::account::HostAccount;
 use crate::backup::runtime::{TokenState, describe_token, managed_clients, managed_transport};
 use crate::backup::uploader::Hold;
 use crate::error::{ControllerError, Result};
+use crate::privacy::{PrivacyState, Published};
 use crate::quiet::Quiet;
+
+tokio::task_local! {
+    /// The privacy state a read began under, for the read being answered in this task.
+    static READING: Published;
+}
+
+/// The token source the relay's clients present, which checks where a request is about to leave.
+///
+/// The token is asked for before a request is signed, and the wait for it is the one place a read
+/// can go from permitted to refused without anything on the request's path noticing. This is the
+/// last point before the request leaves.
+#[derive(Debug)]
+struct Gated {
+    inner: Arc<dyn AccountTokenSource>,
+    privacy: PrivacyState,
+    quiet: Arc<Quiet>,
+}
+
+impl Gated {
+    /// Whether a request may leave now.
+    fn open(&self) -> kr_client::Result<()> {
+        if let Some(left) = self.quiet.left() {
+            return Err(ClientError::Refused {
+                error: kr_client::error::refusal(
+                    ErrorCode::RateLimited,
+                    kr_client::shown::Shown::said(
+                        "the storage service asked to be left alone, and has not been",
+                    ),
+                ),
+                retry_after_seconds: Some(left.as_secs() + u64::from(left.subsec_nanos() > 0)),
+                action: UserAction::Wait,
+            });
+        }
+        let now = self.privacy.now();
+        let began = READING.try_with(|began| *began).ok();
+        if now.private || began.is_some_and(|began| began != now) {
+            return Err(ClientError::refusal(
+                ErrorCode::PermissionDenied,
+                kr_client::shown::Shown::said(
+                    "privacy mode is on, or changed while that was being read, so nothing is sent",
+                ),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl AccountTokenSource for Gated {
+    fn token<'a>(&'a self, scope: &'a str) -> ServiceFuture<'a, AccountToken> {
+        Box::pin(async move {
+            let token = self.inner.token(scope).await?;
+            self.open()?;
+            Ok(token)
+        })
+    }
+}
+
+/// Why a read did not answer.
+enum Failure {
+    /// The service refused it, or the exchange with it failed.
+    Exchange(ClientError),
+    /// This relay refused it, in its own words.
+    Local(ControllerError),
+}
+
+impl From<ClientError> for Failure {
+    fn from(error: ClientError) -> Self {
+        Self::Exchange(error)
+    }
+}
 
 /// A key that exists for this process only, signing the requests the service reads as a device's.
 struct InstallationSigner {
@@ -92,6 +172,7 @@ pub struct BackupRelay {
     storage: Arc<dyn StorageService>,
     manifest: Arc<dyn BackupManifestService>,
     bundles: ManagedSyncService,
+    /// The account's tokens as they are, for the question whether one can be had.
     tokens: Arc<dyn AccountTokenSource>,
     account: Arc<HostAccount>,
     quiet: Arc<Quiet>,
@@ -120,9 +201,15 @@ impl BackupRelay {
         writer: &AuthorisationKeyPair,
         account: Arc<HostAccount>,
         quiet: Arc<Quiet>,
+        privacy: PrivacyState,
     ) -> Result<Self> {
         let tokens = account.tokens_for(origin.as_str());
-        let clients = managed_clients(origin, proxy, writer, &tokens)?;
+        let gated: Arc<dyn AccountTokenSource> = Arc::new(Gated {
+            inner: Arc::clone(&tokens),
+            privacy: privacy.clone(),
+            quiet: Arc::clone(&quiet),
+        });
+        let clients = managed_clients(origin, proxy, writer, &gated)?;
         let (Some(storage), Some(manifest)) = (clients.storage, clients.backup_manifest) else {
             return Err(ControllerError::NotConfigured(
                 "a restore's reads need a storage client and a backup manifest client".to_owned(),
@@ -136,7 +223,7 @@ impl BackupRelay {
             managed_transport(origin, proxy)?,
             installation,
         )
-        .presenting(Arc::clone(&tokens), BACKUP_WRITE_SCOPE)
+        .presenting(gated, BACKUP_WRITE_SCOPE)
         .leaving_delays_to_the_caller();
         Ok(Self {
             origin: origin.clone(),
@@ -149,17 +236,22 @@ impl BackupRelay {
         })
     }
 
-    /// Answers one read.
+    /// Answers one read, which began under the privacy state `began`.
     ///
     /// A read that reaches the service is refused first when the service has asked to be left
     /// alone: nothing is sent, and what is left of the delay is the answer. A delay the service
-    /// names to a read is recorded and answered the same way.
+    /// names to a read is recorded and answered the same way. The same checks run again where the
+    /// request leaves ([`Gated`]).
     ///
     /// # Errors
     ///
     /// Returns a [`ControllerError`] whose code is the service's and whose words are this
     /// program's, and [`ControllerError::InvalidArgument`] for a range that is not one.
-    pub async fn read(&self, params: BackupReadParams) -> Result<BackupReadResult> {
+    pub async fn read(
+        &self,
+        params: BackupReadParams,
+        began: Published,
+    ) -> Result<BackupReadResult> {
         if let BackupReadParams::Object { length, .. } = &params
             && (length.get() == 0 || length.get() > BACKUP_READ_MAX_RANGE_BYTES)
         {
@@ -167,49 +259,56 @@ impl BackupRelay {
                 "a read of an object asks for between one byte and {BACKUP_READ_MAX_RANGE_BYTES}"
             )));
         }
-        let read = match params {
-            BackupReadParams::Service {} => return Ok(self.service().await),
-            other => {
-                if let Some(left) = self.quiet.left() {
-                    return Ok(wait(left));
-                }
-                self.reach(other).await
-            }
-        };
-        match read {
+        if matches!(params, BackupReadParams::Service {}) {
+            return Ok(self.service().await);
+        }
+        if let Some(left) = self.quiet.left() {
+            return Ok(wait(left));
+        }
+        match READING.scope(began, self.reach(params)).await {
             Ok(result) => Ok(result),
-            Err(error) => {
+            Err(Failure::Local(error)) => Err(error),
+            Err(Failure::Exchange(error)) => {
                 let hold = Hold::of(&error);
                 if let Some(delay) = hold.retry_after {
                     self.quiet.owe(delay);
                     return Ok(wait(self.quiet.left().unwrap_or(delay)));
                 }
+                // The service's own text can repeat what it was asked, so a refusal by the service
+                // is its code and a sentence of this program's. Everything else failed on this
+                // host or on the way, and says what it is.
+                let detail = match &error {
+                    ClientError::Refused { .. } => local_words(hold.code).to_owned(),
+                    other => other.to_string(),
+                };
                 Err(ControllerError::Refused {
                     code: hold.code,
-                    detail: local_words(hold.code).to_owned(),
+                    detail,
                 })
             }
         }
     }
 
     /// Sends one read that reaches the service.
-    async fn reach(&self, params: BackupReadParams) -> kr_client::Result<BackupReadResult> {
+    async fn reach(
+        &self,
+        params: BackupReadParams,
+    ) -> std::result::Result<BackupReadResult, Failure> {
         match params {
             BackupReadParams::Service {} => Ok(self.service().await),
             BackupReadParams::Bundle { locator } => self.bundle(&locator.to_string()).await,
             BackupReadParams::Generation {
                 archive_id,
                 checkpoint,
-            } => self.generation(archive_id, checkpoint.0).await,
+            } => Ok(self.generation(archive_id, checkpoint.0).await?),
             BackupReadParams::Object {
                 archive_id,
                 object_id,
                 offset,
                 length,
-            } => {
-                self.object(archive_id, object_id, offset.get(), length.get())
-                    .await
-            }
+            } => Ok(self
+                .object(archive_id, object_id, offset.get(), length.get())
+                .await?),
         }
     }
 
@@ -233,7 +332,7 @@ impl BackupRelay {
         }
     }
 
-    async fn bundle(&self, locator: &str) -> kr_client::Result<BackupReadResult> {
+    async fn bundle(&self, locator: &str) -> std::result::Result<BackupReadResult, Failure> {
         let collection = bundle_collection(&RecoveryContext {
             service_origin: self.origin.as_str().to_owned(),
             bundle_locator: locator.to_owned(),
@@ -243,13 +342,16 @@ impl BackupRelay {
                 position,
                 ciphertext,
             }) => {
+                // No valid sealed bundle is larger, so a larger answer is a service that is not
+                // behaving, and it is refused here rather than cut or sent on.
                 if ciphertext.len() > BACKUP_READ_MAX_BUNDLE_BYTES {
-                    return Err(ClientError::refusal(
-                        ErrorCode::ResourceUnavailable,
-                        kr_client::shown::Shown::said(
-                            "the recovery bundle is larger than one reply carries",
+                    return Err(Failure::Local(ControllerError::Refused {
+                        code: ErrorCode::ResourceUnavailable,
+                        detail: format!(
+                            "the service answered with a recovery bundle over the \
+                             {BACKUP_READ_MAX_BUNDLE_BYTES}-byte limit a sealed bundle has"
                         ),
-                    ));
+                    }));
                 }
                 BackupBundle::Held {
                     write_sequence: U64::new(position.write_sequence),
@@ -267,7 +369,7 @@ impl BackupRelay {
             Err(error) if error.code() == ErrorCode::UnknownSession => BackupBundle::Absent {
                 recovery: Nullable::null(),
             },
-            Err(error) => return Err(error),
+            Err(error) => return Err(Failure::Exchange(error)),
         };
         Ok(BackupReadResult::Bundle { bundle })
     }
@@ -331,5 +433,95 @@ const fn local_words(code: ErrorCode) -> &'static str {
             "the storage service could not be reached"
         }
         _ => "the storage service refused that read",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use tokio::sync::Notify;
+
+    use super::*;
+    use crate::quiet::RealTimer;
+
+    /// An account whose token arrives when the test says, as one does that is being renewed.
+    #[derive(Debug)]
+    struct Renewing(Arc<Notify>);
+
+    impl AccountTokenSource for Renewing {
+        fn token<'a>(&'a self, _scope: &'a str) -> ServiceFuture<'a, AccountToken> {
+            Box::pin(async move {
+                self.0.notified().await;
+                Ok(AccountToken::new("a-token").expect("a token"))
+            })
+        }
+    }
+
+    fn state(generation: u64, private: bool) -> Published {
+        Published {
+            generation: kr_worker::privacy::PrivacyGeneration::new(generation),
+            private,
+        }
+    }
+
+    /// What the gate answers a request that waited for its token while `change` happened.
+    async fn after_waiting(
+        change: impl FnOnce(&PrivacyState, &Quiet),
+    ) -> kr_client::Result<AccountToken> {
+        let privacy = PrivacyState::default();
+        privacy.set(state(1, false));
+        let quiet = Arc::new(Quiet::new(Arc::new(RealTimer)));
+        let renewed = Arc::new(Notify::new());
+        let gate = Arc::new(Gated {
+            inner: Arc::new(Renewing(Arc::clone(&renewed))),
+            privacy: privacy.clone(),
+            quiet: Arc::clone(&quiet),
+        });
+        let asking = tokio::spawn({
+            let gate = Arc::clone(&gate);
+            READING.scope(
+                state(1, false),
+                async move { gate.token("backup.write").await },
+            )
+        });
+        // The request is waiting for its token. Whatever happens to the host in the meantime
+        // happens before the token arrives.
+        tokio::task::yield_now().await;
+        change(&privacy, &quiet);
+        renewed.notify_one();
+        asking.await.expect("the request task")
+    }
+
+    /// KR-REQ-24.27: a read that waited for its token while privacy mode was turned on, or while it
+    /// was turned on and off again, or while the service asked to be left alone, sends nothing;
+    /// the control is the same wait with nothing changed.
+    #[tokio::test]
+    async fn a_request_that_waited_for_its_token_is_checked_again_where_it_leaves() {
+        assert!(
+            after_waiting(|_, _| {}).await.is_ok(),
+            "nothing changed while it waited"
+        );
+
+        let turned_on = after_waiting(|privacy, _| privacy.set(state(2, true)))
+            .await
+            .expect_err("privacy mode was turned on while it waited");
+        assert_eq!(turned_on.code(), ErrorCode::PermissionDenied);
+
+        let there_and_back = after_waiting(|privacy, _| {
+            privacy.set(state(2, true));
+            privacy.set(state(3, false));
+        })
+        .await
+        .expect_err("privacy mode came on and went off again while it waited");
+        assert_eq!(there_and_back.code(), ErrorCode::PermissionDenied);
+
+        let owed = after_waiting(|_, quiet| quiet.owe(Duration::from_secs(30)))
+            .await
+            .expect_err("the service asked to be left alone while it waited");
+        assert_eq!(
+            Hold::of(&owed).retry_after.map(|delay| delay.as_secs()),
+            Some(30)
+        );
     }
 }

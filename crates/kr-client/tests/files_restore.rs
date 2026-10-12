@@ -1398,10 +1398,13 @@ async fn a_service_that_answers_a_read_with_nothing_stops_the_restore() {
     let sealed = world.seal(4, &honest_members());
     let mut source = Scripted::serving(&world, world.bundle(&Shape::default())).publishing(&sealed);
     source.serves_empty_ranges = true;
-    assert!(matches!(
-        restore(&world, &Arc::new(source), None)
-            .await
-            .expect_err("stopped"),
-        RestoreError::Range
-    ));
+    // A restore that kept asking would never end, so the test would hang; it is given a bound so
+    // that a defect fails here instead.
+    let stopped = tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        restore(&world, &Arc::new(source), None),
+    )
+    .await
+    .expect("the restore stops rather than asking for ever");
+    assert!(matches!(stopped.expect_err("stopped"), RestoreError::Range));
 }
