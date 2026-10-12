@@ -6791,6 +6791,41 @@ pub(crate) mod tests {
         );
     }
 
+    /// KR-PERF-003: a store that another process has taken is still found by the page that comes
+    /// after the taking and stops the link, as it was before an empty page was taken without a
+    /// write: the quiet path does not read a store it cannot read as one with nothing to decide.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_store_another_process_took_still_stops_the_link_that_brings_an_empty_page() {
+        let temp = kr_ipc::testing::TempHost::create();
+        let module = self::module(&temp);
+        let session_id = SessionId::new(kr_ipc::new_uuid());
+        let (link, _reader, _writer) = linked(&temp, 1, &module, session_id).await;
+        let empty = AttentionSourcePage {
+            built_at_boot_ms: U64::new(kr_ipc::clock::boot_elapsed_ms()),
+            ..question_page_without_a_question()
+        };
+        let taken = module
+            .take_page(session_id, &link, Cursors::default(), &empty)
+            .await
+            .expect("the store is this module's");
+        assert!(matches!(taken, Taken::Complete));
+
+        // Another process takes the claim on the store's file; the module learns it at its next
+        // write, which the maintenance loop makes at least once a minute.
+        Commits::of(&temp)
+            .observer
+            .execute("UPDATE attention_owner SET claim = claim + 1", [])
+            .expect("the claim is taken");
+        let _ = module.tick_and_forget(0).await;
+        assert!(
+            module
+                .take_page(session_id, &link, Cursors::default(), &empty)
+                .await
+                .is_err(),
+            "the page that comes after the taking is refused, not taken as an idle one"
+        );
+    }
+
     /// The maintenance tick is decided on the blocking pool too, and never on the runtime's own
     /// thread: the runtime here has the one, so a tick that waited on it would hold the whole
     /// runtime.
@@ -7000,6 +7035,34 @@ pub(crate) mod tests {
         );
     }
 
+    /// Commits one event of the workflow journal's stream, in an action of its own.
+    fn record_in_the_journal(
+        journal: &WorkflowStore,
+        kind: &kr_automation::store::JournalEventKind,
+    ) {
+        let admit = || Ok(());
+        let key = kr_automation::ActionKey {
+            actor_id: "local:test".to_owned(),
+            action_id: kr_ipc::new_uuid().to_string(),
+            method: "workflow.run".to_owned(),
+            digest: vec![1],
+        };
+        journal
+            .act(
+                &kr_automation::Submitted {
+                    key: &key,
+                    admission: &admit,
+                    caller_grant: None,
+                },
+                kr_ipc::now_ms().get(),
+                |journal| {
+                    journal.record_event(kind, kr_ipc::now_ms().get())?;
+                    Ok((kr_automation::ActionRecord::done(&"recorded")?, ()))
+                },
+            )
+            .expect("the journal commits the action");
+    }
+
     /// KR-REQ-25.01, KR-REQ-25.03: what the workflow journal records for the attention store, a
     /// workflow paused by one of its limits, reaches the inbox when it is committed, by the
     /// journal's own signal and with no timer to find it.
@@ -7020,101 +7083,86 @@ pub(crate) mod tests {
         };
         assert_eq!(items(&module), 0, "nothing is paused");
 
-        let admit = || Ok(());
-        let key = kr_automation::ActionKey {
-            actor_id: "local:test".to_owned(),
-            action_id: kr_ipc::new_uuid().to_string(),
-            method: "workflow.run".to_owned(),
-            digest: vec![1],
-        };
-        journal
-            .act(
-                &kr_automation::Submitted {
-                    key: &key,
-                    admission: &admit,
-                    caller_grant: None,
-                },
-                kr_ipc::now_ms().get(),
-                |journal| {
-                    journal.record_event(
-                        &kr_automation::store::JournalEventKind::WorkflowPaused {
-                            workflow_id: kr_protocol::ids::WorkflowId::new(kr_ipc::new_uuid()),
-                            revision: 1,
-                            reason: "max_concurrent_runs".to_owned(),
-                        },
-                        kr_ipc::now_ms().get(),
-                    )?;
-                    Ok((kr_automation::ActionRecord::done(&"paused")?, ()))
-                },
-            )
-            .expect("the journal commits the action");
+        record_in_the_journal(
+            &journal,
+            &kr_automation::store::JournalEventKind::WorkflowPaused {
+                workflow_id: kr_protocol::ids::WorkflowId::new(kr_ipc::new_uuid()),
+                revision: 1,
+                reason: "max_concurrent_runs".to_owned(),
+            },
+        );
         tokio::time::sleep(Duration::from_secs(1)).await;
         assert_eq!(items(&module), 1, "the pause is in the inbox");
     }
 
     /// KR-PERF-003: the store reads the workflow journal's records on the journal's signal and has
     /// no deadline of its own for them. That rests on one property of what those records raise,
-    /// which this holds: once the journal's records have been certified, none of the environment's
-    /// items waits for a time, whichever record was read. An item that did (a reminder, or a
-    /// repeat) would need a timer, and the reader of the journal keeps none.
+    /// which this holds for the records the journal writes: once the store has read them and
+    /// certified the environment, none of the environment's items waits for a time, whether the
+    /// record paused a workflow, stopped a chain or ended a pause. An item that did wait (a
+    /// reminder, or a repeat) would need a timer, and the reader of the journal keeps none.
     #[tokio::test(flavor = "multi_thread")]
     async fn no_record_the_workflow_journal_raises_leaves_the_environment_with_a_deadline() {
+        use kr_automation::store::JournalEventKind;
         let temp = kr_ipc::testing::TempHost::create();
         let module = self::module(&temp);
-        let workflow = kr_protocol::attention::AttentionAutomationSubject::Workflow {
-            workflow_id: kr_protocol::ids::WorkflowId::new(kr_ipc::new_uuid()),
-            revision: U64::new(1),
-        };
-        let chain = kr_protocol::attention::AttentionAutomationSubject::CausalChain {
-            causal_root_id: kr_protocol::ids::CausalRootId::new(kr_ipc::new_uuid()),
-        };
-        let kinds = [
-            EventKind::AutomationPaused {
-                subject: workflow.clone(),
-                reason: "max_concurrent_runs".to_owned(),
-                grant_id: None,
-            },
-            EventKind::AutomationPaused {
-                subject: chain,
-                reason: "depth".to_owned(),
-                grant_id: None,
-            },
-            EventKind::AutomationResumed { subject: workflow },
-        ];
-        let events: Vec<_> = kinds
-            .into_iter()
-            .zip(1..)
-            .map(|(kind, sequence)| {
-                SourceEvent::new(
-                    kr_attention::EventCursor::new(AttentionSource::Automation, sequence),
-                    TimestampMs::new(kr_ipc::now_ms().get()),
-                    kind,
-                )
-            })
-            .collect();
-        module
-            .store()
-            .expect("the store")
-            .rebuild(&events, module.reading())
-            .expect("the store reads the records");
-        module
-            .certify_environment(kr_ipc::clock::boot_elapsed_ms())
-            .expect("the certification is recorded");
-        let decided = decisions(&module);
-        assert!(!decided.is_empty(), "the records raised an item");
-        assert!(
-            decided.iter().all(|item| item.0.is_some()),
-            "the certification decided every item: {decided:?}"
-        );
-        assert_eq!(
+        let journal = Arc::new(WorkflowStore::in_memory().expect("a journal"));
+        let workflow_id = kr_protocol::ids::WorkflowId::new(kr_ipc::new_uuid());
+        let waiting = |module: &Arc<AttentionModule>| {
             module
                 .store()
                 .expect("the store")
                 .next_deadline_of(&Origin::Environment, module.reading())
-                .expect("the engine answers"),
-            None,
-            "and none of them waits for a time"
+                .expect("the engine answers")
+        };
+
+        record_in_the_journal(
+            &journal,
+            &JournalEventKind::WorkflowPaused {
+                workflow_id,
+                revision: 1,
+                reason: "max_concurrent_runs".to_owned(),
+            },
         );
+        record_in_the_journal(
+            &journal,
+            &JournalEventKind::CausalLimit {
+                causal_root_id: kr_protocol::ids::CausalRootId::new(kr_ipc::new_uuid()),
+                reason: "depth".to_owned(),
+            },
+        );
+        module
+            .take_automation(&journal)
+            .await
+            .expect("the records are read");
+        let decided = decisions(&module);
+        assert_eq!(
+            decided.len(),
+            2,
+            "a pause and a stopped chain are in the inbox"
+        );
+        assert!(
+            decided.iter().all(|item| item.0.is_some()),
+            "the certification decided both: {decided:?}"
+        );
+        assert_eq!(waiting(&module), None, "and neither waits for a time");
+
+        record_in_the_journal(
+            &journal,
+            &JournalEventKind::WorkflowResumed {
+                workflow_id,
+                revision: 1,
+            },
+        );
+        module
+            .take_automation(&journal)
+            .await
+            .expect("the record is read");
+        assert!(
+            decisions(&module).iter().all(|item| item.0.is_some()),
+            "what the end of the pause left is decided"
+        );
+        assert_eq!(waiting(&module), None, "and nothing waits for a time");
     }
 
     /// The certification of the workflow journal's records decides what an environment item is owed

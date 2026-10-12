@@ -3649,9 +3649,9 @@ mod tests {
     }
 
     /// KR-PERF-003: whoever waits on the journal is told about every commit that changed a row,
-    /// whichever way it was made, and about nothing else. An action's own transaction, a refusal it
-    /// recorded, a single statement and a registration are all seen; a read, a repeat answered from
-    /// a record and a registration that was already made are not.
+    /// whichever way it was made. An action's own transaction, a refusal it recorded and a
+    /// registration are all seen; a read, a repeat answered from a record and a registration that
+    /// was already made, which wrote nothing, are not.
     #[test]
     fn the_journal_announces_each_commit_that_changed_a_row_and_no_other_statement() {
         let store = WorkflowStore::in_memory().unwrap();
