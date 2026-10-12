@@ -3128,8 +3128,17 @@ fn kr_req_24_27_a_placement_on_the_wire_is_waited_for_before_the_change_is_recor
     second_arrival
         .recv_timeout(PATIENCE)
         .expect("the pass asks its question again");
-    turning.join().expect("the change ends");
+    let report = turning.join().expect("the change ends");
     assert_eq!(subsystems.recorded_generation(), 1);
+    assert!(
+        report
+            .exported
+            .iter()
+            .any(|copy| copy.reference.contains("mailbox")
+                && copy.reference.contains(&notification_id.to_string())),
+        "the change itself lists the copy that left: {:?}",
+        report.exported
+    );
 
     // The pass goes on, takes the admission its push needs, and finds the change made: the
     // notification is taken back and nothing is presented after the boundary.
