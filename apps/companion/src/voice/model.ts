@@ -28,6 +28,10 @@ import type {
 
 import type { VoiceCallState } from '../host/port'
 
+/** What the screen says when the host's barrier for its fence could not be read. */
+export const FENCE_UNREADABLE_WORDS =
+  'The host answered with a status for its workers that this app could not read, so it has not confirmed that nothing the call sent can still run.'
+
 /** The sessions a host's answer names as not yet confirmed, and whether the list is cut. */
 export interface ToConfirm {
   /** The sessions whose workers have not confirmed the fence, as the answer names them. */

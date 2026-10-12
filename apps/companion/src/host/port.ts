@@ -503,6 +503,11 @@ export interface VoiceClosure {
   readonly closed_locally: boolean
   /** The host's answer, or null when the host could not be told. */
   readonly settled: Settled<VoiceStopResult> | null
+  /**
+   * Whether the host answered with a barrier for its fence that this build could not read, so that
+   * whether every worker holds is not known here. The grant is revoked either way.
+   */
+  readonly fence_unreadable: boolean
   /** Why the host could not be told, when it could not. */
   readonly host_failure: HostError | null
 }

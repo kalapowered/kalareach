@@ -17,6 +17,7 @@ import {
   asCaptureState,
   choiceFromPreparation,
   choiceWithRate,
+  FENCE_UNREADABLE_WORDS,
   requestedSeconds,
   runningCallFrom,
   toConfirm,
@@ -427,7 +428,9 @@ export function VoiceRoute({
                 ? `This device's call is closed. The host was not told, so its grant may still be open: ${failureWords(closure.host_failure)}`
                 : pending.sessions.length > 0
                   ? `This device's call is closed and its grant withdrawn. ${toConfirmWords(pending, choice?.sessionNames ?? {}, 'call')}`
-                  : null
+                  : closure.fence_unreadable
+                    ? `This device's call is closed and its grant withdrawn. ${FENCE_UNREADABLE_WORDS}`
+                    : null
             )
           })
           .catch((error: unknown) => {

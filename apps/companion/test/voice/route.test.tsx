@@ -241,6 +241,29 @@ describe('while a call is running', () => {
     expect(screen.queryByRole('heading', { name: 'Voice session' })).not.toBeInTheDocument()
   })
 
+  // Section 9: a host whose barrier for its fence this app cannot read has not shown that its
+  // workers hold, so the screen says that and does not report the stop as complete.
+  it('says the host has not confirmed its workers when its status cannot be read', async () => {
+    const person = userEvent.setup()
+    const { controls } = start()
+    await waitForChoice()
+    await person.click(screen.getByRole('button', { name: 'Start voice session' }))
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'End session' })).toBeInTheDocument()
+    })
+
+    controls.leaveNextVoiceStopFenceUnreadable()
+    await person.click(screen.getByRole('button', { name: 'End session' }))
+
+    await waitFor(() => {
+      expect(
+        screen.getByText(/status for its workers that this app could not read/)
+      ).toBeInTheDocument()
+    })
+    expect(screen.getByText(/its grant withdrawn/)).toBeInTheDocument()
+    expect(screen.queryByRole('heading', { name: 'Voice session' })).not.toBeInTheDocument()
+  })
+
   // KR-REQ-15.17: transport closure survives a host that cannot be told about it, and the screen
   // says which half happened rather than reporting a revocation it has no answer for.
   it('closes the call locally when the host cannot be told, and says so', async () => {

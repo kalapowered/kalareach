@@ -434,6 +434,11 @@ export interface FakeHostControls {
    * more workers were affected than one answer carries.
    */
   leaveNextVoiceChangePendingAt(sessionIds: readonly string[], cut?: number): void
+  /**
+   * Has the next end of a call be answered with a barrier for its fence that the page's build
+   * cannot read, as a host that has changed the barrier's shape does.
+   */
+  leaveNextVoiceStopFenceUnreadable(): void
   /** What the next paste from the clipboard finds. */
   setPasteboard(result: PasteView): void
   /** The codes the page started pairing with, in order. */
@@ -705,6 +710,8 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
   let voiceAllowFailure: string | null = null
   let voiceHeldBack: readonly VoiceAction[] = []
   let voiceAllowUnconfirmed = false
+  /** Whether the next end of a call is answered with a barrier this build cannot read. */
+  let voiceStopFenceUnreadable = false
   /** The sessions whose workers the next voice change leaves pending, and how many it cuts. */
   let voiceFencePendingAt: { sessionIds: readonly string[]; cut: number } | null = null
   /** The barrier the next voice change carries: none, or workers that have not held. */
@@ -1618,6 +1625,7 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
         return Promise.resolve({
           closed_locally: running !== null,
           settled: null,
+          fence_unreadable: false,
           host_failure: {
             code: 'RESOURCE_UNAVAILABLE',
             // Native code sends a host's refusal as its code, a colon and the host's words.
@@ -1626,6 +1634,8 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
           }
         })
       }
+      const voiceFenceUnreadable = voiceStopFenceUnreadable
+      voiceStopFenceUnreadable = false
       return Promise.resolve({
         closed_locally: running !== null,
         settled: {
@@ -1637,9 +1647,10 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
             revoked_at_ms: String(VOICE_NOW_MS),
             broker_notified: true,
             sessions_left_running: [SESSION_MAIN],
-            barrier: voiceBarrier()
+            barrier: voiceFenceUnreadable ? null : voiceBarrier()
           }
         },
+        fence_unreadable: voiceFenceUnreadable,
         host_failure: null
       })
     },
@@ -1807,6 +1818,9 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
     },
     leaveNextVoiceChangePendingAt(sessionIds, cut = 0) {
       voiceFencePendingAt = { sessionIds, cut }
+    },
+    leaveNextVoiceStopFenceUnreadable() {
+      voiceStopFenceUnreadable = true
     },
     sessionCreates,
     describe(sessionId, change) {
