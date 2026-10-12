@@ -1194,21 +1194,47 @@ pub async fn voice_stop(
 
 /// What the host answered to a stop, as the page reads it: the result with the barrier of its fence
 /// less the names of the actions the fence named ([`without_the_names`]).
+///
+/// An answer this build cannot read as a stop's result is still an answer: the host was told and
+/// revoked the grant. The page is given what it holds of it without the barrier, and none of the
+/// names.
 fn settled_stop(answer: &kr_client::Settled) -> Result<Settled> {
     let kr_client::Settled::Result(value) = answer else {
         return settled(answer);
     };
-    let stopped: kr_protocol::voice::VoiceStopResult = value
-        .to_typed()
-        .map_err(|error| CommandError::local_failure(error.to_string()))?;
+    let Ok(stopped) = value.to_typed::<kr_protocol::voice::VoiceStopResult>() else {
+        let mut unread = settled(answer)?;
+        if let Some(Value::Object(members)) = unread.value.as_mut() {
+            members.remove("barrier");
+        }
+        return Ok(unread);
+    };
     Ok(Settled {
         receipt: None,
         action_id: None,
-        value: Some(encode(&kr_protocol::voice::VoiceStopResult {
-            barrier: kr_protocol::scalars::Nullable(stopped.barrier.0.map(without_the_names)),
-            ..stopped
-        })?),
+        value: Some(encode(&stopped_for_the_page(stopped))?),
     })
+}
+
+/// A stop's result as the page reads it: the barrier of its fence without the names of the actions
+/// the fence named.
+fn stopped_for_the_page(
+    stopped: kr_protocol::voice::VoiceStopResult,
+) -> kr_protocol::voice::VoiceStopResult {
+    kr_protocol::voice::VoiceStopResult {
+        barrier: kr_protocol::scalars::Nullable(stopped.barrier.0.map(without_the_names)),
+        ..stopped
+    }
+}
+
+/// A replacement's result as the page reads it: what the grant permits and could not carry, and the
+/// barrier of its fence without the names of the actions the fence named.
+fn allowed_for_the_page(granted: kr_protocol::voice::VoiceGrantResult) -> VoiceAllowed {
+    VoiceAllowed {
+        statement: granted.statement,
+        not_held_by_device: granted.not_held_by_device,
+        barrier: kr_protocol::scalars::Nullable(granted.barrier.0.map(without_the_names)),
+    }
 }
 
 /// What ending a call did, locally and on the host.
@@ -1393,13 +1419,7 @@ pub async fn voice_allow(
             Ok(Settled {
                 receipt: None,
                 action_id: None,
-                value: Some(encode(&VoiceAllowed {
-                    statement: granted.statement,
-                    not_held_by_device: granted.not_held_by_device,
-                    barrier: kr_protocol::scalars::Nullable(
-                        granted.barrier.0.map(without_the_names),
-                    ),
-                })?),
+                value: Some(encode(&allowed_for_the_page(granted))?),
             })
         }
         other => submitted(other),
@@ -2081,6 +2101,66 @@ mod tests {
                 text: kr_protocol::voice::FragmentText::new("apply the diff").expect("a fragment"),
             }],
             confirmation: Nullable(proof),
+        }
+    }
+
+    /// A stop's and a replacement's results reach the page without the names of the actions the
+    /// fence named, and as the page reads a session: its identifier as text, not as the wire's bytes.
+    #[test]
+    fn a_stops_and_a_replacements_results_reach_the_page_without_names() {
+        use kr_protocol::action::{BarrierState, FencedAction, RevocationBarrier, WorkerBarrier};
+        use kr_protocol::ids::{ActionId, ActorId, AuthorityRevision, GrantId, SessionId};
+        use kr_protocol::scalars::{CanonicalSet, Nullable, TimestampMs, U64, Uuid};
+
+        let device = ActorId::new("device:phone").expect("a principal");
+        let session = SessionId::new(Uuid::from_bytes([9; 16]));
+        let barrier = RevocationBarrier::new(
+            AuthorityRevision::new(5),
+            vec![WorkerBarrier {
+                session_id: session,
+                state: BarrierState::Pending,
+                acknowledged_revision: Nullable::null(),
+                rejected_actions: vec![FencedAction {
+                    actor_id: device,
+                    action_id: ActionId::new(Uuid::from_bytes([1; 16])),
+                }],
+                rejected_actions_total: U64::new(1),
+                possibly_executed: Vec::new(),
+                possibly_executed_total: U64::new(0),
+                omitted_actions: U64::new(0),
+                names_pending: U64::new(0),
+                detail: String::new(),
+            }],
+        );
+        let stopped = kr_protocol::voice::VoiceStopResult {
+            voice_session_id: kr_protocol::ids::VoiceSessionId::new(Uuid::from_bytes([7; 16])),
+            revoked_grant_id: GrantId::new(Uuid::from_bytes([6; 16])),
+            revoked_at_ms: TimestampMs::new(1_700_000_000_000),
+            broker_notified: true,
+            sessions_left_running: CanonicalSet::new(),
+            barrier: Nullable::some(barrier.clone()),
+        };
+        let granted = kr_protocol::voice::VoiceGrantResult {
+            grant_id: GrantId::new(Uuid::from_bytes([5; 16])),
+            device_id: kr_protocol::ids::DeviceId::new(Uuid::from_bytes([4; 16])),
+            statement: kr_protocol::voice::VoiceGrantStatement::of(&CanonicalSet::new()),
+            not_held_by_device: CanonicalSet::new(),
+            barrier: Nullable::some(barrier),
+        };
+
+        for read in [
+            encode(&stopped_for_the_page(stopped)).expect("it encodes"),
+            encode(&allowed_for_the_page(granted)).expect("it encodes"),
+        ] {
+            let said = read.to_string();
+            assert!(!said.contains("device:phone"), "{said}");
+            assert_eq!(
+                read["barrier"]["workers"][0]["session_id"],
+                session.to_string(),
+                "the page reads a session as text"
+            );
+            assert_eq!(read["barrier"]["workers"][0]["state"], "pending");
+            assert_eq!(read["barrier"]["workers_total"], "1");
         }
     }
 
