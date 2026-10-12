@@ -855,6 +855,37 @@ pub async fn pair_with(
 
 /// Connects a paired device to the host it was paired with.
 pub async fn connect(host: &Host, device: &Device, record: &DeviceRecord) -> Session {
+    Session::start(Arc::new(paired_dial(host, device, record).dial().await)).expect("a session")
+}
+
+/// What a paired device needs to dial the host it was paired with, again and again, with nothing of
+/// the host or the device held: for a suite that puts something of its own between the device's
+/// session and the host.
+#[derive(Clone)]
+pub struct PairedDial {
+    endpoint: Endpoint,
+    addr: EndpointAddr,
+    identity: Arc<LocalIdentity>,
+    host_record: PairedPeer,
+}
+
+impl PairedDial {
+    /// One connection of the device's to the host, authorised as the device.
+    pub async fn dial(&self) -> NetworkTransport {
+        NetworkTransport::connect(
+            &self.endpoint,
+            self.addr.clone(),
+            &self.identity,
+            &self.host_record,
+            SendLimits::default(),
+        )
+        .await
+        .expect("the paired device connects")
+    }
+}
+
+/// How `device`, paired as `record`, dials `host`.
+pub fn paired_dial(host: &Host, device: &Device, record: &DeviceRecord) -> PairedDial {
     let pairing = host.network.pairing();
     let host_record = PairedPeer {
         device_id: pairing.identity().device_id,
@@ -869,16 +900,12 @@ pub async fn connect(host: &Host, device: &Device, record: &DeviceRecord) -> Ses
     for socket in host.network.bound_sockets() {
         addr = addr.with_ip_addr(socket);
     }
-    let transport = NetworkTransport::connect(
-        &device.endpoint,
+    PairedDial {
+        endpoint: device.endpoint.clone(),
         addr,
-        &device.paired_identity(record.device_id),
-        &host_record,
-        SendLimits::default(),
-    )
-    .await
-    .expect("the paired device connects");
-    Session::start(Arc::new(transport)).expect("a session")
+        identity: device.paired_identity(record.device_id),
+        host_record,
+    }
 }
 
 /// A paired device that sends its own frames.

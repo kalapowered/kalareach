@@ -26,6 +26,7 @@ pub struct AppState {
     paste: OnceLock<Arc<dyn PastePlatform>>,
     drafts: Arc<crate::drafts::DraftDesk>,
     questions: crate::questions::QuestionDesk,
+    shares: Arc<crate::sharing::ShareDesk>,
     export_destinations: Mutex<Vec<std::path::PathBuf>>,
     dropped_files: Mutex<Vec<std::path::PathBuf>>,
     supervision: Mutex<Supervision>,
@@ -57,6 +58,7 @@ impl AppState {
             paste: OnceLock::new(),
             drafts: Arc::new(crate::drafts::DraftDesk::default()),
             questions: crate::questions::QuestionDesk::default(),
+            shares: Arc::new(crate::sharing::ShareDesk::default()),
             export_destinations: Mutex::new(Vec::new()),
             dropped_files: Mutex::new(Vec::new()),
             supervision: Mutex::new(Supervision::default()),
@@ -183,6 +185,19 @@ impl AppState {
             .expect("the state lock is not poisoned")
             .as_ref()
             .map(Connection::session)
+            .ok_or_else(CommandError::not_connected)
+    }
+
+    /// The live connection itself, for what has to open another to the same host.
+    ///
+    /// # Errors
+    ///
+    /// Returns `HOST_NOT_CONFIGURED` when there is no connection.
+    pub fn connection(&self) -> Result<Connection> {
+        self.connection
+            .read()
+            .expect("the state lock is not poisoned")
+            .clone()
             .ok_or_else(CommandError::not_connected)
     }
 
@@ -388,6 +403,12 @@ impl AppState {
         }
     }
 
+    /// The attempts to share, accept, take back and hand over that this application keeps.
+    #[must_use]
+    pub fn shares(&self) -> Arc<crate::sharing::ShareDesk> {
+        Arc::clone(&self.shares)
+    }
+
     /// The questions this application has read, and the answers it keeps.
     #[must_use]
     pub const fn questions(&self) -> &crate::questions::QuestionDesk {
@@ -400,6 +421,7 @@ impl AppState {
     pub fn keep_under(&self, data: &std::path::Path) {
         self.questions.keep_at(crate::questions::kept_in(data));
         self.drafts.keep_at(data.to_path_buf());
+        self.shares.keep_at(crate::sharing::kept_in(data));
     }
 
     /// The drafts this device keeps.

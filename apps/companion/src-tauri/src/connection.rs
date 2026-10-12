@@ -61,12 +61,37 @@ pub enum Standing {
     },
 }
 
+/// How another connection to the same host is opened: for a client that asks the host again with
+/// a request it sent on this one, or reads its state, and must not do either on the connection
+/// that may still carry the original.
+pub type Reopen = Arc<
+    dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Connection>> + Send>>
+        + Send
+        + Sync,
+>;
+
 /// A live connection to a host: the one on this machine, or one this device is paired with.
-#[derive(Debug)]
+///
+/// Cloning it shares the session; it does not open another connection.
+#[derive(Clone)]
 pub struct Connection {
     session: Arc<Session>,
     environment_id: EnvironmentId,
     standing: Standing,
+    /// The operating-system user the host authenticated on a local connection: the host makes the
+    /// actor its actions are claimed under from it.
+    local_user: Option<u64>,
+    reopen: Option<Reopen>,
+}
+
+impl std::fmt::Debug for Connection {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Connection")
+            .field("environment_id", &self.environment_id)
+            .field("standing", &self.standing)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Connection {
@@ -78,12 +103,64 @@ impl Connection {
     /// Returns the client library's refusal to start a session on the transport.
     pub fn over(transport: kr_client::ipc::IpcTransport) -> Result<Self> {
         let environment_id = transport.context().environment_id;
+        let local_user = transport.context().peer.uid.get();
         let session = Session::start(transport.shared())?;
         Ok(Self {
             session: Arc::new(session),
             environment_id,
             standing: Standing::Owner,
+            local_user: Some(local_user),
+            reopen: None,
         })
+    }
+
+    /// A connection assembled from a session the caller started on a transport of its own, and
+    /// what is true of it. The application builds its connections with [`Self::over`],
+    /// [`Self::paired`] and [`connect_local`]; a suite that puts something between a session and
+    /// the host, to lose an answer, builds this.
+    #[must_use]
+    pub fn assembled(
+        session: Session,
+        environment_id: EnvironmentId,
+        standing: Standing,
+        local_user: Option<u64>,
+        reopen: Option<Reopen>,
+    ) -> Self {
+        Self {
+            session: Arc::new(session),
+            environment_id,
+            standing,
+            local_user,
+            reopen,
+        }
+    }
+
+    /// This connection, with the way another to the same host is opened.
+    #[must_use]
+    pub fn reopening(mut self, reopen: Reopen) -> Self {
+        self.reopen = Some(reopen);
+        self
+    }
+
+    /// Opens another connection to the same host, as the same device or user.
+    ///
+    /// # Errors
+    ///
+    /// Returns why the host could not be reached, or that this connection cannot be opened again.
+    pub async fn another(&self) -> Result<Self> {
+        match &self.reopen {
+            Some(reopen) => reopen().await,
+            None => Err(CommandError::unavailable(
+                "this application cannot open a second connection to this host",
+            )),
+        }
+    }
+
+    /// The actor the host claims this connection's actions under, when this build can say: a local
+    /// caller's, which the host makes from the user it authenticated.
+    #[must_use]
+    pub fn actor(&self) -> Option<kr_protocol::ids::ActorId> {
+        self.local_user.map(kr_protocol::sharing::local_actor)
     }
 
     /// A connection to a host this device is paired with, as the device the host made it.
@@ -94,7 +171,16 @@ impl Connection {
     /// # Errors
     ///
     /// Returns the failure when the host cannot be reached or cannot say which environment it is.
-    pub async fn paired(device: &Device, host: &PairedHost) -> Result<Self> {
+    pub async fn paired(device: &Arc<Device>, host: &PairedHost) -> Result<Self> {
+        let connection = Self::paired_once(device, host).await?;
+        let (device, host) = (Arc::clone(device), host.clone());
+        Ok(connection.reopening(Arc::new(move || {
+            let (device, host) = (Arc::clone(&device), host.clone());
+            Box::pin(async move { Self::paired_once(&device, &host).await })
+        })))
+    }
+
+    async fn paired_once(device: &Arc<Device>, host: &PairedHost) -> Result<Self> {
         let pairing = device.pairing();
         let identity = pairing.candidate.paired_identity(host.device_id);
         let session =
@@ -119,6 +205,8 @@ impl Connection {
                 device_id: host.device_id,
                 rights: host.proposed_grant.actions.iter().copied().collect(),
             },
+            local_user: None,
+            reopen: None,
         })
     }
 
@@ -228,6 +316,13 @@ impl ConnectionState {
 /// Returns the failure when there is no controller to reach, when its endpoint belongs to another
 /// user, or when the two builds share no protocol major.
 pub async fn connect_local() -> Result<Connection> {
+    Ok(connect_local_once()
+        .await?
+        .reopening(Arc::new(|| Box::pin(connect_local_once()))))
+}
+
+/// One connection to the controller on this machine, that cannot be opened again from.
+async fn connect_local_once() -> Result<Connection> {
     let paths = kr_ipc::paths::HostPaths::discover()
         .map_err(|error| CommandError::unavailable(format!("no host on this machine: {error}")))?;
     let environment_id = paths

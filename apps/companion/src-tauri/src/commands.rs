@@ -115,12 +115,26 @@ pub const NAMED_COMMANDS: &[(&str, Option<Method>)] = &[
     ("review_acknowledge", Some(Method::ReviewAcknowledge)),
     // Change sets.
     ("changeset_read", Some(Method::ChangesetRead)),
-    // Sharing: the devices an invitation can go to, what one would carry, issuing it and the
-    // grants issued.
+    // Sharing: the devices an invitation can go to, what one would carry, the screen it would
+    // include, issuing it, taking it back, accepting one and the grants issued and held. The four
+    // actions that change who holds a session are attempts this application keeps its word about,
+    // and the hand-over of control asks an owner device first.
     ("device_list", Some(Method::DeviceList)),
     ("grant_notices", None),
+    ("session_screen_preview", Some(Method::SessionScreenPreview)),
     ("grant_create", Some(Method::GrantCreate)),
     ("grant_list", Some(Method::GrantList)),
+    ("grant_revoke", Some(Method::GrantRevoke)),
+    ("grant_redeem", Some(Method::GrantRedeem)),
+    ("grant_held", Some(Method::GrantHeld)),
+    ("transfer_ask", None),
+    ("transfer_answered", None),
+    ("transfer_finish", None),
+    ("transfer_cancel", None),
+    ("attempts_list", None),
+    ("attempt_ask", None),
+    ("attempt_hide", None),
+    ("attempt_remove", None),
     // Packages.
     ("plugin_list", Some(Method::PluginList)),
     ("catalogue_list", Some(Method::CatalogueList)),
@@ -225,6 +239,37 @@ pub const NATIVE_METHODS: &[(&str, &[Method])] = &[
         ],
     ),
     ("terminal_view_close", &[Method::SessionDetach]),
+    // A hand-over of a session's control: the host describes the plan from its own records and
+    // asks the owner devices to confirm exactly that, native code reads whether one has, and only
+    // then sends the transfer, under the action the plan names.
+    (
+        "transfer_ask",
+        &[
+            Method::DeviceList,
+            Method::GrantList,
+            Method::SessionRead,
+            Method::OwnerConfirmationRequest,
+        ],
+    ),
+    ("transfer_answered", &[Method::OwnerConfirmationPending]),
+    (
+        "transfer_finish",
+        &[Method::OwnerConfirmationPending, Method::GrantTransfer],
+    ),
+    // What was left unfinished. Asking the host again is an exact repeat of the request that was
+    // sent, and a state check reads what the host shows; neither is an action of its own.
+    ("attempts_list", &[Method::GrantList, Method::GrantHeld]),
+    (
+        "attempt_ask",
+        &[
+            Method::GrantCreate,
+            Method::GrantRevoke,
+            Method::GrantRedeem,
+            Method::GrantTransfer,
+            Method::GrantList,
+            Method::GrantHeld,
+        ],
+    ),
     // The page names a session; native code reads the snapshot of its agent instances and of every
     // request its broker is arbitrating, following the pages of that one snapshot, on the
     // session's own worker.
@@ -306,8 +351,20 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'static
         changeset_read,
         device_list,
         grant_notices,
+        session_screen_preview,
         grant_create,
         grant_list,
+        grant_revoke,
+        grant_redeem,
+        grant_held,
+        transfer_ask,
+        transfer_answered,
+        transfer_finish,
+        transfer_cancel,
+        attempts_list,
+        attempt_ask,
+        attempt_hide,
+        attempt_remove,
         plugin_list,
         catalogue_list,
         pairing_set_origin,
@@ -1019,11 +1076,125 @@ read_command!(
     device_list, Method::DeviceList,
     kr_protocol::sharing::DeviceListParams => kr_protocol::sharing::DeviceListResult
 );
-mutate_command!(
-    /// Issues one invitation: a grant to a paired device, carrying the notices its issuer was
-    /// shown. The host refuses one whose notices differ from what the grant actually carries.
-    grant_create, Method::GrantCreate, kr_protocol::sharing::GrantCreateParams
-);
+/// Issues one invitation: a grant to a paired device, carrying the notices its issuer was shown.
+/// The host refuses one whose notices differ from what the grant actually carries.
+///
+/// The request is composed and kept before it is sent, and a lost answer is asked about again with
+/// the same request: the answer is the attempt, and the host's own result when it gave it.
+#[tauri::command]
+pub async fn grant_create(
+    state: State<'_, AppState>,
+    subject: Subject,
+    params: Value,
+) -> Result<crate::sharing::Attempted> {
+    crate::sharing::create(&state, subject, decode(params)?).await
+}
+
+/// Reads the lines on a session's screen, as an invitation that includes the live view would carry
+/// them. Nothing is sent to the host's daemon: the session's own worker answers.
+#[tauri::command]
+pub async fn session_screen_preview(
+    links: State<'_, crate::agent::WorkerLinks>,
+    state: State<'_, AppState>,
+    params: Value,
+) -> Result<Value> {
+    encode(&crate::sharing::preview(&state, &links, decode(params)?).await?)
+}
+
+/// Takes a share back, or withdraws an invitation that has not been accepted.
+#[tauri::command]
+pub async fn grant_revoke(
+    state: State<'_, AppState>,
+    params: Value,
+) -> Result<crate::sharing::Attempted> {
+    crate::sharing::revoke(&state, decode(params)?).await
+}
+
+/// Accepts an invitation that names this device.
+#[tauri::command]
+pub async fn grant_redeem(
+    state: State<'_, AppState>,
+    params: Value,
+) -> Result<crate::sharing::Attempted> {
+    crate::sharing::redeem(&state, decode(params)?).await
+}
+
+/// Reads what this device is offered and holds, every page of both lists.
+#[tauri::command]
+pub async fn grant_held(state: State<'_, AppState>) -> Result<crate::sharing::Held> {
+    crate::sharing::held(&state).await
+}
+
+/// Asks the owner devices to confirm handing a session's control to another device. Nothing that
+/// changes who holds the session is sent.
+#[tauri::command]
+pub async fn transfer_ask(
+    state: State<'_, AppState>,
+    subject: Subject,
+    params: Value,
+) -> Result<crate::sharing::HandoverAsked> {
+    crate::sharing::transfer_ask(&state, subject, decode(params)?).await
+}
+
+/// Says whether an owner device has answered the confirmation a hand-over waits for.
+#[tauri::command]
+pub async fn transfer_answered(
+    state: State<'_, AppState>,
+    reference: String,
+) -> Result<crate::sharing::HandoverState> {
+    crate::sharing::transfer_answered(&state, &reference).await
+}
+
+/// Sends the hand-over an owner device confirmed, once.
+#[tauri::command]
+pub async fn transfer_finish(
+    state: State<'_, AppState>,
+    reference: String,
+) -> Result<crate::sharing::Attempted> {
+    crate::sharing::transfer_finish(&state, &reference).await
+}
+
+/// Stops waiting for an owner device's confirmation of a hand-over.
+#[tauri::command]
+pub async fn transfer_cancel(state: State<'_, AppState>, reference: String) -> Result<()> {
+    crate::sharing::transfer_cancel(&state, &reference).await
+}
+
+/// The attempts this application keeps for the host it is connected to.
+#[tauri::command]
+pub fn attempts_list(state: State<'_, AppState>) -> Result<crate::sharing::Attempts> {
+    crate::sharing::attempts(&state)
+}
+
+fn action_of(text: &str) -> Result<kr_protocol::ids::ActionId> {
+    text.parse()
+        .map_err(|_| CommandError::invalid("that is not an attempt's identifier"))
+}
+
+/// Asks the host what became of an attempt, once, with the exact request that was sent. It is the
+/// person's choice and is never made by itself.
+#[tauri::command]
+pub async fn attempt_ask(
+    state: State<'_, AppState>,
+    action_id: String,
+) -> Result<crate::sharing::Attempted> {
+    crate::sharing::ask_the_host(&state, action_of(&action_id)?).await
+}
+
+/// Takes an attempt out of view. It releases nothing.
+#[tauri::command]
+pub fn attempt_hide(
+    state: State<'_, AppState>,
+    action_id: String,
+) -> Result<crate::sharing::AttemptView> {
+    crate::sharing::hide(&state, action_of(&action_id)?)
+}
+
+/// Deletes the record of an attempt that is over.
+#[tauri::command]
+pub fn attempt_remove(state: State<'_, AppState>, action_id: String) -> Result<()> {
+    crate::sharing::remove(&state, action_of(&action_id)?)
+}
 read_command!(
     /// Lists the grants this host has issued.
     grant_list, Method::GrantList,
@@ -2579,6 +2750,8 @@ mod tests {
             "plugin.install",
             "plugin.grant",
             "owner.confirmation.complete",
+            "owner.confirmation.request",
+            "grant.transfer",
             "storage.upload.create",
             "storage.object.delete",
             "authority.sync",
@@ -2667,6 +2840,19 @@ mod tests {
                 // What an invitation would carry, from the protocol's own table. It reaches
                 // nothing.
                 "grant_notices",
+                // A hand-over of control: the host describes the plan and asks the owner devices,
+                // native code reads whether one answered, and only then sends the transfer. The
+                // page names a session, a grant, a device and a reference, never a method.
+                "transfer_ask",
+                "transfer_answered",
+                "transfer_finish",
+                "transfer_cancel",
+                // The attempts to share, accept, take back and hand over that this application
+                // keeps, and what a person does with one that was left unfinished.
+                "attempts_list",
+                "attempt_ask",
+                "attempt_hide",
+                "attempt_remove",
                 // The answers kept for a worker out of reach, and what a person does with them:
                 // the questions themselves go to the session's worker.
                 "question_kept",
@@ -2712,6 +2898,8 @@ mod tests {
             Method::PairStatus,
             Method::OwnerConfirmationPending,
             Method::OwnerConfirmationComplete,
+            Method::OwnerConfirmationRequest,
+            Method::GrantTransfer,
         ] {
             assert!(!page.contains(&method), "{method} is a page method");
         }
@@ -2729,6 +2917,16 @@ mod tests {
         assert_eq!(
             performing(Method::PairFinish),
             BTreeSet::from(["pairing_start_code", "pairing_start_read"])
+        );
+        // A confirmation is asked for by the hand-over's own command, and a transfer is sent by
+        // the one that has the owner device's answer, or by the person asking the host about it.
+        assert_eq!(
+            performing(Method::OwnerConfirmationRequest),
+            BTreeSet::from(["transfer_ask"])
+        );
+        assert_eq!(
+            performing(Method::GrantTransfer),
+            BTreeSet::from(["attempt_ask", "transfer_finish"])
         );
         assert_eq!(
             performing(Method::PairRedeem),
@@ -2885,8 +3083,12 @@ mod tests {
             review_acknowledge,
             changeset_read,
             device_list,
+            session_screen_preview,
             grant_create,
             grant_list,
+            grant_revoke,
+            grant_redeem,
+            grant_held,
             plugin_list,
             catalogue_list,
             voice_prepare,
@@ -2918,7 +3120,10 @@ mod tests {
                 continue;
             }
             let expected = match *command {
-                "host_info" | "environment_list" | "description_setup" => "HOST_NOT_CONFIGURED",
+                // What a device holds takes no parameters, and the application is not connected.
+                "host_info" | "environment_list" | "description_setup" | "grant_held" => {
+                    "HOST_NOT_CONFIGURED"
+                }
                 "attachment_upload" => "PERMISSION_DENIED",
                 // This application opens no call, so it refuses every start before it reads one.
                 "voice_start" => "RESOURCE_UNAVAILABLE",
