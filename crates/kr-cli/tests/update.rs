@@ -10267,6 +10267,19 @@ fn no_type_a_store_keeps_is_undeclared() {
     assert!(unaccounted.is_empty(), "{}", unaccounted.join("\n"));
 }
 
+/// KR-REQ-26.10: every record the grants store writes under a name of its own is in the lock. The
+/// registry lists the types it keeps from `grants/durable.rs`, and a record added there without a line
+/// is a stored format the lock would never see change.
+#[test]
+fn every_record_the_grants_store_writes_is_listed_in_the_lock() {
+    let unlisted = stored_formats::records_unlisted(
+        &stored_formats::table::table(),
+        "crates/kr-controller/src/grants/durable.rs",
+    )
+    .expect("the source is read");
+    assert!(unlisted.is_empty(), "{}", unlisted.join("\n"));
+}
+
 /// KR-REQ-26.10: the detection finds what it is for. A line of the known list taken away is found as
 /// the type it named; a known type whose pinned digest is not the one it has is found; a known type
 /// the store has since declared, and one listed for a store the table does not have, are found as
