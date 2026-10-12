@@ -551,7 +551,7 @@ fn the_views_observe_builds_hold_the_names_the_reader_compares() {
         .collect();
     assert_eq!(
         sections,
-        [("authority", Some(2))],
+        [("authority", Some(2)), ("mailbox", Some(3))],
         "the sections that arrived with a level are the production table's"
     );
     assert!(levels.eligibility.is_empty() && super::design_findings(&levels).is_empty());

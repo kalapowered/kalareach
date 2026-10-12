@@ -235,6 +235,7 @@ variables an older build read joins nothing because of them.
 | `voice.broker_origin` | the managed broker this host starts a device's voice session at, through the proxy `network.proxy_url` selects | an absolute `https` origin, or an `http` origin on `localhost`, `127.0.0.1` or `[::1]`, of at most 128 bytes, in lower case, with no path and no port its scheme already implies; a plain-HTTP origin cannot be combined with `network.proxy_url`, because the proxy would carry the account token in clear text |
 | `storage.origin` | the managed storage service this host uploads its backups to | an `https` origin, or an `http` origin on a loopback address, in the spelling a gateway origin has, with no path and no trailing slash; the daemon refuses to start unless it is the managed account service |
 | `authority.origin` | the authority feed this host reads its remote revocations from; a section of level 2: a release that reads level 1 ignores it, and its host takes a device's revocation only from the owner at the machine | an `https` origin, or an `http` origin on a loopback address, in the spelling a gateway origin has, with no path and no trailing slash |
+| `mailbox.origin` | the mailbox service this host places the encrypted objects of its notifications in; a section of level 3, so a release that reads level 2 ignores it and its host places nothing, which leaves a notification whose detail does not fit reaching a device without it | an `https` origin, or an `http` origin on a loopback address, in the spelling a gateway origin has, with no path and no trailing slash |
 
 A field the document does not write selects nothing, because there is no public relay or discovery
 server to fall back on. A URL or an origin names its host the one way the protocol spells every
@@ -258,7 +259,7 @@ servers, to the rendezvous when reserving a code’s locator and opening its roo
 gateway, to webhooks, to chat services, to mail servers when sending mail via the mail submission
 port, to the managed voice broker, to the managed account service when signing in, to the managed
 storage service (`storage.origin`) when backing up, to the authority feed (`authority.origin`),
-to the model’s files, and to plugin repositories. Nothing on that list goes around it.
+to the mailbox service (`mailbox.origin`), to the model’s files, and to plugin repositories. Nothing on that list goes around it.
 
 An address the proxy cannot reach fails, a webhook included. Mail submission is SMTP, so it goes as
 an HTTP `CONNECT` tunnel to the submission server and its port, and the connection’s own TLS runs
