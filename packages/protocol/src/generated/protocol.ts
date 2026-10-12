@@ -11176,6 +11176,7 @@ export interface ConfigurationDocument {
   profiles?: {
     [k: string]: PreferenceSet1
   }
+  relay?: RelaySelection
   /**
    * The revision this host applied. It rises by one with every validated edit.
    */
@@ -11497,6 +11498,40 @@ export interface PreferenceSet1 {
    * The execution context a session is created in when the request does not choose one.
    */
   worker_profile?: WorkerProfile | null
+}
+/**
+ * The relay lease service this host asks for a lease for each paired device, and the
+ * account that pays for them.
+ *
+ * A section of level 4: written only when it selects something, and ignored, with a
+ * count, by a release that reads level 3. Read when the daemon starts, so a change
+ * applies at the next start. No environment variable reaches it.
+ */
+export interface RelaySelection {
+  /**
+   * The service's origin: an `https` origin, or an `http` origin on a loopback address,
+   * spelled as a gateway origin is, with no path and no trailing slash.
+   */
+  origin?: string | null
+  /**
+   * The account that pays, when this host names one.
+   */
+  payer?: RelayPayer | null
+}
+/**
+ * The account that pays for this host's relay leases, and the authorisation that account gave
+ * this host's key.
+ */
+export interface RelayPayer {
+  /**
+   * The account, as a lower-case hyphenated UUID.
+   */
+  account_id: string
+  /**
+   * The authorisation record the account gave this host's key, as a lower-case hyphenated
+   * UUID.
+   */
+  authorisation_id: string
 }
 /**
  * A named reference to something in a secure store.

@@ -1349,15 +1349,23 @@ impl ComposedBundle {
 ///   "voice": { "broker_origin": "https://voice.example.com" },
 ///   "storage": { "origin": "https://reach.example.com" },
 ///   "authority": { "origin": "https://reach.example.com" },
-///   "mailbox": { "origin": "https://reach.example.com" }
+///   "mailbox": { "origin": "https://reach.example.com" },
+///   "relay": {
+///     "origin": "https://reach.example.com",
+///     "payer": {
+///       "account_id": "0b0c4a1e-2f6a-4a7c-9b7e-5d1f3c2a8e41",
+///       "authorisation_id": "7c1d9e52-3b4f-4d86-a0c2-91e5f6b73d08"
+///     }
+///   }
 /// }
 /// ```
 ///
-/// The `network`, `voice`, `storage`, `authority` and `mailbox` sections are the only place a
-/// network selection, the voice broker's origin, the managed storage service's origin, the
-/// authority feed's origin or the mailbox service's origin is chosen, and the daemon reads them
-/// when it starts ([`NetworkSelection`], [`VoiceSelection`], [`StorageSelection`],
-/// [`AuthoritySelection`], [`MailboxSelection`]). No environment variable reaches any of them.
+/// The `network`, `voice`, `storage`, `authority`, `mailbox` and `relay` sections are the only
+/// place a network selection, the voice broker's origin, the managed storage service's origin, the
+/// authority feed's origin, the mailbox service's origin or the relay lease service's origin and
+/// payer is chosen, and the daemon reads them when it starts ([`NetworkSelection`],
+/// [`VoiceSelection`], [`StorageSelection`], [`AuthoritySelection`], [`MailboxSelection`],
+/// [`RelaySelection`]). No environment variable reaches any of them.
 ///
 /// Its numbers are ordinary JSON numbers rather than the decimal strings the wire types use. This
 /// is a file a person may open and edit, not a message a JavaScript consumer parses, and the
@@ -1409,6 +1417,7 @@ impl ComposedBundle {
 /// [`StorageSelection`]: configuration::StorageSelection
 /// [`AuthoritySelection`]: configuration::AuthoritySelection
 /// [`MailboxSelection`]: configuration::MailboxSelection
+/// [`RelaySelection`]: configuration::RelaySelection
 /// [`resolve`]: configuration::resolve
 /// [`ALLOWLIST`]: configuration::ALLOWLIST
 pub mod configuration {
@@ -1974,6 +1983,14 @@ pub mod configuration {
         /// at the next start. No environment variable reaches it.
         #[serde(default, skip_serializing_if = "levels::is_unused")]
         pub mailbox: MailboxSelection,
+        /// The relay lease service this host asks for a lease for each paired device, and the
+        /// account that pays for them.
+        ///
+        /// A section of level 4: written only when it selects something, and ignored, with a
+        /// count, by a release that reads level 3. Read when the daemon starts, so a change
+        /// applies at the next start. No environment variable reaches it.
+        #[serde(default, skip_serializing_if = "levels::is_unused")]
+        pub relay: RelaySelection,
         /// How this environment's control daemon is started when a command finds none running.
         ///
         /// Read by `kr new` when it finds no daemon to ask, so a change applies at the next start.
@@ -2027,6 +2044,7 @@ pub mod configuration {
                 storage: StorageSelection::default(),
                 authority: AuthoritySelection::default(),
                 mailbox: MailboxSelection::default(),
+                relay: RelaySelection::default(),
                 startup: StartupSelection::default(),
                 descriptions: DescriptionsSelection::default(),
                 agents: BTreeMap::new(),
@@ -2600,6 +2618,72 @@ pub mod configuration {
         pub fn origin(&self) -> Option<&str> {
             self.origin.as_ref().map(String::as_str)
         }
+    }
+
+    /// The relay lease service this host asks for a lease for each paired device, and the account
+    /// that pays for the leases.
+    ///
+    /// A relay carries traffic between two endpoints only while it holds a lease the service
+    /// signed for that pair. With a service selected here, the host keeps one lease with it for
+    /// each device it has paired, asks for a refill before a lease runs out, and ends the lease
+    /// of a device that is unpaired. A provider origin, so it is this document's to choose and no
+    /// inherited variable's. The daemon reads it when it starts, so a change applies at the next
+    /// start. Absent means this host asks for no lease: a device reaches it directly or through a
+    /// relay its owner runs.
+    ///
+    /// A host key draws on no allowance of its own, so the service turns away a host that names
+    /// no account. `payer` names the account the console gave this host's key leave to spend, and
+    /// the authorisation it gave: both are shown beside the authorisation in the account console.
+    /// Withdrawing the authorisation there ends the leases issued under it; signing this host out
+    /// of the account does not.
+    ///
+    /// The section arrived with level 4. A release that reads level 3 does not know it: it applies
+    /// the rest of the document, counts the section among the members it ignores, and does not
+    /// edit the document, so a host rolled back to such a release asks for no lease until it is
+    /// brought forward again.
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields, default)]
+    pub struct RelaySelection {
+        /// The service's origin: an `https` origin, or an `http` origin on a loopback address,
+        /// spelled as a gateway origin is, with no path and no trailing slash.
+        pub origin: Nullable<String>,
+        /// The account that pays, when this host names one.
+        pub payer: Nullable<RelayPayer>,
+    }
+
+    impl Default for RelaySelection {
+        fn default() -> Self {
+            Self {
+                origin: Nullable::null(),
+                payer: Nullable::null(),
+            }
+        }
+    }
+
+    impl RelaySelection {
+        /// The service's origin, when one is chosen.
+        #[must_use]
+        pub fn origin(&self) -> Option<&str> {
+            self.origin.as_ref().map(String::as_str)
+        }
+
+        /// The account that pays for the leases, when one is named.
+        #[must_use]
+        pub fn payer(&self) -> Option<&RelayPayer> {
+            self.payer.as_ref()
+        }
+    }
+
+    /// The account that pays for this host's relay leases, and the authorisation that account gave
+    /// this host's key.
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+    #[serde(deny_unknown_fields)]
+    pub struct RelayPayer {
+        /// The account, as a lower-case hyphenated UUID.
+        pub account_id: String,
+        /// The authorisation record the account gave this host's key, as a lower-case hyphenated
+        /// UUID.
+        pub authorisation_id: String,
     }
 
     /// How this environment's control daemon is started when a command finds none running.
@@ -3446,6 +3530,42 @@ pub mod configuration {
                          trailing slash",
                     ),
             );
+        }
+        if let Some(origin) = document.relay.origin()
+            && crate::service::GatewayOrigin::new(origin).is_err()
+        {
+            problems.push(
+                Sentence::new()
+                    .stated("relay.origin (")
+                    .withheld(super::export::ContentClass::Location, origin)
+                    .stated(
+                        ") is not an https origin, or an http origin on a loopback address, in \
+                         the canonical spelling a gateway origin has, with no path and no \
+                         trailing slash",
+                    ),
+            );
+        }
+        if let Some(payer) = document.relay.payer() {
+            if document.relay.origin().is_none() {
+                problems.push(Sentence::new().stated(
+                    "relay.payer is named but relay.origin is not, so there is no service to \
+                     pay for",
+                ));
+            }
+            for (key, value) in [
+                ("relay.payer.account_id", &payer.account_id),
+                ("relay.payer.authorisation_id", &payer.authorisation_id),
+            ] {
+                if value.parse::<crate::scalars::Uuid>().is_err()
+                    || *value != value.to_ascii_lowercase()
+                {
+                    problems.push(
+                        Sentence::new()
+                            .stated(key)
+                            .stated(" is not a lower-case hyphenated UUID"),
+                    );
+                }
+            }
         }
         if problems.is_empty() {
             Ok(())
@@ -4385,8 +4505,8 @@ pub mod configuration {
         about: "the HTTP proxy this host's connections to services go through: the network \
                 endpoint's relay connection, relay latency probe, captive-portal check and Pkarr \
                 servers, the rendezvous, delivery and mail, the managed voice broker and account \
-                service, backups, the authority feed, the mailbox service, the model's files and \
-                plugin repositories",
+                service, backups, the authority feed, the mailbox service, the relay lease service, \
+                the model's files and plugin repositories",
     };
 
     /// The managed voice broker this host starts its devices' calls at.
@@ -4413,6 +4533,18 @@ pub mod configuration {
         about: "the mailbox service this host places the encrypted objects of its notifications in",
     };
 
+    /// The relay lease service this host asks for a lease for each paired device.
+    pub const RELAY_ORIGIN: Selection = Selection {
+        key: "relay.origin",
+        about: "the relay lease service this host asks for a lease for each paired device",
+    };
+
+    /// The account that pays for this host's relay leases.
+    pub const RELAY_PAYER: Selection = Selection {
+        key: "relay.payer",
+        about: "the account, and the authorisation it gave this host, that pay for its relay leases",
+    };
+
     /// How this environment's control daemon is started when a command finds none running.
     pub const STARTUP_CONTROLLER: Selection = Selection {
         key: "startup.controller",
@@ -4421,7 +4553,7 @@ pub mod configuration {
     };
 
     /// Every selection this host reads when it starts, in the order `kr doctor` prints them.
-    pub const SELECTIONS: [Selection; 16] = [
+    pub const SELECTIONS: [Selection; 18] = [
         NETWORK_ENABLED,
         NETWORK_BIND_ADDRESS,
         NETWORK_RELAY_URLS,
@@ -4437,6 +4569,8 @@ pub mod configuration {
         STORAGE_ORIGIN,
         AUTHORITY_ORIGIN,
         MAILBOX_ORIGIN,
+        RELAY_ORIGIN,
+        RELAY_PAYER,
         STARTUP_CONTROLLER,
     ];
 
@@ -4851,6 +4985,16 @@ pub mod configuration {
                 location(document.mailbox.origin()),
             ),
             row(
+                RELAY_ORIGIN,
+                document.relay.origin.is_present(),
+                location(document.relay.origin()),
+            ),
+            row(
+                RELAY_PAYER,
+                document.relay.payer.is_present(),
+                switch(document.relay.payer().is_some()),
+            ),
+            row(
                 STARTUP_CONTROLLER,
                 document.startup.controller.is_present(),
                 Declared::term(
@@ -5007,9 +5151,10 @@ pub mod configuration {
     /// the captive-portal check; they choose no relay, no service and no trust.
     ///
     /// Every network selection, the proxy included, the voice broker's origin, the managed
-    /// storage service's origin, the authority feed's origin and the mailbox service's origin are
-    /// this host's configuration document's ([`NetworkSelection`], [`VoiceSelection`],
-    /// [`StorageSelection`], [`AuthoritySelection`], [`MailboxSelection`]), and nothing reads
+    /// storage service's origin, the authority feed's origin, the mailbox service's origin and the
+    /// relay lease service's origin are this host's configuration document's
+    /// ([`NetworkSelection`], [`VoiceSelection`], [`StorageSelection`], [`AuthoritySelection`],
+    /// [`MailboxSelection`], [`RelaySelection`]), and nothing reads
     /// them from the environment. The managed-service,
     /// rendezvous, delivery, plugin repository and mail clients verify a server against the
     /// platform's own store, the network endpoint verifies its relays and discovery servers
@@ -8588,7 +8733,12 @@ mod tests {
         document.storage.origin = Nullable::some("https://reach.example.com".to_owned());
         document.authority.origin = Nullable::some("https://reach.example.com".to_owned());
         document.mailbox.origin = Nullable::some("https://reach.example.com".to_owned());
-        document.level = 3;
+        document.relay.origin = Nullable::some("https://reach.example.com".to_owned());
+        document.relay.payer = Nullable::some(configuration::RelayPayer {
+            account_id: "0b0c4a1e-2f6a-4a7c-9b7e-5d1f3c2a8e41".to_owned(),
+            authorisation_id: "7c1d9e52-3b4f-4d86-a0c2-91e5f6b73d08".to_owned(),
+        });
+        document.level = 4;
         configuration::validate(&document).expect("a complete selection");
         let written = configuration::contents(&document);
         let loaded = configuration::load(Some(written.as_bytes()));
@@ -8900,6 +9050,71 @@ mod tests {
         let mut document = ConfigurationDocument::empty();
         document.mailbox.origin = Nullable::some("http://127.0.0.1:8787".to_owned());
         configuration::validate(&document).expect("a loopback origin is usable");
+
+        // And so is the relay lease service's, and the account that pays for its leases.
+        for origin in [
+            "reach.example.com",
+            "http://reach.example.com",
+            "https://reach.example.com/",
+            "",
+        ] {
+            let mut document = ConfigurationDocument::empty();
+            document.relay.origin = Nullable::some(origin.to_owned());
+            let problems = configuration::validate(&document).expect_err("an origin it refuses");
+            assert!(
+                problems
+                    .iter()
+                    .any(|problem| problem.as_str().contains("relay.origin")),
+                "{origin}: {problems:?}"
+            );
+        }
+        let payer = |account: &str, authorisation: &str| {
+            Nullable::some(configuration::RelayPayer {
+                account_id: account.to_owned(),
+                authorisation_id: authorisation.to_owned(),
+            })
+        };
+        let mut document = ConfigurationDocument::empty();
+        document.relay.origin = Nullable::some("http://127.0.0.1:8787".to_owned());
+        document.relay.payer = payer(
+            "0b0c4a1e-2f6a-4a7c-9b7e-5d1f3c2a8e41",
+            "7c1d9e52-3b4f-4d86-a0c2-91e5f6b73d08",
+        );
+        configuration::validate(&document).expect("a loopback origin and a payer are usable");
+        for (account, authorisation, key) in [
+            (
+                "not-a-uuid",
+                "7c1d9e52-3b4f-4d86-a0c2-91e5f6b73d08",
+                "relay.payer.account_id",
+            ),
+            (
+                "0b0c4a1e-2f6a-4a7c-9b7e-5d1f3c2a8e41",
+                "7C1D9E52-3B4F-4D86-A0C2-91E5F6B73D08",
+                "relay.payer.authorisation_id",
+            ),
+        ] {
+            document.relay.payer = payer(account, authorisation);
+            let problems = configuration::validate(&document).expect_err("a payer it refuses");
+            assert!(
+                problems
+                    .iter()
+                    .any(|problem| problem.as_str().contains(key)),
+                "{key}: {problems:?}"
+            );
+        }
+        // A payer with no service to pay for is a document that says something it cannot do.
+        let mut document = ConfigurationDocument::empty();
+        document.relay.payer = payer(
+            "0b0c4a1e-2f6a-4a7c-9b7e-5d1f3c2a8e41",
+            "7c1d9e52-3b4f-4d86-a0c2-91e5f6b73d08",
+        );
+        let problems = configuration::validate(&document).expect_err("a payer with no service");
+        assert!(
+            problems
+                .iter()
+                .any(|problem| problem.as_str().contains("relay.payer")),
+            "{problems:?}"
+        );
 
         // A document whose network section does not validate is not this host's to rewrite, so an
         // edit to any other section of it is refused rather than applied on top.
