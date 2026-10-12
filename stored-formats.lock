@@ -190,10 +190,10 @@
           "kind": "sqlite_table",
           "table": "delivery_schema"
         },
-        "version": 9,
+        "version": 10,
         "migrates_from": 6
       },
-      "digest": "f8ba6eb8a6327ec55d420b0639e68ac93af24ab82e2532896f4208e868e258da",
+      "digest": "ebe7c0394928f22d18024781d64b295250349adfb7cea14dd9972f122835c793",
       "kept": [
         "PushDeliveryRequest",
         "SealedEnvelope",
