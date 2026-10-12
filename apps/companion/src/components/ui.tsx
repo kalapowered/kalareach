@@ -11,6 +11,7 @@ import {
   useCallback,
   useEffect,
   useId,
+  useLayoutEffect,
   useRef,
   useState,
   type ButtonHTMLAttributes,
@@ -396,7 +397,25 @@ function ToastBody({
   // The pointer and focus hold it apart: either one is enough.
   const [pointer, setPointer] = useState(false)
   const [focused, setFocused] = useState(false)
-  const held = pointer || focused
+  // Words too many for their box are read by scrolling it, which a timer cannot wait for: the
+  // message stays until the person dismisses it, and the box can be scrolled from the keyboard.
+  const words = useRef<HTMLSpanElement | null>(null)
+  const [overflowing, setOverflowing] = useState(false)
+  useLayoutEffect(() => {
+    const element = words.current
+    if (element === null) return
+    const measure = () => {
+      setOverflowing(element.scrollHeight > element.clientHeight + 1)
+    }
+    measure()
+    if (typeof ResizeObserver === 'undefined') return
+    const watching = new ResizeObserver(measure)
+    watching.observe(element)
+    return () => {
+      watching.disconnect()
+    }
+  }, [message.text, message.said])
+  const held = pointer || focused || overflowing
   useEffect(() => {
     if (held) return
     const handle = setTimeout(
@@ -427,32 +446,45 @@ function ToastBody({
         if (!event.currentTarget.contains(event.relatedTarget)) setFocused(false)
       }}
     >
-      <span
-        className={
-          message.tone === 'danger'
-            ? 'danger-text'
-            : message.tone === 'pending'
-              ? 'faint'
-              : 'success-text'
-        }
-        aria-hidden="true"
-      >
-        {message.tone === 'danger' ? '!' : message.tone === 'pending' ? '…' : '✓'}
-      </span>
-      <span key={message.said ?? 0}>{message.text}</span>
-      {action === undefined ? null : (
-        <Button
-          onClick={() => {
-            action.act()
-            onDismiss()
-          }}
+      <div className="toast-main">
+        <span
+          className={
+            message.tone === 'danger'
+              ? 'danger-text'
+              : message.tone === 'pending'
+                ? 'faint'
+                : 'success-text'
+          }
+          aria-hidden="true"
         >
-          {action.label}
-        </Button>
-      )}
-      <IconButton label="Dismiss" onClick={onDismiss}>
-        ×
-      </IconButton>
+          {message.tone === 'danger' ? '!' : message.tone === 'pending' ? '…' : '✓'}
+        </span>
+        <span
+          className="toast-text"
+          key={message.said ?? 0}
+          ref={words}
+          tabIndex={overflowing ? 0 : undefined}
+          role={overflowing ? 'region' : undefined}
+          aria-label={overflowing ? 'Message' : undefined}
+        >
+          {message.text}
+        </span>
+      </div>
+      <div className="toast-controls">
+        {action === undefined ? null : (
+          <Button
+            onClick={() => {
+              action.act()
+              onDismiss()
+            }}
+          >
+            {action.label}
+          </Button>
+        )}
+        <IconButton label="Dismiss" onClick={onDismiss}>
+          ×
+        </IconButton>
+      </div>
     </div>
   )
 }

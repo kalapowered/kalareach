@@ -166,11 +166,10 @@ for (const surface of ['ios', 'android'] as const) {
       const CHIP = '[data-testid="draft-attachments"] > *'
       const outside = [...(await overrunning(page, PATH_CARD)), ...(await overrunning(page, CHIP))]
       expect(outside, 'lines of the chip and the path that run past the screen or their own box').toEqual([])
-      // The notice after the upload covers the screen at this size, and the pointer that picked the
-      // file can rest on it, which holds it there. The pointer moves off it, as a finger lifts, and
-      // the case waits for the notice to go before it presses the chip's control.
-      await page.mouse.move(1, 1)
-      await expect(page.locator('.toast')).toHaveCount(0, { timeout: 10_000 })
+      // The notice after the upload can lie over the chip's control, and the pointer that picked the
+      // file can rest on it, which holds it there: it is dismissed from its own control.
+      await page.locator('.toast').getByRole('button', { name: 'Dismiss' }).click()
+      await expect(page.locator('.toast')).toHaveCount(0)
       await page
         .getByRole('button', { name: /^Remove .* from this draft$/ })
         .click({ trial: true, timeout: 2_000 })

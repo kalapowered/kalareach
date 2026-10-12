@@ -10,6 +10,8 @@
  * the application runs, is held on the simulator and the emulator by `e2e/system-text-size.sh` and `e2e/system-text-size-android.sh`.
  */
 
+import { Buffer } from 'node:buffer'
+
 import { expect, test, type Page } from '@playwright/test'
 
 import { overrunning, stopWrapping } from './layout'
@@ -306,4 +308,172 @@ test.describe('at the largest text size on a screen 320 points wide', () => {
     expect(atTheLargest.bottom).toBeCloseTo(atOneAndAHalf.bottom, 0)
     expect(atTheLargest.top + atTheLargest.bottom, 'the bars together').toBeLessThan(720 * 0.4)
   })
+})
+
+// KR-REQ-13.19: a message shown in passing takes a part of the screen at every text size.
+test.describe('a passing message', () => {
+  // A passing message is read in passing: at the largest size on the narrowest screen it takes a
+  // part of the screen and no more, its words scroll inside it when they are too many, and Dismiss
+  // and the message's action stay on the screen, pressable, whatever the words are.
+  const OWNER_REQUEST = (hostName: string) => ({
+    ceremony: 'touch_id' as const,
+    requests: [
+      {
+        reference: 'request-1',
+        host_name: hostName,
+        title: 'Pair a new device',
+        detail: null,
+        value: 'f3c1 46fd',
+        facts: [],
+        notice: null,
+        statement: null,
+        reading: null,
+        expires_at_ms: Date.now() + 600_000,
+        checkable: true
+      }
+    ]
+  })
+
+  /** What the toast takes of the screen, and whether its controls are inside it and the screen. */
+  const toastLayout = (page: Page) =>
+    page.evaluate(() => {
+      const toast = document.querySelector<HTMLElement>('.toast')
+      if (toast === null) return null
+      const edge = { width: window.innerWidth, height: window.innerHeight }
+      const box = toast.getBoundingClientRect()
+      const inside = (outer: DOMRect, inner: { left: number; right: number; top: number; bottom: number }) =>
+        inner.left >= outer.left - 0.5 &&
+        inner.right <= outer.right + 0.5 &&
+        inner.top >= outer.top - 0.5 &&
+        inner.bottom <= outer.bottom + 0.5
+      const screen = new DOMRect(0, 0, edge.width, edge.height)
+      const controls = [...toast.querySelectorAll<HTMLElement>('button')].map((button) => {
+        const where = button.getBoundingClientRect()
+        return {
+          name: button.getAttribute('aria-label') ?? button.textContent ?? '',
+          onScreen: inside(screen, where),
+          inToast: inside(box, where)
+        }
+      })
+      const words = toast.querySelector<HTMLElement>('.toast-text')
+      const controlsBox = toast.querySelector<HTMLElement>('.toast-controls')?.getBoundingClientRect()
+      const wordsBox = toast.querySelector<HTMLElement>('.toast-main')?.getBoundingClientRect()
+      return {
+        controlsBeside:
+          controlsBox !== undefined && wordsBox !== undefined && controlsBox.top < wordsBox.bottom - 1,
+        height: box.height,
+        screenHeight: edge.height,
+        onScreen: inside(screen, box),
+        controls,
+        scrolls: words !== null && words.scrollHeight > words.clientHeight + 1,
+        wordsHeight: words?.clientHeight ?? 0
+      }
+    })
+
+  /** Lays the toast out once it has come to rest, and says what it takes of the screen. */
+  const settledToast = async (page: Page) => {
+    // The toast arrives from below the screen: it is measured once it has come to rest on it.
+    await expect.poll(async () => (await toastLayout(page))?.onScreen, { timeout: 10_000 }).toBe(true)
+    return await toastLayout(page)
+  }
+
+  for (const surface of ['ios', 'android'] as const) {
+    // The phone's passing messages say what became of a file; the file's name is the person's, and
+    // can be as long as a file name is.
+    const FILE = {
+      name: `${'a-long-name-for-a-file '.repeat(20)}.png`,
+      mimeType: 'image/png',
+      buffer: Buffer.from('a picked file')
+    }
+
+    test(`keeps a long passing message to part of the screen, with Dismiss in view, on ${surface}`, async ({
+      page
+    }) => {
+      await withSystemTextScale(page, LARGEST)
+      await page.setViewportSize({ width: 320, height: 720 })
+      await page.goto(`/harness.html?surface=${surface}&session=${SESSION}`)
+      const opened = page.waitForEvent('filechooser')
+      await page.getByRole('button', { name: 'Files', exact: true }).click()
+      await (await opened).setFiles(FILE)
+      const toast = page.locator('.toast')
+      await expect(toast).toContainText('a-long-name-for-a-file')
+
+      const layout = await settledToast(page)
+      expect(layout?.height ?? 720, 'the toast takes under half of the screen').toBeLessThan(720 / 2)
+      expect(layout?.scrolls, 'words too many for the box scroll inside it').toBe(true)
+      await expect(toast.locator('.toast-text'), 'the words box takes the keyboard').toHaveAttribute('tabindex', '0')
+      expect(await overrunning(page, '.toast'), 'lines of the message that run past the screen or its box').toEqual([])
+      expect(
+        layout?.controls.filter((control) => !control.onScreen || !control.inToast).map((control) => control.name),
+        'controls of the message that are out of view'
+      ).toEqual([])
+      expect(layout?.controls.map((control) => control.name)).toEqual(['Dismiss'])
+      await toast.getByRole('button', { name: 'Dismiss' }).click({ trial: true, timeout: 2_000 })
+
+      // The words reach their last line by scrolling the box, and the control stays where it is.
+      const before = await toast.getByRole('button', { name: 'Dismiss' }).boundingBox()
+      await toast.locator('.toast-text').evaluate((element) => {
+        element.scrollTop = element.scrollHeight
+      })
+      expect(await toast.getByRole('button', { name: 'Dismiss' }).boundingBox()).toEqual(before)
+
+      // The control: with the words kept from wrapping, the same measure sees them run out of the box.
+      await stopWrapping(page, ['.toast-text'])
+      expect(await overrunning(page, '.toast'), 'the measure sees words that cannot wrap').not.toEqual([])
+
+      await toast.getByRole('button', { name: 'Dismiss' }).click()
+      await expect(toast).toHaveCount(0)
+    })
+
+    test(`keeps the notice of a file with a short name on a few lines at the largest size on ${surface}`, async ({
+      page
+    }) => {
+      await withSystemTextScale(page, LARGEST)
+      await page.setViewportSize({ width: 320, height: 720 })
+      await page.goto(`/harness.html?surface=${surface}&session=${SESSION}`)
+      const opened = page.waitForEvent('filechooser')
+      await page.getByRole('button', { name: 'Files', exact: true }).click()
+      await (await opened).setFiles({ name: 'notes.png', mimeType: 'image/png', buffer: Buffer.from('a picked file') })
+      const toast = page.locator('.toast')
+      await expect(toast).toContainText('notes.png')
+      const layout = await settledToast(page)
+      expect(layout?.scrolls, 'the shortened notice needs no scrolling').toBe(false)
+      await expect(toast.locator('.toast-text')).not.toHaveAttribute('tabindex')
+      expect(layout?.height ?? 720, 'the notice takes under half of the screen').toBeLessThan(720 / 2)
+      expect(await overrunning(page, '.toast')).toEqual([])
+      expect(layout?.controls.every((control) => control.onScreen && control.inToast)).toBe(true)
+    })
+  }
+
+  // The desktop's messages offer an action, and the shared toast keeps it and Dismiss in view on a
+  // narrow window too, with its words bounded by the screen.
+  for (const [name, viewport, host] of [
+    ['one row', { width: 1024, height: 768 }, 'studio'],
+    ['bounded words', { width: 360, height: 640 }, 'studio-with-a-name-that-is-long-enough-to-fill-a-narrow-window '.repeat(12)]
+  ] as const) {
+    test(`keeps a passing message with an action in view: ${name}`, async ({ page }) => {
+      await page.setViewportSize(viewport)
+      await page.goto('/harness.html')
+      await page.waitForSelector('.app-shell')
+      await page.evaluate((view) => {
+        window.krTestHost?.setConfirmations(view)
+      }, OWNER_REQUEST(host))
+      const toast = page.locator('.toast')
+      await expect(toast).toContainText('needs your confirmation')
+      const layout = await settledToast(page)
+      expect(await overrunning(page, '.toast'), 'lines of the message that run past the screen or its box').toEqual([])
+      expect(layout?.controls.map((control) => control.name)).toEqual(['Review', 'Dismiss'])
+      expect(layout?.controls.every((control) => control.onScreen && control.inToast)).toBe(true)
+      if (name === 'one row') {
+        // One row: the controls lie beside the words, not under them.
+        expect(layout?.controlsBeside, 'the controls are beside the words').toBe(true)
+      } else {
+        expect(layout?.height ?? 640, 'the toast takes under half of the screen').toBeLessThan(640 / 2)
+        expect(layout?.scrolls).toBe(true)
+      }
+      for (const control of ['Review', 'Dismiss']) {
+        await toast.getByRole('button', { name: control }).click({ trial: true, timeout: 2_000 })
+      }
+    })
+  }
 })

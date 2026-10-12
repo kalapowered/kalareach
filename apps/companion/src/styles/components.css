@@ -793,8 +793,11 @@ textarea::placeholder {
   left: 50%;
   bottom: 28px;
   display: flex;
+  /* The controls drop under the words when the words would be left too narrow to read. */
+  flex-wrap: wrap;
   align-items: center;
-  gap: 10px;
+  justify-content: flex-end;
+  gap: 4px 10px;
   width: max-content;
   max-width: calc(100vw - 32px);
   border: 1px solid var(--control-line);
@@ -809,6 +812,35 @@ textarea::placeholder {
   transition:
     transform var(--surface-in) var(--ease-out),
     opacity var(--surface-in) var(--ease-out);
+}
+
+.toast-main {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: start;
+  gap: 10px;
+  /* The words keep at least this much room beside the mark, else the controls go under them. */
+  flex: 1 1 0;
+  min-width: min(8em, 100%);
+  line-height: 1.4;
+}
+
+/* The words are bounded by the screen, not by the text size: at the largest size a long message
+   scrolls inside its own box, and the controls below it are never pushed off the screen. */
+.toast-text {
+  max-height: min(12rem, 30dvh);
+  /* Words never scroll sideways: they wrap, and what cannot wrap is cut off, not scrolled to. */
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  overflow-wrap: anywhere;
+}
+
+.toast-controls {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex: 0 0 auto;
 }
 
 /* Nothing appears from nothing: the toast starts below where it lands, not at zero size. */

@@ -356,9 +356,7 @@ export function MobileSession({
             handle
           })
           if (removedFiles.current.has(localId)) return
-          say(
-            `${handle.original_file_name} is uploaded and kept with this draft. A prompt sent from here cannot carry it; give its path to your agent yourself, or remove it to send the text on its own.`
-          )
+          say(`${handle.original_file_name} is uploaded and kept with this draft.`)
           void paths.attach(sessionId, { sessionId }, handle)
         })
         .catch((failure: unknown) => {
