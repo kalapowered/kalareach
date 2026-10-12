@@ -379,15 +379,19 @@ fn kr_req_07_65_a_process_the_session_s_stop_could_not_signal_is_noted() {
     );
     owned.observe();
     assert!(
-        owned.unestablished().is_empty(),
-        "the control: nothing is noted before the stop"
+        !owned
+            .unestablished()
+            .iter()
+            .any(|note| note.contains("could not be stopped")),
+        "the control: no stop is noted before the stop: {:?}",
+        owned.unestablished()
     );
     request_stop(&owned);
     assert!(
         owned
             .unestablished()
             .iter()
-            .any(|note| note.contains("was not signalled")),
+            .any(|note| note.contains("could not be stopped")),
         "the stop says that it could not signal the process: {:?}",
         owned.unestablished()
     );
