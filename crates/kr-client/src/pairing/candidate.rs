@@ -1777,12 +1777,27 @@ where
     T: Send + 'static,
     F: FnOnce(&dyn RendezvousClient) -> kr_pairing::Result<T> + Send + 'static,
 {
+    start_in_room_waiting(room, RECORD_WAIT, start).await
+}
+
+/// [`start_in_room`], with the room given `record_wait` to serve the first frame instead of
+/// [`RECORD_WAIT`].
+pub(crate) async fn start_in_room_waiting<T, F>(
+    room: Arc<dyn CandidateRoom>,
+    record_wait: Duration,
+    start: F,
+) -> Result<(T, RoomSocket), StartRefused>
+where
+    T: Send + 'static,
+    F: FnOnce(&dyn RendezvousClient) -> kr_pairing::Result<T> + Send + 'static,
+{
     let (_keep_open, cancelled) = oneshot::channel::<()>();
     let slot = Arc::new(Mutex::new(None));
     let ending = Arc::new(Mutex::new(None));
     let lookup = RoomLookup {
         runtime: tokio::runtime::Handle::current(),
         room,
+        record_wait,
         slot: Arc::clone(&slot),
         ending: Arc::clone(&ending),
         cancelled: Mutex::new(Some(cancelled)),
@@ -1811,6 +1826,8 @@ where
 struct RoomLookup {
     runtime: tokio::runtime::Handle,
     room: Arc<dyn CandidateRoom>,
+    /// How long the room is given to serve its first frame.
+    record_wait: Duration,
     slot: Arc<Mutex<Option<RoomSocket>>>,
     ending: Arc<Mutex<Option<PairingFailure>>>,
     cancelled: Mutex<Option<oneshot::Receiver<()>>>,
@@ -1828,7 +1845,7 @@ impl RendezvousClient for RoomLookup {
             .unwrap_or_else(PoisonError::into_inner)
             .take();
         let outcome = self.runtime.block_on(async {
-            let opened = first_record(&*self.room, origin, locator);
+            let opened = first_record(&*self.room, origin, locator, self.record_wait);
             match cancelled {
                 Some(cancelled) => tokio::select! {
                     outcome = opened => outcome,
@@ -1867,13 +1884,14 @@ async fn first_record(
     room: &dyn CandidateRoom,
     origin: &RendezvousOrigin,
     locator: &Locator,
+    record_wait: Duration,
 ) -> Result<(LocatorRecord, RoomSocket), PairingFailure> {
     let mut socket = room
         .open(origin, locator)
         .await
         .map_err(|error| PairingFailure::new(room_failure(&error), error.said()))?;
     let no_host = |detail: Shown| PairingFailure::new(FailureKind::NoHostAnswered, detail);
-    match tokio::time::timeout(RECORD_WAIT, socket.incoming.recv()).await {
+    match tokio::time::timeout(record_wait, socket.incoming.recv()).await {
         Ok(Some(ServiceFrame::Record {
             invitation_id,
             expires_at_ms,
@@ -1931,6 +1949,10 @@ mod tests {
     /// It only ends a test that would never finish. Nothing here waits for it to pass, and no test
     /// claims how long anything took.
     const HUNG: Duration = Duration::from_secs(60);
+
+    /// How long a test gives a room to serve its first frame: longer than [`HUNG`], so that the
+    /// room's own wait running out cannot be what closes a socket the test is waiting on.
+    const ROOM_PATIENCE: Duration = Duration::from_secs(60 * 60);
 
     /// A room a test holds the far end of.
     struct HeldRoom {
@@ -2026,8 +2048,9 @@ mod tests {
 
     async fn cancelling_ends_the_wait_and_closes_the_socket() {
         let room = HeldRoom::new(false);
-        let starting = tokio::spawn(start_in_room(
+        let starting = tokio::spawn(start_in_room_waiting(
             room.clone() as Arc<dyn CandidateRoom>,
+            ROOM_PATIENCE,
             |lookup| lookup.lookup(&origin(), &locator()),
         ));
         room.until_opened().await;
