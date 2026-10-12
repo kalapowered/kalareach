@@ -17,9 +17,10 @@
 //! item left in a mailbox. It sees the envelope's routing record (the key identifiers of the host
 //! and the device, the kind of payload, the size and the expiry) and when the item arrived, and
 //! nothing of what is inside. The object's identifier is derived from the notification's with a
-//! secret only this host holds, so the identifier does not link the item to the push. The expiry,
-//! the signing key and the time are the same for both, and a service that serves the push gateway
-//! and the mailbox from one origin can match them by those.
+//! secret only this host holds, so the identifier does not link the item to the push. The expiry
+//! is the same for both, and the time they arrive is close, so a service that serves the push
+//! gateway and the mailbox from one origin, and knows the host's key from the push's sender
+//! record, can match them by those.
 //!
 //! # Which failure is which
 //!
@@ -29,11 +30,15 @@
 //! [`Placement::Later`]: the notification is not presented, and its next attempt is due when its
 //! retry schedule says, or when the service said it would take requests again, whichever is later.
 //! A service that will not take this object, because the device's mailbox is full or the item is
-//! not one it keeps, is [`Placement::Refused`]: the notification is a person's alert, and the
-//! mailbox drains when the device reads it, so it is presented without its detail and its record
-//! says why. A notification does not wait for a mailbox for long either: the attempts it spends
-//! waiting are limited, and so is the time, so that the push still goes, without its detail, while
-//! it can.
+//! not one it keeps, is [`Placement::Refused`]: the notification is a person's alert, and the push
+//! is what brings the device to read its mailbox, so it is presented without its detail and its
+//! record says why.
+//!
+//! The delivery module does not wait for a mailbox for long. A notification spends at most a few of
+//! its attempts waiting, a service that asks to be left alone for longer than the longest wait the
+//! notification's own schedule makes is not waited for, and a wait that would leave no room for
+//! the next attempt before the notification expires is not made. In each case the push is presented
+//! without its detail.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -46,7 +51,7 @@ use kr_protocol::mailbox::SealedEnvelope;
 use kr_protocol::scalars::StoredEnvelopeKey;
 use kr_protocol::service::GatewayOrigin;
 
-use super::transport::{DeliveryTransports, nothing_was_sent};
+use super::transport::DeliveryTransports;
 
 /// What came of placing one object.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -60,8 +65,8 @@ pub enum Placement {
         detail: String,
         /// How long the service asked to be left alone, when it said.
         after: Option<Duration>,
-        /// Whether the request may have reached the service: it may have stored the object
-        /// whatever came back.
+        /// Whether a request was handed to the transport. The service may have stored the object
+        /// whatever came back, so the object is then a copy that may have left this host.
         may_have_left: bool,
     },
     /// The service will not take this object, and asking again would not change that.
@@ -167,7 +172,7 @@ fn placement_of(error: &ClientError) -> Placement {
         | ErrorCode::ResourceUnavailable => Placement::Later {
             detail: format!("the mailbox service did not take it yet: {error}"),
             after,
-            may_have_left: !nothing_was_sent(error),
+            may_have_left: true,
         },
         _ => Placement::Refused {
             detail: format!("the mailbox service would not take it: {error}"),
