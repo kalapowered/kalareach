@@ -636,8 +636,10 @@ async fn invite(
         shown_lines.as_deref(),
     )?;
     if arguments.yes {
-        for line in &summary {
-            let _ = output::write_line(&mut std::io::stderr(), line);
+        // Standard error carries nothing but this program's own words and an export's preview, so
+        // the summary is read on standard output, and not at all when that is a document.
+        if !json {
+            output::lines(&summary);
         }
     } else {
         pair::guard(build_id).await?;
