@@ -830,6 +830,9 @@ pub struct LinkControl {
 struct LinkState {
     holding: bool,
     unreachable: bool,
+    /// Whether a connection that is let through is ended as it is made, as a network that drops it
+    /// at once does.
+    ending: bool,
     refusing: Option<kr_protocol::error::ErrorCode>,
     waiting: Vec<Option<tokio::sync::oneshot::Sender<()>>>,
 }
@@ -901,6 +904,12 @@ impl LinkControl {
         self.state.lock().expect("the record").unreachable = down;
     }
 
+    /// Makes every connection that is let through end as it is made, or stops that. The caller finds
+    /// a connection that is closed: its first send or read fails.
+    pub fn end_connections(&self, ending: bool) {
+        self.state.lock().expect("the record").ending = ending;
+    }
+
     /// Makes the host refuse every connection at admission with `code`, or stops that.
     pub fn refuse(&self, code: Option<kr_protocol::error::ErrorCode>) {
         self.state.lock().expect("the record").refusing = code;
@@ -966,9 +975,9 @@ impl kr_client::pairing::link::HostLink for ControlledLink {
             }
             // What the host does is decided when the connection is let through, so a test can
             // change it while the connection is held.
-            let (refusing, unreachable) = {
+            let (refusing, unreachable, ending) = {
                 let state = self.control.state.lock().expect("the record");
-                (state.refusing, state.unreachable)
+                (state.refusing, state.unreachable, state.ending)
             };
             if let Some(code) = refusing {
                 return Err(kr_client::pairing::link::LinkError::Refused(
@@ -980,7 +989,11 @@ impl kr_client::pairing::link::HostLink for ControlledLink {
                     "the host could not be reached".to_owned(),
                 ));
             }
-            self.own.connect_paired_transport(host, identity).await
+            let transport = self.own.connect_paired_transport(host, identity).await?;
+            if ending {
+                transport.close();
+            }
+            Ok(transport)
         })
     }
 

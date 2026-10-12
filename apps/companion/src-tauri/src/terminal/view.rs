@@ -337,10 +337,15 @@ async fn open_paired(
 ) -> Result<(Wire, ActionTarget), OpenFailure> {
     use kr_protocol::session::{SessionOpenParams, SessionOpenResult};
 
-    let transport = dial
-        .transport()
-        .await
-        .map_err(|reason| reason.to_string())?;
+    let transport = dial.transport().await.map_err(|failure| match failure {
+        // The host could not be reached for this view's connection: the connection is what was
+        // lost, and the host is asked again on the opening's link.
+        crate::standing::Failure::Unreached(reason) => OpenFailure {
+            reason: format!("The host could not be reached for this view: {reason}"),
+            lost: true,
+        },
+        refused @ crate::standing::Failure::Refused(_) => OpenFailure::refused(refused.to_string()),
+    })?;
     let mut wire =
         Wire::Paired(Paired::over(transport, grant_id).map_err(|lost| OpenFailure::lost(&lost))?);
     let opened = wire

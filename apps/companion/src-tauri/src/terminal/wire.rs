@@ -32,9 +32,9 @@ pub(super) struct Lost(pub(super) String);
 /// What a call answered with: the host's refusal, or the value.
 pub(super) type Answer = std::result::Result<ParamsValue, ProtocolError>;
 
-/// The request number before the first one the wire's own calls use: a paired connection numbers
-/// its requests in sequence from 2, after the first the host takes for its own, and a host that
-/// sees a number jump ends the connection.
+/// The request number before the first one the wire's own calls use. A paired connection numbers
+/// its requests in sequence, as a session of the client library does, and the wire's calls and the
+/// loop's carry on from one another.
 const OWN_REQUESTS: u64 = 1;
 
 /// A view's connection to its session.
@@ -165,9 +165,8 @@ impl Wire {
     /// The number the view's loop numbers its requests from.
     ///
     /// A local link has the loop number apart from the ones the attach and the subscription were
-    /// given, in a range of its own. A paired connection numbers a connection's requests in
-    /// sequence, and a host that sees a number jump ends the connection, so the loop carries on
-    /// from the last the opening used.
+    /// given, in a range of its own. A paired connection numbers its requests in sequence, as a
+    /// session of the client library does, so the loop carries on from the last the opening used.
     pub(super) fn first_loop_request(&self) -> u64 {
         match self {
             Self::Local(_) => super::view::LOOP_REQUESTS,

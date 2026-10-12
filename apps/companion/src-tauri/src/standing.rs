@@ -418,11 +418,31 @@ impl Drop for Busy {
 
 type Slot = Arc<tokio::sync::Mutex<Option<Arc<Link>>>>;
 
+/// The link an ambient entry holds, readable without waiting for the slot a call may hold across
+/// its open: a host change closes it through this.
+type Held = Arc<Mutex<Option<Arc<Link>>>>;
+
 struct AmbientEntry {
     session_id: SessionId,
     slot: Slot,
+    held: Held,
     busy: Arc<AtomicUsize>,
     last_used: Instant,
+}
+
+impl AmbientEntry {
+    /// Lets the entry's link go, whether or not a call holds the slot.
+    fn close(&self) {
+        if let Some(link) = self
+            .held
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+        {
+            link.session.close();
+        }
+        close_slot(&self.slot);
+    }
 }
 
 /// The opening a session's screen holds now, and the number of the call that chose it.
@@ -443,6 +463,9 @@ struct Opened {
     /// What closes the raw terminal views opened under this opening, each on a connection of its
     /// own, when the opening ends.
     views: Vec<Box<dyn FnOnce() + Send>>,
+    /// How many views of this opening lost their connection since one last drew a screen, so that a
+    /// view that cannot hold a connection is not opened again at the speed of the network.
+    losses: u32,
 }
 
 #[derive(Default)]
@@ -462,6 +485,8 @@ pub struct PairedLinks {
     /// How many times the host has changed. An ambient open that began under an earlier host
     /// serves nothing.
     generation: std::sync::atomic::AtomicU64,
+    /// How many times a view that lost its connection has had the host asked again.
+    rechecks: AtomicUsize,
 }
 
 impl std::fmt::Debug for PairedLinks {
@@ -507,9 +532,11 @@ impl PairedLinks {
 
     /// Lets every link go and forgets every token: the host has changed.
     pub fn close_all(&self) {
-        self.generation.fetch_add(1, Ordering::SeqCst);
         let (opened, ambient) = {
             let mut inner = self.lock();
+            // Moved on under the lock an ambient call hands its link over under, so a link is
+            // either handed over before this and closed below, or sees the change and closes itself.
+            self.generation.fetch_add(1, Ordering::SeqCst);
             inner.current.clear();
             inner.seen.clear();
             (
@@ -521,11 +548,7 @@ impl PairedLinks {
             opened.end_now();
         }
         for entry in ambient {
-            if let Ok(mut slot) = entry.slot.try_lock()
-                && let Some(link) = slot.take()
-            {
-                link.session.close();
-            }
+            entry.close();
         }
         self.freed.notify_waiters();
     }
@@ -633,6 +656,7 @@ impl PairedLinks {
                         standing: standing.clone(),
                         watch: Some(watch),
                         views: Vec::new(),
+                        losses: 0,
                     },
                 );
                 return Ok(standing);
@@ -672,6 +696,7 @@ impl PairedLinks {
                         standing: standing.clone(),
                         watch,
                         views: Vec::new(),
+                        losses: 0,
                     },
                 );
                 Ok(standing)
@@ -803,7 +828,11 @@ impl PairedLinks {
                 {
                     entry.busy.fetch_add(1, Ordering::SeqCst);
                     entry.last_used = now;
-                    Some((Arc::clone(&entry.slot), Arc::clone(&entry.busy)))
+                    Some((
+                        Arc::clone(&entry.slot),
+                        Arc::clone(&entry.held),
+                        Arc::clone(&entry.busy),
+                    ))
                 } else {
                     // Links idle past their time go first, then the longest idle when a place is
                     // wanted. A busy link is never let go.
@@ -815,7 +844,7 @@ impl PairedLinks {
                         });
                     inner.ambient = held;
                     for entry in idle {
-                        close_slot(&entry.slot);
+                        entry.close();
                     }
                     if inner.ambient.len() >= AMBIENT_LIMIT {
                         let oldest = inner
@@ -827,17 +856,22 @@ impl PairedLinks {
                             .map(|(index, _)| index);
                         if let Some(index) = oldest {
                             let gone = inner.ambient.remove(index);
-                            close_slot(&gone.slot);
+                            gone.close();
                         }
                     }
                     if inner.ambient.len() < AMBIENT_LIMIT {
                         let entry = AmbientEntry {
                             session_id,
                             slot: Slot::default(),
+                            held: Held::default(),
                             busy: Arc::new(AtomicUsize::new(1)),
                             last_used: now,
                         };
-                        let picked = (Arc::clone(&entry.slot), Arc::clone(&entry.busy));
+                        let picked = (
+                            Arc::clone(&entry.slot),
+                            Arc::clone(&entry.held),
+                            Arc::clone(&entry.busy),
+                        );
                         inner.ambient.push(entry);
                         Some(picked)
                     } else {
@@ -845,7 +879,7 @@ impl PairedLinks {
                     }
                 }
             };
-            let Some((slot, busy)) = pick else {
+            let Some((slot, mirror, busy)) = pick else {
                 freed.await;
                 continue;
             };
@@ -860,6 +894,7 @@ impl PairedLinks {
             if let Some(link) = held.as_ref()
                 && live(link).await
             {
+                self.hand_over(generation, &mirror, link)?;
                 return Ok(Leased {
                     link: Arc::clone(link),
                     _busy: Some(claim),
@@ -867,13 +902,6 @@ impl PairedLinks {
                 });
             }
             let opened = dial.open(session_id, None).await;
-            // A host that changed while this was asked is not the host this was asked of.
-            if self.generation.load(Ordering::SeqCst) != generation {
-                if let Ok(Opening::Open(link, _)) = opened {
-                    link.session.close();
-                }
-                return Err(host_changed());
-            }
             let link = match opened {
                 Ok(Opening::Open(link, _)) => link,
                 Ok(Opening::Ended(_)) => {
@@ -884,6 +912,10 @@ impl PairedLinks {
                 }
                 Err(failure) => return Err(failure.command()),
             };
+            // A host that changed while this was asked is not the host this was asked of: the
+            // link is handed over, or closed, under the lock a host change moves the generation
+            // under.
+            self.hand_over(generation, &mirror, &link)?;
             *held = Some(Arc::clone(&link));
             return Ok(Leased {
                 link,
@@ -939,7 +971,13 @@ impl PairedLinks {
     /// the link lives and the opening stands: a prompt in flight on the link is answered first, and
     /// the host answers one request at a time. When the link goes, its watch takes over.
     pub async fn recheck(self: &Arc<Self>, emit: &Emitter, session_id: SessionId, opening: &str) {
+        // Paced by the views of this opening that lost their connections without drawing: the
+        // first is asked about at once, and each one after waits longer, so a view that cannot hold
+        // a connection is not opened again as fast as the network goes.
+        let losses = self.note_loss(session_id, opening);
+        tokio::time::sleep(pause(losses.saturating_sub(1))).await;
         let mut failures: u32 = 0;
+        let mut refused: Option<ErrorCode> = None;
         loop {
             let held = {
                 let inner = self.lock();
@@ -970,6 +1008,14 @@ impl PairedLinks {
             let standing = match asked {
                 Ok(Ok(opened)) => standing_of(&opened),
                 Ok(Err(ClientError::Host(refusal))) if !transient(refusal.code) => {
+                    // A refusal is told only once a second ask agrees: a revocation or an expiry
+                    // landing between the host's two reads reads as a refusal once, and the typed
+                    // answer is what the watch learns when the link closes.
+                    if refused != Some(refusal.code) {
+                        refused = Some(refusal.code);
+                        tokio::time::sleep(pause(0)).await;
+                        continue;
+                    }
                     SessionStanding::Refused {
                         code: refusal.code,
                         message: refusal.message,
@@ -982,15 +1028,50 @@ impl PairedLinks {
                     continue;
                 }
             };
-            if self.set_standing_on(session_id, opening, &link, standing.clone()) {
-                emit(StandingEvent {
-                    session_id: session_id.to_string(),
-                    opening: opening.to_owned(),
-                    standing,
-                });
-            }
+            self.tell_standing_on(emit, session_id, opening, &link, standing);
             return;
         }
+    }
+
+    /// Notes that a view of the opening lost its connection, and answers how many have since one
+    /// last drew a screen.
+    fn note_loss(&self, session_id: SessionId, opening: &str) -> u32 {
+        let mut inner = self.lock();
+        match inner
+            .opened
+            .get_mut(&session_id)
+            .filter(|held| held.opening == opening)
+        {
+            Some(held) => {
+                held.losses = held.losses.saturating_add(1);
+                held.losses
+            }
+            None => 0,
+        }
+    }
+
+    /// Notes that a view of the opening drew a screen: its connection held.
+    pub fn drew(&self, session_id: SessionId, opening: &str) {
+        if let Some(held) = self
+            .lock()
+            .opened
+            .get_mut(&session_id)
+            .filter(|held| held.opening == opening)
+        {
+            held.losses = 0;
+        }
+    }
+
+    /// Notes, at once and where the view's end is known, that the host is to be asked again for a
+    /// view that lost its connection. A test reads how many.
+    pub fn note_recheck(&self) {
+        self.rechecks.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// How many views that lost their connection have had the host asked again.
+    #[must_use]
+    pub fn rechecks(&self) -> usize {
+        self.rechecks.load(Ordering::SeqCst)
     }
 
     /// Ends the connection of a session's opened link as a lost network would, leaving the opening
@@ -1007,22 +1088,37 @@ impl PairedLinks {
         }
     }
 
+    /// Hands `link` to a call that began under `generation`, and records it where a host change
+    /// finds it, or closes it when the host has changed since.
+    fn hand_over(&self, generation: u64, mirror: &Held, link: &Arc<Link>) -> Result<()> {
+        let _inner = self.lock();
+        if self.generation.load(Ordering::SeqCst) != generation {
+            link.session.close();
+            return Err(CommandError::unavailable(
+                "The host in use changed while this was being asked.",
+            ));
+        }
+        *mirror.lock().unwrap_or_else(PoisonError::into_inner) = Some(Arc::clone(link));
+        Ok(())
+    }
+
     /// Lets an ambient link go, if it is still the one held for `session_id`: a call that failed
     /// on an old link does not take a new one away.
     pub(crate) fn forget_ambient(&self, session_id: SessionId, link: &Arc<Link>) {
-        let slot = {
+        let entry = {
             let inner = self.lock();
             inner
                 .ambient
                 .iter()
                 .find(|entry| entry.session_id == session_id)
-                .map(|entry| Arc::clone(&entry.slot))
+                .map(|entry| (Arc::clone(&entry.slot), Arc::clone(&entry.held)))
         };
-        if let Some(slot) = slot
+        if let Some((slot, mirror)) = entry
             && let Ok(mut held) = slot.try_lock()
             && held.as_ref().is_some_and(|held| Arc::ptr_eq(held, link))
         {
             *held = None;
+            mirror.lock().unwrap_or_else(PoisonError::into_inner).take();
             link.session.close();
         }
     }
@@ -1040,24 +1136,16 @@ impl PairedLinks {
         opening: String,
         mut link: Option<Arc<Link>>,
     ) {
-        let tell = |standing: SessionStanding| {
-            emit(StandingEvent {
-                session_id: session_id.to_string(),
-                opening: opening.clone(),
-                standing,
-            });
-        };
         loop {
             if let Some(held) = link.take() {
                 held.session.closed().await;
+                // An opening that is over, or was left or replaced, is not reached again.
                 let lost = SessionStanding::Reconnecting {
                     reason: "contact with this session was lost".to_owned(),
                 };
-                // An opening that is over, or was left or replaced, is not reached again.
-                if !self.set_standing(session_id, &opening, lost.clone()) {
+                if !self.tell_standing(&emit, session_id, &opening, lost) {
                     return;
                 }
-                tell(lost);
             }
             let mut failures: u32 = 0;
             let mut refused: Option<ErrorCode> = None;
@@ -1068,11 +1156,10 @@ impl PairedLinks {
                 }
                 match dial.open(session_id, grant_id).await {
                     Ok(Opening::Open(fresh, standing)) => {
-                        if !self.reinstall(session_id, &opening, &fresh, &standing) {
+                        if !self.tell_reinstall(&emit, session_id, &opening, &fresh, standing) {
                             fresh.session.close();
                             return;
                         }
-                        tell(standing);
                         link = Some(fresh);
                         break;
                     }
@@ -1080,9 +1167,7 @@ impl PairedLinks {
                         let standing = SessionStanding::Ended {
                             reason: end_reason(reason),
                         };
-                        if self.set_standing(session_id, &opening, standing.clone()) {
-                            tell(standing);
-                        }
+                        self.tell_standing(&emit, session_id, &opening, standing);
                         return;
                     }
                     Err(Failure::Refused(refusal)) if !transient(refusal.code) => {
@@ -1093,23 +1178,18 @@ impl PairedLinks {
                                 code: refusal.code,
                                 message: refusal.message,
                             };
-                            if self.set_standing(session_id, &opening, standing.clone()) {
-                                tell(standing);
-                            }
+                            self.tell_standing(&emit, session_id, &opening, standing);
                             return;
                         }
                         refused = Some(refusal.code);
                     }
-                    Err(Failure::Refused(refusal)) => {
+                    Err(Failure::Refused(_)) => {
                         failures = failures.saturating_add(1);
-                        let _ = refusal;
                     }
                     Err(Failure::Unreached(reason)) => {
                         failures = failures.saturating_add(1);
                         let standing = SessionStanding::Reconnecting { reason };
-                        if self.set_standing(session_id, &opening, standing.clone()) {
-                            tell(standing);
-                        }
+                        self.tell_standing(&emit, session_id, &opening, standing);
                     }
                 }
             }
@@ -1123,10 +1203,13 @@ impl PairedLinks {
             .is_some_and(|current| current.opening == opening)
     }
 
-    /// Changes the standing of the opening, if it is still the session's and the host has not said
-    /// it is over: an opening that has ended, been refused or been replaced stays so.
-    fn set_standing(
+    /// Changes the standing of the opening and tells the page, if the opening is still the session's
+    /// and nothing has ended it: an opening that has ended, been refused, closed or replaced stays
+    /// so. The change and its telling are one step under the lock, so a standing is never told
+    /// after one that came later.
+    fn tell_standing(
         &self,
+        emit: &Emitter,
         session_id: SessionId,
         opening: &str,
         standing: SessionStanding,
@@ -1138,18 +1221,25 @@ impl PairedLinks {
             .filter(|held| held.opening == opening && !is_over(&held.standing))
         {
             Some(held) => {
-                held.standing = standing;
+                held.standing = standing.clone();
+                emit(StandingEvent {
+                    session_id: session_id.to_string(),
+                    opening: opening.to_owned(),
+                    standing,
+                });
                 true
             }
             None => false,
         }
     }
 
-    /// Changes the standing of the opening from what the host answered on `link`: only while that
-    /// link is still the opening's and the opening is open, so that a late answer neither reverses
-    /// what the watch learned since nor speaks for a link that has been replaced.
-    fn set_standing_on(
+    /// Changes the standing of the opening from what the host answered on `link`, and tells the
+    /// page: only while that link is still the opening's and the opening is open, so that a late
+    /// answer neither reverses what the watch learned since nor speaks for a link that has been
+    /// replaced.
+    fn tell_standing_on(
         &self,
+        emit: &Emitter,
         session_id: SessionId,
         opening: &str,
         link: &Arc<Link>,
@@ -1165,7 +1255,12 @@ impl PairedLinks {
                     .is_some_and(|held| Arc::ptr_eq(held, link))
         }) {
             Some(held) => {
-                held.standing = standing;
+                held.standing = standing.clone();
+                emit(StandingEvent {
+                    session_id: session_id.to_string(),
+                    opening: opening.to_owned(),
+                    standing,
+                });
                 true
             }
             None => false,
@@ -1173,13 +1268,15 @@ impl PairedLinks {
     }
 
     /// Makes `fresh` the opening's link, with the new epoch and the rights the host just decided,
-    /// if the opening is still the session's and not over. The old link is closed.
-    fn reinstall(
+    /// and tells the page, if the opening is still the session's and not over. The old link is
+    /// closed.
+    fn tell_reinstall(
         &self,
+        emit: &Emitter,
         session_id: SessionId,
         opening: &str,
         fresh: &Arc<Link>,
-        standing: &SessionStanding,
+        standing: SessionStanding,
     ) -> bool {
         let mut inner = self.lock();
         match inner
@@ -1193,6 +1290,11 @@ impl PairedLinks {
                 if let Some(old) = old {
                     old.session.close();
                 }
+                emit(StandingEvent {
+                    session_id: session_id.to_string(),
+                    opening: opening.to_owned(),
+                    standing,
+                });
                 true
             }
             None => false,
@@ -1200,12 +1302,14 @@ impl PairedLinks {
     }
 }
 
-/// Whether a standing is one the host (or the page) ended: nothing changes it afterwards.
+/// Whether a standing is one the host (or the page) ended, or that the session closed: nothing
+/// changes it afterwards.
 fn is_over(standing: &SessionStanding) -> bool {
     matches!(
         standing,
         SessionStanding::Ended { .. }
             | SessionStanding::Refused { .. }
+            | SessionStanding::Closed
             | SessionStanding::Superseded
     )
 }

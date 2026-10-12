@@ -179,16 +179,17 @@ impl TerminalViews {
                 Source::Paired(dial, grant) => view::Reach::Paired(dial, *grant),
             };
             let cause = view::run(reach, session_id, dimensions, receiver, &publish).await;
-            // Not held once it has ended, and only then is every close waiting for it told.
-            held.lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .remove(&id);
-            let _ = ending.send(true);
+            // Before the view is told over, so whoever waits for its end finds it done.
             if cause == view::Cause::Lost
                 && let Some(on_lost) = on_lost
             {
                 on_lost();
             }
+            // Not held once it has ended, and only then is every close waiting for it told.
+            held.lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .remove(&id);
+            let _ = ending.send(true);
         });
         id.to_string()
     }

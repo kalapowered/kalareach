@@ -190,7 +190,9 @@ pub const NAMED_COMMANDS: &[(&str, Option<Method>)] = &[
 /// Each takes the opening of the screen making it and goes over that opening's link, or goes over a
 /// link kept for calls made outside any screen when it names none. The connection for the host
 /// alone refuses them all, because the host serves no worker on it. A command that is not offered
-/// over a paired host is in the list too, because it is refused here before anything is sent. The
+/// over a paired host is in the list too, because it is refused here before anything is sent. A
+/// sharing command that is also refused on a paired standing before anything is sent, such as the
+/// preview of a screen, is not in the list, because it never names a session of a paired host. The
 /// session tour in `tests/phone_sessions.rs` calls each of these once, so one that reaches a worker
 /// over the wrong connection fails there.
 pub const SESSION_BOUND_COMMANDS: &[&str] = &[
@@ -2442,16 +2444,27 @@ pub async fn terminal_view_open<R: tauri::Runtime>(
     let links = std::sync::Arc::clone(state.paired_links());
     let grant = links.opening_grant(session_id, &opening)?;
     let dial = crate::standing::Dial::new(context.device, context.host);
-    let publish: crate::terminal::Publish = std::sync::Arc::new(move |view_state| {
-        // A page that has gone takes nothing; its load ends the view.
-        let _ = on_state.send(view_state);
-    });
+    let publish: crate::terminal::Publish = {
+        let (links, opening) = (std::sync::Arc::clone(&links), opening.clone());
+        std::sync::Arc::new(move |view_state| {
+            if matches!(
+                view_state,
+                crate::terminal::TerminalViewState::Showing { .. }
+            ) {
+                // The view's connection held long enough to draw: its losses so far are forgiven.
+                links.drew(session_id, &opening);
+            }
+            // A page that has gone takes nothing; its load ends the view.
+            let _ = on_state.send(view_state);
+        })
+    };
     // A view that ended because its own connection went may have lost only that: the host is asked
     // again, on the link the opening holds, what the opening allows.
     let on_lost: Box<dyn FnOnce() + Send> = {
         let (links, opening) = (std::sync::Arc::clone(&links), opening.clone());
         let emitter = webview.app_handle().clone();
         Box::new(move || {
+            links.note_recheck();
             tauri::async_runtime::spawn(async move {
                 let emit: crate::standing::Emitter = std::sync::Arc::new(move |event| {
                     let _ = emitter.emit(crate::standing::STANDING_EVENT, event);
@@ -3044,6 +3057,112 @@ mod tests {
         let mut seen = BTreeSet::new();
         for command in SESSION_BOUND_COMMANDS {
             assert!(seen.insert(command), "{command} is listed twice");
+            assert!(
+                NAMED_COMMANDS.iter().any(|(name, _)| name == command),
+                "{command} is not a command the application registers"
+            );
+        }
+    }
+
+    /// The commands that open no link to a session's worker on a paired host: the host's own
+    /// reads, the application's own, the sharing commands, which go over the connection for the
+    /// host alone or to the worker on this computer, and the four that act on a terminal view
+    /// already opened on a session's own connection, whose route the terminal tests prove. Every
+    /// named command is in this list or in [`SESSION_BOUND_COMMANDS`], so a command added to the
+    /// table is not left out of the one tour that proves the route of the commands that reach a
+    /// session: adding one fails this test until it is classified.
+    const HOST_OR_LOCAL_COMMANDS: &[&str] = &[
+        "host_info",
+        "environment_list",
+        "environment_capabilities",
+        "setup_identity",
+        "setup_open_settings",
+        "session_list",
+        "session_read",
+        "session_create",
+        "session_describe",
+        "description_setup",
+        "description_configure",
+        "description_download",
+        "terminal_view_resize",
+        "terminal_view_move",
+        "terminal_view_input",
+        "terminal_view_close",
+        "device_drafts",
+        "device_draft_save",
+        "device_draft_retarget",
+        "device_draft_discard",
+        "device_draft_mark_removal",
+        "attachment_upload_status",
+        "question_kept",
+        "question_dismiss_kept",
+        "attention_read",
+        "attention_acknowledge",
+        "review_read",
+        "review_acknowledge",
+        "changeset_read",
+        "device_list",
+        "grant_notices",
+        "grant_create",
+        "grant_list",
+        "grant_revoke",
+        "grant_redeem",
+        "grant_held",
+        "session_screen_preview",
+        "transfer_ask",
+        "transfer_answered",
+        "transfer_finish",
+        "transfer_cancel",
+        "attempts_list",
+        "attempt_ask",
+        "attempt_set_hidden",
+        "attempt_remove",
+        "plugin_list",
+        "catalogue_list",
+        "pairing_set_origin",
+        "pairing_view",
+        "pairing_start_code",
+        "pairing_paste",
+        "pairing_start_read",
+        "pairing_stop",
+        "owner_confirmations",
+        "owner_confirmation_review",
+        "hosts_use",
+        "hosts_forget",
+        "voice_prepare",
+        "voice_start",
+        "voice_stop",
+        "voice_allow",
+        "voice_scope",
+        "voice_delegate",
+        "voice_context",
+        "voice_set_muted",
+        "voice_call_state",
+        "open_external",
+        "import_remote_image",
+        "choose_export_destination",
+        "export_semantic_json",
+        "export_asciicast",
+        "connection_state",
+        "account_status",
+        "account_sign_in",
+        "account_sign_in_cancel",
+        "account_sign_out",
+        "account_usage",
+    ];
+
+    #[test]
+    fn every_named_command_is_classified_by_the_route_it_takes() {
+        for (command, _) in NAMED_COMMANDS {
+            let session = SESSION_BOUND_COMMANDS.contains(command);
+            let other = HOST_OR_LOCAL_COMMANDS.contains(command);
+            assert!(
+                session != other,
+                "{command} is classified {} times: it reaches a session, or it does not",
+                u8::from(session) + u8::from(other)
+            );
+        }
+        for command in HOST_OR_LOCAL_COMMANDS {
             assert!(
                 NAMED_COMMANDS.iter().any(|(name, _)| name == command),
                 "{command} is not a command the application registers"

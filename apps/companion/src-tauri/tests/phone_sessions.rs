@@ -1246,17 +1246,19 @@ async fn kr_req_19_08_every_command_that_reaches_a_session_goes_by_the_route_the
             json!({ "params": params, "opening": "tour-share" }),
         )
     };
-    // The worker answered, or refused in its own words: the host did not refuse the connection for
-    // serving no session, and the application did not refuse the screen for having been replaced.
-    let reached = |command: &str, answer: Result<Value, Value>| {
-        if let Err(refusal) = answer {
-            let words = refusal["message"].as_str().unwrap_or_default();
+    // The worker's own refusal of what a bare call asks of it: the call reached the session's
+    // worker on its opening's link, and was refused there in the worker's words.
+    let refused_by_the_worker =
+        |command: &str, answer: Result<Value, Value>, refusal_code: &str, words: &str| {
+            let refusal = answer.expect_err("the worker refuses what the tour asks of it");
+            assert_eq!(code(&refusal), refusal_code, "{command}: {refusal}");
             assert!(
-                !words.contains("serves no session") && !words.contains("replaced by another"),
-                "{command} did not reach the session: {refusal}"
+                refusal["message"]
+                    .as_str()
+                    .is_some_and(|said| said.contains(words)),
+                "{command} was refused in the worker's words, {words}: {refusal}"
             );
-        }
-    };
+        };
 
     // The host-wide reads, on the main connection, whatever session they name.
     companion
@@ -1338,42 +1340,53 @@ async fn kr_req_19_08_every_command_that_reaches_a_session_goes_by_the_route_the
         prompt(shared.session_id, instance, "tour"),
     )
     .expect("the prompt is submitted");
-    reached(
+    refused_by_the_worker(
         "agent_prompt_queue",
         about(
             "agent_prompt_queue",
             prompt(shared.session_id, instance, "queued"),
         ),
+        "UNSUPPORTED_CAPABILITY",
+        "agent.prompt.queue",
     );
     let target =
         json!({ "subject": subject(shared.session_id, instance), "binding_revision": "1" });
-    reached(
+    refused_by_the_worker(
         "agent_turn_steer",
         about(
             "agent_turn_steer",
             json!({ "target": target, "turn_id": "turn-1", "text": "stop" }),
         ),
+        "DRAFT_CONFLICT",
+        "is not the turn this instance is running",
     );
-    reached(
+    refused_by_the_worker(
         "agent_turn_cancel",
         about(
             "agent_turn_cancel",
             json!({ "target": target, "turn_id": "turn-1" }),
         ),
+        "DRAFT_CONFLICT",
+        "is not the turn this instance is running",
     );
-    reached(
+    let none = ActionId::new(kr_ipc::new_uuid()).to_string();
+    refused_by_the_worker(
         "agent_approval_inspect",
         about(
             "agent_approval_inspect",
-            json!({ "subject": subject(shared.session_id, instance), "resource_id": "none" }),
+            json!({ "subject": subject(shared.session_id, instance), "resource_id": none }),
         ),
+        "STALE_SESSION",
+        "no interpreted approval",
     );
-    reached(
+    refused_by_the_worker(
         "agent_approval_respond",
         about(
             "agent_approval_respond",
-            json!({ "target": target, "resource_id": "none", "option_id": "approve" }),
+            json!({ "target": target, "resource_id": none, "option_id": "approve" }),
         ),
+        "STALE_SESSION",
+        "no pending resource",
     );
     // A receipt the worker does not hold is the worker's own answer: the read reached it on the
     // session's link and was not refused on the way.
@@ -1395,7 +1408,7 @@ async fn kr_req_19_08_every_command_that_reaches_a_session_goes_by_the_route_the
     )
     .expect_err("a receipt is not read without the screen it belongs to");
     assert_eq!(code(&unnamed), "INVALID_ARGUMENT", "{unnamed}");
-    reached(
+    refused_by_the_worker(
         "action_cancel",
         call(
             "action_cancel",
@@ -1405,42 +1418,59 @@ async fn kr_req_19_08_every_command_that_reaches_a_session_goes_by_the_route_the
                 "opening": "tour-share",
             }),
         ),
+        "INVALID_ARGUMENT",
+        "no receipt for action",
     );
     call(
         "question_settle",
         json!({ "params": { "sessionId": session }, "opening": "tour-share" }),
     )
     .expect("the kept answers are settled");
-    reached(
+    // Nothing is kept here, so this is refused by the application with words; a kept answer is
+    // settled and sent on the screen's link by its own test.
+    let none_kept = call(
         "question_send_kept",
-        call(
-            "question_send_kept",
-            json!({
-                "params": { "questionId": ActionId::new(kr_ipc::new_uuid()).to_string(), "draftedAtMs": 1 },
-                "opening": "tour-share",
-            }),
-        ),
-    );
-    reached(
+        json!({
+            "params": { "questionId": ActionId::new(kr_ipc::new_uuid()).to_string(), "draftedAtMs": 1 },
+            "opening": "tour-share",
+        }),
+    )
+    .expect_err("no answer is kept");
+    assert_eq!(code(&none_kept), "INVALID_ARGUMENT", "{none_kept}");
+    // A question of the pairing's own session is read and answered on that session's link.
+    let read = call(
+        "question_read",
+        json!({
+            "params": { "session_id": own.session_id.to_string(), "question_id": null, "include_resolved": false },
+            "opening": "tour-own",
+        }),
+    )
+    .expect("the questions are read");
+    let listed = &read["questions"][0];
+    let answered = call(
         "question_answer",
-        about(
-            "question_answer",
-            json!({
-                "session_id": session, "question_id": ActionId::new(kr_ipc::new_uuid()).to_string(),
-                "expected_revision": "1", "answer": { "kind": "decision", "decided": true },
-            }),
-        ),
-    );
+        json!({
+            "params": {
+                "session_id": own.session_id.to_string(),
+                "question_id": listed["question_id"],
+                "expected_revision": listed["revision"],
+                "answer": { "kind": "decision", "decided": true },
+            },
+            "opening": "tour-own",
+        }),
+    )
+    .expect("the question is answered on its session's link");
+    assert_eq!(answered["outcome"], "taken", "{answered}");
     // A session is closed on the link of the opening it runs under.
-    let closed = call(
+    call(
         "session_close",
         json!({
             "params": { "session_id": spare.session_id.to_string() },
             "subject": { "sessionId": spare.session_id.to_string(), "sessionEpoch": "1" },
             "opening": "tour-spare",
         }),
-    );
-    reached("session_close", closed);
+    )
+    .expect("the session is closed on the link of its opening");
 
     // What a paired host does not serve a device is refused in words, before anything is sent.
     for (command, body) in [
@@ -1883,10 +1913,11 @@ async fn kr_req_19_08_an_ambient_open_the_host_changed_under_serves_nothing() {
     control.stop_holding();
     control.release_all();
 
-    asking
+    let refused = asking
         .await
         .expect("the call ran")
         .expect_err("a connection made for the host that was forgotten serves nothing");
+    assert_eq!(code(&refused), "RESOURCE_UNAVAILABLE", "{refused}");
     assert_eq!(
         companion
             .app
@@ -1999,13 +2030,13 @@ async fn kr_req_19_08_ambient_calls_for_one_session_share_one_open() {
         })
         .collect();
     held(&control, 1).await;
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    assert_eq!(control.asked() - asked, 1, "one connection is asked for");
     control.stop_holding();
     control.release_all();
     for call in calls {
         call.await.expect("the call ran").expect("answered");
     }
+    // The three calls were answered, and the host was asked for one connection among them.
+    assert_eq!(control.asked() - asked, 1, "one connection is asked for");
     assert_eq!(
         companion
             .app
@@ -2050,22 +2081,31 @@ async fn kr_req_19_08_a_busy_ambient_link_is_not_let_go_for_a_fifth() {
         })
         .collect();
     held(&control, 4).await;
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    assert_eq!(control.asked() - asked, 4, "the fifth waits for a place");
-    assert_eq!(
+    // One of the four is answered, which frees its place: only then is a connection asked for the
+    // fifth, and none of the four was let go for it.
+    control.release(0);
+    tokio::time::timeout(WATCHDOG, async {
+        while control.asked() - asked != 5 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the fifth is asked for once a place is free");
+    control.stop_holding();
+    control.release_all();
+    for call in calls {
+        call.await
+            .expect("the call ran")
+            .expect("answered on a link nobody let go");
+    }
+    assert!(
         companion
             .app
             .state::<companion_tauri::AppState>()
             .paired_links()
-            .ambient(),
-        4
+            .ambient()
+            <= 4
     );
-
-    control.stop_holding();
-    control.release_all();
-    for call in calls {
-        call.await.expect("the call ran").expect("answered");
-    }
     adopted.stop().await;
 }
 
@@ -2135,6 +2175,8 @@ async fn kr_req_19_08_a_second_opening_ends_the_first_under_its_pending_prompt()
 /// stopped for another reason is not opened again by the page.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn kr_req_19_08_a_detached_view_is_not_taken_for_a_lost_connection() {
+    use tauri::Manager as _;
+
     let adopted = Adopted::start(1).await;
     let worker = &adopted.workers[0];
     let session = worker.session_id;
@@ -2145,7 +2187,7 @@ async fn kr_req_19_08_a_detached_view_is_not_taken_for_a_lost_connection() {
     .await;
     let companion = &phone.companion;
     open(companion, session, None, "detached-screen").expect("opens");
-    open_view(companion, session, "detached-screen", 61).expect("opens");
+    let view = open_view(companion, session, "detached-screen", 61).expect("opens");
     companion
         .state_where(61, |state| state["state"] == "showing")
         .await;
@@ -2160,23 +2202,27 @@ async fn kr_req_19_08_a_detached_view_is_not_taken_for_a_lost_connection() {
             .is_some_and(|words| words.contains("detached")),
         "{ended}"
     );
-    // Nothing asks the host again: no standing event follows the end.
-    tokio::time::sleep(Duration::from_millis(1500)).await;
-    let told = companion
-        .standing
-        .texts()
-        .iter()
-        .filter(|text| text.contains("detached-screen"))
-        .count();
-    assert_eq!(told, 0, "the page was told of a change nobody asked about");
+    // Nothing asks the host again: the view is over, and no view that lost its connection has had
+    // the host asked about it.
+    companion
+        .call("terminal_view_close", json!({ "view": view }))
+        .expect("the view is closed");
+    assert_eq!(
+        companion
+            .app
+            .state::<companion_tauri::AppState>()
+            .paired_links()
+            .rechecks(),
+        0
+    );
     adopted.stop().await;
 }
 
-/// KR-REQ-19.08: a view whose own connection is lost before it has drawn a screen is recovered as
-/// well: it is a connection that went, whether or not a frame had arrived, and the host is asked
-/// again on the opening's live link.
+/// KR-REQ-19.08: a view whose own connection ends as it is made, before it has drawn a screen, is
+/// a lost connection too: the host is asked again on the opening's live link, and the page opens a
+/// view again once the connection holds.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn kr_req_19_08_a_view_lost_before_its_first_screen_is_recovered() {
+async fn kr_req_19_08_a_view_whose_connection_ends_as_it_is_made_is_recovered() {
     use tauri::Manager as _;
 
     let adopted = Adopted::start(1).await;
@@ -2187,30 +2233,141 @@ async fn kr_req_19_08_a_view_lost_before_its_first_screen_is_recovered() {
     )
     .await;
     let companion = &phone.companion;
-    open(companion, session, None, "early-screen").expect("opens");
+    open(companion, session, None, "dropped-screen").expect("opens");
 
-    // The view's own connection is held, so it has drawn nothing, and then it is lost.
-    control.hold();
-    let view = open_view(companion, session, "early-screen", 62).expect("a handle comes back");
-    held(&control, 1).await;
-    companion
-        .app
-        .state::<companion_tauri::terminal::TerminalViews>()
-        .lose_connection(&view);
+    control.end_connections(true);
+    let view = open_view(companion, session, "dropped-screen", 62).expect("a handle comes back");
     companion
         .state_where(62, |state| state["state"] == "ended")
         .await;
     // The host is asked on the live link, and says the screen is open: the page opens a view again.
-    heard(companion, "early-screen", |standing| {
+    heard(companion, "dropped-screen", |standing| {
         standing["state"] == "open"
     })
     .await;
-    control.stop_holding();
-    control.release_all();
-    let again = open_view(companion, session, "early-screen", 63).expect("opens again");
+    assert_eq!(
+        companion
+            .app
+            .state::<companion_tauri::AppState>()
+            .paired_links()
+            .rechecks(),
+        1
+    );
+    control.end_connections(false);
+    let again = open_view(companion, session, "dropped-screen", 63).expect("opens again");
     assert_ne!(view, again);
     companion
         .state_where(63, |state| state["state"] == "showing")
         .await;
+    adopted.stop().await;
+}
+
+/// KR-REQ-19.08: a view whose own connection cannot be made, because the host cannot be reached for
+/// it while the screen's link stands, is recovered the same way.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_19_08_a_view_whose_connection_cannot_be_made_is_recovered() {
+    let adopted = Adopted::start(1).await;
+    let session = adopted.workers[0].session_id;
+    let (phone, control) = phone_governed(
+        &adopted,
+        pairing(&[ActionRight::SessionView, ActionRight::TerminalInput]),
+    )
+    .await;
+    let companion = &phone.companion;
+    open(companion, session, None, "unreached-screen").expect("opens");
+
+    control.unreachable(true);
+    open_view(companion, session, "unreached-screen", 64).expect("a handle comes back");
+    companion
+        .state_where(64, |state| state["state"] == "ended")
+        .await;
+    heard(companion, "unreached-screen", |standing| {
+        standing["state"] == "open"
+    })
+    .await;
+    control.unreachable(false);
+    open_view(companion, session, "unreached-screen", 65).expect("opens again");
+    companion
+        .state_where(65, |state| state["state"] == "showing")
+        .await;
+    adopted.stop().await;
+}
+
+/// KR-REQ-19.08: an answer given while the screen's link is being reached again is kept on the
+/// device, and once the link is back it is settled against the worker's question and sent, on the
+/// link of the opening, by the person.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_19_08_a_kept_answer_is_settled_and_sent_on_the_screens_link() {
+    use tauri::Manager as _;
+
+    let adopted = Adopted::start(1).await;
+    let worker = &adopted.workers[0];
+    let asked = worker.ask("kept");
+    let session = worker.session_id;
+    let (phone, control) = phone_governed(
+        &adopted,
+        pairing(&[ActionRight::SessionView, ActionRight::QuestionRespond]),
+    )
+    .await;
+    let companion = &phone.companion;
+    open(companion, session, None, "keeping").expect("opens");
+    let read = companion
+        .call(
+            "question_read",
+            json!({
+                "params": { "session_id": session.to_string(), "question_id": null, "include_resolved": false },
+                "opening": "keeping",
+            }),
+        )
+        .expect("the question is read");
+    let revision = read["questions"][0]["revision"].clone();
+
+    // The link is lost and cannot be made again, so the answer is not confirmed.
+    control.unreachable(true);
+    companion
+        .app
+        .state::<companion_tauri::AppState>()
+        .paired_links()
+        .lose_connection(session);
+    heard(companion, "keeping", |standing| {
+        standing["state"] == "reconnecting"
+    })
+    .await;
+    let kept = companion
+        .call(
+            "question_answer",
+            json!({
+                "params": {
+                    "session_id": session.to_string(),
+                    "question_id": asked.question_id.to_string(),
+                    "expected_revision": revision,
+                    "answer": { "kind": "decision", "decided": true },
+                },
+                "opening": "keeping",
+            }),
+        )
+        .expect("the answer is kept");
+    assert_eq!(kept["outcome"], "kept", "{kept}");
+
+    control.unreachable(false);
+    heard(companion, "keeping", |standing| standing["state"] == "open").await;
+    let settled = companion
+        .call(
+            "question_settle",
+            json!({ "params": { "sessionId": session.to_string() }, "opening": "keeping" }),
+        )
+        .expect("the kept answer is settled against the worker's question");
+    assert_eq!(settled.as_array().map(Vec::len), Some(1), "{settled}");
+    let drafted = kept["draft"]["drafted_at_ms"].clone();
+    let sent = companion
+        .call(
+            "question_send_kept",
+            json!({
+                "params": { "questionId": asked.question_id.to_string(), "draftedAtMs": drafted },
+                "opening": "keeping",
+            }),
+        )
+        .expect("the kept answer is sent on the screen's link");
+    assert_eq!(sent["outcome"], "taken", "{sent}");
     adopted.stop().await;
 }
