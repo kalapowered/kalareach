@@ -6234,12 +6234,12 @@ fn forged_titles_transcripts_identifiers_and_hook_input_leave_the_host_unchanged
         let viewer = stage
             .runtime
             .block_on(Device::create("viewer", &stage.run.root().join("v")));
-        let issuing = ceremony::issue_waiting(stage.host, &["--view", "60", "--direct"]);
+        let issuing = ceremony::issue_waiting(stage.host, &["--guest", "60", "--direct"]);
         let _ = stage
             .runtime
             .block_on(stage.owner.remote.confirm_pending(|_| true))
             .unwrap_or_else(|why| panic!("{why}"));
-        let issued = ceremony::finished(issuing, "kr pair invite --view");
+        let issued = ceremony::finished(issuing, "kr pair invite --guest");
         let candidate = stage
             .runtime
             .block_on(viewer.redeem(issued.document["qr_text"].as_str().expect("a QR text")))
@@ -6263,6 +6263,41 @@ fn forged_titles_transcripts_identifiers_and_hook_input_leave_the_host_unchanged
             .runtime
             .block_on(viewer.connect(&paired_viewer))
             .unwrap_or_else(|why| panic!("{why}"));
+        // The guest is shared the agent's session as a viewer, with its screen, and accepts: the
+        // control is a device that holds a view-only share and is refused input.
+        let shared = ceremony::share_at_terminal(
+            stage.host,
+            &[
+                &agent.session.display,
+                "--to",
+                &paired_viewer.device_id.to_string(),
+                "--live",
+                "--for",
+                "15m",
+            ],
+            b"share",
+        )
+        .1;
+        assert_eq!(shared.exit, 0, "the share: {}", shared.document);
+        let offered: kr_protocol::sharing::GrantHeldResult = stage
+            .runtime
+            .block_on(watching.read(
+                Method::GrantHeld,
+                &kr_protocol::sharing::GrantHeldParams {
+                    offers_after: Nullable::null(),
+                    shares_after: Nullable::null(),
+                },
+            ))
+            .unwrap_or_else(|why| panic!("grant.held: {why}"));
+        let _: kr_protocol::sharing::GrantRedeemResult = stage
+            .runtime
+            .block_on(watching.mutate_environment(
+                Method::GrantRedeem,
+                &kr_protocol::sharing::GrantRedeemParams {
+                    invitation_id: offered.offers[0].invitation_id,
+                },
+            ))
+            .unwrap_or_else(|why| panic!("grant.redeem: {why}"));
         let refused = stage
             .runtime
             .block_on(watching.session().write_input(&InputWriteParams {

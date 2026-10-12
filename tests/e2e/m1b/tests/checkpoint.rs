@@ -336,7 +336,7 @@ fn a_device_pairs_by_code_through_the_site_and_by_direct_qr_over_loopback() {
 
     // A direct invitation on a host with an owner: each owner step is the first device's.
     let second = runtime.block_on(Device::create("second device", &run.root().join("d2")));
-    let issuing = ceremony::issue_waiting(&host, &["--view", "60", "--direct"]);
+    let issuing = ceremony::issue_waiting(&host, &["--guest", "60", "--direct"]);
     runtime
         .block_on(owner.confirm_pending(|display| {
             matches!(
@@ -1357,11 +1357,11 @@ fn the_installed_package_is_bound_into_the_session_and_acts_through_its_broker()
 
     // The control first: a device whose grant does not carry the action's rights.
     let viewer = runtime.block_on(Device::create("viewer", &run.root().join("v")));
-    let issuing = ceremony::issue_waiting(&host, &["--view", "60", "--direct"]);
+    let issuing = ceremony::issue_waiting(&host, &["--guest", "60", "--direct"]);
     let _ = runtime
         .block_on(remote.confirm_pending(|_| true))
         .unwrap_or_else(|why| panic!("{why}"));
-    let issued = ceremony::finished(issuing, "kr pair invite --view");
+    let issued = ceremony::finished(issuing, "kr pair invite --guest");
     let candidate = runtime
         .block_on(viewer.redeem(issued.document["qr_text"].as_str().expect("a QR text")))
         .unwrap_or_else(|why| panic!("{why}"));

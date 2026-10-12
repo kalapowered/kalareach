@@ -44,6 +44,18 @@ fn held(runtime: &tokio::runtime::Runtime, device: &Remote) -> GrantHeldResult {
         .unwrap_or_else(|why| panic!("grant.held: {why}"))
 }
 
+/// A new connection of a paired device: the host ends a connection that has acted under a share
+/// when the share ends, so what a device may do after that is asked on a connection of its own.
+fn reconnected(
+    runtime: &tokio::runtime::Runtime,
+    device: &Device,
+    paired: &kr_e2e_m1b::device::PairedHost,
+) -> Remote {
+    runtime
+        .block_on(device.connect(paired))
+        .unwrap_or_else(|why| panic!("the device connects again: {why}"))
+}
+
 /// The error code of a refusal the host gave, when it gave one.
 fn refused_with<T: std::fmt::Debug>(
     outcome: Result<T, kr_e2e_m1b::device::RequestError>,
@@ -265,6 +277,7 @@ fn a_guest_is_shown_a_session_with_its_screen_and_loses_it_when_the_share_is_tak
             String::from_utf8_lossy(&revoked.stderr)
         );
     }
+    let guest = reconnected(&runtime, &guest_device, &guest_paired);
     let after = runtime.block_on(guest.read::<_, kr_protocol::session::SessionReadResult>(
         Method::SessionRead,
         &SessionReadParams { session_id },
@@ -416,7 +429,9 @@ fn a_session_handed_to_another_device_is_held_by_it_and_refused_to_the_giver() {
         done.document
     );
 
-    // The taker holds the session; the giver is refused.
+    // The taker holds the session; the giver is refused, on a connection of its own, because the
+    // host ended the one that had acted under the share it gave up.
+    let giver = reconnected(&runtime, &giver_device, &giver_paired);
     assert_eq!(held(&runtime, &taker).shares.len(), 1);
     assert!(held(&runtime, &giver).shares.is_empty());
     runtime
