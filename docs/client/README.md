@@ -1220,6 +1220,9 @@ Two things call the storage and backup manifest clients: the host's outbox uploa
 its configuration selects a storage origin (`kr_controller::backup::runtime`), and the device's
 settings archive, `recovery::SettingsArchive`, below.
 
+The relay-lease client has one caller: the daemon's lease keeper, `kr_controller::relay_leases`,
+which `docs/host/README.md` describes.
+
 A field left `None` is a service this client does not use, and nothing degrades. Direct connections,
 local sessions, drafts, plugins, local descriptions and user-operated alternatives need none of
 them. `ServiceClients::availability` reports every service in one shape. A service with no

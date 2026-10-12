@@ -236,6 +236,8 @@ variables an older build read joins nothing because of them.
 | `storage.origin` | the managed storage service this host uploads its backups to | an `https` origin, or an `http` origin on a loopback address, in the spelling a gateway origin has, with no path and no trailing slash; the daemon refuses to start unless it is the managed account service |
 | `authority.origin` | the authority feed this host reads its remote revocations from; a section of level 2: a release that reads level 1 ignores it, and its host takes a device's revocation only from the owner at the machine | an `https` origin, or an `http` origin on a loopback address, in the spelling a gateway origin has, with no path and no trailing slash |
 | `mailbox.origin` | the mailbox service this host places the encrypted objects of its notifications in; a section of level 3, so a release that reads level 2 ignores it and its host places nothing, which leaves a notification whose detail does not fit reaching a device without it | an `https` origin, or an `http` origin on a loopback address, in the spelling a gateway origin has, with no path and no trailing slash |
+| `relay.origin` | the relay lease service this host asks for a lease for each paired device; a section of level 4 | an `https` origin, or an `http` origin on a loopback address, in the spelling a gateway origin has, with no path and no trailing slash |
+| `relay.payer` | the account that pays for those leases and the authorisation it gave this host's key, both copied from the account console | an object with `account_id` and `authorisation_id`, each a lower-case hyphenated UUID; it needs `relay.origin` |
 
 A field the document does not write selects nothing, because there is no public relay or discovery
 server to fall back on. A URL or an origin names its host the one way the protocol spells every
@@ -258,8 +260,9 @@ connecting to the endpoint’s relay connection, relay latency probe, captive-po
 servers, to the rendezvous when reserving a code’s locator and opening its room, to the push
 gateway, to webhooks, to chat services, to mail servers when sending mail via the mail submission
 port, to the managed voice broker, to the managed account service when signing in, to the managed
-storage service (`storage.origin`) when backing up, to the authority feed (`authority.origin`),
-to the mailbox service (`mailbox.origin`), to the model’s files, and to plugin repositories. Nothing on that list goes around it.
+storage service (`storage.origin`) when backing up, to the authority feed (`authority.origin`), to
+the mailbox service (`mailbox.origin`), to the relay lease service (`relay.origin`), to the model’s
+files, and to plugin repositories. Nothing on that list goes around it.
 
 An address the proxy cannot reach fails, a webhook included. Mail submission is SMTP, so it goes as
 an HTTP `CONNECT` tunnel to the submission server and its port, and the connection’s own TLS runs
@@ -293,6 +296,61 @@ document now selects something other than what the daemon started with, the chec
 edit applies at the next start. What only the start can find out, a trust anchor file that is
 missing or empty or a bind address somebody else holds, stops the start with the key named, rather
 than leaving a host that appears to run and cannot be reached.
+
+### Relay leases
+
+Relay leases are used to permit relay servers to carry traffic between two endpoints; a relay will
+only carry traffic when it has a lease, signed by the lease-giving managed service, for that pair of
+endpoints. Only the service can issue one. When a relay lease service is specified in the relay
+section of the document, the daemon will request a relay lease from that service for each device
+that the host has been paired with. The lease will be requested for traffic in both directions,
+between the endpoint of the device being paired with and the endpoint on the host. This ensures
+that, when the device connects, a managed relay server will be able to carry the traffic for the
+pair. A lease is requested when the daemon starts for each device it has been paired with, and also
+when a device is paired while the daemon is running. The `relay` section is read once, when the
+daemon starts, as with the rest of the document.
+
+Leases are issued for fifteen minutes at a time. When there are ten minutes or less remaining on a
+lease, the daemon will request a refill for the lease. The service raises the reservation it already
+has, and its deadline, and opens no second reservation for the pair. When requesting a refill, the
+ceiling it asks for is the larger of what it holds and what the relay had counted when the service
+last answered, plus 512 KiB. An account holds at most 8 MiB outstanding across all its leases, so
+the service stops issuing new ones after sixteen paired devices.
+
+A host key draws on no allowance of its own, so the service turns away a host that names no account.
+`relay.payer` names the account that pays and the authorisation that account gave this host's key,
+and the daemon sends it with every request. Both identifiers come from the account console, where
+the account holder authorises the host by its key. The authorisation can last up to a year.
+Withdrawing it in the console ends the leases issued under it, and the next request is refused.
+Signing the host out with `kr account sign-out` does not, because the lease service does not read
+that sign-in.
+
+When a device is unpaired from a host, the daemon will end the lease for that device with the relay
+lease service, with the reason that the pair is no longer paired. The ending is written to the
+host's record before it is sent, and it is sent again after a failure or a restart until the service
+answers. The same holds for a lease asked for under an authorisation other than the one the document
+now names: the old lease is ended and the pair is asked for afresh.
+
+A request whose answer was lost may have issued a lease. The daemon has not written down a lease it
+was not told of, so it asks again for the same pair with the same request, and the service answers
+with the lease the pair already holds. A pair never holds two.
+
+Three answers are not faults. A spent allowance and a service with no relay to offer are answers
+about capacity: the daemon keeps the leases it holds, the service issues no new one, and `kr doctor`
+warns, with the grace the service reports for connections already running and the paths that still
+work, a direct connection between the devices or a relay you run yourself. A refusal that only the
+owner can clear, such as a host that names no account the service accepts, is shown the same way.
+The daemon asks again after the delay the service names, or after five minutes. A service that
+cannot be reached is asked again with the backoff the daemon's other carriers use. A lease that runs
+out in the meantime stops the relay carrying its pair and nothing else, so direct connections do not
+depend on it.
+
+The record is `relay-leases.sqlite3` in the state directory. It is kept for one service: a daemon
+started against another origin discards what it holds, because a lease identifier means something
+only to the service that issued it. Removing `relay.origin`, or rolling back to a release that reads
+level 3, leaves the leases the host holds to run out within fifteen minutes, and the host sends no
+ending. The `relay-leases` check in `kr doctor` says how many paired devices hold a lease and when
+the next refill is due.
 
 ### Account sign-in
 
