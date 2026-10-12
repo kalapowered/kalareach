@@ -2842,6 +2842,28 @@ impl ExternalSender for HeldTransport {
     }
 }
 
+/// A recipient authority that holds a pass at a gate when it is asked for the `nth` time, which is
+/// how a test makes the moment between two of the pass's questions last.
+#[derive(Debug)]
+struct HeldAuthority {
+    asked: std::sync::atomic::AtomicU64,
+    nth: u64,
+    gate: Gate,
+}
+
+impl RecipientAuthority for HeldAuthority {
+    fn scope_for(&self, rule: &DeliveryRule) -> Option<RecipientScope> {
+        Granted.scope_for(rule)
+    }
+
+    fn device_scope(&self, destination: &DestinationRecord) -> Option<RecipientScope> {
+        if self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1 == self.nth {
+            self.gate.pass();
+        }
+        Granted.device_scope(destination)
+    }
+}
+
 /// A mailbox service that holds each delivery on the wire at its gate, then takes it as the
 /// service does.
 #[derive(Debug)]
@@ -2983,8 +3005,8 @@ impl ExternalSender for Taking {
 /// generation the push that refers to it is presented under. A placement on the wire when privacy
 /// mode is turned on is waited for, and the change is recorded only once the exchange has ended, so
 /// nothing is placed after the boundary. The push needs an admission of its own, so a change that
-/// comes in between takes it back; the detail had left, and the journal lists it among the copies
-/// that did.
+/// comes in between takes it back; the detail had left, and the journal lists the notification
+/// among the copies that did.
 #[test]
 fn kr_req_24_27_a_placement_on_the_wire_is_waited_for_before_the_change_is_recorded() {
     let subsystems = Arc::new(Subsystems::open());
@@ -3027,11 +3049,21 @@ fn kr_req_24_27_a_placement_on_the_wire_is_waited_for_before_the_change_is_recor
         )
     )));
     let gateway = Arc::new(Gateway::default());
+    // The pass asks the recipient's authority three times for this notification: after the
+    // claim, in the attempt, and when the placement has ended. The third is held, so that the
+    // moment between the placement and the push's own admission lasts as long as the test needs.
+    let (second_gate, second_arrival, second_go) = Gate::new();
+    let authority = Arc::new(HeldAuthority {
+        asked: std::sync::atomic::AtomicU64::new(0),
+        nth: 3,
+        gate: second_gate,
+    });
 
     // A pass places the object and is held on the wire.
     let pass = std::thread::spawn({
         let subsystems = Arc::clone(&subsystems);
         let gateway = Arc::clone(&gateway);
+        let authority = Arc::clone(&authority);
         move || {
             subsystems
                 .delivery
@@ -3040,7 +3072,7 @@ fn kr_req_24_27_a_placement_on_the_wire_is_waited_for_before_the_change_is_recor
                     gateway.as_ref(),
                     &Current,
                     &Taking,
-                    &Granted,
+                    authority.as_ref(),
                     &move || at,
                 )
                 .expect("a pass")
@@ -3073,29 +3105,33 @@ fn kr_req_24_27_a_placement_on_the_wire_is_waited_for_before_the_change_is_recor
         "and is not recorded while it waits"
     );
 
-    // The service answers.
+    // The service answers. The placement's admission is let go, and the pass asks the recipient's
+    // authority again, where it is held. No admission is held now, so the change goes through.
     go.send(()).expect("the gate is let go");
-    assert_eq!(pass.join().expect("the pass ends"), 1);
+    second_arrival
+        .recv_timeout(PATIENCE)
+        .expect("the pass asks its question again");
     turning.join().expect("the change ends");
     assert_eq!(subsystems.recorded_generation(), 1);
+
+    // The pass goes on, takes the admission its push needs, and finds the change made: the
+    // notification is taken back and nothing is presented after the boundary.
+    second_go.send(()).expect("the gate is let go");
+    assert_eq!(pass.join().expect("the pass ends"), 1);
     assert_eq!(
         mailbox.web.mailbox_envelopes(&device_mailbox).len(),
         1,
         "the object did reach the device's mailbox"
     );
-
-    // The push needs an admission of its own, taken after the placement's was let go, and a
-    // change that waited for the placement may be recorded before or after it. Either way the
-    // copy of the detail that left is listed, and the notification's record says only what became
-    // of the notification.
-    let presented = gateway.sent.lock().expect("not poisoned").len();
-    let state = delivery_state(&subsystems.delivery, notification_id);
-    if presented == 1 {
-        assert_eq!(state, DeliveryState::Accepted);
-    } else {
-        assert_eq!(presented, 0);
-        assert_eq!(state, DeliveryState::Cancelled, "taken back");
-    }
+    assert!(
+        gateway.sent.lock().expect("not poisoned").is_empty(),
+        "and no push was presented after the boundary"
+    );
+    assert_eq!(
+        delivery_state(&subsystems.delivery, notification_id),
+        DeliveryState::Cancelled,
+        "the notification was taken back, and its record says only that"
+    );
     let listed = subsystems
         .delivery
         .with(|producer| Ok(producer.journal().exported().expect("a read")))
@@ -3103,7 +3139,7 @@ fn kr_req_24_27_a_placement_on_the_wire_is_waited_for_before_the_change_is_recor
     assert_eq!(listed.len(), 1, "the notification is listed once");
     assert!(
         listed[0].reference.contains("mailbox"),
-        "with its detail in the device's mailbox: {}",
+        "with its detail possibly in the device's mailbox: {}",
         listed[0].reference
     );
 }
