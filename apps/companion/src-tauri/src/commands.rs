@@ -1174,7 +1174,7 @@ pub async fn voice_stop(
             )
             .await
             .map_err(CommandError::from)?;
-        settled(&answer)
+        settled_stop(&answer)
     }
     .await;
 
@@ -1189,6 +1189,25 @@ pub async fn voice_stop(
             settled: None,
             host_failure: Some(error),
         },
+    })
+}
+
+/// What the host answered to a stop, as the page reads it: the result with the barrier of its fence
+/// less the names of the actions the fence named ([`without_the_names`]).
+fn settled_stop(answer: &kr_client::Settled) -> Result<Settled> {
+    let kr_client::Settled::Result(value) = answer else {
+        return settled(answer);
+    };
+    let stopped: kr_protocol::voice::VoiceStopResult = value
+        .to_typed()
+        .map_err(|error| CommandError::local_failure(error.to_string()))?;
+    Ok(Settled {
+        receipt: None,
+        action_id: None,
+        value: Some(encode(&kr_protocol::voice::VoiceStopResult {
+            barrier: kr_protocol::scalars::Nullable(stopped.barrier.0.map(without_the_names)),
+            ..stopped
+        })?),
     })
 }
 
@@ -1285,8 +1304,9 @@ struct VoiceAllow {
 ///
 /// Replacing the standing grant ends the calls under it, and when a close sent under one of them
 /// can still reach a worker the host's answer names the workers that have not acknowledged the
-/// fence. That is passed on as the host gave it, null when the replacement owed none, so the screen
-/// can say that those workers are still to confirm.
+/// fence. That is passed on as the host gave it, less the names of the actions the fence named
+/// (see [`without_the_names`]), and null when the replacement owed none, so the screen can say
+/// that those workers are still to confirm.
 #[derive(Debug, Serialize)]
 pub struct VoiceAllowed {
     /// What the grant permits, each action in the sentence that states it.
@@ -1298,14 +1318,37 @@ pub struct VoiceAllowed {
     pub barrier: kr_protocol::scalars::Nullable<kr_protocol::action::RevocationBarrier>,
 }
 
+/// A fence's barrier as the page reads it: which workers have held and which have not, with every
+/// total, and none of the names of the actions the fence named.
+///
+/// A fence names an action by the principal that submitted it, and a call's own close is the
+/// device's, so the names carry the identity the host gave this device. The page reads which
+/// session's worker has not held and how many there were, and holds no identity.
+fn without_the_names(
+    barrier: kr_protocol::action::RevocationBarrier,
+) -> kr_protocol::action::RevocationBarrier {
+    kr_protocol::action::RevocationBarrier {
+        workers: barrier
+            .workers
+            .into_iter()
+            .map(|worker| kr_protocol::action::WorkerBarrier {
+                rejected_actions: Vec::new(),
+                possibly_executed: Vec::new(),
+                ..worker
+            })
+            .collect(),
+        ..barrier
+    }
+}
+
 /// Lets the person allow what a voice call on this device may do, for the host it is paired with.
 ///
 /// The grant is this device's own, so native code names the device: the page does not hold the
 /// identity the host gave it, and a grant for any other device is a host-management change that
 /// this application, a paired device, does not make. The answer states every action the grant
 /// permits, every one the device's own grant could not carry and the barrier of the fence the
-/// replacement owed, and nothing else of what the host answered: the identity of the device stays
-/// here.
+/// replacement owed without the names of the actions it named, and nothing else of what the host
+/// answered: the identity of the device stays here.
 #[tauri::command]
 pub async fn voice_allow(
     state: State<'_, AppState>,
@@ -1353,7 +1396,9 @@ pub async fn voice_allow(
                 value: Some(encode(&VoiceAllowed {
                     statement: granted.statement,
                     not_held_by_device: granted.not_held_by_device,
-                    barrier: granted.barrier,
+                    barrier: kr_protocol::scalars::Nullable(
+                        granted.barrier.0.map(without_the_names),
+                    ),
                 })?),
             })
         }
@@ -2037,6 +2082,58 @@ mod tests {
             }],
             confirmation: Nullable(proof),
         }
+    }
+
+    /// A fence names an action by the principal that submitted it, which for a call's own close is
+    /// the device. The page is given the barrier without those names, and with everything else: the
+    /// session of each worker, its state and every total.
+    #[test]
+    fn the_barrier_the_page_reads_names_no_action_and_keeps_every_count() {
+        use kr_protocol::action::{
+            BarrierState, FencedAction, PossiblyExecutedAction, RevocationBarrier, WorkerBarrier,
+        };
+        use kr_protocol::ids::{ActionId, ActorId, AuthorityRevision, SessionId};
+        use kr_protocol::scalars::{Nullable, U64, Uuid};
+
+        let device = ActorId::new("device:phone").expect("a principal");
+        let session = SessionId::new(Uuid::from_bytes([9; 16]));
+        let barrier = RevocationBarrier::new(
+            AuthorityRevision::new(5),
+            vec![WorkerBarrier {
+                session_id: session,
+                state: BarrierState::Pending,
+                acknowledged_revision: Nullable::null(),
+                rejected_actions: vec![FencedAction {
+                    actor_id: device.clone(),
+                    action_id: ActionId::new(Uuid::from_bytes([1; 16])),
+                }],
+                rejected_actions_total: U64::new(1),
+                possibly_executed: vec![PossiblyExecutedAction {
+                    action_id: ActionId::new(Uuid::from_bytes([2; 16])),
+                    actor_id: device,
+                    method: Method::SessionClose.into(),
+                    state: kr_protocol::receipt::ReceiptState::Unknown,
+                }],
+                possibly_executed_total: U64::new(1),
+                omitted_actions: U64::new(0),
+                names_pending: U64::new(0),
+                detail: "the worker has not acknowledged the revision".to_owned(),
+            }],
+        );
+
+        let read = without_the_names(barrier.clone());
+
+        assert!(read.workers[0].rejected_actions.is_empty());
+        assert!(read.workers[0].possibly_executed.is_empty());
+        assert_eq!(read.workers[0].rejected_actions_total.get(), 1);
+        assert_eq!(read.workers[0].possibly_executed_total.get(), 1);
+        assert_eq!(read.pending(), barrier.pending());
+        assert_eq!(read.workers_total, barrier.workers_total);
+        assert!(
+            !serde_json::to_string(&read)
+                .expect("it encodes")
+                .contains("device:phone")
+        );
     }
 
     #[test]

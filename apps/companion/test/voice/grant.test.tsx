@@ -147,9 +147,8 @@ describe('allowing voice for the first time', () => {
     await screen.findAllByRole('checkbox')
     await userEvent.click(screen.getByTestId('voice-allow'))
     const result = await screen.findByTestId('voice-grant-result')
-    expect(result).toHaveTextContent(
-      'The calls that were running under the earlier allowance have ended. The host has not yet confirmed that nothing the calls sent can still run in Session'
-    )
+    expect(result).toHaveTextContent('have ended.')
+    expect(result).toHaveTextContent('that nothing the calls sent can still run in Session 1.')
     expect(result).not.toHaveTextContent('possibly others')
     expect(result).not.toHaveTextContent('except')
     expect(controls.voiceAllows).toHaveLength(1)
@@ -167,7 +166,7 @@ describe('allowing voice for the first time', () => {
     await screen.findAllByRole('checkbox')
     await userEvent.click(screen.getByTestId('voice-allow'))
     const result = await screen.findByTestId('voice-grant-result')
-    expect(result).toHaveTextContent(', and possibly others.')
+    expect(result).toHaveTextContent('in Session 1, Session 2, and possibly others.')
   })
 
   // KR-REQ-15.21: an answer the host never confirmed does not move the person on as if voice were

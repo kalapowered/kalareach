@@ -234,7 +234,7 @@ describe('while a call is running', () => {
 
     await waitFor(() => {
       expect(
-        screen.getByText(/has not yet confirmed that nothing the call sent can still run in Session/)
+        screen.getByText(/that nothing the call sent can still run in Session 1\./)
       ).toBeInTheDocument()
     })
     expect(screen.getByText(/its grant withdrawn/)).toBeInTheDocument()
