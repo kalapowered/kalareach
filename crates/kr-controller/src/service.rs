@@ -441,6 +441,9 @@ pub struct Controller {
     /// build.
     #[cfg(feature = "testing")]
     device_watch_looks: std::sync::atomic::AtomicU64,
+    /// How many passes privacy mode's tick has finished. Compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    privacy_passes: std::sync::atomic::AtomicU64,
     /// Where this host's own tests stop a lease presentation that has read the clock, before it
     /// waits for the policy's lock. Compiled away in every shipped build.
     #[cfg(feature = "testing")]

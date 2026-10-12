@@ -777,6 +777,8 @@ impl Controller {
             #[cfg(feature = "testing")]
             device_watch_looks: std::sync::atomic::AtomicU64::new(0),
             #[cfg(feature = "testing")]
+            privacy_passes: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(feature = "testing")]
             before_presentation_lock: crate::attention::Pause::default(),
             #[cfg(feature = "testing")]
             after_an_organisation_restriction_commits: crate::attention::Pause::default(),
@@ -1175,18 +1177,42 @@ impl Controller {
     /// work runs on a blocking task that holds only the record, and a worker is told over its
     /// connection alone, so a pass waiting for a blocking thread or for a worker's answer keeps
     /// nothing of the daemon, and nothing of its environment's lock.
+    ///
+    /// It passes every [`PRIVACY_TICK`] while the record has anything for it to do. While it has
+    /// nothing ([`EnvironmentPrivacy::is_dormant`]: privacy mode has never been on, nothing is
+    /// owed and no launch is under way) it waits for the record to say that has changed.
     fn start_privacy_tick(self: &Arc<Self>) {
         let daemon = Arc::downgrade(self);
+        let changed = self.privacy.changed();
         tokio::spawn(async move {
             let mut ticks = tokio::time::interval(PRIVACY_TICK);
             ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut dormant = false;
             loop {
-                ticks.tick().await;
-                if privacy_pass(&daemon).await.is_none() {
+                wait_for_the_next_pass(dormant, &changed, &mut ticks).await;
+                let Some(quiet) = privacy_pass(&daemon).await else {
                     return;
+                };
+                dormant = quiet;
+                #[cfg(feature = "testing")]
+                if let Some(held) = daemon.upgrade() {
+                    held.privacy_passes
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 }
             }
         });
+    }
+
+    /// Makes one pass of privacy mode's tick now, outside its schedule.
+    pub(crate) async fn privacy_pass_now(self: &Arc<Self>) {
+        let _ = privacy_pass(&Arc::downgrade(self)).await;
+    }
+
+    /// How many passes privacy mode's tick has finished. For this host's own tests.
+    #[cfg(feature = "testing")]
+    pub fn privacy_passes(&self) -> u64 {
+        self.privacy_passes
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// How this host's connections to services leave it: through the configuration document's
@@ -1410,7 +1436,11 @@ impl Controller {
 /// The record learns which workers are running and which have ended, retries what it owes, and
 /// each worker whose session has not answered for the generation in force is told it, one after
 /// another, and its answer recorded.
-async fn privacy_pass(daemon: &std::sync::Weak<Controller>) -> Option<()> {
+///
+/// Answers whether the record then needs nothing of the tick until it says otherwise: it is
+/// dormant and every session it follows is one the directory or the registry still shows or
+/// the record has let go of.
+async fn privacy_pass(daemon: &std::sync::Weak<Controller>) -> Option<bool> {
     let (live, recorded, privacy) = {
         let controller = daemon.upgrade()?;
         let live: Vec<SessionId> = controller
@@ -1456,18 +1486,24 @@ async fn privacy_pass(daemon: &std::sync::Weak<Controller>) -> Option<()> {
         }
         None => Launches::default(),
     };
-    let notices = {
+    let (notices, dormant) = {
         let privacy = Arc::clone(&privacy);
         tokio::task::spawn_blocking(move || {
-            if let Some(recorded) = recorded {
+            if let Some(recorded) = &recorded {
                 // An obligation that could not be written is held and written again by the tick.
-                let _ = privacy.sessions_seen(&live, &recorded, &launches.ended, now_ms);
+                let _ = privacy.sessions_seen(&live, recorded, &launches.ended, now_ms);
                 // A launch that never produced a worker owes nothing; a delete the record refuses
                 // leaves it owed, and the next pass tries it again.
                 let _ = privacy.discharge_unstarted(&launches.never_started);
             }
             let _ = privacy.tick(now_ms);
-            privacy.notices_due(now_ms)
+            let notices = privacy.notices_due(now_ms);
+            // Dormant only when the registry could be read, so that what the pass has just
+            // learned of the sessions is what it was told.
+            let dormant = recorded.as_ref().is_some_and(|recorded| {
+                privacy.is_dormant() && privacy.unreached(&live, recorded).is_empty()
+            });
+            (notices, dormant)
         })
         .await
         .unwrap_or_default()
@@ -1479,7 +1515,24 @@ async fn privacy_pass(daemon: &std::sync::Weak<Controller>) -> Option<()> {
         let privacy = Arc::clone(&privacy);
         let _ = tokio::task::spawn_blocking(move || privacy.note_answer(&ack)).await;
     }
-    Some(())
+    Some(dormant)
+}
+
+/// Waits for the next pass of privacy mode's tick: for the record to say it has changed while it
+/// needs nothing of the tick, and for the next tick otherwise.
+async fn wait_for_the_next_pass(
+    dormant: bool,
+    changed: &tokio::sync::Notify,
+    ticks: &mut tokio::time::Interval,
+) {
+    if dormant {
+        changed.notified().await;
+        // The pass this wake begins is the one the tick would have made at its next period, and
+        // the period starts again from it.
+        ticks.reset();
+    } else {
+        ticks.tick().await;
+    }
 }
 
 /// What the registry shows of the launches of the sessions privacy mode's record has no worker for.
@@ -1796,4 +1849,62 @@ fn open_utc_floor(
     };
     let lost = registry.clock_continuity_lost(boot_epoch)?;
     Ok((Arc::new(floor), lost))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// KR-PERF-003: while the record needs nothing of privacy mode's tick, the tick has no period
+    /// of its own: it waits for the record to say it changed, however long that is, and begins a
+    /// new period from the pass that wake makes. Otherwise it waits for its next period.
+    #[tokio::test(start_paused = true)]
+    async fn a_dormant_tick_waits_for_the_record_and_an_active_one_for_its_period() {
+        let changed = tokio::sync::Notify::new();
+        let mut ticks = tokio::time::interval(PRIVACY_TICK);
+        ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // The first period of an interval is at once.
+        wait_for_the_next_pass(false, &changed, &mut ticks).await;
+
+        assert!(
+            tokio::time::timeout(
+                Duration::from_secs(60 * 60),
+                wait_for_the_next_pass(true, &changed, &mut ticks)
+            )
+            .await
+            .is_err(),
+            "a dormant tick waits an hour for nothing"
+        );
+        changed.notify_one();
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(1),
+                wait_for_the_next_pass(true, &changed, &mut ticks)
+            )
+            .await
+            .is_ok(),
+            "and a change to the record ends its wait at once"
+        );
+
+        // The period started again from that pass: the next is a whole period away.
+        assert!(
+            tokio::time::timeout(
+                PRIVACY_TICK - Duration::from_millis(1),
+                wait_for_the_next_pass(false, &changed, &mut ticks)
+            )
+            .await
+            .is_err(),
+            "an active tick waits for its period"
+        );
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(2),
+                wait_for_the_next_pass(false, &changed, &mut ticks)
+            )
+            .await
+            .is_ok(),
+            "and makes its pass when the period has gone"
+        );
+    }
 }

@@ -510,6 +510,10 @@ impl Report {
 #[derive(Debug)]
 pub struct EnvironmentPrivacy {
     inner: Mutex<Inner>,
+    /// Raised each time the record changes in a way that gives the daemon's tick work after a
+    /// stretch with none: privacy mode turned on or off, a daemon start that resumes it, a launch
+    /// the record is told of.
+    changed: Arc<tokio::sync::Notify>,
     state: PrivacyState,
     backup: Arc<BackupService>,
     delivery: Arc<DeliveryModule>,
@@ -575,6 +579,7 @@ impl EnvironmentPrivacy {
                 unrecorded: BTreeMap::new(),
                 sessions: BTreeMap::new(),
             }),
+            changed: Arc::new(tokio::sync::Notify::new()),
             state,
             backup,
             delivery,
@@ -596,6 +601,34 @@ impl EnvironmentPrivacy {
         self.inner.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// The signal raised when a record that needed nothing of the daemon's tick needs it:
+    /// privacy mode turned on or off, a resume at a daemon's start, or a launch the record is
+    /// told of.
+    #[must_use]
+    pub fn changed(&self) -> Arc<tokio::sync::Notify> {
+        Arc::clone(&self.changed)
+    }
+
+    /// Whether the record needs nothing of the daemon's tick until [`Self::changed`] is raised.
+    ///
+    /// That is so while privacy mode has never been turned on and is off, nothing is owed or held
+    /// back, and no launch is under way: the tick then has no notice to send, no step to retry
+    /// and nothing to discharge, and what it would learn of the sessions that come and go is only
+    /// what the record is told again when it next needs it (see [`Self::unreached`]).
+    #[must_use]
+    pub fn is_dormant(&self) -> bool {
+        let inner = self.inner();
+        !inner.mode.is_enabled()
+            && inner.mode.generation() == PrivacyGeneration::INITIAL
+            && inner.owed.is_empty()
+            && inner.unrecorded.is_empty()
+            && inner.obligations.is_empty()
+            && inner
+                .sessions
+                .values()
+                .all(|progress| !matches!(progress.reach, Reach::Launching | Reach::Unknown))
+    }
+
     /// Takes every daemon subsystem through what the record asks for, as a daemon starts.
     ///
     /// With privacy mode on, each subsystem is fenced, has its undispatched work taken back and
@@ -610,6 +643,7 @@ impl EnvironmentPrivacy {
         } else if inner.mode.generation() > PrivacyGeneration::INITIAL {
             self.release(&mut inner, now_ms);
         }
+        self.changed.notify_one();
         self.report(&inner, now_ms)
     }
 
@@ -696,6 +730,7 @@ impl EnvironmentPrivacy {
             progress.notices = Backoff::default();
         }
         self.apply(&mut inner, &Subsystem::ALL, now_ms);
+        self.changed.notify_one();
         Ok(self.report(&inner, now_ms))
     }
 
@@ -744,6 +779,7 @@ impl EnvironmentPrivacy {
             progress.notices = Backoff::default();
         }
         self.release(&mut inner, now_ms);
+        self.changed.notify_one();
         Ok(self.report(&inner, now_ms))
     }
 
@@ -895,6 +931,7 @@ impl EnvironmentPrivacy {
         if progress.reach == Reach::Unknown {
             progress.reach = Reach::Launching;
         }
+        self.changed.notify_one();
         Ok(())
     }
 
@@ -1606,6 +1643,10 @@ impl crate::service::Controller {
             .params
             .to_typed()
             .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
+        // The record is brought up to date with the workers that run and the launches that are
+        // over before it is asked to oblige anything: while it needs nothing of the tick it is
+        // not kept so, and what it follows of the sessions is what this pass leaves.
+        self.privacy_pass_now().await;
         let mut sessions: Vec<SessionId> = {
             let registry = self.registry_handle().lock().await;
             let mut sessions: Vec<SessionId> = registry
@@ -2826,6 +2867,59 @@ mod tests {
         let report = host.privacy.tick(at(1_010));
         assert!(report.completion.is_complete(), "{:?}", report.completion);
         assert_eq!(host.backup.fenced_at().expect("a read"), None);
+    }
+
+    /// KR-PERF-003: a record that has never been on, with nothing owed and no launch under way,
+    /// needs nothing of the daemon's tick, and says when that stops being so: a launch it is told
+    /// of, privacy mode turned on and turned off each raise its signal, and the record is not
+    /// dormant again until the launch is over, or ever while privacy mode has been on.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_record_that_has_never_been_on_needs_nothing_of_the_tick_until_it_changes() {
+        let host = Host::open();
+        let changed = host.privacy.changed();
+        let raised = |changed: Arc<tokio::sync::Notify>| async move {
+            tokio::time::timeout(std::time::Duration::ZERO, changed.notified())
+                .await
+                .is_ok()
+        };
+        let _ = raised(Arc::clone(&changed)).await;
+        assert!(host.privacy.is_dormant(), "a record that was never on");
+
+        host.privacy
+            .note_session_launching(session(1), at(1))
+            .expect("a launch is noted");
+        assert!(
+            raised(Arc::clone(&changed)).await,
+            "a launch the record is told of wakes the tick"
+        );
+        assert!(!host.privacy.is_dormant(), "while the launch is under way");
+        host.privacy.note_session_ended(session(1));
+        assert!(
+            host.privacy.is_dormant(),
+            "and dormant again once the record has let it go"
+        );
+
+        let standing = |write: &mut dyn FnMut() -> crate::error::Result<()>| write();
+        host.privacy
+            .enable(&[session(2)], at(10), &standing)
+            .expect("privacy mode is turned on");
+        assert!(
+            raised(Arc::clone(&changed)).await,
+            "turning privacy mode on wakes the tick"
+        );
+        assert!(!host.privacy.is_dormant(), "with privacy mode on");
+        host.privacy.note_session_ended(session(2));
+        host.privacy
+            .disable(at(20), &standing)
+            .expect("an ended session does not hold privacy mode on");
+        assert!(
+            raised(Arc::clone(&changed)).await,
+            "turning it off wakes the tick"
+        );
+        assert!(
+            !host.privacy.is_dormant(),
+            "and a record that has been on keeps the tick going: its disabling and its obligations are the tick's"
+        );
     }
 
     /// Each live session is told the generation until its worker says its cleanup is complete,
