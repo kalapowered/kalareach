@@ -72,7 +72,7 @@ use kr_protocol::push::{
     MAX_PREVIEW_PLAINTEXT_BYTES, MAX_PROVIDER_PAYLOAD_BYTES, MAX_REGISTRATION_TOKEN_LEN, PushAlert,
     PushDeliveryRequest, provider_payload_within_policy,
 };
-use kr_protocol::scalars::{Bytes, NotificationPreviewKey, Nullable, TimestampMs, U64};
+use kr_protocol::scalars::{Bytes, NotificationPreviewKey, Nullable, TimestampMs, U64, Uuid};
 
 use crate::error::{DeliveryError, Result};
 
@@ -487,6 +487,23 @@ pub fn fresh_notification_id() -> NotificationId {
     NotificationId::new(kr_protocol::scalars::Uuid::from_bytes(
         *uuid::Uuid::new_v4().as_bytes(),
     ))
+}
+
+/// The identifier of the encrypted object that holds the detail one notification's preview refers
+/// to: a keyed digest of the notification's identifier under `secret`, as a collapse identifier is
+/// of a group.
+#[must_use]
+pub fn detail_object_id(secret: &[u8; 32], notification_id: NotificationId) -> EnvelopeId {
+    use hmac::{Hmac, KeyInit as _, Mac as _};
+    use sha2::Sha256;
+
+    let mut mac = Hmac::<Sha256>::new_from_slice(secret).expect("this length is one HMAC accepts");
+    mac.update(b"kr-delivery/detail-object/1");
+    mac.update(notification_id.get().as_bytes());
+    let digest = mac.finalize().into_bytes();
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    EnvelopeId::new(Uuid::from_bytes(bytes))
 }
 
 #[cfg(test)]

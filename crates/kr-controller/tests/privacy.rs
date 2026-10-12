@@ -2681,13 +2681,18 @@ impl Subsystems {
 
     /// Configures `destination` and produces one notice for it.
     fn produce(&self, destination: &DestinationRecord) -> NotificationId {
+        self.produce_saying(destination, "an approval is waiting")
+    }
+
+    /// Configures `destination` and produces one notice for it that says `summary`.
+    fn produce_saying(&self, destination: &DestinationRecord, summary: &str) -> NotificationId {
         self.delivery.configure(destination).expect("a destination");
         let notice = Notice {
             event: EventKey::announcement(Some(session()), "attention.pending_approval/~abcdef", 1),
             alert: PushAlert::ApprovalWaiting,
             urgency: PushUrgency::Attention,
             rule: "attention.pending_approval".to_owned(),
-            summary: "an approval is waiting".to_owned(),
+            summary: summary.to_owned(),
             session_id: Some(session()),
             environment_id: None,
             observed_at_ms: TimestampMs::new(NOW),
@@ -2843,6 +2848,39 @@ impl ExternalSender for HeldTransport {
     }
 }
 
+/// A mailbox service that holds each delivery on the wire at its gate, then takes it as the
+/// service does.
+#[derive(Debug)]
+struct HeldMailbox {
+    gate: Gate,
+    web: kr_service_stand_in::ServiceWeb,
+}
+
+impl kr_client::services::ServiceHttp for HeldMailbox {
+    fn post_json<'a>(
+        &'a self,
+        url: &'a str,
+        body: &'a [u8],
+        headers: &'a [(&'a str, &'a str)],
+    ) -> kr_client::services::ServiceFuture<'a, kr_client::services::ServiceHttpAnswer> {
+        self.gate.pass();
+        self.web.post_json(url, body, headers)
+    }
+}
+
+/// Every origin delivery reaches, through the one held mailbox service.
+#[derive(Debug)]
+struct ThroughTheHeldMailbox(Arc<HeldMailbox>);
+
+impl kr_controller::push::transport::DeliveryTransports for ThroughTheHeldMailbox {
+    fn to(
+        &self,
+        _origin: &kr_protocol::service::GatewayOrigin,
+    ) -> Result<Arc<dyn kr_client::services::ServiceHttp>, String> {
+        Ok(Arc::clone(&self.0) as Arc<dyn kr_client::services::ServiceHttp>)
+    }
+}
+
 /// A gateway that takes whatever it is sent, and remembers it.
 #[derive(Debug, Default)]
 struct Gateway {
@@ -2945,6 +2983,106 @@ impl ExternalSender for Taking {
     ) -> ExternalOutcome {
         ExternalOutcome::Delivered
     }
+}
+
+/// KR-REQ-24.27: the encrypted object a preview refers to is placed under the admission the push
+/// that refers to it is presented under. A placement on the wire when privacy mode is turned on is
+/// waited for, and the change is recorded only once the exchange has ended, so nothing is placed
+/// after the boundary.
+#[test]
+fn kr_req_24_27_a_placement_on_the_wire_is_waited_for_before_the_change_is_recorded() {
+    let subsystems = Arc::new(Subsystems::open());
+    let notification_id = subsystems.produce_saying(&subsystems.phone(), &"x".repeat(1_400));
+    let object = subsystems
+        .delivery
+        .with(|producer| Ok(producer.detail_object_of(notification_id)))
+        .expect("the producer");
+    assert!(
+        subsystems
+            .delivery
+            .with(|producer| Ok(producer.journal().object(object).expect("a read").is_some()))
+            .expect("a read"),
+        "the object is owed to the mailbox"
+    );
+    let (gate, arrival, go) = Gate::new();
+    let mailbox = Arc::new(HeldMailbox {
+        gate,
+        web: kr_service_stand_in::ServiceWeb::new(),
+    });
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("a runtime");
+    assert!(subsystems.delivery.attach_placer(Arc::new(
+        kr_controller::push::mailbox::MailboxPlacer::new(
+            kr_protocol::service::GatewayOrigin::new(mailbox.web.origin()).expect("an origin"),
+            Arc::new(ThroughTheHeldMailbox(Arc::clone(&mailbox))),
+            Arc::new(kr_controller::push::sender::HostSigner::new(
+                AuthorisationKeyPair::generate().expect("a keypair"),
+            )),
+            runtime.handle().clone(),
+        )
+    )));
+    let gateway = Arc::new(Gateway::default());
+
+    // A pass places the object and is held on the wire.
+    let pass = std::thread::spawn({
+        let subsystems = Arc::clone(&subsystems);
+        let gateway = Arc::clone(&gateway);
+        move || {
+            subsystems
+                .delivery
+                .run_due(
+                    gateway.as_ref(),
+                    gateway.as_ref(),
+                    &Current,
+                    &Taking,
+                    &Granted,
+                    &|| NOW,
+                )
+                .expect("a pass")
+        }
+    });
+    arrival
+        .recv_timeout(PATIENCE)
+        .expect("the object is on the wire");
+
+    // Privacy mode is turned on meanwhile. It waits for the exchange, and records nothing yet.
+    let (enabled, enabling) = std::sync::mpsc::channel();
+    let turning = std::thread::spawn({
+        let subsystems = Arc::clone(&subsystems);
+        move || {
+            let report = subsystems
+                .privacy
+                .enable(&[], TimestampMs::new(NOW + 10), &|write| write())
+                .expect("privacy mode is turned on");
+            let _ = enabled.send(());
+            report
+        }
+    });
+    assert!(
+        enabling.recv_timeout(Duration::from_millis(500)).is_err(),
+        "the change waits for the placement on the wire"
+    );
+    assert_eq!(
+        subsystems.recorded_generation(),
+        0,
+        "and is not recorded while it waits"
+    );
+
+    // The service answers.
+    go.send(()).expect("the gate is let go");
+    assert_eq!(pass.join().expect("the pass ends"), 1);
+    turning.join().expect("the change ends");
+    assert_eq!(subsystems.recorded_generation(), 1);
+    assert_eq!(mailbox.web.requests_to("/api/mailbox/deliver"), 1);
+
+    assert_eq!(
+        gateway.sent.lock().expect("not poisoned").len(),
+        1,
+        "the push that refers to the object was presented under the same admission"
+    );
 }
 
 /// KR-REQ-24.27 and KR-REQ-24.28: a send on the wire when privacy mode is turned on is waited for.
