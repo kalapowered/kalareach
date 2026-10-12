@@ -2408,9 +2408,10 @@ pub mod configuration {
         /// `https` origin such as `http://proxy.example.com:3128`: the network endpoint's relays
         /// and Pkarr servers, the rendezvous, delivery and webhooks, the managed voice broker and
         /// account service, uploads of backups to the managed storage service, the authority feed,
-        /// the model's files, and plugin repositories. Nothing goes around it, so an address it cannot reach fails,
-        /// and a daemon that started over a document it could not use sends nothing through these
-        /// routes until it starts again over one it can. Name lookups and mail submission do not
+        /// the model's files, and plugin repositories. Nothing goes around it, so an address it
+        /// cannot reach fails, and a daemon that started over a document it could not use sends
+        /// nothing through these routes until it starts again over one it can. Name lookups and
+        /// mail submission do not
         /// use it. It is this machine's own choice: no invitation or host bundle carries it. It
         /// names no user and no password, because a proxy that needs credentials is not
         /// supported.
@@ -4939,10 +4940,10 @@ pub mod configuration {
     /// storage service's origin and the authority feed's origin are this host's configuration
     /// document's ([`NetworkSelection`], [`VoiceSelection`], [`StorageSelection`],
     /// [`AuthoritySelection`]), and nothing reads them from the environment. The managed-service,
-    /// rendezvous, delivery, plugin repository and mail
-    /// clients verify a server against the platform's own store, the network endpoint verifies its
-    /// relays and discovery servers against the public anchors and the document's relay trust
-    /// anchors, and neither reads the variables other programs take to name a store
+    /// rendezvous, delivery, plugin repository and mail clients verify a server against the
+    /// platform's own store, the network endpoint verifies its relays and discovery servers
+    /// against the public anchors and the document's relay trust anchors, and neither reads the
+    /// variables other programs take to name a store
     /// ([`CERTIFICATE_STORE_VARIABLES`]). No variable names this host's owner: the owner is
     /// recorded through local IPC, by the pairing that establishes it.
     ///

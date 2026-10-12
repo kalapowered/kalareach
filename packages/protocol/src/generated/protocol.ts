@@ -11339,9 +11339,10 @@ export interface NetworkSelection {
    * `https` origin such as `http://proxy.example.com:3128`: the network endpoint's relays
    * and Pkarr servers, the rendezvous, delivery and webhooks, the managed voice broker and
    * account service, uploads of backups to the managed storage service, the authority feed,
-   * the model's files, and plugin repositories. Nothing goes around it, so an address it cannot reach fails,
-   * and a daemon that started over a document it could not use sends nothing through these
-   * routes until it starts again over one it can. Name lookups and mail submission do not
+   * the model's files, and plugin repositories. Nothing goes around it, so an address it
+   * cannot reach fails, and a daemon that started over a document it could not use sends
+   * nothing through these routes until it starts again over one it can. Name lookups and
+   * mail submission do not
    * use it. It is this machine's own choice: no invitation or host bundle carries it. It
    * names no user and no password, because a proxy that needs credentials is not
    * supported.
