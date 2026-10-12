@@ -1,8 +1,8 @@
 //! Putting the encrypted object a notification's preview refers to where its device reads it.
 //!
 //! A notification whose detail does not fit in a push moves the detail into an object sealed to the
-//! paired device's stored-envelope key, and the preview carries only the object's identifier. The
-//! device reads the object from its mailbox, so the object has to be there before the device is
+//! paired device's stored-envelope key, and the preview carries a reference to the object in place
+//! of the text. The device reads the object from its mailbox, so the object has to be there before the device is
 //! told about it. This host places it with `mailbox.deliver`, at the mailbox service its
 //! configuration document selects (`mailbox.origin`), as part of the notification's own attempt:
 //! after the checks that decide whether the notification may be presented, and before the push that
@@ -34,11 +34,12 @@
 //! is what brings the device to read its mailbox, so it is presented without its detail and its
 //! record says why.
 //!
-//! The delivery module does not wait for a mailbox for long. A notification spends at most a few of
-//! its attempts waiting, a service that asks to be left alone for longer than the longest wait the
-//! notification's own schedule makes is not waited for, and a wait that would leave no room for
-//! the next attempt before the notification expires is not made. In each case the push is presented
-//! without its detail.
+//! The delivery module does not wait for a mailbox for long. A notification with less life left
+//! than the longest wait its own schedule makes is presented without its detail and the mailbox is
+//! not asked; one that has it spends at most a few of its attempts waiting; a service that asks to
+//! be left alone for longer than that longest wait is not waited for; and a wait that would leave
+//! less than it before the notification expires is not made. In each case the push is presented
+//! without its detail, and a later attempt at the push does not ask the mailbox again.
 
 use std::sync::Arc;
 use std::time::Duration;
