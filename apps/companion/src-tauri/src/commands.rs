@@ -1228,7 +1228,7 @@ fn allowed_for_the_page(granted: kr_protocol::voice::VoiceGrantResult) -> VoiceA
     }
 }
 
-/// What the host's answer to a stop showed of the fence its withdrawal owed (see [`fence_of`]).
+/// What the host's answer to a stop showed of the fence its withdrawal owed (read by `fence_of`).
 #[derive(Debug, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum VoiceFence {
