@@ -436,6 +436,21 @@
     },
     {
       "entry": {
+        "store": "relay-leases",
+        "scope": "environment",
+        "path": "relay-leases.sqlite3",
+        "recording": {
+          "kind": "sqlite_table",
+          "table": "relay_lease_schema"
+        },
+        "version": 1,
+        "migrates_from": 1
+      },
+      "digest": "4d45bb6993c7c657eff7e0cdae185e573777272176216e447617f4a74f36589a",
+      "kept": []
+    },
+    {
+      "entry": {
         "store": "shell-entries",
         "scope": "state_root",
         "path": "shell-entries.json",
