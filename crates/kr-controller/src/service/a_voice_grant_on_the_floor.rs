@@ -366,6 +366,13 @@ async fn a_revoked_device_is_given_no_grant_by_a_share_that_remains() {
     let controller = daemon_on(&temp, clocks).await;
     let device = paired_holding(&controller, 69, &[ActionRight::SessionView], None);
     shared_with(&controller, &device, &[ActionRight::SessionView], false);
+    assert!(
+        authority(&controller)
+            .device_grant(device.device_id, None)
+            .expect("the host answers")
+            .is_some(),
+        "the control: before the revocation the device has a grant"
+    );
     controller
         .devices()
         .revoke(
@@ -378,7 +385,8 @@ async fn a_revoked_device_is_given_no_grant_by_a_share_that_remains() {
         authority(&controller)
             .device_grant(device.device_id, None)
             .expect("the host answers")
-            .is_none()
+            .is_none(),
+        "the share does not answer for a revoked device"
     );
 }
 
