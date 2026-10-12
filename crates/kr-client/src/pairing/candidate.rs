@@ -1926,10 +1926,18 @@ mod tests {
     use kr_protocol::scalars::Uuid;
     use tokio::sync::mpsc;
 
+    /// How long a wait for the room may take before the test is taken to be hung.
+    ///
+    /// It only ends a test that would never finish. Nothing here waits for it to pass, and no test
+    /// claims how long anything took.
+    const HUNG: Duration = Duration::from_secs(60);
+
     /// A room a test holds the far end of.
     struct HeldRoom {
         serve_record: bool,
-        opened: Mutex<usize>,
+        /// How many sockets the room has opened. It is raised once the socket's far end is kept, so
+        /// a test that sees a socket counted has its far end.
+        opened: tokio::sync::watch::Sender<usize>,
         far: Mutex<Vec<(mpsc::Sender<ServiceFrame>, mpsc::Receiver<ClientFrame>)>>,
     }
 
@@ -1937,22 +1945,33 @@ mod tests {
         fn new(serve_record: bool) -> Arc<Self> {
             Arc::new(Self {
                 serve_record,
-                opened: Mutex::new(0),
+                opened: tokio::sync::watch::Sender::new(0),
                 far: Mutex::new(Vec::new()),
             })
         }
 
         fn opened(&self) -> usize {
-            *self.opened.lock().expect("the count")
+            *self.opened.borrow()
         }
 
-        /// Waits until the device's end of the one socket is gone.
-        async fn closed_within(&self, bound: Duration) -> bool {
-            let far = self.far.lock().expect("the far ends").pop();
-            let Some((_to_device, mut from_device)) = far else {
-                return false;
-            };
-            tokio::time::timeout(bound, async { while from_device.recv().await.is_some() {} })
+        /// Waits until the room has opened a socket.
+        async fn until_opened(&self) {
+            tokio::time::timeout(HUNG, self.opened.subscribe().wait_for(|opened| *opened > 0))
+                .await
+                .expect("the room was opened")
+                .expect("the room is held");
+        }
+
+        /// Waits until the device's end of the socket the room opened last is gone, and says
+        /// whether it went before the test is taken to be hung.
+        async fn closed(&self) -> bool {
+            let (_to_device, mut from_device) = self
+                .far
+                .lock()
+                .expect("the far ends")
+                .pop()
+                .expect("the room opened a socket");
+            tokio::time::timeout(HUNG, async { while from_device.recv().await.is_some() {} })
                 .await
                 .is_ok()
         }
@@ -1964,7 +1983,6 @@ mod tests {
             _origin: &'a RendezvousOrigin,
             _locator: &'a Locator,
         ) -> BoxFuture<'a, Result<RoomSocket, RoomError>> {
-            *self.opened.lock().expect("the count") += 1;
             let (to_device, incoming) = mpsc::channel(8);
             let (outgoing, from_device) = mpsc::channel(8);
             if self.serve_record {
@@ -1979,6 +1997,7 @@ mod tests {
                 .lock()
                 .expect("the far ends")
                 .push((to_device, from_device));
+            self.opened.send_modify(|opened| *opened += 1);
             Box::pin(async move { Ok(RoomSocket { outgoing, incoming }) })
         }
     }
@@ -2011,17 +2030,11 @@ mod tests {
             room.clone() as Arc<dyn CandidateRoom>,
             |lookup| lookup.lookup(&origin(), &locator()),
         ));
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while room.opened() == 0 {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("the room was opened");
+        room.until_opened().await;
         starting.abort();
         assert!(
-            room.closed_within(Duration::from_secs(1)).await,
-            "the socket closed within a second of the cancellation"
+            room.closed().await,
+            "the socket closed after the cancellation"
         );
     }
 
@@ -2042,7 +2055,10 @@ mod tests {
                 room: None
             }
         ));
-        assert!(room.closed_within(Duration::from_secs(1)).await);
+        assert!(
+            room.closed().await,
+            "the socket closed after the failed start"
+        );
     }
 
     async fn a_refused_charge_opens_nothing() {
