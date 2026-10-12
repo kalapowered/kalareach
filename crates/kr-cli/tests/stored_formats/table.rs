@@ -314,16 +314,6 @@ pub fn known() -> Vec<Known> {
         ),
         words(
             "attention",
-            "rules",
-            attention::AttentionRule::ALL
-                .iter()
-                .map(|word| word.as_str().to_owned())
-                .collect(),
-            None,
-            "519c73683ee26b59fd65693a407c92add1673c029b372a0f55d6ab5d779ffcca",
-        ),
-        words(
-            "attention",
             "levels",
             attention::AttentionLevel::ALL
                 .iter()
@@ -673,6 +663,7 @@ pub fn table() -> Vec<Store> {
                         "StoredBinding",
                         "StoredLeaseRecord",
                         "StoredRevocation",
+                        "StoredRemoval",
                     ],
                 ),
                 Kept::Source(
@@ -732,6 +723,15 @@ pub fn table() -> Vec<Store> {
                     attention::AttentionSource::ALL
                         .iter()
                         .map(|source| source.as_str().to_owned())
+                        .collect(),
+                ),
+                // The `rule` of every item holds one of these, and the store refuses a row that
+                // holds another.
+                Kept::Words(
+                    "attention rules",
+                    attention::AttentionRule::ALL
+                        .iter()
+                        .map(|rule| rule.as_str().to_owned())
                         .collect(),
                 ),
             ],
