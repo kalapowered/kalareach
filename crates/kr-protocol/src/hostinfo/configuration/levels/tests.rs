@@ -841,12 +841,7 @@ fn an_unused_relay_section_is_not_written_and_a_release_at_level_3_reads_the_fil
         read.newer.is_none(),
         "a document at the level is read strictly"
     );
-    let edited = edit_in(
-        &load_in(Some(written.as_bytes()), &THIS_RELEASE),
-        &Change::SessionLimit(Some(2)),
-        &THIS_RELEASE,
-    )
-    .expect("an edit");
+    let edited = edit_in(&read, &Change::SessionLimit(Some(2)), &BEFORE_RELAY).expect("an edit");
     assert!(json(&edited.contents).get("relay").is_none());
     assert_eq!(json(&edited.contents)["level"], 3);
 }
