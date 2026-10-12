@@ -2407,8 +2407,8 @@ pub mod configuration {
         /// The HTTP proxy this host's outbound HTTPS goes through, as an absolute `http` or
         /// `https` origin such as `http://proxy.example.com:3128`: the network endpoint's relays
         /// and Pkarr servers, the rendezvous, delivery and webhooks, the managed voice broker and
-        /// account service, uploads of backups to the managed storage service, the model's files,
-        /// and plugin repositories. Nothing goes around it, so an address it cannot reach fails,
+        /// account service, uploads of backups to the managed storage service, the authority feed,
+        /// the model's files, and plugin repositories. Nothing goes around it, so an address it cannot reach fails,
         /// and a daemon that started over a document it could not use sends nothing through these
         /// routes until it starts again over one it can. Name lookups and mail submission do not
         /// use it. It is this machine's own choice: no invitation or host bundle carries it. It
@@ -2541,8 +2541,7 @@ pub mod configuration {
     ///
     /// The section arrived with level 2. A release that reads level 1 does not know it: it
     /// applies the rest of the document, counts the section among the members it ignores, and
-    /// does not edit the document, so a host rolled back to such a release has no feed until it
-    /// is brought forward again.
+    /// does not edit the document.
     #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
     #[serde(deny_unknown_fields, default)]
     pub struct AuthoritySelection {
@@ -4327,7 +4326,8 @@ pub mod configuration {
         key: "network.proxy_url",
         about: "the HTTP proxy this host's outbound HTTPS goes through: the network endpoint's \
                 relays and Pkarr servers, the rendezvous, delivery, the managed voice broker and \
-                account service, backups, the model's files and plugin repositories",
+                account service, backups, the authority feed, the model's files and plugin \
+                repositories",
     };
 
     /// The managed voice broker this host starts its devices' calls at.
@@ -4935,9 +4935,11 @@ pub mod configuration {
     /// reads the hosts file under `SystemRoot`. They move where those requests go and can mislead
     /// the captive-portal check; they choose no relay, no service and no trust.
     ///
-    /// Every network selection, the proxy included, the voice broker's origin and the managed
-    /// storage service's origin are this host's configuration document's ([`NetworkSelection`],
-    /// [`VoiceSelection`], [`StorageSelection`]), and nothing reads them from the environment. The managed-service, rendezvous, delivery, plugin repository and mail
+    /// Every network selection, the proxy included, the voice broker's origin, the managed
+    /// storage service's origin and the authority feed's origin are this host's configuration
+    /// document's ([`NetworkSelection`], [`VoiceSelection`], [`StorageSelection`],
+    /// [`AuthoritySelection`]), and nothing reads them from the environment. The managed-service,
+    /// rendezvous, delivery, plugin repository and mail
     /// clients verify a server against the platform's own store, the network endpoint verifies its
     /// relays and discovery servers against the public anchors and the document's relay trust
     /// anchors, and neither reads the variables other programs take to name a store
