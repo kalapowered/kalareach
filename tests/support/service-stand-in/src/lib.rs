@@ -55,13 +55,20 @@
 //! | A record the host finished with is dropped a week later | source only | `authority-feed/feed.ts:612-618` | `feed.rs` in this crate |
 //! | Uploads the service has lost answer `NOT_FOUND` | source only | `storage/upload.ts:607` | `Moment::UploadsLost`; the daemon's `an_upload_the_service_lost_or_closed_is_made_again` |
 //! | Storage not confirming the write of a part answers `INTERNAL` and closes the upload | source only | `storage/index.ts:830`, `storage/upload.ts:577` | `Moment::PartWriteFails`; the daemon's `an_upload_the_service_lost_or_closed_is_made_again` |
+//! | The recovery bundle is read at its locator by an installation's signature and an account token carrying `backup.write` or `backup.restore`; a locator no write has reached answers an empty read in a history never put back; a written bundle is answered with its place in the order, its revision and its stream | recorded | `sync/index.ts:207-212, 864-994`, `sync/collection.ts:756-830` | `the_stand_in_answers_as_the_worker_did` in `bundle_answers.rs` |
+//! | A read of the bundle with a token the service did not issue is `404 COLLECTION_ABSENT` | recorded | `sync/index.ts:926-946`, `sync/collection.ts:2863` | same |
+//! | A read with no token, an expired one, or one issued without either scope is answered as a token the service did not issue; so is any account's token other than the owner's on a locator that has an owner, word for word | source only: a local deployment signs one account in | `sync/index.ts:926-946`, `sync/collection.ts:2540-2560` | `another_accounts_token_is_told_what_an_absent_collection_is_told` in `bundle_answers.rs` |
+//! | The sync route is proven by an installation's key only: a host's key is `401 UNAUTHENTICATED` with "This method is not proven by that kind of key", before the origin, the freshness or the signature is read; the storage, manifest and feed routes accept either kind | recorded | `sync/index.ts:159-164`, `mailbox/request.ts:164-173` | same; every other test in this crate signs those routes as a host |
+//! | A request to the sync route that is not a read of the bundle: an exchange, a status query, a fence and the members of a settings collection | not modelled: it answers `400 INVALID_REQUEST` and says so. A test puts the bundle in place with `ServiceWeb::put_bundle`. The nonce is spent before the token is read, as for every route here, where the Worker answers a request without a usable token before spending one | `sync/index.ts:207-250` | none |
 
 mod feed;
 mod http;
+mod sync;
 mod web;
 
 pub use http::{Served, serve};
 pub use web::{
-    ACCOUNT, Arrived, BACKUP_WRITE_SCOPE, Handled, IN_PROCESS_ORIGIN, MAX_GENERATIONS, Moment,
-    PART, ServiceWeb, StaleRefusal, TOKEN, document_of, refusal, refusal_after,
+    ACCOUNT, Arrived, BACKUP_RESTORE_SCOPE, BACKUP_WRITE_SCOPE, Handled, IN_PROCESS_ORIGIN,
+    MAX_GENERATIONS, Moment, PART, ServiceWeb, StaleRefusal, TOKEN, document_of, refusal,
+    refusal_after,
 };

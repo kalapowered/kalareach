@@ -1,0 +1,337 @@
+{
+  "decoded": [
+    {
+      "outcome": "absent, recovery None",
+      "step": "read a locator nobody has written, with the restore token"
+    },
+    {
+      "outcome": "held at write 1, revision present, recovery None, 2048 bytes, the bytes written",
+      "step": "read the bundle with the write token"
+    },
+    {
+      "outcome": "held at write 1, revision present, recovery None, 2048 bytes, the bytes written",
+      "step": "read the bundle with the restore token"
+    },
+    {
+      "outcome": "refused UnknownSession, Nothing, after None",
+      "step": "read the bundle with a token the service did not issue"
+    },
+    {
+      "outcome": "refused PermissionDenied, FixConfiguration, after None",
+      "step": "read the bundle signed by a host's key"
+    }
+  ],
+  "exchanges": [
+    {
+      "body": {
+        "data": {
+          "changed": [],
+          "conflicts": [],
+          "more_conflicts": false,
+          "next_conflicts_after_sequence": "0",
+          "recovery_id": null,
+          "removed": [],
+          "revisions": [],
+          "stored": {
+            "allowance_bytes": null,
+            "bytes": "0",
+            "conflicts": "0",
+            "object_limit": "1",
+            "objects": "0"
+          }
+        },
+        "ok": true
+      },
+      "path": "/api/sync/exchange",
+      "shape": {
+        "data": {
+          "changed": {
+            "array": null
+          },
+          "conflicts": {
+            "array": null
+          },
+          "more_conflicts": "boolean",
+          "next_conflicts_after_sequence": "string",
+          "recovery_id": "null",
+          "removed": {
+            "array": null
+          },
+          "revisions": {
+            "array": null
+          },
+          "stored": {
+            "allowance_bytes": "null",
+            "bytes": "string",
+            "conflicts": "string",
+            "object_limit": "string",
+            "objects": "string"
+          }
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "read a locator nobody has written, with the restore token"
+    },
+    {
+      "body": {
+        "data": {
+          "conflict": null,
+          "current_revision": "9f4862d4-8f9b-4739-85cf-8a1fa52445cd",
+          "current_write_sequence": "1",
+          "record": {
+            "bytes": "2304",
+            "kind": "recovery_bundle",
+            "object_id": "9e369422-7240-4ac3-b877-22d28a55c33a",
+            "revision": "9f4862d4-8f9b-4739-85cf-8a1fa52445cd",
+            "updated_at": "2026-10-12T16:23:08.501Z",
+            "write_sequence": "1"
+          },
+          "recovery_id": null,
+          "state": "written",
+          "stored": {
+            "allowance_bytes": null,
+            "bytes": "2304",
+            "conflicts": "0",
+            "object_limit": "1",
+            "objects": "1"
+          }
+        },
+        "ok": true
+      },
+      "path": "/api/sync/exchange",
+      "shape": {
+        "data": {
+          "conflict": "null",
+          "current_revision": "string",
+          "current_write_sequence": "string",
+          "record": {
+            "bytes": "string",
+            "kind": "string",
+            "object_id": "string",
+            "revision": "string",
+            "updated_at": "string",
+            "write_sequence": "string"
+          },
+          "recovery_id": "null",
+          "state": "written",
+          "stored": {
+            "allowance_bytes": "null",
+            "bytes": "string",
+            "conflicts": "string",
+            "object_limit": "string",
+            "objects": "string"
+          }
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "setup: the owner writes the bundle"
+    },
+    {
+      "body": {
+        "data": {
+          "changed": [
+            {
+              "kind": "recovery_bundle",
+              "object": {
+                "ciphertext": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0-P0BBQkNERUZHSElKS0xNTk9QUVJTVFVWV1hZWltcXV5fYGFiY2RlZmdoaWprbG1ub3BxcnN0dXZ3eHl6e3x9fn-AgYKDhIWGh4iJiouMjY6PkJGSk5SVlpeYmZqbnJ2en6ChoqOkpaanqKmqq6ytrq-wsbKztLW2t7i5uru8vb6_wMHCw8TFxsfIycrLzM3Oz9DR0tPU1dbX2Nna29zd3t_g4eLj5OXm5-jp6uvs7e7v8PHy8_T19vf4-foAAQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyAhIiMkJSYnKCkqKywtLi8wMTIzNDU2Nzg5Ojs8PT4_QEFCQ0RFRkdISUpLTE1OT1BRUlNUVVZXWFlaW1xdXl9gYWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXp7fH1-f4CBgoOEhYaHiImKi4yNjo-QkZKTlJWWl5iZmpucnZ6foKGio6SlpqeoqaqrrK2ur7CxsrO0tba3uLm6u7y9vr_AwcLDxMXGx8jJysvMzc7P0NHS09TV1tfY2drb3N3e3-Dh4uPk5ebn6Onq6-zt7u_w8fLz9PX29_j5-gABAgMEBQYHCAkKCwwNDg8QERITFBUWFxgZGhscHR4fICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj9AQUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVpbXF1eX2BhYmNkZWZnaGlqa2xtbm9wcXJzdHV2d3h5ent8fX5_gIGCg4SFhoeIiYqLjI2Oj5CRkpOUlZaXmJmam5ydnp-goaKjpKWmp6ipqqusra6vsLGys7S1tre4ubq7vL2-v8DBwsPExcbHyMnKy8zNzs_Q0dLT1NXW19jZ2tvc3d7f4OHi4-Tl5ufo6err7O3u7_Dx8vP09fb3-Pn6AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0-P0BBQkNERUZHSElKS0xNTk9QUVJTVFVWV1hZWltcXV5fYGFiY2RlZmdoaWprbG1ub3BxcnN0dXZ3eHl6e3x9fn-AgYKDhIWGh4iJiouMjY6PkJGSk5SVlpeYmZqbnJ2en6ChoqOkpaanqKmqq6ytrq-wsbKztLW2t7i5uru8vb6_wMHCw8TFxsfIycrLzM3Oz9DR0tPU1dbX2Nna29zd3t_g4eLj5OXm5-jp6uvs7e7v8PHy8_T19vf4-foAAQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyAhIiMkJSYnKCkqKywtLi8wMTIzNDU2Nzg5Ojs8PT4_QEFCQ0RFRkdISUpLTE1OT1BRUlNUVVZXWFlaW1xdXl9gYWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXp7fH1-f4CBgoOEhYaHiImKi4yNjo-QkZKTlJWWl5iZmpucnZ6foKGio6SlpqeoqaqrrK2ur7CxsrO0tba3uLm6u7y9vr_AwcLDxMXGx8jJysvMzc7P0NHS09TV1tfY2drb3N3e3-Dh4uPk5ebn6Onq6-zt7u_w8fLz9PX29_j5-gABAgMEBQYHCAkKCwwNDg8QERITFBUWFxgZGhscHR4fICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj9AQUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVpbXF1eX2BhYmNkZWZnaGlqa2xtbm9wcXJzdHV2d3h5ent8fX5_gIGCg4SFhoeIiYqLjI2Oj5CRkpOUlZaXmJmam5ydnp-goaKjpKWmp6ipqqusra6vsLGys7S1tre4ubq7vL2-v8DBwsPExcbHyMnKy8zNzs_Q0dLT1NXW19jZ2tvc3d7f4OHi4-Tl5ufo6err7O3u7_Dx8vP09fb3-Pn6AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0-P0BBQkNERUZHSElKS0xNTk9QUVJTVFVWV1hZWltcXV5fYGFiY2RlZmdoaWprbG1ub3BxcnN0dXZ3eHl6e3x9fn-AgYKDhIWGh4iJiouMjY6PkJGSk5SVlpeYmZqbnJ2en6ChoqOkpaanqKmqq6ytrq-wsbKztLW2t7i5uru8vb6_wMHCw8TFxsfIycrLzM3Oz9DR0tPU1dbX2Nna29zd3t_g4eLj5OXm5-jp6uvs7e7v8PHy8_T19vf4-foAAQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyAhIiMkJSYnKCkqKywtLi8wMTIzNDU2Nzg5Ojs8PT4_QEFCQ0RFRkdISUpLTE1OT1BRUlNUVVZXWFlaW1xdXl9gYWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXp7fH1-f4CBgoOEhYaHiImKi4yNjo-QkZKTlJWWl5iZmpucnZ6foKGio6SlpqeoqaqrrK2ur7CxsrO0tba3uLm6u7y9vr_AwcLDxMXGx8jJysvMzc7P0NHS09TV1tfY2drb3N3e3-Dh4uPk5ebn6Onq6-zt7u_w8fLz9PX29_j5-gABAgMEBQYHCAkKCwwNDg8QERITFBUWFxgZGhscHR4fICEiIyQlJic"
+              },
+              "object_id": "9e369422-7240-4ac3-b877-22d28a55c33a",
+              "revision": "9f4862d4-8f9b-4739-85cf-8a1fa52445cd",
+              "updated_at": "2026-10-12T16:23:08.501Z",
+              "write_sequence": "1"
+            }
+          ],
+          "conflicts": [],
+          "more_conflicts": false,
+          "next_conflicts_after_sequence": "0",
+          "recovery_id": null,
+          "removed": [],
+          "revisions": [
+            {
+              "object_id": "9e369422-7240-4ac3-b877-22d28a55c33a",
+              "revision": "9f4862d4-8f9b-4739-85cf-8a1fa52445cd",
+              "write_sequence": "1"
+            }
+          ],
+          "stored": {
+            "allowance_bytes": null,
+            "bytes": "2304",
+            "conflicts": "0",
+            "object_limit": "1",
+            "objects": "1"
+          }
+        },
+        "ok": true
+      },
+      "path": "/api/sync/exchange",
+      "shape": {
+        "data": {
+          "changed": {
+            "array": {
+              "kind": "string",
+              "object": {
+                "ciphertext": "string"
+              },
+              "object_id": "string",
+              "revision": "string",
+              "updated_at": "string",
+              "write_sequence": "string"
+            }
+          },
+          "conflicts": {
+            "array": null
+          },
+          "more_conflicts": "boolean",
+          "next_conflicts_after_sequence": "string",
+          "recovery_id": "null",
+          "removed": {
+            "array": null
+          },
+          "revisions": {
+            "array": {
+              "object_id": "string",
+              "revision": "string",
+              "write_sequence": "string"
+            }
+          },
+          "stored": {
+            "allowance_bytes": "null",
+            "bytes": "string",
+            "conflicts": "string",
+            "object_limit": "string",
+            "objects": "string"
+          }
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "read the bundle with the write token"
+    },
+    {
+      "body": {
+        "data": {
+          "changed": [
+            {
+              "kind": "recovery_bundle",
+              "object": {
+                "ciphertext": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0-P0BBQkNERUZHSElKS0xNTk9QUVJTVFVWV1hZWltcXV5fYGFiY2RlZmdoaWprbG1ub3BxcnN0dXZ3eHl6e3x9fn-AgYKDhIWGh4iJiouMjY6PkJGSk5SVlpeYmZqbnJ2en6ChoqOkpaanqKmqq6ytrq-wsbKztLW2t7i5uru8vb6_wMHCw8TFxsfIycrLzM3Oz9DR0tPU1dbX2Nna29zd3t_g4eLj5OXm5-jp6uvs7e7v8PHy8_T19vf4-foAAQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyAhIiMkJSYnKCkqKywtLi8wMTIzNDU2Nzg5Ojs8PT4_QEFCQ0RFRkdISUpLTE1OT1BRUlNUVVZXWFlaW1xdXl9gYWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXp7fH1-f4CBgoOEhYaHiImKi4yNjo-QkZKTlJWWl5iZmpucnZ6foKGio6SlpqeoqaqrrK2ur7CxsrO0tba3uLm6u7y9vr_AwcLDxMXGx8jJysvMzc7P0NHS09TV1tfY2drb3N3e3-Dh4uPk5ebn6Onq6-zt7u_w8fLz9PX29_j5-gABAgMEBQYHCAkKCwwNDg8QERITFBUWFxgZGhscHR4fICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj9AQUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVpbXF1eX2BhYmNkZWZnaGlqa2xtbm9wcXJzdHV2d3h5ent8fX5_gIGCg4SFhoeIiYqLjI2Oj5CRkpOUlZaXmJmam5ydnp-goaKjpKWmp6ipqqusra6vsLGys7S1tre4ubq7vL2-v8DBwsPExcbHyMnKy8zNzs_Q0dLT1NXW19jZ2tvc3d7f4OHi4-Tl5ufo6err7O3u7_Dx8vP09fb3-Pn6AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0-P0BBQkNERUZHSElKS0xNTk9QUVJTVFVWV1hZWltcXV5fYGFiY2RlZmdoaWprbG1ub3BxcnN0dXZ3eHl6e3x9fn-AgYKDhIWGh4iJiouMjY6PkJGSk5SVlpeYmZqbnJ2en6ChoqOkpaanqKmqq6ytrq-wsbKztLW2t7i5uru8vb6_wMHCw8TFxsfIycrLzM3Oz9DR0tPU1dbX2Nna29zd3t_g4eLj5OXm5-jp6uvs7e7v8PHy8_T19vf4-foAAQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyAhIiMkJSYnKCkqKywtLi8wMTIzNDU2Nzg5Ojs8PT4_QEFCQ0RFRkdISUpLTE1OT1BRUlNUVVZXWFlaW1xdXl9gYWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXp7fH1-f4CBgoOEhYaHiImKi4yNjo-QkZKTlJWWl5iZmpucnZ6foKGio6SlpqeoqaqrrK2ur7CxsrO0tba3uLm6u7y9vr_AwcLDxMXGx8jJysvMzc7P0NHS09TV1tfY2drb3N3e3-Dh4uPk5ebn6Onq6-zt7u_w8fLz9PX29_j5-gABAgMEBQYHCAkKCwwNDg8QERITFBUWFxgZGhscHR4fICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj9AQUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVpbXF1eX2BhYmNkZWZnaGlqa2xtbm9wcXJzdHV2d3h5ent8fX5_gIGCg4SFhoeIiYqLjI2Oj5CRkpOUlZaXmJmam5ydnp-goaKjpKWmp6ipqqusra6vsLGys7S1tre4ubq7vL2-v8DBwsPExcbHyMnKy8zNzs_Q0dLT1NXW19jZ2tvc3d7f4OHi4-Tl5ufo6err7O3u7_Dx8vP09fb3-Pn6AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0-P0BBQkNERUZHSElKS0xNTk9QUVJTVFVWV1hZWltcXV5fYGFiY2RlZmdoaWprbG1ub3BxcnN0dXZ3eHl6e3x9fn-AgYKDhIWGh4iJiouMjY6PkJGSk5SVlpeYmZqbnJ2en6ChoqOkpaanqKmqq6ytrq-wsbKztLW2t7i5uru8vb6_wMHCw8TFxsfIycrLzM3Oz9DR0tPU1dbX2Nna29zd3t_g4eLj5OXm5-jp6uvs7e7v8PHy8_T19vf4-foAAQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyAhIiMkJSYnKCkqKywtLi8wMTIzNDU2Nzg5Ojs8PT4_QEFCQ0RFRkdISUpLTE1OT1BRUlNUVVZXWFlaW1xdXl9gYWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXp7fH1-f4CBgoOEhYaHiImKi4yNjo-QkZKTlJWWl5iZmpucnZ6foKGio6SlpqeoqaqrrK2ur7CxsrO0tba3uLm6u7y9vr_AwcLDxMXGx8jJysvMzc7P0NHS09TV1tfY2drb3N3e3-Dh4uPk5ebn6Onq6-zt7u_w8fLz9PX29_j5-gABAgMEBQYHCAkKCwwNDg8QERITFBUWFxgZGhscHR4fICEiIyQlJic"
+              },
+              "object_id": "9e369422-7240-4ac3-b877-22d28a55c33a",
+              "revision": "9f4862d4-8f9b-4739-85cf-8a1fa52445cd",
+              "updated_at": "2026-10-12T16:23:08.501Z",
+              "write_sequence": "1"
+            }
+          ],
+          "conflicts": [],
+          "more_conflicts": false,
+          "next_conflicts_after_sequence": "0",
+          "recovery_id": null,
+          "removed": [],
+          "revisions": [
+            {
+              "object_id": "9e369422-7240-4ac3-b877-22d28a55c33a",
+              "revision": "9f4862d4-8f9b-4739-85cf-8a1fa52445cd",
+              "write_sequence": "1"
+            }
+          ],
+          "stored": {
+            "allowance_bytes": null,
+            "bytes": "2304",
+            "conflicts": "0",
+            "object_limit": "1",
+            "objects": "1"
+          }
+        },
+        "ok": true
+      },
+      "path": "/api/sync/exchange",
+      "shape": {
+        "data": {
+          "changed": {
+            "array": {
+              "kind": "string",
+              "object": {
+                "ciphertext": "string"
+              },
+              "object_id": "string",
+              "revision": "string",
+              "updated_at": "string",
+              "write_sequence": "string"
+            }
+          },
+          "conflicts": {
+            "array": null
+          },
+          "more_conflicts": "boolean",
+          "next_conflicts_after_sequence": "string",
+          "recovery_id": "null",
+          "removed": {
+            "array": null
+          },
+          "revisions": {
+            "array": {
+              "object_id": "string",
+              "revision": "string",
+              "write_sequence": "string"
+            }
+          },
+          "stored": {
+            "allowance_bytes": "null",
+            "bytes": "string",
+            "conflicts": "string",
+            "object_limit": "string",
+            "objects": "string"
+          }
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "read the bundle with the restore token"
+    },
+    {
+      "body": {
+        "error": {
+          "code": "COLLECTION_ABSENT",
+          "message": "That collection does not exist, or this installation is not one of its members."
+        },
+        "ok": false
+      },
+      "path": "/api/sync/exchange",
+      "shape": {
+        "error": {
+          "code": "COLLECTION_ABSENT",
+          "message": "string"
+        },
+        "ok": false
+      },
+      "status": 404,
+      "step": "read the bundle with a token the service did not issue"
+    },
+    {
+      "body": {
+        "error": {
+          "code": "UNAUTHENTICATED",
+          "message": "This method is not proven by that kind of key."
+        },
+        "ok": false
+      },
+      "path": "/api/sync/exchange",
+      "shape": {
+        "error": {
+          "code": "UNAUTHENTICATED",
+          "message": "string"
+        },
+        "ok": false
+      },
+      "status": 401,
+      "step": "read the bundle signed by a host's key"
+    }
+  ],
+  "names": [
+    "9e369422-7240-4ac3-b877-22d28a55c33a"
+  ],
+  "recorded_from": "a Worker on this machine, started by infra/scripts/testing/local-restore.mjs",
+  "web_commit": "9347c57"
+}

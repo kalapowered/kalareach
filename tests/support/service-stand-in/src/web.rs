@@ -1,5 +1,5 @@
-//! Managed storage, the backup manifest and the authority feed, answering as the managed service
-//! answers them.
+//! Managed storage, the backup manifest, the authority feed and the recovery bundle's read, answering
+//! as the managed service answers them.
 //!
 //! It checks what the service checks before it acts: that the request is addressed to this
 //! service's own origin, that it was signed inside the freshness window, the signature over the
@@ -29,7 +29,9 @@ use kr_protocol::archive::{
     BackupWriterRecord, BackupWriterRecordPayload, MAX_ARCHIVE_DESCRIPTOR_LEN,
 };
 use kr_protocol::error::{ErrorCode, ProtocolError};
-use kr_protocol::service::{ServiceRequestSignature, canonical_body_digest, installation_id};
+use kr_protocol::service::{
+    ServiceRequestSignature, ServiceRequestSigner, canonical_body_digest, installation_id,
+};
 use tokio::sync::watch;
 
 /// The backup allowance the service reports for the one account it knows: the free tier a local
@@ -41,6 +43,10 @@ pub const IN_PROCESS_ORIGIN: &str = "https://reach.kala.to";
 
 /// The scope an account token needs for this service to read it as an account's proof.
 pub const BACKUP_WRITE_SCOPE: &str = "backup.write";
+
+/// The scope a device restoring from a kit is given, which reads the recovery bundle and nothing
+/// else.
+pub const BACKUP_RESTORE_SCOPE: &str = "backup.restore";
 
 /// The most generations one collection keeps; the oldest is dropped first.
 pub const MAX_GENERATIONS: usize = 16;
@@ -173,10 +179,10 @@ struct Collection {
 
 /// What the service knows of one account token.
 #[derive(Clone, Debug)]
-struct Token {
-    account: String,
-    scopes: BTreeSet<String>,
-    live: bool,
+pub(crate) struct Token {
+    pub(crate) account: String,
+    pub(crate) scopes: BTreeSet<String>,
+    pub(crate) live: bool,
 }
 
 /// Everything the service keeps.
@@ -196,6 +202,8 @@ struct State {
     tokens: BTreeMap<String, Token>,
     /// The authority feeds, by the identifier of each host's authorisation key.
     feeds: BTreeMap<String, crate::feed::Feed>,
+    /// The recovery bundles, by locator.
+    bundles: BTreeMap<String, crate::sync::Bundle>,
 }
 
 /// What the service did with one request.
@@ -272,6 +280,59 @@ impl ServiceWeb {
     #[must_use]
     pub fn origin(&self) -> &str {
         &self.origin
+    }
+
+    /// The service issues `token` to `account`, carrying `scopes`.
+    pub fn issue_token(&self, token: &str, account: &str, scopes: &[&str]) {
+        self.state.lock().expect("the state").tokens.insert(
+            token.to_owned(),
+            Token {
+                account: account.to_owned(),
+                scopes: scopes.iter().map(|scope| (*scope).to_owned()).collect(),
+                live: true,
+            },
+        );
+    }
+
+    /// The owner's write of the recovery bundle at `locator` has applied: `account` owns the
+    /// locator from now on if nobody did, and the service holds `ciphertext` there under the next
+    /// place in the collection's order.
+    ///
+    /// Writing again replaces the stream, as a later write of the owner does. A test serves a
+    /// hostile bundle by putting one in place.
+    pub fn put_bundle(&self, locator: &str, account: &str, ciphertext: Vec<u8>) {
+        self.state
+            .lock()
+            .expect("the state")
+            .bundles
+            .entry(locator.to_owned())
+            .or_default()
+            .write(account, ciphertext);
+    }
+
+    /// The collection at `locator` is in the history `recovery` names, as one put back from an
+    /// export is.
+    pub fn put_bundle_back(&self, locator: &str, recovery: &str) {
+        self.state
+            .lock()
+            .expect("the state")
+            .bundles
+            .entry(locator.to_owned())
+            .or_default()
+            .recovery = Some(recovery.to_owned());
+    }
+
+    /// The service stores `bytes` as one object of `archive`, charged to `account`, as the
+    /// completion of an upload leaves it. Storing again replaces the bytes, which is how a test
+    /// serves an object that is not the one that was uploaded.
+    pub fn put_object(&self, archive: &str, object: &str, account: &str, bytes: Vec<u8>) {
+        self.state.lock().expect("the state").objects.insert(
+            (archive.to_owned(), object.to_owned()),
+            Object::Stored {
+                bytes,
+                principal: format!("account:{account}"),
+            },
+        );
     }
 
     /// `token` expires: from now on it proves no account.
@@ -525,6 +586,7 @@ impl ServiceWeb {
             "/api/storage/object/delete" => "storage.object.delete",
             "/api/backup/manifest" => "backup.manifest",
             "/api/authority/sync" => "authority.sync",
+            crate::sync::PATH => "sync.compare_exchange",
             other => panic!("no route at {other}"),
         };
         let Ok(signature) =
@@ -536,6 +598,15 @@ impl ServiceWeb {
                 "That is not a signature this service can check.",
             );
         };
+        // Before anything else is read, as every route does: the kind of key that signed must be
+        // one the method is proven by.
+        if !proves(method, signature.signer) {
+            return refusal(
+                401,
+                "UNAUTHENTICATED",
+                "This method is not proven by that kind of key.",
+            );
+        }
         let body = &document["body"];
         let digest = canonical_body_digest(body).expect("a canonical body");
         if signature.payload.gateway_origin.as_str() != self.origin {
@@ -586,6 +657,9 @@ impl ServiceWeb {
         if method == "authority.sync" {
             return crate::feed::sync(&mut state.feeds, &signature, body, now_ms());
         }
+        if method == "sync.compare_exchange" {
+            return crate::sync::exchange(&state.bundles, &state.tokens, body, token);
+        }
         if body["installation_id"].as_str() != Some(caller.as_str()) {
             return refusal(
                 403,
@@ -629,6 +703,19 @@ impl ServiceWeb {
                 "the connection dropped".to_owned(),
             ))),
         }
+    }
+}
+
+/// Whether a signer of this kind may prove `method`, as the Worker's routes list the kinds.
+///
+/// The storage, manifest and authority-feed routes accept an installation and a host
+/// (`storage/index.ts:161`, `backup/index.ts:96`, `authority-feed/index.ts:115`). Settings sync
+/// accepts an installation only, because settings, drafts and the recovery bundle belong to a
+/// device (`sync/index.ts:159-164`).
+fn proves(method: &str, signer: ServiceRequestSigner) -> bool {
+    match signer {
+        ServiceRequestSigner::Installation => true,
+        ServiceRequestSigner::Host => method != "sync.compare_exchange",
     }
 }
 
