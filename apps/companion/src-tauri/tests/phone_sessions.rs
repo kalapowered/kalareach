@@ -21,7 +21,7 @@ use std::time::Duration;
 
 use kr_protocol::agent::{AgentMutationTarget, AgentPromptParams, PromptText};
 use kr_protocol::ids::{
-    AgentBindingRevision, ApplicationInstanceId, GrantId, InvitationId, SessionId,
+    ActionId, AgentBindingRevision, ApplicationInstanceId, GrantId, InvitationId, SessionId,
 };
 use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::{Nullable, TimestampMs};
@@ -1146,5 +1146,233 @@ async fn kr_req_19_08_a_views_lost_connection_leaves_the_link_and_its_prompt_sta
         .await;
     assert_ne!(first, second);
     assert_eq!(told("open"), 1);
+    adopted.stop().await;
+}
+
+/// KR-REQ-19.08: a phone whose host holds a share for it reaches each command it offers by the
+/// route the host accepts. The host-wide reads are answered on the main connection, the commands
+/// about a session on the link of the opening that session runs under, and what a paired host
+/// serves a device not at all is refused in words before anything is sent. The share then ends, and
+/// the main connection still answers the host-wide reads and the other session's link stands.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_19_08_every_command_goes_by_the_route_the_host_accepts() {
+    let adopted = Adopted::start(2).await;
+    let (shared, own) = (&adopted.workers[0], &adopted.workers[1]);
+    let upstream = Arc::new(Upstream::default());
+    let instance = shared.register_agent(Arc::clone(&upstream));
+    shared.ask("shared");
+    own.ask("own");
+    let mut grant = pairing(&[
+        ActionRight::SessionView,
+        ActionRight::AgentPrompt,
+        ActionRight::QuestionRespond,
+    ]);
+    grant.session_selector = kr_protocol::grant::SessionSelector::These {
+        session_ids: [own.session_id].into_iter().collect(),
+    };
+    let phone = phone_under(&adopted, grant).await;
+    let companion = &phone.companion;
+    let share = shared_with(
+        &adopted,
+        &phone,
+        shared.session_id,
+        RoleSelection::plain(SessionRole::Controller),
+    )
+    .await;
+    open(
+        companion,
+        shared.session_id,
+        Some(share.grant_id),
+        "tour-share",
+    )
+    .expect("opens");
+    open(companion, own.session_id, None, "tour-own").expect("opens");
+    let session = shared.session_id.to_string();
+
+    // The host-wide reads, on the main connection, whatever session they name.
+    companion
+        .call("host_info", json!({}))
+        .expect("the host describes itself");
+    companion
+        .call("grant_held", json!({}))
+        .expect("what the device holds is read on the host's connection");
+    companion
+        .call(
+            "session_list",
+            json!({ "params": { "environment_id": null, "include_closed": false } }),
+        )
+        .expect("the sessions are listed");
+    companion
+        .call(
+            "session_read",
+            json!({ "params": { "session_id": own.session_id.to_string() } }),
+        )
+        .expect("the pairing's session is read");
+    companion
+        .call(
+            "session_describe",
+            json!({ "params": { "session_id": own.session_id.to_string() } }),
+        )
+        .expect("the pairing's session is described");
+    let unreachable = companion
+        .call(
+            "session_describe",
+            json!({ "params": { "session_id": session } }),
+        )
+        .expect_err("a session only a share admits is not described on the host's connection");
+    assert_eq!(code(&unreachable), "INVALID_ARGUMENT", "{unreachable}");
+    companion
+        .call(
+            "attention_read",
+            json!({ "params": {
+                "session_id": null, "include_acknowledged": false, "max_items": 10, "after": null,
+            } }),
+        )
+        .expect("the inbox is read");
+    companion
+        .call(
+            "review_read",
+            json!({ "params": {
+                "session_id": null, "subject": null, "max_reviews": 10, "after": null,
+            } }),
+        )
+        .expect("the reviews are read");
+
+    // The commands about the shared session, on the link of its opening.
+    let about = |command: &str, params: Value| {
+        companion.call(
+            command,
+            json!({ "params": params, "opening": "tour-share" }),
+        )
+    };
+    companion
+        .call(
+            "session_agents",
+            json!({ "sessionId": session, "opening": "tour-share" }),
+        )
+        .expect("the agents are read");
+    about(
+        "agent_capabilities",
+        json!({ "subject": subject(shared.session_id, instance) }),
+    )
+    .expect("the capabilities are read");
+    about(
+        "agent_commands",
+        json!({ "subject": subject(shared.session_id, instance) }),
+    )
+    .expect("the commands are read");
+    about(
+        "agent_snapshot",
+        json!({ "subject": subject(shared.session_id, instance), "from_node": null }),
+    )
+    .expect("the conversation is read");
+    about(
+        "question_read",
+        json!({ "session_id": session, "question_id": null, "include_resolved": false }),
+    )
+    .expect("the questions are read");
+    about(
+        "agent_prompt_submit",
+        prompt(shared.session_id, instance, "tour"),
+    )
+    .expect("the prompt is submitted");
+    // A receipt the worker does not hold is the worker's own answer: the read reached it on the
+    // session's link and was not refused on the way.
+    let unheld = ActionId::new(kr_ipc::new_uuid()).to_string();
+    let unknown = about(
+        "action_read",
+        json!({ "action_id": unheld, "session_id": session }),
+    )
+    .expect_err("the worker holds no such receipt");
+    assert!(
+        unknown["message"]
+            .as_str()
+            .is_some_and(|words| words.contains("no receipt")),
+        "the worker says it holds no receipt: {unknown}"
+    );
+    let unnamed = companion
+        .call(
+            "action_read",
+            json!({ "params": { "action_id": unheld, "session_id": session } }),
+        )
+        .expect_err("a receipt is not read without the screen it belongs to");
+    assert_eq!(code(&unnamed), "INVALID_ARGUMENT", "{unnamed}");
+
+    // What a paired host does not serve a device.
+    let refused = companion
+        .call(
+            "history_page",
+            json!({ "params": { "session_id": session, "from_cursor": "0", "max_bytes": "4096" } }),
+        )
+        .expect_err("retained output is not offered over a paired host");
+    assert_eq!(code(&refused), "RESOURCE_UNAVAILABLE", "{refused}");
+
+    // The share ends: the host-wide reads and the other session's link are untouched.
+    revoke(&adopted.host, share.grant_id).await;
+    heard(companion, "tour-share", |standing| {
+        standing["state"] == "ended"
+    })
+    .await;
+    companion
+        .call(
+            "session_list",
+            json!({ "params": { "environment_id": null, "include_closed": false } }),
+        )
+        .expect("the main connection stands");
+    companion
+        .call(
+            "session_describe",
+            json!({ "params": { "session_id": own.session_id.to_string() } }),
+        )
+        .expect("the pairing's session is still described");
+    companion
+        .call(
+            "question_read",
+            json!({
+                "params": { "session_id": own.session_id.to_string(), "question_id": null, "include_resolved": false },
+                "opening": "tour-own",
+            }),
+        )
+        .expect("the other session's link stands");
+    adopted.stop().await;
+}
+
+/// KR-REQ-19.08: the sessions opened on a host are let go with it. Once the host in use is
+/// forgotten, a screen's commands are refused and no link is kept for it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_19_08_forgetting_the_host_lets_its_sessions_go() {
+    use tauri::Manager as _;
+
+    let adopted = Adopted::start(1).await;
+    let session = adopted.workers[0].session_id;
+    let phone = phone_under(&adopted, pairing(&[ActionRight::SessionView])).await;
+    let companion = &phone.companion;
+    open(companion, session, None, "forgotten-screen").expect("the session opens");
+    let agents = |opening: &str| {
+        companion.call(
+            "session_agents",
+            json!({ "sessionId": session.to_string(), "opening": opening }),
+        )
+    };
+    agents("forgotten-screen").expect("the screen is served");
+    let held = || {
+        companion
+            .app
+            .state::<companion_tauri::AppState>()
+            .paired_links()
+            .opened()
+    };
+    assert_eq!(held(), 1);
+
+    let view = companion
+        .call("pairing_view", json!({}))
+        .expect("the pairing screen");
+    let reference = view["hosts"][0]["reference"].as_str().expect("a reference");
+    companion
+        .call("hosts_forget", json!({ "reference": reference }))
+        .expect("the host in use is forgotten");
+
+    assert_eq!(held(), 0, "no link is kept for a host that was forgotten");
+    agents("forgotten-screen").expect_err("the screen is no longer served");
     adopted.stop().await;
 }
