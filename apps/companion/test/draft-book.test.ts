@@ -1895,6 +1895,75 @@ describe('a composer that holds a file still uploading', () => {
   })
 })
 
+describe('the draft a prompt is kept in once it ended, in each place its text goes', () => {
+  it('is the composer’s own when the text was put back under it, and not the record that was removed', async () => {
+    const store = new FakeDraftStore()
+    const book = await opened(store)
+    type(book, MAIN, 'send this')
+    await book.settled()
+    const token = book.beginSend(MAIN)
+    await token.claimed
+    // The person writes something else, which is stored under the composer's own record, and then
+    // puts the words back there.
+    type(book, MAIN, 'something else')
+    await book.settled()
+    type(book, MAIN, 'send this')
+    await book.settled()
+    const named = new Promise<string | null>((resolve) => {
+      book.endSend(token, 'refused', 'local-1', resolve)
+    })
+
+    const id = await named
+    await book.settled()
+
+    expect(store.all().map((draft) => draft.text)).toEqual(['send this'])
+    expect(id).toBe(store.all()[0]?.id)
+  })
+
+  it('is named when a prompt the host only accepted is then found to be of unknown outcome', async () => {
+    const store = new FakeDraftStore()
+    const book = await opened(store)
+    type(book, MAIN, 'send this')
+    await book.settled()
+    const token = book.beginSend(MAIN)
+    await token.claimed
+    type(book, MAIN, '')
+    const named: (string | null)[] = []
+    book.holdSend(token, 'local-1', (id) => named.push(id))
+
+    book.sendSettled('local-1', 'unknown')
+    await book.settled()
+
+    expect(named).toEqual([store.all()[0]?.id])
+  })
+
+  it('is named again when the store takes the text only after the end', async () => {
+    const store = new FakeDraftStore()
+    const book = await opened(store)
+    // The store cannot be used when the prompt is sent, so nothing stores its text.
+    store.breakOpening()
+    type(book, MAIN, 'send this')
+    await book.settled()
+    const token = book.beginSend(MAIN)
+    await token.claimed
+    // The composer holds other text and the store still refuses, so the text is held in this window.
+    type(book, MAIN, 'newer')
+    const named: (string | null)[] = []
+    book.endSend(token, 'unknown', 'local-1', (id) => named.push(id))
+    await book.settled()
+    expect(named).toEqual([null])
+
+    store.mendOpening()
+    book.writeAll()
+    await book.reload()
+    await book.settled()
+
+    const kept = store.all().find((draft) => draft.text === 'send this')
+    expect(kept).toBeDefined()
+    expect(named.at(-1)).toBe(kept?.id)
+  })
+})
+
 describe('the draft a prompt is kept in once it ended', () => {
   it('is named by the end when the store would not take the text at the press', async () => {
     const store = new FakeDraftStore()
@@ -1916,6 +1985,144 @@ describe('the draft a prompt is kept in once it ended', () => {
 
     expect(id).toBe(store.all()[0]?.id)
     expect(store.all().map((draft) => draft.text)).toEqual(['send this'])
+  })
+})
+
+describe('two sends of the same words, the first said to have been applied', () => {
+  /** The conversation a composer's draft is written for. */
+  const conversation = (instance: string) => ({
+    sessionId: MAIN,
+    applicationInstanceId: instance,
+    agentBindingRevision: '1'
+  })
+
+  /** Sends 'send this' from the composer and ends the send as of unknown outcome under `local`. */
+  async function sendUnknown(book: DraftBook, local: string): Promise<void> {
+    if (book.draft(MAIN).text === '') type(book, MAIN, 'send this')
+    await book.settled()
+    const token = book.beginSend(MAIN)
+    await token.claimed
+    type(book, MAIN, '')
+    book.endSend(token, 'unknown', local)
+    await book.settled()
+  }
+
+  it('end the second as the first did when it ends as of unknown outcome, and its refusal gives nothing back', async () => {
+    const store = new FakeDraftStore()
+    const book = await opened(store)
+    await sendUnknown(book, 'local-1')
+    // The person sends the words again, and that send is on its way when the first is applied.
+    const second = book.beginSend(MAIN)
+    await second.claimed
+    type(book, MAIN, '')
+    book.sendSettled('local-1', 'applied')
+    await book.settled()
+    expect(book.textConsumed(second)).toBe(true)
+    book.endSend(second, 'unknown', 'local-2')
+    await book.settled()
+
+    // Its outcome is unknown, and the words are done: the book still answers for it by its identity.
+    expect(book.textConsumed({ localId: 'local-2' })).toBe(true)
+    book.sendSettled('local-2', 'refused')
+    await book.settled()
+    expect(book.draft(MAIN).text).toBe('')
+    expect(store.all()).toEqual([])
+  })
+
+  it('do not end a send of the same words that was made after the first was applied, whatever the second says later', async () => {
+    const store = new FakeDraftStore()
+    const book = await opened(store)
+    await sendUnknown(book, 'local-1')
+    await sendUnknown(book, 'local-2')
+    book.sendSettled('local-1', 'applied')
+    await book.settled()
+    // The person writes the words once more and sends them: a send of its own.
+    type(book, MAIN, 'send this')
+    await book.settled()
+    const third = book.beginSend(MAIN)
+    await third.claimed
+    type(book, MAIN, '')
+
+    // The second is applied too; that does not make the third's words done.
+    book.sendSettled('local-2', 'applied')
+    await book.settled()
+    expect(book.textConsumed(third)).toBe(false)
+    book.endSend(third, 'refused')
+    await book.settled()
+
+    expect(book.draft(MAIN).text).toBe('send this')
+  })
+
+  it('do not end a send to another conversation', async () => {
+    const store = new FakeDraftStore()
+    const book = await opened(store)
+    book.update(MAIN, (draft) => ({ ...edit(draft, 'send this', 1), target: conversation('x') }))
+    await book.settled()
+    const first = book.beginSend(MAIN)
+    await first.claimed
+    type(book, MAIN, '')
+    book.endSend(first, 'unknown', 'local-1')
+    await book.settled()
+    // The person sends the returned words to another conversation, and that send is on its way.
+    book.retarget(MAIN, conversation('y'))
+    await book.settled()
+    const second = book.beginSend(MAIN)
+    await second.claimed
+    type(book, MAIN, '')
+
+    book.sendSettled('local-1', 'applied')
+    await book.settled()
+    expect(book.textConsumed(second)).toBe(false)
+    book.endSend(second, 'refused')
+    await book.settled()
+
+    expect(book.draft(MAIN).text).toBe('send this')
+  })
+
+  it('leave the draft the person sent to another conversation since', async () => {
+    const store = new FakeDraftStore()
+    const book = await opened(store)
+    book.update(MAIN, (draft) => ({ ...edit(draft, 'send this', 1), target: conversation('x') }))
+    await book.settled()
+    const first = book.beginSend(MAIN)
+    await first.claimed
+    type(book, MAIN, '')
+    book.endSend(first, 'unknown', 'local-1')
+    await book.settled()
+    book.retarget(MAIN, conversation('y'))
+    await book.settled()
+
+    book.sendSettled('local-1', 'applied')
+    await book.settled()
+
+    expect(book.draft(MAIN).text).toBe('send this')
+    expect(store.all().map((draft) => draft.text)).toEqual(['send this'])
+  })
+
+  it('end a second send that waits in this window only, with its failure and its records', async () => {
+    const store = new FakeDraftStore()
+    const book = await opened(store)
+    await sendUnknown(book, 'local-1')
+    const second = book.beginSend(MAIN)
+    await second.claimed
+    // The composer holds other text and the store cannot be read: the second send's words are held
+    // in this window only when it is refused.
+    type(book, MAIN, 'other')
+    store.breakOpening()
+    book.endSend(second, 'refused', 'local-2')
+    await book.settled()
+    expect(book.snapshot().problem).not.toBeNull()
+
+    book.sendSettled('local-1', 'applied')
+    await book.settled()
+    store.mendOpening()
+    book.writeAll()
+    await book.reload()
+    await book.settled()
+
+    expect(book.snapshot().problem).toBeNull()
+    expect(book.snapshot().kept).toEqual([])
+    expect(store.all().map((draft) => draft.text)).toEqual(['other'])
   })
 })
 
@@ -2516,6 +2723,25 @@ describe('a prompt the host is said to have applied after nobody knew what becam
       expect(book.snapshot().kept).toEqual([])
       expect(book.draft(MAIN).text).toBe('newer')
       expect(store.all().map((draft) => draft.text)).toEqual(['newer'])
+    })
+
+    it('is made once the send that holds the draft has ended', async () => {
+      const store = new FakeDraftStore()
+      const { storedDraftId } = await earlierRun(store)
+      const book = await opened(store)
+      // The person sends the words again, and the send holds the stored draft while it is on its way.
+      const second = book.beginSend(MAIN)
+      await second.claimed
+      type(book, MAIN, '')
+
+      book.sendSettled('local-1', 'applied', { sessionId: MAIN, text: 'send this', storedDraftId: storedDraftId ?? '' })
+      await book.settled()
+      book.endSend(second, 'unknown', 'local-2')
+      await book.settled()
+
+      // The first send was applied: its words are not in the composer or the store to be sent again.
+      expect(book.draft(MAIN).text).toBe('')
+      expect(store.all()).toEqual([])
     })
 
     it('leaves a draft that was sent to another conversation since, whatever its words', async () => {

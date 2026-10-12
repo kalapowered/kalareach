@@ -610,17 +610,18 @@ export function MobileSession({
       // ends, so a refusal or an outcome nobody knows leaves it kept.
       const sending = book.beginSend(sessionId)
       const ended = { done: false }
+      // The draft the text is kept in is named again whenever it changes, however the prompt ends and
+      // after it has: it is what a restart finds the text by.
+      const named = (storedDraftId: string | null) => {
+        if (storedDraftId === null) return
+        lifecycle.setSubmissions((current) =>
+          current.map((each) => (each.localId === submission.localId ? { ...each, storedDraftId } : each))
+        )
+      }
       const end = (outcome: 'taken' | 'refused' | 'unknown') => {
         if (ended.done) return
         ended.done = true
-        book.endSend(sending, outcome, submission.localId, (storedDraftId) => {
-          // The text may have been stored only by the end (the store would not take it at the press),
-          // so the draft it is kept in is named again: what a restart finds it by.
-          if (storedDraftId === null) return
-          lifecycle.setSubmissions((current) =>
-            current.map((each) => (each.localId === submission.localId ? { ...each, storedDraftId } : each))
-          )
-        })
+        book.endSend(sending, outcome, submission.localId, named)
       }
       // Local feedback first, and it says queued rather than sent, because it has not left yet.
       lifecycle.setSubmissions((current) => [...current, submission])
@@ -675,7 +676,7 @@ export function MobileSession({
           // A prompt the host has only accepted is not yet taken: it ends when a receipt says how.
           const final = sendOutcomeOf(state)
           if (final !== null) end(final)
-          else book.holdSend(sending, submission.localId)
+          else book.holdSend(sending, submission.localId, named)
         })
         .catch((failure: unknown) => {
           if (claimWasLost(failure)) {

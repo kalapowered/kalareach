@@ -220,6 +220,8 @@ interface Flight {
    * else: a composer is cleared only when it holds that draft.
    */
   keyed?: boolean
+  /** Told the stored draft that holds the prompt's text, when the prompt has ended and each time that changes. */
+  onEnded?: (storedDraftId: string | null) => void
 }
 
 /** How a write of a draft ended. */
@@ -317,6 +319,13 @@ function holdsWhatWasSent(composer: Draft | undefined, sent: Draft): boolean {
  */
 function holdsTextSent(composer: Draft | undefined, sent: Draft): boolean {
   if (composer === undefined || composer.text !== sent.text) return false
+  // A draft the person has since sent to another conversation is theirs, whatever its words.
+  if (
+    composer.target.applicationInstanceId !== sent.target.applicationInstanceId ||
+    composer.target.agentBindingRevision !== sent.target.agentBindingRevision
+  ) {
+    return false
+  }
   const held = new Set(storable(composer).map((handle) => handle.transfer_id))
   return storable(sent).every((handle) => held.has(handle.transfer_id))
 }
@@ -696,8 +705,14 @@ export class DraftBook {
    * identity of the submission that carries it. It ends when [`sendSettled`] is told how; a view
    * going away does not end it, because nothing the view knows could.
    */
-  holdSend(token: Pick<SendToken, 'key'>, localId: string): void {
+  holdSend(
+    token: Pick<SendToken, 'key'>,
+    localId: string,
+    ended?: (storedDraftId: string | null) => void
+  ): void {
     this.#byLocal.set(localId, token.key)
+    const flight = this.#flights.get(token.key)
+    if (flight !== undefined && ended !== undefined) flight.onEnded = ended
   }
 
   /**
@@ -751,6 +766,13 @@ export class DraftBook {
     this.#settleEarlier()
   }
 
+  /** Whether a prompt of this run holds the record, so that what is said of an earlier one waits for it. */
+  #reservedBy(id: string): boolean {
+    return [...this.#flights.values(), ...this.#unsettled, ...this.#storing].some(
+      (flight) => flight.record?.id === id || flight.earlier?.id === id
+    )
+  }
+
   /** Makes the late end of every prompt of an earlier run that is waiting, once the store has been read. */
   #settleEarlier(): void {
     if (this.#status !== 'ready') return
@@ -782,11 +804,19 @@ export class DraftBook {
             record = { id: listed.id, revision: listed.revision }
           }
         }
-        if (record === null) return
-        const sent: Draft = {
-          ...startDraft(key, { sessionId: each.sessionId, applicationInstanceId: null, agentBindingRevision: null }, Date.now()),
-          text: each.text
+        if (record === null) {
+          // A send of this run that holds the draft decides it when it ends: this waits for that.
+          if (this.#reservedBy(each.storedDraftId)) this.#earlier.push(each)
+          return
         }
+        const target = composer?.stored?.id === record.id
+          ? composer.target
+          : {
+              sessionId: each.sessionId,
+              applicationInstanceId: this.#others.find((other) => other.id === record?.id)?.applicationInstanceId ?? null,
+              agentBindingRevision: this.#others.find((other) => other.id === record?.id)?.agentBindingRevision ?? null
+            }
+        const sent: Draft = { ...startDraft(key, target, Date.now()), text: each.text }
         await this.#takenLate({ id: `earlier-${each.localId}`, composer: key, sent, record, earlier: null, keyed: true })
       })
     }
@@ -802,8 +832,13 @@ export class DraftBook {
    * turn of its own.
    */
   async #takenLate(flight: Flight): Promise<void> {
+    // The same words sent again from this composer to this conversation, by a person who checked,
+    // were done by this prompt: they are chosen now, before anything waits, and a prompt whose words
+    // were already done by another does not make more of them done.
+    const same = flight.consumed === true ? [] : this.#sameWords(flight)
     // A recovery that is storing the prompt's text meanwhile finds this and removes what it made.
     flight.consumed = true
+    for (const other of same) other.consumed = true
     const composer = this.#find(flight.composer)
     const cleared =
       composer !== undefined &&
@@ -814,9 +849,9 @@ export class DraftBook {
     await this.#dropKept(flight, cleared)
     await this.#dropEarlier(flight)
     await this.#dropOlder(flight)
-    // The same words sent again from this composer, by a person who checked, were done by this one:
-    // whatever the host says of those, the text is not given back for a third send.
-    this.#consumeSame(flight)
+    // Whatever the host says of those, their text is not given back for a third send, and what they
+    // were holding is not kept.
+    for (const other of same) await this.#endConsumed(other)
     // The text is not to be stored after all, nor listed for a person to copy.
     this.#unsettled = this.#unsettled.filter((each) => each !== flight)
     this.#unstored = this.#unstored.filter((each) => each !== flight)
@@ -909,6 +944,8 @@ export class DraftBook {
       // it to another session: either way it is not the prompt that was sent from this composer.
       const sameText =
         listed.sessionId === flight.sent.target.sessionId &&
+        listed.applicationInstanceId === flight.sent.target.applicationInstanceId &&
+        listed.agentBindingRevision === flight.sent.target.agentBindingRevision &&
         listed.text === flight.sent.text &&
         files(listed.attachments) === files(storable(flight.sent))
       ref = sameText ? { id: listed.id, revision: listed.revision } : null
@@ -918,13 +955,40 @@ export class DraftBook {
     if (!(await this.#dropRecord(ref, flight.id))) this.#owe(ref, flight.id)
   }
 
-  /** Marks the other prompts of a composer that carry exactly the words of `flight` as having been done by it. */
-  #consumeSame(flight: Flight): void {
+  /** The other prompts of a composer that carry exactly the words of `flight`, sent to the same conversation. */
+  #sameWords(flight: Flight): Flight[] {
     const files = (draft: Draft): string => storable(draft).map((handle) => handle.transfer_id).join(' ')
-    for (const other of [...this.#flights.values(), ...this.#unknowns.values(), ...this.#unsettled]) {
-      if (other === flight || other.composer !== flight.composer) continue
-      if (other.sent.text === flight.sent.text && files(other.sent) === files(flight.sent)) other.consumed = true
+    const target = flight.sent.target
+    return [...this.#flights.values(), ...this.#unknowns.values(), ...this.#unsettled].filter(
+      (other) =>
+        other !== flight &&
+        other.composer === flight.composer &&
+        other.sent.text === flight.sent.text &&
+        files(other.sent) === files(flight.sent) &&
+        other.sent.target.applicationInstanceId === target.applicationInstanceId &&
+        other.sent.target.agentBindingRevision === target.agentBindingRevision
+    )
+  }
+
+  /**
+   * Ends what a prompt whose words were done by another was holding while it waited: its text held
+   * in this window only, and a record of it kept apart. A prompt still on its way ends as a taken
+   * one when it ends.
+   */
+  async #endConsumed(flight: Flight): Promise<void> {
+    if (this.#unsettled.includes(flight) && !this.#storing.has(flight)) {
+      this.#unsettled = this.#unsettled.filter((each) => each !== flight)
+      this.#clearFailure(flight.id)
+      await this.#dropSent(flight)
+      await this.#dropEarlier(flight)
+      await this.#dropOlder(flight)
     }
+    if (this.#unstored.includes(flight)) {
+      this.#unstored = this.#unstored.filter((each) => each !== flight)
+      this.#changed()
+      await this.#dropOlder(flight)
+    }
+    if (this.#unknowns.has(flight.id)) await this.#dropKept(flight, null)
   }
 
   /**
@@ -984,15 +1048,17 @@ export class DraftBook {
     const flight = this.#flights.get(token.key)
     if (flight === undefined || flight.endedAs !== undefined) return
     flight.endedAs = outcome
+    if (ended !== undefined) flight.onEnded = ended
     if (localId !== undefined && outcome === 'unknown') this.#byLocal.set(localId, flight.id)
     else if (localId !== undefined) this.#byLocal.delete(localId)
     this.#enqueue(flight.composer, async () => {
       try {
-        // Words that another prompt was applied for are done, whatever became of this one.
+        // Words that another prompt was applied for are done, whatever became of this one. Its
+        // outcome may still be unknown, and the book goes on answering for it until the host says.
         if (outcome === 'taken' || flight.consumed === true) {
           await this.#dropSent(flight)
           await this.#dropEarlier(flight)
-          if (localId !== undefined) this.#byLocal.delete(localId)
+          if (outcome === 'unknown' && localId !== undefined) this.#unknowns.set(flight.id, flight)
           return
         }
         const stored = await this.#giveBack(flight)
@@ -1008,9 +1074,18 @@ export class DraftBook {
         if (outcome === 'unknown' && localId !== undefined) this.#unknowns.set(flight.id, flight)
       } finally {
         this.#flights.delete(flight.id)
-        ended?.(outcome === 'taken' || flight.consumed === true ? null : (flight.record?.id ?? null))
+        flight.onEnded?.(outcome === 'taken' || flight.consumed === true ? null : this.#holding(flight))
+        // A prompt of an earlier run that this one held the draft of is settled now.
+        if (this.#earlier.length > 0) this.#settleEarlier()
       }
     })
+  }
+
+  /** The stored draft that holds a prompt's text now: its own record, or the composer's when the words were put back there. */
+  #holding(flight: Flight): string | null {
+    if (flight.record !== null) return flight.record.id
+    const composer = this.#find(flight.composer)
+    return holdsTextSent(composer, flight.sent) ? (composer?.stored?.id ?? null) : null
   }
 
   /**
@@ -1127,7 +1202,11 @@ export class DraftBook {
       // The screen put the text back and it was stored under the composer's own record. The record
       // set apart for the prompt says the same thing, and goes.
       this.#clearFailure(flight.id)
-      if (record !== null && composer.stored?.id !== record.id) await this.#dropSent({ ...flight, record })
+      if (record !== null && composer.stored?.id !== record.id) {
+        await this.#dropSent({ ...flight, record })
+        // What holds the text now is the composer's own record.
+        flight.record = composer.stored
+      }
       return record !== null || composer.stored !== null
     }
     // The text is listed apart from the composer. The record may have been changed or removed by
@@ -1312,6 +1391,7 @@ export class DraftBook {
         this.#sentRecords.add(stored.id)
         await this.#dropEarlier(flight)
         this.#unsettled = this.#unsettled.filter((each) => each !== flight)
+        flight.onEnded?.(stored.id)
         await this.reload()
       }
     } finally {

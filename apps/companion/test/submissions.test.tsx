@@ -549,6 +549,74 @@ describe('on the desktop', () => {
     })
   })
 
+  it('does not put the text back when the second send answers as unknown after the first was applied, and is then refused', async () => {
+    const device = new FakeDraftStore()
+    const host = fakeHost({ drafts: device })
+    const recorded: Recorded = { state: 'unknown' }
+    let answer: (value: Settled<AgentMutationResult>) => void = () => undefined
+    const second = new Promise<Settled<AgentMutationResult>>((resolve) => {
+      answer = resolve
+    })
+    let attempts = 0
+    const port: HostPort = {
+      ...answering(host.port, UNCONFIRMED, recorded),
+      composerSubmit: () => {
+        attempts += 1
+        return attempts === 1 ? Promise.resolve(UNCONFIRMED) : second
+      }
+    }
+    render(
+      <AppProvider
+        port={port}
+        initialPlace={{ view: 'session', sessionId: SESSION_MAIN, pane: 'semantic' }}
+      >
+        <App />
+      </AppProvider>
+    )
+    const person = userEvent.setup()
+    await person.type(await screen.findByTestId('composer-input'), 'run the migration')
+    await waitFor(() => {
+      expect(screen.getByTestId('composer-send')).toBeEnabled()
+    })
+    await person.click(screen.getByTestId('composer-send'))
+    await person.click(await screen.findByTestId('composer-send-anyway'))
+    await waitFor(() => {
+      expect(attempts).toBe(2)
+    })
+    const states = () =>
+      [...screen.getByTestId('pending-actions').querySelectorAll('li')].map((each) => each.dataset.state)
+    const emit = (sequence: string, receipt: Receipt) => {
+      act(() => {
+        host.controls.emit({
+          stream_id: `receipts:${SESSION_MAIN}`,
+          sequence,
+          body: { kind: 'receipt', receipt }
+        })
+      })
+    }
+
+    // The first is applied while the second is on its way, and the second then says nobody knows.
+    emit('1', receiptAt('applied', ACTION))
+    await waitFor(() => {
+      expect(states()).toEqual(['applied', 'queued'])
+    })
+    await act(async () => {
+      answer({ receipt: null, value: null, action_id: ANOTHER_ACTION })
+      await Promise.resolve()
+    })
+    await waitFor(() => {
+      expect(states()).toEqual(['applied', 'unknown'])
+    })
+    emit('2', receiptAt('refused', ANOTHER_ACTION))
+    await waitFor(() => {
+      expect(states()).toEqual(['applied', 'refused'])
+    })
+    await flush()
+
+    // The words were done once: nothing puts them back for a third send.
+    expect(screen.getByTestId('composer-input')).toHaveValue('')
+  })
+
   it('does not call a prompt taken while the host has only accepted it', async () => {
     const recorded = { state: 'dispatching' as Receipt['state'] }
     const { device, controls } = await sentOnce(WITH_THE_HOST, recorded)
