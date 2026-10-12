@@ -8612,6 +8612,10 @@
           "minimum": 0,
           "type": "integer"
         },
+        "mailbox": {
+          "$ref": "#/$defs/MailboxSelection",
+          "description": "The mailbox service this host places the encrypted objects of its notifications in.\n\nA section of level 3: written only when it selects something, and ignored, with a\ncount, by a release that reads level 2. Read when the daemon starts, so a change applies\nat the next start. No environment variable reaches it."
+        },
         "network": {
           "$ref": "#/$defs/NetworkSelection",
           "default": {
@@ -20353,6 +20357,25 @@
           "type": "string"
         }
       ]
+    },
+    "MailboxSelection": {
+      "additionalProperties": false,
+      "description": "The mailbox service this host places the encrypted objects of its notifications in.\n\nA notification whose detail does not fit in a push moves the detail into an encrypted\nobject sealed to the paired device. With a service selected here, the host places that\nobject in the device's mailbox before it presents the push that refers to it. A provider\norigin, so it is this document's to choose and no inherited variable's. The daemon reads it\nwhen it starts, so a change applies at the next start. Absent means this host places\nnothing: the push is presented as it always was, and a device that looks for the object\nfinds none.\n\nThe section arrived with level 3. A release that reads level 2 does not know it: it applies\nthe rest of the document, counts the section among the members it ignores, and does not\nedit the document, so a host rolled back to such a release places nothing until it is\nbrought forward again.",
+      "properties": {
+        "origin": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "The service's origin: an `https` origin, or an `http` origin on a loopback address,\nspelled as a gateway origin is, with no path and no trailing slash."
+        }
+      },
+      "type": "object"
     },
     "MailboxThreadId": {
       "description": "The group repeated state notifications coalesce in. The sender derives it; the service only compares it.",
