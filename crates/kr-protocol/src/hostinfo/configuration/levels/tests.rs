@@ -47,6 +47,22 @@ const BEFORE_AUTHORITY: Release = Release {
     }],
 };
 
+/// A release that reads level 2 and predates the mailbox section: it takes the section for a
+/// member of a newer release.
+const BEFORE_MAILBOX: Release = Release {
+    level: 2,
+    levelled: &[
+        Levelled {
+            member: "authority",
+            level: 2,
+        },
+        Levelled {
+            member: "mailbox",
+            level: 3,
+        },
+    ],
+};
+
 const BROKER: &str = "https://broker.example.com";
 
 const FEED: &str = "https://reach.example.com";
@@ -565,6 +581,146 @@ fn a_selected_feed_survives_the_file_and_the_registrys_copy() {
 
     // The section is as strict as any other: a field it does not declare refuses the document.
     let stray = br#"{"version": 3, "level": 2, "authority": {"origin": "https://reach.example.com", "relay": 1}}"#;
+    assert_eq!(
+        load_in(Some(stray), &THIS_RELEASE).status.state,
+        DocumentState::Invalid
+    );
+}
+
+/// A document that selects a mailbox service, as this build writes it.
+fn with_a_mailbox() -> ConfigurationDocument {
+    let mut document = ConfigurationDocument::empty();
+    document.mailbox.origin = Nullable::some(FEED.to_owned());
+    document.ceilings.session_limit = Nullable::some(4);
+    document
+}
+
+/// KR-REQ-26.13: the mailbox service's selection is a section of level 3, and a writer stamps the
+/// highest level among the sections the document holds. A document that selects only an authority
+/// feed stays at level 2, so a release that reads level 2 still reads and edits it; one that
+/// selects no mailbox is written without the section.
+#[test]
+fn a_document_is_stamped_with_the_highest_level_among_the_sections_it_holds() {
+    let mut feed_only = ConfigurationDocument::empty();
+    feed_only.authority.origin = Nullable::some(FEED.to_owned());
+    let written = contents_in(&feed_only, &THIS_RELEASE);
+    assert_eq!(json(&written)["level"], 2, "{written}");
+    assert!(json(&written).get("mailbox").is_none(), "{written}");
+
+    let mut both = feed_only;
+    both.mailbox.origin = Nullable::some(FEED.to_owned());
+    let written = contents_in(&both, &THIS_RELEASE);
+    assert_eq!(json(&written)["level"], 3, "{written}");
+    assert_eq!(json(&written)["authority"]["origin"], FEED, "{written}");
+    assert_eq!(json(&written)["mailbox"]["origin"], FEED, "{written}");
+}
+
+/// KR-REQ-26.13: a release that reads level 2 takes the mailbox section for a section of a newer
+/// release: it applies every member it knows, the authority feed's section included, leaves the
+/// mailbox section out, counts and names it, does not fail closed, and does not edit the document.
+/// Without the section a host places no object in a device's mailbox, and presents its pushes as it
+/// always did.
+#[test]
+fn a_release_at_level_2_ignores_the_mailbox_section_and_applies_the_rest() {
+    let mut document = with_a_mailbox();
+    document.authority.origin = Nullable::some(FEED.to_owned());
+    let written = contents_in(&document, &THIS_RELEASE);
+    assert_eq!(json(&written)["level"], 3, "{written}");
+
+    let loaded = load_in(Some(written.as_bytes()), &BEFORE_MAILBOX);
+    assert_eq!(
+        loaded.status.state,
+        DocumentState::Loaded,
+        "{:?}",
+        loaded.status
+    );
+    assert!(!loaded.fails_closed());
+    assert_eq!(
+        loaded.newer,
+        Some(Newer {
+            declared: 3,
+            count: 1,
+            names: vec!["mailbox".to_owned()]
+        })
+    );
+    let used = loaded.document.as_ref().expect("the document is used");
+    assert_eq!(used.ceilings.session_limit.0, Some(4));
+    assert_eq!(used.authority.origin(), Some(FEED), "level 2 is still read");
+    assert_eq!(used.mailbox.origin(), None, "the section is left out");
+    assert!(matches!(
+        edit_in(&loaded, &Change::SessionLimit(Some(2)), &BEFORE_MAILBOX),
+        Err(EditRefused::NotOurs(_))
+    ));
+}
+
+/// KR-REQ-26.13: the positive control of omission. A document with no mailbox section is written
+/// without it and is read, and edited, by a release that reads level 2 as it was before the
+/// section existed.
+#[test]
+fn an_unused_mailbox_section_is_not_written_and_a_release_at_level_2_reads_the_file_strictly() {
+    let mut document = ConfigurationDocument::empty();
+    document.authority.origin = Nullable::some(FEED.to_owned());
+    let written = contents_in(&document, &THIS_RELEASE);
+    assert!(json(&written).get("mailbox").is_none(), "{written}");
+
+    let read = load_in(Some(written.as_bytes()), &BEFORE_MAILBOX);
+    assert_eq!(read.status.state, DocumentState::Loaded);
+    assert!(
+        read.newer.is_none(),
+        "a document at the level is read strictly"
+    );
+    let edited = edit_in(
+        &load_in(Some(written.as_bytes()), &THIS_RELEASE),
+        &Change::SessionLimit(Some(2)),
+        &THIS_RELEASE,
+    )
+    .expect("an edit");
+    assert!(json(&edited.contents).get("mailbox").is_none());
+    assert_eq!(json(&edited.contents)["level"], 2);
+}
+
+/// KR-REQ-26.13: the upgrade half and the round trip of an active value. A document a release at
+/// level 2 wrote is read by this build as it was; once the owner selects a mailbox service the next
+/// write is at level 3 and keeps every other member; the selection survives the file, the typed
+/// document and the copy the registry keeps, which is the file's reading written again.
+#[test]
+fn a_selected_mailbox_survives_the_file_and_the_registrys_copy() {
+    let mut earlier = ConfigurationDocument::empty();
+    earlier.authority.origin = Nullable::some(FEED.to_owned());
+    earlier.ceilings.session_limit = Nullable::some(4);
+    let before = contents_in(&earlier, &THIS_RELEASE);
+    let loaded = load_in(Some(before.as_bytes()), &THIS_RELEASE);
+    assert_eq!(loaded.status.state, DocumentState::Loaded);
+    let mut document = loaded.document.expect("used");
+    assert_eq!(document.mailbox.origin(), None);
+
+    document.mailbox.origin = Nullable::some(FEED.to_owned());
+    let written = contents_in(&document, &THIS_RELEASE);
+    assert_eq!(json(&written)["level"], 3, "{written}");
+    assert_eq!(json(&written)["ceilings"]["session_limit"], 4, "{written}");
+    assert_eq!(json(&written)["authority"]["origin"], FEED, "{written}");
+
+    let read = load_in(Some(written.as_bytes()), &THIS_RELEASE);
+    assert_eq!(
+        read.status.state,
+        DocumentState::Loaded,
+        "{:?}",
+        read.status
+    );
+    let typed = read.document.expect("used");
+    assert_eq!(typed.mailbox.origin(), Some(FEED));
+    assert_eq!(typed.level, 3);
+
+    let copy = contents_in(&typed, &THIS_RELEASE);
+    let from_the_copy = load_in(Some(copy.as_bytes()), &THIS_RELEASE);
+    assert_eq!(from_the_copy.document.as_ref(), Some(&typed));
+    assert_eq!(
+        copy, written,
+        "the copy is the file's reading written again"
+    );
+
+    // The section is as strict as any other: a field it does not declare refuses the document.
+    let stray = br#"{"version": 3, "level": 3, "mailbox": {"origin": "https://reach.example.com", "relay": 1}}"#;
     assert_eq!(
         load_in(Some(stray), &THIS_RELEASE).status.state,
         DocumentState::Invalid

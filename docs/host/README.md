@@ -235,6 +235,7 @@ variables an older build read joins nothing because of them.
 | `voice.broker_origin` | the managed broker this host starts a device's voice session at, through the proxy `network.proxy_url` selects | an absolute `https` origin, or an `http` origin on `localhost`, `127.0.0.1` or `[::1]`, of at most 128 bytes, in lower case, with no path and no port its scheme already implies; a plain-HTTP origin cannot be combined with `network.proxy_url`, because the proxy would carry the account token in clear text |
 | `storage.origin` | the managed storage service this host uploads its backups to | an `https` origin, or an `http` origin on a loopback address, in the spelling a gateway origin has, with no path and no trailing slash; the daemon refuses to start unless it is the managed account service |
 | `authority.origin` | the authority feed this host reads its remote revocations from; a section of level 2: a release that reads level 1 ignores it, and its host takes revocations only from owners who reach it directly | an `https` origin, or an `http` origin on a loopback address, in the spelling a gateway origin has, with no path and no trailing slash |
+| `mailbox.origin` | the mailbox service this host places the encrypted objects of its notifications in; a section of level 3, so a release that reads level 2 ignores it and its host places nothing, which leaves a notification whose detail does not fit reaching a device without it | an `https` origin, or an `http` origin on a loopback address, in the spelling a gateway origin has, with no path and no trailing slash |
 
 A field the document does not write selects nothing, because there is no public relay or discovery
 server to fall back on. A URL or an origin names its host the one way the protocol spells every
@@ -256,15 +257,16 @@ One rule covers the proxy. Every outbound HTTPS connection this host makes goes 
 document names one: the endpoint's relays and Pkarr servers, the rendezvous it reserves a code's
 locator at and opens the room at, delivery to the push gateway, to webhook addresses and to chat
 services, the managed voice broker and the account service it signs in at, backups to the managed
-storage service (`storage.origin`), the authority feed (`authority.origin`), the model's files, and
-plugin repositories. Nothing goes around it, so an address the proxy cannot reach fails, a webhook
-included. Mail submission is SMTP and connects directly, and name lookups go directly too. Without a
-proxy every one of those connections goes directly, apart from iroh's relay latency probe and
-captive-portal check, which then follow `HTTP_PROXY`, `HTTPS_PROXY` and `ALL_PROXY` when those are
-set. The daemon reads the proxy when it starts, like the rest of the section, and every client takes
-that one reading. A daemon that starts over a document it cannot use makes no HTTPS connection to
-the push gateway, a webhook address or a chat service, a plugin repository, the model's files or the
-managed account service, and uploads no backup, until it starts again over one it can use.
+storage service (`storage.origin`), the authority feed (`authority.origin`), the mailbox service
+(`mailbox.origin`), the model's files, and plugin repositories. Nothing goes around it, so an
+address the proxy cannot reach fails, a webhook included. Mail submission is SMTP and connects
+directly, and name lookups go directly too. Without a proxy every one of those connections goes
+directly, apart from iroh's relay latency probe and captive-portal check, which then follow
+`HTTP_PROXY`, `HTTPS_PROXY` and `ALL_PROXY` when those are set. The daemon reads the proxy when it
+starts, like the rest of the section, and every client takes that one reading. A daemon that starts
+over a document it cannot use makes no HTTPS connection to the push gateway, a webhook address or a
+chat service, a plugin repository, the model's files or the managed account service, and uploads no
+backup, until it starts again over one it can use.
 
 The daemon reads both sections once, when it starts, because that is when its endpoint and its
 voice service are built. `kr doctor` prints each field with its value, its source

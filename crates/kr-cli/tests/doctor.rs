@@ -280,7 +280,7 @@ fn a_document_at_a_higher_level_is_refused_an_edit_and_left_exactly_as_it_was() 
     let installation = Installation::create();
     let environment = installation.environment();
     let path = kr_cli::doctor::configuration::document_path(&environment);
-    let higher = r#"{"version": 3, "level": 3, "ceilings": {"session_limit": 4}, "zq_telemetry": {"enabled": true}}"#;
+    let higher = r#"{"version": 3, "level": 4, "ceilings": {"session_limit": 4}, "zq_telemetry": {"enabled": true}}"#;
     kr_ipc::paths::write_owner_only_file(&path, higher.as_bytes()).expect("writes it");
 
     // The control: this build reads the document, so it is the edit that is refused and not the
@@ -305,7 +305,7 @@ fn a_document_at_a_higher_level_is_refused_an_edit_and_left_exactly_as_it_was() 
     );
     let message = String::from_utf8_lossy(&output.stderr);
     assert!(
-        message.contains("level 3") && message.contains("nothing was written"),
+        message.contains("level 4") && message.contains("nothing was written"),
         "{message}"
     );
     assert_eq!(
