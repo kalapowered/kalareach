@@ -1315,10 +1315,11 @@ impl DeliveryModule {
     ///
     /// The exchange is made under an admission of the generation the notification was admitted
     /// under, as the push is, and the admission is let go as soon as the exchange ends. The
-    /// deadline is read under it, immediately before the exchange, so nothing is placed for a
-    /// notification that has expired. The caller asks its questions again before it takes a new
-    /// admission for the send, and a change of privacy mode that came in between takes the
-    /// notification back.
+    /// deadline is read under it, immediately before the exchange, and the service is asked only
+    /// of a notification with more life left than the longest wait of its own schedule, so nothing
+    /// is placed for one that has expired or that the exchange could cost its push. The caller
+    /// asks its questions again before it takes a new admission for the send, and a change of
+    /// privacy mode that came in between takes the notification back.
     fn place_detail(
         &self,
         delivery: &ClaimedDelivery,
@@ -1370,13 +1371,8 @@ impl DeliveryModule {
                 return Ok(nothing(Detail::TakenBack));
             };
             let before = clock.now_ms().max(now_ms);
-            if before >= delivery.expires_at_ms.get() {
-                return Ok(Placing {
-                    detail: Detail::Expired,
-                    asked: false,
-                    at_ms: before,
-                });
-            }
+            // A notification that has expired has less than the room left, and the deadline read
+            // before the send settles it; one that has less than the room is not asked about.
             if before.saturating_add(MAILBOX_ROOM_MS) >= delivery.expires_at_ms.get() {
                 forget()?;
                 return Ok(Placing {
@@ -1716,18 +1712,8 @@ impl DeliveryModule {
         } else {
             self.place_detail(delivery, push, clock, now_ms)?
         };
-        match placing.detail {
-            Detail::TakenBack => return self.taken_back(delivery, now_ms),
-            Detail::Expired => {
-                return self.settle(
-                    delivery,
-                    DeliveryState::Expired,
-                    "the notification expired before its detail could be placed in the device's \
-                     mailbox",
-                    placing.at_ms,
-                );
-            }
-            _ => {}
+        if matches!(placing.detail, Detail::TakenBack) {
+            return self.taken_back(delivery, now_ms);
         }
         if placing.asked && !self.authority_still_holds(record, delivery, authority) {
             // The exchange waited, on a service this host does not control, and the recipient's
@@ -1802,7 +1788,7 @@ impl DeliveryModule {
                         sender.send(&credential, &request)
                     }
                 },
-                Detail::TakenBack | Detail::Expired => {
+                Detail::TakenBack => {
                     unreachable!("a notification that could not go on returned above")
                 }
             }
@@ -2001,8 +1987,6 @@ enum Detail {
     },
     /// Privacy mode was turned on before anything was asked of the service.
     TakenBack,
-    /// The notification expired before anything was asked of the service.
-    Expired,
 }
 
 /// What placing a notification's detail did, and what it asks of the attempt after it.
