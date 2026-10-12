@@ -1350,6 +1350,18 @@ impl Session {
         below
     }
 
+    /// Reads whether a process recorded below a server has left the session for a control daemon's
+    /// own scope, which is noted when it has: the ending of the server asks and forces only what
+    /// is the session's.
+    pub fn process_has_left(
+        &mut self,
+        process: &kr_protocol::identity::ProcessStartIdentity,
+    ) -> bool {
+        self.owned
+            .as_mut()
+            .is_some_and(|owned| owned.read_left(process))
+    }
+
     /// Notes that a process the session owns was ended by force.
     pub fn note_process_forced(&mut self, process: &kr_protocol::identity::ProcessStartIdentity) {
         if let Some(owned) = self.owned.as_mut() {

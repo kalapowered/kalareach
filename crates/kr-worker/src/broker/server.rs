@@ -77,13 +77,20 @@ pub const WITHHELD_VARIABLES: [&str; 2] = kr_protocol::root::LAUNCH_VARIABLES;
 /// and again while the processes below the server end, before each round of force, and once more
 /// at its end. The last reading only reports: a process that it shows for the first time is
 /// returned as one that is still running, with no request to terminate and no force, because the
-/// rounds of force are bounded and the ending cannot wait for another. It happens only below a
-/// process that outlived every round, which is itself returned as running; the session's record
-/// keeps both, so the closure's receipt names them among the survivors.
+/// rounds of force are bounded and the ending cannot wait for another. The session's record can
+/// show one when it recorded a child between two readings, below a parent that ended after the
+/// earlier one, or below a process that outlived every round; the record keeps it, so the
+/// closure's receipt names it among the survivors.
 pub trait Owned: Send + Sync {
     /// Reads what runs below `server` now, and returns the processes recorded below it, the ones
     /// read earlier included, that have not been read as ended.
     fn below(&self, server: &ProcessStartIdentity) -> Vec<ProcessStartIdentity>;
+
+    /// Says whether `process` has left the session for a control daemon's own scope. Such a
+    /// process is not the session's: the ending neither asks it to terminate nor forces it, and
+    /// does not report it as still running. It is asked before every request and every force,
+    /// because a reading that returned the process can be older than the one that read it leaving.
+    fn left(&self, process: &ProcessStartIdentity) -> bool;
 
     /// Notes that `process` was ended by force.
     fn forced(&self, process: &ProcessStartIdentity);
@@ -590,7 +597,10 @@ fn ask_below(
     owned: &dyn Owned,
 ) {
     for process in known {
-        if process_state(process) != ProcessState::Ended && asked.insert(process.clone()) {
+        if process_state(process) != ProcessState::Ended
+            && !owned.left(process)
+            && asked.insert(process.clone())
+        {
             signal(process, Stop::Term, owned);
         }
     }
@@ -621,7 +631,7 @@ async fn end_below(
 ) -> Vec<ProcessStartIdentity> {
     let running = |set: &BTreeSet<ProcessStartIdentity>| -> Vec<ProcessStartIdentity> {
         set.iter()
-            .filter(|process| process_state(process) != ProcessState::Ended)
+            .filter(|process| process_state(process) != ProcessState::Ended && !owned.left(process))
             .cloned()
             .collect()
     };
@@ -647,6 +657,10 @@ async fn end_below(
         // showed and whenever they showed it.
         wait_until_ended(&mut remaining, window_over).await;
         for process in &remaining {
+            // Asked again, after the wait: the process can have left the session meanwhile.
+            if owned.left(process) {
+                continue;
+            }
             if signal(process, Stop::Kill, owned) {
                 owned.forced(process);
                 forced.push(process.clone());
