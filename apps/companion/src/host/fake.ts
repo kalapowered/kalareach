@@ -1617,15 +1617,14 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
       })
     },
 
-    voiceStop: (voiceSessionId) => {
+    voiceStop: () => {
       const running = voice.call
       voice.call = null
       voice.delegations = []
       if (!connected) {
         return Promise.resolve({
           closed_locally: running !== null,
-          settled: null,
-          fence_unreadable: false,
+          fence: null,
           host_failure: {
             code: 'RESOURCE_UNAVAILABLE',
             // Native code sends a host's refusal as its code, a colon and the host's words.
@@ -1634,23 +1633,16 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
           }
         })
       }
-      const voiceFenceUnreadable = voiceStopFenceUnreadable
+      const unreadable = voiceStopFenceUnreadable
       voiceStopFenceUnreadable = false
+      const barrier = unreadable ? null : voiceBarrier()
       return Promise.resolve({
         closed_locally: running !== null,
-        settled: {
-          receipt: null,
-          action_id: null,
-          value: {
-            voice_session_id: voiceSessionId,
-            revoked_grant_id: VOICE_GRANT,
-            revoked_at_ms: String(VOICE_NOW_MS),
-            broker_notified: true,
-            sessions_left_running: [SESSION_MAIN],
-            barrier: voiceFenceUnreadable ? null : voiceBarrier()
-          }
-        },
-        fence_unreadable: voiceFenceUnreadable,
+        fence: unreadable
+          ? { kind: 'unreadable' }
+          : barrier === null
+            ? { kind: 'none' }
+            : { kind: 'barrier', barrier },
         host_failure: null
       })
     },

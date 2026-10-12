@@ -458,8 +458,8 @@ export interface VoiceAllowed {
   readonly not_held_by_device: readonly VoiceAction[]
   /**
    * The workers' status for the calls the replacement ended: null when it owed no fence, and
-   * otherwise the barrier as the host's wait for it left it. A worker still `pending` may yet take
-   * up what one of those calls sent.
+   * otherwise the barrier as the host's wait for it left it, without the names of the actions the
+   * fence named. A worker still `pending` may yet take up what one of those calls sent.
    */
   readonly barrier: VoiceGrantResult['barrier']
 }
@@ -497,17 +497,23 @@ export interface VoiceCallState {
   readonly control: string
 }
 
+/**
+ * What the host's answer to ending a call showed of the fence its withdrawal owed: that it owed
+ * none, the barrier of the workers it waited for (without the names of the actions the fence
+ * named), or that the answer gave no status this build could read, so whether every worker holds
+ * the revision that refuses what the call sent is not known here. The grant is revoked in each.
+ */
+export type VoiceFence =
+  | { readonly kind: 'none' }
+  | { readonly kind: 'barrier'; readonly barrier: NonNullable<VoiceStopResult['barrier']> }
+  | { readonly kind: 'unreadable' }
+
 /** What ending a call did, locally and on the host. */
 export interface VoiceClosure {
   /** Whether this device's own call was closed. True whenever a call was running. */
   readonly closed_locally: boolean
-  /** The host's answer, or null when the host could not be told. */
-  readonly settled: Settled<VoiceStopResult> | null
-  /**
-   * Whether the host answered with a barrier for its fence that this build could not read, so that
-   * whether every worker holds is not known here. The grant is revoked either way.
-   */
-  readonly fence_unreadable: boolean
+  /** What the host's answer showed of its fence, or null when the host could not be told. */
+  readonly fence: VoiceFence | null
   /** Why the host could not be told, when it could not. */
   readonly host_failure: HostError | null
 }

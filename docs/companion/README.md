@@ -349,7 +349,8 @@ and any action the device's own access does not include, which the person reads 
 is shown. When replacing the allowance ended a call whose close could still reach a worker, the
 host's answer names the workers that have not yet confirmed the fence, and the screen names the
 sessions still to confirm, and says when the answer left workers out, before the person goes on. A
-call that ends says the same. The allowance stays until the person changes it.
+call that ends says the same, and says when the host's answer gave no status for its workers that
+the app could read. The allowance stays until the person changes it.
 
 An invitation on the pasteboard is read by native code, not by the page. A code invitation that
 names a service other than this computer's raises the system's own alert, modal to the companion's

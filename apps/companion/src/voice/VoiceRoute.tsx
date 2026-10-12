@@ -422,13 +422,13 @@ export function VoiceRoute({
         void ask(() => port.voiceStop(running.voiceSessionId, {}))
           .then((closure) => {
             if (closure.closed_locally) setCall(null)
-            const pending = toConfirm(closure.settled?.value?.barrier)
+            const pending = toConfirm(closure.fence?.kind === 'barrier' ? closure.fence.barrier : null)
             setNotice(
               closure.host_failure
                 ? `This device's call is closed. The host was not told, so its grant may still be open: ${failureWords(closure.host_failure)}`
                 : pending.sessions.length > 0
                   ? `This device's call is closed and its grant withdrawn. ${toConfirmWords(pending, choice?.sessionNames ?? {}, 'call')}`
-                  : closure.fence_unreadable
+                  : closure.fence?.kind === 'unreadable'
                     ? `This device's call is closed and its grant withdrawn. ${FENCE_UNREADABLE_WORDS}`
                     : null
             )

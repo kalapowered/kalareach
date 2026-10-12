@@ -241,9 +241,9 @@ describe('while a call is running', () => {
     expect(screen.queryByRole('heading', { name: 'Voice session' })).not.toBeInTheDocument()
   })
 
-  // Section 9: a host whose barrier for its fence this app cannot read has not shown that its
-  // workers hold, so the screen says that and does not report the stop as complete.
-  it('says the host has not confirmed its workers when its status cannot be read', async () => {
+  // Section 9: a host whose answer gives no status for its workers that this app can read has not
+  // shown that they hold, so the screen says that and does not report the stop as complete.
+  it('says it cannot confirm the host\'s workers when their status cannot be read', async () => {
     const person = userEvent.setup()
     const { controls } = start()
     await waitForChoice()
@@ -257,11 +257,33 @@ describe('while a call is running', () => {
 
     await waitFor(() => {
       expect(
-        screen.getByText(/status for its workers that this app could not read/)
+        screen.getByText(/this app cannot confirm that nothing the call sent can still run/)
       ).toBeInTheDocument()
     })
     expect(screen.getByText(/its grant withdrawn/)).toBeInTheDocument()
+    expect(screen.queryByText(/has not yet confirmed/)).not.toBeInTheDocument()
     expect(screen.queryByRole('heading', { name: 'Voice session' })).not.toBeInTheDocument()
+  })
+
+  // Section 9: a host that says it owed no fence leaves nothing to confirm, and the screen adds no
+  // notice to a call that has ended.
+  it('adds no notice when the host owed no fence', async () => {
+    const person = userEvent.setup()
+    start()
+    await waitForChoice()
+    await person.click(screen.getByRole('button', { name: 'Start voice session' }))
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'End session' })).toBeInTheDocument()
+    })
+
+    expect(screen.getByRole('heading', { name: 'Voice session' })).toBeInTheDocument()
+    await person.click(screen.getByRole('button', { name: 'End session' }))
+
+    await waitFor(() => {
+      expect(screen.queryByRole('heading', { name: 'Voice session' })).not.toBeInTheDocument()
+    })
+    expect(screen.queryByText(/its grant withdrawn/)).not.toBeInTheDocument()
+    expect(screen.queryByText(/cannot confirm/)).not.toBeInTheDocument()
   })
 
   // KR-REQ-15.17: transport closure survives a host that cannot be told about it, and the screen

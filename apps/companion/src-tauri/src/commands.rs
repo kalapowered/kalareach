@@ -1174,85 +1174,48 @@ pub async fn voice_stop(
             )
             .await
             .map_err(CommandError::from)?;
-        settled_stop(&answer)
+        fence_of(&answer)
     }
     .await;
 
-    Ok(match told_the_host {
-        Ok((settled, fence_unreadable)) => VoiceClosure {
-            closed_locally,
-            settled: Some(settled),
-            fence_unreadable,
-            host_failure: None,
-        },
-        Err(error) => VoiceClosure {
-            closed_locally,
-            settled: None,
-            fence_unreadable: false,
-            host_failure: Some(error),
-        },
-    })
+    Ok(VoiceClosure::of(closed_locally, told_the_host))
 }
 
-/// What the host answered to a stop, as the page reads it: the result with the barrier of its fence
-/// less the names of the actions the fence named ([`without_the_names`]), and whether the barrier
-/// could not be read.
+/// What a stop's answer shows of the fence its withdrawal owed, as the page is given it.
 ///
-/// An answer this build cannot read as a stop's result is still an answer: the host was told and
-/// revoked the grant. The page is given what it holds of it, and the barrier of its fence is read
-/// on its own and given as a stop's barrier is, because a worker that has not held may still take
-/// up what the call sent. A barrier this build cannot read either is left out and reported as
-/// unreadable, since whether the workers hold is then not known here, and the page says so.
-fn settled_stop(answer: &kr_client::Settled) -> Result<(Settled, bool)> {
+/// The page needs one thing of the host's answer, whether every worker holds the revision that
+/// refuses what the call sent, and it is given that and nothing else of the answer: a member this
+/// build does not read is not passed on. The answer is a stop's result when it is a result at all,
+/// so the host revoked the grant; the `barrier` member is then read on its own, and the page is
+/// given the barrier without the names of the actions the fence named ([`without_the_names`]), or
+/// that the host owed no fence, which a host says with a null `barrier`. A barrier that is absent
+/// or that this build cannot read is not "owed none": it is reported as unreadable, because
+/// whether a worker may still take up what the call sent is then not known here. An answer that is
+/// a receipt is not a stop's result, and is a failure to read what the host said.
+fn fence_of(answer: &kr_client::Settled) -> Result<VoiceFence> {
     let kr_client::Settled::Result(value) = answer else {
-        return Ok((settled(answer)?, false));
+        return Err(CommandError::local_failure(
+            "the host answered the stop with a receipt, not with its result",
+        ));
     };
-    if let Ok(stopped) = value.to_typed::<kr_protocol::voice::VoiceStopResult>() {
-        let read = Settled {
-            receipt: None,
-            action_id: None,
-            value: Some(encode(&stopped_for_the_page(stopped))?),
-        };
-        return Ok((read, false));
-    }
-    let mut unread = settled(answer)?;
-    let mut barrier_unreadable = false;
-    if let Some(Value::Object(members)) = unread.value.as_mut() {
-        let barrier = match value.as_value() {
-            kr_cbor::CanonicalValue::Map(result) => result.get("barrier"),
-            _ => None,
-        };
-        match barrier {
-            None | Some(kr_cbor::CanonicalValue::Null) => {
-                members.insert("barrier".to_owned(), Value::Null);
-            }
-            Some(barrier) => {
-                match kr_protocol::envelope::ParamsValue::from(barrier.clone())
-                    .to_typed::<kr_protocol::action::RevocationBarrier>()
-                {
-                    Ok(barrier) => {
-                        members.insert("barrier".to_owned(), encode(&without_the_names(barrier))?);
-                    }
-                    Err(_) => {
-                        members.remove("barrier");
-                        barrier_unreadable = true;
-                    }
-                }
+    let barrier = match value.as_value() {
+        kr_cbor::CanonicalValue::Map(result) => result.get("barrier"),
+        _ => None,
+    };
+    Ok(match barrier {
+        Some(kr_cbor::CanonicalValue::Null) => VoiceFence::NotOwed,
+        Some(barrier) => {
+            match kr_protocol::envelope::ParamsValue::from(barrier.clone())
+                .to_typed::<kr_protocol::action::RevocationBarrier>()
+            {
+                Ok(barrier) => VoiceFence::Barrier {
+                    barrier: without_the_names(barrier),
+                },
+                Err(_) => VoiceFence::Unreadable,
             }
         }
-    }
-    Ok((unread, barrier_unreadable))
-}
-
-/// A stop's result as the page reads it: the barrier of its fence without the names of the actions
-/// the fence named.
-fn stopped_for_the_page(
-    stopped: kr_protocol::voice::VoiceStopResult,
-) -> kr_protocol::voice::VoiceStopResult {
-    kr_protocol::voice::VoiceStopResult {
-        barrier: kr_protocol::scalars::Nullable(stopped.barrier.0.map(without_the_names)),
-        ..stopped
-    }
+        None => VoiceFence::Unreadable,
+    })
 }
 
 /// A replacement's result as the page reads it: what the grant permits and could not carry, and the
@@ -1265,19 +1228,50 @@ fn allowed_for_the_page(granted: kr_protocol::voice::VoiceGrantResult) -> VoiceA
     }
 }
 
+/// What the host's answer to a stop showed of the fence its withdrawal owed (see [`fence_of`]).
+#[derive(Debug, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum VoiceFence {
+    /// The host said it owed no fence.
+    NotOwed,
+    /// The status of the workers the fence waited for, without the names of the actions it named.
+    /// A worker still `pending` may yet take up what the call sent.
+    Barrier {
+        /// The barrier, as a stop's result carries it.
+        barrier: kr_protocol::action::RevocationBarrier,
+    },
+    /// The host revoked the grant, and its answer gave no status for its workers that this build
+    /// could read, so whether every worker holds is not known here.
+    Unreadable,
+}
+
 /// What ending a call did, locally and on the host.
 #[derive(Debug, Serialize)]
 pub struct VoiceClosure {
     /// Whether a call of this process's own was closed. It holds none, so this is false.
     pub closed_locally: bool,
-    /// What the host answered, when it could be told.
-    pub settled: Option<Settled>,
-    /// Whether the host answered with a barrier for its fence that this build could not read, so
-    /// that whether every worker holds the revision that refuses what the call sent is not known
-    /// here. The grant is revoked either way.
-    pub fence_unreadable: bool,
-    /// Why the host could not be told, when it could not.
+    /// What the host's answer showed of its fence, when the host could be told.
+    pub fence: Option<VoiceFence>,
+    /// Why the host could not be told, or its answer not read, when it could not.
     pub host_failure: Option<CommandError>,
+}
+
+impl VoiceClosure {
+    /// The closure for what the host said, or for why it could not be told.
+    fn of(closed_locally: bool, told_the_host: Result<VoiceFence>) -> Self {
+        match told_the_host {
+            Ok(fence) => Self {
+                closed_locally,
+                fence: Some(fence),
+                host_failure: None,
+            },
+            Err(error) => Self {
+                closed_locally,
+                fence: None,
+                host_failure: Some(error),
+            },
+        }
+    }
 }
 
 /// Which of the two local silences a control acts on.
@@ -2136,74 +2130,13 @@ mod tests {
         }
     }
 
-    /// A stop's and a replacement's results reach the page without the names of the actions the
-    /// fence named, and as the page reads a session: its identifier as text, not as the wire's bytes.
-    #[test]
-    fn a_stops_and_a_replacements_results_reach_the_page_without_names() {
+    /// The barrier of a fence that named the device's own close, with one worker that has not held.
+    fn a_barrier_with_a_pending_worker() -> kr_protocol::action::RevocationBarrier {
         use kr_protocol::action::{BarrierState, FencedAction, RevocationBarrier, WorkerBarrier};
-        use kr_protocol::ids::{ActionId, ActorId, AuthorityRevision, GrantId, SessionId};
-        use kr_protocol::scalars::{CanonicalSet, Nullable, TimestampMs, U64, Uuid};
+        use kr_protocol::ids::{ActionId, ActorId, AuthorityRevision, SessionId};
+        use kr_protocol::scalars::{Nullable, U64, Uuid};
 
-        let device = ActorId::new("device:phone").expect("a principal");
-        let session = SessionId::new(Uuid::from_bytes([9; 16]));
-        let barrier = RevocationBarrier::new(
-            AuthorityRevision::new(5),
-            vec![WorkerBarrier {
-                session_id: session,
-                state: BarrierState::Pending,
-                acknowledged_revision: Nullable::null(),
-                rejected_actions: vec![FencedAction {
-                    actor_id: device,
-                    action_id: ActionId::new(Uuid::from_bytes([1; 16])),
-                }],
-                rejected_actions_total: U64::new(1),
-                possibly_executed: Vec::new(),
-                possibly_executed_total: U64::new(0),
-                omitted_actions: U64::new(0),
-                names_pending: U64::new(0),
-                detail: String::new(),
-            }],
-        );
-        let stopped = kr_protocol::voice::VoiceStopResult {
-            voice_session_id: kr_protocol::ids::VoiceSessionId::new(Uuid::from_bytes([7; 16])),
-            revoked_grant_id: GrantId::new(Uuid::from_bytes([6; 16])),
-            revoked_at_ms: TimestampMs::new(1_700_000_000_000),
-            broker_notified: true,
-            sessions_left_running: CanonicalSet::new(),
-            barrier: Nullable::some(barrier.clone()),
-        };
-        let granted = kr_protocol::voice::VoiceGrantResult {
-            grant_id: GrantId::new(Uuid::from_bytes([5; 16])),
-            device_id: kr_protocol::ids::DeviceId::new(Uuid::from_bytes([4; 16])),
-            statement: kr_protocol::voice::VoiceGrantStatement::of(&CanonicalSet::new()),
-            not_held_by_device: CanonicalSet::new(),
-            barrier: Nullable::some(barrier),
-        };
-
-        for read in [
-            encode(&stopped_for_the_page(stopped)).expect("it encodes"),
-            encode(&allowed_for_the_page(granted)).expect("it encodes"),
-        ] {
-            let said = read.to_string();
-            assert!(!said.contains("device:phone"), "{said}");
-            assert_eq!(
-                read["barrier"]["workers"][0]["session_id"],
-                session.to_string(),
-                "the page reads a session as text"
-            );
-            assert_eq!(read["barrier"]["workers"][0]["state"], "pending");
-            assert_eq!(read["barrier"]["workers_total"], "1");
-        }
-    }
-
-    /// A stop's answer as the client gives it: a typed result, or a result with one member this
-    /// build does not know, and the barrier of a fence that named the device's own close.
-    fn a_stop_answered_with_a_pending_worker(unknown_member: bool) -> kr_client::Settled {
-        use kr_protocol::action::{BarrierState, FencedAction, RevocationBarrier, WorkerBarrier};
-        use kr_protocol::ids::{ActionId, ActorId, AuthorityRevision, GrantId, SessionId};
-        use kr_protocol::scalars::{CanonicalSet, Nullable, TimestampMs, U64, Uuid};
-
-        let barrier = RevocationBarrier::new(
+        RevocationBarrier::new(
             AuthorityRevision::new(5),
             vec![WorkerBarrier {
                 session_id: SessionId::new(Uuid::from_bytes([9; 16])),
@@ -2220,101 +2153,203 @@ mod tests {
                 names_pending: U64::new(0),
                 detail: String::new(),
             }],
+        )
+    }
+
+    /// A replacement's result reaches the page without the names of the actions the fence named,
+    /// and as the page reads a session: its identifier as text, not as the wire's bytes.
+    #[test]
+    fn a_replacements_result_reaches_the_page_without_names() {
+        use kr_protocol::ids::GrantId;
+        use kr_protocol::scalars::{CanonicalSet, Nullable, Uuid};
+
+        let granted = kr_protocol::voice::VoiceGrantResult {
+            grant_id: GrantId::new(Uuid::from_bytes([5; 16])),
+            device_id: kr_protocol::ids::DeviceId::new(Uuid::from_bytes([4; 16])),
+            statement: kr_protocol::voice::VoiceGrantStatement::of(&CanonicalSet::new()),
+            not_held_by_device: CanonicalSet::new(),
+            barrier: Nullable::some(a_barrier_with_a_pending_worker()),
+        };
+
+        let read = encode(&allowed_for_the_page(granted)).expect("it encodes");
+
+        let said = read.to_string();
+        assert!(!said.contains("device:phone"), "{said}");
+        assert_eq!(
+            read["barrier"]["workers"][0]["session_id"],
+            kr_protocol::ids::SessionId::new(Uuid::from_bytes([9; 16])).to_string(),
+            "the page reads a session as text"
         );
+        assert_eq!(read["barrier"]["workers"][0]["state"], "pending");
+        assert_eq!(read["barrier"]["workers_total"], "1");
+    }
+
+    /// A stop's answer as the client gives it: the result the host sends, as a map the test may add
+    /// a member to, and the barrier of a fence that named the device's own close.
+    fn a_stop_answered_with(barrier: Option<kr_cbor::CanonicalValue>) -> kr_cbor::CanonicalMap {
+        use kr_protocol::ids::GrantId;
+        use kr_protocol::scalars::{CanonicalSet, Nullable, TimestampMs, Uuid};
+
         let stopped = kr_protocol::voice::VoiceStopResult {
             voice_session_id: kr_protocol::ids::VoiceSessionId::new(Uuid::from_bytes([7; 16])),
             revoked_grant_id: GrantId::new(Uuid::from_bytes([6; 16])),
             revoked_at_ms: TimestampMs::new(1_700_000_000_000),
             broker_notified: true,
             sessions_left_running: CanonicalSet::new(),
-            barrier: Nullable::some(barrier),
+            barrier: Nullable::some(a_barrier_with_a_pending_worker()),
         };
-        let mut value = kr_cbor::to_canonical_value(&stopped).expect("it encodes");
-        if unknown_member {
-            let kr_cbor::CanonicalValue::Map(map) = &mut value else {
-                panic!("a result is a map");
-            };
-            map.insert(
-                "a_member_a_later_host_adds".to_owned(),
-                kr_cbor::CanonicalValue::Bool(true),
-            )
-            .expect("a new key");
+        let kr_cbor::CanonicalValue::Map(typed) =
+            kr_cbor::to_canonical_value(&stopped).expect("it encodes")
+        else {
+            panic!("a result is a map");
+        };
+        let mut result = kr_cbor::CanonicalMap::new();
+        for (key, held) in typed.entries() {
+            if key == "barrier" {
+                if let Some(barrier) = &barrier {
+                    result.insert(key.clone(), barrier.clone()).expect("a key");
+                }
+            } else {
+                result.insert(key.clone(), held.clone()).expect("a key");
+            }
         }
-        kr_client::Settled::Result(value.into())
+        result
     }
 
-    /// What `voice_stop` gives the page for a stop answered with a worker that has not held: the
-    /// worker's session as text, its state and the totals, and no name of an action, whether this
-    /// build reads the answer as a stop's result or not. A host that sends a member this build does
-    /// not know has still revoked the grant, and its pending worker is still shown.
+    fn the_barrier_as_the_host_sends_it() -> kr_cbor::CanonicalValue {
+        kr_cbor::to_canonical_value(&a_barrier_with_a_pending_worker()).expect("it encodes")
+    }
+
+    /// What the page is given for a stop answered with this result, as the command encodes it.
+    fn the_closure_for(result: kr_cbor::CanonicalMap) -> serde_json::Value {
+        let answered = kr_client::Settled::Result(kr_cbor::CanonicalValue::Map(result).into());
+        serde_json::to_value(VoiceClosure::of(true, fence_of(&answered))).expect("it encodes")
+    }
+
+    /// Section 9: a stop answered with a worker that has not held reaches the page as pending, with
+    /// the worker's session as text, its state and the totals, and no name of an action. A member
+    /// of the answer this build does not read is not passed on, whatever it carries: a host newer
+    /// than this build has still revoked the grant, and its pending worker is still shown.
     #[test]
     fn a_stop_with_a_pending_worker_reaches_the_page_as_pending_and_without_names() {
         for unknown_member in [false, true] {
-            let (read, unreadable) =
-                settled_stop(&a_stop_answered_with_a_pending_worker(unknown_member))
-                    .expect("the answer is passed on");
-            assert!(!unreadable, "{unknown_member}: the barrier is read");
-            let read = read.value.expect("it carries a result");
-            let said = read.to_string();
-            assert!(!said.contains("device:phone"), "{said}");
-            let worker = &read["barrier"]["workers"][0];
+            let mut result = a_stop_answered_with(Some(the_barrier_as_the_host_sends_it()));
+            if unknown_member {
+                result
+                    .insert(
+                        "a_member_a_later_host_adds".to_owned(),
+                        kr_cbor::CanonicalValue::Text("device:phone".to_owned()),
+                    )
+                    .expect("a new key");
+            }
+
+            let closure = the_closure_for(result);
+
+            let said = closure.to_string();
+            assert!(!said.contains("device:phone"), "{unknown_member}: {said}");
+            assert!(
+                !said.contains("a_member_a_later_host_adds"),
+                "{unknown_member}: {said}"
+            );
+            assert_eq!(closure["fence"]["kind"], "barrier", "{said}");
+            let worker = &closure["fence"]["barrier"]["workers"][0];
             assert_eq!(worker["state"], "pending", "{unknown_member}: {said}");
             assert_eq!(
                 worker["session_id"],
                 kr_protocol::ids::SessionId::new(kr_protocol::scalars::Uuid::from_bytes([9; 16]))
                     .to_string()
             );
-            assert_eq!(read["barrier"]["workers_total"], "1");
+            assert_eq!(closure["fence"]["barrier"]["workers_total"], "1");
+            assert_eq!(closure["host_failure"], serde_json::Value::Null);
+            let mut members: Vec<&str> = closure
+                .as_object()
+                .expect("a closure is an object")
+                .keys()
+                .map(String::as_str)
+                .collect();
+            members.sort_unstable();
+            assert_eq!(members, ["closed_locally", "fence", "host_failure"]);
         }
     }
 
-    /// A stop answered with a barrier this build cannot read (a member inside the barrier it does
-    /// not know) is passed on without that barrier and with the fence reported as unreadable, so the
-    /// page does not show the stop as complete and does not hold the names the barrier carries.
+    /// Section 9: a stop whose answer gives no status for its workers that this build can read (a
+    /// barrier with a member it does not know, a barrier that is absent, a result that is not a
+    /// map) is reported as unreadable, not as a fence the host did not owe, and the page is given
+    /// nothing the answer carried. A null `barrier` is the host saying it owed none.
     #[test]
-    fn a_stop_whose_barrier_cannot_be_read_is_reported_as_unconfirmed_and_names_nothing() {
-        let kr_client::Settled::Result(value) = a_stop_answered_with_a_pending_worker(false) else {
-            panic!("a result");
-        };
-        let mut value = value.as_value().clone();
-        let kr_cbor::CanonicalValue::Map(result) = &mut value else {
-            panic!("a result is a map");
-        };
-        let mut barrier = match result.get("barrier") {
-            Some(kr_cbor::CanonicalValue::Map(barrier)) => barrier.clone(),
-            other => panic!("a barrier: {other:?}"),
+    fn a_stop_with_no_status_this_build_can_read_is_reported_as_unreadable() {
+        let mut barrier = match the_barrier_as_the_host_sends_it() {
+            kr_cbor::CanonicalValue::Map(barrier) => barrier,
+            other => panic!("a barrier is a map: {other:?}"),
         };
         barrier
             .insert(
                 "a_member_a_later_host_adds".to_owned(),
-                kr_cbor::CanonicalValue::Bool(true),
+                kr_cbor::CanonicalValue::Text("device:phone".to_owned()),
             )
             .expect("a new key");
-        let mut members = kr_cbor::CanonicalMap::new();
-        for (key, held) in result.entries() {
-            let held = if key == "barrier" {
-                kr_cbor::CanonicalValue::Map(barrier.clone())
-            } else {
-                held.clone()
-            };
-            members.insert(key.clone(), held).expect("a key");
+        let unknown_in_the_barrier =
+            a_stop_answered_with(Some(kr_cbor::CanonicalValue::Map(barrier)));
+        let no_barrier = a_stop_answered_with(None);
+        let not_a_map = kr_client::Settled::Result(kr_cbor::CanonicalValue::Bool(true).into());
+        let null_barrier = a_stop_answered_with(Some(kr_cbor::CanonicalValue::Null));
+
+        for (what, result, kind) in [
+            (
+                "an unknown member in the barrier",
+                unknown_in_the_barrier,
+                "unreadable",
+            ),
+            ("no barrier member", no_barrier, "unreadable"),
+            ("a null barrier", null_barrier, "not_owed"),
+        ] {
+            let closure = the_closure_for(result);
+            assert_eq!(closure["fence"]["kind"], kind, "{what}: {closure}");
+            assert!(
+                !closure.to_string().contains("device:phone"),
+                "{what}: {closure}"
+            );
+            assert_eq!(closure["fence"].as_object().map(|each| each.len()), Some(1));
         }
-        members
-            .insert(
-                "a_member_a_later_host_adds".to_owned(),
-                kr_cbor::CanonicalValue::Bool(true),
-            )
-            .expect("a new key");
+        let closure =
+            serde_json::to_value(VoiceClosure::of(true, fence_of(&not_a_map))).expect("it encodes");
+        assert_eq!(closure["fence"]["kind"], "unreadable", "{closure}");
+    }
 
-        let (read, unreadable) = settled_stop(&kr_client::Settled::Result(
-            kr_cbor::CanonicalValue::Map(members).into(),
+    /// A stop answered with a receipt is not an answer the host gave to the stop: the page is told
+    /// the host could not be read, so it says the grant may still be open, and is given no fence.
+    #[test]
+    fn a_stop_answered_with_a_receipt_is_a_failure_to_read_the_host() {
+        use kr_protocol::scalars::{Digest256, Nullable, TimestampMs, U64, Uuid};
+
+        let receipt = kr_protocol::receipt::Receipt {
+            action_id: kr_protocol::ids::ActionId::new(Uuid::from_bytes([1; 16])),
+            actor_id: kr_protocol::ids::ActorId::new("device:phone").expect("a principal"),
+            method: Method::VoiceStop.into(),
+            method_version: kr_protocol::method::MethodVersion::V1,
+            revision: U64::new(2),
+            state: kr_protocol::receipt::ReceiptState::Dispatching,
+            reason: Nullable::null(),
+            payload_digest: Digest256::from_bytes([0; 32]),
+            accepted_deadline_ms: Nullable::null(),
+            error: Nullable::null(),
+            error_withheld: false,
+            updated_at_ms: TimestampMs::new(0),
+        };
+
+        let closure = serde_json::to_value(VoiceClosure::of(
+            true,
+            fence_of(&kr_client::Settled::Receipt(Box::new(receipt))),
         ))
-        .expect("the answer is passed on");
+        .expect("it encodes");
 
-        assert!(unreadable, "the fence is reported as unreadable");
-        let read = read.value.expect("it carries a result");
-        assert!(read.get("barrier").is_none(), "{read}");
-        assert!(!read.to_string().contains("device:phone"), "{read}");
+        assert_eq!(closure["fence"], serde_json::Value::Null, "{closure}");
+        assert_ne!(
+            closure["host_failure"],
+            serde_json::Value::Null,
+            "{closure}"
+        );
+        assert!(!closure.to_string().contains("device:phone"), "{closure}");
     }
 
     /// A fence names an action by the principal that submitted it, which for a call's own close is
