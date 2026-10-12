@@ -7,8 +7,8 @@
 //! rather than any particular one being told apart. KR-REQ-03.27, in part: a fresh host reports
 //! the setting off and holds nothing, a stored choice reaches a device with the reason nothing is
 //! held under it, and the only methods the registry admits a device to that write anything in the
-//! host-and-environment group are the three machine group steps. KR-REQ-23.25, in part, for
-//! `environment.capabilities`.
+//! host-and-environment group are the three machine group steps and the presentation of the
+//! device's own organisation lease. KR-REQ-23.25, in part, for `environment.capabilities`.
 //!
 //! No worker is started here, so no session has work outstanding and nothing here observes an
 //! assertion actually held. Every one of these is a read the daemon answers itself.
@@ -271,8 +271,9 @@ async fn a_device_asking_about_another_environment_is_refused_as_the_owner_is() 
 /// Starting a host never enables inhibition, so a host nobody has configured reports the setting
 /// off and holds nothing. What a device can do about that is nothing: the only methods that write
 /// anything in the host-and-environment group which the registry admits a paired device to are the
-/// three machine group steps, which write the one record that names a grouping and hold no power
-/// setting. What this does not show is the setup assistant's own offer, or the separate choice
+/// three machine group steps, which write the one record that names a grouping, and the
+/// presentation of the device's own organisation lease; neither holds a power setting. What this
+/// does not show is the setup assistant's own offer, or the separate choice
 /// between mains and battery, neither of which is a protocol method.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_device_reads_the_sleep_state_and_cannot_turn_inhibition_on() {
@@ -331,7 +332,9 @@ async fn a_device_reads_the_sleep_state_and_cannot_turn_inhibition_on() {
     // And there is nothing a device can call to change it. Every method the registry admits a
     // paired device to is checked, not a handful of names this test invented: the only writes it
     // admits in the host-and-environment group are the three machine group steps, which change the
-    // one record that names a grouping and grant nothing, and no power setting lives there.
+    // one record that names a grouping and grant nothing, and the presentation of the device's own
+    // organisation lease, which only narrows or renews what the organisation signed; no power
+    // setting lives there.
     let writes_host_configuration: Vec<&str> = Method::ALL
         .iter()
         .filter(|method| {
@@ -346,8 +349,14 @@ async fn a_device_reads_the_sleep_state_and_cannot_turn_inhibition_on() {
         .collect();
     assert_eq!(
         writes_host_configuration,
-        ["machine.join", "machine.merge", "machine.split"],
-        "a device reads this host's state and changes only its machine group"
+        [
+            "machine.join",
+            "machine.merge",
+            "machine.split",
+            "membership.present"
+        ],
+        "a device reads this host's state and changes only its machine group and the lease it \
+         presents"
     );
 
     session.close();
