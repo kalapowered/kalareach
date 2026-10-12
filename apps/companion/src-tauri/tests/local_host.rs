@@ -534,14 +534,13 @@ async fn an_answer_kept_for_a_session_whose_worker_has_gone_is_settled_as_gone()
         },
         drafted_at_ms: TimestampMs::new(5),
     };
-    let store = AnswerDrafts::open(
-        host.kept
-            .path()
-            .join("kept-answers")
-            .join(environment_id.to_string()),
+    let kept = host.kept.path().join("kept-answers");
+    let store = AnswerDrafts::open(kept.join(environment_id.to_string())).expect("a store");
+    let writers = kr_ipc::install::hold_writers(
+        &kr_ipc::install::Writing::in_roots(&kept, &kept),
+        &mut || {},
     )
-    .expect("a store");
-    let writers = kr_ipc::install::hold_writers(&mut || {}).expect("the writers lock");
+    .expect("the writers lock");
     let permit = writers.permit(&WRITTEN).expect("the leave to write");
     store.keep(&draft, &permit).expect("kept");
 

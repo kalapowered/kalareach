@@ -30,6 +30,7 @@ use kr_client::answers::{
     self, AnswerDraft, AnswerDrafts, AnswerError, Answered, QuestionHost, Retired,
 };
 use kr_client::{ClientError, Session};
+use kr_ipc::install::Writing;
 use kr_protocol::envelope::ActionTarget;
 use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::ids::{EnvironmentId, QuestionId, QuestionRevision, SessionId};
@@ -762,7 +763,7 @@ pub async fn answer(
             resolution,
             leftover: false,
         }),
-        (Ok(Answered::Unconfirmed(draft)), _) => keep(store, draft).await,
+        (Ok(Answered::Unconfirmed(draft)), _) => keep(store, draft, desk.root()?).await,
         // The worker took it and removing the copy kept earlier failed: the answer was taken, and
         // the page is told so.
         (Err(AnswerError::Store { .. } | AnswerError::Unreadable { .. }), Some(resolution)) => {
@@ -781,7 +782,12 @@ pub async fn answer(
 /// An update of the host that is switching releases holds the lock, and a write waits for it for up
 /// to [`kr_ipc::install::WRITERS_WAIT_SECONDS`] seconds. When it still cannot write, no copy of the
 /// answer is kept, and the page is told that; what the person wrote stays in the form.
-async fn keep(store: AnswerDrafts, draft: AnswerDraft) -> Result<Answer> {
+///
+/// `root` is the directory the answers are kept in, which is the only place this writes, and so the
+/// place the writer names as its roots. The application is not a program of a host's store, so the
+/// hold is nothing and nothing is registered with a store; the roots say where the write is, for a
+/// store that did register it.
+async fn keep(store: AnswerDrafts, draft: AnswerDraft, root: PathBuf) -> Result<Answer> {
     tokio::task::spawn_blocking(move || {
         let not_kept = |why: String| {
             CommandError::unavailable(format!(
@@ -789,7 +795,8 @@ async fn keep(store: AnswerDrafts, draft: AnswerDraft) -> Result<Answer> {
                  device: {why}; it is still in the form"
             ))
         };
-        let writers = kr_ipc::install::hold_writers(&mut || {})
+        let writing = Writing::in_roots(&root, &root);
+        let writers = kr_ipc::install::hold_writers(&writing, &mut || {})
             .map_err(|refused| not_kept(refused.to_string()))?;
         let permit = writers
             .permit(&answers::WRITTEN)

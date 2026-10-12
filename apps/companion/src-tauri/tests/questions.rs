@@ -665,9 +665,13 @@ fn keep_by_hand(
         answer: choice("main"),
         drafted_at_ms: TimestampMs::new(drafted_at_ms),
     };
-    let store = AnswerDrafts::open(root.join("kept-answers").join(environment_id.to_string()))
-        .expect("a store");
-    let writers = kr_ipc::install::hold_writers(&mut || {}).expect("the writers lock");
+    let kept = root.join("kept-answers");
+    let store = AnswerDrafts::open(kept.join(environment_id.to_string())).expect("a store");
+    let writers = kr_ipc::install::hold_writers(
+        &kr_ipc::install::Writing::in_roots(&kept, &kept),
+        &mut || {},
+    )
+    .expect("the writers lock");
     let permit = writers.permit(&WRITTEN).expect("the leave to write");
     store.keep(&draft, &permit).expect("kept");
     draft
