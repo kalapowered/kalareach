@@ -1749,3 +1749,127 @@ describe('what the entry to the kept drafts says', () => {
     expect(keptEntry({ ...none, kept: [kept] })?.title).toBe('One kept draft')
   })
 })
+
+describe('a composer that holds a file still uploading', () => {
+  /** A file the person added whose upload has not ended: nothing a store can keep, but theirs. */
+  const UPLOADING = {
+    localId: 'file-uploading',
+    transferId: null,
+    name: 'picture.png',
+    byteLen: 12,
+    mediaType: 'image/png',
+    presentedAsImage: false,
+    upload: 'uploading' as const,
+    acceptedUpstream: false,
+    handle: null
+  }
+
+  /** Puts the uploading file in a session's composer, as an attach does. */
+  function attach(book: DraftBook, sessionId: string): void {
+    book.update(sessionId, (draft) => ({ ...draft, attachments: [...draft.attachments, UPLOADING] }))
+  }
+
+  /** The file names a composer shows. */
+  const filesOf = (book: DraftBook, sessionId: string): string[] =>
+    book.draft(sessionId).attachments.map((file) => file.localId)
+
+  it('is not replaced by the text of a prompt the host refused, which is kept apart instead', async () => {
+    const store = new FakeDraftStore()
+    const book = await opened(store)
+    type(book, MAIN, 'send this')
+    await book.settled()
+    const token = book.beginSend(MAIN)
+    // The composer clears when the person presses Send, and they add a file while it is on its way.
+    type(book, MAIN, '')
+    attach(book, MAIN)
+    await book.settled()
+
+    book.endSend(token, 'refused')
+    await book.settled()
+
+    expect(filesOf(book, MAIN)).toEqual(['file-uploading'])
+    expect(book.draft(MAIN).text).toBe('')
+    expect(book.snapshot().kept.map((kept) => [kept.text, kept.why])).toEqual([['send this', 'sent']])
+    expect(store.all().map((draft) => draft.text)).toEqual(['send this'])
+  })
+
+  it('is not replaced by a stored draft when the store is read again', async () => {
+    const store = new FakeDraftStore()
+    const book = await opened(store)
+    attach(book, MAIN)
+    await book.settled()
+    // Another window writes a draft for the same session meanwhile.
+    const other = await opened(store)
+    type(other, MAIN, 'written in another window')
+    await other.settled()
+
+    await book.reload()
+    await book.settled()
+
+    expect(filesOf(book, MAIN)).toEqual(['file-uploading'])
+    expect(book.draft(MAIN).text).toBe('')
+    expect(book.snapshot().kept.map((kept) => kept.text)).toEqual(['written in another window'])
+  })
+
+  it('is not replaced by a kept draft the person puts in the composer; the draft stays listed', async () => {
+    const store = new FakeDraftStore()
+    const one = await opened(store)
+    type(one, MAIN, 'begun')
+    await one.settled()
+    const two = await opened(store)
+    type(two, MAIN, 'theirs')
+    await two.settled()
+    type(one, MAIN, 'mine')
+    await one.settled()
+
+    const restarted = await opened(store)
+    const mine = restarted.snapshot().kept.find((kept) => kept.text === 'mine')
+    // Their text is the composer's, and the person clears it and adds a file before choosing.
+    type(restarted, MAIN, '')
+    attach(restarted, MAIN)
+    await restarted.settled()
+
+    await restarted.useHere(mine?.id ?? '', mine?.revision ?? '')
+    await restarted.settled()
+
+    expect(filesOf(restarted, MAIN)).toEqual(['file-uploading'])
+    expect(restarted.draft(MAIN).text).toBe('')
+    expect(restarted.snapshot().kept.map((kept) => kept.text)).toContain('mine')
+    expect(store.all().map((draft) => draft.text)).toContain('mine')
+  })
+
+  it('stops a move of the composer’s draft to another session, and keeps the file', async () => {
+    const store = new FakeDraftStore()
+    const book = await opened(store)
+    book.update(MAIN, (draft) => ({ ...edit(draft, 'older', 1), state: 'conflicted' }))
+    await book.settled()
+    attach(book, MAIN)
+    await book.settled()
+    const id = store.all()[0]?.id ?? ''
+    const notices: string[] = []
+    book.onNotice((words) => notices.push(words))
+
+    await book.moveTo(id, BUILD, store.all()[0]?.revision ?? '')
+    expect(notices.join(' ')).toMatch(/has not finished uploading/)
+    expect(filesOf(book, MAIN)).toEqual(['file-uploading'])
+    expect(store.all().map((draft) => [draft.sessionId, draft.text])).toEqual([[MAIN, 'older']])
+  })
+
+  it('keeps a file added while a prompt was on its way when the host refuses it and the composer still shows its text', async () => {
+    // The phone keeps the sent text in its composer until the answer, and lets a file be picked.
+    const store = new FakeDraftStore()
+    const book = await opened(store)
+    type(book, MAIN, 'send this')
+    await book.settled()
+    const token = book.beginSend(MAIN)
+    await book.settled()
+    attach(book, MAIN)
+    await book.settled()
+
+    book.endSend(token, 'refused')
+    await book.settled()
+
+    expect(book.draft(MAIN).text).toBe('send this')
+    expect(filesOf(book, MAIN)).toEqual(['file-uploading'])
+  })
+})

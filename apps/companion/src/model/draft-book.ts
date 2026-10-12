@@ -227,6 +227,35 @@ function holdsNothing(draft: Draft): boolean {
   return draft.text.length === 0 && storable(draft).length === 0
 }
 
+/**
+ * Whether a composer holds nothing at all of the person's: no text and no file, whatever became of
+ * the file's upload. A file still uploading, or one that failed, is not something a store can
+ * keep, and is still the person's: a composer that holds one is not free to be replaced.
+ */
+function isEmpty(draft: Draft): boolean {
+  return draft.text.length === 0 && draft.attachments.length === 0
+}
+
+/** Whether a composer holds a file that no store can keep: its upload has not completed. */
+function holdsUnkeptFile(draft: Draft): boolean {
+  return draft.attachments.some((file) => file.upload !== 'uploaded' || file.handle === null)
+}
+
+/** What a composer's files that no store can keep are doing, in words that open a sentence. */
+function unkeptFileWords(draft: Draft): string {
+  const uploading = draft.attachments.some((file) => file.upload === 'uploading')
+  return uploading
+    ? 'A file in the composer has not finished uploading'
+    : 'A file in the composer was not uploaded'
+}
+
+/** What to do about it: wait for an upload that goes on, remove one that has failed. */
+function unkeptFileAdvice(draft: Draft): string {
+  return draft.attachments.some((file) => file.upload === 'uploading')
+    ? 'Wait for it, or remove it'
+    : 'Remove it'
+}
+
 /** Whether a composer holds the same text and files as a draft that was sent. */
 function holdsWhatWasSent(composer: Draft | undefined, sent: Draft): boolean {
   const files = (draft: Draft): string => storable(draft).map((handle) => handle.transfer_id).join(' ')
@@ -634,7 +663,7 @@ export class DraftBook {
     }
     const composer = this.#find(key)
     const same = composer !== undefined && composer.text === sent.text && sameFiles(composer, sent)
-    if (composer === undefined || (composer.stored === null && (holdsNothing(composer) || same))) {
+    if (composer === undefined || (composer.stored === null && (isEmpty(composer) || same))) {
       if (record !== null) {
         this.#clearFailure(flight.id)
         this.#adopt(key, sent, composer, record)
@@ -860,8 +889,15 @@ export class DraftBook {
    */
   #adopt(key: string, sent: Draft, composer: Draft | undefined, record: StoredRef | null): void {
     if (composer) this.#retire(composer)
+    // A file the composer gained since the press is the person's, and goes on the draft beside the
+    // files that were sent.
+    const gained =
+      composer?.attachments.filter(
+        (file) => !sent.attachments.some((sentFile) => sentFile.localId === file.localId)
+      ) ?? []
     const back: Draft = {
       ...sent,
+      attachments: [...sent.attachments, ...gained],
       draftId: key,
       revision: this.#above(key, (composer ?? sent).revision + 1),
       // What happened to the conversation since the press is a fact about it, which the text keeps.
@@ -938,6 +974,13 @@ export class DraftBook {
     const run = async (): Promise<void> => {
       if (keyed !== undefined && pressed !== undefined) await this.#stillThere(keyed, pressed)
       const composer = keyed === undefined ? undefined : this.#find(keyed)
+      if (composer && holdsUnkeptFile(composer)) {
+        // A move takes the composer away, and a file that is not stored would go with it.
+        this.#say(
+          `${unkeptFileWords(composer)}, so the draft was not moved. ${unkeptFileAdvice(composer)}, then move the draft.`
+        )
+        return
+      }
       // What the composer holds is stored first, so that the move acts on all of it, and on the
       // record it is stored under now: a write can have made a copy of it since the press.
       if (composer && (await this.#write(composer.draftId)) === 'failed') {
@@ -997,6 +1040,14 @@ export class DraftBook {
     const key = composerKey(sessionId)
     await this.#enqueueAwait(key, async () => {
       const composer = this.#find(key)
+      if (composer && holdsUnkeptFile(composer)) {
+        // Putting the draft there takes the composer's place, and a file that is not stored cannot
+        // be stored first, so it would be lost.
+        this.#say(
+          `${unkeptFileWords(composer)}, so the kept draft was not put there. It is still listed.`
+        )
+        return
+      }
       // The composer as it is when this begins: anything written in it from here on is the person's
       // newest, and is not put over, whether it is written while the store answers this or the next.
       const edited = composer
@@ -1348,7 +1399,7 @@ export class DraftBook {
     for (const sessionId of sessions) {
       const index = next.findIndex((draft) => draft.target.sessionId === sessionId)
       const mine = index === -1 ? undefined : next[index]
-      if (mine !== undefined && !(holdsNothing(mine) && mine.stored === null)) continue
+      if (mine !== undefined && !(isEmpty(mine) && mine.stored === null)) continue
       const pick = newest(
         list.filter(
           (stored) => stored.sessionId === sessionId && stored.copyOf === null && !held.has(stored.id)
