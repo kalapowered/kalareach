@@ -2367,20 +2367,7 @@ impl DeliveryJournal {
         // to it, and not longer: a notification that will not be presented again has no use for
         // the detail it moved out of its preview.
         if !holds_request {
-            let secret: Option<Vec<u8>> = transaction
-                .query_row(
-                    "SELECT secret FROM delivery_secret WHERE id = 0",
-                    [],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            if let Some(secret) = secret.and_then(|bytes| <[u8; 32]>::try_from(bytes).ok()) {
-                let object = crate::preview::detail_object_id(&secret, transition.notification_id);
-                transaction.execute(
-                    "DELETE FROM delivery_objects WHERE envelope_id = ?1",
-                    params![object.to_string()],
-                )?;
-            }
+            forget_detail_in(&transaction, &identifier)?;
         }
         match transition.next_attempt_at_ms {
             Some(due) if !transition.state.is_settled() => {
@@ -2990,11 +2977,31 @@ impl DeliveryJournal {
         Ok(())
     }
 
+    /// Records that the detail of a claimed notification may have left this host, in an object
+    /// placed in its device's mailbox.
+    ///
+    /// The notification is then one something has dispatched: privacy mode that takes it back
+    /// afterwards lists the copy among those that left instead of calling it unsent, and the
+    /// notification keeps whatever its push still has to do.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DeliveryError::JournalUnavailable`] when the write fails.
+    pub fn note_detail_left(&mut self, notification_id: NotificationId) -> Result<()> {
+        self.connection.execute(
+            "UPDATE delivery_notifications SET dispatched = 1
+              WHERE notification_id = ?1 AND state = 'in_flight'",
+            params![notification_id.to_string()],
+        )?;
+        Ok(())
+    }
+
     /// Forgets one kept object, because it has been placed where its device reads it or because
-    /// nothing will be presented that refers to it.
+    /// the mailbox will not take it.
     ///
     /// An object is kept for as long as it is owed to a mailbox: a row here is an object still to
-    /// be placed. Forgetting one that is not kept is not an error.
+    /// be placed. A settlement of the notification that refers to it forgets it too. Forgetting
+    /// one that is not kept is not an error.
     ///
     /// # Errors
     ///
@@ -4184,12 +4191,40 @@ fn settle_in(
         "DELETE FROM delivery_outbox WHERE notification_id = ?1",
         params![identifier],
     )?;
+    // No request is left to refer to the encrypted object a preview moved its detail into.
+    forget_detail_in(transaction, identifier)?;
     if !state.may_still_arrive() {
         transaction.execute(
             "UPDATE delivery_budget
              SET collapse_into = NULL, collapse_opened_at_ms = NULL, collapse_count = 0
              WHERE collapse_into = ?1",
             params![identifier],
+        )?;
+    }
+    Ok(())
+}
+
+/// Forgets the encrypted object one notification's preview refers to, inside a transaction the
+/// caller owns.
+///
+/// The object's identifier is derived from the notification's with the journal's secret, so the
+/// row is found without a column of its own for it. A row that is not there is not an error.
+fn forget_detail_in(transaction: &rusqlite::Transaction<'_>, identifier: &str) -> Result<()> {
+    let Ok(notification_id) = identifier.parse::<kr_protocol::ids::NotificationId>() else {
+        return Ok(());
+    };
+    let secret: Option<Vec<u8>> = transaction
+        .query_row(
+            "SELECT secret FROM delivery_secret WHERE id = 0",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(secret) = secret.and_then(|bytes| <[u8; 32]>::try_from(bytes).ok()) {
+        let object = crate::preview::detail_object_id(&secret, notification_id);
+        transaction.execute(
+            "DELETE FROM delivery_objects WHERE envelope_id = ?1",
+            params![object.to_string()],
         )?;
     }
     Ok(())
