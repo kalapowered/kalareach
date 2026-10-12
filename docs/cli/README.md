@@ -1430,8 +1430,9 @@ document is the host's whole result with the failure's code and status beside it
 `kr device list [--include-revoked]` lists the devices paired with this host: each one's
 identifier, its name, whether it is an owner device, and the last authority revision it
 acknowledged. `--json` also gives each device's platform, when its pairing ends, whether the host
-finds the pairing run out and whether the pairing opens every session. A device that is offline cannot apply a revocation it has not received, and the
-acknowledgement is how you see which devices have.
+finds the pairing run out and whether the pairing opens every session. A device that is offline
+cannot apply a revocation it has not received, and the acknowledgement is how you see which devices
+have.
 
 `kr device revoke <device>` revokes a device and every grant it holds. An identifier this host never
 paired is refused with `RESOURCE_UNAVAILABLE` and nothing is sent; a device already revoked answers
@@ -1451,12 +1452,14 @@ a session's control to another device. The device is a guest, or any device whos
 already open every session. An owner device, a device whose pairing opens every session, a device
 whose pairing has run out and a revoked device are refused, each with its reason.
 
-`kr share invite` will tell you what the invitation carries before it exists: the role in words, the
-rights it compiles to, when it ends, what the device will see of the session, and the host's
-sentence for each consequence of the rights. With `--live` it also prints the lines on the session's
-screen now, with anything a terminal would act on written out as an escape, and it refuses a screen
-too large for a preview. The preview is the screen as it is when read. When the device opens the
-session, a resize or a program that switches screens can bring earlier lines into view, and the
+`kr share invite` shows the details of the invitation being sent, namely, the identifier and name of
+the device, the name of the role and the rights that it represents, the end time, what the device
+will see of the session, the host's sentence for each consequence of the rights, and a list of any
+shares of the session that the device already holds. If `--live` is specified, the lines that are
+currently displayed on the screen are also shown, with any terminal control characters written out
+as an escape, and the command refuses a screen too big for a preview. The screen shown is the screen
+at the time it is read. If the device opens the session, and then either resizes its terminal or
+runs a program that changes the screen displayed, earlier lines may be scrolled into view, and the
 command says so.
 
 An invitation that carries a consequence or the live screen is issued only after `share` is typed at
@@ -1471,17 +1474,26 @@ never longer than the pairing. After the host writes the invitation, the command
 the host kept with the lines it showed. If they differ, it prints the lines the host kept and the
 command that withdraws the invitation.
 
-If the host's reply is lost, the command asks again with exactly the request it sent, on a
-connection of its own, and then reads the host's state. It prints the identifier of the grant before
-it sends. It reports that an invitation did not happen only once nothing more of it can, and
-otherwise it exits non-zero as unfinished. If the command is interrupted, `kr share list <session>
---all` shows what the host holds.
+Before it sends, the command prints the identifier of the grant it would write, the command that
+lists what the host holds, and the time until which the host can still act on the request. If the
+reply to the invitation is not received, exactly the same request is sent again, on a connection of
+its own, and the state of the host is read. The command reports that the invitation did not happen
+only once nothing more of it can. If it cannot read the host for a minute after that time, it stops,
+says what it does not know and exits with a non-zero exit code, indicating that the outcome is
+unfinished. After a lost invitation, the command first prints what the host shows for that device,
+so that if the command is run again, the run starts from what is already there.
+
+If `--json` is specified, `kr share invite` prints the identifiers of the grant, invitation,
+session, and device, the name of the role, the actions, the end time, and an indication of whether
+the screen has changed. If it has, the document also holds the lines the host kept. It always holds
+the command that withdraws the invitation.
 
 `kr share list` shows each share with its state (waiting to be accepted, active, ended or revoked),
-the device it goes to, its role, its session and when it ends. `kr share revoke` takes a share back,
-or withdraws an invitation nobody has accepted. A revocation is complete when every affected
-session's worker has fenced it; until then it is pending, and the command names what it waits for
-and exits with 1. Asking again is a new revocation. What the device already saw stays with it.
+the device it goes to, its role, whether it includes the live screen, its session and when it ends.
+`kr share revoke` takes a share back, or withdraws an invitation nobody has accepted. A revocation
+is complete when every affected session's worker has fenced it; until then it is pending, and the
+command names what it waits for and exits with 1. Asking again is a new revocation. What the device
+already saw stays with it.
 
 `kr share transfer` hands a session's control to another device. The host describes the transfer
 from its own records, an owner device confirms exactly that plan, and the command then sends the
