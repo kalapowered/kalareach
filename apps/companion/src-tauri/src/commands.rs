@@ -881,9 +881,11 @@ read_command!(
     kr_protocol::transfer::UploadStatusParams => kr_protocol::transfer::UploadStatusResult
 );
 
-mutate_command!(
-    /// Creates a session.
+mutate_result_command!(
+    /// Creates a session, and answers with the method's own result: the page names the new session
+    /// in the next call, so its identifier has to be written as the protocol writes one.
     session_create, Method::SessionCreate, kr_protocol::session::SessionCreateParams
+        => kr_protocol::session::SessionCreateResult
 );
 mutate_command!(
     /// Closes a session, after the interface has shown what closing does.

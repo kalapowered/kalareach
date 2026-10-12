@@ -1,11 +1,12 @@
 //! The commands the control daemon on this machine answers, called the way the page calls them.
 //!
 //! The daemon is kr-controller's in-process host on a temporary tree on the internal disk, with its
-//! secret store a file inside that tree, so nothing here reaches this computer's keychain. It starts
-//! no worker. Each command goes through the invoke path with the parameters the page writes, and
-//! each answer the page is given is read back into the method's own type: so what is checked is
-//! that the host takes the shape the page sends, and that the page is given a shape the protocol
-//! defines.
+//! secret store a file inside that tree, so nothing here reaches this computer's keychain. It
+//! starts no worker, except in the cases that create a session, which start the product's own
+//! worker as a process of its own and end it with the test. Each command goes through the invoke
+//! path with the parameters the page writes, and each answer the page is given is read back into
+//! the method's own type: so what is checked is that the host takes the shape the page sends, and
+//! that the page is given a shape the protocol defines.
 
 #![cfg(unix)]
 
@@ -14,10 +15,11 @@ use std::sync::Arc;
 
 use kr_client::ipc::IpcTransport;
 use kr_controller::service::{Controller, ControllerSetup};
-use kr_controller::supervision::{LaunchOutcome, WorkerLaunch, WorkerSupervisor};
+use kr_controller::supervision::{
+    DetachedSupervisor, LaunchOutcome, WorkerLaunch, WorkerSupervisor,
+};
 use kr_crypto::store::{StoreSelection, open_store_in};
 use kr_ipc::endpoint::Listener;
-use kr_ipc::testing::TempHost;
 use kr_ipc::verify::ControllerIdentity;
 use serde_json::{Value, json};
 use tauri::Manager as _;
@@ -26,10 +28,17 @@ use tauri::test::MockRuntime;
 /// Where the bundle's pages are served from.
 const BUNDLE: &str = "tauri://localhost";
 
+#[path = "../../../../crates/kr-controller/tests/teardown/mod.rs"]
+mod teardown;
+
 /// How long one command may take before the test calls it hung.
 const WATCHDOG: std::time::Duration = std::time::Duration::from_secs(20);
 
-/// A supervisor that starts nothing. These tests create no sessions.
+/// How long a creation that starts a real worker may take before the test calls it hung: the host
+/// itself waits up to half a minute for the worker to report.
+const WORKER_START: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// A supervisor that starts nothing, for the cases that create no session.
 #[derive(Debug)]
 struct RefusingSupervisor;
 
@@ -45,13 +54,49 @@ impl WorkerSupervisor for RefusingSupervisor {
     }
 }
 
+/// Whether the daemon starts the sessions' workers.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Workers {
+    /// None: a creation is refused by the supervisor, after the daemon has read it.
+    None,
+    /// The product's own worker, as a process of its own that the test's tree ends.
+    Live,
+}
+
+/// The worker binary this workspace built, copied to the internal disk and started once there.
+///
+/// # Panics
+///
+/// Panics when the build has no worker: a case that skipped would report a pass for a creation it
+/// never ran. A workspace test run builds the worker, and so does `cargo build -p kr-worker`.
+fn worker_binary(into: &std::path::Path) -> PathBuf {
+    let mut directory = std::env::current_exe().expect("the test binary");
+    directory.pop();
+    if directory.file_name().is_some_and(|name| name == "deps") {
+        directory.pop();
+    }
+    let built = directory.join("kr-worker");
+    assert!(
+        built.is_file(),
+        "this case starts a real worker process and there is none at {}; build it with \
+         `cargo build -p kr-worker`",
+        built.display()
+    );
+    let copied = into.join("kr-worker");
+    kr_ipc::testing::place_and_start_once(&built, &copied, &["--version"]);
+    copied
+}
+
 /// The daemon of one test and the application connected to it.
 struct Host {
-    tree: TempHost,
+    /// The tree, which ends every worker its daemon started before it goes.
+    tree: teardown::Tree,
     /// The description host's test placement, which goes when the daemon's test does.
     _placed: Option<kr_controller::describe::hooks::Placed>,
     _controller: Arc<Controller>,
     clients: tokio::task::JoinHandle<kr_controller::error::Result<()>>,
+    /// Serves the workers' rendezvous, when the daemon starts any.
+    rendezvous: Option<tokio::task::JoinHandle<kr_controller::error::Result<()>>>,
     /// Serves the attachment-chunk endpoint, which a file's chunks travel on.
     chunks: tokio::task::JoinHandle<()>,
     app: tauri::App<MockRuntime>,
@@ -64,20 +109,35 @@ impl Drop for Host {
     fn drop(&mut self) {
         self.clients.abort();
         self.chunks.abort();
+        if let Some(rendezvous) = &self.rendezvous {
+            rendezvous.abort();
+        }
     }
 }
 
 impl Host {
     /// Starts the daemon, and an application whose connection is to it.
     async fn start() -> Self {
-        Self::start_describing(None).await
+        Self::start_with(None, Workers::None).await
+    }
+
+    /// Starts the daemon as `start` does, and lets it start the workers of the sessions it creates.
+    async fn start_creating_sessions() -> Self {
+        Self::start_with(None, Workers::Live).await
     }
 
     /// Starts the daemon as `start` does, with its description host choosing from `catalogue` when
     /// one is given, and told that nothing stands in the way of a model: the memory is free and
     /// the power is the mains'.
     async fn start_describing(catalogue: Option<kr_describe::testing::TestCatalogue>) -> Self {
-        let tree = TempHost::create();
+        Self::start_with(catalogue, Workers::None).await
+    }
+
+    async fn start_with(
+        catalogue: Option<kr_describe::testing::TestCatalogue>,
+        workers: Workers,
+    ) -> Self {
+        let tree = teardown::Tree::create();
         let environment = tree.environment();
         let environment_id = tree.environment_id();
         let placed = catalogue.map(|signed| {
@@ -102,6 +162,16 @@ impl Host {
         });
         let secrets = environment.secrets_dir();
         let build_id = companion_tauri::connection::build_id().expect("a build identity");
+        let (supervisor, worker_program): (Box<dyn WorkerSupervisor>, PathBuf) = match workers {
+            Workers::None => (
+                Box::new(RefusingSupervisor),
+                PathBuf::from("/nonexistent/kr-worker"),
+            ),
+            Workers::Live => (
+                Box::new(DetachedSupervisor::new()),
+                worker_binary(tree.root()),
+            ),
+        };
         let controller = Controller::start(ControllerSetup {
             paths: environment.clone(),
             environment_id,
@@ -115,8 +185,8 @@ impl Host {
             }),
             secret_store: StoreSelection::File,
             boot_identity: kr_ipc::identity::boot_identity().expect("a boot identity"),
-            supervisor: Box::new(RefusingSupervisor),
-            worker_program: PathBuf::from("/nonexistent/kr-worker"),
+            supervisor: tree.supervisor(supervisor),
+            worker_program,
             build_id: build_id.clone(),
             release: "0".to_owned(),
             shell_packages: None,
@@ -127,6 +197,11 @@ impl Host {
         let endpoint = environment.controller_endpoint().expect("an endpoint");
         let listener = Listener::bind(&endpoint).expect("binds the control endpoint");
         let clients = tokio::spawn(Arc::clone(&controller).serve_clients(listener));
+        let rendezvous = (workers == Workers::Live).then(|| {
+            let listener = Listener::bind(&environment.rendezvous_endpoint().expect("an endpoint"))
+                .expect("binds the workers' rendezvous endpoint");
+            tokio::spawn(Arc::clone(&controller).serve_rendezvous(listener))
+        });
         let chunk_listener = kr_controller::transfer::bind_chunk_endpoint(&environment)
             .expect("binds the attachment-chunk endpoint");
         let chunks = tokio::spawn(kr_controller::transfer::serve_chunks(
@@ -150,6 +225,8 @@ impl Host {
                 companion_tauri::commands::catalogue_list,
                 companion_tauri::commands::history_page,
                 companion_tauri::commands::session_create,
+                companion_tauri::commands::session_close,
+                companion_tauri::commands::session_read,
                 companion_tauri::commands::draft_create,
                 companion_tauri::commands::draft_add_attachment,
                 companion_tauri::commands::description_setup,
@@ -177,6 +254,7 @@ impl Host {
             _placed: placed,
             _controller: controller,
             clients,
+            rendezvous,
             chunks,
             app,
             window,
@@ -214,6 +292,16 @@ impl Host {
 
     /// Calls `command` as the page does, and waits for its answer.
     async fn call(&self, command: &'static str, body: Value) -> Result<Value, Value> {
+        self.call_within(command, body, WATCHDOG).await
+    }
+
+    /// Calls `command` as the page does, and waits up to `limit` for its answer.
+    async fn call_within(
+        &self,
+        command: &'static str,
+        body: Value,
+        limit: std::time::Duration,
+    ) -> Result<Value, Value> {
         assert!(
             companion_tauri::commands::NAMED_COMMANDS
                 .iter()
@@ -241,9 +329,9 @@ impl Host {
                     .expect("an answer the page reads")
             })
         });
-        tokio::time::timeout(WATCHDOG, answer)
+        tokio::time::timeout(limit, answer)
             .await
-            .expect("the command answered within the watchdog")
+            .expect("the command answered within its limit")
             .expect("the command's thread finished")
     }
 }
@@ -556,36 +644,41 @@ async fn an_answer_kept_for_a_session_whose_worker_has_gone_is_settled_as_gone()
     assert_eq!(settled[0]["standing"], "gone", "{settled}");
 }
 
+/// What the page writes to create an invisible session of the given shell mode in `cwd`.
+fn creation(host: &Host, shell_mode: &str, shell: Value, cwd: &str) -> Value {
+    json!({
+        "params": {
+            "environment_id": host.environment_id(),
+            "presentation": "invisible",
+            "shell": shell,
+            "shell_mode": shell_mode,
+            "cwd": cwd,
+            "dimensions": null,
+            "worker_profile": "headless_user",
+            "environment_snapshot": [],
+            "palette": null,
+            "launch_profile": {
+                "startup": "host_default",
+                "fenced_launch": false,
+                "command_integrations": []
+            },
+            "terminal": null
+        },
+        "subject": {}
+    })
+}
+
 /// KR-REQ-07.21: a creation of a stock shell, written as the page writes it, reaches the host's own
 /// create path. This daemon starts no workers, so what answers is the host's refusal to start one,
 /// which it can only give for a request it read.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_stock_shells_creation_reaches_the_host_as_the_page_writes_it() {
     let host = Host::start().await;
-    let creation = |shell_mode: &str| {
-        json!({
-            "params": {
-                "environment_id": host.environment_id(),
-                "presentation": "invisible",
-                "shell": null,
-                "shell_mode": shell_mode,
-                "cwd": "/",
-                "dimensions": null,
-                "worker_profile": "headless_user",
-                "environment_snapshot": [],
-                "palette": null,
-                "launch_profile": {
-                    "startup": "host_default",
-                    "fenced_launch": false,
-                    "command_integrations": []
-                },
-                "terminal": null
-            },
-            "subject": {}
-        })
-    };
     let refusal = host
-        .call("session_create", creation("native_compat"))
+        .call(
+            "session_create",
+            creation(&host, "native_compat", Value::Null, "/"),
+        )
         .await
         .expect_err("this daemon starts no workers");
     assert!(refused_by_the_host(&refusal), "{refusal}");
@@ -599,10 +692,67 @@ async fn a_stock_shells_creation_reaches_the_host_as_the_page_writes_it() {
 
     // The control: a shell the protocol does not name is refused before anything is sent.
     let unnamed = host
-        .call("session_create", creation("stock"))
+        .call("session_create", creation(&host, "stock", Value::Null, "/"))
         .await
         .expect_err("a shell mode the protocol does not name");
     assert!(!refused_by_the_host(&unnamed), "{unnamed}");
+}
+
+/// KR-REQ-07.21: the session a creation answers with is the session the page opens next. The page
+/// reads the new session's identifier from the answer of `session_create` and names it in
+/// `session_read`, so the answer carries it in the protocol's own JSON form (an identifier as
+/// hyphenated text, a counter as a decimal string), and the host answers for the session it names.
+/// The daemon starts the product's own worker here, so the creation is a real one.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_created_sessions_identifier_is_one_the_page_can_open() {
+    let host = Host::start_creating_sessions().await;
+    let work = host.tree.root().join("w");
+    std::fs::create_dir(&work).expect("a directory on the internal disk");
+
+    let created = host
+        .call_within(
+            "session_create",
+            creation(
+                &host,
+                "native_compat",
+                json!("/bin/sh"),
+                &work.display().to_string(),
+            ),
+            WORKER_START,
+        )
+        .await
+        .expect("the host creates the session");
+    let session_id = created["value"]["session"]["session_id"]
+        .as_str()
+        .expect("the new session's identifier");
+    // The page names this text in the next call, so it has to be an identifier as the protocol
+    // writes one.
+    session_id
+        .parse::<kr_protocol::ids::SessionId>()
+        .unwrap_or_else(|error| panic!("{session_id:?} is not a session identifier: {error}"));
+    let result: kr_protocol::session::SessionCreateResult = typed(created["value"].clone());
+    assert!(!result.deduplicated, "{created}");
+
+    let read: kr_protocol::session::SessionReadResult = typed(
+        host.call(
+            "session_read",
+            json!({ "params": { "session_id": session_id } }),
+        )
+        .await
+        .expect("the host reads the session the creation named"),
+    );
+    assert_eq!(read.session.session_id, result.session.session_id);
+
+    // The case closes what it made, as the page would: the worker ends with its session.
+    host.call(
+        "session_close",
+        json!({
+            "params": { "session_id": session_id },
+            "subject": { "sessionId": session_id, "sessionEpoch": "1" }
+        }),
+    )
+    .await
+    .expect("the host closes the session");
 }
 
 /// KR-REQ-13.14: a file the page hands over is given a path on the host through the commands the

@@ -1264,6 +1264,7 @@ dependencies = [
  "objc2",
  "objc2-foundation",
  "objc2-local-authentication",
+ "rusqlite",
  "serde",
  "serde_json",
  "sha2 0.11.0",

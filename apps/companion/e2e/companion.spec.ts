@@ -3738,6 +3738,9 @@ test.describe('a new session and its shell', () => {
     await still(page, 'shell-difference-before-creation-07.21')
 
     await sheet.getByRole('button', { name: 'Create session' }).click()
+    // The view that opens is the created session's: the host read it by the identifier the
+    // creation gave, and its directory is the one that was typed.
+    await expect(page.locator('.session-meta')).toHaveText('/Users/rs/work/notes')
     const status = page.getByTestId('shell-mode')
     await expect(status).toContainText('Stock shell')
     await expect(status).toContainText('Ctrl-D can close this session')
