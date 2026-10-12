@@ -641,7 +641,7 @@ fn grants_written(world: &fake::Silent) -> usize {
 /// Whether the daemon holds the invitation a share written as `action` carries: a share's
 /// invitation takes its identity from its action.
 fn invitation_written(world: &fake::Silent, action: u8) -> bool {
-    let (_, invitation_id) = crate::service::Controller::share_identities(
+    let (_, invitation_id) = kr_protocol::sharing::share_identities(
         &ActorId::new("local:test").expect("a principal"),
         Uuid::from_bytes([action; 16]),
     );

@@ -8,6 +8,7 @@ use kr_protocol::broker::{DecoderLedgerEntry, MAX_PROJECTION_SUMMARY_LEN};
 use kr_protocol::envelope::{ControlFrame, MutationRequest, ParamsValue};
 use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::gateway::{PendingKind, PendingResource};
+use kr_protocol::grant::GrantExpiry;
 use kr_protocol::ids::{ActorId, PendingResourceId, SessionId};
 use kr_protocol::method::Method;
 use kr_protocol::projection::AgentResourceSnapshotContinuation;
@@ -179,7 +180,7 @@ impl Controller {
                 Some(Method::GrantRevoke | Method::DeviceRevoke | Method::GrantTransfer) => None,
                 Some(Method::GrantCreate) => {
                     let (grant_id, invitation_id) =
-                        Self::share_identities(actor_id, mutation.action_id.get());
+                        kr_protocol::sharing::share_identities(actor_id, mutation.action_id.get());
                     Some(self.sharing.shared(grant_id, invitation_id).and_then(
                         |shared| match shared {
                             Some(shared) => encode(&shared),
@@ -246,7 +247,10 @@ impl Controller {
                     && self
                         .sharing
                         .grants()
-                        .record(Self::transfer_identity(actor_id, mutation.action_id))?
+                        .record(kr_protocol::sharing::transfer_identity(
+                            actor_id,
+                            mutation.action_id,
+                        ))?
                         .is_some()
             }
             _ => false,
@@ -265,7 +269,10 @@ impl Controller {
             let replacement = self
                 .sharing
                 .grants()
-                .record(Self::transfer_identity(actor_id, mutation.action_id))?
+                .record(kr_protocol::sharing::transfer_identity(
+                    actor_id,
+                    mutation.action_id,
+                ))?
                 .ok_or_else(unfinished_and_unknown)?
                 .grant;
             return encode(
@@ -348,13 +355,143 @@ impl Controller {
         params: &ParamsValue,
     ) -> Result<ParamsValue> {
         let params: kr_protocol::sharing::GrantListParams = parse(params)?;
-        let result = self.sharing.list_for_issuer(
+        let mut result = self.sharing.list_for_issuer(
             issuer,
             params.session_id.as_ref().copied(),
             params.include_resolved,
             self.settled_now_ms(),
         )?;
+        // A device's pairing bounds everything the device does, so a grant ends no later than its
+        // recipient's pairing does, whatever its own expiry says: a share written before this host
+        // refused one that outlasts the pairing is listed with the end it really has.
+        for summary in &mut result.grants {
+            let Some(record) = self
+                .devices
+                .record_for_device(summary.grant.recipient_device_id)?
+            else {
+                continue;
+            };
+            if let GrantExpiry::At { expires_at_ms } = record.grant.expiry {
+                let earlier = summary
+                    .ends_at_ms
+                    .as_ref()
+                    .map_or(expires_at_ms, |own| (*own).min(expires_at_ms));
+                summary.ends_at_ms = Nullable::some(earlier);
+            }
+        }
         encode(&result)
+    }
+
+    /// How one device's pairing stands, as this host decides it.
+    ///
+    /// Whether a pairing has run out is decided as admission decides it, on both clocks: the
+    /// settled UTC expiry and the deadline anchored on the continuous clock. It is not read from
+    /// the device record, which changes only when the host first finds the end.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when the pairing's lifetime cannot be read or an end found cannot be
+    /// written down.
+    pub(crate) fn pairing_facts(
+        &self,
+        record: &net::devices::DeviceRecord,
+    ) -> Result<PairingFacts> {
+        let ends_at_ms = match record.grant.expiry {
+            GrantExpiry::At { expires_at_ms } => Some(expires_at_ms.get()),
+            GrantExpiry::Never => None,
+        };
+        let in_force = record.is_paired() && self.lifetimes().in_force(record)?;
+        let all_sessions = matches!(
+            record.grant.session_selector,
+            kr_protocol::grant::SessionSelector::Any
+        ) && record
+            .grant
+            .environment_selector
+            .admits(self.paths.environment_id());
+        Ok(PairingFacts {
+            ends_at_ms,
+            in_force,
+            all_sessions,
+        })
+    }
+
+    /// Refuses a share that a recipient's pairing cannot carry.
+    ///
+    /// A device's pairing bounds everything it does, so a share to a device this host does not
+    /// pair with, one that was revoked, one whose pairing has run out, or one that would outlast
+    /// its pairing, is a share that ends early or never works. It is refused here, with the reason,
+    /// and never clamped to the pairing's end: an invitation silently shortened is one whose issuer
+    /// believes something untrue about it. A paired device that delegates is told in one sentence
+    /// that does not say anything about another device's pairing, because `device.list` needs
+    /// `host.manage` and this would be a way round it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::PermissionDenied`] for a recipient this host does not pair with
+    /// and [`ControllerError::InvalidArgument`] for a share that would outlast its recipient's
+    /// pairing or whose lifetime is out of bounds.
+    fn check_recipient_pairing(
+        &self,
+        caller: AuthorityCaller,
+        request: &crate::sharing::ShareRequest,
+    ) -> Result<()> {
+        let delegating = matches!(caller, AuthorityCaller::Device(_));
+        let recipient = |detail: &str| {
+            if delegating {
+                ControllerError::PermissionDenied {
+                    detail: DELEGATED_SHARE_REFUSAL.to_owned(),
+                }
+            } else {
+                ControllerError::PermissionDenied {
+                    detail: detail.to_owned(),
+                }
+            }
+        };
+        let record = self
+            .devices
+            .record_for_device(request.recipient_device_id)?
+            .ok_or_else(|| recipient("this host does not pair with that device"))?;
+        if record.revoked_at_ms.is_some() {
+            return Err(recipient(
+                "that device was revoked, and a share to it would never work",
+            ));
+        }
+        let facts = self.pairing_facts(&record)?;
+        if !facts.in_force {
+            return Err(recipient(
+                "that device's pairing has run out; it has to be paired again before a session \
+                 is shared with it",
+            ));
+        }
+        let proposed = crate::sharing::roles::compile(
+            &request.selection,
+            request.session_id,
+            request.lifetime_ms,
+            request.now_ms,
+        )?;
+        if let (
+            GrantExpiry::At {
+                expires_at_ms: share_ends,
+            },
+            Some(pairing_ends),
+        ) = (proposed.expiry, facts.ends_at_ms)
+            && share_ends.get() > pairing_ends
+        {
+            // A paired device that delegates gets the same refusal, with the same code, for every
+            // way a recipient cannot carry the share, so none of them tells it anything of
+            // another device's pairing.
+            if delegating {
+                return Err(ControllerError::PermissionDenied {
+                    detail: DELEGATED_SHARE_REFUSAL.to_owned(),
+                });
+            }
+            return Err(ControllerError::InvalidArgument(format!(
+                "that device's pairing ends in {}, before this share would; choose a shorter \
+                 lifetime or pair the device again",
+                how_long(pairing_ends.saturating_sub(request.now_ms))
+            )));
+        }
+        Ok(())
     }
 
     /// Lists the paired devices, with each one's last authority acknowledgement.
@@ -381,6 +518,7 @@ impl Controller {
                 continue;
             }
             let acknowledged = self.authority_feed().last_acknowledgement(record.device_id);
+            let pairing = self.pairing_facts(&record)?;
             devices.push(kr_protocol::sharing::DeviceSummary {
                 device_id: record.device_id,
                 display_name: record.device_name.as_str().to_owned(),
@@ -394,6 +532,14 @@ impl Controller {
                     .grant
                     .actions
                     .contains(&kr_protocol::rights::ActionRight::HostManage),
+                platform: record.platform,
+                grant_expires_at_ms: kr_protocol::scalars::Nullable(
+                    pairing
+                        .ends_at_ms
+                        .map(kr_protocol::scalars::TimestampMs::new),
+                ),
+                grant_expired: !pairing.in_force,
+                all_sessions: pairing.all_sessions,
             });
         }
         devices.sort_by_key(|device| device.device_id);
@@ -835,7 +981,8 @@ impl Controller {
                     .to_owned(),
             ));
         }
-        let (grant_id, invitation_id) = Self::share_identities(actor_id, mutation.action_id.get());
+        let (grant_id, invitation_id) =
+            kr_protocol::sharing::share_identities(actor_id, mutation.action_id.get());
         let mut request = crate::sharing::ShareRequest {
             invitation_id,
             grant_id,
@@ -869,6 +1016,7 @@ impl Controller {
             self.settle_floor();
             allowed?;
         }
+        self.check_recipient_pairing(caller, &request)?;
         let named = self
             .named_previews(params.session_id, &params.selection)
             .await?;
@@ -1227,6 +1375,26 @@ impl Controller {
                  would keep control of the session",
             ));
         }
+        // The receiving device's grant ends where the one it replaces does, and no pairing carries
+        // a grant past its own end: refused here, before an owner is asked to confirm what the
+        // write would refuse.
+        if !self.pairing_facts(&to)?.in_force {
+            return Err(denied("the receiving device's pairing has run out"));
+        }
+        if let (
+            GrantExpiry::At {
+                expires_at_ms: share_ends,
+            },
+            GrantExpiry::At {
+                expires_at_ms: pairing_ends,
+            },
+        ) = (source.grant.expiry, to.grant.expiry)
+            && share_ends.get() > pairing_ends.get()
+        {
+            return Err(denied(
+                "the receiving device's pairing ends before the access it would be given",
+            ));
+        }
         let to_keys = to.public_keys().ok_or_else(|| {
             denied("this host does not hold all four keys of the receiving device")
         })?;
@@ -1248,7 +1416,7 @@ impl Controller {
             to_device_name: to.device_name.clone(),
             to_keys,
             to_key_revision: to.device_key_revision,
-            new_grant_id: Self::transfer_identity(actor_id, action_id),
+            new_grant_id: kr_protocol::sharing::transfer_identity(actor_id, action_id),
             environment_selector: source.grant.environment_selector.clone(),
             actions,
             history: source.grant.history.clone(),
@@ -1981,62 +2149,38 @@ impl Controller {
         })
     }
 
-    /// The identities of the grant and of the invitation that carries it, for a share written by
-    /// `actor_id` as `action`.
-    ///
-    /// They are derived from the actor and the action the caller named, not minted fresh. An
-    /// attempt that ended before it recorded its answer therefore left a grant and an invitation
-    /// this host can find by that actor's action, and a retry is answered from them. An action is
-    /// claimed per actor, so two actors that send one action identifier write two shares, and
-    /// neither finds the other's.
-    pub(super) fn share_identities(
-        actor_id: &ActorId,
-        action: kr_protocol::scalars::Uuid,
-    ) -> (kr_protocol::ids::GrantId, kr_protocol::ids::InvitationId) {
-        (
-            kr_protocol::ids::GrantId::new(Self::derived_identity(
-                action,
-                format!("grant/{}", actor_id.as_str()).as_bytes(),
-            )),
-            kr_protocol::ids::InvitationId::new(Self::derived_identity(
-                action,
-                format!("invitation/{}", actor_id.as_str()).as_bytes(),
-            )),
-        )
-    }
-
-    /// The identity of the grant a transfer writes, derived from the actor that performs it and
-    /// its action, so the plan an owner confirms names it before the action exists, and a retry
-    /// finds it.
-    pub(super) fn transfer_identity(
-        actor_id: &ActorId,
-        action_id: kr_protocol::ids::ActionId,
-    ) -> kr_protocol::ids::GrantId {
-        kr_protocol::ids::GrantId::new(Self::derived_identity(
-            action_id.get(),
-            format!("transfer/{}", actor_id.as_str()).as_bytes(),
-        ))
-    }
-
-    /// One identity derived from an action identifier and a purpose.
-    ///
-    /// Two identities from one action have to differ, and both have to be the same on a retry, so
-    /// they are the digest of the action and a purpose label rather than anything freshly random.
-    fn derived_identity(
-        action: kr_protocol::scalars::Uuid,
-        purpose: &[u8],
-    ) -> kr_protocol::scalars::Uuid {
-        let digest =
-            kr_cbor::sha256(&[b"kr-sharing/1".as_slice(), purpose, action.as_bytes()].concat());
-        let mut bytes = [0_u8; 16];
-        bytes.copy_from_slice(&digest[..16]);
-        kr_protocol::scalars::Uuid::from_bytes(bytes)
-    }
-
     /// This host's own device identity, derived from its environment.
     #[must_use]
     pub(super) fn host_device_id(&self) -> kr_protocol::ids::DeviceId {
         kr_protocol::ids::DeviceId::new(self.paths.environment_id().get())
+    }
+}
+
+/// What a paired device is told when a share it delegates cannot be carried by its recipient's
+/// pairing: one sentence that names nothing of another device's pairing.
+const DELEGATED_SHARE_REFUSAL: &str =
+    "this host cannot share the session with that device for that long";
+
+/// How one device's pairing stands ([`Controller::pairing_facts`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PairingFacts {
+    /// When the pairing ends, in UTC milliseconds. None for a pairing that never ends.
+    pub(crate) ends_at_ms: Option<u64>,
+    /// Whether the pairing is in force now, on both clocks.
+    pub(crate) in_force: bool,
+    /// Whether the pairing admits every session of this environment.
+    pub(crate) all_sessions: bool,
+}
+
+/// A span in words a person reads in a refusal: whole days, hours or minutes, rounded down.
+fn how_long(ms: u64) -> String {
+    let minutes = ms / 60_000;
+    match minutes {
+        0 => "less than a minute".to_owned(),
+        1 => "1 minute".to_owned(),
+        2..=119 => format!("{minutes} minutes"),
+        120..=2_879 => format!("{} hours", minutes / 60),
+        _ => format!("{} days", minutes / 1_440),
     }
 }
 

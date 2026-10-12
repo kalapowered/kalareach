@@ -362,3 +362,44 @@ async fn kr_req_18_03_a_transfer_the_owner_did_not_confirm_hands_nothing_over() 
     giving.close();
     host.stop().await;
 }
+
+/// KR-REQ-18.03: a transfer to a device whose pairing ends before the access it would be given is
+/// refused when the host is asked to describe it, so an owner device is never asked to confirm
+/// what the host would then refuse: a pairing bounds everything its device does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_18_03_a_transfer_to_a_device_whose_pairing_ends_first_is_not_described() {
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    let (giver, giver_record) = recipient(&host, &owner).await;
+    let (_taker, taker_record) =
+        net_support::recipient_ending_in(&host, &owner, std::time::Duration::from_secs(5 * 60))
+            .await;
+    let session_id = SessionId::new(kr_ipc::new_uuid());
+    // An owner's share lasts an hour unless it is told otherwise: the taker's pairing has five
+    // minutes of it.
+    let (held, _giving) = owned_by(&host, session_id, &giver, &giver_record).await;
+
+    let params = GrantTransferParams {
+        session_id,
+        from_grant_id: held.grant.grant_id,
+        to_device_id: taker_record.device_id,
+    };
+    let mut client = host.client().await;
+    let refused = calls::request(
+        host.environment_id,
+        &mut client,
+        subject(&params, ActionId::new(kr_ipc::new_uuid())),
+    )
+    .await
+    .expect_err("the host describes no transfer its receiver's pairing cannot carry");
+    assert_eq!(refused.code, ErrorCode::PermissionDenied, "{refused:?}");
+    assert!(
+        calls::pending(&mut client)
+            .await
+            .expect("readable")
+            .pending
+            .is_empty(),
+        "no owner device was asked"
+    );
+    host.stop().await;
+}

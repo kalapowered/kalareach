@@ -262,7 +262,7 @@ async fn a_transfer_that_committed_and_was_not_answered_is_answered_from_what_it
         session_id,
         &source,
         taker,
-        Controller::transfer_identity(&actor_id, mutation.action_id),
+        kr_protocol::sharing::transfer_identity(&actor_id, mutation.action_id),
     );
     let digest = kr_protocol::digest::mutation_digest(&mutation, &actor_id).expect("a digest");
     let grants = controller.sharing().grants();

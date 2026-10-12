@@ -12302,6 +12302,10 @@
           ],
           "description": "The last authority revision this device acknowledged."
         },
+        "all_sessions": {
+          "description": "Whether the pairing admits every session of this environment. Such a device holds every\nsession through its pairing already, so a share to it adds nothing the transport can use.",
+          "type": "boolean"
+        },
         "device_id": {
           "$ref": "#/$defs/DeviceId",
           "description": "The device."
@@ -12309,6 +12313,21 @@
         "display_name": {
           "description": "The name it was paired under.",
           "type": "string"
+        },
+        "grant_expired": {
+          "description": "Whether the host finds the pairing run out now, decided on its settled clock as admission\ndecides it, and not from a record that changes only when the host first finds the end.",
+          "type": "boolean"
+        },
+        "grant_expires_at_ms": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TimestampMs"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "When the device's pairing ends, in UTC milliseconds. Null for a pairing that never ends.\n\nA share to this device cannot outlast it."
         },
         "grant_id": {
           "$ref": "#/$defs/GrantId",
@@ -12333,6 +12352,10 @@
           "$ref": "#/$defs/TimestampMs",
           "description": "When it was paired."
         },
+        "platform": {
+          "$ref": "#/$defs/DevicePlatform",
+          "description": "What the device said it runs on. Display text, never authority."
+        },
         "revoked": {
           "description": "Whether the device has been revoked.",
           "type": "boolean"
@@ -12347,7 +12370,11 @@
         "acknowledged_at_ms",
         "revoked",
         "keys",
-        "manages_host"
+        "manages_host",
+        "platform",
+        "grant_expires_at_ms",
+        "grant_expired",
+        "all_sessions"
       ],
       "type": "object"
     },
@@ -16810,6 +16837,17 @@
       "additionalProperties": false,
       "description": "One grant as `grant.list` reports it.",
       "properties": {
+        "ends_at_ms": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TimestampMs"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "When access under this grant ends, as the host decides it: the earlier of the grant's own\nexpiry and the end of its recipient's pairing, because a device's pairing bounds everything\nthe device does. Null when neither ever ends."
+        },
         "grant": {
           "$ref": "#/$defs/Grant",
           "description": "The grant itself."
@@ -16845,7 +16883,8 @@
         "grant",
         "state",
         "revoked_at_ms",
-        "revoked_by_parent"
+        "revoked_by_parent",
+        "ends_at_ms"
       ],
       "type": "object"
     },

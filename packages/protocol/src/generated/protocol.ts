@@ -12646,6 +12646,11 @@ export interface DeviceSummary {
    */
   acknowledged_revision: AuthorityRevision | null
   /**
+   * Whether the pairing admits every session of this environment. Such a device holds every
+   * session through its pairing already, so a share to it adds nothing the transport can use.
+   */
+  all_sessions: boolean
+  /**
    * One paired device.
    */
   device_id: string
@@ -12653,6 +12658,17 @@ export interface DeviceSummary {
    * The name it was paired under.
    */
   display_name: string
+  /**
+   * Whether the host finds the pairing run out now, decided on its settled clock as admission
+   * decides it, and not from a record that changes only when the host first finds the end.
+   */
+  grant_expired: boolean
+  /**
+   * When the device's pairing ends, in UTC milliseconds. Null for a pairing that never ends.
+   *
+   * A share to this device cannot outlast it.
+   */
+  grant_expires_at_ms: TimestampMs | null
   /**
    * One host-issued authority object.
    */
@@ -12673,6 +12689,10 @@ export interface DeviceSummary {
    * A UTC timestamp in milliseconds, as a decimal string in JSON.
    */
   paired_at_ms: string
+  /**
+   * What the device said it runs on. Display text, never authority.
+   */
+  platform: 'macos' | 'windows' | 'linux' | 'ios' | 'android'
   /**
    * Whether the device has been revoked.
    */
@@ -15606,6 +15626,12 @@ export interface GrantListResult {
  * One grant as `grant.list` reports it.
  */
 export interface GrantSummary {
+  /**
+   * When access under this grant ends, as the host decides it: the earlier of the grant's own
+   * expiry and the end of its recipient's pairing, because a device's pairing bounds everything
+   * the device does. Null when neither ever ends.
+   */
+  ends_at_ms: TimestampMs | null
   grant: Grant2
   /**
    * When it was revoked, when it was.

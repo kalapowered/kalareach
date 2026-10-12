@@ -508,6 +508,10 @@ pub struct GrantSummary {
     pub revoked_at_ms: Nullable<TimestampMs>,
     /// The grant whose revocation revoked this one, when it was a descendant.
     pub revoked_by_parent: Nullable<GrantId>,
+    /// When access under this grant ends, as the host decides it: the earlier of the grant's own
+    /// expiry and the end of its recipient's pairing, because a device's pairing bounds everything
+    /// the device does. Null when neither ever ends.
+    pub ends_at_ms: Nullable<TimestampMs>,
 }
 
 /// Parameters of `grant.create`.
@@ -959,6 +963,57 @@ pub(crate) fn fits_a_frame<T: Serialize>(answer: &T) -> bool {
     })
 }
 
+/// The identities of the grant and of the invitation that carries it, for a share written by
+/// `actor_id` as `action`.
+///
+/// They are derived from the actor and the action the caller named, not minted fresh. An attempt
+/// that ended before it recorded its answer therefore left a grant and an invitation the host can
+/// find by that actor's action, and a retry is answered from them; a client that lost the answer
+/// computes the same identities to read what became of the action. An action is claimed per
+/// actor, so two actors that send one action identifier write two shares, and neither finds the
+/// other's.
+#[must_use]
+pub fn share_identities(
+    actor_id: &crate::ids::ActorId,
+    action: crate::scalars::Uuid,
+) -> (GrantId, crate::ids::InvitationId) {
+    (
+        GrantId::new(derived_identity(
+            action,
+            format!("grant/{}", actor_id.as_str()).as_bytes(),
+        )),
+        crate::ids::InvitationId::new(derived_identity(
+            action,
+            format!("invitation/{}", actor_id.as_str()).as_bytes(),
+        )),
+    )
+}
+
+/// The identity of the grant a transfer writes, derived from the actor that performs it and its
+/// action, so the plan an owner confirms names it before the action exists, and a retry finds it.
+#[must_use]
+pub fn transfer_identity(
+    actor_id: &crate::ids::ActorId,
+    action_id: crate::ids::ActionId,
+) -> GrantId {
+    GrantId::new(derived_identity(
+        action_id.get(),
+        format!("transfer/{}", actor_id.as_str()).as_bytes(),
+    ))
+}
+
+/// One identity derived from an action identifier and a purpose.
+///
+/// Two identities from one action have to differ, and both have to be the same on a retry, so they
+/// are the digest of the action and a purpose label rather than anything freshly random.
+fn derived_identity(action: crate::scalars::Uuid, purpose: &[u8]) -> crate::scalars::Uuid {
+    let digest =
+        kr_cbor::sha256(&[b"kr-sharing/1".as_slice(), purpose, action.as_bytes()].concat());
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    crate::scalars::Uuid::from_bytes(bytes)
+}
+
 /// Parameters of `grant.list`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -1014,6 +1069,18 @@ pub struct DeviceSummary {
     pub keys: Nullable<crate::pairing::DevicePublicKeys>,
     /// Whether the device's grant lets it manage this host, which is what an owner's device holds.
     pub manages_host: bool,
+    /// What the device said it runs on. Display text, never authority.
+    pub platform: crate::pairing::DevicePlatform,
+    /// When the device's pairing ends, in UTC milliseconds. Null for a pairing that never ends.
+    ///
+    /// A share to this device cannot outlast it.
+    pub grant_expires_at_ms: Nullable<TimestampMs>,
+    /// Whether the host finds the pairing run out now, decided on its settled clock as admission
+    /// decides it, and not from a record that changes only when the host first finds the end.
+    pub grant_expired: bool,
+    /// Whether the pairing admits every session of this environment. Such a device holds every
+    /// session through its pairing already, so a share to it adds nothing the transport can use.
+    pub all_sessions: bool,
 }
 
 /// The result of `device.list`.

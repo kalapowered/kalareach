@@ -33,7 +33,7 @@ async fn a_transfer_to_a_device_revoked_since_its_plan_writes_nothing() {
         session_id,
         &source,
         revoked,
-        Controller::transfer_identity(
+        kr_protocol::sharing::transfer_identity(
             &actor_id,
             kr_protocol::ids::ActionId::new(Uuid::from_bytes([5; 16])),
         ),
@@ -75,7 +75,7 @@ async fn a_transfer_to_a_device_revoked_since_its_plan_writes_nothing() {
         session_id,
         &source,
         taker,
-        Controller::transfer_identity(
+        kr_protocol::sharing::transfer_identity(
             &actor_id,
             kr_protocol::ids::ActionId::new(Uuid::from_bytes([6; 16])),
         ),

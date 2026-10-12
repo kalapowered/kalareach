@@ -105,6 +105,12 @@ impl GrantRecord {
             state: self.state(now_ms),
             revoked_at_ms: Nullable(self.revoked_at_ms.map(TimestampMs::new)),
             revoked_by_parent: Nullable(self.revoked_by_parent),
+            // The grant's own end. The host lowers it to the end of the recipient's pairing where
+            // it lists, because the pairing is in the device directory and not here.
+            ends_at_ms: Nullable(match self.grant.expiry {
+                GrantExpiry::At { expires_at_ms } => Some(expires_at_ms),
+                GrantExpiry::Never => None,
+            }),
         }
     }
 }

@@ -9,19 +9,29 @@
 
 mod net_support;
 
+use kr_controller::service::net::devices::DeviceRecord;
 use kr_controller::service::net::dispatch::EFFECT_WAIT;
 use kr_controller::sharing::ShareRequest;
 use kr_crypto::keys::DeviceKeys;
 use kr_protocol::envelope::ActionTarget;
-use kr_protocol::error::ErrorCode;
+use kr_protocol::error::{ErrorCode, ProtocolError};
+use kr_protocol::grant::GrantExpiry;
 use kr_protocol::ids::{ActionId, DeviceId, GrantId, InvitationId, SessionId};
 use kr_protocol::method::Method;
+use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::Nullable;
+use kr_protocol::scalars::TimestampMs;
 use kr_protocol::sharing::{
     AuthorityNotice, GrantCreateParams, GrantCreateResult, GrantRedeemParams, GrantRedeemResult,
     GrantRevokeParams, InvitationState, RoleSelection, SessionRole,
 };
-use net_support::{Host, RawDevice, on_the_host, recipient};
+use kr_protocol::sharing::{
+    DeviceListParams, DeviceListResult, DeviceRevokeParams, GrantListParams, GrantListResult,
+};
+use net_support::{
+    Device, Host, MovedWall, RawDevice, on_the_host, owned_by, pair_with, proposal, recipient,
+};
+use std::time::Duration;
 
 /// Shares `session_id` with `recipient` as a viewer, as the owner at this machine does.
 async fn shared(host: &Host, session_id: SessionId, recipient: DeviceId) -> GrantCreateResult {
@@ -35,6 +45,18 @@ async fn shared_for(
     recipient: DeviceId,
     lifetime_ms: Option<u64>,
 ) -> GrantCreateResult {
+    try_share(host, session_id, recipient, lifetime_ms)
+        .await
+        .expect("the share is written")
+}
+
+/// As [`shared_for`], for a share the host may refuse.
+async fn try_share(
+    host: &Host,
+    session_id: SessionId,
+    recipient: DeviceId,
+    lifetime_ms: Option<u64>,
+) -> Result<GrantCreateResult, ProtocolError> {
     let selection = RoleSelection::plain(SessionRole::Viewer);
     let params = GrantCreateParams {
         session_id,
@@ -59,9 +81,7 @@ async fn shared_for(
         )
         .await
         .expect("the call reaches the daemon")
-        .expect("the share is written")
-        .to_typed()
-        .expect("decodes")
+        .map(|answer| answer.to_typed().expect("decodes"))
 }
 
 /// Whether the host holds `grant_id` as active.
@@ -334,5 +354,265 @@ async fn kr_req_25_10_a_connection_is_ended_with_its_share_though_a_request_is_p
          the request was not answered first"
     );
     go.send(()).expect("the held redemption is let go");
+    host.stop().await;
+}
+
+/// The pairing end of `record`, in milliseconds.
+fn pairing_end(record: &DeviceRecord) -> u64 {
+    match record.grant.expiry {
+        GrantExpiry::At { expires_at_ms } => expires_at_ms.get(),
+        GrantExpiry::Never => panic!("this pairing ends"),
+    }
+}
+
+/// The host's device list, as the person at this machine reads it.
+async fn devices(host: &Host) -> DeviceListResult {
+    net_support::pairing::read(
+        &mut host.client().await,
+        Method::DeviceList,
+        &DeviceListParams {
+            include_revoked: true,
+        },
+    )
+    .await
+    .expect("the list is read")
+}
+
+/// KR-REQ-25.10: a share may not outlast its recipient's pairing. A device's pairing bounds
+/// everything it does, so a share that ran past it would end early without its issuer being told.
+/// It is refused, with the pairing's end named, and never shortened to fit; one that fits is
+/// written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_25_10_a_share_may_not_outlast_its_recipients_pairing() {
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    let (_device, record) =
+        net_support::recipient_ending_in(&host, &owner, Duration::from_secs(30 * 60)).await;
+    let session_id = SessionId::new(kr_ipc::new_uuid());
+
+    // The default lifetime is an hour, and the pairing has half of that.
+    let refused = try_share(&host, session_id, record.device_id, None)
+        .await
+        .expect_err("a share past the pairing's end is refused");
+    assert_eq!(refused.code, ErrorCode::InvalidArgument, "{refused:?}");
+    assert!(refused.message.contains("pairing ends in"), "{refused:?}");
+
+    let fits = try_share(&host, session_id, record.device_id, Some(10 * 60_000))
+        .await
+        .expect("a share inside the pairing is written");
+    let GrantExpiry::At { expires_at_ms } = fits.grant.expiry else {
+        panic!("a share ends");
+    };
+    assert!(expires_at_ms.get() <= pairing_end(&record));
+    host.stop().await;
+}
+
+/// KR-REQ-25.10: a share to a device this host does not pair with, or no longer pairs with, is
+/// refused: it would never work, and nothing tells its issuer so.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_25_10_a_share_to_a_device_this_host_does_not_pair_with_is_refused() {
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    let (_device, record) = recipient(&host, &owner).await;
+    let session_id = SessionId::new(kr_ipc::new_uuid());
+
+    let unknown = try_share(&host, session_id, DeviceId::new(kr_ipc::new_uuid()), None)
+        .await
+        .expect_err("a device with no record is refused");
+    assert_eq!(unknown.code, ErrorCode::PermissionDenied, "{unknown:?}");
+
+    let mut client = host.client().await;
+    net_support::pairing::mutate::<_, kr_protocol::sharing::RevocationResult>(
+        host.environment_id,
+        &mut client,
+        Method::DeviceRevoke,
+        &DeviceRevokeParams {
+            device_id: record.device_id,
+        },
+    )
+    .await
+    .expect("the owner revokes the device");
+    let revoked = try_share(&host, session_id, record.device_id, None)
+        .await
+        .expect_err("a revoked device is refused");
+    assert_eq!(revoked.code, ErrorCode::PermissionDenied, "{revoked:?}");
+    host.stop().await;
+}
+
+/// KR-REQ-25.10: the host decides that a pairing has run out on its own clock, as admission does,
+/// and not from a record that changes only when it first finds the end: a share to such a device is
+/// refused, and the device list says so, with the end, the platform and whether the pairing opens
+/// every session.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_25_10_a_pairing_that_has_run_out_takes_no_share_and_the_device_list_says_so() {
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let wall = MovedWall::new();
+    let host = Host::start_on_clocks(&owner, wall.clocks()).await;
+    let (_device, record) =
+        net_support::recipient_ending_in(&host, &owner, Duration::from_secs(5 * 60)).await;
+    let wide = Device::create().await;
+    let wide_record = pair_with(&host, &wide, &owner, proposal(&[ActionRight::SessionView])).await;
+    let session_id = SessionId::new(kr_ipc::new_uuid());
+
+    let listed = devices(&host).await;
+    let entry = |list: &DeviceListResult, device_id: DeviceId| {
+        list.devices
+            .iter()
+            .find(|device| device.device_id == device_id)
+            .cloned()
+            .expect("the device is listed")
+    };
+    let narrow = entry(&listed, record.device_id);
+    assert_eq!(narrow.platform, record.platform);
+    assert_eq!(
+        narrow.grant_expires_at_ms,
+        Nullable::some(TimestampMs::new(pairing_end(&record)))
+    );
+    assert!(!narrow.grant_expired);
+    assert!(
+        !narrow.all_sessions,
+        "a pairing that names no session opens none"
+    );
+    assert!(
+        entry(&listed, wide_record.device_id).all_sessions,
+        "a pairing over every session opens every session"
+    );
+
+    wall.advance(Duration::from_secs(10 * 60));
+    let refused = try_share(&host, session_id, record.device_id, Some(60_000))
+        .await
+        .expect_err("a pairing that has run out takes no share");
+    assert_eq!(refused.code, ErrorCode::PermissionDenied, "{refused:?}");
+    assert!(
+        entry(&devices(&host).await, record.device_id).grant_expired,
+        "the list says the pairing has run out"
+    );
+    host.stop().await;
+}
+
+/// KR-REQ-18.03: a paired device that delegates a share is refused, for every way the recipient's
+/// pairing cannot carry it, with one sentence and one code that say nothing of another device's
+/// pairing: the list that would tell it needs a right it does not hold.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_18_03_a_device_that_delegates_learns_nothing_of_the_recipients_pairing() {
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    let (boss, boss_record) = recipient(&host, &owner).await;
+    let session_id = SessionId::new(kr_ipc::new_uuid());
+    let (above, issuing) = owned_by(&host, session_id, &boss, &boss_record).await;
+    let (_short, short_record) =
+        net_support::recipient_ending_in(&host, &owner, Duration::from_secs(5 * 60)).await;
+
+    let mut refusals = Vec::new();
+    // A recipient whose pairing ends before the delegation would, and one this host never paired.
+    for recipient in [short_record.device_id, DeviceId::new(kr_ipc::new_uuid())] {
+        let selection = RoleSelection::plain(SessionRole::Viewer);
+        let refused = issuing
+            .mutate(
+                Method::GrantCreate,
+                ActionId::new(kr_ipc::new_uuid()),
+                net_support::on_the_session(&host, session_id),
+                &GrantCreateParams {
+                    session_id,
+                    recipient_device_id: recipient,
+                    parent_grant_id: Nullable::some(above.grant.grant_id),
+                    accepted_notices: AuthorityNotice::for_actions(&selection.actions()),
+                    selection,
+                    lifetime_ms: Nullable::some(kr_protocol::scalars::DurationMs::new(600_000)),
+                    owner_confirmation: Nullable::null(),
+                },
+            )
+            .await
+            .expect_err("the delegation is refused");
+        refusals.push((refused.code, refused.message));
+    }
+    assert_eq!(
+        refusals[0], refusals[1],
+        "the two refusals are one sentence under one code"
+    );
+    assert_eq!(refusals[0].0, ErrorCode::PermissionDenied);
+    assert!(
+        !refusals[0].1.contains("pairing"),
+        "the sentence says nothing of a pairing: {:?}",
+        refusals[0]
+    );
+    issuing.close();
+    host.stop().await;
+}
+
+/// KR-REQ-18.03: `grant.list` carries the end a grant really has, which is the earlier of its own
+/// expiry and the end of its recipient's pairing, so a share written before the host refused one
+/// that outlasts the pairing is listed with the end it will have.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_18_03_the_grant_list_carries_the_earlier_of_the_shares_end_and_the_pairings() {
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    let (_short, short_record) =
+        net_support::recipient_ending_in(&host, &owner, Duration::from_secs(30 * 60)).await;
+    let (_long, long_record) = recipient(&host, &owner).await;
+    let session_id = SessionId::new(kr_ipc::new_uuid());
+    // Written below the host's checks, as a share was before they existed: an hour for a device
+    // that has half of it.
+    let write = |recipient: DeviceId| {
+        let selection = RoleSelection::plain(SessionRole::Viewer);
+        host.controller()
+            .sharing()
+            .share(
+                &ShareRequest {
+                    invitation_id: InvitationId::new(kr_ipc::new_uuid()),
+                    grant_id: GrantId::new(kr_ipc::new_uuid()),
+                    environment_id: host.environment_id,
+                    session_id,
+                    issuer_device_id: host.controller().sharing().host_device_id(),
+                    recipient_device_id: recipient,
+                    parent_grant_id: None,
+                    accepted_notices: AuthorityNotice::for_actions(&selection.actions()),
+                    selection,
+                    lifetime_ms: Some(60 * 60_000),
+                    live_screen: None,
+                    named_questions: Vec::new(),
+                    named_approvals: Vec::new(),
+                    authority_revision: host.controller().policy().authority_revision(),
+                    owner_confirmed: false,
+                    now_ms: kr_ipc::now_ms().get(),
+                },
+                || Ok(()),
+            )
+            .expect("the share is written")
+    };
+    let on_short = write(short_record.device_id);
+    let on_long = write(long_record.device_id);
+
+    let listed: GrantListResult = net_support::pairing::read(
+        &mut host.client().await,
+        Method::GrantList,
+        &GrantListParams {
+            session_id: Nullable::some(session_id),
+            include_resolved: false,
+        },
+    )
+    .await
+    .expect("the list is read");
+    let ends = |grant_id: GrantId| {
+        listed
+            .grants
+            .iter()
+            .find(|summary| summary.grant.grant_id == grant_id)
+            .expect("the grant is listed")
+            .ends_at_ms
+    };
+    assert_eq!(
+        ends(on_short.grant.grant_id),
+        Nullable::some(TimestampMs::new(pairing_end(&short_record))),
+        "the pairing ends first"
+    );
+    let GrantExpiry::At { expires_at_ms } = on_long.grant.expiry else {
+        panic!("a share ends");
+    };
+    assert_eq!(
+        ends(on_long.grant.grant_id),
+        Nullable::some(expires_at_ms),
+        "the share ends first"
+    );
     host.stop().await;
 }

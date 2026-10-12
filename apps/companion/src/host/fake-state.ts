@@ -372,7 +372,11 @@ export class ScriptedRecords {
         acknowledged_at_ms: String(ids.nowMs - 60_000),
         revoked: false,
         keys: null,
-        manages_host: false
+        manages_host: false,
+        platform: 'ios',
+        grant_expires_at_ms: String(ids.nowMs + 6 * 86_400_000),
+        grant_expired: false,
+        all_sessions: false
       },
       {
         device_id: RETIRED_PHONE,
@@ -383,7 +387,11 @@ export class ScriptedRecords {
         acknowledged_at_ms: null,
         revoked: true,
         keys: null,
-        manages_host: false
+        manages_host: false,
+        platform: 'android',
+        grant_expires_at_ms: null,
+        grant_expired: false,
+        all_sessions: false
       }
     ]
   }
@@ -1219,7 +1227,13 @@ export class ScriptedRecords {
       expiry: { at: { expires_at_ms: expiresAt } },
       organisation: null
     }
-    this.#grants.push({ grant, state: 'pending', revoked_at_ms: null, revoked_by_parent: null })
+    this.#grants.push({
+      grant,
+      state: 'pending',
+      revoked_at_ms: null,
+      revoked_by_parent: null,
+      ends_at_ms: expiresAt
+    })
     return {
       receipt: null,
       value: {

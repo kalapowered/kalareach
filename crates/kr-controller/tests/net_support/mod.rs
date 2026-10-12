@@ -1245,6 +1245,26 @@ pub async fn recipient(host: &Host, owner: &DeviceKeys) -> (Device, DeviceRecord
     (device, record)
 }
 
+/// As [`recipient`], for a pairing that ends `ends_in` from now.
+pub async fn recipient_ending_in(
+    host: &Host,
+    owner: &DeviceKeys,
+    ends_in: Duration,
+) -> (Device, DeviceRecord) {
+    let device = Device::create().await;
+    let mut grant = proposal(&[ActionRight::SessionView]);
+    grant.session_selector = SessionSelector::None;
+    grant.expiry = GrantExpiry::At {
+        expires_at_ms: kr_protocol::scalars::TimestampMs::new(
+            kr_ipc::now_ms()
+                .get()
+                .saturating_add(u64::try_from(ends_in.as_millis()).unwrap_or(u64::MAX)),
+        ),
+    };
+    let record = pair_with(host, &device, owner, grant).await;
+    (device, record)
+}
+
 /// Shares `session_id` with the device `record` names as an owner of it, as the person at this
 /// machine does, and has that device redeem it on a connection of its own, which is returned.
 pub async fn owned_by(
