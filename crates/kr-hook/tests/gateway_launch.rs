@@ -527,25 +527,25 @@ fn kr_req_11_32_only_the_registered_process_reaches_the_gateway() {
         .expect("a read timeout");
     // Closed without a word: the end of the stream, or, where a stream that is closed with unread
     // bytes resets its peer, a reset at the read, or a broken pipe at the write when the close came
-    // first. A word is a reply, and a held connection is a timeout.
+    // first. The read follows a write that failed too, because a reply sent before the close stays
+    // readable: a word is a reply, and a held connection is a timeout.
     let ended = |error: &std::io::Error| {
         matches!(
             error.kind(),
             std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe
         )
     };
-    let written = std::io::Write::write_all(
+    if let Err(error) = std::io::Write::write_all(
         &mut other,
         b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\
           Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n",
-    );
+    ) {
+        assert!(ended(&error), "the request could not be written: {error}");
+    }
     let mut heard = [0_u8; 16];
-    let closed_without_a_word = match written {
+    let closed_without_a_word = match std::io::Read::read(&mut other, &mut heard) {
+        Ok(read) => read == 0,
         Err(error) => ended(&error),
-        Ok(()) => match std::io::Read::read(&mut other, &mut heard) {
-            Ok(read) => read == 0,
-            Err(error) => ended(&error),
-        },
     };
     assert!(
         closed_without_a_word,
