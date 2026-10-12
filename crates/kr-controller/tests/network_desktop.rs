@@ -333,8 +333,8 @@ async fn a_device_reads_the_sleep_state_and_cannot_turn_inhibition_on() {
     // paired device to is checked, not a handful of names this test invented: the only writes it
     // admits in the host-and-environment group are the three machine group steps, which change the
     // one record that names a grouping and grant nothing, and the presentation of the device's own
-    // organisation lease, which only narrows or renews what the organisation signed; no power
-    // setting lives there.
+    // organisation lease, with the organisation's chain when it has moved; no power setting lives
+    // there.
     let writes_host_configuration: Vec<&str> = Method::ALL
         .iter()
         .filter(|method| {
