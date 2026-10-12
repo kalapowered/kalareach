@@ -62,8 +62,6 @@ enum Standing {
 pub(crate) struct Applied {
     /// The revision the registry allocated for it, or the one in force when nothing was withdrawn.
     pub revision: AuthorityRevision,
-    /// Whether the revocation advanced the revision, which is whether it withdrew anything.
-    pub changed: bool,
     /// Whether the dispatch barrier has held for every worker it affected.
     pub completion: RevocationCompletion,
 }
@@ -235,8 +233,7 @@ impl Controller {
     ///
     /// Returns an error when a revocation cannot be written or the barrier cannot be raised.
     pub(crate) async fn apply_feed_plan(&self, plan: &Plan) -> Result<Applied> {
-        let before = self.authority_revision().await?;
-        let mut revision = before;
+        let mut revision = self.authority_revision().await?;
         let mut pending = 0_u64;
         for device_id in &plan.devices {
             let result = self.revoke_device_authority(*device_id, None, None).await?;
@@ -252,7 +249,6 @@ impl Controller {
         }
         Ok(Applied {
             revision,
-            changed: revision > before,
             completion: if pending == 0 {
                 RevocationCompletion::Complete
             } else {
@@ -310,20 +306,33 @@ impl Controller {
     ///
     /// Returns an error when the request is not one this host may take or the record cannot be
     /// written.
-    pub(crate) fn authority_feed_begin(
+    pub(crate) async fn authority_feed_begin(
         &self,
         request: RevocationRequest,
+        origin: &str,
         previous: AuthorityRevision,
         now_ms: u64,
-    ) -> Result<crate::grants::feed::Beginning> {
+    ) -> Result<crate::grants::feed::RetainedRevocation> {
+        let registry = self.authority_revision().await?;
         let mut feed = self.authority_feed();
-        let beginning = feed.begin(request, previous, now_ms).map_err(|refusal| {
-            crate::error::ControllerError::InvalidArgument(format!(
-                "the feed's request cannot be taken: {refusal:?}"
-            ))
-        })?;
+        let held = feed
+            .begin(
+                request,
+                crate::grants::feed::Basis {
+                    origin,
+                    previous,
+                    registry,
+                    at_ms: now_ms,
+                },
+            )
+            .map_err(|refusal| {
+                crate::error::ControllerError::InvalidArgument(format!(
+                    "the feed's request cannot be taken: {refusal:?}"
+                ))
+            })?
+            .clone();
         self.keep_feed(&feed)?;
-        Ok(beginning)
+        Ok(held)
     }
 
     /// Stops the carrier of the authority feed where a request has been carried out and not yet
@@ -377,8 +386,10 @@ impl Controller {
         host: DeviceId,
     ) -> Result<()> {
         let mut feed = self.authority_feed();
-        feed.note_refusal(request_id, host);
-        self.keep_feed(&feed)
+        if feed.note_refusal(request_id, host) {
+            self.keep_feed(&feed)?;
+        }
+        Ok(())
     }
 
     /// Writes down that this host has nothing more to do for a request the feed holds: it was
@@ -389,8 +400,9 @@ impl Controller {
         host: DeviceId,
     ) {
         let mut feed = self.authority_feed();
-        feed.acknowledge(request_id, host);
-        if let Err(error) = self.keep_feed(&feed) {
+        if feed.acknowledge(request_id, host)
+            && let Err(error) = self.keep_feed(&feed)
+        {
             eprintln!("kr-controller: could not write the authority feed's record down: {error}");
         }
     }

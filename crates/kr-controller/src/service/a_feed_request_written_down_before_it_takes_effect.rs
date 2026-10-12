@@ -39,7 +39,13 @@ async fn a_request_is_in_the_registry_as_soon_as_the_host_begins_to_apply_it() {
         "the control: nothing is written down before the host begins"
     );
     controller
-        .authority_feed_begin(request.clone(), AuthorityRevision::new(0), 2_000)
+        .authority_feed_begin(
+            request.clone(),
+            "https://feed.example",
+            AuthorityRevision::new(0),
+            2_000,
+        )
+        .await
         .expect("the host begins to apply the request");
 
     let stored = controller
@@ -56,5 +62,9 @@ async fn a_request_is_in_the_registry_as_soon_as_the_host_begins_to_apply_it() {
             .collect::<Vec<_>>(),
         vec![request.request_id],
         "the request is on disk before anything it names is withdrawn"
+    );
+    assert_eq!(
+        stored.records[0].origin, "https://feed.example",
+        "with the feed that holds it"
     );
 }
