@@ -218,24 +218,42 @@ impl VoiceAuthority for GrantAuthority {
                 },
             )
             .transpose()?;
-        let candidates = paired
-            .into_iter()
-            .chain(standing.records.iter().map(|record| record.grant.clone()))
-            .filter(|grant| !grant.permits(ActionRight::VoiceUse))
-            .filter(|grant| session_id.is_none_or(|id| grant.session_selector.admits(id)));
         // As this host lets it be used: a right the rights ceiling takes away from every grant, or
         // that an organisation's lease does not give, is not one a spoken action may use, whichever
-        // grant it was written in. Each candidate is read that way before the widest is chosen, so
-        // a grant the host's policy refuses does not stand in the way of one it allows, and one the
-        // policy narrows is not chosen for rights it no longer has. The coordinator reads the
-        // device's authority here before it asks for a confirmation, and the host reads it again
-        // immediately before a close is forwarded, so both are under what is in force when they
-        // read.
+        // grant it was written in. A request under a share needs the grant the device was paired
+        // under to stand under the host's policy, so that grant is read first and its refusal is the
+        // answer: no share answers for a device whose pairing the policy refuses. Each share is then
+        // read the same way before the widest is chosen, so a share the policy refuses does not stand
+        // in the way of a grant it allows, and one the policy narrows is not chosen for rights it no
+        // longer has. A share the host cannot yet decide on, because the clock it reads is not
+        // proven, is no answer while another grant is, and is the answer when none is. The
+        // coordinator reads the device's authority here before it asks for a confirmation, and the
+        // host reads it again immediately before a close is forwarded, so both are under what is in
+        // force when they read.
         let daemon = self.daemon()?;
+        let read = |grant: Grant| {
+            daemon
+                .as_this_host_lets_it_be_used(grant)
+                .map_err(|refusal| refusal.to_protocol_error())
+        };
+        let reaches = |grant: &Grant| {
+            !grant.permits(ActionRight::VoiceUse)
+                && session_id.is_none_or(|id| grant.session_selector.admits(id))
+        };
         let mut widest: Option<Grant> = None;
+        if let Some(pairing) = paired {
+            let covers = reaches(&pairing);
+            let usable = read(pairing).map_err(VoiceError::Host)?;
+            if covers {
+                widest = Some(usable);
+            }
+        }
         let mut refused = None;
-        for candidate in candidates {
-            match daemon.as_this_host_lets_it_be_used(candidate) {
+        for record in &standing.records {
+            if !reaches(&record.grant) {
+                continue;
+            }
+            match read(record.grant.clone()) {
                 Ok(usable) => {
                     if widest
                         .as_ref()
@@ -244,13 +262,7 @@ impl VoiceAuthority for GrantAuthority {
                         widest = Some(usable);
                     }
                 }
-                Err(refusal) => {
-                    let error = refusal.to_protocol_error();
-                    // A refusal that says the host cannot decide yet is not one another grant
-                    // answers for.
-                    if error.code != kr_protocol::error::ErrorCode::PermissionDenied {
-                        return Err(VoiceError::Host(error));
-                    }
+                Err(error) => {
                     refused.get_or_insert(error);
                 }
             }

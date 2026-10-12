@@ -3363,6 +3363,64 @@ pub(crate) mod tests {
         drop(controller);
     }
 
+    /// KR-REQ-26.16 and 09.16: a spoken action's read of a grant that stands on the clock is refused
+    /// while this boot's clock continuity is lost, and while the floor it would stand on is owed its
+    /// record and cannot be written, as a typed request's decision is. A grant that reads no clock is
+    /// read all the same.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_grant_that_stands_on_the_clock_is_not_read_while_the_clock_is_in_doubt() {
+        let temp = kr_ipc::testing::TempHost::create();
+        let controller = daemon(&temp).await;
+        let revision = controller.policy().authority_revision();
+        let now = kr_ipc::now_ms().get();
+        let (lasting, _) = granted(GrantExpiry::Never, revision);
+        let (ending, _) = granted(
+            GrantExpiry::At {
+                expires_at_ms: TimestampMs::new(now + 3_600_000),
+            },
+            revision,
+        );
+        controller
+            .as_this_host_lets_it_be_used(ending.clone())
+            .expect("the clock is proven");
+
+        // The floor is owed its record, and storage takes none.
+        let registry = refuse_policy_writes(&temp);
+        controller
+            .policy
+            .lock()
+            .expect("the policy")
+            .utc_floor()
+            .owe(now + 1);
+        let refused = controller
+            .as_this_host_lets_it_be_used(ending.clone())
+            .expect_err("the floor it stands on is not on disk");
+        assert!(matches!(refused, Refusal::FloorUnrecorded), "{refused:?}");
+        controller
+            .as_this_host_lets_it_be_used(lasting.clone())
+            .expect("a grant that reads no clock does not wait for it");
+        allow_policy_writes(&registry);
+        controller
+            .as_this_host_lets_it_be_used(ending.clone())
+            .expect("the floor is written once storage takes it");
+
+        // The clock's continuity is lost.
+        controller
+            .policy
+            .lock()
+            .expect("the policy")
+            .utc_floor()
+            .lose_continuity();
+        let refused = controller
+            .as_this_host_lets_it_be_used(ending)
+            .expect_err("the clock is not proven");
+        assert!(matches!(refused, Refusal::ClockUnproven), "{refused:?}");
+        controller
+            .as_this_host_lets_it_be_used(lasting)
+            .expect("a grant that reads no clock does not wait for it");
+        drop(controller);
+    }
+
     /// The offline bound runs out on the continuous clock it was anchored on. A decision taken
     /// after the wall clock was wound back reads UTC inside the bound again, and is refused all the
     /// same; a synchronisation of the authority feed anchors the bound afresh. On clocks the test

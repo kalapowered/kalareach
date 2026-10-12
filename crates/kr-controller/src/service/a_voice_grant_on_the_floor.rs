@@ -204,25 +204,27 @@ fn refuse_expiry_records(temp: &kr_ipc::testing::TempHost, table: &str) -> rusql
     registry
 }
 
-/// KR-REQ-26.16: the device's grant a spoken action runs under is chosen among the grants the host
-/// lets be used. A paired grant that needs a lease this host holds none for is refused, and a grant
-/// shared with the device that needs none is the one that answers; neither the widest grant by its
-/// rights before the policy nor the first refusal decides.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_grant_the_host_refuses_does_not_stand_in_the_way_of_one_it_allows() {
-    let temp = kr_ipc::testing::TempHost::create();
-    let (_continuous, _wall, clocks) = manual_clocks();
-    let controller = daemon_on(&temp, clocks).await;
-    let device = paired_needing_a_lease(
-        &controller,
-        64,
-        &[ActionRight::SessionView, ActionRight::SessionClose],
-    );
+/// A grant shared with `device`, which requires membership of an organisation this host is not
+/// enrolled in when `needs_a_lease`.
+fn shared_with(
+    controller: &Controller,
+    device: &DeviceRecord,
+    rights: &[ActionRight],
+    needs_a_lease: bool,
+) -> Grant {
     let shared = Grant {
         issuer_device_id: controller.sharing().host_device_id(),
+        organisation: if needs_a_lease {
+            Nullable::some(kr_protocol::grant::OrganisationRequirement {
+                organisation_id: kr_protocol::ids::OrganisationId::new(kr_ipc::new_uuid()),
+                policy_revision: controller.policy().authority_revision(),
+            })
+        } else {
+            Nullable::null()
+        },
         ..grant(
             device.device_id,
-            &[ActionRight::SessionView],
+            rights,
             None,
             controller.policy().authority_revision(),
         )
@@ -242,13 +244,87 @@ async fn a_grant_the_host_refuses_does_not_stand_in_the_way_of_one_it_allows() {
             || Ok(()),
         )
         .expect("a grant shared with the device");
+    shared
+}
+
+/// KR-REQ-26.16: a share that needs a lease this host holds none for does not stand in the way of the
+/// grant the device was paired under, even where the share carries more rights. The share is refused
+/// as a typed request under it would be, and the pairing grant answers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_share_the_host_refuses_does_not_stand_in_the_way_of_the_pairing_grant() {
+    let temp = kr_ipc::testing::TempHost::create();
+    let (_continuous, _wall, clocks) = manual_clocks();
+    let controller = daemon_on(&temp, clocks).await;
+    let device = paired_holding(&controller, 64, &[ActionRight::SessionView], None);
+    shared_with(
+        &controller,
+        &device,
+        &[ActionRight::SessionView, ActionRight::SessionClose],
+        true,
+    );
 
     let read = authority(&controller)
         .device_grant(device.device_id, None)
         .expect("the host answers")
         .expect("a grant the host lets be used");
 
-    assert_eq!(read.grant_id, shared.grant_id);
+    assert_eq!(read.grant_id, device.grant.grant_id);
+    assert!(!read.permits(ActionRight::SessionClose));
+}
+
+/// KR-REQ-26.16: a request under a share needs the grant the device was paired under to stand under
+/// the host's policy, so a pairing grant the host refuses leaves no share to answer for the device.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pairing_grant_the_host_refuses_leaves_no_share_to_answer() {
+    let temp = kr_ipc::testing::TempHost::create();
+    let (_continuous, _wall, clocks) = manual_clocks();
+    let controller = daemon_on(&temp, clocks).await;
+    let device = paired_needing_a_lease(
+        &controller,
+        65,
+        &[ActionRight::SessionView, ActionRight::SessionClose],
+    );
+    shared_with(&controller, &device, &[ActionRight::SessionView], false);
+
+    let refused = authority(&controller)
+        .device_grant(device.device_id, None)
+        .expect_err("the pairing grant needs a lease this host holds none for");
+
+    assert_eq!(
+        refused.code(),
+        kr_protocol::error::ErrorCode::PermissionDenied,
+        "{refused}"
+    );
+}
+
+/// KR-REQ-26.16 and 09.16: a share the host cannot yet decide on, because the clock it reads is not
+/// proven, does not take a pairing grant that reads no clock from the device. Section 9 keeps usable
+/// what does not depend on the clock.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_share_the_host_cannot_yet_decide_on_does_not_stand_in_the_way_of_the_pairing_grant() {
+    let temp = kr_ipc::testing::TempHost::create();
+    let (_continuous, _wall, clocks) = manual_clocks();
+    let controller = daemon_on(&temp, clocks).await;
+    let device = paired_holding(
+        &controller,
+        66,
+        &[ActionRight::SessionView, ActionRight::SessionClose],
+        None,
+    );
+    shared_with(&controller, &device, &[ActionRight::SessionView], true);
+    controller
+        .policy
+        .lock()
+        .expect("the policy")
+        .utc_floor()
+        .lose_continuity();
+
+    let read = authority(&controller)
+        .device_grant(device.device_id, None)
+        .expect("the host answers")
+        .expect("a grant that reads no clock");
+
+    assert_eq!(read.grant_id, device.grant.grant_id);
 }
 
 /// A voice grant that ran out stays out when this host's wall clock is wound back, for the grant
