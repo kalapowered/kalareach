@@ -1923,7 +1923,7 @@ test.describe("the phone's room for its terminal", () => {
         await page.getByRole('tab', { name: 'Terminal' }).click()
         await expect(page.getByTestId('mobile-terminal-line').first()).toContainText('$ cargo')
         const field = page.getByLabel('Message this session')
-        const send = page.getByRole('button', { name: 'Send' })
+        const send = page.getByRole('button', { name: 'Send', exact: true })
         const reason = page.locator('.m-composer .m-hint', { hasText: 'no confirmed outcome yet' })
         await expect(send).toBeDisabled()
         await expect(field).toHaveAttribute('aria-describedby', (await reason.getAttribute('id')) ?? 'no reason')
