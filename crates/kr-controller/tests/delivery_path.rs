@@ -1168,7 +1168,8 @@ impl Environment {
     }
 
     /// Pairs a device whose grant carries no history bound, with or without the live screen, as
-    /// the sharing screen and `kr pair --view` give them, and connects it.
+    /// the sharing screen gives one and as a pairing proposal over every session can, and connects
+    /// it.
     async fn phone_with_no_history_bound(&self, include_live_screen: bool) -> Phone {
         let device = Device::with_keys(DeviceKeys::generate().expect("device keys")).await;
         let mut grant = proposal(&[ActionRight::SessionView]);
@@ -4216,7 +4217,7 @@ async fn an_external_message_names_only_the_sessions_its_grant_reaches() {
 /// KR-REQ-25.23: a grant with no history bound reaches what was first seen at or after its own
 /// start, as the audience decides, whether or not it includes the live screen, and the message
 /// composed for it says the same: it names the session and does not say that anything was left
-/// out. The two grants are the ones `kr pair --view` and the sharing screen give.
+/// out. The two grants are a pairing over every session, with the live screen and without it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn an_external_message_under_a_grant_with_no_history_bound_leaves_nothing_out() {
     let environment = Environment::start().await;
