@@ -224,6 +224,11 @@ interface Flight {
   keyed?: boolean
   /** Told the stored draft that holds the prompt's text, when the prompt has ended and each time that changes. */
   onEnded?: (storedDraftId: string | null) => void
+  /**
+   * The stored draft the composer took the prompt's text under, when the store held no record for
+   * it: the older version the composer held (null when there was none).
+   */
+  returnedTo?: string | null
 }
 
 /** How a write of a draft ended. */
@@ -827,7 +832,9 @@ export class DraftBook {
           const pending = (flight: Flight): boolean =>
             this.#flights.has(flight.id) || this.#unsettled.includes(flight) || this.#storing.has(flight)
           const holders = [...this.#flights.values(), ...this.#unsettled, ...this.#storing].filter(
-            (flight) => flight.record?.id === each.storedDraftId || flight.earlier?.id === each.storedDraftId
+            (flight) =>
+              flight.order <= each.upTo &&
+              (flight.record?.id === each.storedDraftId || flight.earlier?.id === each.storedDraftId)
           )
           if (holders.length > 0 || (each.held ?? []).some(pending)) {
             this.#earlier.push({ ...each, held: [...new Set([...(each.held ?? []), ...holders])] })
@@ -1015,15 +1022,16 @@ export class DraftBook {
    */
   async #endConsumed(flight: Flight): Promise<void> {
     if (this.#flights.has(flight.id) || this.#storing.has(flight)) return
-    this.#unsettled = this.#unsettled.filter((each) => each !== flight)
     if (this.#unstored.includes(flight)) {
       this.#unstored = this.#unstored.filter((each) => each !== flight)
       this.#changed()
     }
     this.#clearFailure(flight.id)
+    // Its records stay out of reach of every read until they are gone: it lets go of them last.
     await this.#dropKept(flight, null)
     await this.#dropEarlier(flight)
     await this.#dropOlder(flight)
+    this.#unsettled = this.#unsettled.filter((each) => each !== flight)
   }
 
   /**
@@ -1109,18 +1117,21 @@ export class DraftBook {
         if (outcome === 'unknown' && localId !== undefined) this.#unknowns.set(flight.id, flight)
       } finally {
         this.#flights.delete(flight.id)
-        flight.onEnded?.(outcome === 'taken' || flight.consumed === true ? null : this.#holding(flight))
+        flight.onEnded?.(this.#holding(flight))
         // A prompt of an earlier run that this one held the draft of is settled now.
         if (this.#earlier.length > 0) this.#settleEarlier()
       }
     })
   }
 
-  /** The stored draft that holds a prompt's text now: its own record, or the composer's when the words were put back there. */
+  /**
+   * The stored draft that a prompt's text was put under when it came back, or null when it did not:
+   * a prompt the host took, or whose words another send was applied for, has no text to keep. The
+   * draft is the one the prompt made, never one the composer holds by chance with the same words.
+   */
   #holding(flight: Flight): string | null {
-    if (flight.record !== null) return flight.record.id
-    const composer = this.#find(flight.composer)
-    return holdsTextSent(composer, flight.sent) ? (composer?.stored?.id ?? null) : null
+    if (flight.endedAs === 'taken' || flight.consumed === true) return null
+    return flight.record?.id ?? flight.returnedTo ?? null
   }
 
   /**
@@ -1230,6 +1241,7 @@ export class DraftBook {
       // The failure is the composer's from here: its next good write clears it.
       this.#handOverFailure(flight.id, key)
       this.#adopt(key, sent, composer, flight.earlier)
+      flight.returnedTo = flight.earlier?.id ?? null
       flight.earlier = null
       return true
     }
@@ -1237,11 +1249,9 @@ export class DraftBook {
       // The screen put the text back and it was stored under the composer's own record. The record
       // set apart for the prompt says the same thing, and goes.
       this.#clearFailure(flight.id)
-      if (record !== null && composer.stored?.id !== record.id) {
-        await this.#dropSent({ ...flight, record })
-        // What holds the text now is the composer's own record.
-        flight.record = composer.stored
-      }
+      if (record !== null && composer.stored?.id !== record.id) await this.#dropSent({ ...flight, record })
+      // What holds the text now is the composer's own record.
+      flight.record = composer.stored
       return record !== null || composer.stored !== null
     }
     // The text is listed apart from the composer. The record may have been changed or removed by

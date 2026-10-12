@@ -2141,8 +2141,11 @@ describe('two sends of the same words, the first said to have been applied', () 
       expect(gate).toBeNull()
     })
     book.sendSettled('local-1', 'applied')
-    // Everything the first send's end does is made while the recovery waits for its read.
-    for (let turn = 0; turn < 100; turn += 1) await Promise.resolve()
+    // The first send's words are removed from the store while the recovery still waits for its read:
+    // the second is marked by then, and its recovery finds the mark when the read fails.
+    await vi.waitFor(() => {
+      expect(store.all().filter((draft) => draft.text === 'send this')).toHaveLength(1)
+    })
     release()
     await book.settled()
     await book.reload()
@@ -2889,6 +2892,31 @@ describe('a prompt the host is said to have applied after nobody knew what becam
 
       expect(book.draft(MAIN).text).toBe('')
       expect(store.all()).toEqual([])
+    })
+
+    it('leaves a draft the person wrote since with the same words when the send that held the earlier draft was taken', async () => {
+      const store = new FakeDraftStore()
+      const { storedDraftId } = await earlierRun(store)
+      const book = await opened(store)
+      // The store refuses the save that claims the draft, so the send holds it as an older version.
+      store.refuseSaves({ code: 'STORAGE_UNAVAILABLE', message: 'The store refused.' })
+      const second = book.beginSend(MAIN)
+      await second.claimed
+      type(book, MAIN, '')
+      book.sendSettled('local-1', 'applied', { sessionId: MAIN, text: 'send this', storedDraftId: storedDraftId ?? '' })
+      await book.settled()
+      // The store works again, and the person writes the same words as a draft of their own.
+      store.refuseSaves(null)
+      type(book, MAIN, 'other')
+      await book.settled()
+      type(book, MAIN, 'send this')
+      await book.settled()
+
+      book.endSend(second, 'taken', 'local-2')
+      await book.settled()
+
+      expect(book.draft(MAIN).text).toBe('send this')
+      expect(store.all().map((draft) => draft.text)).toEqual(['send this'])
     })
 
     it('leaves a draft that was sent to another conversation since, whatever its words', async () => {
