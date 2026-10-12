@@ -379,14 +379,16 @@ static PROBE_DEADLINE_ASKED_MS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(u64::MAX);
 
 /// Holds every platform command to `deadline` from here on, one that is already running included,
-/// for this host's own tests.
+/// for this host's own tests; `None` gives them the deadline they are shipped with again.
 ///
 /// A test that needs a reading to stay outstanding while it works, and to end when it says so,
 /// cannot do that with a deadline the clock runs out. The value is the process's, so such a test
 /// runs in a process of its own.
 #[cfg(feature = "testing")]
-pub fn set_probe_deadline(deadline: std::time::Duration) {
-    let millis = u64::try_from(deadline.as_millis()).unwrap_or(u64::MAX - 1);
+pub fn set_probe_deadline(deadline: Option<std::time::Duration>) {
+    let millis = deadline.map_or(u64::MAX, |deadline| {
+        u64::try_from(deadline.as_millis()).unwrap_or(u64::MAX - 1)
+    });
     PROBE_DEADLINE_ASKED_MS.store(millis, std::sync::atomic::Ordering::Release);
 }
 
