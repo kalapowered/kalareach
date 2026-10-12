@@ -347,9 +347,9 @@ and the default actions to the host as this device's own grant, which native cod
 page never holds the identity the host gave the device. The answer states what the grant permits
 and any action the device's own access does not include, which the person reads before the call
 is shown. When replacing the allowance ended a call whose close could still reach a worker, the
-host's answer names the workers that have not yet confirmed the fence, and the screen says how many
-sessions are still to confirm before the person goes on. The allowance stays until the person
-changes it.
+host's answer names the workers that have not yet confirmed the fence, and the screen names the
+sessions still to confirm, and says when the answer left workers out, before the person goes on. A
+call that ends says the same. The allowance stays until the person changes it.
 
 An invitation on the pasteboard is read by native code, not by the page. A code invitation that
 names a service other than this computer's raises the system's own alert, modal to the companion's

@@ -22,6 +22,7 @@ afterEach(() => {
 
 /** The session the fake host's workers answer for. */
 const SESSION_MAIN = '8a7b6c50-22bb-4c3d-8e4f-000000000101'
+const SESSION_BUILD = '8a7b6c50-22bb-4c3d-8e4f-000000000102'
 
 function start(setup?: (controls: FakeHostControls) => void): { controls: FakeHostControls } {
   const { port, controls } = fakeHost()
@@ -137,21 +138,36 @@ describe('allowing voice for the first time', () => {
   })
 
   // Section 9: a withdrawal is not complete until its barrier holds, so a replacement that ended a
-  // call whose close could still reach a worker says which sessions are still to confirm, and the
-  // person goes on when they have read it.
-  it('says how many sessions the host has still to confirm after replacing the allowance', async () => {
+  // call whose close could still reach a worker names the sessions the host has still to confirm,
+  // and the person goes on when they have read it.
+  it('names the sessions the host has still to confirm after replacing the allowance', async () => {
     const { controls } = start((fake) => {
-      fake.leaveNextVoiceChangePendingAt(SESSION_MAIN)
+      fake.leaveNextVoiceChangePendingAt([SESSION_MAIN])
     })
     await screen.findAllByRole('checkbox')
     await userEvent.click(screen.getByTestId('voice-allow'))
     const result = await screen.findByTestId('voice-grant-result')
-    expect(result).toHaveTextContent('has not yet confirmed that nothing the call sent can still run in 1 session')
+    expect(result).toHaveTextContent(
+      'The calls that were running under the earlier allowance have ended. The host has not yet confirmed that nothing the calls sent can still run in Session'
+    )
+    expect(result).not.toHaveTextContent('possibly others')
     expect(result).not.toHaveTextContent('except')
     expect(controls.voiceAllows).toHaveLength(1)
     expect(screen.queryByRole('button', { name: 'Start voice session' })).toBeNull()
     await userEvent.click(screen.getByTestId('voice-grant-continue'))
     expect(await screen.findByRole('button', { name: 'Start voice session' })).toBeInTheDocument()
+  })
+
+  // Section 9: the host keeps the workers that have not confirmed before any that have, but an answer
+  // that left workers out may be missing some that have not, and the screen says so.
+  it('says when the answer left workers out of the sessions to confirm', async () => {
+    start((fake) => {
+      fake.leaveNextVoiceChangePendingAt([SESSION_MAIN, SESSION_BUILD], 40)
+    })
+    await screen.findAllByRole('checkbox')
+    await userEvent.click(screen.getByTestId('voice-allow'))
+    const result = await screen.findByTestId('voice-grant-result')
+    expect(result).toHaveTextContent(', and possibly others.')
   })
 
   // KR-REQ-15.21: an answer the host never confirmed does not move the person on as if voice were

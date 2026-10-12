@@ -1303,8 +1303,9 @@ pub struct VoiceAllowed {
 /// The grant is this device's own, so native code names the device: the page does not hold the
 /// identity the host gave it, and a grant for any other device is a host-management change that
 /// this application, a paired device, does not make. The answer states every action the grant
-/// permits and every one the device's own grant could not carry, and nothing else of what the host
-/// answered: the identity of the device stays here.
+/// permits, every one the device's own grant could not carry and the barrier of the fence the
+/// replacement owed, and nothing else of what the host answered: the identity of the device stays
+/// here.
 #[tauri::command]
 pub async fn voice_allow(
     state: State<'_, AppState>,

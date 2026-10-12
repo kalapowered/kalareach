@@ -429,9 +429,11 @@ export interface FakeHostControls {
   leaveNextVoiceAllowUnconfirmed(): void
   /**
    * Has the next allowance of voice, or the next end of a call, come back with the fence it owed
-   * not yet held by the worker of `sessionId`, as a host does while that worker has not answered.
+   * not yet held by the workers of `sessionIds`, as a host does while those workers have not
+   * answered. `cut` workers more were affected and left out of the answer, as a host does when
+   * more workers were affected than one answer carries.
    */
-  leaveNextVoiceChangePendingAt(sessionId: string): void
+  leaveNextVoiceChangePendingAt(sessionIds: readonly string[], cut?: number): void
   /** What the next paste from the clipboard finds. */
   setPasteboard(result: PasteView): void
   /** The codes the page started pairing with, in order. */
@@ -703,30 +705,28 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
   let voiceAllowFailure: string | null = null
   let voiceHeldBack: readonly VoiceAction[] = []
   let voiceAllowUnconfirmed = false
-  /** The session whose worker the next voice change leaves pending, or none. */
-  let voiceFencePendingAt: string | null = null
-  /** The barrier the next voice change carries: none, or one worker that has not held. */
+  /** The sessions whose workers the next voice change leaves pending, and how many it cuts. */
+  let voiceFencePendingAt: { sessionIds: readonly string[]; cut: number } | null = null
+  /** The barrier the next voice change carries: none, or workers that have not held. */
   const voiceBarrier = (): VoiceStopResult['barrier'] => {
-    const sessionId = voiceFencePendingAt
+    const pending = voiceFencePendingAt
     voiceFencePendingAt = null
-    if (sessionId === null) return null
+    if (pending === null) return null
     return {
       authority_revision: '2',
-      workers: [
-        {
-          session_id: sessionId,
-          state: 'pending',
-          acknowledged_revision: null,
-          rejected_actions: [],
-          rejected_actions_total: '0',
-          possibly_executed: [],
-          possibly_executed_total: '0',
-          omitted_actions: '0',
-          names_pending: '0',
-          detail: 'the worker has not acknowledged the revision'
-        }
-      ],
-      workers_total: '1'
+      workers: pending.sessionIds.map((sessionId) => ({
+        session_id: sessionId,
+        state: 'pending' as const,
+        acknowledged_revision: null,
+        rejected_actions: [],
+        rejected_actions_total: '0',
+        possibly_executed: [],
+        possibly_executed_total: '0',
+        omitted_actions: '0',
+        names_pending: '0',
+        detail: 'the worker has not acknowledged the revision'
+      })),
+      workers_total: String(pending.sessionIds.length + pending.cut)
     }
   }
 
@@ -1805,8 +1805,8 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
     leaveNextVoiceAllowUnconfirmed() {
       voiceAllowUnconfirmed = true
     },
-    leaveNextVoiceChangePendingAt(sessionId) {
-      voiceFencePendingAt = sessionId
+    leaveNextVoiceChangePendingAt(sessionIds, cut = 0) {
+      voiceFencePendingAt = { sessionIds, cut }
     },
     sessionCreates,
     describe(sessionId, change) {

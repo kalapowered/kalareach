@@ -279,8 +279,9 @@ link. The answer is written once the workers that answer hold the new revision, 
 barrier as it then stands, cut to the sessions the call reached. A worker that did not answer within
 the time a revocation allows, or that installed the revision and gave no evidence of its fence, is
 named in it as pending, which says that a close sent under the grant could still reach that worker.
-The barrier is cut to what one answer carries, with every total counted before the cut, and a worker
-that is pending is kept whatever is cut. The grant is revoked either way. A stop or a replacement
+The barrier is cut to what one answer carries, with every total counted before the cut: a worker
+that is pending is kept before any that is not, the first one whatever else is cut, and the answer's
+total says how many workers there were. The grant is revoked either way. A stop or a replacement
 that owed no fence carries no barrier.
 
 ## The rate a call runs under

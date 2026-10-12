@@ -28,23 +28,46 @@ import type {
 
 import type { VoiceCallState } from '../host/port'
 
+/** The sessions a host's answer names as not yet confirmed, and whether the list is cut. */
+export interface ToConfirm {
+  /** The sessions whose workers have not confirmed the fence, as the answer names them. */
+  readonly sessions: readonly string[]
+  /**
+   * Whether the answer left workers out. The host keeps the workers that have not confirmed before
+   * any that have, so a list that is cut may still be missing some that have not.
+   */
+  readonly more: boolean
+}
+
 /**
- * How many sessions' workers a host's answer to ending a call, or to replacing what voice may do,
- * names as not yet confirmed.
+ * The sessions a host's answer to ending a call, or to replacing what voice may do, names as not
+ * yet confirmed.
  *
  * The answer carries the barrier of the fence the withdrawal owed, and a worker whose barrier has
  * not held may still take up something the call sent. The grant is withdrawn either way, so this
  * is not a failure: it is what the person is told the host has still to confirm.
  */
-export function sessionsToConfirm(barrier: VoiceStopResult['barrier'] | undefined): number {
-  return barrier?.workers.filter((worker) => worker.state === 'pending').length ?? 0
+export function toConfirm(barrier: VoiceStopResult['barrier'] | undefined): ToConfirm {
+  const workers = barrier?.workers ?? []
+  return {
+    sessions: workers.filter((worker) => worker.state === 'pending').map((worker) => worker.session_id),
+    more: Number(barrier?.workers_total ?? 0) > workers.length
+  }
 }
 
-/** The words that say how many sessions are still to confirm. */
-export function toConfirmWords(sessions: number): string {
-  return `The host has not yet confirmed that nothing the call sent can still run in ${
-    sessions === 1 ? '1 session' : `${sessions} sessions`
-  }.`
+/**
+ * The words that say which sessions the host has still to confirm, for the one call that ended or
+ * for the calls an allowance replaced. A session is called by the name the screen gives it, and by
+ * the start of its identifier where the screen has none.
+ */
+export function toConfirmWords(
+  pending: ToConfirm,
+  names: Readonly<Record<string, string>>,
+  ended: 'call' | 'calls'
+): string {
+  const named = pending.sessions.map((session) => names[session] ?? `session ${session.slice(0, 8)}`)
+  const where = named.join(', ') + (pending.more ? ', and possibly others' : '')
+  return `The host has not yet confirmed that nothing the ${ended} sent can still run in ${where}.`
 }
 
 /** What the microphone is doing, as the native layer reports it. */

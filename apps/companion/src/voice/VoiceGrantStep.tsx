@@ -16,7 +16,7 @@ import { useEffect, useId, useRef, useState, type ReactNode } from 'react'
 
 import type { HostPort, VoiceAllowed, VoiceScope } from '../host/port'
 import { failureMessage } from '../host/port'
-import { sessionsToConfirm, toConfirmWords } from './model'
+import { toConfirm, toConfirmWords } from './model'
 
 /** A session the person can choose, as the host lists it. */
 interface Choice {
@@ -111,7 +111,7 @@ export function VoiceGrantStep({
         // have seen it.
         if (
           settled.value.not_held_by_device.length === 0 &&
-          sessionsToConfirm(settled.value.barrier) === 0
+          toConfirm(settled.value.barrier).sessions.length === 0
         ) {
           onAllowed(sessionIds)
           return
@@ -209,10 +209,12 @@ export function VoiceGrantStep({
                     .join(', ')}: this phone’s own access to the host does not include ${
                     granted.not_held_by_device.length === 1 ? 'it' : 'them'
                   }.`,
-              sessionsToConfirm(granted.barrier) === 0
+              toConfirm(granted.barrier).sessions.length === 0
                 ? null
                 : `The calls that were running under the earlier allowance have ended. ${toConfirmWords(
-                    sessionsToConfirm(granted.barrier)
+                    toConfirm(granted.barrier),
+                    Object.fromEntries((choices ?? []).map((each) => [each.id, each.name])),
+                    'calls'
                   )}`
             ]
               .filter((words) => words !== null)

@@ -220,7 +220,7 @@ describe('while a call is running', () => {
   // Section 9: ending a call is complete for the host once its workers hold the revision that
   // refuses what the call sent. The grant is withdrawn either way, and the screen says which
   // sessions the host has still to confirm instead of reporting a complete stop.
-  it('says how many sessions the host has still to confirm when the call ends', async () => {
+  it('names the sessions the host has still to confirm when the call ends', async () => {
     const person = userEvent.setup()
     const { controls } = start()
     await waitForChoice()
@@ -229,12 +229,12 @@ describe('while a call is running', () => {
       expect(screen.getByRole('button', { name: 'End session' })).toBeInTheDocument()
     })
 
-    controls.leaveNextVoiceChangePendingAt(SESSION_MAIN)
+    controls.leaveNextVoiceChangePendingAt([SESSION_MAIN])
     await person.click(screen.getByRole('button', { name: 'End session' }))
 
     await waitFor(() => {
       expect(
-        screen.getByText(/has not yet confirmed that nothing the call sent can still run in 1 session/)
+        screen.getByText(/has not yet confirmed that nothing the call sent can still run in Session/)
       ).toBeInTheDocument()
     })
     expect(screen.getByText(/its grant withdrawn/)).toBeInTheDocument()
