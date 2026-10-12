@@ -787,14 +787,15 @@ describe('on the phone', () => {
       expect(attempts).toBe(2)
     })
 
-    // The host says the first was applied, while the second is still on its way.
+    // The host says the first was applied, while the second is still on its way. The page is shown
+    // again, which reads the host's record at once instead of after the wait.
     recorded.byAction = { [ACTION]: 'applied' }
-    await waitFor(
-      () => {
-        expect(screen.getByLabelText('Message this session')).toHaveValue('')
-      },
-      { timeout: 6_000 }
-    )
+    act(() => {
+      document.dispatchEvent(new Event('visibilitychange'))
+    })
+    await waitFor(() => {
+      expect(screen.getByLabelText('Message this session')).toHaveValue('')
+    })
     await act(async () => {
       refuse({ code: 'REFUSED', message: 'The host refused it.' })
       await Promise.resolve()
