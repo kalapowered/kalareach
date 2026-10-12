@@ -1,5 +1,5 @@
-//! A stand-in for the managed storage, backup manifest, authority feed, recovery bundle and mailbox
-//! delivery services.
+//! A stand-in for the managed storage, backup manifest, authority feed, recovery bundle, mailbox
+//! delivery and relay lease services.
 //!
 //! The service is the web repository's Worker, and what it answers is stated by that repository's
 //! service contract. This crate answers as the contract states, with the state the service keeps,
@@ -65,6 +65,14 @@
 //! | An identifier a mailbox has carried is remembered until the item's expiry and a day more | not modelled: remembered for good, which no test of this crate waits out | `mailbox/mailbox.ts:335-342` | none |
 //! | An item is removed when it expires, and a delivery is refused unless an installation or a host signed it | not modelled: an item stays, and any signature that verifies is accepted | `mailbox/mailbox.ts:587-588`, `mailbox/index.ts:100-106` | none |
 //! | Claiming, reading and acknowledging a mailbox | not modelled: the device's half, which nothing of this host uses yet | `mailbox/index.ts:168-279` | none |
+//! | A lease request or a revocation is proven by the credential every managed-service method uses, over the origin, the method, a fresh nonce, the time and the digest of the canonical body, and a nonce is spent once; the stand-in rebuilds the digest from the values that arrived | source only: the two relay methods are not in the protocol's registry yet, so the stand-in reads the credential field by field, as the Worker does | `relay/credential.ts:127-185` | the daemon's `a_paired_device_is_given_a_lease_for_its_pair` signs it through the real client |
+//! | A host key draws on no allowance of its own: a host that names no account is `403 FORBIDDEN`, and one that names an account needs an authorisation that account gave its key, still in force, for that account | source only | `relay/lease.ts:2036-2092`, `relay/authorisation.ts` | `a_host_that_names_no_account_is_turned_away_and_the_owner_is_told` |
+//! | A request for a pair that holds a lease revises that lease; naming a lease the service is not carrying is `400 INVALID_REQUEST`; a lease billed to another principal, issued to another caller or under another authorisation is `403 FORBIDDEN` | source only | `relay/lease.ts:466-540` | `a_lease_the_service_no_longer_carries_is_asked_for_again_as_a_new_one` |
+//! | A refill states the new cumulative ceiling and moves the deadline later; a ceiling is never lowered | source only | `relay/lease.ts:809-1100` | `a_lease_is_refilled_before_it_runs_out_and_the_ceiling_follows_what_the_relay_counted` |
+//! | A principal holds at most 8 MiB outstanding across its leases, and a spent allowance holds nothing more: both are `state: exhausted` with the paths that still work and the grace; a service with no relay instance is `state: unavailable` | source only | `relay/lease.ts:560-640, 2230-2260` | `an_allowance_that_is_spent_is_shown_to_the_owner_and_asked_again` |
+//! | A revocation fences the lease and answers with the relay's figures and the settlement; sent again it answers the same; a lease the service never issued is `400`, one issued to another caller `403` | source only | `relay/lease.ts:1195-1260` | `an_ending_whose_answer_was_lost_is_asked_again_until_it_is_answered` |
+//! | Withdrawing an authorisation revokes the leases issued under it | source only | `relay/index.ts:840-880` | `a_withdrawn_authorisation_ends_the_leases_and_the_owner_is_told` |
+//! | The relay installing the lease, the relay's own counting and the settlement's evidence | not modelled: the stand-in answers that the lease is installed and counts the bytes a test says the relay counted | `relay/install.ts`, `relay/settlement.ts` | none |
 //! | Uploads the service has lost answer `NOT_FOUND` | source only | `storage/upload.ts:607` | `Moment::UploadsLost`; the daemon's `an_upload_the_service_lost_or_closed_is_made_again` |
 //! | Storage not confirming the write of a part answers `INTERNAL` and closes the upload | source only | `storage/index.ts:830`, `storage/upload.ts:577` | `Moment::PartWriteFails`; the daemon's `an_upload_the_service_lost_or_closed_is_made_again` |
 //! | The recovery bundle is read at its locator by an installation's signature and an account token carrying `backup.write` or `backup.restore`; a locator no write has reached answers an empty read in a history never put back; a written bundle is answered with its place in the order, its revision and its stream | recorded | `sync/index.ts:207-212, 813-943`, `sync/collection.ts:756-830`, `service-contracts/src/sync.ts:1411-1448, 1511-1515` | `the_stand_in_answers_as_the_worker_did` in `bundle_answers.rs` |
@@ -76,10 +84,12 @@
 mod feed;
 mod http;
 mod mailbox;
+mod relay;
 mod sync;
 mod web;
 
 pub use http::{Served, serve};
+pub use relay::{RelayLeaseView, RelayPayerRecord};
 pub use web::{
     ACCOUNT, Arrived, BACKUP_RESTORE_SCOPE, BACKUP_WRITE_SCOPE, Handled, IN_PROCESS_ORIGIN,
     MAX_GENERATIONS, Moment, PART, ServiceWeb, StaleRefusal, TOKEN, document_of, refusal,
