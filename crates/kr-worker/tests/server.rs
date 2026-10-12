@@ -272,6 +272,19 @@ async fn goes(process: &ProcessStartIdentity) -> bool {
     true
 }
 
+/// Waits until the command has started a process of its own, which a shell does once it has set
+/// up what it ignores: from then on a request to terminate finds the command as it will be.
+async fn set_up(server: &Server, record: &Record) {
+    let started = Instant::now();
+    while record.below(server.identity()).len() < 2 {
+        assert!(
+            started.elapsed() < LIVENESS,
+            "the command started no process of its own"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 /// Watches `processes` from now on, and returns when each was first seen gone, in the order given.
 /// A process is seen no earlier than it went, so a time read from here is never before its end.
 fn watch_until_gone(processes: Vec<ProcessStartIdentity>) -> tokio::task::JoinHandle<Vec<Instant>> {
@@ -315,7 +328,7 @@ async fn kr_req_07_60_a_server_that_ends_with_its_input_leaves_nothing() {
     let command = command_of(&server, &record).await;
     assert!(!gone(&command), "the command runs while the server does");
 
-    let retirement = server.retire(&record).await;
+    let retirement = server.retire(&record, Instant::now().into()).await;
     assert_eq!(retirement.ended, Ended::Input);
     assert!(retirement.forced.is_empty(), "{:?}", retirement.forced);
     assert!(retirement.survivors.is_empty());
@@ -331,7 +344,7 @@ async fn kr_req_07_60_a_server_that_ignores_its_input_ends_when_asked_to_termina
     let _session = to_the_approval(&server).await;
     let command = command_of(&server, &record).await;
 
-    let retirement = server.retire(&record).await;
+    let retirement = server.retire(&record, Instant::now().into()).await;
     assert_eq!(retirement.ended, Ended::Terminate);
     assert!(retirement.forced.is_empty(), "{:?}", retirement.forced);
     assert!(gone(server.identity()) && gone(&command));
@@ -353,10 +366,11 @@ async fn kr_req_07_66_a_server_and_a_command_that_ignore_a_terminate_are_ended_b
     let record = Record::of(&server);
     let _session = to_the_approval(&server).await;
     let command = command_of(&server, &record).await;
+    set_up(&server, &record).await;
 
     let begun = Instant::now();
     let watching = watch_until_gone(vec![server.identity().clone(), command.clone()]);
-    let retirement = server.retire(&record).await;
+    let retirement = server.retire(&record, begun.into()).await;
     assert_eq!(retirement.ended, Ended::Force);
     assert!(retirement.forced.contains(server.identity()));
     assert!(
@@ -393,7 +407,7 @@ async fn kr_req_07_53_a_command_that_ends_when_asked_is_not_forced_with_a_server
 
     let begun = Instant::now();
     let watching = watch_until_gone(vec![command.clone(), server.identity().clone()]);
-    let retirement = server.retire(&record).await;
+    let retirement = server.retire(&record, begun.into()).await;
     assert_eq!(retirement.ended, Ended::Force);
     assert_eq!(retirement.forced, vec![server.identity().clone()]);
     assert!(retirement.survivors.is_empty());
@@ -418,6 +432,7 @@ async fn kr_req_07_60_a_command_that_outlives_a_server_that_died_is_ended_by_wha
     let record = Record::of(&server);
     let mut session = to_the_approval(&server).await;
     let command = command_of(&server, &record).await;
+    set_up(&server, &record).await;
     // The approval is answered and the server dies.
     let id = session.approval["id"].clone();
     write(
@@ -434,7 +449,7 @@ async fn kr_req_07_60_a_command_that_outlives_a_server_that_died_is_ended_by_wha
 
     let begun = Instant::now();
     let watching = watch_until_gone(vec![command.clone()]);
-    let retirement = server.retire(&record).await;
+    let retirement = server.retire(&record, begun.into()).await;
     assert_eq!(retirement.ended, Ended::Already);
     assert!(
         retirement.forced.contains(&command),
@@ -450,6 +465,89 @@ async fn kr_req_07_60_a_command_that_outlives_a_server_that_died_is_ended_by_wha
         went.duration_since(begun) >= FIVE_SECONDS,
         "the command was forced {:?} after the ending began",
         went.duration_since(begun)
+    );
+}
+
+/// A program of the test's own, idle until it is ended, with its identity and a thread that collects
+/// it when it ends, so that it does not wait to be collected.
+struct Idler {
+    identity: ProcessStartIdentity,
+}
+
+fn idler() -> Idler {
+    let mut child = std::process::Command::new("/bin/sleep")
+        .arg("120")
+        .spawn()
+        .expect("the program starts");
+    let identity =
+        kr_ipc::identity::started_process_identity(child.id()).expect("the kernel names it");
+    std::thread::spawn(move || child.wait());
+    Idler { identity }
+}
+
+/// The session's record, as it is when a command starts another process while the others are
+/// ending: `late` is shown only from the second reading that finds `first` ended, and `first` is
+/// shown while it runs.
+struct LateRecord {
+    inner: Record,
+    first: ProcessStartIdentity,
+    late: ProcessStartIdentity,
+    readings_after_first_ended: std::sync::atomic::AtomicUsize,
+}
+
+impl Owned for LateRecord {
+    fn below(&self, server: &ProcessStartIdentity) -> Vec<ProcessStartIdentity> {
+        let mut below = self.inner.below(server);
+        if gone(&self.first) {
+            let readings = self
+                .readings_after_first_ended
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if readings >= 1 {
+                below.push(self.late.clone());
+            }
+        } else {
+            below.push(self.first.clone());
+        }
+        below
+    }
+
+    fn forced(&self, process: &ProcessStartIdentity) {
+        self.inner.forced(process);
+    }
+
+    fn unsignalled(&self, process: &ProcessStartIdentity, why: &str) {
+        self.inner.unsignalled(process, why);
+    }
+}
+
+/// A process the session records only after the ones it already knew have ended is asked to
+/// terminate and given its grace, and is not forced. The record here is the real one with two
+/// programs of the test's own added, because the moment a command's child is first shown cannot
+/// be placed against the ending's readings by any real process.
+#[tokio::test]
+async fn kr_req_07_53_a_process_recorded_while_the_others_are_ending_is_asked_before_it_is_forced()
+{
+    let stand_in = stand_in();
+    let server = start(&stand_in, "ignore-eof", PLAIN).await;
+    let (first, late) = (idler(), idler());
+    let record = LateRecord {
+        inner: Record::of(&server),
+        first: first.identity.clone(),
+        late: late.identity.clone(),
+        readings_after_first_ended: std::sync::atomic::AtomicUsize::new(0),
+    };
+
+    let retirement = server.retire(&record, Instant::now().into()).await;
+    assert_eq!(retirement.ended, Ended::Terminate);
+    assert!(
+        retirement.forced.is_empty(),
+        "nothing was forced: {:?}",
+        retirement.forced
+    );
+    assert!(retirement.survivors.is_empty());
+    assert!(
+        gone(&first.identity) && gone(&late.identity),
+        "both ended when asked"
     );
 }
 
@@ -484,7 +582,7 @@ async fn kr_req_07_60_a_server_that_floods_its_error_stream_goes_on_and_only_its
         assert!(started.elapsed() < LIVENESS, "the tail never rolled over");
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    let retirement = server.retire(&record).await;
+    let retirement = server.retire(&record, Instant::now().into()).await;
     assert!(retirement.survivors.is_empty());
 }
 
@@ -601,7 +699,7 @@ async fn kr_req_07_60_a_server_is_started_as_a_session_runs_it() {
         .expect("ps runs");
     assert_eq!(String::from_utf8_lossy(&group.stdout).trim(), pid);
     let record = Record::of(&server);
-    let retirement = server.retire(&record).await;
+    let retirement = server.retire(&record, Instant::now().into()).await;
     assert!(retirement.survivors.is_empty());
 }
 
@@ -634,7 +732,7 @@ async fn kr_req_07_60_a_command_started_while_the_server_is_being_ended_is_ended
     let _session = to_the_approval(&server).await;
     let _first = command_of(&server, &record).await;
 
-    let retirement = server.retire(&record).await;
+    let retirement = server.retire(&record, Instant::now().into()).await;
     assert_eq!(retirement.ended, Ended::Force);
     assert!(retirement.survivors.is_empty(), "{retirement:?}");
     // The command of the turn, one for the end of the input and one for the terminate: each was

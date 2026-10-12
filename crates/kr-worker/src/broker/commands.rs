@@ -1168,9 +1168,10 @@ impl CommandBackends {
     ///
     /// The session's closure calls this after the acceptance of the close has been delivered, and
     /// beside its own request to stop the processes it owns, so that a server ends gently, with
-    /// the end of its input, before anything is forced.
+    /// the end of its input, before anything is forced. `begun` is when that stop began: nothing
+    /// is forced before five seconds after it.
     #[cfg(unix)]
-    pub async fn end_servers(&self) {
+    pub async fn end_servers(&self, begun: tokio::time::Instant) {
         let closing = std::mem::take(
             &mut *self
                 .closing
@@ -1178,7 +1179,7 @@ impl CommandBackends {
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
         );
         for backend in &closing {
-            backend.end_gateway();
+            backend.end_gateway_since(begun);
         }
         for backend in &closing {
             backend.endings().await;
