@@ -3109,10 +3109,11 @@ impl Broker {
     /// Compiles one installed connector's table for the executable that runs and pins it for one
     /// instance.
     ///
-    /// The tables are the ones [`InstalledConnector::native_tables`] makes, so they are pinned to
-    /// the version a signed record names for the executable's digest, and nothing is pinned for an
-    /// executable no record names or a version the table is not qualified for. What comes back is
-    /// what the connection over them is opened and framed with.
+    /// The tables are the ones
+    /// [`native_tables`](crate::broker::connectors::InstalledConnector::native_tables) makes, so
+    /// they are pinned to the version a signed record names for the executable's digest, and
+    /// nothing is pinned for an executable no record names or a version the table is not qualified
+    /// for. What comes back is what the connection over them is opened and framed with.
     ///
     /// # Errors
     ///
