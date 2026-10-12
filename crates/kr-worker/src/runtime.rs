@@ -1532,16 +1532,15 @@ impl CloseGate {
         }
         let runtime = self.runtime;
         tokio::spawn(async move {
-            // The graceful stop of the session's processes and of its backends' servers begins
-            // here, and their five seconds end together: the servers' ending and this stop are
-            // given one start and so one deadline, and nothing of either is forced before it.
-            let begun = tokio::time::Instant::now();
-            let deadline = begun + GRACE_PERIOD;
             // The servers end beside the processes the session owns, now that the acceptance has
             // been delivered: a server is asked with the end of its input, which lets it end its
-            // commands, and is forced only if it will not go.
+            // commands, and is forced only if it will not go. Its ending counts its five seconds
+            // from `begun`, which comes before this stop's request, so the session's own forcing
+            // (five seconds from that request) can never reach a server's processes before the
+            // ending's window is over.
             #[cfg(unix)]
             let servers = {
+                let begun = tokio::time::Instant::now();
                 let backends = runtime.session().command_backends();
                 backends
                     .map(|backends| tokio::spawn(async move { backends.end_servers(begun).await }))
@@ -1552,7 +1551,8 @@ impl CloseGate {
             }
             // The grace period is an allowance, not a delay. A session whose processes have all
             // stopped moves on immediately; one that still holds something is given the full five
-            // seconds before anything is forced.
+            // seconds after the request to stop before anything is forced.
+            let deadline = tokio::time::Instant::now() + GRACE_PERIOD;
             loop {
                 let remaining = {
                     let session = runtime.session();
