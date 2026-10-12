@@ -61,6 +61,10 @@ fn removals_file(data: &Path) -> PathBuf {
     data.join("drafts-removals")
 }
 
+/// Held while the ledger is changed, so that two windows of one process never change it at once,
+/// whether or not the file lock tells one handle of a process from another.
+static LEDGER_GATE: Mutex<()> = Mutex::new(());
+
 /// What a ledger file holds: nothing when it is not there or cannot be read.
 fn read_removals(file: &Path) -> Vec<DiscardParams> {
     std::fs::read(file)
@@ -163,6 +167,7 @@ impl DraftDesk {
                 "the removals still to be made cannot be kept: {error}"
             ))
         };
+        let _gate = LEDGER_GATE.lock().unwrap_or_else(PoisonError::into_inner);
         std::fs::create_dir_all(&data).map_err(unavailable)?;
         // The lock is on a file of its own, held until this returns: a lock on the ledger itself
         // would go with the name it is renamed over.
@@ -173,6 +178,19 @@ impl DraftDesk {
             .open(data.join("drafts-removals.lock"))
             .map_err(unavailable)?;
         lock.lock().map_err(unavailable)?;
+        // No other writer is between writing a ledger and putting it in place while the lock is
+        // held, so a file staged under the ledger's name is one a crash left.
+        if let Ok(entries) = std::fs::read_dir(&data) {
+            for entry in entries.flatten() {
+                if entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("drafts-removals.staged-")
+                {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
         let file = removals_file(&data);
         let mut removals = read_removals(&file);
         if !change(&mut removals) {
@@ -188,7 +206,14 @@ impl DraftDesk {
         let mut written = std::fs::File::create(&staged).map_err(unavailable)?;
         written.write_all(&bytes).map_err(unavailable)?;
         written.sync_all().map_err(unavailable)?;
-        std::fs::rename(&staged, &file).map_err(unavailable)
+        std::fs::rename(&staged, &file).map_err(unavailable)?;
+        // The rename is in the directory, which is not on disk until the directory is: a power cut
+        // between the two would otherwise lose it.
+        #[cfg(unix)]
+        if let Ok(directory) = std::fs::File::open(&data) {
+            let _ = directory.sync_all();
+        }
+        Ok(())
     }
 
     /// Records a removal the page could not make, so that a start after it finishes it.
@@ -198,7 +223,11 @@ impl DraftDesk {
     /// Returns why the ledger cannot be written.
     pub fn mark_removal(&self, removal: DiscardParams) -> Result<()> {
         self.change_removals(|removals| {
-            removals.retain(|held| held.id != removal.id);
+            // Each version of a draft is owed its own removal: one recorded later for an older
+            // version does not take the entry of a newer one.
+            removals.retain(|held| {
+                held.id != removal.id || held.expected_revision != removal.expected_revision
+            });
             removals.push(removal);
             true
         })

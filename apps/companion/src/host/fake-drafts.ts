@@ -35,6 +35,11 @@ function refuse(code: string, message: string): never {
   throw { code, message, user_action: 'nothing' }
 }
 
+/** What a removal is kept under: a draft's version is a removal of its own. */
+function removalKey(request: DraftDiscardRequest): string {
+  return `${request.id}@${request.expectedRevision}`
+}
+
 const RANK: Readonly<Record<StoredMark, number>> = { open: 0, conflicted: 1, orphaned: 2 }
 
 /** Where a store keeps itself between windows: the part of `Storage` it uses. */
@@ -72,7 +77,7 @@ export class FakeDraftStore {
         clock: number
       }
       this.#drafts = new Map(parsed.drafts.map((draft) => [draft.id, draft]))
-      this.#removals = new Map((parsed.removals ?? []).map((removal) => [removal.id, removal]))
+      this.#removals = new Map((parsed.removals ?? []).map((removal) => [removalKey(removal), removal]))
       this.#counter = parsed.counter
       this.#clock = parsed.clock
     } catch {
@@ -142,7 +147,7 @@ export class FakeDraftStore {
 
   /** Records a removal the page could not make. */
   markRemoval(request: DraftDiscardRequest): void {
-    this.#removals.set(request.id, request)
+    this.#removals.set(removalKey(request), request)
     this.#write()
   }
 
@@ -233,8 +238,9 @@ export class FakeDraftStore {
       return { removed: false }
     }
     if (held.revision !== request.expectedRevision) {
-      // A draft that another window changed is theirs: no removal of it is left to make.
-      this.#endRemoval(request.id)
+      // A draft that another window changed is theirs: the removal of the version named is over,
+      // and one of a later version is still owed.
+      this.#endRemoval(request.id, request.expectedRevision)
       refuse('DRAFT_CONFLICT', `draft ${request.id} is at version ${held.revision}, not ${request.expectedRevision}: another window changed it`)
     }
     this.#drafts.delete(request.id)
@@ -243,8 +249,16 @@ export class FakeDraftStore {
     return { removed: true }
   }
 
-  #endRemoval(id: string): void {
-    if (this.#removals.delete(id)) this.#write()
+  /** Ends the removals owed for a draft: those of one version when it is named, else all of them. */
+  #endRemoval(id: string, version?: string): void {
+    let ended = false
+    for (const [key, removal] of this.#removals) {
+      if (removal.id === id && (version === undefined || removal.expectedRevision === version)) {
+        this.#removals.delete(key)
+        ended = true
+      }
+    }
+    if (ended) this.#write()
   }
 
   #make(request: DraftSaveRequest, files: readonly AttachmentHandle[], copyOf: string | null = null): StoredDraft {

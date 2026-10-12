@@ -1960,4 +1960,24 @@ describe('a removal the store would not make', () => {
     expect(restarted.draft(MAIN).text).toBe('')
     expect(restarted.snapshot().kept).toEqual([])
   })
+
+  it('has every removal it owes made at the next start, whichever version of a draft they name', async () => {
+    const store = new FakeDraftStore()
+    const book = await opened(store)
+    type(book, MAIN, 'one')
+    await book.settled()
+    type(book, MAIN, 'one two')
+    await book.settled()
+    const held = store.all()[0]
+    expect(held?.revision).toBe('2')
+    // An older removal is owed besides the newer one, as two failed removals leave them.
+    store.markRemoval({ id: held?.id ?? '', expectedRevision: '1' })
+    store.markRemoval({ id: held?.id ?? '', expectedRevision: '2' })
+
+    const restarted = await opened(store)
+    await restarted.settled()
+
+    expect(store.all()).toEqual([])
+    expect(store.pendingRemovals()).toEqual([])
+  })
 })

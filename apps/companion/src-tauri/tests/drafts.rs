@@ -844,6 +844,60 @@ fn a_stale_discard_leaves_the_removal_of_a_newer_version_owed() {
     );
 }
 
+/// KR-REQ-13.13: a removal recorded for an older version of a draft, after one for a newer version,
+/// does not take the newer one's entry: each version is owed its own removal.
+#[test]
+fn an_older_removal_recorded_later_leaves_the_removal_of_a_newer_version_owed() {
+    let data = tempfile::tempdir().expect("a data directory");
+    let window = Window::over(data.path());
+    let id = "00000000-0000-4000-8000-000000000001";
+    for revision in ["2", "1", "2"] {
+        window
+            .call(
+                "device_draft_mark_removal",
+                json!({ "id": id, "expectedRevision": revision }),
+            )
+            .expect("the removal is recorded");
+    }
+
+    let owed = window.read()["pendingRemovals"].clone();
+    let mut versions: Vec<&str> = owed
+        .as_array()
+        .expect("a list")
+        .iter()
+        .map(|each| each["expectedRevision"].as_str().expect("a version"))
+        .collect();
+    versions.sort_unstable();
+    assert_eq!(versions, ["1", "2"], "one entry for each version: {owed}");
+}
+
+/// KR-REQ-13.13: what a crash left beside the ledger, between writing a new ledger and putting it
+/// in place, is removed by the next change of it.
+#[test]
+fn a_file_a_crash_left_beside_the_ledger_is_removed_by_the_next_change() {
+    let data = tempfile::tempdir().expect("a data directory");
+    let window = Window::over(data.path());
+    let mark = |id: &str| {
+        window
+            .call(
+                "device_draft_mark_removal",
+                json!({ "id": id, "expectedRevision": "1" }),
+            )
+            .expect("the removal is recorded");
+    };
+    mark("00000000-0000-4000-8000-000000000001");
+    let left = data.path().join("drafts-removals.staged-4242-0");
+    std::fs::write(&left, b"half a ledger").expect("a file left by a crash");
+
+    mark("00000000-0000-4000-8000-000000000002");
+
+    assert!(!left.exists(), "the file a crash left is removed");
+    assert_eq!(
+        window.read()["pendingRemovals"].as_array().map(Vec::len),
+        Some(2)
+    );
+}
+
 /// KR-REQ-13.13: removals recorded at the same moment by windows of one application are all owed
 /// afterwards: the ledger is read, changed and put back as one step, so no writer's entry is lost to
 /// another's.

@@ -807,7 +807,14 @@ export class DraftBook {
   /** Takes up the removals an earlier run began and did not finish. */
   #oweFrom(pending: readonly { readonly id: string; readonly expectedRevision: string }[]): void {
     for (const removal of pending) {
-      if (this.#cleanups.some((each) => each.ref.id === removal.id)) continue
+      // A draft can be owed a removal at each of several versions, and each is made or found over.
+      if (
+        this.#cleanups.some(
+          (each) => each.ref.id === removal.id && each.ref.revision === removal.expectedRevision
+        )
+      ) {
+        continue
+      }
       this.#cleanups.push({
         ref: { id: removal.id, revision: removal.expectedRevision },
         key: `removal-${removal.id}`
