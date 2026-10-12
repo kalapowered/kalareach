@@ -2711,7 +2711,7 @@ async fn kr_req_10_51_a_device_reads_the_decisions_its_grant_names_while_they_ar
     );
 
     // The device the invitation names holds the grant it carries.
-    let redeemed = served
+    served
         .controller
         .sharing()
         .redeem(

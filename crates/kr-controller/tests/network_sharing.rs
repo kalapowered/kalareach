@@ -13,7 +13,6 @@ use kr_controller::service::net::devices::DeviceRecord;
 use kr_controller::service::net::dispatch::EFFECT_WAIT;
 use kr_controller::sharing::ShareRequest;
 use kr_crypto::keys::DeviceKeys;
-use kr_protocol::envelope::ActionTarget;
 use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::grant::GrantExpiry;
 use kr_protocol::ids::{ActionId, DeviceId, GrantId, InvitationId, SessionId};

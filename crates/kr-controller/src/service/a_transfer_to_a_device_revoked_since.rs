@@ -10,7 +10,6 @@ use kr_protocol::scalars::{TimestampMs, Uuid};
 
 use super::a_transfer_left_unanswered::{Ceremony, confirmed, daemon, owner_share, plan_of};
 use super::a_voice_grant_on_the_floor::paired;
-use crate::service::Controller;
 
 /// KR-REQ-23.49: a transfer to a device revoked since the plan was built is refused and writes
 /// nothing, and the grant it would have handed over is still held. The control is the same
