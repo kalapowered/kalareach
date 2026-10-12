@@ -341,6 +341,53 @@ async fn another_accounts_token_is_told_what_an_absent_collection_is_told() {
     // A token the account holds without a scope a read is answered for proves nothing.
     let other_scope = read("a-token-for-another-scope").fetch(&collection).await;
     assert_eq!(format!("{other_scope:?}"), format!("{nobody:?}"));
+    // Nor does one that has expired.
+    web.expire_token(WRITE_TOKEN);
+    let expired = read(WRITE_TOKEN).fetch(&collection).await;
+    assert_eq!(format!("{expired:?}"), format!("{nobody:?}"));
+}
+
+/// A collection put back from an export names its history, and the history reaches the client
+/// whether the bundle is there or not.
+///
+/// Source only: a local deployment is not put back. The Worker answers `recovery_id` from the
+/// collection's own record (`sync/collection.ts`, `recoveryId`).
+#[tokio::test]
+async fn a_collection_put_back_names_its_history_with_or_without_the_bundle() {
+    let web = Arc::new(ServiceWeb::new());
+    web.issue_token(RESTORE_TOKEN, ACCOUNT, &[BACKUP_RESTORE_SCOPE]);
+    let origin = GatewayOrigin::new(web.origin()).expect("an origin");
+    let history = "0a1b2c3d-0000-4000-8000-0000000000aa";
+    let http: Arc<dyn ServiceHttp> = Arc::clone(&web) as _;
+    let fetch = |locator: &str| {
+        let collection = bundle_collection(&RecoveryContext {
+            service_origin: origin.as_str().to_owned(),
+            bundle_locator: locator.to_owned(),
+        });
+        let client = ManagedSyncService::new(
+            origin.clone(),
+            Arc::clone(&http),
+            keyed(ServiceRequestSigner::Installation) as _,
+        )
+        .presenting(
+            Arc::new(Bearer(RESTORE_TOKEN.to_owned())),
+            BACKUP_RESTORE_SCOPE,
+        );
+        async move { client.fetch(&collection).await }
+    };
+    let empty = fresh_locator().expect("a locator");
+    web.put_bundle_back(&empty, history);
+    match fetch(&empty).await {
+        Ok(SyncFetched::Absent { recovery }) => assert!(recovery.is_some()),
+        other => panic!("a put-back collection with no bundle is an empty read: {other:?}"),
+    }
+    let written = fresh_locator().expect("a locator");
+    web.put_bundle(&written, ACCOUNT, stream(2048));
+    web.put_bundle_back(&written, history);
+    match fetch(&written).await {
+        Ok(SyncFetched::Held { position, .. }) => assert!(position.recovery().is_some()),
+        other => panic!("a put-back collection holds its bundle: {other:?}"),
+    }
 }
 
 /// Runs the script against a local Worker and writes what it answered.

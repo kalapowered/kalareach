@@ -190,7 +190,14 @@ pub(crate) fn exchange(
         "stored": {
             "objects": u64::from(held.is_some()).to_string(),
             "conflicts": "0",
-            "bytes": held.map_or(0, |held| held.ciphertext.len() as u64).to_string(),
+            "bytes": held
+                .map_or(0, |held| {
+                    SealedRecoveryBundle {
+                        ciphertext: Bytes::new(held.ciphertext.clone()),
+                    }
+                    .stored_bytes()
+                })
+                .to_string(),
             "object_limit": "1",
             "allowance_bytes": null,
         },
