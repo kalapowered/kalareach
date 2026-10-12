@@ -4428,9 +4428,9 @@ mod tests {
     }
 
     /// A release that reads version 9 kept no answer to a redemption or to a transfer of control,
-    /// and one that reads 10 recorded the configuration document at the version before this one's.
-    /// A registry either left comes forward to this version with no row changed: the answers these
-    /// methods keep are written by a release that writes 10 or later.
+    /// and the release before this one recorded the configuration document at the version before
+    /// this one's. A registry either left comes forward to this version with no row changed: the
+    /// answers these methods keep are written by a release that writes 10 or later.
     #[test]
     fn a_registry_at_an_earlier_version_comes_forward_and_changes_no_row() {
         for from in [9, SCHEMA_VERSION - 1] {
