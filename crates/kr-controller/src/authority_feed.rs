@@ -381,7 +381,7 @@ impl FeedRuntime {
     pub fn doctor_check(&self, controller: &Controller) -> DoctorCheck {
         let status = controller.authority_feed().status();
         let observed = self.shared.observed();
-        let now = kr_ipc::now_ms().get();
+        let now = controller.wall_now_ms();
         let synchronised = match status.last_synchronised_at_ms.0 {
             Some(at) => Sentence::new()
                 .stated("it was last synchronised ")
@@ -718,7 +718,7 @@ async fn settle(
         controller.authority_feed_settled(id, shared.host_device_id);
         return Ok(true);
     }
-    let now = kr_ipc::now_ms().get();
+    let now = controller.wall_now_ms();
     let noted = controller.authority_feed_record(id);
     let plan = match &noted {
         // A different request under an identity this host took, or one this host refused after
@@ -789,7 +789,7 @@ async fn settle(
         host_device_id: shared.host_device_id,
         authority_revision: number,
         completion: applied.completion,
-        acknowledged_at_ms: TimestampMs::new(kr_ipc::now_ms().get()),
+        acknowledged_at_ms: TimestampMs::new(controller.wall_now_ms()),
     };
     let state = shared
         .client

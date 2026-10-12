@@ -270,7 +270,7 @@ impl Controller {
     ///
     /// Returns an error when the device directory cannot be read.
     pub(crate) fn owner_key_ids(&self) -> Result<(Vec<KeyId>, usize)> {
-        let now_ms = kr_ipc::now_ms().get();
+        let now_ms = self.wall_now_ms();
         let mut owners: Vec<_> = self
             .devices
             .devices()?
@@ -398,7 +398,7 @@ impl Controller {
     /// Writes down a successful synchronisation, and, for a host under a bounded offline-validity
     /// policy, extends the bound from it.
     pub(crate) fn authority_feed_synchronised(&self) {
-        let now = kr_ipc::now_ms().get();
+        let now = self.wall_now_ms();
         {
             let mut feed = self.authority_feed();
             feed.synchronised(now);
@@ -446,7 +446,7 @@ impl Controller {
     /// grants are refused whatever happens, and the caller asks again, so the removal reaches the
     /// registry when it can take it.
     pub(crate) async fn authority_feed_removed(&self, origin: &str) -> Result<()> {
-        let now = kr_ipc::now_ms().get();
+        let now = self.wall_now_ms();
         self.refuse_the_grants_that_rest_on_the_feed();
         let removal = {
             let mut feed = self.authority_feed();
@@ -497,7 +497,7 @@ impl Controller {
         if let Err(error) = self
             .tell_the_owner_of_the_feed(
                 kr_attention::EventKind::AuthorityFeedLeft,
-                kr_ipc::now_ms().get(),
+                self.wall_now_ms(),
             )
             .await
         {
