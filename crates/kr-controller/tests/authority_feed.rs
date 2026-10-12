@@ -204,8 +204,8 @@ impl Rig {
     }
 
     /// Stops the daemon and starts it again on its tree, after `edit` has changed what the tree
-    /// holds, with the feed unreachable for the start's first request when `feed_down`. A suite
-    /// closes its clients before it restarts.
+    /// holds, with the feed unreachable for its next four requests when `feed_down`: the start's
+    /// read and the reads a connection asks for. A suite closes its clients before it restarts.
     async fn restarted(
         self,
         feed_down: bool,
@@ -219,15 +219,18 @@ impl Rig {
             ..
         } = self;
         if feed_down {
-            served.web().fail(
-                AUTHORITY,
-                1,
-                Moment::Refuse {
-                    status: 503,
-                    code: "SERVICE_UNAVAILABLE",
-                    retry_after_seconds: None,
-                },
-            );
+            // The start's read and the reads a connection asks for before it is served.
+            for nth in 1..=4 {
+                served.web().fail(
+                    AUTHORITY,
+                    nth,
+                    Moment::Refuse {
+                        status: 503,
+                        code: "SERVICE_UNAVAILABLE",
+                        retry_after_seconds: None,
+                    },
+                );
+            }
         }
         let stopped = host.shut_down().await;
         edit(stopped.tree());
@@ -2000,9 +2003,9 @@ async fn a_notice_is_numbered_above_what_the_attention_store_took_when_the_hosts
     );
 }
 
-/// A record of the removal that is behind the attention store's cursor, as when the registry was put
-/// back to an earlier copy than the store, is numbered again above the cursor at the next start, so
-/// that the notice it holds is given and not taken for one the store has.
+/// A record of the removal that is behind the attention store's cursor, as when the registry was
+/// put back to an earlier copy than the store, is numbered again above the cursor at the next
+/// start, so that the notice it holds is given and not taken for one the store has.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_removal_recorded_behind_the_attention_stores_cursor_is_numbered_again_at_the_next_start()
 {
@@ -2107,6 +2110,23 @@ async fn a_refusal_whose_first_write_failed_is_on_disk_before_it_is_sent() {
     );
     rig.served.web().release_held();
     polled.await;
+}
+
+/// A removal is written down whether or not the attention store can be read when the feed answers:
+/// the record is the one thing a restart finds, and without it a host that starts with the feed
+/// unreachable serves the grants that rest on the feed again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_removal_is_written_down_though_the_attention_store_cannot_be_read() {
+    let rig = Rig::start().await;
+    rig.the_owner_bounds_offline_validity();
+    let (phone, record) = rig.pairs(&[ActionRight::SessionView]).await;
+    rig.host
+        .controller()
+        .make_the_notice_cursor_unreadable(true);
+    rig.the_feed_removes_the_host().await;
+
+    let rig = rig.restarted(true, |_| {}).await;
+    refused_for_the_removal(&rig, &phone, &record).await;
 }
 
 /// The notices about the feed are numbered by the order the host gave them in and not by the time
