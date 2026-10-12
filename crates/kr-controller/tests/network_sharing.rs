@@ -609,12 +609,13 @@ async fn kr_req_18_03_a_device_that_lists_its_delegations_is_not_told_the_recipi
     let host = Host::start(&owner).await;
     let (boss, boss_record) = recipient(&host, &owner).await;
     let (_short, short_record) =
-        net_support::recipient_ending_in(&host, &owner, Duration::from_secs(30 * 60)).await;
+        net_support::recipient_ending_in(&host, &owner, Duration::from_secs(10 * 60)).await;
     let session_id = SessionId::new(kr_ipc::new_uuid());
     let (above, issuing) = owned_by(&host, session_id, &boss, &boss_record).await;
 
-    // Written below the host's checks, as a delegation was before they existed: the boss issued an
-    // hour to a device that has half of it.
+    // Written below the host's checks, as a delegation was before they existed: the boss issued
+    // half an hour to a device whose pairing has ten minutes, and half an hour is less than the
+    // boss's own share has left.
     let selection = RoleSelection::plain(SessionRole::Viewer);
     let written = host
         .controller()
@@ -630,7 +631,7 @@ async fn kr_req_18_03_a_device_that_lists_its_delegations_is_not_told_the_recipi
                 parent_grant_id: Some(above.grant.grant_id),
                 accepted_notices: AuthorityNotice::for_actions(&selection.actions()),
                 selection,
-                lifetime_ms: Some(60 * 60_000),
+                lifetime_ms: Some(30 * 60_000),
                 live_screen: None,
                 named_questions: Vec::new(),
                 named_approvals: Vec::new(),
