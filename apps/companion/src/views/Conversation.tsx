@@ -412,7 +412,7 @@ export function Conversation({
               binding_revision: written.agentBindingRevision ?? binding.binding_revision
             }
       const turn = binding.turn_id ?? ''
-      const call =
+      const dispatch = () =>
         action === 'submit'
           ? port.composerSubmit({ target, draft_id: null, text: typed })
           : action === 'queue'
@@ -420,6 +420,9 @@ export function Conversation({
             : action === 'steer'
               ? port.composerSteer({ target, turn_id: turn, text: typed })
               : port.composerInterrupt({ target: now, turn_id: turn })
+      // A prompt is sent only once the stored draft is this window's to send: another window that
+      // holds the same draft claims it first, and the other one sends nothing.
+      const call = sending === null ? dispatch() : sending.claimed.then(dispatch)
 
       call
         .then((result) => {

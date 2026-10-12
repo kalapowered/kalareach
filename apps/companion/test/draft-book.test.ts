@@ -1873,3 +1873,61 @@ describe('a composer that holds a file still uploading', () => {
     expect(filesOf(book, MAIN)).toEqual(['file-uploading'])
   })
 })
+
+describe('two windows that hold the same draft', () => {
+  /** Two books over one store, as two windows of the application are, both holding one draft. */
+  async function twoHolding(): Promise<{ store: FakeDraftStore; one: DraftBook; two: DraftBook }> {
+    const store = new FakeDraftStore()
+    const one = await opened(store)
+    type(one, MAIN, 'send this once')
+    await one.settled()
+    const two = await opened(store)
+    expect(two.draft(MAIN).text).toBe('send this once')
+    return { store, one, two }
+  }
+
+  it('let only the first claim it to send: the second is refused while the first is on its way', async () => {
+    const { one, two } = await twoHolding()
+    const first = one.beginSend(MAIN)
+    await expect(first.claimed).resolves.toBeUndefined()
+
+    const second = two.beginSend(MAIN)
+    await expect(second.claimed).rejects.toMatchObject({ code: 'DRAFT_CONFLICT' })
+  })
+
+  it('let only the first send it even when the first has finished, and the second keeps its text', async () => {
+    const { store, one, two } = await twoHolding()
+    const notices: string[] = []
+    two.onNotice((words) => notices.push(words))
+    const first = one.beginSend(MAIN)
+    await first.claimed
+    // The host took the prompt: the stored draft is gone.
+    one.endSend(first, 'taken')
+    await one.settled()
+    expect(store.all()).toEqual([])
+
+    const second = two.beginSend(MAIN)
+    await expect(second.claimed).rejects.toMatchObject({ code: 'DRAFT_CONFLICT' })
+    two.endSend(second, 'refused')
+    await two.settled()
+    expect(notices.join(' ')).toMatch(/Another window/)
+    // What this window held is not lost to the refusal.
+    expect(two.draft(MAIN).text).toBe('send this once')
+    expect(store.all().map((draft) => draft.text)).toEqual(['send this once'])
+  })
+
+  it('claim nothing twice in one window: a second press after the first ended is a new draft’s', async () => {
+    const store = new FakeDraftStore()
+    const book = await opened(store)
+    type(book, MAIN, 'one')
+    await book.settled()
+    const first = book.beginSend(MAIN)
+    await first.claimed
+    book.endSend(first, 'taken')
+    await book.settled()
+    type(book, MAIN, 'two')
+    await book.settled()
+    const second = book.beginSend(MAIN)
+    await expect(second.claimed).resolves.toBeUndefined()
+  })
+})

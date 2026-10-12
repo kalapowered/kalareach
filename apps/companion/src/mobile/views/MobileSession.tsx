@@ -629,12 +629,15 @@ export function MobileSession({
       // What the person wrote goes to the conversation they wrote it for, at the binding revision
       // they wrote it at: the host refuses it if that conversation has moved on since.
       const { applicationInstanceId: instance, agentBindingRevision: revision } = draft.target
-      ask(() => {
+      ask(async () => {
+        // The prompt is sent only once the stored draft is this window's to send: another window
+        // that holds the same draft claims it first, and the other one sends nothing.
+        await sending.claimed
         if (instance === null || revision === null) {
           // eslint-disable-next-line @typescript-eslint/only-throw-error -- refused as a command's failure is: data
           throw { code: 'UNSUPPORTED_CAPABILITY', message: 'No agent is running in this session.' }
         }
-        return port.composerSubmit({
+        return await port.composerSubmit({
           target: { subject: subjectOf(sessionId, instance), binding_revision: revision },
           draft_id: null,
           text

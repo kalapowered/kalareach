@@ -159,6 +159,12 @@ export type SendOutcome =
 /** A prompt on its way. */
 export interface SendToken {
   readonly key: string
+  /**
+   * Settles once the stored draft is this window's to send, and rejects when it is not: another
+   * window of the application changed it or sent it first, and this window sends nothing. The
+   * rejection is a command's failure, with the code `DRAFT_CONFLICT`.
+   */
+  readonly claimed: Promise<void>
 }
 
 /** A prompt sent from a draft, from the press to the host's answer. */
@@ -186,6 +192,11 @@ type Written =
   | 'unchanged'
   /** The store refused, and the draft is held in this window only. */
   | 'failed'
+  /**
+   * A claim of the stored draft was lost: another window changed it or removed it first, so what
+   * this window holds is kept beside theirs, or as a draft of its own.
+   */
+  | 'lost'
 
 /** What the writer knows of one draft. */
 interface Track {
@@ -564,11 +575,35 @@ export class DraftBook {
     const token = `send-${String(this.#sends)}`
     const flight: Flight = { id: token, composer: key, sent, record: null, earlier: null }
     this.#flights.set(token, flight)
+    let claim: { resolve: () => void; reject: (failure: unknown) => void } = {
+      resolve: () => undefined,
+      reject: () => undefined
+    }
+    const claimed = new Promise<void>((resolve, reject) => {
+      claim = { resolve, reject }
+    })
+    // A caller that sends nothing more has no use for the rejection, and it is not an unhandled one.
+    claimed.catch(() => undefined)
     this.#enqueue(key, async () => {
       if (this.#status === 'ready' && !holdsNothing(sent)) {
-        const written = await this.#write(key, sent)
+        // The save names the version this window holds and always makes a new one, so of two
+        // windows that hold the same stored draft only the first can claim it.
+        const written = await this.#write(key, sent, true)
         if (written === 'failed') flight.earlier = this.#find(key)?.stored ?? null
         else flight.record = this.#find(key)?.stored ?? null
+        if (written === 'lost') {
+          this.#say(
+            'Another window of this application holds this draft, so it was not sent. It is kept here.'
+          )
+          claim.reject({
+            code: 'DRAFT_CONFLICT',
+            message: 'Another window of this application holds this draft, so it was not sent.'
+          })
+        } else {
+          claim.resolve()
+        }
+      } else {
+        claim.resolve()
       }
       // The composer lets go of the record: the next thing written is a draft of its own, and a
       // composer that still holds what was sent (a phone keeps it until the answer) needs no write.
@@ -577,7 +612,7 @@ export class DraftBook {
       this.#mutate(key, (draft) => ({ ...draft, stored: null }))
       this.#track(key).savedKey = contentKey(now) === contentKey(sent) ? contentKey(now) : null
     })
-    return { key: token }
+    return { key: token, claimed }
   }
 
   /** Says how a prompt that was sent from a draft ended. */
@@ -1284,13 +1319,15 @@ export class DraftBook {
    * stood when a prompt was sent is written to the record the composer holds, even though the
    * composer has moved on since.
    */
-  async #write(key: string, given?: Draft): Promise<Written> {
+  async #write(key: string, given?: Draft, claim = false): Promise<Written> {
     if (this.#status !== 'ready') return 'unchanged'
     const track = this.#track(key)
     const draft = given ?? this.#find(key)
     if (draft === undefined) return 'unchanged'
     const wanted = contentKey(draft)
-    if (wanted === track.savedKey) return 'unchanged'
+    // A claim is a write even when the store already holds what is written: the new version is
+    // what another window's claim of the same one would find taken.
+    if (!claim && wanted === track.savedKey) return 'unchanged'
     const stored = this.#find(key)?.stored ?? draft.stored
     if (holdsNothing(draft)) return await this.#removeStored(key, stored, wanted)
     let saved: DraftSaved
@@ -1324,7 +1361,10 @@ export class DraftBook {
       )
       this.#hold(this.reload())
     }
-    return 'stored'
+    // A draft another window removed is made again under an identity of its own, which for a claim
+    // says the same as a copy: that window sent it or discarded it, and this one is not to send it.
+    const lost = saved.outcome === 'copied' || (stored !== null && saved.draft.id !== stored.id)
+    return claim && lost ? 'lost' : 'stored'
   }
 
   async #removeStored(key: string, stored: Draft['stored'], wanted: string): Promise<Written> {

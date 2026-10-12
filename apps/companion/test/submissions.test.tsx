@@ -7,7 +7,7 @@
  * of an action rather than waiting for an event that may never come.
  */
 
-import { act, cleanup, render, screen, waitFor } from '@testing-library/react'
+import { act, cleanup, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { afterEach, describe, expect, it } from 'vitest'
 
@@ -268,5 +268,57 @@ describe('on the phone', () => {
       },
       { timeout: 3_000 }
     )
+  })
+})
+
+describe('two windows of the desktop application that hold one draft', () => {
+  /** One window of the application over the device's drafts, with the sends its host received. */
+  function open(device: FakeDraftStore) {
+    const host = fakeHost({ drafts: device })
+    const view = render(
+      <AppProvider
+        port={host.port}
+        initialPlace={{ view: 'session', sessionId: SESSION_MAIN, pane: 'semantic' }}
+      >
+        <App />
+      </AppProvider>
+    )
+    return { ...host, within: within(view.container) }
+  }
+
+  it('send it once: the second window is refused and keeps what it held', async () => {
+    const device = new FakeDraftStore()
+    const person = userEvent.setup()
+    const first = open(device)
+    await person.type(await first.within.findByTestId('composer-input'), 'run the migration')
+    await waitFor(() => {
+      expect(device.all().map((draft) => draft.text)).toEqual(['run the migration'])
+    })
+    const second = open(device)
+    await waitFor(() => {
+      expect(second.within.getByTestId('composer-input')).toHaveValue('run the migration')
+    })
+    await waitFor(() => {
+      expect(second.within.getByTestId('composer-send')).toBeEnabled()
+    })
+
+    await person.click(first.within.getByTestId('composer-send'))
+    await waitFor(() => {
+      expect(first.controls.submissions).toBe(1)
+    })
+    await waitFor(() => {
+      expect(device.all()).toEqual([])
+    })
+
+    // The second window still shows the draft, and its Send is refused: nothing reaches its host.
+    await person.click(second.within.getByTestId('composer-send'))
+    await waitFor(() => {
+      expect(second.within.getByTestId('composer-input')).toHaveValue('run the migration')
+    })
+    await waitFor(() => {
+      expect(second.within.getByText('Refused by the host')).toBeInTheDocument()
+    })
+    expect(second.controls.submissions).toBe(0)
+    expect(first.controls.submissions).toBe(1)
   })
 })
