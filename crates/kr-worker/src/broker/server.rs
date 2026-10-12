@@ -18,14 +18,15 @@
 //! terminate (never to hang up: a hang-up kills it at once and leaves its commands behind), and so
 //! is every process the session recorded below it, which is ended by its identity because a
 //! command of the server's leaves its process group and its session and outlives a server that
-//! dies; a recorded process is asked as soon as the server is gone when that is sooner. What is
-//! still running when the window is over is ended by force, and a process that was forced has two
-//! more seconds to be gone, after which the survivors are recorded. What the session recorded is
-//! read before the server is asked anything, again and again while the processes below it are
-//! ending, and before it is ended, since a command whose parent has gone can no longer be found by
-//! its parentage; a process first shown while the others are ending is asked, with the rest of the
-//! window, and every force waits for the window to be over. A process the ending forces is noted
-//! as forced.
+//! dies; a recorded process is asked as soon as the server is gone when that is sooner. A process
+//! that has left the session for a control daemon's own scope is none of this: it is not asked,
+//! not forced and not reported. What is still running when the window is over is ended by force,
+//! and a process that was forced has two more seconds to be gone, after which the survivors are
+//! recorded. What the session recorded is read before the server is asked anything, again and again
+//! while the processes below it are ending, and before it is ended, since a command whose parent
+//! has gone can no longer be found by its parentage; a process first shown while the others are
+//! ending is asked, with the rest of the window, and every force waits for the window to be over. A
+//! process the ending forces is noted as forced.
 //!
 //! **A limit.** On Linux the worker is the child subreaper, so a command the server leaves behind
 //! and the ladder then ends is a child of the worker's that nothing collects: it stays in the
@@ -614,13 +615,15 @@ const RECORD_REREAD: Duration = Duration::from_millis(200);
 /// Until `window_over` the record is read again and again, and every process it shows is asked to
 /// terminate once, so that one that a command started while the others were ending has its grace
 /// too; the window ends early only when a reading finds nothing running. Then what is still running
-/// is ended by force, a few rounds, each reading the record for what the last one left.
+/// is ended by force, a few rounds, each reading the record for what the last one left. A process
+/// that [`Owned::left`] says has left the session is not asked, not forced and not counted as
+/// running, whenever it is asked about.
 ///
 /// **Nothing is forced before `window_over`, by construction:** every round of force first asks
 /// what it has not asked and waits for it until `window_over`, so a process that a reading before
 /// force shows for the first time, at any moment, has the rest of the window and is forced only if
 /// it is still there when the window is over. The reading at the very end only reports (see
-/// [`Owned`]). Returns the processes still running at the end.
+/// [`Owned`]). Returns the processes of the session still running at the end.
 async fn end_below(
     server: &ProcessStartIdentity,
     mut known: BTreeSet<ProcessStartIdentity>,
@@ -656,11 +659,10 @@ async fn end_below(
         // The one place a process is forced: not before the window is over, whatever the readings
         // showed and whenever they showed it.
         wait_until_ended(&mut remaining, window_over).await;
+        // Asked again, after the wait: a process can have left the session meanwhile, and one that
+        // did is neither forced nor waited for.
+        remaining.retain(|process| !owned.left(process));
         for process in &remaining {
-            // Asked again, after the wait: the process can have left the session meanwhile.
-            if owned.left(process) {
-                continue;
-            }
             if signal(process, Stop::Kill, owned) {
                 owned.forced(process);
                 forced.push(process.clone());
