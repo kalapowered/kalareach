@@ -69,7 +69,8 @@ impl InviteMode {
 pub enum InviteGrantKind {
     /// A personal owner grant, valid until revoked.
     PersonalOwner,
-    /// A session invitation, view-only for an hour unless the issuer chose otherwise.
+    /// A session invitation: a pairing that ends, for at most the longest an invitation may last,
+    /// over the rights and sessions the issuer chose. A guest is one that names no session.
     SessionInvitation,
 }
 

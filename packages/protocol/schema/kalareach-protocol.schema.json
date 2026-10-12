@@ -18937,7 +18937,7 @@
         },
         {
           "const": "session_invitation",
-          "description": "A session invitation, view-only for an hour unless the issuer chose otherwise.",
+          "description": "A session invitation: a pairing that ends, for at most the longest an invitation may last,\nover the rights and sessions the issuer chose. A guest is one that names no session.",
           "type": "string"
         }
       ]

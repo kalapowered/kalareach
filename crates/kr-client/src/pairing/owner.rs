@@ -527,7 +527,7 @@ fn authority_over(
     rights: &kr_protocol::scalars::CanonicalSet<ActionRight>,
     sessions: &kr_protocol::grant::SessionSelector,
 ) -> Option<String> {
-    const NONE: &str = "reach no session until one is shared with it";
+    const NONE: &str = "reach only the sessions shared with it";
     if !matches!(sessions, kr_protocol::grant::SessionSelector::None)
         || rights.contains(&ActionRight::HostManage)
     {
@@ -1332,9 +1332,9 @@ mod tests {
         }
     }
 
-    /// KR-REQ-25.28: the owner is told that a guest pairing reaches no session until one is shared
-    /// with it, on the prompt that asks for the confirmation and on the words every other surface
-    /// shows, and a pairing over every session says what its rights allow as it always did.
+    /// The owner is told that a guest pairing reaches only the sessions shared with it, on the
+    /// prompt that asks for the confirmation and on the words every other surface shows, and a
+    /// pairing over every session says what its rights allow as it always did.
     #[test]
     fn a_pairing_over_no_session_says_so() {
         let guest = ProposedGrant {
@@ -1349,12 +1349,12 @@ mod tests {
         };
         let line = reason(&subject, "studio", NOW).expect("a line");
         assert!(
-            line.contains("may reach no session until one is shared with it"),
+            line.contains("may reach only the sessions shared with it for"),
             "{line}"
         );
         assert_eq!(
             describe_rights(&guest.actions, &guest.session_selector),
-            "reach no session until one is shared with it"
+            "reach only the sessions shared with it"
         );
         let wide = grant(&[ActionRight::SessionView], an_hour());
         assert_eq!(

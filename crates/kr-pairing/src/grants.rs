@@ -484,9 +484,9 @@ mod tests {
 
     /// A pairing invitation shows its issuer the rights it proposes and no preview of any named
     /// resource, so a proposal that names a current approval or question is refused, for either
-    /// kind, with the reason, and no grant is issued from it. The controls are the proposals this
-    /// host's own surfaces make: the personal owner grant, and the command line's guest pairing,
-    /// with nothing named.
+    /// kind, with the reason, and no grant is issued from it. The controls are proposals that
+    /// name nothing: the personal owner grant, the command line's guest pairing, and a guest
+    /// pairing that includes the live screen.
     #[test]
     fn a_pairing_proposal_that_names_an_approval_or_a_question_is_refused() {
         for (named, question, approval) in [("approval", false, true), ("question", true, false)] {
@@ -526,14 +526,14 @@ mod tests {
 
         assert!(validate_proposal(&personal_owner_grant(), GrantKind::PersonalOwner, 0).is_ok());
         let guest = guest_grant(0, 60 * 60_000, environment()).expect("a proposal");
-        let view = ProposedGrant {
+        let with_screen = ProposedGrant {
             history: HistoryScope {
                 include_live_screen: true,
                 ..history()
             },
             ..guest
         };
-        assert!(validate_proposal(&view, GrantKind::SessionInvitation, 0).is_ok());
+        assert!(validate_proposal(&with_screen, GrantKind::SessionInvitation, 0).is_ok());
     }
 
     #[test]
