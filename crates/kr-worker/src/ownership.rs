@@ -176,6 +176,9 @@ pub struct OwnedProcesses {
     /// give one a scope.
     #[cfg(test)]
     in_a_scope: std::collections::BTreeSet<(u64, u64)>,
+    /// How many times a test host has read whether a process is in a daemon's own scope.
+    #[cfg(test)]
+    scope_reads: std::sync::atomic::AtomicUsize,
 }
 
 /// The part of a session's record that one observation of its boundary works on, copied out of it.
@@ -272,6 +275,11 @@ pub const MAX_RECORDED_PROCESSES: usize = 1024;
 /// was read as a child of (a root's own is itself).
 type ReadBelow = (ProcessStartIdentity, (u64, u64), (u64, u64));
 
+/// What one operation has read of whether processes are in a control daemon's own scope: each
+/// process once, however many processes are recorded below it. Made at the start of an operation
+/// and dropped at its end, so a reading is never older than the operation that uses it.
+type Scopes = std::cell::RefCell<BTreeMap<(u64, u64), bool>>;
+
 #[derive(Debug)]
 struct Recorded {
     identity: ProcessStartIdentity,
@@ -308,6 +316,8 @@ impl OwnedProcesses {
             refused_for_room: false,
             #[cfg(test)]
             in_a_scope: std::collections::BTreeSet::new(),
+            #[cfg(test)]
+            scope_reads: std::sync::atomic::AtomicUsize::new(0),
         };
         owned.live.insert(key(&root), root.clone());
         owned.seen.insert(
@@ -597,27 +607,42 @@ impl OwnedProcesses {
     /// leave what is below the process behind.
     fn note_left(&mut self, identity: &ProcessStartIdentity) {
         let mut leaving = vec![identity.clone()];
-        while let Some(identity) = leaving.pop() {
-            let this = key(&identity);
+        for below in self.below_in_record(&key(identity)) {
+            if let Some((process, _, _)) = self.under_backends.remove(&below) {
+                leaving.push(process);
+            }
+        }
+        for process in leaving {
+            let this = key(&process);
             let recorded = self.seen.entry(this).or_insert(Recorded {
-                identity,
+                identity: process,
                 forced: false,
                 left: std::sync::atomic::AtomicBool::new(false),
             });
             Self::mark_left(&self.departed, this, recorded);
             self.live.remove(&this);
-            let below: Vec<(u64, u64)> = self
-                .under_backends
-                .iter()
-                .filter(|(below, (_, _, read_below))| *read_below == this && **below != this)
-                .map(|(below, _)| *below)
-                .collect();
-            for below in below {
-                if let Some((process, _, _)) = self.under_backends.remove(&below) {
-                    leaving.push(process);
-                }
+        }
+    }
+
+    /// Everything recorded below `root`, and below that, by the process each was read below. Not
+    /// `root` itself.
+    fn below_in_record(&self, root: &(u64, u64)) -> Vec<(u64, u64)> {
+        let mut children: BTreeMap<(u64, u64), Vec<(u64, u64)>> = BTreeMap::new();
+        for (this, (_, _, above)) in &self.under_backends {
+            if this != above {
+                children.entry(*above).or_default().push(*this);
             }
         }
+        let mut found = Vec::new();
+        let mut pending = vec![*root];
+        while let Some(above) = pending.pop() {
+            for this in children.remove(&above).unwrap_or_default() {
+                found.push(this);
+                pending.push(this);
+            }
+        }
+        found.retain(|this| this != root);
+        found
     }
 
     /// Reads whether a process has left the session for a control daemon's own scope, or is
@@ -629,10 +654,17 @@ impl OwnedProcesses {
     /// first: a process above this one that has left is noted first, and takes everything recorded
     /// below it, this process included.
     pub fn read_left(&mut self, identity: &ProcessStartIdentity) -> bool {
-        if let Some(above) = self.departed_above(&key(identity)) {
+        self.read_left_in(identity, &Scopes::default())
+    }
+
+    /// [`Self::read_left`], with the readings an operation has already made.
+    fn read_left_in(&mut self, identity: &ProcessStartIdentity, scopes: &Scopes) -> bool {
+        if let Some(above) = self.departed_above(&key(identity), scopes) {
             self.note_left(&above);
+            self.note_left(identity);
+            return true;
         }
-        let left = self.left_the_session(identity);
+        let left = self.is_flagged(&key(identity)) || self.in_scope(identity, scopes);
         if left {
             self.note_left(identity);
         }
@@ -641,7 +673,12 @@ impl OwnedProcesses {
 
     /// The nearest process that `this` is recorded below, up to the server, that has left the
     /// session: it was read in a control daemon's own scope at some reading, or is in one now.
-    fn departed_above(&self, this: &(u64, u64)) -> Option<ProcessStartIdentity> {
+    ///
+    /// A departure found in a scope is kept where it was found, and with everything recorded below
+    /// the process, though this holds the record only by shared reference: whichever of the
+    /// processes below it is asked about next, and whether or not the process is still in the
+    /// scope by then, the answer is the same.
+    fn departed_above(&self, this: &(u64, u64), scopes: &Scopes) -> Option<ProcessStartIdentity> {
         let mut above = self
             .under_backends
             .get(this)
@@ -651,12 +688,30 @@ impl OwnedProcesses {
         for _ in 0..self.under_backends.len() {
             let here = above?;
             let (process, _, next) = self.under_backends.get(&here)?;
-            if self.is_flagged(&here) || self.in_a_daemons_scope(process) {
+            if self.is_flagged(&here) {
+                return Some(process.clone());
+            }
+            if self.in_scope(process, scopes) {
+                self.keep_departure(&here);
                 return Some(process.clone());
             }
             above = Some(*next).filter(|next| *next != here);
         }
         None
+    }
+
+    /// Keeps a departure that was read through a shared reference: the process and everything
+    /// recorded below it are flagged as having left, as [`Self::note_left`] does for them, apart
+    /// from the changes that need the record exclusively, which the next reading that holds it
+    /// makes.
+    fn keep_departure(&self, root: &(u64, u64)) {
+        for this in std::iter::once(*root).chain(self.below_in_record(root)) {
+            if let Some(recorded) = self.seen.get(&this) {
+                recorded
+                    .left
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
     }
 
     /// Whether a recorded process has been read as having left the session.
@@ -669,10 +724,10 @@ impl OwnedProcesses {
     /// Whether a process is not one of the session's: it was read in a control daemon's own scope
     /// at some reading, or is in one now, or is recorded below a process that is. What it started
     /// is not the session's either.
-    fn left_the_session(&self, identity: &ProcessStartIdentity) -> bool {
+    fn left_the_session(&self, identity: &ProcessStartIdentity, scopes: &Scopes) -> bool {
         self.is_flagged(&key(identity))
-            || self.in_a_daemons_scope(identity)
-            || self.departed_above(&key(identity)).is_some()
+            || self.in_scope(identity, scopes)
+            || self.departed_above(&key(identity), scopes).is_some()
     }
 
     /// Whether a recorded process is, now, in a control daemon's own scope outside this session's
@@ -680,24 +735,41 @@ impl OwnedProcesses {
     /// as.
     fn in_a_daemons_scope(&self, identity: &ProcessStartIdentity) -> bool {
         #[cfg(test)]
-        if self.in_a_scope.contains(&key(identity)) {
-            return true;
+        {
+            self.scope_reads
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if self.in_a_scope.contains(&key(identity)) {
+                return true;
+            }
         }
         u32::try_from(self.root.pid.get()).is_ok_and(|session| {
             kr_ipc::identity::left_for_a_daemon(identity, session, self.cgroup.as_deref())
         })
     }
 
+    /// [`Self::in_a_daemons_scope`], read once for each process in one operation.
+    fn in_scope(&self, identity: &ProcessStartIdentity, scopes: &Scopes) -> bool {
+        let this = key(identity);
+        let read = scopes.borrow().get(&this).copied();
+        read.unwrap_or_else(|| {
+            let read = self.in_a_daemons_scope(identity);
+            scopes.borrow_mut().insert(this, read);
+            read
+        })
+    }
+
     /// Whether a recorded process is no longer one of the session's: it was read in a control
     /// daemon's scope at some reading, or is in one now, or is recorded below one that is.
-    fn has_left(&self, recorded: &Recorded) -> bool {
+    fn has_left(&self, recorded: &Recorded, scopes: &Scopes) -> bool {
         use std::sync::atomic::Ordering::Relaxed;
 
         if recorded.left.load(Relaxed) {
             return true;
         }
-        let in_one = self.in_a_daemons_scope(&recorded.identity)
-            || self.departed_above(&key(&recorded.identity)).is_some();
+        let in_one = self.in_scope(&recorded.identity, scopes)
+            || self
+                .departed_above(&key(&recorded.identity), scopes)
+                .is_some();
         if in_one {
             // Kept: the process can end before anything reads it again.
             Self::mark_left(&self.departed, key(&recorded.identity), recorded);
@@ -970,8 +1042,9 @@ impl OwnedProcesses {
             agrees.then_some(lineage.identity)
         });
         let agreeing: Vec<ProcessStartIdentity> = agreeing.collect();
+        let scopes = Scopes::default();
         for identity in &agreeing {
-            if self.left_the_session(identity) {
+            if self.left_the_session(identity, &scopes) {
                 self.note_left(identity);
             }
         }
@@ -1000,10 +1073,11 @@ impl OwnedProcesses {
                 .filter(|(below, _)| !self.backends.contains_key(*below))
                 .map(|(_, (identity, _, _))| identity.clone())
                 .collect();
+            let scopes = Scopes::default();
             let mut read = std::collections::BTreeSet::new();
             for identity in departed {
                 read.insert(key(&identity));
-                self.read_left(&identity);
+                self.read_left_in(&identity, &scopes);
             }
             let mut pending: Vec<(ProcessStartIdentity, (u64, u64))> = self
                 .under_backends
@@ -1020,7 +1094,7 @@ impl OwnedProcesses {
                 // whether it is in the scope now or was read there before: what it started is its
                 // own, not the session's. The reading is applied here, as the walk of the
                 // worker's own tree applies it.
-                if !read.contains(&key(&parent)) && self.read_left(&parent) {
+                if !read.contains(&key(&parent)) && self.read_left_in(&parent, &scopes) {
                     continue;
                 }
                 if self.is_flagged(&key(&parent)) {
@@ -1068,9 +1142,16 @@ impl OwnedProcesses {
                     for identity in batch {
                         // One that has left is recorded as having left, not as below the server,
                         // and is not walked.
-                        if !self.read_left(&identity) {
-                            self.under_backends
-                                .insert(key(&identity), (identity.clone(), under, key(&parent)));
+                        if !self.read_left_in(&identity, &scopes) {
+                            // Where it was first read below stays: the system gives the children
+                            // of a process that ended to a process that is not the one they were
+                            // read below, and a departure of the one they were read below has to
+                            // reach them still.
+                            self.under_backends.entry(key(&identity)).or_insert((
+                                identity.clone(),
+                                under,
+                                key(&parent),
+                            ));
                             pending.push((identity.clone(), under));
                         }
                         found.push(identity);
@@ -1133,6 +1214,7 @@ impl OwnedProcesses {
                 .and_then(|pid| rustix::process::getsid(Some(pid)).ok())
                 == Some(session)
         };
+        let scopes = Scopes::default();
         let mut members: Vec<ProcessStartIdentity> = Vec::new();
         let mut walked = std::collections::BTreeSet::new();
         let mut pending: Vec<(u32, ProcessStartIdentity)> = Vec::new();
@@ -1151,7 +1233,7 @@ impl OwnedProcesses {
                 // or was read there before. The reading is applied here, when it is made: a later
                 // read of this walk can fail and end it, and a second reading of the process could
                 // find it gone.
-                let left = self.left_the_session(&identity);
+                let left = self.left_the_session(&identity, &scopes);
                 if left {
                     self.note_left(&identity);
                 }
@@ -1294,10 +1376,11 @@ impl OwnedProcesses {
     /// are exactly the ones no longer running by the time the record is written, and the record
     /// would then say every one of them stopped when it was asked.
     pub fn note_forced_now(&mut self) {
+        let scopes = Scopes::default();
         let left: Vec<(u64, u64)> = self
             .seen
             .iter()
-            .filter(|(_, recorded)| self.has_left(recorded))
+            .filter(|(_, recorded)| self.has_left(recorded, &scopes))
             .map(|(key, _)| *key)
             .collect();
         for (key, recorded) in &mut self.seen {
@@ -1315,11 +1398,13 @@ impl OwnedProcesses {
     /// Returns the processes the kernel confirms have ended.
     #[must_use]
     pub fn terminated(&self) -> Vec<TerminatedProcess> {
+        let scopes = Scopes::default();
         self.seen
             .values()
             .filter(|recorded| {
-                // One read in a control daemon's scope ended without the session ending it.
-                !recorded.left.load(std::sync::atomic::Ordering::Relaxed)
+                // One read in a control daemon's scope, or below one, ended without the session
+                // ending it.
+                !self.has_left(recorded, &scopes)
                     && matches!(
                         kr_ipc::identity::process_state(&recorded.identity),
                         kr_ipc::identity::ProcessState::Ended
@@ -1342,13 +1427,14 @@ impl OwnedProcesses {
     /// is not stopped, and the closure names it apart.
     #[must_use]
     pub fn surviving(&self) -> Vec<ProcessStartIdentity> {
+        let scopes = Scopes::default();
         self.seen
             .values()
             .filter(|recorded| {
                 !matches!(
                     kr_ipc::identity::process_state(&recorded.identity),
                     kr_ipc::identity::ProcessState::Ended
-                ) && !self.has_left(recorded)
+                ) && !self.has_left(recorded, &scopes)
             })
             .map(|recorded| recorded.identity.clone())
             .collect()
@@ -1375,6 +1461,7 @@ impl OwnedProcesses {
     }
 
     fn processes_that_survived(&self) -> Vec<SurvivingResource> {
+        let scopes = Scopes::default();
         self.seen
             .values()
             .filter_map(|recorded| {
@@ -1384,7 +1471,7 @@ impl OwnedProcesses {
                 }
                 // Not the session's, and not counted against what the closure accounts for: named
                 // so that a reader sees what was left running and why.
-                if self.has_left(recorded) {
+                if self.has_left(recorded, &scopes) {
                     return Some(SurvivingResource {
                         kind: LEFT_FOR_A_DAEMON.to_owned(),
                         detail: format!(
@@ -1977,7 +2064,7 @@ mod tests {
             kr_ipc::identity::ended_process_identity(4_000_002),
         );
         assert!(
-            !owned.left_the_session(&found),
+            !owned.left_the_session(&found, &Scopes::default()),
             "outside any scope of a daemon, nothing says it left"
         );
         owned.note_left(&found);
@@ -1988,7 +2075,7 @@ mod tests {
         child.kill().expect("ends the process");
         child.wait().expect("collects the process");
         assert!(
-            owned.left_the_session(&found),
+            owned.left_the_session(&found, &Scopes::default()),
             "read once as having left, it has left, whatever its scope reads now"
         );
         assert!(
@@ -2237,14 +2324,19 @@ mod tests {
     /// that it runs after the intermediate has been ended.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn chain_tree() -> ChainTree {
+        chain_tree_of(std::process::Command::new("sh").args([
+            "-c",
+            "( ( sleep 601 & echo started; wait ) & wait; exec sleep 600 ) & wait",
+        ]))
+    }
+
+    /// The same chain, under whatever program `server` is.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn chain_tree_of(server: &mut std::process::Command) -> ChainTree {
         use std::io::BufRead as _;
         use std::os::unix::process::CommandExt as _;
 
-        let mut server = std::process::Command::new("sh")
-            .args([
-                "-c",
-                "( ( sleep 601 & echo started; wait ) & wait; exec sleep 600 ) & wait",
-            ])
+        let mut server = server
             .process_group(0)
             .stdout(std::process::Stdio::piped())
             .spawn()
@@ -2381,6 +2473,204 @@ mod tests {
                 "it still runs; it is not the session's to stop"
             );
         }
+    }
+
+    /// A server that started a daemon, which started two processes, all running.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    struct FanTree {
+        _group: Group,
+        server: ProcessStartIdentity,
+        daemon: ProcessStartIdentity,
+        children: Vec<ProcessStartIdentity>,
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn fan_tree() -> FanTree {
+        use std::io::BufRead as _;
+        use std::os::unix::process::CommandExt as _;
+
+        let mut server = std::process::Command::new("sh")
+            .args([
+                "-c",
+                "( sleep 600 & sleep 601 & echo started; wait ) & wait",
+            ])
+            .process_group(0)
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("starts a server that starts a daemon");
+        let output = server.stdout.take().expect("its output");
+        let group = Group(server);
+        std::io::BufReader::new(output)
+            .lines()
+            .next()
+            .expect("the daemon says its processes started")
+            .expect("reads the line");
+        let identity = |pid: u32| kr_ipc::identity::process_start_identity(pid).expect("identity");
+        let daemons = kr_ipc::identity::children_of(group.0.id()).expect("the server's children");
+        assert_eq!(daemons.len(), 1, "the server started one daemon");
+        let children = kr_ipc::identity::children_of(daemons[0]).expect("the daemon's children");
+        assert_eq!(children.len(), 2, "the daemon started two processes");
+        FanTree {
+            server: identity(group.0.id()),
+            daemon: identity(daemons[0]),
+            children: children.into_iter().map(identity).collect(),
+            _group: group,
+        }
+    }
+
+    /// KR-REQ-07.13 and KR-REQ-07.60: a departure found where the record is read through a shared
+    /// reference is kept at the process that left, and with everything recorded below it. The
+    /// daemon is in a scope for the first process that is asked about and out of it again for the
+    /// second, as when the daemon ends in between; the second is still not the session's, and the
+    /// record no longer names any of them.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_departure_found_by_a_closures_reading_is_kept_for_the_processes_asked_after() {
+        let tree = fan_tree();
+        let mut owned = session_with(&tree.server);
+        owned.observe_backends();
+        let recorded = owned.below_backend(&tree.server);
+        for read in std::iter::once(&tree.daemon).chain(&tree.children) {
+            assert!(
+                recorded.contains(read),
+                "the control: {read:?} is recorded below the server: {recorded:?}"
+            );
+        }
+
+        owned.in_a_scope.insert(key(&tree.daemon));
+        let first = &owned.seen[&key(&tree.children[0])];
+        assert!(
+            owned.has_left(first, &Scopes::default()),
+            "the first is below a daemon that is in a scope"
+        );
+        owned.in_a_scope.remove(&key(&tree.daemon));
+        let second = &owned.seen[&key(&tree.children[1])];
+        assert!(
+            owned.has_left(second, &Scopes::default()),
+            "the second is below a daemon that was read in a scope, and is not the session's"
+        );
+        let record = owned.record().processes;
+        for left in std::iter::once(&tree.daemon).chain(&tree.children) {
+            assert!(
+                !record.contains(left),
+                "the record names {left:?}, which is not the session's: {record:?}"
+            );
+        }
+    }
+
+    /// KR-REQ-07.60: reading whether the processes below a server have left reads each process's
+    /// scope once, however deep they are: the work is under the session's lock, and a read for
+    /// every process above every process would be quadratic.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn an_observation_of_a_deep_tree_reads_each_scope_once() {
+        use std::io::BufRead as _;
+        use std::os::unix::process::CommandExt as _;
+
+        const DEPTH: usize = 24;
+        let mut script = String::from("echo started; sleep 600");
+        for _ in 0..DEPTH {
+            script = format!("( {script} ; : ) & wait");
+        }
+        let mut server = std::process::Command::new("sh")
+            .args(["-c", &script])
+            .process_group(0)
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("starts a deep tree");
+        let output = server.stdout.take().expect("its output");
+        let group = Group(server);
+        std::io::BufReader::new(output)
+            .lines()
+            .next()
+            .expect("the innermost process says it started")
+            .expect("reads the line");
+        let top = kr_ipc::identity::process_start_identity(group.0.id()).expect("identity");
+        let mut owned = session_with(&top);
+        owned.observe_backends();
+        let recorded = owned.below_backend(&top).len();
+        assert!(
+            recorded > DEPTH,
+            "the walk recorded the whole tree: {recorded} below the server"
+        );
+
+        let before = owned.scope_reads.load(std::sync::atomic::Ordering::Relaxed);
+        owned.observe_backends();
+        let reads = owned.scope_reads.load(std::sync::atomic::Ordering::Relaxed) - before;
+        assert!(
+            reads <= 3 * (recorded + 1),
+            "{reads} scope readings for {recorded} processes below the server"
+        );
+    }
+
+    /// KR-REQ-07.13 and KR-REQ-07.60: a process the system hands to another when its parent ends is
+    /// still recorded below where it was first read, so a departure of the process above its parent
+    /// reaches it. The server here is a child subreaper, so the system gives the process of an
+    /// intermediate that ended to the server, which lists it among its own children at the next
+    /// reading.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_process_handed_to_another_stays_recorded_where_it_was_first_read() {
+        let python = std::process::Command::new("python3").arg("-V").output();
+        if !python.is_ok_and(|output| output.status.success()) {
+            eprintln!("skipped: python3 is not here to make the server a child subreaper");
+            return;
+        }
+        let tree = chain_tree_of(std::process::Command::new("python3").args([
+            "-I",
+            "-c",
+            "import ctypes, os; ctypes.CDLL(None).prctl(36, 1, 0, 0, 0); \
+             os.execvp('sh', ['sh', '-c', \
+             '( ( sleep 601 & echo started; wait ) & wait; exec sleep 600 ) & wait'])",
+        ]));
+        let mut owned = session_with(&tree.server);
+        owned.observe_backends();
+        let recorded = owned.below_backend(&tree.server);
+        for read in [&tree.daemon, &tree.intermediate, &tree.process] {
+            assert!(
+                recorded.contains(read),
+                "the control: {read:?} is recorded below the server: {recorded:?}"
+            );
+        }
+
+        let _ = kr_ipc::identity::stop_process(&tree.intermediate, kr_ipc::identity::Stop::Kill);
+        let waited = std::time::Instant::now();
+        while !matches!(
+            kr_ipc::identity::process_state(&tree.intermediate),
+            kr_ipc::identity::ProcessState::Ended
+        ) {
+            assert!(
+                waited.elapsed() < std::time::Duration::from_secs(60),
+                "the intermediate process did not end"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        // The system has given the process to the server, which lists it as its own child now.
+        let waited = std::time::Instant::now();
+        while !kr_ipc::identity::children_of(u32::try_from(tree.server.pid.get()).expect("pid"))
+            .expect("the server's children")
+            .contains(&u32::try_from(tree.process.pid.get()).expect("pid"))
+        {
+            assert!(
+                waited.elapsed() < std::time::Duration::from_secs(60),
+                "the server was not given the process"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        owned.observe_backends();
+
+        owned.note_left(&tree.daemon);
+        owned.observe_backends();
+        let recorded = owned.below_backend(&tree.server);
+        assert!(
+            !recorded.contains(&tree.daemon) && !recorded.contains(&tree.process),
+            "neither the daemon that left nor the process handed to the server is below the \
+             server: {recorded:?}"
+        );
+        assert!(
+            owned.is_flagged(&key(&tree.process)),
+            "the process was read below the daemon, and leaves with it"
+        );
     }
 
     /// KR-REQ-07.13 and KR-REQ-07.60: a closure stops nothing that is recorded below a process in a
