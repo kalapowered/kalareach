@@ -55,13 +55,16 @@ import type {
   ImportedImage,
   KeyAction,
   KeypadCode,
+  OpenRequest,
   OwnerView,
   PairingView,
   PasteView,
   ReviewOutcome,
   Settled,
+  SessionStanding,
   SettingsPane,
   SetupIdentity,
+  StandingEvent,
   TerminalControl,
   TerminalGrid,
   TerminalInput,
@@ -243,6 +246,38 @@ export interface FakeAccount {
   failSignOut(): void
 }
 
+/** What the host says of the sessions screens open, and what a test can make it say. */
+export interface FakeStandings {
+  /** Every open a screen asked for, in order, as it asked. */
+  readonly opens: readonly OpenRequest[]
+  /** Every opening a screen left, in order. */
+  readonly leaves: readonly { readonly sessionId: string; readonly opening: string }[]
+  /** Every call about a session, and the opening it carried. */
+  readonly carried: readonly {
+    readonly command: string
+    readonly sessionId: string
+    readonly opening: string | undefined
+  }[]
+  /**
+   * What opens of `sessionId` answer from now on: a standing, or the host's refusal. Without it the
+   * host opens the session as its owner does, with every right the connection holds.
+   */
+  answerOpens(
+    sessionId: string,
+    answer: SessionStanding | { readonly code: string; readonly message: string }
+  ): void
+  /**
+   * Says a new standing for the newest opening of `sessionId`, as native code's event does. From
+   * then on the host serves the opening's calls as the standing allows: an ended, closed or refused
+   * opening is refused.
+   */
+  say(sessionId: string, standing: SessionStanding): void
+  /** Says `standing` for the opening `opening`, which may be one that was replaced. */
+  sayTo(sessionId: string, opening: string, standing: SessionStanding): void
+  /** The newest opening's token for `sessionId`, if a screen holds one. */
+  tokenOf(sessionId: string): string | undefined
+}
+
 /** What the fake host can be told to do before a test drives the interface. */
 export interface FakeHostControls {
   /** The account. */
@@ -262,6 +297,8 @@ export interface FakeHostControls {
   readonly questions: FakeQuestions
   /** The grants the host holds, the attempts native code keeps, and what can happen to them. */
   readonly sharing: FakeSharing
+  /** The openings screens made of sessions, and what the host says of them. */
+  readonly standings: FakeStandings
   /** The drafts this device keeps, which another window can write to. */
   readonly drafts: FakeDraftStore
   /** Moves the prompt generation on, which disables the launch buttons. */
@@ -550,6 +587,7 @@ export type HeldRead =
   | 'questionRead'
   | 'sessionRead'
   | 'launchSurface'
+  | 'openSession'
   | 'sessionAgents'
   | 'agentCapabilities'
   | 'agentSnapshot'
@@ -805,6 +843,42 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
     })
   const connectionListeners = new Set<(state: ConnectionState) => void>()
 
+  // The openings screens made: the newest of each session, what the host says of it, and what a
+  // test scripted for the next opens.
+  interface Opening {
+    readonly token: string
+    standing: SessionStanding
+    /** Whether a test chose the standing, so a change of the connection's rights leaves it alone. */
+    readonly scripted: boolean
+  }
+  const openings = new Map<string, Opening>()
+  const scriptedOpens = new Map<
+    string,
+    SessionStanding | { readonly code: string; readonly message: string }
+  >()
+  const opens: OpenRequest[] = []
+  const leaves: { sessionId: string; opening: string }[] = []
+  const carried: { command: string; sessionId: string; opening: string | undefined }[] = []
+  const standingListeners = new Set<(event: StandingEvent) => void>()
+  const tellStanding = (sessionId: string, opening: string, standing: SessionStanding) => {
+    for (const listener of standingListeners) {
+      listener({ session_id: sessionId, opening, standing })
+    }
+  }
+  /** What the host does with a call that names an opening: serves it, or refuses it as it does. */
+  const checkOpening = (command: string, sessionId: string, opening: string | undefined) => {
+    carried.push({ command, sessionId, opening })
+    if (opening === undefined) return
+    const held = openings.get(sessionId)
+    if (held?.token !== opening) {
+      refuse('STALE_SESSION', 'This screen was replaced by another opening of the session.')
+    }
+    const state = held.standing.state
+    if (state === 'ended' || state === 'closed' || state === 'refused' || state === 'superseded') {
+      refuse('PERMISSION_DENIED', 'This session is no longer open to this screen.')
+    }
+  }
+
   /** The answers each held kind of read is waiting to give, in the order the reads were made. */
   const holds = new Map<HeldRead, (() => void)[]>()
   /** The composer sends the host has received, and the ones whose answer a test is holding. */
@@ -897,6 +971,35 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
     connectionState: () => reading('connectionState', connectionNow),
     onConnection: (listener) => register(connectionListeners, listener),
 
+    openSession: (request) =>
+      reading('openSession', () => {
+        opens.push(request)
+        const scripted = scriptedOpens.get(request.sessionId)
+        if (scripted !== undefined && 'code' in scripted) refuse(scripted.code, scripted.message)
+        requireConnection()
+        const standing: SessionStanding = scripted ?? {
+          state: 'open',
+          via: 'owner',
+          grant_id: request.grantId ?? '',
+          actions: rights,
+          includes_live_screen: true,
+          history_from_ms: null,
+          ends_at_ms: null
+        }
+        openings.set(request.sessionId, {
+          token: request.opening,
+          standing,
+          scripted: scripted !== undefined
+        })
+        return standing
+      }),
+    leaveSession: (sessionId, opening) => {
+      leaves.push({ sessionId, opening })
+      if (openings.get(sessionId)?.token === opening) openings.delete(sessionId)
+      return Promise.resolve()
+    },
+    onStanding: (listener) => register(standingListeners, listener),
+
     environmentCapabilities: (params) => {
       requireConnection()
       const asked = (params as { environment_id?: string } | null)?.environment_id
@@ -982,9 +1085,10 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
         value: result
       })
     },
-    sessionClose: (params) => {
+    sessionClose: (params, _subject, opening) => {
       requireConnection()
       const sessionId = (params as { session_id?: string }).session_id ?? SESSION_MAIN
+      checkOpening('sessionClose', sessionId, opening)
       const closure: ClosureRecord = {
         closed_at_ms: String(FAKE_NOW_MS),
         durability: 'durable',
@@ -1104,34 +1208,40 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
     },
 
     // The agent's calls, as the session's own worker answers them.
-    sessionAgents: (sessionId) =>
+    sessionAgents: (sessionId, opening) =>
       reading('sessionAgents', () => {
         requireConnection()
         if (!isSessionId(sessionId)) refuse('INVALID_ARGUMENT', 'that is not a session identifier')
+        checkOpening('sessionAgents', sessionId, opening)
         return records.sessionAgents(sessionId)
       }),
-    agentCapabilities: (params) =>
+    agentCapabilities: (params, opening) =>
       reading('agentCapabilities', () => {
         requireConnection()
+        checkOpening('agentCapabilities', params.subject.session_id, opening)
         return records.capabilities(params)
       }),
-    agentSnapshot: (params) =>
+    agentSnapshot: (params, opening) =>
       reading('agentSnapshot', () => {
         requireConnection()
+        checkOpening('agentSnapshot', params.subject.session_id, opening)
         return records.snapshot(params)
       }),
-    agentCommands: (params) =>
+    agentCommands: (params, opening) =>
       reading('agentCommands', () => {
         requireConnection()
+        checkOpening('agentCommands', params.subject.session_id, opening)
         return records.commands(params)
       }),
-    approvalInspect: (params) =>
+    approvalInspect: (params, opening) =>
       reading('approvalInspect', () => {
         requireConnection()
+        checkOpening('approvalInspect', params.subject.session_id, opening)
         return records.inspect(params)
       }),
-    composerSubmit: (params) => {
+    composerSubmit: (params, opening) => {
       requireConnection()
+      checkOpening('composerSubmit', params.target.subject.session_id, opening)
       submissions += 1
       const answer = records.prompt(params, false)
       if (nextSendUnconfirmed) {
@@ -1140,21 +1250,25 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
       }
       return answeredWhenReleased(answer)
     },
-    composerQueue: (params) => {
+    composerQueue: (params, opening) => {
       requireConnection()
+      checkOpening('composerQueue', params.target.subject.session_id, opening)
       submissions += 1
       return answeredWhenReleased(records.prompt(params, true))
     },
-    composerSteer: (params) => {
+    composerSteer: (params, opening) => {
       requireConnection()
+      checkOpening('composerSteer', params.target.subject.session_id, opening)
       return Promise.resolve(records.steer(params))
     },
-    composerInterrupt: (params) => {
+    composerInterrupt: (params, opening) => {
       requireConnection()
+      checkOpening('composerInterrupt', params.target.subject.session_id, opening)
       return Promise.resolve(records.cancel(params))
     },
-    approvalRespond: (params) => {
+    approvalRespond: (params, opening) => {
       requireConnection()
+      checkOpening('approvalRespond', params.target.subject.session_id, opening)
       return Promise.resolve(records.respond(params))
     },
     pluginActionInvoke: (params) => {
@@ -1269,15 +1383,26 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
       requireConnection()
       return Promise.resolve(records.reviewAcknowledge(params))
     },
-    questionRead: (params) =>
+    questionRead: (params, opening) =>
       reading('questionRead', () => {
         // A question is read from the session's worker over its own link, not through the daemon.
+        checkOpening('questionRead', params.session_id, opening)
         return questions.read(params)
       }),
-    questionAnswer: (params) => Promise.resolve(questions.answer(params)),
+    questionAnswer: (params, opening) => {
+      checkOpening('questionAnswer', params.session_id, opening)
+      return Promise.resolve(questions.answer(params))
+    },
     questionKept: () => Promise.resolve(questions.kept()),
-    questionSettle: (sessionId) => Promise.resolve(questions.settle(sessionId)),
-    questionSendKept: (which) => Promise.resolve(questions.sendKept(which)),
+    questionSettle: (sessionId, opening) => {
+      checkOpening('questionSettle', sessionId, opening)
+      return Promise.resolve(questions.settle(sessionId))
+    },
+    questionSendKept: (which, opening) => {
+      // The session is the kept answer's own, which the host finds.
+      carried.push({ command: 'questionSendKept', sessionId: '', opening })
+      return Promise.resolve(questions.sendKept(which))
+    },
     questionDismissKept: (which) => Promise.resolve(questions.dismissKept(which)),
     deviceList: (params) =>
       reading('deviceList', () => {
@@ -1389,7 +1514,7 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
 
     // The command the page's port sends, read as native code reads it: its arguments decoded in
     // order, then the session identifier parsed and the size checked, or nothing opens.
-    openTerminalView: (sessionId, grid, listener) => {
+    openTerminalView: (sessionId, grid, listener, opening) => {
       const args = { sessionId, ...viewSizeArguments(grid) }
       const undecoded = undecodable('terminal_view_open', args, [
         ['sessionId', aString],
@@ -1398,6 +1523,12 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
       ])
       if (undecoded !== null) return undecoded
       if (!isSessionId(sessionId)) return refused('INVALID_ARGUMENT', 'that is not a session identifier')
+      try {
+        checkOpening('openTerminalView', sessionId, opening)
+      } catch (refusal: unknown) {
+        // eslint-disable-next-line @typescript-eslint/prefer-promise-reject-errors -- a refusal is the data native code rejects with, never an Error
+        return Promise.reject(refusal)
+      }
       const refusal = sizeRefusal(args.columns, args.rows)
       if (refusal !== null) return refused('INVALID_ARGUMENT', refusal)
       const size = { columns: args.columns, rows: args.rows }
@@ -1841,6 +1972,28 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
     records,
     questions,
     sharing,
+    standings: {
+      opens,
+      leaves,
+      carried,
+      answerOpens(sessionId, answer) {
+        scriptedOpens.set(sessionId, answer)
+      },
+      say(sessionId, standing) {
+        const held = openings.get(sessionId)
+        if (held === undefined) return
+        held.standing = standing
+        tellStanding(sessionId, held.token, standing)
+      },
+      sayTo(sessionId, opening, standing) {
+        const held = openings.get(sessionId)
+        if (held?.token === opening) held.standing = standing
+        tellStanding(sessionId, opening, standing)
+      },
+      tokenOf(sessionId) {
+        return openings.get(sessionId)?.token
+      }
+    },
     drafts,
     changePromptGeneration() {
       promptGeneration += 1
@@ -1934,6 +2087,12 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
     descriptionDownloads,
     setRights(next) {
       rights = next
+      // A session opened as the owner holds what the connection holds, and is told when it changes.
+      for (const [sessionId, held] of openings) {
+        if (held.scripted || held.standing.state !== 'open') continue
+        held.standing = { ...held.standing, actions: next }
+        tellStanding(sessionId, held.token, held.standing)
+      }
       for (const listener of connectionListeners) listener(connectionNow())
     },
     hold(read) {

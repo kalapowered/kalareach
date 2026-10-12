@@ -25,6 +25,7 @@ import type { ToastAction, ToastMessage } from '../components/ui'
 import { DraftBook } from '../model/draft-book'
 import { ManualPaths } from '../model/manual-paths'
 import { QuestionForms } from '../model/question-forms'
+import { Openings } from '../model/openings'
 import { SessionStates, type SessionState } from '../model/sessions'
 import { ConfirmationStore } from '../pairing/confirmationStore'
 
@@ -49,6 +50,8 @@ interface AppValue {
   readonly port: HostPort
   /** What every session's views share, kept apart from every other session's. */
   readonly sessions: SessionStates
+  /** The newest opening of each session a screen has made, and what the host said of it. */
+  readonly openings: Openings
   /**
    * The drafts of this window, and the writer that keeps them on this device. It lives above both
    * layouts and every tab, so closing a tab or switching views forgets no draft.
@@ -116,6 +119,7 @@ export function AppProvider({
   // One store per window, created once. A store built during render would be a different store on
   // every render, and every session's state would go with the old one.
   const [sessions] = useState(() => new SessionStates())
+  const [openings] = useState(() => new Openings())
   const [drafts] = useState(() => new DraftBook(port))
   const [paths] = useState(() => new ManualPaths(port))
   const [questionForms] = useState(() => new QuestionForms())
@@ -165,8 +169,9 @@ export function AppProvider({
     (sessionId: string) => {
       setTabs((current) => current.filter((each) => each !== sessionId))
       sessions.forget(sessionId)
+      openings.forget(sessionId)
     },
-    [sessions]
+    [sessions, openings]
   )
 
   const go = useCallback(
@@ -208,6 +213,7 @@ export function AppProvider({
     () => ({
       port,
       sessions,
+      openings,
       drafts,
       paths,
       questionForms,
@@ -230,6 +236,7 @@ export function AppProvider({
     [
       port,
       sessions,
+      openings,
       drafts,
       paths,
       questionForms,

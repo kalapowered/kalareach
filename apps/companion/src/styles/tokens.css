@@ -80,6 +80,7 @@
   --press: 120ms;
   --state: 160ms;
   --surface-in: 200ms;
+  --notice-in: 150ms;
 
   /* Type. The system face first, because it already carries the platform's optical sizing. */
   --font-ui: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;

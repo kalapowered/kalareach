@@ -24,6 +24,7 @@ import type {
   HostEvent,
   HostPort,
   ImportedImage,
+  OpenRequest,
   OwnerView,
   PairingOrigin,
   PairingView,
@@ -33,7 +34,9 @@ import type {
   SessionSubject,
   Settled,
   SettingsPane,
+  SessionStanding,
   SetupIdentity,
+  StandingEvent,
   TerminalView,
   TerminalViewState,
   VoiceCallState,
@@ -54,6 +57,9 @@ export const DROPPED_EVENT = 'kr://dropped'
 
 /** The event the backend publishes the account's view on when it changes by itself. */
 export const ACCOUNT_EVENT = 'kr://account'
+
+/** The event the backend publishes a change of an opened session's standing on. */
+export const STANDING_EVENT = 'kr://standing'
 
 /** The event the backend publishes the pairing screen's state on. */
 export const PAIRING_EVENT = 'kr://pairing'
@@ -111,6 +117,19 @@ export function tauriPort(): HostPort {
   const mutate = <T,>(command: string, params: unknown, subject: SessionSubject): Promise<T> =>
     call<T>(command, { params, subject })
 
+  // A command about a session also names the opening of the screen making it. An opening that is
+  // left out is no opening: native code serves the call over a link kept for calls made outside
+  // any screen.
+  const readIn = <T,>(command: string, params: unknown, opening: string | undefined): Promise<T> =>
+    call<T>(command, { params, opening })
+
+  const mutateIn = <T,>(
+    command: string,
+    params: unknown,
+    subject: SessionSubject,
+    opening: string | undefined
+  ): Promise<T> => call<T>(command, { params, subject, opening })
+
   return {
     // Native code's reason can arrive blank; it is taken in as none, from a read and a change alike.
     connectionState: () =>
@@ -119,6 +138,17 @@ export function tauriPort(): HostPort {
       listening<ConnectionState>(CONNECTION_EVENT, (state) => {
         listener(receivedConnection(state))
       }),
+
+    openSession: (request: OpenRequest) =>
+      call<SessionStanding>('session_open', {
+        sessionId: request.sessionId,
+        grantId: request.grantId,
+        opening: request.opening
+      }),
+    leaveSession: (sessionId, opening) =>
+      call<undefined>('session_leave', { sessionId, opening }),
+    onStanding: (listener: (event: StandingEvent) => void) =>
+      listening<StandingEvent>(STANDING_EVENT, listener),
 
     hostInfo: () => call('host_info', {}),
     environmentList: () => call('environment_list', {}),
@@ -130,7 +160,8 @@ export function tauriPort(): HostPort {
     sessionList: (params) => read('session_list', params),
     sessionRead: (params) => read('session_read', params),
     sessionCreate: (params, subject) => mutate('session_create', params, subject),
-    sessionClose: (params, subject) => mutate('session_close', params, subject),
+    sessionClose: (params, subject, opening) =>
+      mutateIn('session_close', params, subject, opening),
     sessionDescribe: (params) => read('session_describe', params),
     // Both writes are about the host and name no session: the subject is empty.
     descriptionSetup: () => call('description_setup', {}),
@@ -143,16 +174,17 @@ export function tauriPort(): HostPort {
     // The agent's calls go to the session's own worker, which native code reaches and which checks
     // this device's rights itself. A mutation names its session, instance and binding revision in
     // its own parameters, and native code builds its envelope from exactly those.
-    sessionAgents: (sessionId) => call<SessionAgents>('session_agents', { sessionId }),
-    agentCapabilities: (params) => read('agent_capabilities', params),
-    agentSnapshot: (params) => read('agent_snapshot', params),
-    agentCommands: (params) => read('agent_commands', params),
-    approvalInspect: (params) => read('agent_approval_inspect', params),
-    composerSubmit: (params) => call('agent_prompt_submit', { params }),
-    composerQueue: (params) => call('agent_prompt_queue', { params }),
-    composerSteer: (params) => call('agent_turn_steer', { params }),
-    composerInterrupt: (params) => call('agent_turn_cancel', { params }),
-    approvalRespond: (params) => call('agent_approval_respond', { params }),
+    sessionAgents: (sessionId, opening) =>
+      call<SessionAgents>('session_agents', { sessionId, opening }),
+    agentCapabilities: (params, opening) => readIn('agent_capabilities', params, opening),
+    agentSnapshot: (params, opening) => readIn('agent_snapshot', params, opening),
+    agentCommands: (params, opening) => readIn('agent_commands', params, opening),
+    approvalInspect: (params, opening) => readIn('agent_approval_inspect', params, opening),
+    composerSubmit: (params, opening) => call('agent_prompt_submit', { params, opening }),
+    composerQueue: (params, opening) => call('agent_prompt_queue', { params, opening }),
+    composerSteer: (params, opening) => call('agent_turn_steer', { params, opening }),
+    composerInterrupt: (params, opening) => call('agent_turn_cancel', { params, opening }),
+    approvalRespond: (params, opening) => call('agent_approval_respond', { params, opening }),
     pluginActionInvoke: () => noAgreedShape("invoking a package's action"),
 
     deviceDrafts: () => call('device_drafts', {}),
@@ -187,11 +219,11 @@ export function tauriPort(): HostPort {
     attentionAcknowledge: (params) => mutate('attention_acknowledge', params, {}),
     reviewRead: (params) => read('review_read', params),
     reviewAcknowledge: (params) => mutate('review_acknowledge', params, {}),
-    questionRead: (params) => read('question_read', params),
-    questionAnswer: (params) => read('question_answer', params),
+    questionRead: (params, opening) => readIn('question_read', params, opening),
+    questionAnswer: (params, opening) => readIn('question_answer', params, opening),
     questionKept: () => call('question_kept', {}),
-    questionSettle: (sessionId) => read('question_settle', { sessionId }),
-    questionSendKept: (which) => read('question_send_kept', which),
+    questionSettle: (sessionId, opening) => readIn('question_settle', { sessionId }, opening),
+    questionSendKept: (which, opening) => readIn('question_send_kept', which, opening),
     questionDismissKept: (which) => read('question_dismiss_kept', which),
     deviceList: (params) => read('device_list', params),
     grantNotices: (selection) => call<GrantNotices>('grant_notices', { selection }),
@@ -220,12 +252,13 @@ export function tauriPort(): HostPort {
 
     // Each view has a channel of its own, which native code publishes that view's states on and
     // nothing else: no protocol event and no other view's state ever reaches its listener.
-    openTerminalView: async (sessionId, grid, listener): Promise<TerminalView> => {
+    openTerminalView: async (sessionId, grid, listener, opening): Promise<TerminalView> => {
       const states = new Channel<TerminalViewState>()
       states.onmessage = listener
       const view = await call<string>('terminal_view_open', {
         sessionId,
         ...viewSizeArguments(grid),
+        opening,
         onState: states
       })
       return {

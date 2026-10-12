@@ -165,6 +165,53 @@ export function receivedConnection(sent: ConnectionState): ConnectionState {
   return { ...sent, reason: words.length > 0 ? sent.reason : null }
 }
 
+/**
+ * What a session screen is told of the opening it holds.
+ *
+ * A screen opens its session under one grant, and the host says what that grant allows. On the host
+ * on this computer the application is the owner and every right is held. On a host this device is
+ * paired with, `open` carries the host's own decision, `ended` says the share the screen runs under
+ * is over, and `refused` says the host would not open or keep the session, in its own words.
+ * `reconnecting` is contact lost without the grant ending, and is being taken up again.
+ */
+export type SessionStanding =
+  | {
+      readonly state: 'open'
+      /** Whether the screen runs under this computer's ownership, the pairing, or a share. */
+      readonly via: 'owner' | 'pairing' | 'share'
+      readonly grant_id: string
+      /** What the host lets this screen do. */
+      readonly actions: readonly ActionRight[]
+      /** Whether the grant includes the session's live screen. */
+      readonly includes_live_screen: boolean
+      /** How far back the grant's history reaches, in UTC milliseconds, when it reaches back. */
+      readonly history_from_ms: number | null
+      /** When the grant is scheduled to end, in UTC milliseconds, when it ends. */
+      readonly ends_at_ms: number | null
+    }
+  | { readonly state: 'ended'; readonly reason: 'revoked' | 'expired' }
+  | { readonly state: 'closed' }
+  | { readonly state: 'refused'; readonly code: string; readonly message: string }
+  | { readonly state: 'reconnecting'; readonly reason: string }
+  | { readonly state: 'superseded' }
+
+/** One change of an opened session's standing, as native code publishes it. */
+export interface StandingEvent {
+  readonly session_id: string
+  /** The opening it belongs to. A screen applies it only when this is the opening it holds. */
+  readonly opening: string
+  readonly standing: SessionStanding
+}
+
+/** What a screen asks for to open a session. */
+export interface OpenRequest {
+  readonly sessionId: string
+  /** The share the screen runs under, or null for the pairing. */
+  readonly grantId: string | null
+  /** The screen's own token for this opening: up to 64 letters, digits and dashes, used once. */
+  readonly opening: string
+}
+
 /* ---- First-start setup ------------------------------------------------------------------------
  *
  * Three additions, and they are all reads. Setup is where a person is guided through permissions
@@ -882,6 +929,11 @@ export interface DroppedFile {
  *
  * One method per command, named for what the person is doing rather than for the wire. Nothing
  * here takes a method name: a screen cannot reach an operation this list does not carry.
+ *
+ * A command about one session takes, last, the opening of the screen making it. On a host this
+ * device is paired with, the host serves a session only on the connection opened for it, so the
+ * command goes over the link of that opening; a command that names none goes over a link kept for
+ * calls made outside any screen. On the host on this computer the opening is not used.
  */
 export interface HostPort {
   /** Whether a host connection is live, and why not when it is not. */
@@ -892,6 +944,23 @@ export interface HostPort {
    * miss a change.
    */
   onConnection(listener: (state: ConnectionState) => void): Promise<() => void>
+
+  /**
+   * Opens a session for a screen and says what the host decided it may do. A refusal is the host's
+   * own, as a failure. The commands the screen makes about the session carry `opening`; a command
+   * of an opening that was replaced or left is refused with `STALE_SESSION` and reaches nothing.
+   */
+  openSession(request: OpenRequest): Promise<SessionStanding>
+  /**
+   * Leaves an opening: its commands are refused from now on, and what is in flight on its link
+   * answers before the link closes. A token that is not the session's current opening is ignored.
+   */
+  leaveSession(sessionId: string, opening: string): Promise<void>
+  /**
+   * Calls `listener` with each change of an opened session's standing. Resolves once the listener
+   * is registered, with the function that stops it.
+   */
+  onStanding(listener: (event: StandingEvent) => void): Promise<() => void>
 
   hostInfo(): Promise<HostInfoResult>
   environmentList(): Promise<EnvironmentListResult>
@@ -929,7 +998,11 @@ export interface HostPort {
     params: SessionCreateParams,
     subject: SessionSubject
   ): Promise<Settled<SessionCreateResult>>
-  sessionClose(params: unknown, subject: SessionSubject): Promise<Settled<ClosureRecord>>
+  sessionClose(
+    params: unknown,
+    subject: SessionSubject,
+    opening?: string
+  ): Promise<Settled<ClosureRecord>>
   /**
    * What one session is called and what it is doing: the title and where it came from, the
    * generated activity line when there is one, and how current it is.
@@ -970,31 +1043,43 @@ export interface HostPort {
    * Read on the session's own worker, as every page of one snapshot: the page is given the
    * instances and the requests, never parts of two states.
    */
-  sessionAgents(sessionId: string): Promise<SessionAgents>
+  sessionAgents(sessionId: string, opening?: string): Promise<SessionAgents>
   /** What one agent instance can do now, with the evidence behind each capability. */
-  agentCapabilities(params: AgentCapabilitiesParams): Promise<AgentCapabilitiesResult>
+  agentCapabilities(
+    params: AgentCapabilitiesParams,
+    opening?: string
+  ): Promise<AgentCapabilitiesResult>
   /**
    * One part of an agent instance's semantic history, from the node the parameters name, filtered
    * as this device's authority requires.
    */
-  agentSnapshot(params: AgentSnapshotParams): Promise<AgentSnapshotResult>
+  agentSnapshot(params: AgentSnapshotParams, opening?: string): Promise<AgentSnapshotResult>
   /** The commands an agent instance advertises. */
-  agentCommands(params: AgentCommandsParams): Promise<AgentCommandsResult>
+  agentCommands(params: AgentCommandsParams, opening?: string): Promise<AgentCommandsResult>
   /**
    * What an installed decoder read of one approval request and the decisions it offered, with the
    * request's original bytes.
    */
-  approvalInspect(params: AgentApprovalInspectParams): Promise<AgentApprovalInspectResult>
+  approvalInspect(
+    params: AgentApprovalInspectParams,
+    opening?: string
+  ): Promise<AgentApprovalInspectResult>
   /**
    * The agent mutations. Each names the session, the instance and the binding revision it was
    * prepared against in its own parameters, and nothing else: native code builds the envelope from
    * exactly those, so the two cannot disagree.
    */
-  composerSubmit(params: AgentPromptParams): Promise<Settled<AgentMutationResult>>
-  composerQueue(params: AgentPromptParams): Promise<Settled<AgentMutationResult>>
-  composerSteer(params: AgentSteerParams): Promise<Settled<AgentMutationResult>>
-  composerInterrupt(params: AgentCancelParams): Promise<Settled<AgentMutationResult>>
-  approvalRespond(params: AgentApprovalRespondParams): Promise<Settled<AgentApprovalRespondResult>>
+  composerSubmit(params: AgentPromptParams, opening?: string): Promise<Settled<AgentMutationResult>>
+  composerQueue(params: AgentPromptParams, opening?: string): Promise<Settled<AgentMutationResult>>
+  composerSteer(params: AgentSteerParams, opening?: string): Promise<Settled<AgentMutationResult>>
+  composerInterrupt(
+    params: AgentCancelParams,
+    opening?: string
+  ): Promise<Settled<AgentMutationResult>>
+  approvalRespond(
+    params: AgentApprovalRespondParams,
+    opening?: string
+  ): Promise<Settled<AgentApprovalRespondResult>>
   pluginActionInvoke(params: unknown, subject: SessionSubject): Promise<Settled>
 
   /**
@@ -1058,21 +1143,21 @@ export interface HostPort {
    * A session's questions, read on the session's own worker. What is read is what a later answer
    * is checked against: an answer names a question and the revision the person was shown.
    */
-  questionRead(params: QuestionReadParams): Promise<QuestionReadResult>
+  questionRead(params: QuestionReadParams, opening?: string): Promise<QuestionReadResult>
   /**
    * Answers a question, or keeps the answer on this device when the worker cannot be reached. A
    * kept answer has not been sent, and nothing sends it but {@link HostPort.questionSendKept}.
    */
-  questionAnswer(params: QuestionAnswerParams): Promise<AnswerOutcome>
+  questionAnswer(params: QuestionAnswerParams, opening?: string): Promise<AnswerOutcome>
   /** Every answer kept on this device, oldest first, whatever host it was given to. */
   questionKept(): Promise<KeptAnswerList>
   /**
    * Where each answer kept for one session stands against the questions the session lists now.
    * Reads and says; it sends and removes nothing.
    */
-  questionSettle(sessionId: string): Promise<readonly SettledAnswer[]>
+  questionSettle(sessionId: string, opening?: string): Promise<readonly SettledAnswer[]>
   /** Sends one kept answer, for a person who chose to, after the question is read again. */
-  questionSendKept(which: KeptRef): Promise<AnswerOutcome>
+  questionSendKept(which: KeptRef, opening?: string): Promise<AnswerOutcome>
   /**
    * Dismisses one kept answer, if it is still the one the person was shown. Answers whether it was
    * removed.
@@ -1155,7 +1240,8 @@ export interface HostPort {
   openTerminalView(
     sessionId: string,
     grid: TerminalGrid,
-    listener: (state: TerminalViewState) => void
+    listener: (state: TerminalViewState) => void,
+    opening?: string
   ): Promise<TerminalView>
 
   /**

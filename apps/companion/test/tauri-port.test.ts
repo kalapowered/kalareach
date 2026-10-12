@@ -14,7 +14,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { GrantCreateParams, RoleSelection, SessionCreateParams } from '@kalareach/protocol'
 
 import type { ConnectionState } from '../src/host/port'
-import { CONNECTION_EVENT, tauriPort } from '../src/host/tauri'
+import { CONNECTION_EVENT, STANDING_EVENT, tauriPort } from '../src/host/tauri'
 
 const shell = vi.hoisted(() => ({
   invoked: [] as { command: string; args: unknown; options?: unknown }[],
@@ -479,5 +479,77 @@ describe('the desktop port and the drafts this device keeps', () => {
       },
       { command: 'device_draft_discard', args: { params: { id: DRAFT, expectedRevision: '4' } } }
     ])
+  })
+})
+
+describe('the desktop port and a session screen’s opening', () => {
+  const SESSION = '8a7b6c50-22bb-4c3d-8e4f-000000000101'
+  const OPENING = 'opening-0001'
+  const subject = {
+    session_id: SESSION,
+    application_instance_id: '8a7b6c50-22bb-4c3d-8e4f-000000000201'
+  }
+  const target = { subject, binding_revision: '3' }
+
+  it('opens and leaves a session by the screen’s own token, naming the share when it holds one', async () => {
+    const port = tauriPort()
+    await port.openSession({ sessionId: SESSION, grantId: null, opening: OPENING })
+    await port.openSession({ sessionId: SESSION, grantId: 'grant-1', opening: 'opening-0002' })
+    await port.leaveSession(SESSION, OPENING)
+    expect(shell.invoked).toEqual([
+      { command: 'session_open', args: { sessionId: SESSION, grantId: null, opening: OPENING } },
+      {
+        command: 'session_open',
+        args: { sessionId: SESSION, grantId: 'grant-1', opening: 'opening-0002' }
+      },
+      { command: 'session_leave', args: { sessionId: SESSION, opening: OPENING } }
+    ])
+  })
+
+  it('hands on each standing native code publishes, with the opening it belongs to', async () => {
+    const heard: unknown[] = []
+    await tauriPort().onStanding((event) => {
+      heard.push(event)
+    })
+    const event = {
+      session_id: SESSION,
+      opening: OPENING,
+      standing: { state: 'ended', reason: 'revoked' }
+    }
+    shell.handlers.get(STANDING_EVENT)?.({ payload: event })
+    expect(heard).toEqual([event])
+  })
+
+  it('carries the opening on every command about the session, and on none without one', async () => {
+    const port = tauriPort()
+    const prompt = { target, text: 'Summarise the diff', draft_id: null }
+    await port.sessionAgents(SESSION, OPENING)
+    await port.agentCapabilities({ subject }, OPENING)
+    await port.agentSnapshot({ subject, from_node: '5' }, OPENING)
+    await port.agentCommands({ subject }, OPENING)
+    await port.composerSubmit(prompt, OPENING)
+    await port.composerQueue(prompt, OPENING)
+    await port.composerSteer({ target, text: 'Stop', turn_id: 'turn-2' }, OPENING)
+    await port.composerInterrupt({ target, turn_id: 'turn-2' }, OPENING)
+    await port.approvalRespond({ target, resource_id: 'resource-1', option_id: 'approve' }, OPENING)
+    await port.questionRead({ session_id: SESSION, question_id: null, include_resolved: false }, OPENING)
+    await port.sessionClose({ session_id: SESSION }, { sessionId: SESSION }, OPENING)
+    const carried = shell.invoked.map((call) => (call.args as { opening?: string }).opening)
+    expect(carried).toEqual(Array<string>(11).fill(OPENING))
+    // A call made outside any screen names none, and native code serves it on a link of its own.
+    shell.invoked.length = 0
+    await port.sessionAgents(SESSION)
+    await port.questionRead({ session_id: SESSION, question_id: null, include_resolved: false })
+    expect(shell.invoked.map((call) => (call.args as { opening?: string }).opening)).toEqual([
+      undefined,
+      undefined
+    ])
+  })
+
+  it('opens a terminal view under the screen’s opening', async () => {
+    shell.answers.set('terminal_view_open', '7')
+    await tauriPort().openTerminalView(SESSION, { columns: 80, rows: 24 }, () => undefined, OPENING)
+    const [opened] = shell.invoked
+    expect((opened?.args as { opening?: string }).opening).toBe(OPENING)
   })
 })

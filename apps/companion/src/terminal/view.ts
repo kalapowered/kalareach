@@ -186,12 +186,17 @@ function sameGrid(one: TerminalGrid, other: TerminalGrid): boolean {
 /**
  * Opens a view of `sessionId` at the grid `measure` gives, while `showing` holds, and closes it when
  * the pane is left, the session changes or the port does.
+ *
+ * Over a host this device is paired with the view belongs to the screen's opening, which `token`
+ * names: the host attaches it on a connection of its own under the grant the screen runs under,
+ * and it ends with the opening. A different opening is a different view.
  */
 export function useTerminalView(
   port: HostPort,
   sessionId: string,
   measure: () => TerminalGrid,
-  showing = true
+  showing = true,
+  token: string | undefined = undefined
 ): TerminalViewing {
   const [attempt, setAttempt] = useState(0)
   // Each state with the opening it came from: the session and the attempt.
@@ -273,22 +278,27 @@ export function useTerminalView(
     }
     opening.current = open
     port
-      .openTerminalView(sessionId, open.grid, (next) => {
-        if (!current) return
-        stamps.current += 1
-        setHeld({ sessionId, attempt, stamp: stamps.current, state: next })
-        if (next.state === 'showing') {
-          // Held at once as well, so a move made before the next render measures from this frame.
-          frameNow.current = next.screen
-          setFramed({ sessionId, screen: next.screen })
-        }
-        // What native code has settled goes, with the frame that holds it; an end settles all, and
-        // the view takes no move after it.
-        if (next.state === 'ended') open.ended = true
-        const settled = next.state === 'ended' ? Infinity : Number(next.settled)
-        const left = open.pending.filter((move) => move.number > settled)
-        if (left.length !== open.pending.length) keepMoves(open, left)
-      })
+      .openTerminalView(
+        sessionId,
+        open.grid,
+        (next) => {
+          if (!current) return
+          stamps.current += 1
+          setHeld({ sessionId, attempt, stamp: stamps.current, state: next })
+          if (next.state === 'showing') {
+            // Held at once as well, so a move made before the next render measures from this frame.
+            frameNow.current = next.screen
+            setFramed({ sessionId, screen: next.screen })
+          }
+          // What native code has settled goes, with the frame that holds it; an end settles all, and
+          // the view takes no move after it.
+          if (next.state === 'ended') open.ended = true
+          const settled = next.state === 'ended' ? Infinity : Number(next.settled)
+          const left = open.pending.filter((move) => move.number > settled)
+          if (left.length !== open.pending.length) keepMoves(open, left)
+        },
+        token
+      )
       .then(
         (view) => {
           if (!current) {
@@ -324,7 +334,7 @@ export function useTerminalView(
       setAskedControl(null)
       setUnsentInput(null)
     }
-  }, [port, sessionId, attempt, showing, keepMoves])
+  }, [port, sessionId, attempt, showing, keepMoves, token])
 
   const resize = useCallback((grid: TerminalGrid) => {
     const open = opening.current

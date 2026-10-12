@@ -27,6 +27,7 @@ import { flushSync } from 'react-dom'
 
 import { useApp, useSession } from '../../app/state'
 import { useSessionAgent } from '../../app/agent'
+import { useSessionOpening } from '../../app/opening'
 import { useHeldConnection } from '../../app/rights'
 import { AttachmentPaths } from '../../components/AttachmentPaths'
 import { AttachmentThumb } from '../../components/AttachmentThumb'
@@ -35,6 +36,8 @@ import type { ConversationItem } from '../../model/conversation'
 import { claimWasLost, keptEntry } from '../../model/draft-book'
 import { entryLabel, nodeKindLabel } from '../../model/entry-label'
 import { Badge, Banner, Button, Segmented } from '../../components/ui'
+import { StandingBanner } from '../../components/StandingBanner'
+import { isOver, rightsOf } from '../../model/openings'
 import { failureCode, failureMessage, type SessionSubject } from '../../host/port'
 import {
   adoptFirstTarget,
@@ -152,20 +155,26 @@ function isForSession(id: string, sessionId: string): boolean {
 /** The session screen. */
 export function MobileSession({
   sessionId,
+  grantId = null,
   surface,
   lifecycle,
   connected,
-  onOpenKept
+  onOpenKept,
+  onBack
 }: {
   readonly sessionId: string
+  /** The share the screen runs under, or null for the pairing. */
+  readonly grantId?: string | null
   readonly surface: Surface
   readonly lifecycle: Lifecycle
   /** Opens the list of kept drafts, where the shell has one. */
   readonly onOpenKept?: () => void
+  /** Goes back to the list of sessions. */
+  readonly onBack: () => void
   /** Whether the host is in contact, or null before the shell's first answer. */
   readonly connected: boolean | null
 }): ReactNode {
-  const { port, say, drafts: book, paths } = useApp()
+  const { port, say, drafts: book, paths, openings } = useApp()
   const shown = useBook()
   const { drafts: composers, status: draftsStatus, problem: draftsProblem } = shown
   const keptEntryLine = keptEntry(shown)
@@ -173,7 +182,20 @@ export function MobileSession({
   // The session's agent, read from its own worker while this screen is open, into the session's
   // own store: nothing of another session is ever shown under this one.
   const { state: session } = useSession(sessionId)
-  const { unread } = useSessionAgent(sessionId)
+  // The host opens the session for this screen, under the share it names or the pairing, and says
+  // what it allows. Everything this screen asks about the session carries the opening's token.
+  const { record: opened, retry } = useSessionOpening(sessionId, grantId)
+  const token = opened?.token
+  const standing = opened?.standing ?? null
+  const standingOpen = standing?.state === 'open'
+  const over = isOver(standing)
+  // The live screen is drawn only where the grant includes it and the opening is not over. Until
+  // the host has said, nothing is attached.
+  const liveScreen = opened?.held?.includes_live_screen
+  const showsLiveScreen = liveScreen === true && !over
+  const { unread } = useSessionAgent(sessionId, {
+    gate: { token: token ?? null, running: standingOpen }
+  })
   const read = session.loaded || unread !== null ? { refusal: unread } : null
   const nodes = useMemo(
     () => session.conversation.nodes.slice(-80).map(readNode),
@@ -181,11 +203,15 @@ export function MobileSession({
   )
   const [zoom, setZoom] = useState(ZOOM_DEFAULT_INDEX)
   const [latch, setLatch] = useState<Latch>(NO_LATCH)
-  const [busy, setBusy] = useState(false)
+  // The opening a send is in flight under (the empty one is no opening): a new opening starts with
+  // Send free, and what the earlier one left unsettled still holds it.
+  const [busyUnder, setBusyUnder] = useState<string | null>(null)
+  const busy = busyUnder === (token ?? '')
   // Whether the terminal's status shows all it says, rather than its first two lines.
   const [statusOpen, setStatusOpen] = useState(false)
   const statusId = useId()
   const modeButtonId = useId()
+  const noControlId = useId()
   const sendId = useId()
   const attachAgainId = useId()
   const keysHelpId = useId()
@@ -242,7 +268,9 @@ export function MobileSession({
     const read = await port.sessionRead({ session_id: sessionId })
     return { sessionId, sessionEpoch: read.session.session_epoch }
   }, [port, sessionId])
-  const { rights, paired } = useHeldConnection()
+  const { rights: connectionRights, paired } = useHeldConnection()
+  // What this screen may do is what the host decided for its opening.
+  const rights = useMemo(() => rightsOf(opened, connectionRights), [opened, connectionRights])
   // A file needs the host on this phone's own computer and the rights, and nothing of the agent.
   const fileOffer = useMemo(
     () => attachOffer({ connected: connected === true, paired, rights: rights === null ? null : new Set(rights) }),
@@ -269,13 +297,15 @@ export function MobileSession({
   }, [session.agent.unfinished, session.agent.gap, session.agent.withheld])
   const submitOffer = useMemo(
     () =>
-      composerOffers({
-        known: session.agent.instances !== null,
-        binding: liveBinding,
-        capabilities,
-        rights: rights === null ? null : new Set(rights)
-      }).submit,
-    [session.agent.instances, liveBinding, capabilities, rights]
+      over
+        ? { offered: false, reason: 'Nothing more can be sent to this session from here.' }
+        : composerOffers({
+            known: session.agent.instances !== null,
+            binding: liveBinding,
+            capabilities,
+            rights: rights === null ? null : new Set(rights)
+          }).submit,
+    [over, session.agent.instances, liveBinding, capabilities, rights]
   )
 
   /**
@@ -431,9 +461,12 @@ export function MobileSession({
     controlTake,
     refuse,
     unsent
-  } = useTerminalView(port, sessionId, measure, pane === 'terminal')
+  } = useTerminalView(port, sessionId, measure, pane === 'terminal' && showsLiveScreen, token)
   const mode = modeOf(control)
   const controlling = control?.state === 'controlling'
+  // Taking the program's input is the right the host checks for it; the host decides again.
+  const canControl = rights?.includes('terminal.input') === true
+  const cannotControl = rights !== null && !canControl && !over
   // While the view controls the program, the field's place holds the program's keyboard.
   const typingToProgram = pane === 'terminal' && controlling
 
@@ -595,6 +628,10 @@ export function MobileSession({
   const send = useCallback(
     (text: string) => {
       const now = Date.now()
+      // The opening this send is made under. Its answer may come after the screen has opened the
+      // session again, and then it settles its own record and nothing the new opening shows.
+      const opening = openings.tokenOf(sessionId)
+      const stillHere = () => openings.isCurrent(sessionId, opening)
       // The session is in the identity, so one session's outcome is never shown under another.
       const submission: Submission = {
         ...queued(localId(sessionId, now), text.slice(0, 60), now, text),
@@ -625,7 +662,7 @@ export function MobileSession({
       }
       // Local feedback first, and it says queued rather than sent, because it has not left yet.
       lifecycle.setSubmissions((current) => [...current, submission])
-      setBusy(true)
+      setBusyUnder(opening ?? '')
       // What the person wrote goes to the conversation they wrote it for, at the binding revision
       // they wrote it at: the host refuses it if that conversation has moved on since.
       const { applicationInstanceId: instance, agentBindingRevision: revision } = draft.target
@@ -643,11 +680,14 @@ export function MobileSession({
           // eslint-disable-next-line @typescript-eslint/only-throw-error -- refused as a command's failure is: data
           throw { code: 'UNSUPPORTED_CAPABILITY', message: 'No agent is running in this session.' }
         }
-        return await port.composerSubmit({
-          target: { subject: subjectOf(sessionId, instance), binding_revision: revision },
-          draft_id: null,
-          text
-        })
+        return await port.composerSubmit(
+          {
+            target: { subject: subjectOf(sessionId, instance), binding_revision: revision },
+            draft_id: null,
+            text
+          },
+          opening
+        )
       })
         .then((answer) => {
           const state = answeredState(answer)
@@ -659,13 +699,15 @@ export function MobileSession({
             )
           )
           if (wasRefused(state)) {
-            // The submission did not happen. The text stays exactly where it was.
-            say(`The host refused it. What you wrote is still here.`, 'danger')
+            // The submission did not happen. The text stays exactly where it was. The toast is the
+            // current opening's to show: an answer to a replaced one settles its record only.
+            if (stillHere()) say(`The host refused it. What you wrote is still here.`, 'danger')
             end('refused')
             return
           }
           // The composer is cleared only when it still holds what was submitted. A person who
-          // typed the next thing while this one was in flight keeps what they typed.
+          // typed the next thing while this one was in flight keeps what they typed, whichever
+          // opening they typed it under.
           book.setDrafts((drafts) =>
             drafts.map((each) =>
               each.draftId === draft.draftId && each.revision === submittedRevision
@@ -700,15 +742,17 @@ export function MobileSession({
                 : each
             )
           )
-          say(failureMessage(failure), 'danger')
-          end('refused')
+          if (stillHere()) say(failureMessage(failure), 'danger')
+          // An outcome the host could not establish is never given back as a refusal.
+          end(failureCode(failure) === 'OUTCOME_UNKNOWN' ? 'unknown' : 'refused')
         })
         .finally(() => {
-          setBusy(false)
+          if (stillHere()) setBusyUnder(null)
         })
     },
-    [draft, lifecycle, book, port, say, sessionId]
+    [draft, lifecycle, book, port, say, sessionId, openings]
   )
+
 
   // Focus that a terminal key, the program's keyboard or the mode button held when control or the
   // view ends goes to the mode button, which takes control again, or once the view has ended to
@@ -717,6 +761,21 @@ export function MobileSession({
   // view is open again. While a software keyboard is up the bar holding the mode button is hidden,
   // and the focus goes there once it is back.
   const terminalEnded = terminal?.state === 'ended'
+  // A view that ended while its session's opening stayed open lost only its own connection. When
+  // the host says the session is open again, the view attaches again, with the last frame kept and
+  // nothing typed sent again.
+  const told = opened?.told ?? 0
+  const attachedAt = useRef(told)
+  useEffect(() => {
+    if (!terminalEnded) {
+      attachedAt.current = told
+      return
+    }
+    if (told !== attachedAt.current && standingOpen) {
+      attachedAt.current = told
+      again()
+    }
+  }, [terminalEnded, told, standingOpen, again])
   const attachAgain = useOwnControl(attachAgainId, terminalEnded)
   useFocusWhenControlEnds({
     state: terminalEnded ? 'ended' : (control?.state ?? 'none'),
@@ -757,7 +816,12 @@ export function MobileSession({
     [lifecycle, book, sessionId]
   )
   useReceiptReads({ sessionId, connected, submissions: mine, onReceipt: settleFromRecord })
-  const banner = reconnectBanner(connected, mine)
+  // The connection's words for contact lost. A session whose own link is being taken up again, with
+  // the connection to the host still up, says the same, in the same words, and, as the connection's
+  // do, nothing before the shell has answered whether the host is in contact.
+  const contact =
+    reconnectBanner(connected, mine) ??
+    (standing?.state === 'reconnecting' && connected !== null ? reconnectBanner(false, mine) : null)
   // A submission whose outcome nobody knows is the one case where sending again could run the
   // same thing twice. Until a receipt settles it, this session sends nothing more.
   const waiting = unresolved(mine)
@@ -924,7 +988,14 @@ export function MobileSession({
             }
           />
         ) : null}
-        {banner ? <Banner tone={banner.tone} title={banner.title} detail={banner.detail} /> : null}
+        {contact ? <Banner tone={contact.tone} title={contact.title} detail={contact.detail} /> : null}
+        <StandingBanner
+          record={opened}
+          screen={sessionRef}
+          target={target}
+          onBack={onBack}
+          onRetry={retry}
+        />
         {draftsStatus !== 'memory-only' && draftsProblem === null && lifecycle.durable ? null : (
           <Banner
             tone="warning"
@@ -978,7 +1049,11 @@ export function MobileSession({
               // Before the first answer the conversation is being read, which is not the same as
               // empty: the view says which it knows.
               <p className="m-empty">
-                {read ? 'Nothing in this conversation yet.' : 'Reading the conversation…'}
+                {read
+                  ? 'Nothing in this conversation yet.'
+                  : over
+                    ? 'None of this conversation was read.'
+                    : 'Reading the conversation…'}
               </p>
             ) : (
               nodes.map((node) => (
@@ -1005,6 +1080,10 @@ export function MobileSession({
               ))
             )}
           </div>
+        ) : liveScreen === false ? (
+          <p className="m-empty" data-testid="no-live-screen">
+            This share does not include the live screen.
+          </p>
         ) : (
           <>
             {terminal?.state === 'ended' ? (
@@ -1069,7 +1148,7 @@ export function MobileSession({
             lastFocused.current = event.target
           }}
         >
-          {pane === 'terminal' ? (
+          {pane === 'terminal' && liveScreen !== false ? (
             <>
               <div className="m-terminal-hud">
                 <div className="m-terminal-controls">
@@ -1079,7 +1158,8 @@ export function MobileSession({
                   {/* One button whose words change, so the focus stays on it through the take. */}
                   <Button
                     id={modeButtonId}
-                    disabled={control === null}
+                    aria-describedby={cannotControl ? noControlId : undefined}
+                    disabled={control === null || (mode === 'view' && !canControl)}
                     onClick={() => {
                       if (mode === 'view') takeControl()
                       else lookAround()
@@ -1087,6 +1167,11 @@ export function MobileSession({
                   >
                     {mode === 'control' ? 'Look around' : 'Take control'}
                   </Button>
+                  {cannotControl ? (
+                    <span id={noControlId} data-testid="no-terminal-input">
+                      This session does not let you type into the terminal.
+                    </span>
+                  ) : null}
                   <span>{`Zoom ${Math.round((ZOOM_STEPS[zoom] ?? 1) * 100)}%`}</span>
                   {mode === 'view' ? (
                     // With larger text the four wrap onto a second line rather than run off the screen.

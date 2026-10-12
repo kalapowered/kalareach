@@ -687,6 +687,33 @@ textarea::placeholder {
   margin-bottom: 2px;
 }
 
+/*
+ * The banner a session screen shows when its opening is over arrives with a change of opacity, and
+ * nothing else moves. The keyboard rule in the base styles has it arrive at once after a key.
+ */
+.standing-banner {
+  flex-wrap: wrap;
+  opacity: 0;
+  transition: opacity var(--notice-in) var(--ease-out);
+}
+
+/* With large text the words take the width and the buttons wrap under them, inside the screen. */
+.standing-banner > .spacer {
+  flex: 1 1 12rem;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.standing-banner[data-shown='true'] {
+  opacity: 1;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .standing-banner {
+    transition: none;
+  }
+}
+
 /* ---- The sheet ------------------------------------------------------------------------------ */
 
 /*

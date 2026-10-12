@@ -310,6 +310,9 @@ export function MobileApp({
             lifecycle={lifecycle}
             connected={connection?.connected ?? null}
             onOpenKept={openDrafts}
+            onBack={() => {
+              setPlace({ tab: 'sessions' })
+            }}
           />
         ) : null}
         {place.tab === 'hosts' ? (

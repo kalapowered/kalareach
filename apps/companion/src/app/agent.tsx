@@ -66,11 +66,27 @@ interface Read {
   readonly from: string | null
 }
 
+/**
+ * The opening a view reads the agent under, when it has one.
+ *
+ * Every read carries the token, and reading goes on only while the host says the opening is open:
+ * an opening that is over, refused or being taken up again reads nothing, and starts again, from
+ * where the store left off, when it is open.
+ */
+export interface OpeningGate {
+  /** The opening's token, or null before the screen has made one. */
+  readonly token: string | null
+  /** Whether the host says the opening is open. */
+  readonly running: boolean
+}
+
 /** Keeps `sessionId`'s agent read while the calling view is mounted and the page is shown. */
 export function useSessionAgent(
   sessionId: string,
-  cadenceMs: number = AGENT_READ_CADENCE_MS
+  { cadenceMs = AGENT_READ_CADENCE_MS, gate }: { cadenceMs?: number; gate?: OpeningGate } = {}
 ): SessionAgentView {
+  const token = gate === undefined ? undefined : (gate.token ?? undefined)
+  const waiting = gate !== undefined && (gate.token === null || !gate.running)
   const { port, sessions } = useApp()
   const { update } = useSession(sessionId)
   // This view of this session: a refusal read in an earlier visit to it is not shown on a return,
@@ -82,10 +98,12 @@ export function useSessionAgent(
   const again = useRef<() => void>(() => undefined)
 
   useEffect(() => {
+    // An opening that is not open reads nothing; the effect runs again when it is.
+    if (waiting) return
     let watching: Watch | null = null
 
     const once = async (): Promise<Read> => {
-      const agents = await port.sessionAgents(sessionId)
+      const agents = await port.sessionAgents(sessionId, token)
       const live = liveInstance(agents.instances.instances)
       if (live === null) {
         return {
@@ -100,15 +118,15 @@ export function useSessionAgent(
       }
       const instance = live.application_instance_id
       const subject = subjectOf(sessionId, instance)
-      const facts = await port.agentCapabilities({ subject })
+      const facts = await port.agentCapabilities({ subject }, token)
       const known = sessions.get(sessionId).agent
       const commands =
-        known.commandsOf === instance ? null : await port.agentCommands({ subject })
+        known.commandsOf === instance ? null : await port.agentCommands({ subject }, token)
       const start = known.nextNode.get(instance) ?? null
       let from = start
       const parts: AgentSnapshotResult[] = []
       for (let part = 0; part < MAX_PARTS_PER_READ; part += 1) {
-        const read = await port.agentSnapshot({ subject, from_node: from })
+        const read = await port.agentSnapshot({ subject, from_node: from }, token)
         parts.push(read)
         if (read.continuation !== null) {
           from = read.continuation.from_node
@@ -211,7 +229,7 @@ export function useSessionAgent(
       started.stop()
       again.current = () => undefined
     }
-  }, [port, sessions, sessionId, visit, update, cadenceMs])
+  }, [port, sessions, sessionId, visit, update, cadenceMs, token, waiting])
 
   const refresh = useCallback(() => {
     again.current()

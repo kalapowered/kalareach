@@ -25,7 +25,15 @@ const SESSION_BUILD = '8a7b6c50-22bb-4c3d-8e4f-000000000102'
 /** The session view on its own, for one session, as the phone's shell renders it. */
 function OnSession({ sessionId }: { readonly sessionId: string }): ReactNode {
   const lifecycle = useLifecycle(null)
-  return <MobileSession sessionId={sessionId} surface="ios" lifecycle={lifecycle} connected={true} />
+  return (
+    <MobileSession
+      sessionId={sessionId}
+      surface="ios"
+      lifecycle={lifecycle}
+      connected={true}
+      onBack={() => undefined}
+    />
+  )
 }
 
 /** Answers the held read at `index`, and lets everything that answer sets off run. */
@@ -132,10 +140,19 @@ describe("the phone's session view keeps each read to its own session", () => {
   })
 
   it('shows a refused read as a refusal, in the host’s words, not as an empty conversation', async () => {
-    const { port, controls } = fakeHost()
-    controls.setConnected(false)
+    const { port } = fakeHost()
     render(
-      <AppProvider port={port}>
+      <AppProvider
+        port={{
+          ...port,
+          agentSnapshot: () =>
+            Promise.reject({
+              code: 'RESOURCE_UNAVAILABLE',
+              message: 'This host cannot be contacted right now.',
+              user_action: 'retry'
+            })
+        }}
+      >
         <OnSession sessionId={SESSION_MAIN} />
       </AppProvider>
     )
@@ -465,10 +482,32 @@ describe("the phone's raw terminal view (KR-REQ-08.02, 13.18)", () => {
     expect(screen.getByTestId('mobile-terminal')).toHaveAttribute('aria-busy', 'false')
   })
 
-  it('opens again when the host connection comes back after an open was refused', async () => {
+  it('attaches once the host connection comes back and the session is open, and not before', async () => {
     const { port, controls } = fakeHost()
     controls.setConnected(false)
     await onTerminal(port)
+    // The host could not open the session, so there is no view to refuse: nothing is attached.
+    expect(controls.terminalViews).toHaveLength(0)
+    act(() => {
+      controls.setConnected(true)
+    })
+    await waitFor(() => {
+      expect(controls.terminalViews).toHaveLength(1)
+    })
+    await waitFor(() => {
+      expect(screen.getAllByTestId('mobile-terminal-line')).toHaveLength(8)
+    })
+  })
+
+  it('opens again when the host connection comes back after the view was refused', async () => {
+    const { port, controls } = fakeHost()
+    await onTerminal(port)
+    await waitFor(() => {
+      expect(screen.getAllByTestId('mobile-terminal-line')).toHaveLength(8)
+    })
+    act(() => {
+      controls.terminalViews[0]?.end('This session could not be reached: the host went away.')
+    })
     expect(await screen.findByText(/This session could not be reached/)).toBeInTheDocument()
     act(() => {
       controls.setConnected(true)
