@@ -18,10 +18,12 @@
 //! * **Absence proves nothing until nothing more can happen.** The host takes an action's deadline
 //!   as the earlier of its window's expiry and its own receipt time plus the requested lifetime, and
 //!   it reads a connection's requests one at a time, so a request can be read long after it was
-//!   sent. No commit of the action can follow the end of the window it was sent under. A read of
-//!   the host that finds nothing therefore counts only after [`Attempt::bound`] has passed, measured
-//!   as time elapsed on a clock that cannot be stepped, never on the wall clock; after a restart,
-//!   when no such clock survives, the whole bound runs again from the restart.
+//!   sent. After the window it was sent under has ended, no transaction of the action passes its
+//!   admission check, and one that passed it earlier holds the store's lock until it commits, which
+//!   every read of the store waits for. A read of the host that finds nothing therefore counts only
+//!   after [`Attempt::bound`] has passed, measured as time elapsed on a clock that cannot be
+//!   stepped, never on the wall clock; after a restart, when no such clock survives, the whole
+//!   bound runs again from the restart. A read that blocks or fails leaves the attempt as it was.
 //! * **A found grant is proof, an absent one is not.** What a read finds closes the attempt as
 //!   happened. What it does not find closes it as not done only where nothing but the action could
 //!   have put it there and taken it away: an invitation or a transfer. A revocation whose grant is
