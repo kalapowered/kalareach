@@ -395,6 +395,9 @@ pub struct Controller {
     feed_runtime: Option<crate::authority_feed::FeedRuntime>,
     /// Wakes the task that gives the owner's inbox its notices about the authority feed.
     feed_notice_wake: Arc<tokio::sync::Notify>,
+    /// Makes the attention store's cursor unreadable to the numbering of feed notices.
+    #[cfg(feature = "testing")]
+    notice_cursor_unreadable: std::sync::atomic::AtomicBool,
     /// That task, which ends when the daemon is dropped.
     feed_notice_task: std::sync::OnceLock<remote_revocation::EndsWithTheDaemon>,
     /// How many times that task has tried to give one.

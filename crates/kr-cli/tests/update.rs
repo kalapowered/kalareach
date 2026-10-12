@@ -10267,8 +10267,8 @@ fn no_type_a_store_keeps_is_undeclared() {
 }
 
 /// KR-REQ-26.10: every record the grants store writes under a name of its own is in the lock. The
-/// registry lists the types it keeps from `grants/durable.rs`, and a record added there without a line
-/// is a stored format the lock would never see change.
+/// registry lists the types it keeps from `grants/durable.rs`, and a record added there without a
+/// line is a stored format the lock would never see change.
 #[test]
 fn every_record_the_grants_store_writes_is_listed_in_the_lock() {
     let unlisted = stored_formats::records_unlisted(
