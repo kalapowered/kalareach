@@ -481,7 +481,27 @@ fn idler() -> Idler {
 /// The same, for a program that ignores a request to terminate: a shell that sets that up and then
 /// becomes `sleep`, which keeps what was ignored.
 fn stubborn_idler() -> Idler {
-    idling(std::process::Command::new("/bin/sh").args(["-c", "trap '' TERM; exec sleep 120"]))
+    let idler =
+        idling(std::process::Command::new("/bin/sh").args(["-c", "trap '' TERM; exec sleep 120"]));
+    // The shell has set up what it ignores once it has become `sleep`.
+    let started = Instant::now();
+    loop {
+        let named = std::process::Command::new("ps")
+            .args(["-o", "comm=", "-p", &idler.identity.pid.get().to_string()])
+            .output()
+            .expect("ps runs");
+        if String::from_utf8_lossy(&named.stdout)
+            .trim()
+            .ends_with("sleep")
+        {
+            return idler;
+        }
+        assert!(
+            started.elapsed() < LIVENESS,
+            "the program set up what it ignores"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 fn idling(command: &mut std::process::Command) -> Idler {
@@ -493,25 +513,44 @@ fn idling(command: &mut std::process::Command) -> Idler {
 }
 
 /// The session's record, as it is when a command starts another process while the others are
-/// ending: `late` is shown only from the second reading that finds `first` ended, and `first` is
-/// shown while it runs.
+/// ending. `first` is shown while the server runs. The first reading after the server has ended
+/// ends `first` itself, before it returns, and shows neither `first` nor `late`; every reading after
+/// that shows `late`. So the order is placed by the server's end and by the readings, and no
+/// program races with a reading.
 struct LateRecord {
     inner: Record,
+    server: ProcessStartIdentity,
     first: ProcessStartIdentity,
     late: ProcessStartIdentity,
-    readings_after_first_ended: std::sync::atomic::AtomicUsize,
+    first_ended: std::sync::atomic::AtomicBool,
+}
+
+impl LateRecord {
+    fn of(server: &Server, record: Record, first: &Idler, late: &Idler) -> Self {
+        Self {
+            inner: record,
+            server: server.identity().clone(),
+            first: first.identity.clone(),
+            late: late.identity.clone(),
+            first_ended: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
 }
 
 impl Owned for LateRecord {
     fn below(&self, server: &ProcessStartIdentity) -> Vec<ProcessStartIdentity> {
+        use std::sync::atomic::Ordering::SeqCst;
+
         let mut below = self.inner.below(server);
-        if gone(&self.first) {
-            let readings = self
-                .readings_after_first_ended
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            if readings >= 1 {
-                below.push(self.late.clone());
+        if self.first_ended.load(SeqCst) {
+            below.push(self.late.clone());
+        } else if gone(&self.server) {
+            // The reading that finds the server ended is the one `first` ends at.
+            let _ = kr_ipc::identity::stop_process(&self.first, kr_ipc::identity::Stop::Kill);
+            while !gone(&self.first) {
+                std::thread::sleep(Duration::from_millis(5));
             }
+            self.first_ended.store(true, SeqCst);
         } else {
             below.push(self.first.clone());
         }
@@ -537,12 +576,7 @@ async fn kr_req_07_53_a_process_recorded_while_the_others_are_ending_is_asked_be
     let stand_in = stand_in();
     let server = start(&stand_in, "ignore-eof", PLAIN).await;
     let (first, late) = (idler(), idler());
-    let record = LateRecord {
-        inner: Record::of(&server),
-        first: first.identity.clone(),
-        late: late.identity.clone(),
-        readings_after_first_ended: std::sync::atomic::AtomicUsize::new(0),
-    };
+    let record = LateRecord::of(&server, Record::of(&server), &first, &late);
 
     let retirement = server.retire(&record, Instant::now().into()).await;
     assert_eq!(retirement.ended, Ended::Terminate);
@@ -567,12 +601,7 @@ async fn kr_req_07_53_a_process_shown_late_that_ignores_the_request_is_forced_wh
     let stand_in = stand_in();
     let server = start(&stand_in, "ignore-eof", PLAIN).await;
     let (first, late) = (idler(), stubborn_idler());
-    let record = LateRecord {
-        inner: Record::of(&server),
-        first: first.identity.clone(),
-        late: late.identity.clone(),
-        readings_after_first_ended: std::sync::atomic::AtomicUsize::new(0),
-    };
+    let record = LateRecord::of(&server, Record::of(&server), &first, &late);
 
     let begun = Instant::now();
     let watching = watch_until_gone(vec![late.identity.clone()]);
