@@ -307,9 +307,15 @@ impl Controller {
         Ok((named, beyond))
     }
 
-    /// Writes the feed's record down, so a host that stops anywhere finds it as it was.
-    fn keep_feed(&self, feed: &crate::grants::AuthorityFeed) -> Result<()> {
-        self.sharing.grants().store_feed(&feed.snapshot())
+    /// Writes the feed's record down when anything in it is unwritten, so a host that stops
+    /// anywhere finds it as it was, and a write that failed is made again by the next caller.
+    fn keep_feed(&self, feed: &mut crate::grants::AuthorityFeed) -> Result<()> {
+        if !feed.is_unwritten() {
+            return Ok(());
+        }
+        self.sharing.grants().store_feed(&feed.snapshot())?;
+        feed.written();
+        Ok(())
     }
 
     /// What this host holds of one request it took from the feed.
@@ -351,7 +357,7 @@ impl Controller {
                 ))
             })?
             .clone();
-        self.keep_feed(&feed)?;
+        self.keep_feed(&mut feed)?;
         Ok(held)
     }
 
@@ -387,7 +393,7 @@ impl Controller {
     ) -> Result<crate::grants::feed::RetainedRevocation> {
         let mut feed = self.authority_feed();
         feed.took_effect(request_id, revision);
-        self.keep_feed(&feed)?;
+        self.keep_feed(&mut feed)?;
         feed.record(request_id).cloned().ok_or_else(|| {
             crate::error::ControllerError::InvalidArgument(
                 "the request was not written down before it took effect".to_owned(),
@@ -406,10 +412,8 @@ impl Controller {
         host: DeviceId,
     ) -> Result<()> {
         let mut feed = self.authority_feed();
-        if feed.note_refusal(request_id, host) {
-            self.keep_feed(&feed)?;
-        }
-        Ok(())
+        feed.note_refusal(request_id, host);
+        self.keep_feed(&mut feed)
     }
 
     /// Writes down that this host has nothing more to do for a request the feed holds: it was
@@ -420,9 +424,8 @@ impl Controller {
         host: DeviceId,
     ) {
         let mut feed = self.authority_feed();
-        if feed.acknowledge(request_id, host)
-            && let Err(error) = self.keep_feed(&feed)
-        {
+        feed.acknowledge(request_id, host);
+        if let Err(error) = self.keep_feed(&mut feed) {
             eprintln!("kr-controller: could not write the authority feed's record down: {error}");
         }
     }
@@ -434,7 +437,7 @@ impl Controller {
         {
             let mut feed = self.authority_feed();
             feed.synchronised(now);
-            if let Err(error) = self.keep_feed(&feed) {
+            if let Err(error) = self.keep_feed(&mut feed) {
                 eprintln!(
                     "kr-controller: could not write the authority feed's record down: {error}"
                 );
@@ -476,40 +479,49 @@ impl Controller {
     ///
     /// Returns an error when the removal could not be written. The grants are refused whatever
     /// happens, and the caller asks again, so the removal reaches the registry when it can take
-    /// it. A notice the attention store cannot take is owed and given again by the carrier.
+    /// it. A notice the attention store cannot take is given again, apart from the carrier.
     pub(crate) async fn authority_feed_removed(&self, origin: &str) -> Result<()> {
         let now = self.wall_now_ms();
         self.refuse_the_grants_that_rest_on_the_feed();
         {
             let mut feed = self.authority_feed();
             feed.removed_from(origin, now);
-            if let Err(error) = self.keep_feed(&feed) {
+            if let Err(error) = self.keep_feed(&mut feed) {
                 eprintln!(
                     "kr-controller: could not write the authority feed's record down: {error}"
                 );
             }
         }
-        self.record_the_removal(origin, now)?;
+        let grants = self.sharing.grants();
+        let held = grants.stored_feed_removal()?;
+        if held
+            .as_ref()
+            .is_none_or(|held| held.origin.0.as_deref() != Some(origin))
+        {
+            grants.store_feed_removal(&StoredRemoval {
+                origin: Nullable::some(origin.to_owned()),
+                at_ms: TimestampMs::new(now),
+                notice: self.next_feed_notice(held.as_ref()).await,
+            })?;
+        }
+        self.feed_notice_wake.notify_one();
         if let Err(error) = self.tell_the_owner_of_the_feed().await {
             eprintln!("kr-controller: {error}");
         }
         Ok(())
     }
 
-    /// Writes down that the feed at `origin` removed this host, with a notice for the owner's
-    /// inbox owed, unless it is written down already.
-    fn record_the_removal(&self, origin: &str, at_ms: u64) -> Result<()> {
-        let grants = self.sharing.grants();
-        let next = match grants.stored_feed_removal()? {
-            Some(held) if held.origin.0.as_deref() == Some(origin) => return Ok(()),
-            held => StoredRemoval {
-                origin: Nullable::some(origin.to_owned()),
-                at_ms: TimestampMs::new(at_ms),
-                notice: held.map_or(1, |held| held.notice + 1),
-                owed: true,
-            },
-        };
-        grants.store_feed_removal(&next)
+    /// The number of the next notice about the feed: above the one this host last recorded and
+    /// above every one the attention store has taken, so a registry that lost its row cannot
+    /// number a notice behind the store's cursor.
+    async fn next_feed_notice(&self, held: Option<&StoredRemoval>) -> u64 {
+        let attention = Arc::clone(self.attention());
+        let taken = tokio::task::spawn_blocking(move || attention.authority_cursor())
+            .await
+            .ok()
+            .and_then(std::result::Result::ok)
+            .unwrap_or_default();
+        held.map_or(0, |held| held.notice).max(taken) + 1
     }
 
     /// Puts the authority feed's removal right at start: kept for the origin that answered it,
@@ -537,79 +549,111 @@ impl Controller {
                 removed = true;
             }
             // The owner pointed the host at another feed, or at none: the removal is no removal
-            // from that one, and the notice that ends the owner's item is owed.
+            // from that one, and the notice that ends the owner's item is recorded.
             Some(_) => grants.store_feed_removal(&StoredRemoval {
                 origin: Nullable::null(),
-                at_ms: held.at_ms,
-                notice: held.notice + 1,
-                owed: true,
+                at_ms: TimestampMs::new(self.wall_now_ms()),
+                notice: self.next_feed_notice(Some(&held)).await,
             })?,
             None => {}
         }
-        // A notice the attention store cannot take is not a reason to stop the start: it stays
-        // owed, and is given at the next start or by the carrier.
+        // A notice the attention store cannot take is not a reason to stop the start: it is given
+        // again by the task that sees to the notices.
         if let Err(error) = self.tell_the_owner_of_the_feed().await {
             eprintln!("kr-controller: {error}");
         }
         Ok(removed)
     }
 
-    /// Gives the attention store the notice this host owes about its authority feed, if it owes
-    /// one. The notices are numbered by the order they were recorded in and written down before
-    /// they are given, so one the store refused is given again and a clock that moves back puts
-    /// none behind another.
+    /// Gives the attention store the newest notice about the authority feed, unless the store has
+    /// taken it already. Whether it has is the store's own cursor, so a store that was reset or put
+    /// back to an earlier copy is given the notice again, and a notice already taken is a no-op.
     ///
     /// # Errors
     ///
-    /// Returns an error when the record cannot be read or written or the attention store cannot
-    /// take the notice. The notice stays owed.
+    /// Returns an error when the record cannot be read or the attention store cannot take the
+    /// notice. The next call tries again.
     pub(crate) async fn tell_the_owner_of_the_feed(&self) -> Result<()> {
-        let grants = self.sharing.grants();
-        let Some(held) = grants.stored_feed_removal()? else {
+        let Some(held) = self.sharing.grants().stored_feed_removal()? else {
             return Ok(());
         };
-        if !held.owed {
-            return Ok(());
-        }
-        let (kind, at_ms) = if held.origin.0.is_some() {
-            (
-                kr_attention::EventKind::AuthorityFeedRemoved,
-                held.at_ms.get(),
-            )
+        let kind = if held.origin.0.is_some() {
+            kr_attention::EventKind::AuthorityFeedRemoved
         } else {
-            (
-                kr_attention::EventKind::AuthorityFeedLeft,
-                self.wall_now_ms(),
-            )
+            kr_attention::EventKind::AuthorityFeedLeft
         };
         let event = kr_attention::SourceEvent::new(
             kr_attention::EventCursor::new(
                 kr_protocol::attention::AttentionSource::Authority,
                 held.notice,
             ),
-            TimestampMs::new(at_ms),
+            held.at_ms,
             kind,
         );
         let attention = Arc::clone(self.attention());
-        if !matches!(
-            tokio::task::spawn_blocking(move || attention.observe(&[event])).await,
-            Ok(Ok(()))
-        ) {
-            return Err(crate::error::ControllerError::Storage {
+        let notice = held.notice;
+        let given = tokio::task::spawn_blocking(move || -> crate::attention::Answer<()> {
+            if attention.authority_cursor()? >= notice {
+                return Ok(());
+            }
+            attention.observe(&[event])
+        })
+        .await;
+        if matches!(given, Ok(Ok(()))) {
+            Ok(())
+        } else {
+            Err(crate::error::ControllerError::Storage {
                 operation: "tell the owner of the authority feed",
                 detail: "the attention store could not take the notice".to_owned(),
-            });
+            })
         }
-        // Written as given unless a newer notice was recorded meanwhile.
-        if grants
-            .stored_feed_removal()?
-            .is_some_and(|now| now.notice == held.notice)
-        {
-            grants.store_feed_removal(&StoredRemoval {
-                owed: false,
-                ..held
-            })?;
-        }
-        Ok(())
+    }
+
+    /// Starts the task that sees to the notices about the authority feed, which runs for as long
+    /// as the daemon does whether or not it reads a feed: it gives the newest notice, and gives it
+    /// again after a wait for as long as the attention store refuses it. It holds the daemon
+    /// weakly.
+    pub(crate) fn start_feed_notices(self: &Arc<Self>, timer: Arc<dyn crate::quiet::Timer>) {
+        let daemon = Arc::downgrade(self);
+        let wake = Arc::clone(&self.feed_notice_wake);
+        tokio::spawn(async move {
+            let mut backoff = kr_transport::reconnect::Backoff::default();
+            loop {
+                // Interest is registered before the notice is read, so one recorded in between
+                // wakes the wait.
+                let woken = wake.notified();
+                tokio::pin!(woken);
+                woken.as_mut().enable();
+                let Some(controller) = daemon.upgrade() else {
+                    return;
+                };
+                let result = controller.tell_the_owner_of_the_feed().await;
+                controller
+                    .feed_notice_attempts
+                    .send_modify(|attempts| *attempts += 1);
+                drop(controller);
+                match result {
+                    Ok(()) => {
+                        backoff = kr_transport::reconnect::Backoff::default();
+                        woken.await;
+                    }
+                    Err(error) => {
+                        eprintln!("kr-controller: {error}");
+                        tokio::select! {
+                            () = &mut woken => {}
+                            () = timer.sleep(backoff.next_delay()) => {}
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    /// How many times the task that sees to the notices has tried to give one. For a suite that
+    /// waits for the next try.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn feed_notice_attempts(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.feed_notice_attempts.subscribe()
     }
 }
