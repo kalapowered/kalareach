@@ -11535,6 +11535,7 @@ export interface ConfigurationDocument {
   agents?: {
     [k: string]: AgentChoice
   }
+  authority?: AuthoritySelection
   ceilings?: ConfigurationCeilings
   /**
    * The profile selected when a request and the allowlist name none.
@@ -11585,6 +11586,20 @@ export interface AgentChoice {
    * ownership from its profile.
    */
   ownership: 'full' | 'reduced'
+}
+/**
+ * The authority feed this host reads its remote revocations from.
+ *
+ * A section of level 2: written only when it selects something, and ignored, with a
+ * count, by a release that reads level 1. Read when the daemon starts, so a change applies
+ * at the next start. No environment variable reaches it.
+ */
+export interface AuthoritySelection {
+  /**
+   * The service's origin: an `https` origin, or an `http` origin on a loopback address,
+   * spelled as a gateway origin is, with no path and no trailing slash.
+   */
+  origin?: string | null
 }
 /**
  * The ceilings this host configures. They intersect; they never raise anything.
