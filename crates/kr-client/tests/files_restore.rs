@@ -349,6 +349,8 @@ struct Scripted {
     asked: Mutex<Vec<String>>,
     /// Answer every object read with no bytes, as a service that has lost the object might.
     serves_empty_ranges: bool,
+    /// How many empty answers have been given, so a restore that keeps asking fails here.
+    empty_answers: std::sync::atomic::AtomicUsize,
 }
 
 impl Scripted {
@@ -364,6 +366,7 @@ impl Scripted {
             objects: Mutex::default(),
             asked: Mutex::default(),
             serves_empty_ranges: false,
+            empty_answers: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -461,6 +464,13 @@ impl RestoreSource for Scripted {
             .push(format!("object {object:?} at {offset}"));
         Box::pin(async move {
             if self.serves_empty_ranges {
+                let given = self
+                    .empty_answers
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                assert!(
+                    given < 5,
+                    "the restore keeps asking a service that answers nothing"
+                );
                 return Ok(Vec::new());
             }
             let objects = self.objects.lock().expect("objects");
@@ -1398,13 +1408,8 @@ async fn a_service_that_answers_a_read_with_nothing_stops_the_restore() {
     let sealed = world.seal(4, &honest_members());
     let mut source = Scripted::serving(&world, world.bundle(&Shape::default())).publishing(&sealed);
     source.serves_empty_ranges = true;
-    // A restore that kept asking would never end, so the test would hang; it is given a bound so
-    // that a defect fails here instead.
-    let stopped = tokio::time::timeout(
-        std::time::Duration::from_secs(60),
-        restore(&world, &Arc::new(source), None),
-    )
-    .await
-    .expect("the restore stops rather than asking for ever");
+    // The script fails the test when the restore asks more than a few times, so a restore that
+    // never gave up fails here and does not hang.
+    let stopped = restore(&world, &Arc::new(source), None).await;
     assert!(matches!(stopped.expect_err("stopped"), RestoreError::Range));
 }

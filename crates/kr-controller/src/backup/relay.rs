@@ -33,7 +33,6 @@ use std::time::Duration;
 
 use kr_client::error::ClientError;
 use kr_client::recovery::bundle_collection;
-use kr_client::retry::UserAction;
 use kr_client::services::account::{AccountToken, AccountTokenSource, BACKUP_WRITE_SCOPE};
 use kr_client::services::{
     BackupManifestService, ManagedSyncService, ServiceFuture, ServiceSigner, StorageService,
@@ -53,7 +52,7 @@ use kr_protocol::service::{GatewayOrigin, ServiceRequestSigner};
 use kr_transport::config::ProxyUrl;
 
 use crate::account::HostAccount;
-use crate::backup::runtime::{TokenState, describe_token, managed_clients, managed_transport};
+use crate::backup::runtime::{TokenState, clients_over, describe_token, managed_transport};
 use crate::backup::uploader::Hold;
 use crate::error::{ControllerError, Result};
 use crate::privacy::{PrivacyState, Published};
@@ -79,21 +78,20 @@ struct Gated {
 impl Gated {
     /// Whether a request may leave now.
     fn open(&self) -> kr_client::Result<()> {
-        if let Some(left) = self.quiet.left() {
-            return Err(ClientError::Refused {
-                error: kr_client::error::refusal(
-                    ErrorCode::RateLimited,
-                    kr_client::shown::Shown::said(
-                        "the storage service asked to be left alone, and has not been",
-                    ),
+        // This is the relay's own refusal, not a delay the service named, so it carries none: the
+        // record already holds the delay, and the relay answers what is left of it.
+        if self.quiet.left().is_some() {
+            return Err(ClientError::refusal(
+                ErrorCode::RateLimited,
+                kr_client::shown::Shown::said(
+                    "the service asked to be left alone, and the time has not passed",
                 ),
-                retry_after_seconds: Some(left.as_secs() + u64::from(left.subsec_nanos() > 0)),
-                action: UserAction::Wait,
-            });
+            ));
         }
         let now = self.privacy.now();
+        // A read that has not said which state it began under is not sent.
         let began = READING.try_with(|began| *began).ok();
-        if now.private || began.is_some_and(|began| began != now) {
+        if now.private || began != Some(now) {
             return Err(ClientError::refusal(
                 ErrorCode::PermissionDenied,
                 kr_client::shown::Shown::said(
@@ -172,6 +170,8 @@ pub struct BackupRelay {
     storage: Arc<dyn StorageService>,
     manifest: Arc<dyn BackupManifestService>,
     bundles: ManagedSyncService,
+    /// The check every request passes where it leaves, for the one that asks no token.
+    gate: Arc<Gated>,
     /// The account's tokens as they are, for the question whether one can be had.
     tokens: Arc<dyn AccountTokenSource>,
     account: Arc<HostAccount>,
@@ -203,13 +203,56 @@ impl BackupRelay {
         quiet: Arc<Quiet>,
         privacy: PrivacyState,
     ) -> Result<Self> {
+        Self::over(
+            origin,
+            managed_transport(origin, proxy)?,
+            managed_transport(origin, proxy)?,
+            writer,
+            account,
+            quiet,
+            privacy,
+        )
+    }
+
+    /// Builds the relay over the transports `storage` and `bundles` reach the service through.
+    fn over(
+        origin: &GatewayOrigin,
+        storage: Arc<dyn kr_client::services::ServiceHttp>,
+        bundles: Arc<dyn kr_client::services::ServiceHttp>,
+        writer: &AuthorisationKeyPair,
+        account: Arc<HostAccount>,
+        quiet: Arc<Quiet>,
+        privacy: PrivacyState,
+    ) -> Result<Self> {
         let tokens = account.tokens_for(origin.as_str());
-        let gated: Arc<dyn AccountTokenSource> = Arc::new(Gated {
+        Self::over_tokens(
+            origin, storage, bundles, writer, account, tokens, quiet, privacy,
+        )
+    }
+
+    /// Builds the relay over transports and an account's token source.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the relay is its service, its two transports, its key, the account and the \
+                  token source it presents, and the two states it is held to"
+    )]
+    fn over_tokens(
+        origin: &GatewayOrigin,
+        storage: Arc<dyn kr_client::services::ServiceHttp>,
+        bundles: Arc<dyn kr_client::services::ServiceHttp>,
+        writer: &AuthorisationKeyPair,
+        account: Arc<HostAccount>,
+        tokens: Arc<dyn AccountTokenSource>,
+        quiet: Arc<Quiet>,
+        privacy: PrivacyState,
+    ) -> Result<Self> {
+        let gate = Arc::new(Gated {
             inner: Arc::clone(&tokens),
-            privacy: privacy.clone(),
+            privacy,
             quiet: Arc::clone(&quiet),
         });
-        let clients = managed_clients(origin, proxy, writer, &gated)?;
+        let gated: Arc<dyn AccountTokenSource> = Arc::clone(&gate) as _;
+        let clients = clients_over(origin, storage, writer, &gated)?;
         let (Some(storage), Some(manifest)) = (clients.storage, clients.backup_manifest) else {
             return Err(ControllerError::NotConfigured(
                 "a restore's reads need a storage client and a backup manifest client".to_owned(),
@@ -218,18 +261,15 @@ impl BackupRelay {
         let installation = Arc::new(InstallationSigner {
             key: AuthorisationKeyPair::generate().map_err(ControllerError::registry)?,
         });
-        let bundles = ManagedSyncService::new(
-            origin.clone(),
-            managed_transport(origin, proxy)?,
-            installation,
-        )
-        .presenting(gated, BACKUP_WRITE_SCOPE)
-        .leaving_delays_to_the_caller();
+        let bundle_reads = ManagedSyncService::new(origin.clone(), bundles, installation)
+            .presenting(gated, BACKUP_WRITE_SCOPE)
+            .leaving_delays_to_the_caller();
         Ok(Self {
             origin: origin.clone(),
             storage,
             manifest,
-            bundles,
+            bundles: bundle_reads,
+            gate,
             tokens,
             account,
             quiet,
@@ -274,11 +314,18 @@ impl BackupRelay {
                     self.quiet.owe(delay);
                     return Ok(wait(self.quiet.left().unwrap_or(delay)));
                 }
+                // The gate refused for a delay already on the record: that is what is answered.
+                if hold.code == ErrorCode::RateLimited
+                    && let Some(left) = self.quiet.left()
+                {
+                    return Ok(wait(left));
+                }
                 // The service's own text can repeat what it was asked, so a refusal by the service
                 // is its code and a sentence of this program's. Everything else failed on this
                 // host or on the way, and says what it is.
                 let detail = match &error {
                     ClientError::Refused { .. } => local_words(hold.code).to_owned(),
+                    ClientError::Host(error) => error.message.clone(),
                     other => other.to_string(),
                 };
                 Err(ControllerError::Refused {
@@ -385,6 +432,8 @@ impl BackupRelay {
             encrypted_manifest_hash: checkpoint.encrypted_manifest_hash,
             observed_at_ms: checkpoint.verified_at_ms,
         });
+        // A fetch asks for no account token, so the check that stands at the token stands here.
+        self.gate.open()?;
         let fetched = self.manifest.fetch(archive_id, None, held.as_ref()).await?;
         Ok(BackupReadResult::Generation {
             publication: Nullable(fetched.map(|fetched| fetched.publication)),
@@ -420,17 +469,14 @@ fn wait(left: Duration) -> BackupReadResult {
 const fn local_words(code: ErrorCode) -> &'static str {
     match code {
         ErrorCode::PermissionDenied => "the storage service did not accept this host's sign-in",
-        ErrorCode::HostNotConfigured => {
-            "this host holds no account token that a read of backup storage may carry"
-        }
+        ErrorCode::HostNotConfigured => "the storage service says it is not set up for that",
         ErrorCode::QuotaExceeded => "the account's storage allowance is spent",
         ErrorCode::OutcomeUnknown => "the storage service did not finish answering that read",
         ErrorCode::RateLimited | ErrorCode::ServiceCapacity => {
             "the storage service has no capacity for that read now"
         }
-        ErrorCode::UnknownSession => "the storage service holds nothing there",
         ErrorCode::UpstreamUnavailable | ErrorCode::StorageUnavailable => {
-            "the storage service could not be reached"
+            "the storage service could not answer that read"
         }
         _ => "the storage service refused that read",
     }
@@ -438,12 +484,46 @@ const fn local_words(code: ErrorCode) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
+    use kr_client::services::{ServiceHttp, ServiceHttpAnswer};
+    use kr_protocol::ids::{ArchiveId, BackupObjectId};
+    use kr_protocol::scalars::Uuid;
     use tokio::sync::Notify;
 
     use super::*;
     use crate::quiet::RealTimer;
+
+    /// A service that is never reached: it counts what is sent to it and loses every request.
+    #[derive(Debug, Default)]
+    struct Unreached(AtomicUsize);
+
+    impl kr_client::services::ServiceHttp for Unreached {
+        fn post_json<'a>(
+            &'a self,
+            _url: &'a str,
+            _body: &'a [u8],
+            _headers: &'a [(&'a str, &'a str)],
+        ) -> ServiceFuture<'a, ServiceHttpAnswer> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async {
+                Err(ClientError::refusal(
+                    ErrorCode::UpstreamUnavailable,
+                    kr_client::shown::Shown::said("this test's service is never reached"),
+                ))
+            })
+        }
+
+        fn post_bytes<'a>(
+            &'a self,
+            url: &'a str,
+            body: &'a [u8],
+            headers: &'a [(&'a str, &'a str)],
+        ) -> ServiceFuture<'a, ServiceHttpAnswer> {
+            self.post_json(url, body, headers)
+        }
+    }
 
     /// An account whose token arrives when the test says, as one does that is being renewed.
     #[derive(Debug)]
@@ -465,63 +545,180 @@ mod tests {
         }
     }
 
-    /// What the gate answers a request that waited for its token while `change` happened.
-    async fn after_waiting(
-        change: impl FnOnce(&PrivacyState, &Quiet),
-    ) -> kr_client::Result<AccountToken> {
-        let privacy = PrivacyState::default();
-        privacy.set(state(1, false));
-        let quiet = Arc::new(Quiet::new(Arc::new(RealTimer)));
-        let renewed = Arc::new(Notify::new());
-        let gate = Arc::new(Gated {
-            inner: Arc::new(Renewing(Arc::clone(&renewed))),
-            privacy: privacy.clone(),
-            quiet: Arc::clone(&quiet),
-        });
-        let asking = tokio::spawn({
-            let gate = Arc::clone(&gate);
-            READING.scope(
-                state(1, false),
-                async move { gate.token("backup.write").await },
-            )
-        });
-        // The request is waiting for its token. Whatever happens to the host in the meantime
-        // happens before the token arrives.
-        tokio::task::yield_now().await;
-        change(&privacy, &quiet);
-        renewed.notify_one();
-        asking.await.expect("the request task")
+    /// A relay over a service nobody reaches, whose account hands out a token when told to.
+    struct Rig {
+        relay: Arc<BackupRelay>,
+        service: Arc<Unreached>,
+        privacy: PrivacyState,
+        quiet: Arc<Quiet>,
+        renewed: Arc<Notify>,
     }
 
-    /// KR-REQ-24.27: a read that waited for its token while privacy mode was turned on, or while it
-    /// was turned on and off again, or while the service asked to be left alone, sends nothing;
-    /// the control is the same wait with nothing changed.
+    impl Rig {
+        fn new() -> Self {
+            let privacy = PrivacyState::default();
+            privacy.set(state(1, false));
+            let quiet = Arc::new(Quiet::new(Arc::new(RealTimer)));
+            let renewed = Arc::new(Notify::new());
+            let service = Arc::new(Unreached::default());
+            let origin = GatewayOrigin::new("https://storage.example").expect("an origin");
+            let relay = BackupRelay::over_tokens(
+                &origin,
+                Arc::clone(&service) as Arc<dyn ServiceHttp>,
+                Arc::clone(&service) as Arc<dyn ServiceHttp>,
+                &AuthorisationKeyPair::generate().expect("a key"),
+                Arc::new(crate::account::HostAccount::new(
+                    Arc::new(kr_crypto::store::MemoryStore::default()),
+                    kr_protocol::ids::EnvironmentId::new(Uuid::from_bytes([9; 16])),
+                    std::env::temp_dir().as_path(),
+                    Err(kr_protocol::host_account::SignInUnavailable::NotUsable),
+                    None,
+                )),
+                Arc::new(Renewing(Arc::clone(&renewed))),
+                Arc::clone(&quiet),
+                privacy.clone(),
+            )
+            .expect("a relay");
+            Self {
+                relay: Arc::new(relay),
+                service,
+                privacy,
+                quiet,
+                renewed,
+            }
+        }
+
+        fn reads() -> [BackupReadParams; 3] {
+            [
+                BackupReadParams::Bundle {
+                    locator: Uuid::from_bytes([1; 16]),
+                },
+                BackupReadParams::Generation {
+                    archive_id: ArchiveId::new(Uuid::from_bytes([2; 16])),
+                    checkpoint: Nullable::null(),
+                },
+                BackupReadParams::Object {
+                    archive_id: ArchiveId::new(Uuid::from_bytes([2; 16])),
+                    object_id: BackupObjectId::new(Uuid::from_bytes([3; 16])),
+                    offset: U64::new(0),
+                    length: U64::new(16),
+                },
+            ]
+        }
+
+        /// What the relay answers a read that began under privacy generation 1 and found the world
+        /// as `change` left it by the time its request was to leave.
+        async fn answer(
+            &self,
+            read: BackupReadParams,
+            change: impl FnOnce(&PrivacyState, &Quiet),
+        ) -> Result<BackupReadResult> {
+            let relay = Arc::clone(&self.relay);
+            // A read that asks for a token is waiting for it once it has started; whatever happens
+            // to the host in the meantime happens before the token arrives. One that asks for none
+            // has no wait to change the world in, so it is changed before the read is begun, which
+            // is as late as a test can make it.
+            let waits = !matches!(read, BackupReadParams::Generation { .. });
+            let mut change = Some(change);
+            if !waits && let Some(change) = change.take() {
+                change(&self.privacy, &self.quiet);
+            }
+            let asking = tokio::spawn(async move { relay.read(read, state(1, false)).await });
+            tokio::task::yield_now().await;
+            if let Some(change) = change.take() {
+                change(&self.privacy, &self.quiet);
+            }
+            self.renewed.notify_one();
+            asking.await.expect("the read task")
+        }
+    }
+
+    /// KR-REQ-24.27: a read whose request would leave after privacy mode was turned on, or turned
+    /// on and off again, sends nothing. It holds for every read the relay makes, through the real
+    /// storage, manifest and bundle clients, whether they wait for a token or not; the control is
+    /// the same read with nothing changed, which does send.
     #[tokio::test]
-    async fn a_request_that_waited_for_its_token_is_checked_again_where_it_leaves() {
-        assert!(
-            after_waiting(|_, _| {}).await.is_ok(),
-            "nothing changed while it waited"
-        );
+    async fn no_request_leaves_after_privacy_mode_changed_whichever_read_it_is() {
+        for read in Rig::reads() {
+            let control = Rig::new();
+            let _ = control.answer(read.clone(), |_, _| {}).await;
+            assert_eq!(
+                control.service.0.load(Ordering::SeqCst),
+                1,
+                "{read:?}: with nothing changed the request leaves"
+            );
 
-        let turned_on = after_waiting(|privacy, _| privacy.set(state(2, true)))
+            let turned_on = Rig::new();
+            let refused = turned_on
+                .answer(read.clone(), |privacy, _| privacy.set(state(2, true)))
+                .await
+                .expect_err("privacy mode was turned on");
+            assert_eq!(refused.code(), ErrorCode::PermissionDenied, "{read:?}");
+            assert_eq!(turned_on.service.0.load(Ordering::SeqCst), 0, "{read:?}");
+
+            let there_and_back = Rig::new();
+            let refused = there_and_back
+                .answer(read.clone(), |privacy, _| {
+                    privacy.set(state(2, true));
+                    privacy.set(state(3, false));
+                })
+                .await
+                .expect_err("privacy mode came on and went off again");
+            assert_eq!(refused.code(), ErrorCode::PermissionDenied, "{read:?}");
+            assert_eq!(
+                there_and_back.service.0.load(Ordering::SeqCst),
+                0,
+                "{read:?}"
+            );
+        }
+    }
+
+    /// A delay another request recorded while a read waited for its token is owed by that read too:
+    /// it answers what is left and sends nothing.
+    #[tokio::test]
+    async fn no_request_leaves_inside_a_delay_recorded_while_it_waited() {
+        for read in Rig::reads() {
+            let rig = Rig::new();
+            let recorded = std::sync::Mutex::new(None);
+            let answer = rig
+                .answer(read.clone(), |_, quiet| {
+                    quiet.owe(Duration::from_millis(29_500));
+                    *recorded.lock().expect("the deadline") = quiet.owed().map(|owed| owed.until);
+                })
+                .await
+                .expect("an answer");
+            match answer {
+                BackupReadResult::Wait {
+                    retry_after_seconds,
+                } => assert_eq!(retry_after_seconds.get(), 30, "{read:?}: rounded up"),
+                other => panic!("{read:?}: {other:?}"),
+            }
+            assert_eq!(rig.service.0.load(Ordering::SeqCst), 0, "{read:?}");
+            assert_eq!(
+                rig.quiet.owed().map(|owed| owed.until),
+                *recorded.lock().expect("the deadline"),
+                "{read:?}: the gate's own refusal did not move the deadline on the record"
+            );
+        }
+    }
+
+    /// A read that does not say which state it began under is not sent: the check compares with
+    /// something, and when there is nothing it refuses.
+    #[tokio::test]
+    async fn a_read_that_began_under_no_state_is_not_sent() {
+        let rig = Rig::new();
+        rig.renewed.notify_one();
+        let refused = rig
+            .relay
+            .object(
+                ArchiveId::new(Uuid::from_bytes([2; 16])),
+                BackupObjectId::new(Uuid::from_bytes([3; 16])),
+                0,
+                16,
+            )
             .await
-            .expect_err("privacy mode was turned on while it waited");
-        assert_eq!(turned_on.code(), ErrorCode::PermissionDenied);
-
-        let there_and_back = after_waiting(|privacy, _| {
-            privacy.set(state(2, true));
-            privacy.set(state(3, false));
-        })
-        .await
-        .expect_err("privacy mode came on and went off again while it waited");
-        assert_eq!(there_and_back.code(), ErrorCode::PermissionDenied);
-
-        let owed = after_waiting(|_, quiet| quiet.owe(Duration::from_secs(30)))
-            .await
-            .expect_err("the service asked to be left alone while it waited");
-        assert_eq!(
-            Hold::of(&owed).retry_after.map(|delay| delay.as_secs()),
-            Some(30)
-        );
+            .expect_err("no state to compare with");
+        assert_eq!(refused.code(), ErrorCode::PermissionDenied);
+        assert_eq!(rig.service.0.load(Ordering::SeqCst), 0);
     }
 }

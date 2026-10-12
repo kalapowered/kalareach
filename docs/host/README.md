@@ -3528,8 +3528,8 @@ object on the service, at most 512 KiB.
 Reading a bundle is signed as an installation, using an ephemeral key generated in memory by the
 daemon (it is never stored). This is because the settings sync route on the service only accepts
 installation signatures, not signatures made by a host's writer key. However the request also
-carries the host's `backup.write` token beside the signature. Bundles larger than 896 KiB are
-rejected outright, as responses must fit in a single control frame.
+carries the host's `backup.write` token beside the signature. Bundles larger than 128 KiB, the most
+a sealed bundle may be, are rejected outright, as responses must fit in a single control frame.
 
 Reading any of `bundle`, `generation` or `object` is refused while privacy mode is on. The daemon
 checks the privacy state when a read begins, again where the request leaves the host, and once more

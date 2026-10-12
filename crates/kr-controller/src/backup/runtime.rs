@@ -283,7 +283,20 @@ pub fn managed_clients(
     writer: &AuthorisationKeyPair,
     tokens: &Arc<dyn AccountTokenSource>,
 ) -> Result<ServiceClients> {
-    let http = managed_transport(origin, proxy)?;
+    clients_over(origin, managed_transport(origin, proxy)?, writer, tokens)
+}
+
+/// The same clients over a transport the caller made.
+///
+/// # Errors
+///
+/// Returns an error when a client cannot be built, which none is at present.
+pub(crate) fn clients_over(
+    origin: &GatewayOrigin,
+    http: Arc<dyn ServiceHttp>,
+    writer: &AuthorisationKeyPair,
+    tokens: &Arc<dyn AccountTokenSource>,
+) -> Result<ServiceClients> {
     let signer: Arc<dyn ServiceSigner> = Arc::new(WriterSigner {
         key: writer.clone(),
     });

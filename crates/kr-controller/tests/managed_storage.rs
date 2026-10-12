@@ -2653,7 +2653,7 @@ async fn a_host_that_selects_no_storage_service_has_nothing_to_read() {
 }
 
 /// KR-REQ-24.27: while privacy mode is on the daemon reads nothing for a restore, and an answer
-/// read under a state that has changed by the time it is given is not given.
+/// whose read ended under another state than it began under is not given.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_restores_reads_are_refused_while_privacy_mode_is_on_and_held_to_the_state_they_were_read_under()
  {
