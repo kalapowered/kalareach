@@ -2426,11 +2426,10 @@ impl LaunchedForwarder {
 /// KR-REQ-11.22, KR-REQ-11.32, KR-REQ-11.43, KR-REQ-12.11 and KR-REQ-12.14: a bridge that reaches
 /// the bound endpoint becomes a connection this host serves, end to end.
 ///
-/// Nothing here is assembled by the test: the endpoint is bound by the host, the peer identity is
-/// the kernel's, the credential is the launch's, the connection is admitted by the broker, the
-/// dispatch is registered by the composition, and the owner reads both ends. The bridge is a task
-/// in this process rather than a separate executable, so what the kernel names on the accepted
-/// socket is this process, which is exactly the process the registration expects.
+/// The launch is composed by [`launched_forwarder`], with the host's own reservation, registration
+/// and endpoint calls; from the bridge's connection on nothing is assembled by the test: the peer
+/// identity is the kernel's, the credential is the launch's, the connection is admitted by the
+/// broker, the dispatch is registered by the composition, and the owner reads both ends.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_12_14_a_bridge_that_reaches_the_endpoint_becomes_a_served_connection() {
     let directory = private_directory();
