@@ -72,6 +72,13 @@ pub const WITHHELD_VARIABLES: [&str; 2] = kr_protocol::root::LAUNCH_VARIABLES;
 /// What a session recorded of the processes below its servers, as the ending reads and changes it.
 ///
 /// The session implements it over its record of the processes it owns.
+///
+/// The ending reads the record when it begins, again and again while the processes below the server
+/// end, before each round of force, and once more at its end. The last reading only reports: a
+/// process that it shows for the first time is returned as one that is still running, with no
+/// request to terminate and no force. What the session records cannot show one then, because it
+/// records a process only while its parent runs and is recorded, and the ending reaches its end
+/// after a reading that found nothing running; an implementation that can must expect that.
 pub trait Owned: Send + Sync {
     /// Reads what runs below `server` now, and returns the processes recorded below it, the ones
     /// read earlier included, that have not been read as ended.
@@ -599,10 +606,10 @@ const RECORD_REREAD: Duration = Duration::from_millis(200);
 /// is ended by force, a few rounds, each reading the record for what the last one left.
 ///
 /// **Nothing is forced before `window_over`, by construction:** every round of force first asks
-/// what it has not asked and waits for it until `window_over`, so a process that a reading shows
-/// for the first time at any moment, the one after the window's last, has the rest of the window
-/// and is forced only if it is still there when the window is over. Returns the processes still
-/// running at the end.
+/// what it has not asked and waits for it until `window_over`, so a process that a reading before
+/// force shows for the first time, at any moment, has the rest of the window and is forced only if
+/// it is still there when the window is over. The reading at the very end only reports (see
+/// [`Owned`]). Returns the processes still running at the end.
 async fn end_below(
     server: &ProcessStartIdentity,
     mut known: BTreeSet<ProcessStartIdentity>,
