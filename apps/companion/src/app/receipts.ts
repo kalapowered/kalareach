@@ -63,9 +63,13 @@ export function useReceiptReads({
     if (connected !== true || owing === '') return
     // The wait before the next read: the first pace at the start, then twice as long after each.
     let wait = RECEIPT_READ_FIRST_MS
+    // False once the view is gone: a pass that is in the middle of its reads makes no more.
+    let live = true
     const reads = readOnCadence(
       async () => {
         for (const each of latest.current) {
+          // A hidden page reads nothing, and neither does a view that has been left.
+          if (!live || document.visibilityState === 'hidden') return
           if (each.actionId === null) continue
           try {
             const record = await port.actionRead({ action_id: each.actionId, session_id: sessionId })
@@ -90,6 +94,7 @@ export function useReceiptReads({
     document.addEventListener('visibilitychange', shown)
     reads.now()
     return () => {
+      live = false
       document.removeEventListener('visibilitychange', shown)
       reads.stop()
     }

@@ -31,6 +31,9 @@ const UNKNOWN: Submission = {
   error: null
 }
 
+/** A second one, so that a pass of reads has more than one request in it. */
+const ANOTHER: Submission = { ...UNKNOWN, localId: 'local-2', actionId: '00000000-0000-4000-8000-00000000abce' }
+
 /** A record that says nothing new: the host still does not know either. */
 const NOTHING_NEW: Receipt = {
   action_id: ACTION,
@@ -62,8 +65,12 @@ describe('the reads of the host’s record of an action', () => {
   const began: number[] = []
   let start = 0
 
-  /** Mounts a view that reads the record of one action. */
-  function open() {
+  /** The answers of reads the test holds, in the order they were asked, when it holds them. */
+  const held: (() => void)[] = []
+  let holding = false
+
+  /** Mounts a view that reads the record of each action it is given. */
+  function open(submissions: readonly Submission[] = [UNKNOWN]) {
     const host = fakeHost()
     return render(
       <AppProvider
@@ -71,11 +78,16 @@ describe('the reads of the host’s record of an action', () => {
           ...host.port,
           actionRead: () => {
             began.push(Date.now() - start)
-            return Promise.resolve({ receipt: NOTHING_NEW, result: null })
+            if (!holding) return Promise.resolve({ receipt: NOTHING_NEW, result: null })
+            return new Promise((resolve) => {
+              held.push(() => {
+                resolve({ receipt: NOTHING_NEW, result: null })
+              })
+            })
           }
         }}
       >
-        <Reads submissions={[UNKNOWN]} />
+        <Reads submissions={submissions} />
       </AppProvider>
     )
   }
@@ -91,6 +103,8 @@ describe('the reads of the host’s record of an action', () => {
     vi.useFakeTimers()
     start = Date.now()
     began.length = 0
+    held.length = 0
+    holding = false
   })
 
   afterEach(() => {
@@ -127,11 +141,40 @@ describe('the reads of the host’s record of an action', () => {
     expect(began).toEqual([0, 4_000, 12_000, 28_000])
 
     showPage('hidden')
-    await runFor(60_000)
     const reading = began.length
+    await runFor(60_000)
+    // A hidden page reads nothing.
+    expect(began).toHaveLength(reading)
     showPage('visible')
     await runFor(13_000)
     const at = 90_000
     expect(began.slice(reading)).toEqual([at, at + 4_000, at + 12_000])
+  })
+
+  it('stop in the middle of a pass when the page is hidden, and when the view is left', async () => {
+    holding = true
+    const view = open([UNKNOWN, ANOTHER])
+    await runFor(0)
+    // The first read of the pass is on its way, and the page is hidden before it answers.
+    expect(began).toHaveLength(1)
+    showPage('hidden')
+    await act(async () => {
+      held.shift()?.()
+      await Promise.resolve()
+    })
+    await runFor(60_000)
+    expect(began, 'the second read of the pass is not made while the page is hidden').toHaveLength(1)
+
+    showPage('visible')
+    await runFor(0)
+    // Shown again, the pass starts over; and a view that is left in the middle of one reads no more.
+    expect(began).toHaveLength(2)
+    view.unmount()
+    await act(async () => {
+      held.shift()?.()
+      await Promise.resolve()
+    })
+    await runFor(60_000)
+    expect(began, 'a view that is gone reads nothing').toHaveLength(2)
   })
 })
