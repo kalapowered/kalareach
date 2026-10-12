@@ -298,13 +298,42 @@ reason recorded, rather than sent with its text cut out.
 
 ## The object a preview refers to
 
-When the detail of a notification does not fit in the push, the detail moves into an object sealed to the stored-envelope key of the paired device, and the notification includes a reference to the object. The device reads the object from its mailbox, so the object has to be there before the device is told about it.
+When the detail of a notification is too long to fit in the push, it is encrypted in an object under
+the stored-envelope key of the paired device, and the push carries only the object's identifier. The
+device reads the object from its mailbox, so the object has to be there before the device is told
+about it.
 
-When a host has a mailbox service named in the configuration document, it will attempt to place the object in the mailbox as part of sending the notification. All of the normal checks are performed (privacy generation, authority, credential, expiry). If the notification would be sent, the object is placed in the mailbox, and then the notification is sent once the object has been placed. The object follows all of the rules of the notification: privacy mode waits for a placement on the wire as it waits for a send, and a notification whose grant ended leaves nothing in a mailbox.
+When a host has a mailbox service named in its configuration document, it attempts to place the
+object there as part of the notification's own attempt. It performs the same privacy generation,
+authority, credential and expiry checks as it would for any notification. If the checks are
+successful, it places the object under an admission of the generation that the notification was
+admitted under. A mailbox service can take a number of seconds to answer, so the host asks again
+whether the notification has expired and whether the recipient still holds the grant before sending
+the push. The push is sent under an admission of its own. A change of privacy mode waits for a
+placement on the wire as it waits for a send. One that comes in between takes the notification back,
+and the journal lists the object among the copies that left. A notification whose grant ended before
+the attempt leaves nothing in a mailbox.
 
-The mailbox service stores the object as it stores any other item, encrypted and for at most a day. The only information the mailbox service can learn is the size of the object and when it was placed. The object ID is derived from the notification ID using a secret that only this particular host knows, so the mailbox service can't tell which push it's for.
+A mailbox service stores the object like any other item, encrypted and for a maximum of a day. It
+can see the public key that signed the request (the host's), the public key that the object is
+addressed to, some routing information (the key identifiers of the host and the device, the kind of
+payload, and the size and expiry of the object) and the time at which the object arrived. It cannot
+see the contents of the object. The object's identifier is derived from the notification's
+identifier with a secret that only this host holds, so the identifier does not link the object to
+the push. The expiry and the time of arrival are the same for both, and the managed service knows
+the host's key from the push as well, so a service that runs both can match them by those.
 
-Placing the object is idempotent (delivering the same envelope to the mailbox service multiple times will result in the same response each time). If the mailbox service is unavailable, returns a "try again later" response, or simply doesn't respond, the push will not be sent and will be retried according to the normal schedule, but not before the time given by the mailbox service. On the last attempt the notification has, the push is sent without the object. If the mailbox service rejects the object because the mailbox for the device is full, waiting would not change its answer, and the notification is a person's alert, so the notification is sent anyway without its detail, and its record says the mailbox did not take the object. If there is no mailbox service named in the configuration document, the object is not placed and the push is sent as it always was.
+Placing an object is safe to repeat, because the service recognises a second delivery of the same
+envelope and stores one item. If the mailbox service cannot be reached, asks for later or does not
+answer, the push is not sent. It is tried again on its usual schedule, and not before the time the
+service named. The mailbox gets the notification's first five attempts and no more time than the
+notification has: when the next attempt, or the time the service asked for, would reach the
+notification's expiry, the push is sent without its detail, and so it is when the five attempts are
+spent, so that the gateway keeps the last three. A service that refuses the object, because the
+device's mailbox is full, is not waited for either. The notification is a person's alert, and the
+push is what brings the device to read its mailbox, so it is sent without its detail and its record
+says the mailbox did not take the object. A host whose document names no mailbox service places
+nothing and sends the push as it always did.
 
 ## Sending, and not sending twice
 
