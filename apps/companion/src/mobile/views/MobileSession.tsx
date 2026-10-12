@@ -1360,7 +1360,7 @@ export function MobileSession({
                   Keep it for the new conversation
                 </Button>
               ) : null}
-              {fileOffer.offered || connected !== true ? null : (
+              {fileOffer.offered || connected !== true || over ? null : (
                 <p className="small muted" data-testid="attach-reason">
                   {fileOffer.reason}
                 </p>

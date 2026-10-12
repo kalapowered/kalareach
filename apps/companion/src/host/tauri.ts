@@ -101,6 +101,8 @@ function noAgreedShape(operation: string): Promise<never> {
 
 /** What the backend publishes for one host event. */
 interface PublishedEvent {
+  /** The environment of the host it came from. */
+  readonly host?: string
   readonly stream_id: string
   readonly sequence: string
   readonly event_type: string
@@ -109,6 +111,16 @@ interface PublishedEvent {
 
 /** Builds the desktop port. */
 export function tauriPort(): HostPort {
+  // The environment of the host the connection last said it was to. An event that names another
+  // host is one that was on its way when the host changed, and is not the new host's.
+  let host: string | null = null
+  const following = (state: ConnectionState): ConnectionState => {
+    host = state.environment_id
+    return state
+  }
+  const ofThisHost = (published: { readonly host?: string }): boolean =>
+    published.host === undefined || host === null || published.host === host
+
   const call = <T,>(command: string, args: Record<string, unknown>): Promise<T> =>
     invoke<T>(command, args)
 
@@ -133,10 +145,12 @@ export function tauriPort(): HostPort {
   return {
     // Native code's reason can arrive blank; it is taken in as none, from a read and a change alike.
     connectionState: () =>
-      call<ConnectionState>('connection_state', {}).then(receivedConnection),
+      call<ConnectionState>('connection_state', {})
+        .then(receivedConnection)
+        .then(following),
     onConnection: (listener) =>
       listening<ConnectionState>(CONNECTION_EVENT, (state) => {
-        listener(receivedConnection(state))
+        listener(following(receivedConnection(state)))
       }),
 
     openSession: (request: OpenRequest) =>
@@ -298,9 +312,9 @@ export function tauriPort(): HostPort {
     voiceCallState: () => call<VoiceCallState>('voice_call_state', {}),
 
     hostsUse: (reference) =>
-      call<ConnectionState>('hosts_use', { reference }).then(receivedConnection),
+      call<ConnectionState>('hosts_use', { reference }).then(receivedConnection).then(following),
     hostsForget: (reference) =>
-      call<ConnectionState>('hosts_forget', { reference }).then(receivedConnection),
+      call<ConnectionState>('hosts_forget', { reference }).then(receivedConnection).then(following),
     pairingView: () => call<PairingView>('pairing_view', {}),
     pairingSetOrigin: (origin) => call<PairingOrigin>('pairing_set_origin', { origin }),
     pairingStartCode: (code) => call<undefined>('pairing_start_code', { code }),
@@ -349,6 +363,7 @@ export function tauriPort(): HostPort {
 
     subscribe: (listener: (event: HostEvent) => void) =>
       listening<PublishedEvent>(HOST_EVENT, (published) => {
+        if (!ofThisHost(published)) return
         listener({
           stream_id: published.stream_id,
           sequence: published.sequence,

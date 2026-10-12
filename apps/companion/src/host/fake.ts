@@ -847,9 +847,12 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
   // test scripted for the next opens.
   interface Opening {
     readonly token: string
+    readonly grantId: string | null
     standing: SessionStanding
     /** Whether a test chose the standing, so a change of the connection's rights leaves it alone. */
     readonly scripted: boolean
+    /** Whether the host could not be reached when it was asked: it is asked again when it can. */
+    waiting: boolean
   }
   const openings = new Map<string, Opening>()
   const scriptedOpens = new Map<
@@ -860,6 +863,16 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
   const leaves: { sessionId: string; opening: string }[] = []
   const carried: { command: string; sessionId: string; opening: string | undefined }[] = []
   const standingListeners = new Set<(event: StandingEvent) => void>()
+  /** What the host says of a session opened as its owner opens it: every right the connection holds. */
+  const ownerStanding = (grantId: string | null): SessionStanding => ({
+    state: 'open',
+    via: 'owner',
+    grant_id: grantId ?? '',
+    actions: rights,
+    includes_live_screen: true,
+    history_from_ms: null,
+    ends_at_ms: null
+  })
   const tellStanding = (sessionId: string, opening: string, standing: SessionStanding) => {
     for (const listener of standingListeners) {
       listener({ session_id: sessionId, opening, standing })
@@ -976,20 +989,26 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
         opens.push(request)
         const scripted = scriptedOpens.get(request.sessionId)
         if (scripted !== undefined && 'code' in scripted) refuse(scripted.code, scripted.message)
-        requireConnection()
-        const standing: SessionStanding = scripted ?? {
-          state: 'open',
-          via: 'owner',
-          grant_id: request.grantId ?? '',
-          actions: rights,
-          includes_live_screen: true,
-          history_from_ms: null,
-          ends_at_ms: null
+        // A host that cannot be reached does not refuse: the opening stands as `reconnecting` and
+        // is taken up again when the host can be reached, as native code does.
+        if (!connected) {
+          const standing: SessionStanding = { state: 'reconnecting', reason: lostBecause }
+          openings.set(request.sessionId, {
+            token: request.opening,
+            grantId: request.grantId,
+            standing,
+            scripted: false,
+            waiting: true
+          })
+          return standing
         }
+        const standing: SessionStanding = scripted ?? ownerStanding(request.grantId)
         openings.set(request.sessionId, {
           token: request.opening,
+          grantId: request.grantId,
           standing,
-          scripted: scripted !== undefined
+          scripted: scripted !== undefined,
+          waiting: false
         })
         return standing
       }),
@@ -2006,6 +2025,15 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
     setConnected(next, reason = UNREACHABLE) {
       connected = next
       lostBecause = reason
+      // An opening that could not reach the host is taken up again once the host can be reached.
+      if (next) {
+        for (const [sessionId, held] of openings) {
+          if (!held.waiting) continue
+          held.waiting = false
+          held.standing = ownerStanding(held.grantId)
+          tellStanding(sessionId, held.token, held.standing)
+        }
+      }
       // A session's worker has a link of its own: losing the daemon's connection leaves it where it
       // was, and `questions.setReachable` is what takes a worker away.
       for (const listener of connectionListeners) listener(connectionNow())

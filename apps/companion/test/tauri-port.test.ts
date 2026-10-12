@@ -14,7 +14,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { GrantCreateParams, RoleSelection, SessionCreateParams } from '@kalareach/protocol'
 
 import type { ConnectionState } from '../src/host/port'
-import { CONNECTION_EVENT, STANDING_EVENT, tauriPort } from '../src/host/tauri'
+import { CONNECTION_EVENT, HOST_EVENT, STANDING_EVENT, tauriPort } from '../src/host/tauri'
 
 const shell = vi.hoisted(() => ({
   invoked: [] as { command: string; args: unknown; options?: unknown }[],
@@ -551,5 +551,40 @@ describe('the desktop port and a session screen’s opening', () => {
     await tauriPort().openTerminalView(SESSION, { columns: 80, rows: 24 }, () => undefined, OPENING)
     const [opened] = shell.invoked
     expect((opened?.args as { opening?: string }).opening).toBe(OPENING)
+  })
+})
+
+describe('the desktop port and a host that changed', () => {
+  const at = (host: string, sequence: string) => ({
+    payload: { host, stream_id: 'session_state', sequence, event_type: 'x', payload: null }
+  })
+
+  it('drops an event of the host it no longer uses, and keeps the next host’s', async () => {
+    const port = tauriPort()
+    const heard: string[] = []
+    await port.subscribe((event) => {
+      heard.push(event.sequence)
+    })
+    await port.onConnection(() => undefined)
+    const connection = (environment: string) => ({
+      payload: { connected: true, environment_id: environment, reason: null, rights: [], paired: true }
+    })
+
+    shell.handlers.get(CONNECTION_EVENT)?.(connection('env-a'))
+    shell.handlers.get(HOST_EVENT)?.(at('env-a', '1'))
+    shell.handlers.get(CONNECTION_EVENT)?.(connection('env-b'))
+    // An event of the earlier host that was still on its way.
+    shell.handlers.get(HOST_EVENT)?.(at('env-a', '2'))
+    shell.handlers.get(HOST_EVENT)?.(at('env-b', '3'))
+    expect(heard).toEqual(['1', '3'])
+  })
+
+  it('takes an event as it comes before any host is known', async () => {
+    const heard: string[] = []
+    await tauriPort().subscribe((event) => {
+      heard.push(event.sequence)
+    })
+    shell.handlers.get(HOST_EVENT)?.(at('env-a', '1'))
+    expect(heard).toEqual(['1'])
   })
 })

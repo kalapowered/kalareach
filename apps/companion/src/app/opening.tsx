@@ -13,7 +13,7 @@
  * settled are the person's, and stay.
  */
 
-import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from 'react'
+import { useCallback, useEffect, useState, useSyncExternalStore } from 'react'
 
 import { useApp } from './state'
 import { failureCode, failureWords } from '../host/port'
@@ -26,22 +26,6 @@ function newToken(): string {
   const random = globalThis.crypto as Crypto | undefined
   if (typeof random?.randomUUID === 'function') return random.randomUUID()
   return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`
-}
-
-/**
- * The codes of a host that is only unable to answer now. An open that is answered with one is not
- * a refusal: the host is asked again, backing off as native code does for a link it holds.
- */
-const UNABLE_NOW: ReadonlySet<string> = new Set([
-  'RESOURCE_UNAVAILABLE',
-  'STORAGE_UNAVAILABLE',
-  'CLOCK_UNTRUSTED',
-  'UPSTREAM_UNAVAILABLE'
-])
-
-/** How long after an open that could not be answered the next one is asked: 0.25 s, doubling to 30 s. */
-export function retryAfterMs(failures: number): number {
-  return Math.min(30_000, 250 * 2 ** Math.min(failures, 16))
 }
 
 /** What a session holds of what it read, without what the person made. */
@@ -64,12 +48,8 @@ export interface Opened {
 export function useSessionOpening(sessionId: string, grantId: string | null): Opened {
   const { port, openings, sessions } = useApp()
   const [attempt, setAttempt] = useState(0)
-  // Opens in a row the host could not answer, for the wait before the next.
-  const failures = useRef(0)
-
   useEffect(() => {
     let live = true
-    let timer: ReturnType<typeof setTimeout> | undefined
     const token = newToken()
     // Another grant than the session was last open under: what was read under it is not this one's.
     if (openings.begin(sessionId, token, grantId, Date.now())) {
@@ -86,35 +66,22 @@ export function useSessionOpening(sessionId: string, grantId: string | null): Op
     listening
       .then(() => {
         if (!live) return undefined
+        // A host that cannot be reached is not a refusal: native code answers `reconnecting` and
+        // reaches the host again as this opening, and says `open` when it has.
         return port.openSession({ sessionId, grantId, opening: token }).then(
           (standing) => {
-            failures.current = 0
             if (live && !heard) openings.apply(sessionId, token, standing, Date.now())
           },
           (failure: unknown) => {
             if (!live || heard) return
-            const code = failureCode(failure) ?? 'REQUEST_FAILED'
-            if (UNABLE_NOW.has(code)) {
-              // The host could not be reached or could not say yet. That is contact being lost,
-              // not a refusal, and the host is asked again.
-              openings.apply(
-                sessionId,
-                token,
-                { state: 'reconnecting', reason: failureWords(failure) },
-                Date.now()
-              )
-              const wait = retryAfterMs(failures.current)
-              failures.current += 1
-              timer = setTimeout(() => {
-                setAttempt((count) => count + 1)
-              }, wait)
-              return
-            }
-            failures.current = 0
             openings.apply(
               sessionId,
               token,
-              { state: 'refused', code, message: failureWords(failure) },
+              {
+                state: 'refused',
+                code: failureCode(failure) ?? 'REQUEST_FAILED',
+                message: failureWords(failure)
+              },
               Date.now()
             )
           }
@@ -123,7 +90,6 @@ export function useSessionOpening(sessionId: string, grantId: string | null): Op
       .catch(() => undefined)
     return () => {
       live = false
-      clearTimeout(timer)
       void listening.then((stop) => {
         stop()
       }, () => undefined)
