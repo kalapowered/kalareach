@@ -29,7 +29,9 @@ use kr_protocol::sharing::{GrantRedeemParams, RoleSelection, SessionRole};
 use net_support::worker::{Adopted, Upstream, offer, revoke};
 use net_support::{Host, proposal};
 use serde_json::{Value, json};
-use support::{Companion, Phone, WATCHDOG, pair_under, unpaired_phone};
+use support::{
+    Companion, LinkControl, Phone, WATCHDOG, pair_under, unpaired_phone, unpaired_phone_controlled,
+};
 
 /// A pairing grant over every session whose history reaches back to the start, holding `rights`.
 fn pairing(rights: &[ActionRight]) -> kr_protocol::pairing::ProposedGrant {
@@ -586,11 +588,16 @@ async fn kr_req_19_08_a_phone_acts_under_the_share_it_opened_the_session_with() 
     grant.session_selector = kr_protocol::grant::SessionSelector::None;
     let phone = phone_under(&adopted, grant).await;
     let companion = &phone.companion;
+    let asked = worker.ask("under-the-share");
     let share = shared_with(
         &adopted,
         &phone,
         session,
-        RoleSelection::plain(SessionRole::Controller),
+        RoleSelection {
+            include_question_respond: true,
+            named_questions: [asked.question_id].into_iter().collect(),
+            ..RoleSelection::plain(SessionRole::Controller)
+        },
     )
     .await;
 
@@ -607,6 +614,34 @@ async fn kr_req_19_08_a_phone_acts_under_the_share_it_opened_the_session_with() 
         )
         .expect("the prompt is decided under the share");
     assert_eq!(upstream.prompts(), ["under the share"]);
+
+    // A question is answered under the share too: the pairing holds no right to answer.
+    let read = companion
+        .call(
+            "question_read",
+            json!({
+                "params": { "session_id": session.to_string(), "question_id": null, "include_resolved": false },
+                "opening": "under-share",
+            }),
+        )
+        .expect("the question is read under the share");
+    let listed = &read["questions"][0];
+    assert_eq!(listed["question_id"], asked.question_id.to_string());
+    let answered = companion
+        .call(
+            "question_answer",
+            json!({
+                "params": {
+                    "session_id": session.to_string(),
+                    "question_id": asked.question_id.to_string(),
+                    "expected_revision": listed["revision"],
+                    "answer": { "kind": "decision", "decided": true },
+                },
+                "opening": "under-share",
+            }),
+        )
+        .expect("the answer is decided under the share");
+    assert_eq!(answered["outcome"], "taken", "{answered}");
 
     // A command from outside a screen is decided under the pairing, which admits no session.
     let ambient = companion
@@ -1149,15 +1184,23 @@ async fn kr_req_19_08_a_views_lost_connection_leaves_the_link_and_its_prompt_sta
     adopted.stop().await;
 }
 
-/// KR-REQ-19.08: a phone whose host holds a share for it reaches each command it offers by the
-/// route the host accepts. The host-wide reads are answered on the main connection, the commands
-/// about a session on the link of the opening that session runs under, and what a paired host
-/// serves a device not at all is refused in words before anything is sent. The share then ends, and
-/// the main connection still answers the host-wide reads and the other session's link stands.
+/// KR-REQ-19.08: a phone whose host holds a share for it sends each command that reaches a session
+/// by the route the host accepts. The host-wide reads are answered on the main connection; each
+/// command about a session goes on the link of the opening that session runs under, and the
+/// worker answers it, or refuses it in its own words; what a paired host does not serve a device is
+/// refused in words before anything is sent. A command that went over the main connection would be
+/// refused by the host for serving no session. The share then ends, and the main connection still
+/// answers the host-wide reads and the other session's link stands.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn kr_req_19_08_every_command_goes_by_the_route_the_host_accepts() {
-    let adopted = Adopted::start(2).await;
-    let (shared, own) = (&adopted.workers[0], &adopted.workers[1]);
+async fn kr_req_19_08_every_command_that_reaches_a_session_goes_by_the_route_the_host_accepts() {
+    use std::collections::BTreeSet;
+
+    let adopted = Adopted::start(3).await;
+    let (shared, own, spare) = (
+        &adopted.workers[0],
+        &adopted.workers[1],
+        &adopted.workers[2],
+    );
     let upstream = Arc::new(Upstream::default());
     let instance = shared.register_agent(Arc::clone(&upstream));
     shared.ask("shared");
@@ -1166,9 +1209,10 @@ async fn kr_req_19_08_every_command_goes_by_the_route_the_host_accepts() {
         ActionRight::SessionView,
         ActionRight::AgentPrompt,
         ActionRight::QuestionRespond,
+        ActionRight::SessionClose,
     ]);
     grant.session_selector = kr_protocol::grant::SessionSelector::These {
-        session_ids: [own.session_id].into_iter().collect(),
+        session_ids: [own.session_id, spare.session_id].into_iter().collect(),
     };
     let phone = phone_under(&adopted, grant).await;
     let companion = &phone.companion;
@@ -1187,7 +1231,32 @@ async fn kr_req_19_08_every_command_goes_by_the_route_the_host_accepts() {
     )
     .expect("opens");
     open(companion, own.session_id, None, "tour-own").expect("opens");
+    open(companion, spare.session_id, None, "tour-spare").expect("opens");
     let session = shared.session_id.to_string();
+
+    // The commands the tour has called, to be held against the list of those that reach a session.
+    let toured = std::cell::RefCell::new(BTreeSet::<&str>::new());
+    let call = |command: &'static str, body: Value| {
+        toured.borrow_mut().insert(command);
+        companion.call(command, body)
+    };
+    let about = |command: &'static str, params: Value| {
+        call(
+            command,
+            json!({ "params": params, "opening": "tour-share" }),
+        )
+    };
+    // The worker answered, or refused in its own words: the host did not refuse the connection for
+    // serving no session, and the application did not refuse the screen for having been replaced.
+    let reached = |command: &str, answer: Result<Value, Value>| {
+        if let Err(refusal) = answer {
+            let words = refusal["message"].as_str().unwrap_or_default();
+            assert!(
+                !words.contains("serves no session") && !words.contains("replaced by another"),
+                "{command} did not reach the session: {refusal}"
+            );
+        }
+    };
 
     // The host-wide reads, on the main connection, whatever session they name.
     companion
@@ -1239,18 +1308,11 @@ async fn kr_req_19_08_every_command_goes_by_the_route_the_host_accepts() {
         .expect("the reviews are read");
 
     // The commands about the shared session, on the link of its opening.
-    let about = |command: &str, params: Value| {
-        companion.call(
-            command,
-            json!({ "params": params, "opening": "tour-share" }),
-        )
-    };
-    companion
-        .call(
-            "session_agents",
-            json!({ "sessionId": session, "opening": "tour-share" }),
-        )
-        .expect("the agents are read");
+    call(
+        "session_agents",
+        json!({ "sessionId": session, "opening": "tour-share" }),
+    )
+    .expect("the agents are read");
     about(
         "agent_capabilities",
         json!({ "subject": subject(shared.session_id, instance) }),
@@ -1276,6 +1338,43 @@ async fn kr_req_19_08_every_command_goes_by_the_route_the_host_accepts() {
         prompt(shared.session_id, instance, "tour"),
     )
     .expect("the prompt is submitted");
+    reached(
+        "agent_prompt_queue",
+        about(
+            "agent_prompt_queue",
+            prompt(shared.session_id, instance, "queued"),
+        ),
+    );
+    let target =
+        json!({ "subject": subject(shared.session_id, instance), "binding_revision": "1" });
+    reached(
+        "agent_turn_steer",
+        about(
+            "agent_turn_steer",
+            json!({ "target": target, "turn_id": "turn-1", "text": "stop" }),
+        ),
+    );
+    reached(
+        "agent_turn_cancel",
+        about(
+            "agent_turn_cancel",
+            json!({ "target": target, "turn_id": "turn-1" }),
+        ),
+    );
+    reached(
+        "agent_approval_inspect",
+        about(
+            "agent_approval_inspect",
+            json!({ "subject": subject(shared.session_id, instance), "resource_id": "none" }),
+        ),
+    );
+    reached(
+        "agent_approval_respond",
+        about(
+            "agent_approval_respond",
+            json!({ "target": target, "resource_id": "none", "option_id": "approve" }),
+        ),
+    );
     // A receipt the worker does not hold is the worker's own answer: the read reached it on the
     // session's link and was not refused on the way.
     let unheld = ActionId::new(kr_ipc::new_uuid()).to_string();
@@ -1290,22 +1389,93 @@ async fn kr_req_19_08_every_command_goes_by_the_route_the_host_accepts() {
             .is_some_and(|words| words.contains("no receipt")),
         "the worker says it holds no receipt: {unknown}"
     );
-    let unnamed = companion
-        .call(
-            "action_read",
-            json!({ "params": { "action_id": unheld, "session_id": session } }),
-        )
-        .expect_err("a receipt is not read without the screen it belongs to");
+    let unnamed = call(
+        "action_read",
+        json!({ "params": { "action_id": unheld, "session_id": session } }),
+    )
+    .expect_err("a receipt is not read without the screen it belongs to");
     assert_eq!(code(&unnamed), "INVALID_ARGUMENT", "{unnamed}");
+    reached(
+        "action_cancel",
+        call(
+            "action_cancel",
+            json!({
+                "params": { "action_id": unheld },
+                "subject": { "sessionId": session, "sessionEpoch": "1" },
+                "opening": "tour-share",
+            }),
+        ),
+    );
+    call(
+        "question_settle",
+        json!({ "params": { "sessionId": session }, "opening": "tour-share" }),
+    )
+    .expect("the kept answers are settled");
+    reached(
+        "question_send_kept",
+        call(
+            "question_send_kept",
+            json!({
+                "params": { "questionId": ActionId::new(kr_ipc::new_uuid()).to_string(), "draftedAtMs": 1 },
+                "opening": "tour-share",
+            }),
+        ),
+    );
+    reached(
+        "question_answer",
+        about(
+            "question_answer",
+            json!({
+                "session_id": session, "question_id": ActionId::new(kr_ipc::new_uuid()).to_string(),
+                "expected_revision": "1", "answer": { "kind": "decision", "decided": true },
+            }),
+        ),
+    );
+    // A session is closed on the link of the opening it runs under.
+    let closed = call(
+        "session_close",
+        json!({
+            "params": { "session_id": spare.session_id.to_string() },
+            "subject": { "sessionId": spare.session_id.to_string(), "sessionEpoch": "1" },
+            "opening": "tour-spare",
+        }),
+    );
+    reached("session_close", closed);
 
-    // What a paired host does not serve a device.
-    let refused = companion
-        .call(
+    // What a paired host does not serve a device is refused in words, before anything is sent.
+    for (command, body) in [
+        (
             "history_page",
             json!({ "params": { "session_id": session, "from_cursor": "0", "max_bytes": "4096" } }),
-        )
-        .expect_err("retained output is not offered over a paired host");
-    assert_eq!(code(&refused), "RESOURCE_UNAVAILABLE", "{refused}");
+        ),
+        ("shell_launch", json!({ "params": {}, "subject": {} })),
+        ("draft_create", json!({ "params": {}, "subject": {} })),
+        (
+            "draft_add_attachment",
+            json!({ "params": {}, "subject": {} }),
+        ),
+        (
+            "attachment_upload",
+            json!({ "path": "/tmp/none", "subject": {}, "sessionId": session }),
+        ),
+        ("attachment_upload_bytes", json!({})),
+    ] {
+        let refused = call(command, body).expect_err("not offered over a paired host");
+        assert_eq!(
+            code(&refused),
+            "RESOURCE_UNAVAILABLE",
+            "{command}: {refused}"
+        );
+    }
+
+    // Every command that reaches a session was called, except the ones the terminal tests call
+    // (a view is opened under an opening there) and the opening's own two.
+    let elsewhere = ["terminal_view_open", "session_open", "session_leave"];
+    let missed: Vec<_> = companion_tauri::commands::SESSION_BOUND_COMMANDS
+        .iter()
+        .filter(|command| !elsewhere.contains(command) && !toured.borrow().contains(**command))
+        .collect();
+    assert!(missed.is_empty(), "the tour did not call {missed:?}");
 
     // The share ends: the host-wide reads and the other session's link are untouched.
     revoke(&adopted.host, share.grant_id).await;
@@ -1374,5 +1544,673 @@ async fn kr_req_19_08_forgetting_the_host_lets_its_sessions_go() {
 
     assert_eq!(held(), 0, "no link is kept for a host that was forgotten");
     agents("forgotten-screen").expect_err("the screen is no longer served");
+    adopted.stop().await;
+}
+
+/// A phone paired with the host under `grant`, in contact with it, whose connections to the host
+/// the test governs once it says so.
+async fn phone_governed(
+    adopted: &Adopted,
+    grant: kr_protocol::pairing::ProposedGrant,
+) -> (Phone, Arc<LinkControl>) {
+    let control = LinkControl::new();
+    let phone = unpaired_phone_controlled(&adopted.host, &control);
+    pair_under(&phone, &adopted.host, &adopted.owner, grant).await;
+    connected(&phone.companion).await;
+    (phone, control)
+}
+
+/// Waits until `held` connections are held.
+async fn held(control: &LinkControl, count: usize) {
+    tokio::time::timeout(WATCHDOG, async {
+        while control.held() != count {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{count} connections are held, not {}", control.held()));
+}
+
+/// The call that opens `session` for `opening`, made and left to answer.
+fn opening_call(
+    companion: &Companion,
+    session: SessionId,
+    grant: Option<GrantId>,
+    opening: &str,
+) -> tokio::task::JoinHandle<Result<Value, Value>> {
+    companion.start_call(
+        "session_open",
+        json!({
+            "sessionId": session.to_string(),
+            "grantId": grant.map(|grant| grant.to_string()),
+            "opening": opening,
+        }),
+    )
+}
+
+/// KR-REQ-19.08: a place among the eight is held from the call to open, not from the link made. Nine
+/// sessions opened together are refused at the ninth whichever connection answers first, and the
+/// host is asked for eight connections and no more.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_19_08_nine_opens_made_together_hold_eight() {
+    use tauri::Manager as _;
+
+    let adopted = Adopted::start(9).await;
+    let (phone, control) = phone_governed(&adopted, pairing(&[ActionRight::SessionView])).await;
+    let companion = &phone.companion;
+    let asked = control.asked();
+    control.hold();
+
+    let calls: Vec<_> = adopted
+        .workers
+        .iter()
+        .enumerate()
+        .map(|(n, worker)| opening_call(companion, worker.session_id, None, &format!("many-{n}")))
+        .collect();
+    held(&control, 8).await;
+    // The ninth was refused before any connection was asked for.
+    let refused: Vec<_> = tokio::time::timeout(WATCHDOG, async {
+        loop {
+            let done: Vec<_> = calls.iter().filter(|call| call.is_finished()).collect();
+            if !done.is_empty() {
+                return done.len();
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .map(|count| vec![count])
+    .expect("the ninth is refused at once");
+    assert_eq!(refused, [1]);
+    assert_eq!(control.asked() - asked, 8, "the host is asked for eight");
+
+    control.stop_holding();
+    control.release_all();
+    let mut opened = 0;
+    let mut turned_away = Vec::new();
+    for call in calls {
+        match call.await.expect("the call ran") {
+            Ok(standing) => {
+                assert_eq!(standing["state"], "open", "{standing}");
+                opened += 1;
+            }
+            Err(refusal) => turned_away.push(refusal),
+        }
+    }
+    assert_eq!(opened, 8);
+    assert_eq!(turned_away.len(), 1, "{turned_away:?}");
+    assert_eq!(code(&turned_away[0]), "RESOURCE_UNAVAILABLE");
+    assert_eq!(
+        companion
+            .app
+            .state::<companion_tauri::AppState>()
+            .paired_links()
+            .opened(),
+        8
+    );
+    adopted.stop().await;
+}
+
+/// KR-REQ-19.08: another opening of a session is the session's from the moment it is asked for. The
+/// first opening is over then: its commands are refused while the second is still being made, and
+/// when the second fails nothing is left of the first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_19_08_an_opening_that_replaces_another_ends_it_at_once() {
+    use tauri::Manager as _;
+
+    let adopted = Adopted::start(1).await;
+    let session = adopted.workers[0].session_id;
+    let (phone, control) = phone_governed(
+        &adopted,
+        pairing(&[ActionRight::SessionView, ActionRight::QuestionRespond]),
+    )
+    .await;
+    let companion = &phone.companion;
+    open(companion, session, None, "first").expect("the first opens");
+    let read = |opening: &str| {
+        companion.call(
+            "session_agents",
+            json!({ "sessionId": session.to_string(), "opening": opening }),
+        )
+    };
+    read("first").expect("the first is served");
+
+    control.hold();
+    let second = opening_call(companion, session, None, "second");
+    held(&control, 1).await;
+    let stale = read("first").expect_err("the first is over while the second is being made");
+    assert_eq!(code(&stale), "STALE_SESSION", "{stale}");
+    let links = || {
+        companion
+            .app
+            .state::<companion_tauri::AppState>()
+            .paired_links()
+            .opened()
+    };
+    assert_eq!(links(), 0, "the first's link is let go at once");
+
+    // The host refuses the second at admission, and nothing of the first comes back.
+    control.refuse(Some(kr_protocol::error::ErrorCode::PermissionDenied));
+    control.stop_holding();
+    control.release_all();
+    let refused = second
+        .await
+        .expect("the call ran")
+        .expect_err("the second is refused");
+    assert_eq!(code(&refused), "PERMISSION_DENIED", "{refused}");
+    assert_eq!(links(), 0);
+    let gone = read("first").expect_err("the first stays over");
+    assert_eq!(code(&gone), "STALE_SESSION", "{gone}");
+    adopted.stop().await;
+}
+
+/// KR-REQ-19.08: two openings of one session whose connections complete in the other order leave
+/// the later one's link. The earlier one's open answers that it was superseded and installs nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_19_08_two_opens_that_complete_in_reverse_order_leave_the_later_one() {
+    use tauri::Manager as _;
+
+    let adopted = Adopted::start(1).await;
+    let session = adopted.workers[0].session_id;
+    let (phone, control) = phone_governed(&adopted, pairing(&[ActionRight::SessionView])).await;
+    let companion = &phone.companion;
+
+    control.hold();
+    let first = opening_call(companion, session, None, "earlier");
+    held(&control, 1).await;
+    let second = opening_call(companion, session, None, "later");
+    held(&control, 2).await;
+
+    // The later one's connection completes first.
+    control.release(1);
+    let later = second
+        .await
+        .expect("the call ran")
+        .expect("the later opens");
+    assert_eq!(later["state"], "open", "{later}");
+    control.release(0);
+    let earlier = first.await.expect("the call ran").expect("an answer");
+    assert_eq!(earlier["state"], "superseded", "{earlier}");
+
+    let agents = |opening: &str| {
+        companion.call(
+            "session_agents",
+            json!({ "sessionId": session.to_string(), "opening": opening }),
+        )
+    };
+    agents("later").expect("the later is served");
+    let stale = agents("earlier").expect_err("the earlier is not");
+    assert_eq!(code(&stale), "STALE_SESSION", "{stale}");
+    assert_eq!(
+        companion
+            .app
+            .state::<companion_tauri::AppState>()
+            .paired_links()
+            .opened(),
+        1
+    );
+    adopted.stop().await;
+}
+
+/// KR-REQ-19.08: a screen left while its open is still being made leaves no link: the open answers
+/// that it was superseded, and the connection it made is closed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_19_08_a_leave_while_the_open_is_in_flight_leaves_no_link() {
+    use tauri::Manager as _;
+
+    let adopted = Adopted::start(1).await;
+    let session = adopted.workers[0].session_id;
+    let (phone, control) = phone_governed(&adopted, pairing(&[ActionRight::SessionView])).await;
+    let companion = &phone.companion;
+
+    control.hold();
+    let opening = opening_call(companion, session, None, "left-early");
+    held(&control, 1).await;
+    leave(companion, session, "left-early");
+    control.stop_holding();
+    control.release_all();
+    let answered = opening.await.expect("the call ran").expect("an answer");
+    assert_eq!(answered["state"], "superseded", "{answered}");
+    assert_eq!(
+        companion
+            .app
+            .state::<companion_tauri::AppState>()
+            .paired_links()
+            .opened(),
+        0
+    );
+    adopted.stop().await;
+}
+
+/// KR-REQ-19.08: a host that cannot be reached when a session is opened does not fail the open: the
+/// opening stands as `reconnecting`, its commands say it is being reached, and it is reached again
+/// as the same opening when the host can be, with no second call from the page.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_19_08_an_open_made_while_the_host_is_down_reaches_it_when_it_can() {
+    let adopted = Adopted::start(1).await;
+    let worker = &adopted.workers[0];
+    worker.ask("one");
+    let session = worker.session_id;
+    let (phone, control) = phone_governed(
+        &adopted,
+        pairing(&[ActionRight::SessionView, ActionRight::QuestionRespond]),
+    )
+    .await;
+    let companion = &phone.companion;
+
+    control.unreachable(true);
+    let standing = open(companion, session, None, "waiting").expect("the open is not refused");
+    assert_eq!(standing["state"], "reconnecting", "{standing}");
+    let read = || {
+        companion.call(
+            "question_read",
+            json!({
+                "params": { "session_id": session.to_string(), "question_id": null, "include_resolved": false },
+                "opening": "waiting",
+            }),
+        )
+    };
+    let waiting = read().expect_err("a screen with no link yet has nothing to ask");
+    assert_eq!(code(&waiting), "RESOURCE_UNAVAILABLE", "{waiting}");
+
+    control.unreachable(false);
+    let reached = heard(companion, "waiting", |standing| standing["state"] == "open").await;
+    assert_eq!(reached["standing"]["via"], "pairing", "{reached}");
+    read().expect("the opening is served on the link it reached");
+    adopted.stop().await;
+}
+
+/// KR-REQ-19.08: a host that refuses the device at admission is told as a refusal only once a
+/// second probe agrees: one refusal can be a grant changing between the host's reads.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_19_08_a_refusal_is_told_after_two_probes_agree() {
+    use tauri::Manager as _;
+
+    let adopted = Adopted::start(1).await;
+    let session = adopted.workers[0].session_id;
+    let (phone, control) = phone_governed(&adopted, pairing(&[ActionRight::SessionView])).await;
+    let companion = &phone.companion;
+    open(companion, session, None, "probed").expect("the session opens");
+
+    control.refuse(Some(kr_protocol::error::ErrorCode::PermissionDenied));
+    let before = control.asked();
+    companion
+        .app
+        .state::<companion_tauri::AppState>()
+        .paired_links()
+        .lose_connection(session);
+    let told = heard(companion, "probed", |standing| {
+        standing["state"] == "refused"
+    })
+    .await;
+    assert_eq!(told["standing"]["code"], "PERMISSION_DENIED", "{told}");
+    assert_eq!(control.asked() - before, 2, "two probes agreed");
+    adopted.stop().await;
+}
+
+/// KR-REQ-19.08: an ambient call whose connection was being made when the host changed serves
+/// nothing and leaves no link: the host it was made for is not the host in use.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_19_08_an_ambient_open_the_host_changed_under_serves_nothing() {
+    use tauri::Manager as _;
+
+    let adopted = Adopted::start(1).await;
+    let worker = &adopted.workers[0];
+    worker.ask("one");
+    let session = worker.session_id;
+    let (phone, control) = phone_governed(
+        &adopted,
+        pairing(&[ActionRight::SessionView, ActionRight::QuestionRespond]),
+    )
+    .await;
+    let companion = &phone.companion;
+
+    control.hold();
+    let asking = companion.start_call(
+        "question_read",
+        json!({
+            "params": { "session_id": session.to_string(), "question_id": null, "include_resolved": false },
+        }),
+    );
+    held(&control, 1).await;
+    let view = companion
+        .call("pairing_view", json!({}))
+        .expect("the pairing screen");
+    let reference = view["hosts"][0]["reference"].as_str().expect("a reference");
+    companion
+        .call("hosts_forget", json!({ "reference": reference }))
+        .expect("the host in use is forgotten");
+    control.stop_holding();
+    control.release_all();
+
+    asking
+        .await
+        .expect("the call ran")
+        .expect_err("a connection made for the host that was forgotten serves nothing");
+    assert_eq!(
+        companion
+            .app
+            .state::<companion_tauri::AppState>()
+            .paired_links()
+            .ambient(),
+        0
+    );
+    adopted.stop().await;
+}
+
+/// KR-REQ-19.08: the main connection being down does not take a screen's own link with it: a
+/// question is read and answered on the link of the opening, which is the paired route whether or
+/// not the connection for the host alone is up.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_19_08_a_question_is_answered_on_the_screens_link_while_the_main_connection_is_down()
+{
+    use tauri::Manager as _;
+
+    let adopted = Adopted::start(1).await;
+    let worker = &adopted.workers[0];
+    let asked = worker.ask("main-down");
+    let session = worker.session_id;
+    let (phone, control) = phone_governed(
+        &adopted,
+        pairing(&[ActionRight::SessionView, ActionRight::QuestionRespond]),
+    )
+    .await;
+    let companion = &phone.companion;
+    open(companion, session, None, "alone").expect("the session opens");
+
+    // The host cannot be reached again, and the connection for the host alone ends.
+    control.unreachable(true);
+    let (_, _, main) = companion
+        .app
+        .state::<companion_tauri::AppState>()
+        .paired_snapshot()
+        .expect("a connection");
+    main.close();
+    tokio::time::timeout(WATCHDOG, async {
+        loop {
+            let state = companion
+                .call("connection_state", json!({}))
+                .expect("the connection's state");
+            if state["connected"] == false {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the connection for the host alone ends");
+
+    let read = companion
+        .call(
+            "question_read",
+            json!({
+                "params": { "session_id": session.to_string(), "question_id": null, "include_resolved": false },
+                "opening": "alone",
+            }),
+        )
+        .expect("read on the screen's link");
+    let listed = &read["questions"][0];
+    assert_eq!(listed["question_id"], asked.question_id.to_string());
+    let answered = companion
+        .call(
+            "question_answer",
+            json!({
+                "params": {
+                    "session_id": session.to_string(),
+                    "question_id": asked.question_id.to_string(),
+                    "expected_revision": listed["revision"],
+                    "answer": { "kind": "decision", "decided": true },
+                },
+                "opening": "alone",
+            }),
+        )
+        .expect("answered on the screen's link");
+    assert_eq!(answered["outcome"], "taken", "{answered}");
+    adopted.stop().await;
+}
+
+/// KR-REQ-19.08: calls made together from outside any screen for one session share one connection:
+/// the host is asked for one, and every call is answered on it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_19_08_ambient_calls_for_one_session_share_one_open() {
+    use tauri::Manager as _;
+
+    let adopted = Adopted::start(1).await;
+    let worker = &adopted.workers[0];
+    worker.ask("one");
+    let session = worker.session_id;
+    let (phone, control) = phone_governed(
+        &adopted,
+        pairing(&[ActionRight::SessionView, ActionRight::QuestionRespond]),
+    )
+    .await;
+    let companion = &phone.companion;
+    let asked = control.asked();
+    control.hold();
+
+    let calls: Vec<_> = (0..3)
+        .map(|_| {
+            companion.start_call(
+                "question_read",
+                json!({
+                    "params": { "session_id": session.to_string(), "question_id": null, "include_resolved": false },
+                }),
+            )
+        })
+        .collect();
+    held(&control, 1).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(control.asked() - asked, 1, "one connection is asked for");
+    control.stop_holding();
+    control.release_all();
+    for call in calls {
+        call.await.expect("the call ran").expect("answered");
+    }
+    assert_eq!(
+        companion
+            .app
+            .state::<companion_tauri::AppState>()
+            .paired_links()
+            .ambient(),
+        1
+    );
+    adopted.stop().await;
+}
+
+/// KR-REQ-19.08: a place among the four ambient links is not made by letting go of a link a call is
+/// using. With four calls using the four and a fifth wanting a place, the fifth waits, and every
+/// call is answered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_19_08_a_busy_ambient_link_is_not_let_go_for_a_fifth() {
+    use tauri::Manager as _;
+
+    let adopted = Adopted::start(5).await;
+    for worker in &adopted.workers {
+        worker.ask("one");
+    }
+    let (phone, control) = phone_governed(
+        &adopted,
+        pairing(&[ActionRight::SessionView, ActionRight::QuestionRespond]),
+    )
+    .await;
+    let companion = &phone.companion;
+    let asked = control.asked();
+    control.hold();
+
+    let calls: Vec<_> = adopted
+        .workers
+        .iter()
+        .map(|worker| {
+            companion.start_call(
+                "question_read",
+                json!({
+                    "params": { "session_id": worker.session_id.to_string(), "question_id": null, "include_resolved": false },
+                }),
+            )
+        })
+        .collect();
+    held(&control, 4).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(control.asked() - asked, 4, "the fifth waits for a place");
+    assert_eq!(
+        companion
+            .app
+            .state::<companion_tauri::AppState>()
+            .paired_links()
+            .ambient(),
+        4
+    );
+
+    control.stop_holding();
+    control.release_all();
+    for call in calls {
+        call.await.expect("the call ran").expect("answered");
+    }
+    adopted.stop().await;
+}
+
+/// KR-REQ-19.08: another opening of a session ends the first under a prompt it has in flight. The
+/// prompt is not answered as taken: it ends as a connection that ended does, and the second
+/// opening is served.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_19_08_a_second_opening_ends_the_first_under_its_pending_prompt() {
+    let adopted = Adopted::start(1).await;
+    let worker = &adopted.workers[0];
+    let upstream = Arc::new(net_support::worker::HeldUpstream::default());
+    let instance = worker.register_agent_on(Arc::clone(&upstream) as _);
+    let session = worker.session_id;
+    let phone = phone_under(
+        &adopted,
+        pairing(&[ActionRight::SessionView, ActionRight::AgentPrompt]),
+    )
+    .await;
+    let companion = &phone.companion;
+    open(companion, session, None, "first-of-two").expect("opens");
+
+    let sending = companion.start_call(
+        "agent_prompt_submit",
+        json!({ "params": prompt(session, instance, "pending"), "opening": "first-of-two" }),
+    );
+    tokio::time::timeout(WATCHDOG, async {
+        while upstream.prompts().is_empty() {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("the prompt reaches the agent's upstream");
+
+    open(companion, session, None, "second-of-two").expect("the second opens");
+    // The first's link was closed under its prompt: the answer names the action and carries no
+    // receipt and no result, which the page reads as an outcome nobody knows. It is not a taken
+    // prompt.
+    let answer = tokio::time::timeout(WATCHDOG, sending)
+        .await
+        .expect("answered")
+        .expect("ran")
+        .expect("the prompt ends as a connection that ended does");
+    assert!(answer["action_id"].is_string(), "{answer}");
+    assert!(
+        answer["receipt"].is_null() && answer["value"].is_null(),
+        "{answer}"
+    );
+    let stale = companion
+        .call(
+            "session_agents",
+            json!({ "sessionId": session.to_string(), "opening": "first-of-two" }),
+        )
+        .expect_err("the first is over");
+    assert_eq!(code(&stale), "STALE_SESSION", "{stale}");
+    companion
+        .call(
+            "session_agents",
+            json!({ "sessionId": session.to_string(), "opening": "second-of-two" }),
+        )
+        .expect("the second is served");
+    upstream.release();
+    adopted.stop().await;
+}
+
+/// KR-REQ-19.08: a view that ends because the session detached it is not a lost connection: the
+/// page is told why and the host is not asked again what the opening allows, so a view that
+/// stopped for another reason is not opened again by the page.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_19_08_a_detached_view_is_not_taken_for_a_lost_connection() {
+    let adopted = Adopted::start(1).await;
+    let worker = &adopted.workers[0];
+    let session = worker.session_id;
+    let phone = phone_under(
+        &adopted,
+        pairing(&[ActionRight::SessionView, ActionRight::TerminalInput]),
+    )
+    .await;
+    let companion = &phone.companion;
+    open(companion, session, None, "detached-screen").expect("opens");
+    open_view(companion, session, "detached-screen", 61).expect("opens");
+    companion
+        .state_where(61, |state| state["state"] == "showing")
+        .await;
+
+    worker.detach_attachments();
+    let ended = companion
+        .state_where(61, |state| state["state"] == "ended")
+        .await;
+    assert!(
+        ended["reason"]
+            .as_str()
+            .is_some_and(|words| words.contains("detached")),
+        "{ended}"
+    );
+    // Nothing asks the host again: no standing event follows the end.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let told = companion
+        .standing
+        .texts()
+        .iter()
+        .filter(|text| text.contains("detached-screen"))
+        .count();
+    assert_eq!(told, 0, "the page was told of a change nobody asked about");
+    adopted.stop().await;
+}
+
+/// KR-REQ-19.08: a view whose own connection is lost before it has drawn a screen is recovered as
+/// well: it is a connection that went, whether or not a frame had arrived, and the host is asked
+/// again on the opening's live link.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_19_08_a_view_lost_before_its_first_screen_is_recovered() {
+    use tauri::Manager as _;
+
+    let adopted = Adopted::start(1).await;
+    let session = adopted.workers[0].session_id;
+    let (phone, control) = phone_governed(
+        &adopted,
+        pairing(&[ActionRight::SessionView, ActionRight::TerminalInput]),
+    )
+    .await;
+    let companion = &phone.companion;
+    open(companion, session, None, "early-screen").expect("opens");
+
+    // The view's own connection is held, so it has drawn nothing, and then it is lost.
+    control.hold();
+    let view = open_view(companion, session, "early-screen", 62).expect("a handle comes back");
+    held(&control, 1).await;
+    companion
+        .app
+        .state::<companion_tauri::terminal::TerminalViews>()
+        .lose_connection(&view);
+    companion
+        .state_where(62, |state| state["state"] == "ended")
+        .await;
+    // The host is asked on the live link, and says the screen is open: the page opens a view again.
+    heard(companion, "early-screen", |standing| {
+        standing["state"] == "open"
+    })
+    .await;
+    control.stop_holding();
+    control.release_all();
+    let again = open_view(companion, session, "early-screen", 63).expect("opens again");
+    assert_ne!(view, again);
+    companion
+        .state_where(63, |state| state["state"] == "showing")
+        .await;
     adopted.stop().await;
 }

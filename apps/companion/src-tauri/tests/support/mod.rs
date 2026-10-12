@@ -87,6 +87,7 @@ pub fn device_in_boot(
             room,
             bind: Some(loopback()),
             clock: Arc::new(clock),
+            link: None,
         },
         move || {
             if let Some(device) = kept.get() {
@@ -493,6 +494,9 @@ impl Companion {
                 companion_tauri::commands::question_send_kept,
                 companion_tauri::commands::shell_launch,
                 companion_tauri::commands::draft_create,
+                companion_tauri::commands::draft_add_attachment,
+                companion_tauri::commands::attachment_upload,
+                companion_tauri::commands::attachment_upload_bytes,
                 companion_tauri::commands::host_info,
                 companion_tauri::commands::attention_read,
                 companion_tauri::commands::review_read,
@@ -708,6 +712,7 @@ pub fn parts(secrets: Arc<dyn SecretStore>, room: Arc<dyn CandidateRoom>) -> Par
         room,
         bind: Some(loopback()),
         clock: Arc::new(DeviceClock::current().expect("a clock")),
+        link: None,
     }
 }
 
@@ -810,4 +815,208 @@ pub async fn phone_paired_with(host: &Host, owner: &DeviceKeys, rights: &[Action
     let phone = unpaired_phone(host);
     pair(&phone, host, owner, rights).await;
     phone
+}
+
+/// What a test does to the connections a phone makes to its host: holds them until it says, makes
+/// them fail as a host that cannot be reached does, or makes the host refuse them at admission.
+#[derive(Default)]
+pub struct LinkControl {
+    /// How many connections to a paired host were asked for.
+    asked: std::sync::atomic::AtomicUsize,
+    state: Mutex<LinkState>,
+}
+
+#[derive(Default)]
+struct LinkState {
+    holding: bool,
+    unreachable: bool,
+    refusing: Option<kr_protocol::error::ErrorCode>,
+    waiting: Vec<Option<tokio::sync::oneshot::Sender<()>>>,
+}
+
+impl LinkControl {
+    /// A control that lets every connection through.
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    /// Holds each connection asked for from now on until the test releases it.
+    pub fn hold(&self) {
+        self.state.lock().expect("the record").holding = true;
+    }
+
+    /// Lets connections through again. Those held stay held until released.
+    pub fn stop_holding(&self) {
+        self.state.lock().expect("the record").holding = false;
+    }
+
+    /// How many connections have been asked for, held ones included.
+    pub fn asked(&self) -> usize {
+        self.asked.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// How many connections are held now.
+    pub fn held(&self) -> usize {
+        self.state
+            .lock()
+            .expect("the record")
+            .waiting
+            .iter()
+            .filter(|each| each.is_some())
+            .count()
+    }
+
+    /// Releases the held connection that was asked for `index`th among the held ones (counting
+    /// from 0).
+    pub fn release(&self, index: usize) {
+        let sender = self
+            .state
+            .lock()
+            .expect("the record")
+            .waiting
+            .get_mut(index)
+            .and_then(Option::take);
+        if let Some(sender) = sender {
+            let _ = sender.send(());
+        }
+    }
+
+    /// Releases every held connection.
+    pub fn release_all(&self) {
+        let waiting: Vec<_> = self
+            .state
+            .lock()
+            .expect("the record")
+            .waiting
+            .iter_mut()
+            .filter_map(Option::take)
+            .collect();
+        for sender in waiting {
+            let _ = sender.send(());
+        }
+    }
+
+    /// Makes every connection fail as one to a host that cannot be reached does, or stops that.
+    pub fn unreachable(&self, down: bool) {
+        self.state.lock().expect("the record").unreachable = down;
+    }
+
+    /// Makes the host refuse every connection at admission with `code`, or stops that.
+    pub fn refuse(&self, code: Option<kr_protocol::error::ErrorCode>) {
+        self.state.lock().expect("the record").refusing = code;
+    }
+}
+
+/// The phone's way to its host, with a test's control over the connections to a paired host.
+struct ControlledLink {
+    own: Arc<dyn kr_client::pairing::link::HostLink>,
+    control: Arc<LinkControl>,
+}
+
+impl kr_client::pairing::link::HostLink for ControlledLink {
+    fn dial<'a>(
+        &'a self,
+        network: &'a kr_protocol::pairing::NetworkConfig,
+        endpoint: &'a kr_protocol::scalars::EndpointKey,
+    ) -> kr_client::pairing::BoxFuture<
+        'a,
+        Result<iroh::endpoint::Connection, kr_client::pairing::link::LinkError>,
+    > {
+        self.own.dial(network, endpoint)
+    }
+
+    fn open_unpaired<'a>(
+        &'a self,
+        connection: &'a iroh::endpoint::Connection,
+        identity: &'a kr_transport::handshake::LocalIdentity,
+    ) -> kr_client::pairing::BoxFuture<
+        'a,
+        Result<Box<dyn kr_client::pairing::link::Preauth>, kr_client::pairing::link::LinkError>,
+    > {
+        self.own.open_unpaired(connection, identity)
+    }
+
+    fn connect_paired_transport<'a>(
+        &'a self,
+        host: &'a kr_client::pairing::paired::PairedHost,
+        identity: &'a kr_transport::handshake::LocalIdentity,
+    ) -> kr_client::pairing::BoxFuture<
+        'a,
+        Result<
+            Arc<dyn kr_client::transport::ControlTransport>,
+            kr_client::pairing::link::LinkError,
+        >,
+    > {
+        Box::pin(async move {
+            self.control
+                .asked
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let held = {
+                let mut state = self.control.state.lock().expect("the record");
+                if state.holding {
+                    let (sender, receiver) = tokio::sync::oneshot::channel();
+                    state.waiting.push(Some(sender));
+                    Some(receiver)
+                } else {
+                    None
+                }
+            };
+            if let Some(receiver) = held {
+                let _ = receiver.await;
+            }
+            // What the host does is decided when the connection is let through, so a test can
+            // change it while the connection is held.
+            let (refusing, unreachable) = {
+                let state = self.control.state.lock().expect("the record");
+                (state.refusing, state.unreachable)
+            };
+            if let Some(code) = refusing {
+                return Err(kr_client::pairing::link::LinkError::Refused(
+                    kr_protocol::error::ProtocolError::new(code, "the host refused the device"),
+                ));
+            }
+            if unreachable {
+                return Err(kr_client::pairing::link::LinkError::Lost(
+                    "the host could not be reached".to_owned(),
+                ));
+            }
+            self.own.connect_paired_transport(host, identity).await
+        })
+    }
+
+    fn hold<'a>(
+        &'a self,
+        network: &'a kr_protocol::pairing::NetworkConfig,
+    ) -> kr_client::pairing::BoxFuture<
+        'a,
+        Result<kr_client::pairing::link::EndpointHold, kr_client::pairing::link::LinkError>,
+    > {
+        self.own.hold(network)
+    }
+}
+
+/// A phone that has paired with nothing, whose connections to a paired host `control` governs.
+pub fn unpaired_phone_controlled(host: &Host, control: &Arc<LinkControl>) -> Phone {
+    let data = tempfile::tempdir().expect("a directory");
+    let secrets: Arc<dyn SecretStore> = Arc::new(MemoryStore::new());
+    let room: Arc<dyn CandidateRoom> = Arc::new(host.room.clone());
+    let paste = StubPaste::holding("", false);
+    let mut governed = parts(Arc::clone(&secrets), Arc::clone(&room));
+    let control = Arc::clone(control);
+    governed.link = Some(Box::new(move |own| {
+        Arc::new(ControlledLink { own, control }) as Arc<dyn kr_client::pairing::link::HostLink>
+    }));
+    let companion = Companion::start(
+        data.path(),
+        governed,
+        Arc::new(NoOwner),
+        Arc::clone(&paste) as Arc<dyn companion_tauri::pairing::PastePlatform>,
+    );
+    Phone {
+        companion,
+        paste,
+        secrets,
+        room,
+        data,
+    }
 }

@@ -29,7 +29,7 @@ use std::time::{Duration, Instant};
 use kr_client::pairing::link::LinkError;
 use kr_client::pairing::paired::PairedHost;
 use kr_client::{ClientError, Said as _, Session};
-use kr_protocol::error::{ErrorCode, ProtocolError};
+use kr_protocol::error::{ErrorCode, ProtocolError, RetryCategory};
 use kr_protocol::ids::{EnvironmentId, GrantId, SessionEpoch, SessionId};
 use kr_protocol::method::Method;
 use kr_protocol::rights::ActionRight;
@@ -67,13 +67,15 @@ const SEEN_LIMIT: usize = 256;
 /// How long reaching a host and having it open a session may take.
 const OPEN_WITHIN: Duration = Duration::from_secs(20);
 
-/// The pause before the first attempt to reach a host again.
+/// The pause before the first new attempt to reach a host for an opening.
 const FIRST_RETRY: Duration = Duration::from_millis(250);
 
-/// The longest pause between attempts to reach a host again.
+/// The longest pause between attempts while the host does not answer.
 const LONGEST_RETRY: Duration = Duration::from_secs(30);
 
-/// The pause after `failures` attempts in a row that did not reach the host.
+/// The pause after `failures` attempts in a row: the client library's reconnect ladder (250 ms
+/// doubling to 30 seconds), without its jitter, because an opening's attempts are counted by this
+/// code and one opening's recovery is not shared with another's.
 fn pause(failures: u32) -> Duration {
     FIRST_RETRY
         .saturating_mul(2_u32.saturating_pow(failures.min(16)))
@@ -292,35 +294,18 @@ impl Dial {
                 Ok(Opening::Ended(reason))
             }
             SessionOpenResult::InForce {
-                session: summary,
+                session: ref summary,
                 environment_id,
                 grant_id,
                 via,
-                actions,
-                includes_live_screen,
-                history_from_ms,
-                ends_at_ms,
+                ..
             } => {
-                let Some(summary) = summary.0 else {
+                let standing = standing_of(&opened);
+                let Some(summary) = summary.0.clone() else {
                     session.close();
                     return Err(Failure::Unreached(
                         "the host opened a connection for no session".to_owned(),
                     ));
-                };
-                let standing = if summary.state == SessionState::Closed {
-                    SessionStanding::Closed
-                } else {
-                    SessionStanding::Open {
-                        via: match via {
-                            OpenedVia::Pairing => "pairing",
-                            OpenedVia::Share => "share",
-                        },
-                        grant_id: grant_id.to_string(),
-                        actions: actions.iter().copied().collect(),
-                        includes_live_screen,
-                        history_from_ms: history_from_ms.0.map(|at| at.get()),
-                        ends_at_ms: ends_at_ms.0.map(|at| at.get()),
-                    }
                 };
                 let link = Arc::new(Link::paired(
                     session,
@@ -330,6 +315,46 @@ impl Dial {
                     (via == OpenedVia::Share).then_some(grant_id),
                 ));
                 Ok(Opening::Open(link, standing))
+            }
+        }
+    }
+}
+
+/// What the host's answer to `session.open` says of the opening: the rights it decided the open
+/// with, that the share has ended, or that the session has closed. The one reading of the answer,
+/// for the open that makes a link and the question asked again on one that stands.
+fn standing_of(opened: &SessionOpenResult) -> SessionStanding {
+    match opened {
+        SessionOpenResult::Ended { reason } => SessionStanding::Ended {
+            reason: end_reason(*reason),
+        },
+        SessionOpenResult::InForce {
+            session,
+            via,
+            grant_id,
+            actions,
+            includes_live_screen,
+            history_from_ms,
+            ends_at_ms,
+            ..
+        } => {
+            if session
+                .0
+                .as_ref()
+                .is_some_and(|summary| summary.state == SessionState::Closed)
+            {
+                return SessionStanding::Closed;
+            }
+            SessionStanding::Open {
+                via: match via {
+                    OpenedVia::Pairing => "pairing",
+                    OpenedVia::Share => "share",
+                },
+                grant_id: grant_id.to_string(),
+                actions: actions.iter().copied().collect(),
+                includes_live_screen: *includes_live_screen,
+                history_from_ms: history_from_ms.0.map(|at| at.get()),
+                ends_at_ms: ends_at_ms.0.map(|at| at.get()),
             }
         }
     }
@@ -346,13 +371,20 @@ async fn live(link: &Link) -> bool {
 pub(crate) struct Leased {
     link: Arc<Link>,
     _busy: Option<Busy>,
+    /// Counts the call as in flight on an opened link from the moment the link is taken, so a
+    /// leave that follows waits for it and a leave that came first has already refused the call.
+    _flight: Option<InFlight>,
 }
 
 impl Leased {
     /// A lease on a link nothing else can let go: a local link, or an opened one.
     #[must_use]
     pub(crate) fn of(link: Arc<Link>) -> Self {
-        Self { link, _busy: None }
+        Self {
+            link,
+            _busy: None,
+            _flight: None,
+        }
     }
 
     /// The link.
@@ -403,7 +435,9 @@ struct Current {
 /// One session's opened link.
 struct Opened {
     opening: String,
-    link: Arc<Link>,
+    /// The link, or nothing while the host could not be reached for the first time and the watch
+    /// is probing.
+    link: Option<Arc<Link>>,
     standing: SessionStanding,
     watch: Option<tauri::async_runtime::JoinHandle<()>>,
     /// What closes the raw terminal views opened under this opening, each on a connection of its
@@ -425,6 +459,9 @@ struct Inner {
 pub struct PairedLinks {
     inner: Mutex<Inner>,
     freed: Arc<Notify>,
+    /// How many times the host has changed. An ambient open that began under an earlier host
+    /// serves nothing.
+    generation: std::sync::atomic::AtomicU64,
 }
 
 impl std::fmt::Debug for PairedLinks {
@@ -445,15 +482,10 @@ fn well_formed(token: &str) -> bool {
 }
 
 /// Whether a refusal says the host is only unable to answer now, so that asking again may be
-/// answered differently.
+/// answered differently: the protocol's own transient category, and a clock the host does not
+/// trust yet, which it trusts again later.
 fn transient(code: ErrorCode) -> bool {
-    matches!(
-        code,
-        ErrorCode::StorageUnavailable
-            | ErrorCode::ClockUntrusted
-            | ErrorCode::ResourceUnavailable
-            | ErrorCode::UpstreamUnavailable
-    )
+    code.retry_category() == RetryCategory::Transient || code == ErrorCode::ClockUntrusted
 }
 
 impl PairedLinks {
@@ -475,6 +507,7 @@ impl PairedLinks {
 
     /// Lets every link go and forgets every token: the host has changed.
     pub fn close_all(&self) {
+        self.generation.fetch_add(1, Ordering::SeqCst);
         let (opened, ambient) = {
             let mut inner = self.lock();
             inner.current.clear();
@@ -485,7 +518,7 @@ impl PairedLinks {
             )
         };
         for (_, opened) in opened {
-            opened.end();
+            opened.end_now();
         }
         for entry in ambient {
             if let Ok(mut slot) = entry.slot.try_lock()
@@ -499,10 +532,16 @@ impl PairedLinks {
 
     /// Opens `session_id` under `grant_id` (the pairing when none), as the opening the page chose.
     ///
+    /// The opening is the session's current one from the moment this is called: the session's
+    /// earlier opening, if any, is over then, whatever becomes of this one, and a place among the
+    /// eight is held for it until it is left.
+    ///
+    /// A host that cannot be reached, or cannot answer now, does not fail the open: the opening
+    /// stands as `reconnecting` and its watch reaches the host as soon as it can.
+    ///
     /// # Errors
     ///
-    /// Returns a token the page may not use, a ninth opened session, and the host's refusal or why
-    /// it could not be reached.
+    /// Returns a token the page may not use, a ninth opened session, and the host's refusal.
     pub async fn open(
         self: &Arc<Self>,
         dial: &Dial,
@@ -516,7 +555,7 @@ impl PairedLinks {
                 "an opening is up to 64 letters, digits and dashes",
             ));
         }
-        let attempt = {
+        let (attempt, replaced) = {
             let mut inner = self.lock();
             let seen = inner.seen.entry(session_id).or_default();
             if seen.iter().any(|seen| seen == opening) {
@@ -528,7 +567,9 @@ impl PairedLinks {
                 seen.pop_front();
             }
             seen.push_back(opening.to_owned());
-            if !inner.opened.contains_key(&session_id) && inner.opened.len() >= OPENED_LIMIT {
+            // A place is held from the call, not from the link: nine opens made together are
+            // refused at the ninth whichever has answered.
+            if !inner.current.contains_key(&session_id) && inner.current.len() >= OPENED_LIMIT {
                 return Err(CommandError::unavailable(
                     "too many sessions are open; leave one first",
                 ));
@@ -542,8 +583,13 @@ impl PairedLinks {
                     attempt,
                 },
             );
-            attempt
+            (attempt, inner.opened.remove(&session_id))
         };
+        // The earlier opening is over now, not when this one has answered: its commands are
+        // refused, its watch stops and its link and views close.
+        if let Some(old) = replaced {
+            old.end_now();
+        }
         let reached = dial.open(session_id, grant_id).await;
         let mut inner = self.lock();
         let still_mine = inner
@@ -551,13 +597,46 @@ impl PairedLinks {
             .get(&session_id)
             .is_some_and(|current| current.opening == opening && current.attempt == attempt);
         let opening_made = match reached {
-            Err(failure) => {
-                if still_mine {
-                    inner.current.remove(&session_id);
-                }
-                return Err(failure.command());
-            }
             Ok(made) => made,
+            Err(failure) => {
+                if !still_mine {
+                    return Ok(SessionStanding::Superseded);
+                }
+                let unable = match &failure {
+                    Failure::Unreached(_) => true,
+                    Failure::Refused(refusal) => transient(refusal.code),
+                };
+                if !unable {
+                    inner.current.remove(&session_id);
+                    return Err(failure.command());
+                }
+                // The host could not be reached or could not say yet: the opening stands, and its
+                // watch reaches the host again as the same opening.
+                let reason = match failure {
+                    Failure::Unreached(reason) => reason,
+                    Failure::Refused(refusal) => refusal.message,
+                };
+                let standing = SessionStanding::Reconnecting { reason };
+                let watch = tauri::async_runtime::spawn(Arc::clone(self).keep(
+                    dial.clone(),
+                    emit,
+                    session_id,
+                    grant_id,
+                    opening.to_owned(),
+                    None,
+                ));
+                inner.opened.insert(
+                    session_id,
+                    Opened {
+                        opening: opening.to_owned(),
+                        link: None,
+                        standing: standing.clone(),
+                        watch: Some(watch),
+                        views: Vec::new(),
+                    },
+                );
+                return Ok(standing);
+            }
         };
         if !still_mine {
             // Another opening took this one's place, or the screen was left before the host
@@ -570,11 +649,6 @@ impl PairedLinks {
         match opening_made {
             Opening::Ended(reason) => {
                 inner.current.remove(&session_id);
-                let old = inner.opened.remove(&session_id);
-                drop(inner);
-                if let Some(old) = old {
-                    old.end();
-                }
                 Ok(SessionStanding::Ended {
                     reason: end_reason(reason),
                 })
@@ -587,23 +661,19 @@ impl PairedLinks {
                         session_id,
                         grant_id,
                         opening.to_owned(),
-                        Arc::clone(&link),
+                        Some(Arc::clone(&link)),
                     ))
                 });
-                let replaced = inner.opened.insert(
+                inner.opened.insert(
                     session_id,
                     Opened {
                         opening: opening.to_owned(),
-                        link,
+                        link: Some(link),
                         standing: standing.clone(),
                         watch,
                         views: Vec::new(),
                     },
                 );
-                drop(inner);
-                if let Some(old) = replaced {
-                    old.end();
-                }
                 Ok(standing)
             }
         }
@@ -662,21 +732,30 @@ impl PairedLinks {
                  again.",
             ));
         };
-        match &held.standing {
-            SessionStanding::Open { .. } | SessionStanding::Closed => {
-                Ok(Leased::of(Arc::clone(&held.link)))
-            }
-            SessionStanding::Reconnecting { .. } => Err(CommandError::unavailable(
+        let reaching = || {
+            CommandError::unavailable(
                 "Contact with this session was lost. It is being reached again.",
-            )),
+            )
+        };
+        match &held.standing {
+            SessionStanding::Open { .. } | SessionStanding::Closed => held
+                .link
+                .as_ref()
+                .map(|link| Leased {
+                    link: Arc::clone(link),
+                    _busy: None,
+                    // Taken under the same lock the leave takes the link out under.
+                    _flight: Some(Flight::enter(link)),
+                })
+                .ok_or_else(reaching),
+            SessionStanding::Reconnecting { .. } => Err(reaching()),
             SessionStanding::Ended { .. } => Err(CommandError::stated(
                 ErrorCode::PermissionDenied,
                 "This share has ended.",
             )),
-            SessionStanding::Refused { message, .. } => Err(CommandError::stated(
-                ErrorCode::PermissionDenied,
-                message.clone(),
-            )),
+            SessionStanding::Refused { code, message } => {
+                Err(CommandError::stated(*code, message.clone()))
+            }
             SessionStanding::Superseded => Err(CommandError::stated(
                 ErrorCode::StaleSession,
                 "This screen was replaced by another opening of the session.",
@@ -698,15 +777,22 @@ impl PairedLinks {
             let inner = self.lock();
             if let Some(held) = inner.opened.get(&session_id)
                 && matches!(&held.standing, SessionStanding::Open { via: "pairing", .. })
-                && held.link.grant_id.is_none()
+                && let Some(link) = &held.link
+                && link.grant_id.is_none()
             {
-                return Ok(Leased::of(Arc::clone(&held.link)));
+                return Ok(Leased::of(Arc::clone(link)));
             }
         }
+        let generation = self.generation.load(Ordering::SeqCst);
+        let host_changed =
+            || CommandError::unavailable("The host in use changed while this was being asked.");
         loop {
             let freed = self.freed.notified();
             tokio::pin!(freed);
             freed.as_mut().enable();
+            if self.generation.load(Ordering::SeqCst) != generation {
+                return Err(host_changed());
+            }
             let pick = {
                 let mut inner = self.lock();
                 let now = Instant::now();
@@ -768,15 +854,27 @@ impl PairedLinks {
                 freed: Arc::clone(&self.freed),
             };
             let mut held = slot.lock().await;
+            if self.generation.load(Ordering::SeqCst) != generation {
+                return Err(host_changed());
+            }
             if let Some(link) = held.as_ref()
                 && live(link).await
             {
                 return Ok(Leased {
                     link: Arc::clone(link),
                     _busy: Some(claim),
+                    _flight: None,
                 });
             }
-            let link = match dial.open(session_id, None).await {
+            let opened = dial.open(session_id, None).await;
+            // A host that changed while this was asked is not the host this was asked of.
+            if self.generation.load(Ordering::SeqCst) != generation {
+                if let Ok(Opening::Open(link, _)) = opened {
+                    link.session.close();
+                }
+                return Err(host_changed());
+            }
+            let link = match opened {
                 Ok(Opening::Open(link, _)) => link,
                 Ok(Opening::Ended(_)) => {
                     return Err(CommandError::stated(
@@ -790,6 +888,7 @@ impl PairedLinks {
             return Ok(Leased {
                 link,
                 _busy: Some(claim),
+                _flight: None,
             });
         }
     }
@@ -835,79 +934,62 @@ impl PairedLinks {
     /// on a connection of its own ended while the link did not, so the host's answer says whether
     /// the share still stands. An answer that it does is `open`, which the page opens a view again
     /// on; the host ending the share is `ended`.
-    pub async fn recheck(
-        self: &Arc<Self>,
-        dial: &Dial,
-        emit: &Emitter,
-        session_id: SessionId,
-        opening: &str,
-    ) {
-        let link = {
-            let inner = self.lock();
-            inner
-                .opened
-                .get(&session_id)
-                .filter(|held| held.opening == opening)
-                .map(|held| (Arc::clone(&held.link), held.link.grant_id))
-        };
-        let Some((link, grant_id)) = link else {
-            return;
-        };
-        if !live(&link).await {
-            // The link is gone too, and its watch is already reaching the host again.
-            return;
-        }
-        let asked = tokio::time::timeout(
-            OPEN_WITHIN,
-            link.session.read::<_, SessionOpenResult>(
-                Method::SessionOpen,
-                &SessionOpenParams {
-                    session_id: Nullable::some(session_id),
-                    grant_id: Nullable(grant_id),
-                },
-            ),
-        )
-        .await;
-        let _ = dial;
-        let standing = match asked {
-            Ok(Ok(SessionOpenResult::Ended { reason })) => SessionStanding::Ended {
-                reason: end_reason(reason),
-            },
-            Ok(Ok(SessionOpenResult::InForce {
-                via,
-                grant_id,
-                actions,
-                includes_live_screen,
-                history_from_ms,
-                ends_at_ms,
-                ..
-            })) => SessionStanding::Open {
-                via: match via {
-                    OpenedVia::Pairing => "pairing",
-                    OpenedVia::Share => "share",
-                },
-                grant_id: grant_id.to_string(),
-                actions: actions.iter().copied().collect(),
-                includes_live_screen,
-                history_from_ms: history_from_ms.0.map(|at| at.get()),
-                ends_at_ms: ends_at_ms.0.map(|at| at.get()),
-            },
-            Ok(Err(ClientError::Host(refusal))) if !transient(refusal.code) => {
-                SessionStanding::Refused {
-                    code: refusal.code,
-                    message: refusal.message,
-                }
+    ///
+    /// A host that cannot answer now, or an answer that is late, is asked again after a pause while
+    /// the link lives and the opening stands: a prompt in flight on the link is answered first, and
+    /// the host answers one request at a time. When the link goes, its watch takes over.
+    pub async fn recheck(self: &Arc<Self>, emit: &Emitter, session_id: SessionId, opening: &str) {
+        let mut failures: u32 = 0;
+        loop {
+            let held = {
+                let inner = self.lock();
+                inner
+                    .opened
+                    .get(&session_id)
+                    .filter(|held| held.opening == opening)
+                    .and_then(|held| held.link.clone())
+            };
+            let Some(link) = held else {
+                return;
+            };
+            if !live(&link).await {
+                // The link is gone too, and its watch is already reaching the host again.
+                return;
             }
-            // The link failed or the host could not answer now: the link's own watch tells the
-            // page what it learns.
-            _ => return,
-        };
-        if self.set_standing(session_id, opening, standing.clone()) {
-            emit(StandingEvent {
-                session_id: session_id.to_string(),
-                opening: opening.to_owned(),
-                standing,
-            });
+            let asked = tokio::time::timeout(
+                OPEN_WITHIN,
+                link.session.read::<_, SessionOpenResult>(
+                    Method::SessionOpen,
+                    &SessionOpenParams {
+                        session_id: Nullable::some(session_id),
+                        grant_id: Nullable(link.grant_id),
+                    },
+                ),
+            )
+            .await;
+            let standing = match asked {
+                Ok(Ok(opened)) => standing_of(&opened),
+                Ok(Err(ClientError::Host(refusal))) if !transient(refusal.code) => {
+                    SessionStanding::Refused {
+                        code: refusal.code,
+                        message: refusal.message,
+                    }
+                }
+                // The host could not answer now, or the answer was late.
+                _ => {
+                    tokio::time::sleep(pause(failures)).await;
+                    failures = failures.saturating_add(1);
+                    continue;
+                }
+            };
+            if self.set_standing_on(session_id, opening, &link, standing.clone()) {
+                emit(StandingEvent {
+                    session_id: session_id.to_string(),
+                    opening: opening.to_owned(),
+                    standing,
+                });
+            }
+            return;
         }
     }
 
@@ -919,7 +1001,7 @@ impl PairedLinks {
             .lock()
             .opened
             .get(&session_id)
-            .map(|held| Arc::clone(&held.link));
+            .and_then(|held| held.link.clone());
         if let Some(link) = link {
             link.session.close();
         }
@@ -945,9 +1027,10 @@ impl PairedLinks {
         }
     }
 
-    /// Keeps an opened link: waits for its connection to end, and reaches the host again as the
-    /// same opening, telling the page where that stands, until the opening is left, replaced or
-    /// the host says it is over.
+    /// Keeps an opening: waits for its link's connection to end, and reaches the host again as the
+    /// same opening, telling the page where that stands, until the opening is left, replaced or the
+    /// host says it is over. An opening that has no link yet, because the host could not be reached
+    /// when it was made, starts by reaching the host.
     async fn keep(
         self: Arc<Self>,
         dial: Dial,
@@ -955,7 +1038,7 @@ impl PairedLinks {
         session_id: SessionId,
         grant_id: Option<GrantId>,
         opening: String,
-        mut link: Arc<Link>,
+        mut link: Option<Arc<Link>>,
     ) {
         let tell = |standing: SessionStanding| {
             emit(StandingEvent {
@@ -965,19 +1048,17 @@ impl PairedLinks {
             });
         };
         loop {
-            link.session.closed().await;
-            if !self.set_standing(
-                session_id,
-                &opening,
-                SessionStanding::Reconnecting {
+            if let Some(held) = link.take() {
+                held.session.closed().await;
+                let lost = SessionStanding::Reconnecting {
                     reason: "contact with this session was lost".to_owned(),
-                },
-            ) {
-                return;
+                };
+                // An opening that is over, or was left or replaced, is not reached again.
+                if !self.set_standing(session_id, &opening, lost.clone()) {
+                    return;
+                }
+                tell(lost);
             }
-            tell(SessionStanding::Reconnecting {
-                reason: "contact with this session was lost".to_owned(),
-            });
             let mut failures: u32 = 0;
             let mut refused: Option<ErrorCode> = None;
             loop {
@@ -992,7 +1073,7 @@ impl PairedLinks {
                             return;
                         }
                         tell(standing);
-                        link = fresh;
+                        link = Some(fresh);
                         break;
                     }
                     Ok(Opening::Ended(reason)) => {
@@ -1042,7 +1123,8 @@ impl PairedLinks {
             .is_some_and(|current| current.opening == opening)
     }
 
-    /// Changes the standing of the opening's link, if it is still the session's.
+    /// Changes the standing of the opening, if it is still the session's and the host has not said
+    /// it is over: an opening that has ended, been refused or been replaced stays so.
     fn set_standing(
         &self,
         session_id: SessionId,
@@ -1053,7 +1135,7 @@ impl PairedLinks {
         match inner
             .opened
             .get_mut(&session_id)
-            .filter(|held| held.opening == opening)
+            .filter(|held| held.opening == opening && !is_over(&held.standing))
         {
             Some(held) => {
                 held.standing = standing;
@@ -1063,8 +1145,35 @@ impl PairedLinks {
         }
     }
 
+    /// Changes the standing of the opening from what the host answered on `link`: only while that
+    /// link is still the opening's and the opening is open, so that a late answer neither reverses
+    /// what the watch learned since nor speaks for a link that has been replaced.
+    fn set_standing_on(
+        &self,
+        session_id: SessionId,
+        opening: &str,
+        link: &Arc<Link>,
+        standing: SessionStanding,
+    ) -> bool {
+        let mut inner = self.lock();
+        match inner.opened.get_mut(&session_id).filter(|held| {
+            held.opening == opening
+                && matches!(held.standing, SessionStanding::Open { .. })
+                && held
+                    .link
+                    .as_ref()
+                    .is_some_and(|held| Arc::ptr_eq(held, link))
+        }) {
+            Some(held) => {
+                held.standing = standing;
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Makes `fresh` the opening's link, with the new epoch and the rights the host just decided,
-    /// if the opening is still the session's. The old link is closed.
+    /// if the opening is still the session's and not over. The old link is closed.
     fn reinstall(
         &self,
         session_id: SessionId,
@@ -1076,17 +1185,29 @@ impl PairedLinks {
         match inner
             .opened
             .get_mut(&session_id)
-            .filter(|held| held.opening == opening)
+            .filter(|held| held.opening == opening && !is_over(&held.standing))
         {
             Some(held) => {
-                let old = std::mem::replace(&mut held.link, Arc::clone(fresh));
+                let old = held.link.replace(Arc::clone(fresh));
                 held.standing = standing.clone();
-                old.session.close();
+                if let Some(old) = old {
+                    old.session.close();
+                }
                 true
             }
             None => false,
         }
     }
+}
+
+/// Whether a standing is one the host (or the page) ended: nothing changes it afterwards.
+fn is_over(standing: &SessionStanding) -> bool {
+    matches!(
+        standing,
+        SessionStanding::Ended { .. }
+            | SessionStanding::Refused { .. }
+            | SessionStanding::Superseded
+    )
 }
 
 fn close_slot(slot: &Slot) {
@@ -1105,17 +1226,14 @@ fn end_reason(reason: ShareEnd) -> &'static str {
 }
 
 impl Opened {
-    /// Ends the opening: its watch stops, and its link closes once the mutations in flight on it
-    /// have answered, within a mutation's lifetime.
+    /// Ends the opening: its watch stops, the views opened under it close, and its link closes
+    /// once the mutations in flight on it have answered, within a mutation's lifetime. For a
+    /// screen that is left.
     fn end(mut self) {
-        if let Some(watch) = self.watch.take() {
-            watch.abort();
-        }
-        // The views hold the terminal's input lease for as long as they live.
-        for close in std::mem::take(&mut self.views) {
-            close();
-        }
-        let link = self.link;
+        self.stop();
+        let Some(link) = self.link else {
+            return;
+        };
         tauri::async_runtime::spawn(async move {
             let _ = tokio::time::timeout(
                 Duration::from_millis(crate::commands::MUTATION_TTL.get()),
@@ -1124,6 +1242,26 @@ impl Opened {
             .await;
             link.session.close();
         });
+    }
+
+    /// Ends the opening at once, under a mutation in flight if there is one, which then ends as a
+    /// connection that ended does. For an opening that another has replaced, and for a host that
+    /// changed.
+    fn end_now(mut self) {
+        self.stop();
+        if let Some(link) = self.link {
+            link.session.close();
+        }
+    }
+
+    fn stop(&mut self) {
+        if let Some(watch) = self.watch.take() {
+            watch.abort();
+        }
+        // The views hold the terminal's input lease for as long as they live.
+        for close in std::mem::take(&mut self.views) {
+            close();
+        }
     }
 }
 

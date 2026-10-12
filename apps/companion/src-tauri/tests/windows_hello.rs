@@ -105,6 +105,7 @@ async fn the_ceremony_offered_is_the_one_windows_reports() {
             room: Arc::new(NoRoom),
             bind: Some("127.0.0.1:0".parse().expect("loopback")),
             clock: Arc::new(DeviceClock::current().expect("a clock")),
+            link: None,
         },
         || {},
     )

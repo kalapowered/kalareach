@@ -97,14 +97,56 @@ pub(super) enum Reach<'a> {
     Paired(&'a crate::standing::Dial, Option<GrantId>),
 }
 
-/// Runs one view from its open until it ends or is closed.
+/// Why a view's task ended, for whoever opened it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Cause {
+    /// The page closed the view.
+    Closed,
+    /// The view's connection went, or could not be used: nothing the session or the host said.
+    Lost,
+    /// The view ended for another reason, which the page was told: the session closed, the view
+    /// was detached, a screen could not be read, or the host refused it.
+    Other,
+}
+
+/// Why opening a view failed: the words the page is told, and whether it was the connection.
+struct OpenFailure {
+    reason: String,
+    lost: bool,
+}
+
+impl OpenFailure {
+    /// The connection went part way through the open.
+    fn lost(lost: &Lost) -> Self {
+        Self {
+            reason: lost_words(lost),
+            lost: true,
+        }
+    }
+
+    /// The host or the worker refused, or could not be understood.
+    fn refused(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+            lost: false,
+        }
+    }
+}
+
+impl From<String> for OpenFailure {
+    fn from(reason: String) -> Self {
+        Self::refused(reason)
+    }
+}
+
+/// Runs one view from its open until it ends or is closed, and says why it ended.
 pub(super) async fn run(
     reach: Reach<'_>,
     session_id: SessionId,
     dimensions: Dimensions,
     mut commands: UnboundedReceiver<Command>,
     publish: &Publish,
-) {
+) -> Cause {
     // The window's reports, which take the page's sizes and moves while the view is opening too, and
     // control of the program, which a take made while it opens asks for once it is attached.
     let mut window = WindowReports::new(dimensions);
@@ -139,12 +181,12 @@ pub(super) async fn run(
                     }
                     // A close while the view opens cancels the open. The link goes with it, and a
                     // closed connection detaches whatever the attach had made.
-                    Some(Command::Close) | None => return,
+                    Some(Command::Close) | None => return Cause::Closed,
                     Some(Command::Lose) => {
                         publish(TerminalViewState::Ended {
                             reason: "The connection to this session ended.".to_owned(),
                         });
-                        return;
+                        return Cause::Lost;
                     }
                 },
                 opened = &mut opening => break opened,
@@ -153,9 +195,15 @@ pub(super) async fn run(
     };
     let opened = match opened {
         Ok(opened) => opened,
-        Err(reason) => {
-            publish(TerminalViewState::Ended { reason });
-            return;
+        Err(failure) => {
+            publish(TerminalViewState::Ended {
+                reason: failure.reason,
+            });
+            return if failure.lost {
+                Cause::Lost
+            } else {
+                Cause::Other
+            };
         }
     };
     let next_request = opened.wire.first_loop_request();
@@ -186,6 +234,7 @@ pub(super) async fn run(
     if ended.detach {
         view.detach().await;
     }
+    ended.cause
 }
 
 /// Opens the link, has the worker prove who it is, attaches and subscribes.
@@ -197,7 +246,7 @@ async fn open(
     reach: &Reach<'_>,
     session_id: SessionId,
     dimensions: Dimensions,
-) -> Result<Opened, String> {
+) -> Result<Opened, OpenFailure> {
     let (mut wire, target) = match reach {
         Reach::Local(locate) => open_local(locate, session_id).await?,
         Reach::Paired(dial, grant_id) => open_paired(dial, *grant_id, session_id).await?,
@@ -220,13 +269,18 @@ async fn open(
     let answer = wire
         .mutate(Method::SessionAttach, target.clone(), &params)
         .await
-        .map_err(|lost| lost_words(&lost))?
-        .map_err(|refusal| format!("The session refused this view: {}", refusal.message))?;
+        .map_err(|lost| OpenFailure::lost(&lost))?
+        .map_err(|refusal| {
+            OpenFailure::refused(format!(
+                "The session refused this view: {}",
+                refusal.message
+            ))
+        })?;
     let attached: SessionAttachResult = answer.to_typed().map_err(|error| {
-        format!(
+        OpenFailure::refused(format!(
             "The session's answer could not be read: {}",
             Shown::cbor(&error)
-        )
+        ))
     })?;
     let mut streams = CanonicalSet::new();
     streams.insert(EventStream::Output);
@@ -240,12 +294,12 @@ async fn open(
     };
     wire.request(Method::EventsSubscribe, &subscribe)
         .await
-        .map_err(|lost| lost_words(&lost))?
+        .map_err(|lost| OpenFailure::lost(&lost))?
         .map_err(|refusal| {
-            format!(
+            OpenFailure::refused(format!(
                 "The session refused this view's screen: {}",
                 refusal.message
-            )
+            ))
         })?;
     Ok(Opened {
         wire,
@@ -280,14 +334,15 @@ async fn open_paired(
     dial: &crate::standing::Dial,
     grant_id: Option<GrantId>,
     session_id: SessionId,
-) -> Result<(Wire, ActionTarget), String> {
+) -> Result<(Wire, ActionTarget), OpenFailure> {
     use kr_protocol::session::{SessionOpenParams, SessionOpenResult};
 
     let transport = dial
         .transport()
         .await
         .map_err(|reason| reason.to_string())?;
-    let mut wire = Wire::Paired(Paired::over(transport, grant_id).map_err(|lost| lost.0)?);
+    let mut wire =
+        Wire::Paired(Paired::over(transport, grant_id).map_err(|lost| OpenFailure::lost(&lost))?);
     let opened = wire
         .request(
             Method::SessionOpen,
@@ -297,13 +352,15 @@ async fn open_paired(
             },
         )
         .await
-        .map_err(|lost| lost_words(&lost))?
-        .map_err(|refusal| format!("The host refused this view: {}", refusal.message))?;
+        .map_err(|lost| OpenFailure::lost(&lost))?
+        .map_err(|refusal| {
+            OpenFailure::refused(format!("The host refused this view: {}", refusal.message))
+        })?;
     let opened: SessionOpenResult = opened.to_typed().map_err(|error| {
-        format!(
+        OpenFailure::refused(format!(
             "The host's answer could not be read: {}",
             Shown::cbor(&error)
-        )
+        ))
     })?;
     match opened {
         SessionOpenResult::InForce {
@@ -312,7 +369,9 @@ async fn open_paired(
             ..
         } => {
             let Some(summary) = session.0 else {
-                return Err("The host opened a connection for no session.".to_owned());
+                return Err(OpenFailure::refused(
+                    "The host opened a connection for no session.",
+                ));
             };
             let target = ActionTarget {
                 environment_id,
@@ -323,7 +382,7 @@ async fn open_paired(
             };
             Ok((wire, target))
         }
-        SessionOpenResult::Ended { .. } => Err("This share has ended.".to_owned()),
+        SessionOpenResult::Ended { .. } => Err(OpenFailure::refused("This share has ended.")),
     }
 }
 
@@ -412,6 +471,8 @@ fn target(descriptor: &WorkerDescriptor) -> ActionTarget {
 struct Ending {
     /// Why, for the page, or nothing when the page itself closed the view.
     reason: Option<String>,
+    /// What kind of end it was, for whoever opened the view.
+    cause: Cause,
     /// Whether the attachment still stands on a link that still stands, so the view detaches it
     /// before the link closes.
     detach: bool,
@@ -421,6 +482,7 @@ impl Ending {
     /// The page closed the view.
     const CLOSED: Self = Self {
         reason: None,
+        cause: Cause::Closed,
         detach: true,
     };
 
@@ -428,6 +490,7 @@ impl Ending {
     fn ended(reason: impl Into<String>) -> Self {
         Self {
             reason: Some(reason.into()),
+            cause: Cause::Other,
             detach: true,
         }
     }
@@ -436,13 +499,17 @@ impl Ending {
     fn over(reason: impl Into<String>) -> Self {
         Self {
             reason: Some(reason.into()),
+            cause: Cause::Other,
             detach: false,
         }
     }
 
     /// The link is gone, and the attachment with it.
     fn lost() -> Self {
-        Self::over("The connection to this session ended.")
+        Self {
+            cause: Cause::Lost,
+            ..Self::over("The connection to this session ended.")
+        }
     }
 }
 

@@ -47,6 +47,16 @@ pub type Locate = Arc<dyn Fn() -> Result<EnvironmentPaths, String> + Send + Sync
 /// Where one view's states go: the page's channel for it.
 pub type Publish = Arc<dyn Fn(TerminalViewState) + Send + Sync>;
 
+/// What a view of a paired host's session is opened with.
+pub struct Paired {
+    /// The host and the device it is reached as.
+    pub dial: crate::standing::Dial,
+    /// The share the screen runs under, or none for the pairing.
+    pub grant: Option<kr_protocol::ids::GrantId>,
+    /// Runs when the view ends because its own connection went, and for no other reason.
+    pub on_lost: Box<dyn FnOnce() + Send>,
+}
+
 /// Where a view's session is reached from, owned by the view's task.
 enum Source {
     Local(Locate),
@@ -113,26 +123,31 @@ impl TerminalViews {
             session_id,
             dimensions,
             publish,
+            None,
         )
     }
 
     /// Opens a view of `session_id` of a host this device is paired with, on a connection of its
     /// own opened under `grant` (the pairing when none), for the page `page`.
+    ///
+    /// `on_lost` runs when the view ends because its own connection went, and for that reason
+    /// alone: not when the page closed it, and not when the session or the host ended or refused
+    /// it, which the page was told.
     pub fn open_paired(
         &self,
         page: &str,
-        dial: crate::standing::Dial,
-        grant: Option<kr_protocol::ids::GrantId>,
+        paired: Paired,
         session_id: SessionId,
         dimensions: Dimensions,
         publish: Publish,
     ) -> String {
         self.start(
             page,
-            Source::Paired(Box::new(dial), grant),
+            Source::Paired(Box::new(paired.dial), paired.grant),
             session_id,
             dimensions,
             publish,
+            Some(paired.on_lost),
         )
     }
 
@@ -143,6 +158,7 @@ impl TerminalViews {
         session_id: SessionId,
         dimensions: Dimensions,
         publish: Publish,
+        on_lost: Option<Box<dyn FnOnce() + Send>>,
     ) -> String {
         let id = self.next.fetch_add(1, Ordering::Relaxed);
         let (commands, receiver) = tokio::sync::mpsc::unbounded_channel();
@@ -162,12 +178,17 @@ impl TerminalViews {
                 Source::Local(locate) => view::Reach::Local(locate),
                 Source::Paired(dial, grant) => view::Reach::Paired(dial, *grant),
             };
-            view::run(reach, session_id, dimensions, receiver, &publish).await;
+            let cause = view::run(reach, session_id, dimensions, receiver, &publish).await;
             // Not held once it has ended, and only then is every close waiting for it told.
             held.lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .remove(&id);
             let _ = ending.send(true);
+            if cause == view::Cause::Lost
+                && let Some(on_lost) = on_lost
+            {
+                on_lost();
+            }
         });
         id.to_string()
     }

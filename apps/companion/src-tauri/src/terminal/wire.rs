@@ -32,8 +32,9 @@ pub(super) struct Lost(pub(super) String);
 /// What a call answered with: the host's refusal, or the value.
 pub(super) type Answer = std::result::Result<ParamsValue, ProtocolError>;
 
-/// The first request number the wire's own calls use. The view's loop numbers its requests from a
-/// higher range, so an answer is never taken for another call's.
+/// The request number before the first one the wire's own calls use: a paired connection numbers
+/// its requests in sequence from 2, after the first the host takes for its own, and a host that
+/// sees a number jump ends the connection.
 const OWN_REQUESTS: u64 = 1;
 
 /// A view's connection to its session.

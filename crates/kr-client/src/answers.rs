@@ -84,7 +84,7 @@ const fn unstated(version: &u32) -> bool {
 }
 
 /// How long an answer this client sends asks the host to hold its admission.
-const ANSWER_TTL: DurationMs = DurationMs::new(120_000);
+pub const ANSWER_TTL: DurationMs = DurationMs::new(120_000);
 
 /// One answer a person gave that the host has not taken.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]

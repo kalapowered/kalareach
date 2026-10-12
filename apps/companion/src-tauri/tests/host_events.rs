@@ -186,9 +186,11 @@ mod macos {
         // The connection is the application's to hold, as its state holds the host's: the
         // publisher only listens on it.
         let session = Arc::new(session);
+        let host = kr_protocol::ids::EnvironmentId::new(kr_ipc::new_uuid());
         tauri::async_runtime::spawn(companion_tauri::connection::forward_events(
             app.clone(),
             Arc::clone(&session),
+            host,
         ));
 
         runtime.block_on(async {
@@ -214,14 +216,18 @@ mod macos {
                 )
             },
         )?;
+        // Each event names the host it came from, which the page drops events of a host it no
+        // longer uses by.
         let expected = vec![
             json!({
+                "host": host.to_string(),
                 "stream_id": OUTPUT_STREAM,
                 "sequence": "0",
                 "event_type": "session.state",
                 "payload": { "state": "live", "cursor": 42, "changed": [true, null] },
             }),
             json!({
+                "host": host.to_string(),
                 "stream_id": OUTPUT_STREAM,
                 "sequence": "1",
                 "event_type": "session.output",

@@ -27,7 +27,7 @@ use kr_client::pairing::candidate::{AttemptState, Candidate, CandidateRoom, Pair
 use kr_client::pairing::clock::DeviceClock;
 use kr_client::pairing::failure::{FailureKind, PairingFailure};
 use kr_client::pairing::invitation::{Invitation, InvitationSummary, origin_host, read_invitation};
-use kr_client::pairing::link::{EndpointPool, IrohLink};
+use kr_client::pairing::link::{EndpointPool, HostLink, IrohLink};
 use kr_client::pairing::paired::{PairedHost, PairedHosts};
 use kr_client::pairing::room::RoomConnector;
 use kr_crypto::store::{SecretStore, open_store};
@@ -137,6 +137,10 @@ fn failed(failure: &PairingFailure) -> CommandError {
     CommandError::local_failure(failure.to_string())
 }
 
+/// What a test puts a computer's own way of reaching a host behind: it is handed that way and
+/// returns the one the device uses.
+pub type LinkWrap = Box<dyn FnOnce(Arc<dyn HostLink>) -> Arc<dyn HostLink> + Send>;
+
 /// What a device is made of besides its records: where its secrets live, how it opens a room,
 /// where its endpoints bind and the clock it counts on. The product's come from the platform
 /// ([`Parts::platform`]); a test gives its own.
@@ -149,6 +153,9 @@ pub struct Parts {
     pub bind: Option<SocketAddr>,
     /// The clock its attempts are measured on.
     pub clock: Arc<dyn PairingClock + Send + Sync>,
+    /// What this computer's own way of reaching a host is put behind, when it is put behind
+    /// anything: a test holds or refuses the connections it is asked for.
+    pub link: Option<LinkWrap>,
 }
 
 impl Parts {
@@ -177,6 +184,7 @@ impl Parts {
             room: Arc::new(room),
             bind: None,
             clock: Arc::new(clock),
+            link: None,
         })
     }
 }
@@ -219,7 +227,13 @@ impl Device {
             budget: Arc::new(budget),
             clock: parts.clock,
             room: parts.room,
-            link: Arc::new(IrohLink::new(Arc::new(pool))),
+            link: {
+                let own: Arc<dyn HostLink> = Arc::new(IrohLink::new(Arc::new(pool)));
+                match parts.link {
+                    Some(behind) => behind(own),
+                    None => own,
+                }
+            },
             hosts: Arc::new(hosts),
         };
         let origin_file = data.join("pairing-origin");

@@ -274,8 +274,10 @@ async fn open_for_the_host(session: &Session) -> Result<Vec<ActionRight>> {
         {
             CommandError::stated(
                 refusal.code,
-                "the host refused to open this connection; it may be of an earlier build than \
-                 this application",
+                format!(
+                    "{} If the host is of an earlier build than this application, update it.",
+                    refusal.message
+                ),
             )
         }
         other => CommandError::from(other),
@@ -449,6 +451,7 @@ pub async fn keep<R, A, F>(
             Attempt::Nothing => return,
             Attempt::Reached(connection) => {
                 let session = connection.session();
+                let environment_id = connection.environment_id();
                 if !state.connected_for(choice, connection) {
                     return;
                 }
@@ -459,7 +462,7 @@ pub async fn keep<R, A, F>(
                 // A connection that did not last is not a recovery: a host that accepts and then
                 // closes is waited for as one that does not answer.
                 backoff.connected();
-                forward_events(app.clone(), session).await;
+                forward_events(app.clone(), session, environment_id).await;
             }
             Attempt::Failed(error) => {
                 if !state.disconnected_for(choice, error.message) {
@@ -509,6 +512,9 @@ pub async fn this_machines_host() -> Attempt {
 /// One host notification, in the shape the interface reads.
 #[derive(Clone, Debug, Serialize)]
 pub struct PublishedEvent {
+    /// The environment of the host it came from. The page drops an event of a host it no longer
+    /// uses, so one still on its way when the host changed is not taken for the new host's.
+    pub host: String,
     /// The stream it belongs to.
     pub stream_id: String,
     /// Its position in that stream.
@@ -539,7 +545,12 @@ fn read_payload(payload: &kr_protocol::envelope::ParamsValue) -> serde_json::Val
 /// whether an event was its own. When the connection ends the application is told it is not
 /// connected, and its state says so, so a command made afterwards is refused as unconnected rather
 /// than sent down a connection that is gone.
-pub async fn forward_events<R: Runtime>(app: AppHandle<R>, session: Arc<Session>) {
+pub async fn forward_events<R: Runtime>(
+    app: AppHandle<R>,
+    session: Arc<Session>,
+    host: EnvironmentId,
+) {
+    let host = host.to_string();
     let mut events = session.events();
     loop {
         let heard = tokio::select! {
@@ -554,6 +565,7 @@ pub async fn forward_events<R: Runtime>(app: AppHandle<R>, session: Arc<Session>
         match heard {
             Ok(notification) => {
                 let published = PublishedEvent {
+                    host: host.clone(),
                     payload: read_payload(&notification.payload),
                     stream_id: notification.stream_id.to_string(),
                     sequence: notification.sequence.to_string(),
@@ -571,6 +583,7 @@ pub async fn forward_events<R: Runtime>(app: AppHandle<R>, session: Arc<Session>
                     .emit(
                         HOST_EVENT,
                         PublishedEvent {
+                            host: host.clone(),
                             stream_id: String::new(),
                             sequence: String::new(),
                             event_type: "resync_required".to_owned(),

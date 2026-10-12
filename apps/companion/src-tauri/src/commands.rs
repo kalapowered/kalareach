@@ -184,6 +184,44 @@ pub const NAMED_COMMANDS: &[(&str, Option<Method>)] = &[
     ("account_usage", None),
 ];
 
+/// The commands that reach a session's worker or name a session on a host this device is paired
+/// with.
+///
+/// Each takes the opening of the screen making it and goes over that opening's link, or goes over a
+/// link kept for calls made outside any screen when it names none. The connection for the host
+/// alone refuses them all, because the host serves no worker on it. A command that is not offered
+/// over a paired host is in the list too, because it is refused here before anything is sent. The
+/// session tour in `tests/phone_sessions.rs` calls each of these once, so one that reaches a worker
+/// over the wrong connection fails there.
+pub const SESSION_BOUND_COMMANDS: &[&str] = &[
+    "session_agents",
+    "session_close",
+    "session_open",
+    "session_leave",
+    "agent_capabilities",
+    "agent_snapshot",
+    "agent_commands",
+    "agent_approval_inspect",
+    "agent_prompt_submit",
+    "agent_prompt_queue",
+    "agent_turn_steer",
+    "agent_turn_cancel",
+    "agent_approval_respond",
+    "question_read",
+    "question_answer",
+    "question_settle",
+    "question_send_kept",
+    "action_read",
+    "action_cancel",
+    "history_page",
+    "shell_launch",
+    "draft_create",
+    "draft_add_attachment",
+    "attachment_upload",
+    "attachment_upload_bytes",
+    "terminal_view_open",
+];
+
 /// The commands whose native code performs protocol methods of its own, and which.
 ///
 /// Every one is a `None` entry in [`NAMED_COMMANDS`]: the page supplies none of these methods'
@@ -211,7 +249,7 @@ pub const NATIVE_METHODS: &[(&str, &[Method])] = &[
     ),
     // The host's own account of which environment it is, read once the connection to a paired
     // host is up: the connection carries none on its handshake.
-    ("hosts_use", &[Method::HostInfo]),
+    ("hosts_use", &[Method::HostInfo, Method::SessionOpen]),
     ("owner_confirmations", &[Method::OwnerConfirmationPending]),
     (
         "owner_confirmation_review",
@@ -1915,6 +1953,8 @@ pub async fn attachment_upload(
     path: String,
     session_id: Option<String>,
 ) -> Result<Value> {
+    // A host this device is paired with takes no file from it.
+    not_on_a_paired_host(&state, "a file")?;
     // Only a file this window was actually given. The platform hands the backend a path when a
     // person drops something on the window, and that path is spent by one upload. A path the page
     // names is refused, so this command is not a general file read.
@@ -1954,6 +1994,8 @@ pub async fn attachment_upload_bytes(
     state: State<'_, AppState>,
     request: tauri::ipc::Request<'_>,
 ) -> Result<Value> {
+    // A host this device is paired with takes no file from it.
+    not_on_a_paired_host(&state, "a file")?;
     let tauri::ipc::InvokeBody::Raw(bytes) = request.body() else {
         return Err(CommandError::invalid(
             "a pasted or picked file is handed over as raw bytes",
@@ -2400,41 +2442,31 @@ pub async fn terminal_view_open<R: tauri::Runtime>(
     let links = std::sync::Arc::clone(state.paired_links());
     let grant = links.opening_grant(session_id, &opening)?;
     let dial = crate::standing::Dial::new(context.device, context.host);
-    let shown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let app = webview.app_handle().clone();
-    let publish: crate::terminal::Publish = {
-        let (links, dial, opening) = (std::sync::Arc::clone(&links), dial.clone(), opening.clone());
-        let shown = std::sync::Arc::clone(&shown);
-        std::sync::Arc::new(move |view_state| {
-            let ended = matches!(view_state, crate::terminal::TerminalViewState::Ended { .. });
-            if matches!(
-                view_state,
-                crate::terminal::TerminalViewState::Showing { .. }
-            ) {
-                shown.store(true, std::sync::atomic::Ordering::SeqCst);
-            }
-            // A page that has gone takes nothing; its load ends the view.
-            let _ = on_state.send(view_state);
-            // A view that drew a screen and then ended on its own may have lost only its
-            // connection. A view that never drew one was refused, and asking again would only
-            // open it again.
-            if ended && shown.load(std::sync::atomic::Ordering::SeqCst) {
-                let (links, dial, opening) =
-                    (std::sync::Arc::clone(&links), dial.clone(), opening.clone());
-                let emitter = app.clone();
-                tauri::async_runtime::spawn(async move {
-                    let emit: crate::standing::Emitter = std::sync::Arc::new(move |event| {
-                        let _ = emitter.emit(crate::standing::STANDING_EVENT, event);
-                    });
-                    links.recheck(&dial, &emit, session_id, &opening).await;
+    let publish: crate::terminal::Publish = std::sync::Arc::new(move |view_state| {
+        // A page that has gone takes nothing; its load ends the view.
+        let _ = on_state.send(view_state);
+    });
+    // A view that ended because its own connection went may have lost only that: the host is asked
+    // again, on the link the opening holds, what the opening allows.
+    let on_lost: Box<dyn FnOnce() + Send> = {
+        let (links, opening) = (std::sync::Arc::clone(&links), opening.clone());
+        let emitter = webview.app_handle().clone();
+        Box::new(move || {
+            tauri::async_runtime::spawn(async move {
+                let emit: crate::standing::Emitter = std::sync::Arc::new(move |event| {
+                    let _ = emitter.emit(crate::standing::STANDING_EVENT, event);
                 });
-            }
+                links.recheck(&emit, session_id, &opening).await;
+            });
         })
     };
     let handle = views.open_paired(
         webview.label(),
-        dial,
-        grant,
+        crate::terminal::Paired {
+            dial,
+            grant,
+            on_lost,
+        },
         session_id,
         dimensions,
         publish,
@@ -3003,6 +3035,20 @@ mod tests {
             Some(code) => code.to_owned(),
             None => error.to_string(),
         })
+    }
+
+    /// The commands that reach a session are all commands the application registers, and none is
+    /// listed twice.
+    #[test]
+    fn every_session_bound_command_is_a_named_command() {
+        let mut seen = BTreeSet::new();
+        for command in SESSION_BOUND_COMMANDS {
+            assert!(seen.insert(command), "{command} is listed twice");
+            assert!(
+                NAMED_COMMANDS.iter().any(|(name, _)| name == command),
+                "{command} is not a command the application registers"
+            );
+        }
     }
 
     #[test]

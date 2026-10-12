@@ -186,6 +186,17 @@ impl Worker {
         self._runtime.session().attachments().len()
     }
 
+    /// Detaches every attachment the session holds, as the session does for one it ends, so that
+    /// each attachment's subscriber is told it was detached.
+    pub fn detach_attachments(&self) {
+        let mut session = self._runtime.session();
+        for attachment in session.attachments() {
+            session
+                .detach(attachment.attachment_id)
+                .expect("the attachment is held");
+        }
+    }
+
     /// The action target of this session.
     pub fn target(&self, environment_id: EnvironmentId) -> ActionTarget {
         ActionTarget {

@@ -321,24 +321,28 @@ pub struct Kept {
 enum Route {
     /// The host on this machine: the session's worker, over the link held for it.
     Local,
-    /// A host this device is paired with: its daemon forwards the question to the worker, under the
-    /// rights the pairing granted.
+    /// A host this device is paired with: its daemon forwards the question to the worker, over the
+    /// connection the host opened for the session. The connection for the host alone is what
+    /// reads a session's record, and it is `None` while that connection is being taken up again:
+    /// the session's own link does not wait for it.
     Paired {
-        environment_id: EnvironmentId,
-        session: Arc<Session>,
+        main: Option<(EnvironmentId, Arc<Session>)>,
     },
 }
 
 impl Route {
-    /// The route the connection the application has now gives. With no connection the application
-    /// is on its own machine's route, where the worker is reached without the daemon.
+    /// The route the host in use gives. A host this device is paired with is the paired route
+    /// whether or not its connection is up; with no host in use the application is on its own
+    /// machine's route, where the worker is reached without the daemon.
     fn of(state: &AppState) -> Self {
-        match state.paired_snapshot() {
-            Ok((_, environment_id, session)) => Self::Paired {
-                environment_id,
-                session,
-            },
-            Err(_) => Self::Local,
+        if state.paired_context().is_none() {
+            return Self::Local;
+        }
+        Self::Paired {
+            main: state
+                .paired_snapshot()
+                .ok()
+                .map(|(_, environment_id, session)| (environment_id, session)),
         }
     }
 }
@@ -399,7 +403,11 @@ impl<'a> Host<'a> {
                 Ok(environment_id) => Ok(environment_id),
                 Err(_) => Ok(self.link(session_id).await?.ids.environment_id),
             },
-            Route::Paired { environment_id, .. } => Ok(*environment_id),
+            Route::Paired {
+                main: Some((environment_id, _)),
+            } => Ok(*environment_id),
+            // The host's environment is the one the session's own link reaches.
+            Route::Paired { main: None } => Ok(self.link(session_id).await?.ids.environment_id),
         }
     }
 
@@ -422,14 +430,18 @@ impl<'a> Host<'a> {
                     _ => Err(ClientError::ConnectionEnded),
                 }
             }
-            // A screen's opening that is no longer the session's, or a share that has ended, is
-            // the application's own refusal and says so. Anything else that kept a link from
-            // being made is a connection that ended.
+            // On a paired host every refusal is the host's, or the application's own for a screen
+            // that was replaced or a share that has ended, and reaches the person as said: the
+            // library keeps an answer for a code that is only transient. On this machine, a
+            // screen's opening that is no longer the session's, or a share that has ended, is the
+            // application's own refusal, and anything else that kept a link from being made is a
+            // connection that ended.
             Err(error)
-                if matches!(
-                    error.code,
-                    ErrorCode::StaleSession | ErrorCode::PermissionDenied
-                ) =>
+                if matches!(self.route, Route::Paired { .. })
+                    || matches!(
+                        error.code,
+                        ErrorCode::StaleSession | ErrorCode::PermissionDenied
+                    ) =>
             {
                 Err(ClientError::Host(ProtocolError::new(
                     error.code,
@@ -489,12 +501,23 @@ impl QuestionHost for Host<'_> {
         if matches!(self.route, Route::Local) {
             readable_by_this_build(link.build.as_ref(), session_id)?;
         }
+        // Counted in flight until the worker has answered, so that leaving the screen waits for it.
+        let _flying = crate::standing::Flight::enter(link.link());
+        // Under the share the link acts under, which the host checks as it does an agent's mutation.
         let answer = self
-            .within(<Session as QuestionHost>::answer(
-                &link.session,
-                target,
-                params,
-            ))
+            .within(async {
+                link.session
+                    .mutate(
+                        Method::QuestionAnswer,
+                        target,
+                        link.grant_id,
+                        &kr_protocol::envelope::ParamsValue::empty(),
+                        &params,
+                        answers::ANSWER_TTL,
+                    )
+                    .await?
+                    .to_typed::<QuestionResolveResult>()
+            })
             .await;
         let answer = self.settle(session_id, link.link(), answer);
         if let Ok(resolved) = &answer {
@@ -516,7 +539,11 @@ impl QuestionHost for Host<'_> {
                 .state
                 .session()
                 .map_err(|_| ClientError::ConnectionEnded)?,
-            Route::Paired { session, .. } => Arc::clone(session),
+            Route::Paired {
+                main: Some((_, session)),
+            } => Arc::clone(session),
+            // The host's record is the main connection's to read; without it nothing is established.
+            Route::Paired { main: None } => return Err(ClientError::ConnectionEnded),
         };
         let read = self
             .within(session.read::<_, SessionReadResult>(
@@ -691,8 +718,8 @@ pub async fn read(
             let target = target_of(&link);
             Box::new(move |_: &Question| target.clone())
         }
-        Route::Paired { environment_id, .. } => {
-            let environment_id = *environment_id;
+        Route::Paired { .. } => {
+            let environment_id = link.ids.environment_id;
             Box::new(move |question: &Question| target_on(environment_id, question))
         }
     };
