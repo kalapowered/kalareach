@@ -1316,8 +1316,9 @@ impl DeliveryModule {
     /// The exchange is made under an admission of the generation the notification was admitted
     /// under, as the push is, and the admission is let go as soon as the exchange ends. The
     /// deadline is read under it, immediately before the exchange, and the service is asked only
-    /// of a notification with more life left than the longest wait of its own schedule, so nothing
-    /// is placed for one that has expired or that the exchange could cost its push. The caller
+    /// of a notification with more life left than the longest wait of its own schedule and only
+    /// in the attempts the notification may spend on the mailbox, so nothing is placed for one
+    /// that has expired, that the exchange could cost its push, or that has used them. The caller
     /// asks its questions again before it takes a new admission for the send, and a change of
     /// privacy mode that came in between takes the notification back.
     fn place_detail(
@@ -1740,7 +1741,7 @@ impl DeliveryModule {
         // Presented only under an admission of the generation this was admitted under, taken
         // after the renewal and the placement, which wait, and held until the answer is recorded.
         let Some(_admission) = self.admitted(delivery) else {
-            return self.taken_back(delivery, now_ms);
+            return self.taken_back(delivery, clock.now_ms().max(placing.at_ms));
         };
         // The authority question and the admission both wait, on this host's own locks, and the
         // notification's own deadline is read once more, as late as it can be before the send: an
@@ -1988,10 +1989,10 @@ impl DeliveryModule {
 enum Detail {
     /// Nothing is owed, or what was owed is in the mailbox.
     Ready,
-    /// The detail is not placed: the service will not take it, the device has no key to seal it to,
-    /// the object this host kept for it could not be read, or the notification has too little life
-    /// left, or too few attempts, to ask. The push is presented without it, and its record says
-    /// why.
+    /// The detail is not confirmed placed and is not asked for again: the service will not take
+    /// it, the device has no key to seal it to, the object this host kept for it could not be
+    /// read, or the notification has too little life left, or too few attempts, to ask. The push
+    /// is presented without it, and its record says why.
     Missing(String),
     /// Nothing is known to be placed. Whether the push waits for the mailbox is judged by the
     /// caller, at the reading it decides on, with the time the service asked for.
@@ -2009,13 +2010,15 @@ struct Placing {
     /// Whether the service was asked. The exchange waits, so the recipient's authority is asked
     /// about again before anything is presented.
     asked: bool,
-    /// When the exchange ended.
+    /// The latest reading of the clock this step took: when the exchange ended, or when it was
+    /// decided not to ask. It is the floor of the deadline read before the send.
     at_ms: u64,
 }
 
-/// How many attempts at a notification may ask the mailbox, and so wait for it. The rest are the
-/// gateway's: a push that has used them is presented without its detail and without asking, and
-/// still has three attempts at the gateway.
+/// How many attempts at a notification may ask the mailbox. The push waits for the mailbox in all
+/// of them but the last, which sends without the detail if the mailbox still cannot take it, so
+/// the gateway keeps at least the last three attempts. An attempt spent on something else, such
+/// as a renewal that did not happen, counts: one that comes after them does not ask.
 const MAILBOX_ATTEMPTS: u64 = kr_delivery::push::MAX_ATTEMPTS - 3;
 
 /// The longest wait a mailbox service's request for time is honoured for: the longest wait the
@@ -2024,10 +2027,11 @@ const MAILBOX_LONGEST_WAIT_MS: u64 = kr_delivery::push::MAX_BACKOFF_MS;
 
 /// What a notification needs left before this host asks a mailbox about it, or waits for one: the
 /// longest wait its own schedule makes. A pass can be held up by other deliveries and by a slow
-/// renewal, so a shorter room would be spent before the next attempt came. A notification with
-/// no more than this left is presented without its detail at once, and an exchange cannot cost it
-/// its push, because an exchange ends within a request's deadline. A wait can: it is bounded by a
-/// pass that comes on time, which a pass held up by many slow deliveries is not.
+/// renewal, so a shorter room would be spent before the next attempt came. A notification with no
+/// more than this left is presented without its detail at once. One with more is asked about: the
+/// exchange cannot cost it its push, because an exchange ends within a request's deadline, but a
+/// wait can, because it is bounded by a pass that comes on time, which a pass held up by many slow
+/// deliveries is not.
 const MAILBOX_ROOM_MS: u64 = kr_delivery::push::MAX_BACKOFF_MS;
 
 /// When the next attempt at a notification whose detail the mailbox could not take is due, or none
@@ -2042,6 +2046,11 @@ fn mailbox_look(
     at_ms: u64,
     after: Option<std::time::Duration>,
 ) -> Option<u64> {
+    // The attempt after the last one that may ask the mailbox cannot get the detail, so the last
+    // one that may ask does not wait for it.
+    if delivery.attempt >= MAILBOX_ATTEMPTS {
+        return None;
+    }
     let own = kr_delivery::push::next_attempt(
         delivery.notification_id,
         delivery.attempt,
