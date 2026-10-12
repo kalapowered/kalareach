@@ -390,7 +390,8 @@ export class ScriptedRecords {
         manages_host: false,
         platform: 'android',
         grant_expires_at_ms: null,
-        grant_expired: false,
+        // The host counts a revoked device's pairing as run out.
+        grant_expired: true,
         all_sessions: false
       }
     ]

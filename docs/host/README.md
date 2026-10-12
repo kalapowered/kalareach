@@ -5301,8 +5301,8 @@ explicit owner pairing, not a longer invitation.
 The lifetime of a share to a device ends with the end of the corresponding pairing of that device,
 since the pairing defines the boundaries of all its activity. A host shall refuse to share with a
 device that is not paired, that has been revoked, or whose pairing has expired or will expire before
-the requested end of the share. The host shall return the time at which the pairing will end as part
-of the refusal message. The host shall not shorten the share to fit, since the issuer of an
+the requested end of the share. The refusal says how long the pairing has left. The host shall not
+shorten the share to fit, since the issuer of an
 invitation cut short in silence would believe something untrue about it. The determination that a
 pairing has run out is made on the host's settled clock, as admission makes it. A paired device that
 delegates a share and is refused for any of these reasons is given one sentence that says nothing
