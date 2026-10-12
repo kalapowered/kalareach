@@ -1,4 +1,5 @@
-//! A stand-in for the managed storage, backup manifest and authority feed services.
+//! A stand-in for the managed storage, backup manifest, authority feed and mailbox delivery
+//! services.
 //!
 //! The service is the web repository's Worker, and what it answers is stated by that repository's
 //! service contract. This crate answers as the contract states, with the state the service keeps,
@@ -53,11 +54,18 @@
 //! | A feed whose storage failed answers `503 SERVICE_UNAVAILABLE` with `retryAfterSeconds` 2, and a change the feed did not answer is `504 OUTCOME_UNKNOWN` | source only: a local Worker cannot be made to fail | `authority-feed/feed.ts:558-571`, `authority-feed/index.ts:89-93, 153-155` | `Moment::Refuse` |
 //! | One publisher holds at most 32 records the host has not finished with, a feed at most 1,000, and 256 of those are for the keys the host named; past each the answer is `402 QUOTA_EXHAUSTED` | source only: it would make the recording grow with every request | `authority-feed/feed.ts:185-233` | `feed.rs` in this crate |
 //! | A record the host finished with is dropped a week later | source only | `authority-feed/feed.ts:612-618` | `feed.rs` in this crate |
+//! | A delivery names the mailbox it is for by the recipient's stored-envelope key; an envelope routed to another recipient, one the contract's closed schema does not read, and one the protocol's structure check refuses are `400 INVALID_REQUEST` | source only: the Worker's mailbox needs a Durable Object binding a local deployment does not run in this crate's tests | `mailbox/index.ts:90-117`, `mailbox/mailbox.ts:271-275, 1177-1217` | `mailbox.rs` in this crate; the daemon's `a_detail_that_does_not_fit_is_in_the_devices_mailbox_before_the_push_that_refers_to_it` |
+//! | An envelope identifier delivered again with the same item is answered with the state `duplicate` and the position the first delivery was given; with a different item it is `403 FORBIDDEN` | source only | `mailbox/mailbox.ts:236-262` | same; the daemon's `a_delivery_whose_answer_was_lost_is_placed_again_and_stored_once` |
+//! | The newest delivery of a thread replaces the older unread item from the same writer and reports the position it replaced | source only | `mailbox/mailbox.ts:276-298` | `mailbox.rs` in this crate |
+//! | A mailbox holds 1,000 items or 32 MiB and one writer 128 items or 4 MiB, measured after a replacement; past each the answer is `402 QUOTA_EXHAUSTED` | source only | `mailbox/mailbox.ts:892-928` | the daemon's `a_mailbox_that_is_full_does_not_hold_the_push_back` |
+//! | An identifier a mailbox has carried is remembered until the item's expiry and a day more | not modelled: remembered for good, which no test of this crate waits out | `mailbox/mailbox.ts:325-336` | none |
+//! | Claiming, reading and acknowledging a mailbox | not modelled: the device's half, which nothing of this host uses yet | `mailbox/index.ts:127-296` | none |
 //! | Uploads the service has lost answer `NOT_FOUND` | source only | `storage/upload.ts:607` | `Moment::UploadsLost`; the daemon's `an_upload_the_service_lost_or_closed_is_made_again` |
 //! | Storage not confirming the write of a part answers `INTERNAL` and closes the upload | source only | `storage/index.ts:830`, `storage/upload.ts:577` | `Moment::PartWriteFails`; the daemon's `an_upload_the_service_lost_or_closed_is_made_again` |
 
 mod feed;
 mod http;
+mod mailbox;
 mod web;
 
 pub use http::{Served, serve};
