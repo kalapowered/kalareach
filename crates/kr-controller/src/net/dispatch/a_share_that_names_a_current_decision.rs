@@ -2173,6 +2173,58 @@ async fn kr_req_10_51_a_question_read_goes_only_to_a_worker_that_holds_it_to_its
     world.serving.abort();
 }
 
+/// KR-REQ-19.08: a device's read of a session's agent instances goes only to a worker that says it
+/// serves one. A worker of an earlier build answers a method it does not list as it answers a
+/// caller it does not allow, so the daemon cannot tell the two apart from the answer: the read is
+/// refused as an unsupported capability before anything reaches the worker, and reaches a worker
+/// that states the capability, with the device's scope.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_19_08_an_agent_instances_read_goes_only_to_a_worker_that_serves_it() {
+    let asked = |world: &fake::Silent| kr_protocol::recovery::AgentInstancesParams {
+        session_id: world.session_id,
+        agent_resources_from: Nullable::null(),
+    };
+    let mut serving = holds_question_reads();
+    serving
+        .insert(CapabilityId::new(kr_protocol::local::AGENT_INSTANCES_READ).expect("a capability"));
+    for (stated, refused_as) in [
+        (reads_scopes_only(), Some(ErrorCode::UnsupportedCapability)),
+        (serving, None),
+    ] {
+        let (world, holding) = world(Holding::default(), stated).await;
+        let device = scoped_device(&world.controller, 21, 5_000, &[]);
+        let connection = super::RemoteConnection::for_test(&world.controller, device.clone());
+        let answer = connection
+            .read(&device_read(1, Method::AgentInstances, &asked(&world)))
+            .await;
+        let reached: Vec<_> = holding
+            .lock()
+            .expect("held")
+            .forwarded
+            .iter()
+            .map(|forwarded| (forwarded.request.method.method(), forwarded.history.clone()))
+            .collect();
+        match refused_as {
+            Some(code) => {
+                assert_eq!(refused(answer).code, code);
+                assert!(reached.is_empty(), "the read reached no worker");
+            }
+            None => {
+                let _ = answer;
+                assert_eq!(
+                    reached,
+                    vec![(
+                        Some(Method::AgentInstances),
+                        Some(device.grant.history.clone())
+                    )],
+                    "the read reached the worker with the grant's scope"
+                );
+            }
+        }
+        world.serving.abort();
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // KR-REQ-10.51: a real worker, and a device holding the issued grant
 // ---------------------------------------------------------------------------------------------

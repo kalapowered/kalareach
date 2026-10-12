@@ -432,6 +432,11 @@ impl RemoteConnection {
     /// the link is opened under is the grant the connection acts under for that session from then
     /// on ([`Self::fix`]).
     async fn proxy_for(&self, session_id: SessionId, acting: &Acting) -> Result<Arc<WorkerProxy>> {
+        // Every route to a worker passes here, and a connection that serves the host alone has
+        // none: a link would tie it to a session, and the session's own connection ends with its
+        // share while this one must not.
+        self.check_worker_route()
+            .map_err(|error| ControllerError::InvalidArgument(error.message))?;
         let mut held = self.proxy.lock().await;
         // The grant this connection acts under for the session is the one its link was opened
         // under, and a request decided under another is refused here, where the link is.
@@ -598,6 +603,9 @@ impl RemoteConnection {
             Err(_) if answering == Method::SessionClose => return Ok(None),
             Err(error) => return Err(RouteRefusal::Conflict(error)),
         };
+        // A connection that serves the host alone has no route to a worker, and says so rather
+        // than leaving the request to be refused for another reason further on.
+        self.check_worker_route().map_err(RouteRefusal::Conflict)?;
         // A link that cannot be opened is not an answer. The ordinary path decides what this
         // request gets, which for a session whose worker has gone is that session's own refusal
         // rather than a second dispatch.

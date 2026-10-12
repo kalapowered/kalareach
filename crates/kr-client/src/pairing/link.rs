@@ -45,7 +45,7 @@ use super::BoxFuture;
 use super::paired::PairedHost;
 use crate::session::Session;
 use crate::shown::{Said, Shown};
-use crate::transport::NetworkTransport;
+use crate::transport::{ControlTransport, NetworkTransport};
 
 /// Why a call to a host did not answer.
 ///
@@ -153,13 +153,30 @@ pub trait HostLink: Send + Sync {
         identity: &'a LocalIdentity,
     ) -> BoxFuture<'a, Result<Box<dyn Preauth>, LinkError>>;
 
+    /// Connects to a paired host as the device it became, and returns the connection's control
+    /// transport, with no session started on it.
+    ///
+    /// A caller that speaks the protocol through [`Session`] takes [`Self::connect_paired`]; one
+    /// that needs the frames themselves, as a terminal view does, takes the transport and owns
+    /// what it reads.
+    fn connect_paired_transport<'a>(
+        &'a self,
+        host: &'a PairedHost,
+        identity: &'a LocalIdentity,
+    ) -> BoxFuture<'a, Result<Arc<dyn ControlTransport>, LinkError>>;
+
     /// Connects to a paired host as the device it became, and starts a session on the
     /// connection.
     fn connect_paired<'a>(
         &'a self,
         host: &'a PairedHost,
         identity: &'a LocalIdentity,
-    ) -> BoxFuture<'a, Result<Session, LinkError>>;
+    ) -> BoxFuture<'a, Result<Session, LinkError>> {
+        Box::pin(async move {
+            let transport = self.connect_paired_transport(host, identity).await?;
+            Session::start(transport).map_err(|error| LinkError::lost(error.said()))
+        })
+    }
 
     /// Holds the endpoint for `network`, so nothing this device does for another host closes it,
     /// until the hold is dropped.
@@ -508,11 +525,11 @@ impl HostLink for IrohLink {
         })
     }
 
-    fn connect_paired<'a>(
+    fn connect_paired_transport<'a>(
         &'a self,
         host: &'a PairedHost,
         identity: &'a LocalIdentity,
-    ) -> BoxFuture<'a, Result<Session, LinkError>> {
+    ) -> BoxFuture<'a, Result<Arc<dyn ControlTransport>, LinkError>> {
         Box::pin(async move {
             let address = EndpointConfig::from_network_config(&host.network_config)?
                 .peer_addr(&host.host_endpoint_id)?;
@@ -529,7 +546,7 @@ impl HostLink for IrohLink {
                 crate::ClientError::Transport(error) => LinkError::from(error),
                 other => LinkError::lost(other.said()),
             })?;
-            Session::start(Arc::new(transport)).map_err(|error| LinkError::lost(error.said()))
+            Ok(Arc::new(transport) as Arc<dyn ControlTransport>)
         })
     }
 

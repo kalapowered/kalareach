@@ -63,6 +63,7 @@ mod acting;
 mod decision;
 mod forwarding;
 mod narrowing;
+mod opening;
 mod output;
 mod routes;
 
@@ -92,6 +93,10 @@ pub struct RemoteConnection {
     /// The session this connection serves and the grant it acts under for it, fixed when the link
     /// to the session's worker opened ([`Self::fix`]).
     fixed: std::sync::Mutex<Option<(kr_protocol::ids::SessionId, kr_protocol::ids::GrantId)>>,
+    /// What `session.open` scoped this connection to: the host alone, or one session under one
+    /// grant. Unlike `fixed`, it is not cleared when the link to a worker is released, so a
+    /// connection that was opened for a session never serves another.
+    scope: std::sync::Mutex<opening::Scope>,
     /// The end of every share this connection has decided a request under, by the share
     /// ([`Self::grant_ended`] waits for them): the one it opened its worker link under, and any
     /// other a read or a mutation was decided under.
@@ -155,6 +160,7 @@ impl RemoteConnection {
             authority,
             proxy: tokio::sync::Mutex::new(None),
             fixed: std::sync::Mutex::new(None),
+            scope: std::sync::Mutex::new(opening::Scope::Open),
             share_bounds: std::sync::Mutex::new(std::collections::BTreeMap::new()),
             acting_changed: tokio::sync::Notify::new(),
             notifications,
@@ -241,6 +247,7 @@ impl RemoteConnection {
             authority,
             proxy: tokio::sync::Mutex::new(None),
             fixed: std::sync::Mutex::new(None),
+            scope: std::sync::Mutex::new(opening::Scope::Open),
             share_bounds: std::sync::Mutex::new(std::collections::BTreeMap::new()),
             acting_changed: tokio::sync::Notify::new(),
             notifications,

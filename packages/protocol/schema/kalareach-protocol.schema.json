@@ -1719,6 +1719,51 @@
       ],
       "type": "object"
     },
+    "AgentInstancesParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `agent.instances`.",
+      "properties": {
+        "agent_resources_from": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AgentResourceSnapshotContinuation"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Which page of the agent resources to read, as `events.snapshot` takes it."
+        },
+        "session_id": {
+          "$ref": "#/$defs/SessionId",
+          "description": "The session whose agents are read."
+        }
+      },
+      "required": [
+        "session_id",
+        "agent_resources_from"
+      ],
+      "type": "object"
+    },
+    "AgentInstancesResult": {
+      "additionalProperties": false,
+      "description": "The result of `agent.instances`: the two parts of a snapshot a view needs to find a session's\nagents, and nothing of the screen, the geometry, the input lease or the attachments.\n\nA view of a conversation needs to know which agent instances the session has and which\nrequests of theirs wait on a person. A grant that holds the session without its live screen is\nrefused the snapshot that carries both, because the snapshot also carries the screen's state,\nand this read carries none of it.",
+      "properties": {
+        "agent_instances": {
+          "$ref": "#/$defs/AgentInstanceList",
+          "description": "The session's live agent instances."
+        },
+        "agent_resources": {
+          "$ref": "#/$defs/AgentResourceSnapshot",
+          "description": "One page of the agent resources this session's host still arbitrates."
+        }
+      },
+      "required": [
+        "agent_resources",
+        "agent_instances"
+      ],
+      "type": "object"
+    },
     "AgentMutationResult": {
       "additionalProperties": false,
       "description": "What one accepted agent mutation did.",
@@ -21037,6 +21082,11 @@
           "type": "string"
         },
         {
+          "const": "session.open",
+          "description": "Open a paired connection for one session under one grant, or for the host alone. The connection then serves that session and grant, or the host's own reads, and nothing else; the answer carries the rights the host decided the open with, or says the share has ended.",
+          "type": "string"
+        },
+        {
           "const": "session.close",
           "description": "Close a session and hand its final metadata to the archive service.",
           "type": "string"
@@ -21404,6 +21454,11 @@
         {
           "const": "events.snapshot",
           "description": "Take a filtered snapshot and the cursor it was taken at, after RESYNC_REQUIRED.",
+          "type": "string"
+        },
+        {
+          "const": "agent.instances",
+          "description": "Read a session's live agent instances and the requests of theirs that wait on a person, without the screen, the geometry, the input lease or the attachments.",
           "type": "string"
         },
         {
@@ -22795,6 +22850,21 @@
         "last_synchronised_at_ms"
       ],
       "type": "object"
+    },
+    "OpenedVia": {
+      "description": "Which of a device's grants a connection acts under.",
+      "oneOf": [
+        {
+          "const": "pairing",
+          "description": "The grant the device's pairing recorded.",
+          "type": "string"
+        },
+        {
+          "const": "share",
+          "description": "A share issued to the device and redeemed by it.",
+          "type": "string"
+        }
+      ]
     },
     "OperationRecord": {
       "additionalProperties": false,
@@ -34918,6 +34988,142 @@
       ],
       "type": "object"
     },
+    "SessionOpenParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `session.open`.",
+      "properties": {
+        "grant_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GrantId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The share the connection acts under for the session. Null is the device's pairing grant,\nand a share is never chosen on a device's behalf. A grant is named only with a session."
+        },
+        "session_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SessionId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The session this connection is opened for. Null opens the connection for the host: it then\nserves the host's own reads and no session's worker."
+        }
+      },
+      "required": [
+        "session_id",
+        "grant_id"
+      ],
+      "type": "object"
+    },
+    "SessionOpenResult": {
+      "description": "The result of `session.open`.\n\nA share that has ended is an answer and not an error, because the device is entitled to know\nthat the share it asked to act under is over. The host says so only on proof: a refusal of any\nother kind, a share the device never redeemed, a right the host's configuration removed and a\nclock the host does not trust are refusals with their own codes, and none of them is reported\nas an end.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "The connection now acts under the grant the host decided.",
+          "properties": {
+            "actions": {
+              "description": "The rights the host decided the request with: the grant intersected with the host's\npolicy and configured ceiling, not the grant as it was issued.",
+              "items": {
+                "$ref": "#/$defs/ActionRight"
+              },
+              "type": "array",
+              "uniqueItems": true
+            },
+            "ends_at_ms": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/TimestampMs"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "When the grant is scheduled to end: the earlier of its own expiry and the pairing's.\nIt is not the time a revoked share ended."
+            },
+            "environment_id": {
+              "$ref": "#/$defs/EnvironmentId",
+              "description": "The environment the connection serves."
+            },
+            "grant_id": {
+              "$ref": "#/$defs/GrantId",
+              "description": "The grant the connection acts under."
+            },
+            "history_from_ms": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/TimestampMs"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "The moment the grant's history reaches back to, when it reaches any."
+            },
+            "includes_live_screen": {
+              "description": "Whether the grant reaches the session's live screen.",
+              "type": "boolean"
+            },
+            "session": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/SessionSummary"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "The session, as `session.read` shows it. Null for the host scope."
+            },
+            "state": {
+              "const": "in_force",
+              "type": "string"
+            },
+            "via": {
+              "$ref": "#/$defs/OpenedVia",
+              "description": "Whether that is the pairing grant or a share."
+            }
+          },
+          "required": [
+            "state",
+            "session",
+            "environment_id",
+            "grant_id",
+            "via",
+            "actions",
+            "includes_live_screen",
+            "history_from_ms",
+            "ends_at_ms"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The share is over.",
+          "properties": {
+            "reason": {
+              "$ref": "#/$defs/ShareEnd",
+              "description": "Why."
+            },
+            "state": {
+              "const": "ended",
+              "type": "string"
+            }
+          },
+          "required": [
+            "state",
+            "reason"
+          ],
+          "type": "object"
+        }
+      ]
+    },
     "SessionReadParams": {
       "additionalProperties": false,
       "description": "Parameters of `session.read`.",
@@ -35320,6 +35526,21 @@
         "closure"
       ],
       "type": "object"
+    },
+    "ShareEnd": {
+      "description": "Why a share the device holds is no longer in force.",
+      "oneOf": [
+        {
+          "const": "revoked",
+          "description": "Someone with the authority to withdraw it did.",
+          "type": "string"
+        },
+        {
+          "const": "expired",
+          "description": "Its time ran out, and the host has the end on record.",
+          "type": "string"
+        }
+      ]
     },
     "ShareKey": {
       "additionalProperties": false,
@@ -40818,6 +41039,12 @@
     "agent_instance_summary": {
       "$ref": "#/$defs/AgentInstanceSummary"
     },
+    "agent_instances_params": {
+      "$ref": "#/$defs/AgentInstancesParams"
+    },
+    "agent_instances_result": {
+      "$ref": "#/$defs/AgentInstancesResult"
+    },
     "agent_mutation_result": {
       "$ref": "#/$defs/AgentMutationResult"
     },
@@ -42446,6 +42673,12 @@
     },
     "session_list_result": {
       "$ref": "#/$defs/SessionListResult"
+    },
+    "session_open_params": {
+      "$ref": "#/$defs/SessionOpenParams"
+    },
+    "session_open_result": {
+      "$ref": "#/$defs/SessionOpenResult"
     },
     "session_read_params": {
       "$ref": "#/$defs/SessionReadParams"

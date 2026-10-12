@@ -188,6 +188,10 @@ export type CommandBypassReason =
   | 'session_closing'
   | 'flags_conflict'
 /**
+ * One pending resource the broker arbitrates and resolves exactly once.
+ */
+export type PendingResourceId = string
+/**
  * Prompt or steering text carried inline. The normative bound is 65536 bytes of UTF-8; maxLength counts characters and is therefore a necessary rather than a sufficient condition.
  */
 export type PromptText = string
@@ -213,10 +217,6 @@ export type AgentResourceContentClass =
  * A stable host-issued principal for one verified actor. The caller cannot assert it.
  */
 export type ActorId = string
-/**
- * One pending resource the broker arbitrates and resolves exactly once.
- */
-export type PendingResourceId = string
 /**
  * One change an installation makes, with its inverse implied by its kind.
  */
@@ -2142,6 +2142,60 @@ export type DescriptionPause =
   | 'not_downloaded'
   | 'inference_failed'
 /**
+ * The result of `session.open`.
+ *
+ * A share that has ended is an answer and not an error, because the device is entitled to know
+ * that the share it asked to act under is over. The host says so only on proof: a refusal of any
+ * other kind, a share the device never redeemed, a right the host's configuration removed and a
+ * clock the host does not trust are refusals with their own codes, and none of them is reported
+ * as an end.
+ */
+export type SessionOpenResult =
+  | {
+      /**
+       * The rights the host decided the request with: the grant intersected with the host's
+       * policy and configured ceiling, not the grant as it was issued.
+       */
+      actions: ActionRight[]
+      /**
+       * When the grant is scheduled to end: the earlier of its own expiry and the pairing's.
+       * It is not the time a revoked share ended.
+       */
+      ends_at_ms: TimestampMs | null
+      /**
+       * One installed OS, distribution or container environment and OS user.
+       */
+      environment_id: string
+      /**
+       * One host-issued authority object.
+       */
+      grant_id: string
+      /**
+       * The moment the grant's history reaches back to, when it reaches any.
+       */
+      history_from_ms: TimestampMs | null
+      /**
+       * Whether the grant reaches the session's live screen.
+       */
+      includes_live_screen: boolean
+      /**
+       * The session, as `session.read` shows it. Null for the host scope.
+       */
+      session: SessionSummary2 | null
+      state: 'in_force'
+      /**
+       * Whether that is the pairing grant or a share.
+       */
+      via: 'pairing' | 'share'
+    }
+  | {
+      /**
+       * Why.
+       */
+      reason: 'revoked' | 'expired'
+      state: 'ended'
+    }
+/**
  * One relay URL, discovery origin or direct-address hint: printable ASCII without spaces, 1 to 253 bytes.
  */
 export type NetworkHint = string
@@ -2247,12 +2301,14 @@ export interface KalaReachProtocol {
   agent_instance_event?: AgentInstanceEvent
   agent_instance_list?: AgentInstanceList
   agent_instance_summary?: AgentInstanceSummary1
+  agent_instances_params?: AgentInstancesParams
+  agent_instances_result?: AgentInstancesResult
   agent_mutation_result?: AgentMutationResult1
   agent_prompt_params?: AgentPromptParams
   agent_resource_cause?: AgentResourceCause
   agent_resource_content_class?: AgentResourceContentClass
   agent_resource_event?: AgentResourceEvent
-  agent_resource_snapshot?: AgentResourceSnapshot
+  agent_resource_snapshot?: AgentResourceSnapshot1
   agent_resource_snapshot_continuation?: AgentResourceSnapshotContinuation
   agent_snapshot_params?: AgentSnapshotParams
   agent_snapshot_result?: AgentSnapshotResult
@@ -2793,6 +2849,8 @@ export interface KalaReachProtocol {
   session_detach_result?: SessionDetachResult
   session_list_params?: SessionListParams
   session_list_result?: SessionListResult
+  session_open_params?: SessionOpenParams
+  session_open_result?: SessionOpenResult
   session_read_params?: SessionReadParams
   session_read_result?: SessionReadResult
   session_ref?: SessionRef
@@ -4437,162 +4495,65 @@ export interface AgentInstanceSummary1 {
   started_at: string
 }
 /**
- * What one accepted agent mutation did.
+ * Parameters of `agent.instances`.
  */
-export interface AgentMutationResult1 {
+export interface AgentInstancesParams {
   /**
-   * Changes when the active upstream execution owner or selected thread changes.
+   * Which page of the agent resources to read, as `events.snapshot` takes it.
    */
-  binding_revision: string
-  /**
-   * How it reached the upstream.
-   */
-  provenance: 'upstream_typed_rpc' | 'authenticated_hook_response' | 'terminal_input'
-  /**
-   * The turn it applies to, where the upstream names one.
-   */
-  turn_id: AgentTurnId | null
-  /**
-   * The upstream's own identifier for it, where the upstream gave one.
-   */
-  upstream_request_id: UpstreamRequestId | null
-}
-/**
- * Parameters of `agent.prompt.submit` and `agent.prompt.queue`.
- */
-export interface AgentPromptParams {
-  /**
-   * The draft to submit, when the prompt has attachments or was composed elsewhere.
-   */
-  draft_id: DraftId | null
-  target: AgentMutationTarget2
-  /**
-   * The prompt itself, when it is short enough to travel inline.
-   */
-  text: PromptText | null
-}
-/**
- * What the prompt acts on.
- */
-export interface AgentMutationTarget2 {
-  /**
-   * Changes when the active upstream execution owner or selected thread changes.
-   */
-  binding_revision: string
-  subject: AgentSubject1
-}
-/**
- * One committed broker transition, as an attached view is told about it.
- *
- * Section 12 fans resolutions out to every authorised observer and section 24 makes the
- * transition and its event one record. This is the shape that record takes on the way to a view:
- * what changed, what it became, and where the change sits in the broker's own ordered stream, so
- * a view that missed one can see that it did.
- */
-export interface AgentResourceEvent {
-  /**
-   * The actor whose action caused it, where one did.
-   */
-  actor_id: ActorId | null
-  /**
-   * One foreground application within a terminal session.
-   */
-  application_instance_id: string
-  /**
-   * Changes when the active upstream execution owner or selected thread changes.
-   */
-  binding_revision: string
-  /**
-   * The upstream request this resource belongs to, which is the root of its causal chain.
-   */
-  causal_root: string
-  /**
-   * Which of the broker's paths decided it.
-   */
-  cause:
-    | 'recorded'
-    | 'interpreted'
-    | 'rich_claim'
-    | 'dispatched'
-    | 'rich_answer'
-    | 'native_answer'
-    | 'host_answer'
-    | 'upstream'
-    | 'reconciliation'
-  /**
-   * What class of content the resource holds, which is section 24's content classification.
-   */
-  content: 'metadata' | 'terminal_content' | 'authored_content' | 'application_notice' | 'secret'
-  /**
-   * Whether its history is durable or lived through an evidence gap.
-   */
-  durability: 'durable' | 'volatile'
-  /**
-   * The event itself, which never changes and never repeats.
-   */
-  event_id: string
-  /**
-   * The previous event about this same resource, where there is one.
-   */
-  parent_sequence: U64 | null
-  /**
-   * The resource.
-   */
-  resource_id: string
-  /**
-   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
-   */
-  sequence: string
+  agent_resources_from: AgentResourceSnapshotContinuation | null
   /**
    * One KalaReach terminal session.
    */
   session_id: string
+}
+/**
+ * Where a paged agent-resource snapshot continues, and which snapshot it continues.
+ *
+ * It names the snapshot it follows rather than the position that snapshot was taken at, because
+ * one connection can abandon a recovery and start another at the same position: a host changes
+ * what a page carries without moving its stream, so two snapshots of one position can hold
+ * different states. A host that no longer holds the named snapshot answers `RESYNC_REQUIRED`,
+ * and the client takes a fresh one from its first page.
+ */
+export interface AgentResourceSnapshotContinuation {
   /**
-   * What it became.
+   * The `continue_after` of the page this continues.
    */
-  state: 'pending' | 'claimed' | 'resolved' | 'cancelled' | 'expired' | 'uncertain'
+  after_resource_id: string
   /**
    * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
-  stream_generation: string
+  snapshot_id: string
 }
 /**
- * One page of the agent resources a view installs when it starts or resynchronises.
+ * The result of `agent.instances`: the two parts of a snapshot a view needs to find a session's
+ * agents, and nothing of the screen, the geometry, the input lease or the attachments.
  *
- * A view is told what changed, one transition at a time, and a view whose queue overflowed was
- * told to discard what it held. Neither of those is a way back to the truth on its own: the
- * events it missed are gone from its queue, and what it still holds is a partial history. This is
- * the way back. It is taken at one position of the broker's stream, and together its pages hold
- * every resource the broker is still arbitrating at that position.
- *
- * # Why it is paged
- *
- * How many resources a host arbitrates is decided by how long the session ran and how much its
- * upstreams asked of it, so a state carried whole is a state that eventually does not fit the
- * control frame it has to travel in. A subscription that cannot deliver the state cannot restore
- * the view, which is exactly the failure the state exists to prevent. So a page is bounded by
- * what one frame carries, `continue_after` names where the next page starts, and
- * [`AgentResourceSnapshotContinuation`] asks for it.
- *
- * # What makes the pages one state
- *
- * The host copies the state when it cuts the first page, and every later page of that snapshot
- * is cut from the copy. So the pages are one state taken at one position however busy the host
- * is meanwhile, and a client never assembles a half of one state onto a half of another. The
- * copy is kept for the connection that asked, and only until its last page is read, its
- * connection goes, or its deadline passes; a continuation of a copy that has ended is answered
- * `RESYNC_REQUIRED`, and the client starts a fresh snapshot, which always succeeds.
- *
- * # How it meets the events
- *
- * The two fit together at exactly one place. Everything this describes happened at or before
- * `cursor`, and every transition committed after this snapshot was taken carries a higher
- * position. What arrives afterwards is not ordered by that, though: an event committed earlier
- * can still be in flight and reach the view after this does. So a view installs the resources
- * here and then, within the same `stream_generation`, applies the events whose `sequence` is
- * above `cursor` and discards the rest. That gives it the whole stream with nothing counted
- * twice. An event of another generation belongs to another run of the host and is not comparable
- * with this position at all: the view installs a fresh snapshot for it.
+ * A view of a conversation needs to know which agent instances the session has and which
+ * requests of theirs wait on a person. A grant that holds the session without its live screen is
+ * refused the snapshot that carries both, because the snapshot also carries the screen's state,
+ * and this read carries none of it.
+ */
+export interface AgentInstancesResult {
+  agent_instances: AgentInstanceList1
+  agent_resources: AgentResourceSnapshot
+}
+/**
+ * The session's live agent instances.
+ */
+export interface AgentInstanceList1 {
+  /**
+   * Every instance of the session that has not ended, in identifier order.
+   */
+  instances: AgentInstanceSummary1[]
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  sequence: string
+}
+/**
+ * One page of the agent resources this session's host still arbitrates.
  */
 export interface AgentResourceSnapshot {
   /**
@@ -4696,23 +4657,187 @@ export interface DownstreamRequestId {
   upstream: string
 }
 /**
- * Where a paged agent-resource snapshot continues, and which snapshot it continues.
- *
- * It names the snapshot it follows rather than the position that snapshot was taken at, because
- * one connection can abandon a recovery and start another at the same position: a host changes
- * what a page carries without moving its stream, so two snapshots of one position can hold
- * different states. A host that no longer holds the named snapshot answers `RESYNC_REQUIRED`,
- * and the client takes a fresh one from its first page.
+ * What one accepted agent mutation did.
  */
-export interface AgentResourceSnapshotContinuation {
+export interface AgentMutationResult1 {
+  /**
+   * Changes when the active upstream execution owner or selected thread changes.
+   */
+  binding_revision: string
+  /**
+   * How it reached the upstream.
+   */
+  provenance: 'upstream_typed_rpc' | 'authenticated_hook_response' | 'terminal_input'
+  /**
+   * The turn it applies to, where the upstream names one.
+   */
+  turn_id: AgentTurnId | null
+  /**
+   * The upstream's own identifier for it, where the upstream gave one.
+   */
+  upstream_request_id: UpstreamRequestId | null
+}
+/**
+ * Parameters of `agent.prompt.submit` and `agent.prompt.queue`.
+ */
+export interface AgentPromptParams {
+  /**
+   * The draft to submit, when the prompt has attachments or was composed elsewhere.
+   */
+  draft_id: DraftId | null
+  target: AgentMutationTarget2
+  /**
+   * The prompt itself, when it is short enough to travel inline.
+   */
+  text: PromptText | null
+}
+/**
+ * What the prompt acts on.
+ */
+export interface AgentMutationTarget2 {
+  /**
+   * Changes when the active upstream execution owner or selected thread changes.
+   */
+  binding_revision: string
+  subject: AgentSubject1
+}
+/**
+ * One committed broker transition, as an attached view is told about it.
+ *
+ * Section 12 fans resolutions out to every authorised observer and section 24 makes the
+ * transition and its event one record. This is the shape that record takes on the way to a view:
+ * what changed, what it became, and where the change sits in the broker's own ordered stream, so
+ * a view that missed one can see that it did.
+ */
+export interface AgentResourceEvent {
+  /**
+   * The actor whose action caused it, where one did.
+   */
+  actor_id: ActorId | null
+  /**
+   * One foreground application within a terminal session.
+   */
+  application_instance_id: string
+  /**
+   * Changes when the active upstream execution owner or selected thread changes.
+   */
+  binding_revision: string
+  /**
+   * The upstream request this resource belongs to, which is the root of its causal chain.
+   */
+  causal_root: string
+  /**
+   * Which of the broker's paths decided it.
+   */
+  cause:
+    | 'recorded'
+    | 'interpreted'
+    | 'rich_claim'
+    | 'dispatched'
+    | 'rich_answer'
+    | 'native_answer'
+    | 'host_answer'
+    | 'upstream'
+    | 'reconciliation'
+  /**
+   * What class of content the resource holds, which is section 24's content classification.
+   */
+  content: 'metadata' | 'terminal_content' | 'authored_content' | 'application_notice' | 'secret'
+  /**
+   * Whether its history is durable or lived through an evidence gap.
+   */
+  durability: 'durable' | 'volatile'
+  /**
+   * The event itself, which never changes and never repeats.
+   */
+  event_id: string
+  /**
+   * The previous event about this same resource, where there is one.
+   */
+  parent_sequence: U64 | null
   /**
    * One pending resource the broker arbitrates and resolves exactly once.
    */
-  after_resource_id: string
+  resource_id: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  sequence: string
+  /**
+   * One KalaReach terminal session.
+   */
+  session_id: string
+  /**
+   * What it became.
+   */
+  state: 'pending' | 'claimed' | 'resolved' | 'cancelled' | 'expired' | 'uncertain'
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  stream_generation: string
+}
+/**
+ * One page of the agent resources a view installs when it starts or resynchronises.
+ *
+ * A view is told what changed, one transition at a time, and a view whose queue overflowed was
+ * told to discard what it held. Neither of those is a way back to the truth on its own: the
+ * events it missed are gone from its queue, and what it still holds is a partial history. This is
+ * the way back. It is taken at one position of the broker's stream, and together its pages hold
+ * every resource the broker is still arbitrating at that position.
+ *
+ * # Why it is paged
+ *
+ * How many resources a host arbitrates is decided by how long the session ran and how much its
+ * upstreams asked of it, so a state carried whole is a state that eventually does not fit the
+ * control frame it has to travel in. A subscription that cannot deliver the state cannot restore
+ * the view, which is exactly the failure the state exists to prevent. So a page is bounded by
+ * what one frame carries, `continue_after` names where the next page starts, and
+ * [`AgentResourceSnapshotContinuation`] asks for it.
+ *
+ * # What makes the pages one state
+ *
+ * The host copies the state when it cuts the first page, and every later page of that snapshot
+ * is cut from the copy. So the pages are one state taken at one position however busy the host
+ * is meanwhile, and a client never assembles a half of one state onto a half of another. The
+ * copy is kept for the connection that asked, and only until its last page is read, its
+ * connection goes, or its deadline passes; a continuation of a copy that has ended is answered
+ * `RESYNC_REQUIRED`, and the client starts a fresh snapshot, which always succeeds.
+ *
+ * # How it meets the events
+ *
+ * The two fit together at exactly one place. Everything this describes happened at or before
+ * `cursor`, and every transition committed after this snapshot was taken carries a higher
+ * position. What arrives afterwards is not ordered by that, though: an event committed earlier
+ * can still be in flight and reach the view after this does. So a view installs the resources
+ * here and then, within the same `stream_generation`, applies the events whose `sequence` is
+ * above `cursor` and discards the rest. That gives it the whole stream with nothing counted
+ * twice. An event of another generation belongs to another run of the host and is not comparable
+ * with this position at all: the view installs a fresh snapshot for it.
+ */
+export interface AgentResourceSnapshot1 {
+  /**
+   * The resource this page ends at, when the state continues past it.
+   *
+   * Null says the snapshot is complete. Otherwise the rest is asked for with an
+   * [`AgentResourceSnapshotContinuation`] naming this identifier.
+   */
+  continue_after: PendingResourceId | null
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  cursor: string
+  /**
+   * The resources this page carries, in identifier order.
+   */
+  resources: PendingResource[]
   /**
    * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   snapshot_id: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  stream_generation: string
 }
 /**
  * Parameters of `agent.snapshot`.
@@ -14653,8 +14778,8 @@ export interface EventsSnapshotParams {
  * write, no notification and no query.
  */
 export interface EventsSnapshotResult {
-  agent_instances: AgentInstanceList1
-  agent_resources: AgentResourceSnapshot1
+  agent_instances: AgentInstanceList2
+  agent_resources: AgentResourceSnapshot2
   /**
    * Every current attachment, in join order.
    */
@@ -14681,7 +14806,7 @@ export interface EventsSnapshotResult {
  * A resynchronised view installs them and applies the announcements above
  * [`crate::projection::AgentInstanceList::sequence`] that its stream still delivers.
  */
-export interface AgentInstanceList1 {
+export interface AgentInstanceList2 {
   /**
    * Every instance of the session that has not ended, in identifier order.
    */
@@ -14699,7 +14824,7 @@ export interface AgentInstanceList1 {
  * of the requests waiting on a person. The page named by `agent_resources_from` is returned,
  * so the same call that takes the snapshot also reads the rest of it.
  */
-export interface AgentResourceSnapshot1 {
+export interface AgentResourceSnapshot2 {
   /**
    * The resource this page ends at, when the state continues past it.
    *
@@ -14860,8 +14985,8 @@ export interface EventsSubscribeParams {
  * The result of `events.subscribe`.
  */
 export interface EventsSubscribeResult {
-  agent_instances: AgentInstanceList2
-  agent_resources: AgentResourceSnapshot2
+  agent_instances: AgentInstanceList3
+  agent_resources: AgentResourceSnapshot3
   /**
    * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
@@ -14887,7 +15012,7 @@ export interface EventsSubscribeResult {
  * sequence says which: a view applies the announcements above
  * [`crate::projection::AgentInstanceList::sequence`] and discards the rest.
  */
-export interface AgentInstanceList2 {
+export interface AgentInstanceList3 {
   /**
    * Every instance of the session that has not ended, in identifier order.
    */
@@ -14911,7 +15036,7 @@ export interface AgentInstanceList2 {
  * [`crate::projection::AgentResourceSnapshot::continue_after`] is present the rest is read
  * with `events.snapshot` before the events are applied.
  */
-export interface AgentResourceSnapshot2 {
+export interface AgentResourceSnapshot3 {
   /**
    * The resource this page ends at, when the state continues past it.
    *
@@ -17848,6 +17973,7 @@ export interface MethodEntry {
     | 'session.list'
     | 'session.create'
     | 'session.read'
+    | 'session.open'
     | 'session.close'
     | 'session.describe'
     | 'session.rename'
@@ -17922,6 +18048,7 @@ export interface MethodEntry {
     | 'host.clock.establish'
     | 'events.subscribe'
     | 'events.snapshot'
+    | 'agent.instances'
     | 'history.page'
     | 'action.read'
     | 'grant.create'
@@ -26719,6 +26846,7 @@ export interface ServiceRequestPayload {
     | 'session.list'
     | 'session.create'
     | 'session.read'
+    | 'session.open'
     | 'session.close'
     | 'session.describe'
     | 'session.rename'
@@ -26793,6 +26921,7 @@ export interface ServiceRequestPayload {
     | 'host.clock.establish'
     | 'events.subscribe'
     | 'events.snapshot'
+    | 'agent.instances'
     | 'history.page'
     | 'action.read'
     | 'grant.create'
@@ -27467,6 +27596,21 @@ export interface SessionListResult {
    * The sessions, in display-number order.
    */
   sessions: SessionSummary2[]
+}
+/**
+ * Parameters of `session.open`.
+ */
+export interface SessionOpenParams {
+  /**
+   * The share the connection acts under for the session. Null is the device's pairing grant,
+   * and a share is never chosen on a device's behalf. A grant is named only with a session.
+   */
+  grant_id: GrantId | null
+  /**
+   * The session this connection is opened for. Null opens the connection for the host: it then
+   * serves the host's own reads and no session's worker.
+   */
+  session_id: SessionId | null
 }
 /**
  * Parameters of `session.read`.

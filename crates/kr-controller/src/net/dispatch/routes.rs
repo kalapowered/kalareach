@@ -103,6 +103,8 @@ pub(super) enum DeviceRead {
     /// device is the one this connection authenticated as, and nothing in the request names a
     /// device.
     Held,
+    /// `session.open`: scopes the connection and says under what ([`RemoteConnection::session_open`]).
+    Opening,
     /// `session.describe`: the session's name from the environment's metadata store, filtered for
     /// this device. Generated text is answered only when the grant's history reaches back to the
     /// session's start, because a description can summarise anything the session did.
@@ -149,6 +151,7 @@ impl DeviceRead {
             | Method::AgentSnapshot
             | Method::AgentCommands
             | Method::AgentApprovalInspect
+            | Method::AgentInstances
             | Method::QuestionRead => Self::Worker,
             Method::WorkflowRead => Self::Workflow,
             Method::VoiceContext | Method::VoicePrepare => Self::Voice,
@@ -156,6 +159,7 @@ impl DeviceRead {
             Method::GrantList => Self::Grants,
             Method::GrantHeld => Self::Held,
             Method::SessionDescribe => Self::Description,
+            Method::SessionOpen => Self::Opening,
             Method::UploadStatus | Method::DownloadBegin | Method::DownloadChunk => {
                 Self::Refused(Unserved::Transfer)
             }
@@ -282,6 +286,11 @@ impl RemoteConnection {
             Ok(validated) => validated,
             Err(error) => return failure(request.request_id, error),
         };
+        // An open decides its own request: it names the grant to act under, which a generic
+        // decision cannot, and its answer may be that the share is over.
+        if entry.method == Method::SessionOpen {
+            return self.session_open(request, entry, asked).await;
+        }
         // An `action.read` that names an action only is decided over the session the action was
         // performed on, so what the decision carries at the write boundary is the authority over
         // that session.
@@ -456,6 +465,16 @@ impl RemoteConnection {
                     }),
                     Err(error) => failure(request.request_id, error.to_protocol_error()),
                 }
+            }
+            // Answered before the routes are read, so a request cannot arrive here.
+            DeviceRead::Opening => {
+                return failure(
+                    request.request_id,
+                    ProtocolError::new(
+                        ErrorCode::InvalidArgument,
+                        "session.open is answered before it is routed",
+                    ),
+                );
             }
             DeviceRead::Refused(unserved) => {
                 return failure(request.request_id, unserved.refusal(entry));
@@ -723,6 +742,11 @@ impl RemoteConnection {
             // link is also what asks the worker for the acknowledgement a dispatch lease needs,
             // which a device closing a session it never attached to has not caused yet.
             Method::SessionClose => {
+                // A close opens a link of its own to the worker, so the route is refused here,
+                // before it claims an action, on a connection that serves the host alone.
+                if let Err(error) = self.check_worker_route() {
+                    return failure(mutation.request_id, error);
+                }
                 let Some(session_id) = mutation.target.session_id.as_ref().copied() else {
                     return failure(
                         mutation.request_id,

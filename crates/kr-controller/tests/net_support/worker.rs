@@ -10,6 +10,7 @@
 use std::sync::Arc;
 
 use kr_controller::registry::{Registry, WorkerRecord};
+use kr_controller::service::Clocks;
 use kr_crypto::keys::DeviceKeys;
 use kr_crypto::store::open_store_in;
 use kr_ipc::endpoint::Listener;
@@ -368,8 +369,32 @@ impl Adopted {
     /// Starts a daemon on a fresh environment, bootstraps its owner, stops it, starts `sessions`
     /// workers on the tree and starts the daemon again, which adopts them.
     pub async fn start(sessions: u64) -> Self {
+        Self::start_on(sessions, None, Clocks::system()).await
+    }
+
+    /// As [`Self::start`], for a host whose configuration is `document`.
+    pub async fn start_with_document(
+        sessions: u64,
+        document: &kr_protocol::hostinfo::configuration::ConfigurationDocument,
+    ) -> Self {
+        Self::start_on(sessions, Some(document), Clocks::system()).await
+    }
+
+    /// As [`Self::start`], on the clocks a suite moves by hand.
+    pub async fn start_on_clocks(sessions: u64, clocks: Clocks) -> Self {
+        Self::start_on(sessions, None, clocks).await
+    }
+
+    async fn start_on(
+        sessions: u64,
+        document: Option<&kr_protocol::hostinfo::configuration::ConfigurationDocument>,
+        clocks: Clocks,
+    ) -> Self {
         let owner = DeviceKeys::generate().expect("owner keys");
-        let host = Host::start(&owner).await;
+        let host = match document {
+            Some(document) => Host::start_with_document_clocks(&owner, document, clocks).await,
+            None => Host::start_on_clocks(&owner, clocks).await,
+        };
         let stopped = host.shut_down().await;
         let mut workers = Vec::new();
         for display in 1..=sessions {
@@ -422,4 +447,68 @@ impl Adopted {
     pub async fn stop(self) {
         self.host.stop().await;
     }
+}
+
+/// Shares `session_id` with the device `record` names, as the person at this machine does, under
+/// `selection`, and has that device redeem it. Returns the grant.
+pub async fn share(
+    host: &Host,
+    session_id: SessionId,
+    device: &super::Device,
+    record: &kr_controller::service::net::devices::DeviceRecord,
+    selection: kr_protocol::sharing::RoleSelection,
+) -> kr_protocol::grant::Grant {
+    let created: kr_protocol::sharing::GrantCreateResult = host
+        .client()
+        .await
+        .mutate(
+            Method::GrantCreate,
+            kr_protocol::ids::ActionId::new(kr_ipc::new_uuid()),
+            super::on_the_session(host, session_id),
+            &kr_protocol::sharing::GrantCreateParams {
+                session_id,
+                recipient_device_id: record.device_id,
+                parent_grant_id: Nullable::null(),
+                accepted_notices: kr_protocol::sharing::AuthorityNotice::for_actions(
+                    &selection.actions(),
+                ),
+                selection,
+                lifetime_ms: Nullable::null(),
+                owner_confirmation: Nullable::null(),
+            },
+        )
+        .await
+        .expect("the call reaches the daemon")
+        .expect("the share is written")
+        .to_typed()
+        .expect("decodes");
+    let connection = super::RawDevice::connect(host, device, record).await;
+    connection
+        .mutate(
+            Method::GrantRedeem,
+            kr_protocol::ids::ActionId::new(kr_ipc::new_uuid()),
+            super::on_the_host(host),
+            &kr_protocol::sharing::GrantRedeemParams {
+                invitation_id: created.preview.invitation_id,
+            },
+        )
+        .await
+        .expect("the share is redeemed");
+    connection.close();
+    created.grant
+}
+
+/// Withdraws a grant, as the person at this machine does.
+pub async fn revoke(host: &Host, grant_id: kr_protocol::ids::GrantId) {
+    host.client()
+        .await
+        .mutate(
+            Method::GrantRevoke,
+            kr_protocol::ids::ActionId::new(kr_ipc::new_uuid()),
+            super::on_the_host(host),
+            &kr_protocol::sharing::GrantRevokeParams { grant_id },
+        )
+        .await
+        .expect("the call reaches the daemon")
+        .expect("the grant is revoked");
 }

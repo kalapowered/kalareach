@@ -969,6 +969,53 @@ fn the_required_methods_of_the_specification_table_are_all_listed() {
         );
     }
 
+    // A phone that holds a session reaches it over its paired connection. `session.open` scopes a
+    // paired connection to one session under one grant, or to the host alone, and is a paired
+    // device's alone; the host alone needs no session, so it asks for session.view only when a
+    // session is named. `agent.instances` is the part of a snapshot a view of an agent needs, and
+    // carries none of the screen, so a grant without the live screen is served it.
+    let phone = [
+        ("session.open", EffectClass::Read, MethodGroup::Sessions),
+        (
+            "agent.instances",
+            EffectClass::Read,
+            MethodGroup::StateRecovery,
+        ),
+    ];
+    for (name, effect, group) in phone {
+        let entry = lookup(name).unwrap_or_else(|| panic!("{name} is missing from the registry"));
+        assert_eq!(entry.effect, effect, "{name} carries its own effect class");
+        assert_eq!(entry.group, group, "{name} belongs to its own group");
+    }
+    assert_eq!(
+        lookup("session.open").expect("listed").ingress,
+        &[ActorIngress::PairedDevice],
+        "only a paired device opens a connection for a session"
+    );
+    assert_eq!(
+        lookup("session.open").expect("listed").required_rights,
+        &[RequiredRight::basis(
+            RequiredAuthority::PresentViewAuthority
+        )],
+        "an open asks for session.view when it names a session, and for nothing without one"
+    );
+    let instances = lookup("agent.instances").expect("listed");
+    assert_eq!(
+        instances.required_rights,
+        &[RequiredRight::right(ActionRight::SessionView)],
+        "the agents of a session are read under session.view"
+    );
+    assert_eq!(
+        instances.ingress,
+        &[ActorIngress::LocalIpc, ActorIngress::PairedDevice],
+        "the agents are read at the local door and by a paired device, never by a workflow"
+    );
+    assert_eq!(
+        instances.history_filter,
+        HistoryFilter::GrantLowerBound,
+        "what a view of the agents shows is narrowed to the grant's history"
+    );
+
     assert_eq!(
         REGISTRY.len(),
         required.len()
@@ -992,7 +1039,8 @@ fn the_required_methods_of_the_specification_table_are_all_listed() {
             + clock.len()
             + organisation.len()
             + 1
-            + inspection.len(),
+            + inspection.len()
+            + phone.len(),
         "the registry holds the required methods and the named additions"
     );
 }

@@ -179,6 +179,9 @@ impl RemoteConnection {
         claims_geometry: bool,
         named: Option<kr_protocol::ids::GrantId>,
     ) -> std::result::Result<Asked, ProtocolError> {
+        // A connection opened for one session refuses another before anything is decided for it,
+        // so the grant that would have been chosen for the other session is never read.
+        self.check_session_scope(session_id)?;
         // Voice acts under the voice grant the device holds, which the voice coordinator selects
         // for itself, and never under a share.
         let acting = if crate::voice::VoiceModule::serves(entry.method) {
@@ -599,6 +602,9 @@ impl RemoteConnection {
                 "this device's grant has expired",
             ));
         }
+        // A connection opened for something holds every request to it, whichever way the request
+        // reached this decision.
+        self.check_scope(session_id, acting)?;
         let request = crate::grants::AccessRequest {
             method: entry.method,
             ingress: ActorIngress::PairedDevice,

@@ -197,8 +197,9 @@ use crate::receipt::{
     ReceiptResponse,
 };
 use crate::recovery::{
-    EventsSnapshotParams, EventsSnapshotResult, EventsSubscribeParams, EventsSubscribeResult,
-    HistoryPageParams, HistoryPageResult, OutputEvent, ResyncRequired,
+    AgentInstancesParams, AgentInstancesResult, EventsSnapshotParams, EventsSnapshotResult,
+    EventsSubscribeParams, EventsSubscribeResult, HistoryPageParams, HistoryPageResult,
+    OutputEvent, ResyncRequired,
 };
 use crate::relay::{
     RelayConsumptionAck, RelayConsumptionReport, RelayLeaseAck, RelayLeaseRequest,
@@ -216,8 +217,8 @@ use crate::semantic::SemanticContinuation;
 use crate::service::ServiceRequestSignature;
 use crate::session::{
     ClosureRecord, SessionCloseParams, SessionCloseResult, SessionCreateParams,
-    SessionCreateResult, SessionListParams, SessionListResult, SessionReadParams,
-    SessionReadResult, SessionSummary,
+    SessionCreateResult, SessionListParams, SessionListResult, SessionOpenParams,
+    SessionOpenResult, SessionReadParams, SessionReadResult, SessionSummary,
 };
 use crate::sharing::{
     AuthorityFeedStatus, DeviceKeysCompleteParams, DeviceKeysCompleteResult, DeviceKeysDeclaration,
@@ -304,6 +305,8 @@ pub fn protocol_schema() -> Value {
         "agent_commands_params" => AgentCommandsParams,
         "agent_commands_result" => AgentCommandsResult,
         "agent_instance_event" => AgentInstanceEvent,
+        "agent_instances_params" => AgentInstancesParams,
+        "agent_instances_result" => AgentInstancesResult,
         "agent_instance_list" => AgentInstanceList,
         "agent_instance_summary" => AgentInstanceSummary,
         "agent_mutation_result" => AgentMutationResult,
@@ -596,6 +599,8 @@ pub fn protocol_schema() -> Value {
         "session_detach_result" => SessionDetachResult,
         "session_list_params" => SessionListParams,
         "session_list_result" => SessionListResult,
+        "session_open_params" => SessionOpenParams,
+        "session_open_result" => SessionOpenResult,
         "session_read_params" => SessionReadParams,
         "session_read_result" => SessionReadResult,
         "session_ref" => SessionRef,

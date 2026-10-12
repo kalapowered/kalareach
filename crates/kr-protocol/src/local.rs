@@ -331,6 +331,25 @@ pub fn reads_revision_reach(capabilities: &CanonicalSet<CapabilityId>) -> bool {
         .any(|capability| capability.as_str() == AUTHORITY_REVISION_REACH)
 }
 
+/// The capability a worker states when it serves `agent.instances`, and a control daemon reads
+/// before it sends one.
+///
+/// A worker of an earlier build answers a method it does not list as it answers a caller it does
+/// not allow, so a daemon cannot tell the two apart from the answer. A daemon sends the read only
+/// to a worker that states this, and refuses it for any other. A worker can outlive the daemon
+/// that started it, so the statement is kept until no such worker can be reached by a daemon of
+/// this build.
+pub const AGENT_INSTANCES_READ: &str = "agent.instances/1";
+
+/// Returns true when a worker's statement says it serves `agent.instances`
+/// ([`AGENT_INSTANCES_READ`]).
+#[must_use]
+pub fn serves_agent_instances(capabilities: &CanonicalSet<CapabilityId>) -> bool {
+    capabilities
+        .iter()
+        .any(|capability| capability.as_str() == AGENT_INSTANCES_READ)
+}
+
 /// The kind of grant a forwarded `session.attach` was decided under, which decides how much of the
 /// session's screen the attachment is drawn.
 ///

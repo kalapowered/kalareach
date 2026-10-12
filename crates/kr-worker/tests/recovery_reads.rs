@@ -54,8 +54,8 @@ use kr_protocol::method::{Method, MethodVersion};
 use kr_protocol::projection::AgentResourceSnapshotContinuation;
 use kr_protocol::receipt::{ActionReadParams, ActionReadResult};
 use kr_protocol::recovery::{
-    EventStream, EventsSnapshotParams, EventsSnapshotResult, EventsSubscribeParams,
-    EventsSubscribeResult, HistoryGapCause,
+    AgentInstancesParams, AgentInstancesResult, EventStream, EventsSnapshotParams,
+    EventsSnapshotResult, EventsSubscribeParams, EventsSubscribeResult, HistoryGapCause,
 };
 use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::{Digest256, Nullable, TimestampMs, U64, Uuid};
@@ -828,6 +828,101 @@ async fn kr_req_23_48_a_devices_snapshot_is_held_to_its_grants_present_view() {
     assert_eq!(
         shown, late,
         "the device is shown what its grant reaches, and nothing older"
+    );
+}
+
+/// `agent.instances` is the two parts of a snapshot a view of an agent needs, and holds them to the
+/// same scope: the instances the session has, and the resources that wait on a person, cut to what
+/// the reader's grant reaches. It carries nothing of the screen, and a reader that is not the local
+/// owner and arrives with no scope is refused rather than shown everything.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_19_08_the_agent_instances_are_the_snapshots_two_members_under_the_same_scope() {
+    let host = host().await;
+    let early: BTreeSet<PendingResourceId> =
+        (0..3).map(|index| arrive(&host, 1_000 + index)).collect();
+    let late: BTreeSet<PendingResourceId> =
+        (0..2).map(|index| arrive(&host, 5_000 + index)).collect();
+    host.runtime
+        .session()
+        .announce_instance(kr_protocol::projection::AgentInstanceSummary {
+            application_instance_id: instance(),
+            plugin_id: Nullable::null(),
+            profile_id: Nullable::null(),
+            mode: IntegrationMode::Gateway,
+            bypass: Nullable::null(),
+            started_at: TimestampMs::new(1),
+            ended_at: Nullable::null(),
+            refusal: Nullable::null(),
+        });
+    let snapshot_params = EventsSnapshotParams {
+        session_id: host.session_id,
+        agent_resources_from: Nullable::null(),
+    };
+    let instances_params = AgentInstancesParams {
+        session_id: host.session_id,
+        agent_resources_from: Nullable::null(),
+    };
+
+    // The owner is shown what the snapshot shows, in the two members the read keeps.
+    let mut window = owner(&host, ReceiveLimits::default()).await;
+    let snapshot: EventsSnapshotResult = within(
+        "the snapshot",
+        window.request(Method::EventsSnapshot, &snapshot_params),
+    )
+    .await
+    .expect("the call reaches the worker")
+    .expect("a snapshot")
+    .to_typed()
+    .expect("decodes");
+    let instances: AgentInstancesResult = within(
+        "the instances",
+        window.request(Method::AgentInstances, &instances_params),
+    )
+    .await
+    .expect("the call reaches the worker")
+    .expect("the agent instances")
+    .to_typed()
+    .expect("decodes");
+    assert_eq!(instances.agent_instances, snapshot.agent_instances);
+    assert_eq!(instances.agent_instances.instances.len(), 1);
+    let resource_ids = |resources: &kr_protocol::projection::AgentResourceSnapshot| {
+        resources
+            .resources
+            .iter()
+            .map(|resource| resource.resource_id)
+            .collect::<BTreeSet<_>>()
+    };
+    assert_eq!(
+        resource_ids(&instances.agent_resources),
+        early.union(&late).copied().collect::<BTreeSet<_>>()
+    );
+    assert_eq!(
+        resource_ids(&instances.agent_resources),
+        resource_ids(&snapshot.agent_resources)
+    );
+
+    // A paired device, forwarded with the scope of its grant, is shown what that scope reaches.
+    let mut daemon = daemon(&host).await;
+    let answer = forwarded(
+        &mut daemon,
+        Some(reaching_back_to(3_000)),
+        Method::AgentInstances,
+        &instances_params,
+    )
+    .await
+    .expect("the device's agents are answered");
+    let shown: AgentInstancesResult = answer.to_typed().expect("decodes");
+    assert_eq!(resource_ids(&shown.agent_resources), late);
+    assert_eq!(shown.agent_instances.instances.len(), 1);
+
+    // With no scope, a caller that is not the local owner is shown nothing.
+    let refused = forwarded(&mut daemon, None, Method::AgentInstances, &instances_params)
+        .await
+        .expect_err("a reader with no scope is refused");
+    assert_eq!(
+        refused.code,
+        kr_protocol::error::ErrorCode::UnsupportedCapability,
+        "{refused:?}"
     );
 }
 

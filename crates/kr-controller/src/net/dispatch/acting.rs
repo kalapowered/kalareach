@@ -136,6 +136,37 @@ impl RemoteConnection {
         }
     }
 
+    /// The grant a connection is opened for `session_id` under, and the record of it when it is a
+    /// share.
+    ///
+    /// A null grant is the device's pairing grant, whatever shares admit the session: opening a
+    /// connection never selects a share on the device's behalf. A named grant has to be one this
+    /// device holds for the session and has redeemed; one it has not redeemed, one that is
+    /// another device's, a voice grant and one whose selectors do not admit the session all read
+    /// as a grant the device does not hold.
+    ///
+    /// # Errors
+    ///
+    /// Refuses a grant this device does not hold for the session.
+    pub(super) fn acting_to_open(
+        &self,
+        session_id: SessionId,
+        named: Option<GrantId>,
+    ) -> std::result::Result<(Acting, Option<GrantRecord>), ProtocolError> {
+        let Some(named) = named.filter(|named| *named != self.device.grant.grant_id) else {
+            return Ok((Acting::pairing(&self.device.grant), None));
+        };
+        let record = self.share_record(named)?;
+        if !record.is_active() || !self.admits(&record.grant, session_id) {
+            return Err(not_held());
+        }
+        let acting = Acting {
+            grant: record.grant.clone(),
+            held: Held::Share,
+        };
+        Ok((acting, Some(record)))
+    }
+
     /// The grant this connection acts under, once `acting` has opened its link to `session_id`.
     ///
     /// Taken under the lock that guards the link, so two requests that open it at once do not fix

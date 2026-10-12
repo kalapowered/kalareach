@@ -2759,11 +2759,11 @@ mod tests {
             Box::pin(async move { Ok(Box::new(surface) as Box<dyn Preauth>) })
         }
 
-        fn connect_paired<'a>(
+        fn connect_paired_transport<'a>(
             &'a self,
             _host: &'a PairedHost,
             _identity: &'a LocalIdentity,
-        ) -> BoxFuture<'a, Result<crate::session::Session, LinkError>> {
+        ) -> BoxFuture<'a, Result<Arc<dyn crate::transport::ControlTransport>, LinkError>> {
             unreachable!("the host commits nothing")
         }
 

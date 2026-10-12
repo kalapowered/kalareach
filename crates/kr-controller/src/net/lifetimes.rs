@@ -54,6 +54,15 @@ pub enum Anchored {
     Over,
 }
 
+/// Why a stored grant has ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GrantEnd {
+    /// It was revoked.
+    Revoked,
+    /// It ran out, and the end is on record.
+    Expired,
+}
+
 /// Whether a grant is in force now, on both of its deadlines.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GrantStanding {
@@ -451,6 +460,66 @@ impl GrantLifetimes {
         } else {
             GrantStanding::OutOfForce
         })
+    }
+
+    /// Returns why a stored grant has ended, when there is proof that it has, and `None` while it
+    /// is in force.
+    ///
+    /// Not being in force proves nothing about an end: an untrusted clock reads as out of force,
+    /// and an end that is not written down yet reads as unrecorded. So the record is read first,
+    /// and an end is answered only from what is on record. A revocation is on the grant's record
+    /// and is read before anything that needs a clock. An expiry is on record as the grant's
+    /// tombstone; one this finds is written down before it is answered, and a write that cannot be
+    /// made is the transient refusal it is, never an end. A trusted clock alone never says
+    /// "expired".
+    ///
+    /// # Errors
+    ///
+    /// Returns `CLOCK_UNTRUSTED` while the clock cannot say, `STORAGE_UNAVAILABLE` while an end
+    /// found is not written down, and an error when the store cannot be read or written.
+    pub fn stored_end(
+        &self,
+        store: &GrantDirectory,
+        record: &GrantRecord,
+    ) -> Result<Option<GrantEnd>> {
+        let grant_id = record.grant.grant_id;
+        if record.revoked_at_ms.is_some() {
+            return Ok(Some(GrantEnd::Revoked));
+        }
+        if store.grant_expired_at(grant_id)?.is_some() {
+            return Ok(Some(GrantEnd::Expired));
+        }
+        match self.stored_standing(store, record)? {
+            GrantStanding::InForce => Ok(None),
+            GrantStanding::Unrecorded => Err(crate::grants::store::unrecorded()),
+            GrantStanding::OutOfForce => {
+                if store.grant_expired_at(grant_id)?.is_some() {
+                    Ok(Some(GrantEnd::Expired))
+                } else {
+                    Err(ControllerError::ClockUntrusted {
+                        detail: format!(
+                            "{}, so it cannot say whether this grant has run out",
+                            crate::grants::CLOCK_DISTRUSTED
+                        ),
+                    })
+                }
+            }
+        }
+    }
+
+    /// When a stored grant stops serving its holder, in UTC milliseconds: the earlier of its own
+    /// expiry and the expiry of the pairing it is held through, or `None` when neither expires.
+    ///
+    /// It is the time the grant is scheduled to end, not the time a revoked grant ended.
+    #[must_use]
+    pub fn effective_end_ms(record: &GrantRecord, pairing: &Grant) -> Option<u64> {
+        [record.grant.expiry, pairing.expiry]
+            .into_iter()
+            .filter_map(|expiry| match expiry {
+                GrantExpiry::At { expires_at_ms } => Some(expires_at_ms.get()),
+                GrantExpiry::Never => None,
+            })
+            .min()
     }
 
     /// Records that a stored grant was found to have run out, for the grant store to write down.

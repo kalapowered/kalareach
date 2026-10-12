@@ -51,8 +51,8 @@ use kr_protocol::local::{
 };
 use kr_protocol::method::{Method, MethodVersion};
 use kr_protocol::recovery::{
-    EventsSnapshotParams, EventsSubscribeParams, EventsSubscribeResult, HistoryPageParams,
-    OutputEvent,
+    AgentInstancesParams, AgentInstancesResult, EventsSnapshotParams, EventsSubscribeParams,
+    EventsSubscribeResult, HistoryPageParams, OutputEvent,
 };
 use kr_protocol::scalars::{AuthorisationKey, CanonicalSet, Nonce256, Nullable, U64};
 use kr_protocol::session::{
@@ -2656,6 +2656,7 @@ impl WorkerService {
                     kr_protocol::local::FORWARDED_SCREEN_BASIS,
                     kr_protocol::local::AUTHORITY_REVISION_REACH,
                     kr_protocol::local::LOCAL_ACCESS,
+                    kr_protocol::local::AGENT_INSTANCES_READ,
                 ]
                 .into_iter()
                 .filter_map(|capability| kr_protocol::ids::CapabilityId::new(capability).ok()),
@@ -4131,6 +4132,7 @@ impl WorkerService {
             Method::SessionRead => self.session_read(&request.params, caller),
             Method::SessionScreenPreview => self.session_screen_preview(&request.params, caller),
             Method::EventsSnapshot => self.events_snapshot(state, &request.params, caller),
+            Method::AgentInstances => self.agent_instances(state, &request.params, caller),
             Method::HistoryPage => self.history_page(state, &request.params, caller),
             Method::EventsSubscribe => self.events_subscribe(state, &request.params, caller),
             Method::ActionRead => self.action_read(state, caller, &request.params),
@@ -6558,6 +6560,66 @@ impl WorkerService {
             session.hold_resources(attachment_id, state.connection_id, filter, cursor, shown);
         }
         Ok(encoded)
+    }
+
+    /// Serves `agent.instances`: the session's live agent instances and one page of the agent
+    /// resources that wait on a person, and nothing of the screen.
+    ///
+    /// The instances and the resources are the two parts of [`Self::events_snapshot`] a view of an
+    /// agent's conversation needs. They are paged and filtered exactly as that read pages and
+    /// filters them, so a continuation names the copy a first page was cut from. The read replaces
+    /// nothing a subscription holds: it is a read of present state and takes no part in the
+    /// subscription's moment.
+    ///
+    /// A caller that is not the local owner and arrives with no history scope is refused, as every
+    /// read narrowed to a grant's scope is, because an unfiltered resource page would show it
+    /// everything the session holds.
+    fn agent_instances(
+        &self,
+        state: &ConnectionState,
+        params: &ParamsValue,
+        caller: &Caller,
+    ) -> Result<ParamsValue> {
+        let params: AgentInstancesParams = parse(params)?;
+        let session = self.runtime.session();
+        Self::check_session(&session, params.session_id)?;
+        Self::history_of(caller, Method::AgentInstances, "the agent instances")?;
+        let instances = session.agent_instances();
+        let bounds = Self::recovery_bounds(
+            state,
+            Self::answer_bytes(&AgentInstancesResult {
+                agent_resources: Self::no_resources(),
+                agent_instances: instances.clone(),
+            }),
+        )?;
+        let page = match params.agent_resources_from.as_ref() {
+            None => {
+                let filter = Self::resource_filter(caller, Method::AgentInstances, || {
+                    kr_ipc::now_ms().get()
+                });
+                self.begin_recovery(state, bounds, filter.as_ref()).page
+            }
+            Some(from) => self
+                .recoveries
+                .resume(
+                    state.connection_id,
+                    from.snapshot_id.get(),
+                    from.after_resource_id,
+                    self.clock.now(),
+                    bounds,
+                )
+                .ok_or_else(|| WorkerError::ResyncRequired {
+                    detail: "the page this continues has ended, so the rest of it is no longer \
+                             readable: read again from the first page"
+                        .to_owned(),
+                })?,
+        };
+        let answer = AgentInstancesResult {
+            agent_resources: Self::agent_resource_snapshot(page),
+            agent_instances: instances,
+        };
+        Self::within_the_frame(state, &answer)?;
+        encode(&answer)
     }
 
     /// Returns how much of a recovery one page may carry, or refuses the peer outright.

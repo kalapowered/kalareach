@@ -879,6 +879,16 @@ methods! {
     confirmation: None, idempotency: READ,
     doc: "Read one session's filtered metadata and current state.";
 
+    SessionOpen = "session.open", Sessions,
+    effect: Read, ingress: [PairedDevice], rights: [basis(PresentViewAuthority)],
+    selectors: [Session],
+    history: NotApplicable, capability: NO_CAPABILITY, freshness: CurrentAuthority,
+    confirmation: None, idempotency: READ,
+    doc: "Open a paired connection for one session under one grant, or for the host alone. The \
+          connection then serves that session and grant, or the host's own reads, and nothing \
+          else; the answer carries the rights the host decided the open with, or says the share \
+          has ended.";
+
     SessionClose = "session.close", Sessions,
     effect: Write, ingress: [LocalIpc, PairedDevice, Workflow], rights: [req(SessionClose)],
     selectors: [Session],
@@ -1433,6 +1443,14 @@ methods! {
     history: GrantLowerBound, capability: NO_CAPABILITY, freshness: CurrentAuthority,
     confirmation: None, idempotency: READ,
     doc: "Take a filtered snapshot and the cursor it was taken at, after RESYNC_REQUIRED.";
+
+    AgentInstances = "agent.instances", StateRecovery,
+    effect: Read, ingress: [LocalIpc, PairedDevice], rights: [req(SessionView)],
+    selectors: [Session],
+    history: GrantLowerBound, capability: NO_CAPABILITY, freshness: CurrentAuthority,
+    confirmation: None, idempotency: READ,
+    doc: "Read a session's live agent instances and the requests of theirs that wait on a \
+          person, without the screen, the geometry, the input lease or the attachments.";
 
     HistoryPage = "history.page", StateRecovery,
     effect: Read, ingress: [LocalIpc, PairedDevice, Workflow], rights: [req(SessionView)],

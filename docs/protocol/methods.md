@@ -129,6 +129,7 @@ links to its document.
 | `session.list` | read | `local_ipc`, `paired_device`, `workflow` | List the sessions this actor may observe. |  |
 | `session.create` | write | `local_ipc`, `paired_device`, `workflow` | Create a session. Deduplication happens in the controller before a worker exists. |  |
 | `session.read` | read | `local_ipc`, `paired_device`, `workflow` | Read one session's filtered metadata and current state. |  |
+| `session.open` | read | `paired_device` | Open a paired connection for one session under one grant, or for the host alone. The connection then serves that session and grant, or the host's own reads, and nothing else; the answer carries the rights the host decided the open with, or says the share has ended. | [Host: Grants, sharing and revocation](../host/README.md) |
 | `session.close` | write | `local_ipc`, `paired_device`, `workflow` | Close a session and hand its final metadata to the archive service. |  |
 | `session.describe` | read | `local_ipc`, `paired_device`, `workflow` | An authorised read of filtered session metadata, not arbitrary model control. |  |
 | `session.rename` | write | `local_ipc`, `paired_device`, `workflow` | Set a session's pinned label. |  |
@@ -273,6 +274,7 @@ links to its document.
 | --- | --- | --- | --- | --- |
 | `events.subscribe` | read | `local_ipc`, `paired_device`, `workflow` | Subscribe to an event stream from a cursor. |  |
 | `events.snapshot` | read | `local_ipc`, `paired_device`, `workflow` | Take a filtered snapshot and the cursor it was taken at, after RESYNC_REQUIRED. |  |
+| `agent.instances` | read | `local_ipc`, `paired_device` | Read a session's live agent instances and the requests of theirs that wait on a person, without the screen, the geometry, the input lease or the attachments. |  |
 | `history.page` | read | `local_ipc`, `paired_device`, `workflow` | Page retained history. A history request never creates a worker. |  |
 | `action.read` | read | `local_ipc`, `paired_device`, `workflow` | Read a retained receipt. Owning the identifier is not enough: present view authority over the subject the receipt names is checked before it is returned, so a device that lost its scope cannot retrieve protected information through an old action identifier. A receipt for a host effect resolves against that host scope, not against a session. |  |
 

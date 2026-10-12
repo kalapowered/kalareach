@@ -1,6 +1,6 @@
 {
   "description": "One exhaustive authority entry per method. Anything not listed is denied. Generated from crates/kr-protocol; do not edit by hand.",
-  "method_count": 179,
+  "method_count": 181,
   "methods": [
     {
       "capability": "none",
@@ -2021,6 +2021,31 @@
         "session"
       ],
       "summary": "Read one session's filtered metadata and current state.",
+      "version": 1
+    },
+    {
+      "capability": "none",
+      "confirmation": "none",
+      "effect": "read",
+      "freshness": "current_authority",
+      "group": "sessions",
+      "history_filter": "not_applicable",
+      "idempotency": "idempotent_read",
+      "ingress": [
+        "paired_device"
+      ],
+      "method": "session.open",
+      "name": "session.open",
+      "required_rights": [
+        {
+          "authority": "present_view_authority",
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "session"
+      ],
+      "summary": "Open a paired connection for one session under one grant, or for the host alone. The connection then serves that session and grant, or the host's own reads, and nothing else; the answer carries the rights the host decided the open with, or says the share has ended.",
       "version": 1
     },
     {
@@ -4460,6 +4485,36 @@
         "event_stream"
       ],
       "summary": "Take a filtered snapshot and the cursor it was taken at, after RESYNC_REQUIRED.",
+      "version": 1
+    },
+    {
+      "capability": "none",
+      "confirmation": "none",
+      "effect": "read",
+      "freshness": "current_authority",
+      "group": "state_recovery",
+      "history_filter": "grant_lower_bound",
+      "idempotency": "idempotent_read",
+      "ingress": [
+        "local_ipc",
+        "paired_device"
+      ],
+      "method": "agent.instances",
+      "name": "agent.instances",
+      "required_rights": [
+        {
+          "authority": {
+            "right": {
+              "right": "session.view"
+            }
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "session"
+      ],
+      "summary": "Read a session's live agent instances and the requests of theirs that wait on a person, without the screen, the geometry, the input lease or the attachments.",
       "version": 1
     },
     {

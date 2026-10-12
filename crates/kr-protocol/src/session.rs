@@ -12,8 +12,9 @@ use schemars::{JsonSchema, Schema, SchemaGenerator};
 use serde::{Deserialize, Serialize};
 
 use crate::identity::{DesktopBinding, ProcessStartIdentity, WorkerProfile};
-use crate::ids::{EnvironmentId, SessionEpoch, SessionId};
-use crate::scalars::{Nullable, TimestampMs, U64};
+use crate::ids::{EnvironmentId, GrantId, SessionEpoch, SessionId};
+use crate::rights::ActionRight;
+use crate::scalars::{CanonicalSet, Nullable, TimestampMs, U64};
 
 /// The local alias a person types instead of a session UUID.
 ///
@@ -950,6 +951,80 @@ pub struct SessionListParams {
 pub struct SessionListResult {
     /// The sessions, in display-number order.
     pub sessions: Vec<SessionSummary>,
+}
+
+/// Parameters of `session.open`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SessionOpenParams {
+    /// The session this connection is opened for. Null opens the connection for the host: it then
+    /// serves the host's own reads and no session's worker.
+    pub session_id: Nullable<SessionId>,
+    /// The share the connection acts under for the session. Null is the device's pairing grant,
+    /// and a share is never chosen on a device's behalf. A grant is named only with a session.
+    pub grant_id: Nullable<GrantId>,
+}
+
+/// Which of a device's grants a connection acts under.
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum OpenedVia {
+    /// The grant the device's pairing recorded.
+    Pairing,
+    /// A share issued to the device and redeemed by it.
+    Share,
+}
+
+/// Why a share the device holds is no longer in force.
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum ShareEnd {
+    /// Someone with the authority to withdraw it did.
+    Revoked,
+    /// Its time ran out, and the host has the end on record.
+    Expired,
+}
+
+/// The result of `session.open`.
+///
+/// A share that has ended is an answer and not an error, because the device is entitled to know
+/// that the share it asked to act under is over. The host says so only on proof: a refusal of any
+/// other kind, a share the device never redeemed, a right the host's configuration removed and a
+/// clock the host does not trust are refusals with their own codes, and none of them is reported
+/// as an end.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SessionOpenResult {
+    /// The connection now acts under the grant the host decided.
+    InForce {
+        /// The session, as `session.read` shows it. Null for the host scope.
+        session: Nullable<SessionSummary>,
+        /// The environment the connection serves.
+        environment_id: EnvironmentId,
+        /// The grant the connection acts under.
+        grant_id: GrantId,
+        /// Whether that is the pairing grant or a share.
+        via: OpenedVia,
+        /// The rights the host decided the request with: the grant intersected with the host's
+        /// policy and configured ceiling, not the grant as it was issued.
+        actions: CanonicalSet<ActionRight>,
+        /// Whether the grant reaches the session's live screen.
+        includes_live_screen: bool,
+        /// The moment the grant's history reaches back to, when it reaches any.
+        history_from_ms: Nullable<TimestampMs>,
+        /// When the grant is scheduled to end: the earlier of its own expiry and the pairing's.
+        /// It is not the time a revoked share ended.
+        ends_at_ms: Nullable<TimestampMs>,
+    },
+    /// The share is over.
+    Ended {
+        /// Why.
+        reason: ShareEnd,
+    },
 }
 
 /// Parameters of `session.read`.

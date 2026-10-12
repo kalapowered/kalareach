@@ -393,6 +393,18 @@ impl Controller {
             .is_some()
     }
 
+    /// The grants a connection has decided a request under, so a revocation of any of them
+    /// reaches it. A connection that is not registered has none.
+    pub(crate) fn noted_grants(
+        &self,
+        connection_id: ConnectionId,
+    ) -> std::collections::BTreeSet<kr_protocol::ids::GrantId> {
+        self.admitted_table()
+            .get(&connection_id)
+            .map(|registration| registration.acting.clone())
+            .unwrap_or_default()
+    }
+
     /// Withdraws one connection's registration.
     pub(super) fn deregister(&self, connection_id: ConnectionId) {
         self.admitted_table().remove(&connection_id);

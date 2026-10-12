@@ -32,7 +32,7 @@ use kr_client::pairing::owner::{
 };
 use kr_client::pairing::paired::{AttemptMode, PairedHost, PairedHosts};
 use kr_client::pairing::room::{RoomError, RoomSocket};
-use kr_client::session::Session;
+use kr_client::transport::ControlTransport;
 use kr_controller::service::net::config::NetworkSettings;
 use kr_crypto::keys::DeviceKeys;
 use kr_crypto::store::MemoryStore;
@@ -668,11 +668,11 @@ impl HostLink for WatchedLink {
         })
     }
 
-    fn connect_paired<'a>(
+    fn connect_paired_transport<'a>(
         &'a self,
         host: &'a PairedHost,
         identity: &'a LocalIdentity,
-    ) -> BoxFuture<'a, Result<Session, LinkError>> {
+    ) -> BoxFuture<'a, Result<Arc<dyn ControlTransport>, LinkError>> {
         self.paired_connects.fetch_add(1, Ordering::SeqCst);
         if self.severed.load(Ordering::SeqCst) {
             return Box::pin(async { Err(severed()) });
@@ -684,7 +684,7 @@ impl HostLink for WatchedLink {
             if self.sever_paired {
                 return Err(severed());
             }
-            self.inner.connect_paired(host, identity).await
+            self.inner.connect_paired_transport(host, identity).await
         })
     }
 

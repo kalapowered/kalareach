@@ -23,7 +23,7 @@ use kr_controller::service::net::devices::DeviceRecord;
 use kr_crypto::keys::DeviceKeys;
 use kr_protocol::envelope::{ActionTarget, ParamsValue};
 use kr_protocol::error::ErrorCode;
-use kr_protocol::ids::{ActionId, BuildId, EnvironmentId};
+use kr_protocol::ids::{ActionId, EnvironmentId};
 use kr_protocol::method::Method;
 use kr_protocol::question::{
     Question, QuestionAnswer, QuestionAnswerParams, QuestionCancelParams, QuestionResolveResult,
@@ -38,14 +38,6 @@ use net_support::{Device, Host, RawDevice, pair_with, proposal};
 
 /// How long a test waits for the daemon to reach the worker.
 const PATIENCE: Duration = Duration::from_secs(60);
-
-fn build() -> BuildId {
-    BuildId::new("kr-test/0").expect("a build identifier")
-}
-
-fn now() -> TimestampMs {
-    kr_ipc::now_ms()
-}
 
 // ---------------------------------------------------------------------------------------------
 // The daemon that adopts a worker in this process

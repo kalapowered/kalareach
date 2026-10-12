@@ -213,6 +213,32 @@ pub struct EventsSnapshotResult {
     pub agent_instances: crate::projection::AgentInstanceList,
 }
 
+/// Parameters of `agent.instances`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AgentInstancesParams {
+    /// The session whose agents are read.
+    pub session_id: SessionId,
+    /// Which page of the agent resources to read, as `events.snapshot` takes it.
+    pub agent_resources_from: Nullable<crate::projection::AgentResourceSnapshotContinuation>,
+}
+
+/// The result of `agent.instances`: the two parts of a snapshot a view needs to find a session's
+/// agents, and nothing of the screen, the geometry, the input lease or the attachments.
+///
+/// A view of a conversation needs to know which agent instances the session has and which
+/// requests of theirs wait on a person. A grant that holds the session without its live screen is
+/// refused the snapshot that carries both, because the snapshot also carries the screen's state,
+/// and this read carries none of it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AgentInstancesResult {
+    /// One page of the agent resources this session's host still arbitrates.
+    pub agent_resources: crate::projection::AgentResourceSnapshot,
+    /// The session's live agent instances.
+    pub agent_instances: crate::projection::AgentInstanceList,
+}
+
 /// Maximum bytes one history page may carry.
 pub const MAX_HISTORY_PAGE_BYTES: u64 = 1024 * 1024;
 

@@ -240,6 +240,11 @@ pub struct WorkerProxy {
     /// Whether the worker said, in the same answer, that it reads the screen basis of an attach
     /// and draws the attachment the screen that grant allows.
     reads_the_screen_basis: bool,
+    /// Whether the worker said, in the same answer, that it serves `agent.instances`.
+    ///
+    /// A worker of an earlier build answers a method it does not list as it answers a caller it
+    /// does not allow, so the read goes only to a worker that says this.
+    serves_agent_instances: bool,
 }
 
 /// Whom this link owes an answer, and whether it can still give one.
@@ -329,6 +334,8 @@ impl WorkerProxy {
             kr_protocol::local::holds_results_to_scopes(&acknowledgement.capabilities);
         let reads_the_screen_basis =
             kr_protocol::local::reads_the_screen_basis(&acknowledgement.capabilities);
+        let serves_agent_instances =
+            kr_protocol::local::serves_agent_instances(&acknowledgement.capabilities);
         let waiters: Arc<std::sync::Mutex<Waiters>> =
             Arc::new(std::sync::Mutex::new(Waiters::default()));
         let reader = tokio::spawn(read_loop(
@@ -349,6 +356,7 @@ impl WorkerProxy {
             holds_question_reads,
             holds_results_to_scopes,
             reads_the_screen_basis,
+            serves_agent_instances,
         }))
     }
 
@@ -467,7 +475,8 @@ impl WorkerProxy {
     /// # Errors
     ///
     /// As [`Self::forward_mutation`], and `UNSUPPORTED_CAPABILITY` for a question read or a read of
-    /// a receipt with a scope to a worker that does not hold one to it, before anything is sent.
+    /// a receipt with a scope to a worker that does not hold one to it, and for an agent instances
+    /// read to a worker that does not serve it, before anything is sent.
     pub async fn forward_read(
         &self,
         request: &Request,
@@ -489,6 +498,14 @@ impl WorkerProxy {
                 code: kr_protocol::error::ErrorCode::UnsupportedCapability,
                 detail: "this session's worker is of a build that does not hold a question read \
                          to the grant it is made under, so it is not asked"
+                    .to_owned(),
+            });
+        }
+        if request.method == Method::AgentInstances.into() && !self.serves_agent_instances {
+            return Err(ControllerError::Refused {
+                code: kr_protocol::error::ErrorCode::UnsupportedCapability,
+                detail: "this session's worker is of a build that does not serve the agent \
+                         instances read, so it is not asked"
                     .to_owned(),
             });
         }
