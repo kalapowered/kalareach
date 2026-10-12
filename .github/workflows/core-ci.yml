@@ -1459,6 +1459,12 @@ jobs:
       - name: Build the interface
         run: pnpm -C apps/companion build
 
+      # The native backend's case `a_created_sessions_identifier_is_one_the_page_can_open`
+      # (apps/companion/src-tauri/tests/local_host.rs) creates a session, which starts the product's
+      # own worker program. A run of this package's tests builds no other package's program.
+      - name: Build the worker the native backend's session case starts
+        run: cargo build --locked -p kr-worker
+
       # The backend, its boundary, and the shared client's upload sequence.
       - name: Test the native backend
         run: cargo test --locked -p companion-tauri -p kr-client

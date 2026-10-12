@@ -455,6 +455,7 @@ pnpm -C apps/companion typecheck   # both projects
 pnpm -C apps/companion test        # unit and component tests, and the semantic-display benchmark
 pnpm -C apps/companion e2e         # Playwright, against the built bundle in Chromium and WebKit
 pnpm -C apps/companion build       # the production bundle
+cargo build -p kr-worker         # the worker the backend's session cases start
 cargo test -p companion-tauri      # the backend, including the boundary
 ```
 
