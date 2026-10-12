@@ -38,6 +38,9 @@ async function openQuestion(page: Page, surface: 'ios' | 'android'): Promise<voi
   await page.goto(`/harness.html?surface=${surface}&tab=attention`)
   await page.locator('[data-attention^="attention.pending_input"]').click()
   await expect(page.getByTestId('question').first()).toBeVisible()
+  // The sheet that holds it arrives on a spring, and a browser that has to draw it for the first
+  // time can take seconds over the first frame: nothing is measured or pressed until it is at rest.
+  await expect(page.getByTestId('sheet')).toHaveAttribute('data-presentation', 'here', { timeout: 15_000 })
 }
 
 for (const surface of ['ios', 'android'] as const) {
@@ -55,6 +58,16 @@ for (const surface of ['ios', 'android'] as const) {
         screen: window.innerWidth
       }))
       expect(across.page, 'the page is no wider than the screen').toBeLessThanOrEqual(across.screen)
+
+      // The sheet that holds the question clips what is wider than it, and focus scrolls it sideways
+      // to reach that: nothing in it, its footer's button included, is wider than the sheet.
+      const sheet = await page.locator('.sheet').evaluate((element) => ({
+        wide: element.scrollWidth,
+        across: element.clientWidth,
+        scrolled: element.scrollLeft
+      }))
+      expect(sheet.wide, 'the sheet holds everything in it across its width').toBeLessThanOrEqual(sheet.across + 1)
+      expect(sheet.scrolled, 'the sheet has not been scrolled sideways').toBe(0)
 
       // Everything in a question, and every line of its text, lies inside the screen and inside
       // the question's own box.
@@ -91,6 +104,17 @@ for (const surface of ['ios', 'android'] as const) {
         await overrunning(page, '[data-testid="question"]'),
         'the measure sees text that cannot wrap'
       ).not.toEqual([])
+
+      // The controls for the sheet: a title or a footer label that cannot wrap makes the sheet wider
+      // than itself.
+      const widerThanItself = () =>
+        page.locator('.sheet').evaluate((element) => element.scrollWidth > element.clientWidth + 1)
+      await page.addStyleTag({ content: '.dialog-header h2, .dialog-header p { white-space: nowrap !important }' })
+      expect(await widerThanItself(), 'the measure sees a title that cannot wrap').toBe(true)
+      await page.addStyleTag({ content: '.dialog-header h2, .dialog-header p { white-space: normal !important }' })
+      expect(await widerThanItself(), 'with the title wrapping again, the sheet holds everything').toBe(false)
+      await page.addStyleTag({ content: '.dialog-footer .btn { white-space: nowrap !important }' })
+      expect(await widerThanItself(), 'the measure sees a footer label that cannot wrap').toBe(true)
     })
 
     test('sends nothing until Send is pressed after a choice, and keeps an answer given out of contact', async ({

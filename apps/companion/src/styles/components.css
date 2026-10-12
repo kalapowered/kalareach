@@ -756,6 +756,17 @@ textarea::placeholder {
   border-bottom: 1px solid var(--line);
 }
 
+/* The title may be narrower than its longest word at a large text size, whatever face it is set
+   in: it wraps inside its own column, beside the close button, and does not widen the sheet. */
+.dialog-header > div {
+  min-width: 0;
+}
+
+.dialog-header h2,
+.dialog-header p {
+  overflow-wrap: anywhere;
+}
+
 .dialog-header h2 {
   font-size: 1.1875rem;
   margin: 2px 0 5px;
@@ -769,12 +780,23 @@ textarea::placeholder {
 
 .dialog-footer {
   display: flex;
+  /* Buttons that do not fit side by side stand in rows: the footer never grows wider than the sheet. */
+  flex-wrap: wrap;
   justify-content: flex-end;
   align-items: center;
   gap: 9px;
   padding: 17px 24px;
   border-top: 1px solid var(--line);
   background: var(--raised);
+}
+
+/* A label too long for the footer at a large text size wraps inside its button, whatever face the
+   text is set in, and the button stays inside the footer: the sheet clips what is wider than it,
+   and focus then scrolls the whole sheet sideways to reach it. */
+.dialog-footer .btn {
+  white-space: normal;
+  max-inline-size: 100%;
+  text-align: center;
 }
 
 @media (prefers-reduced-motion: reduce) {
