@@ -347,8 +347,9 @@ impl MailboxClient {
 
     /// Leaves the wait a service asks for to the caller.
     ///
-    /// A caller that schedules its own deliveries and holds each one to the delay the service
-    /// named builds the client with this: the first answer, delay included, is then the answer.
+    /// A caller that schedules its own deliveries and decides for itself what to do with the delay
+    /// the service named builds the client with this: the first answer, delay included, is then
+    /// the answer, and the client does not wait or send again.
     #[must_use]
     pub fn leaving_delays_to_the_caller(mut self) -> Self {
         self.call = self.call.leaving_delays_to_the_caller();

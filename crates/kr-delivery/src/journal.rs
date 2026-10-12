@@ -2842,8 +2842,8 @@ impl DeliveryJournal {
                     format!("{identifier} to {destination} ({state})")
                 } else {
                     format!(
-                        "{identifier} to {destination} ({state}), with its detail in the device's \
-                         mailbox"
+                        "{identifier} to {destination} ({state}), its detail possibly in the \
+                         device's mailbox"
                     )
                 },
                 left_at_ms: TimestampMs::new(as_u64(left_at)),
@@ -4447,10 +4447,6 @@ const SCHEMA: &str = "
         destination_digest TEXT NOT NULL DEFAULT '',
         authority_digest TEXT NOT NULL DEFAULT '',
         dispatched INTEGER NOT NULL DEFAULT 0,
-        -- Whether the encrypted object its preview refers to may have been placed in the device's
-        -- mailbox. It is a copy that left this host whether or not the push ever did, so it is a
-        -- fact of its own and not a reading of `dispatched`, which is about the push.
-        detail_left INTEGER NOT NULL DEFAULT 0,
         -- The kind of destination this was admitted for, written once. A destination row can be
         -- configured again as another kind under the same identifier, and what a settlement means
         -- depends on what this delivery was: a paired device's gateway can be asked and a
@@ -4462,6 +4458,10 @@ const SCHEMA: &str = "
         -- pushes the next one back, so one old record cannot hold every later one's turn.
         questions INTEGER NOT NULL DEFAULT 0,
         question_due_at_ms INTEGER,
+        -- Whether the encrypted object its preview refers to may have been placed in the device's
+        -- mailbox. It is a copy that left this host whether or not the push ever did, so it is a
+        -- fact of its own and not a reading of `dispatched`, which is about the push.
+        detail_left INTEGER NOT NULL DEFAULT 0,
         UNIQUE (event_key, destination_id),
         -- A request exists only on a record that may still present it: admitted, on the wire, or
         -- waiting to be presented again. Every settlement takes it, whatever the settlement is,
@@ -7288,6 +7288,10 @@ mod tests {
             .query_row("SELECT version FROM delivery_schema", [], |row| row.get(0))
             .expect("a version");
         assert_eq!(version, SCHEMA_VERSION);
+        assert!(
+            journal.exported().expect("a read").is_empty(),
+            "and the column version 10 added reads as no copy left"
+        );
         let hook = journal
             .destination(&DestinationId::new("hook").expect("an identifier"))
             .expect("a read")
