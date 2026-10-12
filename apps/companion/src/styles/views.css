@@ -1623,3 +1623,308 @@
   object-fit: cover;
   border-radius: 4px;
 }
+
+/* ---- Sharing --------------------------------------------------------------------------------- */
+
+/*
+ * Who has access comes first, then the form. Rows wrap rather than shrink, so at the largest text
+ * size a name, its words and its two buttons each get a line of their own instead of a clipped one.
+ */
+.access,
+.share-form,
+.hand-over {
+  margin-block-end: var(--gap-5);
+}
+
+.access .warning-text,
+.share-form .warning-text,
+.hand-over .warning-text,
+.screen-changed .warning-text {
+  color: var(--warning);
+}
+
+.access h3,
+.share-form > h3,
+.hand-over h3 {
+  margin: 0 0 var(--gap-2);
+}
+
+.access-row {
+  flex-wrap: wrap;
+  row-gap: var(--gap-2);
+}
+
+.access-row:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 4px;
+}
+
+.access-who {
+  display: flex;
+  flex-direction: column;
+  min-inline-size: 10rem;
+  gap: 2px;
+}
+
+.access-name {
+  font-size: 0.8125rem;
+  font-weight: 500;
+  overflow-wrap: anywhere;
+}
+
+.access-actions,
+.attempt-actions,
+.hand-over-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--gap-2);
+  margin: 0;
+}
+
+.access-note {
+  flex-basis: 100%;
+}
+
+.access-revoked {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--gap-2);
+  margin: var(--gap-3) 0 0;
+}
+
+/* An attempt the application is keeping its word about, apart from the grants the host lists. */
+.attempt {
+  margin-block-start: var(--gap-3);
+  padding: var(--gap-3) var(--gap-4);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--subtle);
+}
+
+.attempt p {
+  margin: 0 0 var(--gap-2);
+}
+
+.attempt .attempt-actions {
+  margin-block-end: 0;
+}
+
+.attempt[data-phase='closed'][data-outcome='not_done'],
+.attempt[data-phase='closed'][data-outcome='unknown'] {
+  border-color: var(--warning-line);
+}
+
+/* A choice with a line under it, as the three roles have. */
+.choice-described {
+  align-items: flex-start;
+  padding-block: var(--gap-1);
+}
+
+.choice-described input {
+  margin-block-start: 0.2rem;
+}
+
+.choice-described > span {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.choice-title {
+  font-weight: 500;
+}
+
+.not-offered {
+  margin: var(--gap-2) 0 0;
+  padding-inline-start: 1.1rem;
+  line-height: 1.6;
+}
+
+.select {
+  box-sizing: border-box;
+  min-height: var(--target);
+  /*
+   * Drawn by the page rather than the platform, so that its height is the target's in every
+   * engine: WebKit sets a native menu's height itself and ignores a minimum.
+   */
+  appearance: none;
+  padding: 6px 30px 6px 10px;
+  border: 1px solid var(--control-line);
+  border-radius: 6px;
+  background-color: var(--raised);
+  background-image:
+    linear-gradient(45deg, transparent 50%, var(--muted) 50%),
+    linear-gradient(135deg, var(--muted) 50%, transparent 50%);
+  background-position:
+    calc(100% - 17px) 50%,
+    calc(100% - 12px) 50%;
+  background-size:
+    5px 5px,
+    5px 5px;
+  background-repeat: no-repeat;
+  color: var(--text);
+  font: inherit;
+  font-size: 0.8125rem;
+  max-inline-size: 100%;
+}
+
+.select:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.visually-hidden-label {
+  display: block;
+  min-inline-size: 0;
+  max-inline-size: 100%;
+}
+
+/*
+ * A row of the form puts its control beside its words and wraps it under them when there is no
+ * room, so at the largest text size the words keep a readable line and the control is whole.
+ */
+.share-form .settings-row {
+  flex-wrap: wrap;
+  row-gap: var(--gap-2);
+}
+
+.share-form .settings-row > div:first-child {
+  flex: 1 1 14rem;
+  min-inline-size: 0;
+}
+
+.share-form .choice-row input,
+.hand-over .choice-row input {
+  flex: none;
+  inline-size: 1.125rem;
+  block-size: 1.125rem;
+}
+
+/*
+ * The switch is the design system's: thirty-four by twenty. Its press area here reaches eight
+ * pixels past it above, below and to its left, so a finger that lands beside it still turns it.
+ * It stops at the right edge, where the row ends, so it never makes the pane scroll sideways.
+ */
+.share-form .settings-row .switch-control::before {
+  content: '';
+  position: absolute;
+  inset: -8px 0 -8px -8px;
+}
+
+/*
+ * What opens when a choice calls for it: the preview of the screen, and the consent. The row
+ * grows from nothing and the content fades in after there is room for it; with the keyboard it is
+ * there at once, and with reduced motion it fades and does not travel. It is never reachable
+ * while shut.
+ */
+.disclosure {
+  display: grid;
+  grid-template-rows: 0fr;
+  opacity: 0;
+  transition:
+    grid-template-rows var(--state) var(--ease-out),
+    opacity var(--press) var(--ease-out);
+}
+
+.disclosure > div {
+  overflow: hidden;
+  min-block-size: 0;
+}
+
+.disclosure[data-open='true'] {
+  grid-template-rows: 1fr;
+  opacity: 1;
+  transition:
+    grid-template-rows var(--state) var(--ease-out),
+    opacity var(--state) var(--ease-out) 40ms;
+}
+
+html[data-input='keyboard'] .disclosure,
+html[data-input='keyboard'] .disclosure[data-open='true'] {
+  transition-delay: 0ms;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .disclosure,
+  .disclosure[data-open='true'] {
+    transition: opacity var(--state) var(--ease-out);
+  }
+}
+
+/*
+ * The screen as it is read. Terminal text does not reflow, so the card scrolls on both axes, and it
+ * keeps its height from the moment it opens so the text arriving does not move what is under it.
+ */
+.screen-preview {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--gap-2);
+  margin-block: var(--gap-2) var(--gap-3);
+}
+
+.screen-lines {
+  box-sizing: border-box;
+  inline-size: 100%;
+  block-size: calc(12 * 1.4em + 1.5rem);
+  margin: 0;
+  padding: var(--gap-3);
+  overflow: auto;
+  white-space: pre;
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  line-height: 1.4;
+  border: 1px solid var(--control-line);
+  border-radius: 6px;
+  background: var(--subtle);
+  color: var(--text);
+}
+
+.screen-lines:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.screen-changed {
+  margin-block: var(--gap-3);
+  padding: var(--gap-3) var(--gap-4);
+  border: 1px solid var(--warning-line);
+  border-radius: 8px;
+  background: var(--warning-soft);
+}
+
+.screen-changed .screen-lines {
+  block-size: auto;
+  max-block-size: calc(12 * 1.4em + 1.5rem);
+}
+
+.consent {
+  align-items: flex-start;
+  margin-block: var(--gap-3);
+}
+
+.consent input {
+  margin-block-start: 0.15rem;
+}
+
+.hand-over {
+  padding-block-start: var(--gap-2);
+}
+
+.hand-over-waiting {
+  margin-block: var(--gap-3);
+  padding: var(--gap-3) var(--gap-4);
+  border: 1px solid var(--accent-line);
+  border-radius: 8px;
+  background: var(--accent-soft);
+}
+
+.hand-over-waiting p {
+  margin: 0;
+}
+
+.choice-row[data-unavailable='true'] {
+  color: var(--muted);
+  cursor: default;
+}

@@ -1134,21 +1134,25 @@ describe('the sheet', () => {
 
     // Letting a viewer answer questions is the authority the explanation names, and the host's own
     // sentence for it is shown before anything is issued.
-    await person.click(screen.getByRole('switch', { name: 'Let a viewer or reviewer answer questions' }))
+    await person.click(screen.getByRole('switch', { name: 'Let a viewer answer questions' }))
     await waitFor(() => {
       expect(carries.querySelector('[data-notice="agent_permissions"]')).not.toBeNull()
     })
     expect(carries.textContent).toContain('Answer the agent’s questions')
 
-    // A device paired with this host is chosen, and a retired one is not offered.
+    // A device paired with this host is chosen, and a retired one is not offered. What the
+    // selection carries is a consequence, so the person understands it before the invitation is
+    // issued.
     expect(screen.queryByRole('radio', { name: /Old phone/ })).toBeNull()
-    await person.click(screen.getByRole('radio', { name: /Sam’s iPhone|Sam's iPhone/ }))
+    await person.click(await screen.findByRole('radio', { name: /Sam’s iPhone|Sam's iPhone/ }))
+    expect(screen.getByTestId('invite')).toBeDisabled()
+    await person.click(await screen.findByRole('checkbox', { name: /I understand this lets Sam/ }))
     await person.click(screen.getByTestId('invite'))
 
-    expect(await screen.findByText(/Invitation issued to Sam's iPhone\. It is used once/)).toBeInTheDocument()
+    expect(await screen.findByText(/Invitation ready for Sam's iPhone/)).toBeInTheDocument()
     const issued = await screen.findByTestId('issued-grants')
-    expect(issued.textContent).toContain('Answer the agent’s questions')
-    expect(within(issued).getByText('Waiting to be used')).toBeInTheDocument()
+    expect(within(issued).getByText('Waiting to be accepted')).toBeInTheDocument()
+    expect(controls.sharing.grants()[0]?.grant.actions).toContain('question.respond')
     expect(controls.records.agentOf(SESSION_MAIN).binding.binding_revision).toBe('4')
   })
 })
