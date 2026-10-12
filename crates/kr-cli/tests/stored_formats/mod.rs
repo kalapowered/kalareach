@@ -1754,7 +1754,18 @@ pub fn records_unlisted(stores: &[Store], file: &str) -> Result<Vec<String>, Str
         .collect();
     Ok(source
         .lines()
-        .filter_map(|line| line.strip_prefix("pub struct "))
+        .filter_map(|line| line.trim_start().strip_prefix("pub"))
+        .map(|rest| match rest.strip_prefix('(') {
+            // `pub(crate)` and the like.
+            Some(restricted) => restricted
+                .split_once(')')
+                .map_or("", |(_, after)| after.trim_start()),
+            None => rest.trim_start(),
+        })
+        .filter_map(|rest| {
+            rest.strip_prefix("struct ")
+                .or_else(|| rest.strip_prefix("enum "))
+        })
         .filter_map(|rest| rest.split(|c: char| !c.is_alphanumeric()).next())
         .filter(|name| name.starts_with("Stored") && !listed.contains(name))
         .map(|name| format!("{name} is a record {file} defines and no store lists it as kept"))
