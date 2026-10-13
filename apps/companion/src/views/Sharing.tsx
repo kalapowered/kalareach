@@ -76,7 +76,7 @@ import {
   type OfferedRole
 } from '../model/sharing'
 import { deskOf } from '../model/sharing-desk'
-import { handedOver, invited, pendingWorkers, tookBack } from '../model/sharing-results'
+import { handedOver, invited, rechecked, tookBack } from '../model/sharing-results'
 import { Transfer } from './Transfer'
 
 /** How often the list of who has access is read again while the screen is open. */
@@ -364,16 +364,22 @@ function SharingTab({
       invited(desk, say, made, nameOf(made.grant.recipient_device_id), desk.recall(attempt.action_id))
     } else if (attempt.kind === 'revoke') {
       const grantId = attempt.revoked_grant_id ?? attempt.grant_id ?? ''
-      const meant = desk.meant(grantId)
-      tookBack(
-        desk,
-        say,
-        value as RevocationResult,
-        grantId,
-        meant?.name ?? 'a paired device',
-        meant?.withdrawing ?? false,
-        clock.now()
-      )
+      if (desk.has(grantId)) {
+        // A line already says it was revoked: this is the answer to Check again, whose reply
+        // was lost, and it changes how far the workers have got and nothing else.
+        rechecked(desk, value as RevocationResult, grantId)
+      } else {
+        const meant = desk.meant(grantId)
+        tookBack(
+          desk,
+          say,
+          value as RevocationResult,
+          grantId,
+          meant?.name ?? 'a paired device',
+          meant?.withdrawing ?? false,
+          clock.now()
+        )
+      }
     } else if (attempt.kind === 'transfer') {
       const done = value as GrantTransferResult
       const words = `${nameWords(attempt.label)}: done.`
@@ -454,11 +460,14 @@ function SharingTab({
   /**
    * Gives focus to the row beside the one a control is about to take away, or to the heading when
    * there is none, so that it never falls to the page behind the sheet. Returns what moves it,
-   * for a control whose row goes only when the host says so.
+   * for a control whose row goes only when the host says so. A control that withdraws a grant
+   * names it, and the grant's own row, which the withdrawal takes away too, is not a place to go.
    */
-  const awayFrom = (control: HTMLElement | null): (() => void) => {
+  const awayFrom = (control: HTMLElement | null, withdrawn?: string): (() => void) => {
     const scope = heading.current?.parentElement ?? document
-    const rows = Array.from(scope.querySelectorAll<HTMLElement>('[data-nav]'))
+    const rows = Array.from(scope.querySelectorAll<HTMLElement>('[data-nav]')).filter(
+      (row) => withdrawn === undefined || row.dataset.grant !== withdrawn
+    )
     const own = control?.closest<HTMLElement>('[data-nav]') ?? null
     const index = own === null ? -1 : rows.indexOf(own)
     const next = rows[index + 1] ?? rows[index - 1] ?? heading.current
@@ -504,7 +513,7 @@ function SharingTab({
           say('The host’s answer did not arrive. Check again in a moment.', 'pending')
           return
         }
-        desk.checked(grantId, pendingWorkers(done.value))
+        if (desk.firstTime(done.attempt.action_id)) rechecked(desk, done.value, grantId)
       })
       .catch((error: unknown) => {
         say(failureText(error), 'danger')
@@ -789,7 +798,7 @@ function SharingTab({
                       onClick={(event) => {
                         const grantId = attempt.grant_id
                         if (grantId === null) return
-                        const away = awayFrom(event.currentTarget)
+                        const away = awayFrom(event.currentTarget, grantId)
                         takeBack(grantId, nameOf(attempt.device_id), true, () => {
                           removeAttempt(attempt, away)
                         })
@@ -883,7 +892,7 @@ function SharingTab({
             <Button
               data-testid="screen-withdraw"
               onClick={(event) => {
-                const away = awayFrom(event.currentTarget)
+                const away = awayFrom(event.currentTarget, each.grantId)
                 takeBack(each.grantId, each.name, true, away)
               }}
             >

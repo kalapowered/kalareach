@@ -102,7 +102,11 @@ export function Transfer({
   const mounted = useRef(true)
   /** The reference this panel owns: asked about, and neither sent nor let go. */
   const owned = useRef<string | null>(null)
-  /** Whether the transfer has been sent, after which the polling that sent it is not listened to. */
+  /**
+   * Whether the transfer has been sent, or the person has cancelled: either way the polling that
+   * is still on its way is not listened to, since an answer that arrives after Cancel began must
+   * not send what the person took back.
+   */
   const sending = useRef(false)
   /** What the send reports to, which the polling that began it does not outlive. */
   const latest = useRef({ say, onDone })
@@ -160,7 +164,12 @@ export function Transfer({
         setState('waiting')
       })
       .catch((error: unknown) => {
-        if (!mounted.current) return
+        if (!mounted.current) {
+          // The panel is gone: the person is told here, since what failed can still have put a
+          // request on an owner device.
+          latest.current.say(failureText(error), 'danger')
+          return
+        }
         setFailure(failureText(error))
         setState('choosing')
       })
@@ -259,6 +268,8 @@ export function Transfer({
       onClose()
       return
     }
+    // From here no answer to a poll sends anything: the person took it back.
+    sending.current = true
     owned.current = null
     // The record is cleared before the list is read again, so a cancelled hand-over is not listed.
     void ask(() => port.transferCancel(reference))

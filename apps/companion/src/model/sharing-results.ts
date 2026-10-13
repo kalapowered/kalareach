@@ -71,6 +71,15 @@ export function tookBack(
 }
 
 /**
+ * A revocation was asked about again, by Check again: the line already kept for it says how far
+ * the workers have got, and nothing else about it, neither when it was made nor for whom, is
+ * changed by the answer.
+ */
+export function rechecked(desk: SharingDesk, result: RevocationResult, grantId: string): void {
+  desk.checked(grantId, pendingWorkers(result))
+}
+
+/**
  * A session's control was handed over. The grant the giving device held was revoked with it, and
  * how far the session workers have got with that is kept like any revocation's, to be checked
  * again by that grant's identity.

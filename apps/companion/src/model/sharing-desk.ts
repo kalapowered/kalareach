@@ -108,6 +108,11 @@ export class SharingDesk {
     })
   }
 
+  /** Whether a line for a revocation of `grantId` is kept. */
+  has(grantId: string): boolean {
+    return this.#kept.revoked.some((line) => line.grantId === grantId)
+  }
+
   /** Says how many workers still have not confirmed a revocation already kept, as of a check. */
   checked(grantId: string, pending: number): void {
     this.#change({
