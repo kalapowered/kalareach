@@ -5574,8 +5574,8 @@ The host judges each request from its own records. A request addressed to anothe
 names nothing this host knows, is refused to the feed as an unknown target. A request signed by a
 key that is not a paired device, or by a paired device this host would not let manage it, is refused
 as lacking owner authority. A different request under an identity this host already took is refused
-as superseded. Whether a device may manage the host is decided as the same device's own
-`device.revoke` is: by its grant and its selectors, by this host's policy (an organisation's lease
+as superseded. Whether a device may manage the host is decided as a paired device's own
+`device.list` is: by its grant and its selectors, by this host's policy (an organisation's lease
 and member binding, an exclusive management) and by the rights ceiling the configuration puts in
 force. A bounded offline validity is the one thing left out. It stops personal remote access while
 the feed cannot be reached, and the host has just read the feed. A decision that rests on a clock
