@@ -233,6 +233,91 @@ pub async fn connect(address: &str) -> kr_ipc::endpoint::Connection {
         .expect("the endpoint is reachable")
 }
 
+/// How many hooks a test starts, one after another, to have one reach its worker before its own
+/// deadline.
+pub const ATTEMPTS: usize = 30;
+
+/// A hook that reached a stand-in for the worker.
+pub struct Reached {
+    /// The stand-in it reached. It is the hook's alone: no other hook was pointed at it.
+    pub stand_in: StandIn,
+    /// The connection the hook made.
+    pub stream: kr_ipc::endpoint::Connection,
+    /// The process the operating system names on the connection.
+    pub peer: kr_ipc::peer::PeerIdentity,
+    /// The hook's run, which ends with the hook.
+    pub running: tokio::task::JoinHandle<Ran>,
+}
+
+/// Starts hooks, each against a stand-in for the worker of its own, until one reaches its stand-in,
+/// and returns that one.
+///
+/// `start` is given a fresh stand-in, points a hook at it (writes the registration that names it)
+/// and starts the hook. A hook keeps a deadline from its own start (`HOOK_DEADLINE`) and connects
+/// to its worker inside it. On a loaded machine a hook can be kept from the worker for that long,
+/// by the machine's delivery of its input or scheduling of its start, and then it does what it
+/// promises without having reached anything: it answers `{}` at its deadline, exits 0 and says on
+/// standard error that it did not finish within the deadline. Such a run shows nothing about a
+/// worker that is silent, so it is not the run the case is about; it is let go and another is
+/// started.
+///
+/// It is let go only on the hook's own account of why it ended: the diagnostic names the deadline.
+/// A hook that ended for any other reason did not fail to reach the worker for want of time, it
+/// failed, and that is the case's failure, with its diagnostic. Time does not decide this, because
+/// the time a run took includes the machine's start of the process. The diagnostic is written by a
+/// thread that has a hundred milliseconds in which to run, so a machine that gives it none loses
+/// the line and fails the case here, as it fails the cases that read it when the hook connects.
+/// What a hook owes whatever the worker does is checked on every run that ended early, and `early`
+/// checks the rest. How many hooks are started is bounded.
+///
+/// # Panics
+///
+/// Panics when a hook that ended without reaching its worker did not say that it ran out of its
+/// deadline, or answered otherwise than a hook must, when no hook reached its worker in
+/// [`ATTEMPTS`] tries, and when a running hook neither connects nor ends within [`LIVENESS`].
+pub async fn hook_reaching(
+    directory: &Path,
+    name: &str,
+    case: &str,
+    mut start: impl FnMut(&StandIn) -> tokio::task::JoinHandle<Ran>,
+    mut early: impl FnMut(&Ran),
+) -> Reached {
+    let mut last = String::new();
+    for attempt in 1..=ATTEMPTS {
+        let stand_in = StandIn::bind(directory, name);
+        let mut running = start(&stand_in);
+        tokio::select! {
+            // A connection already made is taken before the hook's end is looked at.
+            biased;
+            accepted = stand_in.listener.accept() => {
+                let (stream, peer) = accepted.expect("the hook connects");
+                return Reached { stand_in, stream, peer, running };
+            }
+            ran = &mut running => {
+                let ran = ran.expect("the hook ran");
+                assert_eq!(ran.code, Some(0), "{case}, try {attempt}: {}", ran.stderr);
+                assert_eq!(ran.stdout, b"{}\n", "{case}, try {attempt}");
+                assert!(
+                    ran.stderr.starts_with("kr-hook: ")
+                        && ran.stderr.contains(&format!(
+                            "within {} ms",
+                            kr_hook::hook::HOOK_DEADLINE.as_millis()
+                        )),
+                    "{case}, try {attempt}: the hook ended without its worker, and not by its \
+                     deadline: {:?}",
+                    ran.stderr
+                );
+                early(&ran);
+                last = ran.stderr;
+            }
+            () = tokio::time::sleep(LIVENESS) => panic!("{case}: the hook did not connect"),
+        }
+    }
+    panic!(
+        "{case}: none of {ATTEMPTS} hooks reached its worker before its own deadline; the last said {last:?}"
+    )
+}
+
 /// Reads one line from a connection, without its newline, and the end of the stream as its end.
 ///
 /// # Panics

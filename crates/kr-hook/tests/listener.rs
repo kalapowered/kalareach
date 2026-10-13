@@ -20,7 +20,7 @@ mod common;
 
 use tokio::io::AsyncWriteExt as _;
 
-use common::{LIVENESS, Placed, StandIn, launched, read_line, run_with_input};
+use common::{LIVENESS, Placed, Reached, hook_reaching, launched, read_line, run_with_input};
 
 /// A `SessionStart` payload as Claude Code writes it on a hook's standard input.
 const SESSION_START: &[u8] = br#"{"session_id":"4d1c0a57-1b1e-4c3a-9d2e-6a0f0c5b7e11","transcript_path":"/tmp/t.jsonl","cwd":"/tmp","hook_event_name":"SessionStart","source":"startup"}"#;
@@ -296,7 +296,8 @@ async fn kr_req_05_09_a_bridge_the_installation_did_not_put_in_place_is_refused(
 /// file holds and its own process as the operating system reads it, declares which bridge it is,
 /// and waits for the admission before it answers `{}`. A listener that closes without admitting it,
 /// or never answers at all, changes nothing about its answer, and the one that never answers
-/// cannot hold it past its deadline.
+/// cannot hold it past its deadline: the forwarder ends at that deadline with the listener still
+/// silent, and the deadline is inside the one-second timeout the package registers.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn kr_req_12_14_over_the_private_endpoint_the_forwarder_presents_the_launch_credential() {
     let placed = Placed::new();
@@ -308,37 +309,38 @@ async fn kr_req_12_14_over_the_private_endpoint_the_forwarder_presents_the_launc
         .expect("the credential is written");
 
     for answer in ["admit", "close", "withhold"] {
-        let stand_in = StandIn::bind(&files, answer);
-        let registration = files.join(format!("registration.{answer}"));
-        std::fs::write(
-            &registration,
-            format!(
-                "endpoint={}\nprofile=lp-1\n\
-                 instance=02020202-0202-0202-0202-020202020202\npid=1\nstart=1\n\
-                 credential={}\nframing=json_lines\n",
-                stand_in.address,
-                credential_file.display()
-            ),
+        // A forwarder the machine kept from the listener for its whole deadline answered without
+        // reaching it, and shows nothing about what the listener does: another is started, against
+        // a listener of its own.
+        let Reached {
+            mut stream,
+            peer,
+            running,
+            ..
+        } = hook_reaching(
+            &files,
+            answer,
+            answer,
+            |stand_in| {
+                let registration = files.join(format!("registration.{answer}"));
+                std::fs::write(
+                    &registration,
+                    format!(
+                        "endpoint={}\nprofile=lp-1\n\
+                         instance=02020202-0202-0202-0202-020202020202\npid=1\nstart=1\n\
+                         credential={}\nframing=json_lines\n",
+                        stand_in.address,
+                        credential_file.display()
+                    ),
+                )
+                .expect("the registration is written");
+                let mut command = placed.command(&["claude-code", "hook"]);
+                command.env("KR_REGISTRATION", &registration);
+                tokio::task::spawn_blocking(move || run_with_input(command, SESSION_START))
+            },
+            |_| {},
         )
-        .expect("the registration is written");
-        let mut command = placed.command(&["claude-code", "hook"]);
-        command.env("KR_REGISTRATION", &registration);
-        let mut running =
-            tokio::task::spawn_blocking(move || run_with_input(command, SESSION_START));
-
-        let (mut stream, peer) = tokio::select! {
-            // A connection already made is taken before the forwarder's end is looked at.
-            biased;
-            accepted = stand_in.listener.accept() => accepted.expect("the forwarder connects"),
-            ran = &mut running => {
-                let ran = ran.expect("the forwarder ran");
-                panic!(
-                    "{answer}: the forwarder ended without connecting, with {:?}: {}",
-                    ran.code, ran.stderr
-                );
-            }
-            () = tokio::time::sleep(LIVENESS) => panic!("{answer}: the forwarder did not connect"),
-        };
+        .await;
         let hello = read_line(&mut stream).await;
         let hello: serde_json::Value = serde_json::from_slice(&hello).expect("the hello is JSON");
         let presented = &hello["kr_hello"];
@@ -395,14 +397,23 @@ async fn kr_req_12_14_over_the_private_endpoint_the_forwarder_presents_the_launc
                 running.await.expect("the forwarder ran")
             }
             _ => {
-                // The connection stays open and says nothing until the forwarder has ended.
+                // The connection stays open and says nothing until the forwarder has ended, so
+                // the forwarder ended with this listener still silent: the deadline it keeps from
+                // its own start, and not the listener, ended it. How long the machine took to
+                // start the process and to let it end is not the forwarder's, so it is not
+                // measured; the deadline is the figure the registration's timeout is checked
+                // against.
                 let ran = running.await.expect("the forwarder ran");
                 drop(stream);
                 assert!(
-                    ran.took < std::time::Duration::from_secs(1),
-                    "a listener that never answers held the hook for {:?}, past the one-second \
-                     SessionEnd timeout",
+                    ran.took >= kr_hook::hook::HOOK_DEADLINE,
+                    "it waited for the listener until its deadline: {:?}",
                     ran.took
+                );
+                assert!(
+                    kr_hook::hook::HOOK_DEADLINE < std::time::Duration::from_secs(1),
+                    "the deadline a silent listener is held to is inside the one-second \
+                     SessionEnd timeout"
                 );
                 ran
             }

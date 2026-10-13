@@ -4,8 +4,9 @@
 //! hook's standard error as one when standard output is empty, and turns plain text with an exit
 //! code other than 0 and 1 into a refusal. So each hook invocation writes exactly `{}` on standard
 //! output and exits 0, with nothing on either stream that a decision could be read from, and it
-//! does so inside the shortest timeout any registration names: with no worker, with a worker that
-//! never answers, with input it cannot read, and with input that never closes.
+//! does so at its own deadline at the latest, which is inside the shortest timeout any registration
+//! names: with no worker, with a worker that never answers, with input it cannot read, and with
+//! input that never closes.
 //!
 //! | Row | What proves it |
 //! | --- | --- |
@@ -18,7 +19,7 @@ mod common;
 use std::io::Read as _;
 use std::time::{Duration, Instant};
 
-use common::{LIVENESS, Placed, StandIn, read_line, run_holding_input, run_with_input};
+use common::{Placed, Reached, hook_reaching, read_line, run_holding_input, run_with_input};
 
 /// The members a hook's output decides with, in the three applications' output types.
 const DECIDING: [&str; 3] = ["decision", "continue", "hookSpecificOutput"];
@@ -247,8 +248,8 @@ fn kr_req_12_27_input_that_never_closes_cannot_hold_a_hook() {
 
 /// KR-REQ-12.27: inside a launch, a hook declares the bridge it is, the application it was invoked
 /// for and `hook`, and a worker that reads the hello and never answers cannot hold it: it answers
-/// `{}` at its own deadline, inside the shortest timeout any registration names, and never waits for
-/// a person.
+/// `{}` at its own deadline, which is inside the shortest timeout any registration names, and never
+/// waits for a person.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn kr_req_12_27_a_worker_that_never_answers_cannot_hold_a_hook() {
     let placed = Placed::new();
@@ -258,40 +259,42 @@ async fn kr_req_12_27_a_worker_that_never_answers_cannot_hold_a_hook() {
     kr_ipc::paths::create_new_owner_only_file(&credential_file, "5e".repeat(32).as_bytes())
         .expect("the credential is written");
     for hooks in every_application() {
-        let stand_in = StandIn::bind(&files, hooks.application);
-        let registration = files.join(format!("registration.{}", hooks.application));
-        std::fs::write(
-            &registration,
-            format!(
-                "endpoint={}\nprofile=lp-1\n\
-                 instance=02020202-0202-0202-0202-020202020202\npid=1\nstart=1\n\
-                 credential={}\nframing=json_lines\n",
-                stand_in.address,
-                credential_file.display()
-            ),
-        )
-        .expect("the registration is written");
         let (event, payload) = &hooks.events[0];
-        let mut command = placed.command(&[hooks.application, "hook"]);
-        command.env("KR_REGISTRATION", &registration);
         let input = payload.to_string();
-        let mut running =
-            tokio::task::spawn_blocking(move || run_with_input(command, input.as_bytes()));
         let case = format!("{} {event}", hooks.application);
 
-        let (mut stream, _peer) = tokio::select! {
-            // A connection already made is taken before the forwarder's end is looked at.
-            biased;
-            accepted = stand_in.listener.accept() => accepted.expect("the hook connects"),
-            ran = &mut running => {
-                let ran = ran.expect("the hook ran");
-                panic!(
-                    "{case}: the hook ended without connecting, with {:?}: {}",
-                    ran.code, ran.stderr
-                );
-            }
-            () = tokio::time::sleep(LIVENESS) => panic!("{case}: the hook did not connect"),
-        };
+        // A hook the machine kept from the worker for its whole deadline answered without reaching
+        // it, and shows nothing about a worker that is silent: another is started, against a worker
+        // of its own.
+        let Reached {
+            mut stream,
+            running,
+            ..
+        } = hook_reaching(
+            &files,
+            hooks.application,
+            &case,
+            |stand_in| {
+                let registration = files.join(format!("registration.{}", hooks.application));
+                std::fs::write(
+                    &registration,
+                    format!(
+                        "endpoint={}\nprofile=lp-1\n\
+                         instance=02020202-0202-0202-0202-020202020202\npid=1\nstart=1\n\
+                         credential={}\nframing=json_lines\n",
+                        stand_in.address,
+                        credential_file.display()
+                    ),
+                )
+                .expect("the registration is written");
+                let mut command = placed.command(&[hooks.application, "hook"]);
+                command.env("KR_REGISTRATION", &registration);
+                let input = input.clone();
+                tokio::task::spawn_blocking(move || run_with_input(command, input.as_bytes()))
+            },
+            |ran| assert_eq!(neutral(&ran.stdout, &ran.stderr), Ok(()), "{case}"),
+        )
+        .await;
         let hello = read_line(&mut stream).await;
         let hello: serde_json::Value = serde_json::from_slice(&hello).expect("the hello is JSON");
         assert_eq!(
@@ -310,7 +313,14 @@ async fn kr_req_12_27_a_worker_that_never_answers_cannot_hold_a_hook() {
             "{case} waited for its worker: {:?}",
             ran.took
         );
-        assert!(ran.took < SHORTEST_TIMEOUT, "{case}: {:?}", ran.took);
+        // The hook ended with the worker's connection open and silent, so its own deadline ended
+        // it, and that deadline is inside the shortest timeout any registration names. How long
+        // the machine took to start the process and to let it end is not the hook's, so it is not
+        // measured.
+        assert!(
+            DEADLINE < SHORTEST_TIMEOUT,
+            "{case}: the deadline is inside the shortest timeout any registration names"
+        );
         // A run that spent its whole deadline waiting still says why, after the answer.
         assert!(
             ran.stderr.starts_with("kr-hook: "),
