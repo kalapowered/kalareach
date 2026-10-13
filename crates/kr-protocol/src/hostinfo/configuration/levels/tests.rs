@@ -748,7 +748,7 @@ fn a_selected_mailbox_survives_the_file_and_the_registrys_copy() {
     );
 }
 
-/// The account that pays, as an owner copies it from the account console.
+/// The account that pays, as an owner copies it from the authorisation the account gave.
 fn a_payer() -> RelayPayer {
     RelayPayer {
         account_id: "0b0c4a1e-2f6a-4a7c-9b7e-5d1f3c2a8e41".to_owned(),
