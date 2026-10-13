@@ -11050,7 +11050,7 @@ fn the_gate_on_command_written_records_refuses_what_it_is_for() {
         exposes: &["configuration"],
     }];
 
-    // The control: each record at the version its table row gives it, with the gaps open.
+    // The control: records at their floors, with the gaps open.
     let at_floor = [
         (Writers::Barred(&CONFIGURATION_2), "configuration", 2, 1),
         (Writers::Barred(&ANSWERS_1), "kept-answers", 1, 0),
