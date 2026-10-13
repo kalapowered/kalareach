@@ -3,8 +3,9 @@
 //! Once a handler for the interrupt is installed, Ctrl-C no longer ends the process by itself: the
 //! command has to notice it, put the terminal back, remove what it wrote and say so. A termination
 //! request, a hang-up (the terminal went away) and Ctrl-\ mean the same; the last would otherwise
-//! end the process with a core dump that holds whatever it was holding. A command that waits on this makes the wait cancellable, because a
-//! blocking read is not ended by a signal that restarts it.
+//! end the process with a core dump that holds whatever it was holding. A command that waits on
+//! this makes the wait cancellable, because a blocking read is not ended by a signal that
+//! restarts it.
 //!
 //! Windows polls sockets only, so a command there reads its secret without a handler and installs
 //! one afterwards ([`Interrupt::arm`]): before that, Ctrl-C ends the process, which has written and

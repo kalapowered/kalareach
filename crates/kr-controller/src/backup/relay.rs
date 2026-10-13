@@ -281,7 +281,7 @@ impl BackupRelay {
     /// A read that reaches the service is refused first when the service has asked to be left
     /// alone: nothing is sent, and what is left of the delay is the answer. A delay the service
     /// names to a read is recorded and answered the same way. The same checks run again where the
-    /// request leaves ([`Gated`]).
+    /// request leaves (`Gated`).
     ///
     /// # Errors
     ///
