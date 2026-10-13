@@ -579,6 +579,20 @@ async fn the_digest_a_person_confirms_changes_with_the_destination_the_environme
     assert_ne!(base, digest(&world, &first, "env-1", b"/restore/b").await);
     assert_ne!(base, digest(&world, &first, "env-2", b"/restore/a").await);
     assert_ne!(base, digest(&world, &newer, "env-1", b"/restore/a").await);
+    // The same archive, signed again at another time, is another plan: the plan shows the time.
+    let signed_again = {
+        let mut payload = first.publication.payload.clone();
+        payload.published_at_ms = TimestampMs::new(6_000);
+        Sealed {
+            publication: resign(payload, &world.writer),
+            objects: first.objects.clone(),
+            manifest_object: first.manifest_object,
+        }
+    };
+    assert_ne!(
+        base,
+        digest(&world, &signed_again, "env-1", b"/restore/a").await
+    );
     // Two folders whose names differ only in bytes that are not text are two destinations.
     assert_ne!(
         digest(&world, &first, "env-1", b"/restore/\xff").await,
