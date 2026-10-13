@@ -136,38 +136,38 @@ fn read_blocking(source: &KitSource, cancel: &AtomicBool) -> Result<KitRead> {
 /// Puts `question` on the error stream and reads the person's answer: one line from the terminal on
 /// standard input, with echo on, or none at the end of the input.
 ///
-/// The wait can be ended: when the returned future is dropped (the run was interrupted) the
-/// blocking read stops at its next short turn, so Ctrl-C at a question stops the run.
+/// The read is made on a thread of its own and is not waited for when this future is dropped, so
+/// Ctrl-C at a question stops the run at once, however the descriptor behaves: some terminal
+/// devices cannot be waited on with a timeout, and a blocking read is not ended by a signal that
+/// restarts it. The thread holds nothing but a duplicate of the descriptor and the answer so far,
+/// and ends with the process.
 ///
 /// # Errors
 ///
 /// Returns a terminal failure when the answer cannot be read.
 pub async fn ask_line(question: &Shown) -> Result<Option<String>> {
     crate::report::say(question);
-    let cancel = Arc::new(AtomicBool::new(false));
-    let _ends_the_wait = CancelOnDrop(Arc::clone(&cancel));
-    tokio::task::spawn_blocking(move || read_answer(&cancel))
-        .await
+    let (answer, arrives) = tokio::sync::oneshot::channel();
+    std::thread::Builder::new()
+        .name("answer".to_owned())
+        .spawn(move || {
+            // Nobody is waiting once the run was stopped, and the answer is not needed then.
+            let _ = answer.send(read_answer());
+        })
         .map_err(|error| {
-            CliError::Other(shown!(
+            CliError::Terminal(shown!(
                 "your answer could not be read: {}",
-                Shown::task(&error)
+                Shown::io(&error)
             ))
-        })?
-}
-
-/// Sets a flag when it is dropped.
-struct CancelOnDrop(Arc<AtomicBool>);
-
-impl Drop for CancelOnDrop {
-    fn drop(&mut self) {
-        self.0.store(true, Ordering::SeqCst);
-    }
+        })?;
+    arrives
+        .await
+        .map_err(|_| CliError::Terminal(Shown::said("your answer could not be read")))?
 }
 
 #[cfg(unix)]
-fn read_answer(cancel: &AtomicBool) -> Result<Option<String>> {
-    use rustix::event::{PollFd, PollFlags, Timespec, poll};
+fn read_answer() -> Result<Option<String>> {
+    use rustix::event::{PollFd, PollFlags, poll};
     use std::os::fd::AsFd as _;
 
     /// An answer is a word; this is more than any answer needs.
@@ -178,22 +178,16 @@ fn read_answer(cancel: &AtomicBool) -> Result<Option<String>> {
         .try_clone_to_owned()
         .map_err(|error| answer_unreadable(&error))?;
     let mut input = File::from(duplicate);
-    let turn = Timespec {
-        tv_sec: 0,
-        tv_nsec: 100_000_000,
-    };
     let mut answer: Vec<u8> = Vec::new();
     let mut chunk = [0_u8; 256];
     // A descriptor that cannot be polled (a terminal device on some systems) is read plainly.
     let mut pollable = true;
     loop {
-        if cancel.load(Ordering::SeqCst) {
-            return Err(interrupt::stopped());
-        }
         if pollable {
+            // A descriptor in non-blocking mode is waited for, so the read does not spin.
             let mut waiting = [PollFd::new(&input, PollFlags::IN)];
-            match poll(&mut waiting, Some(&turn)) {
-                Ok(0) | Err(rustix::io::Errno::INTR) => continue,
+            match poll(&mut waiting, None) {
+                Err(rustix::io::Errno::INTR) => continue,
                 Ok(_) => pollable = !waiting[0].revents().contains(PollFlags::NVAL),
                 Err(error) => {
                     return Err(CliError::Terminal(shown!(
@@ -231,7 +225,7 @@ fn read_answer(cancel: &AtomicBool) -> Result<Option<String>> {
 }
 
 #[cfg(windows)]
-fn read_answer(_cancel: &AtomicBool) -> Result<Option<String>> {
+fn read_answer() -> Result<Option<String>> {
     Err(CliError::Usage(Shown::said(
         "this build does not ask at a console; run the command with --preview and then with \
          --confirm-plan and the digest it printed",
@@ -588,7 +582,8 @@ fn read_terminal(terminal: &File, document: &mut Document, cancel: &AtomicBool) 
     crate::report::say(&Shown::said(
         "Paste the recovery kit, then press Enter on an empty line. Nothing you paste is shown.",
     ));
-    let typed = type_document(terminal, document, cancel).inspect(|()| discard_the_rest(terminal));
+    let typed =
+        type_document(terminal, document, cancel).inspect(|()| discard_the_rest(terminal, cancel));
     let left = prompt.leave();
     // The cursor is where the paste left it.
     crate::report::say(&Shown::said(""));
@@ -597,12 +592,16 @@ fn read_terminal(terminal: &File, document: &mut Document, cancel: &AtomicBool) 
 }
 
 /// Reads and throws away what is still arriving after the document ended, until a read finds
-/// nothing more, so that a paste that comes in more than one piece does not reach the shell.
+/// nothing more or the read is cancelled, so that a paste that comes in more than one piece does
+/// not reach the shell.
 #[cfg(unix)]
-fn discard_the_rest(terminal: &File) {
+fn discard_the_rest(terminal: &File, cancel: &AtomicBool) {
     let mut chunk = Zeroizing::new([0_u8; 256]);
     // Bounded, so input that never stops cannot hold the command.
     for _ in 0..64 {
+        if cancel.load(Ordering::SeqCst) {
+            break;
+        }
         match rustix::io::read(terminal, &mut chunk[..]) {
             Ok(0) | Err(_) => break,
             Ok(_) => {}

@@ -1074,6 +1074,12 @@ impl Window {
     /// then reads one line of its own, so a test can tell whether anything was left waiting in the
     /// terminal's input.
     fn run(rig: &Rig, arguments: &[&str]) -> Self {
+        Self::run_with_input(rig, arguments, "")
+    }
+
+    /// As [`Self::run`], with `kr`'s standard input redirected as the shell word `input` says
+    /// (`< /dev/tty` makes it the terminal device itself, which some systems cannot poll).
+    fn run_with_input(rig: &Rig, arguments: &[&str], input: &str) -> Self {
         let terminal = portable_pty::native_pty_system()
             .openpty(portable_pty::PtySize {
                 rows: 24,
@@ -1086,9 +1092,9 @@ impl Window {
         command.arg("-c");
         // The shell ignores the interrupt a Ctrl-C raises, so that it outlives the command it runs
         // and the test can read what the command left; `kr` installs its own handler.
-        command.arg(
-            "trap '' INT; \"$KR\" \"$@\"; echo \"kr ended $?\"; IFS= read -r first; echo \"first:$first\"",
-        );
+        command.arg(format!(
+            "trap '' INT; \"$KR\" \"$@\" {input}; echo \"kr ended $?\"; IFS= read -r first; echo \"first:$first\""
+        ));
         command.arg("sh");
         for argument in arguments {
             command.arg(argument);
@@ -2320,6 +2326,20 @@ async fn at_a_terminal_only_yes_writes_and_an_interrupt_at_the_question_writes_n
     window.type_line("yes");
     window.wait_for("kr ended 0");
     assert!(names(&fixture.into).contains(&"restore.json".to_owned()));
+}
+
+/// Ctrl-C at the question ends the command also when its standard input is the terminal device
+/// itself, which some systems cannot wait on with a timeout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_interrupt_at_the_question_ends_the_command_when_its_input_is_the_terminal_device() {
+    let fixture = Fixture::new().await;
+    let into = fixture.folder_arg();
+    let mut window = Window::run_with_input(&fixture.rig, &fixture.line(&into, &[]), "< /dev/tty");
+    window.wait_for("Type yes to write these files");
+    window.type_bytes(&[0x03]);
+    let shown = window.wait_for("kr ended");
+    assert!(!shown.contains("kr ended 0"), "{shown}");
+    assert!(names(&fixture.into).is_empty());
 }
 
 /// A bundle that names more than one archive at the service is refused with each listed, and
