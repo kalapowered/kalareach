@@ -19,6 +19,10 @@ path = "src/bin/kr-attach-guard.rs"
 [dependencies]
 # The trust root a repository is added with travels in the request as standard base64.
 base64.workspace = true
+# The folder a restore fills is held open as a directory handle, and every name in it is made and
+# removed through that handle.
+cap-fs-ext.workspace = true
+cap-std.workspace = true
 clap.workspace = true
 # A release archive `kr host update` stages: gzip, then tar.
 flate2.workspace = true
@@ -57,6 +61,8 @@ tokio-util.workspace = true
 # checks carry an expiry, which is why its time type is here too.
 jiff.workspace = true
 tough.workspace = true
+# The recovery kit is read into a buffer that clears itself, and never through a copy that does not.
+zeroize.workspace = true
 
 [dev-dependencies]
 # The update tests make channel roots and sign release manifests with keys of their own.
@@ -92,14 +98,22 @@ rmcp = { workspace = true, features = ["client", "transport-async-rw", "transpor
 rusqlite.workspace = true
 # The setup tests write a home directory of their own rather than this user's.
 tempfile.workspace = true
+# The restore tests put a backup in the storage service and read it back through a real daemon.
+kr-service-stand-in = { path = "../../tests/support/service-stand-in" }
 # The stored-format checks read the types a store keeps from their definitions in the source.
 syn.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
+# The recovery kit is read from a pipe by waiting for it with a short poll, so a signal can end the
+# wait, and the folder a restore fills is checked for its owner.
+rustix = { workspace = true, features = ["event", "process"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys.workspace = true
+# The path of a folder a restore holds open, read from the handle: the record is given its name from
+# the folder the handle holds and not from the text the person typed, which a junction can change.
+winx = "=0.36.4"
 
 # The workspace forbids unsafe code, which a crate that calls the console API cannot honour. This
 # crate denies it instead and allows it in exactly one module, `terminal::windows::console`, which

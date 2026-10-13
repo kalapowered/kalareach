@@ -29,6 +29,7 @@
 //! | [`question`] | Reading and answering an agent's questions from the terminal |
 //! | [`skill`] | Installing the contact skill and its tool configuration for an agent |
 //! | [`bridge`] | `kr bridge`: the process-bridge helper and this host's enrolled environments |
+//! | [`backup`] | `kr backup`: restoring a backup of this host's data with the recovery kit |
 //! | [`export`] | `kr export`: a closed session's retained output, written to a file the person names |
 //! | [`attach`] | Attaching a terminal, forwarding bytes, and the restoration guard |
 //! | [`session`] | Driving one attachment's input, output and connection in a single loop |
@@ -45,6 +46,7 @@
 pub mod account;
 pub mod answer;
 pub mod attach;
+pub mod backup;
 pub mod barrier;
 pub mod bind;
 pub mod bridge;

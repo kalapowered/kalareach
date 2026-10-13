@@ -709,6 +709,25 @@ pub fn hex_digest(text: &str) -> Shown {
     checked(text, lower_hex(text, 64..=64))
 }
 
+/// What a recovery kit's bundle locator says of itself: its first eight characters, when the whole
+/// is an identifier in its canonical spelling, and that it is not one otherwise.
+///
+/// The locator is what finds the bundle, so no more of it is shown than lets a person see that
+/// they typed the kit they meant.
+#[must_use]
+pub fn locator_start(text: &str) -> Shown {
+    let canonical = text.len() == 36
+        && text.char_indices().all(|(at, character)| match at {
+            8 | 13 | 18 | 23 => character == '-',
+            _ => character.is_ascii_digit() || ('a'..='f').contains(&character),
+        });
+    if canonical {
+        checked(&text[..8], true)
+    } else {
+        Shown::said(NOT_AN_IDENTIFIER)
+    }
+}
+
 /// What a build identifier that arrived as text says: itself, when it is one this build reads
 /// (`kr/0.46.0`), and that it is not an identifier otherwise.
 #[must_use]

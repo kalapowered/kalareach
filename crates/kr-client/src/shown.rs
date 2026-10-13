@@ -613,6 +613,43 @@ impl Shown {
             .unwrap_or_else(|| Self::said("[a collection name]"))
     }
 
+    /// Where a generation stands against the bundle's checkpoint, in the sentence a restore shows.
+    ///
+    /// The sentence is made of this program's own words and the generation numbers it names.
+    #[must_use]
+    pub fn restore_standing(standing: &kr_crypto::backup::RestoreGeneration) -> Self {
+        Self::decided(standing.describe())
+    }
+
+    /// A key identifier as a restore names its writer: the first eight bytes, in hexadecimal.
+    ///
+    /// It identifies a key, which is public, and is cut short only so that a line stays short.
+    #[must_use]
+    pub fn key_identifier(key: &kr_protocol::scalars::KeyId) -> Self {
+        Self::decided(
+            key.as_bytes()
+                .iter()
+                .take(8)
+                .map(|byte| format!("{byte:02x}"))
+                .collect(),
+        )
+    }
+
+    /// The name of a file a restore writes: `session-` and four digits and `.json`, or
+    /// `configuration.json`. Any other name is replaced, because a restore never writes one.
+    #[must_use]
+    pub fn restored_file(name: &str) -> Self {
+        let session = name
+            .strip_prefix("session-")
+            .and_then(|rest| rest.strip_suffix(".json"))
+            .is_some_and(|digits| digits.len() == 4 && digits.bytes().all(|b| b.is_ascii_digit()));
+        if session || name == "configuration.json" {
+            Self::decided(name.to_owned())
+        } else {
+            Self::said("[a file name a restore does not write]")
+        }
+    }
+
     /// A terminal type as the environment names one (`TERM`): said when it is one of the terminfo
     /// names this build lists, and replaced otherwise.
     ///
@@ -1493,6 +1530,8 @@ plain!(
     crate::sync::SyncError,
     crate::sync::membership::MembershipError,
     crate::recovery::RecoveryError,
+    crate::recovery::RestoreError,
+    crate::recovery::PublicationRefusal,
     crate::answers::AnswerError,
     crate::recovery::MaterialName,
     crate::answers::Retired,

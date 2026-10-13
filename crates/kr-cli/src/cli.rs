@@ -105,6 +105,43 @@ pub enum Command {
     /// Enrol this host in an organisation's policy, or show what it holds for each.
     #[command(subcommand)]
     Organisation(OrganisationCommand),
+    /// Restore a backup of this host's data with the recovery kit.
+    #[command(subcommand)]
+    Backup(BackupCommand),
+}
+
+/// One `kr backup` operation.
+#[derive(Subcommand)]
+pub enum BackupCommand {
+    /// Restore a backup to readable files in a folder you made, using the recovery kit.
+    ///
+    /// The kit is read from a file you name, from standard input, or typed at the terminal; it is
+    /// never an argument. The command shows what it would write and a digest of that, and writes
+    /// only after you confirm it. Nothing is imported into this host: the files are copies to read.
+    Restore(BackupRestoreArguments),
+}
+
+/// `kr backup restore`.
+#[derive(Args)]
+pub struct BackupRestoreArguments {
+    /// The folder to fill. You make it first: it has to exist, be empty and be yours, and no other
+    /// account may be able to write in it. It is never removed and never replaced.
+    #[arg(long)]
+    pub into: PathBuf,
+    /// Read the recovery kit from this file. Without it, the kit comes from standard input: typed
+    /// at the terminal, with nothing shown, or piped.
+    #[arg(long, value_name = "PATH")]
+    pub kit_file: Option<PathBuf>,
+    /// The archive to restore, by identifier, when the recovery bundle names more than one.
+    #[arg(long)]
+    pub archive: Option<String>,
+    /// Print what would be restored and the digest of that, and write nothing.
+    #[arg(long, conflicts_with = "confirm_plan")]
+    pub preview: bool,
+    /// Write only when what would be restored has this digest, as `--preview` printed it. Without
+    /// `--preview` or this, the command asks at a terminal.
+    #[arg(long, value_name = "DIGEST")]
+    pub confirm_plan: Option<String>,
 }
 
 /// The environment one command acts in.

@@ -503,6 +503,28 @@ impl MemberRefusal {
     }
 }
 
+impl MemberRefusal {
+    /// Why the member is not restored, in this program's words and the numbers that broke a bound.
+    #[must_use]
+    pub fn said(self) -> Shown {
+        match self {
+            Self::Kind { because, .. } => Shown::said(because),
+            Self::UnknownKind => Shown::said("its name is not one a host archive carries"),
+            Self::Duplicate => Shown::said("another member has the same name"),
+            Self::OverMemberCap { size, cap } => crate::shown!(
+                "it holds {} bytes and a member of its kind holds at most {}",
+                size,
+                cap
+            ),
+            Self::OverTotal { cap } => crate::shown!(
+                "the members before it already take the {} bytes a restore accepts",
+                cap
+            ),
+            Self::BadStoredLength => Shown::said("its stored length is not that of any object"),
+        }
+    }
+}
+
 /// What a restore does with one member.
 #[derive(Clone, PartialEq, Eq)]
 pub enum MemberVerdict {
@@ -691,14 +713,7 @@ impl RestorePlan {
                     "size": member.plaintext_len,
                     "written": false,
                     "refused": refusal.word(),
-                    "because": match refusal {
-                        MemberRefusal::Kind { because, .. } => (*because).to_owned(),
-                        MemberRefusal::UnknownKind => "its name is not one a host archive carries".to_owned(),
-                        MemberRefusal::Duplicate => "another member has the same name".to_owned(),
-                        MemberRefusal::OverMemberCap { size, cap } => format!("it holds {size} bytes and a member of its kind holds at most {cap}"),
-                        MemberRefusal::OverTotal { cap } => format!("the members before it already take the {cap} bytes a restore accepts"),
-                        MemberRefusal::BadStoredLength => "its stored length is not that of any object".to_owned(),
-                    },
+                    "because": refusal.said().into_string(),
                 }),
             }).collect::<Vec<_>>(),
         })

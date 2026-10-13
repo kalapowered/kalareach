@@ -4241,6 +4241,8 @@ version = "0.1.0"
 dependencies = [
  "aws-lc-rs",
  "base64 0.23.1",
+ "cap-fs-ext",
+ "cap-std",
  "clap",
  "flate2",
  "jiff",
@@ -4260,6 +4262,7 @@ dependencies = [
  "kr-plugin-sdk",
  "kr-project",
  "kr-protocol",
+ "kr-service-stand-in",
  "kr-shell-integration",
  "kr-term",
  "kr-transfer",
@@ -4284,6 +4287,8 @@ dependencies = [
  "tokio-util",
  "tough",
  "windows-sys 0.61.2",
+ "winx",
+ "zeroize",
 ]
 
 [[package]]
