@@ -24,6 +24,7 @@
 //! generation is sealed; the filenames are inside the encrypted manifest. `backup.sqlite` holds
 //! identities, hashes, sizes, states and the paths of ciphertext.
 
+pub mod binding;
 mod lease;
 pub mod relay;
 pub mod runtime;
@@ -39,6 +40,7 @@ use std::sync::{Arc, Mutex};
 
 use tokio::sync::Notify;
 
+use kr_client::services::AccountMark;
 use kr_crypto::backup::{SealedArchive, StagedObject};
 use kr_flush::{NameKind, flush_directory};
 use kr_protocol::ids::{ArchiveId, BackupGeneration, BackupObjectId};
@@ -54,6 +56,11 @@ use crate::backup::store::{
     Setup, SetupCommit, SetupRecord, Step,
 };
 use crate::error::{ControllerError, Result};
+
+/// How many days after a deletion the storage service removes an object's ciphertext, and goes on
+/// charging for it until then. The service publishes its figure; a status read that says another
+/// is reported by `kr doctor`.
+pub const TOMBSTONE_DAYS: u64 = 7;
 
 /// The stable name this subsystem is reported under, which is section 24's.
 pub const SUBSYSTEM_NAME: &str = "backup";
@@ -262,6 +269,8 @@ pub struct BackupService {
     store: Mutex<BackupStore>,
     readiness: Mutex<Readiness>,
     signals: Arc<BackupSignals>,
+    /// The account the backups belong to, as a request's token is held to it.
+    binding: Arc<binding::Binding>,
     /// The production passes that hold the staging directory. Always taken after the store, and
     /// never while waiting for it.
     leases: Arc<Mutex<lease::Leases>>,
@@ -307,10 +316,13 @@ impl BackupService {
     ///
     /// Returns [`ControllerError::RegistryUnavailable`] when the store cannot be opened.
     pub fn open(state_dir: &Path) -> Result<Self> {
+        let store = BackupStore::open(state_dir)?;
+        let binding = binding_of(&store)?;
         Ok(Self {
-            store: Mutex::new(BackupStore::open(state_dir)?),
+            store: Mutex::new(store),
             readiness: Mutex::new(Readiness::default()),
             signals: Arc::default(),
+            binding,
             leases: Arc::default(),
         })
     }
@@ -323,10 +335,13 @@ impl BackupService {
     ///
     /// Returns [`ControllerError::RegistryUnavailable`] when the store cannot be created.
     pub fn in_memory(staging_root: &Path) -> Result<Self> {
+        let store = BackupStore::in_memory(staging_root)?;
+        let binding = binding_of(&store)?;
         Ok(Self {
-            store: Mutex::new(BackupStore::in_memory(staging_root)?),
+            store: Mutex::new(store),
             readiness: Mutex::new(Readiness::default()),
             signals: Arc::default(),
+            binding,
             leases: Arc::default(),
         })
     }
@@ -335,6 +350,13 @@ impl BackupService {
     #[must_use]
     pub fn signals(&self) -> Arc<BackupSignals> {
         Arc::clone(&self.signals)
+    }
+
+    /// The account the backups belong to, which the token source of every request of the backup
+    /// clients is held to.
+    #[must_use]
+    pub fn binding(&self) -> Arc<binding::Binding> {
+        Arc::clone(&self.binding)
     }
 
     fn store(&self) -> std::sync::MutexGuard<'_, BackupStore> {
@@ -802,6 +824,21 @@ impl BackupService {
         self.store().authorised_writers()
     }
 
+    /// Raises the number of the last generation made for the setup's archive to `generation`, and
+    /// never lowers it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::RegistryUnavailable`] when the store refuses the write.
+    pub fn raise_generation_counter(
+        &self,
+        archive_id: ArchiveId,
+        generation: BackupGeneration,
+    ) -> Result<()> {
+        self.store()
+            .raise_generation_counter(archive_id, generation)
+    }
+
     /// Writes the setup the owner made and enrols its writer, in one transaction, and wakes
     /// whatever produces and carries.
     ///
@@ -821,6 +858,10 @@ impl BackupService {
     ) -> Result<SetupCommit> {
         let mut store = self.store();
         let commit = store.commit_setup(record, replace, now_ms)?;
+        // Inside the hold in which the setup committed, and nowhere else: from here a request the
+        // backup clients make is held to this account.
+        self.binding
+            .switch(AccountMark::from_bytes(record.account_mark));
         if matches!(commit, SetupCommit::Replaced { .. }) {
             // What the earlier archive had running is told to stop with the commit.
             self.leases().cancel_all();
@@ -1006,6 +1047,25 @@ impl BackupService {
             sync_removal(path)?;
         }
         Ok(removed)
+    }
+
+    /// Prohibits further production of one generation and takes back what it never sent, and
+    /// wakes whatever releases the ciphertext of a generation whose production is over.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::RegistryUnavailable`] when the store refuses the write.
+    pub fn cancel_production(
+        &self,
+        archive_id: ArchiveId,
+        backup_generation: BackupGeneration,
+        detail: &str,
+        now_ms: TimestampMs,
+    ) -> Result<()> {
+        self.store()
+            .cancel_production(archive_id, backup_generation, detail, now_ms)?;
+        self.signals.work.notify_one();
+        Ok(())
     }
 
     /// Whether a production pass holds the staging directory now.
@@ -1582,6 +1642,14 @@ impl BackupService {
     }
 }
 
+/// The binding of the setup the store holds, or none when it holds none.
+fn binding_of(store: &BackupStore) -> Result<Arc<binding::Binding>> {
+    Ok(match store.setup()? {
+        Some(setup) => binding::Binding::of(AccountMark::from_bytes(setup.record.account_mark)),
+        None => binding::Binding::unbound(),
+    })
+}
+
 /// Returns every file under this store's staging directory that no object row names.
 ///
 /// Ciphertext is written before the row that names it, so a stop in between leaves a file nothing
@@ -1869,8 +1937,30 @@ impl PrivacySubsystem for BackupPrivacy<'_> {
                 if !left && !in_doubt {
                     return None;
                 }
+                // What this host has deleted at the service. A generation all of whose objects it
+                // deleted is shown until the service removes them, which is the tombstone window
+                // after the last deletion, and not after; one it deleted some of is shown as that.
+                let objects = store
+                    .objects(record.archive_id, record.backup_generation)
+                    .ok()?;
+                let deleted: Vec<u64> = objects
+                    .iter()
+                    .filter_map(|object| object.released_at_ms.map(TimestampMs::get))
+                    .collect();
+                let wholly_deleted = !objects.is_empty() && deleted.len() == objects.len();
+                if wholly_deleted
+                    && deleted.iter().max().is_some_and(|last| {
+                        self.now_ms.get() >= last.saturating_add(TOMBSTONE_DAYS * 86_400_000)
+                    })
+                {
+                    return None;
+                }
                 Some(Exported {
-                    kind: if record.remote == Remote::Published {
+                    kind: if wholly_deleted {
+                        "backup archive, deleted and awaiting removal at the service".to_owned()
+                    } else if !deleted.is_empty() {
+                        "backup archive, partly deleted".to_owned()
+                    } else if record.remote == Remote::Published {
                         "backup archive".to_owned()
                     } else if in_doubt || record.remote == Remote::Unknown {
                         // Something of it left this host and nothing here knows whether a service

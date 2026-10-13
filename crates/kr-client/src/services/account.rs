@@ -1581,7 +1581,51 @@ struct GrantDocument {
     scopes: Vec<String>,
 }
 
+/// Which account, at which service, a token is for.
+///
+/// A domain-separated digest of the issuer, the account's subject and the origin of the service the
+/// token is presented to. Two marks are equal while it is the same account at the same service.
+/// Nothing in a mark says who the account is, and the subject it was made from never leaves the
+/// sign-in: a caller that must know a token is still its account's holds the mark and compares it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct AccountMark([u8; 32]);
+
+impl AccountMark {
+    /// The mark as it is kept.
+    #[must_use]
+    pub const fn to_bytes(self) -> [u8; 32] {
+        self.0
+    }
+
+    /// A mark read back from where it was kept.
+    #[must_use]
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+}
+
+impl fmt::Debug for AccountMark {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AccountMark")
+            .finish_non_exhaustive()
+    }
+}
+
+/// The domain the mark of an account at a service is hashed under.
+const ACCOUNT_MARK_DOMAIN: &str = "kalareach-account-mark/1";
+
 impl StoredGrant {
+    /// The mark of this grant's account at the service at `origin`.
+    fn mark_at(&self, origin: &str) -> AccountMark {
+        let mut digest = sha2::Sha256::new();
+        for part in [ACCOUNT_MARK_DOMAIN, ISSUER, self.subject.as_str(), origin] {
+            digest.update((part.len() as u64).to_be_bytes());
+            digest.update(part.as_bytes());
+        }
+        AccountMark(digest.finalize().into())
+    }
+
     /// A new grant from an exchange's tokens, with an identifier of its own.
     ///
     /// # Errors
@@ -2657,58 +2701,98 @@ fn not_granted(scope: &str) -> ClientError {
 
 impl AccountTokenSource for SignedInAccount {
     fn token<'a>(&'a self, scope: &'a str) -> ServiceFuture<'a, AccountToken> {
+        Box::pin(async move { self.token_for(scope, |_, token| token).await })
+    }
+}
+
+impl SignedInAccount {
+    /// The mark of the account signed in now at the service at `origin`, or none when no account
+    /// is signed in.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the store cannot be read.
+    pub fn mark(&self, origin: &str) -> Result<Option<AccountMark>> {
+        Ok(self.read_grant()?.map(|grant| grant.mark_at(origin)))
+    }
+
+    /// The token for `scope`, with the mark of the account it belongs to at the service at
+    /// `origin`, both from one read of the grant.
+    ///
+    /// A caller that checks the mark of the grant and then asks for a token has read the grant
+    /// twice, and the account can change between the two reads. This is one read.
+    ///
+    /// # Errors
+    ///
+    /// As [`AccountTokenSource::token`].
+    pub fn token_marked<'a>(
+        &'a self,
+        scope: &'a str,
+        origin: &'a str,
+    ) -> ServiceFuture<'a, (AccountToken, AccountMark)> {
         Box::pin(async move {
-            let queued = {
-                let _held = self.hold().await?;
-                let Some(stored) = self.read_grant()? else {
-                    return Err(if self.ended.load(Ordering::SeqCst) {
-                        ended()
-                    } else {
-                        signed_out()
-                    });
-                };
-                if !stored.carries(scope) {
-                    return Err(not_granted(scope));
-                }
-                let now = (self.clock_ms)();
-                if stored.access_expires_at_ms > now.saturating_add(ACCESS_MARGIN_MS) {
-                    return Ok(stored.access_token.clone());
-                }
-                match self.service.refresh(&stored).await? {
-                    Refreshed::Rotated(issued) => {
-                        let rotated = stored.rotated(issued, now);
-                        self.write_grant(&rotated)?;
-                        self.publish();
-                        // A refresh may narrow the grant, which is kept as issued; its token goes
-                        // out only for a scope it still carries.
-                        if !rotated.carries(scope) {
-                            return Err(not_granted(scope));
-                        }
-                        return Ok(rotated.access_token.clone());
-                    }
-                    Refreshed::Ended => {
-                        self.delete_grant()?;
-                        self.ended.store(true, Ordering::SeqCst);
-                        self.publish();
-                        false
-                    }
-                    Refreshed::Refused { leftover } => {
-                        let queued = leftover.is_some();
-                        if let Some(leftover) = leftover {
-                            self.queue(&stored.grant_id, leftover)?;
-                        }
-                        self.delete_grant()?;
-                        self.ended.store(true, Ordering::SeqCst);
-                        self.publish();
-                        queued
-                    }
-                }
-            };
-            if queued {
-                let _ = self.send_pending().await;
-            }
-            Err(ended())
+            self.token_for(scope, |grant, token| (token, grant.mark_at(origin)))
+                .await
         })
+    }
+
+    /// Reads the grant once, refreshes it when the token is near its end, and shapes the answer
+    /// from the grant the token belongs to.
+    async fn token_for<T>(
+        &self,
+        scope: &str,
+        shape: impl Fn(&StoredGrant, AccountToken) -> T,
+    ) -> Result<T> {
+        let queued = {
+            let _held = self.hold().await?;
+            let Some(stored) = self.read_grant()? else {
+                return Err(if self.ended.load(Ordering::SeqCst) {
+                    ended()
+                } else {
+                    signed_out()
+                });
+            };
+            if !stored.carries(scope) {
+                return Err(not_granted(scope));
+            }
+            let now = (self.clock_ms)();
+            if stored.access_expires_at_ms > now.saturating_add(ACCESS_MARGIN_MS) {
+                return Ok(shape(&stored, stored.access_token.clone()));
+            }
+            match self.service.refresh(&stored).await? {
+                Refreshed::Rotated(issued) => {
+                    let rotated = stored.rotated(issued, now);
+                    self.write_grant(&rotated)?;
+                    self.publish();
+                    // A refresh may narrow the grant, which is kept as issued; its token goes
+                    // out only for a scope it still carries.
+                    if !rotated.carries(scope) {
+                        return Err(not_granted(scope));
+                    }
+                    return Ok(shape(&rotated, rotated.access_token.clone()));
+                }
+                Refreshed::Ended => {
+                    self.delete_grant()?;
+                    self.ended.store(true, Ordering::SeqCst);
+                    self.publish();
+                    false
+                }
+                Refreshed::Refused { leftover } => {
+                    let queued = leftover.is_some();
+                    if let Some(leftover) = leftover {
+                        self.queue(&stored.grant_id, leftover)?;
+                    }
+                    self.delete_grant()?;
+                    self.ended.store(true, Ordering::SeqCst);
+                    self.publish();
+                    queued
+                }
+            }
+        };
+        if queued {
+            let _ = self.send_pending().await;
+        }
+        Err(ended())
     }
 }
 

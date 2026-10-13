@@ -348,7 +348,38 @@ impl HostAccount {
         Arc::new(HostTokens {
             inner: Arc::clone(&self.inner),
             origin: origin.to_owned(),
+            binding: None,
         })
+    }
+
+    /// The token source the backup clients present, held to `binding`: it hands out a token only
+    /// when the account signed in now is the one the backups belong to, and, for a request made
+    /// inside a carrier iteration, only when no replacement of that account committed since the
+    /// iteration began.
+    ///
+    /// With nothing bound it passes through, because nothing is owed to an account yet.
+    #[must_use]
+    pub fn bound_tokens_for(
+        &self,
+        origin: &str,
+        binding: Arc<crate::backup::binding::Binding>,
+    ) -> Arc<dyn AccountTokenSource> {
+        Arc::new(HostTokens {
+            inner: Arc::clone(&self.inner),
+            origin: origin.to_owned(),
+            binding: Some(binding),
+        })
+    }
+
+    /// The mark of the account signed in now at the service at `origin`, or none when there is
+    /// none or the sign-in cannot be read.
+    #[must_use]
+    pub fn mark_at(&self, origin: &str) -> Option<kr_client::services::AccountMark> {
+        let held = self.inner.presenting().ok()?;
+        if held.origin != origin {
+            return None;
+        }
+        held.signed_in.mark(origin).ok().flatten()
     }
 
     /// Where the host's sign-in stands.
@@ -851,6 +882,8 @@ struct HostTokens {
     inner: Arc<Inner>,
     /// The service the call is to.
     origin: String,
+    /// The account the token must belong to, for the backup clients.
+    binding: Option<Arc<crate::backup::binding::Binding>>,
 }
 
 impl std::fmt::Debug for HostTokens {
@@ -893,7 +926,39 @@ impl AccountTokenSource for HostTokens {
                     ),
                 ));
             }
-            held.signed_in.token(scope).await
+            let Some(binding) = &self.binding else {
+                return held.signed_in.token(scope).await;
+            };
+            // The mark comes with the token from one read of the grant, and both are compared
+            // with the binding after the read returns: a renewal can take seconds, and the binding
+            // can be switched while it does.
+            let (token, mark) = held.signed_in.token_marked(scope, &self.origin).await?;
+            let bound = binding.read();
+            let Some(account) = bound.mark else {
+                return Ok(token);
+            };
+            if account != mark {
+                return Err(kr_client::ClientError::refusal(
+                    ErrorCode::ResourceUnavailable,
+                    kr_client::shown::Shown::said(
+                        "this host is signed in as another account than the one its backups \
+                         belong to",
+                    ),
+                ));
+            }
+            if crate::backup::binding::ITERATION_EPOCH
+                .try_with(|epoch| *epoch != bound.epoch)
+                .unwrap_or(false)
+            {
+                return Err(kr_client::ClientError::refusal(
+                    ErrorCode::ResourceUnavailable,
+                    kr_client::shown::Shown::said(
+                        "the account this host's backups belong to was replaced while this \
+                         request waited for its token",
+                    ),
+                ));
+            }
+            Ok(token)
         })
     }
 }

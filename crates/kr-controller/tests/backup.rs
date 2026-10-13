@@ -21,7 +21,9 @@ use kr_controller::backup::store::{
     NewGeneration, NewObject, ObligationKind, Production, Publication, Remote, SCHEMA_VERSION,
     SetupCommit, SetupRecord, Step, UploadRecord,
 };
-use kr_controller::backup::uploader::{EXECUTOR as UPLOADER, Idle, Stepped, Uploader};
+use kr_controller::backup::uploader::{
+    EXECUTOR as UPLOADER, Idle, SERVICE_CHAIN_LENGTH, Stepped, Uploader, generations_kept,
+};
 use kr_controller::backup::{Admitted, BackupService, SUBSYSTEM_NAME};
 use kr_controller::error::ControllerError;
 use kr_controller::quiet::{Quiet, RealTimer, Timer};
@@ -5736,8 +5738,13 @@ fn a_deletion_is_asked_for_once_only_for_what_no_other_generation_names_and_neve
             matches!(unpassed, Err(ControllerError::InvalidArgument(_))),
             "{unpassed:?}"
         );
-        let unasked =
-            store.note_object_released(archive_id(), generation_one, own, TimestampMs::new(6_300));
+        let unasked = store.note_object_released(
+            archive_id(),
+            generation_one,
+            own,
+            true,
+            TimestampMs::new(6_300),
+        );
         assert!(
             matches!(unasked, Err(ControllerError::InvalidArgument(_))),
             "an answer to a deletion never asked for: {unasked:?}"
@@ -5802,10 +5809,22 @@ fn a_deletion_is_asked_for_once_only_for_what_no_other_generation_names_and_neve
         .note_deletion_asked(archive_id(), generation_one, own, TimestampMs::new(8_000))
         .expect("asked again");
     store
-        .note_object_released(archive_id(), generation_one, own, TimestampMs::new(9_000))
+        .note_object_released(
+            archive_id(),
+            generation_one,
+            own,
+            true,
+            TimestampMs::new(9_000),
+        )
         .expect("the answer is written down");
     store
-        .note_object_released(archive_id(), generation_one, own, TimestampMs::new(10_000))
+        .note_object_released(
+            archive_id(),
+            generation_one,
+            own,
+            true,
+            TimestampMs::new(10_000),
+        )
         .expect("the same answer again changes nothing");
 
     // A generation whose upload stopped with its outcome unknown goes on producing, and has
@@ -6050,6 +6069,8 @@ struct Scripted {
     faults: Vec<(Kind, usize, Fault)>,
     sent: BTreeMap<Kind, usize>,
     created: u64,
+    /// The daily snapshots the account records, when a test changes them from the default.
+    daily_snapshots: Option<u32>,
 }
 
 /// What the scripted service runs when a part reaches it, before it takes the part.
@@ -6495,10 +6516,14 @@ impl Web {
         } else if state.tombstoned.contains(&identity) {
             true
         } else {
-            return Err(ClientError::Host(ProtocolError::new(
-                ErrorCode::UnknownSession,
-                "the service holds no stored object under that identity",
-            )));
+            return Err(ClientError::Refused {
+                error: ProtocolError::new(
+                    ErrorCode::UnknownSession,
+                    "the service holds no stored object under that identity",
+                ),
+                retry_after_seconds: None,
+                action: UserAction::Nothing,
+            });
         };
         Ok(ObjectDeleted {
             already,
@@ -6651,7 +6676,7 @@ impl StorageService for Web {
                 backup,
                 retention_revision: 1,
                 retention: RetentionPolicy {
-                    daily_snapshots: 30,
+                    daily_snapshots: self.scripted().daily_snapshots.unwrap_or(30),
                     tombstone_days: 30,
                     provider_recovery_days: 7,
                 },
@@ -9295,4 +9320,298 @@ fn unclaimed_staging_is_removed_by_name_and_a_moved_state_directory_keeps_what_i
         claimed,
         "what a row names stays"
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Retention: the host keeps the newest K published generations and deletes the older ones' objects.
+// ---------------------------------------------------------------------------------------------
+
+impl Host {
+    /// Records the owner's setup for the host's archive, with its writer enrolled.
+    fn set_up(&self) {
+        self.service
+            .commit_setup(
+                &a_setup(archive_id(), &self.producer, "ABCD2345"),
+                false,
+                TimestampMs::new(1_000),
+            )
+            .expect("the setup is written");
+    }
+
+    /// Admits generations `first` to `last` one at a time, each carried to its publication.
+    async fn publish_generations(&self, uploader: &mut Uploader, first: u64, last: u64) {
+        for generation in first..=last {
+            self.admit(generation, &[64]);
+            passes(uploader, 10_000 * generation).await;
+            assert_eq!(self.generation(generation).remote, Remote::Published);
+        }
+    }
+
+    fn held_at_the_service(&self, generation: u64) -> bool {
+        self.service
+            .objects(archive_id(), BackupGeneration::new(generation))
+            .expect("a read")
+            .iter()
+            .all(|object| self.web.stored_bytes(object.object_id).is_some())
+    }
+
+    fn deleted_at_the_service(&self, generation: u64) -> bool {
+        self.service
+            .objects(archive_id(), BackupGeneration::new(generation))
+            .expect("a read")
+            .iter()
+            .all(|object| {
+                self.web.stored_bytes(object.object_id).is_none() && object.released_at_ms.is_some()
+            })
+    }
+}
+
+/// With two kept, publishing the third generation deletes the first one's objects at the service
+/// and nothing else; the objects of the two newest stay. With three kept, nothing is deleted. The
+/// figure is the account's recorded daily snapshots, held between two and the service's chain.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_host_keeps_the_newest_published_generations_and_deletes_the_objects_of_older_ones() {
+    assert_eq!(generations_kept(0), 2);
+    assert_eq!(generations_kept(1), 2, "a figure of one keeps two");
+    assert_eq!(generations_kept(5), 5);
+    assert_eq!(generations_kept(30), SERVICE_CHAIN_LENGTH);
+
+    let host = Host::open();
+    host.set_up();
+    host.web.scripted().daily_snapshots = Some(2);
+    let mut uploader = host.uploader(10_000);
+    host.publish_generations(&mut uploader, 1, 3).await;
+    passes(&mut uploader, 40_000).await;
+    assert!(host.deleted_at_the_service(1), "older than the newest two");
+    assert!(host.held_at_the_service(2));
+    assert!(host.held_at_the_service(3));
+    // Written down once, asked once.
+    let asked = host.web.asked().len();
+    assert!(passes(&mut uploader, 50_000).await.is_empty());
+    assert_eq!(host.web.asked().len(), asked);
+    host.web.nothing_asked_twice();
+
+    // The control: three kept, nothing is deleted.
+    let host = Host::open();
+    host.set_up();
+    host.web.scripted().daily_snapshots = Some(3);
+    let mut uploader = host.uploader(10_000);
+    host.publish_generations(&mut uploader, 1, 3).await;
+    passes(&mut uploader, 40_000).await;
+    assert!(host.held_at_the_service(1));
+    assert_eq!(deletions(&host), 0);
+}
+
+/// A host with no setup deletes nothing by retention, whatever it holds as published.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_host_with_no_setup_deletes_nothing_by_retention() {
+    let host = Host::open();
+    host.web.scripted().daily_snapshots = Some(2);
+    let mut uploader = host.uploader(10_000);
+    host.publish_generations(&mut uploader, 1, 4).await;
+    passes(&mut uploader, 50_000).await;
+    assert_eq!(deletions(&host), 0);
+    assert!(host.held_at_the_service(1));
+}
+
+/// The store decides each deletion in the transaction that writes it down, and refuses it for each
+/// reason on its own. The control is the same deletion with none of them standing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_store_refuses_a_retention_deletion_for_each_reason_on_its_own() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    let one = |store: &mut BackupStore, generation: u64, keep: u64| {
+        let object = member_of(generation, 0);
+        store.note_retained_deletion_asked(
+            archive_id(),
+            BackupGeneration::new(generation),
+            object,
+            keep,
+            TimestampMs::new(99_000),
+        )
+    };
+    let counter = AtomicU64::new(0);
+    // A host with three published generations and a setup, a fresh one for each case.
+    let published = async || {
+        let host = Host::open();
+        host.set_up();
+        let mut uploader = host.uploader(10_000);
+        host.publish_generations(&mut uploader, 1, 3).await;
+        counter.fetch_add(1, Ordering::SeqCst);
+        host
+    };
+
+    // The control: generation 1 has two newer ones published.
+    let host = published().await;
+    let mut store = BackupStore::open(&host.state).expect("the store");
+    one(&mut store, 1, 2).expect("asked");
+    one(&mut store, 1, 2).expect("asked again, written down once");
+
+    // The floor of two at the store.
+    let host = published().await;
+    let mut store = BackupStore::open(&host.state).expect("the store");
+    assert!(matches!(
+        one(&mut store, 1, 1),
+        Err(ControllerError::InvalidArgument(_))
+    ));
+    // The newest generation, and the one before it with only one newer.
+    assert!(matches!(
+        one(&mut store, 3, 2),
+        Err(ControllerError::InvalidArgument(_))
+    ));
+    assert!(matches!(
+        one(&mut store, 2, 2),
+        Err(ControllerError::InvalidArgument(_))
+    ));
+
+    // An object another generation names.
+    let host = published().await;
+    rusqlite::Connection::open(host.state.join("backup.sqlite"))
+        .expect("the store")
+        .execute(
+            "INSERT INTO objects (archive_id, backup_generation, object_id, encrypted_hash,
+                                  encrypted_len, staged_path, local_state, acknowledged_bytes)
+             SELECT archive_id, 2, object_id, encrypted_hash, encrypted_len, staged_path || 'x',
+                    'absent', encrypted_len
+               FROM objects WHERE backup_generation = 1 AND object_id = ?1",
+            rusqlite::params![member_of(1, 0).get().as_bytes().as_slice()],
+        )
+        .expect("a second generation that names the object");
+    let mut store = BackupStore::open(&host.state).expect("the store");
+    assert!(matches!(
+        one(&mut store, 1, 2),
+        Err(ControllerError::Refused { .. })
+    ));
+
+    // An attempt of the generation that is still open.
+    let host = published().await;
+    rusqlite::Connection::open(host.state.join("backup.sqlite"))
+        .expect("the store")
+        .execute(
+            "INSERT INTO outbox (archive_id, backup_generation, step, privacy_generation, status,
+                                 enqueued_at_ms)
+             VALUES (?1, 1, 'upload', 0, 'queued', 1)",
+            rusqlite::params![archive_id().get().as_bytes().as_slice()],
+        )
+        .expect("an open attempt");
+    let mut store = BackupStore::open(&host.state).expect("the store");
+    assert!(matches!(
+        one(&mut store, 1, 2),
+        Err(ControllerError::Refused { .. })
+    ));
+
+    // A fence.
+    let host = published().await;
+    host.service
+        .raise_fence(PrivacyGeneration::new(1), TimestampMs::new(98_000))
+        .expect("the fence goes up");
+    let mut store = BackupStore::open(&host.state).expect("the store");
+    assert!(matches!(
+        one(&mut store, 1, 2),
+        Err(ControllerError::Refused { .. })
+    ));
+
+    // A retired writer, and a deletion written down and asked again after the writer was retired.
+    let host = published().await;
+    {
+        let mut store = BackupStore::open(&host.state).expect("the store");
+        one(&mut store, 1, 2).expect("asked");
+    }
+    host.service
+        .retire_writer(
+            archive_id(),
+            host.producer.writer.key_id(),
+            TimestampMs::new(98_000),
+        )
+        .expect("the writer is retired");
+    let mut store = BackupStore::open(&host.state).expect("the store");
+    assert!(matches!(
+        one(&mut store, 1, 2),
+        Err(ControllerError::Refused { .. })
+    ));
+    assert!(matches!(
+        one(&mut store, 1, 2),
+        Err(ControllerError::Refused { .. })
+    ));
+
+    // An archive that is not the setup's.
+    let host = published().await;
+    let other = ArchiveId::new(Uuid::from_bytes([0x12; 16]));
+    host.service
+        .commit_setup(
+            &a_setup(other, &host.producer, "QQQQ2345"),
+            true,
+            TimestampMs::new(98_000),
+        )
+        .expect("a replacement");
+    let mut store = BackupStore::open(&host.state).expect("the store");
+    assert!(matches!(
+        one(&mut store, 1, 2),
+        Err(ControllerError::Refused { .. })
+    ));
+
+    // A host with no setup.
+    let host = Host::open();
+    let mut uploader = host.uploader(10_000);
+    host.publish_generations(&mut uploader, 1, 3).await;
+    let mut store = BackupStore::open(&host.state).expect("the store");
+    assert!(matches!(
+        one(&mut store, 1, 2),
+        Err(ControllerError::Refused { .. })
+    ));
+    assert!(counter.load(Ordering::SeqCst) >= 6);
+}
+
+/// "Not held" is a record that can be false: under an account the archive is not bound to, the
+/// service answers "not found" for an object another principal paid for. The store refuses it for
+/// an archive that is not the setup's, and records a deletion the service confirmed all the same.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_answer_of_not_held_is_not_recorded_for_an_archive_the_host_is_not_bound_to() {
+    let (host, mut uploader) = a_host_with_an_unknown_generation(&[(member_of(1, 0), 64)]).await;
+    // A newer generation is published, the first deletion is asked for and its answer never comes.
+    for nth in 1..=8 {
+        host.web.fail(Kind::Delete, nth, Fault::Dropped);
+    }
+    host.admit(2, &[64]);
+    passes(&mut uploader, 40_000).await;
+    let asked = host
+        .service
+        .objects(archive_id(), BackupGeneration::new(1))
+        .expect("a read")
+        .into_iter()
+        .find(|object| object.deletion_asked_at_ms.is_some() && object.released_at_ms.is_none())
+        .expect("a deletion asked for and not answered");
+
+    // The host is then set up for another archive, and an answer of "not held" for this one says
+    // nothing of the object.
+    let mut store = BackupStore::open(&host.state).expect("the store");
+    let other = ArchiveId::new(Uuid::from_bytes([0x12; 16]));
+    store
+        .commit_setup(
+            &a_setup(other, &host.producer, "QQQQ2345"),
+            false,
+            TimestampMs::new(50_000),
+        )
+        .expect("a setup of another archive");
+    let refused = store.note_object_released(
+        archive_id(),
+        BackupGeneration::new(1),
+        asked.object_id,
+        false,
+        TimestampMs::new(60_000),
+    );
+    assert!(
+        matches!(refused, Err(ControllerError::Refused { .. })),
+        "{refused:?}"
+    );
+    // A deletion the service confirmed cannot come from another principal, and is recorded.
+    store
+        .note_object_released(
+            archive_id(),
+            BackupGeneration::new(1),
+            asked.object_id,
+            true,
+            TimestampMs::new(60_100),
+        )
+        .expect("recorded");
 }

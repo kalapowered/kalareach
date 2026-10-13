@@ -130,8 +130,8 @@ use serde::{Deserialize, Serialize};
 use crate::error::{ClientError, Result};
 
 pub use account::{
-    AccountHttp, AccountService, AccountToken, AccountTokenSource, ManagedAccountService,
-    SignedInAccount,
+    AccountHttp, AccountMark, AccountService, AccountToken, AccountTokenSource,
+    ManagedAccountService, SignedInAccount,
 };
 pub use authority::{
     AnnouncementOutcome, AnnouncementPlacement, AuthorityFeedClient, AuthorityFeedRecord,

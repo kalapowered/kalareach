@@ -1582,10 +1582,16 @@ const MAX_SAFE_COUNTER: u64 = (1 << 53) - 1;
 ///
 /// A tombstoned object reads the same as one that never existed, so this says neither.
 fn not_held() -> ClientError {
-    ClientError::refusal(
-        ErrorCode::UnknownSession,
-        Shown::said("the service holds no stored object under that identity"),
-    )
+    // The service's own answer, so a caller can tell it from a refusal this host made itself: a
+    // host that refused to ask is not a service that holds nothing.
+    ClientError::Refused {
+        error: crate::error::refusal(
+            ErrorCode::UnknownSession,
+            Shown::said("the service holds no stored object under that identity"),
+        ),
+        retry_after_seconds: None,
+        action: crate::retry::UserAction::Nothing,
+    }
 }
 
 /// An answer that was read and says something the service's contract does not allow.

@@ -34,8 +34,11 @@ use rusqlite::{OptionalExtension, params};
 use crate::backup::statements::{Database, Reads, Statement, Writing, sql};
 use crate::error::{ControllerError, Result};
 
+mod retention;
 mod setup;
 
+pub use retention::LEAST_KEPT;
+use retention::standing_refusal;
 pub use setup::{Releasable, Setup, SetupCommit, SetupRecord};
 
 /// The schema version this build reads and writes.
@@ -2780,6 +2783,15 @@ impl BackupStore {
                 |row| row.get(0),
             )
             .map_err(ControllerError::registry)?;
+        // What can move after a deletion is written down: the writer's enrolment and which archive
+        // is the setup's. A request this host would ask again after a replacement or a retirement
+        // is not asked.
+        if let Some(refusal) = standing_refusal(&transaction, &archive, generation, true)? {
+            return Err(ControllerError::Refused {
+                code: kr_protocol::error::ErrorCode::PermissionDenied,
+                detail: refusal,
+            });
+        }
         if asked > 0 {
             return Ok(());
         }
@@ -2855,9 +2867,11 @@ impl BackupStore {
 
     /// Records that the service no longer holds one object this host asked it to delete.
     ///
-    /// The service answered the deletion, or answered that it holds no object under that identity;
-    /// either way nothing of it is charged beyond the service's tombstone window. An answer already
-    /// written down is left as it is, so an answer recorded twice records it once.
+    /// The service answered the deletion (`deleted`), or answered that it holds no object under
+    /// that identity; either way nothing of it is charged beyond the service's tombstone window.
+    /// An answer already written down is left as it is, so an answer recorded twice records it
+    /// once. The second answer is refused for an archive that is not the setup's when a setup
+    /// exists, since "not held" under another account says nothing about the object.
     ///
     /// # Errors
     ///
@@ -2868,6 +2882,7 @@ impl BackupStore {
         archive_id: ArchiveId,
         backup_generation: BackupGeneration,
         object_id: BackupObjectId,
+        deleted: bool,
         now_ms: TimestampMs,
     ) -> Result<()> {
         let archive = archive_id.get().as_bytes().to_vec();
@@ -2877,6 +2892,18 @@ impl BackupStore {
             .connection
             .writing()
             .map_err(ControllerError::registry)?;
+        // The one record that can be false. A service answers "not found" for an object that
+        // another principal paid for, so under an account this archive is not bound to, "not
+        // found" says nothing of the object. A deletion the service confirmed cannot come from
+        // another principal and is recorded whatever the binding says.
+        if !deleted
+            && let Some(refusal) = standing_refusal(&transaction, &archive, generation, false)?
+        {
+            return Err(ControllerError::Refused {
+                code: kr_protocol::error::ErrorCode::PermissionDenied,
+                detail: refusal,
+            });
+        }
         let answered: Option<Option<i64>> = transaction
             .read_one(
                 sql!(

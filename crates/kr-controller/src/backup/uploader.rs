@@ -147,6 +147,21 @@ use crate::backup::store::{
 use crate::error::{ControllerError, Result};
 use crate::quiet::{Owed, Quiet};
 
+/// How many descriptors the storage service's manifest keeps for one archive, which is the longest
+/// chain of generations a restore can be offered. The service's own figure; a host keeps no more
+/// than the service names.
+pub const SERVICE_CHAIN_LENGTH: u64 = 16;
+
+/// How many published generations of its archive this host keeps, from the daily snapshots the
+/// account records: the figure, held between the least a host keeps and the service's chain.
+///
+/// The least is two, because a restore may be reading the previous generation when the next is
+/// published.
+#[must_use]
+pub fn generations_kept(daily_snapshots: u32) -> u64 {
+    u64::from(daily_snapshots).clamp(crate::backup::store::LEAST_KEPT, SERVICE_CHAIN_LENGTH)
+}
+
 /// The name every attempt this uploader carries is dispatched to.
 ///
 /// One name for every process that runs the uploader, because an attempt belongs to the executor it
@@ -764,6 +779,9 @@ pub struct Uploader {
     /// Generations left behind that this process asked the service about and found it does not
     /// hold. Nothing can publish one after that, so the answer stands.
     unheld: BTreeSet<(ArchiveId, BackupGeneration)>,
+    /// How many published generations of the archive the last status read said to keep, or none
+    /// until one has been read. Until then nothing is deleted by retention.
+    kept: Option<u64>,
 }
 
 impl fmt::Debug for Uploader {
@@ -814,6 +832,7 @@ impl Uploader {
             dispatched_here: BTreeSet::new(),
             unanswered: BTreeMap::new(),
             unheld: BTreeSet::new(),
+            kept: None,
         }
     }
 
@@ -901,7 +920,10 @@ impl Uploader {
         }
         if !fenced {
             match self.storage.status().await {
-                Ok(status) if status.backup == BackupState::On => report.status = Some(status),
+                Ok(status) if status.backup == BackupState::On => {
+                    self.kept = Some(generations_kept(status.retention.daily_snapshots));
+                    report.status = Some(status);
+                }
                 Ok(status) => {
                     report.status = Some(status);
                     report.idle = Some(Idle::BackupOff);
@@ -974,7 +996,13 @@ impl Uploader {
     ) -> Result<bool> {
         Ok(!outbox.is_empty()
             || !uploads.is_empty()
-            || !self.reclaimable(outbox, privacy)?.is_empty())
+            || !self
+                .reclaimable(
+                    outbox,
+                    privacy,
+                    Some(self.kept.unwrap_or(SERVICE_CHAIN_LENGTH)),
+                )?
+                .is_empty())
     }
 
     /// Takes the next step, or answers none when nothing can be done now.
@@ -1548,7 +1576,7 @@ impl Uploader {
         now: TimestampMs,
     ) -> Result<Stepped> {
         self.disk.run(|backup| {
-            backup.store().cancel_production(
+            backup.cancel_production(
                 generation.archive_id,
                 generation.backup_generation,
                 &reason,
@@ -1581,12 +1609,7 @@ impl Uploader {
         for other in self.disk.run(|backup| backup.generations())? {
             if other.archive_id == archive_id && other.production == Production::Producing {
                 self.disk.run(|backup| {
-                    backup.store().cancel_production(
-                        archive_id,
-                        other.backup_generation,
-                        &detail,
-                        now,
-                    )
+                    backup.cancel_production(archive_id, other.backup_generation, &detail, now)
                 })?;
             }
         }
@@ -1735,7 +1758,15 @@ impl Uploader {
                 // publication back: a person to act and a delay to wait are both owed.
                 let mut hold = Hold::of(&error);
                 match self.passed_by(generation).await {
-                    Ok(Some(held)) => {
+                    Ok(Some((held, verified))) => {
+                        // A host whose state directory is older than the service's chain would
+                        // otherwise upload a whole generation for each number it is behind. The
+                        // number is raised only for a publication the host's writer signed.
+                        if verified {
+                            self.disk.run(|backup| {
+                                backup.raise_generation_counter(generation.archive_id, held)
+                            })?;
+                        }
                         let reason = format!(
                             "the service already holds generation {} of archive {} and takes no \
                              generation at or below it, so this one is never published and it is \
@@ -1813,7 +1844,7 @@ impl Uploader {
     async fn passed_by(
         &self,
         generation: &GenerationRecord,
-    ) -> std::result::Result<Option<BackupGeneration>, ClientError> {
+    ) -> std::result::Result<Option<(BackupGeneration, bool)>, ClientError> {
         let Some(newest) = self
             .manifest
             .fetch(generation.archive_id, None, None)
@@ -1826,7 +1857,25 @@ impl Uploader {
             payload.descriptor == descriptor && payload.writer_key_id == generation.writer_key_id
         });
         let held = payload.descriptor.backup_generation;
-        Ok((held >= generation.backup_generation && !this_one).then_some(held))
+        // Whether the number is this host's writer's own word and not only the service's: the
+        // publication is for this archive, is signed under the writer's key, and verifies.
+        let verified = payload.descriptor.archive_id == generation.archive_id
+            && payload.writer_key_id == self.writer.key_id()
+            && payload
+                .signing_input()
+                .ok()
+                .and_then(|input| {
+                    SigningTranscript::from_canonical_bytes(BACKUP_PUBLICATION_DOMAIN, input).ok()
+                })
+                .is_some_and(|transcript| {
+                    kr_crypto::sign::verify(
+                        self.writer.public(),
+                        &transcript,
+                        &newest.publication.signature,
+                    )
+                    .is_ok()
+                });
+        Ok((held >= generation.backup_generation && !this_one).then_some((held, verified)))
     }
 
     /// The generation's publication, made the same way every time: the writer's signature over its
@@ -1880,7 +1929,7 @@ impl Uploader {
             let outbox = self.disk.run(|backup| backup.outbox())?;
             let privacy = self.disk.run(|backup| backup.privacy_status())?;
             let Some(work) = self
-                .reclaimable(&outbox, &privacy)?
+                .reclaimable(&outbox, &privacy, self.kept)?
                 .into_iter()
                 .find(|work| !turn.unreclaimed.contains(&work.generation_key()))
             else {
@@ -1889,7 +1938,13 @@ impl Uploader {
             let generation = match work {
                 Reclaim::Delete(generation, object) => {
                     return self
-                        .release(&generation, &object, now, turn)
+                        .release(&generation, &object, None, now, turn)
+                        .await
+                        .map(Some);
+                }
+                Reclaim::Retire(generation, object, kept) => {
+                    return self
+                        .release(&generation, &object, Some(kept), now, turn)
                         .await
                         .map(Some);
                 }
@@ -1928,7 +1983,12 @@ impl Uploader {
     /// establish may still be a publication the service holds. The store decides the same again
     /// when the deletion is written down, before its request leaves. Nothing is done under privacy
     /// mode, whose retained artifacts are deleted only by the person's own action.
-    fn reclaimable(&self, outbox: &[Attempt], privacy: &PrivacyStatus) -> Result<Vec<Reclaim>> {
+    fn reclaimable(
+        &self,
+        outbox: &[Attempt],
+        privacy: &PrivacyStatus,
+        kept: Option<u64>,
+    ) -> Result<Vec<Reclaim>> {
         if privacy.inhibited_at().is_some() {
             return Ok(Vec::new());
         }
@@ -1946,8 +2006,12 @@ impl Uploader {
                 || objects.iter().any(|object| object.released_at_ms.is_some());
             behind.push((record.clone(), objects, unheld));
         }
+        let mut work = Vec::new();
+        if let Some(kept) = kept {
+            work.extend(self.retired(&generations, &uploads, outbox, privacy, kept)?);
+        }
         if behind.is_empty() {
-            return Ok(Vec::new());
+            return Ok(work);
         }
         // Every generation of each archive that names each object, whatever its state.
         let mut named: BTreeMap<(ArchiveId, BackupObjectId), Vec<BackupGeneration>> =
@@ -1969,7 +2033,6 @@ impl Uploader {
                     .push(record.backup_generation);
             }
         }
-        let mut work = Vec::new();
         for (record, objects, unheld) in &behind {
             let unreleased = objects
                 .iter()
@@ -2046,16 +2109,24 @@ impl Uploader {
         &mut self,
         generation: &GenerationRecord,
         object: &ObjectRecord,
+        retiring: Option<u64>,
         now: TimestampMs,
         turn: &mut Turn,
     ) -> Result<Stepped> {
-        let asked = self.disk.run(|backup| {
-            backup.store().note_deletion_asked(
+        let asked = self.disk.run(|backup| match retiring {
+            Some(kept) => backup.store().note_retained_deletion_asked(
+                generation.archive_id,
+                generation.backup_generation,
+                object.object_id,
+                kept,
+                now,
+            ),
+            None => backup.store().note_deletion_asked(
                 generation.archive_id,
                 generation.backup_generation,
                 object.object_id,
                 now,
-            )
+            ),
         });
         if let Err(error) = asked {
             let stepped = waiting_on(error)?;
@@ -2068,7 +2139,11 @@ impl Uploader {
             .await
         {
             Ok(_) => true,
-            Err(error) if error.code() == ErrorCode::UnknownSession => false,
+            // The service's own answer that it holds no such object. A refusal this host made, on
+            // its way to asking, is not one, whatever its code.
+            Err(ClientError::Refused { error, .. }) if error.code == ErrorCode::UnknownSession => {
+                false
+            }
             Err(error) => {
                 turn.unreclaimed.insert(generation_key(generation));
                 return Ok(held_by(
@@ -2088,6 +2163,7 @@ impl Uploader {
                 generation.archive_id,
                 generation.backup_generation,
                 object.object_id,
+                deleted,
                 now,
             )
         });
@@ -2104,6 +2180,82 @@ impl Uploader {
             turn.unreclaimed.insert(generation_key(generation));
         }
         Ok(stepped)
+    }
+
+    /// The objects of published generations that are older than the newest `kept` published
+    /// generations of the host's archive, which this host deletes from the service.
+    ///
+    /// A host with no setup deletes nothing by retention, and only the setup's archive is touched.
+    /// A generation is one this host recorded as published, whatever the service's chain still
+    /// lists, with its production over, no attempt or upload of it open, and privacy mode having
+    /// drawn no line under it. An object another generation names is not offered. The store decides
+    /// each deletion again when it writes it down.
+    fn retired(
+        &self,
+        generations: &[GenerationRecord],
+        uploads: &[UploadRecord],
+        outbox: &[Attempt],
+        privacy: &PrivacyStatus,
+        kept: u64,
+    ) -> Result<Vec<Reclaim>> {
+        let Some(setup) = self.disk.run(|backup| backup.setup())? else {
+            return Ok(Vec::new());
+        };
+        let archive_id = setup.record.archive_id;
+        let mut published: Vec<&GenerationRecord> = generations
+            .iter()
+            .filter(|record| {
+                record.archive_id == archive_id
+                    && record.remote == Remote::Published
+                    && record.production.is_over()
+            })
+            .collect();
+        published.sort_by_key(|record| std::cmp::Reverse(record.backup_generation));
+        let authorised = self
+            .disk
+            .run(|backup| backup.authorised_writers())?
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        let mut work = Vec::new();
+        let older = usize::try_from(kept).unwrap_or(usize::MAX);
+        for record in published.iter().skip(older) {
+            let key = generation_key(record);
+            if privacy_line(record, privacy).is_some()
+                || !authorised.contains(&(record.archive_id, record.writer_key_id))
+                || outbox
+                    .iter()
+                    .any(|attempt| (attempt.archive_id, attempt.backup_generation) == key)
+                || uploads
+                    .iter()
+                    .any(|upload| (upload.archive_id, upload.backup_generation) == key)
+            {
+                continue;
+            }
+            for object in self
+                .disk
+                .run(|backup| backup.objects(record.archive_id, record.backup_generation))?
+            {
+                if object.released_at_ms.is_some() {
+                    continue;
+                }
+                let named_elsewhere = generations.iter().any(|other| {
+                    other.archive_id == record.archive_id
+                        && other.backup_generation != record.backup_generation
+                        && self
+                            .disk
+                            .run(|backup| backup.objects(other.archive_id, other.backup_generation))
+                            .is_ok_and(|objects| {
+                                objects
+                                    .iter()
+                                    .any(|named| named.object_id == object.object_id)
+                            })
+                });
+                if !named_elsewhere {
+                    work.push(Reclaim::Retire((*record).clone(), object, kept));
+                }
+            }
+        }
+        Ok(work)
     }
 
     /// Writes down a generation of unknown outcome the service turns out to hold: its publication
@@ -2143,6 +2295,8 @@ impl Uploader {
 enum Reclaim {
     /// Ask the service whether it holds the generation.
     Ask(GenerationRecord),
+    /// Delete one object of a published generation that is older than the newest this host keeps.
+    Retire(GenerationRecord, ObjectRecord, u64),
     /// Delete one object of a generation the service does not hold.
     Delete(GenerationRecord, ObjectRecord),
 }
@@ -2150,7 +2304,9 @@ enum Reclaim {
 impl Reclaim {
     fn generation_key(&self) -> (ArchiveId, BackupGeneration) {
         match self {
-            Self::Ask(generation) | Self::Delete(generation, _) => generation_key(generation),
+            Self::Ask(generation)
+            | Self::Delete(generation, _)
+            | Self::Retire(generation, _, _) => generation_key(generation),
         }
     }
 }

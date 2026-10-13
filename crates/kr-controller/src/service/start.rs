@@ -655,7 +655,7 @@ impl Controller {
                     &origin,
                     Self::outbound_of(&started)?.proxy()?,
                     &writer,
-                    &account.tokens_for(origin.as_str()),
+                    &account.bound_tokens_for(origin.as_str(), backup.binding()),
                 )?;
                 let runtime = crate::backup::runtime::BackupRuntime::new(
                     Arc::clone(&backup),

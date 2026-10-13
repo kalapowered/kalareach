@@ -71,10 +71,10 @@
           "kind": "sqlite_table",
           "table": "schema_version"
         },
-        "version": 7,
+        "version": 8,
         "migrates_from": 6
       },
-      "digest": "b11d51e934f8f92d54dea612364f4c420bed7f66265f93918ae7a27086a371be",
+      "digest": "a8ae48dc370317fe34b07aedc494752583efa90c8f4c5b766ae583d768e48853",
       "kept": [
         "ArchiveDescriptor"
       ]

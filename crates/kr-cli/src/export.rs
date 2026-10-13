@@ -50,9 +50,9 @@ use crate::resolve::SessionSelector;
 /// How much retained output an export reads unless the person says otherwise.
 pub const DEFAULT_MAX_BYTES: u64 = 16 * 1024 * 1024;
 
-/// The most the file may hold: 192 MiB. An export that would pass it keeps the start of the output
-/// and says it left the rest.
-pub const MAX_FILE_BYTES: u64 = 192 * 1024 * 1024;
+/// The most the file may hold, which is the most a backup accepts of one session. An export that
+/// would pass it keeps the start of the output and says it left the rest.
+pub const MAX_FILE_BYTES: u64 = kr_crypto::backup::MAX_SESSION_MEMBER_BYTES;
 
 /// What a read of one session produced, before any file exists.
 pub struct Exported {

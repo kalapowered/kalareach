@@ -220,6 +220,9 @@ struct Observed {
     last_pass: Option<LastPass>,
     /// Whether the carrier found work and no usable account token the last time it looked.
     token_blocked: bool,
+    /// Whether the ciphertext of finished generations could not all be removed from the disk the
+    /// last time the carrier tried.
+    release_pending: bool,
 }
 
 /// What one pass did, in the words `kr doctor` uses.
@@ -324,6 +327,10 @@ struct Shared {
     account: Arc<dyn AccountTokenSource>,
     /// The host's sign-in, read only to say what is wrong with it.
     sign_in: Arc<HostAccount>,
+    /// The account the backups belong to, once the owner's setup is committed.
+    binding: Arc<crate::backup::binding::Binding>,
+    /// The service the host reaches, as the account mark is made for it.
+    origin: String,
     writer_key_id: KeyId,
     signals: Arc<BackupSignals>,
     observed: Mutex<Observed>,
@@ -338,6 +345,16 @@ struct Shared {
 impl Shared {
     fn observed(&self) -> std::sync::MutexGuard<'_, Observed> {
         self.observed.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Whether the account signed in now is not the one the backups belong to.
+    fn signed_in_as_another(&self) -> bool {
+        let Some(bound) = self.binding.read().mark else {
+            return false;
+        };
+        self.sign_in
+            .mark_at(&self.origin)
+            .is_some_and(|signed_in| signed_in != bound)
     }
 
     /// Whether a request may carry the host's account token now.
@@ -521,8 +538,38 @@ impl Shared {
         }
     }
 
-    /// One pass, or the reason none was made.
+    /// One iteration: the ciphertext of finished generations is released first, whatever the
+    /// service or the account is doing, and then the outbox is carried.
+    ///
+    /// Releasing is the host's own work on its own disk. It is not behind the token gate or the
+    /// status read, so a host that is signed out, or whose service is down, still gives its disk
+    /// back. When some could not be released the carrier does not go to sleep on a signal that
+    /// nothing is waiting to send: it looks again after a delay, because a failed unlink is
+    /// mended by time and not by anyone's action.
     async fn carry(
+        &self,
+        uploader: &mut Uploader,
+        backup: &BackupService,
+        backoff: &mut Backoff,
+    ) -> Wait {
+        let released = on_disk(|| backup.release_finished_ciphertext());
+        self.observed().release_pending = match &released {
+            Ok(released) => released.pending > 0,
+            Err(_) => true,
+        };
+        let wait = self.carry_outbox(uploader, backup, backoff).await;
+        let local_work = on_disk(|| backup.has_finished_ciphertext().unwrap_or(true));
+        if wait == Wait::Signals && local_work {
+            return Wait::Timed {
+                duration: backoff.next_delay(),
+                wakeable: true,
+            };
+        }
+        wait
+    }
+
+    /// The outbox, carried for one pass, or the reason none was made.
+    async fn carry_outbox(
         &self,
         uploader: &mut Uploader,
         backup: &BackupService,
@@ -674,8 +721,10 @@ impl BackupRuntime {
         let quiet = Arc::new(Quiet::new(Arc::clone(&timer)));
         let shared = Arc::new(Shared {
             storage: Arc::clone(storage),
-            account: account.tokens_for(origin.as_str()),
+            account: account.bound_tokens_for(origin.as_str(), backup.binding()),
             sign_in: account,
+            binding: backup.binding(),
+            origin: origin.as_str().to_owned(),
             writer_key_id: writer.key_id(),
             signals: backup.signals(),
             observed: Mutex::default(),
@@ -800,6 +849,7 @@ impl BackupRuntime {
                 self.wake();
             }
         }
+        let other_account = !usable && self.shared.signed_in_as_another();
         let state = if usable {
             TokenState::Usable
         } else {
@@ -808,7 +858,13 @@ impl BackupRuntime {
         let observed = self.shared.observed();
         let writer = self.shared.writer_key_id;
 
-        let mut detail = Sentence::new().stated(state.words()).stated("; ");
+        let mut detail = Sentence::new()
+            .stated(if other_account {
+                "this host is signed in as another account than the one its backups belong to"
+            } else {
+                state.words()
+            })
+            .stated("; ");
         detail = match (&observed.status, observed.status_refusal) {
             (Some(status), _) if status.backup == BackupState::On => {
                 let detail = detail.stated("backup storage is on for the account");
@@ -858,6 +914,12 @@ impl BackupRuntime {
                  be out of date",
             );
         }
+        if observed.release_pending {
+            detail = detail.stated(
+                "; the ciphertext of finished backups could not all be removed from this host's \
+                 disk, so no new backup is made until it is",
+            );
+        }
         let backup_on = observed
             .status
             .as_ref()
@@ -875,6 +937,12 @@ impl BackupRuntime {
             && observed.status_refusal.is_none();
         let remedy = if well {
             None
+        } else if other_account {
+            Some(
+                "Sign this host in as the account its backups belong to with `kr account \
+                 sign-in`, or run `kr backup setup --replace` to back up the account it is \
+                 signed in as.",
+            )
         } else if state != TokenState::Usable {
             Some(state.remedy())
         } else if backup_off {
@@ -969,7 +1037,16 @@ async fn drive(
     loop {
         let wait = match next.take() {
             Some(wait) => wait,
-            None => shared.carry(&mut uploader, &backup, &mut backoff).await,
+            // The epoch of the account binding is noted here, once for the iteration: a request
+            // that asks for its token after a replacement committed is refused, whatever its
+            // checks before said.
+            None => {
+                crate::backup::binding::in_iteration(
+                    backup.binding().read().epoch,
+                    shared.carry(&mut uploader, &backup, &mut backoff),
+                )
+                .await
+            }
         };
         shared.passes.send_modify(|passes| *passes += 1);
         shared.wait(wait, &*timer).await;

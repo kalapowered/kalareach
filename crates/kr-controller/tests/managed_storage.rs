@@ -315,6 +315,56 @@ impl Rig {
             .await;
     }
 
+    /// Signs the host in at the service as another account than the one it held.
+    async fn sign_in_as(&self, subject: &str) {
+        self.controller
+            .host_account()
+            .keep_for_test(IssuedGrant {
+                access_token: AccountToken::new(TOKEN).expect("a token"),
+                expires_in_seconds: 3600,
+                refresh_token: RefreshToken::new("another-refresh-token").expect("a token"),
+                scopes: vec![
+                    "openid".to_owned(),
+                    "voice".to_owned(),
+                    "backup.write".to_owned(),
+                ],
+                subject: subject.to_owned(),
+            })
+            .await;
+    }
+
+    /// The service's origin as the daemon holds it.
+    fn origin(&self) -> String {
+        GatewayOrigin::new(self.served.origin())
+            .expect("the service's origin")
+            .as_str()
+            .to_owned()
+    }
+
+    /// Records the owner's setup for the account signed in now, with the daemon's writer.
+    fn set_up(&self) -> kr_controller::backup::store::SetupRecord {
+        let mark = self
+            .controller
+            .host_account()
+            .mark_at(&self.origin())
+            .expect("an account is signed in");
+        let record = kr_controller::backup::store::SetupRecord {
+            archive_id: archive_id(),
+            origin: self.origin(),
+            account_mark: mark.to_bytes(),
+            recovery_public_key: *self.device.public(),
+            kit_fingerprint: "ABCD2345".to_owned(),
+            writer_key_id: self.writer.key_id(),
+            producer_key_id: self.sender.key_id(),
+            enabled_at_ms: TimestampMs::new(1_000),
+        };
+        self.controller
+            .backup()
+            .commit_setup(&record, false, TimestampMs::new(1_000))
+            .expect("the setup is written");
+        record
+    }
+
     /// Whether the daemon's store holds `generation` as published.
     fn published(&self, generation: u64) -> bool {
         self.controller
@@ -2978,4 +3028,160 @@ async fn an_object_another_account_stored_is_told_as_no_object_is() {
         .expect_err("no such object");
     assert_eq!(theirs.code, nothing.code);
     assert_eq!(theirs.message, nothing.message);
+}
+
+/// Every request of the backup clients is held to the account the backups belong to, where the
+/// token is handed out: a host signed in as another account than the setup's sends nothing, says so
+/// at `kr doctor`, and goes on when the account is the one the backups belong to again. The control
+/// is the same host before it signed in as another account.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_host_signed_in_as_another_account_than_its_backups_belong_to_sends_nothing() {
+    let timer = HeldTimer::held();
+    let rig = Rig::start(Arrangement::NORMAL, Arc::clone(&timer)).await;
+    let web = Arc::clone(rig.served.web());
+    within("the first status read", web.requests_reach(STATUS, 1)).await;
+    rig.set_up();
+
+    rig.sign_in_as("account-2").await;
+    rig.admit_to_an_enrolled_archive(1, &[(1, plaintext(2048))]);
+    within("the carrier says the account is another", async {
+        loop {
+            let (_, detail) = rig.storage_check().await;
+            if detail.contains("another account") {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    assert_eq!(web.requests_to(CREATE), 0, "no upload was begun");
+    assert_eq!(web.requests_to(PART), 0);
+    assert!(
+        rig.storage_remedy()
+            .await
+            .contains("kr backup setup --replace")
+    );
+
+    // The control: the account the backups belong to, and the host goes on. The doctor looks
+    // again at the token, which wakes a carrier that found work and no usable token.
+    rig.sign_in_as("account-1").await;
+    rig.storage_check().await;
+    timer.run_by_itself();
+    rig.until("the generation is published", |rig| rig.published(1))
+        .await;
+}
+
+/// A request that passed its checks under one account and asks for its token after a replacement of
+/// the setup committed is refused before it is signed, however its checks said: the carrier notes
+/// the binding's epoch at the top of an iteration and the token source holds each request in it to
+/// that epoch. A request outside an iteration is held to the account only, and the control is the
+/// same request before the replacement.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_request_in_flight_when_a_replacement_commits_is_refused_its_token() {
+    let timer = HeldTimer::held();
+    let rig = Rig::start(Arrangement::NORMAL, Arc::clone(&timer)).await;
+    let web = Arc::clone(rig.served.web());
+    within("the first status read", web.requests_reach(STATUS, 1)).await;
+    rig.set_up();
+    let backup = rig.controller.backup();
+    let source = rig
+        .controller
+        .host_account()
+        .bound_tokens_for(&rig.origin(), backup.binding());
+    let scope = "backup.write";
+
+    // The control, inside an iteration that began before any replacement.
+    let epoch = backup.binding().read().epoch;
+    kr_controller::backup::binding::in_iteration(epoch, source.token(scope))
+        .await
+        .expect("a token before the replacement");
+
+    // The replacement of the same account commits while a request waits for its token.
+    let other = ArchiveId::new(Uuid::from_bytes([0x12; 16]));
+    let mut replacement = backup.setup().expect("a read").expect("a setup").record;
+    replacement.archive_id = other;
+    replacement.kit_fingerprint = "QQQQ2345".to_owned();
+    backup
+        .commit_setup(&replacement, true, TimestampMs::new(2_000))
+        .expect("the replacement commits");
+    let refused = kr_controller::backup::binding::in_iteration(epoch, source.token(scope)).await;
+    assert!(refused.is_err(), "the request began before the commit");
+    assert!(
+        !refused
+            .as_ref()
+            .err()
+            .is_some_and(|error| error.code() == ErrorCode::UnknownSession),
+        "not the code the uploader reads as the service's answer of not found"
+    );
+    // Outside an iteration, and in one that began after the commit, the same account has its token.
+    source.token(scope).await.expect("outside an iteration");
+    let later = backup.binding().read().epoch;
+    kr_controller::backup::binding::in_iteration(later, source.token(scope))
+        .await
+        .expect("an iteration that began after the commit");
+}
+
+/// The ciphertext of a generation whose production is over leaves the disk at the top of the
+/// carrier's iteration, whatever the service or the account is doing: the host is signed out and
+/// still gives its disk back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_signed_out_host_still_gives_back_the_ciphertext_of_a_finished_generation() {
+    let timer = HeldTimer::held();
+    let rig = Rig::start(
+        Arrangement {
+            token: Token::None,
+            ..Arrangement::NORMAL
+        },
+        Arc::clone(&timer),
+    )
+    .await;
+    let runtime = rig.controller.backup_runtime().expect("a carrier");
+    let mut passes = runtime.passes();
+    within("the pass the carrier began with", async {
+        while *passes.borrow_and_update() < 1 {
+            passes.changed().await.expect("the carrier is running");
+        }
+    })
+    .await;
+    rig.admit(1, &[(1, plaintext(2048))]);
+    let backup = rig.controller.backup();
+    let staged = backup.staging_root();
+    assert!(walk(&staged) > 0, "the ciphertext is staged");
+
+    backup
+        .cancel_production(
+            archive_id(),
+            BackupGeneration::new(1),
+            "given up in this test",
+            TimestampMs::new(2_000),
+        )
+        .expect("production ends");
+    rig.until("the ciphertext is released", |_| walk(&staged) == 0)
+        .await;
+    assert!(
+        backup
+            .objects(archive_id(), BackupGeneration::new(1))
+            .expect("a read")
+            .iter()
+            .all(|object| object.local_state == kr_controller::backup::store::LocalState::Absent)
+    );
+}
+
+fn walk(root: &std::path::Path) -> usize {
+    let mut files = 0;
+    let mut directories = vec![root.to_path_buf()];
+    while let Some(directory) = directories.pop() {
+        for entry in std::fs::read_dir(&directory)
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
+            if entry.path().is_dir() {
+                directories.push(entry.path());
+            } else {
+                files += 1;
+            }
+        }
+    }
+    files
 }
