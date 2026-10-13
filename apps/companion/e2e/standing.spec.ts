@@ -10,6 +10,8 @@
 
 import { expect, test, type Page } from '@playwright/test'
 
+import { overrunning, stopWrapping } from './layout'
+
 const SESSION = '8a7b6c50-22bb-4c3d-8e4f-000000000101'
 const SHARE = '5d0e2a40-77aa-4b2c-9d3e-000000000901'
 
@@ -330,5 +332,41 @@ test.describe('where the focus goes', () => {
     await say(page, shareOf({ actions: ['session.view', 'agent.prompt'] }))
     await expect(page.getByRole('button', { name: 'Escape' })).toBeDisabled()
     await expect(page.locator('.m-pane')).toBeFocused()
+  })
+})
+
+test.describe('an earlier action sent under an earlier opening, at the largest text size', () => {
+  test('is listed inside the screen with the words that say where it was sent', async ({ page }) => {
+    await openSession(page, LARGEST)
+    await page.evaluate(() => {
+      window.krTestHost?.leaveNextSendUnconfirmed()
+    })
+    // One long word, as an identifier is: the line can only be kept inside the screen by breaking it.
+    await page.getByLabel('Message this session').fill('runthemigrationoftheverylongdatabasenamewithoutabreakanywhere')
+    await page.getByRole('button', { name: 'Send', exact: true }).click()
+    const release = page.getByRole('button', { name: 'I checked; send anyway' })
+    await expect(release).toBeVisible()
+
+    // The host refuses the opening and the person opens the session again: a new opening.
+    await say(page, { state: 'refused', code: 'PERMISSION_DENIED', message: 'This share may not do that.' })
+    await page.getByRole('button', { name: 'Try again' }).click()
+    await expect(page.getByTestId('standing-banner')).toBeHidden()
+    await page.getByLabel('Message this session').fill('the next thing')
+    await release.click()
+
+    const earlier = page.getByTestId('earlier-actions')
+    await expect(earlier).toContainText('Outcome unknown')
+    await expect(earlier.getByTestId('earlier-opening')).toBeVisible()
+    await page.screenshot({ path: `/tmp/kr-standing-earlier-${test.info().project.name}.png` })
+    expect(
+      await overrunning(page, '[data-testid="earlier-actions"]'),
+      'lines of the list that run past the screen or their box'
+    ).toEqual([])
+    // The control: with the text kept from wrapping, the same measure sees the list run out.
+    await stopWrapping(page, ['[data-testid="earlier-actions"]'])
+    expect(
+      await overrunning(page, '[data-testid="earlier-actions"]'),
+      'the measure sees the list text that cannot wrap'
+    ).not.toEqual([])
   })
 })

@@ -1078,7 +1078,7 @@
   min-width: 0;
 }
 
-.m-earlier li > span:last-child {
+.m-earlier li > .small {
   min-width: 0;
   overflow-wrap: anywhere;
 }
