@@ -231,7 +231,7 @@ variables an older build read joins nothing because of them.
 | `network.relay_only` | every packet through the relay, and no direct path | `true` or `false`; `true` needs at least one relay |
 | `network.local_discovery` | discovery of peers on the local network | `true` or `false` |
 | `network.mainline_dht` | the public Mainline DHT, which carries no KalaReach service guarantee | `true` or `false` |
-| `network.proxy_url` | the HTTP proxy this host's connections to services go through: the endpoint's relay connection, relay latency probe, captive-portal check and Pkarr servers, the rendezvous, delivery and webhooks, mail submission, the managed voice broker and account service, backups to the managed storage service, the authority feed, the model's files, and plugin repositories; the host's own name lookups do not use it, and absent everything goes directly, apart from the relay latency probe and captive-portal check, which then follow `HTTPS_PROXY`, `HTTP_PROXY` and `ALL_PROXY` when those are set | an absolute `http` or `https` origin, with no user information, no path and no trailing slash |
+| `network.proxy_url` | the HTTP proxy this host's connections to services go through: the endpoint's relay connection, relay latency probe, captive-portal check and Pkarr servers, the rendezvous, delivery and webhooks, mail submission, the managed voice broker and account service, backups to the managed storage service, the authority feed, the mailbox service, the relay lease service, the model's files, and plugin repositories; the host's own name lookups do not use it, and absent everything goes directly, apart from the relay latency probe and captive-portal check, which then follow `HTTPS_PROXY`, `HTTP_PROXY` and `ALL_PROXY` when those are set | an absolute `http` or `https` origin, with no user information, no path and no trailing slash |
 | `voice.broker_origin` | the managed broker this host starts a device's voice session at, through the proxy `network.proxy_url` selects | an absolute `https` origin, or an `http` origin on `localhost`, `127.0.0.1` or `[::1]`, of at most 128 bytes, in lower case, with no path and no port its scheme already implies; a plain-HTTP origin cannot be combined with `network.proxy_url`, because the proxy would carry the account token in clear text |
 | `storage.origin` | the managed storage service this host uploads its backups to | an `https` origin, or an `http` origin on a loopback address, in the spelling a gateway origin has, with no path and no trailing slash; the daemon refuses to start unless it is the managed account service |
 | `authority.origin` | the authority feed this host reads its remote revocations from; a section of level 2: a release that reads level 1 ignores it, and its host takes a device's revocation only from the owner at the machine | an `https` origin, or an `http` origin on a loopback address, in the spelling a gateway origin has, with no path and no trailing slash |
@@ -318,41 +318,50 @@ When asking for a refill, the daemon will ask for the greater of 512 KiB added t
 relay service had last counted for the lease when the managed service last enquired of it, or one
 byte more than the ceiling the lease currently holds. Leases that have been kept alive but were idle
 do not cost anything and are settled when the host ends the lease, but idle leases that are allowed
-to time out are charged in full. A pair is given one block at each refill, about every five minutes,
-so a pair that carries a great deal is held to that rate. An account can only have 8 MiB outstanding
-on leases at any one time (the difference between the ceilings of the reservations the managed
-service holds with the relay service, and what the relay service has counted for those
-reservations). As such, if no traffic goes through the relay service at all, no new leases will be
-issued after sixteen devices have been paired with.
+to time out are charged in full. A pair that carries traffic is given a block beyond what the relay
+had counted at the last answer, about every five minutes, so a pair that carries a great deal is
+held to that rate. A pair that spends the whole of its block between two refills is given one byte
+at the first and a block at the second. An account can only have 8 MiB outstanding on leases at any
+one time (the difference between the ceilings of the reservations the managed service holds with the
+relay service, and what the relay service has counted for those reservations). As such, if no
+traffic goes through the relay service at all, no new lease will be issued after sixteen devices
+have been paired with, and with sixteen idle leases the sum is already 8 MiB, so none of them can be
+raised by a byte and each runs out at its whole hold. Fifteen or fewer can be kept alive.
 
 A host key has no allowance with the relay service, and the managed service will refuse to issue
 leases for a host that does not name an account to use. The `payer` key of the `relay` section must
 name an account to use to pay for relay usage, as well as an authorisation that the holder of the
 named account has given to the key of the host the document belongs to. This information will be
-sent with each request to the managed service to issue or extend a lease. The account holder gives
-the authorisation through the relay service's payer-authorisation interface. They must name the
-signing key of the host that is to use the account, and they must name the maximum amount that can
-be outstanding on any one lease at any one time. This amount must be at least 512 KiB. An
-authorisation can be given for up to a year at a time. Withdrawing an authorisation will cause all
-leases issued under that authorisation to be ended, and the next time the host running the daemon
-asks for a lease to be issued or extended, it will be refused. Signing the host out with `kr account
-sign-out` does not end the leases, because the lease service does not read that sign-in.
+sent with each request to the managed service to issue or extend a lease. The service labels such a
+lease as sponsored by the authorisation, because the host did not select it as its default. The
+account holder gives the authorisation through the relay service's payer-authorisation interface.
+They must name the signing key of the host that is to use the account, and they must name the
+maximum amount that can be outstanding on any one lease at any one time. This amount must be above
+512 KiB, because a lease is raised by at least one byte beyond its first block of 512 KiB and a
+bound of exactly 512 KiB refuses that raise: the lease runs out at its whole hold and `kr doctor`
+says so. 1 MiB is the smallest sensible value. An authorisation can be given for up to a year at a
+time. Withdrawing an authorisation will cause all leases issued under that authorisation to be
+ended, and the next time the host running the daemon asks for a lease to be issued or extended, it
+will be refused. Signing the host out with `kr account sign-out` does not end the leases, because
+the lease service does not read that sign-in.
 
 When a device is unpaired with, the daemon will tell the managed service to end the lease it has for
 that device, and it will give the reason as "the pair is no longer paired". The ending is written to
 the host's record before it is sent, and it is sent again after a failure or a restart until the
 service answers. If the authorisation used to request a lease changes, the daemon will request that
 the old lease be ended and will then ask for a new lease for the pair. If the managed service says
-it has never issued a lease when asked to end one, the daemon will only ask twice more before
-believing it.
+it has never issued a lease when asked to end one, the daemon asks again, no oftener than once a
+minute, and believes it only after three answers and once the longest a lease can live has passed
+since the first, because the service gives the same answer when a revocation raced a refill.
 
 It's possible that the service did issue a lease for a request, but that the answer never arrived.
 Since the daemon won't have written down any lease in that case, it will at some point ask for the
 same pair again, with the same request. Then the service will reply with a lease for a pair it
 already has, as if the answer to the original request had arrived just in time. The record keeps
 such a request until the longest a lease can live has passed, so a device unpaired in the meantime
-still has its lease ended. If a request specifies a payer that the new configuration document does
-not contain, the daemon will not re-issue it, and the lease will expire instead.
+still has its lease ended. If the payer in the configuration document changes meanwhile, the daemon
+does not ask under the new payer until that time has passed, because the service would open a second
+reservation; the lease the first request may have issued runs out by itself.
 
 Three kinds of answers to lease requests are not treated as errors. A spent allowance, and a service
 that could not issue a lease because it has no relay to offer or no room for one more, are answers
@@ -364,13 +373,16 @@ of the devices runs itself. The third kind of answer is a rejection that only th
 for example because the request did not mention any account that the service is willing to accept.
 `kr doctor` will indicate this kind of problem too. For all three kinds of answers, the daemon will
 wait before issuing a request for the same pair again, for the longer of five minutes and the delay
-the service names. If the device gets paired or revoked while waiting, the daemon will adjust its
-bookkeeping accordingly, but it won't issue a new request any sooner. It refills a lease no oftener
-than once a minute, whatever the answer. Other kinds of problems, such as an unreachable service,
-will result in re-tries with a backoff, like for other carriers. If the service replies to a lease
-request that the relay for an existing lease has been retired, the daemon will end the lease and
-request a new one for the pair. A lease that runs out in the meantime stops the relay carrying its
-pair and nothing else.
+the service names. A pairing or revocation while the daemon waits changes what it holds in its
+record, but sends nothing to the service any sooner. It refills a lease no oftener than once a
+minute, whatever the answer. Other kinds of problems, such as an unreachable service, will result in
+re-tries with a backoff, like for other carriers. A refill that the service turns back as
+`unavailable` or as invalid is followed by one request for the ceiling the lease already holds: if
+the service carries the lease, the daemon keeps it, `kr doctor` says why the raise was refused, and
+the raise is tried again after the wait. If the service says the relay carrying a lease is retired,
+the daemon ends the lease and requests a new one for the pair. A lease that has run out is ended at
+the service before the pair is asked for again. A lease that runs out in the meantime stops the
+relay carrying its pair and nothing else.
 
 The daemon writes down lease information in a file called `relay-leases.sqlite3` in its state
 directory. This information is only valid for one service and one host key. If you start a daemon
