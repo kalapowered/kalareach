@@ -365,8 +365,89 @@ async fn kr_req_19_08_a_share_opens_as_named_and_is_never_chosen_for_the_device(
         Some(expiry_of(&grant)),
         "the share ends before the pairing it is held through"
     );
+    // The same share, held through a pairing that ends sooner, is scheduled to end with the
+    // pairing. The host's door refuses to write such a share now, so it is written below that check,
+    // as a record that already outlasts its pairing is.
+    let mut short = proposal(&[ActionRight::SessionView]);
+    short.session_selector = kr_protocol::grant::SessionSelector::None;
+    short.expiry = kr_protocol::grant::GrantExpiry::At {
+        expires_at_ms: TimestampMs::new(kr_ipc::now_ms().get() + 600_000),
+    };
+    let sooner = Device::create().await;
+    let sooner_record = pair_with(&adopted.host, &sooner, &adopted.owner, short).await;
+    let held = share_that_outlasts_its_pairing(
+        &adopted.host,
+        session_id,
+        &sooner,
+        &sooner_record,
+        3_600_000,
+    )
+    .await;
+    assert!(expiry_of(&held) > expiry_of(&sooner_record.grant));
+    let through_it = RawDevice::connect(&adopted.host, &sooner, &sooner_record).await;
+    let standing = in_force(
+        open(&through_it, Some(session_id), Some(held.grant_id))
+            .await
+            .expect("the share opens"),
+    );
+    assert_eq!(standing.ends_at_ms, Some(expiry_of(&sooner_record.grant)));
+    through_it.close();
     connection.close();
     adopted.stop().await;
+}
+
+/// Writes a viewer share of `session_id` to the device `record` names that lasts `lifetime_ms`,
+/// below the host's own check that a share ends no later than its recipient's pairing, and has the
+/// device redeem it. Returns the grant.
+async fn share_that_outlasts_its_pairing(
+    host: &net_support::Host,
+    session_id: SessionId,
+    device: &Device,
+    record: &DeviceRecord,
+    lifetime_ms: u64,
+) -> kr_protocol::grant::Grant {
+    let selection = RoleSelection::plain(SessionRole::Viewer);
+    let written = host
+        .controller()
+        .sharing()
+        .share(
+            &kr_controller::sharing::ShareRequest {
+                invitation_id: kr_protocol::ids::InvitationId::new(kr_ipc::new_uuid()),
+                grant_id: GrantId::new(kr_ipc::new_uuid()),
+                environment_id: host.environment_id,
+                session_id,
+                issuer_device_id: host.controller().sharing().host_device_id(),
+                recipient_device_id: record.device_id,
+                parent_grant_id: None,
+                accepted_notices: kr_protocol::sharing::AuthorityNotice::for_actions(
+                    &selection.actions(),
+                ),
+                selection,
+                lifetime_ms: Some(lifetime_ms),
+                live_screen: None,
+                named_questions: Vec::new(),
+                named_approvals: Vec::new(),
+                authority_revision: host.controller().policy().authority_revision(),
+                owner_confirmed: false,
+                now_ms: kr_ipc::now_ms().get(),
+            },
+            || Ok(()),
+        )
+        .expect("the share is written");
+    let connection = RawDevice::connect(host, device, record).await;
+    connection
+        .mutate(
+            Method::GrantRedeem,
+            ActionId::new(kr_ipc::new_uuid()),
+            net_support::on_the_host(host),
+            &kr_protocol::sharing::GrantRedeemParams {
+                invitation_id: written.preview.invitation_id,
+            },
+        )
+        .await
+        .expect("the share is redeemed");
+    connection.close();
+    written.grant
 }
 
 /// A share without the live view is served the agent and refused the screen. The conversation is
