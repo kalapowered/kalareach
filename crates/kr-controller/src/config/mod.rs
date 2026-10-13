@@ -409,9 +409,9 @@ impl Outbound {
 ///
 /// The network endpoint, the voice service, the backup uploader and the authority feed are built
 /// once, at startup, from the document on disk then. A later edit applies at the next start, and
-/// `kr doctor` compares the two so an owner who changed one can see that it is not in force yet. Two readings are equal when they select the same
-/// and both leave the outbound route open or both close it: why a document could not be used is not
-/// a selection.
+/// `kr doctor` compares the two so an owner who changed one can see that it is not in force yet.
+/// Two readings are equal when they select the same and both leave the outbound route open or both
+/// close it: why a document could not be used is not a selection.
 #[derive(Clone, Debug, Default)]
 pub struct Started {
     /// The network section this daemon joined, or did not join, the network under.

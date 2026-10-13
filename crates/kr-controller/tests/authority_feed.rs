@@ -1205,7 +1205,7 @@ async fn a_pass_that_fails_waits_out_a_backoff_and_then_finishes_the_request() {
     );
 }
 
-/// The host decides the issuer of a request as it decides the same device's own revocation: a
+/// The host decides the issuer of a request as it decides whether the same device may manage it: a
 /// device whose grant carries the right to manage the host, and that this host's configuration
 /// leaves no right to manage with, has no owner authority by the feed either, and what it names is
 /// not withdrawn.
