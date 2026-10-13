@@ -61,7 +61,10 @@
 //!
 //! A lease that has run out is ended at the service before the pair is asked for again: the service
 //! keeps its record of the lease until it is revoked, and a pair whose lease sits on a retired
-//! relay is turned away for as long as that record stands.
+//! relay is turned away for as long as that record stands. A refill that the service finds past its
+//! deadline, because this host's clock is behind the service's, is answered with a new lease whose
+//! reservation holds the ceiling the refill asked for; the keeper ends it and asks for the pair
+//! afresh, so the pair holds a block and not the figures of a reservation that is gone.
 //!
 //! A request whose answer was lost may have issued a lease. The keeper has not written down a lease
 //! identifier it was not told, so it asks again for the same pair, and the service answers with the
@@ -125,6 +128,10 @@ pub const REFILL_WHEN_LEFT: Duration = Duration::from_secs(600);
 /// beyond what the relay counted at the last answer, so a pair that spends its whole block between
 /// two refills is given one byte at the first and a block at the second.
 pub const BLOCK_BYTES: u64 = 512 * 1024;
+
+/// The bytes a refill raises the ceiling by at least, because the service moves a lease's
+/// deadline only when the reservation's ceiling is raised.
+const IDLE_RAISE: u64 = 1;
 
 /// How often the keeper reads the paired devices when nothing woke it.
 pub const POLL_INTERVAL: Duration = Duration::from_secs(60);
@@ -631,7 +638,15 @@ async fn drive(shared: Arc<Shared>) {
             let wait = match report.next {
                 Next::Failed => {
                     let wait = backoff.next_delay();
-                    shared.holds().requests = now.checked_add(wait);
+                    let mut holds = shared.holds();
+                    holds.requests = now.checked_add(wait);
+                    // An answer only the owner or the calendar changes holds the asks as it does
+                    // when nothing failed beside it: a pair that was turned back is not asked again
+                    // at the pace of another pair's backoff.
+                    if report.met_a_standing {
+                        holds.asks = now.checked_add(STANDING_RETRY);
+                    }
+                    drop(holds);
                     wait
                 }
                 Next::Standing => {
@@ -700,6 +715,8 @@ struct Report {
     asked: bool,
     /// Whether the service turned an ending back for a reason only the owner can change.
     refused_an_ending: bool,
+    /// Whether the pass met an answer only the owner or the calendar changes, whatever else it met.
+    met_a_standing: bool,
 }
 
 /// What a failed request means for the pass.
@@ -756,6 +773,7 @@ async fn pass(shared: &Arc<Shared>, running: &Running, controller: &Arc<Controll
                 next: Next::Failed,
                 asked: false,
                 refused_an_ending: false,
+                met_a_standing: false,
             }
         }
     }
@@ -1006,7 +1024,7 @@ async fn reconcile(
         if asked || requests_held_ms == 0 {
             observed.unreachable = unreachable;
         }
-        if !unreachable && (asks_held_ms == 0 || refused_an_ending) {
+        if (!unreachable || standing.is_some()) && (asks_held_ms == 0 || refused_an_ending) {
             observed.standing = standing;
         }
     }
@@ -1028,6 +1046,7 @@ async fn reconcile(
         next,
         asked,
         refused_an_ending,
+        met_a_standing: standing.is_some(),
     })
 }
 
@@ -1144,6 +1163,24 @@ fn afresh(row: Row, now: u64) -> Row {
     }
 }
 
+/// Writes down that a lease is to be ended, and ends it at the service. The pair's row goes with
+/// it: what the host holds for the pair is what the pass asks for next.
+async fn end_lease(
+    shared: &Arc<Shared>,
+    destination: EndpointKey,
+    lease: RelayLeaseId,
+    now: u64,
+) -> Result<Ended> {
+    shared
+        .on_record(move |record| record.end(&destination, lease, LeaseEndReason::Finished))
+        .await?;
+    let owed = Ending {
+        lease_id: lease,
+        reason: LeaseEndReason::Finished,
+    };
+    end(shared, owed, now).await
+}
+
 /// How a refill that raised a lease's ceiling was turned back, before it is known whether the lease
 /// or only the raise was refused.
 #[derive(Clone, Copy, Debug)]
@@ -1196,7 +1233,7 @@ async fn ask(
             row.ceiling
         } else {
             row.ceiling
-                .saturating_add(1)
+                .saturating_add(IDLE_RAISE)
                 .max(row.consumed.saturating_add(BLOCK_BYTES))
         }
         .min(COUNTER_LIMIT);
@@ -1231,6 +1268,31 @@ async fn ask(
                             grace.remaining_bytes.get(),
                         )
                     });
+                }
+                // A refill the service finds past its deadline is answered with a new lease, and
+                // the reservation of the new lease holds the cumulative ceiling the refill asked
+                // for: for a pair that has carried traffic, far more than a new reservation needs.
+                // A host whose clock is behind the service's sends such a refill. The lease is
+                // ended and the pair asked for afresh, so no pair holds more of the account's
+                // aggregate than one block.
+                if ending.is_none()
+                    && let Some(named) = row.lease_id
+                    && grant.lease.lease.lease_id != named
+                    && grant.lease.lease.byte_ceiling.get() > BLOCK_BYTES + IDLE_RAISE
+                {
+                    match end_lease(shared, row.destination, grant.lease.lease.lease_id, now)
+                        .await?
+                    {
+                        Ended::Answered | Ended::Unknown => {
+                            row = afresh(row, now);
+                            probing = None;
+                            continue;
+                        }
+                        Ended::Later => return Ok(Asked::Later),
+                        Ended::OwnerMustLook(code) => {
+                            return Ok(Asked::Standing(Standing::Refused(code)));
+                        }
+                    }
                 }
                 let settled = settle_grant(shared, row, &grant, ending).await?;
                 return Ok(match (probing, settled) {
@@ -1267,17 +1329,7 @@ async fn ask(
                     // The lease is turned away at the ceiling it already holds: the relay carrying
                     // it is no longer one the service can bill through, and the service asks that
                     // the lease be revoked and another asked for.
-                    let destination = row.destination;
-                    shared
-                        .on_record(move |record| {
-                            record.end(&destination, lease, LeaseEndReason::Finished)
-                        })
-                        .await?;
-                    let owed = Ending {
-                        lease_id: lease,
-                        reason: LeaseEndReason::Finished,
-                    };
-                    match end(shared, owed, now).await? {
+                    match end_lease(shared, row.destination, lease, now).await? {
                         Ended::Answered | Ended::Unknown => {
                             row = afresh(row, now);
                             probing = None;
