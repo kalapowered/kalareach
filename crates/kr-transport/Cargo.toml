@@ -34,7 +34,15 @@ tokio-websockets.workspace = true
 tracing.workspace = true
 url.workspace = true
 
+[features]
+# The entry points that bind an endpoint asking one name server of the caller's choosing and no
+# other, for this crate's own tests, which stand a name server of their own on loopback. They are
+# compiled only with this feature, and no shipped build enables it.
+testing = []
+
 [dev-dependencies]
+# This crate's own tests, with the name-server choice above compiled in.
+kr-transport = { path = ".", features = ["testing"] }
 iroh = { workspace = true, features = ["test-utils"] }
 iroh-relay = { workspace = true, features = ["server", "test-utils"] }
 # Certificates from an authority a test makes, for the relay front and the intercepting proxy.

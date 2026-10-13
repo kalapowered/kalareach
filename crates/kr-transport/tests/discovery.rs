@@ -23,12 +23,21 @@ use kr_protocol::hello::ALPN;
 use kr_transport::clock::ManualClock;
 use kr_transport::config::{DiscoveryConfig, EndpointConfig, PublishedAddresses, PublisherPolicy};
 use kr_transport::handshake::{self, Admitted};
+use support::dns::{self, NameServer, TXT};
 use support::pkarr::PkarrRelay;
-use support::{LocalRelay, OneDevice, Side, side, side_with};
+use support::{LocalRelay, OneDevice, Side, side, side_asking, side_with};
 use tokio::task::JoinHandle;
 
 /// How long a test waits for something the machine has to do before it calls it a failure.
 const PATIENCE: Duration = Duration::from_secs(20);
+
+/// How long a test waits for the lookup services to answer before it calls the lookup hung.
+///
+/// Every service the case asks is on loopback in this process, the name server included, so what
+/// the lookup waits for is the resolver's own timers: it ends a query that is not answered after
+/// three seconds and the staggered lookup ends with its last query. This ends a lookup that never
+/// ends and measures nothing.
+const LOOKUP_HUNG: Duration = Duration::from_secs(60);
 
 fn loopback() -> Option<SocketAddr> {
     Some("127.0.0.1:0".parse().expect("a loopback address"))
@@ -83,9 +92,11 @@ async fn resolve(endpoint: &Endpoint, id: EndpointId) -> (Vec<Answer>, Vec<Strin
             }
         }
     };
-    tokio::time::timeout(PATIENCE, collecting)
-        .await
-        .expect("every selected service answers in time");
+    let ended = tokio::time::timeout(LOOKUP_HUNG, collecting).await;
+    assert!(
+        ended.is_ok(),
+        "every selected service answers: so far {answers:?} and {failures:?}"
+    );
     (answers, failures)
 }
 
@@ -174,8 +185,12 @@ async fn an_endpoint_reaches_exactly_the_relay_pkarr_and_dns_services_it_selecte
         !selection.discovery.local_discovery && !selection.discovery.mainline_dht,
         "neither local discovery nor the Mainline DHT is selected"
     );
-    let host = side(&selection, 1, true).await;
-    let peer = side(&selection, 2, false).await;
+    // The one name server either endpoint asks, which is this test's: the DNS lookup is the only
+    // service that reads names, and a lookup that went to the system's or a public name server would
+    // be one the case does not decide.
+    let name_server = NameServer::spawn();
+    let host = side_asking(&selection, 1, true, name_server.address).await;
+    let peer = side_asking(&selection, 2, false, name_server.address).await;
 
     // Three services, and they are the three this selection names: a publisher, a resolver and a
     // DNS lookup. The minimal preset brings none of its own, and there is no local discovery and
@@ -236,8 +251,8 @@ async fn an_endpoint_reaches_exactly_the_relay_pkarr_and_dns_services_it_selecte
     // The resolvers. The resolver holds the host's record because the test puts it there, the way
     // a deployment's publication reaches the service it resolves from. Everything the peer's
     // services then say about the host: the Pkarr resolver answers from the selected resolver and
-    // the publisher is not asked, the DNS lookup is asked and finds nothing because the test's
-    // origin is served by no name server, and nothing else is asked at all.
+    // the publisher is not asked, the DNS lookup is asked and finds nothing because the name server
+    // it asks knows no name under the test's origin, and nothing else is asked at all.
     resolver.hold(&id, publisher.record(&id).expect("the published record"));
     let asked_publisher = publisher.lookups(&id);
     let asked_resolver = resolver.lookups(&id);
@@ -260,9 +275,35 @@ async fn an_endpoint_reaches_exactly_the_relay_pkarr_and_dns_services_it_selecte
         "and never from the publisher"
     );
 
-    // The DNS lookup asks the machine's own name servers, which a test cannot point at a server of
-    // its own, so its origin is read from the service itself. Nothing among the services names the
-    // public n0 infrastructure, whose DNS origin, Pkarr relay and relays all sit under iroh.link.
+    // What the DNS lookup asked, as the name server it asks heard it: the endpoint's record under
+    // the selected origin, as a TXT question, and nothing else. The lookup tries the same question
+    // more than once, so it is the set of questions that is compared.
+    let wanted = dns::Question {
+        name: format!("_iroh.{}.{ORIGIN}", id.to_z32()),
+        kind: TXT,
+    };
+    let mut questions = name_server.asked();
+    questions.dedup();
+    assert_eq!(
+        questions,
+        vec![wanted],
+        "the DNS lookup asks for the host's record under the selected origin and for nothing else"
+    );
+    // And it asks that name server alone: the resolver an endpoint looks names up with holds no
+    // name server of the system's and none of the public ones.
+    let resolver_described = format!("{:?}", peer.endpoint.dns_resolver().expect("a resolver"));
+    assert!(
+        resolver_described.contains(&name_server.address.port().to_string()),
+        "the resolver asks the test's name server: {resolver_described}"
+    );
+    for public in ["1.1.1.1", "8.8.8.8", "9.9.9.9"] {
+        assert!(
+            !resolver_described.contains(public),
+            "and no public name server ({public}): {resolver_described}"
+        );
+    }
+    // The origin is also read from the service itself. Nothing among the services names the public
+    // n0 infrastructure, whose DNS origin, Pkarr relay and relays all sit under iroh.link.
     let described = format!(
         "{:?}",
         host.endpoint.address_lookup().expect("the lookup services")

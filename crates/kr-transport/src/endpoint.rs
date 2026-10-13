@@ -66,7 +66,25 @@ pub async fn bind_listener(
     config: &EndpointConfig,
     identity: &TransportIdentityKeyPair,
 ) -> Result<Endpoint> {
-    bind(config, identity, true).await
+    bind(config, identity, true, None).await
+}
+
+/// Builds an endpoint that listens, as [`bind_listener`] does, and looks every name up through the
+/// one name server `name_server` and through no other: not the system's, and not the public ones.
+///
+/// For this crate's own tests, which stand a name server of their own on loopback so that what an
+/// endpoint asks, and what it is told, is theirs to decide.
+///
+/// # Errors
+///
+/// As [`bind_listener`].
+#[cfg(feature = "testing")]
+pub async fn bind_listener_asking(
+    config: &EndpointConfig,
+    identity: &TransportIdentityKeyPair,
+    name_server: std::net::SocketAddr,
+) -> Result<Endpoint> {
+    bind(config, identity, true, Some(name_server)).await
 }
 
 /// Builds an endpoint that only dials.
@@ -82,13 +100,31 @@ pub async fn bind_dialer(
     config: &EndpointConfig,
     identity: &TransportIdentityKeyPair,
 ) -> Result<Endpoint> {
-    bind(config, identity, false).await
+    bind(config, identity, false, None).await
 }
 
+/// Builds an endpoint that only dials, as [`bind_dialer`] does, and looks every name up through the
+/// one name server `name_server` and through no other. See [`bind_listener_asking`].
+///
+/// # Errors
+///
+/// As [`bind_listener`].
+#[cfg(feature = "testing")]
+pub async fn bind_dialer_asking(
+    config: &EndpointConfig,
+    identity: &TransportIdentityKeyPair,
+    name_server: std::net::SocketAddr,
+) -> Result<Endpoint> {
+    bind(config, identity, false, Some(name_server)).await
+}
+
+/// Builds the endpoint. `name_server` names the one name server it asks, where a test names one;
+/// a shipped build never does, and the endpoint then asks the system's and the public ones.
 async fn bind(
     config: &EndpointConfig,
     identity: &TransportIdentityKeyPair,
     accept: bool,
+    name_server: Option<std::net::SocketAddr>,
 ) -> Result<Endpoint> {
     let seed = identity.export_endpoint_seed();
     let secret_key = SecretKey::from_bytes(seed.expose());
@@ -120,9 +156,11 @@ async fn bind(
             .iter()
             .map(|der| CertificateDer::from(der.clone())),
     );
-    builder = builder
-        .dns_resolver(dns_resolver(&ca_tls)?)
-        .ca_tls_config(ca_tls);
+    let resolver = match name_server {
+        Some(address) => only_asking(address),
+        None => dns_resolver(&ca_tls)?,
+    };
+    builder = builder.dns_resolver(resolver).ca_tls_config(ca_tls);
     // The relay client tunnels through the proxy with CONNECT, and the net report sends its relay
     // latency probe and captive-portal check through it. Nothing falls back to a direct connection
     // when the proxy cannot be reached: the owner chose to go through it. `proxy_from_env` is never
@@ -609,6 +647,17 @@ fn apply_discovery(mut builder: Builder, config: &EndpointConfig) -> Result<Buil
     Ok(builder)
 }
 
+/// Returns the resolver of an endpoint that asks `address` and no other name server: not the
+/// system's, and not the public ones its lookups fall back to.
+fn only_asking(address: std::net::SocketAddr) -> iroh::dns::DnsResolver {
+    iroh::dns::DnsResolver::builder()
+        .add_nameserver_config(
+            iroh::dns::NameserverConfig::udp(address.ip()).with_port(address.port()),
+        )
+        .disable_fallback()
+        .build()
+}
+
 /// The public resolvers this endpoint's lookups fall back to, each as its IPv4 and IPv6 primary
 /// addresses and then its secondary ones.
 ///
@@ -847,7 +896,9 @@ mod tests {
                 ..EndpointConfig::default()
             };
             for accept in [true, false] {
-                let endpoint = bind(&config, &identity, accept).await.expect("an endpoint");
+                let endpoint = bind(&config, &identity, accept, None)
+                    .await
+                    .expect("an endpoint");
                 let sockets = endpoint.bound_sockets();
                 assert!(
                     !sockets.is_empty(),

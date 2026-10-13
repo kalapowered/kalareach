@@ -7,6 +7,7 @@
 #![allow(dead_code)]
 
 pub mod conditions;
+pub mod dns;
 pub mod front;
 pub mod pkarr;
 pub mod proxy;
@@ -107,6 +108,32 @@ pub async fn side_with(
             .await
             .expect("a dialling endpoint")
     };
+    assembled(endpoint, keys, device_byte)
+}
+
+/// Builds one side whose endpoint looks every name up through the one name server `name_server` and
+/// through no other.
+pub async fn side_asking(
+    config: &EndpointConfig,
+    device_byte: u8,
+    listening: bool,
+    name_server: std::net::SocketAddr,
+) -> Side {
+    let keys = DeviceKeys::generate().expect("device keys");
+    let endpoint = if listening {
+        kr_transport::endpoint::bind_listener_asking(config, &keys.transport, name_server)
+            .await
+            .expect("a listening endpoint")
+    } else {
+        kr_transport::endpoint::bind_dialer_asking(config, &keys.transport, name_server)
+            .await
+            .expect("a dialling endpoint")
+    };
+    assembled(endpoint, keys, device_byte)
+}
+
+/// The side an endpoint and its keys make: the record the other side will hold, and the identity.
+fn assembled(endpoint: Endpoint, keys: DeviceKeys, device_byte: u8) -> Side {
     let device_id = DeviceId::new(Uuid::from_bytes([device_byte; 16]));
     let device_key_revision = DeviceKeyRevision::new(1);
     let endpoint_id = *keys.transport.public();
