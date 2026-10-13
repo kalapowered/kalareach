@@ -3489,6 +3489,7 @@ fn the_producers_bounds_are_the_conventions() {
             configuration_member_bytes: 1024 * 1024,
             total_bytes: 3 * 512 * 1024 * 1024,
             members: 4096,
+            disk_reserve_bytes: 1024 * 1024 * 1024,
         }
     );
 }
@@ -3847,4 +3848,43 @@ async fn a_pass_between_two_writes_stops_when_the_daemon_is_told_to_stop() {
             .is_empty(),
         "nothing was admitted"
     );
+}
+
+/// A pass that would leave the disk its staging directory is on with less than its reserve free
+/// stages nothing, and the doctor says why. The control is the same host with the reserve at what
+/// the disk can give.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_pass_that_would_fill_the_disk_stages_nothing() {
+    let timer = HeldTimer::held();
+    let rig = Rig::start_with(Arrangement::NORMAL, Arc::clone(&timer), |host| {
+        closed_session(host, b"a session\r\n", 9_000);
+    })
+    .await;
+    let web = Arc::clone(rig.served.web());
+    within("the first status read", web.requests_reach(STATUS, 1)).await;
+    rig.production_looked(1).await;
+    rig.controller
+        .lower_producer_bounds(kr_controller::service::ProducerBounds {
+            disk_reserve_bytes: u64::MAX / 2,
+            ..kr_controller::service::ProducerBounds::PRODUCTION
+        });
+    rig.set_up();
+    rig.production_looked(2).await;
+    let (status, detail) = rig.production_check().await;
+    assert_eq!(status, DoctorStatus::Warning);
+    assert!(detail.contains("too little room"), "{detail}");
+    assert!(
+        rig.controller
+            .backup()
+            .generations()
+            .expect("a read")
+            .is_empty()
+    );
+    assert_eq!(walk(&rig.controller.backup().staging_root()), 0);
+
+    rig.controller
+        .lower_producer_bounds(kr_controller::service::ProducerBounds::PRODUCTION);
+    timer.run_by_itself();
+    rig.until("the generation is published", |rig| rig.published(1))
+        .await;
 }

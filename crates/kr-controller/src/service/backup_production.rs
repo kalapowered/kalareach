@@ -54,9 +54,6 @@ pub const INTERVAL_MS: u64 = 24 * 60 * 60 * 1000;
 /// The most output a host retains of one session: 128 MiB, the cap a producer reads at most.
 const RETAINED_PER_SESSION_BYTES: u64 = 128 << 20;
 
-/// What a pass leaves free on the disk it stages on: 1 GiB.
-const DISK_RESERVE: u64 = 1 << 30;
-
 /// The longest a pass waits before it looks at its checks again.
 const RECHECK: Duration = Duration::from_secs(60 * 60);
 
@@ -77,6 +74,8 @@ pub struct ProducerBounds {
     pub total_bytes: u64,
     /// The most members one generation holds.
     pub members: usize,
+    /// What a pass leaves free on the disk it stages on, beyond what it can need: 1 GiB.
+    pub disk_reserve_bytes: u64,
 }
 
 impl ProducerBounds {
@@ -86,6 +85,7 @@ impl ProducerBounds {
         configuration_member_bytes: MAX_CONFIGURATION_MEMBER_BYTES,
         total_bytes: MAX_RESTORED_BYTES,
         members: kr_protocol::archive::MAX_MANIFEST_OBJECTS,
+        disk_reserve_bytes: 1 << 30,
     };
 }
 
@@ -503,7 +503,7 @@ impl Controller {
                     })
                     .is_some_and(|made| made == fingerprint);
                 let low = kr_describe::resource::platform::free_space(&state_dir)
-                    .is_some_and(|free| free < needed.saturating_add(DISK_RESERVE));
+                    .is_some_and(|free| free < needed.saturating_add(bounds.disk_reserve_bytes));
                 (unchanged, low)
             })
             .await
