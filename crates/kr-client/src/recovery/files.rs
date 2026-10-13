@@ -293,8 +293,8 @@ pub enum PublicationRefusal {
     #[error("the publication's signature does not verify under the bundle's writer key")]
     BadSignature,
     /// The checkpoint refuses the generation; the standing says how.
-    #[error("the recovery bundle's checkpoint refuses that generation")]
-    Generation(RestoreGeneration),
+    #[error("the recovery bundle's checkpoint refuses that generation. {1}")]
+    Generation(RestoreGeneration, Shown),
 }
 
 crate::debug_as_display!(PublicationRefusal);
@@ -1211,7 +1211,8 @@ fn verify_publication(
         .map_err(|_| PublicationRefusal::BadSignature)?;
     let standing = RestoreGeneration::against(&payload.descriptor, expectation);
     if !standing.is_admissible() {
-        return Err(PublicationRefusal::Generation(standing));
+        let told = Shown::restore_standing(&standing);
+        return Err(PublicationRefusal::Generation(standing, told));
     }
     Ok(standing)
 }

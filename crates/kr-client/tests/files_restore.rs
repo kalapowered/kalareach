@@ -26,9 +26,10 @@ use kr_crypto::sign::{SigningTranscript, sign};
 use kr_protocol::archive::{
     ARCHIVE_DESCRIPTOR_VERSION, ARCHIVE_MANIFEST_SCHEMA_VERSION, ArchiveCheckpoint,
     ArchiveDescriptor, ArchiveManifest, BACKUP_PUBLICATION_DOMAIN, BackupGenerationPublication,
-    BackupGenerationPublicationPayload, CollectionLocator, EncryptedObjectRef, KeyWrapContext,
-    KeyWrapFormat, KeyWrapPurpose, MANIFEST_PAYLOAD_LIMITS, ManifestObject, ManifestPayload,
-    RECOVERY_BUNDLE_SCHEMA_VERSION, RecoveryBundle, RecoveryKit, TrustedProducer, TrustedWriter,
+    BackupGenerationPublicationPayload, CollectionLocator, DescriptorError, EncryptedObjectRef,
+    KeyWrapContext, KeyWrapFormat, KeyWrapPurpose, MANIFEST_PAYLOAD_LIMITS, ManifestObject,
+    ManifestPayload, RECOVERY_BUNDLE_SCHEMA_VERSION, RecoveryBundle, RecoveryKit, TrustedProducer,
+    TrustedWriter,
 };
 use kr_protocol::ids::{ArchiveId, BackupGeneration, BackupObjectId, DeviceId};
 use kr_protocol::scalars::{Digest256, TimestampMs, U64, Uuid};
@@ -702,6 +703,23 @@ async fn a_restore_trusts_the_writers_and_the_generation_the_authenticated_bundl
     ));
     assert_eq!(source.object_reads(), 0);
 
+    // A descriptor over the byte limit, validly signed by the trusted writer, is refused before an
+    // object is read: the restore measures the descriptor it was handed.
+    let mut oversize = world.seal(4, &members);
+    let mut payload = oversize.publication.payload.clone();
+    let wrap = payload.descriptor.manifest_key_wraps[0].clone();
+    payload.descriptor.manifest_key_wraps = vec![wrap; 400];
+    oversize.publication = resign(payload, &world.writer);
+    let source =
+        Arc::new(Scripted::serving(&world, world.bundle(&Shape::default())).publishing(&oversize));
+    assert!(matches!(
+        restore(&world, &source, None).await.expect_err("refused"),
+        RestoreError::Publication(PublicationRefusal::Structure(
+            DescriptorError::TooLarge { .. }
+        ))
+    ));
+    assert_eq!(source.object_reads(), 0);
+
     // A descriptor the protocol refuses, validly signed by the trusted writer, is refused before
     // an object is read.
     let mut invalid = world.seal(4, &members);
@@ -792,10 +810,17 @@ async fn a_generation_the_checkpoint_refuses_is_refused_before_the_manifest_is_r
     // An older generation than the checkpoint, genuinely signed.
     let older = world.seal(3, &members);
     let source = Arc::new(Scripted::serving(&world, world.bundle(&shape())).publishing(&older));
+    let replay = restore(&world, &source, None).await.expect_err("refused");
     assert!(matches!(
-        restore(&world, &source, None).await.expect_err("refused"),
-        RestoreError::Publication(PublicationRefusal::Generation(_))
+        replay,
+        RestoreError::Publication(PublicationRefusal::Generation(..))
     ));
+    // The person is told the two generations: the one offered and the one the checkpoint holds.
+    let told = replay.to_string();
+    assert!(
+        told.contains("generation 3") && told.contains("generation 5"),
+        "{told}"
+    );
     assert_eq!(source.object_reads(), 0, "a replay costs no download");
 
     // The checkpoint's generation with a second genuine manifest.
@@ -803,7 +828,7 @@ async fn a_generation_the_checkpoint_refuses_is_refused_before_the_manifest_is_r
     let source = Arc::new(Scripted::serving(&world, world.bundle(&shape())).publishing(&second));
     assert!(matches!(
         restore(&world, &source, None).await.expect_err("refused"),
-        RestoreError::Publication(PublicationRefusal::Generation(_))
+        RestoreError::Publication(PublicationRefusal::Generation(..))
     ));
     assert_eq!(source.object_reads(), 0);
 
