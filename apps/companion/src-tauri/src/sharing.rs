@@ -1935,7 +1935,14 @@ pub async fn ask_the_host(state: &AppState, action_id: ActionId) -> Result<Attem
     if attempt.is_closed() {
         // A follow-up: only the host's result ends it.
         if reply == Reply::Result {
-            let value = carry.result_json(attempt.kind, said.result.as_ref())?;
+            let value = match carry.result_json(attempt.kind, said.result.as_ref()) {
+                Ok(value) => value,
+                Err(error) => {
+                    // The record stays for another ask, and this one no longer holds it.
+                    desk.release(action_id);
+                    return Err(error);
+                }
+            };
             let _ = desk.drop_record(&carry.store, attempt.action_id);
             let view = desk.view(&attempt);
             desk.forget(action_id);
@@ -1970,7 +1977,13 @@ pub async fn ask_the_host(state: &AppState, action_id: ActionId) -> Result<Attem
         Next::Closed(_) => {
             // Only the host's result closes an attempt that was asked about again: the page is
             // answered with it here, and has no use for a record of it.
-            let value = carry.result_json(attempt.kind, said.result.as_ref())?;
+            let value = match carry.result_json(attempt.kind, said.result.as_ref()) {
+                Ok(value) => value,
+                Err(error) => {
+                    desk.release(action_id);
+                    return Err(error);
+                }
+            };
             let _ = desk.drop_record(&carry.store, action_id);
             desk.forget(action_id);
             desk.drop_result(action_id);
