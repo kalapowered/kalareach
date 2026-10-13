@@ -864,12 +864,24 @@ textarea::placeholder {
 }
 
 /* The words are bounded by the screen, not by the text size or the face they are set in: they
-   take what is left of the toast's half of the screen once the controls beneath them, the padding
-   and the border are counted, so the toast as a whole stays under half of it whatever the words.
-   At the largest size a long message scrolls inside its own box, and the controls below it are
-   never pushed off the screen. */
+   take what is left of the toast's half of the screen once the row of controls beneath them, the
+   border (2px), the padding (18px) and the gap between the rows (4px) are counted, so the toast as
+   a whole stays under half of it whatever the words. At the largest size a long message scrolls
+   inside its own box, and the controls below it are never pushed off the screen. The 80px floor
+   keeps the words usable on a screen too short for half of it to hold them: the toast is then more
+   than half of that screen. */
+.toast {
+  /* The height of the tallest control: Dismiss is a target high, and a button that names an action
+     is one line of its own text, its padding and its border. */
+  --toast-controls: var(--target);
+}
+
+.toast[data-with-action] {
+  --toast-controls: max(var(--target), calc(1.05rem + 18px));
+}
+
 .toast-text {
-  max-height: min(12rem, max(80px, calc(49dvh - var(--target) - 24px)));
+  max-height: min(12rem, max(80px, calc(49dvh - var(--toast-controls) - 24px)));
   /* Words never scroll sideways: they wrap, and what cannot wrap is cut off, not scrolled to. */
   overflow-x: hidden;
   overflow-y: auto;

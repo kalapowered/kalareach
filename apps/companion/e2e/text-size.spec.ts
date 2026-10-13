@@ -530,11 +530,16 @@ test.describe('a passing message', () => {
 
   // The desktop's messages offer an action, and the shared toast keeps it and Dismiss in view on a
   // narrow window too, with its words bounded by the screen.
-  for (const [name, viewport, host] of [
-    ['one row', { width: 1024, height: 768 }, 'studio'],
-    ['bounded words', { width: 360, height: 640 }, 'studio-with-a-name-that-is-long-enough-to-fill-a-narrow-window '.repeat(12)]
+  const LONG_HOST = 'studio-with-a-name-that-is-long-enough-to-fill-a-narrow-window '.repeat(12)
+  for (const [name, viewport, host, scale] of [
+    ['one row', { width: 1024, height: 768 }, 'studio', 1],
+    ['bounded words', { width: 360, height: 640 }, LONG_HOST, 1],
+    // The button that names the action is taller than Dismiss at this size, and the words give up
+    // the room it takes: the toast stays under half of the screen with it.
+    ['bounded words at the largest size', { width: 360, height: 640 }, LONG_HOST, LARGEST]
   ] as const) {
     test(`keeps a passing message with an action in view: ${name}`, async ({ page }) => {
+      await withSystemTextScale(page, scale)
       await page.setViewportSize(viewport)
       await page.goto('/harness.html')
       await page.waitForSelector('.app-shell')

@@ -433,6 +433,7 @@ function ToastBody({
       className="toast"
       role="status"
       aria-live="polite"
+      data-with-action={action === undefined ? undefined : ''}
       onPointerEnter={() => {
         setPointer(true)
       }}
