@@ -9,11 +9,11 @@ use crate::shown::{Said, Shown};
 /// A client failure.
 ///
 /// What it says is a [`Shown`], so no rendering of it carries what a host, a service or a file
-/// sent: [`Said`] is its `Display` and its `Debug`. Four variants hold another crate's value,
+/// sent: [`Said`] is its `Display` and its `Debug`. Five variants hold another crate's value,
 /// because other crates build them and match on what is inside ([`Self::Transport`],
-/// [`Self::Ipc`], [`Self::Host`] and [`Self::Refused`]); each is rendered through its reducer or
-/// door and none is this error's `source()`, so a logger that walks a source chain meets only what
-/// this rendering says.
+/// [`Self::Ipc`], [`Self::Host`], [`Self::Refused`] and [`Self::OutcomeUnknown`]); each is rendered
+/// through its reducer or door and none is this error's `source()`, so a logger that walks a source
+/// chain meets only what this rendering says.
 #[non_exhaustive]
 pub enum ClientError {
     /// The transport failed.

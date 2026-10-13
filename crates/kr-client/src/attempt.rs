@@ -1726,6 +1726,15 @@ mod tests {
             ))),
             Reply::Refused(ErrorCode::PermissionDenied.retry_category())
         );
+        // A host's answer that it cannot establish the outcome is the host's answer, as it was before
+        // the answer carried the action: it is read as a refusal in its own category, not as a loss.
+        assert_eq!(
+            reply(ClientError::OutcomeUnknown {
+                action_id: ActionId::new(Uuid::from_bytes([0xd3; 16])),
+                error: kr_protocol::error::ProtocolError::new(ErrorCode::OutcomeUnknown, "unknown"),
+            }),
+            Reply::Refused(ErrorCode::OutcomeUnknown.retry_category())
+        );
     }
 
     /// The moment a read began is read off the clock when the read is about to be sent, and it

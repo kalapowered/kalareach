@@ -27,7 +27,7 @@ use kr_protocol::envelope::{
 use kr_protocol::hello::ActionWindow;
 use kr_protocol::ids::{ActionId, GrantId, RequestId, StreamId};
 use kr_protocol::method::Method;
-use kr_protocol::receipt::Receipt;
+use kr_protocol::receipt::{ActionReadParams, ActionReadResult, Receipt};
 use kr_protocol::scalars::{DurationMs, Nullable};
 use serde::Serialize;
 use tokio::sync::{Mutex, broadcast, oneshot};
@@ -1007,6 +1007,34 @@ impl Session {
             _ => return Err(ClientError::OtherHost),
         }
         self.submit_composed(composed).await
+    }
+
+    /// Reads what the host recorded of an action, and lets that record settle the action here.
+    ///
+    /// An action whose answer was lost, or whose answer said the host could not establish its
+    /// outcome, stays on the unresolved list: section 9 forbids forgetting it. A record that says
+    /// it was applied, refused or rejected is the host deciding what became of it, so the action
+    /// leaves the list, as it would have had the answer come. A record that says less settles
+    /// nothing, and an action its caller holds ([`Session::send`] and [`Session::repeat`]) stays
+    /// until the caller settles it.
+    ///
+    /// # Errors
+    ///
+    /// Returns the host's refusal, as [`Session::read`] does.
+    pub async fn read_receipt(&self, params: &ActionReadParams) -> Result<ActionReadResult> {
+        let read: ActionReadResult = self.read(Method::ActionRead, params).await?;
+        if read.receipt.action_id == params.action_id && read.receipt.state.is_terminal() {
+            let mut outcomes = self.state.outcomes.lock().await;
+            outcomes.receipts.record(read.receipt.clone());
+            if !outcomes
+                .submitted
+                .get(&params.action_id)
+                .is_some_and(|action| action.held)
+            {
+                outcomes.settle_action(params.action_id);
+            }
+        }
+        Ok(read)
     }
 
     /// Settles an action by the caller's word, once it has decided what the answers came to.

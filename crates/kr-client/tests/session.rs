@@ -139,6 +139,8 @@ struct HostScript {
     answer_mutations_with_result: Mutex<u32>,
     /// Answer every mutation with a receipt in this state instead of `accepted`.
     receipt_state: Mutex<Option<ReceiptState>>,
+    /// The state the host's record of any action reads as, when a request reads it.
+    record_state: Mutex<Option<ReceiptState>>,
     /// Answer nothing at all to this many of the next mutations.
     ///
     /// A host that took the frame and said nothing is what leaves an action whose outcome nobody
@@ -225,9 +227,50 @@ fn spawn_host(
                                     _ => None,
                                 }
                             };
-                            let outcome = match refusal {
-                                Some(code) => Outcome::Error(ProtocolError::new(code, "refused")),
-                                None => Outcome::Ok(answer_read(&request)),
+                            let record = if request.method.as_str()
+                                == kr_protocol::method::Method::ActionRead.entry().name
+                            {
+                                request
+                                    .params
+                                    .to_typed::<kr_protocol::receipt::ActionReadParams>()
+                                    .ok()
+                            } else {
+                                None
+                            };
+                            let outcome = match (refusal, record) {
+                                (Some(code), _) => {
+                                    Outcome::Error(ProtocolError::new(code, "refused"))
+                                }
+                                (None, Some(read)) => Outcome::Ok(
+                                    ParamsValue::from_typed(
+                                        &kr_protocol::receipt::ActionReadResult {
+                                            receipt: Receipt {
+                                                action_id: read.action_id,
+                                                actor_id: kr_protocol::ids::ActorId::new(
+                                                    "device:test",
+                                                )
+                                                .expect("a principal"),
+                                                method: kr_protocol::method::Method::SessionCreate
+                                                    .into(),
+                                                method_version: kr_protocol::method::MethodVersion(
+                                                    1,
+                                                ),
+                                                revision: U64::new(2),
+                                                state: (*script.record_state.lock().await)
+                                                    .unwrap_or(ReceiptState::Unknown),
+                                                reason: Nullable::null(),
+                                                payload_digest: Digest256::from_bytes([0; 32]),
+                                                accepted_deadline_ms: Nullable::null(),
+                                                error: Nullable::null(),
+                                                error_withheld: false,
+                                                updated_at_ms: TimestampMs::new(0),
+                                            },
+                                            result: Nullable::null(),
+                                        },
+                                    )
+                                    .expect("a record"),
+                                ),
+                                (None, None) => Outcome::Ok(answer_read(&request)),
                             };
                             ControlFrame::Response(Response {
                                 request_id: request.request_id,
@@ -1176,6 +1219,101 @@ async fn an_unknown_outcome_is_never_retried_and_names_the_action_to_ask_about()
     let submitted = session.submitted_actions().await;
     assert_eq!(submitted.len(), 1);
     assert_eq!(submitted[0].action_id, script.actions.lock().await[0]);
+
+    session.close();
+    serving.abort();
+}
+
+/// Section 9: an action the host could not establish stays on the unresolved list until the host's
+/// own record says what became of it. A record that is applied, refused or rejected settles it; a
+/// record that says less does not; and an action its caller holds stays until the caller settles it.
+#[tokio::test]
+async fn a_definite_record_of_an_action_nobody_knew_the_end_of_settles_it() {
+    let host = side(1, true).await;
+    let client = side(2, false).await;
+    let script = Arc::new(HostScript::default());
+    let serving = spawn_host(&host, client.record, Arc::clone(&script), None);
+    let session = connect(&client, &host).await;
+    let target = ActionTarget::environment(EnvironmentId::new(Uuid::from_bytes([9; 16])));
+
+    *script.refuse_mutations_with.lock().await = Some(ErrorCode::OutcomeUnknown);
+    let error = session
+        .mutate(
+            Method::SessionCreate,
+            target.clone(),
+            None,
+            &Empty {},
+            &Empty {},
+            DurationMs::new(120_000),
+        )
+        .await
+        .expect_err("an uncertain outcome");
+    let ClientError::OutcomeUnknown { action_id, .. } = error else {
+        panic!("the host could not establish it: {error}");
+    };
+    let read = kr_protocol::receipt::ActionReadParams {
+        action_id,
+        session_id: None,
+    };
+
+    // A record that still says unknown settles nothing.
+    *script.record_state.lock().await = Some(ReceiptState::Unknown);
+    assert_eq!(
+        session
+            .read_receipt(&read)
+            .await
+            .expect("read")
+            .receipt
+            .state,
+        ReceiptState::Unknown
+    );
+    assert_eq!(session.submitted_actions().await.len(), 1);
+    // Nor does one that says the host only has it.
+    *script.record_state.lock().await = Some(ReceiptState::Dispatching);
+    session.read_receipt(&read).await.expect("read");
+    assert_eq!(session.submitted_actions().await.len(), 1);
+
+    // A record that says it was applied does.
+    *script.record_state.lock().await = Some(ReceiptState::Applied);
+    session.read_receipt(&read).await.expect("read");
+    assert!(session.submitted_actions().await.is_empty());
+    assert_eq!(
+        session
+            .receipts()
+            .await
+            .get(&action_id)
+            .map(|receipt| receipt.state),
+        Some(ReceiptState::Applied)
+    );
+
+    // An action its caller holds stays until the caller settles it, whatever the record says.
+    let named = kr_protocol::ids::ActionId::new(Uuid::from_bytes([0x46; 16]));
+    let composed = session
+        .compose(
+            Method::SessionCreate,
+            named,
+            target,
+            None,
+            &Empty {},
+            &Empty {},
+            DurationMs::new(120_000),
+        )
+        .await
+        .expect("composed");
+    session
+        .send(&composed)
+        .await
+        .expect_err("an uncertain outcome");
+    session
+        .read_receipt(&kr_protocol::receipt::ActionReadParams {
+            action_id: named,
+            session_id: None,
+        })
+        .await
+        .expect("read");
+    assert_eq!(session.submitted_actions().await.len(), 1);
+    session.settle(named).await;
+    assert!(session.submitted_actions().await.is_empty());
 
     session.close();
     serving.abort();
