@@ -1276,6 +1276,7 @@ fn a_removed_authority_feed_raises_one_item_until_the_host_reads_another() {
         automation_manage: false,
         host_manage,
         admits_session: &|_| true,
+        history_from_ms: 0,
     };
     let managing = attention
         .inbox(&actor("device:phone"), &Viewer::Device(scope(true)), true)
