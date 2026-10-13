@@ -1221,11 +1221,6 @@ async fn a_lost_reply_to_a_hand_over_is_answered_from_the_hosts_record_and_gates
         .as_str()
         .expect("an action")
         .to_owned();
-    assert!(
-        net_support::holds(&scene.host, hand_over.from)
-            || !net_support::holds(&scene.host, hand_over.from),
-        "the host committed it or not; either way the record is kept"
-    );
 
     // No second hand-over of the session while this one can still happen.
     scene.reconnect_issuer().await;

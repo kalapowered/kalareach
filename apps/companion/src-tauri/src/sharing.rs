@@ -340,6 +340,13 @@ impl ShareDesk {
         store.keep(&next).map_err(failed_store)
     }
 
+    /// Removes the record of an attempt. Like every other write of a record it is made under the
+    /// records lock, so a Hide that read the record before it went cannot write it back after.
+    fn drop_record(&self, store: &AttemptStore, action_id: ActionId) -> Result<()> {
+        let _writing = self.records.lock().unwrap_or_else(PoisonError::into_inner);
+        store.remove(action_id).map_err(failed_store)
+    }
+
     /// Hides an attempt or shows it again, leaving everything else in its record as it is.
     fn set_hidden(
         &self,
@@ -372,9 +379,7 @@ impl ShareDesk {
             .unwrap_or_else(PoisonError::into_inner)
             .get(reference)
             .cloned()
-            .ok_or_else(|| {
-                CommandError::invalid("that hand-over is not one this application is asking about")
-            })
+            .ok_or_else(not_asking_about)
     }
 
     /// Takes a hand-over out of the table to be sent, in one step with `write`, which keeps the
@@ -389,9 +394,7 @@ impl ShareDesk {
             .handovers
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        let handover = held.get(reference).ok_or_else(|| {
-            CommandError::invalid("that hand-over is not one this application is asking about")
-        })?;
+        let handover = held.get(reference).ok_or_else(not_asking_about)?;
         write(handover)?;
         held.remove(reference).ok_or_else(|| {
             CommandError::local_failure("the hand-over left the table while it was being kept")
@@ -410,9 +413,8 @@ impl ShareDesk {
             return Ok(false);
         };
         let action_id = handover.action_id;
-        self.store(handover.environment_id)?
-            .remove(action_id)
-            .map_err(failed_store)?;
+        let store = self.store(handover.environment_id)?;
+        self.drop_record(&store, action_id)?;
         held.remove(reference);
         drop(held);
         self.forget(action_id);
@@ -436,12 +438,18 @@ impl ShareDesk {
             }
             None => return Ok(()),
         }
-        store.remove(action_id).map_err(failed_store)?;
+        self.drop_record(store, action_id)?;
         held.retain(|_, handover| handover.action_id != action_id);
         drop(held);
         self.forget(action_id);
         Ok(())
     }
+}
+
+/// What a reference that names no hand-over this application is asking about is told: one that was
+/// cancelled, ended, or sent.
+fn not_asking_about() -> CommandError {
+    CommandError::invalid("that hand-over is not one this application is asking about")
 }
 
 /// The record kept for an action, when there is one this build reads.
@@ -491,10 +499,14 @@ pub struct AttemptView {
     pub device_id: Option<String>,
     /// The grant it writes, revokes or accepts.
     pub grant_id: Option<String>,
+    /// The grant it takes away: the one a revocation names, the one a hand-over gives up.
+    pub revoked_grant_id: Option<String>,
     /// When it was composed, by this computer's clock. For display only.
     pub composed_at_ms: TimestampMs,
     /// The earliest moment by this computer's clock at which a read of the host that finds nothing
-    /// can close it, while it can still happen. Null once it is over.
+    /// can close it, while it can still happen. Null once it is over, and once that moment has
+    /// passed without a read the host answered: the attempt can then be asked about, and nothing
+    /// says until when it might still happen.
     pub can_happen_until_ms: Option<TimestampMs>,
     /// How many times the host has been asked again.
     pub repeats: u8,
@@ -527,8 +539,9 @@ impl AttemptView {
             session_id: about.session.map(|session| session.to_string()),
             device_id: about.device.map(|device| device.to_string()),
             grant_id: attempt.grant_id.0.map(|grant| grant.to_string()),
+            revoked_grant_id: about.revokes.map(|grant| grant.to_string()),
             composed_at_ms: attempt.composed_at_ms,
-            can_happen_until_ms: (!attempt.is_closed()).then(|| {
+            can_happen_until_ms: (!attempt.is_closed() && !remaining.is_zero()).then(|| {
                 TimestampMs::new(
                     now_ms.saturating_add(u64::try_from(remaining.as_millis()).unwrap_or(u64::MAX)),
                 )
@@ -544,6 +557,7 @@ impl AttemptView {
 struct About {
     session: Option<SessionId>,
     device: Option<DeviceId>,
+    revokes: Option<GrantId>,
 }
 
 impl About {
@@ -555,27 +569,39 @@ impl About {
                 return Self {
                     session: Some(invited.session_id),
                     device: Some(invited.recipient_device_id),
+                    revokes: None,
+                };
+            }
+        } else if *method == Method::GrantRevoke.into() {
+            if let Ok(revoked) = params.to_typed::<GrantRevokeParams>() {
+                return Self {
+                    session: None,
+                    device: None,
+                    revokes: Some(revoked.grant_id),
                 };
             }
         } else if *method == Method::GrantTransfer.into() {
             if let Ok(handed) = params.to_typed::<GrantTransferParams>() {
-                return Self {
-                    session: Some(handed.session_id),
-                    device: Some(handed.to_device_id),
-                };
+                return Self::handing(&handed);
             }
         } else if *method == Method::OwnerConfirmationRequest.into()
             && let Ok(asked) = params.to_typed::<OwnerConfirmationRequestParams>()
             && let ConfirmationSubject::TransferControl(subject) = asked.subject
         {
-            return Self {
-                session: Some(subject.params.session_id),
-                device: Some(subject.params.to_device_id),
-            };
+            return Self::handing(&subject.params);
         }
         Self {
             session: None,
             device: None,
+            revokes: None,
+        }
+    }
+
+    fn handing(handed: &GrantTransferParams) -> Self {
+        Self {
+            session: Some(handed.session_id),
+            device: Some(handed.to_device_id),
+            revokes: Some(handed.from_grant_id),
         }
     }
 }
@@ -801,7 +827,10 @@ impl Carry {
         }
         // The first answer was lost, or is not one that closes it: the record says so before
         // anything else happens.
-        self.keep(&attempt)?;
+        if let Err(error) = self.keep(&attempt) {
+            self.desk.release(action_id);
+            return Err(error);
+        }
         let view = self.desk.view(&attempt);
         let task = Arc::clone(&self);
         tauri::async_runtime::spawn(async move {
@@ -866,8 +895,9 @@ impl Carry {
         if let Some(reading) = reading {
             reading.session().close();
         }
+        // Letting the clock go also lets go of the right to carry the attempt on: a task that took
+        // that right since is not one this end can release.
         self.conclude(&attempt, sent_action).await;
-        self.desk.release(action_id);
     }
 
     /// One exact repeat of a request, on a connection opened for it.
@@ -976,8 +1006,7 @@ impl Carry {
     /// The end of an attempt the page is answered at once: its record goes (`remove`), and the
     /// request is settled in the book.
     async fn finish_record(&self, attempt: &Attempt, sent_action: ActionId) {
-        let _ = self.store.remove(attempt.action_id);
-        self.desk.release(attempt.action_id);
+        let _ = self.desk.drop_record(&self.store, attempt.action_id);
         self.desk.forget(attempt.action_id);
         self.settle(sent_action).await;
     }
@@ -1495,12 +1524,12 @@ pub async fn transfer_ask(
     let challenge = match carry.ask_for_confirmation(&composed).await {
         Ok(challenge) => challenge,
         Err(error) => {
-            let _ = carry.store.remove(attempt.action_id);
+            let _ = carry.desk.drop_record(&carry.store, attempt.action_id);
             return Err(error);
         }
     };
     if challenge.initial_bootstrap {
-        let _ = carry.store.remove(attempt.action_id);
+        let _ = carry.desk.drop_record(&carry.store, attempt.action_id);
         return Err(CommandError::new(
             ErrorCode::OwnerConfirmationRequired,
             "this host has no owner device yet, so nobody can confirm a hand-over of control",
@@ -1639,8 +1668,11 @@ pub async fn transfer_answered(state: &AppState, reference: &str) -> Result<Hand
     else {
         // The challenge is no longer the host's: nothing was sent for it, and the record that holds
         // the session's place goes, so the person can ask again. A send that began since took the
-        // hand-over, and its record is its own.
-        desk.abandon(reference)?;
+        // hand-over, and the challenge is gone because the send used it: that is not an answer
+        // that nothing was handed over.
+        if !desk.abandon(reference)? {
+            return Err(not_asking_about());
+        }
         return Ok(HandoverState {
             state: "gone",
             expires_at_ms,
@@ -1684,8 +1716,8 @@ pub async fn transfer_answered(state: &AppState, reference: &str) -> Result<Hand
     } else {
         "gone"
     };
-    if state_word == "gone" {
-        desk.abandon(reference)?;
+    if state_word == "gone" && !desk.abandon(reference)? {
+        return Err(not_asking_about());
     }
     Ok(HandoverState {
         state: state_word,
@@ -1778,9 +1810,7 @@ pub async fn transfer_cancel(state: &AppState, reference: &str) -> Result<()> {
     if state.shares().abandon(reference)? {
         Ok(())
     } else {
-        Err(CommandError::invalid(
-            "that hand-over is not one this application is asking about",
-        ))
+        Err(not_asking_about())
     }
 }
 
@@ -1805,18 +1835,28 @@ pub fn attempts(state: &AppState) -> Result<Attempts> {
     for kept in store.attempts().map_err(failed_store)? {
         match kept {
             Kept::Unknown { .. } => unreadable += 1,
-            Kept::Known(attempt) => {
-                views.push(desk.view(&attempt));
-                if attempt.phase == Phase::Checking
-                    && belongs_to(&connection, &attempt)
-                    && desk.take(attempt.action_id)
+            Kept::Known(listed) => {
+                views.push(desk.view(&listed));
+                if listed.phase == Phase::Checking
+                    && belongs_to(&connection, &listed)
+                    && desk.take(listed.action_id)
                 {
+                    // Read again now that the right to carry it on is held: a task that ended
+                    // since the listing has written its end, and a copy from before is not
+                    // written over it.
+                    let Ok(Some(attempt)) = find(&store, listed.action_id) else {
+                        desk.release(listed.action_id);
+                        continue;
+                    };
+                    if attempt.phase != Phase::Checking {
+                        desk.release(listed.action_id);
+                        continue;
+                    }
                     let carrying = Arc::new(Carry {
                         desk: Arc::clone(&desk),
                         connection: connection.clone(),
                         store: store.clone(),
                     });
-                    let attempt = *attempt;
                     tauri::async_runtime::spawn(async move {
                         let composed = attempt.composed();
                         carrying
@@ -1851,25 +1891,37 @@ pub async fn ask_the_host(state: &AppState, action_id: ActionId) -> Result<Attem
     let connection = state.connection()?;
     let desk = state.shares();
     let store = desk.store(connection.environment_id())?;
-    let mut attempt = known(&store, action_id)?;
+    // The right to carry an attempt on is taken before its record is read, so the copy read is
+    // the one nothing else is writing from.
+    if !desk.take(action_id) {
+        let attempt = known(&store, action_id)?;
+        return Ok(Attempted {
+            attempt: desk.view(&attempt),
+            value: None,
+        });
+    }
+    let mut attempt = match known(&store, action_id) {
+        Ok(attempt) => attempt,
+        Err(error) => {
+            desk.forget(action_id);
+            return Err(error);
+        }
+    };
     if attempt.phase == Phase::Asking {
+        desk.release(action_id);
         return Err(CommandError::invalid(
             "a hand-over still being confirmed is not asked about",
         ));
     }
     if attempt.is_closed() && !attempt.follow_up {
+        desk.release(action_id);
         return Err(CommandError::invalid("that attempt is over"));
     }
     if !belongs_to(&connection, &attempt) {
+        desk.release(action_id);
         return Err(CommandError::refused(
             "that was made on another host, or as another user, and is asked about only there",
         ));
-    }
-    if !desk.take(action_id) {
-        return Ok(Attempted {
-            attempt: desk.view(&attempt),
-            value: None,
-        });
     }
     let carry = Arc::new(Carry {
         desk: Arc::clone(&desk),
@@ -1883,11 +1935,11 @@ pub async fn ask_the_host(state: &AppState, action_id: ActionId) -> Result<Attem
     if attempt.is_closed() {
         // A follow-up: only the host's result ends it.
         if reply == Reply::Result {
-            let _ = carry.store.remove(attempt.action_id);
             let value = carry.result_json(attempt.kind, said.result.as_ref())?;
+            let _ = desk.drop_record(&carry.store, attempt.action_id);
             let view = desk.view(&attempt);
-            desk.release(action_id);
             desk.forget(action_id);
+            desk.drop_result(action_id);
             return Ok(Attempted {
                 attempt: view,
                 value: Some(value),
@@ -1900,7 +1952,14 @@ pub async fn ask_the_host(state: &AppState, action_id: ActionId) -> Result<Attem
         });
     }
     let next = attempt.after_repeat(reply);
-    carry.keep(&attempt)?;
+    // An attempt that closed is not written: its record goes with the answer, and a closed record
+    // written first would be one without what the result owes.
+    if !matches!(next, Next::Closed(_))
+        && let Err(error) = carry.keep(&attempt)
+    {
+        desk.release(action_id);
+        return Err(error);
+    }
     match next {
         Next::NotSent => {
             desk.release(action_id);
@@ -1912,8 +1971,7 @@ pub async fn ask_the_host(state: &AppState, action_id: ActionId) -> Result<Attem
             // Only the host's result closes an attempt that was asked about again: the page is
             // answered with it here, and has no use for a record of it.
             let value = carry.result_json(attempt.kind, said.result.as_ref())?;
-            let _ = carry.store.remove(action_id);
-            desk.release(action_id);
+            let _ = desk.drop_record(&carry.store, action_id);
             desk.forget(action_id);
             desk.drop_result(action_id);
             carry.settle(sent_action).await;
@@ -1979,7 +2037,7 @@ pub fn remove(state: &AppState, action_id: ActionId) -> Result<()> {
     }
     desk.forget(action_id);
     desk.drop_result(action_id);
-    store.remove(action_id).map_err(failed_store)
+    desk.drop_record(&store, action_id)
 }
 
 /// The ids of the attempts a process is carrying on, for a test to wait on.
@@ -2004,11 +2062,130 @@ mod tests {
     use std::sync::mpsc;
 
     use kr_crypto::keys::DeviceKeys;
-    use kr_protocol::ids::ConfirmationId;
+    use kr_protocol::envelope::MutationRequest;
+    use kr_protocol::ids::{ActionWindowId, ConfirmationId, RequestId};
     use kr_protocol::pairing::SensitiveAction;
-    use kr_protocol::scalars::{CanonicalSet, Digest256, Nonce256, Uuid};
+    use kr_protocol::scalars::{CanonicalSet, Digest256, DurationMs, Nonce256, Uuid};
+    use kr_protocol::sharing::{AuthorityNotice, SessionRole};
 
     use super::*;
+
+    /// An attempt for a request of `method` with `params`, as a record of it holds one.
+    fn attempt_of(kind: Kind, method: Method, params: &impl Serialize) -> Attempt {
+        let composed = ComposedMutation::restored(
+            MutationRequest {
+                request_id: RequestId::new(0),
+                method: method.into(),
+                method_version: method.entry().version,
+                action_id: ActionId::new(Uuid::from_bytes([1; 16])),
+                grant_id: Nullable::null(),
+                target: ActionTarget::environment(EnvironmentId::new(Uuid::from_bytes([7; 16]))),
+                expected: ParamsValue::from_typed(&NoPreconditions {}).expect("encodes"),
+                action_window_id: ActionWindowId::new("window-1").expect("an identifier"),
+                requested_ttl_ms: DurationMs::new(1_000),
+                params: ParamsValue::from_typed(params).expect("encodes"),
+            },
+            0,
+            60_000,
+            None,
+        );
+        Attempt::new(kind, &composed, None, 0, "an attempt")
+    }
+
+    /// An invitation, with the live view of the screen or without it.
+    fn an_invitation(live: bool) -> Attempt {
+        let mut selection = kr_protocol::sharing::RoleSelection::plain(SessionRole::Viewer);
+        selection.include_live_screen = live;
+        attempt_of(
+            Kind::Invite,
+            Method::GrantCreate,
+            &GrantCreateParams {
+                session_id: SessionId::new(Uuid::from_bytes([2; 16])),
+                recipient_device_id: DeviceId::new(Uuid::from_bytes([4; 16])),
+                parent_grant_id: Nullable::null(),
+                accepted_notices: AuthorityNotice::for_actions(&selection.actions()),
+                selection,
+                lifetime_ms: Nullable::null(),
+                owner_confirmation: Nullable::null(),
+            },
+        )
+    }
+
+    /// KR-REQ-23.49: an attempt owes the person what the host's result carries that its end does not
+    /// say: the screen kept with a live invitation, and how far the workers have got with a
+    /// revocation or a hand-over. An invitation without the live view and an acceptance owe nothing,
+    /// so their records go with their end. A live invitation cannot be made by the product's own
+    /// harness, which has no session worker behind its sessions, so the rule is read off the
+    /// request a record holds.
+    #[test]
+    fn an_attempt_owes_the_screen_of_a_live_invitation_and_the_workers_of_a_revocation() {
+        assert!(owes(&an_invitation(true)));
+        assert!(!owes(&an_invitation(false)));
+        let grant = GrantId::new(Uuid::from_bytes([3; 16]));
+        assert!(owes(&attempt_of(
+            Kind::Revoke,
+            Method::GrantRevoke,
+            &GrantRevokeParams { grant_id: grant },
+        )));
+        assert!(owes(&attempt_of(
+            Kind::Transfer,
+            Method::GrantTransfer,
+            &GrantTransferParams {
+                session_id: SessionId::new(Uuid::from_bytes([2; 16])),
+                from_grant_id: grant,
+                to_device_id: DeviceId::new(Uuid::from_bytes([4; 16])),
+            },
+        )));
+        assert!(!owes(&attempt_of(
+            Kind::Redeem,
+            Method::GrantRedeem,
+            &GrantRedeemParams {
+                invitation_id: InvitationId::new(Uuid::from_bytes([6; 16])),
+            },
+        )));
+    }
+
+    /// A revocation and a hand-over say which grant they take away, which the page checks again
+    /// by: the protocol's list of the grants a revocation reached is sorted by identity and can be
+    /// cut, so it does not say which one was named.
+    #[test]
+    fn a_revocation_and_a_hand_over_say_which_grant_they_take_away() {
+        let grant = GrantId::new(Uuid::from_bytes([3; 16]));
+        let revoke = attempt_of(
+            Kind::Revoke,
+            Method::GrantRevoke,
+            &GrantRevokeParams { grant_id: grant },
+        );
+        let view = AttemptView::of(&revoke, None, 0, Duration::from_secs(1));
+        assert_eq!(view.revoked_grant_id, Some(grant.to_string()));
+        let hand_over = attempt_of(
+            Kind::Transfer,
+            Method::GrantTransfer,
+            &GrantTransferParams {
+                session_id: SessionId::new(Uuid::from_bytes([2; 16])),
+                from_grant_id: grant,
+                to_device_id: DeviceId::new(Uuid::from_bytes([4; 16])),
+            },
+        );
+        let view = AttemptView::of(&hand_over, None, 0, Duration::from_secs(1));
+        assert_eq!(view.revoked_grant_id, Some(grant.to_string()));
+        assert_eq!(
+            AttemptView::of(&an_invitation(false), None, 0, Duration::from_secs(1))
+                .revoked_grant_id,
+            None
+        );
+    }
+
+    /// KR-REQ-23.49: an attempt whose bound has passed without a read the host answered does not
+    /// say it can still happen until a moment that is now; it says nothing of when.
+    #[test]
+    fn an_attempt_past_its_bound_says_no_time_until_which_it_can_happen() {
+        let attempt = an_invitation(false);
+        let before = AttemptView::of(&attempt, None, 1_000, Duration::from_secs(5));
+        assert!(before.can_happen_until_ms.is_some());
+        let past = AttemptView::of(&attempt, None, 1_000, Duration::ZERO);
+        assert!(past.can_happen_until_ms.is_none());
+    }
 
     /// A hand-over as the table holds it, for a reference.
     fn desk_holding(reference: &str) -> ShareDesk {
