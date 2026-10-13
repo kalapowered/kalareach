@@ -326,7 +326,16 @@ fn a_guest_is_shown_a_session_with_its_screen_and_loses_it_when_the_share_is_tak
     ]);
     assert!(relay.lost(), "the host's answer was lost on the way back");
     relay.remove();
+    // The document holds what the host answered, which only the repeat on a connection of its own
+    // gives back: a command that took the share's presence in the list for its answer has neither.
     assert!(plain["grant_id"].as_str().is_some(), "{plain}");
+    assert!(
+        plain["actions"]
+            .as_array()
+            .is_some_and(|actions| !actions.is_empty()),
+        "the command was given the host's answer: {plain}"
+    );
+    assert!(plain["ends_at_ms"].as_str().is_some(), "{plain}");
     let offered = held(&runtime, &guest);
     assert_eq!(offered.offers.len(), 1, "the share was made once");
     assert!(!offered.offers[0].includes_live_screen);

@@ -281,8 +281,13 @@ async fn approve(
         ));
         if guest {
             output::line(&stdout_line!(
-                "Share a session with it: `kr share invite <session> --to {}`.",
-                paired.device_id
+                "Share a session with it: `kr share invite <session> --to {}{}`.",
+                paired.device_id,
+                if arguments.environment.is_some() {
+                    shown!(" --environment {}", environment.environment_id)
+                } else {
+                    Shown::said("")
+                }
             ));
         }
     }

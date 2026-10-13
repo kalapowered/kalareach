@@ -87,6 +87,11 @@ const POLL_EVERY: Duration = OWNER_DEVICE_POLL;
 /// a read that failed.
 const READ_WITHIN: Duration = Duration::from_secs(10);
 
+/// How long one send of a request to the host, or one question about it, is given before the
+/// answer counts as lost: a host that keeps a connection open and says nothing is a host that did
+/// not answer, which a repeat on a connection of its own settles.
+const SEND_WITHIN: Duration = Duration::from_secs(30);
+
 /// How long past the time an absent grant counts a command goes on reading a host it cannot read.
 /// A read that reaches the host decides at once once the bound has passed, so only a host that
 /// cannot be read keeps a command waiting, and for this long at the most.
@@ -398,9 +403,7 @@ fn session_of(paths: &HostPaths, host: &Host, text: &str) -> Result<WorkerDescri
 }
 
 /// Maps what the local socket said to a send, to what the attempt makes of it.
-fn reply_of(
-    sent: &std::result::Result<std::result::Result<ParamsValue, ProtocolError>, kr_ipc::IpcError>,
-) -> Reply {
+fn reply_of(sent: &Sent) -> Reply {
     match sent {
         Ok(Ok(_)) => Reply::Result,
         Ok(Err(refusal)) => Reply::Refused(refusal.retry),
@@ -408,6 +411,46 @@ fn reply_of(
         // is what asking again is for.
         Err(_) => Reply::Lost,
     }
+}
+
+/// What the host answered to a request, or what stopped it answering.
+type Sent = std::result::Result<std::result::Result<ParamsValue, ProtocolError>, kr_ipc::IpcError>;
+
+/// The first send of a request, which counts as lost when the host has not answered in time.
+async fn sent_within(send: impl std::future::Future<Output = Sent>) -> Sent {
+    tokio::time::timeout(SEND_WITHIN, send).await.unwrap_or(Err(
+        kr_ipc::IpcError::UnexpectedMessage("the host did not answer in time"),
+    ))
+}
+
+/// Asks about a request again, with exactly that request, on a connection opened for it; the
+/// connection is given back with the answer so a caller that goes on can go on there. A host that
+/// cannot be reached, or does not answer in time, is an answer lost.
+async fn ask_again(
+    host: &Host,
+    request: &kr_protocol::envelope::MutationRequest,
+) -> (Sent, Option<LocalClient>) {
+    let asked = async {
+        match host.another().await {
+            Ok(mut second) => {
+                let sent = second.repeat(request).await;
+                (sent, Some(second))
+            }
+            Err(CliError::Ipc(error)) => (Err(error), None),
+            Err(_) => (
+                Err(kr_ipc::IpcError::UnexpectedMessage(
+                    "the daemon could not be reached",
+                )),
+                None,
+            ),
+        }
+    };
+    tokio::time::timeout(SEND_WITHIN, asked).await.unwrap_or((
+        Err(kr_ipc::IpcError::UnexpectedMessage(
+            "the host did not answer in time",
+        )),
+        None,
+    ))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -529,7 +572,7 @@ async fn perform(
         )
     ));
 
-    let first = host.client.repeat(&request).await;
+    let first = sent_within(host.client.repeat(&request)).await;
     let mut performed = Performed {
         outcome: Outcome::Unknown,
         value: None,
@@ -551,15 +594,9 @@ async fn perform(
             Next::Repeat => {
                 let index = usize::from(attempt.repeats).min(REPEAT_DELAYS.len() - 1);
                 tokio::time::sleep(REPEAT_DELAYS[index]).await;
-                let reply = match host.another().await {
-                    Ok(mut second) => {
-                        let sent = second.repeat(&request).await;
-                        take(&mut performed, &sent);
-                        reply_of(&sent)
-                    }
-                    Err(_) => Reply::Lost,
-                };
-                next = attempt.after_repeat(reply);
+                let (sent, _) = ask_again(host, &request).await;
+                take(&mut performed, &sent);
+                next = attempt.after_repeat(reply_of(&sent));
             }
             Next::Check | Next::Wait => {
                 if !waited_notice {
@@ -602,10 +639,7 @@ async fn perform(
 }
 
 /// Keeps what the host said, when it said the result or a refusal.
-fn take(
-    performed: &mut Performed,
-    sent: &std::result::Result<std::result::Result<ParamsValue, ProtocolError>, kr_ipc::IpcError>,
-) {
+fn take(performed: &mut Performed, sent: &Sent) {
     match sent {
         Ok(Ok(value)) => performed.value = Some(value.clone()),
         Ok(Err(refusal)) if performed.refusal.is_none() => {
@@ -1398,7 +1432,12 @@ async fn revoke(
                 .value
                 .as_ref()
                 .and_then(|value| value.to_typed().ok());
-            finish_revocation(grant_id, revoked.as_ref(), json)
+            finish_revocation(
+                grant_id,
+                revoked.as_ref(),
+                &revoke_command(grant_id, environment_flag(&host, &arguments.selector)),
+                json,
+            )
         }
         other => Err(unfinished(other, "the revocation", &watch.list_command)),
     }
@@ -1408,6 +1447,7 @@ async fn revoke(
 fn finish_revocation(
     grant_id: GrantId,
     revoked: Option<&RevocationResult>,
+    revoke: &Shown,
     json: bool,
 ) -> Result<Completion> {
     let Some(revoked) = revoked else {
@@ -1417,10 +1457,9 @@ fn finish_revocation(
             code: ErrorCode::ResourceUnavailable,
             message: shown!(
                 "grant {} is revoked, and whether each session's worker has fenced it is not \
-                 known: the host's answer was not read; run `kr share revoke {}` again to ask \
-                 each worker",
+                 known: the host's answer was not read; run `{}` again to ask each worker",
                 grant_id,
-                grant_id
+                revoke.clone()
             ),
         };
         if json {
@@ -1438,12 +1477,12 @@ fn finish_revocation(
         code: ErrorCode::ResourceUnavailable,
         message: shown!(
             "the revocation of grant {} is recorded and still pending: {} session worker{} {} \
-             not fenced it yet, and `kr share revoke {}` again reports how far it has got",
+             not fenced it yet, and `{}` again reports how far it has got",
             grant_id,
             pending.len(),
             if pending.len() == 1 { "" } else { "s" },
             if pending.len() == 1 { "has" } else { "have" },
-            grant_id
+            revoke.clone()
         ),
     });
     if json {
@@ -1595,12 +1634,15 @@ async fn transfer(
         crate::shown::utc_moment(expires_at_ms)
     ));
     loop {
-        let pending: OwnerConfirmationPendingResult = host
-            .read(
+        let pending: OwnerConfirmationPendingResult = tokio::time::timeout(
+            READ_WITHIN,
+            host.read(
                 Method::OwnerConfirmationPending,
                 &OwnerConfirmationPendingParams {},
-            )
-            .await?;
+            ),
+        )
+        .await
+        .map_err(|_| CliError::Other(Shown::said("the host did not answer in time")))??;
         match pending
             .pending
             .iter()
@@ -1657,8 +1699,8 @@ async fn transfer(
             finish_transfer(
                 &descriptor,
                 &receiver,
-                from,
-                new_grant_id,
+                (from, new_grant_id),
+                &revoke_command(from, environment_flag(&host, &arguments.selector)),
                 result.as_ref(),
                 json,
             )
@@ -1690,7 +1732,7 @@ async fn ask_for_confirmation(
         )
         .await
         .map_err(CliError::Ipc)?;
-    let mut sent = host.client.repeat(&request).await;
+    let mut sent = sent_within(host.client.repeat(&request)).await;
     let mut asked_again = 0;
     // The connection a repeat was answered on, which the first one no longer is when its reply was
     // lost: the command goes on on it.
@@ -1712,17 +1754,7 @@ async fn ask_for_confirmation(
             Err(_) if asked_again < REPEAT_DELAYS.len() => {
                 tokio::time::sleep(REPEAT_DELAYS[asked_again]).await;
                 asked_again += 1;
-                sent = match host.another().await {
-                    Ok(mut second) => {
-                        let again = second.repeat(&request).await;
-                        answered_on = Some(second);
-                        again
-                    }
-                    Err(error) => Err(match error {
-                        CliError::Ipc(error) => error,
-                        _ => kr_ipc::IpcError::UnexpectedMessage("the daemon could not be reached"),
-                    }),
-                };
+                (sent, answered_on) = ask_again(host, &request).await;
             }
             Err(error) => return Err(CliError::Ipc(error)),
         }
@@ -1733,8 +1765,8 @@ async fn ask_for_confirmation(
 fn finish_transfer(
     descriptor: &WorkerDescriptor,
     receiver: &DeviceSummary,
-    from: GrantId,
-    new_grant_id: GrantId,
+    (from, new_grant_id): (GrantId, GrantId),
+    revoke: &Shown,
     result: Option<&GrantTransferResult>,
     json: bool,
 ) -> Result<Completion> {
@@ -1745,21 +1777,20 @@ fn finish_transfer(
             code: ErrorCode::ResourceUnavailable,
             message: shown!(
                 "the transfer is recorded and the giving device's grant is revoked, and {} \
-                 session worker{} {} not fenced it yet; `kr share revoke {}` again reports how \
-                 far it has got",
+                 session worker{} {} not fenced it yet; `{}` again reports how far it has got",
                 waiting,
                 if waiting == 1 { "" } else { "s" },
                 if waiting == 1 { "has" } else { "have" },
-                from
+                revoke.clone()
             ),
         }),
         None => Some(CliError::Unfinished {
             code: ErrorCode::ResourceUnavailable,
             message: shown!(
                 "the transfer happened, and whether each session's worker has fenced the giving \
-                 device's grant is not known: the host's answer was not read; `kr share revoke \
-                 {}` again asks each worker",
-                from
+                 device's grant is not known: the host's answer was not read; `{}` again asks \
+                 each worker",
+                revoke.clone()
             ),
         }),
     };

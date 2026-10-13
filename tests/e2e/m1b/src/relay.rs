@@ -34,13 +34,15 @@ const MAX_FRAME: usize = 1 << 21;
 struct Plan {
     /// The method whose first request's answer is lost.
     method: &'static str,
-    /// Whether that request has not been seen yet.
+    /// Whether that request has not been seen yet, on any connection.
     armed: AtomicBool,
-    /// The request whose answer is to be dropped, once it has been seen.
-    watching: Mutex<Option<RequestId>>,
     /// Whether an answer was dropped.
     lost: AtomicBool,
 }
+
+/// The request whose answer is to be dropped, once it has been seen. Request identifiers belong to
+/// one connection, so it is kept with the connection that sent it.
+type Watching = Arc<Mutex<Option<RequestId>>>;
 
 /// A relay on the control socket of a running host.
 #[derive(Debug)]
@@ -84,7 +86,6 @@ impl Relay {
         let plan = Arc::new(Plan {
             method: method.entry().name,
             armed: AtomicBool::new(true),
-            watching: Mutex::new(None),
             lost: AtomicBool::new(false),
         });
         let listener = {
@@ -143,11 +144,13 @@ fn restrict(socket: &std::path::Path) {
 async fn relay(client: UnixStream, daemon: UnixStream, plan: Arc<Plan>) {
     let (from_client, to_client) = client.into_split();
     let (from_daemon, to_daemon) = daemon.into_split();
+    let watching = Watching::default();
     let mut requests = {
-        let plan = Arc::clone(&plan);
-        tokio::spawn(async move { requests(from_client, to_daemon, &plan).await })
+        let (plan, watching) = (Arc::clone(&plan), Arc::clone(&watching));
+        tokio::spawn(async move { requests(from_client, to_daemon, &plan, &watching).await })
     };
-    let mut answers = tokio::spawn(async move { answers(from_daemon, to_client, &plan).await });
+    let mut answers =
+        tokio::spawn(async move { answers(from_daemon, to_client, &plan, &watching).await });
     futures_util::future::select(&mut requests, &mut answers).await;
     // Ending both tasks drops the halves of both connections, which ends them.
     requests.abort();
@@ -155,14 +158,18 @@ async fn relay(client: UnixStream, daemon: UnixStream, plan: Arc<Plan>) {
 }
 
 /// The client's frames to the daemon. The first request for the watched method is noted.
-async fn requests(mut from: OwnedReadHalf, mut to: OwnedWriteHalf, plan: &Plan) {
+async fn requests(
+    mut from: OwnedReadHalf,
+    mut to: OwnedWriteHalf,
+    plan: &Plan,
+    watching: &Watching,
+) {
     while let Some(frame) = read_frame(&mut from).await {
         if let Ok(ControlFrame::Mutation(request)) = decode(&frame)
             && request.method.as_str() == plan.method
             && plan.armed.swap(false, Ordering::SeqCst)
         {
-            *plan.watching.lock().unwrap_or_else(PoisonError::into_inner) =
-                Some(request.request_id);
+            *watching.lock().unwrap_or_else(PoisonError::into_inner) = Some(request.request_id);
         }
         if write_frame(&mut to, &frame).await.is_err() {
             return;
@@ -171,10 +178,15 @@ async fn requests(mut from: OwnedReadHalf, mut to: OwnedWriteHalf, plan: &Plan) 
 }
 
 /// The daemon's frames to the client. The answer to the noted request is read and dropped.
-async fn answers(mut from: OwnedReadHalf, mut to: OwnedWriteHalf, plan: &Plan) {
+async fn answers(
+    mut from: OwnedReadHalf,
+    mut to: OwnedWriteHalf,
+    plan: &Plan,
+    watching: &Watching,
+) {
     while let Some(frame) = read_frame(&mut from).await {
         if let Ok(ControlFrame::Response(response)) = decode(&frame) {
-            let mut watching = plan.watching.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut watching = watching.lock().unwrap_or_else(PoisonError::into_inner);
             if *watching == Some(response.request_id) {
                 watching.take();
                 plan.lost.store(true, Ordering::SeqCst);
