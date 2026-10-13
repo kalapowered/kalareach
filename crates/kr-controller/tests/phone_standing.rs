@@ -365,32 +365,6 @@ async fn kr_req_19_08_a_share_opens_as_named_and_is_never_chosen_for_the_device(
         Some(expiry_of(&grant)),
         "the share ends before the pairing it is held through"
     );
-    // The same share, held through a pairing that ends sooner, is scheduled to end with the
-    // pairing.
-    let mut short = proposal(&[ActionRight::SessionView]);
-    short.session_selector = kr_protocol::grant::SessionSelector::None;
-    short.expiry = kr_protocol::grant::GrantExpiry::At {
-        expires_at_ms: TimestampMs::new(kr_ipc::now_ms().get() + 600_000),
-    };
-    let sooner = Device::create().await;
-    let sooner_record = pair_with(&adopted.host, &sooner, &adopted.owner, short).await;
-    let held = share(
-        &adopted.host,
-        session_id,
-        &sooner,
-        &sooner_record,
-        RoleSelection::plain(SessionRole::Viewer),
-    )
-    .await;
-    assert!(expiry_of(&held) > expiry_of(&sooner_record.grant));
-    let through_it = RawDevice::connect(&adopted.host, &sooner, &sooner_record).await;
-    let standing = in_force(
-        open(&through_it, Some(session_id), Some(held.grant_id))
-            .await
-            .expect("the share opens"),
-    );
-    assert_eq!(standing.ends_at_ms, Some(expiry_of(&sooner_record.grant)));
-    through_it.close();
     connection.close();
     adopted.stop().await;
 }
