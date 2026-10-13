@@ -215,9 +215,15 @@ impl RestoreGeneration {
                 "There is no verified generation to compare it with.".to_owned()
             }
         };
+        // A generation that is refused is not being restored, so it is not introduced as if it were.
+        let lead = if self.is_admissible() {
+            "Restoring backup generation"
+        } else {
+            "The service offered backup generation"
+        };
         format!(
-            "Restoring backup generation {generation}. {standing} No restore can show that the \
-             service is not holding a newer backup back."
+            "{lead} {generation}. {standing} No restore can show that the service is not holding \
+             a newer backup back."
         )
     }
 }

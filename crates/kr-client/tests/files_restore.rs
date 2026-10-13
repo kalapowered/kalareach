@@ -821,6 +821,10 @@ async fn a_generation_the_checkpoint_refuses_is_refused_before_the_manifest_is_r
         told.contains("generation 3") && told.contains("generation 5"),
         "{told}"
     );
+    assert!(
+        !told.contains("Restoring"),
+        "a generation that is refused is not introduced as being restored: {told}"
+    );
     assert_eq!(source.object_reads(), 0, "a replay costs no download");
 
     // The checkpoint's generation with a second genuine manifest.
