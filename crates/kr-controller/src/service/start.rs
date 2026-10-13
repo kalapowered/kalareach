@@ -884,6 +884,8 @@ impl Controller {
             #[cfg(feature = "testing")]
             privacy_tick_waiting: Arc::default(),
             #[cfg(feature = "testing")]
+            notice_cursor_unreadable: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(feature = "testing")]
             before_presentation_lock: crate::attention::Pause::default(),
             #[cfg(feature = "testing")]
             after_an_organisation_restriction_commits: crate::attention::Pause::default(),
@@ -953,8 +955,6 @@ impl Controller {
             feed_runtime,
             feed_notice_wake: Arc::new(tokio::sync::Notify::new()),
             feed_notice_task: std::sync::OnceLock::new(),
-            #[cfg(feature = "testing")]
-            notice_cursor_unreadable: std::sync::atomic::AtomicBool::new(false),
             feed_notice_attempts: tokio::sync::watch::channel(0).0,
             transfer,
             project,
