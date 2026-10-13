@@ -323,7 +323,7 @@ impl Controller {
         }
 
         let bounds = production.bounds();
-        let (candidates, open) = match self.closed_candidates(production, bounds).await {
+        let (candidates, open) = match self.closed_candidates().await {
             Ok(found) => found,
             Err(error) => {
                 production.hold(Held::Failed(error.to_string()));
@@ -400,6 +400,10 @@ impl Controller {
                 production.hold(Held::Privacy);
                 None
             }
+            Ok(Ok(Made::Nothing)) => {
+                production.hold(Held::NothingToPack);
+                Some(RECHECK)
+            }
             Ok(Err(error)) => {
                 production.hold(Held::Failed(error.to_string()));
                 Some(backoff.next_delay())
@@ -417,12 +421,7 @@ impl Controller {
     /// A session is packed when its closure is recorded, its worker is confirmed ended (the same
     /// check every read of a closed session asks), it owes privacy mode no cleanup, and the
     /// archive holds output for it.
-    async fn closed_candidates(
-        self: &Arc<Self>,
-        production: &Production,
-        _bounds: ProducerBounds,
-    ) -> Result<(Vec<Candidate>, u64)> {
-        let _ = production;
+    async fn closed_candidates(self: &Arc<Self>) -> Result<(Vec<Candidate>, u64)> {
         let closed = {
             let registry = self.registry.lock().await;
             let mut closed = Vec::new();
@@ -612,6 +611,8 @@ impl Controller {
 enum Made {
     /// A generation was admitted, with this many sessions left out for size.
     Admitted { left_out: u64 },
+    /// Every member was left out, so there was nothing to make a generation of.
+    Nothing,
     /// Privacy mode cancelled the pass; whatever it wrote is gone.
     Cancelled,
 }
@@ -742,7 +743,7 @@ impl Pass {
             objects.push(staged);
         }
         if objects.is_empty() {
-            return Ok(Made::Admitted { left_out });
+            return Ok(Made::Nothing);
         }
         let mut recipients = ArchiveRecipients::new(CollectionKind::Owned);
         recipients.add(self.setup.recovery_public_key);
