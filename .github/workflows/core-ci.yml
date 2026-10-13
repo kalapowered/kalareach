@@ -319,6 +319,14 @@ jobs:
       # It sits after every check that reads only this repository, so all of those have reported by
       # the time anything here contacts a service, and a deployment that is unreachable fails this
       # job without taking their answers with it. Every step after it states `!cancelled()`.
+      #
+      # Each leg writes its whole output to a log of its own in a `deployment-*` directory under
+      # `KR_TEST_ARTIFACTS_DIR`, which "Keep the performance evidence" below uploads, so a leg that
+      # failed is read from its log in the `performance-evidence` artifact. The logs carry no
+      # credential: a leg prints the rule it proved, what it could not give back, the failure of its
+      # own assertions and the error of a request it could not carry, which names the origin, the
+      # path and the fault. It never prints a request, a token or a key, and the keys it holds print
+      # as redacted.
       - name: The deployment answers every leg
         if: ${{ !cancelled() }}
         run: bash scripts/e2e-deployment.sh "$KR_CHECKPOINT_ORIGIN"
@@ -399,9 +407,10 @@ jobs:
         if: ${{ !cancelled() }}
         run: cargo test --locked --release -p kr-transport --test perf -- --nocapture --test-threads=1
 
-      # The figures and verdicts the two steps above wrote, kept whether or not they met their
-      # targets: a run that fell short is the evidence for how far short it fell, and on which
-      # processor.
+      # The figures and verdicts the two steps above wrote, and the log of every leg the deployment
+      # step ran, kept whether or not they met their targets or passed: a run that fell short is the
+      # evidence for how far short it fell, and on which processor, and a leg that failed is the
+      # evidence for what it saw.
       - name: Keep the performance evidence
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
