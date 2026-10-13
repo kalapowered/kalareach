@@ -53,7 +53,7 @@ use kr_protocol::scalars::{
     AuthorisationKey, Nullable, Signature64, TimestampMs, U64, Uuid,
 };
 use kr_protocol::service::{GatewayOrigin, ServiceRequestSigner};
-use kr_service_stand_in::{ACCOUNT, Moment, Served, TOKEN, serve};
+use kr_service_stand_in::{ACCOUNT, Moment, Served, ServiceWeb, TOKEN, serve};
 use serde_json::Value;
 
 mod support;
@@ -1143,6 +1143,14 @@ impl Window {
 /* What a restore needs before it reads anything                               */
 /* -------------------------------------------------------------------------- */
 
+/// Waits until the service has been asked `count` times for `path`. It fails when it never is, so a
+/// command that stopped early fails the test and does not hold it.
+async fn reached(web: &ServiceWeb, path: &str, count: usize) {
+    tokio::time::timeout(LIVENESS_DEADLINE, web.requests_reach(path, count))
+        .await
+        .unwrap_or_else(|_| panic!("the service was never asked {count} times for {path}"));
+}
+
 /// A host with a backup in its service, a kit file naming it, and a folder to fill.
 struct Fixture {
     world: World,
@@ -1206,9 +1214,22 @@ async fn a_restore_is_refused_while_privacy_mode_is_on_before_anything_leaves_th
     let on = fixture.rig.run(&["privacy", "on"], None).await;
     assert!(on.status.success(), "{}", text(&on.stderr));
 
+    // The kit file is not there to be read: a command that refused only when the daemon did would
+    // fail on the kit and not on privacy mode.
     let refused = fixture
         .rig
-        .run(&fixture.line(&into, &["--preview"]), None)
+        .run(
+            &[
+                "backup",
+                "restore",
+                "--into",
+                &into,
+                "--kit-file",
+                "/nonexistent/kit.txt",
+                "--preview",
+            ],
+            None,
+        )
         .await;
     assert_eq!(refused.status.code(), Some(8), "{}", text(&refused.stderr));
     assert!(text(&refused.stderr).contains("privacy mode is on"));
@@ -1430,7 +1451,7 @@ async fn a_read_in_flight_when_privacy_mode_turns_on_is_not_delivered_and_the_ru
     let base = fixture.object_reads();
     web.fail(OBJECT_READ, Fixture::SECOND_MEMBER, Moment::Slow);
     let run = fixture.rig.spawn(&fixture.confirm_line(&into, &digest), &Input::Nothing);
-    web.requests_reach(OBJECT_READ, base + 3).await;
+    reached(web, OBJECT_READ, base + 3).await;
     assert_eq!(
         names(&fixture.into),
         ["session-0001.json"],
@@ -1741,7 +1762,7 @@ async fn the_folder_swapped_during_a_read(replacement_holds_decoys: bool) {
         },
     );
     let run = fixture.rig.spawn(&fixture.confirm_line(&into, &digest), &Input::Nothing);
-    web.requests_reach(OBJECT_READ, base + 3).await;
+    reached(web, OBJECT_READ, base + 3).await;
 
     let moved = fixture.rig.temp.root().join("moved-away");
     std::fs::rename(&fixture.into, &moved).expect("the folder is renamed");
@@ -1922,7 +1943,7 @@ async fn an_interrupt_while_the_members_are_read_stops_the_run_and_removes_its_f
     let base = fixture.object_reads();
     web.fail(OBJECT_READ, Fixture::SECOND_MEMBER, Moment::Slow);
     let run = fixture.rig.spawn(&fixture.confirm_line(&into, &digest), &Input::Nothing);
-    web.requests_reach(OBJECT_READ, base + 3).await;
+    reached(web, OBJECT_READ, base + 3).await;
     assert_eq!(names(&fixture.into), ["session-0001.json"]);
     run.interrupt();
     let ended = run.ended_within_the_deadline().await;
