@@ -35,11 +35,11 @@
 //! record says why.
 //!
 //! The delivery module does not wait for a mailbox for long. A notification with no more life left
-//! than the longest wait its own schedule makes is presented without its detail and the mailbox is
+//! than the limit of its own schedule's waits is presented without its detail and the mailbox is
 //! not asked. One with more waits for the mailbox in its first four attempts, and the fifth sends
 //! without the detail if the mailbox still cannot take it. A service that asks to be left alone
-//! for longer than that longest wait is not waited for, and neither is a wait that would leave no
-//! more than it before the notification expires. In each case the push is presented without its
+//! for longer than that limit is not waited for, and a wait that would leave no more than it
+//! before the notification expires is not made. In each case the push is presented without its
 //! detail, and a later attempt at the push does not ask the mailbox again.
 
 use std::sync::Arc;
