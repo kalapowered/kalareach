@@ -10,7 +10,7 @@
 
 import type { ActionRight, DeviceSummary, GrantSummary } from '@kalareach/protocol'
 
-import type { AttemptView } from '../host/port'
+import { failureMessage, type AttemptView } from '../host/port'
 
 /** The roles the interface offers. Reviewer waits until the host decides diffs under the grant. */
 export type OfferedRole = 'viewer' | 'controller' | 'owner'
@@ -54,9 +54,12 @@ export const ACTION_WORDS: Partial<Readonly<Record<ActionRight, string>>> = {
   'question.respond': 'Answer the agent’s questions',
   'terminal.input': 'Type into the terminal',
   'terminal.geometry': 'Resize the terminal',
+  'terminal.geometry.transfer': 'Hand the terminal’s size to another viewer',
+  'terminal.palette': 'Change the terminal’s colours',
   'agent.prompt': 'Send the agent prompts',
   'agent.cancel': 'Cancel the agent’s turn',
   'agent.approval.respond': 'Answer the agent’s approval requests',
+  'session.rename': 'Rename the session',
   'session.share': 'Share the session with other devices',
   'session.close': 'Close the session'
 }
@@ -189,6 +192,15 @@ export function nameWords(name: string): string {
   return visibly(name)
 }
 
+/**
+ * What the host or native code says when it refuses, as the person reads it. The words can carry a
+ * device's name (an attempt's label does), so characters that turn text round are made visible
+ * here as they are wherever the name is drawn.
+ */
+export function failureText(error: unknown): string {
+  return visibly(failureMessage(error))
+}
+
 /** What the platform the device runs on is called. */
 export function platformWords(platform: string): string {
   switch (platform) {
@@ -245,7 +257,9 @@ export function attemptWords(attempt: AttemptView, nowMs: number): string {
     return `Waiting for an owner device to confirm: ${label}. Cancel it to ask again.`
   }
   if (attempt.phase !== 'closed') {
-    return `Unfinished: ${label}. The host has not said whether it happened.${until}`
+    // With no time to say, it can no longer be told by waiting: only the host can say.
+    const asking = attempt.can_happen_until_ms === null ? ' It may have happened; ask the host.' : until
+    return `Unfinished: ${label}. The host has not said whether it happened.${asking}`
   }
   switch (attempt.outcome) {
     case 'happened':
@@ -283,14 +297,6 @@ export function roleOfRights(actions: readonly ActionRight[]): string {
  * control pictures, and the rest as their code in angle brackets.
  */
 export function visibly(line: string): string {
-  const unseen = (code: number): boolean =>
-    (code >= 0x80 && code <= 0x9f) ||
-    code === 0x061c ||
-    code === 0x200e ||
-    code === 0x200f ||
-    (code >= 0x202a && code <= 0x202e) ||
-    (code >= 0x2066 && code <= 0x2069) ||
-    code === 0xfeff
   return Array.from(line, (char) => {
     const code = char.codePointAt(0) ?? 0
     if (code < 0x20) return String.fromCodePoint(0x2400 + code)
@@ -298,4 +304,41 @@ export function visibly(line: string): string {
     if (unseen(code)) return `‹U+${code.toString(16).toUpperCase().padStart(4, '0')}›`
     return char
   }).join('')
+}
+
+/**
+ * Whether a character can hide or reorder text: the C1 controls, the soft hyphen, the joiners, the
+ * line and paragraph separators, the directional marks and overrides, the invisible operators,
+ * the variation selectors, the byte order mark and the tag characters. The set is the one `kr`
+ * hides in what it prints from a session.
+ */
+function unseen(code: number): boolean {
+  return (
+    (code >= 0x80 && code <= 0x9f) ||
+    code === 0x00ad ||
+    code === 0x034f ||
+    (code >= 0x0600 && code <= 0x0605) ||
+    code === 0x061c ||
+    code === 0x06dd ||
+    code === 0x070f ||
+    (code >= 0x0890 && code <= 0x0891) ||
+    code === 0x08e2 ||
+    (code >= 0x115f && code <= 0x1160) ||
+    (code >= 0x17b4 && code <= 0x17b5) ||
+    (code >= 0x180b && code <= 0x180f) ||
+    (code >= 0x200b && code <= 0x200f) ||
+    (code >= 0x2028 && code <= 0x202e) ||
+    (code >= 0x2060 && code <= 0x206f) ||
+    code === 0x3164 ||
+    (code >= 0xfe00 && code <= 0xfe0f) ||
+    code === 0xfeff ||
+    code === 0xffa0 ||
+    (code >= 0xfff0 && code <= 0xfffb) ||
+    code === 0x110bd ||
+    code === 0x110cd ||
+    (code >= 0x13430 && code <= 0x1343f) ||
+    (code >= 0x1bca0 && code <= 0x1bca3) ||
+    (code >= 0x1d173 && code <= 0x1d17a) ||
+    (code >= 0xe0000 && code <= 0xe0fff)
+  )
 }

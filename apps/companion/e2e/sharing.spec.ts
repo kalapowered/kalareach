@@ -290,6 +290,8 @@ for (const size of SIZES) {
       await photograph(page, `sharing-asking-${size.name}`)
       await attempt.getByTestId('attempt-cancel').click()
       await expect(attempt).toHaveCount(0)
+      // The row that took focus is gone: it went to the row beside it, not to the page behind.
+      await expect(page.locator('[data-testid="access"] [data-state="active"]')).toBeFocused()
     })
 
     // KR-REQ-18.15: the hand-over sheet waits for an owner device; its focus starts on its heading

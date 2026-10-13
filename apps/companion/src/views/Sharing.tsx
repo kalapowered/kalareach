@@ -20,7 +20,15 @@
  * which road it came by.
  */
 
-import { useCallback, useEffect, useId, useRef, useState, type ReactNode } from 'react'
+import {
+  useCallback,
+  useEffect,
+  useId,
+  useRef,
+  useState,
+  useSyncExternalStore,
+  type ReactNode
+} from 'react'
 
 import type {
   ActionRight,
@@ -37,7 +45,6 @@ import type {
 import { Badge, Banner, Button, Card, CommitButton, Switch } from '../components/ui'
 import { useApp } from '../app/state'
 import {
-  failureMessage,
   watch,
   type AttemptView,
   type GrantNotices,
@@ -51,6 +58,7 @@ import {
   actionWords,
   attemptWords,
   defaultLasting,
+  failureText,
   historyFrom,
   isOpen,
   lastings,
@@ -67,6 +75,8 @@ import {
   whyNot,
   type OfferedRole
 } from '../model/sharing'
+import { deskOf } from '../model/sharing-desk'
+import { handedOver, invited, pendingWorkers, tookBack } from '../model/sharing-results'
 import { Transfer } from './Transfer'
 
 /** How often the list of who has access is read again while the screen is open. */
@@ -87,30 +97,6 @@ type Preview =
       readonly readAt: number
     }
 
-/** A revocation the screen has just made, kept because the list drops resolved grants. */
-interface Revoked {
-  readonly grantId: string
-  readonly name: string
-  readonly atMs: number
-  readonly pending: number
-}
-
-/**
- * A screen the host kept with an invitation that the person has to judge: it differs from the one
- * they were shown, or the one they were shown is no longer here to compare it with.
- */
-interface ScreenNote {
-  readonly grantId: string
-  readonly name: string
-  readonly kind: 'changed' | 'unverified'
-  readonly lines: readonly string[]
-}
-
-/** How many workers a revocation still waits for. */
-function pendingWorkers(result: RevocationResult): number {
-  return result.barrier.workers.filter((worker) => worker.state === 'pending').length
-}
-
 /** The selection an invitation as chosen carries. */
 function selectionOf(
   role: OfferedRole,
@@ -129,8 +115,18 @@ function selectionOf(
   }
 }
 
-/** Sharing, over one session. */
-export function Sharing({
+/**
+ * Sharing, over one session. A new session is a new screen: nothing the form held, no choice and
+ * no tick, carries over to the next.
+ */
+export function Sharing(props: {
+  readonly sessionId: string
+  readonly subject: SessionSubject
+}): ReactNode {
+  return <SharingTab key={props.sessionId} {...props} />
+}
+
+function SharingTab({
   sessionId,
   subject
 }: {
@@ -138,25 +134,23 @@ export function Sharing({
   readonly subject: SessionSubject
 }): ReactNode {
   const { port, say } = useApp()
+  const desk = deskOf(port)
+  const kept = useSyncExternalStore(desk.subscribe, desk.snapshot)
+  const revoked = kept.revoked
+  const notes = kept.notes.filter((each) => each.sessionId === sessionId)
   const [devices, setDevices] = useState<DeviceListResult | null>(null)
   const [grants, setGrants] = useState<GrantListResult | null>(null)
   const [attempts, setAttempts] = useState<readonly AttemptView[]>([])
+  const [unreadable, setUnreadable] = useState(0)
   const [failure, setFailure] = useState<string | null>(null)
   const [now, setNow] = useState(() => clock.now())
-  const [revoked, setRevoked] = useState<readonly Revoked[]>([])
   const [handing, setHanding] = useState<GrantSummary | null>(null)
-  const [notes, setNotes] = useState<readonly ScreenNote[]>([])
   const reads = useRef<Watch | null>(null)
-  const handled = useRef(new Set<string>())
   const headingId = useId()
   const heading = useRef<HTMLHeadingElement | null>(null)
   const focusNext = useRef<string | null>(null)
   const focusAttempt = useRef<string | null>(null)
   const returnTo = useRef<string | null>(null)
-  /** The lines the person was shown with an invitation whose answer has not arrived, by action. */
-  const shownFor = useRef(new Map<string, readonly string[]>())
-  /** Who a revocation was for, and whether it withdrew an invitation, by grant, for its report. */
-  const revoking = useRef(new Map<string, { readonly name: string; readonly withdrawing: boolean }>())
 
   // The form.
   const [recipient, setRecipient] = useState<string | null>(null)
@@ -192,17 +186,18 @@ export function Sharing({
         port.attemptsList()
       ])
     )
-      .then(([paired, issued, kept]) => {
+      .then(([paired, issued, listed]) => {
         if (!current()) return
         setDevices(paired)
         setGrants(issued)
-        setAttempts(kept.attempts)
+        setAttempts(listed.attempts)
+        setUnreadable(listed.unreadable)
         setNow(clock.now())
         setFailure(null)
       })
       .catch((error: unknown) => {
         if (!current()) return
-        setFailure(failureMessage(error))
+        setFailure(failureText(error))
       })
   }, [port, sessionId])
 
@@ -235,7 +230,7 @@ export function Sharing({
         if (current) setNotices({ key: noticeKey, notices: carried })
       })
       .catch((error: unknown) => {
-        if (current) setFailure(failureMessage(error))
+        if (current) setFailure(failureText(error))
       })
     return () => {
       current = false
@@ -246,6 +241,8 @@ export function Sharing({
   const everyone = devices?.devices ?? []
   const names = new Map(everyone.map((device) => [device.device_id, device.display_name]))
   const nameOf = (id: string | null): string => (id === null ? undefined : names.get(id)) ?? 'A paired device'
+  /** Whether an attempt is about this session, or about no session in particular. */
+  const here = (attempt: AttemptView) => attempt.session_id === null || attempt.session_id === sessionId
 
   const offered = everyone.filter((device) => !device.revoked && whyNot(device, now) === null)
   const notOffered = everyone.filter((device) => !device.revoked && whyNot(device, now) !== null)
@@ -300,7 +297,7 @@ export function Sharing({
         choose(() => {
           setLive(false)
         })
-        setPreviewFailure(failureMessage(error))
+        setPreviewFailure(failureText(error))
       })
     return () => {
       current = false
@@ -353,69 +350,37 @@ export function Sharing({
       ?.focus()
   }, [handing])
 
-  /** Keeps a screen note about an invitation for the person to judge, in place of an older one. */
-  const note = (next: ScreenNote) => {
-    setNotes((each) => [...each.filter((other) => other.grantId !== next.grantId), next])
-  }
-
-  /** Keeps the line that says a revocation was made and how far the session workers have got. */
-  const keepRevocation = (result: RevocationResult, grantId: string, name: string): number => {
-    const pending = pendingWorkers(result)
-    setRevoked((each) => [
-      ...each.filter((line) => line.grantId !== grantId),
-      { grantId, name, atMs: clock.now(), pending }
-    ])
-    return pending
-  }
-
   // ---- What the host's result for an attempt is told as, whichever road it came by --------------
 
   /**
-   * An invitation was written. With the live view, the host kept a screen with it: it is compared
-   * with the one the person was shown, and when there is nothing to compare it with the person is
-   * told that, and can withdraw the invitation.
+   * The host's result for an attempt, in hand by the command that sent it, by a repeat native code
+   * made in the background, or by the person asking the host. The first delivery is told and kept
+   * on the desk, which outlives this screen; a second, by another road, changes nothing.
    */
-  const invited = (made: GrantCreateResult, shownLines: readonly string[] | null | undefined) => {
-    const name = nameOf(made.grant.recipient_device_id)
-    say(`Invitation ready for ${nameWords(name)}. They accept it on their device.`)
-    const kept = made.preview.live_screen?.lines ?? null
-    if (kept === null) return
-    const grantId = made.grant.grant_id
-    if (shownLines === null || shownLines === undefined) {
-      note({ grantId, name, kind: 'unverified', lines: kept })
-    } else if (JSON.stringify(kept) !== JSON.stringify(shownLines)) {
-      note({ grantId, name, kind: 'changed', lines: kept })
-    }
-  }
-
-  /** A share was taken back, or an invitation withdrawn; says how far the session workers have got. */
-  const tookBack = (result: RevocationResult, grantId: string, name: string, withdrawing: boolean) => {
-    const pending = keepRevocation(result, grantId, name)
-    setNotes((each) => each.filter((other) => other.grantId !== grantId))
-    say(
-      withdrawing
-        ? `Invitation to ${nameWords(name)} withdrawn.`
-        : pending === 0
-          ? `Revoked ${nameWords(name)}’s access.`
-          : `Revoked ${nameWords(name)}’s access. ${String(pending)} session worker${pending === 1 ? ' has' : 's have'} not confirmed yet.`,
-      withdrawing || pending === 0 ? 'success' : 'pending'
-    )
-  }
-
-  /** The host's result for an attempt that was carried on or asked about, which the page now has. */
   const receive = (attempt: AttemptView, value: unknown) => {
+    if (!desk.firstTime(attempt.action_id)) return
     if (attempt.kind === 'invite') {
-      const lines = shownFor.current.get(attempt.action_id)
-      shownFor.current.delete(attempt.action_id)
-      invited(value as GrantCreateResult, lines)
+      const made = value as GrantCreateResult
+      invited(desk, say, made, nameOf(made.grant.recipient_device_id), desk.recall(attempt.action_id))
     } else if (attempt.kind === 'revoke') {
-      const grantId = attempt.grant_id ?? ''
-      const meant = revoking.current.get(grantId)
-      tookBack(value as RevocationResult, grantId, meant?.name ?? 'a paired device', meant?.withdrawing ?? false)
+      const grantId = attempt.revoked_grant_id ?? attempt.grant_id ?? ''
+      const meant = desk.meant(grantId)
+      tookBack(
+        desk,
+        say,
+        value as RevocationResult,
+        grantId,
+        meant?.name ?? 'a paired device',
+        meant?.withdrawing ?? false,
+        clock.now()
+      )
     } else if (attempt.kind === 'transfer') {
       const done = value as GrantTransferResult
-      say(`${nameWords(attempt.label)}: done.`)
-      keepRevocation(done.revoked, done.revoked.revoked_grants[0] ?? '', 'the device that gave control up')
+      const words = `${nameWords(attempt.label)}: done.`
+      if (attempt.revoked_grant_id === null) say(words)
+      else {
+        handedOver(desk, say, done, attempt.revoked_grant_id, 'the device that gave control up', words, clock.now())
+      }
     }
   }
 
@@ -426,20 +391,21 @@ export function Sharing({
   })
 
   // An attempt that was carried on after the command that sent it returned, and ended with the
-  // host's result, is told once as the success the command would have been. Its record then has no
-  // further use, and goes.
+  // host's result, is told once as the success the command would have been, where it belongs: an
+  // invitation or a hand-over of another session waits for that session's tab. Its record then has
+  // no further use, and goes.
   useEffect(() => {
     for (const attempt of attempts) {
       if (attempt.phase !== 'closed' || attempt.outcome !== 'happened') continue
-      if (attempt.result === null || handled.current.has(attempt.action_id)) continue
-      handled.current.add(attempt.action_id)
+      if (attempt.result === null || !here(attempt)) continue
       latest.current.receive(attempt, attempt.result)
       void ask(() => port.attemptRemove(attempt.action_id)).then(load, (error: unknown) => {
         // Told once, and not told again each time the attempts are read: the record stays, and a
         // restart lists it with what the host can still be asked for.
-        say(failureMessage(error), 'danger')
+        say(failureText(error), 'danger')
       })
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- `here` and `receive` read the latest render
   }, [attempts, port, load, say])
 
   const issue = () => {
@@ -464,7 +430,7 @@ export function Sharing({
     )
       .then((done) => {
         // The lines the person was shown are kept for the answer, by whichever road it arrives.
-        if (shownLines !== null) shownFor.current.set(done.attempt.action_id, shownLines)
+        if (shownLines !== null) desk.remember(done.attempt.action_id, shownLines)
         if (done.attempt.phase !== 'closed' || done.value === null) {
           say(
             `The host’s answer did not arrive. The invitation to ${nameWords(chosen.display_name)} is listed as unfinished; ask the host about it.`,
@@ -472,22 +438,38 @@ export function Sharing({
           )
         } else {
           focusNext.current = done.value.grant.grant_id
-          latest.current.receive(done.attempt, done.value)
+          receive(done.attempt, done.value)
           setConsentAt(null)
         }
         return load()
       })
       .catch((error: unknown) => {
-        say(failureMessage(error), 'danger')
+        say(failureText(error), 'danger')
       })
       .finally(() => {
         setIssuing(false)
       })
   }
 
+  /**
+   * Gives focus to the row beside the one a control is about to take away, or to the heading when
+   * there is none, so that it never falls to the page behind the sheet. Returns what moves it,
+   * for a control whose row goes only when the host says so.
+   */
+  const awayFrom = (control: HTMLElement | null): (() => void) => {
+    const scope = heading.current?.parentElement ?? document
+    const rows = Array.from(scope.querySelectorAll<HTMLElement>('[data-nav]'))
+    const own = control?.closest<HTMLElement>('[data-nav]') ?? null
+    const index = own === null ? -1 : rows.indexOf(own)
+    const next = rows[index + 1] ?? rows[index - 1] ?? heading.current
+    return () => {
+      next?.focus()
+    }
+  }
+
   /** Takes a share back or withdraws an invitation, and tells what the host said. */
   const takeBack = (grantId: string, name: string, withdrawing: boolean, after?: () => void) => {
-    revoking.current.set(grantId, { name, withdrawing })
+    desk.intend(grantId, { name, withdrawing })
     ask(() => port.grantRevoke({ grant_id: grantId }))
       .then((done) => {
         if (done.value === null) {
@@ -497,12 +479,14 @@ export function Sharing({
           )
           return load()
         }
-        tookBack(done.value, grantId, name, withdrawing)
+        if (desk.firstTime(done.attempt.action_id)) {
+          tookBack(desk, say, done.value, grantId, name, withdrawing, clock.now())
+        }
         after?.()
         return load()
       })
       .catch((error: unknown) => {
-        say(failureMessage(error), 'danger')
+        say(failureText(error), 'danger')
       })
   }
 
@@ -513,28 +497,33 @@ export function Sharing({
     takeBack(summary.grant.grant_id, nameOf(summary.grant.recipient_device_id), withdrawing)
   }
 
-  const checkAgain = (line: Revoked) => {
-    ask(() => port.grantRevoke({ grant_id: line.grantId }))
+  const checkAgain = (grantId: string) => {
+    ask(() => port.grantRevoke({ grant_id: grantId }))
       .then((done) => {
         if (done.value === null) {
           say('The host’s answer did not arrive. Check again in a moment.', 'pending')
           return
         }
-        keepRevocation(done.value, line.grantId, line.name)
+        desk.checked(grantId, pendingWorkers(done.value))
       })
       .catch((error: unknown) => {
-        say(failureMessage(error), 'danger')
+        say(failureText(error), 'danger')
       })
   }
 
-  const askHost = (attempt: AttemptView) => {
+  const askHost = (attempt: AttemptView, away: () => void) => {
     ask(() => port.attemptAsk(attempt.action_id))
       .then((done) => {
-        if (done.value !== null) latest.current.receive(attempt, done.value)
+        if (done.value === null) {
+          say('The host did not say what became of it. Ask again in a moment.', 'pending')
+        } else {
+          receive(attempt, done.value)
+          away()
+        }
         return load()
       })
       .catch((error: unknown) => {
-        say(failureMessage(error), 'danger')
+        say(failureText(error), 'danger')
       })
   }
 
@@ -542,20 +531,19 @@ export function Sharing({
     focusAttempt.current = `${hidden ? 'show' : 'attempt'}:${attempt.action_id}`
     void ask(() => port.attemptSetHidden(attempt.action_id, hidden)).then(load, (error: unknown) => {
       focusAttempt.current = null
-      say(failureMessage(error), 'danger')
+      say(failureText(error), 'danger')
     })
   }
 
-  const removeAttempt = (attempt: AttemptView) => {
+  const removeAttempt = (attempt: AttemptView, away: () => void) => {
+    away()
     void ask(() => port.attemptRemove(attempt.action_id)).then(load, (error: unknown) => {
-      say(failureMessage(error), 'danger')
+      say(failureText(error), 'danger')
     })
   }
 
   const grantRows = [...(grants?.grants ?? [])]
   const owners = everyone.filter((device) => device.manages_host && !device.revoked)
-  /** Whether an attempt is about this session, or about no session in particular. */
-  const here = (attempt: AttemptView) => attempt.session_id === null || attempt.session_id === sessionId
   const visibleAttempts = attempts.filter(
     (attempt) =>
       !attempt.hidden && !(attempt.phase === 'closed' && attempt.result !== null) && here(attempt)
@@ -573,13 +561,11 @@ export function Sharing({
           givingName={nameOf(handing.grant.recipient_device_id)}
           devices={everyone}
           nowMs={now}
-          onDone={(_receiver, revocation) => {
-            if (revocation !== null) {
-              keepRevocation(revocation, handing.grant.grant_id, nameOf(handing.grant.recipient_device_id))
-            }
+          onDone={(_receiver, replacementGrantId) => {
             returnTo.current = null
             setHanding(null)
-            focusNext.current = 'heading'
+            // The person is taken to the row of the device that now holds the session.
+            focusNext.current = replacementGrantId ?? 'heading'
             void load()
           }}
           onClose={() => {
@@ -637,6 +623,7 @@ export function Sharing({
                     className="divided-row access-row"
                     key={summary.grant.grant_id}
                     data-grant={summary.grant.grant_id}
+                    data-nav
                     data-state={summary.state}
                     tabIndex={-1}
                   >
@@ -714,7 +701,13 @@ export function Sharing({
         ) : null}
 
         {revoked.map((line) => (
-          <p className="small access-revoked" key={line.grantId} data-testid="recently-revoked">
+          <p
+            className="small access-revoked"
+            key={line.grantId}
+            data-testid="recently-revoked"
+            data-nav
+            tabIndex={-1}
+          >
             <span>
               Revoked {nameWords(line.name)} at {momentWords(line.atMs, now)}.
               {line.pending > 0
@@ -725,7 +718,7 @@ export function Sharing({
               <Button
                 data-testid="check-again"
                 onClick={() => {
-                  checkAgain(line)
+                  checkAgain(line.grantId)
                 }}
               >
                 Check again
@@ -733,8 +726,9 @@ export function Sharing({
             ) : null}
             <Button
               data-testid="revoked-dismiss"
-              onClick={() => {
-                setRevoked((each) => each.filter((other) => other.grantId !== line.grantId))
+              onClick={(event) => {
+                awayFrom(event.currentTarget)()
+                desk.dismissRevocation(line.grantId)
               }}
             >
               Dismiss
@@ -748,6 +742,7 @@ export function Sharing({
             key={attempt.action_id}
             data-testid="attempt"
             data-attempt={attempt.action_id}
+            data-nav
             data-phase={attempt.phase}
             data-outcome={attempt.outcome ?? undefined}
             role="status"
@@ -755,7 +750,7 @@ export function Sharing({
           >
             <p className="small">{attemptWords(attempt, now)}</p>
             {attempt.refusal !== null ? (
-              <p className="small muted">The host said: {attempt.refusal}</p>
+              <p className="small muted">The host said: {visibly(attempt.refusal)}</p>
             ) : null}
             {attempt.kind === 'invite' && attempt.phase === 'closed' && attempt.follow_up ? (
               <p className="small" data-testid="attempt-unverified">
@@ -767,8 +762,8 @@ export function Sharing({
               {attempt.phase === 'asking' ? (
                 <Button
                   data-testid="attempt-cancel"
-                  onClick={() => {
-                    removeAttempt(attempt)
+                  onClick={(event) => {
+                    removeAttempt(attempt, awayFrom(event.currentTarget))
                   }}
                 >
                   Cancel
@@ -778,8 +773,8 @@ export function Sharing({
                   {attempt.phase !== 'closed' || attempt.follow_up ? (
                     <Button
                       data-testid="attempt-ask"
-                      onClick={() => {
-                        askHost(attempt)
+                      onClick={(event) => {
+                        askHost(attempt, awayFrom(event.currentTarget))
                       }}
                     >
                       Ask the host
@@ -791,11 +786,12 @@ export function Sharing({
                   attempt.grant_id !== null ? (
                     <Button
                       data-testid="attempt-withdraw"
-                      onClick={() => {
+                      onClick={(event) => {
                         const grantId = attempt.grant_id
                         if (grantId === null) return
+                        const away = awayFrom(event.currentTarget)
                         takeBack(grantId, nameOf(attempt.device_id), true, () => {
-                          removeAttempt(attempt)
+                          removeAttempt(attempt, away)
                         })
                       }}
                     >
@@ -814,8 +810,8 @@ export function Sharing({
                   ) : (
                     <Button
                       data-testid="attempt-remove"
-                      onClick={() => {
-                        removeAttempt(attempt)
+                      onClick={(event) => {
+                        removeAttempt(attempt, awayFrom(event.currentTarget))
                       }}
                     >
                       Remove
@@ -851,6 +847,13 @@ export function Sharing({
             </ul>
           </div>
         ) : null}
+        {unreadable > 0 ? (
+          <p className="small muted" data-testid="attempts-unreadable">
+            {String(unreadable)} record{unreadable === 1 ? '' : 's'} kept by another release of this
+            application {unreadable === 1 ? 'is' : 'are'} not read here, and {unreadable === 1 ? 'is' : 'are'} left as{' '}
+            {unreadable === 1 ? 'it is' : 'they are'}.
+          </p>
+        ) : null}
       </section>
 
       {notes.map((each) => (
@@ -860,6 +863,8 @@ export function Sharing({
           key={each.grantId}
           data-testid="screen-changed"
           data-kind={each.kind}
+          data-nav
+          tabIndex={-1}
         >
           <h3>
             {each.kind === 'changed'
@@ -877,16 +882,18 @@ export function Sharing({
           <p className="attempt-actions">
             <Button
               data-testid="screen-withdraw"
-              onClick={() => {
-                takeBack(each.grantId, each.name, true)
+              onClick={(event) => {
+                const away = awayFrom(event.currentTarget)
+                takeBack(each.grantId, each.name, true, away)
               }}
             >
               Withdraw
             </Button>
             <Button
               data-testid="screen-dismiss"
-              onClick={() => {
-                setNotes((others) => others.filter((other) => other.grantId !== each.grantId))
+              onClick={(event) => {
+                awayFrom(event.currentTarget)()
+                desk.dismissNote(each.grantId)
               }}
             >
               Dismiss

@@ -790,11 +790,14 @@ export interface AttemptView {
   readonly device_id: string | null
   /** The grant it writes, revokes or accepts. */
   readonly grant_id: string | null
+  /** The grant it takes away: the one a revocation names, the one a hand-over gives up. */
+  readonly revoked_grant_id: string | null
   /** When it was composed, by this computer's clock. For display only. */
   readonly composed_at_ms: string
   /**
    * The earliest moment, by this computer's clock, at which a read of the host that finds nothing
-   * can close it. Null once it is over.
+   * can close it. Null once it is over, and once that moment has passed without an answer: the
+   * attempt can then be asked about, and nothing says until when it might still happen.
    */
   readonly can_happen_until_ms: string | null
   /** How many times the host has been asked again. */

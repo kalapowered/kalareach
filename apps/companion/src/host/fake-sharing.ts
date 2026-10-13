@@ -107,6 +107,13 @@ export interface FakeSharing {
    * gone. What it kept in its records stays.
    */
   restart(): void
+  /**
+   * The bound that keeps an absent grant from counting has passed and no read of the host has been
+   * answered: an attempt that is not over says nothing of until when it can still happen.
+   */
+  lapse(): void
+  /** How many records native code keeps that this build does not read, which the page counts. */
+  setUnreadable(count: number): void
   /** How many times the page has sent each action, by kind. */
   sent(): Readonly<Record<AttemptKind, number>>
 }
@@ -167,6 +174,7 @@ export class ScriptedSharing implements FakeSharing {
   #lose: 'none' | 'answer' | 'request' = 'none'
   #barrierHeld = false
   #finishHold: { release: () => void; fail: (failure: unknown) => void; held: Promise<void> } | null = null
+  #unreadable = 0
   #actions = 0
   #references = 0
   #sent: Record<AttemptKind, number> = { invite: 0, redeem: 0, revoke: 0, transfer: 0 }
@@ -268,6 +276,17 @@ export class ScriptedSharing implements FakeSharing {
     }
   }
 
+  lapse(): void {
+    for (const entry of this.#entries) {
+      if (entry.view.phase === 'closed') continue
+      entry.view = { ...entry.view, can_happen_until_ms: null }
+    }
+  }
+
+  setUnreadable(count: number): void {
+    this.#unreadable = count
+  }
+
   sent(): Readonly<Record<AttemptKind, number>> {
     return this.#sent
   }
@@ -343,6 +362,8 @@ export class ScriptedSharing implements FakeSharing {
       `Taking back the access of ${this.#nameOf(grant.grant.recipient_device_id)}`,
       null,
       grant.grant.recipient_device_id,
+      read.grant_id,
+      'composed',
       read.grant_id
     )
     if (this.#lost(entry)) {
@@ -406,7 +427,8 @@ export class ScriptedSharing implements FakeSharing {
       read.session_id,
       read.to_device_id,
       null,
-      'asking'
+      'asking',
+      read.from_grant_id
     )
     const expiresAtMs = this.#ids.nowMs + 120_000
     this.#handovers.set(reference, {
@@ -464,7 +486,10 @@ export class ScriptedSharing implements FakeSharing {
       const apply = (): GrantTransferResult => {
         this.#revoke(giving)
         const replacement = this.#replacement(giving, params.to_device_id)
-        return { replacement: replacement.grant, revoked: this.#revocation(giving) }
+        return {
+          replacement: replacement.grant,
+          revoked: this.#revocation(giving, [idOf('00000000', 7)])
+        }
       }
       if (lost) {
         if (entry.written) entry.result = apply()
@@ -491,7 +516,7 @@ export class ScriptedSharing implements FakeSharing {
   }
 
   attemptsList(): Attempts {
-    return { attempts: this.#entries.map((entry) => entry.view), unreadable: 0 }
+    return { attempts: this.#entries.map((entry) => entry.view), unreadable: this.#unreadable }
   }
 
   attemptAsk(actionId: string): Attempted {
@@ -566,7 +591,8 @@ export class ScriptedSharing implements FakeSharing {
     sessionId: string | null,
     deviceId: string | null,
     grantId: string | null = null,
-    phase: AttemptPhase = 'composed'
+    phase: AttemptPhase = 'composed',
+    revokedGrantId: string | null = null
   ): Entry {
     this.#actions += 1
     this.#sent[kind] += 1
@@ -582,6 +608,7 @@ export class ScriptedSharing implements FakeSharing {
         session_id: sessionId,
         device_id: deviceId,
         grant_id: grantId,
+        revoked_grant_id: revokedGrantId,
         composed_at_ms: String(this.#ids.nowMs),
         can_happen_until_ms: String(this.#ids.nowMs + 330_000),
         repeats: 0,
@@ -746,13 +773,18 @@ export class ScriptedSharing implements FakeSharing {
     summary.revoked_at_ms = String(this.#ids.nowMs)
   }
 
-  #revocation(summary: GrantSummary): RevocationResult {
+  /**
+   * What the host says of a revocation. `alsoRevoked` names grants that went with it (a hand-over
+   * revokes the giving grant's descendants): the host's list of them is sorted by identity, so the
+   * grant that was named is not always the first.
+   */
+  #revocation(summary: GrantSummary, alsoRevoked: readonly string[] = []): RevocationResult {
     const pending = this.#barrierHeld
     this.#barrierHeld = false
     return {
       authority_revision: '6',
-      revoked_grants: [summary.grant.grant_id],
-      revoked_grants_total: '1',
+      revoked_grants: [...alsoRevoked, summary.grant.grant_id],
+      revoked_grants_total: String(alsoRevoked.length + 1),
       barrier: {
         authority_revision: '6',
         workers: pending

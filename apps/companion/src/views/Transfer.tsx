@@ -11,22 +11,45 @@
  * The panel owns a reference from the moment the owner devices are asked until it is sent or let
  * go. Whenever it leaves one without sending it (the person cancels, the panel closes, the send
  * fails) it lets the reference go, so no hand-over is left holding the session's place with
- * nobody able to finish it. Once the transfer is sent, how it went is told whether or not the
- * panel is still on screen: the send does not depend on the polling that preceded it.
+ * nobody able to finish it. Once the transfer is sent, how it went is told, and what the host said
+ * of the giving device's revocation is kept on the page's desk, whether or not the panel is still
+ * on screen: the send does not depend on the polling that preceded it, or on the screen.
  */
 
 import { useEffect, useRef, useState, type ReactNode } from 'react'
 
-import type { DeviceSummary, GrantSummary, RevocationResult } from '@kalareach/protocol'
+import type { DeviceSummary, GrantSummary } from '@kalareach/protocol'
 
 import { Button, CommitButton } from '../components/ui'
 import { useApp } from '../app/state'
-import { failureMessage, type HandoverAsked, type SessionSubject } from '../host/port'
+import { isHostError, type HandoverAsked, type SessionSubject } from '../host/port'
 import { ask } from '../mobile/model/call'
-import { momentWords, nameWords, pairingEnd, platformWords, whyNot } from '../model/sharing'
+import {
+  failureText,
+  momentWords,
+  nameWords,
+  pairingEnd,
+  platformWords,
+  whyNot
+} from '../model/sharing'
+import { deskOf } from '../model/sharing-desk'
+import { handedOver } from '../model/sharing-results'
 
 /** How often the panel asks whether an owner device has answered. */
 const POLL_MS = 1000
+
+/**
+ * Whether a failure of asking about a hand-over is the end of it. A host that cannot be reached
+ * for a moment is not: the challenge is still the owner devices' to answer, and the next ask finds
+ * out. A hand-over that is no longer one native code is asking about, or whose plan was not the
+ * one asked for, is.
+ */
+function endsHandOver(error: unknown): boolean {
+  return (
+    isHostError(error) &&
+    ['INVALID_ARGUMENT', 'OWNER_CONFIRMATION_REQUIRED', 'PERMISSION_DENIED'].includes(error.code)
+  )
+}
 
 /** Why a device cannot receive this share, or none when it can. */
 function whyNotReceiver(device: DeviceSummary, giving: GrantSummary, nowMs: number): string | null {
@@ -60,14 +83,15 @@ export function Transfer({
   readonly devices: readonly DeviceSummary[]
   readonly nowMs: number
   /**
-   * Called once the transfer is over, with the receiving device's name when it happened and the
-   * host's account of the giving device's revocation when it gave one.
+   * Called once the transfer is over while the panel is still on screen, with the receiving
+   * device's name and the identity of the grant it now holds when it happened.
    */
-  readonly onDone: (receiver: string | null, revoked: RevocationResult | null) => void
+  readonly onDone: (receiver: string | null, replacementGrantId: string | null) => void
   /** Called when the person leaves the panel. */
   readonly onClose: () => void
 }): ReactNode {
   const { port, say } = useApp()
+  const desk = deskOf(port)
   const [receiver, setReceiver] = useState<string | null>(null)
   const [asked, setAsked] = useState<HandoverAsked | null>(null)
   const [state, setState] = useState<'choosing' | 'asking' | 'waiting' | 'sending' | 'gone'>(
@@ -78,6 +102,8 @@ export function Transfer({
   const mounted = useRef(true)
   /** The reference this panel owns: asked about, and neither sent nor let go. */
   const owned = useRef<string | null>(null)
+  /** Whether the transfer has been sent, after which the polling that sent it is not listened to. */
+  const sending = useRef(false)
   /** What the send reports to, which the polling that began it does not outlive. */
   const latest = useRef({ say, onDone })
 
@@ -135,7 +161,7 @@ export function Transfer({
       })
       .catch((error: unknown) => {
         if (!mounted.current) return
-        setFailure(failureMessage(error))
+        setFailure(failureText(error))
         setState('choosing')
       })
   }
@@ -147,6 +173,7 @@ export function Transfer({
    */
   const send = (reply: HandoverAsked) => {
     owned.current = null
+    sending.current = true
     setState('sending')
     ask(() => port.transferFinish(reply.reference))
       .then((done) => {
@@ -154,22 +181,39 @@ export function Transfer({
         const session =
           reply.session_number === null ? 'The session' : `Session ${String(reply.session_number)}`
         const to = nameWords(reply.to_device_name)
-        latest.current.say(
-          unfinished
-            ? `The hand-over to ${to} was sent, but the host’s answer did not arrive. It is listed as unfinished.`
-            : `${session} is now with ${to}.`,
-          unfinished ? 'pending' : 'success'
-        )
+        if (unfinished || done.value === null) {
+          latest.current.say(
+            `The hand-over to ${to} was sent, but the host’s answer did not arrive. It is listed as unfinished.`,
+            'pending'
+          )
+        } else if (desk.firstTime(done.attempt.action_id)) {
+          // Kept on the desk, which outlives this panel: the host's account of the giving
+          // device's revocation is told however soon the person leaves.
+          handedOver(
+            desk,
+            latest.current.say,
+            done.value,
+            giving.grant.grant_id,
+            givingName,
+            `${session} is now with ${to}.`,
+            Date.now()
+          )
+        }
         if (mounted.current) {
-          latest.current.onDone(unfinished ? null : reply.to_device_name, done.value?.revoked ?? null)
+          latest.current.onDone(
+            unfinished ? null : reply.to_device_name,
+            done.value?.replacement.grant_id ?? null
+          )
         }
       })
       .catch((error: unknown) => {
         // Nothing was sent, or the host refused it: either way the reference is spent or the
-        // hand-over still waits, and the panel goes back to choosing with the host's words.
+        // hand-over still waits. The person is told with the host's own words wherever they are.
         void ask(() => port.transferCancel(reply.reference)).catch(() => undefined)
+        latest.current.say(failureText(error), 'danger')
         if (!mounted.current) return
-        setFailure(failureMessage(error))
+        sending.current = false
+        setFailure(failureText(error))
         setState('choosing')
       })
   }
@@ -178,27 +222,27 @@ export function Transfer({
   useEffect(() => {
     if (state !== 'waiting' || asked === null) return
     let live = true
-    let sentOnce = false
     const reply = asked
     const handle = setInterval(() => {
       ask(() => port.transferAnswered(reply.reference))
         .then((answer) => {
-          if (!live) return
+          // An answer to an ask made before the send began says nothing of the send.
+          if (!live || sending.current) return
           if (answer.state === 'gone') {
             owned.current = null
             setState('gone')
             return
           }
-          if (answer.state === 'answered' && !sentOnce) {
+          if (answer.state === 'answered') {
             // The transfer is sent once, on the owner device's answer.
-            sentOnce = true
+            clearInterval(handle)
             send(reply)
           }
         })
         .catch((error: unknown) => {
-          if (!live) return
+          if (!live || sending.current || !endsHandOver(error)) return
           release(reply.reference)
-          setFailure(failureMessage(error))
+          setFailure(failureText(error))
           setState('choosing')
         })
     }, POLL_MS)
@@ -211,8 +255,15 @@ export function Transfer({
 
   const cancel = () => {
     const reference = owned.current
-    if (reference !== null) release(reference)
-    onClose()
+    if (reference === null) {
+      onClose()
+      return
+    }
+    owned.current = null
+    // The record is cleared before the list is read again, so a cancelled hand-over is not listed.
+    void ask(() => port.transferCancel(reference))
+      .catch(() => undefined)
+      .then(onClose)
   }
 
   const to = asked === null ? '' : nameWords(asked.to_device_name)
