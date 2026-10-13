@@ -218,7 +218,11 @@ fn lifetime(asked: Option<Lasts>, pairing_ends_at_ms: Option<u64>, now_ms: u64) 
 /// Returns a usage mistake when none is meant or several are, and says why a device that cannot
 /// take a share cannot: it manages this host, its pairing already opens every session, its pairing
 /// has run out, or it was revoked.
-fn pick_device<'a>(listed: &'a [DeviceSummary], text: &str) -> Result<&'a DeviceSummary> {
+fn pick_device<'a>(
+    listed: &'a [DeviceSummary],
+    text: &str,
+    environment: &Shown,
+) -> Result<&'a DeviceSummary> {
     let device = match text.parse::<DeviceId>() {
         Ok(device_id) => listed.iter().find(|device| device.device_id == device_id),
         Err(_) => {
@@ -243,8 +247,9 @@ fn pick_device<'a>(listed: &'a [DeviceSummary], text: &str) -> Result<&'a Device
         }
     };
     let Some(device) = device else {
-        return Err(CliError::Usage(Shown::said(
-            "no paired device has that identifier or name; `kr device list` shows them",
+        return Err(CliError::Usage(shown!(
+            "no paired device has that identifier or name; `kr device list{}` shows them",
+            environment.clone()
         )));
     };
     if device.revoked {
@@ -256,9 +261,11 @@ fn pick_device<'a>(listed: &'a [DeviceSummary], text: &str) -> Result<&'a Device
         )));
     }
     if device.all_sessions {
-        return Err(CliError::Usage(Shown::said(
+        return Err(CliError::Usage(shown!(
             "that device's pairing already opens every session, so a share to it adds nothing the \
-             connection can use; pair it as a guest (`kr pair invite --guest`) to share one session",
+             connection can use; pair it as a guest (`kr pair invite --guest{}`) to share one \
+             session",
+            environment.clone()
         )));
     }
     if device.grant_expired {
@@ -556,8 +563,7 @@ async fn perform(
     // made on the clock that cannot be stepped.
     report::say(&shown!(
         "The grant this {} is {}. If this command is interrupted, `{}` shows what the host holds. \
-         The host can still act on this until {}: a grant missing from the list before then does \
-         not mean it will not appear.",
+         The host can still act on this until {}: {}.",
         if kind == Kind::Revoke {
             "revokes"
         } else {
@@ -569,7 +575,12 @@ async fn perform(
             kr_ipc::now_ms()
                 .get()
                 .saturating_add(u64::try_from(attempt.bound().as_millis()).unwrap_or(u64::MAX))
-        )
+        ),
+        Shown::said(if kind == Kind::Revoke {
+            "a grant still listed as active before then can still be revoked by it"
+        } else {
+            "a grant missing from the list before then does not mean it will not appear"
+        })
     ));
 
     let first = sent_within(host.client.repeat(&request)).await;
@@ -687,13 +698,13 @@ fn unfinished(outcome: Outcome, what: &'static str, list_command: &Shown) -> Cli
             list.clone()
         ),
         Outcome::HadEnded => shown!(
-            "the grant had already ended when {} was asked. {}",
+            "the grant has ended and {} did not revoke it. {}",
             what,
             list.clone()
         ),
         Outcome::Unknown | Outcome::Happened | Outcome::Refused => shown!(
-            "what became of {} is not known: the host did not answer and its state does not \
-             show. {}",
+            "what became of {} is not known: the host did not answer, and its state could not be \
+             read or does not settle it. {}",
             what,
             list.clone()
         ),
@@ -723,7 +734,8 @@ async fn invite(
     let descriptor = session_of(paths, &host, &arguments.session)?;
     let session_id = descriptor.session_id;
     let devices = host.devices().await?;
-    let device = pick_device(&devices.devices, &arguments.to)?.clone();
+    let environment = environment_flag(&host, &arguments.selector);
+    let device = pick_device(&devices.devices, &arguments.to, &environment)?.clone();
     let pairing_ends = device.grant_expires_at_ms.as_ref().map(|ends| ends.get());
     // The end the person is shown is the end the host is asked for: it is fixed here, and what the
     // person's time at the question takes comes out of the share, not out of what was shown.
@@ -811,14 +823,11 @@ async fn invite(
         owner_confirmation: Nullable::null(),
     };
     let target = crate::attach::target(&descriptor);
-    let environment = environment_flag(&host, &arguments.selector);
     let watch = Watch {
         session_id: Some(session_id),
         grant_id,
-        list_command: list_command(
-            Some(shown!("{}", descriptor.display_number.get())),
-            environment.clone(),
-        ),
+        // The session's identifier, which names it when its display number is gone with it.
+        list_command: list_command(Some(shown!("{}", session_id)), environment.clone()),
     };
     let performed = perform(
         &mut host,
@@ -1062,24 +1071,29 @@ fn summary_of(
             } else {
                 "the agent's conversation and questions"
             };
+            let never = if selection.include_live_screen {
+                " Never the terminal's scrollback."
+            } else {
+                ""
+            };
             if from.get() == 0 {
                 stdout_line!(
-                    "  Earlier activity: {} from before, everything the host keeps.",
-                    scope
+                    "  Earlier activity: {} from before, everything the host keeps.{}",
+                    scope,
+                    Shown::said(never)
                 )
             } else {
                 stdout_line!(
-                    "  Earlier activity: {} from {}.",
+                    "  Earlier activity: {} from {}.{}",
                     scope,
-                    crate::shown::utc_moment(from.get())
+                    crate::shown::utc_moment(from.get()),
+                    Shown::said(never)
                 )
             }
         }
     });
     if selection.include_live_screen {
-        lines.push(stdout_line!(
-            "  The live screen is included. It never shows the terminal's scrollback."
-        ));
+        lines.push(stdout_line!("  The live screen is included."));
     } else {
         lines.push(stdout_line!(
             "  No terminal and no live stream: the device does not see the screen."
@@ -1564,7 +1578,8 @@ async fn transfer(
     let descriptor = session_of(paths, &host, &arguments.session)?;
     let session_id = descriptor.session_id;
     let devices = host.devices().await?;
-    let receiver = pick_device(&devices.devices, &arguments.to)?.clone();
+    let environment = environment_flag(&host, &arguments.selector);
+    let receiver = pick_device(&devices.devices, &arguments.to, &environment)?.clone();
     if !devices
         .devices
         .iter()
@@ -1572,9 +1587,10 @@ async fn transfer(
     {
         return Err(CliError::refused_in_its_own_words(
             ErrorCode::OwnerConfirmationRequired,
-            Shown::said(
+            shown!(
                 "no owner device is paired with this host, so nobody can confirm a transfer of \
-                 control; pair one with `kr pair invite --owner`",
+                 control; pair one with `kr pair invite --owner{}`",
+                environment.clone()
             ),
         ));
     }
@@ -1670,10 +1686,7 @@ async fn transfer(
     let watch = Watch {
         session_id: Some(session_id),
         grant_id: new_grant_id,
-        list_command: list_command(
-            Some(shown!("{}", descriptor.display_number.get())),
-            environment_flag(&host, &arguments.selector),
-        ),
+        list_command: list_command(Some(shown!("{}", session_id)), environment.clone()),
     };
     let performed = perform(
         &mut host,
@@ -1700,7 +1713,7 @@ async fn transfer(
                 &descriptor,
                 &receiver,
                 (from, new_grant_id),
-                &revoke_command(from, environment_flag(&host, &arguments.selector)),
+                &revoke_command(from, environment.clone()),
                 result.as_ref(),
                 json,
             )
@@ -1750,13 +1763,24 @@ async fn ask_for_confirmation(
                     ))
                 });
             }
-            Ok(Err(refusal)) => return Err(CliError::Refused(refusal)),
-            Err(_) if asked_again < REPEAT_DELAYS.len() => {
+            // The host's own answer to the request, which only the first send is: a refusal to a
+            // repeat can be the host saying it has no record of an action it never read.
+            Ok(Err(refusal)) if asked_again == 0 => return Err(CliError::Refused(refusal)),
+            _ if asked_again < REPEAT_DELAYS.len() => {
                 tokio::time::sleep(REPEAT_DELAYS[asked_again]).await;
                 asked_again += 1;
                 (sent, answered_on) = ask_again(host, &request).await;
             }
-            Err(error) => return Err(CliError::Ipc(error)),
+            _ => {
+                return Err(CliError::Unfinished {
+                    code: ErrorCode::OutcomeUnknown,
+                    message: Shown::said(
+                        "the host did not answer, so nothing was handed over; an owner device can \
+                         still be shown the request for up to two minutes, and will do nothing \
+                         with it that this command sends",
+                    ),
+                });
+            }
         }
     }
 }
@@ -1975,11 +1999,13 @@ mod tests {
         let devices = [owner, wide, ran_out, revoked, phone.clone(), twin_a, twin_b];
 
         assert_eq!(
-            pick_device(&devices, "phone").expect("by name").device_id,
+            pick_device(&devices, "phone", &Shown::said(""))
+                .expect("by name")
+                .device_id,
             phone.device_id
         );
         assert_eq!(
-            pick_device(&devices, &phone.device_id.to_string())
+            pick_device(&devices, &phone.device_id.to_string(), &Shown::said(""))
                 .expect("by identifier")
                 .device_id,
             phone.device_id
@@ -1993,14 +2019,17 @@ mod tests {
             "twin",
         ] {
             assert!(
-                matches!(pick_device(&devices, refused), Err(CliError::Usage(_))),
+                matches!(
+                    pick_device(&devices, refused, &Shown::said("")),
+                    Err(CliError::Usage(_))
+                ),
                 "{refused}"
             );
         }
         let by_identifier = devices[3].device_id.to_string();
         assert!(
             matches!(
-                pick_device(&devices, &by_identifier),
+                pick_device(&devices, &by_identifier, &Shown::said("")),
                 Err(CliError::Usage(_))
             ),
             "a revoked device is refused even by identifier"

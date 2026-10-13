@@ -398,6 +398,55 @@ fn a_guest_is_shown_a_session_with_its_screen_and_loses_it_when_the_share_is_tak
         .unwrap_or_else(|left| panic!("the leg left processes running: {left}"));
 }
 
+/// The host carries an invitation out and never says so, to the command or to any repeat of it: the
+/// command asks again three times, each on a connection of its own, then reads the host's state,
+/// finds the invitation, and says it happened without the host's own answer. The share is made
+/// once. KR-REQ-23.49.
+#[test]
+fn an_invitation_whose_every_answer_is_lost_is_found_by_reading_the_host() {
+    let runtime = runtime();
+    let run = Run::start("sharing-unanswered");
+    let host = Host::start(&run, &HostOptions::default());
+    let owner_device = runtime.block_on(Device::create("owner", &run.root().join("o")));
+    let (_, owner) = ceremony::pair_first_owner(&host, &owner_device, &runtime);
+    let (_, display) = new_session(&host);
+    let guest_device = runtime.block_on(Device::create("guest", &run.root().join("g")));
+    let (guest_paired, guest) = ceremony::pair_guest(&host, &owner, &guest_device, &runtime, "60");
+
+    let relay = Relay::losing_every_answer_to(&host, &runtime, Method::GrantCreate);
+    let issued = host.kr_json(&[
+        "share",
+        "invite",
+        &display,
+        "--to",
+        &guest_paired.device_id.to_string(),
+        "--yes",
+        "--for",
+        "15m",
+    ]);
+    assert!(relay.lost(), "the host's answers were lost on the way back");
+    relay.remove();
+    assert!(issued["grant_id"].as_str().is_some(), "{issued}");
+    assert!(
+        issued["actions"].is_null() && issued["ends_at_ms"].is_null(),
+        "the command was never given the host's answer, and says so by not inventing it: {issued}"
+    );
+    assert_eq!(
+        held(&runtime, &guest).offers.len(),
+        1,
+        "the share was made once"
+    );
+
+    guest.close();
+    owner.close();
+    runtime.block_on(guest_device.close());
+    runtime.block_on(owner_device.close());
+    host.stop()
+        .unwrap_or_else(|problem| panic!("the host did not stop cleanly: {problem}"));
+    run.closing_check()
+        .unwrap_or_else(|left| panic!("the leg left processes running: {left}"));
+}
+
 /// The owner hands a session's control to another device: the command waits for an owner device to
 /// confirm exactly the plan the host describes, the transfer then completes, and the giving device
 /// is refused where the receiving device now holds the session. KR-REQ-18.03.
@@ -408,8 +457,8 @@ fn a_session_handed_to_another_device_is_held_by_it_and_refused_to_the_giver() {
 
 /// The host's answer to the request for the owner devices' confirmation is lost on the way back:
 /// the command asks again with the same request on a connection of its own, the host gives back the
-/// same challenge, the owner device is shown one plan, and the command goes on, on the connection
-/// that answered, to hand the session over once. KR-REQ-23.49.
+/// challenge, and the command goes on, on the connection that answered, to wait for the owner
+/// device and hand the session over once. KR-REQ-23.49.
 #[test]
 fn a_hand_over_whose_first_answer_was_lost_goes_on_and_is_made_once() {
     hand_over(

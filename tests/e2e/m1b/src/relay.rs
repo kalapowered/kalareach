@@ -8,6 +8,9 @@
 //! as a connection does that the person's computer lost. The daemon went on to carry the request
 //! out first, because the answer is what it sends afterwards.
 //!
+//! A relay can instead lose the answer to every request for the method, which is a host that
+//! carries its requests out and never says so: what a command does then is read the host's state.
+//!
 //! The daemon keeps listening where it is: its socket file is moved aside, not closed, and moved
 //! back when the relay is removed.
 
@@ -34,7 +37,9 @@ const MAX_FRAME: usize = 1 << 21;
 struct Plan {
     /// The method whose first request's answer is lost.
     method: &'static str,
-    /// Whether that request has not been seen yet, on any connection.
+    /// Whether every request for the method loses its answer, and not the first alone.
+    every: bool,
+    /// Whether the first request has not been seen yet, on any connection.
     armed: AtomicBool,
     /// Whether an answer was dropped.
     lost: AtomicBool,
@@ -75,6 +80,30 @@ impl Relay {
         runtime: &tokio::runtime::Runtime,
         method: Method,
     ) -> Self {
+        Self::in_front_of(host, runtime, method, false)
+    }
+
+    /// Puts a relay in front of the control socket of `host`, which loses the answer to every
+    /// `method` request that goes through it.
+    ///
+    /// # Panics
+    ///
+    /// As [`Self::losing_the_answer_to`].
+    #[must_use]
+    pub fn losing_every_answer_to(
+        host: &Host<'_>,
+        runtime: &tokio::runtime::Runtime,
+        method: Method,
+    ) -> Self {
+        Self::in_front_of(host, runtime, method, true)
+    }
+
+    fn in_front_of(
+        host: &Host<'_>,
+        runtime: &tokio::runtime::Runtime,
+        method: Method,
+        every: bool,
+    ) -> Self {
         let socket = host
             .environment()
             .controller_endpoint()
@@ -85,6 +114,7 @@ impl Relay {
         std::fs::rename(&socket, &aside).expect("the daemon's socket is moved aside");
         let plan = Arc::new(Plan {
             method: method.entry().name,
+            every,
             armed: AtomicBool::new(true),
             lost: AtomicBool::new(false),
         });
@@ -167,7 +197,7 @@ async fn requests(
     while let Some(frame) = read_frame(&mut from).await {
         if let Ok(ControlFrame::Mutation(request)) = decode(&frame)
             && request.method.as_str() == plan.method
-            && plan.armed.swap(false, Ordering::SeqCst)
+            && (plan.armed.swap(false, Ordering::SeqCst) || plan.every)
         {
             *watching.lock().unwrap_or_else(PoisonError::into_inner) = Some(request.request_id);
         }
