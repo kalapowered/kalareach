@@ -173,6 +173,37 @@ pub fn after_each_read<T>(then: impl FnMut(u32, &str) + 'static, work: impl FnOn
     platform::after_each_read(then, work)
 }
 
+/// Runs `then` on this thread each time it opens the `/proc` entry that says whether a process the
+/// kernel has just described is still running, with that process and before the entry is read, for
+/// the host crates' own tests: what a test uses to have the process end in the window between the
+/// kernel describing it and the kernel being asked whether it runs. It runs until the returned hook
+/// is dropped.
+///
+/// A process that is collected in that window leaves the entry open and unreadable, and the read
+/// fails with the error a process that is not there gives. An error `then` returns fails the read
+/// with that error instead, as a kernel that would not answer does.
+#[cfg(all(feature = "testing", any(target_os = "linux", target_os = "android")))]
+#[must_use = "the hook ends when it is dropped"]
+pub fn before_each_running_check(
+    then: impl FnMut(u32) -> Option<std::io::Error> + 'static,
+) -> RunningCheckHook {
+    platform::before_each_running_check(then);
+    RunningCheckHook(std::marker::PhantomData)
+}
+
+/// What [`before_each_running_check`] returns: it ends the hook when it is dropped. The hook is
+/// this thread's, so the guard stays on it.
+#[cfg(all(feature = "testing", any(target_os = "linux", target_os = "android")))]
+#[derive(Debug)]
+pub struct RunningCheckHook(std::marker::PhantomData<*const ()>);
+
+#[cfg(all(feature = "testing", any(target_os = "linux", target_os = "android")))]
+impl Drop for RunningCheckHook {
+    fn drop(&mut self) {
+        platform::end_before_each_running_check();
+    }
+}
+
 /// Runs `work`, and `then` once, right after a stop on this thread has read the instance of the
 /// process it is about to signal, for the host crates' own tests: what a test uses to have the
 /// process run a new program in the window between the reading and the signal.
@@ -613,7 +644,24 @@ mod platform {
     /// Every question this module asks about one process reads through here, so a test can see
     /// which processes a question read about.
     fn read_process_file(pid: u32, file: &str) -> std::io::Result<String> {
-        let read = std::fs::read_to_string(format!("/proc/{pid}/{file}"));
+        read_process_file_opened(pid, file, |_| None)
+    }
+
+    /// Reads one of a process's own `/proc` files, running `opened` with the process once the file
+    /// is open and before it is read. An error `opened` returns is the read's failure.
+    fn read_process_file_opened(
+        pid: u32,
+        file: &str,
+        opened: impl FnOnce(u32) -> Option<std::io::Error>,
+    ) -> std::io::Result<String> {
+        let read = std::fs::File::open(format!("/proc/{pid}/{file}")).and_then(|mut entry| {
+            if let Some(failure) = opened(pid) {
+                return Err(failure);
+            }
+            let mut text = String::new();
+            std::io::Read::read_to_string(&mut entry, &mut text)?;
+            Ok(text)
+        });
         #[cfg(feature = "testing")]
         {
             PROCESS_READS.with(|reads| {
@@ -634,6 +682,11 @@ mod platform {
     #[cfg(feature = "testing")]
     type AfterRead = Box<dyn FnMut(u32, &str)>;
 
+    /// What a test runs between opening and reading a running check: the process asked about, and
+    /// the failure it gives the read, where it gives one.
+    #[cfg(feature = "testing")]
+    type BeforeRunningCheck = Box<dyn FnMut(u32) -> Option<std::io::Error>>;
+
     #[cfg(feature = "testing")]
     thread_local! {
         /// The processes this thread has read about since a test began counting, or none when
@@ -643,6 +696,39 @@ mod platform {
         /// What a test runs after each read on this thread, where one is.
         static AFTER_READ: std::cell::RefCell<Option<AfterRead>> =
             const { std::cell::RefCell::new(None) };
+        /// What a test runs on this thread between opening the entry that says whether a process
+        /// runs and reading it, where one is.
+        static BEFORE_RUNNING_CHECK: std::cell::RefCell<Option<BeforeRunningCheck>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// Has `then` run between opening and reading each running check on this thread.
+    #[cfg(feature = "testing")]
+    pub fn before_each_running_check(then: impl FnMut(u32) -> Option<std::io::Error> + 'static) {
+        BEFORE_RUNNING_CHECK.with(|slot| *slot.borrow_mut() = Some(Box::new(then)));
+    }
+
+    /// Ends what [`before_each_running_check`] began.
+    #[cfg(feature = "testing")]
+    pub fn end_before_each_running_check() {
+        BEFORE_RUNNING_CHECK.with(|slot| *slot.borrow_mut() = None);
+    }
+
+    /// What a running check does once the entry is open: nothing, unless a test is ending a process
+    /// there or failing the read.
+    fn between_opening_and_reading(pid: u32) -> Option<std::io::Error> {
+        #[cfg(feature = "testing")]
+        {
+            // Taken out while it runs, so that it can ask about processes itself.
+            if let Some(mut then) = BEFORE_RUNNING_CHECK.with(|slot| slot.borrow_mut().take()) {
+                let failure = then(pid);
+                BEFORE_RUNNING_CHECK.with(|slot| *slot.borrow_mut() = Some(then));
+                return failure;
+            }
+        }
+        #[cfg(not(feature = "testing"))]
+        let _ = pid;
+        None
     }
 
     /// Runs `work`, and `then` after each read it makes on this thread, with the process read
@@ -710,17 +796,32 @@ mod platform {
     /// identifier to be collected and given to something else in between, and the state of that
     /// something else is not an answer about this process.
     pub(super) fn liveness(pid: u32, start_value: u64) -> super::ProcessState {
-        let path = format!("/proc/{pid}/stat");
-        match read_process_file(pid, "stat") {
+        liveness_from(
+            read_process_file_opened(pid, "stat", between_opening_and_reading),
+            pid,
+            start_value,
+        )
+    }
+
+    /// What reading the entry that says whether a process whose identity matched is running comes
+    /// to.
+    ///
+    /// The kernel described this process a moment ago, so an entry that is not there, or one the
+    /// process leaves while it is read, is a process that has ended; the kernel gives the first
+    /// for an entry it cannot find and the second for one whose process has been collected since
+    /// it was opened. Every other failure - a descriptor limit, a permission, a kernel that would
+    /// not answer - proves nothing, and answering "ended" to it would retire a live worker or
+    /// leave a survivor out of a closure record.
+    fn liveness_from(
+        read: std::io::Result<String>,
+        pid: u32,
+        start_value: u64,
+    ) -> super::ProcessState {
+        match read {
             Ok(text) => decide(&text, start_value),
-            // A missing entry is a process that has gone. Every other failure - a descriptor limit,
-            // a permission, a kernel that would not answer - proves nothing, and answering "ended"
-            // to it would retire a live worker or leave a survivor out of a closure record.
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                super::ProcessState::Ended
-            }
+            Err(error) if gone(&error) => super::ProcessState::Ended,
             Err(error) => super::ProcessState::Unknown {
-                detail: format!("{path}: {error}"),
+                detail: format!("/proc/{pid}/stat: {error}"),
             },
         }
     }
@@ -1385,19 +1486,13 @@ mod platform {
         }
     }
 
-    /// Whether a failed read of a `/proc` entry is the entry being absent.
-    fn is_absent(error: &std::io::Error) -> bool {
-        error.kind() == std::io::ErrorKind::NotFound
-            || error.raw_os_error() == Some(rustix::io::Errno::SRCH.raw_os_error())
-    }
-
     pub(super) fn query_process(pid: u32) -> super::ProcessQuery {
         let path = format!("/proc/{pid}/stat");
         let text = match read_process_file(pid, "stat") {
             Ok(text) => text,
-            // An absent entry is a process that has gone only when the kernel agrees. A permission,
-            // a descriptor limit or an entry that vanished part way through a read proves nothing.
-            Err(error) if is_absent(&error) => {
+            // An absent entry, or one that vanished part way through the read, is a process that has
+            // gone only when the kernel agrees. A permission or a descriptor limit proves nothing.
+            Err(error) if gone(&error) => {
                 match after_a_missing_entry(held(pid), || read_process_file(pid, "stat"), pid) {
                     Ok(text) => text,
                     Err(answer) => return answer,
@@ -1437,7 +1532,7 @@ mod platform {
 
     #[cfg(test)]
     mod tests {
-        use super::{Held, after_a_missing_entry, decide, parse_start_ticks};
+        use super::{Held, after_a_missing_entry, decide, liveness_from, parse_start_ticks};
         use crate::identity::{ProcessQuery, ProcessState};
 
         /// What the kernel says about numbers, read for real: a process of another account, or any
@@ -1485,6 +1580,35 @@ mod platform {
                 Some("4242 (x) S"),
                 "an entry that has appeared by the second reading is read"
             );
+        }
+
+        /// A running check whose entry is not there, or whose process is collected after the entry
+        /// was opened, finds a process that has ended. Every other way the read can fail leaves the
+        /// question open: a process the kernel will not describe is not one that has gone.
+        #[test]
+        fn a_running_check_that_finds_the_process_gone_is_an_end_and_no_other_failure_is() {
+            let error = |number: rustix::io::Errno| {
+                std::io::Error::from_raw_os_error(number.raw_os_error())
+            };
+            for gone in [
+                std::io::Error::from(std::io::ErrorKind::NotFound),
+                error(rustix::io::Errno::SRCH),
+            ] {
+                assert_eq!(liveness_from(Err(gone), 4242, 1), ProcessState::Ended);
+            }
+            for open in [
+                error(rustix::io::Errno::ACCESS),
+                error(rustix::io::Errno::MFILE),
+                error(rustix::io::Errno::IO),
+            ] {
+                assert!(
+                    matches!(
+                        liveness_from(Err(open), 4242, 1),
+                        ProcessState::Unknown { .. }
+                    ),
+                    "a failed read is not a death"
+                );
+            }
         }
 
         /// Builds a `/proc/<pid>/stat` line with the state, thread count and start time given.

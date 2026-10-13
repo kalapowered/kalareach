@@ -400,6 +400,129 @@ async fn kr_req_23_30_an_action_cancelled_while_prepared_claims_nothing() {
     assert_eq!(after.revision, draft.revision, "nothing was claimed");
 }
 
+/// What interrupts the kernel's answer to whether an exited host still runs.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy)]
+enum Interruption {
+    /// The host's parent collects it, so the entry the kernel opened is gone before it is read.
+    Collected,
+    /// The kernel does not answer.
+    Unanswered,
+}
+
+/// Ends the plugin hosts of a harness whose one host has exited and not been collected, with the
+/// interruption in the middle of the third question the harness asks about it, and says what the
+/// harness did and whether the interruption happened.
+///
+/// The harness asks about a host three times: whether it needs killing, whether it has ended, and
+/// last which hosts are left. The first two see an ended host, as the kernel describes it before
+/// its parent collects it; the third is the question a parent that collects its children, or a
+/// kernel that will not answer, interrupts after the kernel has described the host and before it
+/// says whether it still runs.
+#[cfg(target_os = "linux")]
+fn end_an_exited_host(interruption: Interruption) -> (std::thread::Result<()>, bool) {
+    let tree = kr_ipc::testing::TempHost::create();
+    let mut host = std::process::Command::new("/bin/sh")
+        .args(["-c", "exec sleep 600"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("starts a stand-in for a plugin host");
+    let identity = kr_ipc::identity::process_start_identity(host.id()).expect("its identity");
+    let number = host.id();
+    let pid = rustix::process::Pid::from_raw(i32::try_from(number).expect("a process identifier"))
+        .expect("a process");
+    host.kill().expect("ends the stand-in");
+    rustix::process::waitid(
+        rustix::process::WaitId::Pid(pid),
+        rustix::process::WaitIdOptions::EXITED | rustix::process::WaitIdOptions::NOWAIT,
+    )
+    .expect("waits for it to exit without collecting it");
+    // Shared with the hook, so the host is collected through the handle that owns its number: the
+    // handle then knows it was collected and never waits on a number the kernel may have given to
+    // another process since.
+    let host = std::rc::Rc::new(std::cell::RefCell::new(host));
+
+    let services = plugin_world::Services::default();
+    services.lock().expect("the services").push((
+        format!("kr-plugin-host-{}", kr_ipc::new_uuid()),
+        Some(identity),
+    ));
+    let ending = plugin_world::HostEnding {
+        services,
+        environment: tree.environment(),
+    };
+    let asked = std::cell::Cell::new(0_u32);
+    let interrupted = std::rc::Rc::new(std::cell::Cell::new(false));
+    let hook = kr_ipc::identity::before_each_running_check({
+        let interrupted = std::rc::Rc::clone(&interrupted);
+        let host = std::rc::Rc::clone(&host);
+        move |process| {
+            if process != number {
+                return None;
+            }
+            asked.set(asked.get() + 1);
+            if asked.get() != 3 {
+                return None;
+            }
+            interrupted.set(true);
+            match interruption {
+                Interruption::Collected => {
+                    host.borrow_mut().wait().expect("collects the stand-in");
+                    None
+                }
+                Interruption::Unanswered => Some(std::io::Error::from_raw_os_error(
+                    rustix::io::Errno::IO.raw_os_error(),
+                )),
+            }
+        }
+    });
+
+    // Ending the hosts asserts that every one was seen to end, and the assertion is a panic.
+    let ended = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(ending)));
+    drop(hook);
+    // Collected by the hook, or here when it was not; the handle remembers a collection it made.
+    host.borrow_mut().wait().expect("collects the stand-in");
+    (ended, interrupted.get())
+}
+
+/// The harness that ends the plugin hosts a test started sees a host that is collected between the
+/// kernel describing it and the kernel being asked whether it still runs as one that ended, and not
+/// as a host that was not seen to end.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_host_collected_between_the_two_readings_is_seen_to_end() {
+    let (ended, interrupted) = end_an_exited_host(Interruption::Collected);
+
+    assert!(
+        interrupted,
+        "the host was collected between the two readings of the last question"
+    );
+    assert!(
+        ended.is_ok(),
+        "the harness saw the host end and said nothing"
+    );
+}
+
+/// The control: when the kernel does not answer, the harness does not take an exited host for one
+/// that ended. It says the host was not seen to end, which is what keeps a host that is still
+/// running from being left behind unreported.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_host_the_kernel_will_not_describe_is_not_taken_for_one_that_ended() {
+    let (ended, interrupted) = end_an_exited_host(Interruption::Unanswered);
+
+    assert!(interrupted, "the kernel did not answer the last question");
+    let said = ended.expect_err("the harness reports a host it did not see end");
+    let said = said
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| said.downcast_ref::<&str>().copied())
+        .unwrap_or_default();
+    assert!(said.contains("not seen to end"), "and says so: {said}");
+}
+
 /// KR-REQ-23.30: a plan that offers another attachment than the one the invocation names is
 /// refused by name before the draft is claimed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]

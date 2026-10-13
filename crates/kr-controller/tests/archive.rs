@@ -792,6 +792,15 @@ fn taking_ownership_creates_no_worker_and_no_store() {
 /// A process this test starts to stand in for what a crashed session left behind: it runs until it
 /// is ended, and ends when asked.
 fn leftover() -> Reaped {
+    let (child, identity) = spawn_leftover();
+    Reaped { child, identity }
+}
+
+/// The process [`leftover`] stands in with, and its identity, for a test that collects it itself.
+fn spawn_leftover() -> (
+    std::process::Child,
+    kr_protocol::identity::ProcessStartIdentity,
+) {
     #[cfg(unix)]
     let mut command = {
         let mut command = std::process::Command::new("/bin/sh");
@@ -816,7 +825,7 @@ fn leftover() -> Reaped {
         .spawn()
         .expect("starts a process");
     let identity = kr_ipc::identity::process_start_identity(child.id()).expect("its identity");
-    Reaped { child, identity }
+    (child, identity)
 }
 
 /// A leftover process, ended when the test is over whatever the test did.
@@ -1065,6 +1074,156 @@ async fn a_hold_that_could_not_be_taken_at_the_request_is_tried_again_at_the_end
     assert!(
         ended.forced,
         "and as forced, because it was not asked to end: {fenced:?}"
+    );
+}
+
+/// Ends a child this test started and waits until it has exited without collecting it, so the
+/// kernel still describes it, as a process that has exited and is waiting for its parent.
+#[cfg(target_os = "linux")]
+fn exited_and_not_collected(child: &mut std::process::Child) {
+    child.kill().expect("ends the process");
+    rustix::process::waitid(
+        rustix::process::WaitId::Pid(collectable(child)),
+        rustix::process::WaitIdOptions::EXITED | rustix::process::WaitIdOptions::NOWAIT,
+    )
+    .expect("waits for it to exit without collecting it");
+}
+
+/// The process identifier of a child, as the kernel's calls take it.
+#[cfg(target_os = "linux")]
+fn collectable(child: &std::process::Child) -> rustix::process::Pid {
+    rustix::process::Pid::from_raw(i32::try_from(child.id()).expect("a process identifier"))
+        .expect("a process")
+}
+
+/// What interrupts the kernel's answer to whether an exited process still runs.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy)]
+enum Interruption {
+    /// The process's parent collects it, so the entry the kernel opened is gone before it is read.
+    Collected,
+    /// The kernel does not answer.
+    Unanswered,
+}
+
+/// Fences a session whose one recorded process has exited and not been collected, with the
+/// interruption in the middle of the second question the pass asks about it, and says whether the
+/// interruption happened.
+///
+/// The pass asks about the process twice, once to see it end and once more last. The first sees an
+/// ended process, as the kernel describes it before its parent collects it; the second is the
+/// question a parent that collects its children, or a kernel that will not answer, interrupts
+/// after the kernel has described the process and before it says whether it still runs.
+#[cfg(target_os = "linux")]
+async fn fence_an_exited_process(
+    interruption: Interruption,
+) -> (
+    kr_protocol::identity::ProcessStartIdentity,
+    kr_controller::archive::Fenced,
+    bool,
+) {
+    let (_temp, archive) = host();
+    let session_id = session();
+    // Not a guarded leftover: the hook collects this process itself, and a guard that signalled it
+    // afterwards would signal a number the kernel may have given to another process.
+    let (mut child, identity) = spawn_leftover();
+    exited_and_not_collected(&mut child);
+    let number = child.id();
+    // Shared with the hook, so the process is collected through the handle that owns its number:
+    // the handle then knows it was collected and never waits on, or signals, a number the kernel
+    // may have given to another process since.
+    let child = std::rc::Rc::new(std::cell::RefCell::new(child));
+    {
+        let mut journal = journal_for(&archive, session_id);
+        journal
+            .record_owned(session_id, &owned_record(vec![identity.clone()]))
+            .expect("records what the session owned");
+    }
+    let ownership = take(&archive, session_id);
+    let asked = std::cell::Cell::new(0_u32);
+    let interrupted = std::rc::Rc::new(std::cell::Cell::new(false));
+    let hook = kr_ipc::identity::before_each_running_check({
+        let interrupted = std::rc::Rc::clone(&interrupted);
+        let child = std::rc::Rc::clone(&child);
+        move |process| {
+            if process != number {
+                return None;
+            }
+            asked.set(asked.get() + 1);
+            if asked.get() != 2 {
+                return None;
+            }
+            interrupted.set(true);
+            match interruption {
+                Interruption::Collected => {
+                    child.borrow_mut().wait().expect("collects the process");
+                    None
+                }
+                Interruption::Unanswered => Some(std::io::Error::from_raw_os_error(
+                    rustix::io::Errno::IO.raw_os_error(),
+                )),
+            }
+        }
+    });
+
+    let fenced = archive.fence_owned(&ownership, None).await;
+    drop(hook);
+    // Collected by the hook, or here when it was not; the handle remembers a collection it made.
+    child.borrow_mut().wait().expect("collects the process");
+    (identity, fenced, interrupted.get())
+}
+
+/// A recorded process that is collected between the kernel describing it and the kernel being asked
+/// whether it still runs has ended: the closure names it among the processes that ended, and not
+/// among survivors this host cannot say have ended.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "current_thread")]
+async fn a_recorded_process_collected_between_the_two_readings_has_ended() {
+    let (identity, fenced, interrupted) = fence_an_exited_process(Interruption::Collected).await;
+
+    assert!(
+        interrupted,
+        "the process was collected between the two readings of the last question"
+    );
+    assert!(
+        fenced
+            .ended
+            .iter()
+            .any(|ended| ended.identity == identity && !ended.forced),
+        "it is named among the processes that ended: {fenced:?}"
+    );
+    assert!(
+        !fenced
+            .surviving
+            .iter()
+            .any(|resource| resource.kind == "process"),
+        "and no process is named as surviving: {fenced:?}"
+    );
+}
+
+/// The control: when the kernel does not answer, an exited process is not claimed to have ended. It
+/// is named as one this host cannot say has ended, which is what keeps a process that is still
+/// running out of a closure that calls it gone.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "current_thread")]
+async fn a_recorded_process_the_kernel_will_not_describe_is_not_claimed_to_have_ended() {
+    let (identity, fenced, interrupted) = fence_an_exited_process(Interruption::Unanswered).await;
+
+    assert!(interrupted, "the kernel did not answer the last question");
+    assert!(
+        !fenced.ended.iter().any(|ended| ended.identity == identity),
+        "it is not claimed to have ended: {fenced:?}"
+    );
+    let named = fenced
+        .surviving
+        .iter()
+        .find(|resource| resource.kind == "process")
+        .unwrap_or_else(|| panic!("it is named among what survived: {fenced:?}"));
+    assert!(
+        named
+            .detail
+            .contains(&format!("process {} ", identity.pid.get())),
+        "by its identifier: {named:?}"
     );
 }
 
