@@ -719,6 +719,7 @@ impl Controller {
             Some(runtime) => runtime.doctor_check().await,
             None => crate::backup::runtime::BackupRuntime::unconfigured_check(),
         });
+        checks.push(self.production_check());
         checks.push(DoctorCheck::new(
             "configuration-secrets",
             "Secrets are named references, never configuration exports",

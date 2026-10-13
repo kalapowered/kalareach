@@ -242,6 +242,7 @@ impl Drop for ProductionLease {
         // Production waits for the pass to be over, and so does the cleanup a fence owes.
         self.signals.work.notify_one();
         self.signals.lease_ended.notify_one();
+        self.signals.produce.notify_one();
     }
 }
 

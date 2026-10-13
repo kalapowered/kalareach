@@ -53,6 +53,7 @@ mod admission;
 mod attention_reach;
 pub(crate) mod authority_changes;
 mod backup_actions;
+mod backup_production;
 mod barrier;
 mod capabilities;
 mod close;
@@ -77,6 +78,8 @@ mod start;
 mod voice_actions;
 mod voice_close;
 mod workers;
+
+pub use backup_production::{Held as ProductionHeld, ProducerBounds};
 
 pub use barrier::DEBT_PASS_INTERVAL;
 pub use capabilities::{CAPABILITY_REVISION_FILE, DESKTOP_REREAD_INTERVAL};
@@ -390,6 +393,8 @@ pub struct Controller {
     /// What reads the storage service for a restore, when this host's configuration document
     /// selects one.
     backup_relay: Option<Arc<crate::backup::relay::BackupRelay>>,
+    /// What makes this host's backups, when its configuration document selects a storage service.
+    backup_production: Option<Arc<backup_production::Production>>,
     /// The configuration this daemon has put into force.
     ///
     /// A document is a file a person may also edit by hand, and its effects live outside it: the

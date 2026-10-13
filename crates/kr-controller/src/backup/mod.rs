@@ -304,6 +304,9 @@ pub struct BackupSignals {
     /// A production pass ended, so the cleanup a fence owes, which waits for it, can be tried
     /// again at once.
     pub lease_ended: Notify,
+    /// Something that can change what the producer does happened: a setup was committed, a fence
+    /// was released, a generation finished or ciphertext left the disk.
+    pub produce: Notify,
 }
 
 impl BackupService {
@@ -867,6 +870,7 @@ impl BackupService {
             self.leases().cancel_all();
         }
         self.signals.work.notify_one();
+        self.signals.produce.notify_one();
         Ok(commit)
     }
 
@@ -907,6 +911,7 @@ impl BackupService {
             self.store()
                 .release_fence(fence_generation.get(), resumed_generation.get(), now_ms)?;
         self.signals.work.notify_one();
+        self.signals.produce.notify_one();
         Ok(released)
     }
 
@@ -939,6 +944,20 @@ impl BackupService {
             store.staging_root().to_path_buf(),
             status.current_generation,
         ))
+    }
+
+    /// Returns the fingerprint of what one generation was made from, if it was made from the
+    /// host's state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::RegistryUnavailable`] when the store cannot be read.
+    pub fn made_from(
+        &self,
+        archive_id: ArchiveId,
+        backup_generation: BackupGeneration,
+    ) -> Result<Option<Digest256>> {
+        self.store().made_from(archive_id, backup_generation)
     }
 
     /// Whether the disk still holds ciphertext that no generation needs any more.
@@ -1010,6 +1029,10 @@ impl BackupService {
                 let _ = std::fs::remove_dir(directory);
             }
         }
+        if released.objects > 0 {
+            // The producer waits for this before it stages another generation.
+            self.signals.produce.notify_one();
+        }
         Ok(released)
     }
 
@@ -1064,6 +1087,7 @@ impl BackupService {
     ) -> Result<()> {
         self.store()
             .cancel_production(archive_id, backup_generation, detail, now_ms)?;
+        self.signals.produce.notify_one();
         self.signals.work.notify_one();
         Ok(())
     }
@@ -1392,7 +1416,12 @@ impl BackupService {
         // Read under the store lock, like every other production decision, so a failure recorded
         // by another thread cannot land between the read and the transaction.
         let withheld = self.unready();
-        store.note_published(attempt, produced_under.get(), withheld.as_deref(), now_ms)
+        let publication =
+            store.note_published(attempt, produced_under.get(), withheld.as_deref(), now_ms)?;
+        // A generation finished: the producer looks again, and the carrier releases its ciphertext.
+        self.signals.produce.notify_one();
+        self.signals.work.notify_one();
+        Ok(publication)
     }
 
     /// Records that one attempt stopped and this host cannot establish what became of it.
@@ -1410,7 +1439,10 @@ impl BackupService {
     pub fn note_attempt_stopped(&self, attempt: u64, now_ms: TimestampMs) -> Result<()> {
         // Both halves of the caller's statement are recorded: that attempt has ended, so it and
         // the obligation naming it end together, and what a service may hold is written down.
-        self.store().note_attempt_stopped(attempt, now_ms)
+        self.store().note_attempt_stopped(attempt, now_ms)?;
+        self.signals.produce.notify_one();
+        self.signals.work.notify_one();
+        Ok(())
     }
 
     /// Resolves whatever an earlier daemon left unfinished.

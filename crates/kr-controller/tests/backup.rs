@@ -8393,6 +8393,10 @@ impl Timer for Moving {
     fn now(&self) -> std::time::Instant {
         *self.now.lock().expect("the clock")
     }
+
+    fn unix_ms(&self) -> u64 {
+        kr_ipc::now_ms().get()
+    }
 }
 
 /// A service that asked to be left alone is sent nothing until the delay has passed, and the pass

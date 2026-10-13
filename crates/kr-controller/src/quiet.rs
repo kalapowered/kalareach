@@ -19,6 +19,10 @@ pub trait Timer: Send + Sync + std::fmt::Debug {
 
     /// The time a delay the service named is counted from and against.
     fn now(&self) -> Instant;
+
+    /// The time of day in milliseconds since the Unix epoch, which the times a host writes down
+    /// are read against. A test that moves this moves the day a schedule is kept by.
+    fn unix_ms(&self) -> u64;
 }
 
 /// The clock the daemon waits by.
@@ -32,6 +36,10 @@ impl Timer for RealTimer {
 
     fn now(&self) -> Instant {
         Instant::now()
+    }
+
+    fn unix_ms(&self) -> u64 {
+        kr_ipc::now_ms().get()
     }
 }
 

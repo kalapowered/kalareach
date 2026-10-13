@@ -181,6 +181,8 @@ pub struct HeldTimer {
     waits: Mutex<Vec<Held>>,
     asked: Notify,
     now: Mutex<std::time::Instant>,
+    /// The time of day, which stands still until the test moves it.
+    unix_ms: Mutex<u64>,
 }
 
 impl Default for HeldTimer {
@@ -190,6 +192,7 @@ impl Default for HeldTimer {
             waits: Mutex::default(),
             asked: Notify::new(),
             now: Mutex::new(std::time::Instant::now()),
+            unix_ms: Mutex::new(kr_ipc::now_ms().get()),
         }
     }
 }
@@ -225,9 +228,19 @@ impl Timer for HeldTimer {
     fn now(&self) -> std::time::Instant {
         *self.now.lock().expect("the clock")
     }
+
+    fn unix_ms(&self) -> u64 {
+        *self.unix_ms.lock().expect("the time of day")
+    }
 }
 
 impl HeldTimer {
+    /// Moves the time of day on by `by`.
+    pub fn advance_day(&self, by: Duration) {
+        let mut now = self.unix_ms.lock().expect("the time of day");
+        *now = now.saturating_add(u64::try_from(by.as_millis()).unwrap_or(u64::MAX));
+    }
+
     /// A timer that lets every wait end at once.
     pub fn automatic() -> Arc<Self> {
         let timer = Arc::new(Self::default());

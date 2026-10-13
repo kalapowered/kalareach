@@ -185,7 +185,19 @@ struct Rig {
 
 impl Rig {
     async fn start(arrangement: Arrangement, timer: Arc<HeldTimer>) -> Self {
+        Self::start_with(arrangement, timer, |_| {}).await
+    }
+
+    /// Starts as [`Self::start`] does, after `prepare` has put what a test needs into the host
+    /// tree: the registry and the spools are the daemon's to open, so a closed session is made
+    /// before it does.
+    async fn start_with(
+        arrangement: Arrangement,
+        timer: Arc<HeldTimer>,
+        prepare: impl FnOnce(&kr_ipc::testing::TempHost),
+    ) -> Self {
         let host = kr_ipc::testing::TempHost::create();
+        prepare(&host);
         let served = serve().await;
         served.web().set_backup(arrangement.backup_on);
         if let Some(moment) = arrangement.first_status {
@@ -355,7 +367,7 @@ impl Rig {
             recovery_public_key: *self.device.public(),
             kit_fingerprint: "ABCD2345".to_owned(),
             writer_key_id: self.writer.key_id(),
-            producer_key_id: self.sender.key_id(),
+            producer_key_id: daemon_producer(&self.host).key_id(),
             enabled_at_ms: TimestampMs::new(1_000),
         };
         self.controller
@@ -400,6 +412,17 @@ impl Rig {
             .expect("host.doctor is served on the local socket")
             .to_typed()
             .expect("a result of the declared shape")
+    }
+
+    /// What the doctor says of the producer.
+    async fn production_check(&self) -> (DoctorStatus, String) {
+        let result = self.doctor().await;
+        let check = result
+            .checks
+            .iter()
+            .find(|check| check.id() == "backup-production")
+            .expect("the producer's check is reported");
+        (check.status, check.detail().to_owned())
     }
 
     /// What the doctor tells a person to do about the storage service.
@@ -692,6 +715,20 @@ fn daemon_writer(host: &kr_ipc::testing::TempHost) -> AuthorisationKeyPair {
         &kr_controller::service::net::device_key_scope(host.environment_id()),
     )
     .expect("the daemon's writer key")
+}
+
+/// The key the daemon's wraps are sent from: its stored-envelope device key, read from its own
+/// file-backed secret store once the daemon has made it.
+fn daemon_producer(host: &kr_ipc::testing::TempHost) -> StoredEnvelopeKeyPair {
+    let store =
+        open_store_in(&host.environment().secrets_dir()).expect("the daemon's secret store");
+    kr_crypto::store::load_device_keys(
+        store.store.as_ref(),
+        &kr_controller::service::net::device_key_scope(host.environment_id()),
+    )
+    .expect("the device keys read")
+    .expect("the daemon made its device keys")
+    .stored_envelope
 }
 
 /// The owner's signed enrolment of `writer` as the writer of `archive`'s collection.
@@ -3184,4 +3221,307 @@ fn walk(root: &std::path::Path) -> usize {
         }
     }
     files
+}
+
+// ---------------------------------------------------------------------------------------------
+// The host makes its backups.
+// ---------------------------------------------------------------------------------------------
+
+/// A closed session the registry holds a closure for, with output in its spool, written into the
+/// host tree before the daemon starts.
+fn closed_session(
+    host: &kr_ipc::testing::TempHost,
+    output: &[u8],
+    closed_at_ms: u64,
+) -> kr_protocol::ids::SessionId {
+    use kr_controller::registry::{LaunchPhase, Registry};
+    use kr_protocol::ids::{ActorId, SessionEpoch, SessionId};
+    use kr_protocol::session::{ClosureReason, ClosureRecord, Durability, OwnershipCoverage};
+
+    let mut registry = Registry::open(
+        host.environment().registry_database(),
+        host.environment_id(),
+    )
+    .expect("the registry");
+    let admission = registry
+        .reserve(
+            &ActorId::new("local:501").expect("a principal"),
+            kr_ipc::new_uuid(),
+            kr_protocol::scalars::Digest256::from_bytes([1; 32]),
+            &[0xa0],
+            TimestampMs::new(1),
+        )
+        .expect("a reservation");
+    let session_id: SessionId = admission.reservation.session_id;
+    registry
+        .set_phase(admission.reservation.reservation_id, LaunchPhase::Closed)
+        .expect("the session closes");
+    registry
+        .record_closure(&ClosureRecord {
+            session_id,
+            session_epoch: SessionEpoch::V1,
+            reason: ClosureReason::RootExit,
+            root_exit_code: Nullable::some(kr_protocol::scalars::U64::new(0)),
+            root_signal: Nullable::null(),
+            terminated: Vec::new(),
+            surviving: Vec::new(),
+            ownership_coverage: OwnershipCoverage::Complete,
+            durability: Durability::Durable,
+            closed_at_ms: TimestampMs::new(closed_at_ms),
+        })
+        .expect("the closure");
+    let mut history = kr_worker::history::OutputHistory::with_spool(
+        8,
+        host.environment().session_spool(session_id),
+        kr_worker::history::SpoolLayout::new(8, 1 << 20),
+    )
+    .expect("a spool");
+    history.append(output);
+    session_id
+}
+
+/// What a generation holds, opened as the recovery recipient opens it: the members by name, with
+/// their plaintext.
+fn opened_members(rig: &Rig, generation: u64) -> std::collections::BTreeMap<String, Vec<u8>> {
+    use kr_crypto::backup::{
+        ArchiveExpectation, ArchiveReader, GenerationExpectation, open_archive,
+    };
+
+    let record = rig
+        .controller
+        .backup()
+        .generation(archive_id(), BackupGeneration::new(generation))
+        .expect("a read")
+        .expect("the generation");
+    let descriptor_bytes = record.descriptor.expect("a descriptor");
+    let descriptor =
+        kr_protocol::archive::ArchiveDescriptor::from_canonical_bytes(&descriptor_bytes)
+            .expect("a descriptor");
+    let web = rig.served.web();
+    let stored = |object: BackupObjectId| {
+        web.stored(&archive_id().to_string(), &object.to_string())
+            .expect("the service holds the object")
+    };
+    let manifest = stored(descriptor.encrypted_manifest.object_id);
+    let reader = ArchiveReader::Device(&rig.device);
+    let sender = daemon_producer(&rig.host);
+    let opened = open_archive(
+        &reader,
+        sender.public(),
+        &[TrustedWriter {
+            writer_key_id: rig.writer.key_id(),
+            signing_key: *rig.writer.public(),
+            enrolled_at_ms: TimestampMs::new(1_000),
+        }],
+        &ArchiveExpectation {
+            archive_id: archive_id(),
+            generation: GenerationExpectation::Unverified,
+        },
+        &descriptor_bytes,
+        &manifest,
+    )
+    .expect("the recovery recipient opens the generation");
+    opened
+        .objects()
+        .iter()
+        .map(|entry| {
+            let restored = opened
+                .restore_object(
+                    &reader,
+                    sender.public(),
+                    entry.object.object_id,
+                    &stored(entry.object.object_id),
+                )
+                .expect("a member opens");
+            (entry.filename.clone(), restored.plaintext.expose().to_vec())
+        })
+        .collect()
+}
+
+/// A generation is made of a closed session and the configuration document, uploaded, published,
+/// and opened by the recovery recipient with the members the convention names. A second pass finds
+/// nothing changed and makes no second generation; a changed document, a day later, makes the next
+/// one, numbered after the first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_host_makes_a_backup_of_a_closed_session_and_its_configuration_once_a_day() {
+    let timer = HeldTimer::held();
+    let mut closed = None;
+    let rig = Rig::start_with(Arrangement::NORMAL, Arc::clone(&timer), |host| {
+        closed = Some(closed_session(
+            host,
+            b"first line\r\nsecond line\r\n",
+            9_000,
+        ));
+    })
+    .await;
+    let session = closed.expect("a closed session");
+    let web = Arc::clone(rig.served.web());
+    within("the first status read", web.requests_reach(STATUS, 1)).await;
+    rig.set_up();
+    rig.until("the first generation is published", |rig| rig.published(1))
+        .await;
+
+    let members = opened_members(&rig, 1);
+    let names: Vec<&str> = members.keys().map(String::as_str).collect();
+    assert_eq!(
+        names,
+        [
+            "host/configuration.json".to_owned(),
+            format!("sessions/{session}.json")
+        ]
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+    );
+    let document: serde_json::Value =
+        serde_json::from_slice(&members[&format!("sessions/{session}.json")])
+            .expect("a session export");
+    assert_eq!(document["format"], "kalareach-session-export/1");
+    let output: Vec<u8> = document["output"]["chunks"]
+        .as_array()
+        .expect("chunks")
+        .iter()
+        .flat_map(|chunk| {
+            kr_protocol::scalars::from_base64url(chunk["base64url"].as_str().expect("text"))
+                .expect("decodes")
+        })
+        .collect();
+    assert_eq!(output, b"first line\r\nsecond line\r\n");
+
+    // Nothing changed: a day later there is still one generation.
+    timer.advance_day(Duration::from_secs(25 * 3600));
+    rig.controller.backup().signals().produce.notify_one();
+    within("the producer sees nothing changed", async {
+        loop {
+            let (_, detail) = rig.production_check().await;
+            if detail.contains("nothing has changed") {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    assert_eq!(
+        rig.controller.backup().generations().expect("a read").len(),
+        1
+    );
+
+    // A document changed in place makes the next one.
+    let mut changed = kr_protocol::hostinfo::configuration::ConfigurationDocument::empty();
+    changed.revision = 2;
+    changed.storage.origin = Nullable::some(rig.served.origin().to_owned());
+    kr_ipc::paths::write_owner_only_file(
+        &kr_worker::config::document_path(&rig.host.environment()),
+        kr_protocol::hostinfo::configuration::contents(&changed).as_bytes(),
+    )
+    .expect("the document");
+    rig.controller.backup().signals().produce.notify_one();
+    rig.until("the second generation is published", |rig| rig.published(2))
+        .await;
+    assert_eq!(
+        rig.controller
+            .backup()
+            .setup()
+            .expect("a read")
+            .expect("a setup")
+            .generation_counter,
+        2
+    );
+}
+
+/// The sizes a generation is held to are the convention's, which a restore accepts: an external
+/// fact the producer and the restore must agree on, so the production value is written out here.
+#[test]
+fn the_producers_bounds_are_the_conventions() {
+    assert_eq!(
+        kr_controller::service::ProducerBounds::PRODUCTION,
+        kr_controller::service::ProducerBounds {
+            session_member_bytes: 192 * 1024 * 1024,
+            configuration_member_bytes: 1024 * 1024,
+            total_bytes: 3 * 512 * 1024 * 1024,
+            members: 4096,
+        }
+    );
+}
+
+/// Over the count the convention allows, the sessions after the newest ones that fit are left out of
+/// the generation, and `kr doctor` says so. The bound is lowered through the same path production
+/// takes. The control is the same host with both sessions inside the bound.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_sessions_past_the_member_bound_are_left_out_and_the_doctor_says_so() {
+    let timer = HeldTimer::held();
+    let mut closed = Vec::new();
+    let rig = Rig::start_with(Arrangement::NORMAL, Arc::clone(&timer), |host| {
+        closed.push(closed_session(host, b"the older session\r\n", 8_000));
+        closed.push(closed_session(host, b"the newer session\r\n", 9_000));
+    })
+    .await;
+    let newer = closed[1];
+    rig.controller
+        .lower_producer_bounds(kr_controller::service::ProducerBounds {
+            members: 2,
+            ..kr_controller::service::ProducerBounds::PRODUCTION
+        });
+    let web = Arc::clone(rig.served.web());
+    within("the first status read", web.requests_reach(STATUS, 1)).await;
+    rig.set_up();
+    rig.until("the generation is published", |rig| rig.published(1))
+        .await;
+    let members = opened_members(&rig, 1);
+    let names: Vec<&String> = members.keys().collect();
+    assert_eq!(
+        names,
+        [
+            &"host/configuration.json".to_owned(),
+            &format!("sessions/{newer}.json")
+        ]
+    );
+    let (_, detail) = rig.production_check().await;
+    assert!(
+        detail.contains("1 closed sessions were left out"),
+        "{detail}"
+    );
+}
+
+/// Nothing is read or made while privacy mode is on, whatever the setup says, and a generation
+/// follows when it is off again. A setup made while it is on is allowed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn nothing_is_made_while_privacy_mode_is_on_and_a_generation_follows_when_it_is_off() {
+    let timer = HeldTimer::held();
+    let rig = Rig::start_with(Arrangement::NORMAL, Arc::clone(&timer), |host| {
+        closed_session(host, b"a session\r\n", 9_000);
+    })
+    .await;
+    let web = Arc::clone(rig.served.web());
+    within("the first status read", web.requests_reach(STATUS, 1)).await;
+    assert!(rig.set_privacy(true).await);
+    rig.set_up();
+    within("the producer finds privacy mode on", async {
+        loop {
+            let (_, detail) = rig.production_check().await;
+            if detail.contains("privacy mode is on") {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    assert!(
+        rig.controller
+            .backup()
+            .generations()
+            .expect("a read")
+            .is_empty(),
+        "nothing was made"
+    );
+    assert!(web.arrived().iter().all(|arrived| arrived.path != CREATE));
+
+    within("privacy mode is turned off", async {
+        while !rig.set_privacy(false).await {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    rig.until("a generation is published", |rig| rig.published(1))
+        .await;
 }

@@ -636,8 +636,8 @@ impl Controller {
         // time one is needed and loaded after that. They go through the proxy this daemon started
         // with, the endpoint's own. Nothing runs yet: settling comes before the store is
         // reconciled, and the carrier starts after it.
-        let (backup_runtime, relay_parts) = match started.storage.origin() {
-            None => (None, None),
+        let (backup_runtime, relay_parts, backup_production) = match started.storage.origin() {
+            None => (None, None, None),
             Some(origin) => {
                 let origin = kr_protocol::service::GatewayOrigin::new(origin).map_err(|error| {
                     ControllerError::NotConfigured(format!(
@@ -657,6 +657,12 @@ impl Controller {
                     &writer,
                     &account.bound_tokens_for(origin.as_str(), backup.binding()),
                 )?;
+                let production = Arc::new(super::backup_production::Production::new(
+                    origin.as_str().to_owned(),
+                    writer.clone(),
+                    device_keys.stored_envelope.clone(),
+                    Arc::clone(&timer),
+                ));
                 let runtime = crate::backup::runtime::BackupRuntime::new(
                     Arc::clone(&backup),
                     &clients,
@@ -669,7 +675,11 @@ impl Controller {
                 // the same record of the delays the service has named. The relay is built once
                 // privacy mode's state is published, which every read of it is held to.
                 let quiet = runtime.quiet();
-                (Some(runtime), Some((origin, writer, quiet)))
+                (
+                    Some(runtime),
+                    Some((origin, writer, quiet)),
+                    Some(production),
+                )
             }
         };
         // External destinations' credentials are kept in the same store as this host's own keys,
@@ -861,6 +871,7 @@ impl Controller {
             backup,
             backup_runtime,
             backup_relay,
+            backup_production,
             transfer,
             project,
             qualification: std::sync::RwLock::new(qualification),
@@ -1079,6 +1090,8 @@ impl Controller {
             if let Some(runtime) = &controller.backup_runtime {
                 runtime.run();
             }
+            // And what the host makes of its own state is made, for as long as the daemon runs.
+            controller.start_backup_production();
         }
         // A device whose grant runs out while the daemon runs is no longer paired, and its
         // destination, the credential held for it and the authorisation behind it end with that,

@@ -278,7 +278,7 @@ impl Controller {
     /// # Errors
     ///
     /// Returns an invalid-argument refusal naming what this host has not established.
-    async fn refuse_if_live(self: &Arc<Self>, session_id: SessionId) -> Result<()> {
+    pub(super) async fn refuse_if_live(self: &Arc<Self>, session_id: SessionId) -> Result<()> {
         if self.a_worker_may_still_own(session_id).await? {
             return Err(ControllerError::InvalidArgument(format!(
                 "session {session_id} has a worker this daemon has not confirmed ended"

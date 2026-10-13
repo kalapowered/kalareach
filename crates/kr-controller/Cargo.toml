@@ -32,7 +32,7 @@ iroh.workspace = true
 kr-cbor.workspace = true
 kr-changeset.workspace = true
 # The managed-service seams: one HTTP exchange and one signature, both supplied by the embedder.
-kr-client = { workspace = true, default-features = false }
+kr-client = { workspace = true, default-features = false, features = ["terminal"] }
 kr-crypto.workspace = true
 kr-delivery.workspace = true
 # Session names, pins and generated-description provenance: the environment's session-metadata
