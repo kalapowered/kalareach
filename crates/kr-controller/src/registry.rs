@@ -4513,11 +4513,11 @@ mod tests {
         );
     }
 
-    /// The release before this one left the device store's record of the host's wall clock with
-    /// three columns. A registry at that release's version comes forward with the columns the
-    /// record has since gained and keeps the row it held.
+    /// A registry at version 7 holds the device store's record of the host's wall clock with three
+    /// columns. It comes forward with the columns the record has since gained and keeps the row it
+    /// held.
     #[test]
-    fn a_registry_of_the_release_before_is_brought_forward_with_the_clock_record_it_gained() {
+    fn a_registry_at_version_7_is_brought_forward_with_the_clock_record_it_gained() {
         let directory = tempfile::tempdir().expect("a directory");
         let path = directory.path().join("registry.sqlite3");
         drop(Registry::open(&path, environment()).expect("a registry"));
@@ -4574,12 +4574,12 @@ mod tests {
         assert_eq!(kept, 1234);
     }
 
-    /// The release before this one recorded the document an environment accepted at version 1 of the
-    /// configuration document. A registry of that release comes forward with the record as it was,
-    /// and the record is still the document it was: read at the version this build writes, not
-    /// refused as one it does not know.
+    /// A registry at version 7 recorded the document an environment accepted at version 1 of the
+    /// configuration document. It comes forward with the record as it was, and the record is still
+    /// the document it was: read at the version this build writes, not refused as one it does not
+    /// know.
     #[test]
-    fn a_registry_of_the_release_before_is_brought_forward_with_the_document_it_accepted() {
+    fn a_registry_at_version_7_is_brought_forward_with_the_document_it_accepted() {
         let directory = tempfile::tempdir().expect("a directory");
         let path = directory.path().join("registry.sqlite3");
         let earlier =
@@ -4624,12 +4624,12 @@ mod tests {
     }
 
     /// A release that reads version 9 kept no answer to a redemption or to a transfer of control.
-    /// A registry it left, and one left at the version before this one, come forward to this
-    /// version with no row changed: the answers these methods keep are written by a release that
-    /// writes 10 or later.
+    /// A registry it left, and one at each later version, come forward to this version with as many
+    /// rows in the answer and grant tables as they held: the steps from 9 write only the version,
+    /// and the answers these methods keep are written by a release that writes 10 or later.
     #[test]
-    fn a_registry_at_an_earlier_version_comes_forward_and_changes_no_row() {
-        for from in [9, SCHEMA_VERSION - 1] {
+    fn a_registry_at_an_earlier_version_comes_forward_with_the_rows_it_held() {
+        for from in 9..SCHEMA_VERSION {
             let directory = tempfile::tempdir().expect("a directory");
             let path = directory.path().join("registry.sqlite3");
             drop(Registry::open(&path, environment()).expect("a registry"));
