@@ -360,6 +360,14 @@ impl Rig {
             .host_account()
             .mark_at(&self.origin())
             .expect("an account is signed in");
+        self.set_up_for(mark)
+    }
+
+    /// Records the owner's setup for the account `mark` names, whichever is signed in now.
+    fn set_up_for(
+        &self,
+        mark: kr_client::services::AccountMark,
+    ) -> kr_controller::backup::store::SetupRecord {
         let record = kr_controller::backup::store::SetupRecord {
             archive_id: archive_id(),
             origin: self.origin(),
@@ -3077,9 +3085,15 @@ async fn a_host_signed_in_as_another_account_than_its_backups_belong_to_sends_no
     let rig = Rig::start(Arrangement::NORMAL, Arc::clone(&timer)).await;
     let web = Arc::clone(rig.served.web());
     within("the first status read", web.requests_reach(STATUS, 1)).await;
-    rig.set_up();
-
+    // The setup is the first account's, and the host is signed in as another before it commits, so
+    // the producer, which this host's document wakes, has nothing it may send either.
+    let mark = rig
+        .controller
+        .host_account()
+        .mark_at(&rig.origin())
+        .expect("an account is signed in");
     rig.sign_in_as("account-2").await;
+    rig.set_up_for(mark);
     rig.admit_to_an_enrolled_archive(1, &[(1, plaintext(2048))]);
     within("the carrier says the account is another", async {
         loop {
@@ -3524,4 +3538,47 @@ async fn nothing_is_made_while_privacy_mode_is_on_and_a_generation_follows_when_
     .await;
     rig.until("a generation is published", |rig| rig.published(1))
         .await;
+}
+
+/// The members together never pass the total a restore accepts, the configuration among them: it
+/// is counted first, and a session that no longer fits is left out whole.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_configuration_is_counted_in_the_total_a_restore_accepts() {
+    let timer = HeldTimer::held();
+    let rig = Rig::start_with(Arrangement::NORMAL, Arc::clone(&timer), |host| {
+        closed_session(host, b"a session\r\n", 9_000);
+    })
+    .await;
+    let configured = std::fs::read(kr_worker::config::document_path(&rig.host.environment()))
+        .expect("the document");
+    let configuration = kr_protocol::hostinfo::configuration::contents(
+        &kr_protocol::hostinfo::configuration::load(Some(&configured))
+            .document
+            .expect("a document"),
+    )
+    .len() as u64;
+    let total = configuration + 10;
+    rig.controller
+        .lower_producer_bounds(kr_controller::service::ProducerBounds {
+            total_bytes: total,
+            ..kr_controller::service::ProducerBounds::PRODUCTION
+        });
+    let web = Arc::clone(rig.served.web());
+    within("the first status read", web.requests_reach(STATUS, 1)).await;
+    rig.set_up();
+    rig.until("the generation is published", |rig| rig.published(1))
+        .await;
+    let members = opened_members(&rig, 1);
+    assert_eq!(
+        members.keys().collect::<Vec<_>>(),
+        ["host/configuration.json"],
+        "the session no longer fit and is left out whole"
+    );
+    assert!(
+        members
+            .values()
+            .map(|member| member.len() as u64)
+            .sum::<u64>()
+            <= total
+    );
 }

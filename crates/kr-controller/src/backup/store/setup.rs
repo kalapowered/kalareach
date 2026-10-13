@@ -174,6 +174,23 @@ impl BackupStore {
                             .to_owned(),
                     ));
                 }
+                // An archive this host already has generations of is not the next one: a late
+                // repeat of a setup for an archive that was replaced would otherwise start its
+                // count again under generations the host still records.
+                let used: i64 = transaction
+                    .read_one(
+                        sql!("SELECT COUNT(*) FROM generations WHERE archive_id = ?1"),
+                        params![archive],
+                        |row| row.get(0),
+                    )
+                    .map_err(ControllerError::registry)?;
+                if used > 0 {
+                    return Err(ControllerError::InvalidArgument(
+                        "this host already records generations of that archive, so it cannot be \
+                         set up for it again"
+                            .to_owned(),
+                    ));
+                }
                 let set_aside = earlier.record.archive_id;
                 transaction
                     .run(
@@ -303,6 +320,31 @@ impl BackupStore {
                     .map_err(|_| ControllerError::registry("a stored fingerprint is not 32 bytes"))
             })
             .transpose()
+    }
+
+    /// Whether any object of a generation whose production is over still has its ciphertext on this
+    /// host's disk, whether or not it can be given back yet.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::RegistryUnavailable`] when the store cannot be read.
+    pub fn holds_finished_ciphertext(&self) -> Result<bool> {
+        let held: i64 = self
+            .connection
+            .read_one(
+                sql!(
+                    "SELECT COUNT(*) FROM objects
+                       JOIN generations
+                         ON generations.archive_id = objects.archive_id
+                        AND generations.backup_generation = objects.backup_generation
+                      WHERE objects.local_state = 'present'
+                        AND generations.production IN ('cancelled', 'complete')"
+                ),
+                [],
+                |row| row.get(0),
+            )
+            .map_err(ControllerError::registry)?;
+        Ok(held > 0)
     }
 
     /// Returns every object whose ciphertext is on this host's disk and no longer needed there.

@@ -54,6 +54,9 @@ pub const INTERVAL_MS: u64 = 24 * 60 * 60 * 1000;
 /// The most output a host retains of one session: 128 MiB, the cap a producer reads at most.
 const RETAINED_PER_SESSION_BYTES: u64 = 128 << 20;
 
+/// What a pass leaves free on the disk it stages on: 1 GiB.
+const DISK_RESERVE: u64 = 1 << 30;
+
 /// The longest a pass waits before it looks at its checks again.
 const RECHECK: Duration = Duration::from_secs(60 * 60);
 
@@ -105,6 +108,8 @@ pub enum Held {
     /// The ciphertext of a finished generation is still on the disk, and nothing new is staged
     /// before it is released.
     Releasing,
+    /// The disk holds too little to stage a generation and keep a gibibyte free.
+    LowDisk,
     /// It has not been a day yet.
     NotDue,
     /// What would be packed is what the newest generation was made from.
@@ -241,7 +246,7 @@ impl Controller {
                     backup.setup()?,
                     backup.generations()?,
                     backup.authorised_writers()?,
-                    backup.has_finished_ciphertext()?,
+                    backup.holds_finished_ciphertext()?,
                     backup.privacy_status()?,
                 ))
             })
@@ -322,6 +327,34 @@ impl Controller {
             }
         }
 
+        // Files a pass that was killed left, and the lease that holds the staging directory, both
+        // before anything is read: the content is read under the privacy generation the lease
+        // names, and a privacy cycle after that is caught where the generation is admitted.
+        let sweep = {
+            let backup = Arc::clone(&backup);
+            tokio::task::spawn_blocking(move || backup.remove_unclaimed_staging()).await
+        };
+        if !matches!(sweep, Ok(Ok(_))) {
+            production.hold(Held::Failed(
+                "the staging directory could not be swept".to_owned(),
+            ));
+            return Some(backoff.next_delay());
+        }
+        let published = self.privacy.state().now();
+        if published.private {
+            production.hold(Held::Privacy);
+            return None;
+        }
+        let lease = match backup.begin_production() {
+            Ok(lease) => lease,
+            // Refused: privacy mode stopped production since the check, or the store is not
+            // ready. The first is signalled when it is over; the second is looked at again soon.
+            Err(_) => {
+                production.hold(Held::Privacy);
+                return Some(RELEASE_WAIT);
+            }
+        };
+
         let bounds = production.bounds();
         let (candidates, open) = match self.closed_candidates().await {
             Ok(found) => found,
@@ -331,7 +364,7 @@ impl Controller {
             }
         };
         production.observed().open_sessions = open;
-        let configuration = self.configuration_member(bounds);
+        let configuration = self.configuration_member(bounds).await;
         let selected = bounds
             .members
             .saturating_sub(usize::from(configuration.is_some()));
@@ -361,16 +394,15 @@ impl Controller {
             return Some(RECHECK);
         }
 
-        let lease = match backup.begin_production() {
-            Ok(lease) => lease,
-            // Refused: privacy mode stopped production between the check and the lease, or the
-            // store is not ready. The first is signalled when it is over; the second is looked at
-            // again soon.
-            Err(_) => {
-                production.hold(Held::Privacy);
-                return Some(RELEASE_WAIT);
-            }
-        };
+        // The disk the staging directory is on must hold what the pass can need and a gibibyte
+        // more, so a pass never fills the disk the registry and the spools are on.
+        let needed = projected_bytes(&candidates, configuration.as_deref(), bounds);
+        if let Some(free) = kr_describe::resource::platform::free_space(self.paths().state_dir())
+            && free < needed.saturating_add(DISK_RESERVE)
+        {
+            production.hold(Held::LowDisk);
+            return Some(RECHECK);
+        }
         let archive = self.archive().clone();
         let pass = Pass {
             lease,
@@ -379,8 +411,9 @@ impl Controller {
             generation: generation_counter.saturating_add(1),
             candidates,
             configuration,
-            fingerprint,
             bounds,
+            published,
+            privacy: self.privacy.state().clone(),
             now_ms: now,
             environment: self.paths().environment_id().get(),
             writer: production.writer.clone(),
@@ -479,10 +512,14 @@ impl Controller {
 
     /// The configuration document as the daemon accepts it, as the canonical text it is kept as,
     /// or none when it is not there, cannot be used or passes its bound.
-    fn configuration_member(&self, bounds: ProducerBounds) -> Option<Vec<u8>> {
-        let path = kr_worker::config::document_path(self.paths());
-        let bytes = std::fs::read(path).ok()?;
-        let loaded = kr_protocol::hostinfo::configuration::load(Some(&bytes));
+    ///
+    /// It is read the way the daemon reads it, with the checks of the file that read makes, on a
+    /// blocking worker.
+    async fn configuration_member(&self, bounds: ProducerBounds) -> Option<Vec<u8>> {
+        let paths = self.paths().clone();
+        let loaded = tokio::task::spawn_blocking(move || kr_worker::config::load(&paths))
+            .await
+            .ok()?;
         if loaded.fails_closed() {
             return None;
         }
@@ -561,6 +598,14 @@ impl Controller {
                 ),
                 None,
             ),
+            Some(Held::LowDisk) => (
+                DoctorStatus::Warning,
+                Sentence::new().stated(
+                    "the disk this host keeps its state on has too little room to stage a backup \
+                     and keep a gibibyte free",
+                ),
+                Some("Free some space on that disk."),
+            ),
             Some(Held::NotDue) => (
                 DoctorStatus::Ok,
                 Sentence::new().stated("the newest backup is less than a day old"),
@@ -592,7 +637,10 @@ impl Controller {
             detail = detail
                 .stated("; ")
                 .number(observed.left_out_sessions)
-                .stated(" closed sessions were left out of the last backup because of its size");
+                .stated(
+                    " closed sessions were left out of the last backup, for its size or because their \
+                     output could not be read",
+                );
         }
         if observed.left_out_configuration {
             detail = detail.stated("; the configuration document was not packed");
@@ -625,8 +673,10 @@ struct Pass {
     generation: u64,
     candidates: Vec<Candidate>,
     configuration: Option<Vec<u8>>,
-    fingerprint: Digest256,
     bounds: ProducerBounds,
+    /// The privacy state read before the lease, which must be the state at admission.
+    published: crate::privacy::Published,
+    privacy: crate::privacy::PrivacyState,
     now_ms: u64,
     environment: kr_protocol::scalars::Uuid,
     writer: AuthorisationKeyPair,
@@ -661,8 +711,14 @@ impl PageSource for SpoolPages<'_> {
 impl Pass {
     async fn make(self) -> Result<Made> {
         let mut objects: Vec<StagedObject> = Vec::new();
-        let mut total = 0u64;
+        // The configuration is counted first, so the members together never pass the total a
+        // restore accepts, whichever sessions are left out.
+        let mut total = self
+            .configuration
+            .as_ref()
+            .map_or(0, |document| document.len() as u64);
         let mut left_out = 0u64;
+        let mut unreadable = Vec::new();
         let generation = BackupGeneration::new(self.generation);
         let archive_id = self.setup.archive_id;
         let stage = |staged: &mut StagedObject| -> Result<Option<()>> {
@@ -678,7 +734,12 @@ impl Pass {
                 Err(Staging::Failed(error)) => Err(error),
             }
         };
-        for candidate in &self.candidates {
+        for (position, candidate) in self.candidates.iter().enumerate() {
+            if total >= self.bounds.total_bytes {
+                // The total is reached: this session and every later one are left out.
+                left_out += (self.candidates.len() - position) as u64;
+                break;
+            }
             let mut source = SpoolPages {
                 archive: &self.archive,
                 session_id: candidate.summary.session_id,
@@ -699,9 +760,12 @@ impl Pass {
             let composed = match composed {
                 Ok(composed) => composed,
                 Err(Stop::Source(Staging::Cancelled)) => return Ok(Made::Cancelled),
-                // A session whose output cannot be read is left out, and the rest go on.
+                // A session whose output cannot be read is left out, and the rest go on. It is
+                // not in the fingerprint kept with the generation, so the next day's pass finds
+                // what it would pack changed and tries it again.
                 Err(_) => {
                     left_out += 1;
+                    unreadable.push(position);
                     continue;
                 }
             };
@@ -772,12 +836,25 @@ impl Pass {
             Err(Staging::Cancelled) => return Ok(Made::Cancelled),
             Err(Staging::Failed(error)) => return Err(error),
         }
+        // Privacy mode may have gone on and off since this pass read its content: the state it
+        // read under must be the one in force now, and not private.
+        if self.privacy.now() != self.published {
+            return Ok(Made::Cancelled);
+        }
+        let kept: Vec<&Candidate> = self
+            .candidates
+            .iter()
+            .enumerate()
+            .filter(|(position, _)| !unreadable.contains(position))
+            .map(|(_, candidate)| candidate)
+            .collect();
+        let fingerprint = fingerprint_of(&kept, self.configuration.as_deref());
         match self.backup.admit_produced(
             &self.lease,
             &sealed,
             &objects,
             self.writer.key_id(),
-            self.fingerprint,
+            fingerprint,
             TimestampMs::new(self.now_ms),
         ) {
             Ok(_) => Ok(Made::Admitted { left_out }),
@@ -805,10 +882,11 @@ fn spool_bytes(directory: &std::path::Path) -> u64 {
 /// A digest of what would be packed: each session's identifier, when it closed and how much output
 /// it retains, and the configuration's own digest. The identifiers go into the digest and nowhere
 /// else; a member's name is inside the encrypted manifest and the store never writes it down.
-fn fingerprint_of(candidates: &[Candidate], configuration: Option<&[u8]>) -> Digest256 {
+fn fingerprint_of(candidates: &[impl AsRef<Candidate>], configuration: Option<&[u8]>) -> Digest256 {
     let mut hashed = Vec::new();
     hashed.extend_from_slice(b"kalareach-backup-source/1");
     for candidate in candidates {
+        let candidate = candidate.as_ref();
         hashed.extend_from_slice(candidate.summary.session_id.get().as_bytes());
         hashed.extend_from_slice(&candidate.closed_at_ms.to_be_bytes());
         hashed.extend_from_slice(&candidate.retained_bytes.to_be_bytes());
@@ -821,4 +899,36 @@ fn fingerprint_of(candidates: &[Candidate], configuration: Option<&[u8]>) -> Dig
         None => hashed.push(0),
     }
     Digest256::from_bytes(kr_cbor::sha256(&hashed))
+}
+
+impl AsRef<Self> for Candidate {
+    fn as_ref(&self) -> &Self {
+        self
+    }
+}
+
+/// What a pass can need on the disk it stages on: for each session, the smaller of the session
+/// member bound and forty times its retained output (a document is not four thirds of its output
+/// once its pieces are small), up to the total, with the ciphertext's overhead, the configuration
+/// and the manifest.
+fn projected_bytes(
+    candidates: &[Candidate],
+    configuration: Option<&[u8]>,
+    bounds: ProducerBounds,
+) -> u64 {
+    // The encrypted manifest is at most its payload bound plus the stream's overhead, which the
+    // headroom below covers.
+    const MANIFEST_HEADROOM: u64 = 64 * 1024 * 1024 + 4096;
+    let mut total = configuration.map_or(0, |document| document.len() as u64);
+    for candidate in candidates {
+        if total >= bounds.total_bytes {
+            break;
+        }
+        total += bounds
+            .session_member_bytes
+            .min(candidate.retained_bytes.saturating_mul(40));
+    }
+    total
+        .min(bounds.total_bytes)
+        .saturating_add(MANIFEST_HEADROOM)
 }

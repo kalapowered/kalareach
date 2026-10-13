@@ -832,6 +832,15 @@ impl EnvironmentPrivacy {
         self.report(&inner, now_ms)
     }
 
+    /// Lets the backup service's cleanup be tried at the next tick whatever its schedule says.
+    ///
+    /// A production pass that held the staging directory delayed the cleanup a fence owes, and the
+    /// schedule counted that as a try that got nowhere; the end of the pass is the news that the
+    /// cleanup can go on.
+    pub fn retry_backup_cleanup(&self) {
+        self.inner().cleanup = Backoff::default();
+    }
+
     /// Answers `privacy.set`: turns privacy mode on or off and says where the change stands.
     ///
     /// `sessions` are the sessions the environment holds content for, each of which owes its own

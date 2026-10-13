@@ -9192,6 +9192,7 @@ fn the_database_refuses_to_lower_the_count_or_to_delete_the_setup() {
 /// still producing keeps its files, one whose upload is open keeps them, and a generation that
 /// completed loses them, its rows say so and its directory goes. An unlink that fails leaves the
 /// object pending, and the next try finishes it.
+#[cfg(unix)]
 #[test]
 fn finished_ciphertext_leaves_the_disk_and_a_failed_unlink_is_tried_again() {
     use std::os::unix::fs::PermissionsExt as _;
@@ -9618,4 +9619,108 @@ async fn an_answer_of_not_held_is_not_recorded_for_an_archive_the_host_is_not_bo
             TimestampMs::new(60_100),
         )
         .expect("recorded");
+}
+
+/// Ciphertext is given back by the cleanup a fence owes and by nothing else while a fence stands:
+/// the carrier's release stays out, and the directory of a generation is not taken from under a
+/// cleanup that has still to flush it. The control: with no fence the same release goes through.
+#[test]
+fn finished_ciphertext_is_not_released_under_a_fence_and_the_cleanup_completes() {
+    let environment = Environment::open();
+    let service = environment.service();
+    let producer = Producer::generate();
+    service
+        .enrol_writer(producer.writer.key_id(), archive_id(), TimestampMs::new(1))
+        .expect("the writer is enrolled");
+    let objects = [stage(1, "a.cbor", b"one")];
+    service
+        .admit(
+            &producer.seal(1, &objects),
+            &objects,
+            producer.writer.key_id(),
+            TimestampMs::new(5_000),
+        )
+        .expect("the generation is admitted");
+    service
+        .raise_fence(PrivacyGeneration::new(1), TimestampMs::new(6_000))
+        .expect("the fence goes up");
+    service
+        .cancel_undispatched_work(PrivacyGeneration::new(1), TimestampMs::new(6_100))
+        .expect("the work is taken back");
+    assert!(!service.has_finished_ciphertext().expect("a read"));
+    assert_eq!(
+        service
+            .release_finished_ciphertext()
+            .expect("a release")
+            .objects,
+        0,
+        "nothing is given back under a fence"
+    );
+    service
+        .run_cleanup(PrivacyGeneration::new(1), TimestampMs::new(6_200))
+        .expect("the cleanup runs");
+    assert!(
+        service.obligations().expect("a read").is_empty(),
+        "the cleanup finished, with the directories its files were in still there to flush"
+    );
+    assert_eq!(
+        service
+            .release_fence(
+                PrivacyGeneration::new(1),
+                PrivacyGeneration::new(2),
+                TimestampMs::new(6_300),
+            )
+            .expect("a release"),
+        FenceRelease::Released
+    );
+}
+
+/// A setup repeated as itself does not move the binding, so the carrier's tokens are not refused
+/// for an iteration by a repeat; a replacement is refused for an archive the host already has
+/// generations of.
+#[test]
+fn a_repeated_setup_leaves_the_binding_and_a_used_archive_is_not_set_up_again() {
+    let root = tempfile::tempdir().expect("a disposable directory");
+    let service = BackupService::in_memory(&root.path().join("backup")).expect("a service");
+    service
+        .reconcile(TimestampMs::new(4_000))
+        .expect("reconciliation");
+    let producer = Producer::generate();
+    let record = a_setup(archive_id(), &producer, "ABCD2345");
+    service
+        .commit_setup(&record, false, TimestampMs::new(1_000))
+        .expect("written");
+    let epoch = service.binding().read().epoch;
+    assert_eq!(
+        service
+            .commit_setup(&record, false, TimestampMs::new(1_001))
+            .expect("a repeat"),
+        SetupCommit::Unchanged
+    );
+    assert_eq!(service.binding().read().epoch, epoch);
+
+    let objects = [stage(1, "a.cbor", b"one")];
+    service
+        .admit(
+            &producer.seal(1, &objects),
+            &objects,
+            producer.writer.key_id(),
+            TimestampMs::new(5_000),
+        )
+        .expect("a generation");
+    let next = ArchiveId::new(Uuid::from_bytes([0x12; 16]));
+    service
+        .commit_setup(
+            &a_setup(next, &producer, "QQQQ2345"),
+            true,
+            TimestampMs::new(6_000),
+        )
+        .expect("a replacement");
+    assert!(
+        matches!(
+            service.commit_setup(&record, true, TimestampMs::new(7_000)),
+            Err(ControllerError::InvalidArgument(_))
+        ),
+        "a late repeat for the archive that was replaced does not bring it back"
+    );
 }

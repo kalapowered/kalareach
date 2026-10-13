@@ -740,8 +740,9 @@ impl BackupService {
             // The name is gone from the directory, and the directory entry is flushed so losing
             // power cannot bring it back. A flush this host could not make is not a removal it may
             // report: losing power could return the name, and the obligation that would find it
-            // again would be gone.
-            if let Err(error) = sync_directory(&path) {
+            // again would be gone. The directory the name was in may be gone too, with its last
+            // object, and then it is the nearest one that is still there that is flushed.
+            if let Err(error) = sync_removal(&path) {
                 store.note_obligation_failed(obligation.id, &error.to_string(), now_ms)?;
                 continue;
             }
@@ -863,8 +864,10 @@ impl BackupService {
         let commit = store.commit_setup(record, replace, now_ms)?;
         // Inside the hold in which the setup committed, and nowhere else: from here a request the
         // backup clients make is held to this account.
-        self.binding
-            .switch(AccountMark::from_bytes(record.account_mark));
+        if commit != SetupCommit::Unchanged {
+            self.binding
+                .switch(AccountMark::from_bytes(record.account_mark));
+        }
         if matches!(commit, SetupCommit::Replaced { .. }) {
             // What the earlier archive had running is told to stop with the commit.
             self.leases().cancel_all();
@@ -966,7 +969,26 @@ impl BackupService {
     ///
     /// Returns [`ControllerError::RegistryUnavailable`] when the store cannot be read.
     pub fn has_finished_ciphertext(&self) -> Result<bool> {
-        Ok(!self.store().releasable_ciphertext()?.is_empty())
+        let store = self.store();
+        // Under a fence the cleanup the fence owes removes what is left, and a removal of the same
+        // files and their directory from here would leave that cleanup nothing to flush.
+        if store.privacy_status()?.inhibited_at().is_some() {
+            return Ok(false);
+        }
+        Ok(!store.releasable_ciphertext()?.is_empty())
+    }
+
+    /// Whether the disk holds ciphertext of a generation whose production is over, in any archive,
+    /// whether or not it can be given back yet: an attempt or an upload of it may still be open.
+    ///
+    /// The producer stages nothing while this is so, so the ciphertext on the disk is at most one
+    /// generation's, across a replacement of the setup too.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::RegistryUnavailable`] when the store cannot be read.
+    pub fn holds_finished_ciphertext(&self) -> Result<bool> {
+        self.store().holds_finished_ciphertext()
     }
 
     /// Removes the staged ciphertext of every generation whose production is over and which no
@@ -985,6 +1007,11 @@ impl BackupService {
     pub fn release_finished_ciphertext(&self) -> Result<Released> {
         let (todo, root) = {
             let store = self.store();
+            // Nothing is given back under a fence: the cleanup it owes names the same files and
+            // flushes the directories they are in, and it is the cleanup that completes it.
+            if store.privacy_status()?.inhibited_at().is_some() {
+                return Ok(Released::default());
+            }
             (
                 store.releasable_ciphertext()?,
                 store.staging_root().to_path_buf(),
@@ -1009,7 +1036,7 @@ impl BackupService {
                     continue;
                 }
             }
-            if let Err(error) = sync_directory(&path) {
+            if let Err(error) = sync_removal(&path) {
                 released.pending += 1;
                 released.failure.get_or_insert_with(|| error.to_string());
                 continue;

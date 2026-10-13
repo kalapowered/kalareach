@@ -1230,6 +1230,8 @@ impl Controller {
     fn start_privacy_tick(self: &Arc<Self>) {
         let daemon = Arc::downgrade(self);
         let changed = self.privacy.changed();
+        let signals = self.backup.signals();
+        let privacy = Arc::downgrade(&self.privacy);
         #[cfg(feature = "testing")]
         let (passes, waiting) = (
             Arc::clone(&self.privacy_passes),
@@ -1242,7 +1244,15 @@ impl Controller {
             loop {
                 #[cfg(feature = "testing")]
                 waiting.store(dormant, std::sync::atomic::Ordering::SeqCst);
-                wait_for_the_next_pass(dormant, &changed, &mut ticks).await;
+                // A backup production pass that ended lets the cleanup it held up go on at once.
+                tokio::select! {
+                    () = wait_for_the_next_pass(dormant, &changed, &mut ticks) => {}
+                    () = signals.lease_ended.notified(), if !dormant => {
+                        if let Some(privacy) = privacy.upgrade() {
+                            privacy.retry_backup_cleanup();
+                        }
+                    }
+                }
                 #[cfg(feature = "testing")]
                 waiting.store(false, std::sync::atomic::Ordering::SeqCst);
                 let Some(quiet) = privacy_pass(&daemon).await else {
