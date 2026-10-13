@@ -146,6 +146,10 @@ pub(crate) struct Relay {
     frozen_deadlines: bool,
     /// The most a principal holds outstanding across its leases.
     aggregate_limit: u64,
+    /// The allowance warning every answer carries, in percent: 80 or 95.
+    warning: Option<u32>,
+    /// The principal is inside its bounded grace, so every answer carries what is left of it.
+    in_grace: bool,
     /// The time of the request being answered, by the machine's clock.
     seen_ms: u64,
     counter: u64,
@@ -163,6 +167,8 @@ impl Default for Relay {
             no_relay: false,
             frozen_deadlines: false,
             aggregate_limit: OUTSTANDING_CEILING_BYTES,
+            warning: None,
+            in_grace: false,
             seen_ms: 0,
             counter: 0,
             issuer: AuthorisationKeyPair::generate().expect("an admission key"),
@@ -248,6 +254,36 @@ impl Relay {
     /// refill past it.
     pub(crate) const fn limit_aggregate(&mut self, bytes: u64) {
         self.aggregate_limit = bytes;
+    }
+
+    /// Every answer carries the allowance warning at `percent`, or none.
+    pub(crate) const fn warn(&mut self, percent: Option<u32>) {
+        self.warning = percent;
+    }
+
+    /// The principal is inside its bounded grace, or is not: every answer carries what is left.
+    pub(crate) const fn enter_grace(&mut self, in_grace: bool) {
+        self.in_grace = in_grace;
+    }
+
+    /// The warnings an answer carries.
+    fn warnings(&self) -> Value {
+        self.warning.map_or_else(
+            || json!([]),
+            |threshold| {
+                json!([{ "threshold": threshold, "raised_at": "2026-10-12T12:00:00.000Z" }])
+            },
+        )
+    }
+
+    /// What is left of the principal's grace, as an answer carries it.
+    fn grace_remainder(&self) -> Value {
+        json!({
+            "started_at": "2026-10-12T12:00:00.000Z",
+            "ends_at": "2026-10-12T12:15:00.000Z",
+            "remaining_ms": "600000",
+            "remaining_bytes": "104857600",
+        })
     }
 
     /// The service has no record of a lease any more: it never issued it, as far as it can say.
@@ -731,8 +767,8 @@ fn granted(relay: &Relay, payer: &str, lease: &Lease) -> ServiceHttpAnswer {
         "payer": payer,
         "reservation_id": lease.reservation_id,
         "allowance": allowance(relay, reserved),
-        "warnings": [],
-        "grace": Value::Null,
+        "warnings": relay.warnings(),
+        "grace": if relay.in_grace { relay.grace_remainder() } else { Value::Null },
     }))
 }
 
@@ -818,14 +854,9 @@ fn refused_answer(relay: &Relay, payer: &str, state: &str, message: &str) -> Ser
             "A self-hosted relay configured in the service settings."
         ],
         "allowance": allowance(relay, relay.outstanding(payer)),
-        "warnings": [],
-        "grace": if state == "exhausted" {
-            json!({
-                "started_at": "2026-10-12T12:00:00.000Z",
-                "ends_at": "2026-10-12T12:15:00.000Z",
-                "remaining_ms": "600000",
-                "remaining_bytes": "104857600",
-            })
+        "warnings": relay.warnings(),
+        "grace": if state == "exhausted" || relay.in_grace {
+            relay.grace_remainder()
         } else {
             Value::Null
         },
