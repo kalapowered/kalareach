@@ -324,13 +324,13 @@ operated by the same party as the push gateway can match them.
 
 Placing an object is safe to repeat, because the service recognises a second delivery of the same
 envelope and stores one item. The mailbox is asked only while the notification has more life left
-than the longest wait of its own schedule, which is five minutes; one with five minutes or less goes
+than the limit of its own schedule's waits, which is five minutes; one with five minutes or less goes
 at once without its detail. If the service cannot be reached, asks for later or does not answer, the
 push is not sent. It is tried again on its usual schedule, and not before the time the service
 named. The push waits for the mailbox in the notification's first four attempts. The push goes at
 once, without its detail, when the service asks for more than five minutes, when waiting would leave
-five minutes or less before the notification expires, and at the fifth attempt, so that the gateway
-keeps at least the last three. Once a push has gone without its detail, a later attempt at it does
+five minutes or less before the notification expires, and at the fifth attempt if the mailbox still
+cannot take the object, so that the gateway keeps at least the last three. Once a push has gone without its detail, a later attempt at it does
 not ask the mailbox again. A service that refuses the object, because the device's mailbox is full,
 is not waited for either. The notification is a person's alert, and the push is what brings the
 device to read its mailbox, so it goes without its detail and its record says why. A host whose
