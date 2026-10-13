@@ -6,7 +6,7 @@
  * the page says it has. What the page keeps of a result then has to outlive the screen that
  * showed it: the person can leave the sharing tab, or have the hand-over sheet open, while the
  * host's answer arrives, and a note about a screen or a line about a revocation that went with the
- * screen would be a result nobody was shown. So these live here, for the page's life, by the host
+ * screen would be a result nobody was shown. So these live here, for the page's life, by the port
  * the page talks to, and the screens only draw them.
  *
  * A result is taken in once: the roads it can arrive by (the command that sent the action, a
@@ -52,6 +52,7 @@ export class SharingDesk {
   #kept: Kept = { revoked: [], notes: [] }
   readonly #listeners = new Set<() => void>()
   readonly #taken = new Set<string>()
+  readonly #checks = new Set<string>()
   readonly #shown = new Map<string, readonly string[]>()
   readonly #meant = new Map<string, Meant>()
 
@@ -74,6 +75,19 @@ export class SharingDesk {
     if (this.#taken.has(action)) return false
     this.#taken.add(action)
     return true
+  }
+
+  /**
+   * Marks the action of a Check again as one, so that its answer, however late and whether or not
+   * the line it checks is still there, is only ever an answer to a check.
+   */
+  markCheck(action: string): void {
+    this.#checks.add(action)
+  }
+
+  /** Whether `action` is a Check again. */
+  isCheck(action: string): boolean {
+    return this.#checks.has(action)
   }
 
   /** The lines the person was shown with an invitation, kept for the answer that comes later. */
@@ -141,10 +155,10 @@ export class SharingDesk {
   }
 }
 
-/** One desk for each host the page talks to, for as long as the page lives. */
+/** One desk for each port the page talks to, for as long as the page lives. */
 const desks = new WeakMap<HostPort, SharingDesk>()
 
-/** The desk of a host. */
+/** The desk of a port. */
 export function deskOf(port: HostPort): SharingDesk {
   let desk = desks.get(port)
   if (desk === undefined) {

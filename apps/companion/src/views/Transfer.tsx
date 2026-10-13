@@ -122,6 +122,15 @@ export function Transfer({
     heading.current?.focus()
   }, [])
 
+  // The control that was pressed goes when the sheet moves on (asking gives way to waiting, a
+  // refusal to choosing): focus that was on it is brought back to the heading, not left on the
+  // page behind the sheet. Focus the person moved elsewhere is theirs.
+  useEffect(() => {
+    if (document.activeElement === document.body || document.activeElement === null) {
+      heading.current?.focus()
+    }
+  }, [state])
+
   /** Lets a reference go without sending it. The host has nothing to undo: only a record to clear. */
   const release = (reference: string) => {
     if (owned.current === reference) owned.current = null

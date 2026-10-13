@@ -1052,7 +1052,7 @@ describe('what an attempt says when the host has not', () => {
     controls.sharing.setUnreadable(2)
     await reread()
     const line = await screen.findByTestId('attempts-unreadable')
-    expect(line.textContent).toMatch(/2 records kept by another release/)
+    expect(line.textContent).toMatch(/2 records of sharing on this device are not read by this version/)
     expect(line.textContent).toMatch(/left as\s+they are/)
   })
 })
@@ -1149,7 +1149,7 @@ describe('a hand-over the person cancelled', () => {
         transferAsk: () =>
           new Promise<never>((_resolve, reject) => {
             rejectAsk = () => {
-               
+
               reject({
                 code: 'RESOURCE_UNAVAILABLE',
                 message: 'the host did not answer, so it is not known whether an owner device was asked',
@@ -1242,5 +1242,121 @@ describe('where focus goes when an invitation is withdrawn from the row that is 
     })
     expect(document.body).not.toHaveFocus()
     expect(screen.getByRole('heading', { level: 2, name: 'Sharing' })).toHaveFocus()
+  })
+})
+
+describe('what is left of the sharing page when a control goes', () => {
+  it('tells the failure of a remove once, not at every reading of the list', async () => {
+    const host = fakeHost()
+    let removes = 0
+    const failing = {
+      ...host,
+      port: {
+        ...host.port,
+        attemptRemove: () => {
+          removes += 1
+          return Promise.reject({
+            code: 'RESOURCE_UNAVAILABLE',
+            message: 'the record could not be removed',
+            user_action: 'none'
+          })
+        }
+      }
+    } as typeof host
+    const { controls, person } = await openSharing(failing)
+    await person.click(screen.getByRole('radio', { name: PHONE }))
+    controls.sharing.loseNextAnswer()
+    await person.click(screen.getByTestId('invite'))
+    await screen.findByTestId('attempt')
+    controls.sharing.recover()
+    await reread()
+    await screen.findByText(/the record could not be removed/)
+    await reread()
+    await reread()
+    expect(removes).toBe(1)
+  })
+
+  it('keeps focus on the line when Check again goes because nothing is pending', async () => {
+    const { controls, person } = await withOwnerShare()
+    await askForHandOver(person)
+    controls.sharing.holdBarrier(true)
+    act(() => {
+      controls.sharing.ownerAnswers()
+    })
+    const line = await screen.findByTestId('recently-revoked', {}, { timeout: 4000 })
+    await person.click(within(line).getByTestId('check-again'))
+    await waitFor(() => {
+      expect(within(screen.getByTestId('recently-revoked')).queryByTestId('check-again')).toBeNull()
+    })
+    expect(screen.getByTestId('recently-revoked')).toHaveFocus()
+  })
+
+  it('does not bring a dismissed line back when the answer to its Check again is recovered', async () => {
+    const { controls, person } = await withOwnerShare()
+    await askForHandOver(person)
+    controls.sharing.holdBarrier(true)
+    act(() => {
+      controls.sharing.ownerAnswers()
+    })
+    const line = await screen.findByTestId('recently-revoked', {}, { timeout: 4000 })
+    controls.sharing.loseNextAnswer()
+    await person.click(within(line).getByTestId('check-again'))
+    await screen.findByTestId('attempt')
+    await person.click(within(screen.getByTestId('recently-revoked')).getByTestId('revoked-dismiss'))
+    controls.sharing.recover()
+    await reread()
+    await waitFor(() => {
+      expect(screen.queryByTestId('attempt')).toBeNull()
+    })
+    expect(screen.queryByTestId('recently-revoked')).toBeNull()
+  })
+
+  it('moves focus to a row that is still there when the one chosen was dismissed while the host answered', async () => {
+    const host = fakeHost()
+    let releaseRevoke: () => void = () => undefined
+    const slow = {
+      ...host,
+      port: {
+        ...host.port,
+        grantRevoke: (params: Parameters<typeof host.port.grantRevoke>[0]) =>
+          new Promise<Awaited<ReturnType<typeof host.port.grantRevoke>>>((resolve) => {
+            releaseRevoke = () => {
+              resolve(host.port.grantRevoke(params))
+            }
+          })
+      }
+    }
+    const { controls, person } = await openSharing(slow)
+    controls.sharing.setScreen(['before'])
+    await person.click(screen.getByRole('switch', { name: 'Let them watch the session live' }))
+    await screen.findByRole('region', { name: /^Screen at / })
+    controls.sharing.setScreen(['first change'])
+    await person.click(screen.getByRole('radio', { name: PHONE }))
+    await person.click(screen.getByTestId('invite'))
+    await screen.findByTestId('screen-changed')
+    controls.sharing.setScreen(['second change'])
+    await person.click(screen.getByRole('radio', { name: /Guest tablet/ }))
+    await person.click(screen.getByTestId('invite'))
+    await waitFor(() => {
+      expect(screen.getAllByTestId('screen-changed')).toHaveLength(2)
+    })
+    const [first, second] = screen.getAllByTestId('screen-changed')
+    // Withdraw the first note and, while the host answers, dismiss the second.
+    await person.click(within(first).getByTestId('screen-withdraw'))
+    await person.click(within(second).getByTestId('screen-dismiss'))
+    await act(async () => {
+      releaseRevoke()
+      await Promise.resolve()
+    })
+    await waitFor(() => {
+      expect(screen.queryByTestId('screen-changed')).toBeNull()
+    })
+    expect(document.body).not.toHaveFocus()
+  })
+
+  it('does not leave focus on the page behind the hand-over sheet when asking gives way to waiting', async () => {
+    const { person } = await withOwnerShare()
+    await askForHandOver(person)
+    expect(document.body).not.toHaveFocus()
   })
 })

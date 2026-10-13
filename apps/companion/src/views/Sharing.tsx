@@ -76,7 +76,7 @@ import {
   type OfferedRole
 } from '../model/sharing'
 import { deskOf } from '../model/sharing-desk'
-import { handedOver, invited, rechecked, tookBack } from '../model/sharing-results'
+import { handedOver, invited, pendingWorkers, rechecked, tookBack } from '../model/sharing-results'
 import { Transfer } from './Transfer'
 
 /** How often the list of who has access is read again while the screen is open. */
@@ -357,17 +357,18 @@ function SharingTab({
    * made in the background, or by the person asking the host. The first delivery is told and kept
    * on the desk, which outlives this screen; a second, by another road, changes nothing.
    */
-  const receive = (attempt: AttemptView, value: unknown) => {
-    if (!desk.firstTime(attempt.action_id)) return
+  const receive = (attempt: AttemptView, value: unknown): boolean => {
+    if (!desk.firstTime(attempt.action_id)) return false
     if (attempt.kind === 'invite') {
       const made = value as GrantCreateResult
       invited(desk, say, made, nameOf(made.grant.recipient_device_id), desk.recall(attempt.action_id))
     } else if (attempt.kind === 'revoke') {
       const grantId = attempt.revoked_grant_id ?? attempt.grant_id ?? ''
-      if (desk.has(grantId)) {
-        // A line already says it was revoked: this is the answer to Check again, whose reply
-        // was lost, and it changes how far the workers have got and nothing else.
-        rechecked(desk, value as RevocationResult, grantId)
+      if (desk.isCheck(attempt.action_id)) {
+        // The answer to a Check again whose reply was lost. It changes how far the workers have
+        // got on the line that is there, and never makes a line: one the person dismissed since
+        // stays dismissed.
+        if (desk.has(grantId)) recheck(value as RevocationResult, grantId)
       } else {
         const meant = desk.meant(grantId)
         tookBack(
@@ -388,6 +389,21 @@ function SharingTab({
         handedOver(desk, say, done, attempt.revoked_grant_id, 'the device that gave control up', words, clock.now())
       }
     }
+    return true
+  }
+
+  /**
+   * Says how far the workers have got with a revocation already on the page. A button that is on
+   * that line and goes when nothing is pending gives its focus to the line first.
+   */
+  function recheck(result: RevocationResult, grantId: string): void {
+    if (pendingWorkers(result) === 0) {
+      const line = document.querySelector<HTMLElement>(`[data-line="${grantId}"]`)
+      if (line !== null && line.contains(document.activeElement) && document.activeElement !== line) {
+        line.focus()
+      }
+    }
+    rechecked(desk, result, grantId)
   }
 
   // What the latest render knows, for the callbacks that outlive a render.
@@ -404,7 +420,9 @@ function SharingTab({
     for (const attempt of attempts) {
       if (attempt.phase !== 'closed' || attempt.outcome !== 'happened') continue
       if (attempt.result === null || !here(attempt)) continue
-      latest.current.receive(attempt, attempt.result)
+      // Only the delivery that took the result in removes the record, once: a record that stays
+      // is not asked to go at every reading of the list.
+      if (!latest.current.receive(attempt, attempt.result)) continue
       void ask(() => port.attemptRemove(attempt.action_id)).then(load, (error: unknown) => {
         // Told once, and not told again each time the attempts are read: the record stays, and a
         // restart lists it with what the host can still be asked for.
@@ -464,15 +482,20 @@ function SharingTab({
    * names it, and the grant's own row, which the withdrawal takes away too, is not a place to go.
    */
   const awayFrom = (control: HTMLElement | null, withdrawn?: string): (() => void) => {
-    const scope = heading.current?.parentElement ?? document
-    const rows = Array.from(scope.querySelectorAll<HTMLElement>('[data-nav]')).filter(
-      (row) => withdrawn === undefined || row.dataset.grant !== withdrawn
-    )
+    const rowsNow = (): HTMLElement[] =>
+      Array.from(
+        (heading.current?.parentElement ?? document).querySelectorAll<HTMLElement>('[data-nav]')
+      ).filter((row) => withdrawn === undefined || row.dataset.grant !== withdrawn)
     const own = control?.closest<HTMLElement>('[data-nav]') ?? null
-    const index = own === null ? -1 : rows.indexOf(own)
-    const next = rows[index + 1] ?? rows[index - 1] ?? heading.current
+    const was = own === null ? -1 : rowsNow().indexOf(own)
     return () => {
-      next?.focus()
+      // Looked for when focus is to move, not when the control was pressed: a row the person
+      // dismissed while the host was answering is not a place to go.
+      const rows = rowsNow()
+      const at = own !== null && rows.includes(own) ? rows.indexOf(own) : -1
+      const next =
+        at >= 0 ? (rows[at + 1] ?? rows[at - 1]) : (rows[Math.max(was, 0)] ?? rows[rows.length - 1])
+      ;(next ?? heading.current)?.focus()
     }
   }
 
@@ -509,11 +532,14 @@ function SharingTab({
   const checkAgain = (grantId: string) => {
     ask(() => port.grantRevoke({ grant_id: grantId }))
       .then((done) => {
+        // Whatever comes of it, this action is a check: its answer, if it arrives later, is only
+        // ever an answer to one.
+        desk.markCheck(done.attempt.action_id)
         if (done.value === null) {
           say('The host’s answer did not arrive. Check again in a moment.', 'pending')
           return
         }
-        if (desk.firstTime(done.attempt.action_id)) rechecked(desk, done.value, grantId)
+        if (desk.firstTime(done.attempt.action_id) && desk.has(grantId)) recheck(done.value, grantId)
       })
       .catch((error: unknown) => {
         say(failureText(error), 'danger')
@@ -714,6 +740,7 @@ function SharingTab({
             className="small access-revoked"
             key={line.grantId}
             data-testid="recently-revoked"
+            data-line={line.grantId}
             data-nav
             tabIndex={-1}
           >
@@ -858,9 +885,9 @@ function SharingTab({
         ) : null}
         {unreadable > 0 ? (
           <p className="small muted" data-testid="attempts-unreadable">
-            {String(unreadable)} record{unreadable === 1 ? '' : 's'} kept by another release of this
-            application {unreadable === 1 ? 'is' : 'are'} not read here, and {unreadable === 1 ? 'is' : 'are'} left as{' '}
-            {unreadable === 1 ? 'it is' : 'they are'}.
+            {String(unreadable)} record{unreadable === 1 ? '' : 's'} of sharing on this device{' '}
+            {unreadable === 1 ? 'is' : 'are'} not read by this version, and{' '}
+            {unreadable === 1 ? 'is' : 'are'} left as {unreadable === 1 ? 'it is' : 'they are'}.
           </p>
         ) : null}
       </section>
