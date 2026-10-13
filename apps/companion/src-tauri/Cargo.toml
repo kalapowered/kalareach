@@ -80,8 +80,13 @@ windows-future = { workspace = true, features = ["std"] }
 # What `tauri build` turns on, and what a release build must have: the interface comes from the
 # bundle rather than from a development server.
 custom-protocol = ["tauri/custom-protocol"]
+# Seams the application's own tests act through, compiled in for them and in no shipped build: the
+# clock that counts a share's bound can be moved on, to pass a bound no test can wait out.
+testing = ["kr-client/testing"]
 
 [dev-dependencies]
+# This crate's own tests, with the seams above compiled in.
+companion-tauri = { path = ".", features = ["testing"] }
 # The pinned width model, which a test measures a placed run against.
 kr-width.workspace = true
 # The pairing suite runs this computer against kr-controller's in-process daemon, whose test

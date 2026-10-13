@@ -122,6 +122,8 @@ struct Handover {
 pub struct ShareDesk {
     root: Mutex<Option<PathBuf>>,
     pace: Mutex<Option<Pace>>,
+    /// Time a test has added to the clock that counts an attempt's bound.
+    #[cfg(feature = "testing")]
     skew: Mutex<Duration>,
     running: Mutex<HashMap<ActionId, Running>>,
     handovers: Mutex<HashMap<String, Handover>>,
@@ -149,7 +151,9 @@ impl ShareDesk {
     }
 
     /// Makes the clock that counts an attempt's bound read `by` later than it does. A test uses
-    /// it to pass a bound it cannot wait out; nothing in the application calls it.
+    /// it to pass a bound it cannot wait out; a shipped build has no such thing, since time added
+    /// makes a read count sooner than it should.
+    #[cfg(feature = "testing")]
     pub fn advance(&self, by: Duration) {
         let mut skew = self.skew.lock().unwrap_or_else(PoisonError::into_inner);
         *skew = skew.saturating_add(by);
@@ -198,7 +202,9 @@ impl ShareDesk {
             .unwrap_or_else(PoisonError::into_inner)
             .get(&action_id)
             .map_or_else(Armed::now, |running| running.armed);
-        armed.skewed(*self.skew.lock().unwrap_or_else(PoisonError::into_inner))
+        #[cfg(feature = "testing")]
+        let armed = armed.skewed(*self.skew.lock().unwrap_or_else(PoisonError::into_inner));
+        armed
     }
 
     /// How long ago the attempt's bound began to be counted.

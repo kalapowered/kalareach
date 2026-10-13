@@ -1247,6 +1247,7 @@ version = "0.1.0"
 dependencies = [
  "block2",
  "companion-platform",
+ "companion-tauri",
  "iroh",
  "kr-cbor",
  "kr-client",
