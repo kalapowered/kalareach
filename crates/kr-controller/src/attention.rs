@@ -2681,12 +2681,14 @@ impl AttentionModule {
     // ----- The workflow journal's alerts ----------------------------------------------------
 
     /// Reads the workflow journal's attention records for as long as the module is held: one pass
-    /// now, and then one each time the journal changes.
+    /// now, and then one each time the journal changes and holds a record the store has not read.
     ///
-    /// The first pass has run when this returns, so a daemon that waits for it at its start has put
-    /// right whatever the last daemon left between the store and the journal before it serves
-    /// anything. After a pass that stopped short the next is made after `AUTOMATION_EVERY`. A
-    /// second call starts nothing further.
+    /// A change to the journal that brings no such record (a workflow's subscription, a position
+    /// another reader moved) costs one look at the journal and no pass: every pass reads the host's
+    /// clock, and a host at rest reads it when something chose to. The first pass has run when this
+    /// returns, so a daemon that waits for it at its start has put right whatever the last daemon
+    /// left between the store and the journal before it serves anything. After a pass that stopped
+    /// short the next is made after `AUTOMATION_EVERY`. A second call starts nothing further.
     pub async fn consume_automation(self: &Arc<Self>, journal: Arc<WorkflowStore>) {
         if self.automation_started.set(()).is_err() {
             return;
@@ -2717,9 +2719,12 @@ impl AttentionModule {
                 let (Some(held), Some(journal)) = (module.upgrade(), journal.upgrade()) else {
                     return;
                 };
-                // Marked before the pass reads the journal, so what is committed while it runs is
-                // seen by the pass after it.
+                // Marked before the journal is looked at, so what is committed while it is read is
+                // seen by the wait after it.
                 changes.borrow_and_update();
+                if clean && !held.automation_records_waiting(&journal).await {
+                    continue;
+                }
                 let taken = held.take_automation(&journal).await;
                 clean = taken.is_ok();
                 held.report_automation(taken);
@@ -2731,6 +2736,24 @@ impl AttentionModule {
             .automation_task
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(task);
+    }
+
+    /// Whether the workflow journal holds an attention record past the store's cursor, which a
+    /// pass would read. Answers `true` when it cannot tell, so the pass is made and reports why.
+    async fn automation_records_waiting(self: &Arc<Self>, journal: &Arc<WorkflowStore>) -> bool {
+        let module = Arc::clone(self);
+        let journal = Arc::clone(journal);
+        tokio::task::spawn_blocking(move || {
+            let Ok(cursor) = module.automation_cursor() else {
+                return true;
+            };
+            match journal.events_after(cursor, ATTENTION_EVENTS, 1) {
+                Ok(page) => !page.is_empty(),
+                Err(_) => true,
+            }
+        })
+        .await
+        .unwrap_or(true)
     }
 
     /// Makes one pass over the workflow journal's attention records.
@@ -6965,21 +6988,27 @@ pub(crate) mod tests {
         }
     }
 
-    /// KR-PERF-003: the store's reading of the workflow journal keeps no timer. After its first
-    /// passes, which settle what the journal's own registration writes, hours of waiting make none.
+    /// KR-PERF-003: the store's reading of the workflow journal keeps no timer, and the one pass it
+    /// makes when it starts is the only one while the journal brings no attention record: not for
+    /// the registration that pass writes, and not for what another reader of the journal writes
+    /// (a second consumer's registration). Every pass reads the host's clock, so a pass nothing
+    /// asked for is a clock reading at a moment nothing chose.
     #[tokio::test(start_paused = true)]
-    async fn an_idle_reader_of_the_workflow_journal_makes_no_pass_while_the_journal_does_not_change()
+    async fn the_reader_of_the_workflow_journal_makes_one_pass_at_its_start_and_none_for_what_brings_no_record()
      {
         let temp = kr_ipc::testing::TempHost::create();
         let module = self::module(&temp);
         let journal = Arc::new(WorkflowStore::in_memory().expect("a journal"));
         module.consume_automation(Arc::clone(&journal)).await;
         let passes = || module.automation_passes.load(Ordering::SeqCst);
+        assert_eq!(passes(), 1, "the first pass was made");
         tokio::time::sleep(Duration::from_secs(60 * 60)).await;
-        let settled = passes();
-        assert!(settled > 0, "the first pass was made");
+        assert_eq!(passes(), 1, "an hour of waiting made no second pass");
+        journal
+            .register_consumer("another-reader", &[], kr_ipc::now_ms().get())
+            .expect("another reader registers");
         tokio::time::sleep(Duration::from_secs(60 * 60)).await;
-        assert_eq!(passes(), settled, "an hour of waiting made no pass");
+        assert_eq!(passes(), 1, "a change that brings no record made no pass");
     }
 
     /// KR-PERF-003: a pass over the workflow journal that writes and then fails, every time, is
