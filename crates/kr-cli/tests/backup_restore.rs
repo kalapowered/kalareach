@@ -2406,3 +2406,23 @@ async fn the_folder_is_checked_again_when_opened_and_the_probe_removes_only_what
     assert!(warnings.is_empty(), "nothing is left to say");
     assert_eq!(names(&fixture.into), ["restore.json"]);
 }
+
+/// A run that ends without publishing its record removes what it made, however it ended, a panic
+/// included: dropping the held folder is the backstop under the explicit cleanup.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_held_folder_dropped_before_the_record_is_published_is_emptied_of_what_was_made() {
+    use kr_cli::backup::directory::Destination;
+
+    let fixture = Fixture::new().await;
+    let destination = Destination::check(&fixture.into).expect("the folder passes");
+    let mut held = destination.open().expect("the folder opens");
+    held.write_member("session-0001.json", b"what a restore wrote")
+        .expect("a member is written");
+    assert_eq!(names(&fixture.into), ["session-0001.json"]);
+    drop(held);
+    assert!(
+        names(&fixture.into).is_empty(),
+        "the file was removed with the handle"
+    );
+    assert!(fixture.into.is_dir(), "the folder is never removed");
+}
