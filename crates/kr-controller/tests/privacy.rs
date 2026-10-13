@@ -2899,6 +2899,10 @@ impl kr_controller::push::transport::DeliveryTransports for ThroughTheHeldMailbo
     ) -> Result<Arc<dyn kr_client::services::ServiceHttp>, String> {
         Ok(Arc::clone(&self.0) as Arc<dyn kr_client::services::ServiceHttp>)
     }
+
+    fn outbound(&self) -> kr_controller::config::Outbound {
+        kr_controller::config::Outbound::Direct
+    }
 }
 
 /// A gateway that takes whatever it is sent, and remembers it.
