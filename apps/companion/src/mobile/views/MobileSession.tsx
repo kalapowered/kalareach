@@ -193,9 +193,11 @@ export function MobileSession({
   // the host has said, nothing is attached.
   const liveScreen = opened?.held?.includes_live_screen
   const showsLiveScreen = liveScreen === true && !over
-  const { unread } = useSessionAgent(sessionId, {
-    gate: { token: token ?? null, running: standingOpen }
-  })
+  const gate = useMemo(
+    () => ({ token: token ?? null, running: standingOpen }),
+    [token, standingOpen]
+  )
+  const { unread } = useSessionAgent(sessionId, { gate })
   const read = session.loaded || unread !== null ? { refusal: unread } : null
   const nodes = useMemo(
     () => session.conversation.nodes.slice(-80).map(readNode),
@@ -838,7 +840,7 @@ export function MobileSession({
     },
     [lifecycle, book, sessionId]
   )
-  useReceiptReads({ sessionId, connected, submissions: mine, onReceipt: settleFromRecord })
+  useReceiptReads({ sessionId, connected, submissions: mine, onReceipt: settleFromRecord, gate })
   // The connection's words for contact lost. A session whose own link is being taken up again, with
   // the connection to the host still up, says the same, in the same words, and, as the connection's
   // do, nothing before the shell has answered whether the host is in contact.

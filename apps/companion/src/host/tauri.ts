@@ -245,7 +245,7 @@ export function tauriPort(): HostPort {
       mutate<Settled>('draft_add_attachment', params, subject),
 
     historyPage: (params) => read('history_page', params),
-    actionRead: (params) => read('action_read', params),
+    actionRead: (params, opening) => readIn('action_read', params, opening),
     // Attention and review belong to the environment, so an acknowledgement names no session.
     attentionRead: (params) => read('attention_read', params),
     attentionAcknowledge: (params) => mutate('attention_acknowledge', params, {}),

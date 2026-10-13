@@ -17,6 +17,7 @@ import { useEffect, useRef } from 'react'
 import type { Receipt } from '@kalareach/protocol'
 
 import { applyReceipt, type Submission } from '../model/receipts'
+import type { OpeningGate } from './agent'
 import { readOnCadence } from './cadence'
 import { useApp } from './state'
 
@@ -37,17 +38,23 @@ export function awaitsReceipt(submission: Submission): boolean {
 /**
  * Reads the record of every action of `sessionId` that has no outcome yet, while the host is
  * reached, and hands `onReceipt` each record that says more than the submission does.
+ *
+ * A screen with an opening reads under its token, and only while the host says the opening is
+ * open: the host decides the read over the session under the standing it holds now, so an opening
+ * that is over, refused or being taken up again reads nothing and reads at once when it is open.
  */
 export function useReceiptReads({
   sessionId,
   connected,
   submissions,
-  onReceipt
+  onReceipt,
+  gate
 }: {
   readonly sessionId: string
   readonly connected: boolean | null
   readonly submissions: readonly Submission[]
   readonly onReceipt: (localId: string, receipt: Receipt) => void
+  readonly gate?: OpeningGate
 }): void {
   const { port } = useApp()
   const owed = submissions.filter(awaitsReceipt)
@@ -59,8 +66,10 @@ export function useReceiptReads({
     settle.current = onReceipt
   })
   const owing = owed.map((each) => `${each.localId}|${each.actionId ?? ''}`).join(',')
+  const token = gate === undefined ? undefined : (gate.token ?? undefined)
+  const waiting = gate !== undefined && (gate.token === null || !gate.running)
   useEffect(() => {
-    if (connected !== true || owing === '') return
+    if (connected !== true || owing === '' || waiting) return
     // The wait before the next read: the first pace at the start, then twice as long after each.
     let wait = RECEIPT_READ_FIRST_MS
     // False once the view is gone: a pass that is in the middle of its reads makes no more.
@@ -72,7 +81,10 @@ export function useReceiptReads({
           if (!live || document.visibilityState === 'hidden') return
           if (each.actionId === null) continue
           try {
-            const record = await port.actionRead({ action_id: each.actionId, session_id: sessionId })
+            const record = await port.actionRead(
+              { action_id: each.actionId, session_id: sessionId },
+              token
+            )
             // Only a record that says more than the submission does is taken, so that a read of the
             // same answer again changes nothing.
             if (applyReceipt(each, record.receipt) !== each) settle.current(each.localId, record.receipt)
@@ -98,5 +110,5 @@ export function useReceiptReads({
       document.removeEventListener('visibilitychange', shown)
       reads.stop()
     }
-  }, [connected, owing, port, sessionId])
+  }, [connected, owing, port, sessionId, token, waiting])
 }

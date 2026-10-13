@@ -12,7 +12,7 @@ import { type ReactNode } from 'react'
 import { describe, expect, it } from 'vitest'
 import { act, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
-import type { ActionRight } from '@kalareach/protocol'
+import type { ActionRight, Receipt } from '@kalareach/protocol'
 
 import { AppProvider, useApp } from '../../src/app/state'
 import { fakeHost } from '../../src/host/fake'
@@ -602,6 +602,129 @@ describe('contact with a session being taken up again', () => {
     })
     expect(await screen.findByText('Not in contact with this host')).toBeInTheDocument()
     expect(screen.queryByText('Connected again')).toBeNull()
+  })
+})
+
+describe('what became of a send the host could not confirm', () => {
+  /** A receipt of an action, at the state the host's record holds. */
+  function receiptAt(action: string, state: Receipt['state']): Receipt {
+    return {
+      action_id: action,
+      actor_id: 'device:phone',
+      error: null,
+      method: 'agent.prompt.submit',
+      method_version: 1,
+      payload_digest: '0'.repeat(64),
+      reason: null,
+      revision: '1',
+      state,
+      updated_at_ms: '0',
+      accepted_deadline_ms: null
+    }
+  }
+
+  const ACTION = 'f3a6c0de-0000-4000-8000-000000000001'
+
+  /**
+   * A port whose prompts the host takes and never confirms, as the real host answers an outcome it
+   * cannot establish (with the action's identifier), whose record of every action is `state`, and the
+   * reads it was asked for, with their openings.
+   */
+  function recording(port: HostPort, state: () => Receipt['state']) {
+    const reads: { readonly action: string; readonly opening: string | undefined }[] = []
+    const sent: (string | undefined)[] = []
+    return {
+      reads,
+      sent,
+      port: {
+        ...port,
+        composerSubmit: (params: Parameters<HostPort['composerSubmit']>[0], opening?: string) => {
+          sent.push(opening)
+          return port
+            .composerSubmit(params, opening)
+            .then((answer) => ({ ...answer, receipt: null, value: null, action_id: ACTION }))
+        },
+        actionRead: (params: { action_id: string }, opening?: string) => {
+          reads.push({ action: params.action_id, opening })
+          return Promise.resolve({ receipt: receiptAt(params.action_id, state()), result: null })
+        }
+      } as HostPort
+    }
+  }
+
+  async function sendOne(person: ReturnType<typeof userEvent.setup>) {
+    await screen.findByText(FIRST_ENTRY)
+    await person.type(screen.getByLabelText('Message this session'), 'go on')
+    await person.click(screen.getByRole('button', { name: 'Send' }))
+  }
+
+  it('reads the host’s record of the action under the screen’s opening, and settles the send by it', async () => {
+    const person = userEvent.setup()
+    const host = fakeHost()
+    const record = recording(host.port, () => 'applied')
+    render(screenOn(record.port))
+    await sendOne(person)
+
+    await waitFor(() => {
+      expect(record.reads.length).toBeGreaterThan(0)
+    })
+    const token = host.controls.standings.tokenOf(SESSION_MAIN)
+    expect(token).toBeDefined()
+    expect(record.reads.every((read) => read.opening === token)).toBe(true)
+    expect(await screen.findByText('Applied')).toBeInTheDocument()
+    expect(screen.queryByTestId('composer-send-anyway')).toBeNull()
+  })
+
+  it('lets a person who checked send again under the same opening, as a new action, and keeps the earlier one listed', async () => {
+    const person = userEvent.setup()
+    const host = fakeHost()
+    const record = recording(host.port, () => 'unknown')
+    render(screenOn(record.port))
+    await sendOne(person)
+    await waitFor(() => {
+      expect(record.reads.length).toBeGreaterThan(0)
+    })
+    const field = screen.getByLabelText('Message this session')
+    await person.clear(field)
+    await person.type(field, 'the next thing')
+    await person.click(await screen.findByTestId('composer-send-anyway'))
+
+    await waitFor(() => {
+      expect(record.sent).toHaveLength(2)
+    })
+    const token = host.controls.standings.tokenOf(SESSION_MAIN)
+    expect(record.sent).toEqual([token, token])
+    // The earlier action is still listed as one nobody knows the end of.
+    expect(await screen.findByTestId('earlier-actions')).toHaveTextContent('Outcome unknown')
+  })
+
+  it('reads nothing while the opening is not open, and reads at once when it is open again', async () => {
+    const person = userEvent.setup()
+    const host = fakeHost()
+    const record = recording(host.port, () => 'unknown')
+    render(screenOn(record.port))
+    await sendOne(person)
+    await waitFor(() => {
+      expect(record.reads.length).toBe(1)
+    })
+
+    // The link is lost: the host is asked nothing more under this opening until it says it is open.
+    act(() => {
+      host.controls.standings.say(SESSION_MAIN, {
+        state: 'reconnecting',
+        reason: 'Contact with the session was lost.'
+      })
+    })
+    await screen.findByText('Not in contact with this host')
+    expect(record.reads).toHaveLength(1)
+
+    act(() => {
+      host.controls.standings.say(SESSION_MAIN, share(['session.view', 'agent.prompt']))
+    })
+    await waitFor(() => {
+      expect(record.reads).toHaveLength(2)
+    })
+    expect(record.reads[1]?.opening).toBe(record.reads[0]?.opening)
   })
 })
 
