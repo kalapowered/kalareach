@@ -650,6 +650,29 @@ describe('the desktop port and a host being chosen', () => {
     }
   )
 
+  it('takes events as they come when a choice is refused and the connection cannot say which host is in use', async () => {
+    const port = tauriPort()
+    const heard: string[] = []
+    await port.subscribe((event) => {
+      heard.push(event.sequence)
+    })
+    await port.onConnection(() => undefined)
+    shell.handlers.get(CONNECTION_EVENT)?.(connection('env-a'))
+
+    const refused = Promise.reject(new Error('That host is not in the list.'))
+    refused.catch(() => undefined)
+    const unread = Promise.reject(new Error('The connection could not be read.'))
+    unread.catch(() => undefined)
+    shell.answers.set('hosts_use', refused)
+    shell.answers.set('connection_state', unread)
+    await expect(port.hostsUse('host-x')).rejects.toThrow('That host is not in the list.')
+
+    // Nothing says which host is in use, so nothing is dropped, as before any host was known.
+    shell.handlers.get(HOST_EVENT)?.(at('env-a', '1'))
+    shell.handlers.get(HOST_EVENT)?.(at('env-b', '2'))
+    expect(heard).toEqual(['1', '2'])
+  })
+
   it('keeps what the connection said when a read made before it answers after it', async () => {
     const port = tauriPort()
     const heard: string[] = []
