@@ -231,6 +231,67 @@ for (const size of SIZES) {
       await photograph(page, `sharing-unfinished-${size.name}`)
     })
 
+    // KR-REQ-18.14: an attempt the person hid is not lost from sight: the one line that says so has
+    // the control that shows it again, focus goes to it and back, and nothing is pushed sideways.
+    test('hides an unfinished attempt and shows it again, with focus following', async ({ page }) => {
+      await openSharing(page)
+      await page.evaluate(() => {
+        window.krTestHost?.sharing.loseNextAnswer()
+      })
+      await page.getByRole('radio', { name: /Sam's iPhone/ }).check()
+      await page.getByTestId('invite').click()
+      const attempt = page.getByTestId('attempt')
+      await expect(attempt).toBeVisible()
+      await attempt.getByTestId('attempt-hide').focus()
+      await page.keyboard.press('Enter')
+      const show = page.getByTestId('attempt-show')
+      await expect(show).toBeVisible()
+      await expect(show).toBeFocused()
+      expect(await overflowsSideways(page, '[data-testid="access"]')).toEqual([])
+      expect((await show.boundingBox())?.height ?? 0).toBeGreaterThanOrEqual(30)
+      await photograph(page, `sharing-hidden-${size.name}`)
+
+      await page.keyboard.press('Enter')
+      await expect(attempt).toBeVisible()
+      await expect(attempt).toBeFocused()
+      await expect(page.getByTestId('hidden-attempts')).toHaveCount(0)
+    })
+
+    // KR-REQ-18.15: a hand-over left asking, whose reference is gone, is cancelled from the list.
+    test('lists a hand-over that can no longer be finished with the one control that cancels it', async ({
+      page
+    }) => {
+      await openSharing(page)
+      await page.getByRole('radio', { name: /Sam's iPhone/ }).check()
+      await page.getByRole('radio', { name: /Owner/ }).check()
+      await page.getByTestId('lasts').selectOption('15m')
+      await page.getByRole('checkbox', { name: /I understand this lets Sam/ }).check()
+      await page.getByTestId('invite').click()
+      await page.evaluate(() => {
+        const [first] = window.krTestHost?.sharing.grants() ?? []
+        if (first !== undefined) window.krTestHost?.sharing.deviceAccepts(first.grant.grant_id)
+      })
+      await page.evaluate(() => window.dispatchEvent(new Event('focus')))
+      await page.getByTestId('hand-over-open').click()
+      const sheet = page.getByTestId('hand-over')
+      await sheet.getByRole('radio', { name: /Guest tablet/ }).check()
+      await sheet.getByTestId('hand-over-ask').click()
+      await expect(sheet.getByTestId('hand-over-waiting')).toBeVisible()
+      // The application stops and starts again: the record is kept and the reference is not.
+      await page.evaluate(() => {
+        window.krTestHost?.sharing.restart()
+      })
+      await sheet.getByTestId('hand-over-cancel').click()
+      const attempt = page.getByTestId('attempt')
+      await expect(attempt).toHaveAttribute('data-phase', 'asking')
+      await expect(attempt.getByTestId('attempt-ask')).toHaveCount(0)
+      await expect(attempt.getByTestId('attempt-hide')).toHaveCount(0)
+      expect(await overflowsSideways(page, '[data-testid="access"]')).toEqual([])
+      await photograph(page, `sharing-asking-${size.name}`)
+      await attempt.getByTestId('attempt-cancel').click()
+      await expect(attempt).toHaveCount(0)
+    })
+
     // KR-REQ-18.15: the hand-over sheet waits for an owner device; its focus starts on its heading
     // and returns to the button that opened it.
     test('hands a session over only after an owner device answers, and returns focus', async ({

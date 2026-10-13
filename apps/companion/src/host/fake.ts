@@ -1320,9 +1320,9 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
       requireConnection()
       return attempting(() => sharing.transferAnswered(reference))
     },
-    transferFinish: (reference) => {
+    transferFinish: async (reference) => {
       requireConnection()
-      return attempting(() => sharing.transferFinish(reference))
+      return await sharing.transferFinish(reference)
     },
     transferCancel: (reference) => {
       requireConnection()
@@ -1338,9 +1338,9 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
       requireConnection()
       return attempting(() => sharing.attemptAsk(actionId))
     },
-    attemptHide: (actionId) => {
+    attemptSetHidden: (actionId, hidden) => {
       requireConnection()
-      return attempting(() => sharing.attemptHide(actionId))
+      return attempting(() => sharing.attemptSetHidden(actionId, hidden))
     },
     attemptRemove: (actionId) => {
       requireConnection()

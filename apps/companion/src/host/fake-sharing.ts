@@ -90,16 +90,33 @@ export interface FakeSharing {
   passTheBound(): void
   /** The next revocation's barrier has a worker that has not fenced it, until told otherwise. */
   holdBarrier(held: boolean): void
+  /**
+   * The host's answer to the next hand-over that is sent is held until the test lets it go: the
+   * hand-over is sent at once, and the page is told how it went only then.
+   */
+  holdNextFinish(): FinishHold
   /** An owner device answers the confirmation every waiting hand-over asks for. */
   ownerAnswers(): void
   /** The confirmation every waiting hand-over asks for runs out before an owner device answers. */
   challengeRunsOut(): void
   /** The device an invitation names accepts it: the grant becomes active. */
   deviceAccepts(grantId: string): void
-  /** The application is stopped and started again: nothing it was carrying on goes on. */
+  /**
+   * The application is stopped and started again: nothing it was carrying on goes on, a hand-over
+   * that was being asked for has no reference left, and the host's results it held in memory are
+   * gone. What it kept in its records stays.
+   */
   restart(): void
   /** How many times the page has sent each action, by kind. */
   sent(): Readonly<Record<AttemptKind, number>>
+}
+
+/** A hand-over's answer held back, and what the test does with it. */
+export interface FinishHold {
+  /** The host's answer arrives. */
+  give(): void
+  /** The send fails with the host's own words. */
+  refuse(code: string, message: string): void
 }
 
 /** The most lines a preview carries before it is cut. */
@@ -117,6 +134,8 @@ export const SCREEN: readonly string[] = [
 /** One attempt, and what the host did with its action. */
 interface Entry {
   view: AttemptView
+  /** Whether it is an invitation that includes the live view of the screen. */
+  live: boolean
   /** Whether the host wrote the action. */
   written: boolean
   /** What the host answered, for the repeat that is answered from its record. */
@@ -147,6 +166,7 @@ export class ScriptedSharing implements FakeSharing {
   #previewFailure: string | null = null
   #lose: 'none' | 'answer' | 'request' = 'none'
   #barrierHeld = false
+  #finishHold: { release: () => void; fail: (failure: unknown) => void; held: Promise<void> } | null = null
   #actions = 0
   #references = 0
   #sent: Record<AttemptKind, number> = { invite: 0, redeem: 0, revoke: 0, transfer: 0 }
@@ -202,6 +222,24 @@ export class ScriptedSharing implements FakeSharing {
     this.#barrierHeld = held
   }
 
+  holdNextFinish(): FinishHold {
+    let release: () => void = () => undefined
+    let fail: (failure: unknown) => void = () => undefined
+    const held = new Promise<void>((resolve, reject) => {
+      release = resolve
+      fail = reject
+    })
+    this.#finishHold = { release, fail, held }
+    return {
+      give: () => {
+        release()
+      },
+      refuse: (code, message) => {
+        fail(new FakeHostError(code, message).toPayload())
+      }
+    }
+  }
+
   ownerAnswers(): void {
     for (const handover of this.#handovers.values()) {
       if (handover.state === 'waiting') handover.state = 'answered'
@@ -222,8 +260,12 @@ export class ScriptedSharing implements FakeSharing {
 
   restart(): void {
     // Nothing is carried on after a restart: an attempt waits for the person, and a hand-over
-    // that was being asked for has nothing the application can finish.
+    // that was being asked for has nothing the application can finish. A result held in memory
+    // for the page is gone with the process; the host's record of the action still has it.
     this.#handovers.clear()
+    for (const entry of this.#entries) {
+      entry.view = { ...entry.view, result: null }
+    }
   }
 
   sent(): Readonly<Record<AttemptKind, number>> {
@@ -277,6 +319,7 @@ export class ScriptedSharing implements FakeSharing {
       read.session_id,
       read.recipient_device_id
     )
+    entry.live = read.selection.include_live_screen
     const lost = this.#lost(entry)
     // A request that never reached the host wrote nothing.
     if (lost && !entry.written) return this.#unfinished(entry)
@@ -396,7 +439,9 @@ export class ScriptedSharing implements FakeSharing {
     }
   }
 
-  transferFinish(reference: string): Attempted<GrantTransferResult> {
+  transferFinish(
+    reference: string
+  ): Attempted<GrantTransferResult> | Promise<Attempted<GrantTransferResult>> {
     const handover = this.#handover(reference)
     if (handover.state !== 'answered') {
       refuse(
@@ -404,26 +449,42 @@ export class ScriptedSharing implements FakeSharing {
         'no owner device has confirmed this hand-over, so it is not sent'
       )
     }
+    // The hand-over leaves the table when it is sent, as it does in native code: a cancel that
+    // comes after finds nothing to cancel.
     this.#handovers.delete(reference)
     const { entry, params } = handover
     entry.view = { ...entry.view, phase: 'composed' }
     this.#sent.transfer += 1
-    const lost = this.#lost(entry)
-    const giving = this.#grants.find((summary) => summary.grant.grant_id === params.from_grant_id)
-    if (giving === undefined) refuse('RESOURCE_UNAVAILABLE', 'the host holds no such share')
-    const apply = (): GrantTransferResult => {
-      this.#revoke(giving)
-      const replacement = this.#replacement(giving, params.to_device_id)
-      return { replacement: replacement.grant, revoked: this.#revocation(giving) }
+    const hold = this.#finishHold
+    this.#finishHold = null
+    const settle = (): Attempted<GrantTransferResult> => {
+      const lost = this.#lost(entry)
+      const giving = this.#grants.find((summary) => summary.grant.grant_id === params.from_grant_id)
+      if (giving === undefined) refuse('RESOURCE_UNAVAILABLE', 'the host holds no such share')
+      const apply = (): GrantTransferResult => {
+        this.#revoke(giving)
+        const replacement = this.#replacement(giving, params.to_device_id)
+        return { replacement: replacement.grant, revoked: this.#revocation(giving) }
+      }
+      if (lost) {
+        if (entry.written) entry.result = apply()
+        return this.#unfinished(entry)
+      }
+      return this.#answer(entry, apply())
     }
-    if (lost) {
-      if (entry.written) entry.result = apply()
-      return this.#unfinished(entry)
-    }
-    return this.#answer(entry, apply())
+    if (hold === null) return settle()
+    return hold.held.then(
+      () => settle(),
+      (failure: unknown) => {
+        // The host refused the hand-over: nothing was written, and the page was told so.
+        this.#entries.splice(this.#entries.indexOf(entry), 1)
+        throw failure
+      }
+    )
   }
 
   transferCancel(reference: string): void {
+    // A hand-over that has been sent is no longer one this application is asking about.
     const handover = this.#handover(reference)
     this.#handovers.delete(reference)
     this.#entries.splice(this.#entries.indexOf(handover.entry), 1)
@@ -449,9 +510,15 @@ export class ScriptedSharing implements FakeSharing {
     return { attempt: entry.view, value: entry.result }
   }
 
-  attemptHide(actionId: string): AttemptView {
+  attemptSetHidden(actionId: string, hidden: boolean): AttemptView {
     const entry = this.#entry(actionId)
-    entry.view = { ...entry.view, hidden: true }
+    if (hidden && entry.view.phase === 'asking') {
+      refuse('INVALID_ARGUMENT', 'a hand-over still being confirmed is cancelled, not hidden')
+    }
+    if (hidden && entry.view.phase === 'closed') {
+      refuse('INVALID_ARGUMENT', 'an attempt that is over is removed, not hidden')
+    }
+    entry.view = { ...entry.view, hidden }
     return entry.view
   }
 
@@ -521,6 +588,7 @@ export class ScriptedSharing implements FakeSharing {
         refusal: null,
         result: null
       },
+      live: false,
       written: false,
       result: null
     }
@@ -556,7 +624,13 @@ export class ScriptedSharing implements FakeSharing {
 
   #close(entry: Entry, outcome: AttemptOutcome, result: unknown, asked = false): void {
     this.#set(entry, 'closed', outcome)
-    entry.view = { ...entry.view, result: asked ? null : result }
+    // What the host's result carries is owed until the page takes it: the screen kept with a live
+    // invitation, and how far the workers have got with a revocation. An attempt that is over is
+    // shown whatever was done to its row.
+    const owed =
+      outcome === 'happened' &&
+      (entry.view.kind === 'revoke' || entry.view.kind === 'transfer' || entry.live)
+    entry.view = { ...entry.view, result: asked ? null : result, follow_up: owed, hidden: false }
   }
 
   #answer<T>(entry: Entry, value: T): Attempted<T> {

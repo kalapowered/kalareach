@@ -779,7 +779,11 @@ export interface AttemptView {
   readonly label: string
   /** Whether the person hid it. Hiding releases nothing. */
   readonly hidden: boolean
-  /** Whether it closed without the host's result and the person may still ask the host for it. */
+  /**
+   * Whether it closed with something still owed to the person that the host's result carries (the
+   * screen the host kept with a live invitation, how far the workers have got with a revocation),
+   * and the host can be asked for it until the record is removed.
+   */
   readonly follow_up: boolean
   readonly session_id: string | null
   /** The device invited, or the one that receives control. */
@@ -1119,9 +1123,15 @@ export interface HostPort {
    * person's choice and is never made by the application itself.
    */
   attemptAsk(actionId: string): Promise<Attempted>
-  /** Takes an attempt out of view. It releases nothing. */
-  attemptHide(actionId: string): Promise<AttemptView>
-  /** Deletes the record of an attempt that is over. */
+  /**
+   * Takes an attempt out of view, or shows it again. Hiding releases nothing, a hand-over still
+   * being confirmed is cancelled and not hidden, and an attempt that is over is removed.
+   */
+  attemptSetHidden(actionId: string, hidden: boolean): Promise<AttemptView>
+  /**
+   * Deletes the record of an attempt that is over, or cancels a hand-over that was never sent.
+   * Refuses an attempt that can still happen.
+   */
   attemptRemove(actionId: string): Promise<void>
 
   pluginList(params: PluginListParams): Promise<PluginListResult>

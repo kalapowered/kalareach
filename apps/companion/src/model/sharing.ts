@@ -180,6 +180,15 @@ export function spanWords(ms: number): string {
   return `${String(Math.floor(minutes / 1_440))} days`
 }
 
+/**
+ * A device's name as the person reads it. A name is whatever its owner typed, so a character that
+ * turns text round is made visible, as it is on the screen's preview, and cannot reorder the words
+ * the interface puts beside it.
+ */
+export function nameWords(name: string): string {
+  return visibly(name)
+}
+
 /** What the platform the device runs on is called. */
 export function platformWords(platform: string): string {
   switch (platform) {
@@ -231,27 +240,30 @@ export function attemptWords(attempt: AttemptView, nowMs: number): string {
     attempt.can_happen_until_ms === null
       ? ''
       : ` It can still happen until ${momentWords(Number(attempt.can_happen_until_ms), nowMs)}.`
-  if (attempt.phase === 'asking') return `Waiting for an owner device to confirm: ${attempt.label}.`
+  const label = nameWords(attempt.label)
+  if (attempt.phase === 'asking') {
+    return `Waiting for an owner device to confirm: ${label}. Cancel it to ask again.`
+  }
   if (attempt.phase !== 'closed') {
-    return `Unfinished: ${attempt.label}. The host has not said whether it happened.${until}`
+    return `Unfinished: ${label}. The host has not said whether it happened.${until}`
   }
   switch (attempt.outcome) {
     case 'happened':
       return attempt.kind === 'revoke'
-        ? `${attempt.label}: done. Whether each session worker has stopped acting under it is not known.`
+        ? `${label}: done. Whether each session worker has stopped acting under it is not known.`
         : attempt.kind === 'transfer'
-          ? `${attempt.label}: done. Whether each session worker has stopped acting under the old access is not known.`
-          : `${attempt.label}: done.`
+          ? `${label}: done. Whether each session worker has stopped acting under the old access is not known.`
+          : `${label}: done.`
     case 'not_done':
-      return `${attempt.label}: it did not happen, as far as the host shows, and it cannot now. It is safe to try again.`
+      return `${label}: it did not happen, as far as the host shows, and it cannot now. It is safe to try again.`
     case 'not_accepted':
-      return `${attempt.label}: it was not accepted, as far as the host shows.`
+      return `${label}: it was not accepted, as far as the host shows.`
     case 'had_ended':
-      return `${attempt.label}: the access had already ended, so this changed nothing.`
+      return `${label}: the access had already ended, so this changed nothing.`
     case 'refused':
-      return `${attempt.label}: the host refused it.`
+      return `${label}: the host refused it.`
     default:
-      return `What became of this cannot be told from what the host shows: ${attempt.label}.`
+      return `What became of this cannot be told from what the host shows: ${label}.`
   }
 }
 

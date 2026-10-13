@@ -1715,6 +1715,43 @@
   border-color: var(--warning-line);
 }
 
+.attempt:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 4px;
+}
+
+/* The attempts the person hid, each with the one control that shows it again. */
+.hidden-attempts {
+  margin-block-start: var(--gap-3);
+}
+
+.hidden-attempts p {
+  margin: 0 0 var(--gap-2);
+}
+
+.hidden-attempts ul {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.hidden-attempts li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--gap-2);
+  padding-block: var(--gap-1);
+}
+
+.hidden-attempts li > span {
+  min-inline-size: 0;
+  overflow-wrap: anywhere;
+}
+
+.screen-changed .attempt-actions {
+  margin-block-start: var(--gap-2);
+}
+
 /* A choice with a line under it, as the three roles have. */
 .choice-described {
   align-items: flex-start;

@@ -20,13 +20,21 @@ import { fakeHost, type FakeHostControls } from '../src/host/fake'
 
 const SESSION_MAIN = '8a7b6c50-22bb-4c3d-8e4f-000000000101'
 
-/** Opens the sharing tab of the main session. */
-async function openSharing(): Promise<{
+/** The scripted host, and the controls a test has over it. */
+type Host = ReturnType<typeof fakeHost>
+
+/**
+ * Opens the sharing tab of the main session over a host. A test that stops the application and
+ * starts it again unmounts the page and opens the same host again: the host keeps what native
+ * code kept, and the page starts with nothing.
+ */
+async function openSharing(host: Host = fakeHost(), phone: RegExp = PHONE): Promise<{
   controls: FakeHostControls
   person: ReturnType<typeof userEvent.setup>
+  unmount: () => void
 }> {
-  const { port, controls } = fakeHost()
-  render(
+  const { port, controls } = host
+  const view = render(
     <AppProvider port={port} initialPlace={{ view: 'session', sessionId: SESSION_MAIN, pane: 'semantic' }}>
       <App />
     </AppProvider>
@@ -36,9 +44,9 @@ async function openSharing(): Promise<{
   await person.click(await screen.findByRole('button', { name: 'Sharing' }))
   await screen.findByTestId('share-form')
   await waitFor(() => {
-    expect(screen.getByRole('radio', { name: /Sam’s iPhone|Sam's iPhone/ })).toBeInTheDocument()
+    expect(screen.getByRole('radio', { name: phone })).toBeInTheDocument()
   })
-  return { controls, person }
+  return { controls, person, unmount: view.unmount }
 }
 
 /** Reads the screen's lists again, as the window being focused does. */
@@ -50,6 +58,37 @@ async function reread(): Promise<void> {
 }
 
 const PHONE = /Sam’s iPhone|Sam's iPhone/
+
+/** An owner share the device has accepted, so that there is something to hand over. */
+async function withOwnerShare(host: Host = fakeHost()): Promise<Awaited<ReturnType<typeof openSharing>>> {
+  const opened = await openSharing(host)
+  const { controls, person } = opened
+  await person.click(screen.getByRole('radio', { name: PHONE }))
+  await person.click(screen.getByRole('radio', { name: /Owner/ }))
+  // A quarter of an hour: short enough for the other tablet’s pairing to carry it on.
+  await person.selectOptions(screen.getByTestId('lasts'), '15m')
+  await person.click(await screen.findByRole('checkbox', { name: /I understand this lets Sam/ }))
+  await person.click(screen.getByTestId('invite'))
+  await waitFor(() => {
+    expect(controls.sharing.grants()).toHaveLength(1)
+  })
+  controls.sharing.deviceAccepts(controls.sharing.grants()[0]?.grant.grant_id ?? '')
+  await reread()
+  await screen.findByTestId('hand-over-open')
+  return opened
+}
+
+/** Opens the hand-over sheet, chooses the device that can receive, and asks the owner devices. */
+async function askForHandOver(person: ReturnType<typeof userEvent.setup>): Promise<HTMLElement> {
+  await person.click(screen.getByTestId('hand-over-open'))
+  const sheet = await screen.findByTestId('hand-over')
+  const receivers = within(sheet).getAllByRole<HTMLInputElement>('radio')
+  await person.click(receivers.find((each) => !each.disabled) as HTMLInputElement)
+  await person.click(within(sheet).getByTestId('hand-over-ask'))
+  await within(sheet).findByTestId('hand-over-waiting')
+  return sheet
+}
+
 
 describe('who an invitation can go to', () => {
   it('offers the devices it can, says why not for the others, and omits a retired one', async () => {
@@ -338,25 +377,6 @@ describe('an attempt whose answer was lost', () => {
 })
 
 describe('handing control over', () => {
-  /** An owner share the device has accepted, so that there is something to hand over. */
-  async function withOwnerShare(): Promise<Awaited<ReturnType<typeof openSharing>>> {
-    const opened = await openSharing()
-    const { controls, person } = opened
-    await person.click(screen.getByRole('radio', { name: PHONE }))
-    await person.click(screen.getByRole('radio', { name: /Owner/ }))
-    // A quarter of an hour: short enough for the other tablet’s pairing to carry it on.
-    await person.selectOptions(screen.getByTestId('lasts'), '15m')
-    await person.click(await screen.findByRole('checkbox', { name: /I understand this lets Sam/ }))
-    await person.click(screen.getByTestId('invite'))
-    await waitFor(() => {
-      expect(controls.sharing.grants()).toHaveLength(1)
-    })
-    controls.sharing.deviceAccepts(controls.sharing.grants()[0]?.grant.grant_id ?? '')
-    await reread()
-    await screen.findByTestId('hand-over-open')
-    return opened
-  }
-
   it('waits for an owner device and sends nothing until it has answered', async () => {
     const { controls, person } = await withOwnerShare()
     await person.click(screen.getByTestId('hand-over-open'))
@@ -413,5 +433,348 @@ describe('handing control over', () => {
     expect(await within(sheet).findByTestId('hand-over-gone', {}, { timeout: 4000 })).toBeInTheDocument()
     expect(within(sheet).getByTestId('hand-over-again')).toBeInTheDocument()
     expect(controls.sharing.grants().filter((each) => each.state === 'active')).toHaveLength(1)
+  })
+})
+
+describe('a hand-over that is sent while the panel has stopped asking', () => {
+  it('is told when the host’s answer comes after the panel moved on to sending', async () => {
+    const { controls, person } = await withOwnerShare()
+    const sheet = await askForHandOver(person)
+    const hold = controls.sharing.holdNextFinish()
+    act(() => {
+      controls.sharing.ownerAnswers()
+    })
+    await within(sheet).findByTestId('hand-over-sending', {}, { timeout: 4000 })
+    // Asked once, and sent once.
+    expect(controls.sharing.sent().transfer).toBe(2)
+
+    // The screen reads its lists again while the host has not answered, as it does every few
+    // seconds: the sheet stays on what is true, and a later answer is still told.
+    await reread()
+    expect(screen.getByTestId('hand-over-sending')).toBeInTheDocument()
+    act(() => {
+      hold.give()
+    })
+    await waitFor(() => {
+      expect(screen.queryByTestId('hand-over')).toBeNull()
+    })
+    expect(await screen.findByText(/is now with/)).toBeInTheDocument()
+  })
+
+  it('goes back to choosing with the host’s own words when the send is refused, and can ask again', async () => {
+    const { controls, person } = await withOwnerShare()
+    const sheet = await askForHandOver(person)
+    const hold = controls.sharing.holdNextFinish()
+    act(() => {
+      controls.sharing.ownerAnswers()
+    })
+    await within(sheet).findByTestId('hand-over-sending', {}, { timeout: 4000 })
+    act(() => {
+      hold.refuse('PERMISSION_DENIED', 'the host would not hand the session over')
+    })
+    const failure = await within(sheet).findByTestId('hand-over-failure')
+    expect(failure.textContent).toMatch(/the host would not hand the session over/)
+    expect(within(sheet).queryByTestId('hand-over-sending')).toBeNull()
+
+    // Nothing is left holding the session’s place: another request is asked at once.
+    await person.click(within(sheet).getByTestId('hand-over-ask'))
+    expect(await within(sheet).findByTestId('hand-over-waiting')).toBeInTheDocument()
+    // Asked, sent and refused, and asked again.
+    expect(controls.sharing.sent().transfer).toBe(3)
+  })
+
+  it('shows how far the session workers have got with the share the giver lost, and checks again', async () => {
+    const { controls, person } = await withOwnerShare()
+    await askForHandOver(person)
+    controls.sharing.holdBarrier(true)
+    act(() => {
+      controls.sharing.ownerAnswers()
+    })
+    const line = await screen.findByTestId('recently-revoked', {}, { timeout: 4000 })
+    expect(line.textContent).toMatch(/1 session worker has not confirmed yet/)
+    await person.click(within(line).getByTestId('check-again'))
+    await waitFor(() => {
+      expect(screen.getByTestId('recently-revoked').textContent).not.toMatch(/not confirmed yet/)
+    })
+  })
+
+  it('lets the hand-over go when the panel is left, so nothing holds the session’s place', async () => {
+    const { controls, person, unmount } = await withOwnerShare()
+    await askForHandOver(person)
+    expect(controls.sharing.attempts()).toHaveLength(1)
+    unmount()
+    await waitFor(() => {
+      expect(controls.sharing.attempts()).toHaveLength(0)
+    })
+    expect(controls.sharing.sent().transfer).toBe(1)
+  })
+
+  it('cancels a hand-over whose reference the application lost when it started again', async () => {
+    const host = fakeHost()
+    const first = await withOwnerShare(host)
+    await askForHandOver(first.person)
+    first.controls.sharing.restart()
+    first.unmount()
+
+    const { person } = await openSharing(host)
+    const row = await screen.findByTestId('attempt')
+    expect(row).toHaveAttribute('data-phase', 'asking')
+    // It is not asked about and not hidden away with the session’s place held: it is cancelled.
+    expect(within(row).queryByTestId('attempt-ask')).toBeNull()
+    expect(within(row).queryByTestId('attempt-hide')).toBeNull()
+    await person.click(within(row).getByTestId('attempt-cancel'))
+    await waitFor(() => {
+      expect(screen.queryByTestId('attempt')).toBeNull()
+    })
+    expect(host.controls.sharing.attempts()).toHaveLength(0)
+  })
+})
+
+describe('an attempt the person hid', () => {
+  it('is shown again by the one control that says it is hidden, and focus follows', async () => {
+    const { controls, person } = await openSharing()
+    await person.click(screen.getByRole('radio', { name: PHONE }))
+    controls.sharing.loseNextAnswer()
+    await person.click(screen.getByTestId('invite'))
+    const attempt = await screen.findByTestId('attempt')
+    await person.click(within(attempt).getByTestId('attempt-hide'))
+    await waitFor(() => {
+      expect(screen.queryByTestId('attempt')).toBeNull()
+    })
+    const show = await screen.findByTestId('attempt-show')
+    await waitFor(() => {
+      expect(show).toHaveFocus()
+    })
+    expect(controls.sharing.attempts()[0]?.hidden).toBe(true)
+
+    await person.click(show)
+    const back = await screen.findByTestId('attempt')
+    await waitFor(() => {
+      expect(back).toHaveFocus()
+    })
+    expect(screen.queryByTestId('hidden-attempts')).toBeNull()
+    // Shown again, it can be asked about, and the host answers from its record.
+    await person.click(within(back).getByTestId('attempt-ask'))
+    await waitFor(() => {
+      expect(screen.queryByTestId('attempt')).toBeNull()
+    })
+    expect(controls.sharing.grants()).toHaveLength(1)
+  })
+})
+
+describe('the screen the host kept with a live invitation', () => {
+  /** An invitation with the live view whose answer is lost after the host wrote it. */
+  async function liveInvitationLost(host: Host = fakeHost()) {
+    const opened = await openSharing(host)
+    const { controls, person } = opened
+    controls.sharing.setScreen(['before'])
+    await person.click(screen.getByRole('radio', { name: PHONE }))
+    await person.click(screen.getByRole('switch', { name: 'Let them watch the session live' }))
+    await screen.findByRole('region', { name: /^Screen at / })
+    return opened
+  }
+
+  it('is compared with the one the person saw when the answer is recovered in the background', async () => {
+    const { controls, person } = await liveInvitationLost()
+    controls.sharing.setScreen(['after the program redrew'])
+    controls.sharing.loseNextAnswer()
+    await person.click(screen.getByTestId('invite'))
+    await screen.findByTestId('attempt')
+    controls.sharing.recover()
+    await reread()
+    const card = await screen.findByTestId('screen-changed')
+    expect(card).toHaveAttribute('data-kind', 'changed')
+    expect(card.textContent).toContain('after the program redrew')
+    await waitFor(() => {
+      expect(screen.queryByTestId('attempt')).toBeNull()
+    })
+    expect(controls.sharing.attempts()).toHaveLength(0)
+  })
+
+  it('says nothing when it is the screen the person saw', async () => {
+    const { controls, person } = await liveInvitationLost()
+    controls.sharing.loseNextAnswer()
+    await person.click(screen.getByTestId('invite'))
+    await screen.findByTestId('attempt')
+    controls.sharing.recover()
+    await reread()
+    await waitFor(() => {
+      expect(screen.queryByTestId('attempt')).toBeNull()
+    })
+    expect(await screen.findByText(/Invitation ready for Sam/)).toBeInTheDocument()
+    expect(screen.queryByTestId('screen-changed')).toBeNull()
+  })
+
+  it('says it could not be compared, and offers to withdraw, when the application started again before the answer', async () => {
+    const host = fakeHost()
+    const first = await liveInvitationLost(host)
+    first.controls.sharing.loseNextAnswer()
+    await first.person.click(screen.getByTestId('invite'))
+    await screen.findByTestId('attempt')
+    // The host’s answer is recovered, and the application stops before the page reads it.
+    first.controls.sharing.recover()
+    first.controls.sharing.restart()
+    first.unmount()
+
+    const { person } = await openSharing(host)
+    const row = await screen.findByTestId('attempt')
+    expect(row).toHaveAttribute('data-phase', 'closed')
+    expect(within(row).getByTestId('attempt-unverified')).toBeInTheDocument()
+    await person.click(within(row).getByTestId('attempt-ask'))
+    const card = await screen.findByTestId('screen-changed')
+    expect(card).toHaveAttribute('data-kind', 'unverified')
+    expect(card.textContent).toContain('before')
+    await person.click(within(card).getByTestId('screen-withdraw'))
+    await waitFor(() => {
+      expect(screen.queryByTestId('screen-changed')).toBeNull()
+    })
+    expect(host.controls.sharing.grants().map((each) => each.state)).toEqual(['revoked'])
+  })
+})
+
+describe('a revocation whose answer was lost', () => {
+  /** A share the device accepted, ready to be taken back. */
+  async function withActiveShare(host: Host = fakeHost()) {
+    const opened = await openSharing(host)
+    const { controls, person } = opened
+    await person.click(screen.getByRole('radio', { name: PHONE }))
+    await person.click(screen.getByTestId('invite'))
+    await waitFor(() => {
+      expect(controls.sharing.grants()).toHaveLength(1)
+    })
+    controls.sharing.deviceAccepts(controls.sharing.grants()[0]?.grant.grant_id ?? '')
+    await reread()
+    await waitFor(() => {
+      expect(screen.getByTestId('access').querySelector('[data-state="active"]')).not.toBeNull()
+    })
+    return opened
+  }
+
+  it('keeps what the host said of the workers when it is recovered in the background, and checks again', async () => {
+    const { controls, person } = await withActiveShare()
+    controls.sharing.holdBarrier(true)
+    controls.sharing.loseNextAnswer()
+    await person.click(screen.getByTestId('revoke'))
+    await screen.findByTestId('attempt')
+    controls.sharing.recover()
+    await reread()
+    const line = await screen.findByTestId('recently-revoked')
+    expect(line.textContent).toMatch(/1 session worker has not confirmed yet/)
+    await person.click(within(line).getByTestId('check-again'))
+    // The line the background road made is the one the check changes.
+    await waitFor(() => {
+      expect(screen.getByTestId('recently-revoked').textContent).not.toMatch(/not confirmed yet/)
+    })
+    expect(screen.getAllByTestId('recently-revoked')).toHaveLength(1)
+  })
+
+  it('keeps what the host said of the workers when the person asks the host', async () => {
+    const { controls, person } = await withActiveShare()
+    controls.sharing.holdBarrier(true)
+    controls.sharing.loseNextAnswer()
+    await person.click(screen.getByTestId('revoke'))
+    await screen.findByTestId('attempt')
+    controls.sharing.passTheBound()
+    await reread()
+    const row = await waitFor(() => {
+      const found = screen.getByTestId('attempt')
+      expect(found).toHaveAttribute('data-outcome', 'happened')
+      return found
+    })
+    await person.click(within(row).getByTestId('attempt-ask'))
+    const line = await screen.findByTestId('recently-revoked')
+    expect(line.textContent).toMatch(/1 session worker has not confirmed yet/)
+    expect(within(line).getByTestId('check-again')).toBeInTheDocument()
+  })
+})
+
+describe('what an invitation is agreed to', () => {
+  /** Chooses a viewer who may answer questions, so the invitation carries a consequence. */
+  async function consentedTo(person: ReturnType<typeof userEvent.setup>): Promise<HTMLElement> {
+    await person.click(screen.getByRole('radio', { name: PHONE }))
+    await person.click(screen.getByRole('switch', { name: 'Let a viewer answer questions' }))
+    const consent = await screen.findByRole('checkbox', { name: /I understand this lets Sam/ })
+    await person.click(consent)
+    expect(consent).toBeChecked()
+    return consent
+  }
+
+  it('is asked for again whenever any choice changes, and not given back by changing it back', async () => {
+    const { person } = await openSharing()
+    const consent = await consentedTo(person)
+
+    // The earlier activity, the lifetime and the live view each take the tick back.
+    await person.selectOptions(screen.getByTestId('history'), 'hour')
+    expect(consent).not.toBeChecked()
+    await person.click(consent)
+    await person.selectOptions(screen.getByTestId('lasts'), '15m')
+    expect(consent).not.toBeChecked()
+    await person.click(consent)
+    await person.click(screen.getByRole('switch', { name: 'Let them watch the session live' }))
+    expect(consent).not.toBeChecked()
+    expect(screen.getByTestId('invite')).toBeDisabled()
+
+    // Changing a choice back is another change: the earlier tick is not the person’s any more.
+    await person.click(consent)
+    await person.selectOptions(screen.getByTestId('history'), 'none')
+    expect(consent).not.toBeChecked()
+    await person.click(consent)
+    await person.selectOptions(screen.getByTestId('history'), 'hour')
+    await person.selectOptions(screen.getByTestId('history'), 'none')
+    expect(consent).not.toBeChecked()
+  })
+
+  it('is not restored by changing the role or the device away and back', async () => {
+    const { person } = await openSharing()
+    await person.click(screen.getByRole('radio', { name: PHONE }))
+    await person.click(screen.getByRole('radio', { name: /Controller/ }))
+    const consent = await screen.findByRole('checkbox', { name: /I understand this lets Sam/ })
+    await person.click(consent)
+    expect(consent).toBeChecked()
+    await person.click(screen.getByRole('radio', { name: /Owner/ }))
+    await person.click(screen.getByRole('radio', { name: /Controller/ }))
+    expect(screen.getByRole('checkbox', { name: /I understand this lets/ })).not.toBeChecked()
+
+    await person.click(screen.getByRole('checkbox', { name: /I understand this lets/ }))
+    await person.click(screen.getByRole('radio', { name: /Guest tablet/ }))
+    await person.click(screen.getByRole('radio', { name: PHONE }))
+    expect(screen.getByRole('checkbox', { name: /I understand this lets/ })).not.toBeChecked()
+  })
+})
+
+describe('a device name that turns text round', () => {
+  it('is shown with the character made visible wherever the screen says it', async () => {
+    const host = fakeHost()
+    const named = {
+      ...host,
+      port: {
+        ...host.port,
+        deviceList: async (params: Parameters<typeof host.port.deviceList>[0]) => {
+          const listed = await host.port.deviceList(params)
+          return {
+            ...listed,
+            devices: listed.devices.map((each) =>
+              each.display_name.startsWith('Sam') && each.platform === 'ios' && !each.all_sessions
+                ? { ...each, display_name: 'Sam‮s iPhone' }
+                : each
+            )
+          }
+        }
+      }
+    }
+    const { controls, person } = await openSharing(named, /Sam‹U\+202E›s iPhone/)
+    const radio = await screen.findByRole('radio', { name: /Sam‹U\+202E›s iPhone/ })
+    expect(radio.closest('label')?.textContent).not.toContain('‮')
+    await person.click(radio)
+    await person.click(screen.getByTestId('invite'))
+    const row = await waitFor(() => {
+      const found = screen.getByTestId('access').querySelector('[data-state="pending"]')
+      expect(found).not.toBeNull()
+      return found as HTMLElement
+    })
+    expect(row.textContent).toContain('Sam‹U+202E›s iPhone')
+    expect(row.textContent).not.toContain('‮')
+    expect(await screen.findByText(/Invitation ready for Sam‹U\+202E›s iPhone/)).toBeInTheDocument()
+    expect(controls.sharing.grants()).toHaveLength(1)
   })
 })

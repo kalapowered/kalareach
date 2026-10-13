@@ -207,7 +207,7 @@ export function tauriPort(): HostPort {
     transferCancel: (reference) => call<undefined>('transfer_cancel', { reference }),
     attemptsList: () => call('attempts_list', {}),
     attemptAsk: (actionId) => call('attempt_ask', { actionId }),
-    attemptHide: (actionId) => call('attempt_hide', { actionId }),
+    attemptSetHidden: (actionId, hidden) => call('attempt_set_hidden', { actionId, hidden }),
     attemptRemove: (actionId) => call<undefined>('attempt_remove', { actionId }),
 
     pluginList: (params) => read('plugin_list', params),

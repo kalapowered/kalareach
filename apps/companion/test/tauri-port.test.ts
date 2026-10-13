@@ -248,7 +248,7 @@ describe('the desktop port and the published methods', () => {
     await port.transferCancel('reference-1')
     await port.attemptsList()
     await port.attemptAsk('action-1')
-    await port.attemptHide('action-1')
+    await port.attemptSetHidden('action-1', true)
     await port.attemptRemove('action-1')
     await port.pluginList({ environment_id: environment })
     await port.catalogueList({ environment_id: environment })
@@ -272,7 +272,7 @@ describe('the desktop port and the published methods', () => {
       'transfer_cancel',
       'attempts_list',
       'attempt_ask',
-      'attempt_hide',
+      'attempt_set_hidden',
       'attempt_remove',
       'plugin_list',
       'catalogue_list',
@@ -296,6 +296,7 @@ describe('the desktop port and the published methods', () => {
     })
     expect(named('transfer_answered')).toEqual({ reference: 'reference-1' })
     expect(named('attempt_ask')).toEqual({ actionId: 'action-1' })
+    expect(named('attempt_set_hidden')).toEqual({ actionId: 'action-1', hidden: true })
     expect(named('grant_revoke')).toEqual({ params: { grant_id: 'grant-1' } })
     expect(named('grant_held')).toEqual({})
   })
