@@ -281,8 +281,10 @@ the time a revocation allows, or that installed the revision and gave no evidenc
 named in it as pending, which says that a close sent under the grant could still reach that worker.
 The barrier is cut to what one answer carries, with every total counted before the cut: a worker
 that is pending is kept before any that is not, the first one whatever else is cut, and the answer's
-total says how many workers there were. The grant is revoked either way. A stop or a replacement
-that owed no fence carries a null `barrier`, not an absent one: a companion that finds no status
+total says how many workers there were. A stop or a replacement that finds the call's grant
+already withdrawn, by its owner say, owes a fence of its own while a close is on its way under that
+grant, and carries where the workers stand. The grant is revoked either way. A stop or a replacement that owed no
+fence carries a null `barrier`, not an absent one: a companion that finds no status
 in a stop's answer reads the withdrawal as not confirmed.
 
 ## The rate a call runs under

@@ -499,7 +499,7 @@ export interface VoiceCallState {
 
 /**
  * What the host's answer to ending a call showed of the fence its withdrawal owed: that it owed
- * none (`not_owed`, the names native code gives it), the barrier of the workers it waited for
+ * none (`not_owed`, the word native code gives it), the barrier of the workers it waited for
  * (without the names of the actions the fence named), or that the answer gave no status this build
  * could read, so whether every worker holds the revision that refuses what the call sent is not
  * known here. The grant is revoked in each. A page that meets a kind it does not know reads it as

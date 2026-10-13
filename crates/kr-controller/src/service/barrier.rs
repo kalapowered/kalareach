@@ -854,8 +854,12 @@ impl Controller {
     /// refuses it. Its reach is the connections acting under the grants withdrawn, and none acts
     /// under a call's grant: every connection stays admitted, at the revision now in force, so the
     /// answer to the stop that withdrew the grant, and every other answer on the link it was sent
-    /// on, is delivered. The debt is published the moment the store has committed, so every admission and
-    /// forward is refused until the barrier retires it.
+    /// on, is delivered. The debt is published the moment the store has committed, so every
+    /// admission and forward is refused until the barrier retires it.
+    ///
+    /// A revocation that finds the grant already withdrawn while a close is still on its way under
+    /// it owes a fence of its own: the earlier change's revision may not be in force yet, so this
+    /// change advances it, after reading the grant, and the answer carries where the workers stand.
     ///
     /// The caller waits outside its lock and before it answers, and is given the barrier as it
     /// stands when the wait ends, pending workers named. The barrier runs on its own task, so a

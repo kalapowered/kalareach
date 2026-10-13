@@ -320,8 +320,9 @@ pub struct GrantRevocation {
     /// that revoked it, is on disk until that barrier completes, which is what keeps it in here.
     /// One revoked whose fence is done is not. A grant that has run out stays in: the worker takes
     /// its lease at its own deadline on its own clock, and this host's clock is not the judge of
-    /// whether that has passed. A proposal nobody redeemed has no holder and is not in here. There
-    /// is one whenever [`Self::debt`] is, since the debt is written for a live grant of this list.
+    /// whether that has passed. A proposal nobody redeemed has no holder and is not in here. A
+    /// voice grant holds no input and is never in here, so a debt written only for a voice grant
+    /// whose close can still run (see [`Self::debt`]) has nothing in this list.
     pub reached: Vec<GrantId>,
     /// The grants of [`Self::reached`] that carry `terminal.input`: the only ones an input lease
     /// can be held under, so the only ones a worker has to be told.
@@ -336,8 +337,9 @@ pub struct GrantRevocation {
     pub covers_every_session: bool,
     /// The debt this revocation wrote in the transaction that revoked, when it withdrew live
     /// authority a worker can hold work under (every grant but a voice grant, and a voice grant
-    /// while a close forwarded under it can still run at a worker): one row for the whole change,
-    /// retired only by a barrier that follows it.
+    /// while a close forwarded under it can still run at a worker, even when an earlier change had
+    /// already withdrawn it): one row for the whole change, retired only by a barrier that follows
+    /// it.
     pub debt: Option<DebtId>,
 }
 
@@ -1187,7 +1189,15 @@ impl GrantDirectory {
                 .map_err(ControllerError::registry)?;
             if changed == 0 {
                 // Already revoked, on its own or under an earlier ancestor. Its first revocation's
-                // moment and ancestor stand, and this call did not withdraw anything.
+                // moment and ancestor stand, and this call did not withdraw anything. A close
+                // still on its way under it can reach a worker that has not yet refused it, and
+                // the earlier change's fence is that change's to raise and may not be in force:
+                // the revision it advances to may be advanced after this call reads the grant.
+                // So this change owes a fence of its own for that close, which advances the
+                // revision after this read and reports where the workers stand.
+                if held.contains(&record.grant.grant_id) && debt.is_none() {
+                    *debt = Some(owe_within(connection, covers, now_ms)?);
+                }
                 continue;
             }
             // An invitation still waiting for this grant is withdrawn with it, so the invitation

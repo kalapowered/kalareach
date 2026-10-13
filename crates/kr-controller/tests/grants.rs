@@ -1376,7 +1376,8 @@ fn a_revocation_reaches_the_grants_that_can_still_hold_input() {
     );
 
     // A revocation of a grant that has run out is a revocation that reaches it: the debt it writes
-    // is for a grant in the list, so a fence is never owed for nothing.
+    // is for a grant in the list, so a fence is never owed for nothing (a voice grant whose close
+    // can still run is the one grant a debt is written for that holds no input).
     let directory = GrantDirectory::in_memory().expect("a grant store");
     build(&directory);
     let revocation = directory

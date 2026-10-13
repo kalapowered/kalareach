@@ -1215,6 +1215,130 @@ async fn a_revocation_of_a_call_s_grant_while_a_close_is_on_its_way_withdraws_no
     call.world.serving.abort();
 }
 
+/// KR-REQ-15.13 and 09.12: a stop that finds the call's grant already withdrawn by its owner, with
+/// a close still on its way and the worker not yet shown to hold the revision, reports that worker
+/// as pending. The owner's withdrawal wrote its debt, but its revision may not be in force when the
+/// stop reads the grant, so the stop owes a fence of its own: it advances the revision after its
+/// read, withdraws no connection, and answers where the workers stand.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stop_after_the_owner_withdrew_the_grant_reports_the_fence_still_pending() {
+    let call = Call::start().await;
+    let before = revision(&call.controller).await;
+    let here = admit(&call.controller, call.device.device_id).await;
+    let hold = call
+        .controller
+        .sharing()
+        .grants()
+        .hold_close(call.voice_grant_id());
+    call.controller
+        .revoke_grant(call.voice_grant_id(), super::Audience::Host, None, None)
+        .await
+        .expect("the owner revokes the call's grant");
+    assert_eq!(revision(&call.controller).await, before + 1);
+
+    let answered: VoiceStopResult = call
+        .submit_voice(Method::VoiceStop, &call.stop_submitted())
+        .await
+        .expect("the stop is answered")
+        .to_typed()
+        .expect("a stop result");
+
+    let barrier = answered
+        .barrier
+        .0
+        .expect("a close can still run, so the stop reports the fence");
+    assert!(!barrier.holds(), "the worker gave no evidence of its fence");
+    assert_eq!(barrier.pending(), vec![call.world.session_id]);
+    assert_eq!(
+        revision(&call.controller).await,
+        before + 2,
+        "the stop's own fence advanced the revision after the owner's"
+    );
+    assert!(owed(&call.controller).is_empty());
+    assert_eq!(
+        call.controller
+            .admitted_revision(here)
+            .ok()
+            .map(|r| r.get()),
+        Some(before + 2),
+        "no connection acts under a call's grant, so the device's connection stays"
+    );
+    drop(hold);
+    call.world.serving.abort();
+}
+
+/// KR-REQ-15.14 and 09.12: a replacement of the standing grant that finds the call's grant already
+/// withdrawn by its owner, with a close still on its way, reports the worker as pending in the same
+/// way a stop does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_replacement_after_the_owner_withdrew_the_calls_grant_reports_the_fence_still_pending() {
+    let call = Call::start().await;
+    let hold = call
+        .controller
+        .sharing()
+        .grants()
+        .hold_close(call.voice_grant_id());
+    call.controller
+        .revoke_grant(call.voice_grant_id(), super::Audience::Host, None, None)
+        .await
+        .expect("the owner revokes the call's grant");
+    let replacement = voice_mutation_of(
+        Method::VoiceGrant,
+        call.world.environment_id,
+        &VoiceGrantParams {
+            device_id: call.device.device_id,
+            session_ids: [call.world.session_id].into_iter().collect(),
+            actions: Nullable::some([VoiceAction::Status].into_iter().collect()),
+        },
+    );
+
+    let answered: VoiceGrantResult = call
+        .submit_voice(Method::VoiceGrant, &replacement)
+        .await
+        .expect("the replacement is answered")
+        .to_typed()
+        .expect("a grant result");
+
+    let barrier = answered
+        .barrier
+        .0
+        .expect("a close can still run, so the replacement reports the fence");
+    assert!(!barrier.holds(), "the worker gave no evidence of its fence");
+    assert_eq!(barrier.pending(), vec![call.world.session_id]);
+    drop(hold);
+    call.world.serving.abort();
+}
+
+/// KR-REQ-15.13 and 09.12: the control. A stop that finds the call's grant already withdrawn, with
+/// no close on its way, owes no fence and says so.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stop_after_the_owner_withdrew_the_grant_with_no_close_on_its_way_owes_nothing() {
+    let call = Call::start().await;
+    let before = revision(&call.controller).await;
+    call.controller
+        .revoke_grant(call.voice_grant_id(), super::Audience::Host, None, None)
+        .await
+        .expect("the owner revokes the call's grant");
+
+    let answered: VoiceStopResult = call
+        .submit_voice(Method::VoiceStop, &call.stop_submitted())
+        .await
+        .expect("the stop is answered")
+        .to_typed()
+        .expect("a stop result");
+
+    assert!(
+        answered.barrier.0.is_none(),
+        "no close can run, so no fence is owed"
+    );
+    assert_eq!(
+        revision(&call.controller).await,
+        before,
+        "with no close on its way neither the owner's withdrawal nor the stop owed a fence"
+    );
+    call.world.serving.abort();
+}
+
 /// An admission that stands, with the time it has left.
 #[derive(Debug)]
 struct StandingFor(Option<std::time::Duration>);
