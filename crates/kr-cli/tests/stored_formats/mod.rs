@@ -26,8 +26,8 @@
 //! the distance at which a name is taken for a misspelling, and a digest of each such section.
 //! A section may be added at the same version when it has the shape that lets an older release
 //! ignore it, its level is above the store's level before it and no higher than the store's level
-//! now, and no locked section's digest, no level and no distance moves with the version standing
-//! still.
+//! now, and no locked section's digest moves with the version standing still. The store's level and
+//! the distance never go down, and a locked section's level never changes.
 //!
 //! What it cannot see, and the documentation says so: a hand edit of the lock itself (the same
 //! check against the lock on main sees that), a type that a store keeps and that no type the table
