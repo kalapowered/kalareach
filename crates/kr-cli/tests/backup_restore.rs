@@ -1093,12 +1093,22 @@ impl Window {
     /// then reads one line of its own, so a test can tell whether anything was left waiting in the
     /// terminal's input.
     fn run(rig: &Rig, arguments: &[&str]) -> Self {
-        Self::run_with_input(rig, arguments, "")
+        Self::open(rig, arguments, "", b"")
     }
 
     /// As [`Self::run`], with `kr`'s standard input redirected as the shell word `input` says
     /// (`< /dev/tty` makes it the terminal device itself, which some systems cannot poll).
     fn run_with_input(rig: &Rig, arguments: &[&str], input: &str) -> Self {
+        Self::open(rig, arguments, input, b"")
+    }
+
+    /// As [`Self::run`], with `typed_ahead` already typed into the window before the shell starts,
+    /// so it is waiting in the terminal's input before `kr` has shown anything.
+    fn run_after_typing(rig: &Rig, arguments: &[&str], typed_ahead: &[u8]) -> Self {
+        Self::open(rig, arguments, "", typed_ahead)
+    }
+
+    fn open(rig: &Rig, arguments: &[&str], input: &str, typed_ahead: &[u8]) -> Self {
         let terminal = portable_pty::native_pty_system()
             .openpty(portable_pty::PtySize {
                 rows: 24,
@@ -1124,12 +1134,16 @@ impl Window {
         }
         command.env("KR", kr().display().to_string());
         command.cwd(&rig.work);
+        let mut typing = terminal.master.take_writer().expect("a writer");
+        typing
+            .write_all(typed_ahead)
+            .and_then(|()| typing.flush())
+            .expect("types into the window");
         let shell = terminal
             .slave
             .spawn_command(command)
             .expect("starts the window's shell");
         let mut reader = terminal.master.try_clone_reader().expect("a reader");
-        let typing = terminal.master.take_writer().expect("a writer");
         let seen = Arc::new(Mutex::new(Vec::new()));
         let collected = Arc::clone(&seen);
         std::thread::spawn(move || {
@@ -2359,6 +2373,42 @@ async fn an_interrupt_at_the_question_ends_the_command_when_its_input_is_the_ter
     let shown = window.wait_for("kr ended");
     assert!(!shown.contains("kr ended 0"), "{shown}");
     assert!(names(&fixture.into).is_empty());
+}
+
+/// A line typed before the question is shown is not the answer to it: the person answers what is on
+/// the screen.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_line_typed_before_the_question_is_shown_does_not_answer_it() {
+    let fixture = Fixture::new().await;
+    let into = fixture.folder_arg();
+    let mut window = Window::run_after_typing(&fixture.rig, &fixture.line(&into, &[]), b"yes\n");
+    window.wait_for("Type yes to write these files");
+    window.type_line("no");
+    let shown = window.wait_for("kr ended");
+    assert!(!shown.contains("kr ended 0"), "{shown}");
+    assert!(
+        names(&fixture.into).is_empty(),
+        "the line typed ahead confirmed nothing"
+    );
+}
+
+/// What was typed before the kit prompt appeared is not part of the kit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn lines_typed_before_the_kit_prompt_appears_are_not_part_of_the_kit() {
+    let fixture = Fixture::new().await;
+    let into = fixture.folder_arg();
+    let kit = fixture.world.kit_text(&[fixture.rig.origin()]);
+    let mut window = Window::run_after_typing(
+        &fixture.rig,
+        &["backup", "restore", "--into", &into, "--preview"],
+        b"stray\n\n",
+    );
+    window.wait_for("Nothing you paste is shown.");
+    window.type_bytes(format!("{kit}\n").as_bytes());
+    window.wait_for("Type yes if that is the kit you meant");
+    window.type_line("no");
+    let shown = window.wait_for("kr ended");
+    assert!(!shown.contains("kr ended 0"), "{shown}");
 }
 
 /// A bundle that names more than one archive at the service is refused with each listed, and

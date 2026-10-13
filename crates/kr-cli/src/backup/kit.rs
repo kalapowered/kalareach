@@ -136,16 +136,22 @@ fn read_blocking(source: &KitSource, cancel: &AtomicBool) -> Result<KitRead> {
 /// Puts `question` on the error stream and reads the person's answer: one line from the terminal on
 /// standard input, with echo on, or none at the end of the input.
 ///
+/// What was typed before the question was shown is thrown away, so an answer is to what the person
+/// can see.
+///
 /// The read is made on a thread of its own and is not waited for when this future is dropped, so
 /// Ctrl-C at a question stops the run at once, however the descriptor behaves: some terminal
 /// devices cannot be waited on with a timeout, and a blocking read is not ended by a signal that
 /// restarts it. The thread holds nothing but a duplicate of the descriptor and the answer so far,
-/// and ends with the process.
+/// and ends with the process. A caller therefore drops the future only to end the run: the thread
+/// is still reading, and would take the next line a later question asked for.
 ///
 /// # Errors
 ///
 /// Returns a terminal failure when the answer cannot be read.
 pub async fn ask_line(question: &Shown) -> Result<Option<String>> {
+    #[cfg(unix)]
+    discard_typed_ahead();
     crate::report::say(question);
     let (answer, arrives) = tokio::sync::oneshot::channel();
     std::thread::Builder::new()
@@ -163,6 +169,19 @@ pub async fn ask_line(question: &Shown) -> Result<Option<String>> {
     arrives
         .await
         .map_err(|_| CliError::Terminal(Shown::said("your answer could not be read")))?
+}
+
+/// Throws away what is waiting on a terminal's standard input. It is done before a question is
+/// shown, so a line typed before the person could read the question cannot answer it. Standard
+/// input that is not a terminal is left alone.
+#[cfg(unix)]
+fn discard_typed_ahead() {
+    use std::os::fd::AsFd as _;
+
+    let input = std::io::stdin();
+    if rustix::termios::isatty(input.as_fd()) {
+        let _ = rustix::termios::tcflush(input.as_fd(), rustix::termios::QueueSelector::IFlush);
+    }
 }
 
 #[cfg(unix)]
@@ -534,8 +553,15 @@ impl<'a> Prompt<'a> {
         silent.input_modes.remove(InputModes::ICRNL);
         silent.special_codes[SpecialCodeIndex::VMIN] = 0;
         silent.special_codes[SpecialCodeIndex::VTIME] = 2;
-        // What was typed before this prompt was shown was echoed, and is not part of the kit.
-        rustix::termios::tcsetattr(terminal, OptionalActions::Flush, &silent).map_err(failed)?;
+        // What was typed before this prompt was shown was echoed, and is not part of the kit. The
+        // call waits for output to drain, so a signal can end it early; it is asked again.
+        loop {
+            match rustix::termios::tcsetattr(terminal, OptionalActions::Flush, &silent) {
+                Ok(()) => break,
+                Err(rustix::io::Errno::INTR) => {}
+                Err(error) => return Err(failed(error)),
+            }
+        }
         Ok(Self {
             terminal,
             saved,
