@@ -3,9 +3,9 @@
 //! Section 10 makes the target host the judge of owner authority: the feed stores the request and
 //! decides nothing about who may make it. So the host checks, from its own records, that the
 //! request is addressed to it, that the device that signed it is paired, signed what it published
-//! and is, now, a device this host would let manage it (decided as the same device's own
-//! `device.revoke` is, by its grant, this host's policy and its configuration), and that it names
-//! something this host knows and has not withdrawn. A request that passes is carried out as the
+//! and is, now, a device this host would let manage it (decided as a paired device's own call of
+//! [`MANAGEMENT_PROBE`] is, by its grant, this host's policy and its configuration), and that it
+//! names something this host knows and has not withdrawn. A request that passes is carried out as the
 //! owner at this machine's own revocation is, through the same barrier, so the revision it takes
 //! is the one the registry allocates and the completion it reports is the barrier's.
 
@@ -25,6 +25,17 @@ use crate::config::ceilings::CeilingRefusal;
 use crate::error::Result;
 use crate::grants::{AccessRequest, GrantRecord, Refusal, StoredRemoval};
 use crate::service::net::devices::DeviceRecord;
+
+/// The method whose decision stands for "this device holds `host.manage` at the paired-device
+/// door". It is not asked for to list devices.
+///
+/// `device.revoke` is the owner's at this machine and is not listed for a paired device, so a
+/// paired device's right to manage the host cannot be asked of it, and a remote owner's revocation
+/// reaches the host through the feed instead. `device.list` is listed at the paired-device door
+/// and requires `host.manage` and no other right, so the decision made for it is the grant's
+/// rights, its selectors, this host's policy, the ceiling and the clock, and nothing else. A test
+/// holds it to that.
+pub const MANAGEMENT_PROBE: Method = Method::DeviceList;
 
 /// The most keys a host may name as permitted to remove its feed.
 pub const MOST_REMOVAL_KEYS: usize = kr_client::services::authority::MAX_REMOVAL_KEYS;
@@ -124,8 +135,9 @@ impl Controller {
         Ok(Judged::Apply(plan))
     }
 
-    /// Whether `device` may manage this host now, decided as its own `device.revoke` is: by its
-    /// grant, this host's policy and the rights ceiling this host's configuration put in force.
+    /// Whether `device` may manage this host now, decided as its own call of [`MANAGEMENT_PROBE`]
+    /// is: by its grant, this host's policy and the rights ceiling this host's configuration put
+    /// in force.
     ///
     /// One thing differs. A bounded offline validity is what stops personal remote access while
     /// the authority feed cannot be reached, and the caller has just read the feed, so the bound is
@@ -158,7 +170,7 @@ impl Controller {
             revoked_by_parent: None,
         };
         let request = AccessRequest {
-            method: Method::DeviceRevoke,
+            method: MANAGEMENT_PROBE,
             ingress: ActorIngress::PairedDevice,
             environment_id: self.paths().environment_id(),
             session_id: None,
@@ -730,5 +742,46 @@ impl Controller {
     #[must_use]
     pub fn feed_notice_attempts(&self) -> tokio::sync::watch::Receiver<u64> {
         self.feed_notice_attempts.subscribe()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MANAGEMENT_PROBE;
+    use kr_protocol::actor::ActorIngress;
+    use kr_protocol::authority::{AuthorityDecision, RequiredAuthority, RightCondition};
+    use kr_protocol::method::MethodVersion;
+    use kr_protocol::rights::ActionRight;
+
+    /// The decision that stands for a paired device's right to manage the host is the right and
+    /// nothing else: if the method it is asked for stops being listed at the paired-device door,
+    /// or starts to require another right or a condition, the feed would turn every owner away or
+    /// ask more of one than managing the host.
+    #[test]
+    fn the_method_that_stands_for_managing_the_host_requires_that_right_alone_at_the_paired_door() {
+        let AuthorityDecision::Listed(entry) = kr_protocol::method::decide(
+            MANAGEMENT_PROBE.as_str(),
+            MethodVersion::V1,
+            ActorIngress::PairedDevice,
+        ) else {
+            panic!(
+                "{} is not listed at the paired-device door",
+                MANAGEMENT_PROBE.as_str()
+            );
+        };
+        let required: Vec<_> = entry
+            .required_rights
+            .iter()
+            .map(|required| (required.authority, required.when))
+            .collect();
+        assert_eq!(
+            required,
+            vec![(
+                RequiredAuthority::Right {
+                    right: ActionRight::HostManage
+                },
+                RightCondition::Always
+            )]
+        );
     }
 }
