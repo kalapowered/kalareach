@@ -105,11 +105,7 @@ impl Destination {
 }
 
 fn unusable(path: &Path, reason: &'static str) -> CliError {
-    CliError::Usage(shown!(
-        "{} {}",
-        crate::shown::named(path),
-        reason
-    ))
+    CliError::Usage(shown!("{} {}", crate::shown::named(path), reason))
 }
 
 /// Opens the directory at `path` without following a link at its end, and checks it through the
@@ -177,7 +173,10 @@ fn check_owner(dir: &Dir, path: &Path) -> Result<()> {
         ))
     })?;
     if metadata.uid() != rustix::process::geteuid().as_raw() {
-        return Err(unusable(path, "is not owned by you, so a restore does not fill it"));
+        return Err(unusable(
+            path,
+            "is not owned by you, so a restore does not fill it",
+        ));
     }
     if metadata.mode() & 0o002 != 0 {
         return Err(unusable(

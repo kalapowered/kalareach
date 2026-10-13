@@ -116,7 +116,8 @@ async fn restore(
         report::say(&line);
     }
     if read.entered == Entered::Typed {
-        let question = Shown::said("Type yes if that is the kit you meant, or anything else to stop:");
+        let question =
+            Shown::said("Type yes if that is the kit you meant, or anything else to stop:");
         let answer = tokio::select! {
             answer = kit::ask_line(&question) => answer?,
             () = interrupt.arrived() => return Err(interrupt::stopped()),

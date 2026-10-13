@@ -732,7 +732,8 @@ mod tests {
         let refused = READING
             .scope(
                 state(1, false),
-                rig.relay.generation(ArchiveId::new(Uuid::from_bytes([2; 16])), None),
+                rig.relay
+                    .generation(ArchiveId::new(Uuid::from_bytes([2; 16])), None),
             )
             .await
             .expect_err("the gate refuses inside a delay");
@@ -743,7 +744,8 @@ mod tests {
         let _ = READING
             .scope(
                 state(1, false),
-                free.relay.generation(ArchiveId::new(Uuid::from_bytes([2; 16])), None),
+                free.relay
+                    .generation(ArchiveId::new(Uuid::from_bytes([2; 16])), None),
             )
             .await;
         assert_eq!(free.service.0.load(Ordering::SeqCst), 1);

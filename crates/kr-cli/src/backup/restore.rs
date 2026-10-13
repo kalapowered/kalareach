@@ -279,16 +279,13 @@ pub async fn restore_with<P: Privacy, C: Conversation>(
     talk: &mut C,
     held: &mut Option<Held>,
 ) -> Result<Outcome> {
-    let prepared = match kr_client::recovery::FilesRestore::prepare(
-        kit,
-        Arc::clone(&run.source),
-        run.archive,
-    )
-    .await
-    {
-        Ok(prepared) => prepared,
-        Err(error) => return Err(explain(error, privacy, run.began).await),
-    };
+    let prepared =
+        match kr_client::recovery::FilesRestore::prepare(kit, Arc::clone(&run.source), run.archive)
+            .await
+        {
+            Ok(prepared) => prepared,
+            Err(error) => return Err(explain(error, privacy, run.began).await),
+        };
     let planned = plan_of(&prepared, &run)?;
     match &run.decision {
         Decision::Preview => return Ok(Outcome::Previewed(planned)),

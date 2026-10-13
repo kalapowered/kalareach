@@ -14,7 +14,7 @@
 //! `std::io::Stdin`, whose buffer is private to the standard library and is never cleared. The raw
 //! bound is [`RAW_LIMIT`] bytes, so a kit saved by an editor with a byte-order mark and CR LF line
 //! ends still reads; a leading mark and the CRs are removed in that buffer, and the kit's own
-//! bound ([`MAX_RECOVERY_KIT_BYTES`]) applies to what is left.
+//! bound ([`kr_client::recovery::MAX_RECOVERY_KIT_BYTES`]) applies to what is left.
 //!
 //! A read can be cancelled: a pipe is waited on in short turns that look at a flag, and a terminal
 //! is read with a short timeout that does the same. When it ends, however it ends, the terminal's
@@ -31,7 +31,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use kr_client::recovery::{MAX_RECOVERY_KIT_BYTES, parse_kit};
+use kr_client::recovery::parse_kit;
 use kr_client::shown;
 use kr_client::shown::Shown;
 use kr_protocol::archive::RecoveryKit;
@@ -218,7 +218,10 @@ fn read_answer(cancel: &AtomicBool) -> Result<Option<String>> {
     if answer.is_empty() {
         return Ok(None);
     }
-    let line = answer.split(|byte| *byte == b'\n').next().unwrap_or_default();
+    let line = answer
+        .split(|byte| *byte == b'\n')
+        .next()
+        .unwrap_or_default();
     // Text that is not UTF-8 is not yes: a decline, said as one.
     Ok(Some(String::from_utf8_lossy(line).into_owned()))
 }
@@ -333,9 +336,6 @@ impl Document {
             self.bytes[at] = 0;
         }
         self.len = kept;
-        if self.len > MAX_RECOVERY_KIT_BYTES {
-            return Err(too_long());
-        }
         let text = std::str::from_utf8(&self.bytes[..self.len]).map_err(|_| {
             CliError::Usage(Shown::said("that is not a recovery kit: it is not text"))
         })?;
@@ -529,7 +529,9 @@ impl<'a> Prompt<'a> {
         };
         let saved = rustix::termios::tcgetattr(terminal).map_err(failed)?;
         let mut silent = saved.clone();
-        silent.local_modes.remove(LocalModes::ICANON | LocalModes::ECHO | LocalModes::ECHONL);
+        silent
+            .local_modes
+            .remove(LocalModes::ICANON | LocalModes::ECHO | LocalModes::ECHONL);
         silent.special_codes[SpecialCodeIndex::VMIN] = 0;
         silent.special_codes[SpecialCodeIndex::VTIME] = 2;
         rustix::termios::tcsetattr(terminal, OptionalActions::Now, &silent).map_err(failed)?;

@@ -25,8 +25,8 @@ use kr_client::services::account::{
     AuthorisationGrant, Exchanged, IssuedGrant, RefreshToken, Refreshed, StoredGrant,
 };
 use kr_client::services::{
-    BackupManifestService, HttpDeadlines, HttpService, ManagedBackupManifestService,
-    ServiceFuture, ServiceHttp, ServiceSigner, managed_response_limits,
+    BackupManifestService, HttpDeadlines, HttpService, ManagedBackupManifestService, ServiceFuture,
+    ServiceHttp, ServiceSigner, managed_response_limits,
 };
 use kr_controller::account::{HostAccount, Service};
 use kr_controller::quiet::Timer;
@@ -43,15 +43,15 @@ use kr_crypto::store::{StoreSelection, open_store_in};
 use kr_ipc::endpoint::Listener;
 use kr_ipc::verify::ControllerIdentity;
 use kr_protocol::archive::{
-    ArchiveCheckpoint, BACKUP_PUBLICATION_DOMAIN, BACKUP_WRITER_DOMAIN, BackupGenerationPublication,
-    BackupGenerationPublicationPayload, BackupWriterRecord, BackupWriterRecordPayload,
-    CollectionLocator, RECOVERY_BUNDLE_SCHEMA_VERSION, RecoveryBundle, RecoveryContext,
-    TrustedProducer, TrustedWriter,
+    ArchiveCheckpoint, BACKUP_PUBLICATION_DOMAIN, BACKUP_WRITER_DOMAIN,
+    BackupGenerationPublication, BackupGenerationPublicationPayload, BackupWriterRecord,
+    BackupWriterRecordPayload, CollectionLocator, RECOVERY_BUNDLE_SCHEMA_VERSION, RecoveryBundle,
+    RecoveryContext, TrustedProducer, TrustedWriter,
 };
-use kr_protocol::ids::{ArchiveId, BackupGeneration, BackupObjectId, BackupWriterRevision, BuildId, DeviceId};
-use kr_protocol::scalars::{
-    AuthorisationKey, Nullable, Signature64, TimestampMs, U64, Uuid,
+use kr_protocol::ids::{
+    ArchiveId, BackupGeneration, BackupObjectId, BackupWriterRevision, BuildId, DeviceId,
 };
+use kr_protocol::scalars::{AuthorisationKey, Nullable, Signature64, TimestampMs, U64, Uuid};
 use kr_protocol::service::{GatewayOrigin, ServiceRequestSigner};
 use kr_service_stand_in::{ACCOUNT, Moment, Served, ServiceWeb, TOKEN, serve};
 use serde_json::Value;
@@ -422,8 +422,7 @@ impl Rig {
                             .expect("an identity"))
                         }),
                         secret_store: StoreSelection::File,
-                        boot_identity: kr_ipc::identity::boot_identity()
-                            .expect("a boot identity"),
+                        boot_identity: kr_ipc::identity::boot_identity().expect("a boot identity"),
                         supervisor: Box::new(NoWorkers),
                         worker_program: PathBuf::from("/nonexistent/kr-worker"),
                         build_id: build(),
@@ -656,7 +655,8 @@ impl Running {
         } = self;
         let status = ended.await.expect("the command ran");
         drop(stdin);
-        let take = |held: &Mutex<Vec<u8>>| held.lock().unwrap_or_else(PoisonError::into_inner).clone();
+        let take =
+            |held: &Mutex<Vec<u8>>| held.lock().unwrap_or_else(PoisonError::into_inner).clone();
         std::process::Output {
             status,
             stdout: take(&stdout),
@@ -863,7 +863,13 @@ async fn a_fresh_host_restores_a_backup_from_the_kit_alone_and_changes_nothing_o
     let preview = rig
         .run(
             &[
-                "backup", "restore", "--into", &into_arg, "--kit-file", &kit_arg, "--preview",
+                "backup",
+                "restore",
+                "--into",
+                &into_arg,
+                "--kit-file",
+                &kit_arg,
+                "--preview",
                 "--json",
             ],
             None,
@@ -880,7 +886,9 @@ async fn a_fresh_host_restores_a_backup_from_the_kit_alone_and_changes_nothing_o
         "a control key, host authority and an unknown name are shown as not restored"
     );
     assert!(
-        plan["not_restored"][0]["because"].as_str().is_some_and(|because| !because.is_empty()),
+        plan["not_restored"][0]["because"]
+            .as_str()
+            .is_some_and(|because| !because.is_empty()),
         "{plan}"
     );
 
@@ -1126,7 +1134,11 @@ impl Window {
     fn echoes(&self) -> bool {
         use std::os::unix::fs::OpenOptionsExt as _;
 
-        let name = self.terminal.master.tty_name().expect("the terminal's name");
+        let name = self
+            .terminal
+            .master
+            .tty_name()
+            .expect("the terminal's name");
         let tty = std::fs::OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NOCTTY)
@@ -1256,7 +1268,9 @@ async fn a_kit_that_names_only_a_self_hosted_service_is_refused_by_name_and_asks
     let fixture = Fixture::new().await;
     std::fs::write(
         &fixture.kit,
-        fixture.world.kit_text(&["https://backups.self-hosted.example"]),
+        fixture
+            .world
+            .kit_text(&["https://backups.self-hosted.example"]),
     )
     .expect("the kit file");
     let into = fixture.folder_arg();
@@ -1329,7 +1343,10 @@ async fn a_refusal_the_service_words_with_the_locator_reaches_no_output_with_it(
         !shown.contains(&locator[..10]),
         "more of the locator than the first eight characters is in {shown}"
     );
-    assert!(shown.contains(&locator[..8]), "the first eight are shown back");
+    assert!(
+        shown.contains(&locator[..8]),
+        "the first eight are shown back"
+    );
     // The control: the request the service refused did carry the whole locator.
     let sent = fixture
         .rig
@@ -1390,7 +1407,10 @@ async fn only_the_digest_of_the_plan_in_hand_writes_anything() {
         .run(&fixture.line(&into, &["--confirm-plan", &digest]), None)
         .await;
     assert!(!stale.status.success());
-    assert!(names(&fixture.into).is_empty(), "a stale digest writes nothing");
+    assert!(
+        names(&fixture.into).is_empty(),
+        "a stale digest writes nothing"
+    );
 
     // The control: the digest of the plan now in hand writes.
     let fresh = digest_of(&fixture.preview().await);
@@ -1443,14 +1463,17 @@ impl Fixture {
 /// KR-REQ-24.27, 24.28: a read in flight when privacy mode turns on is not delivered, nothing more
 /// is sent, and the files the run wrote are removed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_read_in_flight_when_privacy_mode_turns_on_is_not_delivered_and_the_run_removes_its_files() {
+async fn a_read_in_flight_when_privacy_mode_turns_on_is_not_delivered_and_the_run_removes_its_files()
+ {
     let fixture = Fixture::new().await;
     let into = fixture.folder_arg();
     let digest = digest_of(&fixture.preview().await);
     let web = fixture.rig.served.web();
     let base = fixture.object_reads();
     web.fail(OBJECT_READ, Fixture::SECOND_MEMBER, Moment::Slow);
-    let run = fixture.rig.spawn(&fixture.confirm_line(&into, &digest), &Input::Nothing);
+    let run = fixture
+        .rig
+        .spawn(&fixture.confirm_line(&into, &digest), &Input::Nothing);
     reached(web, OBJECT_READ, base + 3).await;
     assert_eq!(
         names(&fixture.into),
@@ -1468,7 +1491,10 @@ async fn a_read_in_flight_when_privacy_mode_turns_on_is_not_delivered_and_the_ru
         "{}",
         text(&ended.stderr)
     );
-    assert!(names(&fixture.into).is_empty(), "the run removed what it wrote");
+    assert!(
+        names(&fixture.into).is_empty(),
+        "the run removed what it wrote"
+    );
     assert_eq!(
         fixture.object_reads(),
         base + 3,
@@ -1482,10 +1508,7 @@ struct Scripted(Vec<&'static str>);
 impl kr_cli::backup::restore::Conversation for Scripted {
     fn show(&mut self, _lines: &[kr_client::shown::Shown]) {}
 
-    async fn ask(
-        &mut self,
-        _question: &kr_client::shown::Shown,
-    ) -> kr_cli::Result<Option<String>> {
+    async fn ask(&mut self, _question: &kr_client::shown::Shown) -> kr_cli::Result<Option<String>> {
         Ok(self.0.pop().map(str::to_owned))
     }
 }
@@ -1518,7 +1541,11 @@ impl kr_cli::backup::restore::Privacy for TurnsPrivacyOnAfterTheLastMember {
 async fn restore_through_the_library(
     fixture: &Fixture,
     turn_on: bool,
-) -> (kr_cli::Result<kr_cli::backup::restore::Outcome>, Option<kr_cli::backup::directory::Held>, usize) {
+) -> (
+    kr_cli::Result<kr_cli::backup::restore::Outcome>,
+    Option<kr_cli::backup::directory::Held>,
+    usize,
+) {
     use kr_cli::backup::directory::Destination;
     use kr_cli::backup::restore::{Decision, Privacy as _, Run, restore_with};
     use kr_cli::backup::source::{DaemonSource, real_pause};
@@ -1529,7 +1556,9 @@ async fn restore_through_the_library(
     let selector = EnvironmentSelector { environment: None };
     let mut privacy = TurnsPrivacyOnAfterTheLastMember {
         asking: Daemon::open(paths, &selector).await.expect("a connection"),
-        other: Daemon::open(paths, &selector).await.expect("another connection"),
+        other: Daemon::open(paths, &selector)
+            .await
+            .expect("another connection"),
         turn_on: false,
         asked: 0,
     };
@@ -1586,7 +1615,10 @@ async fn privacy_mode_turned_on_after_the_last_member_removes_the_files_and_make
     let control = Fixture::new().await;
     let (outcome, _held, asked) = restore_through_the_library(&control, false).await;
     assert!(outcome.is_ok(), "{:?}", outcome.err());
-    assert_eq!(asked, 1, "privacy mode is read once more after the last member");
+    assert_eq!(
+        asked, 1,
+        "privacy mode is read once more after the last member"
+    );
     assert!(names(&control.into).contains(&"restore.json".to_owned()));
 
     let fixture = Fixture::new().await;
@@ -1621,7 +1653,9 @@ async fn a_delay_the_service_names_is_waited_out_and_the_same_read_repeated() {
             retry_after_seconds: Some(1),
         },
     );
-    let run = fixture.rig.spawn(&fixture.confirm_line(&into, &digest), &Input::Nothing);
+    let run = fixture
+        .rig
+        .spawn(&fixture.confirm_line(&into, &digest), &Input::Nothing);
     run.stderr_shows("Waiting 1 s, wait 1 of 5.").await;
     assert_eq!(
         names(&fixture.into),
@@ -1645,7 +1679,8 @@ async fn a_delay_the_service_names_is_waited_out_and_the_same_read_repeated() {
 
 /// After five waits for one read the run stops, removes its files and says when to try again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_service_that_keeps_asking_for_quiet_stops_the_run_after_five_waits_and_removes_its_files() {
+async fn a_service_that_keeps_asking_for_quiet_stops_the_run_after_five_waits_and_removes_its_files()
+ {
     let fixture = Fixture::new().await;
     let into = fixture.folder_arg();
     let digest = digest_of(&fixture.preview().await);
@@ -1670,7 +1705,10 @@ async fn a_service_that_keeps_asking_for_quiet_stops_the_run_after_five_waits_an
     let said = text(&ended.stderr);
     assert_eq!(said.matches("Waiting 1 s,").count(), 5, "{said}");
     assert!(said.contains("try again after"), "{said}");
-    assert!(names(&fixture.into).is_empty(), "the run removed what it wrote");
+    assert!(
+        names(&fixture.into).is_empty(),
+        "the run removed what it wrote"
+    );
     assert_eq!(
         fixture.object_reads(),
         base + 3,
@@ -1723,7 +1761,10 @@ async fn a_folder_that_is_not_the_persons_to_fill_is_refused_before_anything_is_
     let refused = preview(fixture.folder_arg()).await;
     assert_eq!(refused.status.code(), Some(2));
     let said = text(&refused.stderr);
-    assert!(said.contains("not empty") && said.contains(".DS_Store"), "{said}");
+    assert!(
+        said.contains("not empty") && said.contains(".DS_Store"),
+        "{said}"
+    );
 
     // A folder that is not there, and a file.
     let missing = fixture.rig.temp.root().join("missing");
@@ -1736,7 +1777,11 @@ async fn a_folder_that_is_not_the_persons_to_fill_is_refused_before_anything_is_
     assert_eq!(refused.status.code(), Some(2));
     assert!(text(&refused.stderr).contains("not a folder"));
 
-    assert_eq!(fixture.bundle_reads(), 1, "only the control asked the service");
+    assert_eq!(
+        fixture.bundle_reads(),
+        1,
+        "only the control asked the service"
+    );
 }
 
 /// While a member is being read the folder is renamed away and another is put at its path, which
@@ -1761,13 +1806,20 @@ async fn the_folder_swapped_during_a_read(replacement_holds_decoys: bool) {
             retry_after_seconds: None,
         },
     );
-    let run = fixture.rig.spawn(&fixture.confirm_line(&into, &digest), &Input::Nothing);
+    let run = fixture
+        .rig
+        .spawn(&fixture.confirm_line(&into, &digest), &Input::Nothing);
     reached(web, OBJECT_READ, base + 3).await;
 
     let moved = fixture.rig.temp.root().join("moved-away");
     std::fs::rename(&fixture.into, &moved).expect("the folder is renamed");
     std::fs::create_dir(&fixture.into).expect("another folder at its path");
-    let decoys = ["session-0001.json", "session-0002.json", "configuration.json", "restore.json"];
+    let decoys = [
+        "session-0001.json",
+        "session-0002.json",
+        "configuration.json",
+        "restore.json",
+    ];
     if replacement_holds_decoys {
         for name in decoys {
             std::fs::write(fixture.into.join(name), b"DECOY").expect("a decoy");
@@ -1788,7 +1840,11 @@ async fn the_folder_swapped_during_a_read(replacement_holds_decoys: bool) {
     }
     assert_eq!(
         names(&fixture.into).len(),
-        if replacement_holds_decoys { decoys.len() } else { 0 },
+        if replacement_holds_decoys {
+            decoys.len()
+        } else {
+            0
+        },
         "the replacement gained and lost nothing"
     );
     assert!(
@@ -1796,7 +1852,10 @@ async fn the_folder_swapped_during_a_read(replacement_holds_decoys: bool) {
         "the folder the run opened holds none of its files once it removed them: {:?}",
         names(&moved)
     );
-    assert!(moved.is_dir() && fixture.into.is_dir(), "no folder was removed");
+    assert!(
+        moved.is_dir() && fixture.into.is_dir(),
+        "no folder was removed"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1857,10 +1916,17 @@ async fn a_longest_kit_with_a_byte_order_mark_and_crlf_restores_and_a_longer_one
         kit.push_str(&format!("origin: https://pad-{more:02}.example\n"));
         more += 1;
     }
-    assert!(kit.len() <= kit_limit() && kit.len() + 20 > kit_limit(), "{}", kit.len());
+    assert!(
+        kit.len() <= kit_limit() && kit.len() + 20 > kit_limit(),
+        "{}",
+        kit.len()
+    );
     let mut sent = vec![0xEF, 0xBB, 0xBF];
     sent.extend_from_slice(kit.replace('\n', "\r\n").as_bytes());
-    assert!(sent.len() > kit_limit(), "the document as sent is over the limit");
+    assert!(
+        sent.len() > kit_limit(),
+        "the document as sent is over the limit"
+    );
     let allowed = fixture
         .rig
         .run(
@@ -1881,7 +1947,11 @@ async fn a_longest_kit_with_a_byte_order_mark_and_crlf_restores_and_a_longer_one
         )
         .await;
     assert_eq!(refused.status.code(), Some(2), "{}", text(&refused.stderr));
-    assert_eq!(fixture.bundle_reads(), reads, "nothing was asked of the service");
+    assert_eq!(
+        fixture.bundle_reads(),
+        reads,
+        "nothing was asked of the service"
+    );
 }
 
 fn kit_limit() -> usize {
@@ -1903,7 +1973,15 @@ async fn a_kit_file_that_is_a_pipe_with_no_writer_is_refused_and_does_not_hang()
     let refused = tokio::time::timeout(
         LIVENESS_DEADLINE,
         fixture.rig.run(
-            &["backup", "restore", "--into", &into, "--kit-file", &fifo, "--preview"],
+            &[
+                "backup",
+                "restore",
+                "--into",
+                &into,
+                "--kit-file",
+                &fifo,
+                "--preview",
+            ],
             None,
         ),
     )
@@ -1925,11 +2003,16 @@ async fn an_interrupt_ends_a_command_waiting_for_a_kit_on_a_pipe_that_stays_open
         &["backup", "restore", "--into", &into, "--preview"],
         &Input::Held(partial),
     );
-    run.stderr_shows("Reading the recovery kit from standard input.").await;
+    run.stderr_shows("Reading the recovery kit from standard input.")
+        .await;
     run.interrupt();
     let ended = run.ended_within_the_deadline().await;
     assert!(!ended.status.success());
-    assert!(text(&ended.stderr).contains("stopped"), "{}", text(&ended.stderr));
+    assert!(
+        text(&ended.stderr).contains("stopped"),
+        "{}",
+        text(&ended.stderr)
+    );
     assert_eq!(fixture.bundle_reads(), 0);
 }
 
@@ -1942,13 +2025,18 @@ async fn an_interrupt_while_the_members_are_read_stops_the_run_and_removes_its_f
     let web = fixture.rig.served.web();
     let base = fixture.object_reads();
     web.fail(OBJECT_READ, Fixture::SECOND_MEMBER, Moment::Slow);
-    let run = fixture.rig.spawn(&fixture.confirm_line(&into, &digest), &Input::Nothing);
+    let run = fixture
+        .rig
+        .spawn(&fixture.confirm_line(&into, &digest), &Input::Nothing);
     reached(web, OBJECT_READ, base + 3).await;
     assert_eq!(names(&fixture.into), ["session-0001.json"]);
     run.interrupt();
     let ended = run.ended_within_the_deadline().await;
     assert!(!ended.status.success());
-    assert!(names(&fixture.into).is_empty(), "the run removed what it wrote");
+    assert!(
+        names(&fixture.into).is_empty(),
+        "the run removed what it wrote"
+    );
 }
 
 /// The kit typed at a terminal: nothing is shown as it is typed, the document ends at a blank line,
@@ -1966,19 +2054,31 @@ async fn a_kit_typed_at_a_terminal_is_not_shown_and_what_follows_it_never_reache
         &["backup", "restore", "--into", &into, "--preview"],
     );
     window.wait_for("Nothing you paste is shown.");
-    assert!(!window.echoes(), "the terminal shows nothing while the kit is typed");
+    assert!(
+        !window.echoes(),
+        "the terminal shows nothing while the kit is typed"
+    );
     // The kit, a blank line, and more than the command reads at once, which stays in the
     // terminal's queue unless the command throws it away.
     let after = "PASTED-AFTER-THE-KIT\n".repeat(25);
     window.type_bytes(format!("{kit}\n{after}").as_bytes());
     let shown = window.wait_for("Type yes if that is the kit you meant");
     assert!(!shown.contains(&seed), "the seed was shown");
-    assert!(!shown.contains(&locator[..13]), "more of the locator than eight characters was shown");
-    assert!(shown.contains(&locator[..8]), "the first eight characters are shown back");
+    assert!(
+        !shown.contains(&locator[..13]),
+        "more of the locator than eight characters was shown"
+    );
+    assert!(
+        shown.contains(&locator[..8]),
+        "the first eight characters are shown back"
+    );
     assert!(window.echoes(), "echo is back for the question");
     window.type_line("yes");
     let shown = window.wait_for("kr ended 0");
-    assert!(shown.contains("Digest of this plan") || shown.contains("digest"), "{shown}");
+    assert!(
+        shown.contains("Digest of this plan") || shown.contains("digest"),
+        "{shown}"
+    );
     // What follows in the terminal is the next thing typed, not what was pasted after the kit.
     window.type_line("marker");
     let shown = window.wait_for("first:");
@@ -2046,7 +2146,10 @@ async fn at_a_terminal_only_yes_writes_and_an_interrupt_at_the_question_writes_n
     window.type_bytes(&[0x03]);
     let shown = window.wait_for("kr ended");
     assert!(!shown.contains("kr ended 0"));
-    assert!(names(&fixture.into).is_empty(), "an interrupt at the question writes nothing");
+    assert!(
+        names(&fixture.into).is_empty(),
+        "an interrupt at the question writes nothing"
+    );
 
     let mut window = Window::run(&fixture.rig, &fixture.line(&into, &[]));
     window.wait_for(question);

@@ -16,9 +16,7 @@ use std::time::Duration;
 
 use kr_client::error::ClientError;
 use kr_client::recovery::{RestoreSource, SignInCause, SourceService, SourceSignIn};
-use kr_client::services::{
-    ServiceFuture, SyncFetched, SyncPosition, SyncRecoveryId, SyncRevision,
-};
+use kr_client::services::{ServiceFuture, SyncFetched, SyncPosition, SyncRecoveryId, SyncRevision};
 use kr_client::shown;
 use kr_client::shown::{Said as _, Shown};
 use kr_protocol::archive::{ArchiveCheckpoint, BackupGenerationPublication};
@@ -135,9 +133,7 @@ impl RestoreSource for DaemonSource {
                         BackupSignIn::WithoutScope => {
                             SourceSignIn::Unusable(SignInCause::WithoutScope)
                         }
-                        BackupSignIn::NotRenewed => {
-                            SourceSignIn::Unusable(SignInCause::NotRenewed)
-                        }
+                        BackupSignIn::NotRenewed => SourceSignIn::Unusable(SignInCause::NotRenewed),
                     },
                 }),
                 _ => Err(contrary()),
