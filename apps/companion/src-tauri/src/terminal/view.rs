@@ -369,7 +369,18 @@ async fn open_paired(
         .await
         .map_err(|lost| OpenFailure::lost(&lost))?
         .map_err(|refusal| {
-            OpenFailure::refused(format!("The host refused this view: {}", refusal.message))
+            // A host that cannot answer now has not refused the view: the opening's link asks again.
+            if crate::standing::transient(refusal.code) {
+                OpenFailure {
+                    reason: format!(
+                        "The host could not answer for this view now: {}",
+                        refusal.message
+                    ),
+                    lost: true,
+                }
+            } else {
+                OpenFailure::refused(format!("The host refused this view: {}", refusal.message))
+            }
         })?;
     let opened: SessionOpenResult = opened.to_typed().map_err(|error| {
         OpenFailure::refused(format!(
