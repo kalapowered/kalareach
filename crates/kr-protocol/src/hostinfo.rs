@@ -4504,8 +4504,8 @@ pub mod configuration {
         about: "the HTTP proxy this host's connections to services go through: the network \
                 endpoint's relay connection, relay latency probe, captive-portal check and Pkarr \
                 servers, the rendezvous, delivery and mail, the managed voice broker and account \
-                service, backups, the authority feed, the mailbox service, the relay lease service, \
-                the model's files and plugin repositories",
+                service, backups, the authority feed, the mailbox service, the relay lease \
+                service, the model's files and plugin repositories",
     };
 
     /// The managed voice broker this host starts its devices' calls at.
@@ -4541,7 +4541,8 @@ pub mod configuration {
     /// The account that pays for this host's relay leases.
     pub const RELAY_PAYER: Selection = Selection {
         key: "relay.payer",
-        about: "the account, and the authorisation it gave this host, that pay for its relay leases",
+        about: "the account, and the authorisation it gave this host, that pay for its relay \
+                leases",
     };
 
     /// How this environment's control daemon is started when a command finds none running.
