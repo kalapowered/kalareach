@@ -818,6 +818,24 @@ pub fn write_relay_document(
     write_document(host, &document);
 }
 
+/// Gives the host of a stopped daemon an authorisation key of a new pair, the one the next daemon
+/// on its tree signs with, and returns its public half.
+pub fn replace_host_authorisation(
+    host: &kr_ipc::testing::TempHost,
+) -> kr_protocol::scalars::AuthorisationKey {
+    let secrets = open_store_in(&host.environment().secrets_dir())
+        .expect("a secret store for the test environment");
+    let scope = net::device_key_scope(host.environment_id());
+    let mut keys = kr_crypto::store::load_device_keys(secrets.store.as_ref(), &scope)
+        .expect("the host's keys can be read")
+        .expect("the host has keys");
+    keys.authorisation =
+        kr_crypto::keys::AuthorisationKeyPair::generate().expect("an authorisation key");
+    kr_crypto::store::store_device_keys(secrets.store.as_ref(), &scope, &keys)
+        .expect("the host's keys are stored");
+    *keys.authorisation.public()
+}
+
 /// A device with keys of its own and an endpoint to dial from.
 pub struct Device {
     keys: DeviceKeys,

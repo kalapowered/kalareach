@@ -69,8 +69,8 @@ pub struct Row {
     pub consumed: u64,
     /// When the lease stops being valid, in UTC milliseconds on the service's clock.
     pub expires_at_ms: u64,
-    /// When a request that may have issued a lease was first written down, in UTC milliseconds on
-    /// this host's clock. Meaningful only while the row names no lease.
+    /// When the latest request that may have issued a lease was written down, in UTC milliseconds
+    /// on this host's clock. Meaningful only while the row names no lease.
     pub written_at_ms: u64,
 }
 
