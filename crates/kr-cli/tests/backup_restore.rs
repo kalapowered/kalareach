@@ -254,14 +254,23 @@ fn seal(world: &World, generation: u64, members: &[(&str, Vec<u8>)]) -> Sealed {
 
 /// The bundle the owner keeps at the locator: the writer and the producer it trusts, the archive,
 /// and optionally the checkpoint the owner last verified.
-fn bundle(world: &World, origin: &str, checkpoint: Option<ArchiveCheckpoint>) -> Vec<u8> {
+fn bundle(
+    world: &World,
+    origin: &str,
+    checkpoint: Option<ArchiveCheckpoint>,
+    archives: &[ArchiveId],
+) -> Vec<u8> {
     let bundle = RecoveryBundle {
         schema_version: U64::new(RECOVERY_BUNDLE_SCHEMA_VERSION),
-        collections: vec![CollectionLocator {
-            service_origin: origin.to_owned(),
-            locator: "collection-1".to_owned(),
-            archive_id: archive(),
-        }],
+        collections: archives
+            .iter()
+            .enumerate()
+            .map(|(at, archive_id)| CollectionLocator {
+                service_origin: origin.to_owned(),
+                locator: format!("collection-{}", at + 1),
+                archive_id: *archive_id,
+            })
+            .collect(),
         trusted_writers: [world.trusted_writer()].into_iter().collect(),
         trusted_producers: [world.trusted_producer()].into_iter().collect(),
         checkpoints: checkpoint.into_iter().collect(),
@@ -547,7 +556,7 @@ impl Rig {
         web.put_bundle(
             &world.locator,
             ACCOUNT,
-            bundle(world, self.origin(), checkpoint),
+            bundle(world, self.origin(), checkpoint, &[archive()]),
         );
     }
 }
@@ -705,10 +714,14 @@ impl Running {
 
     /// Sends the command an interrupt, as Ctrl-C does to a process outside a terminal.
     fn interrupt(&self) {
+        self.signal(rustix::process::Signal::INT);
+    }
+
+    /// Sends the command a signal.
+    fn signal(&self, signal: rustix::process::Signal) {
         let pid = rustix::process::Pid::from_raw(i32::try_from(self.pid).expect("a process id"))
             .expect("a process id");
-        rustix::process::kill_process(pid, rustix::process::Signal::INT)
-            .expect("the interrupt is sent");
+        rustix::process::kill_process(pid, signal).expect("the signal is sent");
     }
 }
 
@@ -948,6 +961,27 @@ async fn a_fresh_host_restores_a_backup_from_the_kit_alone_and_changes_nothing_o
         before,
         "a restore imports nothing into the host"
     );
+    // The kit's seed and the full locator are in nothing this host kept and nothing it reports:
+    // not in a file below its tree, and not in a support bundle.
+    let bundle_path = rig.temp.root().join("support.tar");
+    let _ = rig
+        .run(
+            &["doctor", "--bundle", &bundle_path.display().to_string()],
+            None,
+        )
+        .await;
+    assert!(bundle_path.is_file(), "the support bundle was written");
+    for (name, bytes) in tree(rig.temp.root()) {
+        if name == "w/kit.txt" || name.starts_with("restored/") {
+            continue;
+        }
+        for needle in [world.seed_text(), world.locator.clone()] {
+            assert!(
+                !text(&bytes).contains(&needle),
+                "{name} holds the kit's seed or locator"
+            );
+        }
+    }
     for refused in ["CONTROL-KEY-BYTES", "AUTHORITY", "UNKNOWN"] {
         assert!(
             tree(&into)
@@ -1340,7 +1374,7 @@ async fn a_refusal_the_service_words_with_the_locator_reaches_no_output_with_it(
     let shown = format!("{}{}", text(&refused.stdout), text(&refused.stderr));
     let locator = &fixture.world.locator;
     assert!(
-        !shown.contains(&locator[..10]),
+        !shown.contains(&locator[..9]),
         "more of the locator than the first eight characters is in {shown}"
     );
     assert!(
@@ -1460,11 +1494,9 @@ impl Fixture {
     }
 }
 
-/// KR-REQ-24.27, 24.28: a read in flight when privacy mode turns on is not delivered, nothing more
-/// is sent, and the files the run wrote are removed.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_read_in_flight_when_privacy_mode_turns_on_is_not_delivered_and_the_run_removes_its_files()
- {
+/// A read in flight when privacy mode changes: nothing more is sent, the files the run wrote are
+/// removed, and the run says which it was.
+async fn a_read_in_flight_when_privacy_mode_changes(turn_it_off_again: bool) -> String {
     let fixture = Fixture::new().await;
     let into = fixture.folder_arg();
     let digest = digest_of(&fixture.preview().await);
@@ -1483,14 +1515,13 @@ async fn a_read_in_flight_when_privacy_mode_turns_on_is_not_delivered_and_the_ru
 
     let on = fixture.rig.run(&["privacy", "on"], None).await;
     assert!(on.status.success(), "{}", text(&on.stderr));
+    if turn_it_off_again {
+        let off = fixture.rig.run(&["privacy", "off"], None).await;
+        assert!(off.status.success(), "{}", text(&off.stderr));
+    }
     web.release_held();
     let ended = run.ended_within_the_deadline().await;
     assert!(!ended.status.success());
-    assert!(
-        text(&ended.stderr).contains("privacy mode"),
-        "{}",
-        text(&ended.stderr)
-    );
     assert!(
         names(&fixture.into).is_empty(),
         "the run removed what it wrote"
@@ -1498,8 +1529,52 @@ async fn a_read_in_flight_when_privacy_mode_turns_on_is_not_delivered_and_the_ru
     assert_eq!(
         fixture.object_reads(),
         base + 3,
-        "nothing more was asked of the service once privacy mode was on"
+        "nothing more was asked of the service once privacy mode had changed"
     );
+    text(&ended.stderr)
+}
+
+/// KR-REQ-24.27, 24.28: a read in flight when privacy mode turns on is not delivered, and the run
+/// says privacy mode is on and what to do about it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_read_in_flight_when_privacy_mode_turns_on_is_not_delivered_and_the_run_removes_its_files()
+ {
+    let said = a_read_in_flight_when_privacy_mode_changes(false).await;
+    assert!(said.contains("kr privacy off"), "{said}");
+}
+
+/// Privacy mode turned on and off again while a read is in flight is a change too, and the advice
+/// is not to turn it off, which it is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_read_in_flight_when_privacy_mode_turns_on_and_off_again_is_not_delivered_either() {
+    let said = a_read_in_flight_when_privacy_mode_changes(true).await;
+    assert!(said.contains("turned on and off"), "{said}");
+    assert!(!said.contains("kr privacy off"), "{said}");
+}
+
+/// The relay refuses with one code for privacy mode and for a sign-in the service did not accept,
+/// and the command tells them apart: with privacy mode off the advice is to sign in again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_sign_in_the_service_did_not_accept_is_told_as_one_and_not_as_privacy_mode() {
+    let fixture = Fixture::new().await;
+    let into = fixture.folder_arg();
+    fixture.rig.served.web().fail(
+        OBJECT_READ,
+        1,
+        Moment::Refuse {
+            status: 403,
+            code: "FORBIDDEN",
+            retry_after_seconds: None,
+        },
+    );
+    let refused = fixture
+        .rig
+        .run(&fixture.line(&into, &["--preview"]), None)
+        .await;
+    assert_eq!(refused.status.code(), Some(8), "{}", text(&refused.stderr));
+    let said = text(&refused.stderr);
+    assert!(said.contains("kr account sign-in"), "{said}");
+    assert!(!said.contains("privacy"), "{said}");
 }
 
 /// What the person typed at the terminal, scripted for the library's own seam.
@@ -1520,12 +1595,22 @@ struct TurnsPrivacyOnAfterTheLastMember {
     other: kr_cli::daemon::Daemon,
     turn_on: bool,
     asked: usize,
+    folder: PathBuf,
 }
 
 impl kr_cli::backup::restore::Privacy for TurnsPrivacyOnAfterTheLastMember {
     async fn status(&mut self) -> kr_cli::Result<kr_protocol::privacy::PrivacyReport> {
         self.asked += 1;
         if self.turn_on {
+            assert_eq!(
+                names(&self.folder),
+                [
+                    "configuration.json",
+                    "session-0001.json",
+                    "session-0002.json"
+                ],
+                "privacy mode turns on after the last member is written and before the record"
+            );
             let _: kr_protocol::privacy::PrivacyReport = self
                 .other
                 .mutate(
@@ -1582,6 +1667,7 @@ async fn restore_through_the_library_pausing(
             .expect("another connection"),
         turn_on: false,
         asked: 0,
+        folder: fixture.into.clone(),
     };
     let began = privacy.status().await.expect("privacy mode reads");
     privacy.asked = 0;
@@ -2063,28 +2149,33 @@ async fn a_kit_file_that_is_a_pipe_with_no_writer_is_refused_and_does_not_hang()
     assert!(text(&refused.stderr).contains("not a regular file"));
 }
 
-/// Ctrl-C while a kit is being piped in and the writer holds the pipe open ends the command
-/// promptly, with nothing asked of the service.
+/// An interrupt, a termination, a hang-up or Ctrl-\ while a kit is being piped in and the writer
+/// holds the pipe open ends the command promptly, with nothing asked of the service. The last would
+/// otherwise end it with a core dump.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_interrupt_ends_a_command_waiting_for_a_kit_on_a_pipe_that_stays_open() {
+async fn a_signal_that_ends_a_command_waiting_for_a_kit_on_a_pipe_that_stays_open() {
+    use rustix::process::Signal;
+
     let fixture = Fixture::new().await;
     let into = fixture.folder_arg();
     let kit = fixture.world.kit_text(&[fixture.rig.origin()]);
     let partial = &kit.as_bytes()[..kit.len() / 2];
-    let run = fixture.rig.spawn(
-        &["backup", "restore", "--into", &into, "--preview"],
-        &Input::Held(partial),
-    );
-    run.stderr_shows("Reading the recovery kit from standard input.")
-        .await;
-    run.interrupt();
-    let ended = run.ended_within_the_deadline().await;
-    assert!(!ended.status.success());
-    assert!(
-        text(&ended.stderr).contains("stopped"),
-        "{}",
-        text(&ended.stderr)
-    );
+    for signal in [Signal::INT, Signal::TERM, Signal::HUP, Signal::QUIT] {
+        let run = fixture.rig.spawn(
+            &["backup", "restore", "--into", &into, "--preview"],
+            &Input::Held(partial),
+        );
+        run.stderr_shows("Reading the recovery kit from standard input.")
+            .await;
+        run.signal(signal);
+        let ended = run.ended_within_the_deadline().await;
+        assert!(!ended.status.success(), "{signal:?}");
+        assert!(
+            text(&ended.stderr).contains("stopped"),
+            "{signal:?}: {}",
+            text(&ended.stderr)
+        );
+    }
     assert_eq!(fixture.bundle_reads(), 0);
 }
 
@@ -2132,12 +2223,13 @@ async fn a_kit_typed_at_a_terminal_is_not_shown_and_what_follows_it_never_reache
     );
     // The kit, a blank line, and more than the command reads at once, which stays in the
     // terminal's queue unless the command throws it away.
+    // Line ends are CR LF, as a kit pasted from a Windows editor has them.
     let after = "PASTED-AFTER-THE-KIT\n".repeat(25);
-    window.type_bytes(format!("{kit}\n{after}").as_bytes());
+    window.type_bytes(format!("{kit}\n{after}").replace('\n', "\r\n").as_bytes());
     let shown = window.wait_for("Type yes if that is the kit you meant");
     assert!(!shown.contains(&seed), "the seed was shown");
     assert!(
-        !shown.contains(&locator[..13]),
+        !shown.contains(&locator[..9]),
         "more of the locator than eight characters was shown"
     );
     assert!(
@@ -2228,4 +2320,89 @@ async fn at_a_terminal_only_yes_writes_and_an_interrupt_at_the_question_writes_n
     window.type_line("yes");
     window.wait_for("kr ended 0");
     assert!(names(&fixture.into).contains(&"restore.json".to_owned()));
+}
+
+/// A bundle that names more than one archive at the service is refused with each listed, and
+/// `--archive` chooses one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_bundle_that_names_several_archives_lists_them_and_the_person_chooses_one() {
+    let fixture = Fixture::new().await;
+    let into = fixture.folder_arg();
+    let other = ArchiveId::new(id(0x12));
+    fixture.rig.served.web().put_bundle(
+        &fixture.world.locator,
+        ACCOUNT,
+        bundle(
+            &fixture.world,
+            fixture.rig.origin(),
+            None,
+            &[archive(), other],
+        ),
+    );
+    let refused = fixture
+        .rig
+        .run(&fixture.line(&into, &["--preview"]), None)
+        .await;
+    assert_eq!(refused.status.code(), Some(2), "{}", text(&refused.stderr));
+    let said = text(&refused.stderr);
+    for listed in [archive(), other] {
+        assert!(said.contains(&listed.to_string()), "{said}");
+    }
+    assert!(said.contains("--archive"), "{said}");
+    assert!(names(&fixture.into).is_empty());
+
+    let chosen = archive().to_string();
+    let allowed = fixture
+        .rig
+        .run(
+            &fixture.line(&into, &["--archive", &chosen, "--preview"]),
+            None,
+        )
+        .await;
+    assert!(allowed.status.success(), "{}", text(&allowed.stderr));
+}
+
+/// The folder is checked again when it is opened, so an entry put in after the first check is found;
+/// the probe of how the record is published removes only the names it made, so a name another
+/// writer put in meanwhile stays; and a record published whole leaves nothing to warn about.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_folder_is_checked_again_when_opened_and_the_probe_removes_only_what_it_made() {
+    use kr_cli::backup::directory::Destination;
+
+    let fixture = Fixture::new().await;
+    let destination = Destination::check(&fixture.into).expect("the folder passes");
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+        assert_eq!(
+            destination.native_bytes(),
+            fixture.into.as_os_str().as_bytes()
+        );
+    }
+    std::fs::write(fixture.into.join("late"), b"x").expect("an entry");
+    assert!(
+        destination.open().is_err(),
+        "an entry put in after the check is found"
+    );
+    std::fs::remove_file(fixture.into.join("late")).expect("removed");
+
+    let mut held = destination.open().expect("the folder opens");
+    let theirs = fixture.into.join(".restore-probe-link");
+    std::fs::write(&theirs, b"THEIRS").expect("another writer's file");
+    assert!(held.probe_publication().is_err(), "the name is taken");
+    assert_eq!(
+        std::fs::read(&theirs).expect("it is still there"),
+        b"THEIRS",
+        "a name the probe did not make is not removed"
+    );
+    assert_eq!(names(&fixture.into), [".restore-probe-link"]);
+    std::fs::remove_file(&theirs).expect("removed");
+
+    held.probe_publication().expect("a folder that publishes");
+    assert!(
+        names(&fixture.into).is_empty(),
+        "the probe took its names away"
+    );
+    let warnings = held.publish_record(b"{}").expect("the record is published");
+    assert!(warnings.is_empty(), "nothing is left to say");
+    assert_eq!(names(&fixture.into), ["restore.json"]);
 }

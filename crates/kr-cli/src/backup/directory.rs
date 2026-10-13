@@ -84,10 +84,26 @@ impl Destination {
         &self.path
     }
 
-    /// The path as the plan's digest holds it.
+    /// The path as the operating system names it, in bytes, which is what the plan's digest holds.
+    ///
+    /// A name is not always text, and two folders whose names differ only in bytes no text can show
+    /// are two folders, so the digest is never made from a rendering of the path.
     #[must_use]
-    pub fn spelled(&self) -> String {
-        kr_client::shown::spelled(&self.path)
+    pub fn native_bytes(&self) -> Vec<u8> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt as _;
+            self.path.as_os_str().as_bytes().to_vec()
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::ffi::OsStrExt as _;
+            self.path
+                .as_os_str()
+                .encode_wide()
+                .flat_map(u16::to_le_bytes)
+                .collect()
+        }
     }
 
     /// Opens the folder for the run, checking it again.
@@ -100,6 +116,7 @@ impl Destination {
             dir: open_checked(&self.path)?,
             path: self.path.clone(),
             made: Vec::new(),
+            probe_left: Vec::new(),
         })
     }
 }
@@ -244,6 +261,8 @@ pub struct Held {
     path: PathBuf,
     /// The names this run made and has not given up, in the order it made them.
     made: Vec<String>,
+    /// The names the publication probe made and could not remove.
+    probe_left: Vec<String>,
 }
 
 kr_client::debug_as_name!(Held);
@@ -262,7 +281,7 @@ impl Held {
     /// # Errors
     ///
     /// Returns a usage failure when it cannot.
-    pub fn probe_publication(&self) -> Result<()> {
+    pub fn probe_publication(&mut self) -> Result<()> {
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(unix)]
@@ -278,9 +297,14 @@ impl Held {
                 Shown::io(&error)
             )));
         }
+        // Only a name this probe made is removed: a name another writer put in the folder in the
+        // meantime is theirs, and the probe that found it there made nothing.
+        self.probe_left.push(PROBE.to_owned());
         let published = self.publish_probe();
-        let _ = self.dir.remove_file(PROBE);
-        let _ = self.dir.remove_file(PROBE_LINK);
+        if published.is_ok() {
+            self.probe_left.push(PROBE_LINK.to_owned());
+        }
+        self.remove_probe_names();
         published.map_err(|error| {
             CliError::Usage(shown!(
                 "the folder {} is on a file system that cannot give a finished file its name \
@@ -290,6 +314,18 @@ impl Held {
                 Shown::io(&error)
             ))
         })
+    }
+
+    /// Removes the probe's names, and keeps the ones that could not be removed.
+    fn remove_probe_names(&mut self) {
+        let names = std::mem::take(&mut self.probe_left);
+        self.probe_left = names
+            .into_iter()
+            .filter(|name| match self.dir.remove_file(name) {
+                Ok(()) => false,
+                Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+            })
+            .collect();
     }
 
     #[cfg(unix)]
@@ -374,10 +410,19 @@ impl Held {
         // The record has its name: this run has finished and nothing it made is taken back.
         self.made.clear();
         let mut left = Vec::new();
-        if self.dir.remove_file(RECORD_TEMPORARY).is_err() {
+        // Where the record was given its name by a rename the temporary name is gone already.
+        if let Err(error) = self.dir.remove_file(RECORD_TEMPORARY)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
             left.push(shown!(
                 "a temporary file was left at {}",
                 crate::shown::named(&self.path.join(RECORD_TEMPORARY))
+            ));
+        }
+        for name in std::mem::take(&mut self.probe_left) {
+            left.push(shown!(
+                "a file this restore made could not be removed: {}",
+                crate::shown::named(&self.path.join(name))
             ));
         }
         if kr_flush::flush_held_directory(&self.dir, kr_flush::NameKind::File).is_err() {
@@ -406,6 +451,13 @@ impl Held {
     /// The folder itself is never removed, and nothing is removed recursively.
     pub fn clean(&mut self) -> Vec<Shown> {
         let mut left = Vec::new();
+        self.remove_probe_names();
+        for name in std::mem::take(&mut self.probe_left) {
+            left.push(shown!(
+                "a file this restore made could not be removed: {}",
+                crate::shown::named(&self.path.join(name))
+            ));
+        }
         for name in std::mem::take(&mut self.made).into_iter().rev() {
             match self.dir.remove_file(&name) {
                 Ok(()) => {}
@@ -417,5 +469,13 @@ impl Held {
             }
         }
         left
+    }
+}
+
+impl Drop for Held {
+    /// A run that ends any way but by publishing its record, a panic included, removes what it
+    /// made.
+    fn drop(&mut self) {
+        let _ = self.clean();
     }
 }

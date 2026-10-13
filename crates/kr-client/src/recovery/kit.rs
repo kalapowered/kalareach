@@ -272,6 +272,13 @@ fn decode_seed(text: &str) -> Result<Zeroizing<Vec<u8>>, RecoveryError> {
         if character == '-' || character == ' ' {
             continue;
         }
+        // The buffer is reserved at the length this format writes, so a longer seed is refused
+        // before it can grow and leave an uncleared copy behind.
+        if symbols.len() == SYMBOLS {
+            return Err(RecoveryError::MalformedKit {
+                what: "a seed that is not the length this format writes",
+            });
+        }
         symbols.push(symbol_value(character).ok_or(RecoveryError::MalformedKit {
             what: "a character the recovery alphabet does not use",
         })?);

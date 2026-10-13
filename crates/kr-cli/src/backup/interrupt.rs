@@ -2,7 +2,8 @@
 //!
 //! Once a handler for the interrupt is installed, Ctrl-C no longer ends the process by itself: the
 //! command has to notice it, put the terminal back, remove what it wrote and say so. A termination
-//! request means the same. A command that waits on this makes the wait cancellable, because a
+//! request, a hang-up (the terminal went away) and Ctrl-\ mean the same; the last would otherwise
+//! end the process with a core dump that holds whatever it was holding. A command that waits on this makes the wait cancellable, because a
 //! blocking read is not ended by a signal that restarts it.
 //!
 //! Windows polls sockets only, so a command there reads its secret without a handler and installs
@@ -20,6 +21,10 @@ pub struct Interrupt {
     interrupt: tokio::signal::unix::Signal,
     #[cfg(unix)]
     terminate: tokio::signal::unix::Signal,
+    #[cfg(unix)]
+    hangup: tokio::signal::unix::Signal,
+    #[cfg(unix)]
+    quit: tokio::signal::unix::Signal,
     #[cfg(windows)]
     ctrl_c: Option<tokio::signal::windows::CtrlC>,
 }
@@ -46,6 +51,8 @@ impl Interrupt {
             Ok(Self {
                 interrupt: signal(SignalKind::interrupt()).map_err(failed)?,
                 terminate: signal(SignalKind::terminate()).map_err(failed)?,
+                hangup: signal(SignalKind::hangup()).map_err(failed)?,
+                quit: signal(SignalKind::quit()).map_err(failed)?,
             })
         }
         #[cfg(windows)]
@@ -80,6 +87,8 @@ impl Interrupt {
             tokio::select! {
                 _ = self.interrupt.recv() => {}
                 _ = self.terminate.recv() => {}
+                _ = self.hangup.recv() => {}
+                _ = self.quit.recv() => {}
             }
         }
         #[cfg(windows)]

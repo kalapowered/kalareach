@@ -560,7 +560,7 @@ async fn the_digest_a_person_confirms_changes_with_the_destination_the_environme
         world: &World,
         sealed: &Sealed,
         environment: &str,
-        destination: &str,
+        destination: &[u8],
     ) -> String {
         let source =
             Arc::new(Scripted::serving(world, world.bundle(&Shape::default())).publishing(sealed));
@@ -570,15 +570,20 @@ async fn the_digest_a_person_confirms_changes_with_the_destination_the_environme
             .digest(environment, destination)
             .expect("a digest")
     }
-    let base = digest(&world, &first, "env-1", "/restore/a").await;
+    let base = digest(&world, &first, "env-1", b"/restore/a").await;
     assert_eq!(
         base,
-        digest(&world, &first, "env-1", "/restore/a").await,
+        digest(&world, &first, "env-1", b"/restore/a").await,
         "it is stable"
     );
-    assert_ne!(base, digest(&world, &first, "env-1", "/restore/b").await);
-    assert_ne!(base, digest(&world, &first, "env-2", "/restore/a").await);
-    assert_ne!(base, digest(&world, &newer, "env-1", "/restore/a").await);
+    assert_ne!(base, digest(&world, &first, "env-1", b"/restore/b").await);
+    assert_ne!(base, digest(&world, &first, "env-2", b"/restore/a").await);
+    assert_ne!(base, digest(&world, &newer, "env-1", b"/restore/a").await);
+    // Two folders whose names differ only in bytes that are not text are two destinations.
+    assert_ne!(
+        digest(&world, &first, "env-1", b"/restore/\xff").await,
+        digest(&world, &first, "env-1", b"/restore/\xfe").await
+    );
     // The same generation with other content has another manifest and the same names and sizes:
     // only the manifest's hash tells the two plans apart.
     let other_content = world.seal(
@@ -593,7 +598,7 @@ async fn the_digest_a_person_confirms_changes_with_the_destination_the_environme
     );
     assert_ne!(
         base,
-        digest(&world, &other_content, "env-1", "/restore/a").await,
+        digest(&world, &other_content, "env-1", b"/restore/a").await,
         "a plan with another manifest is another plan"
     );
 }
@@ -1332,7 +1337,7 @@ async fn the_record_says_what_was_written_and_what_was_refused_and_holds_nothing
         Arc::new(Scripted::serving(&world, world.bundle(&Shape::default())).publishing(&sealed));
     let prepared = restore(&world, &source, None).await.expect("a plan");
     let plan = prepared.plan();
-    let digest = plan.digest("env-1", "/restore/a").expect("a digest");
+    let digest = plan.digest("env-1", b"/restore/a").expect("a digest");
     let written = vec![plan.members[0].object_id];
     let record = plan.record(&digest, &written).to_string();
     assert!(record.contains("kalareach-restore/1"));

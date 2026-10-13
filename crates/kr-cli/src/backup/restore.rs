@@ -341,7 +341,7 @@ pub async fn restore_with<P: Privacy, C: Conversation>(
 fn plan_of(prepared: &PreparedRestore, run: &Run<'_>) -> Result<Planned> {
     let plan = prepared.plan().clone();
     let digest = plan
-        .digest(&run.environment, &run.destination.spelled())
+        .digest(&run.environment, &run.destination.native_bytes())
         .ok_or_else(|| CliError::Other(Shown::said("the restore plan could not be encoded")))?;
     Ok(Planned {
         plan,
@@ -441,19 +441,27 @@ async fn explain<P: Privacy>(
         {
             // The relay refuses with one code for privacy mode and for a sign-in the service did
             // not accept; privacy mode decides which advice is true.
-            let private = match privacy.status().await {
-                Ok(now) => Some(now.enabled || now.generation != began.generation),
-                Err(_) => None,
-            };
-            match private {
-                Some(true) => CliError::refused_in_its_own_words(
+            let state = privacy
+                .status()
+                .await
+                .ok()
+                .map(|now| (now.enabled, now.generation != began.generation));
+            match state {
+                Some((true, _)) => CliError::refused_in_its_own_words(
                     ErrorCode::PermissionDenied,
                     Shown::said(
-                        "privacy mode is on, or changed, so nothing is restored: turn it off with \
-                         `kr privacy off` once its cleanup is complete, then restore again",
+                        "privacy mode is on, so nothing is restored: turn it off with `kr privacy \
+                         off` once its cleanup is complete, then restore again",
                     ),
                 ),
-                Some(false) => CliError::refused_in_its_own_words(
+                Some((false, true)) => CliError::refused_in_its_own_words(
+                    ErrorCode::PermissionDenied,
+                    Shown::said(
+                        "privacy mode was turned on and off while the restore ran, so nothing was \
+                         kept; restore again",
+                    ),
+                ),
+                Some((false, false)) => CliError::refused_in_its_own_words(
                     ErrorCode::PermissionDenied,
                     Shown::said(
                         "the storage service did not accept this host's sign-in; sign this host \

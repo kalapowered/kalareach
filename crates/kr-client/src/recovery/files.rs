@@ -579,11 +579,14 @@ crate::debug_as_name!(MemberVerdict, PlannedMember, RestorePlan);
 #[derive(Serialize)]
 struct DigestInput<'a> {
     environment: &'a str,
-    destination: &'a str,
+    /// The destination as the operating system spells it, in lowercase hexadecimal, so two names
+    /// that differ in bytes no text can show are two destinations.
+    destination: String,
     origin: &'a str,
     archive: ArchiveId,
     generation: u64,
     manifest_hash: Digest256,
+    published_at_ms: u64,
     writer: KeyId,
     standing: String,
     bundle_revision: u64,
@@ -627,22 +630,27 @@ impl RestorePlan {
             .sum()
     }
 
-    /// The digest the person confirms: a domain, the environment, the absolute destination and
-    /// everything the plan says, as lowercase hexadecimal.
+    /// The digest the person confirms: a domain, the environment, the absolute destination (as the
+    /// bytes the operating system names it by) and everything the plan says, as lowercase
+    /// hexadecimal.
     ///
     /// A generation published between the preview and the confirmation changes it, so the
     /// confirmation is for the archive that was shown.
     ///
     /// Returns nothing when the plan cannot be encoded, which no plan this module makes is.
     #[must_use]
-    pub fn digest(&self, environment: &str, destination: &str) -> Option<String> {
+    pub fn digest(&self, environment: &str, destination: &[u8]) -> Option<String> {
         let input = DigestInput {
             environment,
-            destination,
+            destination: destination
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect(),
             origin: &self.origin,
             archive: self.archive_id,
             generation: self.generation.get(),
             manifest_hash: self.manifest_hash,
+            published_at_ms: self.published_at_ms.get(),
             writer: self.writer,
             standing: self.standing.describe(),
             bundle_revision: self.bundle_revision,

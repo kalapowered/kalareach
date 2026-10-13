@@ -124,8 +124,9 @@ pub enum BackupCommand {
 /// `kr backup restore`.
 #[derive(Args)]
 pub struct BackupRestoreArguments {
-    /// The folder to fill. You make it first: it has to exist, be empty and be yours, and no other
-    /// account may be able to write in it. It is never removed and never replaced.
+    /// The folder to fill. You make it first: it has to exist and be empty, on Unix it has to be
+    /// yours and not writable by every account, and it is not a link. It is never removed and never
+    /// replaced.
     #[arg(long)]
     pub into: PathBuf,
     /// Read the recovery kit from this file. Without it, the kit comes from standard input: typed

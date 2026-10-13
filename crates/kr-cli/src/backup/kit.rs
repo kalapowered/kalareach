@@ -184,19 +184,23 @@ fn read_answer(cancel: &AtomicBool) -> Result<Option<String>> {
     };
     let mut answer: Vec<u8> = Vec::new();
     let mut chunk = [0_u8; 256];
+    // A descriptor that cannot be polled (a terminal device on some systems) is read plainly.
+    let mut pollable = true;
     loop {
         if cancel.load(Ordering::SeqCst) {
             return Err(interrupt::stopped());
         }
-        let mut waiting = [PollFd::new(&input, PollFlags::IN)];
-        match poll(&mut waiting, Some(&turn)) {
-            Ok(0) | Err(rustix::io::Errno::INTR) => continue,
-            Ok(_) => {}
-            Err(error) => {
-                return Err(CliError::Terminal(shown!(
-                    "your answer could not be waited for: {}",
-                    crate::shown::errno(error)
-                )));
+        if pollable {
+            let mut waiting = [PollFd::new(&input, PollFlags::IN)];
+            match poll(&mut waiting, Some(&turn)) {
+                Ok(0) | Err(rustix::io::Errno::INTR) => continue,
+                Ok(_) => pollable = !waiting[0].revents().contains(PollFlags::NVAL),
+                Err(error) => {
+                    return Err(CliError::Terminal(shown!(
+                        "your answer could not be waited for: {}",
+                        crate::shown::errno(error)
+                    )));
+                }
             }
         }
         match input.read(&mut chunk) {
@@ -519,7 +523,7 @@ struct Prompt<'a> {
 #[cfg(unix)]
 impl<'a> Prompt<'a> {
     fn enter(terminal: &'a File) -> Result<Self> {
-        use rustix::termios::{LocalModes, OptionalActions, SpecialCodeIndex};
+        use rustix::termios::{InputModes, LocalModes, OptionalActions, SpecialCodeIndex};
 
         let failed = |error: rustix::io::Errno| {
             CliError::Terminal(shown!(
@@ -532,9 +536,12 @@ impl<'a> Prompt<'a> {
         silent
             .local_modes
             .remove(LocalModes::ICANON | LocalModes::ECHO | LocalModes::ECHONL);
+        // A carriage return stays one, so a CR LF line end can be told from two line ends.
+        silent.input_modes.remove(InputModes::ICRNL);
         silent.special_codes[SpecialCodeIndex::VMIN] = 0;
         silent.special_codes[SpecialCodeIndex::VTIME] = 2;
-        rustix::termios::tcsetattr(terminal, OptionalActions::Now, &silent).map_err(failed)?;
+        // What was typed before this prompt was shown was echoed, and is not part of the kit.
+        rustix::termios::tcsetattr(terminal, OptionalActions::Flush, &silent).map_err(failed)?;
         Ok(Self {
             terminal,
             saved,
@@ -550,15 +557,21 @@ impl<'a> Prompt<'a> {
         if self.restored {
             return Ok(());
         }
+        loop {
+            match rustix::termios::tcsetattr(self.terminal, OptionalActions::Flush, &self.saved) {
+                Ok(()) => break,
+                Err(rustix::io::Errno::INTR) => {}
+                // Not marked restored, so dropping this tries once more.
+                Err(error) => {
+                    return Err(CliError::Terminal(shown!(
+                        "the terminal's modes could not be put back: {}",
+                        crate::shown::errno(error)
+                    )));
+                }
+            }
+        }
         self.restored = true;
-        rustix::termios::tcsetattr(self.terminal, OptionalActions::Flush, &self.saved).map_err(
-            |error| {
-                CliError::Terminal(shown!(
-                    "the terminal's modes could not be put back: {}",
-                    crate::shown::errno(error)
-                ))
-            },
-        )
+        Ok(())
     }
 }
 
@@ -575,12 +588,26 @@ fn read_terminal(terminal: &File, document: &mut Document, cancel: &AtomicBool) 
     crate::report::say(&Shown::said(
         "Paste the recovery kit, then press Enter on an empty line. Nothing you paste is shown.",
     ));
-    let typed = type_document(terminal, document, cancel);
+    let typed = type_document(terminal, document, cancel).inspect(|()| discard_the_rest(terminal));
     let left = prompt.leave();
     // The cursor is where the paste left it.
     crate::report::say(&Shown::said(""));
     typed?;
     left
+}
+
+/// Reads and throws away what is still arriving after the document ended, until a read finds
+/// nothing more, so that a paste that comes in more than one piece does not reach the shell.
+#[cfg(unix)]
+fn discard_the_rest(terminal: &File) {
+    let mut chunk = Zeroizing::new([0_u8; 256]);
+    // Bounded, so input that never stops cannot hold the command.
+    for _ in 0..64 {
+        match rustix::io::read(terminal, &mut chunk[..]) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+    }
 }
 
 /// Reads what is typed until the document ends.
@@ -644,6 +671,8 @@ struct Typing {
     escape: Escape,
     /// Whether the document has a first line yet.
     started: bool,
+    /// Whether the byte before was a carriage return, so a line feed after it ends no second line.
+    after_return: bool,
 }
 
 #[cfg(unix)]
@@ -666,6 +695,7 @@ impl Typing {
             }
             Escape::None => {}
         }
+        let was_return = std::mem::take(&mut self.after_return);
         match byte {
             0x1b => self.escape = Escape::Introduced,
             // Ctrl-D ends the document where the terminal's own end of input is switched off.
@@ -675,7 +705,10 @@ impl Typing {
                     document.pop();
                 }
             }
+            // The line feed of a CR LF line end is the same line end.
+            b'\n' if was_return => {}
             b'\n' | b'\r' => {
+                self.after_return = byte == b'\r';
                 let at_line_start = document.last().is_none_or(|last| last == b'\n');
                 if at_line_start {
                     // An empty line after the first ends the document; before it, it is ignored.
