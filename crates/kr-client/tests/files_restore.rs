@@ -869,7 +869,7 @@ async fn a_bundle_served_for_another_kit_locator_or_origin_does_not_open() {
         .expect_err("refused");
     assert!(matches!(
         refused,
-        RestoreError::Recovery(kr_client::recovery::RecoveryError::BundleNotAuthentic)
+        RestoreError::Recovery(ref inner) if matches!(**inner, kr_client::recovery::RecoveryError::BundleNotAuthentic)
     ));
 
     // A bundle sealed for another locator, served at the kit's.
@@ -882,7 +882,7 @@ async fn a_bundle_served_for_another_kit_locator_or_origin_does_not_open() {
     );
     assert!(matches!(
         restore(&world, &source, None).await.expect_err("refused"),
-        RestoreError::Recovery(kr_client::recovery::RecoveryError::BundleNotAuthentic)
+        RestoreError::Recovery(ref inner) if matches!(**inner, kr_client::recovery::RecoveryError::BundleNotAuthentic)
     ));
 
     // A bundle sealed for another origin, served as this one's.
@@ -895,7 +895,7 @@ async fn a_bundle_served_for_another_kit_locator_or_origin_does_not_open() {
     );
     assert!(matches!(
         restore(&world, &source, None).await.expect_err("refused"),
-        RestoreError::Recovery(kr_client::recovery::RecoveryError::BundleNotAuthentic)
+        RestoreError::Recovery(ref inner) if matches!(**inner, kr_client::recovery::RecoveryError::BundleNotAuthentic)
     ));
 
     // A bundle at no locator the kit names is an absent bundle, kept apart from a bad one.
@@ -949,7 +949,7 @@ async fn a_kit_that_names_no_service_this_host_reaches_is_refused_by_name() {
         .expect_err("refused");
     assert!(matches!(
         refused,
-        RestoreError::Recovery(kr_client::recovery::RecoveryError::MalformedKit { .. })
+        RestoreError::Recovery(ref inner) if matches!(**inner, kr_client::recovery::RecoveryError::MalformedKit { .. })
     ));
     assert!(!source.asked().iter().any(|call| call == "bundle"));
 
@@ -963,7 +963,7 @@ async fn a_kit_that_names_no_service_this_host_reaches_is_refused_by_name() {
         .expect_err("refused");
     assert!(matches!(
         refused,
-        RestoreError::Recovery(kr_client::recovery::RecoveryError::MistypedKit)
+        RestoreError::Recovery(ref inner) if matches!(**inner, kr_client::recovery::RecoveryError::MistypedKit)
     ));
     assert!(source.asked().is_empty());
 

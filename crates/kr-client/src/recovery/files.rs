@@ -319,7 +319,7 @@ pub enum RestoreError {
     OriginNotConfigured,
     /// The kit, the bundle or the service refused at the recovery layer.
     #[error("{0}")]
-    Recovery(RecoveryError),
+    Recovery(Box<RecoveryError>),
     /// The service holds no bundle at the kit's locator for this host's account.
     #[error("the service holds no recovery bundle for this account at that locator")]
     BundleAbsent,
@@ -922,7 +922,7 @@ impl FilesRestore {
     ) -> Result<PreparedRestore, RestoreError> {
         // 1. The kit's checksum, before anything is derived or asked.
         let seed = RecoverySeed::from_kit(&kit)
-            .map_err(|_| RestoreError::Recovery(RecoveryError::MistypedKit))?;
+            .map_err(|_| RestoreError::Recovery(Box::new(RecoveryError::MistypedKit)))?;
         let service = source.service().await?;
         if let SourceSignIn::Unusable(cause) = service.sign_in {
             return Err(RestoreError::NotSignedIn {
@@ -935,9 +935,11 @@ impl FilesRestore {
         // The locator is an identifier in its canonical spelling, and the service refuses
         // anything else, so a kit that carries another is wrong before it is used.
         if !is_an_identifier(&kit.bundle_locator) {
-            return Err(RestoreError::Recovery(RecoveryError::MalformedKit {
-                what: "a bundle locator that is not an identifier",
-            }));
+            return Err(RestoreError::Recovery(Box::new(
+                RecoveryError::MalformedKit {
+                    what: "a bundle locator that is not an identifier",
+                },
+            )));
         }
 
         // 2. The bundle, through a reader that cannot write.
@@ -952,7 +954,7 @@ impl FilesRestore {
                 origin.clone(),
                 Arc::clone(&reader) as Arc<dyn SyncBackupService>,
             ))
-            .map_err(RestoreError::Recovery)?;
+            .map_err(|error| RestoreError::Recovery(Box::new(error)))?;
         let material = match fresh.open_bundle(&origin).await {
             Ok(material) => material,
             Err(RecoveryError::Service(error)) => {
@@ -962,7 +964,7 @@ impl FilesRestore {
                     RestoreError::Read(error)
                 });
             }
-            Err(other) => return Err(RestoreError::Recovery(other)),
+            Err(other) => return Err(RestoreError::Recovery(Box::new(other))),
         };
 
         // 3. One archive.
