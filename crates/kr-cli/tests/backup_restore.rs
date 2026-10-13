@@ -2289,6 +2289,33 @@ async fn a_kit_typed_at_a_terminal_is_not_shown_and_what_follows_it_never_reache
     assert!(!shown.contains(&seed));
 }
 
+/// A paste that is not a kit ends the command with no question after it, so what was pasted past
+/// the end of the document is left for the shell unless the command throws it away.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn text_pasted_after_a_document_that_is_not_a_kit_never_reaches_the_shell() {
+    let fixture = Fixture::new().await;
+    let into = fixture.folder_arg();
+    let mut window = Window::run(
+        &fixture.rig,
+        &["backup", "restore", "--into", &into, "--preview"],
+    );
+    window.wait_for("Nothing you paste is shown.");
+    // More than the command reads at once, so some of it is still in the terminal's queue when the
+    // document ends.
+    let after = "PASTED-AFTER-THE-DOCUMENT\n".repeat(25);
+    window.type_bytes(
+        format!("not a kit\n\n{after}")
+            .replace('\n', "\r\n")
+            .as_bytes(),
+    );
+    let shown = window.wait_for("kr ended");
+    assert!(!shown.contains("kr ended 0"), "{shown}");
+    assert_eq!(fixture.bundle_reads(), 0);
+    window.type_line("marker");
+    let shown = window.wait_for("first:");
+    assert!(shown.contains("first:marker"), "{}", shown.escape_debug());
+}
+
 /// A kit typed at a terminal is not used until the person says it is the kit they meant: a wrong
 /// answer ends the command before the service is asked anything.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
