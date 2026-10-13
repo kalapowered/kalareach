@@ -5,9 +5,9 @@
 //! request is addressed to it, that the device that signed it is paired, signed what it published
 //! and is, now, a device this host would let manage it (decided as a paired device's own call of
 //! [`MANAGEMENT_PROBE`] is, by its grant, this host's policy and its configuration), and that it
-//! names something this host knows and has not withdrawn. A request that passes is carried out as the
-//! owner at this machine's own revocation is, through the same barrier, so the revision it takes
-//! is the one the registry allocates and the completion it reports is the barrier's.
+//! names something this host knows and has not withdrawn. A request that passes is carried out as
+//! the owner at this machine's own revocation is, through the same barrier, so the revision it
+//! takes is the one the registry allocates and the completion it reports is the barrier's.
 
 use kr_client::services::authority::RejectionReason;
 use std::sync::Arc;
@@ -756,7 +756,9 @@ mod tests {
     /// The decision that stands for a paired device's right to manage the host is the right and
     /// nothing else: if the method it is asked for stops being listed at the paired-device door,
     /// or starts to require another right or a condition, the feed would turn every owner away or
-    /// ask more of one than managing the host.
+    /// ask more of one than managing the host. The decision reads only whether the method is
+    /// reachable from the door and which rights it requires; a change that makes it read more of
+    /// the method's entry needs this test to say so.
     #[test]
     fn the_method_that_stands_for_managing_the_host_requires_that_right_alone_at_the_paired_door() {
         let AuthorityDecision::Listed(entry) = kr_protocol::method::decide(

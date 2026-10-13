@@ -4531,8 +4531,9 @@ mod tests {
 
     /// A release that reads version 9 kept no answer to a redemption or to a transfer of control.
     /// A registry it left, and one at each later version, come forward to this version with as many
-    /// rows in the answer and grant tables as they held: the steps from 9 write only the version,
-    /// and the answers these methods keep are written by a release that writes 10 or later.
+    /// rows in the answer and grant tables as they held: the registry's own steps from 9 write only
+    /// the version, and the answers these methods keep are written by a release that writes 10 or
+    /// later.
     #[test]
     fn a_registry_at_an_earlier_version_comes_forward_with_the_rows_it_held() {
         for from in 9..SCHEMA_VERSION {
