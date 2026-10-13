@@ -237,6 +237,15 @@ impl Rig {
             .and_then(|at| u64::try_from(at).ok())
     }
 
+    /// How many lease requests for one device's pair reached the service.
+    fn requests_for(&self, device: &DeviceRecord) -> usize {
+        let destination = serde_json::to_value(device.endpoint_id).expect("an endpoint");
+        self.bodies(ISSUE)
+            .iter()
+            .filter(|body| body["destination_endpoint_key"] == destination)
+            .count()
+    }
+
     /// How many revocations of one lease reached the service.
     fn revocations_of(&self, lease_id: &str) -> usize {
         self.bodies(REVOKE)
@@ -290,6 +299,11 @@ impl Rig {
 
     /// Stops the daemon and starts it again on its tree.
     async fn restarted(self) -> Self {
+        self.restarted_after(|_| {}).await
+    }
+
+    /// Stops the daemon, lets `change` alter its tree, and starts it again on the tree.
+    async fn restarted_after(self, change: impl FnOnce(&kr_ipc::testing::TempHost)) -> Self {
         let Self {
             host,
             served,
@@ -300,6 +314,7 @@ impl Rig {
             ..
         } = self;
         let stopped = host.shut_down().await;
+        change(stopped.tree());
         let timer = HeldTimer::held();
         let host = stopped.start_with_timer(Arc::clone(&timer) as _).await;
         Self {
@@ -1616,4 +1631,385 @@ async fn a_host_that_selects_no_lease_service_says_so() {
         .find(|check| check.id() == "relay-leases")
         .expect("the check is there");
     assert_eq!(check.status, DoctorStatus::NotApplicable);
+}
+
+/// KR-REQ-17.51: a refill the service finds past its deadline is answered with a new lease, and the
+/// service gives that lease the cumulative ceiling the refill asked for, which for a pair that has
+/// carried traffic is far more than a new reservation needs. A host whose clock is behind the
+/// service's sends such a refill, believing the lease has time left. The host ends that lease and
+/// asks for the pair afresh, so no pair holds more of the account's aggregate than one block.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refill_the_service_finds_expired_does_not_leave_the_old_ceiling_held() {
+    let rig = Rig::start().await;
+    let owner = rig.owner_device();
+    let first = rig.live_lease_for(&owner).expect("a lease");
+    for _ in 0..3 {
+        let lease = rig.live_lease_for(&owner).expect("a lease");
+        rig.served.web().relay_counts(&lease.lease_id, u64::MAX / 4);
+        rig.time_passes(Duration::from_secs(301));
+        rig.pass().await;
+    }
+    let carried = rig.live_lease_for(&owner).expect("the same lease");
+    assert_eq!(carried.lease_id, first.lease_id);
+    assert!(
+        carried.byte_ceiling > 2 * BLOCK_BYTES,
+        "the pair has carried traffic: {}",
+        carried.byte_ceiling
+    );
+
+    // The service's clock is a lease's life ahead of the host's: its refill falls due by the host's
+    // clock when the lease has run out by the service's.
+    rig.served
+        .web()
+        .advance_relay_clock(Duration::from_secs(u64::from(LEASE_SECONDS)));
+    rig.time_passes(Duration::from_secs(301));
+    rig.pass().await;
+
+    let leases = rig.leases_for(&owner);
+    let live: Vec<_> = leases.iter().filter(|lease| lease.live).collect();
+    assert_eq!(live.len(), 1, "one lease carries the pair");
+    assert_eq!(
+        live[0].byte_ceiling, BLOCK_BYTES,
+        "and it holds a new reservation's block, not the old ceiling"
+    );
+    assert_eq!(
+        leases
+            .iter()
+            .filter(|lease| lease.ended_for == Some("finished"))
+            .count(),
+        1,
+        "the lease the service opened at the old ceiling was ended"
+    );
+    assert_eq!(
+        rig.lease_in_the_record(&owner),
+        Some(Some(live[0].lease_id.clone()))
+    );
+    assert_eq!(rig.endings_owed(), 0);
+}
+
+/// KR-REQ-17.51: an answer only the owner or the calendar can change holds the asks for the
+/// standing interval, also when a request to another pair in the same pass got no answer. The pair
+/// that was turned back is not asked again at the pace of the other one's backoff.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refusal_met_beside_a_request_that_failed_is_not_asked_again_at_the_backoff() {
+    let rig = Rig::start().await;
+    rig.served.web().fail(
+        ISSUE,
+        1,
+        Moment::Refuse {
+            status: 503,
+            code: "SERVICE_UNAVAILABLE",
+            retry_after_seconds: None,
+        },
+    );
+    let (_first_phone, first) = rig.pairs().await;
+    rig.until("the first pair was asked and not answered", || {
+        rig.requests(ISSUE) == 2
+    })
+    .await;
+    rig.pass().await;
+    let (_second_phone, second) = rig.pairs().await;
+    rig.pass().await;
+    assert_eq!(rig.requests(ISSUE), 2, "the backoff holds the second pair");
+
+    // The next pass meets a refusal and then a failure.
+    rig.served.web().fail(
+        ISSUE,
+        1,
+        Moment::Refuse {
+            status: 403,
+            code: "FORBIDDEN",
+            retry_after_seconds: None,
+        },
+    );
+    rig.served.web().fail(
+        ISSUE,
+        2,
+        Moment::Refuse {
+            status: 503,
+            code: "SERVICE_UNAVAILABLE",
+            retry_after_seconds: None,
+        },
+    );
+    rig.timer.advance(Duration::from_secs(60));
+    rig.pass().await;
+    assert_eq!(rig.requests(ISSUE), 4, "a refusal and a failure");
+
+    rig.timer.advance(Duration::from_secs(60));
+    rig.pass().await;
+    assert_eq!(
+        rig.requests(ISSUE),
+        4,
+        "the refusal holds the asks for the standing interval, which a backoff does not outlast"
+    );
+
+    rig.timer.advance(STANDING_RETRY);
+    rig.pass().await;
+    assert!(rig.holds(&first) && rig.holds(&second));
+}
+
+/// KR-REQ-17.40: the allowance warning an answer carries is shown to the owner, and is gone when an
+/// answer carries none.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_allowance_warning_is_shown_until_an_answer_carries_none() {
+    let rig = Rig::start().await;
+    assert_eq!(rig.check().await.status, DoctorStatus::Ok);
+    rig.served.web().warn_relay_allowance(Some(80));
+    rig.time_passes(Duration::from_secs(301));
+    rig.pass().await;
+    let shown = rig.check().await;
+    assert_eq!(shown.status, DoctorStatus::Warning, "{}", shown.detail());
+    assert!(shown.detail().contains("80 percent"), "{}", shown.detail());
+
+    rig.served.web().warn_relay_allowance(None);
+    rig.time_passes(Duration::from_secs(301));
+    rig.pass().await;
+    assert_eq!(rig.check().await.status, DoctorStatus::Ok);
+}
+
+/// KR-REQ-17.52: the grace a grant carries, for connections already running when the allowance ran
+/// out, is shown to the owner as what is left of it, and stops being shown when it has ended or the
+/// next grant carries none.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_grace_a_grant_carries_is_shown_until_it_ends() {
+    let rig = Rig::start().await;
+    rig.served.web().enter_relay_grace(true);
+    rig.time_passes(Duration::from_secs(301));
+    rig.pass().await;
+    let shown = rig.check().await;
+    assert!(
+        shown.detail().contains("104857600 bytes"),
+        "{}",
+        shown.detail()
+    );
+
+    // The window ends by the host's clock, as the answer said.
+    rig.wall.advance(Duration::from_secs(601));
+    assert!(
+        !rig.check().await.detail().contains("104857600 bytes"),
+        "a grace that has ended is not shown"
+    );
+
+    rig.time_passes(Duration::from_secs(301));
+    rig.pass().await;
+    rig.served.web().enter_relay_grace(false);
+    rig.time_passes(Duration::from_secs(301));
+    rig.pass().await;
+    assert!(!rig.check().await.detail().contains("104857600 bytes"));
+}
+
+/// KR-REQ-17.35: a credential the service will not admit is a refusal about this host's request,
+/// and the owner is told the clock and the service origin as well as the payer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_credential_the_service_will_not_admit_names_the_clock_and_the_origin() {
+    let rig = Rig::start().await;
+    rig.served.web().fail(
+        ISSUE,
+        1,
+        Moment::Refuse {
+            status: 401,
+            code: "UNAUTHENTICATED",
+            retry_after_seconds: None,
+        },
+    );
+    let (_phone, _record) = rig.pairs().await;
+    rig.until("the keeper has been refused", || {
+        rig.timer.asked_for().contains(&STANDING_RETRY)
+    })
+    .await;
+    let shown = rig.check().await;
+    assert_eq!(shown.status, DoctorStatus::Warning);
+    let remedy = shown.remedy().expect("a remedy");
+    assert!(
+        remedy.contains("clock") && remedy.contains("relay.origin"),
+        "{remedy}"
+    );
+}
+
+/// KR-REQ-17.35: what the host holds belongs to the key that asked for it. A host that signs with
+/// another key sends no lease identifier of the first key's and asks for nothing to be ended: the
+/// service would answer that the lease was issued to another caller. It asks for each pair afresh,
+/// under the authorisation its account gave the new key, and the leases the first key held run out
+/// by themselves.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lease_identifier_is_never_sent_under_another_host_key() {
+    let rig = Rig::start().await;
+    let owner = rig.owner_device();
+    let first = rig.live_lease_for(&owner).expect("a lease");
+    let revoked = rig.requests(REVOKE);
+
+    let Rig {
+        host,
+        served,
+        owner: owner_keys,
+        wall,
+        ..
+    } = rig;
+    let stopped = host.shut_down().await;
+    let host_key = net_support::replace_host_authorisation(stopped.tree());
+    let payer = served
+        .web()
+        .authorise_relay_payer(&host_key, 8 * 1024 * 1024);
+    net_support::write_relay_document(
+        stopped.tree(),
+        Some(served.origin()),
+        Some((&payer.account_id, &payer.authorisation_id)),
+    );
+    let timer = HeldTimer::held();
+    let host = stopped.start_with_timer(Arc::clone(&timer) as _).await;
+    let rig = Rig {
+        host,
+        served,
+        timer,
+        wall,
+        owner: owner_keys,
+        host_key,
+        payer,
+    };
+    rig.until("the second key holds a lease for the pair", || {
+        rig.leases_for(&owner)
+            .iter()
+            .any(|lease| lease.live && lease.lease_id != first.lease_id)
+    })
+    .await;
+
+    for body in &rig.bodies(ISSUE)[1..] {
+        assert!(
+            body["lease_id"].is_null(),
+            "no identifier of the first key's is sent"
+        );
+    }
+    assert_eq!(rig.requests(REVOKE), revoked, "and nothing of it is ended");
+    assert!(
+        rig.leases_for(&owner)
+            .iter()
+            .any(|lease| lease.lease_id == first.lease_id && lease.live),
+        "the first key's lease is left to run out"
+    );
+}
+
+/// KR-REQ-17.51: a document this host cannot use leaves the record as it is, so a document that is
+/// broken for a day does not cost the host an ending it owes. The ending is sent when the document
+/// can be read again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_document_that_cannot_be_used_does_not_cost_an_ending_the_host_owes() {
+    let rig = Rig::start().await;
+    let (_phone, record) = rig.pairs().await;
+    rig.until("the paired device holds a lease", || rig.holds(&record))
+        .await;
+    rig.served.web().fail(REVOKE, 1, Moment::Before);
+    rig.host
+        .network()
+        .revoke_device(record.device_id)
+        .await
+        .expect("the device is revoked");
+    rig.until("the ending is owed", || {
+        rig.endings_owed() == 1 && rig.requests(REVOKE) == 1
+    })
+    .await;
+
+    let rig = rig
+        .restarted_after(net_support::write_unusable_document)
+        .await;
+    assert!(
+        rig.host.controller().relay_keeper().is_none(),
+        "a document that cannot be used selects no service"
+    );
+    assert_eq!(rig.endings_owed(), 1, "the ending is still owed");
+
+    let origin = rig.served.origin().to_owned();
+    let (account, authorisation) = (
+        rig.payer.account_id.clone(),
+        rig.payer.authorisation_id.clone(),
+    );
+    let rig = rig
+        .restarted_after(|tree| {
+            net_support::write_relay_document(
+                tree,
+                Some(&origin),
+                Some((&account, &authorisation)),
+            );
+        })
+        .await;
+    rig.until("the service has ended the lease", || {
+        rig.live_lease_for(&record).is_none() && rig.endings_owed() == 0
+    })
+    .await;
+}
+
+/// A record written by a build that reads a newer schema is refused before anything is written to
+/// it, so that build still finds it as it left it.
+#[test]
+fn a_record_of_a_newer_schema_is_refused_before_anything_is_written() {
+    use kr_controller::relay_leases::record::{Kept, Record};
+
+    let directory = kr_ipc::testing::PrivateTempDir::create();
+    let path = directory.path().join("relay-leases.sqlite3");
+    {
+        let connection = rusqlite::Connection::open(&path).expect("a database");
+        connection
+            .execute_batch(
+                "CREATE TABLE relay_lease_schema (version INTEGER NOT NULL);
+                 INSERT INTO relay_lease_schema (version) VALUES (99);",
+            )
+            .expect("a newer schema");
+    }
+    assert!(Record::open(directory.path(), Kept::Nothing).is_err());
+
+    let connection = rusqlite::Connection::open(&path).expect("the database");
+    let tables: i64 = connection
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type = 'table'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("the tables");
+    let version: i64 = connection
+        .query_row("SELECT version FROM relay_lease_schema", [], |row| {
+            row.get(0)
+        })
+        .expect("the version");
+    assert_eq!((tables, version), (1, 99), "nothing was written");
+}
+
+/// KR-REQ-17.51: a row that names no lease is kept while a lease its request may have issued could
+/// be alive, and forgotten once the longest a lease lives has passed, because the lease, if there
+/// was one, has run out by itself and there is nothing to ask for.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_row_that_names_no_lease_is_forgotten_once_no_lease_it_could_name_is_alive() {
+    let rig = Rig::start().await;
+    rig.served.web().fail(ISSUE, 1, Moment::After);
+    let (_phone, record) = rig.pairs().await;
+    rig.until("the host has a row for the pair and no lease in it", || {
+        rig.lease_in_the_record(&record) == Some(None) && rig.live_lease_for(&record).is_some()
+    })
+    .await;
+    rig.pass().await;
+    rig.host
+        .network()
+        .revoke_device(record.device_id)
+        .await
+        .expect("the device is revoked");
+    rig.pass().await;
+    assert_eq!(
+        rig.lease_in_the_record(&record),
+        Some(None),
+        "kept while a lease its request issued may be alive"
+    );
+    let asked = rig.requests_for(&record);
+    assert_eq!(asked, 1);
+
+    // The daemon is down for longer than a lease lives.
+    rig.wall
+        .advance(Duration::from_secs(u64::from(LEASE_SECONDS) + 200));
+    let rig = rig.restarted().await;
+    rig.until("the row is forgotten", || {
+        rig.lease_in_the_record(&record).is_none()
+    })
+    .await;
+    assert_eq!(
+        rig.requests_for(&record),
+        asked,
+        "nothing is asked for a lease that can no longer be alive"
+    );
 }

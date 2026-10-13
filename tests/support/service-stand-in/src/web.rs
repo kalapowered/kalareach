@@ -455,6 +455,21 @@ impl ServiceWeb {
             .freeze_deadlines(frozen);
     }
 
+    /// Every relay answer carries the allowance warning at `percent` (80 or 95), or none.
+    pub fn warn_relay_allowance(&self, percent: Option<u32>) {
+        self.state.lock().expect("the state").relay.warn(percent);
+    }
+
+    /// The accounts are inside the bounded grace an exhausted allowance gives, or are not: every
+    /// relay answer carries what is left of it.
+    pub fn enter_relay_grace(&self, in_grace: bool) {
+        self.state
+            .lock()
+            .expect("the state")
+            .relay
+            .enter_grace(in_grace);
+    }
+
     /// The service has no record of one lease any more.
     pub fn forget_relay_lease(&self, lease_id: &str) {
         self.state.lock().expect("the state").relay.forget(lease_id);
