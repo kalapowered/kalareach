@@ -624,6 +624,32 @@ describe('the desktop port and a host being chosen', () => {
     expect(heard).toEqual(['1', '3'])
   })
 
+  it.each(['hosts_use', 'hosts_forget'] as const)(
+    'goes on taking the events of the host in use when %s is refused',
+    async (command) => {
+      const port = tauriPort()
+      const heard: string[] = []
+      await port.subscribe((event) => {
+        heard.push(event.sequence)
+      })
+      await port.onConnection(() => undefined)
+      shell.handlers.get(CONNECTION_EVENT)?.(connection('env-a'))
+      shell.handlers.get(HOST_EVENT)?.(at('env-a', '1'))
+
+      // Native code refuses the choice and changes nothing: no connection event comes.
+      const refused = Promise.reject(new Error('That host is not in the list.'))
+      refused.catch(() => undefined)
+      shell.answers.set(command, refused)
+      shell.answers.set('connection_state', connection('env-a').payload)
+      await expect(
+        command === 'hosts_use' ? port.hostsUse('host-x') : port.hostsForget('host-x')
+      ).rejects.toThrow('That host is not in the list.')
+
+      shell.handlers.get(HOST_EVENT)?.(at('env-a', '2'))
+      expect(heard).toEqual(['1', '2'])
+    }
+  )
+
   it('keeps what the connection said when a read made before it answers after it', async () => {
     const port = tauriPort()
     const heard: string[] = []

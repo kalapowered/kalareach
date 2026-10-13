@@ -140,6 +140,29 @@ export function tauriPort(): HostPort {
   const call = <T,>(command: string, args: Record<string, unknown>): Promise<T> =>
     invoke<T>(command, args)
 
+  /**
+   * Asks native code to use or forget a host. While it is asked, nothing of the old host is the new
+   * one's. A refusal changes nothing there: the connection it kept is asked what it is, so the host
+   * still in use is heard again, unless the connection has said something since.
+   */
+  const choose = (command: string, reference: string): Promise<ConnectionState> => {
+    const at = choosing()
+    return call<ConnectionState>(command, { reference })
+      .then(receivedConnection)
+      .then(learned(at))
+      .catch(async (failure: unknown) => {
+        await call<ConnectionState>('connection_state', {})
+          .then(receivedConnection)
+          .then(learned(at))
+          .catch(() => {
+            // Nothing can say which host is in use: events are taken as they come, as before any
+            // host was known.
+            if (said === at) host = undefined
+          })
+        throw failure
+      })
+  }
+
   const read = <T,>(command: string, params: unknown): Promise<T> => call<T>(command, { params })
 
   const mutate = <T,>(command: string, params: unknown, subject: SessionSubject): Promise<T> =>
@@ -329,18 +352,8 @@ export function tauriPort(): HostPort {
     voiceSetMuted: (what, muted) => call<VoiceCallState>('voice_set_muted', { what, muted }),
     voiceCallState: () => call<VoiceCallState>('voice_call_state', {}),
 
-    hostsUse: (reference) => {
-      const at = choosing()
-      return call<ConnectionState>('hosts_use', { reference })
-        .then(receivedConnection)
-        .then(learned(at))
-    },
-    hostsForget: (reference) => {
-      const at = choosing()
-      return call<ConnectionState>('hosts_forget', { reference })
-        .then(receivedConnection)
-        .then(learned(at))
-    },
+    hostsUse: (reference) => choose('hosts_use', reference),
+    hostsForget: (reference) => choose('hosts_forget', reference),
     pairingView: () => call<PairingView>('pairing_view', {}),
     pairingSetOrigin: (origin) => call<PairingOrigin>('pairing_set_origin', { origin }),
     pairingStartCode: (code) => call<undefined>('pairing_start_code', { code }),
