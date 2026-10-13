@@ -2540,8 +2540,8 @@ pub mod configuration {
     /// A provider origin, so it is this document's to choose and no inherited variable's. The
     /// daemon reads it when it starts, so a change applies at the next start. An owner whose host
     /// lost its feed points it at another service, or at none. Absent means this host has no feed:
-    /// it takes revocations from the owners who reach it directly, and a remote owner's revocation
-    /// cannot reach it.
+    /// a remote owner's revocation cannot reach it, and only the owner at the machine revokes a
+    /// device.
     ///
     /// The section arrived with level 2. A release that reads level 1 does not know it: it
     /// applies the rest of the document, counts the section among the members it ignores, and
