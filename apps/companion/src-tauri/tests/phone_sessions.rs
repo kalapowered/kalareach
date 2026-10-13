@@ -764,6 +764,19 @@ async fn kr_req_19_08_a_prompt_the_host_cannot_establish_reaches_the_page_with_i
         )
         .expect("the receipt is read under the opening");
     assert_eq!(read["receipt"]["state"], "unknown", "{read}");
+    // A record that still says unknown does not settle it: the link goes on counting the action.
+    {
+        use tauri::Manager as _;
+        let state = companion.app.state::<companion_tauri::AppState>();
+        assert_eq!(
+            state
+                .paired_links()
+                .unresolved(session, "unknown-screen")
+                .await,
+            Some(1),
+            "the action nobody knows the end of stays in the link's book"
+        );
+    }
 
     upstream.release();
     adopted.stop().await;

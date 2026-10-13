@@ -1098,6 +1098,14 @@ impl PairedLinks {
         self.rechecks.load(Ordering::SeqCst)
     }
 
+    /// How many actions the opened link of a session still counts as unresolved, or none when the
+    /// opening holds no link. For a test of what the link's book keeps.
+    #[doc(hidden)]
+    pub async fn unresolved(&self, session_id: SessionId, opening: &str) -> Option<usize> {
+        let link = self.opened_link(session_id, opening).ok()?;
+        Some(link.session.submitted_actions().await.len())
+    }
+
     /// Ends the connection of a session's opened link as a lost network would, leaving the opening
     /// in place, so that its watch reaches the host again. For a test of that recovery.
     #[doc(hidden)]

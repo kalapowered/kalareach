@@ -198,6 +198,27 @@ impl WorkerLinks {
         self.settle(state, session_id, link.link(), answer)
     }
 
+    /// Reads what the host recorded of one action, on the session's own link, and lets a definite
+    /// record settle the action in that link's book.
+    ///
+    /// An action whose outcome nobody knew stays in the book until the host's record says what
+    /// became of it; without this a client that asked, and was told, would go on counting it.
+    ///
+    /// # Errors
+    ///
+    /// Returns why the worker could not be reached, or the worker's own refusal.
+    pub async fn read_receipt(
+        &self,
+        state: &AppState,
+        session_id: SessionId,
+        opening: Option<&str>,
+        params: &kr_protocol::receipt::ActionReadParams,
+    ) -> Result<kr_protocol::receipt::ActionReadResult> {
+        let link = self.link(state, session_id, opening).await?;
+        let answer = link.session.read_receipt(params).await;
+        self.settle(state, session_id, link.link(), answer)
+    }
+
     /// Submits one agent mutation to the worker of the session `about` names, about its instance at
     /// the binding revision it names, and waits for the worker to settle it.
     ///

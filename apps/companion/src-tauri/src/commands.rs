@@ -1078,24 +1078,16 @@ pub async fn action_read(
                  screen, naming the session",
             ));
         };
-        let answer: kr_protocol::receipt::ActionReadResult = links
-            .read(
-                &state,
-                session_id,
-                Some(opening),
-                Method::ActionRead,
-                &typed,
-            )
+        let answer = links
+            .read_receipt(&state, session_id, Some(opening), &typed)
             .await?;
         return encode(&answer);
     }
-    let answer: kr_protocol::receipt::ActionReadResult = match typed.session_id {
+    let answer = match typed.session_id {
         Some(session_id) if links.serves(session_id)? => {
-            links
-                .read(&state, session_id, None, Method::ActionRead, &typed)
-                .await?
+            links.read_receipt(&state, session_id, None, &typed).await?
         }
-        _ => state.session()?.read(Method::ActionRead, &typed).await?,
+        _ => state.session()?.read_receipt(&typed).await?,
     };
     encode(&answer)
 }
