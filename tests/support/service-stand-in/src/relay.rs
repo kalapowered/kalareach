@@ -120,7 +120,7 @@ pub struct RelayLeaseView {
     pub ended_for: Option<&'static str>,
 }
 
-/// What an account console gives a host: the ids a host names to be paid for by the account.
+/// What an account's authorisation gives a host: the ids a host names to be paid for by the account.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RelayPayerRecord {
     /// The account that pays.
@@ -144,6 +144,10 @@ pub(crate) struct Relay {
     no_relay: bool,
     /// A deadline cannot be moved later, as at the end of a month's period.
     frozen_deadlines: bool,
+    /// The most a principal holds outstanding across its leases.
+    aggregate_limit: u64,
+    /// The time of the request being answered, by the machine's clock.
+    seen_ms: u64,
     counter: u64,
     issuer: AuthorisationKeyPair,
 }
@@ -158,6 +162,8 @@ impl Default for Relay {
             exhausted: false,
             no_relay: false,
             frozen_deadlines: false,
+            aggregate_limit: OUTSTANDING_CEILING_BYTES,
+            seen_ms: 0,
             counter: 0,
             issuer: AuthorisationKeyPair::generate().expect("an admission key"),
         }
@@ -238,6 +244,12 @@ impl Relay {
         self.frozen_deadlines = frozen;
     }
 
+    /// The most a principal may hold outstanding across its leases, as a test narrows it to put a
+    /// refill past it.
+    pub(crate) const fn limit_aggregate(&mut self, bytes: u64) {
+        self.aggregate_limit = bytes;
+    }
+
     /// The service has no record of a lease any more: it never issued it, as far as it can say.
     pub(crate) fn forget(&mut self, lease_id: &str) {
         self.leases.remove(lease_id);
@@ -273,11 +285,17 @@ impl Relay {
     }
 
     /// The bytes an account has outstanding across its live leases: what each holds beyond what
-    /// the relay has counted for it, which is what the aggregate bound is measured on.
+    /// the relay has counted for it, which is what the aggregate bound is measured on. The
+    /// reservation of a lease past its deadline has been settled, so it holds nothing.
     fn outstanding(&self, payer: &str) -> u64 {
+        let service_now = self.service_now(self.seen_ms);
         self.leases
             .values()
-            .filter(|lease| lease.state == LeaseState::Installed && lease.payer == payer)
+            .filter(|lease| {
+                lease.state == LeaseState::Installed
+                    && lease.payer == payer
+                    && lease.expires_at_ms > service_now
+            })
             .map(|lease| lease.ceiling - lease.consumed)
             .sum()
     }
@@ -458,6 +476,7 @@ pub(crate) fn issue(
     document: &Value,
     now_ms: u64,
 ) -> ServiceHttpAnswer {
+    relay.seen_ms = now_ms;
     let Ok(body) = serde_json::from_value::<IssueBody>(document["body"].clone()) else {
         return invalid("That lease request is not one this service reads.");
     };
@@ -476,7 +495,7 @@ pub(crate) fn issue(
         Ok(proof) => proof,
         Err(refused) => return refused,
     };
-    let asked = body.byte_ceiling.get();
+    let mut asked = body.byte_ceiling.get();
     if body.source_endpoint_key == body.destination_endpoint_key {
         return invalid("A lease binds two different endpoints.");
     }
@@ -611,6 +630,10 @@ pub(crate) fn issue(
                 expired.ended_for = Some("expired");
             }
             found = None;
+            // A fresh reservation holds everything it is given, so what a cumulative total meant to
+            // the one that is gone is not what it means to this one: it is clamped to what the
+            // payer authorises, not refused for a figure the caller was right to ask for.
+            asked = asked.min(max_bytes);
         }
     }
     // What the payer authorises is a bound on what a lease holds outstanding: the cumulative
@@ -640,7 +663,8 @@ pub(crate) fn issue(
         );
     }
     // The ledger refuses a hold that would take the principal past its allowance, which is an
-    // exhaustion, or past the aggregate it may hold outstanding, which is a refusal of this request.
+    // exhaustion, or past the aggregate it may hold outstanding, which is a refusal of this
+    // request.
     let addition = asked - held;
     if relay.exhausted {
         return refused_answer(
@@ -650,7 +674,7 @@ pub(crate) fn issue(
             "The relay allowance for this period is used up.",
         );
     }
-    if relay.outstanding(&payer) + addition > OUTSTANDING_CEILING_BYTES {
+    if relay.outstanding(&payer) + addition > relay.aggregate_limit {
         return refused_answer(
             relay,
             &payer,
@@ -816,6 +840,7 @@ pub(crate) fn revoke(
     document: &Value,
     now_ms: u64,
 ) -> ServiceHttpAnswer {
+    relay.seen_ms = now_ms;
     let Ok(body) = serde_json::from_value::<RevokeBody>(document["body"].clone()) else {
         return invalid("That revocation request is not one this service reads.");
     };

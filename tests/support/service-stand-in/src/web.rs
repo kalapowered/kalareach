@@ -368,7 +368,7 @@ impl ServiceWeb {
     }
 
     /// An account gives the host whose signing key is `host` leave to spend its relay allowance,
-    /// with at most `byte_ceiling` bytes outstanding for one lease, as the account console does.
+    /// with at most `byte_ceiling` bytes outstanding for one lease, as an account's authorisation does.
     /// Returns the ids a host names to be paid for.
     pub fn authorise_relay_payer(
         &self,
@@ -399,6 +399,16 @@ impl ServiceWeb {
             .expect("the state")
             .relay
             .exhaust(exhausted);
+    }
+
+    /// The most an account may hold outstanding across its leases, as the service's ledger bounds
+    /// it, narrowed so that a refill passes it.
+    pub fn limit_relay_aggregate(&self, bytes: u64) {
+        self.state
+            .lock()
+            .expect("the state")
+            .relay
+            .limit_aggregate(bytes);
     }
 
     /// The service has no relay instance to offer a new lease, or has one again.
