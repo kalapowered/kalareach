@@ -342,7 +342,7 @@ fn plan_of(prepared: &PreparedRestore, run: &Run<'_>) -> Result<Planned> {
     let plan = prepared.plan().clone();
     let digest = plan
         .digest(&run.environment, &run.destination.spelled())
-        .map_err(|error| CliError::Other(shown!("{}", error)))?;
+        .ok_or_else(|| CliError::Other(Shown::said("the restore plan could not be encoded")))?;
     Ok(Planned {
         plan,
         digest,

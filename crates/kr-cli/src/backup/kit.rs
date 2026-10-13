@@ -18,7 +18,7 @@
 //!
 //! A read can be cancelled: a pipe is waited on in short turns that look at a flag, and a terminal
 //! is read with a short timeout that does the same. When it ends, however it ends, the terminal's
-//! modes come back with the input still waiting discarded ([`OptionalActions::Flush`]), so what was
+//! modes come back with the input still waiting discarded (`OptionalActions::Flush`), so what was
 //! pasted past the end of the kit never reaches the shell or its history. A paste that arrives
 //! after that still does; for a paste the size of a kit it is unlikely, and the documentation says
 //! so.

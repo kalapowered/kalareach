@@ -394,9 +394,6 @@ pub enum RestoreError {
     /// A member was asked for that the plan does not restore.
     #[error("that member is not one this restore's plan writes")]
     NotInPlan,
-    /// The plan could not be encoded to make its digest.
-    #[error("the restore plan could not be encoded")]
-    Unencodable,
 }
 
 crate::debug_as_display!(RestoreError);
@@ -636,11 +633,9 @@ impl RestorePlan {
     /// A generation published between the preview and the confirmation changes it, so the
     /// confirmation is for the archive that was shown.
     ///
-    /// # Errors
-    ///
-    /// Returns [`RestoreError::Unencodable`] when the plan cannot be encoded, which no plan this
-    /// module makes is.
-    pub fn digest(&self, environment: &str, destination: &str) -> Result<String, RestoreError> {
+    /// Returns nothing when the plan cannot be encoded, which no plan this module makes is.
+    #[must_use]
+    pub fn digest(&self, environment: &str, destination: &str) -> Option<String> {
         let input = DigestInput {
             environment,
             destination,
@@ -670,17 +665,19 @@ impl RestorePlan {
                 })
                 .collect(),
         };
-        let encoded = kr_cbor::to_canonical_vec(&input).map_err(|_| RestoreError::Unencodable)?;
+        let encoded = kr_cbor::to_canonical_vec(&input).ok()?;
         let mut bytes = Vec::with_capacity(PLAN_DOMAIN.len() + encoded.len());
         bytes.extend_from_slice(PLAN_DOMAIN);
         bytes.extend_from_slice(&encoded);
-        Ok(kr_cbor::sha256(&bytes)
-            .iter()
-            .fold(String::with_capacity(64), |mut text, byte| {
-                use fmt::Write as _;
-                let _ = write!(text, "{byte:02x}");
-                text
-            }))
+        Some(
+            kr_cbor::sha256(&bytes)
+                .iter()
+                .fold(String::with_capacity(64), |mut text, byte| {
+                    use fmt::Write as _;
+                    let _ = write!(text, "{byte:02x}");
+                    text
+                }),
+        )
     }
 
     /// The record left beside the files once every member is written.
@@ -925,7 +922,8 @@ impl FilesRestore {
                 why: Shown::said(cause.why()),
             });
         }
-        let origin = kit_origin_for(&kit, &service.origin)?;
+        let origin =
+            kit_origin_for(&kit, &service.origin).ok_or(RestoreError::OriginNotConfigured)?;
         // The locator is an identifier in its canonical spelling, and the service refuses
         // anything else, so a kit that carries another is wrong before it is used.
         if !is_an_identifier(&kit.bundle_locator) {
@@ -1086,13 +1084,12 @@ fn is_an_identifier(text: &str) -> bool {
 /// A gateway origin has one canonical spelling, so the configured origin and the kit's entry for it
 /// are the same text. The bundle key is derived from that text byte for byte, so a kit that spells
 /// the origin another way names a service this host is not configured for.
-fn kit_origin_for(kit: &RecoveryKit, configured: &str) -> Result<String, RestoreError> {
-    GatewayOrigin::new(configured).map_err(|_| RestoreError::OriginNotConfigured)?;
+fn kit_origin_for(kit: &RecoveryKit, configured: &str) -> Option<String> {
+    GatewayOrigin::new(configured).ok()?;
     kit.service_origins
         .iter()
         .find(|named| named.as_str() == configured)
         .cloned()
-        .ok_or(RestoreError::OriginNotConfigured)
 }
 
 /// The archive to restore, from the entries of the authenticated bundle that name the configured
