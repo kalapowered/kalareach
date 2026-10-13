@@ -100,6 +100,7 @@ struct Running {
 }
 
 /// A hand-over between the owner device's confirmation being asked for and the transfer being sent.
+#[derive(Clone)]
 struct Handover {
     /// The action the transfer will be sent under, which is also the attempt's name.
     action_id: ActionId,
@@ -126,7 +127,13 @@ pub struct ShareDesk {
     #[cfg(feature = "testing")]
     skew: Mutex<Duration>,
     running: Mutex<HashMap<ActionId, Running>>,
+    /// The hand-overs being asked about, by the reference the page holds. A hand-over leaves this
+    /// table once, either abandoned or committed to a send ([`ShareDesk::commit`]); whoever takes it
+    /// owns its record, and the lock these two share is what orders them.
     handovers: Mutex<HashMap<String, Handover>>,
+    /// Held while a record is read and written back, so that what a person did to an attempt and
+    /// what a task carrying it on learned are never written over one another.
+    records: Mutex<()>,
     /// What the host answered to an attempt that was carried on after the command that sent it
     /// returned, kept until the page has read it and removed the attempt. A restart loses it, and
     /// the host's record of the action still has it ([`ask_the_host`]).
@@ -318,6 +325,135 @@ impl ShareDesk {
             .unwrap_or_else(PoisonError::into_inner)
             .remove(&action_id);
     }
+
+    /// Writes what a task learned of an attempt.
+    ///
+    /// Whether the person hid the attempt is theirs and not the task's, and the task holds an
+    /// earlier copy of the record: so it is carried forward from the record as it is now, never
+    /// from the copy. An attempt that is over is written unhidden, since its end is what the
+    /// person is owed.
+    fn save(&self, store: &AttemptStore, attempt: &Attempt) -> Result<()> {
+        let _writing = self.records.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut next = attempt.clone();
+        next.hidden =
+            !next.is_closed() && find(store, next.action_id)?.is_some_and(|stored| stored.hidden);
+        store.keep(&next).map_err(failed_store)
+    }
+
+    /// Hides an attempt or shows it again, leaving everything else in its record as it is.
+    fn set_hidden(
+        &self,
+        store: &AttemptStore,
+        action_id: ActionId,
+        hidden: bool,
+    ) -> Result<Attempt> {
+        let _writing = self.records.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut attempt = find(store, action_id)?
+            .ok_or_else(|| CommandError::invalid("no such attempt is kept"))?;
+        if hidden && attempt.phase == Phase::Asking {
+            return Err(CommandError::invalid(
+                "a hand-over still being confirmed is cancelled, not hidden",
+            ));
+        }
+        if hidden && attempt.is_closed() {
+            return Err(CommandError::invalid(
+                "an attempt that is over is removed, not hidden",
+            ));
+        }
+        attempt.hidden = hidden;
+        store.keep(&attempt).map_err(failed_store)?;
+        Ok(attempt)
+    }
+
+    /// What the hand-over a reference names stands at, while it is still being asked about.
+    fn handover(&self, reference: &str) -> Result<Handover> {
+        self.handovers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(reference)
+            .cloned()
+            .ok_or_else(|| {
+                CommandError::invalid("that hand-over is not one this application is asking about")
+            })
+    }
+
+    /// Takes a hand-over out of the table to be sent, in one step with `write`, which keeps the
+    /// record that says so. Nothing else can take it meanwhile: an abandon that comes after finds
+    /// it gone, and one that came before took it, so `write` is not run.
+    fn commit(
+        &self,
+        reference: &str,
+        write: impl FnOnce(&Handover) -> Result<()>,
+    ) -> Result<Handover> {
+        let mut held = self
+            .handovers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let handover = held.get(reference).ok_or_else(|| {
+            CommandError::invalid("that hand-over is not one this application is asking about")
+        })?;
+        write(handover)?;
+        held.remove(reference).ok_or_else(|| {
+            CommandError::local_failure("the hand-over left the table while it was being kept")
+        })
+    }
+
+    /// Takes a hand-over out of the table without sending it, and removes the record that held its
+    /// place, in one step. False when it is no longer in the table: a send took it, or another
+    /// abandon did, and whoever took it owns the record.
+    fn abandon(&self, reference: &str) -> Result<bool> {
+        let mut held = self
+            .handovers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let Some(handover) = held.get(reference) else {
+            return Ok(false);
+        };
+        let action_id = handover.action_id;
+        self.store(handover.environment_id)?
+            .remove(action_id)
+            .map_err(failed_store)?;
+        held.remove(reference);
+        drop(held);
+        self.forget(action_id);
+        Ok(true)
+    }
+
+    /// Removes the record of a hand-over that is still being confirmed, and its place in the table
+    /// when this process has it. The record is looked at again under the table's lock: a send that
+    /// committed since the caller looked has changed it, and what is being sent is never removed.
+    fn withdraw_asking(&self, store: &AttemptStore, action_id: ActionId) -> Result<()> {
+        let mut held = self
+            .handovers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        match find(store, action_id)? {
+            Some(attempt) if attempt.phase == Phase::Asking => {}
+            Some(_) => {
+                return Err(CommandError::refused(
+                    "that can still happen, so its record stays until it is over",
+                ));
+            }
+            None => return Ok(()),
+        }
+        store.remove(action_id).map_err(failed_store)?;
+        held.retain(|_, handover| handover.action_id != action_id);
+        drop(held);
+        self.forget(action_id);
+        Ok(())
+    }
+}
+
+/// The record kept for an action, when there is one this build reads.
+fn find(store: &AttemptStore, action_id: ActionId) -> Result<Option<Attempt>> {
+    Ok(store
+        .attempts()
+        .map_err(failed_store)?
+        .into_iter()
+        .find_map(|kept| match kept {
+            Kept::Known(attempt) if attempt.action_id == action_id => Some(*attempt),
+            _ => None,
+        }))
 }
 
 fn failed_store(error: kr_client::attempt::AttemptError) -> CommandError {
@@ -343,9 +479,11 @@ pub struct AttemptView {
     pub outcome: Option<Outcome>,
     /// One line that says what it was.
     pub label: String,
-    /// Whether the person hid it. Hiding releases nothing.
+    /// Whether the person hid it. Hiding releases nothing, and an attempt that is over is shown.
     pub hidden: bool,
-    /// Whether it closed without the host's result and the person may still ask for it.
+    /// Whether it closed with something still owed to the person that the host's result carries
+    /// (the screen the host kept with a live invitation, how far the workers have got with a
+    /// revocation), and the host can be asked for it until the page removes the record.
     pub follow_up: bool,
     /// The session it is about, when it names one.
     pub session_id: Option<String>,
@@ -610,7 +748,7 @@ struct Carry {
 
 impl Carry {
     fn keep(&self, attempt: &Attempt) -> Result<()> {
-        self.store.keep(attempt).map_err(failed_store)
+        self.desk.save(&self.store, attempt)
     }
 
     /// Sends a composed request for the first time and does what its first answer settles.
@@ -715,6 +853,12 @@ impl Carry {
                     };
                 }
             }
+            if let Phase::Closed(outcome) = attempt.phase {
+                // The record that says the attempt is over also says what is still owed, so a
+                // page that reads the end finds both, and no later write can bring back a record
+                // the page has removed.
+                attempt.follow_up = outcome == Outcome::Happened && owes(&attempt);
+            }
             if let Err(error) = self.keep(&attempt) {
                 tracing::warn!(%error, "the state of an attempt could not be kept");
             }
@@ -722,8 +866,7 @@ impl Carry {
         if let Some(reading) = reading {
             reading.session().close();
         }
-        self.conclude(&mut attempt, sent_action, said.result.as_ref())
-            .await;
+        self.conclude(&attempt, sent_action).await;
         self.desk.release(action_id);
     }
 
@@ -813,29 +956,15 @@ impl Carry {
         Some((found, began))
     }
 
-    /// Does what an attempt that was carried on calls for once it is over: keeps its record, so
-    /// the page can read how it ended, with the host's result beside it when it was given, and
-    /// settles the request in the connection's book.
+    /// Lets go of what an attempt that was carried on needed once it is over: its clock, and the
+    /// request in the connection's book. Its record is already as the page is to read it, and the
+    /// host's result stays in memory until the page has read it.
     ///
-    /// The page removes the record once it has shown the end ([`remove`]). A live invitation that
-    /// closed without the host's result keeps its request as a follow-up: the person may still ask
-    /// the host for the screen it kept, to compare it with the one the person saw.
-    async fn conclude(
-        &self,
-        attempt: &mut Attempt,
-        sent_action: ActionId,
-        result: Option<&ParamsValue>,
-    ) {
-        if let Phase::Closed(outcome) = attempt.phase {
-            attempt.follow_up = outcome == Outcome::Happened
-                && result.is_none()
-                && attempt.kind == Kind::Invite
-                && includes_live_screen(attempt);
-            if let Err(error) = self.keep(attempt) {
-                tracing::warn!(%error, "an attempt that closed could not be kept");
-            }
-        }
-        // The clock is let go with the task; a result kept for the page stays until it is read.
+    /// The page removes the record once it has shown the end ([`remove`]). Until then the record
+    /// stays a follow-up when the host's result carries something the person is owed ([`owes`]),
+    /// whether or not this process holds it: the result in memory is lost with a restart, and the
+    /// host's record of the action still has it for the person to ask for.
+    async fn conclude(&self, attempt: &Attempt, sent_action: ActionId) {
         self.desk.forget(attempt.action_id);
         self.settle(sent_action).await;
     }
@@ -881,6 +1010,17 @@ fn includes_live_screen(attempt: &Attempt) -> bool {
         .params
         .to_typed::<GrantCreateParams>()
         .is_ok_and(|invited| invited.selection.include_live_screen)
+}
+
+/// Whether the host's result for an attempt carries something the person is owed, which the
+/// attempt's end alone does not tell: the screen the host kept with a live invitation, to compare
+/// with the one the person saw, and how far the session workers have got with a revocation.
+fn owes(attempt: &Attempt) -> bool {
+    match attempt.kind {
+        Kind::Invite => includes_live_screen(attempt),
+        Kind::Revoke | Kind::Transfer => true,
+        Kind::Redeem => false,
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1231,29 +1371,6 @@ pub struct PlanView {
     pub to_device_name: String,
 }
 
-fn handover_of(state: &AppState, reference: &str) -> Result<(Handover, Arc<ShareDesk>)> {
-    let desk = state.shares();
-    let held = desk
-        .handovers
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner);
-    let handover = held.get(reference).ok_or_else(|| {
-        CommandError::invalid("that hand-over is not one this application is asking about")
-    })?;
-    Ok((
-        Handover {
-            action_id: handover.action_id,
-            params: handover.params.clone(),
-            target: handover.target.clone(),
-            challenge: handover.challenge.clone(),
-            received: handover.received,
-            plan: handover.plan.clone(),
-            environment_id: handover.environment_id,
-        },
-        Arc::clone(&desk),
-    ))
-}
-
 /// Asks the host to put a hand-over of a session's control to the owner devices.
 ///
 /// Nothing that changes who holds the session is sent: the host describes the plan from its own
@@ -1375,7 +1492,7 @@ pub async fn transfer_ask(
     {
         return Err(under_way(&blocker, "A hand-over of this session"));
     }
-    let challenge = match carry.ask_for_confirmation(&attempt, &composed).await {
+    let challenge = match carry.ask_for_confirmation(&composed).await {
         Ok(challenge) => challenge,
         Err(error) => {
             let _ = carry.store.remove(attempt.action_id);
@@ -1425,9 +1542,13 @@ impl Carry {
     /// Sends the confirmation request, and asks again with the same request, on a connection
     /// opened for it, when the answer is lost. The host keeps its answer, so the owner device shows
     /// one request however often it is asked.
+    ///
+    /// Only the host's answer to the first send is final when it refuses. A refusal to a repeat can
+    /// be the host saying it has no record of an action it never read, so it is asked about again
+    /// like a lost answer; when the repeats are used up, whether an owner device was asked is not
+    /// known.
     async fn ask_for_confirmation(
         &self,
-        attempt: &Attempt,
         composed: &ComposedMutation,
     ) -> Result<OwnerConfirmationRequestResult> {
         let pace = self.desk.pace();
@@ -1435,6 +1556,8 @@ impl Carry {
         let sent_action = composed.action_id();
         let mut outcome = self.connection.session().send(composed).await;
         said.take(&outcome);
+        // The host's own refusal of the first send, which a repeat's refusal never replaces.
+        let first_refusal = said.refusal.clone();
         let mut asked_again = 0;
         let challenge = loop {
             match Reply::of(&outcome) {
@@ -1449,8 +1572,8 @@ impl Carry {
                 Reply::Refused(
                     kr_protocol::error::RetryCategory::NoRetry
                     | kr_protocol::error::RetryCategory::ConfigurationChange,
-                ) => {
-                    break Err(said.refusal.take().map_or_else(
+                ) if asked_again == 0 => {
+                    break Err(first_refusal.clone().map_or_else(
                         || CommandError::local_failure("the host refused the request"),
                         CommandError::from,
                     ));
@@ -1477,14 +1600,14 @@ impl Carry {
                 }
                 Reply::Refused(_) | Reply::Lost => {
                     break Err(CommandError::unavailable(
-                        "the host did not answer, so no owner device was asked and nothing was \
-                         handed over",
+                        "the host did not answer, so it is not known whether an owner device was \
+                         asked; one can still be shown the request for up to two minutes, and \
+                         nothing this application sends will hand anything over",
                     ));
                 }
             }
         };
         self.connection.session().settle(sent_action).await;
-        let _ = attempt;
         challenge
     }
 }
@@ -1500,7 +1623,8 @@ impl Carry {
 /// hand-over.
 pub async fn transfer_answered(state: &AppState, reference: &str) -> Result<HandoverState> {
     let connection = issuing(state)?;
-    let (handover, desk) = handover_of(state, reference)?;
+    let desk = state.shares();
+    let handover = desk.handover(reference)?;
     let pending: OwnerConfirmationPendingResult = read(
         &connection,
         Method::OwnerConfirmationPending,
@@ -1514,8 +1638,9 @@ pub async fn transfer_answered(state: &AppState, reference: &str) -> Result<Hand
         .find(|waiting| waiting.request == handover.challenge)
     else {
         // The challenge is no longer the host's: nothing was sent for it, and the record that holds
-        // the session's place goes, so the person can ask again.
-        end_handover(&desk, reference, &connection, handover.action_id).await;
+        // the session's place goes, so the person can ask again. A send that began since took the
+        // hand-over, and its record is its own.
+        desk.abandon(reference)?;
         return Ok(HandoverState {
             state: "gone",
             expires_at_ms,
@@ -1534,7 +1659,7 @@ pub async fn transfer_answered(state: &AppState, reference: &str) -> Result<Hand
                 || seen.to_device_id != asked.to_device_id
                 || Some(seen.new_grant_id) != expected
             {
-                end_handover(&desk, reference, &connection, handover.action_id).await;
+                desk.abandon(reference)?;
                 return Err(CommandError::new(
                     ErrorCode::OwnerConfirmationRequired,
                     "the host described a different hand-over than the one asked for, so nothing \
@@ -1560,7 +1685,7 @@ pub async fn transfer_answered(state: &AppState, reference: &str) -> Result<Hand
         "gone"
     };
     if state_word == "gone" {
-        end_handover(&desk, reference, &connection, handover.action_id).await;
+        desk.abandon(reference)?;
     }
     Ok(HandoverState {
         state: state_word,
@@ -1572,31 +1697,17 @@ pub async fn transfer_answered(state: &AppState, reference: &str) -> Result<Hand
     })
 }
 
-/// Forgets a hand-over that was not sent, with the record that held its place.
-async fn end_handover(
-    desk: &ShareDesk,
-    reference: &str,
-    connection: &Connection,
-    action_id: ActionId,
-) {
-    desk.handovers
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .remove(reference);
-    desk.forget(action_id);
-    if let Ok(store) = desk.store(connection.environment_id()) {
-        let _ = store.remove(action_id);
-    }
-}
-
 /// Sends the transfer an owner device has confirmed, once.
+///
+/// The hand-over leaves the table in the same step that keeps the record of the transfer, so
+/// a cancel either came first, and nothing is sent, or comes after, and finds nothing to cancel.
 ///
 /// # Errors
 ///
 /// Refuses when the confirmation has not been answered, and returns the host's refusal.
 pub async fn transfer_finish(state: &AppState, reference: &str) -> Result<Attempted> {
     let connection = issuing(state)?;
-    let (handover, desk) = handover_of(state, reference)?;
+    let desk = state.shares();
     let answered = transfer_answered(state, reference).await?;
     if answered.state != "answered" {
         return Err(CommandError::new(
@@ -1604,26 +1715,15 @@ pub async fn transfer_finish(state: &AppState, reference: &str) -> Result<Attemp
             "no owner device has confirmed this hand-over, so it is not sent",
         ));
     }
-    // Looked at again: answering may have recorded the plan.
-    let (handover_seen, _) = handover_of(state, reference)?;
-    let Some(plan) = handover_seen.plan.or(handover.plan) else {
+    // Looked at again: reading the answer may have recorded the plan.
+    let handover = desk.handover(reference)?;
+    let Some(plan) = handover.plan.clone() else {
         return Err(CommandError::local_failure(
             "the host's description of the plan was not read, so the hand-over is not sent",
         ));
     };
     let environment_id = connection.environment_id();
     let store = desk.store(environment_id)?;
-    let kept = store
-        .attempts()
-        .map_err(failed_store)?
-        .into_iter()
-        .find_map(|kept| match kept {
-            Kept::Known(attempt) if attempt.action_id == handover.action_id => Some(attempt),
-            _ => None,
-        })
-        .ok_or_else(|| {
-            CommandError::local_failure("the record of this hand-over is no longer kept")
-        })?;
     let composed = connection
         .session()
         .compose(
@@ -1636,25 +1736,33 @@ pub async fn transfer_finish(state: &AppState, reference: &str) -> Result<Attemp
             MUTATION_TTL,
         )
         .await?;
-    // The bound counts the challenge's life from its reply, on the clock that started then; the
-    // attempt's own clock is armed anew below.
-    let mut attempt = *kept;
-    if !attempt.confirmed(&composed, plan, handover.received) {
-        return Err(CommandError::local_failure(
-            "the record of this hand-over is not one waiting for its confirmation",
-        ));
-    }
-    desk.handovers
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .remove(reference);
-    desk.rearm(handover.action_id);
+    let mut sending = None;
+    desk.commit(reference, |held| {
+        let mut attempt = find(&store, held.action_id)?
+            .filter(|kept| kept.phase == Phase::Asking)
+            .ok_or_else(|| {
+                CommandError::local_failure("the record of this hand-over is no longer kept")
+            })?;
+        // The bound counts the challenge's life from its reply, on the clock that started then; the
+        // attempt's own clock is armed anew below.
+        if !attempt.confirmed(&composed, plan, held.received) {
+            return Err(CommandError::local_failure(
+                "the record of this hand-over is not one waiting for its confirmation",
+            ));
+        }
+        desk.save(&store, &attempt)?;
+        desk.rearm(held.action_id);
+        sending = Some(attempt);
+        Ok(())
+    })?;
+    let attempt = sending.ok_or_else(|| {
+        CommandError::local_failure("the hand-over was taken without a record of it")
+    })?;
     let carry = Arc::new(Carry {
         desk,
         connection,
         store,
     });
-    carry.keep(&attempt)?;
     carry.begin(attempt, composed).await
 }
 
@@ -1663,12 +1771,17 @@ pub async fn transfer_finish(state: &AppState, reference: &str) -> Result<Attemp
 ///
 /// # Errors
 ///
-/// Refuses a reference this application is not asking about.
+/// Refuses a reference this application is not asking about, which includes one whose transfer
+/// has been sent.
 pub async fn transfer_cancel(state: &AppState, reference: &str) -> Result<()> {
-    let connection = issuing(state)?;
-    let (handover, desk) = handover_of(state, reference)?;
-    end_handover(&desk, reference, &connection, handover.action_id).await;
-    Ok(())
+    issuing(state)?;
+    if state.shares().abandon(reference)? {
+        Ok(())
+    } else {
+        Err(CommandError::invalid(
+            "that hand-over is not one this application is asking about",
+        ))
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1721,15 +1834,7 @@ pub fn attempts(state: &AppState) -> Result<Attempts> {
 }
 
 fn known(store: &AttemptStore, action_id: ActionId) -> Result<Attempt> {
-    store
-        .attempts()
-        .map_err(failed_store)?
-        .into_iter()
-        .find_map(|kept| match kept {
-            Kept::Known(attempt) if attempt.action_id == action_id => Some(*attempt),
-            _ => None,
-        })
-        .ok_or_else(|| CommandError::invalid("no such attempt is kept"))
+    find(store, action_id)?.ok_or_else(|| CommandError::invalid("no such attempt is kept"))
 }
 
 /// Asks the host what became of an attempt, once, with the exact request that was sent, on a
@@ -1838,19 +1943,18 @@ pub async fn ask_the_host(state: &AppState, action_id: ActionId) -> Result<Attem
     }
 }
 
-/// Takes an attempt out of view. It releases nothing: while the attempt can still happen, its
-/// record, its reads and the gate on a second one stay.
+/// Takes an attempt out of view, or shows it again. Hiding releases nothing: while the attempt can
+/// still happen, its record, its reads and the gate on a second one stay.
 ///
 /// # Errors
 ///
-/// Returns why the record could not be kept.
-pub fn hide(state: &AppState, action_id: ActionId) -> Result<AttemptView> {
+/// Refuses to hide a hand-over still being confirmed, which is cancelled, and an attempt that is
+/// over, which is removed. Returns why the record could not be kept.
+pub fn set_hidden(state: &AppState, action_id: ActionId, hidden: bool) -> Result<AttemptView> {
     let connection = state.connection()?;
     let desk = state.shares();
     let store = desk.store(connection.environment_id())?;
-    let mut attempt = known(&store, action_id)?;
-    attempt.hidden = true;
-    store.keep(&attempt).map_err(failed_store)?;
+    let attempt = desk.set_hidden(&store, action_id, hidden)?;
     Ok(desk.view(&attempt))
 }
 
@@ -1865,7 +1969,10 @@ pub fn remove(state: &AppState, action_id: ActionId) -> Result<()> {
     let desk = state.shares();
     let store = desk.store(connection.environment_id())?;
     let attempt = known(&store, action_id)?;
-    if !attempt.is_closed() && attempt.phase != Phase::Asking {
+    if attempt.phase == Phase::Asking {
+        return desk.withdraw_asking(&store, action_id);
+    }
+    if !attempt.is_closed() {
         return Err(CommandError::refused(
             "that can still happen, so its record stays until it is over",
         ));
@@ -1891,3 +1998,121 @@ pub fn carried_on(state: &AppState) -> HashSet<ActionId> {
 
 #[allow(dead_code, reason = "the types a page's parameters are parsed into")]
 const _: fn(&GrantCreateParams, &InvitationId, &GrantId) = |_, _, _| {};
+
+#[cfg(test)]
+mod tests {
+    use std::sync::mpsc;
+
+    use kr_crypto::keys::DeviceKeys;
+    use kr_protocol::ids::ConfirmationId;
+    use kr_protocol::pairing::SensitiveAction;
+    use kr_protocol::scalars::{CanonicalSet, Digest256, Nonce256, Uuid};
+
+    use super::*;
+
+    /// A hand-over as the table holds it, for a reference.
+    fn desk_holding(reference: &str) -> ShareDesk {
+        let keys = DeviceKeys::generate().expect("keys").public_keys();
+        let environment_id = EnvironmentId::new(Uuid::from_bytes([7; 16]));
+        let desk = ShareDesk::default();
+        desk.handovers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(
+                reference.to_owned(),
+                Handover {
+                    action_id: ActionId::new(Uuid::from_bytes([1; 16])),
+                    params: GrantTransferParams {
+                        session_id: SessionId::new(Uuid::from_bytes([2; 16])),
+                        from_grant_id: GrantId::new(Uuid::from_bytes([3; 16])),
+                        to_device_id: DeviceId::new(Uuid::from_bytes([4; 16])),
+                    },
+                    target: ActionTarget::environment(environment_id),
+                    challenge: OwnerConfirmationRequest {
+                        confirmation_id: ConfirmationId::new(Uuid::from_bytes([5; 16])),
+                        action: SensitiveAction::ConfirmDevice,
+                        action_digest: Digest256::from_bytes([6; 32]),
+                        destination_keys: Nullable::null(),
+                        destination_rights: std::iter::empty().collect::<CanonicalSet<_>>(),
+                        host_device_id: DeviceId::new(Uuid::from_bytes([8; 16])),
+                        host_endpoint_id: keys.transport,
+                        nonce: Nonce256::from_bytes([9; 32]),
+                        expires_at_ms: TimestampMs::new(1),
+                    },
+                    received: Armed::now(),
+                    plan: None,
+                    environment_id,
+                },
+            );
+        desk.keep_at(tempfile::tempdir().expect("a directory").keep());
+        desk
+    }
+
+    /// KR-REQ-18.15: a hand-over is abandoned or sent, never both. Once it has been taken to be
+    /// sent, a cancel finds nothing to cancel and removes nothing of what is being sent; once it
+    /// has been cancelled, nothing is written for a send.
+    #[test]
+    fn a_hand_over_is_abandoned_or_sent_and_never_both() {
+        let sent = desk_holding("a");
+        let mut written = false;
+        sent.commit("a", |_| {
+            written = true;
+            Ok(())
+        })
+        .map(|_| ())
+        .expect("taken to be sent");
+        assert!(written);
+        assert!(
+            !sent.abandon("a").expect("looked at"),
+            "it is the send's now"
+        );
+
+        let cancelled = desk_holding("b");
+        assert!(cancelled.abandon("b").expect("abandoned"));
+        let mut written = false;
+        let refused = cancelled.commit("b", |_| {
+            written = true;
+            Ok(())
+        });
+        assert!(refused.is_err(), "a cancelled hand-over is not sent");
+        assert!(!written, "and nothing is kept for it");
+    }
+
+    /// KR-REQ-18.15: taking a hand-over to be sent keeps its record in the same step. A cancel that
+    /// begins while the record is being kept waits for the step to end, and then finds the
+    /// hand-over gone, so it can never remove the record a send is relying on.
+    #[test]
+    fn a_cancel_begun_while_a_send_keeps_its_record_waits_and_finds_nothing() {
+        let desk = Arc::new(desk_holding("c"));
+        let (inside, inside_wait) = mpsc::channel();
+        let (go, go_wait) = mpsc::channel::<()>();
+        let sending = {
+            let desk = Arc::clone(&desk);
+            std::thread::spawn(move || {
+                desk.commit("c", |_| {
+                    inside.send(()).expect("told");
+                    go_wait.recv().expect("let go");
+                    Ok(())
+                })
+                .map(|_| ())
+            })
+        };
+        inside_wait.recv().expect("the send is keeping its record");
+        let cancelling = {
+            let desk = Arc::clone(&desk);
+            std::thread::spawn(move || desk.abandon("c"))
+        };
+        go.send(()).expect("let go");
+        sending
+            .join()
+            .expect("the send ended")
+            .expect("it was sent");
+        assert!(
+            !cancelling
+                .join()
+                .expect("the cancel ended")
+                .expect("it looked"),
+            "the cancel found the hand-over already taken"
+        );
+    }
+}

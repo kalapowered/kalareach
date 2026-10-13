@@ -133,7 +133,7 @@ pub const NAMED_COMMANDS: &[(&str, Option<Method>)] = &[
     ("transfer_cancel", None),
     ("attempts_list", None),
     ("attempt_ask", None),
-    ("attempt_hide", None),
+    ("attempt_set_hidden", None),
     ("attempt_remove", None),
     // Packages.
     ("plugin_list", Some(Method::PluginList)),
@@ -363,7 +363,7 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'static
         transfer_cancel,
         attempts_list,
         attempt_ask,
-        attempt_hide,
+        attempt_set_hidden,
         attempt_remove,
         plugin_list,
         catalogue_list,
@@ -1181,13 +1181,14 @@ pub async fn attempt_ask(
     crate::sharing::ask_the_host(&state, action_of(&action_id)?).await
 }
 
-/// Takes an attempt out of view. It releases nothing.
+/// Takes an attempt out of view, or shows it again. Hiding releases nothing.
 #[tauri::command]
-pub fn attempt_hide(
+pub fn attempt_set_hidden(
     state: State<'_, AppState>,
     action_id: String,
+    hidden: bool,
 ) -> Result<crate::sharing::AttemptView> {
-    crate::sharing::hide(&state, action_of(&action_id)?)
+    crate::sharing::set_hidden(&state, action_of(&action_id)?, hidden)
 }
 
 /// Deletes the record of an attempt that is over.
@@ -2851,7 +2852,7 @@ mod tests {
                 // keeps, and what a person does with one that was left unfinished.
                 "attempts_list",
                 "attempt_ask",
-                "attempt_hide",
+                "attempt_set_hidden",
                 "attempt_remove",
                 // The answers kept for a worker out of reach, and what a person does with them:
                 // the questions themselves go to the session's worker.

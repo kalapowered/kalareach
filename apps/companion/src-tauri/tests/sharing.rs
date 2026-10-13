@@ -51,6 +51,7 @@ use net_support::{Device, Host, an_open_session, owned_by, recipient};
 use serde_json::{Value, json};
 use tauri::Manager as _;
 use tauri::test::MockRuntime;
+use tokio::sync::Notify;
 
 /// Where the bundle's pages are served from.
 const BUNDLE: &str = "tauri://localhost";
@@ -264,7 +265,7 @@ impl Page {
                 companion_tauri::commands::transfer_cancel,
                 companion_tauri::commands::attempts_list,
                 companion_tauri::commands::attempt_ask,
-                companion_tauri::commands::attempt_hide,
+                companion_tauri::commands::attempt_set_hidden,
                 companion_tauri::commands::attempt_remove,
                 companion_tauri::commands::attention_read,
             ])
@@ -534,6 +535,32 @@ impl Scene {
             taker_record,
             giving,
         }
+    }
+
+    /// The body of a request to hand the session over from the device, which holds it as an owner
+    /// of it, to another paired device, and the connection that keeps the device's share alive.
+    async fn hand_over_body(&self) -> (Value, net_support::RawDevice) {
+        let (_share, giving) =
+            owned_by(&self.host, self.session_id, &self.device, &self.record).await;
+        let (_taker, taker_record) = recipient(&self.host, &self.owner).await;
+        let from = self
+            .listed()
+            .await
+            .grants
+            .iter()
+            .find(|summary| summary.state == GrantState::Active)
+            .expect("the device's share")
+            .grant
+            .grant_id;
+        let body = json!({
+            "params": serde_json::to_value(&GrantTransferParams {
+                session_id: self.session_id,
+                from_grant_id: from,
+                to_device_id: taker_record.device_id,
+            }).expect("encodes"),
+            "subject": { "sessionId": self.session_id.to_string(), "sessionEpoch": "1" },
+        });
+        (body, giving)
     }
 
     async fn stop(self) {
@@ -956,7 +983,10 @@ async fn a_second_invitation_is_not_started_while_the_first_can_still_happen() {
 
     let hidden = scene
         .issuer
-        .call("attempt_hide", json!({ "actionId": action }))
+        .call(
+            "attempt_set_hidden",
+            json!({ "actionId": action, "hidden": true }),
+        )
         .await
         .expect("hidden");
     assert_eq!(hidden["hidden"], true);
@@ -1150,13 +1180,20 @@ async fn a_hand_over_asks_an_owner_device_and_sends_only_what_it_confirmed() {
     );
     assert!(scene.issuer.attempts().await.is_empty());
 
-    // The reference is spent: it sends nothing again.
+    // The reference is spent: it sends nothing again, and cancelling it undoes nothing.
     let again = scene
         .issuer
         .call("transfer_finish", json!({ "reference": reference }))
         .await
         .expect_err("a hand-over is sent once");
     assert_eq!(code_of(&again), "INVALID_ARGUMENT", "{again}");
+    let cancelled = scene
+        .issuer
+        .call("transfer_cancel", json!({ "reference": reference }))
+        .await
+        .expect_err("a hand-over that was sent is not cancelled");
+    assert_eq!(code_of(&cancelled), "INVALID_ARGUMENT", "{cancelled}");
+    assert!(net_support::holds(&scene.host, result.replacement.grant_id));
     giving.close();
     scene.stop().await;
 }
@@ -1525,6 +1562,307 @@ async fn a_guests_attention_read_is_the_hosts_refusal() {
         refused.is_err(),
         "a guest has no attention inbox of its own: {refused:?}"
     );
+    scene.stop().await;
+}
+
+/// KR-REQ-18.15, KR-REQ-23.49: an application stopped while an owner device was being asked to
+/// confirm a hand-over starts with the record of it and none of the reference the page held. The
+/// record holds the session's place, is not something the host can be asked about, and cannot be
+/// hidden away: the person cancels it, and the next hand-over of the session is not refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_hand_over_being_confirmed_when_the_application_stopped_is_cancelled_from_its_record() {
+    let mut scene = Scene::start().await;
+    let (body, giving) = scene.hand_over_body().await;
+    scene
+        .issuer
+        .call("transfer_ask", body.clone())
+        .await
+        .expect("the owner devices are asked");
+
+    scene.restart_issuer().await;
+    let back = scene.issuer.attempts().await;
+    assert_eq!(back.len(), 1, "the record is read back");
+    assert_eq!(back[0]["phase"], "asking");
+    let action = back[0]["action_id"].as_str().expect("an action").to_owned();
+
+    let asked = scene
+        .issuer
+        .call("attempt_ask", json!({ "actionId": action }))
+        .await
+        .expect_err("a hand-over still being confirmed is not asked about");
+    assert_eq!(code_of(&asked), "INVALID_ARGUMENT", "{asked}");
+    let hidden = scene
+        .issuer
+        .call(
+            "attempt_set_hidden",
+            json!({ "actionId": action, "hidden": true }),
+        )
+        .await
+        .expect_err("it is cancelled, not hidden away with its place held");
+    assert_eq!(code_of(&hidden), "INVALID_ARGUMENT", "{hidden}");
+    let held = scene
+        .issuer
+        .call("transfer_ask", body.clone())
+        .await
+        .expect_err("it still holds the session's place");
+    assert_eq!(code_of(&held), "PERMISSION_DENIED", "{held}");
+
+    scene
+        .issuer
+        .call("attempt_remove", json!({ "actionId": action }))
+        .await
+        .expect("the person cancels it");
+    assert!(scene.issuer.attempts().await.is_empty());
+    scene
+        .issuer
+        .call("transfer_ask", body)
+        .await
+        .expect("and the session can be handed over again");
+    assert!(
+        net_support::holds(&scene.host, giving_grant(&scene).await),
+        "and the giving device still holds the session"
+    );
+    giving.close();
+    scene.stop().await;
+}
+
+/// The grant the device's share of the session is held under.
+async fn giving_grant(scene: &Scene) -> GrantId {
+    scene
+        .listed()
+        .await
+        .grants
+        .iter()
+        .find(|summary| {
+            summary.state == GrantState::Active
+                && summary.grant.recipient_device_id == scene.record.device_id
+        })
+        .expect("the device's share")
+        .grant
+        .grant_id
+}
+
+/// KR-REQ-23.49: what a person does to an attempt, hiding it or showing it, is theirs, and the task
+/// carrying the attempt on does not undo it by writing the copy of the record it began with. An
+/// attempt that ends is shown whatever was done to it, since its end is what the person is owed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_attempt_is_hidden_and_shown_by_the_person_and_not_undone_by_the_task_carrying_it_on() {
+    let mut scene = Scene::start().await;
+    // The first connection the application opens for a repeat waits for the test; every one after
+    // it fails until the test lets one be made.
+    let parked = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let open = Arc::new(AtomicBool::new(false));
+    let opened = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let reopen: Reopen = {
+        let endpoint = scene.host.endpoint().clone();
+        let (parked, release, open, opened) = (
+            Arc::clone(&parked),
+            Arc::clone(&release),
+            Arc::clone(&open),
+            Arc::clone(&opened),
+        );
+        Arc::new(move || {
+            let endpoint = endpoint.clone();
+            let (parked, release, open, opened) = (
+                Arc::clone(&parked),
+                Arc::clone(&release),
+                Arc::clone(&open),
+                Arc::clone(&opened),
+            );
+            Box::pin(async move {
+                if opened.fetch_add(1, Ordering::SeqCst) == 0 {
+                    parked.notify_one();
+                    release.notified().await;
+                }
+                if !open.load(Ordering::SeqCst) {
+                    return Err(companion_tauri::CommandError::unavailable("no connection"));
+                }
+                let transport = IpcTransport::connect_app(
+                    &endpoint,
+                    companion_tauri::connection::build_id().expect("a build identity"),
+                )
+                .await
+                .map_err(companion_tauri::CommandError::from)?;
+                Connection::over(transport)
+            })
+        })
+    };
+    let faults = Arc::new(Faults::default());
+    let inner = local_connection(&scene.host, Some(&faults)).await;
+    scene.issuer.state().connected(inner.reopening(reopen));
+    scene.issuer_faults = faults;
+    scene.issuer_faults.answer.store(true, Ordering::SeqCst);
+
+    let sent = scene
+        .issuer
+        .call("grant_create", scene.invitation(SessionRole::Viewer))
+        .await
+        .expect("answered");
+    assert_ne!(sent["attempt"]["phase"], "closed");
+    let action = sent["attempt"]["action_id"]
+        .as_str()
+        .expect("an action")
+        .to_owned();
+    // The task is waiting to repeat the request, with the record as it was when it began.
+    parked.notified().await;
+    let hidden = scene
+        .issuer
+        .call(
+            "attempt_set_hidden",
+            json!({ "actionId": action, "hidden": true }),
+        )
+        .await
+        .expect("hidden");
+    assert_eq!(hidden["hidden"], true);
+
+    // It goes on, and writes what it learns: the person's choice stands.
+    release.notify_one();
+    let after = scene
+        .issuer
+        .attempt_where(|attempt| attempt["repeats"].as_u64() >= Some(1))
+        .await;
+    assert_eq!(
+        after["hidden"], true,
+        "the task's write left the person's choice alone: {after}"
+    );
+
+    // Showing it is as much theirs, and the task's next writes leave that alone too.
+    let shown = scene
+        .issuer
+        .call(
+            "attempt_set_hidden",
+            json!({ "actionId": action, "hidden": false }),
+        )
+        .await
+        .expect("shown");
+    assert_eq!(shown["hidden"], false);
+    let later = scene
+        .issuer
+        .attempt_where(|attempt| attempt["repeats"].as_u64() >= Some(3))
+        .await;
+    assert_eq!(later["hidden"], false);
+
+    // Hidden again, and then it ends: the end is shown.
+    scene
+        .issuer
+        .call(
+            "attempt_set_hidden",
+            json!({ "actionId": action, "hidden": true }),
+        )
+        .await
+        .expect("hidden again");
+    open.store(true, Ordering::SeqCst);
+    let done = scene
+        .issuer
+        .attempt_where(|attempt| attempt["phase"] == "closed")
+        .await;
+    assert_eq!(done["hidden"], false, "an attempt that is over is shown");
+    let refused = scene
+        .issuer
+        .call(
+            "attempt_set_hidden",
+            json!({ "actionId": action, "hidden": true }),
+        )
+        .await
+        .expect_err("an attempt that is over is removed, not hidden");
+    assert_eq!(code_of(&refused), "INVALID_ARGUMENT", "{refused}");
+    scene.stop().await;
+}
+
+/// KR-REQ-23.49: what the host's result carries, which the end of an attempt does not say, is owed
+/// to the person until the page has taken it. A revocation whose result was recovered in the
+/// background and held in memory is still one the host can be asked for when the application
+/// stops before the page read it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_result_recovered_in_the_background_can_still_be_asked_for_after_a_restart() {
+    let mut scene = Scene::start().await;
+    let made = scene
+        .issuer
+        .call("grant_create", scene.invitation(SessionRole::Viewer))
+        .await
+        .expect("issued");
+    let created: GrantCreateResult = typed(&made["value"]);
+    scene.issuer_faults.answer.store(true, Ordering::SeqCst);
+    scene
+        .issuer
+        .call(
+            "grant_revoke",
+            json!({ "params": serde_json::to_value(&GrantRevokeParams {
+                grant_id: created.grant.grant_id,
+            }).expect("encodes") }),
+        )
+        .await
+        .expect("answered though the host's answer was lost");
+    let done = scene
+        .issuer
+        .attempt_where(|attempt| attempt["phase"] == "closed")
+        .await;
+    assert_eq!(done["outcome"], "happened");
+    let in_memory: RevocationResult = typed(&done["result"]);
+    assert!(in_memory.barrier.holds());
+    assert_eq!(
+        done["follow_up"], true,
+        "the page has not taken the result, so the host can still be asked for it"
+    );
+
+    scene.restart_issuer().await;
+    let back = scene.issuer.attempts().await;
+    assert_eq!(back.len(), 1);
+    assert_eq!(
+        back[0]["result"],
+        Value::Null,
+        "the result in memory is gone"
+    );
+    assert_eq!(back[0]["follow_up"], true);
+    let asked = scene
+        .issuer
+        .call(
+            "attempt_ask",
+            json!({ "actionId": back[0]["action_id"].as_str().expect("an action") }),
+        )
+        .await
+        .expect("the host answers from its record");
+    let result: RevocationResult = typed(&asked["value"]);
+    assert!(result.barrier.holds());
+    assert!(
+        scene.issuer.attempts().await.is_empty(),
+        "and the record goes once the result is the page's"
+    );
+    scene.stop().await;
+}
+
+/// KR-REQ-18.15: a refusal is the host's answer to the confirmation request only when it answers
+/// the first send. The request never reached the host, so every repeat is a first admission on a
+/// connection the window does not belong to and is refused; that is not the host saying no owner
+/// device was asked, and when the repeats are used up nothing is known of it. The record that held
+/// the session's place goes, since nothing was or will be sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refusal_to_a_repeat_of_the_confirmation_request_is_not_the_hosts_answer() {
+    let mut scene = Scene::start().await;
+    let (body, giving) = scene.hand_over_body().await;
+    scene.issuer_faults.request.store(true, Ordering::SeqCst);
+    let unknown = scene
+        .issuer
+        .call("transfer_ask", body.clone())
+        .await
+        .expect_err("nothing is known of the request");
+    assert_eq!(code_of(&unknown), "RESOURCE_UNAVAILABLE", "{unknown}");
+    assert!(
+        unknown["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("not known whether an owner device was asked"),
+        "{unknown}"
+    );
+    assert!(scene.issuer.attempts().await.is_empty());
+    scene.reconnect_issuer().await;
+    scene
+        .issuer
+        .call("transfer_ask", body)
+        .await
+        .expect("and the session can be handed over again");
+    giving.close();
     scene.stop().await;
 }
 
