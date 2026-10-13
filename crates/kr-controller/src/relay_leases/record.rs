@@ -13,13 +13,13 @@
 //! was written, because until then the pair may still hold a lease the host has not been told of.
 //!
 //! Everything in the record belongs to one service and one host key. The record names the scope it
-//! was kept for, and a daemon started for another scope, or for none, discards what it holds: a lease
-//! identifier is meaningful only to the service that issued it, and an ending can be answered only
-//! for the key that asked for the lease. The leases left behind run out by themselves. A daemon that
-//! cannot use its configuration document opens the record as it finds it, so a document that is
-//! broken for a day does not cost the host an ending it owes. The file is made at every start,
-//! whether or not a service is selected, so the environment's stored formats do not depend on the
-//! configuration.
+//! was kept for, and a daemon started for another scope, or for none, discards what it holds: a
+//! lease identifier is meaningful only to the service that issued it, and an ending can be answered
+//! only for the key that asked for the lease. The leases left behind run out by themselves. A
+//! daemon that cannot use its configuration document opens the record as it finds it, so a document
+//! that is broken for a day does not cost the host an ending it owes. The file is made at every
+//! start, whether or not a service is selected, so the environment's stored formats do not depend
+//! on the configuration.
 
 use std::path::Path;
 use std::sync::{Mutex, PoisonError};
