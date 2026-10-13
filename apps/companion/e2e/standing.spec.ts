@@ -3,7 +3,7 @@
  * browser engines, at the default text size and at the largest.
  *
  * The screen keeps what it read and turns off what sends. The banner that says why enters with an
- * opacity change of 150 ms, none under a request for less motion and none after a key, takes the
+ * opacity change of 160 ms, none under a request for less motion and none after a key, takes the
  * focus only when the control the focus was on has been turned off, and stays inside the screen with
  * its buttons a finger tall at the largest size. Screenshots go to `/tmp`.
  */
@@ -204,7 +204,7 @@ test.describe('how the banner arrives', () => {
   const ran = (page: Page): Promise<string[]> =>
     page.evaluate(() => (window as unknown as { krRan: string[] }).krRan)
 
-  test('fades in over 150 ms after a pointer press', async ({ page }) => {
+  test('fades in over 160 ms after a pointer press', async ({ page }) => {
     await openSession(page, 1, shareOf())
     await expect(page.getByText('Find why the reconnect test is flaky.')).toBeVisible()
     await page.mouse.click(10, 10)
@@ -214,7 +214,7 @@ test.describe('how the banner arrives', () => {
     await expect(page.getByTestId('standing-banner')).toHaveCSS('opacity', '1')
     // The opacity change ran, and it is the declared one.
     expect(await ran(page)).toEqual(['opacity'])
-    await expect(page.getByTestId('standing-banner')).toHaveCSS('transition-duration', '0.15s')
+    await expect(page.getByTestId('standing-banner')).toHaveCSS('transition-duration', '0.16s')
   })
 
   test('arrives at once under a request for less motion', async ({ page }) => {

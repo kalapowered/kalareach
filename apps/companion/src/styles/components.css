@@ -694,7 +694,7 @@ textarea::placeholder {
 .standing-banner {
   flex-wrap: wrap;
   opacity: 0;
-  transition: opacity var(--notice-in) var(--ease-out);
+  transition: opacity var(--state) var(--ease-out);
 }
 
 /* With large text the words take the width and the buttons wrap under them, inside the screen. */

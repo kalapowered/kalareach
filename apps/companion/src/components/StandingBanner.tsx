@@ -6,10 +6,10 @@
  * this says why in the host's words, with the way out: back to the list, and, for a refusal, to try
  * the host again.
  *
- * The banner arrives with a change of opacity over 150 ms. A request for less motion, and a
- * keyboard press, have it arrive at once; the stylesheet decides both. The change is announced once,
- * through a status region that is always there, so a screen reader hears it however the banner
- * arrives. Focus stays where it is, unless the control it is on has just been turned off: then it
+ * The banner arrives with a change of opacity over the interface's state duration. A request for
+ * less motion, and a keyboard press, have it arrive at once; the stylesheet decides both. The
+ * change is announced once, through a status region that is always there, so a screen reader hears
+ * it however the banner arrives. Focus stays where it is, unless the control it is on has just been turned off: then it
  * moves to the banner, so a keyboard or screen-reader user is not left on nothing.
  */
 
