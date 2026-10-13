@@ -163,7 +163,7 @@ pub struct StoredRemoval {
     pub at_ms: TimestampMs,
     /// The number of the newest notice about the feed. It rises with each change, above every
     /// number the attention store has taken when the host can read the store, and apart from any
-    /// clock. A start numbers it again above the store's cursor if it stands at or below it.
+    /// clock. A start numbers it again above the store's cursor if it stands below it.
     pub notice: u64,
 }
 
