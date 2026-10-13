@@ -302,4 +302,33 @@ test.describe('where the focus goes', () => {
     await say(page, { state: 'ended', reason: 'revoked' })
     await expect(page.getByTestId('standing-banner')).toBeFocused()
   })
+
+  /** Takes control of the program from the terminal pane and puts the focus on a terminal key. */
+  async function typingWithAKey(page: Page): Promise<void> {
+    await openSession(page, 1, shareOf())
+    await expect(page.getByText('Find why the reconnect test is flaky.')).toBeVisible()
+    await page.getByRole('tab', { name: 'Terminal' }).click()
+    await expect(page.getByRole('button', { name: 'Take control' })).toBeEnabled()
+    await page.getByRole('button', { name: 'Take control' }).click()
+    const escape = page.getByRole('button', { name: 'Escape' })
+    await expect(escape).toBeEnabled()
+    await escape.focus()
+    await expect(escape).toBeFocused()
+  }
+
+  test('stays in the pane when the contact is lost under a key of the terminal', async ({ page }) => {
+    await typingWithAKey(page)
+    await say(page, { state: 'reconnecting', reason: 'Contact with the session was lost.' })
+    await expect(page.getByRole('button', { name: 'Escape' })).toBeDisabled()
+    await expect(page.locator('.m-pane')).toBeFocused()
+  })
+
+  test('stays in the pane when the host takes the right to type away under a key of the terminal', async ({
+    page
+  }) => {
+    await typingWithAKey(page)
+    await say(page, shareOf({ actions: ['session.view', 'agent.prompt'] }))
+    await expect(page.getByRole('button', { name: 'Escape' })).toBeDisabled()
+    await expect(page.locator('.m-pane')).toBeFocused()
+  })
 })

@@ -798,7 +798,9 @@ export function MobileSession({
   }, [terminalEnded, told, standingOpen, again])
   const attachAgain = useOwnControl(attachAgainId, terminalEnded)
   useFocusWhenControlEnds({
-    state: terminalEnded ? 'ended' : (control?.state ?? 'none'),
+    // The opening taking the right to type away, or the contact it stands on, turns the keys and the
+    // program's keyboard off as the view's own end does, so it is a change of state here.
+    state: terminalEnded ? 'ended' : `${control?.state ?? 'none'}${canControl ? '' : ' without the right'}`,
     heldFor: (element) =>
       element?.closest('.m-accessory') != null ||
       element?.matches('[data-program-keyboard]') === true ||
@@ -806,10 +808,14 @@ export function MobileSession({
       attachAgain.held(element),
     // An opening that is over has turned the terminal's controls off: the banner that says so is
     // where the focus goes.
-    destination: () =>
-      over
-        ? document.querySelector<HTMLElement>('[data-testid="standing-banner"]')
-        : document.getElementById(terminalEnded ? attachAgainId : modeButtonId)
+    destination: () => {
+      if (over) return document.querySelector<HTMLElement>('[data-testid="standing-banner"]')
+      if (terminalEnded) return document.getElementById(attachAgainId)
+      // The mode button takes control again where the right is there, and the move waits for it to be
+      // able to. Where the right is not there the button stays off, and the pane, which takes the
+      // focus by script, is where the person is not left on nothing.
+      return canControl ? document.getElementById(modeButtonId) : paneRef.current
+    }
   })
 
   const mine = lifecycle.state.submissions.filter((submission) =>
@@ -969,6 +975,9 @@ export function MobileSession({
   // The actions that are not finished, other than the newest, which the badge beside Send shows: an
   // action sent past one nobody knows the end of leaves that one listed, with its own status.
   const earlier = unresolved(mine).filter((submission) => submission !== mine.at(-1))
+  // A record made under an earlier opening of the session says so, wherever it is listed.
+  const underEarlier = (submission: Submission) =>
+    submission.opening !== undefined && submission.opening !== token
   const earlierActions =
     earlier.length === 0 || typingToProgram ? null : (
       <ul className="m-earlier" data-testid="earlier-actions">
@@ -976,6 +985,11 @@ export function MobileSession({
           <li key={submission.localId}>
             <Badge tone="accent">{describeState(submission.state)}</Badge>
             <span className="small muted">{submission.label}</span>
+            {underEarlier(submission) ? (
+              <span className="small muted" data-testid="earlier-opening">
+                Sent under an earlier opening of this session.
+              </span>
+            ) : null}
           </li>
         ))}
       </ul>
@@ -989,7 +1003,7 @@ export function MobileSession({
       >
         {describeState(submission.state)}
       </Badge>
-      {submission.opening !== undefined && submission.opening !== token ? (
+      {underEarlier(submission) ? (
         // The result of a send made before the screen opened the session again: it settles its own
         // record, and says it was sent under the earlier opening.
         <span className="small muted" data-testid="sent-earlier">

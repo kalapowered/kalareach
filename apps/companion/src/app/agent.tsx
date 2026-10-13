@@ -92,7 +92,9 @@ export function useSessionAgent(
   // This view of this session: a refusal read in an earlier visit to it is not shown on a return,
   // until a read in this visit says so again.
   // The opening is part of the visit: what an earlier opening's read was refused with is not this one's.
-  const visit = useMemo(() => ({ sessionId, token }), [sessionId, token])
+  // Each time the opening stops being open and is open again starts another visit: what an earlier read
+  // was refused with is not shown again before a read of this one has answered.
+  const visit = useMemo(() => ({ sessionId, token, waiting }), [sessionId, token, waiting])
   const [unread, setUnread] = useState<{ readonly visit: object; readonly words: string } | null>(
     null
   )

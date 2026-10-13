@@ -10,7 +10,7 @@
 
 import { type ReactNode } from 'react'
 import { describe, expect, it } from 'vitest'
-import { act, render, screen, waitFor, within } from '@testing-library/react'
+import { act, render, renderHook, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import type { ActionRight, Receipt } from '@kalareach/protocol'
 
@@ -19,6 +19,7 @@ import { fakeHost } from '../../src/host/fake'
 import type { HostPort, SessionStanding } from '../../src/host/port'
 import { MobileSession } from '../../src/mobile/views/MobileSession'
 import { useLifecycle } from '../../src/mobile/useLifecycle'
+import { useTerminalView } from '../../src/terminal/view'
 
 const SESSION_MAIN = '8a7b6c50-22bb-4c3d-8e4f-000000000101'
 const SHARE = '5d0e2a40-77aa-4b2c-9d3e-000000000901'
@@ -49,10 +50,12 @@ function Said(): ReactNode {
 /** The session screen as the phone's shell renders it, under `grantId` when it names one. */
 function OnSession({
   grantId = null,
-  onBack = () => undefined
+  onBack = () => undefined,
+  connected = true
 }: {
   readonly grantId?: string | null
   readonly onBack?: () => void
+  readonly connected?: boolean | null
 }): ReactNode {
   const lifecycle = useLifecycle(null)
   return (
@@ -61,16 +64,21 @@ function OnSession({
       grantId={grantId}
       surface="ios"
       lifecycle={lifecycle}
-      connected={true}
+      connected={connected}
       onBack={onBack}
     />
   )
 }
 
-function screenOn(port: HostPort, grantId: string | null = null, onBack?: () => void): ReactNode {
+function screenOn(
+  port: HostPort,
+  grantId: string | null = null,
+  onBack?: () => void,
+  connected: boolean | null = true
+): ReactNode {
   return (
     <AppProvider port={port}>
-      <OnSession grantId={grantId} onBack={onBack} />
+      <OnSession grantId={grantId} onBack={onBack} connected={connected} />
       <Said />
     </AppProvider>
   )
@@ -96,6 +104,21 @@ describe('a session screen opens its session (KR-REQ-19.08)', () => {
 
     unmount()
     expect(controls.standings.leaves).toEqual([{ sessionId: SESSION_MAIN, opening: token }])
+  })
+
+  it('says so, and waits on no words, when it cannot listen for what the host says', async () => {
+    const host = fakeHost()
+    render(
+      screenOn({
+        ...host.port,
+        onStanding: () => Promise.reject(new Error('no listener'))
+      })
+    )
+    expect(
+      await screen.findByText('This device could not listen for what the host says of this session.')
+    ).toBeInTheDocument()
+    // Nothing was asked of the host without a way to hear its answer.
+    expect(host.controls.standings.opens).toHaveLength(0)
   })
 
   it('leaves an opening whose open the host has not yet answered', async () => {
@@ -603,6 +626,21 @@ describe('contact with a session being taken up again', () => {
     expect(await screen.findByText('Not in contact with this host')).toBeInTheDocument()
     expect(screen.queryByText('Connected again')).toBeNull()
   })
+
+  it('says nothing of contact before the shell has answered whether the host is in contact', async () => {
+    const { port, controls } = fakeHost()
+    controls.standings.answerOpens(SESSION_MAIN, {
+      state: 'reconnecting',
+      reason: 'Contact with the session was lost.'
+    })
+    render(screenOn(port, null, undefined, null))
+    // The screen has its opening, and it is being reached again; the connection has not said.
+    await waitFor(() => {
+      expect(controls.standings.opens).toHaveLength(1)
+    })
+    expect(screen.queryByText('Not in contact with this host')).toBeNull()
+    expect(screen.queryByText('Connected again')).toBeNull()
+  })
 })
 
 describe('what became of a send the host could not confirm', () => {
@@ -698,6 +736,35 @@ describe('what became of a send the host could not confirm', () => {
     expect(await screen.findByTestId('earlier-actions')).toHaveTextContent('Outcome unknown')
   })
 
+  it('says of an earlier action that was sent under an earlier opening, wherever it is listed', async () => {
+    const person = userEvent.setup()
+    const host = fakeHost()
+    const record = recording(host.port, () => 'unknown')
+    host.controls.standings.answerOpens(SESSION_MAIN, share(['session.view', 'agent.prompt']))
+    const view = render(screenOn(record.port, SHARE))
+    await sendOne(person)
+    await waitFor(() => {
+      expect(record.reads.length).toBeGreaterThan(0)
+    })
+
+    // The screen opens the session again, and the person, who checked, sends the next thing there.
+    view.rerender(screenOn(record.port, null))
+    await waitFor(() => {
+      expect(host.controls.standings.opens).toHaveLength(2)
+    })
+    const field = await screen.findByLabelText('Message this session')
+    await person.clear(field)
+    await person.type(field, 'the next thing')
+    await person.click(await screen.findByTestId('composer-send-anyway'))
+
+    // The first send is now an earlier action, listed with its own status, and says where it was sent.
+    const earlier = await screen.findByTestId('earlier-actions')
+    expect(within(earlier).getByText('Outcome unknown')).toBeInTheDocument()
+    expect(within(earlier).getByTestId('earlier-opening')).toHaveTextContent(
+      'Sent under an earlier opening of this session.'
+    )
+  })
+
   it('reads nothing while the opening is not open, and reads at once when it is open again', async () => {
     const person = userEvent.setup()
     const host = fakeHost()
@@ -769,6 +836,74 @@ describe('the terminal under an opening', () => {
       expect(controls.terminalViews.length).toBeGreaterThan(1)
     })
     expect(screen.queryAllByTestId('mobile-terminal-line')).toHaveLength(0)
+  })
+
+  it('turns the keys off at once while the contact is being taken up again, and gives nothing back', async () => {
+    const person = userEvent.setup()
+    const { port, controls } = fakeHost()
+    controls.standings.answerOpens(SESSION_MAIN, share(['session.view', 'terminal.input']))
+    render(screenOn(port, SHARE))
+    await screen.findByText(FIRST_ENTRY)
+    await person.click(screen.getByRole('tab', { name: 'Terminal' }))
+    await waitFor(() => {
+      expect(screen.getAllByTestId('mobile-terminal-line').length).toBeGreaterThan(0)
+    })
+    await person.click(screen.getByRole('button', { name: 'Take control' }))
+    act(() => {
+      controls.terminalViews[0]?.grantControl()
+    })
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'Escape' })).toBeEnabled()
+    })
+
+    // The host says nothing of rights while it is reached again, so the screen offers nothing, though
+    // the view still holds the lease and no release is made: the keys are off by the screen's own word.
+    act(() => {
+      controls.standings.say(SESSION_MAIN, {
+        state: 'reconnecting',
+        reason: 'Contact with the session was lost.'
+      })
+    })
+    expect(screen.getByRole('button', { name: 'Escape' })).toBeDisabled()
+    expect(controls.terminalViews[0]?.inputs.some((input) => input.kind === 'release')).toBe(false)
+  })
+
+  it('sends the program nothing once the screen may no longer control it, whatever the view shows', async () => {
+    const { port, controls } = fakeHost()
+    const view = renderHook(
+      ({ may }) =>
+        useTerminalView(port, SESSION_MAIN, () => ({ columns: 80, rows: 24 }), true, undefined, may),
+      { initialProps: { may: true } }
+    )
+    await waitFor(() => {
+      expect(controls.terminalViews).toHaveLength(1)
+    })
+    await waitFor(() => {
+      expect(view.result.current.frame).not.toBeNull()
+    })
+    act(() => {
+      view.result.current.takeControl()
+    })
+    act(() => {
+      controls.terminalViews[0]?.grantControl()
+    })
+    await waitFor(() => {
+      expect(view.result.current.controlTake()).not.toBeNull()
+    })
+    const wheel = { kind: 'wheel', column: 0, line: 0, turns: 1, shift: false, alt: false, control: false } as const
+    await act(async () => {
+      await view.result.current.toProgram(wheel)
+    })
+    const reached = controls.terminalViews[0]?.inputs.filter((input) => input.kind === 'wheel').length
+    expect(reached).toBe(1)
+
+    // The view still shows control, and the page may no longer use it.
+    view.rerender({ may: false })
+    expect(view.result.current.controlTake()).toBeNull()
+    await act(async () => {
+      await view.result.current.toProgram(wheel)
+    })
+    expect(controls.terminalViews[0]?.inputs.filter((input) => input.kind === 'wheel')).toHaveLength(1)
   })
 
   it('gives back control the opening no longer lets the person use, and stops what the keys send', async () => {
