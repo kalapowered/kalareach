@@ -1664,8 +1664,7 @@ impl WorkerService {
                             continue;
                         }
                         PeerState::Quiet => {
-                            state.answering_held =
-                                ready.pending.caller.gate_restrictions.is_some();
+                            state.answering_held = ready.pending.caller.gate_restrictions.is_some();
                             Some(self.dispatch_prepared(&mut state, *ready))
                         }
                     }
