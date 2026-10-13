@@ -662,7 +662,7 @@ impl BackupService {
         // A pass that holds the staging directory may be between two writes, so the scan that
         // would call its files unclaimed waits for it. The lease is read in this hold of the
         // store, before the walk: a pass cannot write and end between the walk and the discharge.
-        let writing = self.staging_is_unsettled();
+        let writing = self.leases().any();
         match Self::cleanup_within_store(&mut store, writing, now_ms) {
             Ok(removed) => {
                 self.note_step_succeeded(PrivacyStep::Remove, generation.get());
@@ -690,13 +690,16 @@ impl BackupService {
                 // Not discharged, and the report says why.
                 store.note_obligation_failed(
                     obligation.id,
-                    "a backup pass is still writing to the staging directory, or has removals it \
-                     has not yet flushed",
+                    "a backup pass is still writing to the staging directory",
                     now_ms,
                 )?;
                 continue;
             }
-            match unregistered_staged_files(store) {
+            // What a pass took away is made durable before the walk is called done: names a power
+            // loss could bring back are names this cleanup would have reported gone.
+            let walked = flush_staging_tree(store.staging_root())
+                .and_then(|()| unregistered_staged_files(store));
+            match walked {
                 Ok(found) => {
                     let records = store.record_staging_scan(&obligation, &found, now_ms)?;
                     removed.records = removed.records.saturating_add(records);
@@ -1076,19 +1079,6 @@ impl BackupService {
         self.leases().cancel_all();
     }
 
-    /// Whether a pass still holds the staging directory, or took files away that a flush has not
-    /// yet made durable. A flush that failed before is tried again here.
-    fn staging_is_unsettled(&self) -> bool {
-        let pending = self.leases().take_unflushed();
-        let failed: Vec<PathBuf> = pending
-            .into_iter()
-            .filter(|path| sync_removal(path).is_err())
-            .collect();
-        let mut leases = self.leases();
-        leases.leave_unflushed(failed);
-        leases.any() || leases.has_unflushed()
-    }
-
     /// Removes the files in the staging directory that no object row names, and the directories
     /// they leave empty.
     ///
@@ -1104,14 +1094,16 @@ impl BackupService {
     /// read.
     pub fn remove_unclaimed_staging(&self) -> Result<u64> {
         let store = self.store();
-        if self.staging_is_unsettled() {
+        if self.leases().any() {
             return Ok(0);
         }
         let found = unregistered_staged_files(&store)?;
         let mut removed = 0u64;
         for path in &found {
-            if std::fs::remove_file(path).is_ok() {
-                removed += 1;
+            match std::fs::remove_file(path) {
+                Ok(()) => removed += 1,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(ControllerError::registry(error)),
             }
             if let Some(directory) = path.parent()
                 && directory != store.staging_root()
@@ -1119,15 +1111,10 @@ impl BackupService {
                 let _ = std::fs::remove_dir(directory);
             }
         }
-        // A flush that fails is kept to be tried again: the names are gone from the directory and
-        // no later sweep would find them, but losing power could bring them back.
-        let failed: Vec<PathBuf> = found
-            .iter()
-            .filter(|path| sync_removal(path).is_err())
-            .cloned()
-            .collect();
-        if !failed.is_empty() {
-            self.leases().leave_unflushed(failed);
+        // The sweep runs again before every pass, so a removal whose flush fails and is undone by
+        // a power loss is found and removed once more; the failure still stops the pass.
+        for path in &found {
+            sync_removal(path)?;
         }
         Ok(removed)
     }
@@ -1825,6 +1812,18 @@ fn sync_removal(path: &Path) -> Result<()> {
         directory = current.parent();
     }
     Ok(())
+}
+
+/// Makes every removal under the staging root durable: the directory of each generation, then the
+/// root.
+pub(super) fn flush_staging_tree(root: &Path) -> Result<()> {
+    for entry in std::fs::read_dir(root).map_err(ControllerError::registry)? {
+        let path = entry.map_err(ControllerError::registry)?.path();
+        if path.is_dir() {
+            flush_directory(&path, NameKind::File).map_err(ControllerError::registry)?;
+        }
+    }
+    flush_directory(root, NameKind::Directory).map_err(ControllerError::registry)
 }
 
 fn flush_up_from(start: Option<&Path>, first: NameKind) -> Result<()> {

@@ -259,6 +259,9 @@ async fn run(
         })
         .await?
     };
+    // A backup pass that is reading and sealing is told to stop however this function ends, so that
+    // ending the process does not wait for it to finish its members.
+    let _stop_backup_production = controller.stop_backup_production_when_dropped();
     // The catalogue is seeded from the generation compiled into this build at every start, before
     // the local endpoints are bound. The network endpoint, where the host has one, is bound inside
     // `Controller::start`; a request on it meanwhile waits for the catalogue's lock. A seed that
@@ -312,9 +315,6 @@ async fn run(
             println!("kr-controller: stopped: an update of this host replaces this daemon");
         }
     }
-    // A backup pass that is reading and sealing is told to stop, so that ending the process does
-    // not wait for it to finish its members.
-    controller.stop_backup_production();
     Ok(())
 }
 

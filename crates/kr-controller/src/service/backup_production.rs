@@ -12,8 +12,9 @@
 //!   accepts it.
 //!
 //! The members, their bounds and their names are the convention's, held in
-//! `kr_crypto::backup` for the producer and the restore alike. Over the total, the sessions after
-//! the one that would pass it are left out of this generation and `kr doctor` says how many.
+//! `kr_crypto::backup` for the producer and the restore alike. A session that would pass the total
+//! is left out of this generation whole, a smaller one after it may still fit, and `kr doctor`
+//! says how many were left out.
 //!
 //! # When a pass makes a generation
 //!
@@ -23,6 +24,9 @@
 //! it has been a day since the newest counted generation; and what would be packed differs from
 //! what that generation was made from. The pass holds a lease on the staging directory, which keeps
 //! the cleanup privacy mode owes open until it has stopped.
+//!
+//! The store, the secret store and the disk are read on blocking workers. The registry is read as
+//! every read of a closed session reads it, under its own lock.
 
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
@@ -232,6 +236,17 @@ impl Drop for PassPause {
     }
 }
 
+/// Stops the producer's passes when it is dropped; see
+/// [`Controller::stop_backup_production_when_dropped`].
+#[derive(Debug)]
+pub struct StopBackupProduction(Arc<Controller>);
+
+impl Drop for StopBackupProduction {
+    fn drop(&mut self) {
+        self.0.backup.stop_production_passes();
+    }
+}
+
 /// One closed session that may be packed.
 struct Candidate {
     summary: SessionSummary,
@@ -251,11 +266,13 @@ impl Controller {
         }
     }
 
-    /// Tells a production pass that is running to stop where it is, and removes what it wrote. The
-    /// daemon calls this as it stops, so that ending the process does not wait for a pass to read
-    /// and seal everything it has begun. Nothing waits for the pass here.
-    pub fn stop_backup_production(&self) {
-        self.backup.stop_production_passes();
+    /// A guard that tells a production pass that is running to stop where it is, and to remove
+    /// what it wrote, when it is dropped. The daemon holds one from the moment it starts to the
+    /// moment it ends, by whichever way it ends, so that ending the process does not wait for a
+    /// pass to read and seal everything it has begun. Nothing waits for the pass.
+    #[must_use = "the passes are stopped when the guard is dropped"]
+    pub fn stop_backup_production_when_dropped(self: &Arc<Self>) -> StopBackupProduction {
+        StopBackupProduction(Arc::clone(self))
     }
 
     /// Puts a pause into the next production pass, after its first member is staged.
@@ -313,8 +330,9 @@ impl Controller {
     /// One look at the checks, and a generation if they all hold. Returns how long to wait, or none
     /// when only a signal can change what held the pass back.
     ///
-    /// Everything that reads the store, the secret store or the disk runs on a blocking worker, so
-    /// a cleanup that holds the store for a while never holds a thread of the reactor.
+    /// The pass's own reads of the store, the secret store and the disk run on blocking workers, so
+    /// a cleanup that holds the store for a while never holds a thread of the reactor. The reads of
+    /// the registry that every read of a closed session makes are made as they are made there.
     async fn production_pass(
         self: &Arc<Self>,
         production: &Arc<Production>,
@@ -541,6 +559,8 @@ impl Controller {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .take(),
+            #[cfg(feature = "testing")]
+            paused_once: std::sync::atomic::AtomicBool::new(false),
         };
         let handle = tokio::runtime::Handle::current();
         let made = tokio::task::spawn_blocking(move || handle.block_on(pass.make())).await;
@@ -848,6 +868,9 @@ struct Pass {
     backup: Arc<crate::backup::BackupService>,
     #[cfg(feature = "testing")]
     pause: Option<Arc<Meeting>>,
+    /// Whether the pause has been met: a pause holds a pass once.
+    #[cfg(feature = "testing")]
+    paused_once: std::sync::atomic::AtomicBool,
 }
 
 /// The pages of a closed session's retained output, read from the archive under the lease.
@@ -879,7 +902,11 @@ impl Pass {
     /// while it was held.
     #[cfg(feature = "testing")]
     async fn paused_after_a_member(&self) -> bool {
-        if let Some(meeting) = &self.pause {
+        if let Some(meeting) = &self.pause
+            && !self
+                .paused_once
+                .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
             meeting.reached.notify_one();
             meeting.resume.notified().await;
         }
@@ -1097,8 +1124,8 @@ impl AsRef<Self> for Candidate {
 
 /// What a pass can need on the disk it stages on: for each session, the smaller of the session
 /// member bound and forty times its retained output (a document is not four thirds of its output
-/// once its pieces are small), up to the total, with the ciphertext's overhead, the configuration
-/// and the manifest.
+/// once its pieces are small), up to the total, with the configuration and room for the manifest.
+/// The ciphertext's overhead is a few kilobytes for each member, which the reserve left free covers.
 fn projected_bytes(
     candidates: &[Candidate],
     configuration: Option<&[u8]>,

@@ -53,6 +53,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
 
 use kr_delivery::privacy::DeliveryOutbox;
@@ -518,6 +519,9 @@ pub struct EnvironmentPrivacy {
     backup: Arc<BackupService>,
     delivery: Arc<DeliveryModule>,
     descriptions: Arc<DescribeModule>,
+    /// Whether the backup cleanup's schedule is to start again at the next tick. It is set without
+    /// the record's mutex, which an enabling holds across work on the backup store.
+    retry_cleanup: AtomicBool,
     /// Where this module's own tests stop an enabling: its record written, inside the backup
     /// store's hold, before the backup fence goes up.
     #[cfg(test)]
@@ -592,6 +596,7 @@ impl EnvironmentPrivacy {
             backup,
             delivery,
             descriptions,
+            retry_cleanup: AtomicBool::new(false),
             #[cfg(test)]
             after_record: crate::attention::Pause::default(),
             #[cfg(test)]
@@ -838,7 +843,7 @@ impl EnvironmentPrivacy {
     /// schedule counted that as a try that got nowhere; the end of the pass is the news that the
     /// cleanup can go on.
     pub fn retry_backup_cleanup(&self) {
-        self.inner().cleanup = Backoff::default();
+        self.retry_cleanup.store(true, Ordering::SeqCst);
     }
 
     /// Answers `privacy.set`: turns privacy mode on or off and says where the change stands.
@@ -1259,6 +1264,9 @@ impl EnvironmentPrivacy {
 
     /// Runs the backup service's cleanup again while it holds obligations and its turn has come.
     fn clean_backup(&self, inner: &mut Inner, now_ms: TimestampMs) {
+        if self.retry_cleanup.swap(false, Ordering::SeqCst) {
+            inner.cleanup = Backoff::default();
+        }
         if inner.owed.contains_key(&Subsystem::Backup) || !inner.cleanup.due(now_ms) {
             return;
         }

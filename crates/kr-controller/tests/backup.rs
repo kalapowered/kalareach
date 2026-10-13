@@ -9903,3 +9903,58 @@ fn a_generation_number_at_or_below_the_count_is_not_admitted() {
         )
         .expect("the number after the count is admitted");
 }
+
+/// A removal is made durable before the cleanup a fence owes is called done: a pass took its file
+/// away and the flush of the staging directory failed, so the walk is not discharged, whatever the
+/// service remembers; the cleanup finishes once the directory can be flushed. The state is the
+/// disk's and the store's, so it holds across opening the service again.
+#[test]
+fn a_removal_that_could_not_be_flushed_holds_the_cleanup_open_across_a_restart() {
+    let (_root, state) = state_directory();
+    let refused = {
+        let service = BackupService::open(&state).expect("a backup service");
+        service
+            .reconcile(TimestampMs::new(4_000))
+            .expect("the startup reconciliation");
+        let lease = service.begin_production().expect("a lease");
+        lease
+            .stage(
+                archive_id(),
+                BackupGeneration::new(1),
+                object_id(1),
+                b"ciphertext",
+            )
+            .expect("a file is staged");
+        privacy(&service)
+            .fence(PrivacyGeneration::new(1))
+            .expect("the fence goes up");
+        let refused = kr_flush::testing::refuse_flushes_of(service.staging_root());
+        drop(lease);
+        assert!(
+            files_under(&service.staging_root()).is_empty(),
+            "the pass took away what it wrote"
+        );
+        refused
+    };
+
+    let service = BackupService::open(&state).expect("the service is opened again");
+    service
+        .run_cleanup(PrivacyGeneration::new(1), TimestampMs::new(7_000))
+        .expect("cleanup");
+    assert!(
+        service
+            .obligations()
+            .expect("a read")
+            .iter()
+            .any(|obligation| obligation.kind == ObligationKind::ScanStaging),
+        "the walk is not discharged while the removal is not durable"
+    );
+    drop(refused);
+    service
+        .run_cleanup(PrivacyGeneration::new(1), TimestampMs::new(7_100))
+        .expect("cleanup");
+    assert!(
+        service.obligations().expect("a read").is_empty(),
+        "the directory is flushed and the cleanup completes"
+    );
+}

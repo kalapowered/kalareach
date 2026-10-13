@@ -3577,7 +3577,8 @@ async fn nothing_is_made_while_privacy_mode_is_on_and_a_generation_follows_when_
 }
 
 /// The members together never pass the total a restore accepts, the configuration among them: it
-/// is counted first, and a session that no longer fits is left out whole.
+/// is counted first, and a session that no longer fits beside it is left out whole. The total here
+/// takes the session and the configuration each alone, and not both.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_configuration_is_counted_in_the_total_a_restore_accepts() {
     let timer = HeldTimer::held();
@@ -3585,37 +3586,57 @@ async fn the_configuration_is_counted_in_the_total_a_restore_accepts() {
         closed_session(host, b"a session\r\n", 9_000);
     })
     .await;
-    let configured = std::fs::read(kr_worker::config::document_path(&rig.host.environment()))
-        .expect("the document");
-    let configuration = kr_protocol::hostinfo::configuration::contents(
-        &kr_protocol::hostinfo::configuration::load(Some(&configured))
-            .document
-            .expect("a document"),
-    )
-    .len() as u64;
-    let total = configuration + 10;
-    rig.controller
-        .lower_producer_bounds(kr_controller::service::ProducerBounds {
-            total_bytes: total,
-            ..kr_controller::service::ProducerBounds::PRODUCTION
-        });
     let web = Arc::clone(rig.served.web());
     within("the first status read", web.requests_reach(STATUS, 1)).await;
     rig.set_up();
-    rig.until("the generation is published", |rig| rig.published(1))
+    rig.until("the first generation is published", |rig| rig.published(1))
         .await;
-    let members = opened_members(&rig, 1);
+    let first = opened_members(&rig, 1);
+    assert_eq!(first.len(), 2, "the control: both fit under the convention");
+    let session: u64 = first
+        .iter()
+        .filter(|(name, _)| name.starts_with("sessions/"))
+        .map(|(_, member)| member.len() as u64)
+        .sum();
+    let configuration = first["host/configuration.json"].len() as u64;
+
+    // A day on and a changed document (of the same length): the next generation may hold the
+    // session or the configuration, and not both.
+    rig.controller
+        .lower_producer_bounds(kr_controller::service::ProducerBounds {
+            total_bytes: session + configuration - 1,
+            ..kr_controller::service::ProducerBounds::PRODUCTION
+        });
+    let mut changed = kr_protocol::hostinfo::configuration::ConfigurationDocument::empty();
+    changed.revision = 2;
+    changed.storage.origin = Nullable::some(rig.served.origin().to_owned());
     assert_eq!(
-        members.keys().collect::<Vec<_>>(),
+        kr_protocol::hostinfo::configuration::contents(&changed).len() as u64,
+        configuration,
+        "the document keeps its length"
+    );
+    kr_ipc::paths::write_owner_only_file(
+        &kr_worker::config::document_path(&rig.host.environment()),
+        kr_protocol::hostinfo::configuration::contents(&changed).as_bytes(),
+    )
+    .expect("the document");
+    timer.advance_day(Duration::from_secs(25 * 3600));
+    rig.controller.backup().signals().produce.notify_one();
+    timer.run_by_itself();
+    rig.until("the second generation is published", |rig| rig.published(2))
+        .await;
+    let second = opened_members(&rig, 2);
+    assert_eq!(
+        second.keys().collect::<Vec<_>>(),
         ["host/configuration.json"],
-        "the session no longer fit and is left out whole"
+        "the session no longer fits beside the configuration and is left out whole"
     );
     assert!(
-        members
+        second
             .values()
             .map(|member| member.len() as u64)
             .sum::<u64>()
-            <= total
+            < session + configuration
     );
 }
 
@@ -3739,8 +3760,8 @@ async fn no_generation_is_staged_while_a_finished_ones_ciphertext_is_still_on_th
     rig.controller
         .lower_producer_bounds(kr_controller::service::ProducerBounds::PRODUCTION);
     timer.advance_day(Duration::from_secs(25 * 3600));
-    rig.controller.backup().signals().produce.notify_one();
     let looked = *rig.controller.production_looks().borrow();
+    rig.controller.backup().signals().produce.notify_one();
     rig.production_looked(looked + 1).await;
     let (status, detail) = rig.production_check().await;
     assert_eq!(status, DoctorStatus::Warning);
@@ -3831,7 +3852,7 @@ async fn a_pass_between_two_writes_stops_when_the_daemon_is_told_to_stop() {
     within("the pass has staged its first member", pause.reached()).await;
     assert!(walk(&staging) > 0, "the pass wrote a file");
 
-    rig.controller.stop_backup_production();
+    drop(rig.controller.stop_backup_production_when_dropped());
     pause.resume();
     within("the pass takes away what it wrote", async {
         while rig.controller.backup().production_running() {
