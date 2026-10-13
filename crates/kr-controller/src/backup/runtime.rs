@@ -552,12 +552,16 @@ impl Shared {
         backup: &BackupService,
         backoff: &mut Backoff,
     ) -> Wait {
-        let released = on_disk(|| backup.release_finished_ciphertext());
-        self.observed().release_pending = match &released {
-            Ok(released) => released.pending > 0,
-            Err(_) => true,
+        let wait = {
+            let released = on_disk(|| backup.release_finished_ciphertext());
+            self.note_release(&released);
+            let wait = self.carry_outbox(uploader, backup, backoff).await;
+            // The pass may have finished a generation, and its ciphertext is given back now and not
+            // in an iteration of its own.
+            let released = on_disk(|| backup.release_finished_ciphertext());
+            self.note_release(&released);
+            wait
         };
-        let wait = self.carry_outbox(uploader, backup, backoff).await;
         let local_work = on_disk(|| backup.has_finished_ciphertext().unwrap_or(true));
         if wait == Wait::Signals && local_work {
             return Wait::Timed {
@@ -566,6 +570,13 @@ impl Shared {
             };
         }
         wait
+    }
+
+    fn note_release(&self, released: &Result<crate::backup::Released>) {
+        self.observed().release_pending = match released {
+            Ok(released) => released.pending > 0,
+            Err(_) => true,
+        };
     }
 
     /// The outbox, carried for one pass, or the reason none was made.

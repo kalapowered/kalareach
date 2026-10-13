@@ -1418,9 +1418,9 @@ impl BackupService {
         let withheld = self.unready();
         let publication =
             store.note_published(attempt, produced_under.get(), withheld.as_deref(), now_ms)?;
-        // A generation finished: the producer looks again, and the carrier releases its ciphertext.
+        // A generation finished: the producer looks again. The carrier releases its ciphertext at
+        // the end of the pass it is in.
         self.signals.produce.notify_one();
-        self.signals.work.notify_one();
         Ok(publication)
     }
 
@@ -1441,7 +1441,6 @@ impl BackupService {
         // the obligation naming it end together, and what a service may hold is written down.
         self.store().note_attempt_stopped(attempt, now_ms)?;
         self.signals.produce.notify_one();
-        self.signals.work.notify_one();
         Ok(())
     }
 
