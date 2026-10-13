@@ -234,7 +234,7 @@ variables an older build read joins nothing because of them.
 | `network.proxy_url` | the HTTP proxy this host's connections to services go through: the endpoint's relay connection, relay latency probe, captive-portal check and Pkarr servers, the rendezvous, delivery and webhooks, mail submission, the managed voice broker and account service, backups to the managed storage service, the authority feed, the model's files, and plugin repositories; the host's own name lookups do not use it, and absent everything goes directly, apart from the relay latency probe and captive-portal check, which then follow `HTTPS_PROXY`, `HTTP_PROXY` and `ALL_PROXY` when those are set | an absolute `http` or `https` origin, with no user information, no path and no trailing slash |
 | `voice.broker_origin` | the managed broker this host starts a device's voice session at, through the proxy `network.proxy_url` selects | an absolute `https` origin, or an `http` origin on `localhost`, `127.0.0.1` or `[::1]`, of at most 128 bytes, in lower case, with no path and no port its scheme already implies; a plain-HTTP origin cannot be combined with `network.proxy_url`, because the proxy would carry the account token in clear text |
 | `storage.origin` | the managed storage service this host uploads its backups to | an `https` origin, or an `http` origin on a loopback address, in the spelling a gateway origin has, with no path and no trailing slash; the daemon refuses to start unless it is the managed account service |
-| `authority.origin` | the authority feed this host reads its remote revocations from; a section of level 2: a release that reads level 1 ignores it, and its host takes revocations only from owners who reach it directly | an `https` origin, or an `http` origin on a loopback address, in the spelling a gateway origin has, with no path and no trailing slash |
+| `authority.origin` | the authority feed this host reads its remote revocations from; a section of level 2: a release that reads level 1 ignores it, and its host takes a device's revocation only from the owner at the machine | an `https` origin, or an `http` origin on a loopback address, in the spelling a gateway origin has, with no path and no trailing slash |
 
 A field the document does not write selects nothing, because there is no public relay or discovery
 server to fall back on. A URL or an origin names its host the one way the protocol spells every
@@ -4686,8 +4686,8 @@ records the end of a chain's exhaustion, so its item stays in the inbox, and eac
 acknowledges it for themselves.
 
 A host whose authority feed answers that it was removed from it raises one item, of its own and
-not of any session, which the owner at the machine and every device that manages the host see. It
-stands until the host reads another feed or none, which an owner brings about by changing
+not of any session, which the owner at the machine sees, and every device that manages the host
+and whose grant's history reaches the removal. It stands until the host reads another feed or none, which an owner brings about by changing
 `authority.origin` in the configuration document.
 
 An application notice is the one untrusted rule. Any process writing to the terminal can emit one,
@@ -5561,7 +5561,7 @@ feed is reported stale rather than current.
 
 When the configuration document names an `authority.origin`, the daemon runs a carrier for the feed
 for as long as it lives. When it names none, no remote owner's revocation can reach the host, and
-the owners paired with it revoke directly. The origin is read only once, at start. The carrier signs
+only the owner at the machine revokes a device. The origin is read only once, at start. The carrier signs
 as the host, with the authorisation key its pairings recorded, which is what the feed is addressed
 by. It reads the feed at four moments: when the daemon starts, when a connection is established,
 every 30 seconds after that, and when an owner is paired or revoked. A connection waits for a read
@@ -5615,7 +5615,7 @@ everything addressed to the host, so the host learns no revocation from it again
 an owner published there and the host had not applied is gone. The host records the answer with the
 origin that gave it, and from then on `device.list` and `kr doctor` say the feed was removed beside
 the last time it was synchronised, and the attention inbox holds an urgent item for the owner and
-for every device that manages the host. The grants that do not rest on the feed carry on: the
+for every device that manages the host and whose grant's history reaches the removal. The grants that do not rest on the feed carry on: the
 default non-expiring owner grant is account-free and stays usable. The grants that do rest on it are
 refused until an owner acts at the host: an organisation's, personal remote access under a bounded
 offline-validity policy the owner chose, and personal remote access on a host that is exclusively

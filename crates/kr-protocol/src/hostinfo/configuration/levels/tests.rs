@@ -492,8 +492,8 @@ fn an_unused_authority_section_is_not_written_and_a_release_at_level_1_reads_the
 
 /// KR-REQ-26.13: a release that reads level 1 takes the authority section for a section of a newer
 /// release: it applies every member it knows, leaves the section out, counts and names it, does not
-/// fail closed, and does not edit the document. Without the section a host takes revocations only
-/// from the owners who reach it directly.
+/// fail closed, and does not edit the document. Without the section a host takes a device's
+/// revocation only from the owner at the machine.
 #[test]
 fn a_release_at_level_1_ignores_the_authority_section_and_applies_the_rest() {
     let written = contents_in(&with_a_feed(), &THIS_RELEASE);
@@ -526,8 +526,8 @@ fn a_release_at_level_1_ignores_the_authority_section_and_applies_the_rest() {
 }
 
 /// KR-REQ-26.13: the upgrade half and the round trip of an active value. A document a release at
-/// level 1 wrote is read by this build as it was; once the owner selects a feed the next write is at
-/// level 2 and keeps every other member; the selection survives the file, the typed document and
+/// level 1 wrote is read by this build as it was; once the owner selects a feed the next write is
+/// at level 2 and keeps every other member; the selection survives the file, the typed document and
 /// the copy the registry keeps, which is the file's reading written again.
 #[test]
 fn a_selected_feed_survives_the_file_and_the_registrys_copy() {
