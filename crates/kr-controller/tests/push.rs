@@ -9096,6 +9096,36 @@ fn a_wait_that_would_leave_the_notification_less_than_the_room_is_not_made() {
     assert!(detail.contains("mailbox"), "{detail}");
 }
 
+/// KR-REQ-09.21: a wait that would leave the notification exactly the room is not made either: the
+/// edge is exclusive here as it is for the first look. The service asks for five minutes and the
+/// notification has ten, so the next attempt would leave exactly five minutes; the mailbox was
+/// asked once, and the push goes at once without its detail.
+#[test]
+fn a_wait_that_would_leave_the_notification_exactly_the_room_is_not_made() {
+    let (environment, _) = environment_keeping_the_hosts_mailbox_key();
+    let now = real_now();
+    let service = MailboxService::attach(&environment);
+    queue_an_oversized_notification_living(&environment, &service, now, 10 * 60_000);
+    let gateway = WatchedGateway::over(&service);
+    service.web.fail(
+        MailboxService::DELIVER,
+        1,
+        kr_service_stand_in::Moment::Refuse {
+            status: 503,
+            code: "SERVICE_UNAVAILABLE",
+            retry_after_seconds: Some(300),
+        },
+    );
+
+    assert_eq!(pass_at(&environment, &gateway, now), 1);
+
+    assert_eq!(service.asked(), 1);
+    assert_eq!(gateway.held_at_the_push(), [0]);
+    let (state, detail) = the_notification_is(&environment);
+    assert_eq!(state, DeliveryState::Accepted);
+    assert!(detail.contains("mailbox"), "{detail}");
+}
+
 /// KR-REQ-09.21: the deadline is asked again when the placement ends. A notification whose
 /// placement takes far longer than a request may, so that it has expired when the exchange ends,
 /// is not presented; its detail did reach the mailbox, so the journal keeps it among the copies
@@ -9266,7 +9296,7 @@ fn a_mailbox_that_asks_for_five_minutes_is_waited_for() {
     assert_eq!(the_notification_is(&environment).0, DeliveryState::Accepted);
 }
 
-/// KR-REQ-09.21: a notification with no more life left than the longest wait of its own schedule
+/// KR-REQ-09.21: a notification with no more life left than the limit of its own schedule's waits
 /// is presented without its detail, and the mailbox is not asked: the exchange and a wait could
 /// each cost it the push.
 #[test]
@@ -9458,6 +9488,28 @@ fn a_clock_set_back_after_an_expiry_was_seen_does_not_undo_it() {
     assert_eq!(the_notification_is(&environment).0, DeliveryState::Expired);
 }
 
+/// A recipient authority that clears a flag when it is asked for the `nth` time. With a clock that
+/// reads the flag once, it keeps any reading from being taken after that question.
+#[derive(Debug)]
+struct Disarming {
+    asked: std::sync::atomic::AtomicU64,
+    nth: u64,
+    armed: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl RecipientAuthority for Disarming {
+    fn scope_for(&self, rule: &DeliveryRule) -> Option<RecipientScope> {
+        Granted(BTreeSet::new()).scope_for(rule)
+    }
+
+    fn device_scope(&self, destination: &DestinationRecord) -> Option<RecipientScope> {
+        if self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1 == self.nth {
+            self.armed.store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+        Granted(BTreeSet::new()).device_scope(destination)
+    }
+}
+
 /// A recipient authority that arms a flag when it is asked for the `nth` time, which a clock
 /// reads once and clears.
 #[derive(Debug)]
@@ -9480,8 +9532,8 @@ impl RecipientAuthority for Armed {
     }
 }
 
-/// KR-REQ-09.21: the room is exclusive at its edge. A notification with exactly the longest wait of
-/// its own schedule left is not asked about; the push goes at once without its detail.
+/// KR-REQ-09.21: the room is exclusive at its edge. A notification with exactly the limit of its own
+/// schedule's waits left is not asked about; the push goes at once without its detail.
 #[test]
 fn a_notification_with_exactly_the_room_left_is_sent_without_asking_the_mailbox() {
     let (environment, _) = environment_keeping_the_hosts_mailbox_key();
@@ -9499,7 +9551,9 @@ fn a_notification_with_exactly_the_room_left_is_sent_without_asking_the_mailbox(
 
 /// KR-REQ-09.21: an expiry seen when the placement ends is not undone by a clock set back
 /// afterwards. The clock reads the notification's end once, right after the exchange, and an
-/// earlier time after it.
+/// earlier time after it. The reading is cleared at the pass's third question of the recipient's
+/// authority, which comes after the exchange, so the expiry is seen only if the step that ends the
+/// placement takes the reading itself: a step that kept the caller's reading would send the push.
 #[test]
 fn a_clock_set_back_after_a_placement_saw_the_expiry_does_not_undo_it() {
     let (environment, _) = environment_keeping_the_hosts_mailbox_key();
@@ -9521,6 +9575,13 @@ fn a_clock_set_back_after_a_placement_saw_the_expiry_does_not_undo_it() {
             }
         }
     };
+    // The questions of the pass: one after the claim, one in the attempt, and the third after the
+    // exchange.
+    let authority = Disarming {
+        asked: std::sync::atomic::AtomicU64::new(0),
+        nth: 3,
+        armed: Arc::clone(&armed),
+    };
 
     environment
         .module
@@ -9529,7 +9590,7 @@ fn a_clock_set_back_after_a_placement_saw_the_expiry_does_not_undo_it() {
             &gateway,
             &held(now + 30 * 24 * 60 * 60 * 1000),
             &ExternalDouble::answering(Vec::new()),
-            &Granted(BTreeSet::new()),
+            &authority,
             &clock,
         )
         .expect("a pass");
