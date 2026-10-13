@@ -232,13 +232,16 @@ const NOT_FINISHED: &[u8] = br#"{"ok":false,"error":{"code":"SERVICE_UNAVAILABLE
 /// For the next `stalls` deliveries it carries the delivery to the deployment, which stores it,
 /// and hands back the route's answer to a mailbox that had not answered by its deadline in place
 /// of the deployment's own: what a device sees when its mailbox stores an item after the route
-/// stopped waiting for it. Everything else passes through as it came.
+/// stopped waiting for it. That answer does not depend on what became of the carriage. A route
+/// whose mailbox it could not carry the delivery to, or whose answer it did not hear, is a route
+/// whose mailbox did not finish answering, so a carriage the network ended is the same answer.
+/// Everything else passes through as it came.
 #[derive(Debug)]
 struct LateMailbox {
     through: Arc<dyn ServiceHttp>,
     /// How many more deliveries are answered too late.
     stalls: AtomicUsize,
-    /// How many deliveries have reached the deployment through it.
+    /// How many deliveries were sent through it.
     deliveries: AtomicUsize,
 }
 
@@ -264,9 +267,9 @@ impl ServiceHttp for LateMailbox {
         headers: &'a [(&'a str, &'a str)],
     ) -> ServiceFuture<'a, ServiceHttpAnswer> {
         Box::pin(async move {
-            let answer = self.through.post_json(url, body, headers).await?;
+            let carried = self.through.post_json(url, body, headers).await;
             if !url.ends_with(MAILBOX_DELIVER_PATH) {
-                return Ok(answer);
+                return carried;
             }
             self.deliveries.fetch_add(1, Ordering::SeqCst);
             let late = self
@@ -275,14 +278,17 @@ impl ServiceHttp for LateMailbox {
                     left.checked_sub(1)
                 })
                 .is_ok();
-            Ok(if late {
-                ServiceHttpAnswer {
+            if late {
+                // What became of the carriage is said, because it is no longer the answer.
+                if let Err(error) = &carried {
+                    eprintln!("a delivery the route could not carry or hear back: {error}");
+                }
+                return Ok(ServiceHttpAnswer {
                     status: 503,
                     body: NOT_FINISHED.to_vec(),
-                }
-            } else {
-                answer
-            })
+                });
+            }
+            carried
         })
     }
 
@@ -956,7 +962,7 @@ async fn kr_req_23_57_a_delivery_the_mailbox_finished_late_twice_comes_back_as_t
             .deliver(mailboxes.recipient.public(), &envelope)
             .await
             .expect_err("the second answer is the answer");
-        assert_eq!(error.code(), ErrorCode::ServiceCapacity);
+        assert_eq!(error.code(), ErrorCode::ServiceCapacity, "{error}");
         assert_eq!(late.deliveries(), 2, "never a third send");
 
         let page = mailboxes
