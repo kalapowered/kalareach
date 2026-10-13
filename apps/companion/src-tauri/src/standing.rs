@@ -67,19 +67,15 @@ const SEEN_LIMIT: usize = 256;
 /// How long reaching a host and having it open a session may take.
 const OPEN_WITHIN: Duration = Duration::from_secs(20);
 
-/// The pause before the first new attempt to reach a host for an opening.
-const FIRST_RETRY: Duration = Duration::from_millis(250);
-
-/// The longest pause between attempts while the host does not answer.
-const LONGEST_RETRY: Duration = Duration::from_secs(30);
-
-/// The pause after `failures` attempts in a row: the client library's reconnect ladder (250 ms
-/// doubling to 30 seconds), without its jitter, because an opening's attempts are counted by this
-/// code and one opening's recovery is not shared with another's.
+/// The longest wait after `failures` attempts in a row: the ceiling of the client library's
+/// reconnect ladder (section 23) before its jitter. The recheck of a view that lost its connection
+/// waits this long, because the views of one opening are counted by this code and not by a loop.
 fn pause(failures: u32) -> Duration {
-    FIRST_RETRY
-        .saturating_mul(2_u32.saturating_pow(failures.min(16)))
-        .min(LONGEST_RETRY)
+    let mut ladder = kr_client::reconnect::ReconnectLoop::new();
+    for _ in 0..failures.min(16) {
+        ladder.disconnected();
+    }
+    ladder.ceiling()
 }
 
 /// What the page is told of an opened session.
@@ -1168,8 +1164,10 @@ impl PairedLinks {
         opening: String,
         mut link: Option<Arc<Link>>,
     ) {
+        let mut backoff = kr_client::reconnect::ReconnectLoop::new();
         loop {
             if let Some(held) = link.take() {
+                backoff.connected();
                 held.session.closed().await;
                 // An opening that is over, or was left or replaced, is not reached again.
                 let lost = SessionStanding::Reconnecting {
@@ -1179,10 +1177,12 @@ impl PairedLinks {
                     return;
                 }
             }
-            let mut failures: u32 = 0;
             let mut refused: Option<ErrorCode> = None;
             loop {
-                tokio::time::sleep(pause(failures)).await;
+                // Jittered, growing while the host does not answer, and starting over only once a
+                // link has lasted: a link that opens and closes at once is not reached again at
+                // network speed, and a host's openings that lose one network do not all return together.
+                tokio::time::sleep(backoff.disconnected()).await;
                 if !self.is_current(session_id, &opening) {
                     return;
                 }
@@ -1215,11 +1215,8 @@ impl PairedLinks {
                         }
                         refused = Some(refusal.code);
                     }
-                    Err(Failure::Refused(_)) => {
-                        failures = failures.saturating_add(1);
-                    }
+                    Err(Failure::Refused(_)) => {}
                     Err(Failure::Unreached(reason)) => {
-                        failures = failures.saturating_add(1);
                         let standing = SessionStanding::Reconnecting { reason };
                         self.tell_standing(&emit, session_id, &opening, standing);
                     }
