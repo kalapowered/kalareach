@@ -4703,7 +4703,7 @@
     },
     "AuthoritySelection": {
       "additionalProperties": false,
-      "description": "The authority feed this host reads its remote revocations from.\n\nA provider origin, so it is this document's to choose and no inherited variable's. The\ndaemon reads it when it starts, so a change applies at the next start. An owner whose host\nlost its feed points it at another service, or at none. Absent means this host has no feed:\nit takes revocations from the owners who reach it directly, and a remote owner's revocation\ncannot reach it.\n\nThe section arrived with level 2. A release that reads level 1 does not know it: it\napplies the rest of the document, counts the section among the members it ignores, and\ndoes not edit the document.",
+      "description": "The authority feed this host reads its remote revocations from.\n\nA provider origin, so it is this document's to choose and no inherited variable's. The\ndaemon reads it when it starts, so a change applies at the next start. An owner whose host\nlost its feed points it at another service, or at none. Absent means this host has no feed:\na remote owner's revocation cannot reach it, and only the owner at the machine revokes a\ndevice.\n\nThe section arrived with level 2. A release that reads level 1 does not know it: it\napplies the rest of the document, counts the section among the members it ignores, and\ndoes not edit the document.",
       "properties": {
         "origin": {
           "anyOf": [
