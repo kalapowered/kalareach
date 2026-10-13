@@ -64,13 +64,13 @@ use kr_protocol::pairing::{
 use kr_protocol::preauth::{PairStatusParams, PairStatusResult};
 use kr_protocol::scalars::{CanonicalSet, Nullable};
 
-use crate::bind::{self, Membership};
+use crate::bind;
 use crate::cli::{
     ClockArguments, PairCancelArguments, PairCommand, PairInvitationArguments, PairInviteArguments,
 };
 use crate::error::{CliError, Result};
 use crate::output::{self, Asked, Document, Line, Request, closed};
-use crate::resolve::{self, ATTACHMENT_VARIABLE, SESSION_VARIABLE};
+use crate::resolve;
 use crate::stdout_line;
 
 /// How often the command asks again while an owner device has not confirmed yet.
@@ -643,37 +643,11 @@ async fn guard(build_id: &BuildId) -> Result<()> {
     if !std::io::stdin().is_terminal() || !output::is_terminal() {
         return Err(CliError::NotATerminal);
     }
-    for variable in [SESSION_VARIABLE, ATTACHMENT_VARIABLE] {
-        if std::env::var_os(variable).is_some() {
-            return Err(refused(
-                ErrorCode::PermissionDenied,
-                shown!(
-                    "{} is set, so this is inside a KalaReach session; what a host with no owner \
-                     confirms is confirmed at a terminal outside every session",
-                    variable
-                ),
-            ));
-        }
-    }
-    match bind::membership(build_id).await {
-        Membership::Outside => Ok(()),
-        Membership::Inside(session_id) => Err(refused(
-            ErrorCode::PermissionDenied,
-            shown!(
-                "this process is inside session {}; what a host with no owner confirms is \
-                 confirmed at a terminal outside every session",
-                session_id
-            ),
-        )),
-        Membership::Unknown(why) => Err(refused(
-            ErrorCode::PermissionDenied,
-            shown!(
-                "whether this process is inside a KalaReach session cannot be established ({}); \
-                 what a host with no owner confirms is confirmed only where it can",
-                why
-            ),
-        )),
-    }
+    bind::require_outside(
+        build_id,
+        "what a host with no owner confirms is confirmed at a terminal outside every session",
+    )
+    .await
 }
 
 /// The terminal the person types at, opened as itself rather than through this command's

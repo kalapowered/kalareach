@@ -208,6 +208,55 @@ pub async fn membership(build_id: &BuildId) -> Membership {
     undecided.map_or(Membership::Outside, Membership::Unknown)
 }
 
+/// Refuses unless this process is outside every KalaReach session.
+///
+/// A command that reads or shows something only the person at a terminal may hold, such as a
+/// recovery kit or a host's first confirmation, would put it into a session's output, which the
+/// session's worker keeps and an agent in it can read. So it runs outside every session, and the
+/// guard takes no one's word for it: `KR_SESSION` and `KR_ATTACHMENT` refuse at once, and otherwise
+/// every live session's worker is asked ([`membership`]), so a process whose environment was
+/// cleaned is still found inside. Whatever cannot be established refuses too.
+///
+/// `because` ends each refusal and says why this command stays outside a session. The guard is not
+/// isolation from other code running as the same user, which section 10 also says; it stops a
+/// command started by accident inside a session.
+///
+/// # Errors
+///
+/// Returns a refusal with `PERMISSION_DENIED` when this process is inside a session, or when whether
+/// it is cannot be established.
+pub async fn require_outside(build_id: &BuildId, because: &'static str) -> Result<()> {
+    for variable in [
+        crate::resolve::SESSION_VARIABLE,
+        crate::resolve::ATTACHMENT_VARIABLE,
+    ] {
+        if std::env::var_os(variable).is_some() {
+            return Err(inside(shown!(
+                "{} is set, so this is inside a KalaReach session; {}",
+                variable,
+                because
+            )));
+        }
+    }
+    match membership(build_id).await {
+        Membership::Outside => Ok(()),
+        Membership::Inside(session_id) => Err(inside(shown!(
+            "this process is inside session {}; {}",
+            session_id,
+            because
+        ))),
+        Membership::Unknown(why) => Err(inside(shown!(
+            "whether this process is inside a KalaReach session cannot be established ({}); {}",
+            why,
+            because
+        ))),
+    }
+}
+
+fn inside(message: Shown) -> CliError {
+    CliError::refused_in_its_own_words(ErrorCode::PermissionDenied, message)
+}
+
 /// Lists every environment this host has a directory for, and fails where one cannot be read.
 ///
 /// [`crate::resolve::environments`] passes over a directory whose identity it cannot read, which is
