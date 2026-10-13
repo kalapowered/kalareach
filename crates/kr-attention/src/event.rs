@@ -357,7 +357,8 @@ pub enum EventKind {
     /// The host learns no revocation from the feed again, and a revocation an owner published
     /// there and the host had not applied is gone. An owner who did not remove it needs to know.
     AuthorityFeedRemoved,
-    /// The host reads another authority feed, or none, so the one that removed it no longer matters.
+    /// The host reads another authority feed, or none, so the one that removed it no longer
+    /// matters.
     AuthorityFeedLeft,
 }
 
