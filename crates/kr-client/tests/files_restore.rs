@@ -579,6 +579,23 @@ async fn the_digest_a_person_confirms_changes_with_the_destination_the_environme
     assert_ne!(base, digest(&world, &first, "env-1", "/restore/b").await);
     assert_ne!(base, digest(&world, &first, "env-2", "/restore/a").await);
     assert_ne!(base, digest(&world, &newer, "env-1", "/restore/a").await);
+    // The same generation with other content has another manifest and the same names and sizes:
+    // only the manifest's hash tells the two plans apart.
+    let other_content = world.seal(
+        4,
+        &honest_members()
+            .into_iter()
+            .map(|(name, mut bytes)| {
+                bytes[0] ^= 1;
+                (name, bytes)
+            })
+            .collect::<Vec<_>>(),
+    );
+    assert_ne!(
+        base,
+        digest(&world, &other_content, "env-1", "/restore/a").await,
+        "a plan with another manifest is another plan"
+    );
 }
 
 /// Every claim about who may vouch for an archive, each with a signature a trusted writer made

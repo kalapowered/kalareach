@@ -14,7 +14,6 @@ pub mod kit;
 pub mod restore;
 pub mod source;
 
-use std::io::IsTerminal as _;
 use std::sync::Arc;
 
 use kr_client::shown;
@@ -64,8 +63,12 @@ fn decide(arguments: &BackupRestoreArguments) -> Result<Decision> {
     }
     // A console is not asked: the confirmation there is the digest, given back.
     #[cfg(unix)]
-    if std::io::stdin().is_terminal() && report::is_terminal() {
-        return Ok(Decision::Ask);
+    {
+        use std::io::IsTerminal as _;
+
+        if std::io::stdin().is_terminal() && report::is_terminal() {
+            return Ok(Decision::Ask);
+        }
     }
     Err(CliError::Usage(Shown::said(
         "this command shows what it would write before it writes it and needs your confirmation: \

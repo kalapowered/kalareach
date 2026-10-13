@@ -1546,9 +1546,30 @@ async fn restore_through_the_library(
     Option<kr_cli::backup::directory::Held>,
     usize,
 ) {
+    restore_through_the_library_pausing(
+        fixture,
+        turn_on,
+        kr_cli::backup::source::real_pause(),
+        || {},
+    )
+    .await
+}
+
+/// As [`restore_through_the_library`], spending the waits the service names with `pause`, and
+/// calling `armed` between the preview and the confirmed run.
+async fn restore_through_the_library_pausing(
+    fixture: &Fixture,
+    turn_on: bool,
+    pause: kr_cli::backup::source::Pause,
+    armed: impl FnOnce(),
+) -> (
+    kr_cli::Result<kr_cli::backup::restore::Outcome>,
+    Option<kr_cli::backup::directory::Held>,
+    usize,
+) {
     use kr_cli::backup::directory::Destination;
     use kr_cli::backup::restore::{Decision, Privacy as _, Run, restore_with};
-    use kr_cli::backup::source::{DaemonSource, real_pause};
+    use kr_cli::backup::source::DaemonSource;
     use kr_cli::cli::EnvironmentSelector;
     use kr_cli::daemon::Daemon;
 
@@ -1566,7 +1587,7 @@ async fn restore_through_the_library(
     privacy.asked = 0;
     let source = Arc::new(DaemonSource::new(
         Daemon::open(paths, &selector).await.expect("a connection"),
-        real_pause(),
+        pause,
     ));
     let destination = Destination::check(&fixture.into).expect("the folder passes");
     let kit = kr_client::recovery::parse_kit(&fixture.world.kit_text(&[fixture.rig.origin()]))
@@ -1595,6 +1616,7 @@ async fn restore_through_the_library(
         panic!("a preview previews");
     };
     privacy.turn_on = turn_on;
+    armed();
     let mut held = None;
     let outcome = restore_with(
         run(Decision::Confirmed(planned.digest().to_owned())),
@@ -1675,6 +1697,56 @@ async fn a_delay_the_service_names_is_waited_out_and_the_same_read_repeated() {
         std::fs::read(fixture.into.join("session-0002.json")).expect("a file"),
         fixture.held[1].1
     );
+}
+
+/// The wait a service names is spent before the same read is asked again: the command does not ask
+/// again until the time it said it would wait has passed. The test holds the wait where it is spent,
+/// so a command that did not wait at all would finish before it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_wait_a_service_names_is_spent_before_the_same_read_is_asked_again() {
+    let fixture = Fixture::new().await;
+    let spent = Arc::new(Mutex::new(Vec::<Duration>::new()));
+    let begun = Arc::new(tokio::sync::Notify::new());
+    let over = Arc::new(tokio::sync::Notify::new());
+    let pause: kr_cli::backup::source::Pause = {
+        let (spent, begun, over) = (Arc::clone(&spent), Arc::clone(&begun), Arc::clone(&over));
+        Arc::new(move |time| {
+            spent
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(time);
+            begun.notify_one();
+            let over = Arc::clone(&over);
+            Box::pin(async move { over.notified().await })
+        })
+    };
+    let web = Arc::clone(fixture.rig.served.web());
+    let restore = restore_through_the_library_pausing(&fixture, false, pause, || {
+        web.fail(
+            OBJECT_READ,
+            Fixture::SECOND_MEMBER,
+            Moment::Refuse {
+                status: 429,
+                code: "RATE_LIMITED",
+                retry_after_seconds: Some(1),
+            },
+        );
+    });
+    tokio::pin!(restore);
+    tokio::select! {
+        _ = &mut restore => panic!("the restore finished without waiting for the service"),
+        () = begun.notified() => {}
+    }
+    assert_eq!(
+        *spent.lock().unwrap_or_else(PoisonError::into_inner),
+        [Duration::from_secs(1)]
+    );
+    // The daemon's clock is the test's: the delay is over once it is moved past it.
+    fixture.rig.timer.advance(Duration::from_secs(2));
+    over.notify_one();
+    let (outcome, _held, _asked) = restore.await;
+    assert!(outcome.is_ok(), "{:?}", outcome.err());
+    assert!(names(&fixture.into).contains(&"restore.json".to_owned()));
 }
 
 /// After five waits for one read the run stops, removes its files and says when to try again.
