@@ -2218,6 +2218,27 @@ impl Uploader {
             .collect::<BTreeSet<_>>();
         let mut work = Vec::new();
         let older = usize::try_from(kept).unwrap_or(usize::MAX);
+        if published.len() <= older {
+            return Ok(work);
+        }
+        // Which generations of the archive name each object, read once: the objects of a
+        // generation the host keeps are never offered, and one object another generation names
+        // is not offered either.
+        let mut named: BTreeMap<BackupObjectId, BTreeSet<BackupGeneration>> = BTreeMap::new();
+        for other in generations
+            .iter()
+            .filter(|other| other.archive_id == archive_id)
+        {
+            for object in self
+                .disk
+                .run(|backup| backup.objects(other.archive_id, other.backup_generation))?
+            {
+                named
+                    .entry(object.object_id)
+                    .or_default()
+                    .insert(other.backup_generation);
+            }
+        }
         for record in published.iter().skip(older) {
             let key = generation_key(record);
             if privacy_line(record, privacy).is_some()
@@ -2238,17 +2259,10 @@ impl Uploader {
                 if object.released_at_ms.is_some() {
                     continue;
                 }
-                let named_elsewhere = generations.iter().any(|other| {
-                    other.archive_id == record.archive_id
-                        && other.backup_generation != record.backup_generation
-                        && self
-                            .disk
-                            .run(|backup| backup.objects(other.archive_id, other.backup_generation))
-                            .is_ok_and(|objects| {
-                                objects
-                                    .iter()
-                                    .any(|named| named.object_id == object.object_id)
-                            })
+                let named_elsewhere = named.get(&object.object_id).is_some_and(|holders| {
+                    holders
+                        .iter()
+                        .any(|holder| *holder != record.backup_generation)
                 });
                 if !named_elsewhere {
                     work.push(Reclaim::Retire((*record).clone(), object, kept));
