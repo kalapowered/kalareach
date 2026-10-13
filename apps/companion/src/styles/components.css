@@ -767,9 +767,17 @@ textarea::placeholder {
   overflow-wrap: anywhere;
 }
 
+/* A sheet's header is its bar, and it is sized as the phone's two bars are: its type grows with the
+   text up to one and a half times the base size and holds there. A header that grew without bound
+   would take the whole sheet at the largest size, and what the sheet holds would lie below the
+   screen where a finger cannot reach it. */
 .dialog-header h2 {
-  font-size: 1.1875rem;
+  font-size: calc(var(--chrome-unit) * 1.1875);
   margin: 2px 0 5px;
+}
+
+.dialog-header p {
+  font-size: calc(var(--chrome-unit) * 0.875);
 }
 
 .dialog-body {

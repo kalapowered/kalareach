@@ -10,6 +10,7 @@
 
 import { expect, test, type Page } from '@playwright/test'
 
+import { PRESENTATION_DEADLINE } from './bounds'
 import { overrunning, stopWrapping } from './layout'
 
 /** The largest accessibility size's body text, 53 points, against 17 at the default setting. */
@@ -40,7 +41,7 @@ async function openQuestion(page: Page, surface: 'ios' | 'android'): Promise<voi
   await expect(page.getByTestId('question').first()).toBeVisible()
   // The sheet that holds it arrives on a spring, and a browser that has to draw it for the first
   // time can take seconds over the first frame: nothing is measured or pressed until it is at rest.
-  await expect(page.getByTestId('sheet')).toHaveAttribute('data-presentation', 'here', { timeout: 15_000 })
+  await expect(page.getByTestId('sheet')).toHaveAttribute('data-presentation', 'here', { timeout: PRESENTATION_DEADLINE })
 }
 
 for (const surface of ['ios', 'android'] as const) {
@@ -59,15 +60,25 @@ for (const surface of ['ios', 'android'] as const) {
       }))
       expect(across.page, 'the page is no wider than the screen').toBeLessThanOrEqual(across.screen)
 
-      // The sheet that holds the question clips what is wider than it, and focus scrolls it sideways
-      // to reach that: nothing in it, its footer's button included, is wider than the sheet.
-      const sheet = await page.locator('.sheet').evaluate((element) => ({
-        wide: element.scrollWidth,
-        across: element.clientWidth,
-        scrolled: element.scrollLeft
-      }))
+      // The sheet that holds the question clips what lies outside it, and a focus or a trial press
+      // scrolls it to reach that, which a finger cannot do. So the sheet holds everything in it
+      // across its width and down its height, and its body, the part that scrolls, is left room.
+      const sheetBox = () =>
+        page.locator('.sheet').evaluate((element) => ({
+          wide: element.scrollWidth,
+          across: element.clientWidth,
+          tall: element.scrollHeight,
+          high: element.clientHeight,
+          left: element.scrollLeft,
+          top: element.scrollTop,
+          body: element.querySelector<HTMLElement>('.dialog-body')?.clientHeight ?? 0
+        }))
+      const sheet = await sheetBox()
       expect(sheet.wide, 'the sheet holds everything in it across its width').toBeLessThanOrEqual(sheet.across + 1)
-      expect(sheet.scrolled, 'the sheet has not been scrolled sideways').toBe(0)
+      expect(sheet.tall, 'the sheet holds everything in it down its height').toBeLessThanOrEqual(sheet.high + 1)
+      expect(sheet.body, 'the sheet shows at least two fingers of its body').toBeGreaterThanOrEqual(2 * finger)
+      expect(await overrunning(page, '.dialog-header'), 'lines of the sheet header that run past it').toEqual([])
+      expect(await overrunning(page, '.dialog-footer'), 'lines of the sheet footer that run past it').toEqual([])
 
       // Everything in a question, and every line of its text, lies inside the screen and inside
       // the question's own box.
@@ -98,27 +109,25 @@ for (const surface of ['ios', 'android'] as const) {
         await controls.nth(index).click({ trial: true, timeout: 2_000 })
       }
 
-      // The control: with the text kept from wrapping, the same measure sees it run out of its box.
-      await stopWrapping(page, ['[data-testid="question"]'])
-      expect(
-        await overrunning(page, '[data-testid="question"]'),
-        'the measure sees text that cannot wrap'
-      ).not.toEqual([])
+      // No press needed the sheet to be scrolled: a finger could not have done it.
+      const afterwards = await sheetBox()
+      expect(afterwards.left, 'the sheet was not scrolled sideways to reach a control').toBe(0)
+      expect(afterwards.top, 'the sheet was not scrolled down to reach a control').toBe(0)
 
-      // The controls for the sheet: a title or a footer label that cannot wrap makes the sheet wider
-      // than itself.
-      const widerThanItself = () =>
-        page.locator('.sheet').evaluate((element) => element.scrollWidth > element.clientWidth + 1)
-      await page.addStyleTag({ content: '.dialog-header h2, .dialog-header p { white-space: nowrap !important }' })
-      expect(await widerThanItself(), 'the measure sees a title that cannot wrap').toBe(true)
-      await page.addStyleTag({ content: '.dialog-header h2, .dialog-header p { white-space: normal !important }' })
-      expect(await widerThanItself(), 'with the title wrapping again, the sheet holds everything').toBe(false)
-      // A label long enough to be wider than any face makes it, kept from wrapping.
-      await page.locator('.dialog-footer .btn').evaluate((button) => {
-        button.textContent = 'Open the session and read everything it has said so far in full'
-      })
-      await page.addStyleTag({ content: '.dialog-footer .btn { white-space: nowrap !important }' })
-      expect(await widerThanItself(), 'the measure sees a footer label that cannot wrap').toBe(true)
+      // The control for the sheet's height: a header whose type grows without bound, as it did,
+      // leaves the body no room, or lies below the sheet's own bottom.
+      await page.addStyleTag({ content: '.dialog-header h2, .dialog-header p { font-size: 1.1875rem !important }' })
+      const unbound = await sheetBox()
+      expect(
+        unbound.tall > unbound.high + 1 || unbound.body < 2 * finger,
+        'the measure sees a header that takes the sheet'
+      ).toBe(true)
+
+      // The controls: with the text kept from wrapping, the same measure sees it run out of its box.
+      await stopWrapping(page, ['[data-testid="question"]', '.dialog-header', '.dialog-footer'])
+      for (const root of ['[data-testid="question"]', '.dialog-header', '.dialog-footer']) {
+        expect(await overrunning(page, root), `the measure sees text of ${root} that cannot wrap`).not.toEqual([])
+      }
     })
 
     test('sends nothing until Send is pressed after a choice, and keeps an answer given out of contact', async ({
