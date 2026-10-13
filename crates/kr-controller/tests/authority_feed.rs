@@ -11,8 +11,8 @@
 //! removed the host refuses the grants that rest on it, shows it, tells the owner, and leaves the
 //! rest.
 //!
-//! The feed is the stand-in held to a recording of a local Worker. Every wait the daemon asks for is
-//! held by the test.
+//! The feed is the stand-in held to a recording of a local Worker. Every wait the daemon asks for
+//! is held by the test.
 
 mod net_support;
 

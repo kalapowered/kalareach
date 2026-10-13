@@ -411,7 +411,8 @@ impl Controller {
         })
     }
 
-    /// Writes down that this host refuses a request it began to take, before it says so to the feed.
+    /// Writes down that this host refuses a request it began to take, before it says so to the
+    /// feed.
     ///
     /// # Errors
     ///
@@ -457,7 +458,8 @@ impl Controller {
             && let Err(error) = self.update_policy(|policy| policy.note_feed_synchronised(now))
         {
             eprintln!(
-                "kr-controller: could not extend the bounded offline validity from the feed: {error}"
+                "kr-controller: could not extend the bounded offline validity from the feed: \
+                 {error}"
             );
         }
     }
@@ -576,7 +578,7 @@ impl Controller {
     /// The number of the next notice about the feed: above the one this host last recorded and
     /// above every one the attention store has taken, so a registry that lost its row cannot
     /// number a notice behind the store's cursor. A start numbers again a notice that was numbered
-    /// without the cursor and stands at or below it.
+    /// without the cursor and stands below it.
     async fn next_feed_notice(&self, held: Option<&StoredRemoval>) -> Result<u64> {
         let taken = self.feed_notice_cursor().await?;
         Ok(held.map_or(0, |held| held.notice).max(taken) + 1)
@@ -667,13 +669,16 @@ impl Controller {
             attention.observe(&[event])
         })
         .await;
-        if matches!(given, Ok(Ok(()))) {
-            Ok(())
-        } else {
-            Err(crate::error::ControllerError::Storage {
+        match given {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => Err(crate::error::ControllerError::Storage {
                 operation: "tell the owner of the authority feed",
-                detail: "the attention store could not take the notice".to_owned(),
-            })
+                detail: format!("the attention store could not take the notice: {error}"),
+            }),
+            Err(error) => Err(crate::error::ControllerError::Storage {
+                operation: "tell the owner of the authority feed",
+                detail: format!("the task that gives the notice did not finish: {error}"),
+            }),
         }
     }
 
