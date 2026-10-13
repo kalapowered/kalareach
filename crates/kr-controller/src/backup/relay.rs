@@ -1,11 +1,11 @@
 //! The relay of a restore's reads of the managed storage service.
 //!
-//! A restore runs in the `kr` process, which holds the recovery kit, opens the archive and writes the
-//! files. This host holds the account the service is read with, so the daemon makes the requests.
-//! It relays ciphertext and public records and nothing else: it holds no seed, opens no archive and
-//! knows no file name or destination. What it sees is what the service holds already, the archive
-//! and object identifiers a read names, the bundle's locator and the checkpoint a generation read
-//! is held to, and none of them is written to a log or put in an error.
+//! A restore runs in the `kr` process, which holds the recovery kit, opens the archive and writes
+//! the files. This host holds the account the service is read with, so the daemon makes the
+//! requests. It relays ciphertext and public records and nothing else: it holds no seed, opens no
+//! archive and knows no file name or destination. What it sees is what the service holds already,
+//! the archive and object identifiers a read names, the bundle's locator and the checkpoint a
+//! generation read is held to, and none of them is written to a log or put in an error.
 //!
 //! * **The bundle read signs as an installation.** The service's settings-sync route accepts an
 //!   installation's signature only, and this host's writer key signs as a host. The daemon makes a

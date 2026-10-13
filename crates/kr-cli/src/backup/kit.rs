@@ -6,8 +6,8 @@
 //!
 //! * a file the person names ([`KitSource::File`]), which has to be a regular file;
 //! * standard input when it is not a terminal, such as a pipe;
-//! * standard input when it is a terminal (Unix only): one pasted document, with nothing shown, that
-//!   ends at the first blank line after its first line, at Ctrl-D, or at the size bound.
+//! * standard input when it is a terminal (Unix only): one pasted document, with nothing shown,
+//!   that ends at the first blank line after its first line, at Ctrl-D, or at the size bound.
 //!
 //! Every read is made into one buffer of a fixed size that clears itself when it is dropped, from a
 //! file made out of a duplicate of descriptor 0 or from the file named, and never through
@@ -88,8 +88,8 @@ kr_client::debug_as_name!(KitRead);
 /// # Errors
 ///
 /// Returns a usage failure for a document that is not a recovery kit, a file that is not a regular
-/// file, and a terminal prompt where none is offered; a terminal failure when the terminal cannot be
-/// read or its modes cannot be changed or put back; and the interrupt's failure when it arrives.
+/// file, and a terminal prompt where none is offered; a terminal failure when the terminal cannot
+/// be read or its modes cannot be changed or put back; and the interrupt's failure when it arrives.
 pub async fn read(source: KitSource, interrupt: &mut Interrupt) -> Result<KitRead> {
     if source == KitSource::Standard && !std::io::stdin().is_terminal() {
         // Said before the wait begins, so a script that feeds the kit knows the command is
