@@ -9,8 +9,8 @@
 //!
 //! # What the keeper holds
 //!
-//! For each paired device, the lease the service issued for the pair of this host's endpoint and the
-//! device's, and the endings the service has not yet answered. Both are kept in a record that
+//! For each paired device, the lease the service issued for the pair of this host's endpoint and
+//! the device's, and the endings the service has not yet answered. Both are kept in a record that
 //! survives a restart ([`record`]), because a lease nothing remembers cannot be ended, and a host
 //! that had forgotten it owed an ending would leave the pair carried until the lease ran out.
 //!
@@ -48,20 +48,33 @@
 //! every carrier of this host uses, and a lease running out meanwhile stops forwarding for its pair
 //! and nothing else: direct paths do not depend on it.
 //!
-//! The service answers `unavailable` to a refill when the relay carrying the lease is no longer one
-//! it can bill through, and asks that the lease be revoked and another asked for. The keeper ends
-//! the lease and asks for the pair afresh in the same pass.
+//! The service answers `unavailable` to a refill for more than one reason: the relay carrying the
+//! lease is no longer one it can bill through, the raise would pass the aggregate it holds
+//! outstanding for the account, or the allowance does not cover it. It answers `INVALID_REQUEST`
+//! when the raise would pass what the authorisation lets one lease hold outstanding, and also when
+//! it does not carry the lease. The answer does not say which, so the keeper asks once more for the
+//! ceiling the lease already holds, which the service answers as it stands unless the relay is
+//! retired or the lease is not carried. If the lease stands, the raise was refused and not the
+//! lease: the keeper keeps it, tells the owner, and tries the raise again after a wait. If the
+//! relay is retired, it ends the lease and asks for the pair afresh in the same pass. If the lease
+//! is not carried, it asks for the pair afresh.
+//!
+//! A lease that has run out is ended at the service before the pair is asked for again: the service
+//! keeps its record of the lease until it is revoked, and a pair whose lease sits on a retired
+//! relay is turned away for as long as that record stands.
 //!
 //! A request whose answer was lost may have issued a lease. The keeper has not written down a lease
 //! identifier it was not told, so it asks again for the same pair, and the service answers with the
-//! lease the pair already holds. The row stays until the longest a lease can live has passed since
-//! it was written, whatever the later answers say, so a device unpaired in the meantime still has
-//! its lease ended. The same holds after a restart.
+//! lease the pair already holds. The row is written again with the time of each such request and
+//! stays until the longest a lease can live has passed since the last one, whatever the later
+//! answers say, so a device unpaired in the meantime still has its lease ended. The same holds
+//! after a restart, and for a change of payer: the pair is not asked for under the new payer until
+//! the row has aged out, because the service would open a second reservation for it.
 
 pub mod record;
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
@@ -75,6 +88,7 @@ use kr_client::services::{
 use kr_protocol::error::ErrorCode;
 use kr_protocol::hostinfo::export::Sentence;
 use kr_protocol::hostinfo::{DoctorCheck, DoctorStatus};
+use kr_protocol::ids::RelayLeaseId;
 use kr_protocol::scalars::EndpointKey;
 use kr_protocol::service::GatewayOrigin;
 use kr_transport::config::ProxyUrl;
@@ -106,8 +120,10 @@ pub const REFILL_WHEN_LEFT: Duration = Duration::from_secs(600);
 
 /// The bytes the keeper reserves for a pair beyond what the relay has counted for it. A principal
 /// holds at most 8 MiB outstanding across all its leases, so a block this size serves sixteen
-/// paired devices when none of them has been carrying traffic. A pair that is carrying traffic is
-/// given one block at each refill.
+/// paired devices when none of them has been carrying traffic, though the sixteenth cannot be
+/// refilled while the other fifteen hold theirs. A pair that is carrying traffic is given a block
+/// beyond what the relay counted at the last answer, so a pair that spends its whole block between
+/// two refills is given one byte at the first and a block at the second.
 pub const BLOCK_BYTES: u64 = 512 * 1024;
 
 /// How often the keeper reads the paired devices when nothing woke it.
@@ -122,8 +138,10 @@ pub const MIN_ASK_GAP: Duration = Duration::from_secs(60);
 pub const STANDING_RETRY: Duration = Duration::from_secs(5 * 60);
 
 /// How many times an ending is sent again when the service answers that it never issued the lease,
-/// before the host takes that for the truth. The service gives the same answer, in the same words'
-/// code, when a revocation raced a refill and should be asked again.
+/// and for at least how long ([`LONGEST_LEASE_MS`]), before the host takes that for the truth. The
+/// service gives the same answer, in the same code, when a revocation raced a refill and should be
+/// asked again, so the answer proves the lease absent only once no lease the service could have
+/// held then is still alive.
 const UNKNOWN_ENDING_TRIES: u32 = 3;
 
 /// The longest a lease can live, in milliseconds, with the margin two clocks may differ by.
@@ -180,6 +198,9 @@ enum Standing {
     NoLease,
     /// The service turned the request back, and only the owner can change that.
     Refused(ErrorCode),
+    /// The authorisation lets one lease hold less outstanding than a refill needs, so the service
+    /// extends no lease and each runs out at its whole hold.
+    Bound,
 }
 
 /// What the doctor says of the keeper.
@@ -201,6 +222,9 @@ struct Observed {
     local_fault: bool,
     /// The highest allowance warning the service raised in its last answer, in percent.
     warning: Option<u32>,
+    /// The grace the service said was left to connections already running when it last granted a
+    /// lease: when it ends, in UTC milliseconds on this host's clock, and the bytes left.
+    grace: Option<(u64, u64)>,
 }
 
 /// How long requests wait, by the timer's clock.
@@ -237,11 +261,21 @@ struct Shared {
     holds: Mutex<Holds>,
     /// When each pair was last asked for, in UTC milliseconds on this host's clock.
     asked_at: Mutex<BTreeMap<[u8; 32], u64>>,
-    /// How many times each ending was answered "never issued".
-    unknown_endings: Mutex<BTreeMap<[u8; 16], u32>>,
+    /// How each ending that was answered "never issued" has fared: how many times, when first and
+    /// when last.
+    unknown_endings: Mutex<BTreeMap<[u8; 16], UnknownEnding>>,
     observed: Mutex<Observed>,
     running: OnceLock<Running>,
-    stopped: AtomicBool,
+}
+
+/// An ending the service answered "never issued".
+#[derive(Clone, Copy, Debug)]
+struct UnknownEnding {
+    answers: u32,
+    /// When it was first answered so, in UTC milliseconds on this host's clock.
+    first_ms: u64,
+    /// When it was last answered so, on the timer's clock.
+    last: Instant,
 }
 
 impl Shared {
@@ -335,7 +369,6 @@ impl RelayKeeper {
                 unknown_endings: Mutex::default(),
                 observed: Mutex::default(),
                 running: OnceLock::new(),
-                stopped: AtomicBool::new(false),
             }),
             task: Mutex::new(None),
         }
@@ -434,6 +467,17 @@ impl RelayKeeper {
                 .number(u64::from(percent))
                 .stated(" percent");
         }
+        if let Some((ends, bytes)) = observed.grace
+            && ends > now
+            && !matches!(observed.standing, Some(Standing::Exhausted { .. }))
+        {
+            detail = detail
+                .stated("; the grace left to a connection already running is ")
+                .number((ends - now) / 1000)
+                .stated(" seconds, or ")
+                .number(bytes)
+                .stated(" bytes at the last answer");
+        }
         let (status, remedy) = if observed.local_fault {
             (
                 DoctorStatus::Warning,
@@ -475,8 +519,13 @@ impl RelayKeeper {
                      for one more for the account that pays",
                 ),
                 Standing::Refused(ErrorCode::PermissionDenied) => detail.stated(
-                    "; the service turned this host's request back: it names the account a host \
-                     spends, and the authorisation has to be in force for this host's key",
+                    "; the service turned this host's request back: the account that pays, the \
+                     authorisation for this host's key, this machine's clock or the service \
+                     origin is not one it accepts",
+                ),
+                Standing::Bound => detail.stated(
+                    "; the authorisation lets one lease hold too little for the service to extend \
+                     it, so a lease runs out at its whole hold",
                 ),
                 Standing::Refused(ErrorCode::HostNotConfigured) => detail
                     .stated("; the service answered that it is not set up to issue relay leases"),
@@ -491,8 +540,14 @@ impl RelayKeeper {
                 }
                 Standing::Refused(ErrorCode::PermissionDenied) => {
                     "Check that `relay.payer` in the configuration document names an authorisation \
-                     given to this host's key and still in force, and start the daemon again. \
-                     This host asks the service again by itself."
+                     given to this host's key and still in force, that `relay.origin` is the \
+                     service you mean, and that this machine's clock is right, and start the \
+                     daemon again. The daemon's log has the service's own words. This host asks \
+                     the service again by itself."
+                }
+                Standing::Bound => {
+                    "Give the authorisation a byte bound above 512 KiB; 1 MiB is the smallest sensible \
+                     value. This host asks the service again by itself."
                 }
                 Standing::Refused(_) => {
                     "Check `relay.origin` in the configuration document and that this host is \
@@ -559,9 +614,6 @@ impl Drop for RelayKeeper {
 async fn drive(shared: Arc<Shared>) {
     let mut backoff = Backoff::default();
     loop {
-        if shared.stopped.load(Ordering::SeqCst) {
-            return;
-        }
         let Some(running) = shared.running.get() else {
             return;
         };
@@ -583,7 +635,15 @@ async fn drive(shared: Arc<Shared>) {
                     wait
                 }
                 Next::Standing => {
-                    shared.holds().asks = now.checked_add(STANDING_RETRY);
+                    let until = now.checked_add(STANDING_RETRY);
+                    let mut holds = shared.holds();
+                    holds.asks = until;
+                    // An ending the service turned back for a reason only the owner can change is
+                    // not sent again by the next signal either.
+                    if report.refused_an_ending {
+                        holds.requests = until;
+                    }
+                    drop(holds);
                     STANDING_RETRY
                 }
                 Next::Due(wait) => {
@@ -638,6 +698,8 @@ struct Report {
     next: Next,
     /// Whether the pass made a request and none of them failed.
     asked: bool,
+    /// Whether the service turned an ending back for a reason only the owner can change.
+    refused_an_ending: bool,
 }
 
 /// What a failed request means for the pass.
@@ -693,6 +755,7 @@ async fn pass(shared: &Arc<Shared>, running: &Running, controller: &Arc<Controll
             Report {
                 next: Next::Failed,
                 asked: false,
+                refused_an_ending: false,
             }
         }
     }
@@ -721,6 +784,8 @@ async fn reconcile(
     let mut standing = None;
     let mut asked = false;
     let mut refusals = 0_u32;
+    let refill_ms = u64::try_from(REFILL_WHEN_LEFT.as_millis()).unwrap_or(u64::MAX);
+    let gap_ms = u64::try_from(MIN_ASK_GAP.as_millis()).unwrap_or(u64::MAX);
 
     let devices = Arc::clone(&running.devices);
     let paired: Vec<_> = tokio::task::spawn_blocking(move || devices.devices())
@@ -732,32 +797,35 @@ async fn reconcile(
     let is_paired =
         |endpoint: &EndpointKey| paired.iter().any(|device| device.endpoint_id == *endpoint);
     let payer_key = shared.payer_key();
-    let fresh = |row: &Row| Row {
-        lease_id: None,
-        ceiling: BLOCK_BYTES,
-        consumed: 0,
-        expires_at_ms: 0,
-        written_at_ms: now,
-        ..row.clone()
-    };
+    // Paired devices whose row names no lease and was asked for under another payer, with the time
+    // of the request.
+    let mut held_back: Vec<(EndpointKey, u64)> = Vec::new();
 
     // A row whose device is no longer paired, or whose lease was asked for under another payer or
-    // for another host key, is a lease to end. A row with no lease is a request whose answer the
-    // host never saw: the pair may hold a lease until the longest a lease lives has passed since the
-    // request was written, and asking again is how the host learns which. That can be asked only of
-    // the payer it was asked under; a row for another payer is dropped, and the lease, if the
-    // service issued one, runs out by itself.
+    // for another host key, is a lease to end. So is a lease that has run out: the service settled
+    // its reservation, but it keeps its record of the lease until it is revoked, and a pair whose
+    // lease sits on a retired relay is turned away for as long as that record stands. A row with no
+    // lease is a request whose answer the host never saw: the pair may hold a lease until the
+    // longest a lease lives has passed since the request was last written, and asking again is how
+    // the host learns which. That can be asked only of the payer it was asked under. For a device
+    // that is no longer paired the ask ends what it finds. For a device still paired under another
+    // payer it is waited out, because the service would open a second reservation under the new
+    // payer that the old one would not show; for a device that is neither, the row is dropped and
+    // the lease, if the service issued one, runs out by itself.
     let mut unwanted = Vec::new();
     for row in shared.on_record(Record::rows).await? {
         let same_asker = row.source == running.endpoint && row.payer == payer_key;
         let device_is_paired = is_paired(&row.destination);
         let destination = row.destination;
         if same_asker && device_is_paired {
-            // A lease that has run out is no lease: the service has settled it, and what it
-            // counted belongs to a reservation that is gone.
-            if row.lease_id.is_some() && row.expires_at_ms <= now {
-                let reset = fresh(&row);
-                shared.on_record(move |record| record.save(&reset)).await?;
+            if let Some(lease) = row.lease_id
+                && row.expires_at_ms <= now
+            {
+                shared
+                    .on_record(move |record| {
+                        record.end(&destination, lease, LeaseEndReason::Finished)
+                    })
+                    .await?;
             }
             continue;
         }
@@ -772,8 +840,14 @@ async fn reconcile(
                     .on_record(move |record| record.end(&destination, lease, reason))
                     .await?;
             }
-            None if same_asker && now.saturating_sub(row.written_at_ms) <= LONGEST_LEASE_MS => {
-                unwanted.push(row);
+            None if now.saturating_sub(row.written_at_ms) <= LONGEST_LEASE_MS
+                && (same_asker || device_is_paired) =>
+            {
+                if same_asker {
+                    unwanted.push(row);
+                } else {
+                    held_back.push((destination, row.written_at_ms));
+                }
             }
             None => {
                 shared
@@ -785,16 +859,24 @@ async fn reconcile(
 
     // What the service is owed an ending for goes before anything is asked of it, so a pair it
     // still carries after its device was unpaired is not left waiting behind the asks below.
+    let mut refused_an_ending = false;
     if requests_held_ms == 0 {
         for ending in shared.on_record(Record::endings).await? {
+            if unknown_waits(shared, ending.lease_id) {
+                continue;
+            }
             asked = true;
-            match end(shared, ending).await? {
-                Ended::Answered => {}
+            match end(shared, ending, now).await? {
+                Ended::Answered | Ended::Unknown => {}
                 Ended::Later => {
                     unreachable = true;
                     break;
                 }
-                Ended::OwnerMustLook(code) => standing = Some(Standing::Refused(code)),
+                Ended::OwnerMustLook(code) => {
+                    standing = Some(Standing::Refused(code));
+                    refused_an_ending = true;
+                    break;
+                }
             }
         }
     }
@@ -816,14 +898,30 @@ async fn reconcile(
         }
     }
 
-    let refill_ms = u64::try_from(REFILL_WHEN_LEFT.as_millis()).unwrap_or(u64::MAX);
-    let gap_ms = u64::try_from(MIN_ASK_GAP.as_millis()).unwrap_or(u64::MAX);
     let rows = shared.on_record(Record::rows).await?;
     // When each paired device can next be asked for, in milliseconds from now, and whether it is
     // asked for in this pass.
     let mut soonest: Option<u64> = None;
     if !unreachable {
-        for device in &paired {
+        // The leases the host holds are refilled before a pair with none is asked for, so a pair
+        // the service has no room for does not keep the rest from being refilled.
+        let mut ordered: Vec<&DeviceRecord> = paired.iter().collect();
+        ordered.sort_by_key(|device| {
+            !rows
+                .iter()
+                .any(|row| row.destination == device.endpoint_id && row.lease_id.is_some())
+        });
+        for device in ordered {
+            if let Some((_, written_ms)) = held_back
+                .iter()
+                .find(|(held, _)| *held == device.endpoint_id)
+            {
+                let ready_at = written_ms
+                    .saturating_add(LONGEST_LEASE_MS)
+                    .saturating_add(1);
+                soonest = Some(soonest.map_or(ready_at, |soonest| soonest.min(ready_at)));
+                continue;
+            }
             let row = rows
                 .iter()
                 .find(|row| row.destination == device.endpoint_id)
@@ -908,7 +1006,7 @@ async fn reconcile(
         if asked || requests_held_ms == 0 {
             observed.unreachable = unreachable;
         }
-        if !unreachable && (asked || asks_held_ms == 0) {
+        if !unreachable && (asks_held_ms == 0 || refused_an_ending) {
             observed.standing = standing;
         }
     }
@@ -926,46 +1024,82 @@ async fn reconcile(
             });
         Next::Due(until.clamp(Duration::from_secs(1), POLL_INTERVAL))
     };
-    Ok(Report { next, asked })
+    Ok(Report {
+        next,
+        asked,
+        refused_an_ending,
+    })
 }
 
 /// What an ending came to.
 enum Ended {
-    /// The service answered, or answered that there is nothing of that name to end.
+    /// The service answered, or answered in a way that proves there is nothing of that name to end.
     Answered,
-    /// The service could not be reached, asked for a delay, or answered in a way that is asked
-    /// again.
+    /// The service answered that it never issued the lease, and the host has not yet asked often
+    /// enough, or for long enough, to take that for the truth. The ending stays owed.
+    Unknown,
+    /// The service could not be reached, or asked for a delay.
     Later,
     /// The service turned the request back and only the owner can change that.
     OwnerMustLook(ErrorCode),
 }
 
+/// Whether an ending the service answered "never issued" is left alone for now: it is asked again
+/// no oftener than the gap, by the timer's clock.
+fn unknown_waits(shared: &Shared, lease: RelayLeaseId) -> bool {
+    let now = shared.timer.now();
+    shared
+        .unknown_endings
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get(lease.get().as_bytes())
+        .is_some_and(|seen| {
+            now.checked_duration_since(seen.last)
+                .is_some_and(|since| since < MIN_ASK_GAP)
+        })
+}
+
 /// Asks the service to end one lease, and writes down that it answered.
-async fn end(shared: &Arc<Shared>, ending: Ending) -> Result<Ended> {
+async fn end(shared: &Arc<Shared>, ending: Ending, now: u64) -> Result<Ended> {
     if let Err(error) = shared.service.revoke(ending.lease_id, ending.reason).await {
         return Ok(match failure_of(&error, &shared.quiet) {
             // The service says it never issued a lease of that name. It says the same when a
-            // revocation raced a refill, so it is asked again before it is believed.
+            // revocation raced a refill and should be asked again, so the answer is believed only
+            // when it has been given [`UNKNOWN_ENDING_TRIES`] times and the longest a lease lives
+            // has passed since the first: a lease that was alive then is gone by now, and the
+            // service settles it by itself.
             Failure::NotActed(ErrorCode::InvalidArgument) => {
-                let tries = {
+                let believed = {
                     let mut tried = shared
                         .unknown_endings
                         .lock()
                         .unwrap_or_else(PoisonError::into_inner);
-                    let tries = tried.entry(*ending.lease_id.get().as_bytes()).or_insert(0);
-                    *tries += 1;
-                    *tries
+                    let seen =
+                        tried
+                            .entry(*ending.lease_id.get().as_bytes())
+                            .or_insert(UnknownEnding {
+                                answers: 0,
+                                first_ms: now,
+                                last: shared.timer.now(),
+                            });
+                    seen.answers += 1;
+                    seen.last = shared.timer.now();
+                    seen.answers >= UNKNOWN_ENDING_TRIES
+                        && now.saturating_sub(seen.first_ms) >= LONGEST_LEASE_MS
                 };
-                if tries >= UNKNOWN_ENDING_TRIES {
+                if believed {
                     shared
                         .on_record(move |record| record.settle(ending.lease_id))
                         .await?;
                     Ended::Answered
                 } else {
-                    Ended::Later
+                    Ended::Unknown
                 }
             }
-            Failure::NotActed(code) if needs_the_owner(code) => Ended::OwnerMustLook(code),
+            Failure::NotActed(code) if needs_the_owner(code) => {
+                log_refusal(&error);
+                Ended::OwnerMustLook(code)
+            }
             _ => Ended::Later,
         });
     }
@@ -973,6 +1107,17 @@ async fn end(shared: &Arc<Shared>, ending: Ending) -> Result<Ended> {
         .on_record(move |record| record.settle(ending.lease_id))
         .await?;
     Ok(Ended::Answered)
+}
+
+/// Says in the daemon's log what the service answered, which the doctor's sentence for the code
+/// does not carry.
+fn log_refusal(error: &ClientError) {
+    if let ClientError::Refused { error, .. } = error {
+        eprintln!(
+            "kr-controller: the relay lease service turned a request back ({:?}): {}",
+            error.code, error.message
+        );
+    }
 }
 
 /// What an ask came to.
@@ -987,11 +1132,42 @@ enum Asked {
     Standing(Standing),
 }
 
+/// A named lease at the start of a new reservation: nothing counted, no deadline.
+fn afresh(row: Row, now: u64) -> Row {
+    Row {
+        lease_id: None,
+        ceiling: BLOCK_BYTES,
+        consumed: 0,
+        expires_at_ms: 0,
+        written_at_ms: now,
+        ..row
+    }
+}
+
+/// How a refill that raised a lease's ceiling was turned back, before it is known whether the lease
+/// or only the raise was refused.
+#[derive(Clone, Copy, Debug)]
+enum Turned {
+    /// The service answered `unavailable`: a retired relay, the aggregate it holds outstanding, or
+    /// an allowance that does not cover the raise.
+    Unavailable,
+    /// The service answered `INVALID_REQUEST`: the raise would pass what the authorisation lets one
+    /// lease hold outstanding, or the service does not carry the lease.
+    Invalid,
+}
+
 /// Asks the service for the lease a device is due, or for the lease it may hold that the host has
 /// not seen, and writes down what came back.
 ///
 /// `ending` is set when the device is no longer wanted: the ask is made only to learn the lease
 /// the service may be carrying, which is then ended.
+///
+/// A refill that raised the ceiling and was turned back with one of the two answers that do not say
+/// why is followed by a request for the ceiling the lease already holds, which the service answers
+/// as it stands unless the relay is retired or the lease is not carried. A lease that stands is
+/// kept and the owner is told why the raise was refused. A retired relay's lease is ended and the
+/// pair asked for afresh; a lease the service does not carry is dropped and the pair asked for
+/// afresh.
 #[allow(clippy::too_many_lines)]
 async fn ask(
     shared: &Arc<Shared>,
@@ -1000,10 +1176,13 @@ async fn ask(
     ending: Option<LeaseEndReason>,
     now: u64,
 ) -> Result<Asked> {
-    for attempt in 0..2 {
+    let mut probing: Option<Turned> = None;
+    for _ in 0..3 {
         if row.lease_id.is_none() {
-            // Written before it is sent: a stop between the two leaves a row that says the pair
-            // may hold a lease.
+            // Written before it is sent, with the time of this request: a stop between the two
+            // leaves a row that says the pair may hold a lease, and the row is kept for as long as
+            // a lease asked for now can live.
+            row.written_at_ms = now;
             let saved = row.clone();
             shared.on_record(move |record| record.save(&saved)).await?;
         }
@@ -1011,14 +1190,17 @@ async fn ask(
         // when that would not raise it: the service moves a lease's deadline only with a raised
         // ceiling. A request that names none asks for the block it was written with, so it is the
         // same request each time it is asked again.
-        let ceiling = if row.lease_id.is_some() {
+        let ceiling = if row.lease_id.is_none() {
+            row.ceiling.max(BLOCK_BYTES)
+        } else if probing.is_some() {
+            row.ceiling
+        } else {
             row.ceiling
                 .saturating_add(1)
                 .max(row.consumed.saturating_add(BLOCK_BYTES))
-        } else {
-            row.ceiling.max(BLOCK_BYTES)
         }
         .min(COUNTER_LIMIT);
+        let raises = row.lease_id.is_some() && ceiling > row.ceiling;
         let request = LeaseRequest {
             source: running.endpoint,
             destination: row.destination,
@@ -1040,8 +1222,24 @@ async fn ask(
         }
         match answer {
             Ok(RelayLeaseAnswer::Granted(grant)) => {
-                shared.observed().warning = warning_of(&grant.warnings);
-                return settle_grant(shared, row, &grant, ending).await;
+                {
+                    let mut observed = shared.observed();
+                    observed.warning = warning_of(&grant.warnings);
+                    observed.grace = grant.grace.0.as_ref().map(|grace| {
+                        (
+                            now.saturating_add(grace.remaining_ms.get()),
+                            grace.remaining_bytes.get(),
+                        )
+                    });
+                }
+                let settled = settle_grant(shared, row, &grant, ending).await?;
+                return Ok(match (probing, settled) {
+                    // The lease stands, so it was the raise that was refused: the owner is told
+                    // why, and the raise is tried again after a wait.
+                    (Some(Turned::Unavailable), Asked::Held) => Asked::Standing(Standing::NoLease),
+                    (Some(Turned::Invalid), Asked::Held) => Asked::Standing(Standing::Bound),
+                    (_, settled) => settled,
+                });
             }
             Ok(RelayLeaseAnswer::Exhausted(refusal)) => {
                 shared.observed().warning = warning_of(&refusal.warnings);
@@ -1061,9 +1259,14 @@ async fn ask(
             }
             Ok(RelayLeaseAnswer::Unavailable(refusal)) => {
                 shared.observed().warning = warning_of(&refusal.warnings);
-                // The relay carrying a lease the host holds is no longer one the service can bill
-                // through, and the service asks that the lease be revoked and another asked for.
-                if let (Some(lease), true) = (row.lease_id, attempt == 0 && ending.is_none()) {
+                if let (Some(lease), true) = (row.lease_id, ending.is_none()) {
+                    if raises && probing.is_none() {
+                        probing = Some(Turned::Unavailable);
+                        continue;
+                    }
+                    // The lease is turned away at the ceiling it already holds: the relay carrying
+                    // it is no longer one the service can bill through, and the service asks that
+                    // the lease be revoked and another asked for.
                     let destination = row.destination;
                     shared
                         .on_record(move |record| {
@@ -1074,16 +1277,10 @@ async fn ask(
                         lease_id: lease,
                         reason: LeaseEndReason::Finished,
                     };
-                    match end(shared, owed).await? {
-                        Ended::Answered => {
-                            row = Row {
-                                lease_id: None,
-                                ceiling: BLOCK_BYTES,
-                                consumed: 0,
-                                expires_at_ms: 0,
-                                written_at_ms: now,
-                                ..row
-                            };
+                    match end(shared, owed, now).await? {
+                        Ended::Answered | Ended::Unknown => {
+                            row = afresh(row, now);
+                            probing = None;
                             continue;
                         }
                         Ended::Later => return Ok(Asked::Later),
@@ -1094,31 +1291,25 @@ async fn ask(
                 }
                 return nothing_issued(shared, ending, Standing::NoLease, &refusal);
             }
-            Err(_) => match failure.expect("a failed request has a failure") {
-                // The service is not carrying the lease the host named: it ended, or it was
-                // never kept. The pair is asked for afresh, with the figures of a new
-                // reservation, and the service answers with the lease it holds for the pair, if
-                // it holds one.
-                Failure::NotActed(ErrorCode::InvalidArgument)
-                    if row.lease_id.is_some() && attempt == 0 =>
-                {
-                    row = Row {
-                        lease_id: None,
-                        ceiling: BLOCK_BYTES,
-                        consumed: 0,
-                        expires_at_ms: 0,
-                        written_at_ms: now,
-                        ..row
-                    };
+            Err(error) => match failure.expect("a failed request has a failure") {
+                // The raise was refused, or the service does not carry the lease the host named:
+                // the ceiling the lease already holds tells which. If the service does not carry
+                // it, it ended or was never kept, and the pair is asked for afresh, with the
+                // figures of a new reservation; the service answers with the lease it holds for
+                // the pair, if it holds one.
+                Failure::NotActed(ErrorCode::InvalidArgument) if row.lease_id.is_some() => {
+                    if raises && probing.is_none() {
+                        probing = Some(Turned::Invalid);
+                        continue;
+                    }
+                    row = afresh(row, now);
+                    probing = None;
                 }
                 // Nothing was issued by this request. The row stays: an earlier request whose
                 // answer was lost may have issued a lease, and the row is how it is ended.
                 Failure::NotActed(code) if needs_the_owner(code) => {
-                    return Ok(if ending.is_some() {
-                        Asked::Nothing
-                    } else {
-                        Asked::Standing(Standing::Refused(code))
-                    });
+                    log_refusal(&error);
+                    return Ok(Asked::Standing(Standing::Refused(code)));
                 }
                 Failure::NotActed(ErrorCode::QuotaExceeded) => {
                     return Ok(if ending.is_some() {
