@@ -493,7 +493,7 @@ impl FeedRuntime {
             DoctorStatus::NotApplicable,
             Sentence::new().stated(
                 "no authority feed is selected, so a remote owner's revocation cannot reach this \
-                 host; the owners paired with it revoke directly",
+                 host; only the owner at this machine revokes a device (`kr device revoke`)",
             ),
             None,
         )
