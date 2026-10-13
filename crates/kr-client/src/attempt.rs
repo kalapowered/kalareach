@@ -615,8 +615,10 @@ impl Armed {
         }
     }
 
-    /// The same clock reading `by` more than it does. It only ever adds time, which waiting adds
-    /// as well; a test that has to pass a bound without waiting is the one caller that needs it.
+    /// The same clock reading `by` more than it does. Added time makes a read count sooner than
+    /// it should, so no shipped build has it: a test that has to pass a bound without waiting is
+    /// the one caller that needs it.
+    #[cfg(any(test, feature = "testing"))]
     #[must_use]
     pub fn skewed(self, by: Duration) -> Self {
         Self {
