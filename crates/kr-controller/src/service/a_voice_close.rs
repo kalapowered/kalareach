@@ -1267,6 +1267,69 @@ async fn a_stop_after_the_owner_withdrew_the_grant_reports_the_fence_still_pendi
     call.world.serving.abort();
 }
 
+/// KR-REQ-15.13 and 09.12: the stop's report does not read anything the owner publishes. The
+/// owner's withdrawal is committed and its debt is on disk, but not published, and no revision has
+/// advanced for it. The stop owes a fence of its own, so the revision it reports is above the one
+/// a close in flight was validated at, and the worker is pending until it shows that revision.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stop_between_the_owner_s_commit_and_its_publication_reports_a_later_revision() {
+    let call = Call::start().await;
+    let before = revision(&call.controller).await;
+    let hold = call
+        .controller
+        .sharing()
+        .grants()
+        .hold_close(call.voice_grant_id());
+    let committed = call
+        .controller
+        .sharing()
+        .grants()
+        .revoke(
+            call.voice_grant_id(),
+            call.controller.settled_now_ms(),
+            || Ok(()),
+        )
+        .expect("the owner's withdrawal commits");
+    let owners = committed
+        .debt
+        .expect("a close is on its way, so the owner's withdrawal owes a fence");
+    assert_eq!(owed(&call.controller), vec![owners]);
+    assert_eq!(revision(&call.controller).await, before);
+    call.controller
+        .check_fence()
+        .expect("the owner has published nothing, so nothing is refused yet");
+
+    let answered: VoiceStopResult = call
+        .submit_voice(Method::VoiceStop, &call.stop_submitted())
+        .await
+        .expect("the stop is answered")
+        .to_typed()
+        .expect("a stop result");
+
+    let barrier = answered
+        .barrier
+        .0
+        .expect("a close can still run, so the stop reports the fence");
+    assert_eq!(
+        barrier.authority_revision.get(),
+        before + 1,
+        "the revision the stop reports was advanced after the owner's commit"
+    );
+    assert_eq!(
+        call.script.installed_revision().map(|held| held.get()),
+        Some(before + 1)
+    );
+    assert!(!barrier.holds(), "the worker gave no evidence of its fence");
+    assert_eq!(barrier.pending(), vec![call.world.session_id]);
+    assert_eq!(
+        owed(&call.controller),
+        vec![owners],
+        "the stop retired its own debt and left the owner's"
+    );
+    drop(hold);
+    call.world.serving.abort();
+}
+
 /// KR-REQ-15.14 and 09.12: a replacement of the standing grant that finds the call's grant already
 /// withdrawn by its owner, with a close still on its way, reports the worker as pending in the same
 /// way a stop does.
@@ -1305,6 +1368,10 @@ async fn a_replacement_after_the_owner_withdrew_the_calls_grant_reports_the_fenc
         .expect("a close can still run, so the replacement reports the fence");
     assert!(!barrier.holds(), "the worker gave no evidence of its fence");
     assert_eq!(barrier.pending(), vec![call.world.session_id]);
+    assert!(
+        owed(&call.controller).is_empty(),
+        "the replacement owed one fence and its barrier retired it"
+    );
     drop(hold);
     call.world.serving.abort();
 }
