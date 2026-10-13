@@ -3269,7 +3269,8 @@ fn only_the_host_issues_ordered_revisions_and_records_are_retained_until_acknowl
     };
 
     // The request carries no revision at all. The daemon's registry allocates the number, from the
-    // same sequence its own revocations use, and the feed is told of it as the revocation completes.
+    // same sequence its own revocations use, and the feed is told of it as the revocation
+    // completes.
     let basis = |at_ms: u64| Basis {
         origin: "https://feed.example",
         previous: AuthorityRevision::new(0),
