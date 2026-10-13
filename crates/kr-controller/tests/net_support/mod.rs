@@ -375,7 +375,7 @@ impl Host {
     /// `owner` as its first owner.
     ///
     /// The host's own keys are `host_keys`, put where the daemon finds them when it starts, so a
-    /// suite can have the service's account console authorise the host's key before the daemon
+    /// suite can have the account authorise the host's key before the daemon
     /// asks for the first lease.
     pub async fn start_with_relay(
         owner: &DeviceKeys,
