@@ -54,7 +54,9 @@ impl Controller {
     ///
     /// A revocation that withdrew nothing — the grant and its subtree were already revoked —
     /// advances no revision. Advancing one would fence every live connection on the host for a
-    /// retry that changed nothing.
+    /// retry that changed nothing. The exception is a call's voice grant with a close still on its
+    /// way: that retry owes a fence of its own, which withdraws no connection (a call's grant
+    /// names none).
     ///
     /// `audience` is who the answer is for ([`Audience`]). `carried` is the admission of the
     /// mutation this revocation is performing, when it is performing one. It is checked again
@@ -384,7 +386,8 @@ impl Controller {
     /// Shared by every revocation path so the order cannot drift between them. Each path publishes
     /// its debts itself, once, the moment its restriction has been attempted, and hands `own` here;
     /// this captures them with whatever else is owed. A revocation that found its work already done
-    /// published none, and its barrier captures whatever is still owed, which is how a retry of a
+    /// published none (unless a close was still on its way under a call's grant, which it owes a
+    /// fence for), and its barrier captures whatever is still owed, which is how a retry of a
     /// revocation whose barrier failed fences for it. Nothing newly withdrawn and nothing owed is
     /// answered with the revision in force and the barrier as it stands.
     pub(super) async fn complete_revocation(

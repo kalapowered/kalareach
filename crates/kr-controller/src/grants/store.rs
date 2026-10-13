@@ -337,9 +337,9 @@ pub struct GrantRevocation {
     pub covers_every_session: bool,
     /// The debt this revocation wrote in the transaction that revoked, when it withdrew live
     /// authority a worker can hold work under (every grant but a voice grant, and a voice grant
-    /// while a close forwarded under it can still run at a worker, even when an earlier change had
-    /// already withdrawn it): one row for the whole change, retired only by a barrier that follows
-    /// it.
+    /// while a close forwarded under it can still run at a worker), or when it found a voice grant
+    /// an earlier change had withdrawn with such a close still on its way: one row for the whole
+    /// change, retired only by a barrier that follows it.
     pub debt: Option<DebtId>,
 }
 
@@ -1103,9 +1103,11 @@ impl GrantDirectory {
     /// [`GrantRevocation::revoked`] names only what **this** call revoked. A repeat finds the
     /// subtree already revoked and names nothing, which is what lets a caller tell a revocation
     /// that did something from one that found the work done: advancing the authority revision for
-    /// a repeat would make a retry look like a new withdrawal of authority. `held` is the voice
-    /// grants with a close outstanding, read while the caller holds the store's lock
-    /// ([`Self::held_closes`]).
+    /// a repeat would make a retry look like a new withdrawal of authority. The one repeat that
+    /// owes a fence is a call's voice grant found withdrawn with a close still held under it: the
+    /// earlier change's revision may not be in force yet, so the repeat advances one of its own.
+    /// `held` is the voice grants with a close outstanding, read while the caller holds the
+    /// store's lock ([`Self::held_closes`]).
     fn revoke_within(
         connection: &Connection,
         grant_id: GrantId,
@@ -1136,10 +1138,11 @@ impl GrantDirectory {
 
     /// Withdraws a subtree [`Self::subtree_to_revoke`] read, inside the caller's transaction.
     ///
-    /// The first live grant it withdraws that owes a fence writes the change's one debt row into
-    /// `debt`, which names what the change was (`covers`); a later subtree of the same change
-    /// finds it written and writes nothing more. `held` is the voice grants with a close
-    /// outstanding, read while the caller holds the store's lock ([`Self::held_closes`]).
+    /// The first live grant it withdraws that owes a fence, or the first voice grant it finds
+    /// already withdrawn with a close held under it, writes the change's one debt row into `debt`,
+    /// which names what the change was (`covers`); a later subtree of the same change finds it
+    /// written and writes nothing more. `held` is the voice grants with a close outstanding, read
+    /// while the caller holds the store's lock ([`Self::held_closes`]).
     fn revoke_subtree(
         connection: &Connection,
         grant_id: GrantId,
