@@ -3541,32 +3541,6 @@ response will be sent indicating the length of the remaining delay period. The d
 delay in the same record as the carrier of the host's own backups, so that a restore and an upload
 do not both press on a service that asked for quiet.
 
-### What a restore checks, and in what order
-
-The caller's own expectation first: the archive it means to restore. Without it, a genuine
-enrolment and a genuine publication for a *different* collection of the same owner would pass every
-signature check. Then the owner's enrolment, because it is the owner's own signature and it is what
-says this writer may publish for this collection at all. Then the writer key the recovery bundle
-supplied, which must be the key that enrolment names and must be its own identifier. Then the
-publication's structure and its signature under that writer. Then the generation against the
-checkpoint the owner trusts, which refuses an archive older than what the owner verified and one
-that claims the checkpoint's generation with a different manifest.
-
-`VerifiedRestore` is built by that call and by nothing else, and its fields are private.
-`VerifiedRestore::expectation` builds what `kr_crypto::backup::open_archive` is handed, and it takes
-no argument: it carries the archive, the exact generation and the encrypted-manifest hash the
-publication's signature covered, so the archive that is opened is the one whose authority was
-established and a second genuine generation of the same collection cannot be substituted for it.
-
-What a restore puts back is decided by `kr_crypto::backup`'s table, so this host and the device that
-made the backup give the same answer: session content, device configuration and generation
-checkpoints come back; reusable endpoint and control-signing private keys, the notification
-extension's preview key, the recovery seed, this host's own grant and revocation authority and any
-revoked grant do not, each with the reason rather than as a silent omission. The table classifies
-material a caller names rather than inspecting an object's bytes, so it is the decision and the
-caller's export and import paths are the gate. **No path reads an archive back into a host**: the
-table is the check an import would make, and no import makes it.
-
 ### The uploader
 
 `backup::uploader` is the executor the outbox waits for. It takes the attempts in order, dispatches

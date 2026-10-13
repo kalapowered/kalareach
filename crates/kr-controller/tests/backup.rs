@@ -1,5 +1,4 @@
-//! The environment's backup service: its store, its reconciliation, its restore checks and its
-//! privacy hook.
+//! The environment's backup service: its store, its reconciliation and its privacy hook.
 //!
 //! Section 24's ownership row for backup generations, and section 24's privacy paragraphs. Rule 12
 //! applies to every path here: `backup.sqlite` and every staged byte live under the platform
@@ -22,23 +21,17 @@ use kr_controller::backup::store::{
     ObligationKind, Production, Publication, Remote, SCHEMA_VERSION, Step, UploadRecord,
 };
 use kr_controller::backup::uploader::{EXECUTOR as UPLOADER, Idle, Stepped, Uploader};
-use kr_controller::backup::{Admitted, BackupService, RestoreRequest, SUBSYSTEM_NAME};
+use kr_controller::backup::{Admitted, BackupService, SUBSYSTEM_NAME};
 use kr_controller::error::ControllerError;
 use kr_controller::quiet::{Quiet, RealTimer, Timer};
 use kr_crypto::backup::{
-    ArchivePlan, ArchiveRecipients, CheckpointSource, CollectionKind, GenerationExpectation,
-    KeyRotation, Material, ObjectSource, SealedArchive, StagedObject, seal_archive, stage_object,
+    ArchivePlan, ArchiveRecipients, CollectionKind, KeyRotation, ObjectSource, SealedArchive,
+    StagedObject, seal_archive, stage_object,
 };
 use kr_crypto::keys::{AuthorisationKeyPair, StoredEnvelopeKeyPair};
-use kr_protocol::archive::{
-    ArchiveCheckpoint, ArchiveDescriptor, BackupGenerationPublication,
-    BackupGenerationPublicationPayload, BackupWriterRecord, BackupWriterRecordPayload,
-    TrustedWriter,
-};
+use kr_protocol::archive::{ArchiveDescriptor, BackupGenerationPublication, BackupWriterRecord};
 use kr_protocol::error::{ErrorCode, ProtocolError};
-use kr_protocol::ids::{
-    ArchiveId, BackupGeneration, BackupObjectId, BackupWriterRevision, DeviceId,
-};
+use kr_protocol::ids::{ArchiveId, BackupGeneration, BackupObjectId, DeviceId};
 use kr_protocol::pairing::GenerationCheckpoint;
 use kr_protocol::scalars::{AuthorisationKey, Digest256, KeyId, TimestampMs, Uuid};
 use kr_worker::privacy::{PrivacyGeneration, PrivacyMode, PrivacySubsystem};
@@ -104,7 +97,6 @@ impl Environment {
 /// One writer, one producer key and one recipient.
 struct Producer {
     writer: AuthorisationKeyPair,
-    owner: AuthorisationKeyPair,
     sender: StoredEnvelopeKeyPair,
     device: StoredEnvelopeKeyPair,
 }
@@ -113,7 +105,6 @@ impl Producer {
     fn generate() -> Self {
         Self {
             writer: AuthorisationKeyPair::generate().expect("a writer key"),
-            owner: AuthorisationKeyPair::generate().expect("an owner key"),
             sender: StoredEnvelopeKeyPair::generate().expect("a producer key"),
             device: StoredEnvelopeKeyPair::generate().expect("a device key"),
         }
@@ -146,42 +137,6 @@ impl Producer {
             objects,
         )
         .expect("a sealed archive")
-    }
-
-    fn enrolment(&self, revision: u64) -> BackupWriterRecord {
-        let payload = BackupWriterRecordPayload {
-            archive_id: archive_id(),
-            writer: TrustedWriter {
-                writer_key_id: self.writer.key_id(),
-                signing_key: *self.writer.public(),
-                enrolled_at_ms: TimestampMs::new(1_000),
-            },
-            writer_revision: BackupWriterRevision::new(revision),
-            owner_key_id: self.owner.key_id(),
-            enrolled_at_ms: TimestampMs::new(1_000),
-        };
-        let transcript = kr_crypto::sign::SigningTranscript::from_canonical_bytes(
-            kr_protocol::archive::BACKUP_WRITER_DOMAIN,
-            payload.signing_input().expect("an enrolment input"),
-        )
-        .expect("a transcript");
-        let signature = kr_crypto::sign::sign(&self.owner, &transcript).expect("a signature");
-        BackupWriterRecord { payload, signature }
-    }
-
-    fn publish(&self, sealed: &SealedArchive) -> BackupGenerationPublication {
-        let payload = BackupGenerationPublicationPayload {
-            descriptor: sealed.descriptor.clone(),
-            writer_key_id: self.writer.key_id(),
-            published_at_ms: TimestampMs::new(2_000),
-        };
-        let transcript = kr_crypto::sign::SigningTranscript::from_canonical_bytes(
-            kr_protocol::archive::BACKUP_PUBLICATION_DOMAIN,
-            payload.signing_input().expect("a publication input"),
-        )
-        .expect("a transcript");
-        let signature = kr_crypto::sign::sign(&self.writer, &transcript).expect("a signature");
-        BackupGenerationPublication { payload, signature }
     }
 }
 
@@ -898,228 +853,6 @@ fn releasing_the_fence_admits_backup_production_again_under_the_new_generation()
             .is_none(),
         "what the fence stopped is not reconstructed"
     );
-}
-
-// ---------------------------------------------------------------------------------------------
-// KR-REQ-24.16: generation and writer authority verified, and a restore that returns data only.
-// ---------------------------------------------------------------------------------------------
-
-#[test]
-fn a_restore_verifies_the_owners_enrolment_the_writers_signature_and_the_generation() {
-    let producer = Producer::generate();
-    let objects = [stage(1, "a.cbor", b"one")];
-    let sealed = producer.seal(4, &objects);
-    let publication = producer.publish(&sealed);
-    let enrolment = producer.enrolment(1);
-    let checkpoint = ArchiveCheckpoint {
-        archive_id: archive_id(),
-        backup_generation: BackupGeneration::new(4),
-        encrypted_manifest_hash: sealed.descriptor.encrypted_manifest.encrypted_object_hash,
-        verified_at_ms: TimestampMs::new(3_000),
-    };
-
-    let verified = RestoreRequest {
-        archive_id: archive_id(),
-        publication: &publication,
-        descriptor_len: sealed.descriptor_bytes.len(),
-        enrolment: &enrolment,
-        owner_key: producer.owner.public(),
-        writer_key: producer.writer.public(),
-        generation: GenerationExpectation::Checkpoint(CheckpointSource::Pairing, &checkpoint),
-    }
-    .verify()
-    .expect("the restore is admitted");
-    assert_eq!(verified.archive_id(), archive_id());
-    assert_eq!(verified.writer_key_id(), producer.writer.key_id());
-    assert_eq!(verified.writer_revision(), 1);
-    assert!(verified.generation().describe().contains("generation 4"));
-    assert!(!verified.generation().proves_no_newer_archive());
-
-    // What it hands the archive layer is built from what was verified and takes no argument, so a
-    // second genuine generation of the same collection cannot be substituted for it.
-    let expectation = verified.expectation();
-    assert_eq!(expectation.archive_id, archive_id());
-    let GenerationExpectation::Exactly(pinned) = expectation.generation else {
-        panic!("a verified restore pins the generation it established");
-    };
-    assert_eq!(pinned.backup_generation, BackupGeneration::new(4));
-    assert_eq!(
-        pinned.encrypted_manifest_hash,
-        sealed.descriptor.encrypted_manifest.encrypted_object_hash
-    );
-
-    // And the archive layer refuses another generation against it.
-    let other = producer.seal(6, &objects);
-    assert!(
-        kr_crypto::backup::open_archive(
-            &kr_crypto::backup::ArchiveReader::Device(&producer.device),
-            producer.sender.public(),
-            &[TrustedWriter {
-                writer_key_id: producer.writer.key_id(),
-                signing_key: *producer.writer.public(),
-                enrolled_at_ms: TimestampMs::new(1_000),
-            }],
-            &expectation,
-            &other.descriptor_bytes,
-            &other.encrypted_manifest,
-        )
-        .is_err(),
-        "the archive opened is the archive whose authority was established"
-    );
-}
-
-#[test]
-fn a_restore_is_refused_when_any_of_the_three_checks_does_not_hold() {
-    let producer = Producer::generate();
-    let impostor = Producer::generate();
-    let objects = [stage(1, "a.cbor", b"one")];
-    let sealed = producer.seal(4, &objects);
-    let publication = producer.publish(&sealed);
-    let enrolment = producer.enrolment(1);
-
-    // An enrolment signed by somebody who is not the collection's owner.
-    assert!(
-        matches!(
-            RestoreRequest {
-                archive_id: archive_id(),
-                publication: &publication,
-                descriptor_len: sealed.descriptor_bytes.len(),
-                enrolment: &enrolment,
-                owner_key: impostor.owner.public(),
-                writer_key: producer.writer.public(),
-                generation: GenerationExpectation::Unverified,
-            }
-            .verify(),
-            Err(kr_controller::error::ControllerError::PermissionDenied { .. })
-        ),
-        "the enrolment is verified against the owner's own key"
-    );
-
-    // A writer key that is not the one the owner enrolled.
-    assert!(
-        matches!(
-            RestoreRequest {
-                archive_id: archive_id(),
-                publication: &publication,
-                descriptor_len: sealed.descriptor_bytes.len(),
-                enrolment: &enrolment,
-                owner_key: producer.owner.public(),
-                writer_key: impostor.writer.public(),
-                generation: GenerationExpectation::Unverified,
-            }
-            .verify(),
-            Err(kr_controller::error::ControllerError::PermissionDenied { .. })
-        ),
-        "a writer the bundle supplied is checked against the owner's enrolment"
-    );
-
-    // A publication whose signature is another writer's.
-    let forged = BackupGenerationPublication {
-        payload: publication.payload.clone(),
-        signature: impostor.publish(&sealed).signature,
-    };
-    assert!(
-        matches!(
-            RestoreRequest {
-                archive_id: archive_id(),
-                publication: &forged,
-                descriptor_len: sealed.descriptor_bytes.len(),
-                enrolment: &enrolment,
-                owner_key: producer.owner.public(),
-                writer_key: producer.writer.public(),
-                generation: GenerationExpectation::Unverified,
-            }
-            .verify(),
-            Err(kr_controller::error::ControllerError::PermissionDenied { .. })
-        ),
-        "the publication's own signature is verified under the enrolled writer"
-    );
-
-    // A publication for another archive than the one being restored.
-    assert!(
-        matches!(
-            RestoreRequest {
-                archive_id: ArchiveId::new(Uuid::from_bytes([0x99; 16])),
-                publication: &publication,
-                descriptor_len: sealed.descriptor_bytes.len(),
-                enrolment: &enrolment,
-                owner_key: producer.owner.public(),
-                writer_key: producer.writer.public(),
-                generation: GenerationExpectation::Unverified,
-            }
-            .verify(),
-            Err(kr_controller::error::ControllerError::PermissionDenied { .. })
-        ),
-        "the caller's own expectation is checked before any signature"
-    );
-
-    // A generation the checkpoint says is older than what the owner verified.
-    let checkpoint = ArchiveCheckpoint {
-        archive_id: archive_id(),
-        backup_generation: BackupGeneration::new(9),
-        encrypted_manifest_hash: Digest256::from_bytes([0xab; 32]),
-        verified_at_ms: TimestampMs::new(3_000),
-    };
-    let refusal = RestoreRequest {
-        archive_id: archive_id(),
-        publication: &publication,
-        descriptor_len: sealed.descriptor_bytes.len(),
-        enrolment: &enrolment,
-        owner_key: producer.owner.public(),
-        writer_key: producer.writer.public(),
-        generation: GenerationExpectation::Checkpoint(CheckpointSource::Pairing, &checkpoint),
-    }
-    .verify()
-    .expect_err("a replayed older archive");
-    assert!(refusal.to_string().contains("generation 4"));
-
-    // A descriptor over section 20's byte limit fails before anything else.
-    assert!(matches!(
-        RestoreRequest {
-            archive_id: archive_id(),
-            publication: &publication,
-            descriptor_len: kr_protocol::archive::MAX_ARCHIVE_DESCRIPTOR_LEN + 1,
-            enrolment: &enrolment,
-            owner_key: producer.owner.public(),
-            writer_key: producer.writer.public(),
-            generation: GenerationExpectation::Unverified,
-        }
-        .verify(),
-        Err(kr_controller::error::ControllerError::PermissionDenied { .. })
-    ));
-}
-
-/// The table's answers, which are the decision a restore acts on rather than a gate over bytes.
-///
-/// `RestoreRequest::admit` classifies kinds a caller names. The archive layer below it carries
-/// opaque objects, so what closes section 20 ¶11 is each import path asking for every kind it
-/// carries; this establishes the answer it gets.
-#[test]
-fn a_restore_classifies_a_reusable_host_control_key_as_material_it_refuses() {
-    let admitted = RestoreRequest::admit(&[
-        Material::SessionData,
-        Material::DeviceConfiguration,
-        Material::BackupGenerationCheckpoint,
-        Material::EndpointPrivateKey,
-        Material::ControlSigningPrivateKey,
-        Material::NotificationPreviewPrivateKey,
-        Material::RecoverySeed,
-        Material::Grant { revoked: true },
-        Material::HostGrantAuthority,
-    ]);
-    assert_eq!(admitted.restored.len(), 3);
-    for refused in [
-        Material::EndpointPrivateKey,
-        Material::ControlSigningPrivateKey,
-        Material::NotificationPreviewPrivateKey,
-        Material::RecoverySeed,
-        Material::Grant { revoked: true },
-        Material::HostGrantAuthority,
-    ] {
-        assert!(admitted.refused_kind(refused), "{refused:?} is refused");
-    }
-    assert!(admitted.limits.requires_fresh_owner_authorised_pairing());
-    assert!(!admitted.limits.creates_remote_control_authority());
 }
 
 // ---------------------------------------------------------------------------------------------

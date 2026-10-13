@@ -10,12 +10,6 @@
 //! * **Reconciliation at startup.** What is still authorised resumes; what is not is cancelled;
 //!   and a publication that was dispatched and never answered is recorded as *unknown*, because
 //!   that is what this host knows about it.
-//! * **Verification before a restore.** The owner's enrolment, the writer's signature over the
-//!   publication, and the generation against the trusted checkpoint, in that order. A restore that
-//!   has not passed all three does not start.
-//! * **Data only.** [`RestoreRequest::admit`] answers every material kind a caller asks for, and
-//!   refuses each one that would recreate authority rather than return data. The answer is
-//!   `kr_crypto::backup`'s, so a host and a device cannot disagree about it.
 //! * **The privacy hook.** [`BackupService::privacy`] is the service's
 //!   `kr_worker::privacy::PrivacySubsystem`: it fences the outbox at the generation, takes back
 //!   what has not been dispatched, removes the staged ciphertext it holds, reports what is still in
@@ -42,16 +36,10 @@ use std::sync::{Arc, Mutex};
 
 use tokio::sync::Notify;
 
-use kr_crypto::backup::{
-    GenerationExpectation, Material, RestoreAdmissions, RestoreGeneration, SealedArchive,
-    StagedObject, admit_for_restore,
-};
+use kr_crypto::backup::{SealedArchive, StagedObject};
 use kr_flush::{NameKind, flush_directory};
-use kr_protocol::archive::{
-    ArchiveCheckpoint, BackupGenerationPublication, BackupWriterRecord, BackupWriterRecordPayload,
-};
 use kr_protocol::ids::{ArchiveId, BackupGeneration, BackupObjectId};
-use kr_protocol::scalars::{AuthorisationKey, KeyId, TimestampMs};
+use kr_protocol::scalars::{KeyId, TimestampMs};
 use kr_worker::privacy::{
     Cancelled, Exported, Fenced, KeptExplicitly, PrivacyGeneration, PrivacySubsystem, Removed,
     Unavailable,
@@ -259,183 +247,6 @@ impl Reconciliation {
             && self.completed.is_empty()
             && self.unanswered.is_empty()
             && self.fenced.is_empty()
-    }
-}
-
-/// One restore, before anything of it is read.
-#[derive(Clone, Debug)]
-pub struct RestoreRequest<'a> {
-    /// The archive this restore means to read.
-    ///
-    /// The caller's own expectation rather than the publication's claim. Without it, another valid
-    /// enrolment and publication under the same owner would pass every signature check and restore
-    /// a different collection.
-    pub archive_id: ArchiveId,
-    /// The publication the service handed back.
-    pub publication: &'a BackupGenerationPublication,
-    /// The size of the descriptor as it arrived, which is the quantity section 20 bounds.
-    pub descriptor_len: usize,
-    /// The owner's enrolment of the writer, as the owner signed it.
-    pub enrolment: &'a BackupWriterRecord,
-    /// The owner's authorisation key, which the enrolment is verified against.
-    pub owner_key: &'a AuthorisationKey,
-    /// The writer's signing key, from the owner's recovery bundle and nowhere else.
-    pub writer_key: &'a AuthorisationKey,
-    /// What the generation the service offered is compared against.
-    pub generation: GenerationExpectation<'a>,
-}
-
-/// A restore whose authority and generation have both been established.
-///
-/// There is no way to build one except through [`RestoreRequest::verify`], so a caller cannot
-/// reach the reading half without having passed the checking half.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct VerifiedRestore {
-    archive_id: ArchiveId,
-    writer_key_id: KeyId,
-    writer_revision: u64,
-    generation: RestoreGeneration,
-    /// The generation and manifest the publication's signature actually covered.
-    ///
-    /// The archive that is opened is opened against this, so a second valid generation of the same
-    /// collection cannot be substituted for the one whose authority was established.
-    pinned: ArchiveCheckpoint,
-}
-
-impl VerifiedRestore {
-    /// Returns the archive whose authority and generation were established.
-    #[must_use]
-    pub const fn archive_id(&self) -> ArchiveId {
-        self.archive_id
-    }
-
-    /// Returns the writer whose signature was verified.
-    #[must_use]
-    pub const fn writer_key_id(&self) -> KeyId {
-        self.writer_key_id
-    }
-
-    /// Returns the enrolment revision the owner signed.
-    #[must_use]
-    pub const fn writer_revision(&self) -> u64 {
-        self.writer_revision
-    }
-
-    /// Returns where the generation stands against the trusted checkpoint, which a restore
-    /// displays.
-    #[must_use]
-    pub const fn generation(&self) -> RestoreGeneration {
-        self.generation
-    }
-
-    /// Returns what this restore hands to `kr_crypto::backup::open_archive`.
-    ///
-    /// It takes no argument, and that is the point. It is built entirely from what verification
-    /// established: the archive whose authority was checked, and the exact generation and
-    /// encrypted-manifest hash the publication's signature covered. Opening against it therefore
-    /// admits one archive at one generation with one manifest, so a second genuine generation of
-    /// the same collection cannot be substituted for the one that was verified.
-    #[must_use]
-    pub const fn expectation(&self) -> kr_crypto::backup::ArchiveExpectation<'_> {
-        kr_crypto::backup::ArchiveExpectation {
-            archive_id: self.archive_id,
-            generation: GenerationExpectation::Exactly(&self.pinned),
-        }
-    }
-}
-
-impl RestoreRequest<'_> {
-    /// Verifies the owner's enrolment, the writer's signature and the generation, in that order.
-    ///
-    /// The order matters. The enrolment is what says this writer may publish for this archive at
-    /// all, and it is the owner's own signature; the publication's signature is then checked
-    /// against the key that enrolment names, which is also the key the recovery bundle supplied;
-    /// and the generation is compared with the checkpoint last. A restore that started reading
-    /// before any of the three would be reading an archive nothing had vouched for.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ControllerError::PermissionDenied`] when the enrolment, the writer or the
-    /// signature does not hold, and [`ControllerError::InvalidArgument`] when the generation is
-    /// one the checkpoint refuses.
-    pub fn verify(&self) -> Result<VerifiedRestore> {
-        let payload = &self.enrolment.payload;
-        // The collection the caller meant, before anything else. A genuine enrolment and a genuine
-        // publication for another archive of the same owner would otherwise pass.
-        if self.publication.payload.descriptor.archive_id != self.archive_id
-            || payload.archive_id != self.archive_id
-        {
-            return Err(ControllerError::PermissionDenied {
-                detail: "that publication is for another archive than the one being restored"
-                    .to_owned(),
-            });
-        }
-        // 1. The owner's own statement about who may write this collection.
-        let transcript = enrolment_transcript(payload)?;
-        kr_crypto::sign::verify(self.owner_key, &transcript, &self.enrolment.signature).map_err(
-            |_| ControllerError::PermissionDenied {
-                detail: "the backup writer enrolment is not signed by this collection's owner"
-                    .to_owned(),
-            },
-        )?;
-        if payload.owner_key_id != authorisation_key_id(self.owner_key) {
-            return Err(ControllerError::PermissionDenied {
-                detail: "the backup writer enrolment names another owner key".to_owned(),
-            });
-        }
-        // 2. The writer key the bundle supplied is the one the owner enrolled, and it is its own
-        //    identifier. A key that named itself something else would pass the enrolment check and
-        //    verify nothing.
-        let writer_key_id = authorisation_key_id(self.writer_key);
-        if payload.writer.writer_key_id != writer_key_id
-            || payload.writer.signing_key != *self.writer_key
-        {
-            return Err(ControllerError::PermissionDenied {
-                detail: "the writer key this restore holds is not the one the owner enrolled"
-                    .to_owned(),
-            });
-        }
-        // 3. The publication's own structure, and then its signature under that writer.
-        self.publication
-            .check_structure(self.descriptor_len, payload)
-            .map_err(|error| ControllerError::PermissionDenied {
-                detail: error.to_string(),
-            })?;
-        let transcript = publication_transcript(self.publication)?;
-        kr_crypto::sign::verify(self.writer_key, &transcript, &self.publication.signature)
-            .map_err(|_| ControllerError::PermissionDenied {
-                detail: "the backup generation publication is not signed by its writer".to_owned(),
-            })?;
-
-        // 4. The generation, against the checkpoint the owner trusts.
-        let generation =
-            RestoreGeneration::against(&self.publication.payload.descriptor, self.generation);
-        if !generation.is_admissible() {
-            return Err(ControllerError::InvalidArgument(generation.describe()));
-        }
-        let descriptor = &self.publication.payload.descriptor;
-        Ok(VerifiedRestore {
-            archive_id: descriptor.archive_id,
-            writer_key_id,
-            writer_revision: payload.writer_revision.get(),
-            generation,
-            pinned: ArchiveCheckpoint {
-                archive_id: descriptor.archive_id,
-                backup_generation: descriptor.backup_generation,
-                encrypted_manifest_hash: descriptor.encrypted_manifest.encrypted_object_hash,
-                verified_at_ms: self.publication.payload.published_at_ms,
-            },
-        })
-    }
-
-    /// Answers every material kind a caller asked to restore.
-    ///
-    /// Section 24: *restore data only, not reusable host-control keys.* The answer is
-    /// `kr_crypto::backup`'s, so this host and the device that made the backup give the same one,
-    /// and every refusal carries the reason rather than being a silent omission.
-    #[must_use]
-    pub fn admit(candidates: &[Material]) -> RestoreAdmissions {
-        admit_for_restore(candidates)
     }
 }
 
@@ -1552,43 +1363,6 @@ fn sync_directory(path: &Path) -> Result<()> {
         directory = current.parent();
     }
     Ok(())
-}
-
-/// Builds the transcript one writer enrolment is signed over.
-fn enrolment_transcript(
-    payload: &BackupWriterRecordPayload,
-) -> Result<kr_crypto::sign::SigningTranscript> {
-    let bytes = payload
-        .signing_input()
-        .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
-    kr_crypto::sign::SigningTranscript::from_canonical_bytes(
-        kr_protocol::archive::BACKUP_WRITER_DOMAIN,
-        bytes,
-    )
-    .map_err(|error| ControllerError::InvalidArgument(error.to_string()))
-}
-
-/// Builds the transcript one generation publication is signed over.
-fn publication_transcript(
-    publication: &BackupGenerationPublication,
-) -> Result<kr_crypto::sign::SigningTranscript> {
-    let bytes = publication
-        .payload
-        .signing_input()
-        .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
-    kr_crypto::sign::SigningTranscript::from_canonical_bytes(
-        kr_protocol::archive::BACKUP_PUBLICATION_DOMAIN,
-        bytes,
-    )
-    .map_err(|error| ControllerError::InvalidArgument(error.to_string()))
-}
-
-/// Returns the key identifier of one authorisation public key.
-fn authorisation_key_id(key: &AuthorisationKey) -> KeyId {
-    kr_crypto::keys::key_id(
-        kr_protocol::pairing::KeyPurpose::Authorisation,
-        key.as_bytes(),
-    )
 }
 
 /// The backup service as privacy mode sees it, for one pass.

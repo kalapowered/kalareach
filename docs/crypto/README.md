@@ -210,12 +210,12 @@ retain_only` is the whole policy: a host passes the backups it still retains and
 one it no longer retains goes, keys zeroising as they are dropped.
 
 A signed manifest stops forgery; it does not stop a service handing back an older archive the owner
-really did write. `GenerationExpectation` is the three questions a restore can be asking, because
-they have different answers: nothing to compare against, the latest generation the owner verified,
-or exactly one generation with exactly one manifest. `RestoreGeneration::against` answers it and
+really did write. `GenerationExpectation` is the two questions a restore can be asking, because
+they have different answers: nothing to compare against, or the latest generation the owner
+verified. `RestoreGeneration::against` answers it and
 says where the archive stands: at the checkpoint, ahead of it, replayed from before it, claiming
-its generation with another manifest, for a different archive altogether, or not the generation
-this restore was authorised for. The last four are refused, and refused by `open_archive` itself
+its generation with another manifest, or for a different archive altogether.
+The last three are refused, and refused by `open_archive` itself
 rather than only reported, so a caller that never looked at the report still cannot restore a
 replay. Where the checkpoint came from travels with the answer, because a paired device's and a
 recovery bundle's mean different things to a person. `proves_no_newer_archive` is always false and is a method rather than a comment: a service

@@ -617,8 +617,8 @@ async fn the_digest_a_person_confirms_changes_with_the_destination_the_environme
     );
 }
 
-/// Every claim about who may vouch for an archive, each with a signature a trusted writer made
-/// wherever the claim is not about the signature itself.
+/// KR-REQ-24.16: writer authority is verified. Every claim about who may vouch for an archive, each
+/// with a signature a trusted writer made wherever the claim is not about the signature itself.
 #[tokio::test]
 async fn a_restore_trusts_the_writers_and_the_generation_the_authenticated_bundle_names() {
     let world = World::new();
@@ -765,7 +765,8 @@ async fn a_restore_trusts_the_writers_and_the_generation_the_authenticated_bundl
     assert_eq!(source.object_reads(), 0);
 }
 
-/// The checkpoint is what catches a genuine archive from the wrong time.
+/// KR-REQ-24.16: the generation is verified. The checkpoint is what catches a genuine archive from
+/// the wrong time.
 #[tokio::test]
 async fn a_generation_the_checkpoint_refuses_is_refused_before_the_manifest_is_read() {
     let world = World::new();
@@ -835,6 +836,29 @@ async fn a_generation_the_checkpoint_refuses_is_refused_before_the_manifest_is_r
         restore(&world, &source, None).await.expect_err("stopped"),
         RestoreError::NoGeneration
     ));
+}
+
+/// KR-REQ-24.16: the archive that is opened is the one whose publication was verified. Another
+/// genuine generation of the same collection, served under the manifest object the verified
+/// publication names, is not it.
+#[tokio::test]
+async fn a_second_genuine_manifest_served_for_the_verified_publication_does_not_open() {
+    let world = World::new();
+    let members = honest_members();
+    let verified = world.seal(4, &members);
+    let later = world.seal(6, &members);
+    let swapped = Sealed {
+        publication: verified.publication.clone(),
+        objects: later.objects.clone(),
+        manifest_object: verified.manifest_object,
+    };
+    let source =
+        Arc::new(Scripted::serving(&world, world.bundle(&Shape::default())).publishing(&swapped));
+    assert!(matches!(
+        restore(&world, &source, None).await.expect_err("refused"),
+        RestoreError::Archive(_)
+    ));
+    assert_eq!(source.object_reads(), 1, "only the manifest was read");
 }
 
 /// A publication that declares a manifest longer than any manifest is, is refused before a byte is
@@ -1116,8 +1140,8 @@ async fn the_archive_is_one_the_authenticated_bundle_lists_at_the_configured_ser
     assert!(matches!(other.newest, CandidateState::Refused(_)));
 }
 
-/// What a member is called decides what a restore does with it, and nothing it is not told about
-/// is written.
+/// KR-REQ-24.16 and 20.17: a restore returns data only. What a member is called decides what a
+/// restore does with it, and nothing it is not told about is written.
 #[tokio::test]
 async fn members_a_restore_never_puts_back_and_names_it_does_not_know_are_refused() {
     let world = World::new();
@@ -1129,6 +1153,8 @@ async fn members_a_restore_never_puts_back_and_names_it_does_not_know_are_refuse
             (session, stored),
             ("keys/endpoint/device-1", stored),
             ("keys/control/host", stored),
+            ("keys/notification-preview/device-1", stored),
+            ("keys/collection/settings", stored),
             ("authority/grants", stored),
             ("recovery/seed", stored),
             ("grants/revoked/g-1", stored),
@@ -1155,7 +1181,7 @@ async fn members_a_restore_never_puts_back_and_names_it_does_not_know_are_refuse
             ..
         }
     ));
-    let kinds: Vec<Material> = verdicts[1..6]
+    let kinds: Vec<Material> = verdicts[1..8]
         .iter()
         .map(|verdict| match verdict {
             MemberVerdict::Refused(MemberRefusal::Kind { material, .. }) => *material,
@@ -1167,6 +1193,8 @@ async fn members_a_restore_never_puts_back_and_names_it_does_not_know_are_refuse
         vec![
             Material::EndpointPrivateKey,
             Material::ControlSigningPrivateKey,
+            Material::NotificationPreviewPrivateKey,
+            Material::SyncCollectionKey,
             Material::HostGrantAuthority,
             Material::RecoverySeed,
             Material::Grant { revoked: true },
@@ -1174,20 +1202,20 @@ async fn members_a_restore_never_puts_back_and_names_it_does_not_know_are_refuse
     );
     // A name the convention does not know, and a traversal, are refused as unknown.
     assert!(matches!(
-        verdicts[6],
+        verdicts[8],
         MemberVerdict::Refused(MemberRefusal::UnknownKind)
     ));
     assert!(matches!(
-        verdicts[7],
+        verdicts[9],
         MemberVerdict::Refused(MemberRefusal::UnknownKind)
     ));
     // Two members with one name are both refused.
     assert!(matches!(
-        verdicts[8],
+        verdicts[10],
         MemberVerdict::Refused(MemberRefusal::Duplicate)
     ));
     assert!(matches!(
-        verdicts[9],
+        verdicts[11],
         MemberVerdict::Refused(MemberRefusal::Duplicate)
     ));
     assert_eq!(plan.restored().count(), 1, "only the session is written");

@@ -893,6 +893,25 @@ async fn a_fresh_host_restores_a_backup_from_the_kit_alone_and_changes_nothing_o
     let digest = digest_of(&preview);
     let plan: Value = serde_json::from_slice(&preview.stdout).expect("the plan is JSON");
     assert_eq!(plan["files"].as_array().expect("files").len(), 3);
+    // The plan names the archive, the generation, the writer whose signature was checked and where
+    // the generation stands, which a person confirms with the digest.
+    assert_eq!(plan["backup_generation"], 1);
+    assert_eq!(plan["archive"], archive().get().to_string());
+    let writer: String = world
+        .writer_pair
+        .key_id()
+        .as_bytes()
+        .iter()
+        .take(8)
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    assert_eq!(plan["writer_key"], writer);
+    assert!(
+        plan["standing"]
+            .as_str()
+            .is_some_and(|standing| standing.contains("generation 1")),
+        "{plan}"
+    );
     assert_eq!(
         plan["not_restored"].as_array().expect("refused").len(),
         3,
