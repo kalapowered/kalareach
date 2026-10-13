@@ -141,6 +141,8 @@ struct HostScript {
     receipt_state: Mutex<Option<ReceiptState>>,
     /// The state the host's record of any action reads as, when a request reads it.
     record_state: Mutex<Option<ReceiptState>>,
+    /// The action a record read answers about instead of the one asked, when a test sets one.
+    record_of_another: Mutex<Option<kr_protocol::ids::ActionId>>,
     /// Answer nothing at all to this many of the next mutations.
     ///
     /// A host that took the frame and said nothing is what leaves an action whose outcome nobody
@@ -245,7 +247,8 @@ fn spawn_host(
                                     ParamsValue::from_typed(
                                         &kr_protocol::receipt::ActionReadResult {
                                             receipt: Receipt {
-                                                action_id: read.action_id,
+                                                action_id: (*script.record_of_another.lock().await)
+                                                    .unwrap_or(read.action_id),
                                                 actor_id: kr_protocol::ids::ActorId::new(
                                                     "device:test",
                                                 )
@@ -1273,8 +1276,16 @@ async fn a_definite_record_of_an_action_nobody_knew_the_end_of_settles_it() {
     session.read_receipt(&read).await.expect("read");
     assert_eq!(session.submitted_actions().await.len(), 1);
 
-    // A record that says it was applied does.
+    // A record of another action settles nothing of this one.
     *script.record_state.lock().await = Some(ReceiptState::Applied);
+    *script.record_of_another.lock().await = Some(kr_protocol::ids::ActionId::new(
+        Uuid::from_bytes([0x47; 16]),
+    ));
+    session.read_receipt(&read).await.expect("read");
+    assert_eq!(session.submitted_actions().await.len(), 1);
+    *script.record_of_another.lock().await = None;
+
+    // A record that says it was applied does.
     session.read_receipt(&read).await.expect("read");
     assert!(session.submitted_actions().await.is_empty());
     assert_eq!(
