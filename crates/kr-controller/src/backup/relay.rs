@@ -493,7 +493,7 @@ mod tests {
     use tokio::sync::Notify;
 
     use super::*;
-    use crate::quiet::RealTimer;
+    use crate::testing::HeldTimer;
 
     /// A service that is never reached: it counts what is sent to it and loses every request.
     #[derive(Debug, Default)]
@@ -525,14 +525,19 @@ mod tests {
         }
     }
 
-    /// An account whose token arrives when the test says, as one does that is being renewed.
+    /// An account whose token arrives when the test says, as one does that is being renewed, and
+    /// that says when it was asked.
     #[derive(Debug)]
-    struct Renewing(Arc<Notify>);
+    struct Renewing {
+        renewed: Arc<Notify>,
+        asked: Arc<Notify>,
+    }
 
     impl AccountTokenSource for Renewing {
         fn token<'a>(&'a self, _scope: &'a str) -> ServiceFuture<'a, AccountToken> {
             Box::pin(async move {
-                self.0.notified().await;
+                self.asked.notify_one();
+                self.renewed.notified().await;
                 Ok(AccountToken::new("a-token").expect("a token"))
             })
         }
@@ -552,14 +557,20 @@ mod tests {
         privacy: PrivacyState,
         quiet: Arc<Quiet>,
         renewed: Arc<Notify>,
+        asked: Arc<Notify>,
+        _runtime: tempfile::TempDir,
     }
 
     impl Rig {
         fn new() -> Self {
             let privacy = PrivacyState::default();
             privacy.set(state(1, false));
-            let quiet = Arc::new(Quiet::new(Arc::new(RealTimer)));
+            // A clock that stands still until it is moved, so what is left of a delay is exactly
+            // what the test made it.
+            let quiet = Arc::new(Quiet::new(HeldTimer::automatic()));
             let renewed = Arc::new(Notify::new());
+            let asked = Arc::new(Notify::new());
+            let runtime = tempfile::tempdir().expect("a runtime directory");
             let service = Arc::new(Unreached::default());
             let origin = GatewayOrigin::new("https://storage.example").expect("an origin");
             let relay = BackupRelay::over_tokens(
@@ -570,11 +581,14 @@ mod tests {
                 Arc::new(crate::account::HostAccount::new(
                     Arc::new(kr_crypto::store::MemoryStore::default()),
                     kr_protocol::ids::EnvironmentId::new(Uuid::from_bytes([9; 16])),
-                    std::env::temp_dir().as_path(),
+                    runtime.path(),
                     Err(kr_protocol::host_account::SignInUnavailable::NotUsable),
                     None,
                 )),
-                Arc::new(Renewing(Arc::clone(&renewed))),
+                Arc::new(Renewing {
+                    renewed: Arc::clone(&renewed),
+                    asked: Arc::clone(&asked),
+                }),
                 Arc::clone(&quiet),
                 privacy.clone(),
             )
@@ -585,6 +599,8 @@ mod tests {
                 privacy,
                 quiet,
                 renewed,
+                asked,
+                _runtime: runtime,
             }
         }
 
@@ -624,7 +640,10 @@ mod tests {
                 change(&self.privacy, &self.quiet);
             }
             let asking = tokio::spawn(async move { relay.read(read, state(1, false)).await });
-            tokio::task::yield_now().await;
+            if waits {
+                // The read is waiting for its token once the token source has been asked.
+                self.asked.notified().await;
+            }
             if let Some(change) = change.take() {
                 change(&self.privacy, &self.quiet);
             }
@@ -700,6 +719,34 @@ mod tests {
                 "{read:?}: the gate's own refusal did not move the deadline on the record"
             );
         }
+    }
+
+    /// The gate itself refuses a request that would leave inside a delay on the record, for a
+    /// generation read, which asks for no token and so has no wait in which a delay could be
+    /// recorded: the check is made directly, with the delay already owed when the request is to
+    /// leave. Without it the read's early check is all that stands.
+    #[tokio::test]
+    async fn a_generation_read_is_refused_by_the_gate_inside_a_delay_on_the_record() {
+        let rig = Rig::new();
+        rig.quiet.owe(Duration::from_secs(45));
+        let refused = READING
+            .scope(
+                state(1, false),
+                rig.relay.generation(ArchiveId::new(Uuid::from_bytes([2; 16])), None),
+            )
+            .await
+            .expect_err("the gate refuses inside a delay");
+        assert_eq!(refused.code(), ErrorCode::RateLimited);
+        assert_eq!(rig.service.0.load(Ordering::SeqCst), 0);
+        // The control: with no delay on the record the same call sends.
+        let free = Rig::new();
+        let _ = READING
+            .scope(
+                state(1, false),
+                free.relay.generation(ArchiveId::new(Uuid::from_bytes([2; 16])), None),
+            )
+            .await;
+        assert_eq!(free.service.0.load(Ordering::SeqCst), 1);
     }
 
     /// A read that does not say which state it began under is not sent: the check compares with
