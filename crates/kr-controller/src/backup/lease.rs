@@ -36,13 +36,15 @@ use crate::error::ControllerError;
 pub(super) struct Leases {
     live: BTreeMap<u64, Arc<AtomicBool>>,
     next: u64,
+    /// Whether the daemon is stopping: a lease granted after that is cancelled when it is made.
+    stopping: bool,
 }
 
 impl Leases {
     pub(super) fn grant(&mut self) -> (u64, Arc<AtomicBool>) {
         let id = self.next;
         self.next += 1;
-        let flag = Arc::new(AtomicBool::new(false));
+        let flag = Arc::new(AtomicBool::new(self.stopping));
         self.live.insert(id, Arc::clone(&flag));
         (id, flag)
     }
@@ -56,6 +58,12 @@ impl Leases {
         for flag in self.live.values() {
             flag.store(true, Ordering::SeqCst);
         }
+    }
+
+    /// Cancels every lease that is live, and every one granted from now on.
+    pub(super) fn stop(&mut self) {
+        self.stopping = true;
+        self.cancel_all();
     }
 
     /// Whether a pass is running.

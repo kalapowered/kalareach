@@ -1074,9 +1074,10 @@ impl BackupService {
         Ok(released)
     }
 
-    /// Tells every production pass to stop where it is. Nothing waits for any of them.
+    /// Tells every production pass to stop where it is, and any that begins afterwards. Nothing
+    /// waits for any of them.
     pub fn stop_production_passes(&self) {
-        self.leases().cancel_all();
+        self.leases().stop();
     }
 
     /// Removes the files in the staging directory that no object row names, and the directories
@@ -1091,7 +1092,7 @@ impl BackupService {
     /// # Errors
     ///
     /// Returns [`ControllerError::RegistryUnavailable`] when the store or the directory cannot be
-    /// read.
+    /// read, a file cannot be removed, or the staging directory cannot be flushed.
     pub fn remove_unclaimed_staging(&self) -> Result<u64> {
         let store = self.store();
         if self.leases().any() {
@@ -1111,11 +1112,9 @@ impl BackupService {
                 let _ = std::fs::remove_dir(directory);
             }
         }
-        // The sweep runs again before every pass, so a removal whose flush fails and is undone by
-        // a power loss is found and removed once more; the failure still stops the pass.
-        for path in &found {
-            sync_removal(path)?;
-        }
+        // The whole staging directory is flushed on every sweep, the one that found nothing
+        // included: a removal whose flush failed last time is not a removal that is made.
+        flush_staging_tree(store.staging_root())?;
         Ok(removed)
     }
 
@@ -1819,8 +1818,14 @@ fn sync_removal(path: &Path) -> Result<()> {
 pub(super) fn flush_staging_tree(root: &Path) -> Result<()> {
     for entry in std::fs::read_dir(root).map_err(ControllerError::registry)? {
         let path = entry.map_err(ControllerError::registry)?.path();
-        if path.is_dir() {
-            flush_directory(&path, NameKind::File).map_err(ControllerError::registry)?;
+        // A directory that is gone since the listing was taken has nothing left to flush; the
+        // flush of the root below makes its removal durable.
+        if path.is_dir() && path.exists() {
+            match flush_directory(&path, NameKind::File) {
+                Ok(()) => {}
+                Err(_) if !path.exists() => {}
+                Err(error) => return Err(ControllerError::registry(error)),
+            }
         }
     }
     flush_directory(root, NameKind::Directory).map_err(ControllerError::registry)

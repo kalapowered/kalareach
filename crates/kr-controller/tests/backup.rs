@@ -9958,3 +9958,44 @@ fn a_removal_that_could_not_be_flushed_holds_the_cleanup_open_across_a_restart()
         "the directory is flushed and the cleanup completes"
     );
 }
+
+/// The sweep of unclaimed files reports success only when the staging directory has been made
+/// durable, on every call: a sweep that finds nothing, after one that removed a file and could not
+/// flush, is not a sweep that succeeded.
+#[test]
+fn the_sweep_is_not_done_while_the_staging_directory_cannot_be_flushed() {
+    let environment = Environment::open();
+    let service = environment.service();
+    let root = service.staging_root();
+    let strays = root.join("stray-1");
+    std::fs::create_dir_all(&strays).expect("a directory of a pass that was killed");
+    std::fs::write(strays.join("lost.krb"), b"ciphertext nothing names").expect("a stray file");
+
+    let refused = kr_flush::testing::refuse_flushes_of(root.clone());
+    assert!(
+        service.remove_unclaimed_staging().is_err(),
+        "the file went and the flush failed"
+    );
+    assert!(files_under(&root).is_empty(), "the stray file is gone");
+    assert!(
+        service.remove_unclaimed_staging().is_err(),
+        "a sweep that finds nothing does not make the failed flush a success"
+    );
+    drop(refused);
+    assert_eq!(service.remove_unclaimed_staging().expect("a sweep"), 0);
+}
+
+/// A pass that begins after the daemon was told to stop is cancelled when it is granted, so a
+/// look that had not yet taken its lease does not start work the stop was meant to end.
+#[test]
+fn a_pass_that_begins_after_the_stop_is_cancelled() {
+    let environment = Environment::open();
+    let service = environment.service();
+    let before = service.begin_production().expect("a lease");
+    assert!(!before.is_cancelled(), "the control: no stop yet");
+    service.stop_production_passes();
+    assert!(before.is_cancelled());
+    drop(before);
+    let after = service.begin_production().expect("a lease");
+    assert!(after.is_cancelled());
+}

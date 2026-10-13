@@ -239,11 +239,11 @@ impl Drop for PassPause {
 /// Stops the producer's passes when it is dropped; see
 /// [`Controller::stop_backup_production_when_dropped`].
 #[derive(Debug)]
-pub struct StopBackupProduction(Arc<Controller>);
+pub struct StopBackupProduction(Arc<crate::backup::BackupService>);
 
 impl Drop for StopBackupProduction {
     fn drop(&mut self) {
-        self.0.backup.stop_production_passes();
+        self.0.stop_production_passes();
     }
 }
 
@@ -272,7 +272,7 @@ impl Controller {
     /// pass to read and seal everything it has begun. Nothing waits for the pass.
     #[must_use = "the passes are stopped when the guard is dropped"]
     pub fn stop_backup_production_when_dropped(self: &Arc<Self>) -> StopBackupProduction {
-        StopBackupProduction(Arc::clone(self))
+        StopBackupProduction(Arc::clone(&self.backup))
     }
 
     /// Puts a pause into the next production pass, after its first member is staged.
@@ -563,7 +563,15 @@ impl Controller {
             paused_once: std::sync::atomic::AtomicBool::new(false),
         };
         let handle = tokio::runtime::Handle::current();
-        let made = tokio::task::spawn_blocking(move || handle.block_on(pass.make())).await;
+        // The pass holds the daemon while it runs, as every write that must not outlive it does:
+        // the environment's lock goes with the daemon, and a pass that is still writing then would
+        // write beside the next daemon.
+        let daemon = Arc::clone(self);
+        let made = tokio::task::spawn_blocking(move || {
+            let _daemon = daemon;
+            handle.block_on(pass.make())
+        })
+        .await;
         match made {
             Ok(Ok(Made::Admitted {
                 left_out,

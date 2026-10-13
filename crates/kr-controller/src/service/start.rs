@@ -1095,8 +1095,6 @@ impl Controller {
             if let Some(runtime) = &controller.backup_runtime {
                 runtime.run();
             }
-            // And what the host makes of its own state is made, for as long as the daemon runs.
-            controller.start_backup_production();
         }
         // A device whose grant runs out while the daemon runs is no longer paired, and its
         // destination, the credential held for it and the authorisation behind it end with that,
@@ -1146,6 +1144,11 @@ impl Controller {
         // to be up before anything is dispatched, and a start that fails anywhere above executes
         // nothing at all.
         controller.automation.start();
+        // What the host makes of its own state is made from here, for as long as the daemon runs.
+        // A pass that is due begins within moments of this, and a start that failed above would
+        // leave it running with nothing to tell it to stop, so it starts after every step that can
+        // fail.
+        controller.start_backup_production();
         Ok(controller)
     }
 
