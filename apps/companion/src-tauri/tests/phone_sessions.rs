@@ -734,7 +734,11 @@ async fn kr_req_19_08_a_prompt_the_host_cannot_establish_reaches_the_page_with_i
             json!({ "params": prompt(session, instance, "never answered"), "opening": "unknown-screen" }),
         )
         .expect("an outcome nobody can establish is an answer with its action, not a refusal");
-    assert_eq!(upstream.prompts().len(), 1, "the frame reached the upstream once");
+    assert_eq!(
+        upstream.prompts().len(),
+        1,
+        "the frame reached the upstream once"
+    );
     assert!(settled["receipt"].is_null(), "{settled}");
     assert!(settled["value"].is_null(), "{settled}");
     let action_id = settled["action_id"]

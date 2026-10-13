@@ -1323,7 +1323,10 @@ async fn read_loop(transport: Arc<dyn ControlTransport>, state: Arc<SessionState
 ///
 /// A host that says it cannot establish whether the action happened has not refused it, and the
 /// client holds the identifier the host's answer lacks, so the two travel together.
-fn refused_or_unknown(action_id: ActionId, error: kr_protocol::error::ProtocolError) -> ClientError {
+fn refused_or_unknown(
+    action_id: ActionId,
+    error: kr_protocol::error::ProtocolError,
+) -> ClientError {
     if error.code.retry_category() == kr_protocol::error::RetryCategory::OutcomeUnknown {
         ClientError::OutcomeUnknown { action_id, error }
     } else {
