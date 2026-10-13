@@ -7,6 +7,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
+use futures_util::FutureExt as _;
 use kr_client::error::ClientError;
 use kr_client::retry::UserAction;
 use kr_client::services::{
@@ -32,7 +33,10 @@ use kr_crypto::backup::{
     StagedObject, seal_archive, stage_object,
 };
 use kr_crypto::keys::{AuthorisationKeyPair, StoredEnvelopeKeyPair};
-use kr_protocol::archive::{ArchiveDescriptor, BackupGenerationPublication, BackupWriterRecord};
+use kr_protocol::archive::{
+    ArchiveDescriptor, BackupGenerationPublication, BackupGenerationPublicationPayload,
+    BackupWriterRecord,
+};
 use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::ids::{ArchiveId, BackupGeneration, BackupObjectId, DeviceId};
 use kr_protocol::pairing::GenerationCheckpoint;
@@ -6235,6 +6239,16 @@ impl Web {
         self.scripted().stored.len()
     }
 
+    /// Makes the service hold a publication it was never sent, as a generation another copy of
+    /// this host's state published would be.
+    fn hold(&self, publication: BackupGenerationPublication) {
+        let descriptor = &publication.payload.descriptor;
+        self.scripted().published.insert(
+            (descriptor.archive_id, descriptor.backup_generation),
+            publication,
+        );
+    }
+
     fn publication(&self, generation: u64) -> Option<BackupGenerationPublication> {
         self.scripted()
             .published
@@ -9723,4 +9737,169 @@ fn a_repeated_setup_leaves_the_binding_and_a_used_archive_is_not_set_up_again() 
         ),
         "a late repeat for the archive that was replaced does not bring it back"
     );
+}
+
+/// The publication of `generation` as the writer signs it, or with its signature spoiled.
+fn publication_of(
+    producer: &Producer,
+    generation: u64,
+    signed: bool,
+) -> BackupGenerationPublication {
+    let objects = [stage(0x70, "held.cbor", b"held")];
+    let sealed = producer.seal_with_manifest(generation, &objects, object_id(0xf1));
+    let payload = BackupGenerationPublicationPayload {
+        descriptor: sealed.descriptor.clone(),
+        writer_key_id: producer.writer.key_id(),
+        published_at_ms: TimestampMs::new(9_000),
+    };
+    let transcript = kr_crypto::sign::SigningTranscript::from_canonical_bytes(
+        kr_protocol::archive::BACKUP_PUBLICATION_DOMAIN,
+        payload.signing_input().expect("a publication input"),
+    )
+    .expect("a transcript");
+    let signing = if signed {
+        &producer.writer
+    } else {
+        &AuthorisationKeyPair::generate().expect("another key")
+    };
+    let signature = kr_crypto::sign::sign(signing, &transcript).expect("a signature");
+    BackupGenerationPublication { payload, signature }
+}
+
+/// The service names a generation number higher than the host has made, because the host's state
+/// is older than the service's chain. The host's count follows the number only when the
+/// publication it comes from verifies under the host's own writer key: otherwise the number is only
+/// the service's word, and a count raised by it would skip every number below it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_count_follows_the_service_only_for_a_publication_the_writer_signed() {
+    for signed in [true, false] {
+        let host = Host::open();
+        host.set_up();
+        host.web.hold(publication_of(&host.producer, 5, signed));
+        host.admit(1, &[64]);
+        let mut uploader = host.uploader(10_000);
+        passes(&mut uploader, 10_000).await;
+        assert_eq!(host.generation(1).production, Production::Cancelled);
+        let counted = host
+            .service
+            .setup()
+            .expect("a read")
+            .expect("a setup")
+            .generation_counter;
+        assert_eq!(counted, if signed { 5 } else { 1 }, "signed: {signed}");
+    }
+}
+
+/// A generation after a complete privacy cycle is one privacy mode drew a line under: retention
+/// does not delete its objects, whatever newer generations are published. The control is the same
+/// host before the cycle.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retention_leaves_a_generation_privacy_mode_drew_a_line_under() {
+    let host = Host::open();
+    host.set_up();
+    let mut uploader = host.uploader(10_000);
+    host.publish_generations(&mut uploader, 1, 3).await;
+    let ask = |generation: u64| {
+        let mut store = BackupStore::open(&host.state).expect("the store");
+        store.note_retained_deletion_asked(
+            archive_id(),
+            BackupGeneration::new(generation),
+            member_of(generation, 0),
+            2,
+            TimestampMs::new(99_000),
+        )
+    };
+
+    host.service
+        .raise_fence(PrivacyGeneration::new(1), TimestampMs::new(98_000))
+        .expect("the fence goes up");
+    host.service
+        .cancel_undispatched_work(PrivacyGeneration::new(1), TimestampMs::new(98_100))
+        .expect("the work is taken back");
+    host.service
+        .run_cleanup(PrivacyGeneration::new(1), TimestampMs::new(98_200))
+        .expect("cleanup");
+    assert_eq!(
+        host.service
+            .release_fence(
+                PrivacyGeneration::new(1),
+                PrivacyGeneration::new(2),
+                TimestampMs::new(98_300),
+            )
+            .expect("a release"),
+        FenceRelease::Released
+    );
+    assert!(matches!(ask(1), Err(ControllerError::Refused { .. })));
+
+    // The control: a generation admitted after the cycle is deleted in its turn.
+    host.publish_generations(&mut uploader, 4, 6).await;
+    ask(4).expect("a generation of the generation in force, with two newer published");
+}
+
+/// The end of a production pass wakes what releases its ciphertext and what finishes the cleanup a
+/// fence owes, and does not wake the producer: a pass that failed would otherwise begin again at
+/// once and never wait out its delay.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_end_of_a_pass_does_not_wake_the_producer() {
+    let environment = Environment::open();
+    let service = environment.service();
+    let signals = service.signals();
+    let lease = service.begin_production().expect("a lease");
+    drop(lease);
+    assert!(
+        signals.lease_ended.notified().now_or_never().is_some(),
+        "the cleanup a fence owes is told the pass is over"
+    );
+    assert!(
+        signals.work.notified().now_or_never().is_some(),
+        "what releases ciphertext is told"
+    );
+    assert!(
+        signals.produce.notified().now_or_never().is_none(),
+        "the producer is not told"
+    );
+}
+
+/// A number at or below the last one this host made is not made again, whether or not a
+/// generation of that number is still there: cleanup frees numbers, and the count keeps them.
+#[test]
+fn a_generation_number_at_or_below_the_count_is_not_admitted() {
+    let root = tempfile::tempdir().expect("a disposable directory");
+    let service = BackupService::in_memory(&root.path().join("backup")).expect("a service");
+    service
+        .reconcile(TimestampMs::new(4_000))
+        .expect("reconciliation");
+    let producer = Producer::generate();
+    service
+        .commit_setup(
+            &a_setup(archive_id(), &producer, "ABCD2345"),
+            false,
+            TimestampMs::new(1_000),
+        )
+        .expect("written");
+    service
+        .raise_generation_counter(archive_id(), BackupGeneration::new(3))
+        .expect("the count is raised");
+    for number in [2, 3] {
+        let objects = [stage(1, "a.cbor", b"one")];
+        let refused = service.admit(
+            &producer.seal(number, &objects),
+            &objects,
+            producer.writer.key_id(),
+            TimestampMs::new(5_000),
+        );
+        assert!(
+            matches!(refused, Err(ControllerError::InvalidArgument(_))),
+            "{number}: {refused:?}"
+        );
+    }
+    let objects = [stage(1, "a.cbor", b"one")];
+    service
+        .admit(
+            &producer.seal(4, &objects),
+            &objects,
+            producer.writer.key_id(),
+            TimestampMs::new(5_100),
+        )
+        .expect("the number after the count is admitted");
 }

@@ -116,8 +116,11 @@ pub enum Held {
     NothingChanged,
     /// There is nothing to pack: no closed session with output and no configuration document.
     NothingToPack,
-    /// A pass failed, and the host tries again after a wait.
-    Failed(String),
+    /// A pass was stopped before it finished, or could not begin, because privacy mode, a change
+    /// of the setup or the store's state interrupted it, and the host looks again soon.
+    Interrupted,
+    /// A pass failed, for this reason, and the host tries again after a wait.
+    Failed(&'static str),
 }
 
 /// What the producer last found, for `kr doctor`.
@@ -126,6 +129,8 @@ pub(crate) struct Observed {
     held: Option<Held>,
     /// How many closed sessions the last pass left out, and whether the configuration was.
     left_out_sessions: u64,
+    /// How many of those were left out because their output could not be read.
+    left_out_unreadable: u64,
     left_out_configuration: bool,
     /// How many sessions had not closed at the last pass, and so are in no backup yet.
     open_sessions: u64,
@@ -141,6 +146,12 @@ pub(crate) struct Production {
     pub(crate) timer: Arc<dyn Timer>,
     bounds: Mutex<ProducerBounds>,
     observed: Mutex<Observed>,
+    /// How many times the producer has looked at its checks, for a test to wait on.
+    #[cfg(feature = "testing")]
+    looks: tokio::sync::watch::Sender<u64>,
+    /// A pause a test puts in the pass between two writes.
+    #[cfg(feature = "testing")]
+    pause: Mutex<Option<Arc<Meeting>>>,
 }
 
 impl Production {
@@ -157,6 +168,10 @@ impl Production {
             timer,
             bounds: Mutex::new(ProducerBounds::PRODUCTION),
             observed: Mutex::default(),
+            #[cfg(feature = "testing")]
+            looks: tokio::sync::watch::channel(0).0,
+            #[cfg(feature = "testing")]
+            pause: Mutex::new(None),
         }
     }
 
@@ -182,6 +197,41 @@ impl std::fmt::Debug for Production {
     }
 }
 
+/// Where a pass and the test that paused it meet.
+#[cfg(feature = "testing")]
+#[derive(Debug, Default)]
+struct Meeting {
+    reached: tokio::sync::Notify,
+    resume: tokio::sync::Notify,
+}
+
+/// A pause a test puts into a production pass, after its first member is staged: the pass says it
+/// has got there and goes on only when the test lets it, or when this is dropped, so a test that
+/// fails does not leave a pass waiting for ever.
+#[cfg(feature = "testing")]
+#[derive(Debug)]
+pub struct PassPause(Arc<Meeting>);
+
+#[cfg(feature = "testing")]
+impl PassPause {
+    /// Waits until a pass has staged its first member and stopped there.
+    pub async fn reached(&self) {
+        self.0.reached.notified().await;
+    }
+
+    /// Lets the pass go on.
+    pub fn resume(&self) {
+        self.0.resume.notify_one();
+    }
+}
+
+#[cfg(feature = "testing")]
+impl Drop for PassPause {
+    fn drop(&mut self) {
+        self.0.resume.notify_one();
+    }
+}
+
 /// One closed session that may be packed.
 struct Candidate {
     summary: SessionSummary,
@@ -199,6 +249,35 @@ impl Controller {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner) = bounds;
         }
+    }
+
+    /// Tells a production pass that is running to stop where it is, and removes what it wrote. The
+    /// daemon calls this as it stops, so that ending the process does not wait for a pass to read
+    /// and seal everything it has begun. Nothing waits for the pass here.
+    pub fn stop_backup_production(&self) {
+        self.backup.stop_production_passes();
+    }
+
+    /// Puts a pause into the next production pass, after its first member is staged.
+    #[cfg(feature = "testing")]
+    pub fn pause_the_next_pass_after_its_first_member(&self) -> PassPause {
+        let meeting = Arc::new(Meeting::default());
+        if let Some(production) = &self.backup_production {
+            *production
+                .pause
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = Some(Arc::clone(&meeting));
+        }
+        PassPause(meeting)
+    }
+
+    /// The number of times the producer has looked at its checks, which changes at each look.
+    #[cfg(feature = "testing")]
+    pub fn production_looks(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.backup_production.as_ref().map_or_else(
+            || tokio::sync::watch::channel(0).1,
+            |production| production.looks.subscribe(),
+        )
     }
 
     /// Starts the producer's task, which runs until the daemon goes. It holds the daemon weakly.
@@ -233,7 +312,21 @@ impl Controller {
 
     /// One look at the checks, and a generation if they all hold. Returns how long to wait, or none
     /// when only a signal can change what held the pass back.
+    ///
+    /// Everything that reads the store, the secret store or the disk runs on a blocking worker, so
+    /// a cleanup that holds the store for a while never holds a thread of the reactor.
     async fn production_pass(
+        self: &Arc<Self>,
+        production: &Arc<Production>,
+        backoff: &mut Backoff,
+    ) -> Option<Duration> {
+        let wait = self.look_at_the_checks(production, backoff).await;
+        #[cfg(feature = "testing")]
+        production.looks.send_modify(|looks| *looks += 1);
+        wait
+    }
+
+    async fn look_at_the_checks(
         self: &Arc<Self>,
         production: &Arc<Production>,
         backoff: &mut Backoff,
@@ -241,6 +334,8 @@ impl Controller {
         let backup = Arc::clone(&self.backup);
         let facts = {
             let backup = Arc::clone(&backup);
+            let account = Arc::clone(self.host_account());
+            let origin = production.origin.clone();
             tokio::task::spawn_blocking(move || {
                 Ok::<_, ControllerError>((
                     backup.setup()?,
@@ -248,15 +343,18 @@ impl Controller {
                     backup.authorised_writers()?,
                     backup.holds_finished_ciphertext()?,
                     backup.privacy_status()?,
+                    account.mark_at(&origin).map(|mark| mark.to_bytes()),
                 ))
             })
             .await
         };
-        let Ok(Ok((setup, generations, writers, finished, privacy))) = facts else {
-            production.hold(Held::Failed(
-                "the backup store could not be read".to_owned(),
+        let Ok(Ok((setup, generations, writers, finished, privacy, account))) = facts else {
+            return Some(failed(
+                production,
+                backoff,
+                "the backup store could not be read",
+                None,
             ));
-            return Some(backoff.next_delay());
         };
         let Some(Setup {
             record,
@@ -270,10 +368,7 @@ impl Controller {
             production.hold(Held::Privacy);
             return None;
         }
-        let account = self.host_account().mark_at(&production.origin);
-        if production.origin != record.origin
-            || account.map(|mark| mark.to_bytes()) != Some(record.account_mark)
-        {
+        if production.origin != record.origin || account != Some(record.account_mark) {
             production.hold(Held::Account);
             return Some(RECHECK);
         }
@@ -335,22 +430,28 @@ impl Controller {
             tokio::task::spawn_blocking(move || backup.remove_unclaimed_staging()).await
         };
         if !matches!(sweep, Ok(Ok(_))) {
-            production.hold(Held::Failed(
-                "the staging directory could not be swept".to_owned(),
+            return Some(failed(
+                production,
+                backoff,
+                "the staging directory could not be swept",
+                None,
             ));
-            return Some(backoff.next_delay());
         }
         let published = self.privacy.state().now();
         if published.private {
             production.hold(Held::Privacy);
             return None;
         }
-        let lease = match backup.begin_production() {
-            Ok(lease) => lease,
+        let lease = {
+            let backup = Arc::clone(&backup);
+            tokio::task::spawn_blocking(move || backup.begin_production()).await
+        };
+        let lease = match lease {
+            Ok(Ok(lease)) => lease,
             // Refused: privacy mode stopped production since the check, or the store is not
-            // ready. The first is signalled when it is over; the second is looked at again soon.
-            Err(_) => {
-                production.hold(Held::Privacy);
+            // ready. The first is signalled when it is over; both are looked at again soon.
+            _ => {
+                production.hold(Held::Interrupted);
                 return Some(RELEASE_WAIT);
             }
         };
@@ -359,8 +460,12 @@ impl Controller {
         let (candidates, open) = match self.closed_candidates().await {
             Ok(found) => found,
             Err(error) => {
-                production.hold(Held::Failed(error.to_string()));
-                return Some(backoff.next_delay());
+                return Some(failed(
+                    production,
+                    backoff,
+                    "the closed sessions could not be listed",
+                    Some(&error),
+                ));
             }
         };
         production.observed().open_sessions = open;
@@ -375,31 +480,42 @@ impl Controller {
         {
             let mut observed = production.observed();
             observed.left_out_sessions = left_out as u64;
+            observed.left_out_unreadable = 0;
             observed.left_out_configuration = configuration.is_none();
         }
         if candidates.is_empty() && configuration.is_none() {
             production.hold(Held::NothingToPack);
             return Some(RECHECK);
         }
-        let unchanged = newest
-            .and_then(|generation| {
-                backup
-                    .made_from(generation.archive_id, generation.backup_generation)
-                    .ok()
-                    .flatten()
+        // Whether the newest generation was made from what would be packed now, and whether the
+        // disk the staging directory is on holds what the pass can need and a gibibyte more, so a
+        // pass never fills the disk the registry and the spools are on.
+        let needed = projected_bytes(&candidates, configuration.as_deref(), bounds);
+        let checks = {
+            let backup = Arc::clone(&backup);
+            let newest =
+                newest.map(|generation| (generation.archive_id, generation.backup_generation));
+            let state_dir = self.paths().state_dir().to_path_buf();
+            tokio::task::spawn_blocking(move || {
+                let unchanged = newest
+                    .and_then(|(archive_id, generation)| {
+                        backup.made_from(archive_id, generation).ok().flatten()
+                    })
+                    .is_some_and(|made| made == fingerprint);
+                let low = kr_describe::resource::platform::free_space(&state_dir)
+                    .is_some_and(|free| free < needed.saturating_add(DISK_RESERVE));
+                (unchanged, low)
             })
-            .is_some_and(|made| made == fingerprint);
+            .await
+        };
+        let Ok((unchanged, low_disk)) = checks else {
+            return Some(failed(production, backoff, "the pass stopped", None));
+        };
         if unchanged {
             production.hold(Held::NothingChanged);
             return Some(RECHECK);
         }
-
-        // The disk the staging directory is on must hold what the pass can need and a gibibyte
-        // more, so a pass never fills the disk the registry and the spools are on.
-        let needed = projected_bytes(&candidates, configuration.as_deref(), bounds);
-        if let Some(free) = kr_describe::resource::platform::free_space(self.paths().state_dir())
-            && free < needed.saturating_add(DISK_RESERVE)
-        {
+        if low_disk {
             production.hold(Held::LowDisk);
             return Some(RECHECK);
         }
@@ -419,32 +535,46 @@ impl Controller {
             writer: production.writer.clone(),
             sender: production.sender.clone(),
             backup: Arc::clone(&backup),
+            #[cfg(feature = "testing")]
+            pause: production
+                .pause
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take(),
         };
         let handle = tokio::runtime::Handle::current();
         let made = tokio::task::spawn_blocking(move || handle.block_on(pass.make())).await;
         match made {
-            Ok(Ok(Made::Admitted { left_out })) => {
-                production.observed().left_out_sessions += left_out;
+            Ok(Ok(Made::Admitted {
+                left_out,
+                unreadable,
+            })) => {
+                {
+                    let mut observed = production.observed();
+                    observed.left_out_sessions += left_out;
+                    observed.left_out_unreadable = unreadable;
+                }
                 production.hold(Held::InProgress);
                 backoff.reset();
                 Some(RECHECK)
             }
+            // Stopped by privacy mode, which signals when it is over, or by a change of the setup.
+            // A fence whose record failed sends no signal, so the pass looks again soon.
             Ok(Ok(Made::Cancelled)) => {
-                production.hold(Held::Privacy);
-                None
+                production.hold(Held::Interrupted);
+                Some(RELEASE_WAIT)
             }
             Ok(Ok(Made::Nothing)) => {
                 production.hold(Held::NothingToPack);
                 Some(RECHECK)
             }
-            Ok(Err(error)) => {
-                production.hold(Held::Failed(error.to_string()));
-                Some(backoff.next_delay())
-            }
-            Err(_) => {
-                production.hold(Held::Failed("the pass stopped".to_owned()));
-                Some(backoff.next_delay())
-            }
+            Ok(Err(error)) => Some(failed(
+                production,
+                backoff,
+                "a generation could not be written or admitted",
+                Some(&error),
+            )),
+            Err(_) => Some(failed(production, backoff, "the pass stopped", None)),
         }
     }
 
@@ -486,7 +616,9 @@ impl Controller {
                 continue;
             }
             let spool = self.paths().session_spool(session_id);
-            let retained = spool_bytes(&spool);
+            let retained = tokio::task::spawn_blocking(move || spool_bytes(&spool))
+                .await
+                .unwrap_or(0);
             if retained == 0 {
                 continue;
             }
@@ -621,9 +753,19 @@ impl Controller {
                 Sentence::new().stated("there is no closed session with output to back up"),
                 None,
             ),
-            Some(Held::Failed(_)) => (
+            Some(Held::Interrupted) => (
+                DoctorStatus::Ok,
+                Sentence::new().stated(
+                    "the last pass was stopped before it finished, by privacy mode or by a change \
+                     of the setup, and looks again soon",
+                ),
+                None,
+            ),
+            Some(Held::Failed(reason)) => (
                 DoctorStatus::Warning,
-                Sentence::new().stated("the last pass failed and will be tried again"),
+                Sentence::new()
+                    .stated("the last pass failed, and will be tried again: ")
+                    .stated(reason),
                 None,
             ),
         };
@@ -638,9 +780,14 @@ impl Controller {
                 .stated("; ")
                 .number(observed.left_out_sessions)
                 .stated(
-                    " closed sessions were left out of the last backup, for its size or because their \
-                     output could not be read",
+                    " closed sessions were left out of the last backup, for its size or its count",
                 );
+            if observed.left_out_unreadable > 0 {
+                detail = detail
+                    .stated(" or because their output could not be read (")
+                    .number(observed.left_out_unreadable)
+                    .stated(" of them)");
+            }
         }
         if observed.left_out_configuration {
             detail = detail.stated("; the configuration document was not packed");
@@ -655,10 +802,27 @@ impl Controller {
     }
 }
 
+/// Records that a pass failed for `reason`, writes what went wrong to the daemon's log, and gives
+/// the wait before the next try: it doubles from a minute to an hour.
+fn failed(
+    production: &Production,
+    backoff: &mut Backoff,
+    reason: &'static str,
+    error: Option<&ControllerError>,
+) -> Duration {
+    match error {
+        Some(error) => eprintln!("kr-controller: a backup pass failed: {reason}: {error}"),
+        None => eprintln!("kr-controller: a backup pass failed: {reason}"),
+    }
+    production.hold(Held::Failed(reason));
+    backoff.next_delay()
+}
+
 /// How the pass ended.
 enum Made {
-    /// A generation was admitted, with this many sessions left out for size.
-    Admitted { left_out: u64 },
+    /// A generation was admitted, with this many sessions left out in all, this many of them
+    /// because their output could not be read.
+    Admitted { left_out: u64, unreadable: u64 },
     /// Every member was left out, so there was nothing to make a generation of.
     Nothing,
     /// Privacy mode cancelled the pass; whatever it wrote is gone.
@@ -682,6 +846,8 @@ struct Pass {
     writer: AuthorisationKeyPair,
     sender: StoredEnvelopeKeyPair,
     backup: Arc<crate::backup::BackupService>,
+    #[cfg(feature = "testing")]
+    pause: Option<Arc<Meeting>>,
 }
 
 /// The pages of a closed session's retained output, read from the archive under the lease.
@@ -709,6 +875,17 @@ impl PageSource for SpoolPages<'_> {
 }
 
 impl Pass {
+    /// Where a test holds the pass between two writes. Returns whether the pass was cancelled
+    /// while it was held.
+    #[cfg(feature = "testing")]
+    async fn paused_after_a_member(&self) -> bool {
+        if let Some(meeting) = &self.pause {
+            meeting.reached.notify_one();
+            meeting.resume.notified().await;
+        }
+        self.lease.is_cancelled()
+    }
+
     async fn make(self) -> Result<Made> {
         let mut objects: Vec<StagedObject> = Vec::new();
         // The configuration is counted first, so the members together never pass the total a
@@ -790,6 +967,10 @@ impl Pass {
                 return Ok(Made::Cancelled);
             }
             objects.push(staged);
+            #[cfg(feature = "testing")]
+            if self.paused_after_a_member().await {
+                return Ok(Made::Cancelled);
+            }
         }
         if let Some(document) = &self.configuration {
             let mut staged = stage_object(
@@ -805,6 +986,10 @@ impl Pass {
                 return Ok(Made::Cancelled);
             }
             objects.push(staged);
+            #[cfg(feature = "testing")]
+            if self.paused_after_a_member().await {
+                return Ok(Made::Cancelled);
+            }
         }
         if objects.is_empty() {
             return Ok(Made::Nothing);
@@ -857,7 +1042,10 @@ impl Pass {
             fingerprint,
             TimestampMs::new(self.now_ms),
         ) {
-            Ok(_) => Ok(Made::Admitted { left_out }),
+            Ok(_) => Ok(Made::Admitted {
+                left_out,
+                unreadable: unreadable.len() as u64,
+            }),
             // Privacy mode cancelled the pass between its last write and its admission.
             Err(ControllerError::Refused { .. }) if self.lease.is_cancelled() => {
                 Ok(Made::Cancelled)

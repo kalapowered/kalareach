@@ -312,6 +312,9 @@ async fn run(
             println!("kr-controller: stopped: an update of this host replaces this daemon");
         }
     }
+    // A backup pass that is reading and sealing is told to stop, so that ending the process does
+    // not wait for it to finish its members.
+    controller.stop_backup_production();
     Ok(())
 }
 

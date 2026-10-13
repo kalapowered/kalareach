@@ -1725,6 +1725,24 @@ impl BackupStore {
                 ),
             });
         }
+        // A number at or below the last one made is taken: the setup counts upward, and a number
+        // that cleanup freed or the service refused is not made again.
+        let counted: Option<i64> = transaction
+            .read_one(
+                sql!(
+                    "SELECT generation_counter FROM host_backup
+                      WHERE id = 0 AND archive_id = ?1"
+                ),
+                params![archive],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(ControllerError::registry)?;
+        if counted.is_some_and(|counted| counted >= generation) {
+            return Err(ControllerError::InvalidArgument(
+                "that backup generation number is not above the last this host made".to_owned(),
+            ));
+        }
         transaction
             .run(
                 sql!(

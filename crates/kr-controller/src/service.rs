@@ -79,6 +79,8 @@ mod voice_actions;
 mod voice_close;
 mod workers;
 
+#[cfg(feature = "testing")]
+pub use backup_production::PassPause;
 pub use backup_production::{Held as ProductionHeld, ProducerBounds};
 
 pub use barrier::DEBT_PASS_INTERVAL;

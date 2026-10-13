@@ -662,7 +662,7 @@ impl BackupService {
         // A pass that holds the staging directory may be between two writes, so the scan that
         // would call its files unclaimed waits for it. The lease is read in this hold of the
         // store, before the walk: a pass cannot write and end between the walk and the discharge.
-        let writing = self.leases().any();
+        let writing = self.staging_is_unsettled();
         match Self::cleanup_within_store(&mut store, writing, now_ms) {
             Ok(removed) => {
                 self.note_step_succeeded(PrivacyStep::Remove, generation.get());
@@ -690,7 +690,8 @@ impl BackupService {
                 // Not discharged, and the report says why.
                 store.note_obligation_failed(
                     obligation.id,
-                    "a backup pass is still writing to the staging directory",
+                    "a backup pass is still writing to the staging directory, or has removals it \
+                     has not yet flushed",
                     now_ms,
                 )?;
                 continue;
@@ -736,6 +737,13 @@ impl BackupService {
                     store.note_obligation_failed(obligation.id, &error.to_string(), now_ms)?;
                     continue;
                 }
+            }
+            // The directory of a generation goes with its last file; one that still holds another
+            // object stays.
+            if let Some(directory) = path.parent()
+                && directory != store.staging_root()
+            {
+                let _ = std::fs::remove_dir(directory);
             }
             // The name is gone from the directory, and the directory entry is flushed so losing
             // power cannot bring it back. A flush this host could not make is not a removal it may
@@ -1063,6 +1071,24 @@ impl BackupService {
         Ok(released)
     }
 
+    /// Tells every production pass to stop where it is. Nothing waits for any of them.
+    pub fn stop_production_passes(&self) {
+        self.leases().cancel_all();
+    }
+
+    /// Whether a pass still holds the staging directory, or took files away that a flush has not
+    /// yet made durable. A flush that failed before is tried again here.
+    fn staging_is_unsettled(&self) -> bool {
+        let pending = self.leases().take_unflushed();
+        let failed: Vec<PathBuf> = pending
+            .into_iter()
+            .filter(|path| sync_removal(path).is_err())
+            .collect();
+        let mut leases = self.leases();
+        leases.leave_unflushed(failed);
+        leases.any() || leases.has_unflushed()
+    }
+
     /// Removes the files in the staging directory that no object row names, and the directories
     /// they leave empty.
     ///
@@ -1078,7 +1104,7 @@ impl BackupService {
     /// read.
     pub fn remove_unclaimed_staging(&self) -> Result<u64> {
         let store = self.store();
-        if self.leases().any() {
+        if self.staging_is_unsettled() {
             return Ok(0);
         }
         let found = unregistered_staged_files(&store)?;
@@ -1093,8 +1119,15 @@ impl BackupService {
                 let _ = std::fs::remove_dir(directory);
             }
         }
-        for path in &found {
-            sync_removal(path)?;
+        // A flush that fails is kept to be tried again: the names are gone from the directory and
+        // no later sweep would find them, but losing power could bring them back.
+        let failed: Vec<PathBuf> = found
+            .iter()
+            .filter(|path| sync_removal(path).is_err())
+            .cloned()
+            .collect();
+        if !failed.is_empty() {
+            self.leases().leave_unflushed(failed);
         }
         Ok(removed)
     }
@@ -1165,7 +1198,7 @@ impl BackupService {
         if lease.is_cancelled() {
             return Err(ControllerError::Refused {
                 code: kr_protocol::error::ErrorCode::PermissionDenied,
-                detail: "this backup pass was cancelled by privacy mode".to_owned(),
+                detail: "this backup pass was cancelled, by privacy mode or by a replacement of the setup".to_owned(),
             });
         }
 
@@ -1316,7 +1349,7 @@ impl BackupService {
                 .map_err(|staging| match staging {
                     Staging::Cancelled => ControllerError::Refused {
                         code: kr_protocol::error::ErrorCode::PermissionDenied,
-                        detail: "this backup pass was cancelled by privacy mode".to_owned(),
+                        detail: "this backup pass was cancelled, by privacy mode or by a replacement of the setup".to_owned(),
                     },
                     Staging::Failed(error) => error,
                 })
@@ -1985,64 +2018,72 @@ impl PrivacySubsystem for BackupPrivacy<'_> {
             .filter(|attempt| attempt.status == AttemptStatus::Dispatched)
             .map(|attempt| (attempt.archive_id, attempt.backup_generation))
             .collect();
-        Ok(generations
+        let listed = generations
             .into_iter()
-            .filter_map(|record| {
-                let left = record.remote.is_artifact();
-                let in_doubt = unanswered.iter().any(|(archive, generation)| {
-                    *archive == record.archive_id && *generation == record.backup_generation
-                });
-                if !left && !in_doubt {
-                    return None;
-                }
-                // What this host has deleted at the service. A generation all of whose objects it
-                // deleted is shown until the service removes them, which is the tombstone window
-                // after the last deletion, and not after; one it deleted some of is shown as that.
-                let objects = store
-                    .objects(record.archive_id, record.backup_generation)
-                    .ok()?;
-                let deleted: Vec<u64> = objects
-                    .iter()
-                    .filter_map(|object| object.released_at_ms.map(TimestampMs::get))
-                    .collect();
-                let wholly_deleted = !objects.is_empty() && deleted.len() == objects.len();
-                if wholly_deleted
-                    && deleted.iter().max().is_some_and(|last| {
-                        self.now_ms.get() >= last.saturating_add(TOMBSTONE_DAYS * 86_400_000)
-                    })
-                {
-                    return None;
-                }
-                Some(Exported {
-                    kind: if wholly_deleted {
-                        "backup archive, deleted and awaiting removal at the service".to_owned()
-                    } else if !deleted.is_empty() {
-                        "backup archive, partly deleted".to_owned()
-                    } else if record.remote == Remote::Published {
-                        "backup archive".to_owned()
-                    } else if in_doubt || record.remote == Remote::Unknown {
-                        // Something of it left this host and nothing here knows whether a service
-                        // kept it. A person is told that rather than told nothing.
-                        "backup archive, outcome unknown".to_owned()
-                    } else {
-                        // A service acknowledged its ciphertext and no descriptor of it was
-                        // published. The bytes are there; the archive is not complete.
-                        "backup object ciphertext".to_owned()
-                    },
-                    reference: format!(
-                        "{} generation {}",
-                        record.archive_id,
-                        record.backup_generation.get()
-                    ),
-                    left_at_ms: record.settled_at_ms.unwrap_or(record.created_at_ms),
-                    // False, and it stays false until this host holds a route to ask for the
-                    // removal. `deletable` says this host has a way to ask; it does not say a
-                    // person cannot ask the service themselves. Claiming otherwise would offer an
-                    // action nothing here can perform, which is the false promise section 24
-                    // forbids.
-                    deletable: false,
-                })
-            })
-            .collect())
+            .map(
+                |record| -> std::result::Result<Option<Exported>, Unavailable> {
+                    let left = record.remote.is_artifact();
+                    let in_doubt = unanswered.iter().any(|(archive, generation)| {
+                        *archive == record.archive_id && *generation == record.backup_generation
+                    });
+                    if !left && !in_doubt {
+                        return Ok(None);
+                    }
+                    // What this host has deleted at the service. A generation all of whose objects it
+                    // deleted is shown until the service removes them, which is the tombstone window
+                    // after the last deletion, and not after; one it deleted some of is shown as that.
+                    let objects = store
+                        .objects(record.archive_id, record.backup_generation)
+                        .map_err(|error| {
+                            unavailable(
+                                "the backup store cannot list a generation's objects",
+                                &error,
+                            )
+                        })?;
+                    let deleted: Vec<u64> = objects
+                        .iter()
+                        .filter_map(|object| object.released_at_ms.map(TimestampMs::get))
+                        .collect();
+                    let wholly_deleted = !objects.is_empty() && deleted.len() == objects.len();
+                    if wholly_deleted
+                        && deleted.iter().max().is_some_and(|last| {
+                            self.now_ms.get() >= last.saturating_add(TOMBSTONE_DAYS * 86_400_000)
+                        })
+                    {
+                        return Ok(None);
+                    }
+                    Ok(Some(Exported {
+                        kind: if wholly_deleted {
+                            "backup archive, deleted and awaiting removal at the service".to_owned()
+                        } else if !deleted.is_empty() {
+                            "backup archive, partly deleted".to_owned()
+                        } else if record.remote == Remote::Published {
+                            "backup archive".to_owned()
+                        } else if in_doubt || record.remote == Remote::Unknown {
+                            // Something of it left this host and nothing here knows whether a service
+                            // kept it. A person is told that rather than told nothing.
+                            "backup archive, outcome unknown".to_owned()
+                        } else {
+                            // A service acknowledged its ciphertext and no descriptor of it was
+                            // published. The bytes are there; the archive is not complete.
+                            "backup object ciphertext".to_owned()
+                        },
+                        reference: format!(
+                            "{} generation {}",
+                            record.archive_id,
+                            record.backup_generation.get()
+                        ),
+                        left_at_ms: record.settled_at_ms.unwrap_or(record.created_at_ms),
+                        // False, and it stays false until this host holds a route to ask for the
+                        // removal. `deletable` says this host has a way to ask; it does not say a
+                        // person cannot ask the service themselves. Claiming otherwise would offer an
+                        // action nothing here can perform, which is the false promise section 24
+                        // forbids.
+                        deletable: false,
+                    }))
+                },
+            )
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(listed.into_iter().flatten().collect())
     }
 }

@@ -56,7 +56,9 @@ use kr_protocol::ids::{
 };
 use kr_protocol::local::LocalClientKind;
 use kr_protocol::method::Method;
-use kr_protocol::privacy::PrivacySetParams;
+use kr_protocol::privacy::{
+    PrivacyCompletion, PrivacyReport, PrivacySetParams, PrivacyStatusParams,
+};
 use kr_protocol::scalars::{AuthorisationKey, Nullable, Signature64, TimestampMs, Uuid};
 use kr_protocol::service::{GatewayOrigin, ServiceRequestSigner};
 use kr_service_stand_in::{ACCOUNT, Moment, Served, TOKEN, serve};
@@ -479,6 +481,39 @@ impl Rig {
             .await
             .expect("the call reaches the daemon")
             .is_ok()
+    }
+
+    /// Where privacy mode stands, as `privacy.status` says.
+    async fn privacy_report(&self) -> PrivacyReport {
+        let mut client = LocalClient::connect(&self.client_endpoint, LocalClientKind::Cli, build())
+            .await
+            .expect("connects");
+        client
+            .request(Method::PrivacyStatus, &PrivacyStatusParams {})
+            .await
+            .expect("the call reaches the daemon")
+            .expect("privacy mode's report")
+            .to_typed()
+            .expect("decodes")
+    }
+
+    /// Whether privacy mode's last change has finished taking effect.
+    async fn privacy_complete(&self) -> bool {
+        matches!(
+            self.privacy_report().await.completion,
+            PrivacyCompletion::Complete
+        )
+    }
+
+    /// Waits until the producer has looked at its checks `looks` times in all.
+    async fn production_looked(&self, looks: u64) {
+        let mut seen = self.controller.production_looks();
+        within("the producer's look", async {
+            while *seen.borrow_and_update() < looks {
+                seen.changed().await.expect("the producer is running");
+            }
+        })
+        .await;
     }
 
     /// Turns privacy mode on and waits until the daemon has ended the work it had in hand, which is
@@ -3580,5 +3615,236 @@ async fn the_configuration_is_counted_in_the_total_a_restore_accepts() {
             .map(|member| member.len() as u64)
             .sum::<u64>()
             <= total
+    );
+}
+
+/// Whether this user can write to a directory whose mode forbids it, as a superuser can: a test
+/// that makes a write fail by a directory's mode has nothing to show then.
+#[cfg(unix)]
+fn can_write_through_a_forbidding_mode(directory: &std::path::Path) -> bool {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o500))
+        .expect("the directory is made read-only");
+    let probe = directory.join("probe");
+    let writes = std::fs::File::create(&probe).is_ok();
+    let _ = std::fs::remove_file(&probe);
+    if writes {
+        std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))
+            .expect("the directory is writable again");
+    }
+    writes
+}
+
+#[cfg(unix)]
+fn allow_writing(directory: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))
+        .expect("the directory is writable again");
+}
+
+/// A pass that fails waits out its delay before it looks again: the end of a pass does not wake
+/// the producer. The directory the pass staged in is writable again by the time it could look, so a
+/// pass that began at once would succeed and the test would see the generation.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_pass_that_fails_waits_before_it_looks_again() {
+    let timer = HeldTimer::held();
+    let rig = Rig::start_with(Arrangement::NORMAL, Arc::clone(&timer), |host| {
+        closed_session(host, b"a session\r\n", 9_000);
+    })
+    .await;
+    let web = Arc::clone(rig.served.web());
+    within("the first status read", web.requests_reach(STATUS, 1)).await;
+    rig.production_looked(1).await;
+    let staging = rig.controller.backup().staging_root();
+    if can_write_through_a_forbidding_mode(&staging) {
+        return;
+    }
+    rig.set_up();
+    rig.production_looked(2).await;
+    let (_, detail) = rig.production_check().await;
+    assert!(detail.contains("the last pass failed"), "{detail}");
+    allow_writing(&staging);
+    for _ in 0..200 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        *rig.controller.production_looks().borrow(),
+        2,
+        "the producer looked again before its delay was over"
+    );
+    assert!(
+        rig.controller
+            .backup()
+            .generations()
+            .expect("a read")
+            .is_empty()
+    );
+
+    // The delay ends, and the next pass makes the generation.
+    timer.run_by_itself();
+    rig.until("the generation is published", |rig| rig.published(1))
+        .await;
+}
+
+/// No new generation is staged while the ciphertext of a finished one is still on the disk, and the
+/// doctor says why; once it is released the next one is made. An unlink that fails stands for the
+/// ciphertext that cannot be released.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn no_generation_is_staged_while_a_finished_ones_ciphertext_is_still_on_the_disk() {
+    let timer = HeldTimer::held();
+    let rig = Rig::start_with(Arrangement::NORMAL, Arc::clone(&timer), |host| {
+        closed_session(host, b"a session\r\n", 9_000);
+    })
+    .await;
+    let web = Arc::clone(rig.served.web());
+    within("the first status read", web.requests_reach(STATUS, 1)).await;
+    // Nothing to pack, so the producer leaves the first generation to the test.
+    let nothing = kr_controller::service::ProducerBounds {
+        configuration_member_bytes: 0,
+        members: 0,
+        ..kr_controller::service::ProducerBounds::PRODUCTION
+    };
+    rig.controller.lower_producer_bounds(nothing);
+    rig.set_up();
+    rig.production_looked(2).await;
+    let (_, detail) = rig.production_check().await;
+    assert!(detail.contains("no closed session"), "{detail}");
+
+    web.fail(PART, 1, Moment::Slow);
+    rig.admit_to_an_enrolled_archive(1, &[(1, plaintext(2048))]);
+    within("the part is on its way", web.requests_reach(PART, 1)).await;
+    let staging = rig.controller.backup().staging_root();
+    let directory = std::fs::read_dir(&staging)
+        .expect("the staging directory")
+        .flatten()
+        .map(|entry| entry.path())
+        .find(|path| path.is_dir())
+        .expect("the generation's directory");
+    if can_write_through_a_forbidding_mode(&directory) {
+        web.release_held();
+        return;
+    }
+    web.release_held();
+    rig.until("the first generation is published", |rig| rig.published(1))
+        .await;
+    let staged = walk(&staging);
+    assert!(staged > 0, "its ciphertext cannot be released");
+
+    // Now there is something to pack, a day on.
+    rig.controller
+        .lower_producer_bounds(kr_controller::service::ProducerBounds::PRODUCTION);
+    timer.advance_day(Duration::from_secs(25 * 3600));
+    rig.controller.backup().signals().produce.notify_one();
+    let looked = *rig.controller.production_looks().borrow();
+    rig.production_looked(looked + 1).await;
+    let (status, detail) = rig.production_check().await;
+    assert_eq!(status, DoctorStatus::Warning);
+    assert!(detail.contains("still on this host's disk"), "{detail}");
+    assert_eq!(walk(&staging), staged, "nothing new was staged");
+    assert_eq!(
+        rig.controller.backup().generations().expect("a read").len(),
+        1
+    );
+
+    // The directory can be written again; the release goes through and the next generation follows.
+    allow_writing(&directory);
+    timer.run_by_itself();
+    rig.until("the second generation is published", |rig| rig.published(2))
+        .await;
+}
+
+/// Privacy mode turned on while a pass is between two writes waits for the pass: the backup part
+/// of the cleanup is reported outstanding and privacy mode is not turned off until the pass has
+/// stopped and taken away what it wrote, and the generation that follows holds nothing from the
+/// private time.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn privacy_mode_turned_on_between_two_writes_of_a_pass_waits_for_the_pass() {
+    let timer = HeldTimer::held();
+    let rig = Rig::start(Arrangement::NORMAL, Arc::clone(&timer)).await;
+    let web = Arc::clone(rig.served.web());
+    within("the first status read", web.requests_reach(STATUS, 1)).await;
+    rig.production_looked(1).await;
+    let staging = rig.controller.backup().staging_root();
+    let pause = rig.controller.pause_the_next_pass_after_its_first_member();
+    rig.set_up();
+    within("the pass has staged its first member", pause.reached()).await;
+    assert!(walk(&staging) > 0, "the pass wrote a file");
+
+    assert!(rig.set_privacy(true).await, "privacy mode is turned on");
+    let backup_outstanding = |report: &PrivacyReport| match &report.completion {
+        PrivacyCompletion::Complete => false,
+        PrivacyCompletion::Reconciling { outstanding }
+        | PrivacyCompletion::Unavailable { outstanding, .. } => outstanding
+            .iter()
+            .any(|work| work.subsystem == kr_controller::backup::SUBSYSTEM_NAME),
+    };
+    assert!(
+        backup_outstanding(&rig.privacy_report().await),
+        "the backup cleanup is not complete while the pass can still write"
+    );
+    assert!(
+        !rig.set_privacy(false).await,
+        "privacy mode is not turned off while its cleanup is unfinished"
+    );
+
+    pause.resume();
+    within("the backup cleanup completes", async {
+        while backup_outstanding(&rig.privacy_report().await) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    assert_eq!(walk(&staging), 0, "the pass took away what it wrote");
+    assert!(
+        rig.controller
+            .backup()
+            .generations()
+            .expect("a read")
+            .is_empty(),
+        "nothing was admitted"
+    );
+    assert!(rig.privacy_complete().await);
+
+    assert!(rig.set_privacy(false).await, "privacy mode is turned off");
+    rig.until("a generation follows", |rig| rig.published(1))
+        .await;
+}
+
+/// A daemon that stops tells a pass that is between two writes to stop: the pass writes no more,
+/// takes away what it wrote and admits nothing, so ending the process never waits for it to read
+/// and seal the rest of its members.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_pass_between_two_writes_stops_when_the_daemon_is_told_to_stop() {
+    let timer = HeldTimer::held();
+    let rig = Rig::start(Arrangement::NORMAL, Arc::clone(&timer)).await;
+    let web = Arc::clone(rig.served.web());
+    within("the first status read", web.requests_reach(STATUS, 1)).await;
+    rig.production_looked(1).await;
+    let staging = rig.controller.backup().staging_root();
+    let pause = rig.controller.pause_the_next_pass_after_its_first_member();
+    rig.set_up();
+    within("the pass has staged its first member", pause.reached()).await;
+    assert!(walk(&staging) > 0, "the pass wrote a file");
+
+    rig.controller.stop_backup_production();
+    pause.resume();
+    within("the pass takes away what it wrote", async {
+        while rig.controller.backup().production_running() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    assert_eq!(walk(&staging), 0);
+    assert!(
+        rig.controller
+            .backup()
+            .generations()
+            .expect("a read")
+            .is_empty(),
+        "nothing was admitted"
     );
 }

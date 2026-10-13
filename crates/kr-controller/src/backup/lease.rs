@@ -21,7 +21,7 @@
 //! cleanup read the registry while they hold the store, and the end of a lease takes the registry
 //! alone.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -31,11 +31,15 @@ use kr_protocol::ids::{ArchiveId, BackupGeneration, BackupObjectId};
 use crate::backup::{BackupSignals, sync_removal, write_staged};
 use crate::error::ControllerError;
 
-/// The leases that are live, by identity, each with the flag that cancels it.
+/// The leases that are live, by identity, each with the flag that cancels it, and the removals of
+/// finished passes that are not yet flushed to the disk.
 #[derive(Debug, Default)]
 pub(super) struct Leases {
     live: BTreeMap<u64, Arc<AtomicBool>>,
     next: u64,
+    /// Files a pass took away whose directory it could not flush: losing power could bring the
+    /// names back, so the cleanup a fence owes is not complete while any is left.
+    unflushed: BTreeSet<PathBuf>,
 }
 
 impl Leases {
@@ -61,6 +65,21 @@ impl Leases {
     /// Whether a pass is running.
     pub(super) fn any(&self) -> bool {
         !self.live.is_empty()
+    }
+
+    /// Whether removals are left that a flush has not made durable.
+    pub(super) fn has_unflushed(&self) -> bool {
+        !self.unflushed.is_empty()
+    }
+
+    /// Takes the removals not yet flushed, for the caller to flush outside this lock.
+    pub(super) fn take_unflushed(&mut self) -> BTreeSet<PathBuf> {
+        std::mem::take(&mut self.unflushed)
+    }
+
+    /// Keeps removals whose flush failed, to be tried again.
+    pub(super) fn leave_unflushed(&mut self, paths: impl IntoIterator<Item = PathBuf>) {
+        self.unflushed.extend(paths);
     }
 }
 
@@ -226,8 +245,18 @@ impl ProductionLease {
                 let _ = std::fs::remove_dir(directory);
             }
         }
-        for path in &paths {
-            let _ = sync_removal(path);
+        // A flush that fails is not a removal this host may call done: the names could come back
+        // with a power loss, after the cleanup a fence owes has found nothing. They are kept for
+        // the service to flush again, and the cleanup waits for them.
+        let failed: Vec<PathBuf> = paths
+            .into_iter()
+            .filter(|path| sync_removal(path).is_err())
+            .collect();
+        if !failed.is_empty() {
+            self.leases
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .leave_unflushed(failed);
         }
     }
 }
