@@ -125,15 +125,6 @@ impl SecretName {
         Self::new(format!("{scope}/backup-writer"))
     }
 
-    /// Returns the name of the recovery seed inside `scope`.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the resulting name breaks a name rule.
-    pub fn recovery_seed(scope: &str) -> Result<Self> {
-        Self::new(format!("{scope}/recovery-seed"))
-    }
-
     /// Returns the name of one synchronised collection's key, at one epoch, inside `scope`.
     ///
     /// A shared collection's key is not a device key. It belongs to the collection rather than to
@@ -1418,34 +1409,6 @@ pub fn load_or_create_backup_writer(
     Ok(keys)
 }
 
-/// Writes the recovery seed to its own item.
-///
-/// # Errors
-///
-/// Returns an error when the store rejects the write.
-pub fn store_recovery_seed(
-    store: &dyn SecretStore,
-    scope: &str,
-    seed: &crate::kdf::RecoverySeed,
-) -> Result<()> {
-    store.set(&SecretName::recovery_seed(scope)?, seed.expose())
-}
-
-/// Reads the recovery seed back, or `None` when the host has none.
-///
-/// # Errors
-///
-/// Returns an error when the store fails or the stored value is not 32 bytes.
-pub fn load_recovery_seed(
-    store: &dyn SecretStore,
-    scope: &str,
-) -> Result<Option<crate::kdf::RecoverySeed>> {
-    let Some(stored) = store.get(&SecretName::recovery_seed(scope)?)? else {
-        return Ok(None);
-    };
-    crate::kdf::RecoverySeed::from_stored_bytes(stored.expose()).map(Some)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1469,7 +1432,7 @@ mod tests {
     #[test]
     fn the_memory_store_round_trips_and_deletes() {
         let store = MemoryStore::new();
-        let name = SecretName::new("host/recovery-seed").expect("a name");
+        let name = SecretName::new("host/example-item").expect("a name");
         assert!(store.get(&name).expect("a read").is_none());
         store.set(&name, b"secret").expect("a write");
         assert_eq!(
@@ -1569,22 +1532,6 @@ mod tests {
                 .expect("a read")
                 .is_none()
         );
-    }
-
-    #[test]
-    fn a_recovery_seed_round_trips_through_a_store() {
-        let store = MemoryStore::new();
-        assert!(
-            load_recovery_seed(&store, "host")
-                .expect("a read")
-                .is_none()
-        );
-        let seed = crate::kdf::RecoverySeed::generate().expect("a seed");
-        store_recovery_seed(&store, "host", &seed).expect("a write");
-        let loaded = load_recovery_seed(&store, "host")
-            .expect("a read")
-            .expect("the seed");
-        assert_eq!(loaded.checksum(), seed.checksum());
     }
 
     #[test]

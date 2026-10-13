@@ -24,11 +24,14 @@
 //! generation is sealed; the filenames are inside the encrypted manifest. `backup.sqlite` holds
 //! identities, hashes, sizes, states and the paths of ciphertext.
 
+mod lease;
 pub mod relay;
 pub mod runtime;
 mod statements;
 pub mod store;
 pub mod uploader;
+
+pub use lease::{ProductionLease, StagedFile, Staging};
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -39,7 +42,7 @@ use tokio::sync::Notify;
 use kr_crypto::backup::{SealedArchive, StagedObject};
 use kr_flush::{NameKind, flush_directory};
 use kr_protocol::ids::{ArchiveId, BackupGeneration, BackupObjectId};
-use kr_protocol::scalars::{KeyId, TimestampMs};
+use kr_protocol::scalars::{Digest256, KeyId, TimestampMs};
 use kr_worker::privacy::{
     Cancelled, Exported, Fenced, KeptExplicitly, PrivacyGeneration, PrivacySubsystem, Removed,
     Unavailable,
@@ -48,7 +51,7 @@ use kr_worker::privacy::{
 use crate::backup::store::{
     Attempt, AttemptStatus, BackupStore, FenceRelease, GenerationRecord, NewGeneration, NewObject,
     ObjectRecord, Obligation, ObligationKind, PrivacyRequest, PrivacyStatus, Publication, Remote,
-    Step,
+    Setup, SetupCommit, SetupRecord, Step,
 };
 use crate::error::{ControllerError, Result};
 
@@ -259,6 +262,22 @@ pub struct BackupService {
     store: Mutex<BackupStore>,
     readiness: Mutex<Readiness>,
     signals: Arc<BackupSignals>,
+    /// The production passes that hold the staging directory. Always taken after the store, and
+    /// never while waiting for it.
+    leases: Arc<Mutex<lease::Leases>>,
+}
+
+/// What releasing the ciphertext of finished generations did.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Released {
+    /// How many objects' ciphertext was removed from the disk.
+    pub objects: u64,
+    /// How many bytes that was.
+    pub bytes: u64,
+    /// How many objects are still to release, because their removal or its flush failed.
+    pub pending: u64,
+    /// Why the first of them failed.
+    pub failure: Option<String>,
 }
 
 /// What tells whatever carries the outbox to the service that there is something to do.
@@ -273,6 +292,9 @@ pub struct BackupSignals {
     /// A privacy fence was raised, which the carrier answers whatever else it is waiting for,
     /// because the cleanup a fence owes waits for work in flight to end.
     pub fence: Notify,
+    /// A production pass ended, so the cleanup a fence owes, which waits for it, can be tried
+    /// again at once.
+    pub lease_ended: Notify,
 }
 
 impl BackupService {
@@ -289,6 +311,7 @@ impl BackupService {
             store: Mutex::new(BackupStore::open(state_dir)?),
             readiness: Mutex::new(Readiness::default()),
             signals: Arc::default(),
+            leases: Arc::default(),
         })
     }
 
@@ -304,6 +327,7 @@ impl BackupService {
             store: Mutex::new(BackupStore::in_memory(staging_root)?),
             readiness: Mutex::new(Readiness::default()),
             signals: Arc::default(),
+            leases: Arc::default(),
         })
     }
 
@@ -315,6 +339,12 @@ impl BackupService {
 
     fn store(&self) -> std::sync::MutexGuard<'_, BackupStore> {
         self.store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn leases(&self) -> std::sync::MutexGuard<'_, lease::Leases> {
+        self.leases
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
@@ -348,6 +378,9 @@ impl BackupService {
             },
             cause.to_string(),
         );
+        // A host that could not take a privacy step is unready, and a pass that is running is
+        // cancelled with it.
+        self.leases().cancel_all();
     }
 
     /// Records that one privacy step did, in the end, do what it was asked.
@@ -452,6 +485,7 @@ impl BackupService {
         // guard while holding it. Without that, a gate could pass its readiness check and then
         // wait for the store while this failure was being recorded, and produce afterwards.
         let mut store = self.store();
+        self.leases().cancel_all();
         match store.accept_privacy_request(generation.get(), now_ms) {
             Ok(request) => Ok(request),
             Err(error) => {
@@ -481,6 +515,7 @@ impl BackupService {
         now_ms: TimestampMs,
     ) -> Result<Fenced> {
         let mut store = self.store();
+        self.leases().cancel_all();
         match Self::fence_within_store(&mut store, generation, now_ms) {
             Ok(fenced) => {
                 self.note_step_succeeded(PrivacyStep::Fence, generation.get());
@@ -518,6 +553,7 @@ impl BackupService {
         record: impl FnOnce() -> std::result::Result<(), E>,
     ) -> std::result::Result<Result<Fenced>, E> {
         let mut store = self.store();
+        self.leases().cancel_all();
         record()?;
         Ok(
             match Self::fence_within_store(&mut store, generation, now_ms) {
@@ -598,7 +634,11 @@ impl BackupService {
         now_ms: TimestampMs,
     ) -> Result<Removed> {
         let mut store = self.store();
-        match Self::cleanup_within_store(&mut store, now_ms) {
+        // A pass that holds the staging directory may be between two writes, so the scan that
+        // would call its files unclaimed waits for it. The lease is read in this hold of the
+        // store, before the walk: a pass cannot write and end between the walk and the discharge.
+        let writing = self.leases().any();
+        match Self::cleanup_within_store(&mut store, writing, now_ms) {
             Ok(removed) => {
                 self.note_step_succeeded(PrivacyStep::Remove, generation.get());
                 Ok(removed)
@@ -610,13 +650,26 @@ impl BackupService {
         }
     }
 
-    fn cleanup_within_store(store: &mut BackupStore, now_ms: TimestampMs) -> Result<Removed> {
+    fn cleanup_within_store(
+        store: &mut BackupStore,
+        writing: bool,
+        now_ms: TimestampMs,
+    ) -> Result<Removed> {
         let mut removed = Removed::default();
         for obligation in store
             .obligations()?
             .into_iter()
             .filter(|obligation| obligation.kind == ObligationKind::ScanStaging)
         {
+            if writing {
+                // Not discharged, and the report says why.
+                store.note_obligation_failed(
+                    obligation.id,
+                    "a backup pass is still writing to the staging directory",
+                    now_ms,
+                )?;
+                continue;
+            }
             match unregistered_staged_files(store) {
                 Ok(found) => {
                     let records = store.record_staging_scan(&obligation, &found, now_ms)?;
@@ -730,6 +783,52 @@ impl BackupService {
         Ok(())
     }
 
+    /// Returns the setup the owner made, if there is one, with the count of the generations made
+    /// under it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::RegistryUnavailable`] when the store cannot be read.
+    pub fn setup(&self) -> Result<Option<Setup>> {
+        self.store().setup()
+    }
+
+    /// Returns every writer this host may still publish under, with the archive it may publish.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::RegistryUnavailable`] when the store cannot be read.
+    pub fn authorised_writers(&self) -> Result<Vec<(ArchiveId, KeyId)>> {
+        self.store().authorised_writers()
+    }
+
+    /// Writes the setup the owner made and enrols its writer, in one transaction, and wakes
+    /// whatever produces and carries.
+    ///
+    /// With `replace` over a setup of another archive, the earlier archive's writer is retired and
+    /// what it had not finished is cancelled in the same transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::InvalidArgument`] when a setup of another archive is there and
+    /// `replace` was not asked for, or one of this archive is there with something else recorded,
+    /// and [`ControllerError::RegistryUnavailable`] when the store refuses the write.
+    pub fn commit_setup(
+        &self,
+        record: &SetupRecord,
+        replace: bool,
+        now_ms: TimestampMs,
+    ) -> Result<SetupCommit> {
+        let mut store = self.store();
+        let commit = store.commit_setup(record, replace, now_ms)?;
+        if matches!(commit, SetupCommit::Replaced { .. }) {
+            // What the earlier archive had running is told to stop with the commit.
+            self.leases().cancel_all();
+        }
+        self.signals.work.notify_one();
+        Ok(commit)
+    }
+
     /// Retires a backup writer for one archive, so its unfinished generations there stop being
     /// authorised. Its enrolments for other collections are untouched.
     ///
@@ -770,24 +869,178 @@ impl BackupService {
         Ok(released)
     }
 
-    /// Stages one sealed generation and records it.
+    /// Takes the lease a production pass holds while it writes to the staging directory.
     ///
-    /// The ciphertext is written first and the rows second, so a crash between them leaves files
-    /// nothing claims rather than rows naming files that are not there: a sweep can remove the
-    /// first, and nothing can recover from the second.
-    ///
-    /// The object keys are never written. They are in the [`StagedObject`]s the caller holds, and
-    /// they stop mattering the moment the generation is sealed.
+    /// It is granted under the store's lock, to a service that is ready, with no privacy fence up
+    /// and no privacy request accepted whose fence is not up yet. The content the pass reads is
+    /// read under the privacy generation the lease names.
     ///
     /// # Errors
     ///
-    /// Returns [`ControllerError::RegistryUnavailable`] when the ciphertext cannot be written or
-    /// the store refuses the transaction.
-    pub fn admit(
+    /// Returns [`ControllerError::Refused`] when the service is not ready or privacy mode stops
+    /// production, and [`ControllerError::RegistryUnavailable`] when the store cannot be read.
+    pub fn begin_production(&self) -> Result<ProductionLease> {
+        let store = self.store();
+        self.require_ready()?;
+        let status = store.privacy_status()?;
+        if let Some(fenced_at) = status.inhibited_at() {
+            return Err(ControllerError::Refused {
+                code: kr_protocol::error::ErrorCode::PermissionDenied,
+                detail: format!("backup production is fenced at privacy generation {fenced_at}"),
+            });
+        }
+        let (id, flag) = self.leases().grant();
+        Ok(ProductionLease::new(
+            id,
+            flag,
+            Arc::clone(&self.leases),
+            Arc::clone(&self.signals),
+            store.staging_root().to_path_buf(),
+            status.current_generation,
+        ))
+    }
+
+    /// Whether the disk still holds ciphertext that no generation needs any more.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::RegistryUnavailable`] when the store cannot be read.
+    pub fn has_finished_ciphertext(&self) -> Result<bool> {
+        Ok(!self.store().releasable_ciphertext()?.is_empty())
+    }
+
+    /// Removes the staged ciphertext of every generation whose production is over and which no
+    /// attempt or upload holds open, one object at a time.
+    ///
+    /// The order is the privacy cleanup's: the file is unlinked, its directory is flushed, and only
+    /// then is the row written that says it is absent, so a row never runs ahead of the removal.
+    /// A flush that fails leaves the object to release again. The file is found by the staging
+    /// root and the object's name, not by the path its row was written with. A generation's
+    /// directory goes with its last object.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::RegistryUnavailable`] when the store cannot be read or written.
+    /// A file that cannot be removed is not an error: it is counted as pending, with the reason.
+    pub fn release_finished_ciphertext(&self) -> Result<Released> {
+        let (todo, root) = {
+            let store = self.store();
+            (
+                store.releasable_ciphertext()?,
+                store.staging_root().to_path_buf(),
+            )
+        };
+        let mut released = Released::default();
+        for item in todo {
+            let path = lease::staged_path_under(
+                &root,
+                item.archive_id,
+                item.backup_generation,
+                item.object_id,
+            );
+            let bytes = std::fs::metadata(&path).map_or(0, |metadata| metadata.len());
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                // Already gone: the row that says the ciphertext is here is what is left to write.
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    released.pending += 1;
+                    released.failure.get_or_insert_with(|| error.to_string());
+                    continue;
+                }
+            }
+            if let Err(error) = sync_directory(&path) {
+                released.pending += 1;
+                released.failure.get_or_insert_with(|| error.to_string());
+                continue;
+            }
+            let changed = self.store().note_ciphertext_released(
+                item.archive_id,
+                item.backup_generation,
+                item.object_id,
+            )?;
+            if changed {
+                released.objects += 1;
+                released.bytes = released.bytes.saturating_add(bytes);
+            }
+            if let Some(directory) = path.parent() {
+                // The last object's removal leaves the generation's directory empty. One that
+                // still holds a file is not empty and stays.
+                let _ = std::fs::remove_dir(directory);
+            }
+        }
+        Ok(released)
+    }
+
+    /// Removes the files in the staging directory that no object row names, and the directories
+    /// they leave empty.
+    ///
+    /// A kill between a file's write and the row that names it leaves a file nothing accounts for.
+    /// The files are found by their names under the staging root, so a state directory reached by
+    /// another spelling than the one a row was written under does not make a claimed file look
+    /// unclaimed. A pass that holds the staging directory is not interrupted: nothing is removed
+    /// while one runs.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::RegistryUnavailable`] when the store or the directory cannot be
+    /// read.
+    pub fn remove_unclaimed_staging(&self) -> Result<u64> {
+        let store = self.store();
+        if self.leases().any() {
+            return Ok(0);
+        }
+        let found = unregistered_staged_files(&store)?;
+        let mut removed = 0u64;
+        for path in &found {
+            if std::fs::remove_file(path).is_ok() {
+                removed += 1;
+            }
+            if let Some(directory) = path.parent()
+                && directory != store.staging_root()
+            {
+                let _ = std::fs::remove_dir(directory);
+            }
+        }
+        for path in &found {
+            sync_removal(path)?;
+        }
+        Ok(removed)
+    }
+
+    /// Whether a production pass holds the staging directory now.
+    #[must_use]
+    pub fn production_running(&self) -> bool {
+        self.leases().any()
+    }
+
+    /// Records one sealed generation whose ciphertext the pass has already staged under `lease`.
+    ///
+    /// The ciphertext is written before the rows, so a crash between them leaves files nothing
+    /// claims rather than rows naming files that are not there: the next start removes the first,
+    /// and nothing can recover from the second. Nothing is written here: each file is found where
+    /// the lease put it, at the length its object says, and the rows are one transaction.
+    ///
+    /// The object keys are never written. They are in the [`StagedObject`]s the caller holds, and
+    /// they stop mattering the moment the generation is sealed. `made_from` is the digest of what
+    /// the generation was made from, kept with it so that unchanged content makes no second one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::Refused`] when the pass was cancelled, the service is not ready
+    /// or privacy mode stopped production, or the content was read under a privacy generation
+    /// that is no longer in force; [`ControllerError::PermissionDenied`] when the writer is not
+    /// enrolled for the archive or did not sign the manifest; [`ControllerError::InvalidArgument`]
+    /// when the generation is already admitted, the objects are not the manifest's members, or a
+    /// staged file is not the length its object says; and
+    /// [`ControllerError::RegistryUnavailable`] when the store refuses the transaction.
+    pub fn admit_produced(
         &self,
+        lease: &ProductionLease,
         sealed: &SealedArchive,
         objects: &[StagedObject],
         writer_key_id: KeyId,
+        made_from: Digest256,
         now_ms: TimestampMs,
     ) -> Result<Admitted> {
         let archive_id = sealed.descriptor.archive_id;
@@ -798,6 +1051,12 @@ impl BackupService {
         // stops this gate passing and then waiting for the store while a failure is recorded.
         let mut store = self.store();
         self.require_ready()?;
+        if lease.is_cancelled() {
+            return Err(ControllerError::Refused {
+                code: kr_protocol::error::ErrorCode::PermissionDenied,
+                detail: "this backup pass was cancelled by privacy mode".to_owned(),
+            });
+        }
 
         // Privacy mode stopped content-bearing backup production at a generation, and it stays
         // stopped. A host that recorded a fence and then admitted more work would have fenced
@@ -814,8 +1073,7 @@ impl BackupService {
                 detail: "this host holds no enrolment of that writer for that archive".to_owned(),
             });
         }
-        // A generation already admitted is not admitted again. Writing its ciphertext first and
-        // finding out second would overwrite the staged manifest of the archive already recorded.
+        // A generation already admitted is not admitted again.
         if store.generation(archive_id, backup_generation)?.is_some() {
             return Err(ControllerError::InvalidArgument(
                 "that backup generation is already admitted on this host".to_owned(),
@@ -858,38 +1116,39 @@ impl BackupService {
 
         let mut rows: Vec<NewObject> = Vec::with_capacity(objects.len() + 1);
         let mut staged_bytes = 0u64;
-        let mut written_paths = Vec::new();
-        for staged in objects {
-            let path = store.staged_path(archive_id, backup_generation, staged.object_id());
-            if let Err(error) = write_staged(&path, staged.bytes()) {
-                cleanup_staged(&written_paths);
-                return Err(error);
+        let mut claimed = Vec::with_capacity(objects.len() + 1);
+        let manifest = &sealed.descriptor.encrypted_manifest;
+        let references = objects
+            .iter()
+            .map(StagedObject::reference)
+            .chain(std::iter::once(manifest));
+        for reference in references {
+            let path = lease.staged_path(archive_id, backup_generation, reference.object_id);
+            let staged_len = std::fs::metadata(&path)
+                .map_err(|_| {
+                    ControllerError::InvalidArgument(format!(
+                        "the ciphertext of object {} is not staged on this host",
+                        reference.object_id
+                    ))
+                })?
+                .len();
+            if staged_len != reference.encrypted_len.get() {
+                return Err(ControllerError::InvalidArgument(format!(
+                    "the ciphertext staged for object {} is {staged_len} bytes, and its \
+                     reference says {}",
+                    reference.object_id,
+                    reference.encrypted_len.get()
+                )));
             }
-            written_paths.push(path.clone());
-            staged_bytes = staged_bytes.saturating_add(staged.bytes().len() as u64);
+            staged_bytes = staged_bytes.saturating_add(staged_len);
+            claimed.push(path.clone());
             rows.push(NewObject {
-                object_id: staged.object_id(),
-                encrypted_object_hash: staged.reference().encrypted_object_hash,
-                encrypted_len: staged.reference().encrypted_len.get(),
+                object_id: reference.object_id,
+                encrypted_object_hash: reference.encrypted_object_hash,
+                encrypted_len: reference.encrypted_len.get(),
                 staged_path: path,
             });
         }
-        // The encrypted manifest is an object like any other, so the upload accounting covers it
-        // and a generation is complete only when it has arrived too.
-        let manifest = &sealed.descriptor.encrypted_manifest;
-        let manifest_path = store.staged_path(archive_id, backup_generation, manifest.object_id);
-        if let Err(error) = write_staged(&manifest_path, &sealed.encrypted_manifest) {
-            cleanup_staged(&written_paths);
-            return Err(error);
-        }
-        written_paths.push(manifest_path.clone());
-        staged_bytes = staged_bytes.saturating_add(sealed.encrypted_manifest.len() as u64);
-        rows.push(NewObject {
-            object_id: manifest.object_id,
-            encrypted_object_hash: manifest.encrypted_object_hash,
-            encrypted_len: manifest.encrypted_len.get(),
-            staged_path: manifest_path,
-        });
 
         let offered = NewGeneration {
             archive_id,
@@ -897,17 +1156,15 @@ impl BackupService {
             writer_key_id,
             descriptor: sealed.descriptor_bytes.clone(),
             created_at_ms: now_ms,
+            content_read_under: lease.read_under(),
+            made_from: Some(made_from),
         };
-        // The privacy generation is the store's, read inside the transaction that writes the row.
-        // There is no way for this host, or the caller behind it, to admit work under a generation
-        // read before a fence went up and came down again.
-        let admission = match store.admit(&offered, &rows, now_ms) {
-            Ok(admission) => admission,
-            Err(error) => {
-                cleanup_staged(&written_paths);
-                return Err(error);
-            }
-        };
+        // The privacy generation the row is stamped with is the store's, read inside the
+        // transaction that writes it, and the generation the content was read under must be that
+        // one. There is no way for this host, or the caller behind it, to admit work read before
+        // a fence went up and came down again.
+        let admission = store.admit(&offered, &rows, now_ms)?;
+        lease.claim(&claimed);
         self.signals.work.notify_one();
         Ok(Admitted {
             archive_id,
@@ -917,6 +1174,53 @@ impl BackupService {
             staged_objects: rows.len(),
             staged_bytes,
         })
+    }
+
+    /// Stages one sealed generation's ciphertext and records it, for a test that fabricates a
+    /// generation without a production pass.
+    ///
+    /// It takes a lease of its own, writes each object's ciphertext and the encrypted manifest
+    /// under it, and admits through the same call a pass does.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::admit_produced`], and [`ControllerError::RegistryUnavailable`] when the
+    /// ciphertext cannot be written.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn admit(
+        &self,
+        sealed: &SealedArchive,
+        objects: &[StagedObject],
+        writer_key_id: KeyId,
+        now_ms: TimestampMs,
+    ) -> Result<Admitted> {
+        let lease = self.begin_production()?;
+        let archive_id = sealed.descriptor.archive_id;
+        let backup_generation = sealed.descriptor.backup_generation;
+        let manifest_object_id = sealed.descriptor.encrypted_manifest.object_id;
+        let staging = |object_id, bytes: &[u8]| {
+            lease
+                .stage(archive_id, backup_generation, object_id, bytes)
+                .map(|_| ())
+                .map_err(|staging| match staging {
+                    Staging::Cancelled => ControllerError::Refused {
+                        code: kr_protocol::error::ErrorCode::PermissionDenied,
+                        detail: "this backup pass was cancelled by privacy mode".to_owned(),
+                    },
+                    Staging::Failed(error) => error,
+                })
+        };
+        for staged in objects {
+            if staged.object_id() == manifest_object_id {
+                return Err(ControllerError::InvalidArgument(
+                    "a member object under the encrypted manifest's own identifier".to_owned(),
+                ));
+            }
+            staging(staged.object_id(), staged.bytes())?;
+        }
+        staging(manifest_object_id, &sealed.encrypted_manifest)?;
+        let made_from = Digest256::from_bytes(kr_cbor::sha256(&sealed.descriptor_bytes));
+        self.admit_produced(&lease, sealed, objects, writer_key_id, made_from, now_ms)
     }
 
     /// Hands one queued attempt to `executor`, and records that it has gone.
@@ -1310,13 +1614,6 @@ fn unregistered_staged_files(store: &BackupStore) -> Result<Vec<PathBuf>> {
     Ok(found)
 }
 
-/// Removes staged ciphertext files that were written before staging failed.
-fn cleanup_staged(paths: &[PathBuf]) {
-    for path in paths {
-        let _ = std::fs::remove_file(path);
-    }
-}
-
 /// Writes one staged object's ciphertext, durably, before any row names it.
 ///
 /// Created exclusively, flushed, and its directory entry flushed, so a row committed afterwards
@@ -1352,8 +1649,28 @@ fn write_staged(path: &PathBuf, bytes: &[u8]) -> Result<()> {
 /// immediate parent. The directory holding the file is flushed for a file's name and each one above
 /// it for a directory's, which is the right the flush's handle asks for on Windows.
 fn sync_directory(path: &Path) -> Result<()> {
+    flush_up_from(path.parent(), NameKind::File)
+}
+
+/// Flushes the directory entries a removal changed: the nearest directory of `path` that is still
+/// there, and every one above it up to the staging root. A removal that took an empty directory
+/// with it changed the entry in its parent.
+fn sync_removal(path: &Path) -> Result<()> {
     let mut directory = path.parent();
     let mut kind = NameKind::File;
+    while let Some(current) = directory {
+        if current.exists() {
+            return flush_up_from(Some(current), kind);
+        }
+        kind = NameKind::Directory;
+        directory = current.parent();
+    }
+    Ok(())
+}
+
+fn flush_up_from(start: Option<&Path>, first: NameKind) -> Result<()> {
+    let mut directory = start;
+    let mut kind = first;
     while let Some(current) = directory {
         flush_directory(current, kind).map_err(ControllerError::registry)?;
         if current.file_name().is_some_and(|name| name == "backup") {

@@ -18,7 +18,8 @@ use kr_client::services::{
 };
 use kr_controller::backup::store::{
     AttemptOutcome, AttemptStatus, BackupStore, FenceRelease, GenerationRecord, LocalState,
-    ObligationKind, Production, Publication, Remote, SCHEMA_VERSION, Step, UploadRecord,
+    NewGeneration, NewObject, ObligationKind, Production, Publication, Remote, SCHEMA_VERSION,
+    SetupCommit, SetupRecord, Step, UploadRecord,
 };
 use kr_controller::backup::uploader::{EXECUTOR as UPLOADER, Idle, Stepped, Uploader};
 use kr_controller::backup::{Admitted, BackupService, SUBSYSTEM_NAME};
@@ -5428,8 +5429,9 @@ fn schema_version(connection: &rusqlite::Connection) -> i64 {
         .expect("the version")
 }
 
-/// Writes a store back to the schema the previous build wrote: this build's schema without the
-/// upload and release tables and their rules, at version 6.
+/// Writes a store back to the schema the build before the producer wrote: this build's schema
+/// without the upload and release tables and their rules, the setup record and the source
+/// fingerprints, at version 6.
 fn as_version_6(state: &std::path::Path) {
     let connection =
         rusqlite::Connection::open(state.join("backup.sqlite")).expect("the backup store");
@@ -5441,12 +5443,19 @@ fn as_version_6(state: &std::path::Path) {
              DROP TRIGGER an_acknowledged_part_is_never_withdrawn;
              DROP TABLE uploads;
              DROP TRIGGER a_deletion_is_asked_for_once;
-             DROP TRIGGER only_an_object_of_an_unknown_generation_is_deleted;
+             DROP TRIGGER only_an_object_of_a_generation_no_publication_can_name_is_deleted;
              DROP TRIGGER an_object_another_generation_names_is_not_deleted;
              DROP TRIGGER a_deletion_asked_for_keeps_what_it_is;
              DROP TRIGGER a_deletion_asked_for_is_never_taken_back;
              DROP TRIGGER an_object_this_host_asked_to_delete_is_named_no_more;
              DROP TABLE releases;
+             DROP TRIGGER a_setup_is_never_deleted;
+             DROP TRIGGER a_setup_of_one_archive_keeps_what_it_recorded;
+             DROP TRIGGER the_count_of_one_archive_never_goes_down;
+             DROP TRIGGER a_replacement_starts_its_count_at_nothing;
+             DROP TABLE host_backup;
+             DROP TRIGGER what_a_generation_was_made_from_is_not_rewritten;
+             DROP TABLE generation_sources;
              UPDATE schema_version SET version = 6;",
         )
         .expect("the store is written back to version 6");
@@ -5534,6 +5543,127 @@ fn a_version_6_store_holding_a_rule_this_build_never_wrote_is_refused_and_left_a
     assert_eq!(schema_version(&connection), 6);
     assert_eq!(upload_objects(&connection), 0);
     assert_eq!(release_objects(&connection), 0);
+}
+
+/// Writes a store back to the schema the build before the producer wrote with uploads and
+/// releases: this build's schema without the setup record, the source fingerprints and the wider
+/// rule for which generation's objects are deleted, at version 7.
+fn as_version_7(state: &std::path::Path) {
+    let connection =
+        rusqlite::Connection::open(state.join("backup.sqlite")).expect("the backup store");
+    connection
+        .execute_batch(
+            "DROP TRIGGER a_setup_is_never_deleted;
+             DROP TRIGGER a_setup_of_one_archive_keeps_what_it_recorded;
+             DROP TRIGGER the_count_of_one_archive_never_goes_down;
+             DROP TRIGGER a_replacement_starts_its_count_at_nothing;
+             DROP TABLE host_backup;
+             DROP TRIGGER what_a_generation_was_made_from_is_not_rewritten;
+             DROP TABLE generation_sources;
+             DROP TRIGGER only_an_object_of_a_generation_no_publication_can_name_is_deleted;
+             CREATE TRIGGER only_an_object_of_an_unknown_generation_is_deleted
+             BEFORE INSERT ON releases
+             WHEN NOT EXISTS (SELECT 1 FROM generations
+                               WHERE archive_id = NEW.archive_id
+                                 AND backup_generation = NEW.backup_generation
+                                 AND production = 'cancelled'
+                                 AND remote = 'unknown')
+             BEGIN
+                 SELECT RAISE(ABORT, 'only an object of a generation whose production ended with \
+                                      its outcome unknown is deleted');
+             END;
+             UPDATE schema_version SET version = 7;",
+        )
+        .expect("the store is written back to version 7");
+    assert_eq!(schema_version(&connection), 7);
+}
+
+/// A store at version 7 is brought to this build's schema once, by the step that adds the setup
+/// record and the source fingerprints and widens the rule for which objects are deleted, and it
+/// keeps everything it had recorded.
+#[test]
+fn a_version_7_store_is_brought_to_this_builds_schema_once_and_keeps_what_it_recorded() {
+    let (_root, state) = state_directory();
+    let (member, upload) = a_store_with_an_upload_in_flight(&state);
+    let first = BackupGeneration::new(1);
+    let (generations, attempts, objects, uploads) = {
+        let mut store = BackupStore::open(&state).expect("the backup store");
+        store
+            .record_upload(upload, archive_id(), first, member, "upload-one")
+            .expect("an upload is recorded");
+        (
+            store.generations().expect("a read"),
+            store.attempts().expect("a read"),
+            store.objects(archive_id(), first).expect("a read"),
+            store.uploads().expect("a read"),
+        )
+    };
+    assert_eq!(uploads.len(), 1, "an upload was in flight");
+    as_version_7(&state);
+
+    let store = BackupStore::open(&state).expect("a version-7 store opens, brought forward");
+    assert_eq!(store.generations().expect("a read"), generations);
+    assert_eq!(store.attempts().expect("a read"), attempts);
+    assert_eq!(store.objects(archive_id(), first).expect("a read"), objects);
+    assert!(
+        store.setup().expect("a read").is_none(),
+        "no setup was made"
+    );
+    assert_eq!(store.uploads().expect("a read"), uploads);
+    drop(store);
+
+    let connection =
+        rusqlite::Connection::open(state.join("backup.sqlite")).expect("the backup store");
+    assert_eq!(schema_version(&connection), SCHEMA_VERSION);
+    assert_eq!(
+        release_objects(&connection),
+        6,
+        "the table and its five rules"
+    );
+    drop(connection);
+
+    // Once: the next open finds this build's store and takes it as it is.
+    BackupStore::open(&state).expect("the store opens again");
+}
+
+/// A store at version 7 that holds something this build does not define is refused as any other
+/// store is, and the step that would have brought it forward leaves it exactly as it was.
+#[test]
+fn a_version_7_store_holding_a_rule_this_build_never_wrote_is_refused_and_left_at_version_7() {
+    let (_root, state) = state_directory();
+    a_store_with_an_upload_in_flight(&state);
+    as_version_7(&state);
+    let connection =
+        rusqlite::Connection::open(state.join("backup.sqlite")).expect("the backup store");
+    connection
+        .execute_batch(
+            "CREATE TRIGGER sqliteXforget AFTER INSERT ON writers
+             BEGIN
+                 DELETE FROM outbox WHERE status = 'terminal';
+             END;",
+        )
+        .expect("the added rule is written");
+    drop(connection);
+
+    let message = match BackupStore::open(&state) {
+        Ok(_) => panic!("a version-7 store holding a rule this build never wrote was opened"),
+        Err(refusal) => refusal.to_string(),
+    };
+    assert!(
+        message.contains("sqliteXforget"),
+        "the refusal says what this build does not define: {message}"
+    );
+    let connection =
+        rusqlite::Connection::open(state.join("backup.sqlite")).expect("the backup store");
+    assert_eq!(schema_version(&connection), 7);
+    let tables: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name = 'host_backup'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("the schema");
+    assert_eq!(tables, 0, "the step left nothing behind");
 }
 
 /// A deletion is written down before it is asked for, once, and the store decides it from its own
@@ -8636,4 +8766,533 @@ async fn an_upload_refused_as_not_permitted_is_abandoned_and_uploaded_again_unde
         1
     );
     host.web.stored_once();
+}
+
+// ---------------------------------------------------------------------------------------------
+// The host's own production: the lease a pass holds, the setup, the count and the release.
+// ---------------------------------------------------------------------------------------------
+
+fn files_under(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut found = Vec::new();
+    let mut directories = vec![root.to_path_buf()];
+    while let Some(directory) = directories.pop() {
+        let Ok(entries) = std::fs::read_dir(&directory) else {
+            continue;
+        };
+        for entry in entries {
+            let path = entry.expect("an entry").path();
+            if path.is_dir() {
+                directories.push(path);
+            } else {
+                found.push(path);
+            }
+        }
+    }
+    found.sort();
+    found
+}
+
+/// A pass that is writing to the staging directory is outside the account privacy mode keeps, so
+/// the lease holds the cleanup a fence owes open: the walk of the staging directory is not
+/// discharged while the pass runs, the fence cannot be released, and the pass is told to stop. When
+/// it has stopped its files are gone and the cleanup completes. The control is the same fence with
+/// no pass.
+#[test]
+fn a_running_pass_holds_the_cleanup_a_fence_owes_open_until_it_has_stopped() {
+    let environment = Environment::open();
+    let service = environment.service();
+    let lease = service.begin_production().expect("a lease");
+    let staged = lease
+        .stage(
+            archive_id(),
+            BackupGeneration::new(1),
+            object_id(1),
+            b"ciphertext",
+        )
+        .expect("the first object is staged");
+    assert!(staged.path.exists());
+
+    privacy(service)
+        .fence(PrivacyGeneration::new(1))
+        .expect("the fence goes up");
+    assert!(lease.is_cancelled(), "a fence cancels the pass");
+    assert!(matches!(
+        lease.stage(
+            archive_id(),
+            BackupGeneration::new(1),
+            object_id(2),
+            b"more ciphertext"
+        ),
+        Err(kr_controller::backup::Staging::Cancelled)
+    ));
+
+    service
+        .run_cleanup(PrivacyGeneration::new(1), TimestampMs::new(7_000))
+        .expect("cleanup");
+    let owed = service.obligations().expect("a read");
+    assert!(
+        owed.iter()
+            .any(|obligation| obligation.kind == ObligationKind::ScanStaging),
+        "the walk is not discharged while the pass runs: {owed:?}"
+    );
+    assert!(
+        !service.outstanding_work().expect("a read").is_complete(),
+        "privacy mode is not complete while the pass runs"
+    );
+    assert!(matches!(
+        service
+            .release_fence(
+                PrivacyGeneration::new(1),
+                PrivacyGeneration::new(2),
+                TimestampMs::new(7_100),
+            )
+            .expect("a release is attempted"),
+        FenceRelease::Pending { .. }
+    ));
+
+    drop(lease);
+    assert!(
+        files_under(&service.staging_root()).is_empty(),
+        "the pass took away what it wrote"
+    );
+    service
+        .run_cleanup(PrivacyGeneration::new(1), TimestampMs::new(7_200))
+        .expect("cleanup");
+    assert!(service.obligations().expect("a read").is_empty());
+    assert_eq!(
+        service
+            .release_fence(
+                PrivacyGeneration::new(1),
+                PrivacyGeneration::new(2),
+                TimestampMs::new(7_300),
+            )
+            .expect("a release"),
+        FenceRelease::Released
+    );
+
+    // The control: a fence with no pass running is cleaned up on the first try.
+    let quiet = Environment::open();
+    privacy(quiet.service())
+        .fence(PrivacyGeneration::new(1))
+        .expect("the fence goes up");
+    quiet
+        .service()
+        .run_cleanup(PrivacyGeneration::new(1), TimestampMs::new(7_000))
+        .expect("cleanup");
+    assert!(quiet.service().obligations().expect("a read").is_empty());
+}
+
+/// A lease is refused to a host privacy mode has stopped, whether the fence is up or only asked
+/// for.
+#[test]
+fn a_lease_is_refused_while_privacy_mode_stops_production() {
+    let environment = Environment::open();
+    let service = environment.service();
+    service
+        .accept_privacy_request(PrivacyGeneration::new(1), TimestampMs::new(6_000))
+        .expect("the request is accepted");
+    assert!(
+        matches!(
+            service.begin_production(),
+            Err(ControllerError::Refused { .. })
+        ),
+        "a request accepted whose fence is not up counts"
+    );
+}
+
+/// Content read under one privacy generation is never stamped with a later one. After a complete
+/// privacy cycle the generation the content was read under is not the one in force, and the store
+/// refuses the generation in the transaction that would write it. The control is the same
+/// generation read under the generation in force.
+#[test]
+fn content_read_before_a_privacy_cycle_is_not_admitted_after_it() {
+    let (_root, state) = state_directory();
+    let producer = Producer::generate();
+    let objects = [stage(1, "a.cbor", b"one")];
+    let sealed = producer.seal(1, &objects);
+    let read_under = {
+        let service = BackupService::open(&state).expect("a backup service");
+        service
+            .reconcile(TimestampMs::new(4_000))
+            .expect("the startup reconciliation");
+        service
+            .enrol_writer(producer.writer.key_id(), archive_id(), TimestampMs::new(1))
+            .expect("the writer is enrolled");
+        let read_under = service.begin_production().expect("a lease").read_under();
+        privacy(&service)
+            .fence(PrivacyGeneration::new(1))
+            .expect("the fence goes up");
+        service
+            .run_cleanup(PrivacyGeneration::new(1), TimestampMs::new(7_000))
+            .expect("cleanup");
+        assert_eq!(
+            service
+                .release_fence(
+                    PrivacyGeneration::new(1),
+                    PrivacyGeneration::new(2),
+                    TimestampMs::new(7_100),
+                )
+                .expect("a release"),
+            FenceRelease::Released
+        );
+        read_under
+    };
+    let mut store = BackupStore::open(&state).expect("the backup store");
+    let rows: Vec<NewObject> = objects
+        .iter()
+        .map(|object| NewObject {
+            object_id: object.object_id(),
+            encrypted_object_hash: object.reference().encrypted_object_hash,
+            encrypted_len: object.reference().encrypted_len.get(),
+            staged_path: state.join("not-written"),
+        })
+        .collect();
+    let offered = |read_under: u64| NewGeneration {
+        archive_id: archive_id(),
+        backup_generation: BackupGeneration::new(1),
+        writer_key_id: producer.writer.key_id(),
+        descriptor: sealed.descriptor_bytes.clone(),
+        created_at_ms: TimestampMs::new(8_000),
+        content_read_under: read_under,
+        made_from: Some(Digest256::from_bytes([7; 32])),
+    };
+    let refused = store.admit(&offered(read_under), &rows, TimestampMs::new(8_000));
+    assert!(
+        matches!(refused, Err(ControllerError::Refused { .. })),
+        "{refused:?}"
+    );
+    assert!(store.generations().expect("a read").is_empty());
+    store
+        .admit(&offered(2), &rows, TimestampMs::new(8_100))
+        .expect("content read under the generation in force is admitted");
+    assert_eq!(
+        store
+            .made_from(archive_id(), BackupGeneration::new(1))
+            .expect("a read"),
+        Some(Digest256::from_bytes([7; 32]))
+    );
+}
+
+fn a_setup(archive: ArchiveId, producer: &Producer, fingerprint: &str) -> SetupRecord {
+    SetupRecord {
+        archive_id: archive,
+        origin: "https://storage.example".to_owned(),
+        account_mark: [9; 32],
+        recovery_public_key: *producer.device.public(),
+        kit_fingerprint: fingerprint.to_owned(),
+        writer_key_id: producer.writer.key_id(),
+        producer_key_id: producer.sender.key_id(),
+        enabled_at_ms: TimestampMs::new(1_000),
+    }
+}
+
+/// The setup is one transaction with the writer's enrolment, repeats as itself, refuses another
+/// archive without a replacement, keeps what it recorded, and never lowers the count of the last
+/// generation made, which a generation admitted raises.
+#[test]
+fn the_setup_is_written_with_its_writer_repeats_as_itself_and_counts_generations_up() {
+    let root = tempfile::tempdir().expect("a disposable directory");
+    let mut store = BackupStore::in_memory(&root.path().join("backup")).expect("a store");
+    let producer = Producer::generate();
+    assert!(store.setup().expect("a read").is_none());
+
+    let record = a_setup(archive_id(), &producer, "ABCD2345");
+    assert_eq!(
+        store
+            .commit_setup(&record, false, TimestampMs::new(1_000))
+            .expect("the setup is written"),
+        SetupCommit::Written
+    );
+    assert!(
+        store
+            .authorises(archive_id(), producer.writer.key_id())
+            .expect("a read"),
+        "the writer is enrolled in the same transaction"
+    );
+    assert_eq!(
+        store
+            .commit_setup(&record, false, TimestampMs::new(1_001))
+            .expect("a repeat"),
+        SetupCommit::Unchanged
+    );
+    let other_kit = a_setup(archive_id(), &producer, "ZZZZ2345");
+    assert!(matches!(
+        store.commit_setup(&other_kit, false, TimestampMs::new(1_002)),
+        Err(ControllerError::InvalidArgument(_))
+    ));
+    let other_archive = a_setup(
+        ArchiveId::new(Uuid::from_bytes([0x12; 16])),
+        &producer,
+        "QQQQ2345",
+    );
+    assert!(
+        matches!(
+            store.commit_setup(&other_archive, false, TimestampMs::new(1_003)),
+            Err(ControllerError::InvalidArgument(_))
+        ),
+        "another archive is a replacement, asked for"
+    );
+    assert_eq!(
+        store.setup().expect("a read").expect("a setup").record,
+        record
+    );
+
+    // The count is raised and never lowered.
+    store
+        .raise_generation_counter(archive_id(), BackupGeneration::new(3))
+        .expect("raised");
+    store
+        .raise_generation_counter(archive_id(), BackupGeneration::new(2))
+        .expect("not lowered");
+    assert_eq!(
+        store
+            .setup()
+            .expect("a read")
+            .expect("a setup")
+            .generation_counter,
+        3
+    );
+}
+
+/// A replacement retires the earlier archive's writer and cancels what the earlier archive had
+/// not finished, in the one transaction that writes the new setup, and starts its own count. What
+/// the earlier archive had finished is left alone.
+#[test]
+fn a_replacement_retires_the_earlier_writer_cancels_what_it_had_not_finished_and_counts_afresh() {
+    let root = tempfile::tempdir().expect("a disposable directory");
+    let service = BackupService::in_memory(&root.path().join("backup")).expect("a service");
+    service
+        .reconcile(TimestampMs::new(4_000))
+        .expect("reconciliation");
+    let producer = Producer::generate();
+    let objects = [stage(1, "a.cbor", b"one")];
+    let record = a_setup(archive_id(), &producer, "ABCD2345");
+    service
+        .commit_setup(&record, false, TimestampMs::new(1_000))
+        .expect("the setup is written");
+    let admitted = service
+        .admit(
+            &producer.seal(1, &objects),
+            &objects,
+            producer.writer.key_id(),
+            TimestampMs::new(5_000),
+        )
+        .expect("a generation is admitted");
+    assert_eq!(
+        service
+            .setup()
+            .expect("a read")
+            .expect("a setup")
+            .generation_counter,
+        1,
+        "admitting a generation raises the count"
+    );
+    let _ = admitted;
+
+    let next = ArchiveId::new(Uuid::from_bytes([0x12; 16]));
+    let replacement = a_setup(next, &producer, "QQQQ2345");
+    assert_eq!(
+        service
+            .commit_setup(&replacement, true, TimestampMs::new(6_000))
+            .expect("the replacement is written"),
+        SetupCommit::Replaced {
+            earlier: archive_id(),
+            cancelled: 1
+        }
+    );
+    let generation = service
+        .generation(archive_id(), BackupGeneration::new(1))
+        .expect("a read")
+        .expect("the generation is still recorded");
+    assert_eq!(generation.production, Production::Cancelled);
+    assert!(
+        !service
+            .authorised_writers()
+            .expect("a read")
+            .contains(&(archive_id(), producer.writer.key_id())),
+        "the earlier archive's writer is retired"
+    );
+    assert!(
+        service
+            .authorised_writers()
+            .expect("a read")
+            .contains(&(next, producer.writer.key_id())),
+        "the new archive's writer is enrolled"
+    );
+    let setup = service.setup().expect("a read").expect("a setup");
+    assert_eq!(setup.record, replacement);
+    assert_eq!(setup.generation_counter, 0, "the new archive counts afresh");
+}
+
+/// The count of an archive is not lowered by anything, direct SQL included, and a setup is never
+/// deleted.
+#[test]
+fn the_database_refuses_to_lower_the_count_or_to_delete_the_setup() {
+    let (_root, state) = state_directory();
+    let producer = Producer::generate();
+    {
+        let mut store = BackupStore::open(&state).expect("the backup store");
+        store
+            .commit_setup(
+                &a_setup(archive_id(), &producer, "ABCD2345"),
+                false,
+                TimestampMs::new(1_000),
+            )
+            .expect("the setup is written");
+        store
+            .raise_generation_counter(archive_id(), BackupGeneration::new(5))
+            .expect("raised");
+    }
+    let connection =
+        rusqlite::Connection::open(state.join("backup.sqlite")).expect("the backup store");
+    assert!(
+        connection
+            .execute("UPDATE host_backup SET generation_counter = 1", [])
+            .is_err()
+    );
+    assert!(connection.execute("DELETE FROM host_backup", []).is_err());
+    assert!(
+        connection
+            .execute("UPDATE host_backup SET kit_fingerprint = 'OTHER234'", [])
+            .is_err(),
+        "a setup of one archive keeps what it recorded"
+    );
+}
+
+/// The ciphertext of a generation whose production is over leaves the disk, and not before: one
+/// still producing keeps its files, one whose upload is open keeps them, and a generation that
+/// completed loses them, its rows say so and its directory goes. An unlink that fails leaves the
+/// object pending, and the next try finishes it.
+#[test]
+fn finished_ciphertext_leaves_the_disk_and_a_failed_unlink_is_tried_again() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let environment = Environment::open();
+    let service = environment.service();
+    let producer = Producer::generate();
+    service
+        .enrol_writer(producer.writer.key_id(), archive_id(), TimestampMs::new(1))
+        .expect("the writer is enrolled");
+    let objects = [stage(1, "a.cbor", b"one"), stage(2, "b.cbor", b"two")];
+    let admitted = service
+        .admit(
+            &producer.seal(1, &objects),
+            &objects,
+            producer.writer.key_id(),
+            TimestampMs::new(5_000),
+        )
+        .expect("the generation is admitted");
+    service
+        .note_dispatched(admitted.sequence, EXECUTOR, TimestampMs::new(5_100))
+        .expect("its upload leaves");
+    let before = files_under(&service.staging_root());
+    assert_eq!(before.len(), 3, "two members and the manifest are staged");
+    assert!(
+        !service.has_finished_ciphertext().expect("a read"),
+        "a generation still producing keeps its ciphertext"
+    );
+    assert_eq!(
+        service
+            .release_finished_ciphertext()
+            .expect("a release")
+            .objects,
+        0
+    );
+
+    let publication = dispatch_publication(
+        service,
+        admitted.sequence,
+        BackupGeneration::new(1),
+        TimestampMs::new(5_200),
+    );
+    service
+        .note_published(
+            publication,
+            PrivacyGeneration::INITIAL,
+            TimestampMs::new(5_300),
+        )
+        .expect("the generation is published");
+
+    // A directory that cannot be written to makes the unlink fail.
+    let directory = before[0]
+        .parent()
+        .expect("a generation directory")
+        .to_path_buf();
+    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o500))
+        .expect("the directory is made read-only");
+    assert!(service.has_finished_ciphertext().expect("a read"));
+    let failed = service.release_finished_ciphertext().expect("a release");
+    if failed.pending > 0 {
+        // Not a user that can write anywhere (root): the failure cannot be made.
+        assert_eq!(failed.objects, 0);
+        assert!(failed.failure.is_some());
+        assert_eq!(files_under(&service.staging_root()).len(), 3);
+        assert!(service.has_finished_ciphertext().expect("a read"));
+    }
+    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))
+        .expect("the directory is writable again");
+
+    let released = service.release_finished_ciphertext().expect("a release");
+    assert_eq!(released.pending, 0);
+    assert!(files_under(&service.staging_root()).is_empty());
+    assert!(
+        !directory.exists(),
+        "the generation's directory goes with its last object"
+    );
+    assert!(
+        service
+            .objects(archive_id(), BackupGeneration::new(1))
+            .expect("a read")
+            .iter()
+            .all(|row| row.local_state == LocalState::Absent)
+    );
+    assert!(!service.has_finished_ciphertext().expect("a read"));
+}
+
+/// A file in the staging directory that no object row names is removed at start, and a file a row
+/// names is not, even when the state directory is reached under another name than the one the row
+/// was written under.
+#[test]
+fn unclaimed_staging_is_removed_by_name_and_a_moved_state_directory_keeps_what_it_claims() {
+    let root = tempfile::tempdir().expect("a disposable directory");
+    let first = root.path().join("first");
+    std::fs::create_dir_all(&first).expect("the state directory");
+    let producer = Producer::generate();
+    let objects = [stage(1, "a.cbor", b"one")];
+    {
+        let service = BackupService::open(&first).expect("a service");
+        service
+            .reconcile(TimestampMs::new(4_000))
+            .expect("reconciliation");
+        service
+            .enrol_writer(producer.writer.key_id(), archive_id(), TimestampMs::new(1))
+            .expect("the writer is enrolled");
+        service
+            .admit(
+                &producer.seal(1, &objects),
+                &objects,
+                producer.writer.key_id(),
+                TimestampMs::new(5_000),
+            )
+            .expect("the generation is admitted");
+    }
+    let second = root.path().join("second");
+    std::fs::rename(&first, &second).expect("the state directory is moved");
+    let stray = second.join("backup").join("stray-1").join("nothing.krb");
+    std::fs::create_dir_all(stray.parent().expect("a directory")).expect("a directory");
+    std::fs::write(&stray, b"left by a pass that was killed").expect("a stray file");
+
+    let service = BackupService::open(&second).expect("a service at the moved directory");
+    let claimed = files_under(&second.join("backup")).len() - 1;
+    assert_eq!(service.remove_unclaimed_staging().expect("a sweep"), 1);
+    assert!(!stray.exists());
+    assert!(
+        !stray.parent().expect("a directory").exists(),
+        "the directory it left empty goes"
+    );
+    assert_eq!(
+        files_under(&second.join("backup")).len(),
+        claimed,
+        "what a row names stays"
+    );
 }

@@ -92,7 +92,7 @@ impl std::fmt::Debug for StagedObject {
             .debug_struct("StagedObject")
             .field("reference", &self.reference)
             .field("filename", &self.filename)
-            .field("encrypted_len", &self.bytes.len())
+            .field("encrypted_len", &self.reference.encrypted_len)
             .field("key", &self.key)
             .field("source_digest", &"Digest256(redacted)")
             .field("rotation", &self.rotation)
@@ -124,6 +124,16 @@ impl StagedObject {
     #[must_use]
     pub fn bytes(&self) -> &[u8] {
         &self.bytes
+    }
+
+    /// Drops the ciphertext from memory once it has been written somewhere, keeping everything
+    /// the manifest and the key wraps need: the reference, the key and the rotation.
+    ///
+    /// A generation's ciphertext is up to 1.5 GiB, and a producer writes each object to its
+    /// staging file as it is made, so only one is in memory at a time. [`Self::bytes`] is empty
+    /// afterwards.
+    pub fn release_ciphertext(&mut self) {
+        self.bytes = Vec::new();
     }
 
     /// Returns the key rotation this ciphertext was made under.

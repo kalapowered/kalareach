@@ -1066,6 +1066,15 @@ impl Controller {
                 .map_err(|_| ControllerError::RegistryUnavailable {
                     detail: "the backup service could not be reconciled".to_owned(),
                 })??;
+            // A pass that was stopped between writing a file and the row that names it left a
+            // file nothing accounts for. It is removed by its name here, before any pass of this
+            // run can stage another, and what a row names is left alone.
+            let backup = Arc::clone(&controller.backup);
+            tokio::task::spawn_blocking(move || backup.remove_unclaimed_staging())
+                .await
+                .map_err(|_| ControllerError::RegistryUnavailable {
+                    detail: "the backup staging directory could not be swept".to_owned(),
+                })??;
             // And then the outbox is carried, for as long as the daemon runs.
             if let Some(runtime) = &controller.backup_runtime {
                 runtime.run();

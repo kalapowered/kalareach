@@ -398,8 +398,8 @@ only the kit can authenticate what it retrieved.
 
 `RecoverySeed::to_kit` exports the user's copy and `from_kit` reads it back after checking the kit's
 profile version and its checksum. The kit's seed is a redacted, zeroising secret, so printing a kit
-does not print the owner's recovery authority. `store::store_recovery_seed` and `store::load_recovery_seed` keep the owner's copy in the
-secure store.
+does not print the owner's recovery authority. A host never keeps the seed: the kit is the only
+copy, and a producer needs the recovery recipient's public key and nothing else of it.
 
 The recovery recipient is an ordinary stored-envelope `crypto_box` recipient. It is not a fifth key
 purpose: what makes it different is that it is derived from the seed rather than generated on a

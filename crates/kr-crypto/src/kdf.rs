@@ -220,10 +220,6 @@ impl RecoverySeed {
             public: StoredEnvelopeKey::from_bytes(public),
         })
     }
-
-    pub(crate) const fn expose(&self) -> &[u8; 32] {
-        self.0.expose()
-    }
 }
 
 /// The `crypto_box` recipient a recovery-enabled collection wraps its manifest keys for.

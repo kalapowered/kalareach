@@ -34,13 +34,17 @@ use rusqlite::{OptionalExtension, params};
 use crate::backup::statements::{Database, Reads, Statement, Writing, sql};
 use crate::error::{ControllerError, Result};
 
+mod setup;
+
+pub use setup::{Releasable, Setup, SetupCommit, SetupRecord};
+
 /// The schema version this build reads and writes.
 ///
 /// It says which build wrote a store, and it is what tells a database from a later build apart
 /// before anything else is read. What a store *enforces* is not left to it: opening compares the
 /// schema itself against the one this build writes, so a database holding a weaker rule is refused
 /// whether or not anybody remembered to move this number when that rule changed.
-pub const SCHEMA_VERSION: i64 = 7;
+pub const SCHEMA_VERSION: i64 = 8;
 
 /// The schema version the previous build wrote, which is this build's schema without the upload
 /// and release tables and their rules.
@@ -49,6 +53,13 @@ pub const SCHEMA_VERSION: i64 = 7;
 /// version: when the builds that wrote one are outside the installed-version upgrade window that
 /// section 24 keeps host migrators for.
 const VERSION_WITHOUT_UPLOADS: i64 = 6;
+
+/// The schema version the build before the producer wrote, which is this build's schema without
+/// the setup record, the fingerprints of what generations were made from, and the rule that lets
+/// an object of a published generation be deleted once newer ones are held.
+///
+/// Remove it, with the step that reads it, on the same condition as [`VERSION_WITHOUT_UPLOADS`].
+const VERSION_WITHOUT_SETUP: i64 = 7;
 
 /// The oldest schema version this build brings forward.
 pub const OLDEST_SCHEMA_VERSION: i64 = VERSION_WITHOUT_UPLOADS;
@@ -597,8 +608,10 @@ pub struct Attempt {
 /// One generation offered for admission.
 ///
 /// It carries what the producer knows and nothing else. Where production has got to, what a
-/// service holds and which privacy generation the work belongs to are the store's to decide, so
-/// there is nowhere in this type for a caller to put a generation it read earlier.
+/// service holds and which privacy generation the work is stamped with are the store's to decide,
+/// so there is nowhere in this type for a caller to put a stamp. The one thing it carries about
+/// privacy mode is a precondition: the generation the content was read under, which the store
+/// holds against the generation in force when it writes the row.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NewGeneration {
     /// The archive.
@@ -611,6 +624,14 @@ pub struct NewGeneration {
     pub descriptor: Vec<u8>,
     /// When it was produced.
     pub created_at_ms: TimestampMs,
+    /// The privacy generation in force when the content was read. The store refuses the
+    /// generation unless that is still the one in force inside the transaction that writes it, so
+    /// content read before a fence went up and came down again is never stamped with the
+    /// generation that came after.
+    pub content_read_under: u64,
+    /// A digest of what the generation was made from, kept with it, where it was made from this
+    /// host's own state.
+    pub made_from: Option<Digest256>,
 }
 
 /// One object offered with a generation.
@@ -733,6 +754,9 @@ impl BackupStore {
             if version == VERSION_WITHOUT_UPLOADS {
                 return self.migrate_from_version_6();
             }
+            if version == VERSION_WITHOUT_SETUP {
+                return self.migrate_from_version_7();
+            }
             if version != SCHEMA_VERSION {
                 return Err(ControllerError::RegistryUnavailable {
                     detail: format!(
@@ -821,6 +845,9 @@ impl BackupStore {
             .run_script(RELEASES)
             .map_err(ControllerError::registry)?;
         transaction
+            .run_script(SETUP)
+            .map_err(ControllerError::registry)?;
+        transaction
             .run(
                 sql!("UPDATE schema_version SET version = ?1"),
                 params![SCHEMA_VERSION],
@@ -829,6 +856,48 @@ impl BackupStore {
         let found = read_definition(&transaction)?;
         if found != expected {
             // Dropping the transaction rolls it back, so the store stays at version 6.
+            return Err(ControllerError::RegistryUnavailable {
+                detail: first_difference(&found, &expected),
+            });
+        }
+        transaction.commit().map_err(ControllerError::registry)
+    }
+
+    /// Takes a store the previous build wrote, at schema version 7, to this build's schema, once.
+    ///
+    /// This build's schema is version 7's with the setup record and the source fingerprints added,
+    /// and the one rule that restricted which generation's objects are deleted replaced by the
+    /// wider one. What the store holds is compared with this build's schema inside the
+    /// transaction, so a version-7 store holding anything this build does not define is refused
+    /// and left as it was found. What it recorded is kept.
+    ///
+    /// Remove this step with [`VERSION_WITHOUT_SETUP`].
+    fn migrate_from_version_7(&mut self) -> Result<()> {
+        let expected = definition_this_build_writes()?;
+        let transaction = self
+            .connection
+            .writing()
+            .map_err(ControllerError::registry)?;
+        transaction
+            .run_script(sql!(
+                "DROP TRIGGER IF EXISTS only_an_object_of_an_unknown_generation_is_deleted;"
+            ))
+            .map_err(ControllerError::registry)?;
+        transaction
+            .run_script(RELEASE_RULE)
+            .map_err(ControllerError::registry)?;
+        transaction
+            .run_script(SETUP)
+            .map_err(ControllerError::registry)?;
+        transaction
+            .run(
+                sql!("UPDATE schema_version SET version = ?1"),
+                params![SCHEMA_VERSION],
+            )
+            .map_err(ControllerError::registry)?;
+        let found = read_definition(&transaction)?;
+        if found != expected {
+            // Dropping the transaction rolls it back, so the store stays at version 7.
             return Err(ControllerError::RegistryUnavailable {
                 detail: first_difference(&found, &expected),
             });
@@ -931,7 +1000,7 @@ macro_rules! uploads_definition {
 /// two cannot write these objects differently.
 macro_rules! releases_definition {
     () => {
-        "
+        concat!("
                  CREATE TABLE IF NOT EXISTS releases (
                      archive_id        BLOB NOT NULL,
                      backup_generation INTEGER NOT NULL,
@@ -950,17 +1019,6 @@ macro_rules! releases_definition {
                                  AND object_id = NEW.object_id)
                  BEGIN
                      SELECT RAISE(ABORT, 'a deletion of an object is asked for once');
-                 END;
-                 CREATE TRIGGER IF NOT EXISTS only_an_object_of_an_unknown_generation_is_deleted
-                 BEFORE INSERT ON releases
-                 WHEN NOT EXISTS (SELECT 1 FROM generations
-                                   WHERE archive_id = NEW.archive_id
-                                     AND backup_generation = NEW.backup_generation
-                                     AND production = 'cancelled'
-                                     AND remote = 'unknown')
-                 BEGIN
-                     SELECT RAISE(ABORT, 'only an object of a generation whose production ended \
-                                          with its outcome unknown is deleted');
                  END;
                  CREATE TRIGGER IF NOT EXISTS an_object_another_generation_names_is_not_deleted
                  BEFORE INSERT ON releases
@@ -997,6 +1055,125 @@ macro_rules! releases_definition {
                  BEGIN
                      SELECT RAISE(ABORT, 'an object this host asked the service to delete is never \
                                           named by another generation');
+                 END;",
+            release_rule!())
+    };
+}
+
+/// Which generation's objects may be asked to be deleted at a service, as the store enforces it.
+///
+/// An object of a generation whose production ended with its outcome unknown, which no publication
+/// can name any more, and an object of a generation this host holds as published once its
+/// production is over: complete, or cancelled after the publication was out there. Nothing else.
+/// The finer rules, that newer generations are held and that no fence or open attempt stands in the
+/// way, are the store function's, which writes a deletion down in the one transaction that checks
+/// them.
+///
+/// One text, in [`releases_definition`] and in the step that brings a version-7 store to this
+/// schema.
+macro_rules! release_rule {
+    () => {
+        "
+                 CREATE TRIGGER IF NOT EXISTS only_an_object_of_a_generation_no_publication_can_name_is_deleted
+                 BEFORE INSERT ON releases
+                 WHEN NOT EXISTS (SELECT 1 FROM generations
+                                   WHERE archive_id = NEW.archive_id
+                                     AND backup_generation = NEW.backup_generation
+                                     AND ((production = 'cancelled' AND remote = 'unknown')
+                                          OR (production IN ('complete', 'cancelled')
+                                              AND remote = 'published')))
+                 BEGIN
+                     SELECT RAISE(ABORT, 'only an object of a generation whose production ended \
+                                          with its outcome unknown, or of a published generation \
+                                          whose production is over, is deleted');
+                 END;"
+    };
+}
+
+/// What this host recorded when its owner set up backups, and the fingerprint of what each
+/// generation was made from.
+///
+/// The setup is one row. It names the archive the host's backups are of, the service origin and
+/// the account they belong to, the recovery recipient's public key and the fingerprint of the kit
+/// that opens them, the writer and the producer by their key identifiers, when it was set up, and
+/// the number of the last generation this host made. That number is never lowered for its archive:
+/// cleanup deletes a generation that left nothing at the service, and a number taken from the rows
+/// would be taken again. A setup is never deleted, and one of the same archive keeps what it
+/// recorded; a different archive is a replacement, which starts its own count.
+///
+/// The fingerprint of what a generation was made from is one digest, written in the transaction
+/// that admits the generation and removed with it. It holds nothing a person named: not a session,
+/// not a file.
+///
+/// One text, in [`DEFINITION`] and in the steps that bring an earlier store to this schema.
+macro_rules! setup_definition {
+    () => {
+        "
+                 CREATE TABLE IF NOT EXISTS host_backup (
+                     id                  INTEGER PRIMARY KEY CHECK (id = 0),
+                     archive_id          BLOB NOT NULL,
+                     origin              TEXT NOT NULL,
+                     account_mark        BLOB NOT NULL,
+                     recovery_public_key BLOB NOT NULL,
+                     kit_fingerprint     TEXT NOT NULL,
+                     writer_key_id       BLOB NOT NULL,
+                     producer_key_id     BLOB NOT NULL,
+                     enabled_at_ms       INTEGER NOT NULL,
+                     generation_counter  INTEGER NOT NULL DEFAULT 0,
+                     CHECK (length(archive_id) = 16),
+                     CHECK (length(origin) BETWEEN 1 AND 2048),
+                     CHECK (length(account_mark) = 32),
+                     CHECK (length(recovery_public_key) = 32),
+                     CHECK (length(kit_fingerprint) BETWEEN 1 AND 64),
+                     CHECK (generation_counter >= 0)
+                 );
+                 CREATE TRIGGER IF NOT EXISTS a_setup_is_never_deleted
+                 BEFORE DELETE ON host_backup
+                 BEGIN
+                     SELECT RAISE(ABORT, 'the setup of backups on this host is never deleted');
+                 END;
+                 CREATE TRIGGER IF NOT EXISTS a_setup_of_one_archive_keeps_what_it_recorded
+                 BEFORE UPDATE ON host_backup
+                 WHEN NEW.archive_id = OLD.archive_id
+                  AND (NEW.origin <> OLD.origin
+                    OR NEW.account_mark <> OLD.account_mark
+                    OR NEW.recovery_public_key <> OLD.recovery_public_key
+                    OR NEW.kit_fingerprint <> OLD.kit_fingerprint
+                    OR NEW.writer_key_id <> OLD.writer_key_id
+                    OR NEW.producer_key_id <> OLD.producer_key_id
+                    OR NEW.enabled_at_ms <> OLD.enabled_at_ms)
+                 BEGIN
+                     SELECT RAISE(ABORT, 'a setup of one archive keeps what it recorded, and \
+                                          another archive is a replacement');
+                 END;
+                 CREATE TRIGGER IF NOT EXISTS the_count_of_one_archive_never_goes_down
+                 BEFORE UPDATE OF generation_counter ON host_backup
+                 WHEN NEW.archive_id = OLD.archive_id
+                  AND NEW.generation_counter < OLD.generation_counter
+                 BEGIN
+                     SELECT RAISE(ABORT, 'the number of the last generation made for an archive \
+                                          is never lowered');
+                 END;
+                 CREATE TRIGGER IF NOT EXISTS a_replacement_starts_its_count_at_nothing
+                 BEFORE UPDATE ON host_backup
+                 WHEN NEW.archive_id <> OLD.archive_id AND NEW.generation_counter <> 0
+                 BEGIN
+                     SELECT RAISE(ABORT, 'the setup of another archive starts counting its \
+                                          generations at nothing');
+                 END;
+                 CREATE TABLE IF NOT EXISTS generation_sources (
+                     archive_id        BLOB NOT NULL,
+                     backup_generation INTEGER NOT NULL,
+                     fingerprint       BLOB NOT NULL,
+                     PRIMARY KEY (archive_id, backup_generation),
+                     FOREIGN KEY (archive_id, backup_generation)
+                         REFERENCES generations (archive_id, backup_generation),
+                     CHECK (length(fingerprint) = 32)
+                 );
+                 CREATE TRIGGER IF NOT EXISTS what_a_generation_was_made_from_is_not_rewritten
+                 BEFORE UPDATE ON generation_sources
+                 BEGIN
+                     SELECT RAISE(ABORT, 'what a backup generation was made from is not rewritten');
                  END;"
     };
 }
@@ -1006,6 +1183,13 @@ const UPLOADS: Statement = sql!(uploads_definition!());
 
 /// And the release table and its rules.
 const RELEASES: Statement = sql!(releases_definition!());
+
+/// What a version-7 store gains: the rule that decides which generation's objects are deleted.
+const RELEASE_RULE: Statement = sql!(release_rule!());
+
+/// What an earlier store gains: the setup record and the fingerprints of what generations were
+/// made from.
+const SETUP: Statement = sql!(setup_definition!());
 
 /// Everything one backup store is: its tables, its indexes, and the rules it enforces.
 const DEFINITION: Statement = sql!(concat!(
@@ -1418,6 +1602,7 @@ const DEFINITION: Statement = sql!(concat!(
                  ",
     uploads_definition!(),
     releases_definition!(),
+    setup_definition!(),
     "
                  INSERT INTO privacy_state (id, current_generation, enabled) VALUES (0, 0, 0);"
 ));
@@ -1485,9 +1670,12 @@ impl BackupStore {
         backup_generation: BackupGeneration,
         object_id: BackupObjectId,
     ) -> PathBuf {
-        self.staging_root
-            .join(format!("{}-{}", archive_id, backup_generation.get()))
-            .join(format!("{object_id}.krb"))
+        crate::backup::lease::staged_path_under(
+            &self.staging_root,
+            archive_id,
+            backup_generation,
+            object_id,
+        )
     }
 
     /// Admits one generation: its record, its object rows and its first upload attempt, together.
@@ -1524,6 +1712,16 @@ impl BackupStore {
             });
         }
         let privacy_generation = current_generation(&transaction)?;
+        if u64::try_from(privacy_generation).ok() != Some(offered.content_read_under) {
+            return Err(ControllerError::Refused {
+                code: kr_protocol::error::ErrorCode::PermissionDenied,
+                detail: format!(
+                    "that backup content was read under privacy generation {}, and this host is \
+                     at {privacy_generation}",
+                    offered.content_read_under
+                ),
+            });
+        }
         transaction
             .run(
                 sql!(
@@ -1581,6 +1779,28 @@ impl BackupStore {
                 )
                 .map_err(ControllerError::registry)?;
         }
+        if let Some(made_from) = offered.made_from {
+            transaction
+                .run(
+                    sql!(
+                        "INSERT INTO generation_sources (archive_id, backup_generation, fingerprint)
+                     VALUES (?1, ?2, ?3)"
+                    ),
+                    params![archive, generation, made_from.as_bytes().as_slice()],
+                )
+                .map_err(ControllerError::registry)?;
+        }
+        // The number of the last generation made, kept with the setup so that a number cleanup
+        // made free is not taken again.
+        transaction
+            .run(
+                sql!(
+                    "UPDATE host_backup SET generation_counter = ?2
+                  WHERE id = 0 AND archive_id = ?1 AND generation_counter < ?2"
+                ),
+                params![archive, generation],
+            )
+            .map_err(ControllerError::registry)?;
         let sequence = enqueue(
             &transaction,
             offered.archive_id,
@@ -3556,7 +3776,12 @@ impl BackupStore {
         Ok(finished)
     }
 
-    /// Returns every path an object row names as staged on this host.
+    /// Returns where every object row's ciphertext is staged under this store's staging root.
+    ///
+    /// The path is made from the row's identities and the root the store holds now, and not read
+    /// from the path the row was written with, so a state directory that is reached by another
+    /// spelling than the one a row was written under cannot make the ciphertext of a row look like
+    /// a file nothing claims.
     ///
     /// # Errors
     ///
@@ -3564,14 +3789,27 @@ impl BackupStore {
     pub fn registered_staged_paths(&self) -> Result<Vec<PathBuf>> {
         let mut statement = self
             .connection
-            .prepared(sql!("SELECT staged_path FROM objects"))
+            .prepared(sql!(
+                "SELECT archive_id, backup_generation, object_id FROM objects"
+            ))
             .map_err(ControllerError::registry)?;
         let rows = statement
-            .query_map([], |row| row.get::<_, String>(0))
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                ))
+            })
             .map_err(ControllerError::registry)?;
         let mut paths = Vec::new();
         for row in rows {
-            paths.push(PathBuf::from(row.map_err(ControllerError::registry)?));
+            let (archive, generation, object) = row.map_err(ControllerError::registry)?;
+            paths.push(self.staged_path(
+                ArchiveId::new(uuid(&archive, "an archive identifier")?),
+                BackupGeneration::new(u64::try_from(generation).unwrap_or(0)),
+                BackupObjectId::new(uuid(&object, "an object identifier")?),
+            ));
         }
         Ok(paths)
     }
@@ -4218,6 +4456,7 @@ fn try_finish_generation(
         for statement in [
             sql!("DELETE FROM outbox WHERE archive_id = ?1 AND backup_generation = ?2"),
             sql!("DELETE FROM uploads WHERE archive_id = ?1 AND backup_generation = ?2"),
+            sql!("DELETE FROM generation_sources WHERE archive_id = ?1 AND backup_generation = ?2"),
             sql!("DELETE FROM objects WHERE archive_id = ?1 AND backup_generation = ?2"),
         ] {
             transaction
