@@ -5560,24 +5560,24 @@ owed from the moment a connection is established until one has happened on it, a
 feed is reported stale rather than current.
 
 When the configuration document names an `authority.origin`, the daemon runs a carrier for the feed
-for as long as it lives; when it names none, no remote owner's revocation can reach the host and the
-owners paired with it revoke directly. The origin is read once, at start. The carrier signs as the
-host, with the authorisation key its pairings recorded, which is what the feed is addressed by, and
-reads the feed at four moments: when the daemon starts, when a connection is established, every 30
-seconds after that, and when an owner is paired or revoked. A connection waits for a read that began
-after it was admitted before anything it asks is answered, for at most five seconds, so a device
-the feed holds a revocation for is refused on its first request and not at the next poll; a feed
-that does not answer in that time leaves the connection served, and the status goes stale when the
-pass that was held ends without an answer.
+for as long as it lives. When it names none, no remote owner's revocation can reach the host, and
+the owners paired with it revoke directly. The origin is read only once, at start. The carrier signs
+as the host, with the authorisation key its pairings recorded, which is what the feed is addressed
+by. It reads the feed at four moments: when the daemon starts, when a connection is established,
+every 30 seconds after that, and when an owner is paired or revoked. A connection waits for a read
+that began after it was admitted, for at most five seconds, before anything it asks is answered. So
+a device the feed holds a revocation for is refused on its first request and not at the next poll. A
+feed that does not answer in that time leaves the connection served, and the status goes stale when
+the pass that was held ends without an answer.
 
 The host judges each request from its own records. A request addressed to another host, or that
-names nothing this host knows, is refused to the feed as an unknown target; one signed by a key
-that is not a paired device, or by a paired device this host would not let manage it, is refused as
-lacking owner authority; a different request under an identity this host already took is refused
+names nothing this host knows, is refused to the feed as an unknown target. A request signed by a
+key that is not a paired device, or by a paired device this host would not let manage it, is refused
+as lacking owner authority. A different request under an identity this host already took is refused
 as superseded. Whether a device may manage the host is decided as the same device's own
 `device.revoke` is: by its grant and its selectors, by this host's policy (an organisation's lease
 and member binding, an exclusive management) and by the rights ceiling the configuration puts in
-force. A bounded offline validity is the one thing left out: it stops personal remote access while
+force. A bounded offline validity is the one thing left out. It stops personal remote access while
 the feed cannot be reached, and the host has just read the feed. A decision that rests on a clock
 reading this host has not written down, or on a clock it has not proven, is not taken: the pass
 stops and asks again, and no request is refused for it. A device whose grant holds no right to
