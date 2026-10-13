@@ -152,9 +152,11 @@ impl Reply {
         match outcome {
             Ok(Settled::Result(_)) => Self::Result,
             Ok(Settled::Receipt(_)) => Self::Lost,
-            Err(ClientError::Host(error) | ClientError::Refused { error, .. }) => {
-                Self::Refused(error.retry)
-            }
+            Err(
+                ClientError::Host(error)
+                | ClientError::Refused { error, .. }
+                | ClientError::OutcomeUnknown { error, .. },
+            ) => Self::Refused(error.retry),
             Err(
                 ClientError::SubmissionUncertain { .. }
                 | ClientError::Transport(_)

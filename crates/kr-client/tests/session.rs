@@ -1161,6 +1161,13 @@ async fn an_unknown_outcome_is_never_retried_and_names_the_action_to_ask_about()
         .expect_err("an uncertain outcome");
     assert_eq!(error.code(), ErrorCode::OutcomeUnknown);
     assert_eq!(script.actions.lock().await.len(), 1);
+    // The host's answer names no action; the client holds the identifier it recorded before it sent,
+    // and carries it with what the host said.
+    let sent = script.actions.lock().await[0];
+    assert!(
+        matches!(&error, ClientError::OutcomeUnknown { action_id, .. } if *action_id == sent),
+        "the answer carries the action it is about: {error}"
+    );
     let decision = error.decision(RequestClass::Dispatchable);
     assert_eq!(decision.recovery, Recovery::QueryOutcome);
     assert_eq!(error.user_action(), UserAction::CheckTheOutcome);
@@ -1169,6 +1176,50 @@ async fn an_unknown_outcome_is_never_retried_and_names_the_action_to_ask_about()
     let submitted = session.submitted_actions().await;
     assert_eq!(submitted.len(), 1);
     assert_eq!(submitted[0].action_id, script.actions.lock().await[0]);
+
+    session.close();
+    serving.abort();
+}
+
+/// A request composed first and sent for the first time carries the same unknown as a mutation: the
+/// action its caller named, with what the host said, and it stays held until the caller settles it.
+#[tokio::test]
+async fn a_composed_send_the_host_cannot_establish_carries_the_action_its_caller_named() {
+    let host = side(1, true).await;
+    let client = side(2, false).await;
+    let script = Arc::new(HostScript::default());
+    let serving = spawn_host(&host, client.record, Arc::clone(&script), None);
+    let session = connect(&client, &host).await;
+
+    let named = kr_protocol::ids::ActionId::new(Uuid::from_bytes([0x45; 16]));
+    let composed = session
+        .compose(
+            Method::SessionCreate,
+            named,
+            ActionTarget::environment(EnvironmentId::new(Uuid::from_bytes([9; 16]))),
+            None,
+            &Empty {},
+            &Empty {},
+            DurationMs::new(120_000),
+        )
+        .await
+        .expect("composed");
+    *script.refuse_mutations_with.lock().await = Some(ErrorCode::OutcomeUnknown);
+    let error = session
+        .send(&composed)
+        .await
+        .expect_err("the host cannot say what became of it");
+    assert!(
+        matches!(&error, ClientError::OutcomeUnknown { action_id, .. } if *action_id == named),
+        "the answer carries the action its caller named: {error}"
+    );
+    assert_eq!(
+        session.submitted_actions().await.len(),
+        1,
+        "and the action stays held until its caller settles it"
+    );
+    session.settle(named).await;
+    assert!(session.submitted_actions().await.is_empty());
 
     session.close();
     serving.abort();

@@ -522,6 +522,11 @@ mod tests {
         assert!(ends_the_link(&ClientError::SubmissionUncertain {
             action_id: kr_protocol::ids::ActionId::new(kr_ipc::new_uuid()),
         }));
+        // The host's own answer that it cannot establish an outcome is made on a link that stands.
+        assert!(!ends_the_link(&ClientError::OutcomeUnknown {
+            action_id: kr_protocol::ids::ActionId::new(kr_ipc::new_uuid()),
+            error: kr_protocol::error::ProtocolError::new(ErrorCode::OutcomeUnknown, "unknown"),
+        }));
         for code in [
             ErrorCode::StaleSession,
             ErrorCode::PermissionDenied,

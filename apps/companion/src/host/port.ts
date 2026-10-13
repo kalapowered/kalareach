@@ -849,7 +849,10 @@ export interface AttemptView {
   readonly can_happen_until_ms: string | null
   /** How many times the host has been asked again. */
   readonly repeats: number
-  /** What the host said when it refused, in its words, while that is known. */
+  /**
+   * What the host said when it refused, or could not say what became of the request, in its words,
+   * while that is known.
+   */
   readonly refusal: string | null
   /**
    * The host's result, in the method's own shape, for an attempt that was carried on after the

@@ -116,6 +116,19 @@ pub enum ClientError {
         /// The action whose outcome is unknown.
         action_id: kr_protocol::ids::ActionId,
     },
+    /// The host answered that it cannot say whether a mutation happened, and this is the action.
+    ///
+    /// The client made and recorded the action's identifier before it sent the request, and the
+    /// host's answer names none, so the two are carried together. The host's refusal is as it said
+    /// it. The action stays unresolved: the caller asks the host what became of it, as for
+    /// [`Self::SubmissionUncertain`], and never submits it again. Unlike a connection that ended,
+    /// this answer says nothing against the connection it came on.
+    OutcomeUnknown {
+        /// The action whose outcome the host could not establish.
+        action_id: kr_protocol::ids::ActionId,
+        /// What the host said.
+        error: ProtocolError,
+    },
     /// The host requires a fresh snapshot before it will serve this stream again.
     ResyncRequired,
     /// No implementation of a managed service is configured.
@@ -146,6 +159,7 @@ impl ClientError {
             | Self::NoActionWindow => ErrorCode::ResourceUnavailable,
             Self::ConnectionEnded => ErrorCode::ResourceUnavailable,
             Self::SubmissionUncertain { .. } => ErrorCode::OutcomeUnknown,
+            Self::OutcomeUnknown { error, .. } => error.code,
             Self::ResyncRequired => ErrorCode::ResyncRequired,
             Self::ServiceNotConfigured(_) => ErrorCode::HostNotConfigured,
             Self::Draft(error) => error.code(),
@@ -288,6 +302,11 @@ impl Said for ClientError {
             Self::SubmissionUncertain { action_id } => crate::shown!(
                 "the outcome of action {} is unknown: the connection ended after it was sent",
                 *action_id
+            ),
+            Self::OutcomeUnknown { action_id, error } => crate::shown!(
+                "the host cannot say whether action {} happened: {}",
+                *action_id,
+                Shown::protocol(error)
             ),
             Self::ResyncRequired => Shown::said("the host requires a resynchronisation"),
             Self::ServiceNotConfigured(what) => {

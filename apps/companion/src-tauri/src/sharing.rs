@@ -93,7 +93,8 @@ impl Default for Pace {
 struct Running {
     /// When this process began to count the attempt's bound.
     armed: Armed,
-    /// What the host said when it refused the request, in its words.
+    /// What the host said when it refused the request, or when it could not say what became of it,
+    /// in its words.
     refusal: Option<String>,
     /// Whether a task of this process is carrying the attempt on.
     driving: bool,
@@ -510,7 +511,8 @@ pub struct AttemptView {
     pub can_happen_until_ms: Option<TimestampMs>,
     /// How many times the host has been asked again.
     pub repeats: u8,
-    /// What the host said when it refused, in its words, while that is known.
+    /// What the host said when it refused, or when it could not say what became of the request, in
+    /// its words, while that is known.
     pub refusal: Option<String>,
     /// The host's result, in the method's own shape, for an attempt that was carried on after the
     /// command that sent it returned and ended with the result. Null once the page has removed the
@@ -654,7 +656,9 @@ fn holding(state: &AppState) -> Result<Connection> {
 
 fn host_refusal(error: &ClientError) -> Option<&ProtocolError> {
     match error {
-        ClientError::Host(refusal) | ClientError::Refused { error: refusal, .. } => Some(refusal),
+        ClientError::Host(refusal)
+        | ClientError::Refused { error: refusal, .. }
+        | ClientError::OutcomeUnknown { error: refusal, .. } => Some(refusal),
         _ => None,
     }
 }
@@ -2310,5 +2314,24 @@ mod tests {
                 .expect("it looked"),
             "the cancel found the hand-over already taken"
         );
+    }
+
+    /// What the host says of an answer it could not give is kept with the attempt as what it says
+    /// of a refusal is, because the person can act on its words; a connection that ended says
+    /// nothing of the host's.
+    #[test]
+    fn the_hosts_words_for_an_unknown_outcome_are_kept_as_its_words_for_a_refusal() {
+        let mut said = Said::default();
+        said.take(&Err(ClientError::OutcomeUnknown {
+            action_id: ActionId::new(Uuid::from_bytes([1; 16])),
+            error: ProtocolError::new(ErrorCode::OutcomeUnknown, "unknown"),
+        }));
+        assert_eq!(
+            said.refusal.map(|refusal| refusal.code),
+            Some(ErrorCode::OutcomeUnknown)
+        );
+        let mut lost = Said::default();
+        lost.take(&Err(ClientError::ConnectionEnded));
+        assert!(lost.refusal.is_none());
     }
 }

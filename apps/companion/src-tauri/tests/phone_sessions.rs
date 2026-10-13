@@ -708,6 +708,63 @@ async fn kr_req_19_08_a_leave_waits_for_the_prompt_in_flight() {
     adopted.stop().await;
 }
 
+/// KR-REQ-19.08 and section 9: a prompt the host cannot establish reaches the page as an action it
+/// has an identifier for, not as a refusal, and the screen's link goes on standing. The page can ask
+/// what became of it under the same opening, and is told what the host's record says.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn kr_req_19_08_a_prompt_the_host_cannot_establish_reaches_the_page_with_its_action() {
+    let adopted = Adopted::start(1).await;
+    let worker = &adopted.workers[0];
+    let upstream = Arc::new(net_support::worker::HeldUpstream::default());
+    let instance = worker.register_agent_on(Arc::clone(&upstream) as _);
+    let session = worker.session_id;
+    let phone = phone_under(
+        &adopted,
+        pairing(&[ActionRight::SessionView, ActionRight::AgentPrompt]),
+    )
+    .await;
+    let companion = &phone.companion;
+    open(companion, session, None, "unknown-screen").expect("the session opens");
+
+    // The agent's upstream takes the frame and never answers, so the worker, at its own deadline,
+    // answers that the outcome cannot be established.
+    let settled = companion
+        .call(
+            "agent_prompt_submit",
+            json!({ "params": prompt(session, instance, "never answered"), "opening": "unknown-screen" }),
+        )
+        .expect("an outcome nobody can establish is an answer with its action, not a refusal");
+    assert_eq!(upstream.prompts().len(), 1, "the frame reached the upstream once");
+    assert!(settled["receipt"].is_null(), "{settled}");
+    assert!(settled["value"].is_null(), "{settled}");
+    let action_id = settled["action_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the answer names the action: {settled}"))
+        .to_owned();
+
+    // The link the answer came on is still the screen's: the answer said nothing against it.
+    companion
+        .call(
+            "session_agents",
+            json!({ "sessionId": session.to_string(), "opening": "unknown-screen" }),
+        )
+        .expect("the screen's link stands");
+    // And the host's record of the action is read on it, under the opening.
+    let read = companion
+        .call(
+            "action_read",
+            json!({
+                "params": { "action_id": action_id, "session_id": session.to_string() },
+                "opening": "unknown-screen",
+            }),
+        )
+        .expect("the receipt is read under the opening");
+    assert_eq!(read["receipt"]["state"], "unknown", "{read}");
+
+    upstream.release();
+    adopted.stop().await;
+}
+
 /// KR-REQ-19.08: the phone holds at most four ambient links and eight opened ones. Five sessions
 /// asked about at once from outside any screen are all answered, with no more than four links held;
 /// a ninth session opened is refused until one is left.

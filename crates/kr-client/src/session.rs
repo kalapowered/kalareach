@@ -865,7 +865,7 @@ impl Session {
                 // is not decided twice: an answer that says the outcome is unknown leaves the
                 // action on the unresolved list, and section 9 forbids forgetting one.
                 match response.outcome {
-                    Outcome::Error(error) => Err(ClientError::from(error)),
+                    Outcome::Error(error) => Err(refused_or_unknown(action_id, error)),
                     Outcome::Ok(value) => Ok(Settled::Result(value)),
                 }
             }
@@ -1069,7 +1069,7 @@ impl Session {
         match waiter.wait().await {
             Ok(Answer::Receipt(receipt)) => Ok(Settled::Receipt(receipt)),
             Ok(Answer::Response(response)) => match response.outcome {
-                Outcome::Error(error) => Err(ClientError::from(error)),
+                Outcome::Error(error) => Err(refused_or_unknown(action_id, error)),
                 Outcome::Ok(value) => Ok(Settled::Result(value)),
             },
             Err(_) => Err(ClientError::SubmissionUncertain { action_id }),
@@ -1317,6 +1317,18 @@ async fn read_loop(transport: Arc<dyn ControlTransport>, state: Arc<SessionState
     // connection nothing is reading. Every waiter learns that its answer is not coming.
     transport.close();
     state.end();
+}
+
+/// What a host's refusal of a mutation is, given the action the mutation carried.
+///
+/// A host that says it cannot establish whether the action happened has not refused it, and the
+/// client holds the identifier the host's answer lacks, so the two travel together.
+fn refused_or_unknown(action_id: ActionId, error: kr_protocol::error::ProtocolError) -> ClientError {
+    if error.code.retry_category() == kr_protocol::error::RetryCategory::OutcomeUnknown {
+        ClientError::OutcomeUnknown { action_id, error }
+    } else {
+        ClientError::from(error)
+    }
 }
 
 /// Returns whether one response settled what it answered.

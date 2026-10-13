@@ -524,7 +524,12 @@ fn submitted(
 ) -> Result<Settled> {
     match answer {
         Ok(value) => settled(&value),
-        Err(kr_client::ClientError::SubmissionUncertain { action_id }) => Ok(Settled {
+        // The connection ended after the request was sent, or the host said it cannot establish
+        // whether it happened: either way the action exists, and is what the page asks about.
+        Err(
+            kr_client::ClientError::SubmissionUncertain { action_id }
+            | kr_client::ClientError::OutcomeUnknown { action_id, .. },
+        ) => Ok(Settled {
             receipt: None,
             value: None,
             action_id: Some(action_id.to_string()),
@@ -569,7 +574,10 @@ where
 {
     match answer {
         Ok(value) => settled_as::<R>(&value),
-        Err(kr_client::ClientError::SubmissionUncertain { action_id }) => Ok(Settled {
+        Err(
+            kr_client::ClientError::SubmissionUncertain { action_id }
+            | kr_client::ClientError::OutcomeUnknown { action_id, .. },
+        ) => Ok(Settled {
             receipt: None,
             value: None,
             action_id: Some(action_id.to_string()),
