@@ -1233,9 +1233,9 @@ fn the_workflow_journal_s_numbering_has_holes_that_are_not_gaps() {
     assert_eq!(left[0].automation, Nullable::some(chain));
 }
 
-/// A host whose authority feed removed it raises one urgent item of the environment's own, which the
-/// owner and a device that manages the host see and a device that only views a session does not;
-/// the same answer repeated is the same item; and the host reading another feed ends it. The
+/// A host whose authority feed removed it raises one urgent item of the environment's own, which
+/// the owner and a device that manages the host see and a device that only views a session does
+/// not; the same answer repeated is the same item; and the host reading another feed ends it. The
 /// source numbers a notice by the moment it was recorded, so the distance between two is not a gap.
 #[test]
 fn a_removed_authority_feed_raises_one_item_until_the_host_reads_another() {

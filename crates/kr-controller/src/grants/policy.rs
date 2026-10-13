@@ -1274,11 +1274,10 @@ impl HostPolicy {
                 })
             }
             None => {
-                // Personal authority. It continues through an organisation outage, unless this
-                // host is exclusively organisation-managed, in which case there is no personal
-                // path left to continue on.
-                // The person at this machine is never locked out of it by a feed: the owner's way to
-                // act at the host is through this door.
+                // Personal authority. It continues through an organisation outage, unless this host
+                // is exclusively organisation-managed, in which case there is no personal path left
+                // to continue on. The person at this machine is never locked out of it by a feed:
+                // the owner's way to act at the host is through this door.
                 if self.feed_removed
                     && request.ingress != ActorIngress::LocalIpc
                     && (self.exclusively_managed || self.offline.is_some())
