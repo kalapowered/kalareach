@@ -9999,3 +9999,46 @@ fn a_pass_that_begins_after_the_stop_is_cancelled() {
     let after = service.begin_production().expect("a lease");
     assert!(after.is_cancelled());
 }
+
+/// The sweep makes the directory of a generation durable as well as the root: a stray file in a
+/// directory that stays (it holds something else) is removed, and the flush of that directory
+/// failing is a failed sweep.
+#[test]
+fn the_sweep_is_not_done_while_a_generation_directory_cannot_be_flushed() {
+    let environment = Environment::open();
+    let service = environment.service();
+    let root = service.staging_root();
+    let generation = root.join("stray-2");
+    std::fs::create_dir_all(generation.join("kept")).expect("a directory that stays");
+    std::fs::write(generation.join("lost.krb"), b"ciphertext nothing names").expect("a stray file");
+
+    let refused = kr_flush::testing::refuse_flushes_of(generation.clone());
+    assert!(
+        service.remove_unclaimed_staging().is_err(),
+        "the file went and the flush of its directory failed"
+    );
+    assert!(generation.join("kept").exists(), "the directory stays");
+    drop(refused);
+    assert_eq!(service.remove_unclaimed_staging().expect("a sweep"), 0);
+}
+
+/// A staging directory that was taken away is not a fault of the sweep: it has nothing to remove
+/// and nothing to flush, and the next pass makes it again.
+#[test]
+fn a_sweep_of_a_staging_directory_that_is_gone_finds_nothing() {
+    let environment = Environment::open();
+    let service = environment.service();
+    let root = service.staging_root();
+    std::fs::remove_dir_all(&root).expect("the staging directory is taken away");
+    assert_eq!(service.remove_unclaimed_staging().expect("a sweep"), 0);
+    let lease = service.begin_production().expect("a lease");
+    let staged = lease
+        .stage(
+            archive_id(),
+            BackupGeneration::new(1),
+            object_id(1),
+            b"ciphertext",
+        )
+        .expect("the directory is made again");
+    assert!(staged.path.exists());
+}

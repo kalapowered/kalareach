@@ -1087,7 +1087,7 @@ impl BackupService {
     /// The files are found by their names under the staging root, so a state directory reached by
     /// another spelling than the one a row was written under does not make a claimed file look
     /// unclaimed. A pass that holds the staging directory is not interrupted: nothing is removed
-    /// while one runs.
+    /// while one runs, and a sweep that finds one claims nothing.
     ///
     /// # Errors
     ///
@@ -1112,8 +1112,8 @@ impl BackupService {
                 let _ = std::fs::remove_dir(directory);
             }
         }
-        // The whole staging directory is flushed on every sweep, the one that found nothing
-        // included: a removal whose flush failed last time is not a removal that is made.
+        // The whole staging directory is flushed on every sweep that runs, the one that found
+        // nothing included: a removal whose flush failed last time is not a removal that is made.
         flush_staging_tree(store.staging_root())?;
         Ok(removed)
     }
@@ -1816,11 +1816,16 @@ fn sync_removal(path: &Path) -> Result<()> {
 /// Makes every removal under the staging root durable: the directory of each generation, then the
 /// root.
 pub(super) fn flush_staging_tree(root: &Path) -> Result<()> {
+    // A root that is gone has nothing in it to flush: the nearest directory that is there holds
+    // the removal, and the next write of a file makes the root again.
+    if !root.exists() {
+        return sync_removal(root);
+    }
     for entry in std::fs::read_dir(root).map_err(ControllerError::registry)? {
         let path = entry.map_err(ControllerError::registry)?.path();
         // A directory that is gone since the listing was taken has nothing left to flush; the
         // flush of the root below makes its removal durable.
-        if path.is_dir() && path.exists() {
+        if path.is_dir() {
             match flush_directory(&path, NameKind::File) {
                 Ok(()) => {}
                 Err(_) if !path.exists() => {}

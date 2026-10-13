@@ -271,7 +271,7 @@ impl Controller {
     /// moment it ends, by whichever way it ends, so that ending the process does not wait for a
     /// pass to read and seal everything it has begun. Nothing waits for the pass.
     #[must_use = "the passes are stopped when the guard is dropped"]
-    pub fn stop_backup_production_when_dropped(self: &Arc<Self>) -> StopBackupProduction {
+    pub fn stop_backup_production_when_dropped(&self) -> StopBackupProduction {
         StopBackupProduction(Arc::clone(&self.backup))
     }
 
@@ -297,7 +297,8 @@ impl Controller {
         )
     }
 
-    /// Starts the producer's task, which runs until the daemon goes. It holds the daemon weakly.
+    /// Starts the producer's task, which runs until the daemon goes. It holds the daemon weakly
+    /// while it waits, and a pass holds it for as long as the pass runs.
     pub(super) fn start_backup_production(self: &Arc<Self>) {
         let Some(production) = self.backup_production.clone() else {
             return;
