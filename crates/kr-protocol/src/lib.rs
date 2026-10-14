@@ -122,6 +122,7 @@ pub mod attention;
 pub mod authority;
 pub mod automation;
 pub mod backup_read;
+pub mod backup_setup;
 pub mod broker;
 pub mod catalogue;
 pub mod changeset;

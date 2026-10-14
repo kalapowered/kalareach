@@ -57,6 +57,11 @@ use crate::automation::{
     WorkflowRunParams, WorkflowRunResult, WorkflowRunStatus, WorkflowRunSummary, WorkflowTrigger,
 };
 use crate::backup_read::{BackupBundle, BackupReadParams, BackupReadResult, BackupSignIn};
+use crate::backup_setup::{
+    BackupEnableCause, BackupEnableParams, BackupEnableResult, BackupHostKeys, BackupLastAttempt,
+    BackupSetupState, BackupStatusParams, BackupStatusResult, BackupStorageState,
+    BackupStorageUnread, BackupUnusable,
+};
 use crate::broker::{
     ActionToken, ActionTokenClaim, CapabilityMap, DecoderLedgerEntry, DecodingTrust,
     InstanceCapabilityRecord, LaunchProfile, PreparedEffect,
@@ -860,6 +865,18 @@ pub fn protocol_schema() -> Value {
         "backup_read_params" => BackupReadParams,
         "backup_read_result" => BackupReadResult,
         "backup_sign_in" => BackupSignIn,
+        // Setting this host's backups up, appended for the same reason.
+        "backup_enable_cause" => BackupEnableCause,
+        "backup_enable_params" => BackupEnableParams,
+        "backup_enable_result" => BackupEnableResult,
+        "backup_host_keys" => BackupHostKeys,
+        "backup_last_attempt" => BackupLastAttempt,
+        "backup_setup_state" => BackupSetupState,
+        "backup_status_params" => BackupStatusParams,
+        "backup_status_result" => BackupStatusResult,
+        "backup_storage_state" => BackupStorageState,
+        "backup_storage_unread" => BackupStorageUnread,
+        "backup_unusable" => BackupUnusable,
         // Session descriptions: the setup read and the two writes, the facts a worker keeps per
         // session and the request and page the control daemon reads them with. Appended for the
         // same reason.

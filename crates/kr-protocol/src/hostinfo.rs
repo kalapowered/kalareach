@@ -6155,6 +6155,26 @@ pub mod export {
             self
         }
 
+        /// Appends the fingerprint that matches a recovery kit to this host: eight symbols of the
+        /// recovery alphabet in two groups of four, which this host derives from a public key and
+        /// which says nothing of the seed. Text that is not that is withheld by its class and
+        /// length.
+        #[must_use]
+        pub fn kit_fingerprint(mut self, value: &str) -> Self {
+            const ALPHABET: &str = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+            let well_formed = value.len() == 9
+                && value.char_indices().all(|(at, symbol)| match at {
+                    4 => symbol == '-',
+                    _ => ALPHABET.contains(symbol),
+                });
+            if well_formed {
+                self.text.push_str(value);
+            } else {
+                self.text.push_str(&withheld(ContentClass::Name, value));
+            }
+            self
+        }
+
         /// Appends a number.
         #[must_use]
         pub fn number(mut self, value: u64) -> Self {

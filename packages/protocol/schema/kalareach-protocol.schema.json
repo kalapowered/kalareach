@@ -4758,6 +4758,313 @@
         }
       ]
     },
+    "BackupEnableCause": {
+      "description": "How the last call to `backup.enable` ended, when it did not set backups up.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "The host's configuration selects no storage service.",
+          "properties": {
+            "kind": {
+              "const": "no_service",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "No account token could be had, for this reason.",
+          "properties": {
+            "kind": {
+              "const": "sign_in",
+              "type": "string"
+            },
+            "sign_in": {
+              "$ref": "#/$defs/BackupSignIn",
+              "description": "Why."
+            }
+          },
+          "required": [
+            "kind",
+            "sign_in"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The host is signed in as another account than the one the call began under.",
+          "properties": {
+            "kind": {
+              "const": "another_account",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "A key this host holds is not the one the call names.",
+          "properties": {
+            "kind": {
+              "const": "keys_changed",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The sealed bundle is larger than any sealed bundle may be.",
+          "properties": {
+            "kind": {
+              "const": "bundle_too_large",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Backups are set up for another archive, and the call did not ask to replace them.",
+          "properties": {
+            "kind": {
+              "const": "already_set_up",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "This host already records generations of that archive, so it cannot be set up for it again.",
+          "properties": {
+            "kind": {
+              "const": "archive_in_use",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The account has no allowance for backup storage.",
+          "properties": {
+            "kind": {
+              "const": "no_allowance",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The service did not take the account's token as an account's: it answered as if the bundle\nwere not there.",
+          "properties": {
+            "kind": {
+              "const": "token_not_accepted",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The locator already holds another bundle.",
+          "properties": {
+            "kind": {
+              "const": "bundle_conflict",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The service refused the write of the bundle, the enrolment of the writer or the change of\nretention.",
+          "properties": {
+            "code": {
+              "$ref": "#/$defs/ErrorCode",
+              "description": "The service's error code."
+            },
+            "kind": {
+              "const": "service_refused",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "code"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "BackupEnableParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `backup.enable`: everything the daemon needs to set backups up, and nothing of the\nrecovery seed.",
+      "properties": {
+        "archive_id": {
+          "$ref": "#/$defs/ArchiveId",
+          "description": "The archive the backups are of, chosen by the command. The call is idempotent on it."
+        },
+        "bundle_locator": {
+          "$ref": "#/$defs/Uuid",
+          "description": "The bundle's locator. It is the one kit value that reaches the daemon."
+        },
+        "enabled_at_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "The instant the command chose, which the writer's and the producer's entries in the bundle\nand the enrolment carry. Every repeat names the same one."
+        },
+        "kit_fingerprint": {
+          "description": "The fingerprint that matches the kit to this host.",
+          "type": "string"
+        },
+        "producer_key_id": {
+          "$ref": "#/$defs/KeyId",
+          "description": "The producer the command read from `backup.status` and put in the bundle."
+        },
+        "recovery_public_key": {
+          "$ref": "#/$defs/StoredEnvelopeKey",
+          "description": "The recovery recipient's public key, which every generation wraps its keys for."
+        },
+        "replace": {
+          "description": "Whether this replaces backups that are set up for another archive.",
+          "type": "boolean"
+        },
+        "request_id": {
+          "$ref": "#/$defs/Uuid",
+          "description": "The identity the bundle's write goes out under: the same for every repeat of the call."
+        },
+        "sealed_bundle": {
+          "$ref": "#/$defs/Bytes",
+          "description": "The sealed bundle, which only the seed opens."
+        },
+        "writer_key_id": {
+          "$ref": "#/$defs/KeyId",
+          "description": "The writer the command read from `backup.status` and put in the bundle."
+        }
+      },
+      "required": [
+        "archive_id",
+        "recovery_public_key",
+        "kit_fingerprint",
+        "bundle_locator",
+        "sealed_bundle",
+        "request_id",
+        "enabled_at_ms",
+        "writer_key_id",
+        "producer_key_id",
+        "replace"
+      ],
+      "type": "object"
+    },
+    "BackupEnableResult": {
+      "description": "What `backup.enable` answers.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "Backups are set up, by this call or by an earlier one with the same bytes.",
+          "properties": {
+            "archive_id": {
+              "$ref": "#/$defs/ArchiveId",
+              "description": "The archive."
+            },
+            "enabled_at_ms": {
+              "$ref": "#/$defs/TimestampMs",
+              "description": "When the setup was made, in UTC milliseconds."
+            },
+            "kit_fingerprint": {
+              "description": "The fingerprint of the kit that opens it.",
+              "type": "string"
+            },
+            "state": {
+              "const": "enabled",
+              "type": "string"
+            }
+          },
+          "required": [
+            "state",
+            "archive_id",
+            "kit_fingerprint",
+            "enabled_at_ms"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Nothing was recorded on this host, for this cause. The kit opens nothing unless a later\ncall finishes the setup.",
+          "properties": {
+            "cause": {
+              "$ref": "#/$defs/BackupEnableCause",
+              "description": "Why."
+            },
+            "state": {
+              "const": "declined",
+              "type": "string"
+            }
+          },
+          "required": [
+            "state",
+            "cause"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The daemon cannot say how the call ended. Nothing local has changed that a repeat does not\nfinish: ask again with the same bytes, after the delay if one is named.",
+          "properties": {
+            "retry_after_seconds": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/U64"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "The seconds the service asked to be left alone for, or null."
+            },
+            "state": {
+              "const": "unknown",
+              "type": "string"
+            }
+          },
+          "required": [
+            "state",
+            "retry_after_seconds"
+          ],
+          "type": "object"
+        }
+      ]
+    },
     "BackupGeneration": {
       "description": "The backup generation an archive belongs to. Only its producer advances it.",
       "pattern": "^(0|[1-9][0-9]*)$",
@@ -4803,6 +5110,61 @@
         "descriptor",
         "writer_key_id",
         "published_at_ms"
+      ],
+      "type": "object"
+    },
+    "BackupHostKeys": {
+      "additionalProperties": false,
+      "description": "The host's keys a setup names, by identifier and public key.",
+      "properties": {
+        "producer_key_id": {
+          "$ref": "#/$defs/KeyId",
+          "description": "The producer's identifier."
+        },
+        "producer_public_key": {
+          "$ref": "#/$defs/StoredEnvelopeKey",
+          "description": "The producer's public key."
+        },
+        "writer_key_id": {
+          "$ref": "#/$defs/KeyId",
+          "description": "The writer's identifier."
+        },
+        "writer_public_key": {
+          "$ref": "#/$defs/AuthorisationKey",
+          "description": "The writer's public key."
+        }
+      },
+      "required": [
+        "writer_key_id",
+        "writer_public_key",
+        "producer_key_id",
+        "producer_public_key"
+      ],
+      "type": "object"
+    },
+    "BackupLastAttempt": {
+      "additionalProperties": false,
+      "description": "The last call to `backup.enable` that did not set backups up, kept until the next one.",
+      "properties": {
+        "cause": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/BackupEnableCause"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "How it ended: a cause when the daemon confirmed that nothing was recorded, or null when the\noutcome was not known."
+        },
+        "kit_fingerprint": {
+          "description": "The fingerprint of the kit the call carried.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kit_fingerprint",
+        "cause"
       ],
       "type": "object"
     },
@@ -5053,6 +5415,88 @@
         }
       ]
     },
+    "BackupSetupState": {
+      "description": "Where this host's backups stand.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "Backups are not set up on this host.",
+          "properties": {
+            "state": {
+              "const": "none",
+              "type": "string"
+            }
+          },
+          "required": [
+            "state"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "A call to `backup.enable` has not ended. The fingerprint is the one its kit carries.",
+          "properties": {
+            "kit_fingerprints": {
+              "description": "The fingerprint of the kit each call that has not ended carries, oldest first.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "state": {
+              "const": "in_progress",
+              "type": "string"
+            }
+          },
+          "required": [
+            "state",
+            "kit_fingerprints"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Backups are set up.",
+          "properties": {
+            "archive_id": {
+              "$ref": "#/$defs/ArchiveId",
+              "description": "The archive the backups are of."
+            },
+            "enabled_at_ms": {
+              "$ref": "#/$defs/TimestampMs",
+              "description": "When the setup was made, in UTC milliseconds."
+            },
+            "kit_fingerprint": {
+              "description": "The fingerprint that matches the kit to this host.",
+              "type": "string"
+            },
+            "state": {
+              "const": "committed",
+              "type": "string"
+            },
+            "unusable": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/BackupUnusable"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Why this host cannot make backups now, or null when it can."
+            }
+          },
+          "required": [
+            "state",
+            "archive_id",
+            "kit_fingerprint",
+            "enabled_at_ms",
+            "unusable"
+          ],
+          "type": "object"
+        }
+      ]
+    },
     "BackupSignIn": {
       "description": "Why this host holds no account token a read may carry, or that it does.",
       "oneOf": [
@@ -5084,6 +5528,186 @@
         {
           "const": "not_renewed",
           "description": "The sign-in looks whole and no token could be had from it just now.",
+          "type": "string"
+        }
+      ]
+    },
+    "BackupStatusParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `backup.status`. The environment is the one the connection reaches.",
+      "type": "object"
+    },
+    "BackupStatusResult": {
+      "additionalProperties": false,
+      "description": "What `backup.status` answers.",
+      "properties": {
+        "keys": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/BackupHostKeys"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The host's keys, or null when it selects no service."
+        },
+        "last_attempt": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/BackupLastAttempt"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The last call that did not set backups up, if the daemon still holds it."
+        },
+        "privacy_mode": {
+          "description": "Whether privacy mode is on.",
+          "type": "boolean"
+        },
+        "service": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The storage service this host is configured for, or null when it selects none."
+        },
+        "setup": {
+          "$ref": "#/$defs/BackupSetupState",
+          "description": "Where the setup stands."
+        },
+        "sign_in": {
+          "$ref": "#/$defs/BackupSignIn",
+          "description": "Whether this host holds an account token a request may carry, and why not when it does not."
+        },
+        "storage": {
+          "$ref": "#/$defs/BackupStorageState",
+          "description": "What the account holds at the service."
+        }
+      },
+      "required": [
+        "service",
+        "sign_in",
+        "privacy_mode",
+        "setup",
+        "keys",
+        "storage",
+        "last_attempt"
+      ],
+      "type": "object"
+    },
+    "BackupStorageState": {
+      "description": "What the account holds at the service, as a live read answered it.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "Nothing was asked of the service, for this reason.",
+          "properties": {
+            "read": {
+              "const": "unread",
+              "type": "string"
+            },
+            "why": {
+              "$ref": "#/$defs/BackupStorageUnread",
+              "description": "Why."
+            }
+          },
+          "required": [
+            "read",
+            "why"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The service answered.",
+          "properties": {
+            "allowance_bytes": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/U64"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "The allowance in bytes, when the service could read it."
+            },
+            "backup_on": {
+              "description": "Whether managed backup storage is on for the account.",
+              "type": "boolean"
+            },
+            "daily_snapshots": {
+              "$ref": "#/$defs/U64",
+              "description": "The daily snapshots the account records."
+            },
+            "deleted_still_charged_bytes": {
+              "$ref": "#/$defs/U64",
+              "description": "The bytes deleted and still charged."
+            },
+            "held_bytes": {
+              "$ref": "#/$defs/U64",
+              "description": "The bytes the account holds readable."
+            },
+            "read": {
+              "const": "read",
+              "type": "string"
+            }
+          },
+          "required": [
+            "read",
+            "backup_on",
+            "daily_snapshots",
+            "allowance_bytes",
+            "held_bytes",
+            "deleted_still_charged_bytes"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "BackupStorageUnread": {
+      "description": "Why `backup.status` did not ask the service.",
+      "oneOf": [
+        {
+          "const": "no_token",
+          "description": "This host holds no account token a read may carry.",
+          "type": "string"
+        },
+        {
+          "const": "delayed",
+          "description": "The service asked to be left alone, and the time has not passed.",
+          "type": "string"
+        },
+        {
+          "const": "failed",
+          "description": "The read failed.",
+          "type": "string"
+        }
+      ]
+    },
+    "BackupUnusable": {
+      "description": "Why a setup that exists cannot make backups, and `kr backup setup --replace` is the remedy.",
+      "oneOf": [
+        {
+          "const": "account",
+          "description": "The account signed in, or the service selected, is not the one the backups belong to.",
+          "type": "string"
+        },
+        {
+          "const": "keys",
+          "description": "A key this host holds is not the one the setup names.",
+          "type": "string"
+        },
+        {
+          "const": "writer_retired",
+          "description": "The writer is not enrolled for the archive any more.",
           "type": "string"
         }
       ]
@@ -20829,6 +21453,16 @@
         {
           "const": "backup.read",
           "description": "One read of what the managed storage service holds, for a restore that runs in the command line: which service this host is configured for and whether it may be asked, the recovery bundle at a locator, the newest generation published for an archive held to a checkpoint, or one range of a stored object. The host relays ciphertext and public records with its own account and sees no seed, plaintext, file name or destination. It answers none of the last three while privacy mode is on, and it sends nothing while the service has asked to be left alone, answering what is left of the delay instead.",
+          "type": "string"
+        },
+        {
+          "const": "backup.status",
+          "description": "Where this host's backups stand, for the owner who is setting them up: which storage service this host is configured for and whether it may be asked, whether backups are set up, being set up or not, the host's writer and producer by public key and identifier, and what the account holds at the service.",
+          "type": "string"
+        },
+        {
+          "const": "backup.enable",
+          "description": "Set this host's backups up, at the host itself: write the sealed recovery bundle to the storage service, enrol the host's writer for the archive, turn managed backup storage on, and record the setup, in that order. The host is given the recovery recipient's public key, the bundle's locator and the sealed bundle, and never the recovery seed. A call whose answer was lost is made again with the same bytes and is answered from what the first left.",
           "type": "string"
         },
         {
@@ -41213,8 +41847,23 @@
     "backup_bundle": {
       "$ref": "#/$defs/BackupBundle"
     },
+    "backup_enable_cause": {
+      "$ref": "#/$defs/BackupEnableCause"
+    },
+    "backup_enable_params": {
+      "$ref": "#/$defs/BackupEnableParams"
+    },
+    "backup_enable_result": {
+      "$ref": "#/$defs/BackupEnableResult"
+    },
     "backup_generation_publication": {
       "$ref": "#/$defs/BackupGenerationPublication"
+    },
+    "backup_host_keys": {
+      "$ref": "#/$defs/BackupHostKeys"
+    },
+    "backup_last_attempt": {
+      "$ref": "#/$defs/BackupLastAttempt"
     },
     "backup_read_params": {
       "$ref": "#/$defs/BackupReadParams"
@@ -41222,8 +41871,26 @@
     "backup_read_result": {
       "$ref": "#/$defs/BackupReadResult"
     },
+    "backup_setup_state": {
+      "$ref": "#/$defs/BackupSetupState"
+    },
     "backup_sign_in": {
       "$ref": "#/$defs/BackupSignIn"
+    },
+    "backup_status_params": {
+      "$ref": "#/$defs/BackupStatusParams"
+    },
+    "backup_status_result": {
+      "$ref": "#/$defs/BackupStatusResult"
+    },
+    "backup_storage_state": {
+      "$ref": "#/$defs/BackupStorageState"
+    },
+    "backup_storage_unread": {
+      "$ref": "#/$defs/BackupStorageUnread"
+    },
+    "backup_unusable": {
+      "$ref": "#/$defs/BackupUnusable"
     },
     "backup_writer_record": {
       "$ref": "#/$defs/BackupWriterRecord"

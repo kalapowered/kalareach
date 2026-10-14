@@ -495,6 +495,26 @@ methods! {
           answers none of the last three while privacy mode is on, and it sends nothing while the \
           service has asked to be left alone, answering what is left of the delay instead.";
 
+    BackupStatus = "backup.status", HostAndEnvironment,
+    effect: Read, ingress: [LocalIpc], rights: [req(HostManage)], selectors: [Environment],
+    history: NotApplicable, capability: NO_CAPABILITY, freshness: CurrentAuthority,
+    confirmation: None, idempotency: READ,
+    doc: "Where this host's backups stand, for the owner who is setting them up: which storage \
+          service this host is configured for and whether it may be asked, whether backups are set \
+          up, being set up or not, the host's writer and producer by public key and identifier, \
+          and what the account holds at the service.";
+
+    BackupEnable = "backup.enable", HostAndEnvironment,
+    effect: Write, ingress: [LocalIpc], rights: [req(HostManage)], selectors: [Environment],
+    history: NotApplicable, capability: NO_CAPABILITY, freshness: ActionWindow,
+    confirmation: None, idempotency: keyed("archive identifier"),
+    doc: "Set this host's backups up, at the host itself: write the sealed recovery bundle to the \
+          storage service, enrol the host's writer for the archive, turn managed backup storage \
+          on, and record the setup, in that order. The host is given the recovery recipient's \
+          public key, the bundle's locator and the sealed bundle, and never the recovery seed. A \
+          call whose answer was lost is made again with the same bytes and is answered from what \
+          the first left.";
+
     HostUpdateHandover = "host.update.handover", HostAndEnvironment,
     effect: Write, ingress: [LocalIpc], rights: [req(HostManage)], selectors: [Host, Environment],
     history: NotApplicable, capability: NO_CAPABILITY, freshness: ActionWindow,
@@ -2023,6 +2043,9 @@ mod tests {
         ("account.status", &[ActionRight::HostManage]),
         // Reading what the managed storage service holds for a restore, with this host's account.
         ("backup.read", &[ActionRight::HostManage]),
+        // Setting this host's backups up and reading where they stand, at the host itself.
+        ("backup.status", &[ActionRight::HostManage]),
+        ("backup.enable", &[ActionRight::HostManage]),
         // Session descriptions: reading what is offered, and the two changes an owner makes.
         ("description.setup", &[ActionRight::HostManage]),
         ("description.configure", &[ActionRight::HostManage]),

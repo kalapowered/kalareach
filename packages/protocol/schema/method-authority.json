@@ -1,6 +1,6 @@
 {
   "description": "One exhaustive authority entry per method. Anything not listed is denied. Generated from crates/kr-protocol; do not edit by hand.",
-  "method_count": 181,
+  "method_count": 183,
   "methods": [
     {
       "capability": "none",
@@ -487,6 +487,68 @@
         "environment"
       ],
       "summary": "One read of what the managed storage service holds, for a restore that runs in the command line: which service this host is configured for and whether it may be asked, the recovery bundle at a locator, the newest generation published for an archive held to a checkpoint, or one range of a stored object. The host relays ciphertext and public records with its own account and sees no seed, plaintext, file name or destination. It answers none of the last three while privacy mode is on, and it sends nothing while the service has asked to be left alone, answering what is left of the delay instead.",
+      "version": 1
+    },
+    {
+      "capability": "none",
+      "confirmation": "none",
+      "effect": "read",
+      "freshness": "current_authority",
+      "group": "host_and_environment",
+      "history_filter": "not_applicable",
+      "idempotency": "idempotent_read",
+      "ingress": [
+        "local_ipc"
+      ],
+      "method": "backup.status",
+      "name": "backup.status",
+      "required_rights": [
+        {
+          "authority": {
+            "right": {
+              "right": "host.manage"
+            }
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "environment"
+      ],
+      "summary": "Where this host's backups stand, for the owner who is setting them up: which storage service this host is configured for and whether it may be asked, whether backups are set up, being set up or not, the host's writer and producer by public key and identifier, and what the account holds at the service.",
+      "version": 1
+    },
+    {
+      "capability": "none",
+      "confirmation": "none",
+      "effect": "write",
+      "freshness": "action_window",
+      "group": "host_and_environment",
+      "history_filter": "not_applicable",
+      "idempotency": {
+        "keyed": {
+          "key": "archive identifier"
+        }
+      },
+      "ingress": [
+        "local_ipc"
+      ],
+      "method": "backup.enable",
+      "name": "backup.enable",
+      "required_rights": [
+        {
+          "authority": {
+            "right": {
+              "right": "host.manage"
+            }
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "environment"
+      ],
+      "summary": "Set this host's backups up, at the host itself: write the sealed recovery bundle to the storage service, enrol the host's writer for the archive, turn managed backup storage on, and record the setup, in that order. The host is given the recovery recipient's public key, the bundle's locator and the sealed bundle, and never the recovery seed. A call whose answer was lost is made again with the same bytes and is answered from what the first left.",
       "version": 1
     },
     {

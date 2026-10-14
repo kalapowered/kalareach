@@ -391,6 +391,221 @@ export type BackupBundle =
  */
 export type Uuid = string
 /**
+ * How the last call to `backup.enable` ended, when it did not set backups up.
+ */
+export type BackupEnableCause =
+  | {
+      kind: 'no_service'
+    }
+  | {
+      kind: 'sign_in'
+      /**
+       * Why.
+       */
+      sign_in: 'usable' | 'signed_out' | 'waiting' | 'ended' | 'without_scope' | 'not_renewed'
+    }
+  | {
+      kind: 'another_account'
+    }
+  | {
+      kind: 'keys_changed'
+    }
+  | {
+      kind: 'bundle_too_large'
+    }
+  | {
+      kind: 'already_set_up'
+    }
+  | {
+      kind: 'archive_in_use'
+    }
+  | {
+      kind: 'no_allowance'
+    }
+  | {
+      kind: 'token_not_accepted'
+    }
+  | {
+      kind: 'bundle_conflict'
+    }
+  | {
+      /**
+       * The service's error code.
+       */
+      code:
+        | 'INVALID_ARGUMENT'
+        | 'UNSUPPORTED_SCHEMA'
+        | 'UNSUPPORTED_CAPABILITY'
+        | 'PERMISSION_DENIED'
+        | 'PAIRING_EXPIRED'
+        | 'PAIRING_REJECTED'
+        | 'PAIRING_AUTH_FAILED'
+        | 'PAIRING_ATTEMPTS_EXHAUSTED'
+        | 'RENDEZVOUS_UNAVAILABLE'
+        | 'RENDEZVOUS_CONFIG_ERROR'
+        | 'UNKNOWN_SESSION'
+        | 'AMBIGUOUS_SESSION'
+        | 'AMBIGUOUS_ATTACHMENT'
+        | 'TERMINAL_UNAVAILABLE'
+        | 'TERMINAL_PROBE_FAILED'
+        | 'INPUT_INCOMPATIBLE'
+        | 'SESSION_CLOSED'
+        | 'SESSION_LIMIT'
+        | 'RESOURCE_UNAVAILABLE'
+        | 'HOST_NOT_CONFIGURED'
+        | 'ENVIRONMENT_UNAVAILABLE'
+        | 'DESKTOP_UNAVAILABLE'
+        | 'STALE_SESSION'
+        | 'LEASE_LOST'
+        | 'GEOMETRY_NOT_OWNER'
+        | 'DRAFT_CONFLICT'
+        | 'EDITOR_BUSY'
+        | 'ID_CONFLICT'
+        | 'UPSTREAM_UNAVAILABLE'
+        | 'OUTCOME_UNKNOWN'
+        | 'RESYNC_REQUIRED'
+        | 'QUOTA_EXCEEDED'
+        | 'RATE_LIMITED'
+        | 'SERVICE_CAPACITY'
+        | 'CLOCK_UNTRUSTED'
+        | 'STORAGE_UNAVAILABLE'
+        | 'SHELL_INTEGRATION_UNSUPPORTED'
+        | 'ATTACHMENT_INTEGRITY'
+        | 'REPOSITORY_UNTRUSTED'
+        | 'PACKAGE_UNAVAILABLE_OFFLINE'
+        | 'PLUGIN_GRANT_REQUIRED'
+        | 'PLUGIN_DISABLED'
+        | 'QUESTION_RESOLVED'
+        | 'QUESTION_EXPIRED'
+        | 'NOT_IN_KR_SESSION'
+        | 'OWNER_CONFIRMATION_REQUIRED'
+        | 'CAUSAL_LIMIT'
+        | 'SOURCE_CHANGED'
+      kind: 'service_refused'
+    }
+/**
+ * What `backup.enable` answers.
+ */
+export type BackupEnableResult =
+  | {
+      /**
+       * The archive.
+       */
+      archive_id: string
+      /**
+       * A UTC timestamp in milliseconds, as a decimal string in JSON.
+       */
+      enabled_at_ms: string
+      /**
+       * The fingerprint of the kit that opens it.
+       */
+      kit_fingerprint: string
+      state: 'enabled'
+    }
+  | {
+      /**
+       * Why.
+       */
+      cause:
+        | {
+            kind: 'no_service'
+          }
+        | {
+            kind: 'sign_in'
+            /**
+             * Why.
+             */
+            sign_in: 'usable' | 'signed_out' | 'waiting' | 'ended' | 'without_scope' | 'not_renewed'
+          }
+        | {
+            kind: 'another_account'
+          }
+        | {
+            kind: 'keys_changed'
+          }
+        | {
+            kind: 'bundle_too_large'
+          }
+        | {
+            kind: 'already_set_up'
+          }
+        | {
+            kind: 'archive_in_use'
+          }
+        | {
+            kind: 'no_allowance'
+          }
+        | {
+            kind: 'token_not_accepted'
+          }
+        | {
+            kind: 'bundle_conflict'
+          }
+        | {
+            /**
+             * The service's error code.
+             */
+            code:
+              | 'INVALID_ARGUMENT'
+              | 'UNSUPPORTED_SCHEMA'
+              | 'UNSUPPORTED_CAPABILITY'
+              | 'PERMISSION_DENIED'
+              | 'PAIRING_EXPIRED'
+              | 'PAIRING_REJECTED'
+              | 'PAIRING_AUTH_FAILED'
+              | 'PAIRING_ATTEMPTS_EXHAUSTED'
+              | 'RENDEZVOUS_UNAVAILABLE'
+              | 'RENDEZVOUS_CONFIG_ERROR'
+              | 'UNKNOWN_SESSION'
+              | 'AMBIGUOUS_SESSION'
+              | 'AMBIGUOUS_ATTACHMENT'
+              | 'TERMINAL_UNAVAILABLE'
+              | 'TERMINAL_PROBE_FAILED'
+              | 'INPUT_INCOMPATIBLE'
+              | 'SESSION_CLOSED'
+              | 'SESSION_LIMIT'
+              | 'RESOURCE_UNAVAILABLE'
+              | 'HOST_NOT_CONFIGURED'
+              | 'ENVIRONMENT_UNAVAILABLE'
+              | 'DESKTOP_UNAVAILABLE'
+              | 'STALE_SESSION'
+              | 'LEASE_LOST'
+              | 'GEOMETRY_NOT_OWNER'
+              | 'DRAFT_CONFLICT'
+              | 'EDITOR_BUSY'
+              | 'ID_CONFLICT'
+              | 'UPSTREAM_UNAVAILABLE'
+              | 'OUTCOME_UNKNOWN'
+              | 'RESYNC_REQUIRED'
+              | 'QUOTA_EXCEEDED'
+              | 'RATE_LIMITED'
+              | 'SERVICE_CAPACITY'
+              | 'CLOCK_UNTRUSTED'
+              | 'STORAGE_UNAVAILABLE'
+              | 'SHELL_INTEGRATION_UNSUPPORTED'
+              | 'ATTACHMENT_INTEGRITY'
+              | 'REPOSITORY_UNTRUSTED'
+              | 'PACKAGE_UNAVAILABLE_OFFLINE'
+              | 'PLUGIN_GRANT_REQUIRED'
+              | 'PLUGIN_DISABLED'
+              | 'QUESTION_RESOLVED'
+              | 'QUESTION_EXPIRED'
+              | 'NOT_IN_KR_SESSION'
+              | 'OWNER_CONFIRMATION_REQUIRED'
+              | 'CAUSAL_LIMIT'
+              | 'SOURCE_CHANGED'
+            kind: 'service_refused'
+          }
+      state: 'declined'
+    }
+  | {
+      /**
+       * The seconds the service asked to be left alone for, or null.
+       */
+      retry_after_seconds: U64 | null
+      state: 'unknown'
+    }
+/**
  * Parameters of `backup.read`: exactly one read.
  */
 export type BackupReadParams =
@@ -508,10 +723,85 @@ export type BackupReadResult =
       retry_after_seconds: string
     }
 /**
+ * Where this host's backups stand.
+ */
+export type BackupSetupState =
+  | {
+      state: 'none'
+    }
+  | {
+      /**
+       * The fingerprint of the kit each call that has not ended carries, oldest first.
+       */
+      kit_fingerprints: string[]
+      state: 'in_progress'
+    }
+  | {
+      /**
+       * The archive the backups are of.
+       */
+      archive_id: string
+      /**
+       * A UTC timestamp in milliseconds, as a decimal string in JSON.
+       */
+      enabled_at_ms: string
+      /**
+       * The fingerprint that matches the kit to this host.
+       */
+      kit_fingerprint: string
+      state: 'committed'
+      /**
+       * Why this host cannot make backups now, or null when it can.
+       */
+      unusable: BackupUnusable | null
+    }
+/**
+ * Why a setup that exists cannot make backups, and `kr backup setup --replace` is the remedy.
+ */
+export type BackupUnusable = 'account' | 'keys' | 'writer_retired'
+/**
  * Why this host holds no account token a read may carry, or that it does.
  */
 export type BackupSignIn =
   'usable' | 'signed_out' | 'waiting' | 'ended' | 'without_scope' | 'not_renewed'
+/**
+ * What the account holds at the service, as a live read answered it.
+ */
+export type BackupStorageState =
+  | {
+      read: 'unread'
+      /**
+       * Why.
+       */
+      why: 'no_token' | 'delayed' | 'failed'
+    }
+  | {
+      /**
+       * The allowance in bytes, when the service could read it.
+       */
+      allowance_bytes: U64 | null
+      /**
+       * Whether managed backup storage is on for the account.
+       */
+      backup_on: boolean
+      /**
+       * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+       */
+      daily_snapshots: string
+      /**
+       * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+       */
+      deleted_still_charged_bytes: string
+      /**
+       * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+       */
+      held_bytes: string
+      read: 'read'
+    }
+/**
+ * Why `backup.status` did not ask the service.
+ */
+export type BackupStorageUnread = 'no_token' | 'delayed' | 'failed'
 /**
  * One frame on a bridge's standard input or output.
  *
@@ -2359,10 +2649,21 @@ export interface KalaReachProtocol {
   authority_revision_notice?: AuthorityRevisionNotice
   authority_revision_record?: AuthorityRevisionRecord
   backup_bundle?: BackupBundle
+  backup_enable_cause?: BackupEnableCause
+  backup_enable_params?: BackupEnableParams
+  backup_enable_result?: BackupEnableResult
   backup_generation_publication?: BackupGenerationPublication
+  backup_host_keys?: BackupHostKeys
+  backup_last_attempt?: BackupLastAttempt
   backup_read_params?: BackupReadParams
   backup_read_result?: BackupReadResult
+  backup_setup_state?: BackupSetupState
   backup_sign_in?: BackupSignIn
+  backup_status_params?: BackupStatusParams
+  backup_status_result?: BackupStatusResult
+  backup_storage_state?: BackupStorageState
+  backup_storage_unread?: BackupStorageUnread
+  backup_unusable?: BackupUnusable
   backup_writer_record?: BackupWriterRecord
   bridge_frame?: BridgeFrame
   bridge_hello?: BridgeHello
@@ -6703,6 +7004,52 @@ export interface AuthorityRevisionRecord {
   signature: string
 }
 /**
+ * Parameters of `backup.enable`: everything the daemon needs to set backups up, and nothing of the
+ * recovery seed.
+ */
+export interface BackupEnableParams {
+  /**
+   * The archive the backups are of, chosen by the command. The call is idempotent on it.
+   */
+  archive_id: string
+  /**
+   * A 128-bit identifier. On the wire it is a 16-byte string; in JSON it is the canonical hyphenated lower-case text form.
+   */
+  bundle_locator: string
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  enabled_at_ms: string
+  /**
+   * The fingerprint that matches the kit to this host.
+   */
+  kit_fingerprint: string
+  /**
+   * The producer the command read from `backup.status` and put in the bundle.
+   */
+  producer_key_id: string
+  /**
+   * The recovery recipient's public key, which every generation wraps its keys for.
+   */
+  recovery_public_key: string
+  /**
+   * Whether this replaces backups that are set up for another archive.
+   */
+  replace: boolean
+  /**
+   * A 128-bit identifier. On the wire it is a 16-byte string; in JSON it is the canonical hyphenated lower-case text form.
+   */
+  request_id: string
+  /**
+   * The sealed bundle, which only the seed opens.
+   */
+  sealed_bundle: string
+  /**
+   * The writer the command read from `backup.status` and put in the bundle.
+   */
+  writer_key_id: string
+}
+/**
  * One published generation and the writer's signature over it.
  */
 export interface BackupGenerationPublication {
@@ -6749,6 +7096,41 @@ export interface ArchiveDescriptor1 {
   version: string
 }
 /**
+ * The host's keys a setup names, by identifier and public key.
+ */
+export interface BackupHostKeys {
+  /**
+   * The producer's identifier.
+   */
+  producer_key_id: string
+  /**
+   * The producer's public key.
+   */
+  producer_public_key: string
+  /**
+   * The writer's identifier.
+   */
+  writer_key_id: string
+  /**
+   * The writer's public key.
+   */
+  writer_public_key: string
+}
+/**
+ * The last call to `backup.enable` that did not set backups up, kept until the next one.
+ */
+export interface BackupLastAttempt {
+  /**
+   * How it ended: a cause when the daemon confirmed that nothing was recorded, or null when the
+   * outcome was not known.
+   */
+  cause: BackupEnableCause | null
+  /**
+   * The fingerprint of the kit the call carried.
+   */
+  kit_fingerprint: string
+}
+/**
  * The latest generation an owner has verified for one archive.
  *
  * A fresh client needs this to detect a service replaying an older valid backup. A recovery-only
@@ -6771,6 +7153,102 @@ export interface ArchiveCheckpoint {
    * A UTC timestamp in milliseconds, as a decimal string in JSON.
    */
   verified_at_ms: string
+}
+/**
+ * Parameters of `backup.status`. The environment is the one the connection reaches.
+ */
+export interface BackupStatusParams {}
+/**
+ * What `backup.status` answers.
+ */
+export interface BackupStatusResult {
+  /**
+   * The host's keys, or null when it selects no service.
+   */
+  keys: BackupHostKeys | null
+  /**
+   * The last call that did not set backups up, if the daemon still holds it.
+   */
+  last_attempt: BackupLastAttempt | null
+  /**
+   * Whether privacy mode is on.
+   */
+  privacy_mode: boolean
+  /**
+   * The storage service this host is configured for, or null when it selects none.
+   */
+  service: string | null
+  /**
+   * Where the setup stands.
+   */
+  setup:
+    | {
+        state: 'none'
+      }
+    | {
+        /**
+         * The fingerprint of the kit each call that has not ended carries, oldest first.
+         */
+        kit_fingerprints: string[]
+        state: 'in_progress'
+      }
+    | {
+        /**
+         * The archive the backups are of.
+         */
+        archive_id: string
+        /**
+         * A UTC timestamp in milliseconds, as a decimal string in JSON.
+         */
+        enabled_at_ms: string
+        /**
+         * The fingerprint that matches the kit to this host.
+         */
+        kit_fingerprint: string
+        state: 'committed'
+        /**
+         * Why this host cannot make backups now, or null when it can.
+         */
+        unusable: BackupUnusable | null
+      }
+  /**
+   * Whether this host holds an account token a request may carry, and why not when it does not.
+   */
+  sign_in: 'usable' | 'signed_out' | 'waiting' | 'ended' | 'without_scope' | 'not_renewed'
+  /**
+   * What the account holds at the service.
+   */
+  storage:
+    | {
+        read: 'unread'
+        /**
+         * Why.
+         */
+        why: 'no_token' | 'delayed' | 'failed'
+      }
+    | {
+        /**
+         * The allowance in bytes, when the service could read it.
+         */
+        allowance_bytes: U64 | null
+        /**
+         * Whether managed backup storage is on for the account.
+         */
+        backup_on: boolean
+        /**
+         * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+         */
+        daily_snapshots: string
+        /**
+         * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+         */
+        deleted_still_charged_bytes: string
+        /**
+         * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+         */
+        held_bytes: string
+        read: 'read'
+      }
 }
 /**
  * One collection's writer enrolment, signed by the collection owner's authorisation key.
@@ -17923,6 +18401,8 @@ export interface MethodEntry {
     | 'account.sign_out'
     | 'account.status'
     | 'backup.read'
+    | 'backup.status'
+    | 'backup.enable'
     | 'host.update.handover'
     | 'description.setup'
     | 'description.configure'
@@ -26796,6 +27276,8 @@ export interface ServiceRequestPayload {
     | 'account.sign_out'
     | 'account.status'
     | 'backup.read'
+    | 'backup.status'
+    | 'backup.enable'
     | 'host.update.handover'
     | 'description.setup'
     | 'description.configure'
