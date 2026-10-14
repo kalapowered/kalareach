@@ -29,6 +29,15 @@ public protocol VoiceCallObserver: AnyObject {
     func voiceCall(_ call: VoiceCall, receivedProviderEvent data: Data)
     /// The first remote audio track arrived. It reports a track, not audible playback.
     func voiceCallReceivedFirstAudio(_ call: VoiceCall)
+    /// What the microphone is doing changed: the call's gate decided it.
+    func voiceCall(_ call: VoiceCall, captureChanged state: VoiceCaptureState)
+    /// The call ended, whatever ended it, and its audio is given back.
+    func voiceCallEnded(_ call: VoiceCall)
+}
+
+extension VoiceCallObserver {
+    public func voiceCall(_: VoiceCall, captureChanged _: VoiceCaptureState) {}
+    public func voiceCallEnded(_: VoiceCall) {}
 }
 
 /// One native voice call.
@@ -323,7 +332,13 @@ public final class VoiceCall: NSObject {
             return { work.cancel() }
         }
 
-        func publish(_ state: VoiceCaptureState) { AudioSession.shared.publish(state, for: call) }
+        func publish(_ state: VoiceCaptureState) {
+            AudioSession.shared.publish(state, for: call)
+            // Told on the call's own queue, not on the thread that changed it: the control calls
+            // this under its lock, and what an observer does must not wait for that thread.
+            let call = call
+            call.queue.async { call.observer?.voiceCall(call, captureChanged: state) }
+        }
 
         func ended() {
             call.watchRecorder(false)
@@ -331,6 +346,8 @@ public final class VoiceCall: NSObject {
             call.events?.delegate = nil
             call.events = nil
             AudioSession.shared.release(call)
+            let call = call
+            call.queue.async { call.observer?.voiceCallEnded(call) }
         }
     }
 

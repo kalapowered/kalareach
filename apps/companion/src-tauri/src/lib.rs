@@ -36,6 +36,9 @@ pub mod hosts;
 pub mod links;
 pub mod owner;
 pub mod pairing;
+/// The checks a debug build runs for the voice call's bridge on a phone.
+#[cfg(debug_assertions)]
+pub mod probe;
 pub mod questions;
 pub mod remote;
 pub mod setup;
@@ -120,6 +123,8 @@ pub fn run() {
             open_pairing(app.handle());
             #[cfg(mobile)]
             hosts::resume(app.handle());
+            #[cfg(all(debug_assertions, mobile))]
+            probe::start(app.handle());
             Ok(())
         })
         .run(tauri::generate_context!())

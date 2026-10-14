@@ -82,6 +82,18 @@ class VoiceCall private constructor(
          * call's own thread.
          */
         fun onFirstAudio()
+
+        /**
+         * The media connection changed state: `new`, `connecting`, `connected`, `disconnected`,
+         * `failed` or `closed`. On the call's own thread.
+         */
+        fun onConnectionState(state: String) {}
+
+        /**
+         * The call ended, whatever ended it, and its microphone is given back. On the thread that
+         * ended it, never on a WebRTC thread.
+         */
+        fun onEnded() {}
     }
 
     /** The call's own thread: its timers, and everything the platform reports. */
@@ -465,6 +477,7 @@ class VoiceCall private constructor(
         }
 
         override fun ended() {
+            observer.onEnded()
             val (open, callback) = synchronized(lock) {
                 val held = connection to routeCallback
                 connection = null
@@ -553,6 +566,20 @@ class VoiceCall private constructor(
             if (announcedFirstAudio) return
             announcedFirstAudio = true
             handler.post { observer.onFirstAudio() }
+        }
+
+        override fun onConnectionChange(newState: PeerConnection.PeerConnectionState) {
+            val word = when (newState) {
+                PeerConnection.PeerConnectionState.NEW -> "new"
+                PeerConnection.PeerConnectionState.CONNECTING -> "connecting"
+                PeerConnection.PeerConnectionState.CONNECTED -> "connected"
+                PeerConnection.PeerConnectionState.DISCONNECTED -> "disconnected"
+                PeerConnection.PeerConnectionState.FAILED -> "failed"
+                PeerConnection.PeerConnectionState.CLOSED -> "closed"
+            }
+            // On this call's own thread: a call that ended itself from this callback would
+            // dispose the connection that is calling it.
+            handler.post { observer.onConnectionState(word) }
         }
 
         override fun onSignalingChange(state: PeerConnection.SignalingState) {}

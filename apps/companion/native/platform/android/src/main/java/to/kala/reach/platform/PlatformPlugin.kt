@@ -1,5 +1,6 @@
 package to.kala.reach.platform
 
+import android.Manifest
 import android.app.Activity
 import android.content.ActivityNotFoundException
 import android.content.Intent
@@ -13,16 +14,27 @@ import android.webkit.WebView
 import androidx.activity.ComponentActivity
 import androidx.activity.result.ActivityResultLauncher
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.core.app.NotificationManagerCompat
 import androidx.browser.auth.AuthTabIntent
 import androidx.browser.customtabs.CustomTabsClient
 import androidx.browser.customtabs.CustomTabsIntent
 import app.tauri.annotation.Command
 import app.tauri.annotation.InvokeArg
+import app.tauri.annotation.Permission
+import app.tauri.annotation.PermissionCallback
 import app.tauri.annotation.TauriPlugin
+import app.tauri.PermissionState
+import app.tauri.plugin.Channel
 import app.tauri.plugin.Invoke
 import app.tauri.plugin.JSObject
 import app.tauri.plugin.Plugin
 import java.io.File
+import java.util.concurrent.Executors
+import to.kala.reach.companion.mobile.CallBridge
+import to.kala.reach.companion.mobile.CallBridgeHolder
+import to.kala.reach.companion.mobile.CallNews
+import to.kala.reach.companion.mobile.CallRefused
+import to.kala.reach.companion.mobile.CallWire
 import to.kala.reach.companion.mobile.SecretFiles
 import to.kala.reach.companion.mobile.SignInSession
 
@@ -39,6 +51,12 @@ class SessionArguments {
 @InvokeArg
 class AttemptArguments {
     lateinit var attempt: String
+}
+
+@InvokeArg
+class CallOpenArguments {
+    lateinit var call: String
+    lateinit var events: Channel
 }
 
 @InvokeArg
@@ -62,8 +80,22 @@ class WrittenArguments {
  * way. Every result carries the attempt it belongs to. Secrets are files sealed under a Keystore
  * key.
  */
-@TauriPlugin
+@TauriPlugin(
+    permissions = [
+        Permission(strings = [Manifest.permission.RECORD_AUDIO], alias = "microphone"),
+        Permission(strings = [Manifest.permission.POST_NOTIFICATIONS], alias = "notifications"),
+    ],
+)
 class PlatformPlugin(private val activity: Activity) : Plugin(activity) {
+    /**
+     * Where a command to the voice call waits for the media engine. A command arrives on the thread
+     * Rust's runtime called from, which must not be held, and a stop must be able to run while an
+     * offer is still being made, so each command has a thread of its own.
+     */
+    private val calls = Executors.newCachedThreadPool { task ->
+        Thread(task, "kr-call-command").apply { isDaemon = true }
+    }
+
     private val secrets by lazy {
         SecretFiles(File(activity.noBackupFilesDir, "secrets"), KeystoreSealer())
     }
@@ -81,6 +113,96 @@ class PlatformPlugin(private val activity: Activity) : Plugin(activity) {
             Log.i(LOG_TAG, "the platform TLS verifier has the application context")
         } catch (failure: RuntimeException) {
             Log.e(LOG_TAG, "the platform TLS verifier could not start", failure)
+        }
+    }
+
+    // The voice call is the application's own, in a module this library cannot see: the application
+    // registers its bridge at start, and each command is handed to it off the arriving thread.
+
+    @Command
+    fun callOpen(invoke: Invoke) {
+        // The microphone is asked for here, and notifications from Android 13, before anything is
+        // made. Refusing notifications does not refuse the call: it is reported, and Rust decides.
+        val wanted = buildList {
+            if (getPermissionState("microphone") != PermissionState.GRANTED) add("microphone")
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+                getPermissionState("notifications") != PermissionState.GRANTED
+            ) {
+                add("notifications")
+            }
+        }
+        if (wanted.isEmpty()) openCall(invoke) else requestPermissionForAliases(wanted.toTypedArray(), invoke, "callPermissionsAnswered")
+    }
+
+    @PermissionCallback
+    fun callPermissionsAnswered(invoke: Invoke) {
+        openCall(invoke)
+    }
+
+    private fun openCall(invoke: Invoke) {
+        if (getPermissionState("microphone") != PermissionState.GRANTED) {
+            invoke.reject("the microphone is not allowed", CallRefused.MICROPHONE_REFUSED)
+            return
+        }
+        val arguments = invoke.parseArgs(CallOpenArguments::class.java)
+        val notifications = NotificationManagerCompat.from(activity).areNotificationsEnabled()
+        carryOut(invoke) { bridge ->
+            bridge.open(arguments.call, CallNews { frame -> arguments.events.send(JSObject(frame)) })
+            CallWire.opened(notifications)
+        }
+    }
+
+    @Command
+    fun callOffer(invoke: Invoke) =
+        carryOut(invoke) { bridge -> CallWire.offered(bridge.offer(CallWire.call(invoke.getRawArgs()))) }
+
+    @Command
+    fun callAccept(invoke: Invoke) =
+        carryOut(invoke) { bridge ->
+            val answer = CallWire.answer(invoke.getRawArgs())
+            CallWire.answered(bridge.accept(answer.call, answer.sdp))
+        }
+
+    @Command
+    fun callPermit(invoke: Invoke) =
+        carryOut(invoke) { bridge ->
+            val permit = CallWire.permit(invoke.getRawArgs())
+            CallWire.permitted(bridge.permit(permit.call, permit.voiceSessionId, permit.closesAtEpochMs))
+        }
+
+    @Command
+    fun callMute(invoke: Invoke) =
+        carryOut(invoke) { bridge ->
+            val mute = CallWire.mute(invoke.getRawArgs())
+            bridge.setMuted(mute.call, mute.what, mute.muted)
+            CallWire.nothing()
+        }
+
+    @Command
+    fun callStop(invoke: Invoke) =
+        carryOut(invoke) { bridge ->
+            bridge.stop(CallWire.call(invoke.getRawArgs()))
+            CallWire.nothing()
+        }
+
+    @Command
+    fun callState(invoke: Invoke) = carryOut(invoke) { bridge -> CallWire.held(bridge.held()) }
+
+    /** Runs one command on the registered bridge and answers `invoke` with its JSON result. */
+    private fun carryOut(invoke: Invoke, command: (CallBridge) -> String) {
+        val bridge = CallBridgeHolder.bridge
+        if (bridge == null) {
+            invoke.reject("this build holds no voice call", "unavailable")
+            return
+        }
+        calls.execute {
+            try {
+                invoke.resolve(JSObject(command(bridge)))
+            } catch (refused: CallRefused) {
+                invoke.reject(refused.message, refused.code)
+            } catch (failure: Exception) {
+                invoke.reject(failure.message ?: failure.toString(), "engine")
+            }
         }
     }
 

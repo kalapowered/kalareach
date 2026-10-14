@@ -18,6 +18,10 @@ apply(plugin = "org.jetbrains.kotlin.jvm")
 layout.buildDirectory.set(rootProject.layout.buildDirectory.dir("krnative"))
 
 dependencies {
+    // The platform's own `org.json` is what runs on a phone, so the library is only compiled
+    // against here, and is what the tests on a developer's machine run with.
+    add("compileOnly", "org.json:json:20240303")
+    add("testImplementation", "org.json:json:20240303")
     add("testImplementation", "junit:junit:4.13.2")
 }
 
@@ -26,4 +30,8 @@ extensions.configure<org.jetbrains.kotlin.gradle.dsl.KotlinJvmProjectExtension>(
     sourceSets["test"].kotlin.srcDir("src/test/kotlin")
 }
 
-tasks.withType<Test>().configureEach { useJUnit() }
+tasks.withType<Test>().configureEach {
+    useJUnit()
+    // The cases the Rust and Swift halves are tested against, which these tests decode as well.
+    systemProperty("kr.fixtures", file("../platform/fixtures").path)
+}

@@ -1,0 +1,12 @@
+{
+  "class": "KRCallAdapter",
+  "shared": "krShared",
+  "call": "krCall:",
+  "keys": {
+    "command": "command",
+    "arguments": "arguments",
+    "news": "news",
+    "reply": "reply"
+  },
+  "commands": ["callOpen", "callOffer", "callAccept", "callPermit", "callMute", "callStop", "callState"]
+}

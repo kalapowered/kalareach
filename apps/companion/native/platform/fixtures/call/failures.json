@@ -1,0 +1,8 @@
+[
+  { "code": "microphone_refused", "kind": "microphone_refused" },
+  { "code": "already_running", "kind": "already_running" },
+  { "code": "no_such_call", "kind": "no_such_call" },
+  { "code": "ended", "kind": "ended" },
+  { "code": "engine", "kind": "engine" },
+  { "code": "a code a later build adds", "kind": "unavailable" }
+]

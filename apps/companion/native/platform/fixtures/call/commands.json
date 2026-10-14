@@ -1,0 +1,52 @@
+[
+  {
+    "command": "callOpen",
+    "request": { "call": "c1", "events": "__CHANNEL__:7" },
+    "response": { "notifications": "granted" }
+  },
+  {
+    "command": "callOpen",
+    "request": { "call": "c2", "events": "__CHANNEL__:8" },
+    "response": { "notifications": "denied" }
+  },
+  {
+    "command": "callOffer",
+    "request": { "call": "c1" },
+    "response": { "sdp": "v=0\r\ns=-\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n" }
+  },
+  {
+    "command": "callAccept",
+    "request": { "call": "c1", "sdp": "v=0\r\ns=-\r\na=ice-lite\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\n" },
+    "response": { "usesDtx": true }
+  },
+  {
+    "command": "callPermit",
+    "request": { "call": "c1", "voiceSessionId": "5b2f0a3c-8a56-4c53-bb7e-6a4a4a1c9e01", "closesAtEpochMs": 1760300000000 },
+    "response": { "permitted": true }
+  },
+  {
+    "command": "callMute",
+    "request": { "call": "c1", "what": "microphone", "muted": true },
+    "response": {}
+  },
+  {
+    "command": "callMute",
+    "request": { "call": "c1", "what": "playback", "muted": false },
+    "response": {}
+  },
+  {
+    "command": "callStop",
+    "request": { "call": "c1" },
+    "response": {}
+  },
+  {
+    "command": "callState",
+    "request": {},
+    "response": { "call": "c1", "capture": "muted_by_person", "playing": true }
+  },
+  {
+    "command": "callState",
+    "request": {},
+    "response": { "call": null, "capture": "idle", "playing": false }
+  }
+]

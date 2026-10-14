@@ -1,4 +1,5 @@
 import AuthenticationServices
+import CompanionCallLink
 import CompanionSession
 import SwiftRs
 import Tauri
@@ -18,6 +19,12 @@ struct SessionArguments: Decodable {
 /// Which attempt a call is about.
 struct AttemptArguments: Decodable {
   let attempt: String
+}
+
+/// What opening a call takes: its name, and the channel its news is sent on.
+struct CallOpenArguments: Decodable {
+  let call: String
+  let events: Channel
 }
 
 /// What the device can do, reported as facts; the plugin's Rust crate decides what they mean.
@@ -129,6 +136,48 @@ class PlatformPlugin: Plugin, ASWebAuthenticationPresentationContextProviding {
       }
       invoke.resolve(["done": true])
     }
+  }
+
+  // MARK: The voice call
+
+  // The call is the application's own, in a target this package cannot see, so each command is
+  // handed to the application's adapter by name (`CallLink`) and answered when the adapter answers.
+
+  @objc public func callOpen(_ invoke: Invoke) throws {
+    let channel = try invoke.parseArgs(CallOpenArguments.self).events
+    forward(invoke, news: { json in
+      if let object = PlatformPlugin.object(of: json as String) { channel.send(object) }
+    })
+  }
+
+  @objc public func callOffer(_ invoke: Invoke) { forward(invoke) }
+  @objc public func callAccept(_ invoke: Invoke) { forward(invoke) }
+  @objc public func callPermit(_ invoke: Invoke) { forward(invoke) }
+  @objc public func callMute(_ invoke: Invoke) { forward(invoke) }
+  @objc public func callStop(_ invoke: Invoke) { forward(invoke) }
+  @objc public func callState(_ invoke: Invoke) { forward(invoke) }
+
+  /// Hands one command to the application's call and answers `invoke` with what it answers.
+  private func forward(_ invoke: Invoke, news: CallLink.News? = nil) {
+    let reply: CallLink.Reply = { result, code, message in
+      if let result = result as String?, let object = PlatformPlugin.object(of: result) {
+        invoke.resolve(object)
+      } else {
+        invoke.reject(
+          (message as String?) ?? "the call could not do that", code: (code as String?) ?? "engine")
+      }
+    }
+    let taken = CallLink.send(invoke.command, arguments: invoke.getRawArgs(), news: news, reply: reply)
+    if !taken { invoke.reject("this build holds no voice call", code: "unavailable") }
+  }
+
+  /// A JSON object as the text the application's call speaks it in.
+  private static func object(of json: String) -> JsonObject? {
+    guard
+      let data = json.data(using: .utf8),
+      let parsed = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+    else { return nil }
+    return parsed.mapValues { Optional($0) }
   }
 
   /// Answers the waiting call with the attempt's one result; a result for any other attempt is

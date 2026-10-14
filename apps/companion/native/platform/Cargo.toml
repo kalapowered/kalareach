@@ -18,6 +18,7 @@ serde.workspace = true
 serde_json.workspace = true
 tauri.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
 tracing.workspace = true
 
 # iOS keeps secrets in the protected keychain store, in this application's own access group, only

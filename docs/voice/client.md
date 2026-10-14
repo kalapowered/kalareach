@@ -47,6 +47,14 @@ voice screen starts a call through the application's own command, which refuses 
 platform before the host is asked for anything: the application's own process negotiates no
 connection. The phone connections above are not started from the screen.
 
+## How the application reaches the call
+
+The call is native code, and the rest of the application reaches it through one interface. The application asks for a call to be opened, for its offer, for the provider's answer to be applied, for the call to be permitted, muted or stopped, and for what the device holds. Native code answers each request once. It reports the call's news on a channel it was given when the call was opened: the state of the connection, what the provider sent on its read-only channel, the first remote audio, what the microphone is doing, and the end of the call.
+
+Each item of news carries the call's name and a number counted from one. A gap in the numbers, or a queue that was full when news arrived, is reported as lost news and never as silence. A provider event is the one kind of news that is dropped when the queue is full. A request that native code cannot carry out is refused with a code from a closed set: the microphone is not allowed, a call is already running, there is no such call, the call has ended, or the media engine could not do it.
+
+On iOS the call lives in a target the platform plugin cannot see, so the plugin finds the application's adapter by the name of its class. On Android the application registers its bridge when it starts and the plugin finds it there, so no class is looked up by name and a minified build cannot break the link. The shapes of every request and every item of news are fixtures that the Rust, Swift and Kotlin tests all read. On iOS the application does not ask the person for notifications, since a call there needs none; it reports what the person has already allowed. A debug build can drive the whole interface on a simulator or an emulator with `scripts/e2e-voice-call-bridge.sh`. The voice screen still starts no call.
+
 ## Screen lock and background audio
 
 Section 15 ¶21: live voice stays usable after screen lock through the native iOS audio session and
