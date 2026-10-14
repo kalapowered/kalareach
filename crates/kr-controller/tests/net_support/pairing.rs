@@ -7,6 +7,7 @@
 
 use iroh::endpoint::{ConnectError, ConnectingError, ConnectionError};
 use iroh::{Endpoint, EndpointAddr};
+use kr_client::ClientError;
 use kr_crypto::keys::{AuthorisationKeyPair, DeviceKeys};
 use kr_ipc::client::LocalClient;
 use kr_pairing::confirm::sign_confirmation;
@@ -33,6 +34,7 @@ use kr_protocol::preauth::{
     PairRedeemParams, PairRedeemResult, PairStatusParams, PairStatusResult,
 };
 use kr_protocol::scalars::{AuthorisationKey, Nullable};
+use kr_transport::TransportError;
 use kr_transport::handshake::{self, CandidateConnection, LocalIdentity};
 
 /// The host as the candidate sees it: the endpoint identity the invitation pinned.
@@ -77,13 +79,45 @@ pub fn host_addr(payload: &DirectQrPayload) -> EndpointAddr {
 /// wait at once.
 const REACH_DEADLINE: std::time::Duration = std::time::Duration::from_secs(300);
 
+/// Makes `attempt` again for as long as it ends because nothing answered it, and returns the
+/// first outcome that is not that.
+///
+/// An attempt that the transport gives up on, because nothing answered inside its 30-second
+/// inactivity threshold, is made again on a new connection, as a client reconnects once the
+/// transport is declared unavailable. `unanswered` says which failures are that one. Nothing the
+/// host keeps depends on such an attempt: it has not read a frame, so no invitation is spent by
+/// it.
+///
+/// # Panics
+///
+/// Panics when [`REACH_DEADLINE`] passes before an attempt is answered.
+pub async fn until_answered<T, E>(
+    mut attempt: impl AsyncFnMut() -> Result<T, E>,
+    unanswered: impl Fn(&E) -> bool,
+) -> Result<T, E> {
+    let mut attempts = 0_u32;
+    let answered = tokio::time::timeout(REACH_DEADLINE, async {
+        loop {
+            attempts += 1;
+            match attempt().await {
+                Err(error) if unanswered(&error) => {}
+                outcome => return outcome,
+            }
+        }
+    })
+    .await;
+    answered.unwrap_or_else(|_| {
+        panic!(
+            "no attempt to reach the host was answered in {REACH_DEADLINE:?}: {attempts} attempts, \
+             each ended by the transport's inactivity threshold"
+        )
+    })
+}
+
 /// Dials `addr` from `endpoint` until a connection is made, and returns it.
 ///
-/// An attempt that the transport gives up on because nothing answered inside its 30-second
-/// inactivity threshold is made again on a new connection, as a client reconnects
-/// once the transport is declared unavailable. Nothing the host keeps depends on such an attempt:
-/// it has not read a frame, so no invitation is spent by it. Any other failure is the case's
-/// failure.
+/// An attempt the transport gave up on is made again ([`until_answered`]). Any other failure is the
+/// case's failure.
 ///
 /// # Panics
 ///
@@ -93,27 +127,27 @@ pub async fn dial_until_connected(
     addr: impl Into<EndpointAddr>,
 ) -> iroh::endpoint::Connection {
     let addr: EndpointAddr = addr.into();
-    let mut attempts = 0_u32;
-    let reached = tokio::time::timeout(REACH_DEADLINE, async {
-        loop {
-            attempts += 1;
-            match endpoint
+    until_answered(
+        async || {
+            endpoint
                 .connect(addr.clone(), kr_protocol::hello::ALPN)
                 .await
-            {
-                Ok(connection) => return connection,
-                Err(error) if gave_up_unanswered(&error) => {}
-                Err(error) => panic!("the candidate reaches the host: {error}"),
-            }
-        }
-    })
-    .await;
-    reached.unwrap_or_else(|_| {
-        panic!(
-            "the candidate did not reach the host in {REACH_DEADLINE:?}: {attempts} attempts, \
-             each ended by the transport's inactivity threshold"
-        )
-    })
+        },
+        gave_up_unanswered,
+    )
+    .await
+    .unwrap_or_else(|error| panic!("the candidate reaches the host: {error}"))
+}
+
+/// Whether a paired device's transport ended an attempt because nothing answered it: the
+/// transport reports the connection that timed out before it was established as such, and a
+/// failure of any other kind is the host's answer or something else.
+pub fn transport_gave_up_unanswered(error: &ClientError) -> bool {
+    matches!(
+        error,
+        ClientError::Transport(TransportError::Connect(message))
+            if *message == ConnectingError::from(ConnectionError::TimedOut).to_string()
+    )
 }
 
 /// Whether the transport ended an attempt because nothing answered it.
