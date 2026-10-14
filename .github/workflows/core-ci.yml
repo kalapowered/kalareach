@@ -1587,6 +1587,19 @@ jobs:
         timeout-minutes: 10
         run: bash scripts/disk-report.sh begin "the image as it arrives"
 
+      # The runner image carries a simulator runtime for each Xcode platform and release, about
+      # 113 GB of disk images with 54 GB of caches made from them. This job runs the workspace's
+      # tests, demonstrations and measurements on the host: none of them builds with xcodebuild or
+      # starts a simulator, so none of the runtimes is used and all of them are removed, with their
+      # caches. What the build leaves on the disk is all that is left to fit in the room.
+      - name: Free the disk the build needs
+        timeout-minutes: 30
+        run: bash scripts/free-simulator-runtimes.sh
+
+      - name: What the disk holds with the runtimes cleared
+        timeout-minutes: 10
+        run: bash scripts/disk-report.sh step "the simulator runtimes cleared"
+
       # What this runner is, printed before anything asserts on it, so a pass or a failure below
       # names the system, the login session, the keychain and the disk it happened on. The two
       # scripts start four build jobs unless told otherwise, and this runner has fewer processors
