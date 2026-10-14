@@ -1418,6 +1418,7 @@ async fn a_lease_that_runs_out_on_a_retired_relay_is_ended_and_the_pair_is_given
     let owner = rig.owner_device();
     let first = rig.live_lease_for(&owner).expect("a lease");
     rig.served.web().retire_relay_of(&first.lease_id);
+    let before = rig.requests(ISSUE);
 
     // The host did not refill, and the lease ran out: it slept, or had no network.
     rig.time_passes(Duration::from_secs(u64::from(LEASE_SECONDS) + 1));
@@ -1425,6 +1426,16 @@ async fn a_lease_that_runs_out_on_a_retired_relay_is_ended_and_the_pair_is_given
 
     let renewed = rig.live_lease_for(&owner).expect("a new lease");
     assert_ne!(renewed.lease_id, first.lease_id);
+    let sent = rig.bodies(ISSUE);
+    assert_eq!(
+        sent.len(),
+        before + 1,
+        "a lease the host knows has run out is ended and not refilled"
+    );
+    assert!(
+        sent[before]["lease_id"].is_null(),
+        "and the pair is asked for afresh"
+    );
     let old = rig
         .leases_for(&owner)
         .into_iter()
@@ -2012,4 +2023,35 @@ async fn a_row_that_names_no_lease_is_forgotten_once_no_lease_it_could_name_is_a
         asked,
         "nothing is asked for a lease that can no longer be alive"
     );
+}
+
+/// KR-REQ-17.51: a device whose grant runs out is no longer paired, and its lease is ended when the
+/// directory records that, without waiting for the next time the keeper looks. The device finds
+/// its grant has run out on its next request; the record of that wakes the keeper.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_device_whose_grant_runs_out_has_its_lease_ended() {
+    let rig = Rig::start().await;
+    let (phone, record) = rig.pairs().await;
+    rig.until("the paired device holds a lease", || rig.holds(&record))
+        .await;
+    let session = net_support::connect(&rig.host, &phone, &record).await;
+
+    // The grant is a day long on this host's clock.
+    rig.wall.advance(Duration::from_secs(25 * 60 * 60));
+    session
+        .read::<_, HostDoctorResult>(Method::HostDoctor, &())
+        .await
+        .expect_err("the grant has run out");
+
+    rig.until("the lease is ended at the service", || {
+        rig.leases_for(&record).iter().all(|lease| !lease.live) && rig.endings_owed() == 0
+    })
+    .await;
+    assert!(
+        rig.leases_for(&record)
+            .iter()
+            .any(|lease| lease.ended_for == Some("unpaired")),
+        "it is ended as a lease of a pair that is no longer paired"
+    );
+    assert_eq!(rig.lease_in_the_record(&record), None);
 }
