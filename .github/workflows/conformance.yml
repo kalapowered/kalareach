@@ -149,6 +149,22 @@ jobs:
         timeout-minutes: 5
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
+      - name: Survey the image
+        timeout-minutes: 20
+        run: |
+          df -h /System/Volumes/Data
+          diskutil apfs list | head -40 || true
+          xcode-select -p
+          ls -la /Applications | head -60
+          xcrun simctl runtime list 2>&1 | head -60 || true
+          hdiutil info 2>&1 | head -40 || true
+          echo "== top level"
+          sudo du -xk -d 1 /System/Volumes/Data 2>/dev/null | sort -nr | head -25
+          echo "== deep"
+          sudo du -xk -d 3 /System/Volumes/Data/Applications /System/Volumes/Data/Library /System/Volumes/Data/Users /System/Volumes/Data/opt /System/Volumes/Data/usr /System/Volumes/Data/private 2>/dev/null | sort -nr | head -160
+          echo "== runner home"
+          sudo du -xk -d 2 /Users/runner 2>/dev/null | sort -nr | head -60
+
       - name: What this runner is
         timeout-minutes: 2
         run: |
