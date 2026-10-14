@@ -2977,6 +2977,12 @@ fn attempt_once(
         })?;
         *left_something = false;
     }
+    // The image holds what keeps the system's indexer from reading it once it is attached, and
+    // the directory it is made from is a place of its own: the image's directory is the caller's.
+    let source = tempfile::tempdir().map_err(|error| {
+        Refusal::Fatal(format!("the image's contents could not be made: {error}"))
+    })?;
+    let contents = kr_ipc::testing::volumes::never_indexed_contents(source.path(), "contents");
     let ran = run_tool(
         tool,
         [
@@ -2987,10 +2993,13 @@ fn attempt_once(
             filesystem,
             "-volname",
             volume_name,
+            "-format",
+            "UDRW",
+            "-srcfolder",
         ]
         .map(std::ffi::OsStr::new)
         .into_iter()
-        .chain([image.as_os_str()]),
+        .chain([contents.as_os_str(), image.as_os_str()]),
     )
     .map_err(Refusal::Fatal)?;
     if ran.status.success() {
@@ -3163,25 +3172,14 @@ impl Drop for Attached {
 /// process `hdiutil info` still shows serving the image.
 #[cfg(target_os = "macos")]
 fn detach_image(image: &std::path::Path, mount_point: &std::path::Path) -> Result<(), String> {
-    let said = match std::process::Command::new("/usr/bin/hdiutil")
-        .args(["detach", "-force"])
-        .arg(mount_point)
-        .output()
-    {
-        Ok(output) if output.status.success() => return Ok(()),
-        Ok(output) => format!(
-            "hdiutil ended with {}: {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
-        ),
-        Err(error) => format!("hdiutil could not be run: {error}"),
-    };
-    Err(format!(
-        "the disk image {} did not detach from {} ({said}); {}",
-        image.display(),
-        mount_point.display(),
-        serving(image)
-    ))
+    kr_ipc::testing::volumes::detach_attached(mount_point).map_err(|said| {
+        format!(
+            "the disk image {} did not detach from {} ({said}); {}",
+            image.display(),
+            mount_point.display(),
+            serving(image)
+        )
+    })
 }
 
 /// Says which processes `hdiutil info` shows serving `image`, by number and name.
