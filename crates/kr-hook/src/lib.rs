@@ -96,10 +96,16 @@ pub fn report(line: &str) {
 /// ends with it, and its line is lost: with nothing left before `by`, the line is written only if
 /// that thread gets to it before the process ends.
 pub fn report_by(line: &str, by: std::time::Instant) {
-    write_by(format!("kr-hook: {line}\n").into_bytes(), by, |bytes| {
+    report_with(line, by, |bytes| {
         use std::io::Write as _;
         let _ = std::io::stderr().lock().write_all(bytes);
     });
+}
+
+/// [`report_by`] with the write given, which is what a standard error is to it: the line is
+/// formatted here, and handed to `write` on a thread of its own, waited for no later than `by`.
+pub fn report_with(line: &str, by: std::time::Instant, write: impl FnOnce(&[u8]) + Send + 'static) {
+    write_by(format!("kr-hook: {line}\n").into_bytes(), by, write);
 }
 
 /// How many diagnostic lines [`Reports`] holds while its writer waits on standard error.

@@ -14,7 +14,7 @@
 mod common;
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use common::Placed;
 use common::launched::{self, Launch};
@@ -61,9 +61,8 @@ fn asked(thread: &str, request_id: &str) -> Vec<u8> {
 }
 
 /// Has the application run one hook, admits it, applies what it observed, and returns the report
-/// with what the hook itself answered and how long the whole round took.
-async fn hook(launch: &mut Launch, payload: &[u8]) -> (HookReport, launched::Outcome, Duration) {
-    let started = Instant::now();
+/// with what the hook itself answered.
+async fn hook(launch: &mut Launch, payload: &[u8]) -> (HookReport, launched::Outcome) {
     let request = launch.hook(payload);
     let admitted = launch.accept().await.expect("the hook is admitted");
     assert_eq!(admitted.surface, BridgeSurface::Hook);
@@ -74,7 +73,7 @@ async fn hook(launch: &mut Launch, payload: &[u8]) -> (HookReport, launched::Out
     let outcome = tokio::task::spawn_blocking(move || launched::outcome(&request))
         .await
         .expect("the hook ended");
-    (report, outcome, started.elapsed())
+    (report, outcome)
 }
 
 fn start(placed: &Placed) -> Launch {
@@ -141,16 +140,15 @@ async fn kr_req_12_18_each_registered_hook_observes_and_answers_neutrally() {
     ];
     let mut cursors = Vec::new();
     for (payload, event, timeout) in events {
-        let (report, outcome, took) = hook(&mut launch, &payload).await;
+        let (report, outcome) = hook(&mut launch, &payload).await;
         assert_eq!(report.observation.event, event);
         assert_eq!(report.observation.thread.as_str(), FIRST_THREAD);
         assert_eq!(outcome.code, 0, "{event:?}: {}", outcome.stderr);
         assert_eq!(outcome.stdout, b"{}\n", "{event:?}");
         assert!(outcome.stderr.is_empty(), "{event:?}: {}", outcome.stderr);
-        assert!(
-            took < timeout,
-            "{event:?} took {took:?}, past the {timeout:?} the package registers"
-        );
+        // The hook's stderr is empty, so it answered from what the worker applied and not at its
+        // deadline, which with the allowance after it is inside the timeout the package registers.
+        common::assert_answered_in_time(&outcome.stderr, timeout, &format!("{event:?}"));
         match event {
             ObservedEvent::ThreadStarted => {
                 assert!(matches!(report.thread, ThreadChange::Selected(_)));
@@ -254,7 +252,7 @@ async fn kr_req_11_62_a_thread_switch_the_hooks_report_invalidates_the_questions
         connection_id: ConnectionId::new(Uuid::from_bytes([6; 16])),
     };
 
-    let (started, _, _) = hook(&mut launch, &session_start(FIRST_THREAD, "startup")).await;
+    let (started, _) = hook(&mut launch, &session_start(FIRST_THREAD, "startup")).await;
     assert!(
         matches!(started.thread, ThreadChange::Selected(_)),
         "{:?}",
@@ -275,7 +273,7 @@ async fn kr_req_11_62_a_thread_switch_the_hooks_report_invalidates_the_questions
             .is_none(),
         "when it is asked, nothing yet says which thread asked it"
     );
-    let (_, outcome, _) = hook(
+    let (_, outcome) = hook(
         &mut launch,
         &asked(FIRST_THREAD, "asked-in-the-first-thread"),
     )
@@ -289,7 +287,7 @@ async fn kr_req_11_62_a_thread_switch_the_hooks_report_invalidates_the_questions
     );
 
     // The person runs `/clear`: Claude Code ends the first thread and starts another.
-    let (ended, _, _) = hook(
+    let (ended, _) = hook(
         &mut launch,
         &serde_json::json!({"session_id": FIRST_THREAD, "hook_event_name": "SessionEnd",
             "reason": "clear"})
@@ -302,7 +300,7 @@ async fn kr_req_11_62_a_thread_switch_the_hooks_report_invalidates_the_questions
         "{:?}",
         ended.thread
     );
-    let (switched, outcome, _) = hook(&mut launch, &session_start(SECOND_THREAD, "clear")).await;
+    let (switched, outcome) = hook(&mut launch, &session_start(SECOND_THREAD, "clear")).await;
     assert!(
         matches!(switched.thread, ThreadChange::Selected(_)),
         "{:?}",
@@ -358,7 +356,7 @@ async fn kr_req_11_62_a_thread_switch_the_hooks_report_invalidates_the_questions
         .create(&helper, &ask("reported-late"), now(3_000))
         .expect("asked");
     hook(&mut launch, &session_start(FIRST_THREAD, "resume")).await;
-    let (back, _, _) = hook(&mut launch, &session_start(SECOND_THREAD, "resume")).await;
+    let (back, _) = hook(&mut launch, &session_start(SECOND_THREAD, "resume")).await;
     assert!(
         matches!(back.thread, ThreadChange::Selected(_)),
         "{:?}",
@@ -409,13 +407,13 @@ async fn kr_req_11_62_a_thread_switch_the_hooks_report_invalidates_the_questions
         .create(&helper, &ask("across-a-compaction"), now(5_000))
         .expect("asked");
     hook(&mut launch, &asked(SECOND_THREAD, "across-a-compaction")).await;
-    let (continued, _, _) = hook(&mut launch, &session_start(SECOND_THREAD, "compact")).await;
+    let (continued, _) = hook(&mut launch, &session_start(SECOND_THREAD, "compact")).await;
     assert_eq!(continued.thread, ThreadChange::Unchanged);
     assert_eq!(
         state_of(&questions, compacted.question.question_id, 5_100),
         QuestionState::Pending
     );
-    let (resumed, _, _) = hook(&mut launch, &session_start(SECOND_THREAD, "resume")).await;
+    let (resumed, _) = hook(&mut launch, &session_start(SECOND_THREAD, "resume")).await;
     assert!(
         matches!(resumed.thread, ThreadChange::Selected(_)),
         "{:?}",
