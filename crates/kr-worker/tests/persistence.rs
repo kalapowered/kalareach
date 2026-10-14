@@ -1194,8 +1194,6 @@ fn every_way_of_opening_a_journal_waits_for_a_holder_that_has_not_let_go_of_its_
             drop(held);
         });
         let opened = open(&path);
-        // A refusal that was given at once leaves the hook for the next case to find.
-        kr_worker::persistence::release::on_the_next_wait(|| {});
         assert!(
             waited.load(Ordering::SeqCst),
             "{name}: the open reported the refusal instead of waiting for the holder: {opened:?}"

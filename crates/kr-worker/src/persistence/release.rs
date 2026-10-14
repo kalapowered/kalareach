@@ -59,30 +59,29 @@ pub fn once_the_previous_holder_has_let_go<T>(
     }
 }
 
-/// What a test runs the next time an open waits for a previous holder, for this host's own tests.
 #[cfg(feature = "testing")]
-static ON_THE_NEXT_WAIT: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>> =
-    std::sync::Mutex::new(None);
-
-/// Runs `hook` the next time an open is told its previous holder has not let go, once, before the
-/// open asks again, for this host's own tests.
-///
-/// It is how a test lets go of a store at the moment the open is waiting for it, rather than
-/// after a time it chose. It is compiled away in every shipped build.
-#[cfg(feature = "testing")]
-pub fn on_the_next_wait(hook: impl FnOnce() + Send + 'static) {
-    *ON_THE_NEXT_WAIT
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Box::new(hook));
+thread_local! {
+    /// What a test runs the next time an open on this thread waits for a previous holder.
+    static ON_THE_NEXT_WAIT: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
-/// Runs the hook a test left for the next wait, if it left one.
+/// Runs `hook` the next time an open on this thread is told its previous holder has not let go,
+/// once, before the open asks again, for this host's own tests.
+///
+/// It is how a test lets go of a store at the moment the open is waiting for it, rather than
+/// after a time it chose. It belongs to the calling thread, because an open waits on the thread
+/// that asked, so a test running beside another one cannot be answered with the other's wait. It
+/// is compiled away in every shipped build.
+#[cfg(feature = "testing")]
+pub fn on_the_next_wait(hook: impl FnOnce() + 'static) {
+    ON_THE_NEXT_WAIT.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+/// Runs the hook a test left for this thread's next wait, if it left one.
 #[cfg(feature = "testing")]
 fn announce_the_wait() {
-    let hook = ON_THE_NEXT_WAIT
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .take();
+    let hook = ON_THE_NEXT_WAIT.with(|slot| slot.borrow_mut().take());
     if let Some(hook) = hook {
         hook();
     }
