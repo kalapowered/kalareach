@@ -81,9 +81,9 @@ url.workspace = true
 [features]
 # The pause the host's own tests use to stand between an attention action's admission and its
 # store write, the hooks that place the description process, its clock and the conditions it reads,
-# and the stub that stands in for the description process. It compiles to nothing without this
-# feature, and no shipped build enables it.
-testing = ["kr-describe/testing", "kr-voice/testing"]
+# the stub that stands in for the description process, and the bound a test gives the project
+# service's Git reads. It compiles to nothing without this feature, and no shipped build enables it.
+testing = ["kr-describe/testing", "kr-voice/testing", "kr-project/git-fixtures"]
 
 [target.'cfg(unix)'.dependencies]
 rustix = { workspace = true, features = ["fs", "process"] }

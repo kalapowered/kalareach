@@ -242,8 +242,17 @@ impl ProjectModule {
         // examines directories. All three are blocking work, so they run on a blocking task rather
         // than on the daemon's reactor.
         let paths = paths.clone();
+        #[cfg(feature = "testing")]
+        let git_read_bound = crate::testing::git_read_bound();
         let service = tokio::task::spawn_blocking(move || {
+            #[cfg(feature = "testing")]
+            let mut service = ProjectService::open(&paths)?;
+            #[cfg(not(feature = "testing"))]
             let service = ProjectService::open(&paths)?;
+            #[cfg(feature = "testing")]
+            if let Some(bound) = git_read_bound {
+                service.hold_git_read_deadline(bound);
+            }
             // A publication interrupted between its two commits is resolved before anything is
             // served, so a repository record never names an object this daemon has not found.
             service.recover()?;
