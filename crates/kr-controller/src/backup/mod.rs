@@ -28,6 +28,7 @@ pub mod binding;
 mod lease;
 pub mod relay;
 pub mod runtime;
+pub mod setup;
 mod statements;
 pub mod store;
 pub mod uploader;
@@ -44,7 +45,7 @@ use kr_client::services::AccountMark;
 use kr_crypto::backup::{SealedArchive, StagedObject};
 use kr_flush::{NameKind, flush_directory};
 use kr_protocol::ids::{ArchiveId, BackupGeneration, BackupObjectId};
-use kr_protocol::scalars::{Digest256, KeyId, TimestampMs};
+use kr_protocol::scalars::{KeyId, TimestampMs};
 use kr_worker::privacy::{
     Cancelled, Exported, Fenced, KeptExplicitly, PrivacyGeneration, PrivacySubsystem, Removed,
     Unavailable,
@@ -271,6 +272,9 @@ pub struct BackupService {
     signals: Arc<BackupSignals>,
     /// The account the backups belong to, as a request's token is held to it.
     binding: Arc<binding::Binding>,
+    /// The fingerprint of the kit the recorded setup was made with, kept beside the binding so that
+    /// `kr doctor` can say it without a read of the store.
+    kit: Mutex<Option<String>>,
     /// The production passes that hold the staging directory. Always taken after the store, and
     /// never while waiting for it.
     leases: Arc<Mutex<lease::Leases>>,
@@ -321,11 +325,13 @@ impl BackupService {
     pub fn open(state_dir: &Path) -> Result<Self> {
         let store = BackupStore::open(state_dir)?;
         let binding = binding_of(&store)?;
+        let kit = Mutex::new(store.setup()?.map(|setup| setup.record.kit_fingerprint));
         Ok(Self {
             store: Mutex::new(store),
             readiness: Mutex::new(Readiness::default()),
             signals: Arc::default(),
             binding,
+            kit,
             leases: Arc::default(),
         })
     }
@@ -340,11 +346,13 @@ impl BackupService {
     pub fn in_memory(staging_root: &Path) -> Result<Self> {
         let store = BackupStore::in_memory(staging_root)?;
         let binding = binding_of(&store)?;
+        let kit = Mutex::new(store.setup()?.map(|setup| setup.record.kit_fingerprint));
         Ok(Self {
             store: Mutex::new(store),
             readiness: Mutex::new(Readiness::default()),
             signals: Arc::default(),
             binding,
+            kit,
             leases: Arc::default(),
         })
     }
@@ -360,6 +368,15 @@ impl BackupService {
     #[must_use]
     pub fn binding(&self) -> Arc<binding::Binding> {
         Arc::clone(&self.binding)
+    }
+
+    /// The fingerprint of the kit the recorded setup was made with, when a setup is recorded.
+    #[must_use]
+    pub fn recorded_kit(&self) -> Option<String> {
+        self.kit
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     fn store(&self) -> std::sync::MutexGuard<'_, BackupStore> {
@@ -878,6 +895,11 @@ impl BackupService {
         if commit != SetupCommit::Unchanged {
             self.binding
                 .switch(AccountMark::from_bytes(record.account_mark));
+            *self
+                .kit
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                Some(record.kit_fingerprint.clone());
         }
         if matches!(commit, SetupCommit::Replaced { .. }) {
             // What the earlier archive had running is told to stop with the commit.
@@ -1349,7 +1371,9 @@ impl BackupService {
         }
         staging(manifest_object_id, &sealed.encrypted_manifest)?;
         let made_from = MadeFrom {
-            fingerprint: Digest256::from_bytes(kr_cbor::sha256(&sealed.descriptor_bytes)),
+            fingerprint: kr_protocol::scalars::Digest256::from_bytes(kr_cbor::sha256(
+                &sealed.descriptor_bytes,
+            )),
             unreadable: Vec::new(),
         };
         self.admit_produced(&lease, sealed, objects, writer_key_id, made_from, now_ms)

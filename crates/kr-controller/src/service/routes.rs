@@ -275,6 +275,7 @@ impl Controller {
             Method::PrivacyStatus => self.privacy_status().await,
             Method::AccountStatus => self.account_status(&request.params),
             Method::BackupRead => self.backup_read(&request.params).await,
+            Method::BackupStatus => self.backup_status(&request.params).await,
             Method::DescriptionSetup => self.description_setup(),
             _ => Err(ControllerError::InvalidArgument(format!(
                 "{} is not a read this daemon serves",
@@ -881,6 +882,22 @@ impl Controller {
                         self.update_handover(mutation),
                     )
                     .await;
+            }
+            // Setting this host's backups up changes the host's own record and the account's
+            // storage at the service, and nothing a session holds. A call is idempotent on its
+            // archive, and its repeats are answered from what the first left.
+            Method::BackupEnable => {
+                match accepted.filter(|accepted| self.clock.now() < accepted.deadline) {
+                    Some(_) => match self.authorised(connection_id) {
+                        Ok(_) => self.backup_enable(mutation).await,
+                        Err(error) => Err(error),
+                    },
+                    None => Err(ControllerError::WindowExpired {
+                        detail: "the deadline this action was admitted under passed before it \
+                                 could run"
+                            .to_owned(),
+                    }),
+                }
             }
             _ => Err(ControllerError::InvalidArgument(format!(
                 "{} is not a mutation this daemon serves",

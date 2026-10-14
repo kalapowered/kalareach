@@ -45,6 +45,10 @@ use kr_protocol::archive::{
     TrustedWriter,
 };
 use kr_protocol::backup_read::{BackupBundle, BackupReadParams, BackupReadResult, BackupSignIn};
+use kr_protocol::backup_setup::{
+    BackupEnableCause, BackupEnableParams, BackupEnableResult, BackupSetupState,
+    BackupStatusParams, BackupStatusResult, BackupStorageState, BackupUnusable,
+};
 use kr_protocol::envelope::ActionTarget;
 use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::host_account::{
@@ -70,6 +74,9 @@ const STATUS: &str = "/api/storage/status";
 const MANIFEST: &str = "/api/backup/manifest";
 const OBJECT_READ: &str = "/api/storage/object/read";
 const SYNC: &str = "/api/sync/exchange";
+const RETENTION: &str = "/api/storage/retention";
+const COMPLETE: &str = "/api/storage/upload/complete";
+const DELETE: &str = "/api/storage/object/delete";
 
 /// A failure guard for a test that waits on a condition: the tests decide on what the daemon did,
 /// and this only keeps one that went wrong from hanging.
@@ -331,10 +338,15 @@ impl Rig {
 
     /// Signs the host in at the service as another account than the one it held.
     async fn sign_in_as(&self, subject: &str) {
+        self.sign_in_with(subject, TOKEN).await;
+    }
+
+    /// Signs the host in at the service as `subject`, with an access token the service issued.
+    async fn sign_in_with(&self, subject: &str, token: &str) {
         self.controller
             .host_account()
             .keep_for_test(IssuedGrant {
-                access_token: AccountToken::new(TOKEN).expect("a token"),
+                access_token: AccountToken::new(token).expect("a token"),
                 expires_in_seconds: 3600,
                 refresh_token: RefreshToken::new("another-refresh-token").expect("a token"),
                 scopes: vec![
@@ -375,7 +387,7 @@ impl Rig {
             origin: self.origin(),
             account_mark: mark.to_bytes(),
             recovery_public_key: *self.device.public(),
-            kit_fingerprint: "ABCD2345".to_owned(),
+            kit_fingerprint: kr_client::recovery::kit_fingerprint(self.device.public()),
             writer_key_id: self.writer.key_id(),
             producer_key_id: daemon_producer(&self.host).key_id(),
             enabled_at_ms: TimestampMs::new(1_000),
@@ -3332,9 +3344,20 @@ fn closed_session(
 /// What a generation holds, opened as the recovery recipient opens it: the members by name, with
 /// their plaintext.
 fn opened_members(rig: &Rig, generation: u64) -> std::collections::BTreeMap<String, Vec<u8>> {
-    use kr_crypto::backup::{
-        ArchiveExpectation, ArchiveReader, GenerationExpectation, open_archive,
-    };
+    opened_members_as(
+        rig,
+        generation,
+        &kr_crypto::backup::ArchiveReader::Device(&rig.device),
+    )
+}
+
+/// What a generation holds, opened as `reader` opens it.
+fn opened_members_as(
+    rig: &Rig,
+    generation: u64,
+    reader: &kr_crypto::backup::ArchiveReader<'_>,
+) -> std::collections::BTreeMap<String, Vec<u8>> {
+    use kr_crypto::backup::{ArchiveExpectation, GenerationExpectation, open_archive};
 
     let record = rig
         .controller
@@ -3352,10 +3375,9 @@ fn opened_members(rig: &Rig, generation: u64) -> std::collections::BTreeMap<Stri
             .expect("the service holds the object")
     };
     let manifest = stored(descriptor.encrypted_manifest.object_id);
-    let reader = ArchiveReader::Device(&rig.device);
     let sender = daemon_producer(&rig.host);
     let opened = open_archive(
-        &reader,
+        reader,
         sender.public(),
         &[TrustedWriter {
             writer_key_id: rig.writer.key_id(),
@@ -3376,7 +3398,7 @@ fn opened_members(rig: &Rig, generation: u64) -> std::collections::BTreeMap<Stri
         .map(|entry| {
             let restored = opened
                 .restore_object(
-                    &reader,
+                    reader,
                     sender.public(),
                     entry.object.object_id,
                     &stored(entry.object.object_id),
@@ -3996,4 +4018,740 @@ async fn a_session_that_cannot_be_read_makes_no_generation_each_day_and_is_tried
         second.contains_key(&format!("sessions/{session}.json")),
         "the session is in the generation made once it could be read"
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// The owner sets backups up.
+// ---------------------------------------------------------------------------------------------
+
+/// What the owner's command sends and reads, as the daemon is asked.
+impl Rig {
+    /// What `kr backup setup` would send for `archive`: a kit, the sealed bundle and the call, built
+    /// from the keys `backup.status` names.
+    fn prepared_setup(
+        &self,
+        archive: ArchiveId,
+        replace: bool,
+    ) -> kr_client::recovery::PreparedSetup {
+        let producer = daemon_producer(&self.host);
+        kr_client::recovery::prepare_setup(&kr_client::recovery::SetupInputs {
+            origin: &self.origin(),
+            archive_id: archive,
+            writer: (self.writer.key_id(), *self.writer.public()),
+            producer: (producer.key_id(), *producer.public()),
+            enabled_at_ms: kr_ipc::now_ms(),
+            replace,
+        })
+        .expect("a setup is prepared")
+    }
+
+    /// `backup.enable`, as the command's connection makes it.
+    async fn enable(&self, params: &BackupEnableParams) -> BackupEnableResult {
+        enable_at(&self.client_endpoint, self.host.environment_id(), params).await
+    }
+
+    /// `backup.enable` in a task of its own, for a call the test watches while it runs.
+    fn enable_in_the_background(
+        &self,
+        params: &BackupEnableParams,
+    ) -> tokio::task::JoinHandle<BackupEnableResult> {
+        let endpoint = self.client_endpoint.clone();
+        let environment = self.host.environment_id();
+        let params = params.clone();
+        tokio::spawn(async move { enable_at(&endpoint, environment, &params).await })
+    }
+
+    /// `backup.status`.
+    async fn backup_status(&self) -> BackupStatusResult {
+        let mut client = LocalClient::connect(&self.client_endpoint, LocalClientKind::Cli, build())
+            .await
+            .expect("connects");
+        client
+            .request(Method::BackupStatus, &BackupStatusParams {})
+            .await
+            .expect("the call reaches the daemon")
+            .expect("backup.status is served on the local socket")
+            .to_typed()
+            .expect("a result of the declared shape")
+    }
+
+    /// The paths of the requests the stand-in has been given, in order, from `from` on.
+    fn requested_since(&self, from: usize) -> Vec<String> {
+        self.served.web().arrived()[from..]
+            .iter()
+            .map(|arrived| arrived.path.clone())
+            .collect()
+    }
+}
+
+async fn enable_at(
+    endpoint: &kr_ipc::paths::Endpoint,
+    environment: kr_protocol::ids::EnvironmentId,
+    params: &BackupEnableParams,
+) -> BackupEnableResult {
+    let mut client = LocalClient::connect(endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects");
+    client
+        .mutate(
+            Method::BackupEnable,
+            ActionId::new(kr_ipc::new_uuid()),
+            ActionTarget::environment(environment),
+            params,
+        )
+        .await
+        .expect("the call reaches the daemon")
+        .expect("backup.enable answers")
+        .to_typed()
+        .expect("a result of the declared shape")
+}
+
+fn archive_two() -> ArchiveId {
+    ArchiveId::new(Uuid::from_bytes([0x22; 16]))
+}
+
+/// A host with no setup, no enrolment and backup storage off, and a closed session to back up.
+async fn a_host_to_set_up(timer: &Arc<HeldTimer>) -> (Rig, kr_protocol::ids::SessionId) {
+    let mut closed = None;
+    let rig = Rig::start_with(
+        Arrangement {
+            enrolled: false,
+            backup_on: false,
+            ..Arrangement::NORMAL
+        },
+        Arc::clone(timer),
+        |host| closed = Some(closed_session(host, b"a line\r\n", 9_000)),
+    )
+    .await;
+    let session = closed.expect("a closed session");
+    within(
+        "the first status read",
+        rig.served.web().requests_reach(STATUS, 1),
+    )
+    .await;
+    (rig, session)
+}
+
+/// The owner's setup through the daemon, as the command makes it: the bundle is written to the
+/// service first, the writer is enrolled by the host's owner key, managed backup storage is turned
+/// on, and then the setup is recorded; the host then makes a backup that the recovery recipient the
+/// kit's seed derives opens, with the producer and the writer the bundle names. A call made again
+/// with the same bytes is answered from what the first left, and sends nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_owners_setup_writes_the_bundle_then_enrols_the_writer_and_the_host_then_backs_up() {
+    let timer = HeldTimer::held();
+    let (rig, session) = a_host_to_set_up(&timer).await;
+    let web = Arc::clone(rig.served.web());
+
+    let before = rig.backup_status().await;
+    assert_eq!(before.service.0.as_deref(), Some(rig.origin().as_str()));
+    assert_eq!(before.sign_in, BackupSignIn::Usable);
+    assert!(matches!(before.setup, BackupSetupState::None {}));
+    let keys = before.keys.0.expect("the host's keys");
+    assert_eq!(keys.writer_key_id, rig.writer.key_id());
+    assert_eq!(keys.producer_key_id, daemon_producer(&rig.host).key_id());
+    assert!(matches!(
+        before.storage,
+        BackupStorageState::Read {
+            backup_on: false,
+            ..
+        }
+    ));
+
+    let made = rig.prepared_setup(archive_id(), false);
+    let asked = web.arrived().len();
+    let result = rig.enable(&made.params).await;
+    assert_eq!(
+        result,
+        BackupEnableResult::Enabled {
+            archive_id: archive_id(),
+            kit_fingerprint: made.kit_fingerprint.clone(),
+            enabled_at_ms: made.params.enabled_at_ms,
+        }
+    );
+
+    // The order the specification gives: the bundle, then the writer, then storage on.
+    let paths = rig.requested_since(asked);
+    let at = |wanted: &str, skip: usize| {
+        paths
+            .iter()
+            .enumerate()
+            .filter(|(_, path)| path.as_str() == wanted)
+            .nth(skip)
+            .map(|(index, _)| index)
+            .unwrap_or_else(|| panic!("no {wanted} in {paths:?}"))
+    };
+    assert!(at(SYNC, 0) < at(MANIFEST, 0), "{paths:?}");
+    assert!(at(MANIFEST, 0) < at(RETENTION, 0), "{paths:?}");
+    assert_eq!(
+        web.bundle(&made.params.bundle_locator.to_string()),
+        Some(made.params.sealed_bundle.as_slice().to_vec())
+    );
+    let sent = web.arrived();
+    let signer = |path: &str| {
+        sent[asked..]
+            .iter()
+            .find(|arrived| arrived.path == path)
+            .and_then(|arrived| arrived.signed_by)
+            .expect("a signed request")
+    };
+    let owner = kr_crypto::store::load_device_keys(
+        open_store_in(&rig.host.environment().secrets_dir())
+            .expect("the daemon's secret store")
+            .store
+            .as_ref(),
+        &kr_controller::service::net::device_key_scope(rig.host.environment_id()),
+    )
+    .expect("the device keys read")
+    .expect("the daemon made its device keys")
+    .authorisation;
+    let (kind, key) = signer(SYNC);
+    assert_eq!(
+        kind,
+        kr_protocol::service::ServiceRequestSigner::Installation
+    );
+    assert_ne!(
+        key,
+        *rig.writer.public(),
+        "the bundle is not signed with the writer"
+    );
+    assert_ne!(key, *owner.public(), "nor with the owner's key");
+    assert_eq!(
+        signer(MANIFEST),
+        (
+            kr_protocol::service::ServiceRequestSigner::Host,
+            *owner.public()
+        ),
+        "the enrolment is the host's owner key's"
+    );
+
+    // Recorded, with the writer enrolled for the archive.
+    let row = rig
+        .controller
+        .backup()
+        .setup()
+        .expect("a read")
+        .expect("a setup");
+    assert_eq!(row.record.archive_id, archive_id());
+    assert_eq!(row.record.kit_fingerprint, made.kit_fingerprint);
+    assert!(
+        rig.controller
+            .backup()
+            .authorised_writers()
+            .expect("a read")
+            .contains(&(archive_id(), rig.writer.key_id()))
+    );
+    let after = rig.backup_status().await;
+    assert!(matches!(
+        after.setup,
+        BackupSetupState::Committed { unusable, .. } if unusable.0.is_none()
+    ));
+    let (_, detail) = rig.production_check().await;
+    assert!(detail.contains(&made.kit_fingerprint), "{detail}");
+
+    // And the host backs up: the generation opens as the recovery recipient opens it.
+    rig.until("the first generation is published", |rig| rig.published(1))
+        .await;
+    let kit = kr_client::recovery::parse_kit(&made.kit).expect("the kit");
+    let seed = kr_crypto::kdf::RecoverySeed::from_kit(&kit).expect("the seed");
+    let recipient = seed.recipient().expect("the recipient");
+    let members = opened_members_as(
+        &rig,
+        1,
+        &kr_crypto::backup::ArchiveReader::Recovery(&recipient),
+    );
+    assert!(members.contains_key(&format!("sessions/{session}.json")));
+
+    // Made again with the same bytes: answered from the record, with nothing sent.
+    let asked = web.arrived().len();
+    assert_eq!(rig.enable(&made.params).await, result);
+    assert_eq!(
+        web.arrived().len(),
+        asked,
+        "a repeat after success sends nothing"
+    );
+}
+
+/// A bundle the service refuses is not followed by the writer's enrolment or a recorded setup, and
+/// a call made again once the service takes it finishes the setup.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_bundle_the_service_refuses_is_followed_by_no_enrolment_and_no_setup() {
+    let timer = HeldTimer::held();
+    let (rig, _) = a_host_to_set_up(&timer).await;
+    let web = Arc::clone(rig.served.web());
+    let made = rig.prepared_setup(archive_id(), false);
+
+    web.refuse_bundle_writes(true);
+    assert_eq!(
+        rig.enable(&made.params).await,
+        BackupEnableResult::Declined {
+            cause: BackupEnableCause::NoAllowance {}
+        }
+    );
+    assert_eq!(
+        web.requests_to(MANIFEST),
+        0,
+        "no enrolment follows a refused bundle"
+    );
+    assert!(rig.controller.backup().setup().expect("a read").is_none());
+    let (_, detail) = rig.production_check().await;
+    assert!(
+        detail.contains("the account has no backup allowance"),
+        "{detail}"
+    );
+    let status = rig.backup_status().await;
+    assert!(status.last_attempt.0.is_some());
+
+    // The control: the same kit offered again once the service takes the bundle.
+    web.refuse_bundle_writes(false);
+    assert!(matches!(
+        rig.enable(&made.params).await,
+        BackupEnableResult::Enabled { .. }
+    ));
+    assert!(rig.backup_status().await.last_attempt.0.is_none());
+    assert_eq!(web.requests_to(MANIFEST), 1);
+}
+
+/// A write whose answer was lost is settled by reading the bundle: the same bytes are there, and
+/// the call goes on in one try. A write that never reached the service is an unknown outcome the
+/// repeat finishes, under the same request identity, and nothing is recorded in between.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_bundle_write_whose_answer_was_lost_is_settled_by_the_bundle_and_one_that_never_left_is_made_again()
+ {
+    let timer = HeldTimer::held();
+    let (rig, _) = a_host_to_set_up(&timer).await;
+    let web = Arc::clone(rig.served.web());
+
+    // Applied, and the answer lost.
+    let made = rig.prepared_setup(archive_id(), false);
+    web.fail(SYNC, 1, Moment::After);
+    assert!(matches!(
+        rig.enable(&made.params).await,
+        BackupEnableResult::Enabled { .. }
+    ));
+    assert_eq!(
+        web.requests_to(SYNC),
+        2,
+        "the write, and the read that found it applied"
+    );
+
+    // Never left: nothing at the service, an unknown outcome, nothing recorded.
+    let (other, _) = a_host_to_set_up(&HeldTimer::held()).await;
+    let web = Arc::clone(other.served.web());
+    let made = other.prepared_setup(archive_id(), false);
+    web.fail(SYNC, 1, Moment::Before);
+    assert!(matches!(
+        other.enable(&made.params).await,
+        BackupEnableResult::Unknown { .. }
+    ));
+    assert!(other.controller.backup().setup().expect("a read").is_none());
+    assert_eq!(web.requests_to(MANIFEST), 0);
+    assert!(matches!(
+        other.enable(&made.params).await,
+        BackupEnableResult::Enabled { .. }
+    ));
+    let identities: Vec<String> = web
+        .arrived()
+        .iter()
+        .filter(|arrived| arrived.path == SYNC)
+        .filter_map(|arrived| {
+            arrived.body["exchange"]["request_id"]
+                .as_str()
+                .map(str::to_owned)
+        })
+        .collect();
+    assert_eq!(identities.len(), 2);
+    assert_eq!(
+        identities[0], identities[1],
+        "the repeat carries the same identity"
+    );
+}
+
+/// An enrolment whose answer was lost is an unknown outcome with nothing recorded, and the repeat
+/// sends the same bytes: the service answers a different record at the same revision `FORBIDDEN`,
+/// so a repeat that finishes is a repeat that sent the same bytes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_enrolment_whose_answer_was_lost_is_sent_again_with_the_same_bytes() {
+    let timer = HeldTimer::held();
+    let (rig, _) = a_host_to_set_up(&timer).await;
+    let web = Arc::clone(rig.served.web());
+    let made = rig.prepared_setup(archive_id(), false);
+
+    web.fail(MANIFEST, 1, Moment::After);
+    assert!(matches!(
+        rig.enable(&made.params).await,
+        BackupEnableResult::Unknown { .. }
+    ));
+    assert!(rig.controller.backup().setup().expect("a read").is_none());
+    // Not an instant later in the repeat: the same bytes are `unchanged`, a new instant is refused.
+    assert!(matches!(
+        rig.enable(&made.params).await,
+        BackupEnableResult::Enabled { .. }
+    ));
+    let bodies: Vec<serde_json::Value> = web
+        .arrived()
+        .iter()
+        .filter(|arrived| arrived.path == MANIFEST)
+        .map(|arrived| arrived.body["enrol"]["record"]["payload"].clone())
+        .collect();
+    assert_eq!(bodies.len(), 2);
+    assert_eq!(bodies[0], bodies[1]);
+}
+
+/// Another archive is refused without `replace` and sends nothing; a call that is not the setup's
+/// own keys is refused; the host's keys are named by `backup.status`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_second_archive_is_refused_without_replace_and_a_call_naming_other_keys_is_refused() {
+    let timer = HeldTimer::held();
+    let (rig, _) = a_host_to_set_up(&timer).await;
+    let web = Arc::clone(rig.served.web());
+    let first = rig.prepared_setup(archive_id(), false);
+    assert!(matches!(
+        rig.enable(&first.params).await,
+        BackupEnableResult::Enabled { .. }
+    ));
+
+    let asked = web.arrived().len();
+    let second = rig.prepared_setup(archive_two(), false);
+    assert_eq!(
+        rig.enable(&second.params).await,
+        BackupEnableResult::Declined {
+            cause: BackupEnableCause::AlreadySetUp {}
+        }
+    );
+    assert_eq!(web.arrived().len(), asked, "nothing was sent");
+
+    // Keys other than the ones the host holds.
+    let mut wrong = rig.prepared_setup(archive_two(), true);
+    wrong.params.writer_key_id = kr_crypto::keys::key_id(
+        kr_protocol::pairing::KeyPurpose::Authorisation,
+        AuthorisationKeyPair::generate()
+            .expect("a key")
+            .public()
+            .as_bytes(),
+    );
+    assert_eq!(
+        rig.enable(&wrong.params).await,
+        BackupEnableResult::Declined {
+            cause: BackupEnableCause::KeysChanged {}
+        }
+    );
+    assert_eq!(web.arrived().len(), asked);
+}
+
+/// `backup.status` and `kr doctor` tell a setup that is under way: while the call waits at the
+/// service, while a repeat waits for the mutex after the first call failed (the first call's entry
+/// is gone, the repeat's is not), and while the call is before its local transaction. The control is
+/// the status when no call is running.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_setup_under_way_is_told_by_status_and_the_doctor_at_each_point_of_the_call() {
+    let timer = HeldTimer::held();
+    let (rig, _) = a_host_to_set_up(&timer).await;
+    let web = Arc::clone(rig.served.web());
+    let made = rig.prepared_setup(archive_id(), false);
+    assert!(matches!(
+        rig.backup_status().await.setup,
+        BackupSetupState::None {}
+    ));
+
+    // The first call is held at the service; a repeat waits behind it for the mutex.
+    web.fail(SYNC, 1, Moment::Hold);
+    let first = rig.enable_in_the_background(&made.params);
+    within("the bundle write", web.requests_reach(SYNC, 1)).await;
+    let second = rig.enable_in_the_background(&made.params);
+    within("both calls are told", async {
+        loop {
+            if let BackupSetupState::InProgress { kit_fingerprints } =
+                rig.backup_status().await.setup
+                && kit_fingerprints.len() == 2
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    let (_, detail) = rig.production_check().await;
+    assert!(
+        detail.contains("a setup is in progress with the kit"),
+        "{detail}"
+    );
+
+    // The first call fails; the repeat is still under way, and is told alone.
+    web.release_held();
+    assert!(matches!(
+        first.await.expect("the first call ends"),
+        BackupEnableResult::Unknown { .. }
+    ));
+    // The repeat goes on to finish while the status is read. The state it is in is told, whichever
+    // point it has reached: held, or done.
+    let finished = second.await.expect("the repeat ends");
+    assert!(matches!(finished, BackupEnableResult::Enabled { .. }));
+    assert!(matches!(
+        rig.backup_status().await.setup,
+        BackupSetupState::Committed { .. }
+    ));
+
+    // Held before its local transaction: the enrolment waits at the service.
+    let (other, _) = a_host_to_set_up(&HeldTimer::held()).await;
+    let web = Arc::clone(other.served.web());
+    let made = other.prepared_setup(archive_id(), false);
+    web.fail(MANIFEST, 1, Moment::Hold);
+    let call = other.enable_in_the_background(&made.params);
+    within("the enrolment", web.requests_reach(MANIFEST, 1)).await;
+    assert!(matches!(
+        other.backup_status().await.setup,
+        BackupSetupState::InProgress { .. }
+    ));
+    assert!(other.controller.backup().setup().expect("a read").is_none());
+    web.release_held();
+    let _ = call.await.expect("the call ends");
+}
+
+/// A host signed in as another account while a call runs commits nothing: the request that carries
+/// a token is stopped before it leaves, and the enrolment, which carries none, is followed by a
+/// comparison of the account before the setup is recorded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_sign_in_as_another_account_during_the_call_stops_it_before_anything_is_recorded() {
+    // During the bundle write, which the service has applied and not yet answered: the enrolment
+    // goes out, which carries no token, and the request that follows it, which does, does not.
+    let timer = HeldTimer::held();
+    let (rig, _) = a_host_to_set_up(&timer).await;
+    let web = Arc::clone(rig.served.web());
+    let made = rig.prepared_setup(archive_id(), false);
+    web.fail(SYNC, 1, Moment::Slow);
+    let call = rig.enable_in_the_background(&made.params);
+    within("the bundle write", web.requests_reach(SYNC, 1)).await;
+    rig.sign_in_as("account-2").await;
+    web.release_held();
+    assert_eq!(
+        call.await.expect("the call ends"),
+        BackupEnableResult::Declined {
+            cause: BackupEnableCause::AnotherAccount {}
+        }
+    );
+    assert_eq!(
+        web.requests_to(MANIFEST),
+        1,
+        "the enrolment carries no token"
+    );
+    assert_eq!(
+        web.requests_to(RETENTION),
+        0,
+        "no request that carries a token left under the account signed in since"
+    );
+    assert!(rig.controller.backup().setup().expect("a read").is_none());
+
+    // During the last request, which the service has applied and not yet answered: every request
+    // has left under the account the call began under, and the account is compared again before
+    // anything is recorded.
+    let (rig, _) = a_host_to_set_up(&HeldTimer::held()).await;
+    let web = Arc::clone(rig.served.web());
+    let made = rig.prepared_setup(archive_id(), false);
+    web.fail(RETENTION, 1, Moment::Slow);
+    let call = rig.enable_in_the_background(&made.params);
+    within("the retention change", web.requests_reach(RETENTION, 1)).await;
+    rig.sign_in_as("account-2").await;
+    web.release_held();
+    assert_eq!(
+        call.await.expect("the call ends"),
+        BackupEnableResult::Declined {
+            cause: BackupEnableCause::AnotherAccount {}
+        }
+    );
+    assert!(rig.controller.backup().setup().expect("a read").is_none());
+}
+
+/// `backup.status` says why a setup that is recorded cannot make backups: the account signed in is
+/// not the one it belongs to.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_status_of_a_setup_says_when_another_account_is_signed_in() {
+    let timer = HeldTimer::held();
+    let (rig, _) = a_host_to_set_up(&timer).await;
+    let made = rig.prepared_setup(archive_id(), false);
+    assert!(matches!(
+        rig.enable(&made.params).await,
+        BackupEnableResult::Enabled { .. }
+    ));
+    rig.sign_in_as("account-2").await;
+    assert!(matches!(
+        rig.backup_status().await.setup,
+        BackupSetupState::Committed { unusable, .. }
+            if unusable.0 == Some(BackupUnusable::Account)
+    ));
+}
+
+/// A replacement commits the setup of another archive, retires the earlier archive's writer and
+/// takes back what the earlier archive had not finished; the earlier archive's published
+/// generations and objects stay at the service. A replacement that fails before it commits leaves
+/// all of it as it was, and the carrier still bound to the earlier account.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_replacement_retires_the_earlier_writer_and_takes_back_its_unfinished_work_and_a_failed_one_changes_nothing()
+ {
+    let timer = HeldTimer::held();
+    let (rig, _) = a_host_to_set_up(&timer).await;
+    let web = Arc::clone(rig.served.web());
+    let first = rig.prepared_setup(archive_id(), false);
+    assert!(matches!(
+        rig.enable(&first.params).await,
+        BackupEnableResult::Enabled { .. }
+    ));
+    rig.until("the first generation is published", |rig| rig.published(1))
+        .await;
+
+    // Work of the earlier archive that has not left: its upload waits at the service.
+    let sent_before = web.requests_to(PART) + web.requests_to(COMPLETE);
+    web.fail(CREATE, 1, Moment::Hold);
+    rig.admit_to_an_enrolled_archive(2, &[(2, plaintext(2048))]);
+    within("the upload begins", web.requests_reach(CREATE, 2)).await;
+    let epoch = rig.controller.backup().binding().read().epoch;
+
+    // A replacement the service refuses changes nothing.
+    let second = rig.prepared_setup(archive_two(), true);
+    web.refuse_bundle_writes(true);
+    assert!(matches!(
+        rig.enable(&second.params).await,
+        BackupEnableResult::Declined { .. }
+    ));
+    web.refuse_bundle_writes(false);
+    assert_eq!(rig.controller.backup().binding().read().epoch, epoch);
+    assert_eq!(
+        rig.controller
+            .backup()
+            .setup()
+            .expect("a read")
+            .expect("a setup")
+            .record
+            .archive_id,
+        archive_id()
+    );
+    assert_eq!(
+        rig.controller
+            .backup()
+            .generation(archive_id(), BackupGeneration::new(2))
+            .expect("a read")
+            .expect("the generation")
+            .production,
+        Production::Producing
+    );
+
+    // The replacement that goes through.
+    let result = rig.enable(&second.params).await;
+    assert!(
+        matches!(result, BackupEnableResult::Enabled { .. }),
+        "{result:?}"
+    );
+    assert!(rig.controller.backup().binding().read().epoch > epoch);
+    assert_eq!(
+        rig.controller
+            .backup()
+            .setup()
+            .expect("a read")
+            .expect("a setup")
+            .record
+            .archive_id,
+        archive_two()
+    );
+    let writers = rig
+        .controller
+        .backup()
+        .authorised_writers()
+        .expect("a read");
+    assert!(writers.contains(&(archive_two(), rig.writer.key_id())));
+    assert!(
+        !writers.contains(&(archive_id(), rig.writer.key_id())),
+        "the earlier archive's writer is retired"
+    );
+    assert_eq!(
+        rig.controller
+            .backup()
+            .generation(archive_id(), BackupGeneration::new(2))
+            .expect("a read")
+            .expect("the generation")
+            .production,
+        Production::Cancelled,
+        "what the earlier archive had not finished is taken back"
+    );
+    // What was published stays published, and its objects stay at the service.
+    assert!(rig.published(1));
+    web.release_held();
+    for _ in 0..100 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        web.requests_to(PART) + web.requests_to(COMPLETE),
+        sent_before,
+        "nothing of the earlier archive's second generation is sent"
+    );
+}
+
+/// A replacement under another account sends no request for the earlier archive, and records no
+/// deletion of its objects as done: the service answers "not found" to the other account for an
+/// object the first account paid for, and a deletion recorded then would be one that never
+/// happened. The account's recorded snapshots are lower than the generations the earlier archive
+/// holds, which is when a host that kept deleting would delete.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_replacement_under_another_account_sends_nothing_for_the_earlier_archive() {
+    let timer = HeldTimer::held();
+    let (rig, _) = a_host_to_set_up(&timer).await;
+    let web = Arc::clone(rig.served.web());
+    web.issue_token("the-second-token", "account-two", &["backup.write"]);
+    let first = rig.prepared_setup(archive_id(), false);
+    assert!(matches!(
+        rig.enable(&first.params).await,
+        BackupEnableResult::Enabled { .. }
+    ));
+    rig.until("the first generation is published", |rig| rig.published(1))
+        .await;
+    rig.admit_to_an_enrolled_archive(2, &[(2, plaintext(2048))]);
+    rig.until("the second generation is published", |rig| rig.published(2))
+        .await;
+    rig.admit_to_an_enrolled_archive(3, &[(3, plaintext(2048))]);
+    rig.until("the third generation is published", |rig| rig.published(3))
+        .await;
+
+    // Another account signs in and replaces the setup; its snapshots would delete the oldest.
+    rig.sign_in_with("account-two", "the-second-token").await;
+    let second = rig.prepared_setup(archive_two(), true);
+    let result = rig.enable(&second.params).await;
+    assert!(
+        matches!(result, BackupEnableResult::Enabled { .. }),
+        "{result:?}"
+    );
+    let asked = web.arrived().len();
+    web.set_daily_snapshots(2);
+    timer.run_by_itself();
+    // The carrier looks at its work again, twice, and asks the service what the account records:
+    // that is the pass in which a host that kept deleting would delete.
+    let mut passes = rig.controller.backup_runtime().expect("a carrier").passes();
+    let before = *passes.borrow_and_update();
+    for step in 1..=2 {
+        rig.controller.backup().signals().work.notify_one();
+        within("the carrier's pass", async {
+            while *passes.borrow_and_update() < before + step {
+                passes.changed().await.expect("the carrier is running");
+            }
+        })
+        .await;
+    }
+    assert!(
+        web.requests_to(STATUS) > 1,
+        "the pass asked the service what the account records"
+    );
+    let since = rig.requested_since(asked);
+    assert!(
+        since.iter().all(|path| path != DELETE),
+        "no deletion left for the earlier archive: {since:?}"
+    );
+    for generation in 1..=3 {
+        assert!(
+            rig.controller
+                .backup()
+                .objects(archive_id(), BackupGeneration::new(generation))
+                .expect("a read")
+                .iter()
+                .all(|object| object.released_at_ms.is_none()),
+            "no deletion of generation {generation} is recorded as done"
+        );
+    }
 }

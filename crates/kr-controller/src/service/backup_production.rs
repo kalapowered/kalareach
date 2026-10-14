@@ -38,6 +38,7 @@ use kr_crypto::backup::{
     stage_object,
 };
 use kr_crypto::keys::{AuthorisationKeyPair, StoredEnvelopeKeyPair};
+use kr_protocol::backup_setup::{BackupEnableCause, BackupUnusable};
 use kr_protocol::ids::{BackupGeneration, BackupObjectId, DeviceId, SessionId};
 use kr_protocol::recovery::HistoryPageResult;
 use kr_protocol::scalars::{Digest256, TimestampMs};
@@ -394,18 +395,19 @@ impl Controller {
             production.hold(Held::Privacy);
             return None;
         }
-        if production.origin != record.origin || account != Some(record.account_mark) {
-            production.hold(Held::Account);
-            return Some(RECHECK);
-        }
-        if production.writer.key_id() != record.writer_key_id
-            || production.sender.key_id() != record.producer_key_id
-        {
-            production.hold(Held::Keys);
-            return Some(RECHECK);
-        }
-        if !writers.contains(&(record.archive_id, record.writer_key_id)) {
-            production.hold(Held::WriterRetired);
+        if let Some(unusable) = crate::backup::setup::standing(
+            &record,
+            &production.origin,
+            account,
+            production.writer.key_id(),
+            production.sender.key_id(),
+            &writers,
+        ) {
+            production.hold(match unusable {
+                BackupUnusable::Account => Held::Account,
+                BackupUnusable::Keys => Held::Keys,
+                BackupUnusable::WriterRetired => Held::WriterRetired,
+            });
             return Some(RECHECK);
         }
         let mine: Vec<_> = generations
@@ -908,6 +910,33 @@ impl Controller {
         if observed.left_out_configuration {
             detail = detail.stated("; the configuration document was not packed");
         }
+        if let Some(fingerprint) = self.backup.recorded_kit() {
+            detail = detail
+                .stated("; set up with the kit ")
+                .kit_fingerprint(&fingerprint);
+        }
+        if let Some(setup) = &self.backup_setup {
+            let (running, last) = setup.progress();
+            for fingerprint in &running {
+                detail = detail
+                    .stated("; a setup is in progress with the kit ")
+                    .kit_fingerprint(fingerprint);
+            }
+            if running.is_empty()
+                && let Some(last) = last
+            {
+                detail = detail
+                    .stated("; the last setup, with the kit ")
+                    .kit_fingerprint(&last.kit_fingerprint)
+                    .stated(match last.cause.0 {
+                        None => {
+                            " ended in a way this host cannot say: keep that kit until this \
+                             shows the setup with its fingerprint, or no setup"
+                        }
+                        Some(cause) => cause_words(&cause),
+                    });
+            }
+        }
         DoctorCheck::new(
             "backup-production",
             "This host makes its backups",
@@ -932,6 +961,38 @@ fn failed(
     }
     production.hold(Held::Failed(reason));
     backoff.next_delay()
+}
+
+/// What a setup that did not finish ended on, for `kr doctor`.
+const fn cause_words(cause: &BackupEnableCause) -> &'static str {
+    match cause {
+        BackupEnableCause::NoService {} => " did not finish: this host selects no storage service",
+        BackupEnableCause::SignIn { .. } => " did not finish: no account token could be had",
+        BackupEnableCause::AnotherAccount {} => {
+            " did not finish: the account signed in changed during it"
+        }
+        BackupEnableCause::KeysChanged {} => " did not finish: a key of this host changed",
+        BackupEnableCause::BundleTooLarge {} => " did not finish: the bundle was too large",
+        BackupEnableCause::AlreadySetUp {} => {
+            " did not finish: backups are set up already, and replacing them was not asked for"
+        }
+        BackupEnableCause::ArchiveInUse {} => {
+            " did not finish: this host already records generations of that archive"
+        }
+        BackupEnableCause::NoAllowance {} => {
+            " did not finish: the account has no backup allowance; that kit opens nothing"
+        }
+        BackupEnableCause::TokenNotAccepted {} => {
+            " did not finish: the service did not take this host's account token; that kit opens \
+             nothing"
+        }
+        BackupEnableCause::BundleConflict {} => {
+            " did not finish: the locator holds another bundle; that kit opens nothing"
+        }
+        BackupEnableCause::ServiceRefused { .. } => {
+            " did not finish: the service refused it; that kit opens nothing"
+        }
+    }
 }
 
 /// How the pass ended.

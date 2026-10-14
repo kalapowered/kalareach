@@ -395,6 +395,9 @@ pub struct Controller {
     /// What reads the storage service for a restore, when this host's configuration document
     /// selects one.
     backup_relay: Option<Arc<crate::backup::relay::BackupRelay>>,
+    /// What the owner's setup of this host's backups does, when its configuration document selects
+    /// a storage service.
+    backup_setup: Option<Arc<crate::backup::setup::BackupSetup>>,
     /// What makes this host's backups, when its configuration document selects a storage service.
     backup_production: Option<Arc<backup_production::Production>>,
     /// The configuration this daemon has put into force.

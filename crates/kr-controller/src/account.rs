@@ -348,7 +348,7 @@ impl HostAccount {
         Arc::new(HostTokens {
             inner: Arc::clone(&self.inner),
             origin: origin.to_owned(),
-            binding: None,
+            held_to: HeldTo::Nothing,
         })
     }
 
@@ -367,7 +367,23 @@ impl HostAccount {
         Arc::new(HostTokens {
             inner: Arc::clone(&self.inner),
             origin: origin.to_owned(),
-            binding: Some(binding),
+            held_to: HeldTo::Cell(binding),
+        })
+    }
+
+    /// The token source one call presents, fixed to the account whose mark the call took when it
+    /// began: it hands out a token only while the account signed in is that one, so a call that
+    /// runs for a while never presents the account another sign-in has put in its place.
+    #[must_use]
+    pub fn tokens_fixed_to(
+        &self,
+        origin: &str,
+        mark: kr_client::services::AccountMark,
+    ) -> Arc<dyn AccountTokenSource> {
+        Arc::new(HostTokens {
+            inner: Arc::clone(&self.inner),
+            origin: origin.to_owned(),
+            held_to: HeldTo::Account(mark),
         })
     }
 
@@ -883,7 +899,18 @@ struct HostTokens {
     /// The service the call is to.
     origin: String,
     /// The account the token must belong to, for the backup clients.
-    binding: Option<Arc<crate::backup::binding::Binding>>,
+    held_to: HeldTo,
+}
+
+/// What the account a token belongs to is checked against.
+enum HeldTo {
+    /// Nothing: the call is to a service the host presents its account to, whichever account.
+    Nothing,
+    /// The account the backups belong to, as the committed setup records it and a replacement
+    /// moves it.
+    Cell(Arc<crate::backup::binding::Binding>),
+    /// One account, fixed when a call began.
+    Account(kr_client::services::AccountMark),
 }
 
 impl std::fmt::Debug for HostTokens {
@@ -926,8 +953,22 @@ impl AccountTokenSource for HostTokens {
                     ),
                 ));
             }
-            let Some(binding) = &self.binding else {
-                return held.signed_in.token(scope).await;
+            let binding = match &self.held_to {
+                HeldTo::Nothing => return held.signed_in.token(scope).await,
+                HeldTo::Account(fixed) => {
+                    let (token, mark) = held.signed_in.token_marked(scope, &self.origin).await?;
+                    if mark != *fixed {
+                        return Err(kr_client::ClientError::refusal(
+                            ErrorCode::ResourceUnavailable,
+                            kr_client::shown::Shown::said(
+                                "this host is signed in as another account than the one this \
+                                 call began under",
+                            ),
+                        ));
+                    }
+                    return Ok(token);
+                }
+                HeldTo::Cell(binding) => binding,
             };
             // The mark comes with the token from one read of the grant, and both are compared
             // with the binding after the read returns: a renewal can take seconds, and the binding

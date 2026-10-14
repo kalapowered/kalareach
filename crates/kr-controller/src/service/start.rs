@@ -657,6 +657,10 @@ impl Controller {
                     &writer,
                     &account.bound_tokens_for(origin.as_str(), backup.binding()),
                 )?;
+                // Kept for the owner's setup, which signs the writer's enrolment with the host's
+                // device authorisation key and names the producer by its stored-envelope key.
+                let host_owner_key = device_keys.authorisation.clone();
+                let producer_key = device_keys.stored_envelope.clone();
                 let production = Arc::new(super::backup_production::Production::new(
                     origin.as_str().to_owned(),
                     writer.clone(),
@@ -677,7 +681,13 @@ impl Controller {
                 let quiet = runtime.quiet();
                 (
                     Some(runtime),
-                    Some((origin, writer, quiet)),
+                    Some((
+                        origin,
+                        writer,
+                        quiet,
+                        host_owner_key.clone(),
+                        producer_key.clone(),
+                    )),
                     Some(production),
                 )
             }
@@ -751,17 +761,29 @@ impl Controller {
                 detail: "the privacy record could not be opened".to_owned(),
             })??
         };
-        let backup_relay = match relay_parts {
-            None => None,
-            Some((origin, writer, quiet)) => {
-                Some(Arc::new(crate::backup::relay::BackupRelay::new(
+        let (backup_relay, backup_setup) = match relay_parts {
+            None => (None, None),
+            Some((origin, writer, quiet, owner_key, producer_key)) => {
+                let proxy = Self::outbound_of(&started)?.proxy()?.cloned();
+                let relay = Arc::new(crate::backup::relay::BackupRelay::new(
                     &origin,
-                    Self::outbound_of(&started)?.proxy()?,
+                    proxy.as_ref(),
                     &writer,
                     Arc::clone(&account),
-                    quiet,
+                    Arc::clone(&quiet),
                     privacy.state(),
-                )?))
+                )?);
+                let setup = Arc::new(crate::backup::setup::BackupSetup::new(
+                    origin,
+                    proxy,
+                    writer,
+                    owner_key,
+                    producer_key,
+                    Arc::clone(&account),
+                    Arc::clone(&backup),
+                    quiet,
+                ));
+                (Some(relay), Some(setup))
             }
         };
         // What a read of the changes since a visit is answered with, when it asks for a summary,
@@ -871,6 +893,7 @@ impl Controller {
             backup,
             backup_runtime,
             backup_relay,
+            backup_setup,
             backup_production,
             transfer,
             project,

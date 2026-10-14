@@ -1,7 +1,9 @@
-//! A restore's reads of the managed storage service: the one method that serves them.
+//! The methods that serve this host's backups to the command line: a restore's reads of the managed
+//! storage service, and the owner's setup of what the host backs up.
 
 use kr_protocol::backup_read::{BackupReadParams, BackupReadResult};
-use kr_protocol::envelope::ParamsValue;
+use kr_protocol::backup_setup::{BackupEnableParams, BackupStatusParams};
+use kr_protocol::envelope::{MutationRequest, ParamsValue};
 
 use crate::error::{ControllerError, Result};
 
@@ -50,5 +52,52 @@ impl Controller {
         }
         ParamsValue::from_typed(&answer)
             .map_err(|error| ControllerError::InvalidArgument(error.to_string()))
+    }
+
+    /// Answers `backup.status`: where this host's backups stand, for the owner who is setting them
+    /// up.
+    ///
+    /// The service is read live, bounded, and not at all while the service has asked to be left
+    /// alone.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::NotConfigured`] when the host selects no storage service, and
+    /// [`ControllerError::InvalidArgument`] for parameters that are not empty.
+    pub(super) async fn backup_status(&self, params: &ParamsValue) -> Result<ParamsValue> {
+        let _: BackupStatusParams = parse(params)?;
+        let setup = self.backup_setup_of()?;
+        let answer = setup.status(self.privacy.state().now().private).await;
+        ParamsValue::from_typed(&answer)
+            .map_err(|error| ControllerError::InvalidArgument(error.to_string()))
+    }
+
+    /// Answers `backup.enable`: sets this host's backups up, as the command asked.
+    ///
+    /// Setting up moves no content: the bundle is key material, so privacy mode neither stops it
+    /// nor is stopped by it. What the call writes to the service is the sealed bundle, a writer's
+    /// enrolment and the account's retention switch.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::NotConfigured`] when the host selects no storage service, and
+    /// [`ControllerError::InvalidArgument`] for a call that is not well formed.
+    pub(super) async fn backup_enable(&self, mutation: &MutationRequest) -> Result<ParamsValue> {
+        let params: BackupEnableParams = parse(&mutation.params)?;
+        let setup = self.backup_setup_of()?;
+        let answer = setup.enable(params).await?;
+        ParamsValue::from_typed(&answer)
+            .map_err(|error| ControllerError::InvalidArgument(error.to_string()))
+    }
+
+    fn backup_setup_of(&self) -> Result<&std::sync::Arc<crate::backup::setup::BackupSetup>> {
+        self.backup_setup.as_ref().ok_or_else(|| {
+            ControllerError::NotConfigured(format!(
+                "{} in this host's configuration document ({}) selects no storage service, so \
+                 there is nothing to set backups up at",
+                kr_protocol::hostinfo::configuration::STORAGE_ORIGIN.key,
+                kr_protocol::hostinfo::configuration::FILE_NAME,
+            ))
+        })
     }
 }

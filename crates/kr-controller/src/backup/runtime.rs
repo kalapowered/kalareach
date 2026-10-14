@@ -87,24 +87,26 @@ pub const STORAGE_DEADLINES: HttpDeadlines = HttpDeadlines {
     total: Duration::from_secs(90),
 };
 
-/// The key this host signs its managed-storage requests and the generations it publishes with.
+/// A key of this host's, signing a request to the service as a host's.
 ///
-/// The service reads it as a host's, which is how it treats a host-produced archive.
-struct WriterSigner {
-    key: AuthorisationKeyPair,
+/// The writer's signs its managed-storage requests and the generations it publishes, and the
+/// service reads it as a host's, which is how it treats a host-produced archive. The owner's signs
+/// the enrolment of that writer.
+pub(crate) struct HostKeySigner {
+    pub(crate) key: AuthorisationKeyPair,
 }
 
-impl std::fmt::Debug for WriterSigner {
+impl std::fmt::Debug for HostKeySigner {
     /// The public key, which is what names this writer to the service. Never the private half.
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
-            .debug_struct("WriterSigner")
+            .debug_struct("HostKeySigner")
             .field("public_key", self.key.public())
             .finish_non_exhaustive()
     }
 }
 
-impl ServiceSigner for WriterSigner {
+impl ServiceSigner for HostKeySigner {
     fn signer(&self) -> ServiceRequestSigner {
         ServiceRequestSigner::Host
     }
@@ -300,7 +302,7 @@ pub(crate) fn clients_over(
     writer: &AuthorisationKeyPair,
     tokens: &Arc<dyn AccountTokenSource>,
 ) -> Result<ServiceClients> {
-    let signer: Arc<dyn ServiceSigner> = Arc::new(WriterSigner {
+    let signer: Arc<dyn ServiceSigner> = Arc::new(HostKeySigner {
         key: writer.clone(),
     });
     let source = Arc::clone(tokens);

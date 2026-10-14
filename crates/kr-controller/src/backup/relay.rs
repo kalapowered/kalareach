@@ -128,8 +128,8 @@ impl From<ClientError> for Failure {
 }
 
 /// A key that exists for this process only, signing the requests the service reads as a device's.
-struct InstallationSigner {
-    key: AuthorisationKeyPair,
+pub(crate) struct InstallationSigner {
+    pub(crate) key: AuthorisationKeyPair,
 }
 
 impl std::fmt::Debug for InstallationSigner {
