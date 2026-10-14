@@ -351,6 +351,10 @@ const MACOS_SKIPS: &[(&str, &str)] = &[
         "needs a second filesystem, which the landing workflow's macOS job attaches for it",
     ),
     (
+        "a_volume_whose_disk_is_held_is_detached_once_it_is_let_go",
+        "needs a second filesystem, which the landing workflow's macOS job attaches for it",
+    ),
+    (
         "kr_req_11_38_every_export_is_stopped_by_its_own_deadline",
         "a timed case, which runs in a step of its own, one at a time",
     ),
