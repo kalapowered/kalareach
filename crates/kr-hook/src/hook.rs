@@ -15,7 +15,10 @@
 //! the answer is written and the process ends, whatever is still in flight. The answer goes before
 //! anything the run says about itself: a diagnostic goes to standard error after it, and is waited
 //! for until the same deadline or [`DIAGNOSTIC_ALLOWANCE`] after the answer, whichever is later, so
-//! a standard error nobody reads can hold neither the answer nor, past that, the end.
+//! a standard error nobody reads can hold neither the answer nor, past that, the end. The
+//! diagnostic says how long the run had run, on its own clock, when its answer was written
+//! ([`answered_after`]), which is the figure to hold against an application's timeout: how long the
+//! machine took to start the process and to let it end lies outside the run.
 
 use std::time::Duration;
 
@@ -128,31 +131,113 @@ pub enum Report {
 /// Runs one hook of `application` and answers neutrally.
 #[must_use]
 pub fn run(application: &'static Application) -> std::process::ExitCode {
-    let started = std::time::Instant::now();
+    run_with(
+        std::time::Instant::now(),
+        move |started| observe(application, started),
+        answer,
+        |bytes| {
+            use std::io::Write as _;
+            let _ = std::io::stderr().lock().write_all(bytes);
+        },
+    );
+    std::process::ExitCode::SUCCESS
+}
+
+/// One run: the work, the answer, and the diagnostic, with what writes each given.
+///
+/// The work runs on its own thread so the deadline is kept whatever it is waiting on. When the
+/// deadline passes the answer is written and the process ends, which ends that thread too. The
+/// wait ends the deadline after the hook's own start, not after the thread started.
+///
+/// The application waits for the answer, and a standard error nobody reads can hold a write to it
+/// for as long as nobody reads it. So the answer goes first, and the diagnostic, if there is one,
+/// gets what remains of the deadline, and at least [`DIAGNOSTIC_ALLOWANCE`] after the answer
+/// ([`diagnostic_bound`]). A run whose work finished says nothing. `answer` and `write` are what
+/// writes each, and `run` passes the real ones.
+fn run_with(
+    started: std::time::Instant,
+    work: impl FnOnce(std::time::Instant) -> Result<(), String> + Send + 'static,
+    answer: impl FnOnce(),
+    write: impl FnOnce(&[u8]) + Send + 'static,
+) {
     let (finished, outcome) = std::sync::mpsc::channel();
-    // The work runs on its own thread so the deadline is kept whatever it is waiting on. When the
-    // deadline passes, the answer is written and the process ends, which ends that thread too.
     std::thread::spawn(move || {
-        let _ = finished.send(observe(application, started));
+        let _ = finished.send(work(started));
     });
-    // The wait ends the deadline after the hook's own start, not after the thread above started.
     let failure = match outcome.recv_timeout(HOOK_DEADLINE.saturating_sub(started.elapsed())) {
         Ok(Ok(())) => None,
         Ok(Err(failure)) => Some(failure),
-        Err(_) => Some(format!(
-            "the hook did not finish within {} ms, and answered anyway",
-            HOOK_DEADLINE.as_millis()
-        )),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Some(deadline_diagnostic()),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            Some("the hook's work ended without saying how".to_owned())
+        }
     };
-    // The application waits for the answer, and a standard error nobody reads can hold a write to
-    // it for as long as nobody reads it. So the answer goes first, and the diagnostic gets what
-    // remains of the deadline, and at least the allowance after the answer.
     answer();
+    let answered = std::time::Instant::now();
     if let Some(failure) = failure {
-        let by = (started + HOOK_DEADLINE).max(std::time::Instant::now() + DIAGNOSTIC_ALLOWANCE);
-        crate::report_by(&failure, by);
+        let answered_after = answered.saturating_duration_since(started);
+        crate::report_with(
+            &format!(
+                "{failure} (answered after {} ms)",
+                answered_after.as_millis()
+            ),
+            diagnostic_bound(started, answered),
+            write,
+        );
     }
-    std::process::ExitCode::SUCCESS
+}
+
+/// The moment a run stops waiting for its diagnostic to be written, given when it started and when
+/// its answer was written: the deadline, or the allowance after the answer when that is later.
+///
+/// The run ends no later than this, whatever standard error does, so it is also the latest a run
+/// that answered no later than its deadline ends: [`HOOK_DEADLINE`] plus [`DIAGNOSTIC_ALLOWANCE`]
+/// after its start.
+#[must_use]
+pub fn diagnostic_bound(
+    started: std::time::Instant,
+    answered: std::time::Instant,
+) -> std::time::Instant {
+    (started + HOOK_DEADLINE).max(answered + DIAGNOSTIC_ALLOWANCE)
+}
+
+/// What a run says when it answered because [`HOOK_DEADLINE`] passed before its observation was
+/// through.
+///
+/// It is the one place the words are written, so that a reader of a run's standard error asks
+/// [`ran_out_of_its_deadline`] and is never left to match them.
+#[must_use]
+pub fn deadline_diagnostic() -> String {
+    format!(
+        "the hook did not finish within {} ms, and answered anyway",
+        HOOK_DEADLINE.as_millis()
+    )
+}
+
+/// Whether `diagnostic`, what a run wrote to standard error, says that the run answered because
+/// its time ran out, and not because of anything else that went wrong: its deadline passed before
+/// its observation was through, or the worker did not admit it inside the same length of time.
+/// Which of the two ends a run whose worker is silent is up to which clock is read first.
+#[must_use]
+pub fn ran_out_of_its_deadline(diagnostic: &str) -> bool {
+    [
+        deadline_diagnostic(),
+        crate::exchange::ExchangeError::TimedOut.to_string(),
+    ]
+    .iter()
+    .any(|words| diagnostic.contains(words.as_str()))
+}
+
+/// How long a run says it had run, on its own clock from its start, when its answer was written,
+/// if `diagnostic` is what a run writes to standard error about why it answered as it did, and
+/// `None` for anything else.
+///
+/// A run that needed nothing from its deadline and had nothing to say writes no diagnostic.
+#[must_use]
+pub fn answered_after(diagnostic: &str) -> Option<Duration> {
+    let (_, after) = diagnostic.trim_end().rsplit_once(" (answered after ")?;
+    let milliseconds = after.strip_suffix(" ms)")?.parse().ok()?;
+    Some(Duration::from_millis(milliseconds))
 }
 
 /// Reads the event the application wrote and, inside a launch, reaches the worker with it.
@@ -465,6 +550,154 @@ fn answer() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A run waits for its diagnostic no later than its deadline, or the allowance after an answer
+    /// that came later, and in either case no later than the deadline and the allowance after the
+    /// run's start: the whole of what a standard error nobody reads could hold it.
+    #[test]
+    fn a_run_waits_for_its_diagnostic_no_later_than_the_deadline_and_the_allowance_after_its_start()
+    {
+        let started = std::time::Instant::now();
+        for after in [0, 1, 250, 499, 500].map(Duration::from_millis) {
+            let bound = diagnostic_bound(started, started + after);
+            assert!(bound >= started + HOOK_DEADLINE);
+            assert!(bound >= started + after + DIAGNOSTIC_ALLOWANCE);
+            assert!(
+                bound <= started + HOOK_DEADLINE + DIAGNOSTIC_ALLOWANCE,
+                "answered after {after:?}: {:?}",
+                bound.duration_since(started)
+            );
+        }
+    }
+
+    /// The timeout a session ending is given, the shortest any registration names.
+    const SESSION_END_TIMEOUT: Duration = Duration::from_secs(1);
+
+    /// How many runs a test starts, one after another, to have one whose work reported before the
+    /// deadline.
+    const ATTEMPTS: usize = 30;
+
+    /// What one run did when its work reported at once.
+    struct Immediate {
+        answered: bool,
+        /// What was written to standard error, as text.
+        said: String,
+        /// How long the call took, from the run's start to its return.
+        ran_for: Duration,
+    }
+
+    /// Runs `run_with` once with work that reports `outcome` at once, and returns what it did.
+    ///
+    /// The work is on a thread of its own, as in a run, and a machine that keeps it off the
+    /// processor past the deadline makes the run answer at its deadline instead: such a run says
+    /// so, and shows nothing about the branch the caller is after.
+    fn immediate(outcome: Result<(), String>) -> Immediate {
+        let said = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let into = std::sync::Arc::clone(&said);
+        let started = std::time::Instant::now();
+        let mut answered = false;
+        run_with(
+            started,
+            move |_| outcome,
+            || answered = true,
+            move |bytes| into.lock().expect("the line").extend_from_slice(bytes),
+        );
+        let ran_for = started.elapsed();
+        let said = String::from_utf8_lossy(&said.lock().expect("the line")).into_owned();
+        Immediate {
+            answered,
+            said,
+            ran_for,
+        }
+    }
+
+    /// A run that finishes its work answers and says nothing, inside the one-second timeout a
+    /// session ending is given, by the run's own clock: from its start to the end of the call, so
+    /// what the machine takes to start the process and to let it end is not in it.
+    #[test]
+    fn a_run_whose_work_finishes_answers_inside_the_session_end_timeout_and_says_nothing() {
+        for _ in 0..ATTEMPTS {
+            let ran = immediate(Ok(()));
+            assert!(ran.answered, "the answer is written");
+            if ran_out_of_its_deadline(&ran.said) {
+                // The work thread was kept off the processor for the whole deadline.
+                continue;
+            }
+            assert_eq!(ran.said, "", "a diagnostic was written");
+            assert!(
+                ran.ran_for < SESSION_END_TIMEOUT,
+                "a run whose work finished was through inside the one-second timeout: {:?}",
+                ran.ran_for
+            );
+            return;
+        }
+        panic!("no run of {ATTEMPTS} had its work report before its deadline");
+    }
+
+    /// A run whose work never finishes, with a standard error nobody reads, is held by neither
+    /// past the bound, by the run's own clock: the work waits for ever, the diagnostic's write
+    /// stalls, and the run is through at the deadline and the allowance after its start, inside the
+    /// one-second timeout a session ending is given.
+    #[test]
+    fn a_run_that_waits_for_ever_and_whose_diagnostic_nobody_reads_ends_at_the_bound() {
+        let (release, stalled) = std::sync::mpsc::channel::<()>();
+        let started = std::time::Instant::now();
+        let mut answered = false;
+        run_with(
+            started,
+            move |_| {
+                // Waits until the test lets it go, which is after the run is through.
+                let _ = stalled.recv_timeout(Duration::from_secs(30));
+                Ok(())
+            },
+            || answered = true,
+            |_| {
+                // The write stalls too.
+                std::thread::sleep(Duration::from_secs(30));
+            },
+        );
+        let ran_for = started.elapsed();
+        drop(release);
+        assert!(answered, "the answer is written");
+        assert!(
+            ran_for >= HOOK_DEADLINE + DIAGNOSTIC_ALLOWANCE,
+            "it waited the allowance for the line: {ran_for:?}"
+        );
+        assert!(
+            ran_for < SESSION_END_TIMEOUT,
+            "it was through inside the one-second timeout of a session ending: {ran_for:?}"
+        );
+    }
+
+    /// A run whose work failed says why, with how long it had run when its answer was written.
+    #[test]
+    fn a_run_whose_work_failed_says_why_and_when_it_answered() {
+        for _ in 0..ATTEMPTS {
+            let ran = immediate(Err("the input was not an event".to_owned()));
+            assert!(ran.answered, "the answer is written");
+            if ran.said.is_empty() || ran_out_of_its_deadline(&ran.said) {
+                // The work thread, or the writer's, was kept off the processor past the bound.
+                continue;
+            }
+            assert!(
+                ran.said.starts_with("kr-hook: the input was not an event"),
+                "{:?}",
+                ran.said
+            );
+            assert!(
+                answered_after(&ran.said).is_some_and(|after| after < SESSION_END_TIMEOUT),
+                "{:?}",
+                ran.said
+            );
+            assert!(
+                ran.ran_for < SESSION_END_TIMEOUT,
+                "a run whose work failed was through inside the one-second timeout: {:?}",
+                ran.ran_for
+            );
+            return;
+        }
+        panic!("no run of {ATTEMPTS} had its work fail before its deadline");
+    }
 
     /// Every application this forwarder serves.
     const EVERY: [&Application; 3] = [

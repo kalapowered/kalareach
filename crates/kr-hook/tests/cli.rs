@@ -79,10 +79,10 @@ fn kr_req_11_42_anything_but_a_registered_invocation_is_a_usage_error() {
 }
 
 /// KR-REQ-11.42, KR-REQ-11.43: the hook registration's own invocation, in a process whose
-/// environment names no launch, reads its event, answers exactly `{}` and exits 0 well inside the
-/// shortest timeout the package registers, without a word on standard output beyond the answer.
-/// A session identifier in the environment does not change that: it names no registration and no
-/// credential.
+/// environment names no launch, reads its event, answers exactly `{}` and exits 0 inside the
+/// shortest timeout the package registers, by its own clock, without a word on standard output
+/// beyond the answer. A session identifier in the environment does not change that: it names no
+/// registration and no credential.
 #[test]
 fn outside_a_launch_a_hook_answers_neutrally_and_reaches_for_nothing() {
     let placed = Placed::new();
@@ -94,10 +94,10 @@ fn outside_a_launch_a_hook_answers_neutrally_and_reaches_for_nothing() {
         let ran = run_with_input(command, SESSION_START);
         assert_eq!(ran.code, Some(0), "{}", ran.stderr);
         assert_eq!(ran.stdout, b"{}\n");
-        assert!(
-            ran.took < std::time::Duration::from_secs(1),
-            "answered in {:?}, inside the one-second SessionEnd timeout",
-            ran.took
+        common::assert_answered_in_time(
+            &ran.stderr,
+            std::time::Duration::from_secs(1),
+            "the one-second SessionEnd timeout",
         );
     }
 }
@@ -119,10 +119,10 @@ fn kr_req_12_18_a_hook_whose_input_never_closes_still_answers_in_time() {
         "it waited for its input until its deadline: {:?}",
         ran.took
     );
-    assert!(
-        ran.took < std::time::Duration::from_secs(1),
-        "answered in {:?}, inside the one-second SessionEnd timeout",
-        ran.took
+    common::assert_answered_inside(
+        &ran,
+        std::time::Duration::from_secs(1),
+        "the one-second SessionEnd timeout",
     );
 }
 

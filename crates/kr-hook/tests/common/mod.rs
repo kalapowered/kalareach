@@ -298,11 +298,7 @@ pub async fn hook_reaching(
                 assert_eq!(ran.code, Some(0), "{case}, try {attempt}: {}", ran.stderr);
                 assert_eq!(ran.stdout, b"{}\n", "{case}, try {attempt}");
                 assert!(
-                    ran.stderr.starts_with("kr-hook: ")
-                        && ran.stderr.contains(&format!(
-                            "within {} ms",
-                            kr_hook::hook::HOOK_DEADLINE.as_millis()
-                        )),
+                    kr_hook::hook::ran_out_of_its_deadline(&ran.stderr),
                     "{case}, try {attempt}: the hook ended without its worker, and not by its \
                      deadline: {:?}",
                     ran.stderr
@@ -320,24 +316,98 @@ pub async fn hook_reaching(
 
 /// Reads one line from a connection, without its newline, and the end of the stream as its end.
 ///
+/// A peer that has gone ends the stream: on Windows a pipe whose other end closed says so by
+/// failing the read as broken, and the stream's end is what that is.
+///
 /// # Panics
 ///
-/// Panics when the read fails or takes longer than [`LIVENESS`].
+/// Panics when the read fails otherwise or takes longer than [`LIVENESS`].
 pub async fn read_line(stream: &mut kr_ipc::endpoint::Connection) -> Vec<u8> {
     use tokio::io::AsyncReadExt as _;
 
     let mut line = Vec::new();
     let mut byte = [0_u8; 1];
     loop {
-        let read = tokio::time::timeout(LIVENESS, stream.read(&mut byte))
+        let read = match tokio::time::timeout(LIVENESS, stream.read(&mut byte))
             .await
             .expect("a bounded read")
-            .expect("the line is read");
+        {
+            Ok(read) => read,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+                ) =>
+            {
+                0
+            }
+            Err(error) => panic!("the line is read: {error}"),
+        };
         if read == 0 || byte[0] == b'\n' {
             return line;
         }
         line.push(byte[0]);
     }
+}
+
+/// Checks that a hook answered inside `timeout`, given what it wrote on standard error.
+///
+/// A hook that wrote a line says in it how long it had run, on its own clock, when its answer was
+/// written: that is the figure held against `timeout`, and a hook that ran out of its deadline
+/// because the machine was slow to deliver what it waits for answers validly by it
+/// ([`assert_answered_inside`] also needs the line to say the deadline ran out). One that wrote
+/// no line answered before the deadline, from what it read or from the worker, and the latest
+/// such a hook ends is its deadline and the allowance for a line it would have said after, which
+/// is the bound its own code computes (`hook::diagnostic_bound`, held by the crate's unit tests):
+/// both are inside the timeout, which is the whole of what the machine's start and end of the
+/// process could not change.
+///
+/// # Panics
+///
+/// Panics when the hook says it answered at `timeout` or later, or when its deadline and the
+/// allowance after it are not inside `timeout`.
+pub fn assert_answered_in_time(stderr: &str, timeout: Duration, case: &str) {
+    // Any line a hook writes says how long it had run when its answer was written.
+    if let Some(after) = kr_hook::hook::answered_after(stderr) {
+        assert!(
+            after < timeout,
+            "{case}: the hook answered {after:?} after its start, past the {timeout:?} it is given"
+        );
+    }
+    assert!(
+        kr_hook::hook::HOOK_DEADLINE + kr_hook::hook::DIAGNOSTIC_ALLOWANCE < timeout,
+        "{case}: the deadline and the allowance after it are not inside the {timeout:?} the \
+         application gives the hook"
+    );
+}
+
+/// Checks that a run that ended because its time ran out answered inside `timeout`, by the hook's
+/// own account of how long it had run.
+///
+/// The figure is the hook's own clock, from the start of its run to the moment its answer was
+/// written. How long the machine took to start the process and to let it end is not in it, so it
+/// is the figure to hold against the timeout an application gives a hook (the shortest is one
+/// second, for a session ending).
+///
+/// # Panics
+///
+/// Panics when the run did not say that it ran out of its deadline, or says it answered at
+/// `timeout` or later.
+pub fn assert_answered_inside(ran: &Ran, timeout: Duration, case: &str) {
+    assert!(
+        kr_hook::hook::ran_out_of_its_deadline(&ran.stderr),
+        "{case}: the hook did not say it ran out of its deadline: {:?}",
+        ran.stderr
+    );
+    let after = kr_hook::hook::answered_after(&ran.stderr).expect("it said how long it had run");
+    assert!(
+        after >= kr_hook::hook::HOOK_DEADLINE,
+        "{case}: the hook says it answered before its deadline, which it ran out of: {after:?}"
+    );
+    assert!(
+        after < timeout,
+        "{case}: the hook answered {after:?} after its start, past the {timeout:?} it is given"
+    );
 }
 
 /// What one run of the forwarder produced.

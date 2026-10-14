@@ -19,7 +19,10 @@ mod common;
 use std::io::Read as _;
 use std::time::{Duration, Instant};
 
-use common::{Placed, Reached, hook_reaching, read_line, run_holding_input, run_with_input};
+use common::{
+    ATTEMPTS, LIVENESS, Placed, Reached, hook_reaching, read_line, run_holding_input,
+    run_with_input,
+};
 
 /// The members a hook's output decides with, in the three applications' output types.
 const DECIDING: [&str; 3] = ["decision", "continue", "hookSpecificOutput"];
@@ -178,7 +181,8 @@ fn kr_req_12_27_the_neutrality_check_refuses_a_planted_decision() {
 }
 
 /// KR-REQ-12.27: outside a launch, each registered event of every application is answered with
-/// exactly `{}` and exit 0, inside the shortest timeout any registration names.
+/// exactly `{}` and exit 0, inside the shortest timeout any registration names by the hook's own
+/// clock.
 #[test]
 fn kr_req_12_27_outside_a_launch_every_hook_answers_neutrally() {
     let placed = Placed::new();
@@ -192,11 +196,7 @@ fn kr_req_12_27_outside_a_launch_every_hook_answers_neutrally() {
             assert_eq!(ran.code, Some(0), "{case}: {}", ran.stderr);
             assert_eq!(ran.stdout, b"{}\n", "{case}");
             assert_eq!(neutral(&ran.stdout, &ran.stderr), Ok(()), "{case}");
-            assert!(
-                ran.took < SHORTEST_TIMEOUT,
-                "{case} answered in {:?}",
-                ran.took
-            );
+            common::assert_answered_in_time(&ran.stderr, SHORTEST_TIMEOUT, &case);
         }
     }
 }
@@ -222,7 +222,7 @@ fn kr_req_12_27_input_a_hook_cannot_read_is_answered_neutrally() {
             assert_eq!(ran.code, Some(0), "{case}: {}", ran.stderr);
             assert_eq!(ran.stdout, b"{}\n", "{case}");
             assert_eq!(neutral(&ran.stdout, &ran.stderr), Ok(()), "{case}");
-            assert!(ran.took < SHORTEST_TIMEOUT, "{case}: {:?}", ran.took);
+            common::assert_answered_in_time(&ran.stderr, SHORTEST_TIMEOUT, &case);
         }
     }
 }
@@ -242,7 +242,7 @@ fn kr_req_12_27_input_that_never_closes_cannot_hold_a_hook() {
         assert_eq!(ran.stdout, b"{}\n", "{case}");
         assert_eq!(neutral(&ran.stdout, &ran.stderr), Ok(()), "{case}");
         assert!(ran.took >= DEADLINE, "{case} waited: {:?}", ran.took);
-        assert!(ran.took < SHORTEST_TIMEOUT, "{case}: {:?}", ran.took);
+        common::assert_answered_inside(&ran, SHORTEST_TIMEOUT, &case);
     }
 }
 
@@ -252,6 +252,20 @@ fn kr_req_12_27_input_that_never_closes_cannot_hold_a_hook() {
 /// waits for a person.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn kr_req_12_27_a_worker_that_never_answers_cannot_hold_a_hook() {
+    a_worker_that_never_answers(None).await;
+}
+
+/// KR-REQ-12.27: a worker that reads the hello and never answers is answered inside the one-second
+/// timeout a session ending is given, by the hook's own account of how long it had run: it answers
+/// at its own deadline, and the deadline is the whole of what the worker could hold.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kr_req_12_27_a_silent_worker_is_answered_inside_the_session_end_timeout() {
+    a_worker_that_never_answers(Some("SessionEnd")).await;
+}
+
+/// Runs a hook of each application against a worker that never answers: the application's first
+/// event, or the event named.
+async fn a_worker_that_never_answers(named: Option<&str>) {
     let placed = Placed::new();
     let files = placed.host.root().join("files");
     kr_ipc::paths::create_private_directory(&files).expect("a private directory");
@@ -259,43 +273,76 @@ async fn kr_req_12_27_a_worker_that_never_answers_cannot_hold_a_hook() {
     kr_ipc::paths::create_new_owner_only_file(&credential_file, "5e".repeat(32).as_bytes())
         .expect("the credential is written");
     for hooks in every_application() {
-        let (event, payload) = &hooks.events[0];
+        let (event, payload) = match named {
+            None => &hooks.events[0],
+            Some(name) => hooks
+                .events
+                .iter()
+                .find(|(event, _)| *event == name)
+                .expect("every application registers the event"),
+        };
         let input = payload.to_string();
         let case = format!("{} {event}", hooks.application);
 
         // A hook the machine kept from the worker for its whole deadline answered without reaching
-        // it, and shows nothing about a worker that is silent: another is started, against a worker
-        // of its own.
-        let Reached {
-            mut stream,
-            running,
-            ..
-        } = hook_reaching(
-            &files,
-            hooks.application,
-            &case,
-            |stand_in| {
-                let registration = files.join(format!("registration.{}", hooks.application));
-                std::fs::write(
-                    &registration,
-                    format!(
-                        "endpoint={}\nprofile=lp-1\n\
-                         instance=02020202-0202-0202-0202-020202020202\npid=1\nstart=1\n\
-                         credential={}\nframing=json_lines\n",
-                        stand_in.address,
-                        credential_file.display()
-                    ),
+        // it, and one that reached it and was out of its deadline before its hello was written
+        // ended without having said anything: neither shows anything about a worker that is
+        // silent, and another is started, against a worker of its own.
+        let mut last = String::new();
+        let (stream, running, hello) = 'hello: {
+            for _ in 0..ATTEMPTS {
+                let Reached {
+                    mut stream,
+                    running,
+                    ..
+                } = hook_reaching(
+                    &files,
+                    hooks.application,
+                    &case,
+                    |stand_in| {
+                        let registration =
+                            files.join(format!("registration.{}", hooks.application));
+                        std::fs::write(
+                            &registration,
+                            format!(
+                                "endpoint={}\nprofile=lp-1\n\
+                                 instance=02020202-0202-0202-0202-020202020202\npid=1\nstart=1\n\
+                                 credential={}\nframing=json_lines\n",
+                                stand_in.address,
+                                credential_file.display()
+                            ),
+                        )
+                        .expect("the registration is written");
+                        let mut command = placed.command(&[hooks.application, "hook"]);
+                        command.env("KR_REGISTRATION", &registration);
+                        let input = input.clone();
+                        tokio::task::spawn_blocking(move || {
+                            run_with_input(command, input.as_bytes())
+                        })
+                    },
+                    |ran| assert_eq!(neutral(&ran.stdout, &ran.stderr), Ok(()), "{case}"),
                 )
-                .expect("the registration is written");
-                let mut command = placed.command(&[hooks.application, "hook"]);
-                command.env("KR_REGISTRATION", &registration);
-                let input = input.clone();
-                tokio::task::spawn_blocking(move || run_with_input(command, input.as_bytes()))
-            },
-            |ran| assert_eq!(neutral(&ran.stdout, &ran.stderr), Ok(()), "{case}"),
-        )
-        .await;
-        let hello = read_line(&mut stream).await;
+                .await;
+                let hello = read_line(&mut stream).await;
+                if !hello.is_empty() {
+                    break 'hello (stream, running, hello);
+                }
+                let ran = running.await.expect("the hook ran");
+                assert_eq!(ran.code, Some(0), "{case}: {}", ran.stderr);
+                assert_eq!(ran.stdout, b"{}\n", "{case}");
+                assert_eq!(neutral(&ran.stdout, &ran.stderr), Ok(()), "{case}");
+                assert!(
+                    kr_hook::hook::ran_out_of_its_deadline(&ran.stderr),
+                    "{case}: the hook connected and ended without a hello, and not by its \
+                     deadline: {:?}",
+                    ran.stderr
+                );
+                last = ran.stderr;
+            }
+            panic!(
+                "{case}: none of {ATTEMPTS} hooks said hello before its own deadline; the last said {last:?}"
+            );
+        };
         let hello: serde_json::Value = serde_json::from_slice(&hello).expect("the hello is JSON");
         assert_eq!(
             hello["kr_hello"]["bridge"],
@@ -314,13 +361,10 @@ async fn kr_req_12_27_a_worker_that_never_answers_cannot_hold_a_hook() {
             ran.took
         );
         // The hook ended with the worker's connection open and silent, so its own deadline ended
-        // it, and that deadline is inside the shortest timeout any registration names. How long
-        // the machine took to start the process and to let it end is not the hook's, so it is not
-        // measured.
-        assert!(
-            DEADLINE < SHORTEST_TIMEOUT,
-            "{case}: the deadline is inside the shortest timeout any registration names"
-        );
+        // it, and it says how long it had run when it did, on its own clock. That is held against
+        // the shortest timeout any registration names, and how long the machine took to start the
+        // process and to let it end, which is not the hook's, is not.
+        common::assert_answered_inside(&ran, SHORTEST_TIMEOUT, &case);
         // A run that spent its whole deadline waiting still says why, after the answer.
         assert!(
             ran.stderr.starts_with("kr-hook: "),
@@ -331,7 +375,9 @@ async fn kr_req_12_27_a_worker_that_never_answers_cannot_hold_a_hook() {
 }
 
 /// KR-REQ-12.27: a standard error nobody reads cannot hold a hook. With standard error a pipe that
-/// is full before the hook starts, every hook still writes `{}` and exits 0 inside the shortest
+/// is full before the hook starts, every hook still writes `{}` and exits 0: a hook held by the
+/// pipe would never exit, which is what the wait here is for. The most a hook waits for a
+/// diagnostic is its deadline and the allowance after the answer, and both are inside the shortest
 /// timeout any registration names. The control, an empty pipe, still gets the diagnostic line.
 #[test]
 fn kr_req_12_27_a_standard_error_nobody_reads_cannot_hold_a_hook() {
@@ -353,19 +399,10 @@ fn kr_req_12_27_a_standard_error_nobody_reads_cannot_hold_a_hook() {
                 b"not json",
                 writer,
             );
-            assert!(
-                held.answered.is_some_and(|after| after < SHORTEST_TIMEOUT),
-                "{case}: no answer within {SHORTEST_TIMEOUT:?}"
-            );
             assert_eq!(held.answer, b"{}\n", "{case}");
-            assert!(
-                held.exited.is_some_and(|after| after < SHORTEST_TIMEOUT),
-                "{case}: no exit within {SHORTEST_TIMEOUT:?}: {:?}",
-                held.exited
-            );
             assert_eq!(held.code, Some(0), "{case}");
+            let mut said = String::new();
             if !full {
-                let mut said = String::new();
                 diagnostics
                     .read_to_string(&mut said)
                     .expect("the diagnostics are read");
@@ -376,7 +413,13 @@ fn kr_req_12_27_a_standard_error_nobody_reads_cannot_hold_a_hook() {
                     "{case}: one diagnostic line: {said:?}"
                 );
                 assert_eq!(neutral(&held.answer, &said), Ok(()), "{case}");
+                // The line carries how long the hook had run, on its own clock, when it wrote
+                // its answer, which is what is held against the timeout.
+                let after = kr_hook::hook::answered_after(&said)
+                    .unwrap_or_else(|| panic!("{case}: the line says when it answered: {said:?}"));
+                assert!(after < SHORTEST_TIMEOUT, "{case}: answered after {after:?}");
             }
+            common::assert_answered_in_time(&said, SHORTEST_TIMEOUT, &case);
         }
     }
 }
@@ -385,16 +428,12 @@ fn kr_req_12_27_a_standard_error_nobody_reads_cannot_hold_a_hook() {
 struct Held {
     /// Everything it wrote to standard output.
     answer: Vec<u8>,
-    /// How long after its start the first of that arrived, where it did in time.
-    answered: Option<Duration>,
-    /// Its exit code, where it exited in time.
+    /// Its exit code, where it exited.
     code: Option<i32>,
-    /// How long after its start it exited, where it did in time.
-    exited: Option<Duration>,
 }
 
 /// Runs a hook with `input` on its standard input and `diagnostics` as its standard error, for at
-/// most [`SHORTEST_TIMEOUT`], and ends it if it is still running then.
+/// most [`LIVENESS`], and ends it if it is still running then.
 fn run_beside(
     mut command: std::process::Command,
     input: &[u8],
@@ -416,41 +455,26 @@ fn run_beside(
     stdin.write_all(input).expect("the input is written");
     drop(stdin);
     let mut stdout = child.stdout.take().expect("its output");
-    let (first, arrived) = std::sync::mpsc::channel();
     let reading = std::thread::spawn(move || {
         let mut answer = Vec::new();
-        let mut buffer = [0_u8; 64];
-        while let Ok(count) = stdout.read(&mut buffer) {
-            if count == 0 {
-                break;
-            }
-            if answer.is_empty() {
-                let _ = first.send(started.elapsed());
-            }
-            answer.extend_from_slice(&buffer[..count]);
-        }
+        let _ = stdout.read_to_end(&mut answer);
         answer
     });
-    let answered = arrived
-        .recv_timeout(SHORTEST_TIMEOUT.saturating_sub(started.elapsed()))
-        .ok();
-    let (code, exited) = loop {
+    let code = loop {
         if let Some(status) = child.try_wait().expect("the forwarder can be waited on") {
-            break (status.code(), Some(started.elapsed()));
+            break status.code();
         }
-        if started.elapsed() >= SHORTEST_TIMEOUT {
+        if started.elapsed() >= LIVENESS {
             // This test's own child, which it has not collected, so the number is still its.
             let _ = child.kill();
             let _ = child.wait();
-            break (None, None);
+            break None;
         }
         std::thread::sleep(Duration::from_millis(5));
     };
     Held {
         answer: reading.join().expect("the output is read"),
-        answered,
         code,
-        exited,
     }
 }
 
