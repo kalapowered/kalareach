@@ -766,11 +766,7 @@ async fn an_authentication_failure_says_nothing_more() {
     let device = Device::create().await;
     let candidate = device.candidate();
     let mut payload = direct_payload(&invited);
-    let connection = candidate
-        .endpoint
-        .connect(host_addr(&payload), kr_protocol::hello::ALPN)
-        .await
-        .expect("the candidate reaches the host");
+    let connection = calls::dial_until_connected(candidate.endpoint, host_addr(&payload)).await;
     let mut unpaired = handshake::connect_unpaired(&connection, candidate.identity)
         .await
         .expect("an unpaired connection");
