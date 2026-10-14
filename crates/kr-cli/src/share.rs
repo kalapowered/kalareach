@@ -612,12 +612,23 @@ async fn perform(
             Next::Check | Next::Wait => {
                 if !waited_notice {
                     waited_notice = true;
-                    report::say(&shown!(
-                        "The host did not answer, so its state is read until it shows what \
-                         became of this; nothing counts as not done before {} seconds from the \
-                         first send.",
-                        attempt.bound().as_secs()
-                    ));
+                    // A refusal that is not the host's last word is shown, so the person is not
+                    // told that nothing was heard when something was.
+                    match &performed.refusal {
+                        Some(refusal) => report::say(&shown!(
+                            "The host said: {}. That does not say that nothing was done, so its \
+                             state is read until it shows what became of this; nothing counts as \
+                             not done before {} seconds from the first send.",
+                            Shown::protocol(refusal),
+                            attempt.bound().as_secs()
+                        )),
+                        None => report::say(&shown!(
+                            "The host did not answer, so its state is read until it shows what \
+                             became of this; nothing counts as not done before {} seconds from \
+                             the first send.",
+                            attempt.bound().as_secs()
+                        )),
+                    }
                 }
                 tokio::time::sleep(CHECK_EVERY).await;
                 // The moment the read begins is what decides whether it counts.
