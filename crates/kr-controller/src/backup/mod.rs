@@ -51,9 +51,9 @@ use kr_worker::privacy::{
 };
 
 use crate::backup::store::{
-    Attempt, AttemptStatus, BackupStore, FenceRelease, GenerationRecord, NewGeneration, NewObject,
-    ObjectRecord, Obligation, ObligationKind, PrivacyRequest, PrivacyStatus, Publication, Remote,
-    Setup, SetupCommit, SetupRecord, Step,
+    Attempt, AttemptStatus, BackupStore, FenceRelease, GenerationRecord, MadeFrom, NewGeneration,
+    NewObject, ObjectRecord, Obligation, ObligationKind, PrivacyRequest, PrivacyStatus,
+    Publication, Remote, Setup, SetupCommit, SetupRecord, Step,
 };
 use crate::error::{ControllerError, Result};
 
@@ -960,8 +960,7 @@ impl BackupService {
         ))
     }
 
-    /// Returns the fingerprint of what one generation was made from, if it was made from the
-    /// host's state.
+    /// Returns what one generation was made from, if it was made from the host's state.
     ///
     /// # Errors
     ///
@@ -970,7 +969,7 @@ impl BackupService {
         &self,
         archive_id: ArchiveId,
         backup_generation: BackupGeneration,
-    ) -> Result<Option<Digest256>> {
+    ) -> Result<Option<MadeFrom>> {
         self.store().made_from(archive_id, backup_generation)
     }
 
@@ -1170,7 +1169,7 @@ impl BackupService {
         sealed: &SealedArchive,
         objects: &[StagedObject],
         writer_key_id: KeyId,
-        made_from: Digest256,
+        made_from: MadeFrom,
         now_ms: TimestampMs,
     ) -> Result<Admitted> {
         let archive_id = sealed.descriptor.archive_id;
@@ -1349,7 +1348,10 @@ impl BackupService {
             staging(staged.object_id(), staged.bytes())?;
         }
         staging(manifest_object_id, &sealed.encrypted_manifest)?;
-        let made_from = Digest256::from_bytes(kr_cbor::sha256(&sealed.descriptor_bytes));
+        let made_from = MadeFrom {
+            fingerprint: Digest256::from_bytes(kr_cbor::sha256(&sealed.descriptor_bytes)),
+            unreadable: Vec::new(),
+        };
         self.admit_produced(&lease, sealed, objects, writer_key_id, made_from, now_ms)
     }
 

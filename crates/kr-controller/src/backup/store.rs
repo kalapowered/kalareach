@@ -632,9 +632,25 @@ pub struct NewGeneration {
     /// content read before a fence went up and came down again is never stamped with the
     /// generation that came after.
     pub content_read_under: u64,
-    /// A digest of what the generation was made from, kept with it, where it was made from this
-    /// host's own state.
-    pub made_from: Option<Digest256>,
+    /// What the generation was made from, kept with it, where it was made from this host's own
+    /// state.
+    pub made_from: Option<MadeFrom>,
+}
+
+/// What a generation was made from: one digest of every closed session that could have been
+/// packed and of the configuration, and the digests of the sessions among them that could not be
+/// read when it was made.
+///
+/// The unreadable sessions count in the first digest like every other, so a host whose sessions
+/// have not changed makes no new generation however many it could not read. The second list is how
+/// they are found again to be tried: a digest of each session's identity, when it closed and how
+/// much output it retains, which names nothing a person chose.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MadeFrom {
+    /// The digest of everything that could have been packed.
+    pub fingerprint: Digest256,
+    /// The digests of the sessions whose output could not be read.
+    pub unreadable: Vec<Digest256>,
 }
 
 /// One object offered with a generation.
@@ -1168,10 +1184,12 @@ macro_rules! setup_definition {
                      archive_id        BLOB NOT NULL,
                      backup_generation INTEGER NOT NULL,
                      fingerprint       BLOB NOT NULL,
+                     unreadable        BLOB NOT NULL,
                      PRIMARY KEY (archive_id, backup_generation),
                      FOREIGN KEY (archive_id, backup_generation)
                          REFERENCES generations (archive_id, backup_generation),
-                     CHECK (length(fingerprint) = 32)
+                     CHECK (length(fingerprint) = 32),
+                     CHECK (length(unreadable) % 32 = 0)
                  );
                  CREATE TRIGGER IF NOT EXISTS what_a_generation_was_made_from_is_not_rewritten
                  BEFORE UPDATE ON generation_sources
@@ -1800,14 +1818,24 @@ impl BackupStore {
                 )
                 .map_err(ControllerError::registry)?;
         }
-        if let Some(made_from) = offered.made_from {
+        if let Some(made_from) = &offered.made_from {
             transaction
                 .run(
                     sql!(
-                        "INSERT INTO generation_sources (archive_id, backup_generation, fingerprint)
-                     VALUES (?1, ?2, ?3)"
+                        "INSERT INTO generation_sources
+                         (archive_id, backup_generation, fingerprint, unreadable)
+                     VALUES (?1, ?2, ?3, ?4)"
                     ),
-                    params![archive, generation, made_from.as_bytes().as_slice()],
+                    params![
+                        archive,
+                        generation,
+                        made_from.fingerprint.as_bytes().as_slice(),
+                        made_from
+                            .unreadable
+                            .iter()
+                            .flat_map(|digest| digest.as_bytes().iter().copied())
+                            .collect::<Vec<u8>>(),
+                    ],
                 )
                 .map_err(ControllerError::registry)?;
         }

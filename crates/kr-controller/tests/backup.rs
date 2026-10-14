@@ -19,8 +19,8 @@ use kr_client::services::{
 };
 use kr_controller::backup::store::{
     AttemptOutcome, AttemptStatus, BackupStore, FenceRelease, GenerationRecord, LocalState,
-    NewGeneration, NewObject, ObligationKind, Production, Publication, Remote, SCHEMA_VERSION,
-    SetupCommit, SetupRecord, Step, UploadRecord,
+    MadeFrom, NewGeneration, NewObject, ObligationKind, Production, Publication, Remote,
+    SCHEMA_VERSION, SetupCommit, SetupRecord, Step, UploadRecord,
 };
 use kr_controller::backup::uploader::{
     EXECUTOR as UPLOADER, Idle, SERVICE_CHAIN_LENGTH, Stepped, Uploader, generations_kept,
@@ -8997,7 +8997,10 @@ fn content_read_before_a_privacy_cycle_is_not_admitted_after_it() {
         descriptor: sealed.descriptor_bytes.clone(),
         created_at_ms: TimestampMs::new(8_000),
         content_read_under: read_under,
-        made_from: Some(Digest256::from_bytes([7; 32])),
+        made_from: Some(MadeFrom {
+            fingerprint: Digest256::from_bytes([7; 32]),
+            unreadable: vec![Digest256::from_bytes([8; 32])],
+        }),
     };
     let refused = store.admit(&offered(read_under), &rows, TimestampMs::new(8_000));
     assert!(
@@ -9012,7 +9015,10 @@ fn content_read_before_a_privacy_cycle_is_not_admitted_after_it() {
         store
             .made_from(archive_id(), BackupGeneration::new(1))
             .expect("a read"),
-        Some(Digest256::from_bytes([7; 32]))
+        Some(MadeFrom {
+            fingerprint: Digest256::from_bytes([7; 32]),
+            unreadable: vec![Digest256::from_bytes([8; 32])],
+        })
     );
 }
 

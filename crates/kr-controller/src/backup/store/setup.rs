@@ -6,7 +6,7 @@ use kr_protocol::scalars::StoredEnvelopeKey;
 
 use super::{
     ArchiveId, BackupGeneration, BackupObjectId, BackupStore, ControllerError, Digest256, KeyId,
-    OptionalExtension, PathBuf, Reads, Result, TimestampMs, Writing, cancel_production,
+    MadeFrom, OptionalExtension, PathBuf, Reads, Result, TimestampMs, Writing, cancel_production,
     cancel_queued_attempts, key_id, millis, params, sql, try_finish_generation, uuid,
 };
 
@@ -287,8 +287,7 @@ impl BackupStore {
         Ok(())
     }
 
-    /// Returns the fingerprint of what one generation was made from, if it was made from the
-    /// host's state.
+    /// Returns what one generation was made from, if it was made from the host's state.
     ///
     /// # Errors
     ///
@@ -297,27 +296,36 @@ impl BackupStore {
         &self,
         archive_id: ArchiveId,
         backup_generation: BackupGeneration,
-    ) -> Result<Option<Digest256>> {
-        let found: Option<Vec<u8>> = self
+    ) -> Result<Option<MadeFrom>> {
+        let found: Option<(Vec<u8>, Vec<u8>)> = self
             .connection
             .read_one(
                 sql!(
-                    "SELECT fingerprint FROM generation_sources
+                    "SELECT fingerprint, unreadable FROM generation_sources
                   WHERE archive_id = ?1 AND backup_generation = ?2"
                 ),
                 params![
                     archive_id.get().as_bytes().as_slice(),
                     i64::try_from(backup_generation.get()).unwrap_or(i64::MAX),
                 ],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()
             .map_err(ControllerError::registry)?;
+        let stored = |bytes: &[u8]| {
+            <[u8; 32]>::try_from(bytes)
+                .map(Digest256::from_bytes)
+                .map_err(|_| ControllerError::registry("a stored digest is not 32 bytes"))
+        };
         found
-            .map(|bytes| {
-                <[u8; 32]>::try_from(bytes.as_slice())
-                    .map(Digest256::from_bytes)
-                    .map_err(|_| ControllerError::registry("a stored fingerprint is not 32 bytes"))
+            .map(|(fingerprint, unreadable)| {
+                Ok(MadeFrom {
+                    fingerprint: stored(&fingerprint)?,
+                    unreadable: unreadable
+                        .chunks(32)
+                        .map(stored)
+                        .collect::<Result<Vec<_>>>()?,
+                })
             })
             .transpose()
     }

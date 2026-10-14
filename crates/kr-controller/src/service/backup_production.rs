@@ -45,7 +45,7 @@ use kr_protocol::session::SessionSummary;
 use kr_transport::reconnect::Backoff;
 
 use crate::archive::ArchiveService;
-use crate::backup::store::{Production as ProductionState, Setup};
+use crate::backup::store::{MadeFrom, Production as ProductionState, Setup};
 use crate::backup::{ProductionLease, Staging};
 use crate::error::{ControllerError, Result};
 use crate::quiet::Timer;
@@ -135,6 +135,9 @@ pub(crate) struct Observed {
     left_out_sessions: u64,
     /// How many of those were left out because their output could not be read.
     left_out_unreadable: u64,
+    /// When the sessions that could not be read were last tried again, so that they are tried once
+    /// a day and not at every look.
+    probed_at_ms: Option<u64>,
     left_out_configuration: bool,
     /// How many sessions had not closed at the last pass, and so are in no backup yet.
     open_sessions: u64,
@@ -248,10 +251,14 @@ impl Drop for StopBackupProduction {
 }
 
 /// One closed session that may be packed.
+#[derive(Clone)]
 struct Candidate {
     summary: SessionSummary,
     closed_at_ms: u64,
     retained_bytes: u64,
+    /// A digest of the session's identity, when it closed and how much output it retains: what a
+    /// generation keeps of it, and all it keeps.
+    digest: Digest256,
 }
 
 impl Controller {
@@ -465,7 +472,7 @@ impl Controller {
             let backup = Arc::clone(&backup);
             tokio::task::spawn_blocking(move || backup.begin_production()).await
         };
-        let lease = match lease {
+        let mut lease = match lease {
             Ok(Ok(lease)) => lease,
             // Refused: privacy mode stopped production since the check, or the store is not
             // ready. The first is signalled when it is over; both are looked at again soon.
@@ -499,7 +506,6 @@ impl Controller {
         {
             let mut observed = production.observed();
             observed.left_out_sessions = left_out as u64;
-            observed.left_out_unreadable = 0;
             observed.left_out_configuration = configuration.is_none();
         }
         if candidates.is_empty() && configuration.is_none() {
@@ -516,20 +522,48 @@ impl Controller {
                 newest.map(|generation| (generation.archive_id, generation.backup_generation));
             let state_dir = self.paths().state_dir().to_path_buf();
             tokio::task::spawn_blocking(move || {
-                let unchanged = newest
-                    .and_then(|(archive_id, generation)| {
-                        backup.made_from(archive_id, generation).ok().flatten()
-                    })
-                    .is_some_and(|made| made == fingerprint);
+                let made = newest.and_then(|(archive_id, generation)| {
+                    backup.made_from(archive_id, generation).ok().flatten()
+                });
                 let low = kr_describe::resource::platform::free_space(&state_dir)
                     .is_some_and(|free| free < needed.saturating_add(bounds.disk_reserve_bytes));
-                (unchanged, low)
+                (made, low)
             })
             .await
         };
-        let Ok((unchanged, low_disk)) = checks else {
+        let Ok((made, low_disk)) = checks else {
             return Some(failed(production, backoff, "the pass stopped", None));
         };
+        // The sessions that could not be read count in the fingerprint like every other, so a host
+        // whose sessions have not changed makes no new generation however many it could not read.
+        // They are tried again once a day, and a generation is made when one of them can be read.
+        let mut unchanged = made
+            .as_ref()
+            .is_some_and(|made| made.fingerprint == fingerprint);
+        if unchanged && let Some(made) = made.as_ref().filter(|made| !made.unreadable.is_empty()) {
+            production.observed().left_out_unreadable = made.unreadable.len() as u64;
+            let tried = production.observed().probed_at_ms;
+            if tried.is_none_or(|at| at > now || now >= at.saturating_add(INTERVAL_MS)) {
+                let retry: Vec<Candidate> = candidates
+                    .iter()
+                    .filter(|candidate| made.unreadable.contains(&candidate.digest))
+                    .cloned()
+                    .collect();
+                let probed = self.probe_unreadable(lease, retry, bounds, now).await;
+                let Ok((returned, readable)) = probed else {
+                    return Some(failed(production, backoff, "the pass stopped", None));
+                };
+                lease = returned;
+                // A probe that privacy mode cut short has tried nothing, and is tried at the next
+                // look.
+                let Some(readable) = readable else {
+                    production.hold(Held::Interrupted);
+                    return Some(RELEASE_WAIT);
+                };
+                production.observed().probed_at_ms = Some(now);
+                unchanged = !readable;
+            }
+        }
         if unchanged {
             production.hold(Held::NothingChanged);
             return Some(RECHECK);
@@ -582,6 +616,7 @@ impl Controller {
                     let mut observed = production.observed();
                     observed.left_out_sessions += left_out;
                     observed.left_out_unreadable = unreadable;
+                    observed.probed_at_ms = Some(now);
                 }
                 production.hold(Held::InProgress);
                 backoff.reset();
@@ -605,6 +640,57 @@ impl Controller {
             )),
             Err(_) => Some(failed(production, backoff, "the pass stopped", None)),
         }
+    }
+
+    /// Tries the sessions a generation could not read, once, under the lease the pass holds, and
+    /// says whether any of them reads now. None says privacy mode stopped the try.
+    ///
+    /// Nothing is staged: a session is composed and the document dropped.
+    async fn probe_unreadable(
+        self: &Arc<Self>,
+        lease: ProductionLease,
+        retry: Vec<Candidate>,
+        bounds: ProducerBounds,
+        now_ms: u64,
+    ) -> std::result::Result<(ProductionLease, Option<bool>), tokio::task::JoinError> {
+        let archive = self.archive().clone();
+        let handle = tokio::runtime::Handle::current();
+        let daemon = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            let _daemon = daemon;
+            handle.block_on(async move {
+                let mut readable = Some(false);
+                for candidate in &retry {
+                    let mut source = SpoolPages {
+                        archive: &archive,
+                        session_id: candidate.summary.session_id,
+                        lease: &lease,
+                    };
+                    let composed = session_export::compose(
+                        &mut source,
+                        &candidate.summary,
+                        Bounds {
+                            max_read_bytes: RETAINED_PER_SESSION_BYTES,
+                            max_document_bytes: bounds.session_member_bytes,
+                            max_chunks: session_export::MAX_CHUNKS,
+                        },
+                        candidate.retained_bytes,
+                        now_ms,
+                    )
+                    .await;
+                    if composed.is_ok() {
+                        readable = Some(true);
+                        break;
+                    }
+                    if lease.is_cancelled() {
+                        readable = None;
+                        break;
+                    }
+                }
+                (lease, readable)
+            })
+        })
+        .await
     }
 
     /// The closed sessions that can be packed, newest closure first, and how many sessions have
@@ -656,6 +742,7 @@ impl Controller {
                 summary: self.closed_session(&closure, display_number).await,
                 closed_at_ms,
                 retained_bytes: retained,
+                digest: session_digest(session_id, closed_at_ms, retained),
             });
         }
         candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.closed_at_ms));
@@ -811,12 +898,12 @@ impl Controller {
                 .stated(
                     " closed sessions were left out of the last backup, for its size or its count",
                 );
-            if observed.left_out_unreadable > 0 {
-                detail = detail
-                    .stated(" or because their output could not be read (")
-                    .number(observed.left_out_unreadable)
-                    .stated(" of them)");
-            }
+        }
+        if observed.left_out_unreadable > 0 {
+            detail = detail
+                .stated("; ")
+                .number(observed.left_out_unreadable)
+                .stated(" closed sessions could not be read and are in no backup yet");
         }
         if observed.left_out_configuration {
             detail = detail.stated("; the configuration document was not packed");
@@ -849,8 +936,8 @@ fn failed(
 
 /// How the pass ended.
 enum Made {
-    /// A generation was admitted, with this many sessions left out in all, this many of them
-    /// because their output could not be read.
+    /// A generation was admitted, with this many sessions left out for size or count, and this
+    /// many left out because their output could not be read.
     Admitted { left_out: u64, unreadable: u64 },
     /// Every member was left out, so there was nothing to make a generation of.
     Nothing,
@@ -973,12 +1060,12 @@ impl Pass {
             let composed = match composed {
                 Ok(composed) => composed,
                 Err(Stop::Source(Staging::Cancelled)) => return Ok(Made::Cancelled),
-                // A session whose output cannot be read is left out, and the rest go on. It is
-                // not in the fingerprint kept with the generation, so the next day's pass finds
-                // what it would pack changed and tries it again.
+                // A session whose output cannot be read is left out, and the rest go on. The
+                // generation keeps its digest beside the fingerprint, so that it is found and
+                // tried again, and a host whose sessions have not changed makes no new generation
+                // for it.
                 Err(_) => {
-                    left_out += 1;
-                    unreadable.push(position);
+                    unreadable.push(candidate.digest);
                     continue;
                 }
             };
@@ -1062,25 +1149,22 @@ impl Pass {
         if self.privacy.now() != self.published {
             return Ok(Made::Cancelled);
         }
-        let kept: Vec<&Candidate> = self
-            .candidates
-            .iter()
-            .enumerate()
-            .filter(|(position, _)| !unreadable.contains(position))
-            .map(|(_, candidate)| candidate)
-            .collect();
-        let fingerprint = fingerprint_of(&kept, self.configuration.as_deref());
+        let unreadable_sessions = unreadable.len() as u64;
+        let made_from = MadeFrom {
+            fingerprint: fingerprint_of(&self.candidates, self.configuration.as_deref()),
+            unreadable,
+        };
         match self.backup.admit_produced(
             &self.lease,
             &sealed,
             &objects,
             self.writer.key_id(),
-            fingerprint,
+            made_from,
             TimestampMs::new(self.now_ms),
         ) {
             Ok(_) => Ok(Made::Admitted {
                 left_out,
-                unreadable: unreadable.len() as u64,
+                unreadable: unreadable_sessions,
             }),
             // Privacy mode cancelled the pass between its last write and its admission.
             Err(ControllerError::Refused { .. }) if self.lease.is_cancelled() => {
@@ -1103,17 +1187,26 @@ fn spool_bytes(directory: &std::path::Path) -> u64 {
         .sum()
 }
 
-/// A digest of what would be packed: each session's identifier, when it closed and how much output
-/// it retains, and the configuration's own digest. The identifiers go into the digest and nowhere
-/// else; a member's name is inside the encrypted manifest and the store never writes it down.
-fn fingerprint_of(candidates: &[impl AsRef<Candidate>], configuration: Option<&[u8]>) -> Digest256 {
+/// A digest of one session as a generation keeps it: its identifier, when it closed and how much
+/// output it retains. The identifier goes into the digest and nowhere else; a member's name is
+/// inside the encrypted manifest and the store never writes it down.
+fn session_digest(session_id: SessionId, closed_at_ms: u64, retained_bytes: u64) -> Digest256 {
+    let mut hashed = Vec::with_capacity(64);
+    hashed.extend_from_slice(b"kalareach-backup-session/1");
+    hashed.extend_from_slice(session_id.get().as_bytes());
+    hashed.extend_from_slice(&closed_at_ms.to_be_bytes());
+    hashed.extend_from_slice(&retained_bytes.to_be_bytes());
+    Digest256::from_bytes(kr_cbor::sha256(&hashed))
+}
+
+/// A digest of everything that could be packed: the digest of each closed session, in the order
+/// they are packed, and the configuration's own digest. A session that cannot be read is in it
+/// like any other.
+fn fingerprint_of(candidates: &[Candidate], configuration: Option<&[u8]>) -> Digest256 {
     let mut hashed = Vec::new();
-    hashed.extend_from_slice(b"kalareach-backup-source/1");
+    hashed.extend_from_slice(b"kalareach-backup-source/2");
     for candidate in candidates {
-        let candidate = candidate.as_ref();
-        hashed.extend_from_slice(candidate.summary.session_id.get().as_bytes());
-        hashed.extend_from_slice(&candidate.closed_at_ms.to_be_bytes());
-        hashed.extend_from_slice(&candidate.retained_bytes.to_be_bytes());
+        hashed.extend_from_slice(candidate.digest.as_bytes());
     }
     match configuration {
         Some(document) => {
@@ -1123,12 +1216,6 @@ fn fingerprint_of(candidates: &[impl AsRef<Candidate>], configuration: Option<&[
         None => hashed.push(0),
     }
     Digest256::from_bytes(kr_cbor::sha256(&hashed))
-}
-
-impl AsRef<Self> for Candidate {
-    fn as_ref(&self) -> &Self {
-        self
-    }
 }
 
 /// What a pass can need on the disk it stages on: for each session, the smaller of the session

@@ -3909,3 +3909,91 @@ async fn a_pass_that_would_fill_the_disk_stages_nothing() {
     rig.until("the generation is published", |rig| rig.published(1))
         .await;
 }
+
+/// The files of one closed session's spool, which the test makes unreadable and readable again.
+#[cfg(unix)]
+fn set_spool_mode(
+    host: &kr_ipc::testing::TempHost,
+    session: kr_protocol::ids::SessionId,
+    mode: u32,
+) {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let spool = host.environment().session_spool(session);
+    for entry in std::fs::read_dir(&spool).expect("the spool").flatten() {
+        if entry.path().is_file() {
+            std::fs::set_permissions(entry.path(), std::fs::Permissions::from_mode(mode))
+                .expect("the file's mode");
+        }
+    }
+}
+
+/// A closed session whose spool cannot be read is left out of a generation and counted in what the
+/// generation was made from like every other: two days on, with nothing changed, no second
+/// generation is made, however long the spool stays unreadable. Once the spool reads, the next day's
+/// look makes the generation that holds the session. The control is the same host with the spool
+/// readable, which packs it at once.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_session_that_cannot_be_read_makes_no_generation_each_day_and_is_tried_again() {
+    let timer = HeldTimer::held();
+    let mut closed = None;
+    let rig = Rig::start_with(Arrangement::NORMAL, Arc::clone(&timer), |host| {
+        let session = closed_session(host, b"a session\r\n", 9_000);
+        set_spool_mode(host, session, 0o000);
+        closed = Some(session);
+    })
+    .await;
+    let session = closed.expect("a closed session");
+    let spool = rig.host.environment().session_spool(session);
+    let readable = std::fs::read_dir(&spool)
+        .expect("the spool")
+        .flatten()
+        .any(|entry| std::fs::File::open(entry.path()).is_ok());
+    if readable {
+        // A user that reads anywhere (root): the failure cannot be made.
+        return;
+    }
+    let web = Arc::clone(rig.served.web());
+    within("the first status read", web.requests_reach(STATUS, 1)).await;
+    rig.set_up();
+    rig.until("the first generation is published", |rig| rig.published(1))
+        .await;
+    let first = opened_members(&rig, 1);
+    assert_eq!(
+        first.keys().collect::<Vec<_>>(),
+        ["host/configuration.json"],
+        "the session that cannot be read is left out"
+    );
+    let (_, detail) = rig.production_check().await;
+    assert!(detail.contains("could not be read"), "{detail}");
+
+    // Two days on, nothing changed: no second generation, and the doctor still says why.
+    for _ in 0..2 {
+        timer.advance_day(Duration::from_secs(25 * 3600));
+        let looked = *rig.controller.production_looks().borrow();
+        rig.controller.backup().signals().produce.notify_one();
+        rig.production_looked(looked + 1).await;
+        assert_eq!(
+            rig.controller.backup().generations().expect("a read").len(),
+            1,
+            "a spool that stays unreadable makes no generation"
+        );
+        let (_, detail) = rig.production_check().await;
+        assert!(detail.contains("nothing has changed"), "{detail}");
+        assert!(detail.contains("could not be read"), "{detail}");
+    }
+
+    // The spool reads again: the next day's look finds it and makes the generation.
+    set_spool_mode(&rig.host, session, 0o600);
+    timer.advance_day(Duration::from_secs(25 * 3600));
+    timer.run_by_itself();
+    rig.controller.backup().signals().produce.notify_one();
+    rig.until("the second generation is published", |rig| rig.published(2))
+        .await;
+    let second = opened_members(&rig, 2);
+    assert!(
+        second.contains_key(&format!("sessions/{session}.json")),
+        "the session is in the generation made once it could be read"
+    );
+}
