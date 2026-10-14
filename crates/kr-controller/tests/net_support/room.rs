@@ -789,6 +789,10 @@ impl<'a> CodeCandidate<'a> {
     /// transcript to both live endpoints with `pair.finish`.
     ///
     /// Returns the connection, the candidate's unpaired session on it and the host's answer.
+    ///
+    /// The dial is made once. The candidate's handshake has ten seconds from its start and no
+    /// message extends them, so a dial the transport gave up on after its 30-second inactivity
+    /// threshold, made again, could not finish this pairing.
     pub async fn finish(
         &mut self,
     ) -> (
