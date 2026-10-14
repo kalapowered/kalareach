@@ -98,6 +98,21 @@ impl FaultKind {
     }
 }
 
+/// Says what one storage failure was, for a person and for the record of a fault.
+///
+/// The store's message names only the family of a failure: "disk I/O error" is what it says for a
+/// truncation the system refused as much as for a read that failed. The result code it answered
+/// with tells them apart, so it is part of what is recorded.
+#[must_use]
+pub fn describe(error: &rusqlite::Error) -> String {
+    match error {
+        rusqlite::Error::SqliteFailure(failure, _) => {
+            format!("{error} (result code {})", failure.extended_code)
+        }
+        other => other.to_string(),
+    }
+}
+
 /// One fault, as the seam reports it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct JournalFault {
@@ -346,7 +361,7 @@ impl JournalHealth {
     pub(crate) fn observe(&self, error: &rusqlite::Error, now_ms: u64) -> bool {
         self.note_fault(JournalFault {
             kind: FaultKind::classify(error),
-            detail: error.to_string(),
+            detail: describe(error),
             observed_at_ms: TimestampMs::new(now_ms),
             durable_through: self.durable_through(),
         })

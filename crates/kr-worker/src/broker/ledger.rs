@@ -568,7 +568,7 @@ impl Faults {
         }
         self.health.observe(&error, kr_ipc::now_ms().get());
         BrokerError::StoreFault {
-            detail: error.to_string(),
+            detail: crate::persistence::fault::describe(&error),
         }
     }
 }

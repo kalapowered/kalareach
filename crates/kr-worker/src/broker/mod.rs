@@ -4160,10 +4160,19 @@ impl BrokerState {
         write: impl FnOnce(&mut Ledger) -> Result<T>,
     ) -> Result<T> {
         if !self.volatile.writes_are_durable() {
+            // What the store said when it failed is part of the refusal, so a person who meets it
+            // is told which failure the host is waiting to recover from.
+            let said = self
+                .health
+                .condition()
+                .fault()
+                .map_or_else(String::new, |fault| {
+                    format!(" ({}: {})", fault.kind.as_str(), fault.detail)
+                });
             return Err(BrokerError::LedgerUnavailable {
                 detail: format!(
-                    "the journal is faulted, so {what} waits for the recovery that can write it \
-                     down"
+                    "the journal is faulted{said}, so {what} waits for the recovery that can \
+                     write it down"
                 ),
             });
         }

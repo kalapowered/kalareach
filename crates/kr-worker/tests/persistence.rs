@@ -1140,7 +1140,9 @@ fn every_way_of_opening_a_journal_waits_for_a_holder_that_has_not_let_go_of_its_
     use std::sync::atomic::{AtomicBool, Ordering};
 
     let (path, index) = a_closed_journal("previous-holder-lets-go");
-    let openers: [(&str, fn(&Path) -> kr_worker::Result<()>); 4] = [
+    type Opener = fn(&Path) -> kr_worker::Result<()>;
+
+    let openers: [(&str, Opener); 4] = [
         ("open", |path| Journal::open(path).map(drop)),
         ("open_existing", |path| {
             Journal::open_existing(path).map(drop)
