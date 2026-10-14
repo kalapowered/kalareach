@@ -214,6 +214,9 @@ struct State {
     feeds: BTreeMap<String, crate::feed::Feed>,
     /// The recovery bundles, by locator.
     bundles: BTreeMap<String, crate::sync::Bundle>,
+    /// Whether the account's backup storage refuses the write of a bundle, as an account with no
+    /// allowance does.
+    bundle_writes_refused: bool,
 }
 
 /// What the service did with one request.
@@ -468,6 +471,32 @@ impl ServiceWeb {
         }
     }
 
+    /// The account records `daily_snapshots` as its retention from now on, as a client of another
+    /// device may have set it.
+    pub fn set_daily_snapshots(&self, daily_snapshots: u32) {
+        let mut state = self.state.lock().expect("the state");
+        state.daily_snapshots = daily_snapshots;
+        state.revision += 1;
+    }
+
+    /// The account's backup storage admits no write of a recovery bundle from now on, or admits
+    /// one again.
+    pub fn refuse_bundle_writes(&self, refused: bool) {
+        self.state.lock().expect("the state").bundle_writes_refused = refused;
+    }
+
+    /// The sealed bundle the service holds at `locator`, if it holds one.
+    #[must_use]
+    pub fn bundle(&self, locator: &str) -> Option<Vec<u8>> {
+        self.state
+            .lock()
+            .expect("the state")
+            .bundles
+            .get(locator)
+            .and_then(|bundle| bundle.held.as_ref())
+            .map(|held| held.ciphertext.clone())
+    }
+
     /// Backup storage is turned on or off by some other client.
     pub fn set_backup(&self, on: bool) {
         let mut state = self.state.lock().expect("the state");
@@ -680,7 +709,14 @@ impl ServiceWeb {
             return crate::feed::sync(&mut state.feeds, &signature, body, now_ms());
         }
         if method == "sync.compare_exchange" {
-            return crate::sync::exchange(&state.bundles, &state.tokens, body, token);
+            let state = &mut *state;
+            return crate::sync::exchange(
+                &mut state.bundles,
+                &state.tokens,
+                body,
+                token,
+                !state.bundle_writes_refused,
+            );
         }
         if body["installation_id"].as_str() != Some(caller.as_str()) {
             return refusal(

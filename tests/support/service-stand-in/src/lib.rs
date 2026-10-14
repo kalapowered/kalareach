@@ -9,10 +9,11 @@
 //!
 //! Where the stand-in and the Worker could differ, the Worker is right. The recorded answers a
 //! local Worker gave (`fixtures/service/storage-answers.json`,
-//! `fixtures/service/authority-answers.json` and `fixtures/service/bundle-answers.json`) are what a
-//! test holds the stand-in to, and what the clients are held to read:
-//! `crates/kr-client/tests/service_answers.rs`, `crates/kr-client/tests/authority_answers.rs` and
-//! `crates/kr-client/tests/bundle_answers.rs`.
+//! `fixtures/service/authority-answers.json`, `fixtures/service/bundle-answers.json` and
+//! `fixtures/service/bundle-write-answers.json`) are what a test holds the stand-in to, and what
+//! the clients are held to read: `crates/kr-client/tests/service_answers.rs`,
+//! `crates/kr-client/tests/authority_answers.rs`, `crates/kr-client/tests/bundle_answers.rs` and
+//! `crates/kr-client/tests/bundle_writes.rs`.
 //!
 //! # What each behaviour is held to
 //!
@@ -40,6 +41,8 @@
 //! | A new generation published with no account proof is `402 QUOTA_EXHAUSTED` | contract and source only: a local deployment's free tier includes backup storage, so the Worker accepts it there | `backup/index.ts:224`, the production catalogue | the daemon's `an_account_the_service_turns_away_is_waited_for_as_a_person` reaches it through the status route instead |
 //! | `RATE_LIMITED` and `SERVICE_UNAVAILABLE` carry `retryAfterSeconds`, and the `Retry-After` header | source only: a local Worker cannot be made to rate limit or to be unavailable | `object-call.ts:64-73`, `auth/routes.ts:369` | `Moment::Refuse`; the daemon's reaction table; the client's own reading of it in `services/signed.rs` |
 //! | A read of an object another account stored is `404 NOT_FOUND`, as one never stored or tombstoned is | source only: a local deployment signs one account in | `storage/index.ts:1005-1025, 1193-1197` | `an_object_another_account_stored_is_told_as_no_object_is` in the daemon's suite |
+//! | The owner's write of the recovery bundle compares the revision it names with the one held (none for a bundle nobody wrote) and applies when they agree; a write that disagrees is answered `conflict` carrying the object as it stands; a request identity sent again with the same content is answered what it was answered the first time, and with other content is `409 ID_CONFLICT`; a token that may only read, and a host's key, are refused | recorded | `sync/collection.ts` `exchange`, `sync/index.ts` | `the_stand_in_answers_as_the_worker_did` in `bundle_writes.rs` |
+//! | An account with no backup allowance is refused the write of the bundle as `QUOTA_EXHAUSTED` | source only: the local deployment's free tier includes backup storage | `sync/collection.ts` (the ledger's hold) | `an_account_with_no_allowance_is_refused_the_write` in `bundle_writes.rs`; the daemon's `a_bundle_the_service_refuses_is_followed_by_no_enrolment_and_no_setup` |
 //! | A collection put back from an export names its history (`recovery_id`) in a read of the bundle, whether the bundle is there or not | source only: a local deployment is not put back | `sync/collection.ts` `recoveryId` | `a_collection_put_back_names_its_history_with_or_without_the_bundle` in `bundle_answers.rs` |
 //! | A refusal whose words repeat the request it refused, which can carry a bundle's locator | not applicable: a hostile service, as the transport faults are; the Worker's own error text is fixed (`object-call.ts:64-73`) | not applicable | `Moment::Echo`; the daemon's `a_refusal_the_service_words_with_the_locator_reaches_the_restore_without_it` |
 //! | A collection deleted from the account console is `410 COLLECTION_DELETED` | source only | `storage/index.ts:211`, `backup/collection.ts:531` | `ServiceWeb::delete_collection`; `a_deleted_collection_stops_the_attempt` |
