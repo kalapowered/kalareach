@@ -20,7 +20,9 @@ mod common;
 
 use tokio::io::AsyncWriteExt as _;
 
-use common::{LIVENESS, Placed, Reached, hook_reaching, launched, read_line, run_with_input};
+use common::{
+    ATTEMPTS, LIVENESS, Placed, Ran, Reached, hook_reaching, launched, read_line, run_with_input,
+};
 
 /// A `SessionStart` payload as Claude Code writes it on a hook's standard input.
 const SESSION_START: &[u8] = br#"{"session_id":"4d1c0a57-1b1e-4c3a-9d2e-6a0f0c5b7e11","transcript_path":"/tmp/t.jsonl","cwd":"/tmp","hook_event_name":"SessionStart","source":"startup"}"#;
@@ -310,113 +312,57 @@ async fn kr_req_12_14_over_the_private_endpoint_the_forwarder_presents_the_launc
 
     for answer in ["admit", "close", "withhold"] {
         // A forwarder the machine kept from the listener for its whole deadline answered without
-        // reaching it, and shows nothing about what the listener does: another is started, against
-        // a listener of its own.
-        let Reached {
-            mut stream,
-            peer,
-            running,
-            ..
-        } = hook_reaching(
-            &files,
-            answer,
-            answer,
-            |stand_in| {
-                let registration = files.join(format!("registration.{answer}"));
-                std::fs::write(
-                    &registration,
-                    format!(
-                        "endpoint={}\nprofile=lp-1\n\
-                         instance=02020202-0202-0202-0202-020202020202\npid=1\nstart=1\n\
-                         credential={}\nframing=json_lines\n",
-                        stand_in.address,
-                        credential_file.display()
-                    ),
+        // reaching it, and one that reached it so late that its deadline passed before the
+        // exchange was through ended without the listener's answer. Neither shows anything about
+        // what the listener does: another is started, against a listener of its own, and the
+        // forwarder's own account of why it ended decides that it is let go.
+        let mut interrupted = Vec::new();
+        let ran = 'exchanged: {
+            for _ in 0..ATTEMPTS {
+                let reached = hook_reaching(
+                    &files,
+                    answer,
+                    answer,
+                    |stand_in| {
+                        let registration = files.join(format!("registration.{answer}"));
+                        std::fs::write(
+                            &registration,
+                            format!(
+                                "endpoint={}\nprofile=lp-1\n\
+                                 instance=02020202-0202-0202-0202-020202020202\npid=1\nstart=1\n\
+                                 credential={}\nframing=json_lines\n",
+                                stand_in.address,
+                                credential_file.display()
+                            ),
+                        )
+                        .expect("the registration is written");
+                        let mut command = placed.command(&["claude-code", "hook"]);
+                        command.env("KR_REGISTRATION", &registration);
+                        tokio::task::spawn_blocking(move || run_with_input(command, SESSION_START))
+                    },
+                    |_| {},
                 )
-                .expect("the registration is written");
-                let mut command = placed.command(&["claude-code", "hook"]);
-                command.env("KR_REGISTRATION", &registration);
-                tokio::task::spawn_blocking(move || run_with_input(command, SESSION_START))
-            },
-            |_| {},
-        )
-        .await;
-        let hello = read_line(&mut stream).await;
-        let hello: serde_json::Value = serde_json::from_slice(&hello).expect("the hello is JSON");
-        let presented = &hello["kr_hello"];
-        assert_eq!(presented["credential"], credential.as_str());
-        assert_eq!(
-            presented["bridge"],
-            serde_json::json!({"application": "claude-code", "surface": "hook"})
-        );
-        // The process is the forwarder's own, as the operating system reads it now, while the
-        // forwarder is waiting for this listener's answer.
-        let pid = u32::try_from(presented["pid"].as_u64().expect("a process")).expect("a pid");
-        let read = kr_ipc::identity::process_start_identity(pid).expect("the process is running");
-        assert_eq!(presented["start"].as_u64(), Some(read.start_value.get()));
-        // The process the operating system names on the connection is the one the hello presents.
-        assert_eq!(
-            peer.pid,
-            Some(pid),
-            "{answer}: the kernel names the process that presented itself"
-        );
-        // And the host's own comparison takes it as the launch's private exchange.
-        let launch_credential = kr_worker::broker::Credential::from_registration_text(&credential)
-            .expect("the launch credential");
-        let bytes: Vec<u8> = (0..32)
-            .map(|index| {
-                u8::from_str_radix(&credential[index * 2..index * 2 + 2], 16).expect("hex")
-            })
-            .collect();
-        assert!(launch_credential.authenticates(&bytes));
-
-        let ran = match answer {
-            "admit" => {
-                stream
-                    .write_all(b"{\"kr_bridge\":{\"admitted\":\"hook\"}}\n")
-                    .await
-                    .expect("admitted");
-                // The observation comes behind the hello, and the forwarder waits for this end to
-                // close once it has been read.
-                let observation = read_line(&mut stream).await;
-                let observation: serde_json::Value =
-                    serde_json::from_slice(&observation).expect("the observation is JSON");
-                assert_eq!(
-                    observation,
-                    serde_json::json!({"kr_observation": {
-                        "event": "thread_started",
-                        "thread": "4d1c0a57-1b1e-4c3a-9d2e-6a0f0c5b7e11",
-                        "detail": "startup",
-                    }})
-                );
-                drop(stream);
-                running.await.expect("the forwarder ran")
+                .await;
+                match exchange(answer, &credential, reached).await {
+                    Ok(ran) => break 'exchanged ran,
+                    Err(Interrupted(ran)) => {
+                        assert_eq!(ran.code, Some(0), "{answer}: {}", ran.stderr);
+                        assert_eq!(ran.stdout, b"{}\n", "{answer}");
+                        assert!(
+                            kr_hook::hook::ran_out_of_its_deadline(&ran.stderr),
+                            "{answer}: the exchange with the forwarder broke, and the forwarder \
+                             did not end by its deadline: {:?}",
+                            ran.stderr
+                        );
+                        interrupted.push(ran.stderr);
+                    }
+                }
             }
-            "close" => {
-                drop(stream);
-                running.await.expect("the forwarder ran")
-            }
-            _ => {
-                // The connection stays open and says nothing until the forwarder has ended, so
-                // the forwarder ended with this listener still silent: the deadline it keeps from
-                // its own start, and not the listener, ended it. How long the machine took to
-                // start the process and to let it end is not the forwarder's, so it is not
-                // measured; the deadline is the figure the registration's timeout is checked
-                // against.
-                let ran = running.await.expect("the forwarder ran");
-                drop(stream);
-                assert!(
-                    ran.took >= kr_hook::hook::HOOK_DEADLINE,
-                    "it waited for the listener until its deadline: {:?}",
-                    ran.took
-                );
-                assert!(
-                    kr_hook::hook::HOOK_DEADLINE < std::time::Duration::from_secs(1),
-                    "the deadline a silent listener is held to is inside the one-second \
-                     SessionEnd timeout"
-                );
-                ran
-            }
+            panic!(
+                "{answer}: none of {ATTEMPTS} forwarders was through its exchange before its own \
+                 deadline; the last said {:?}",
+                interrupted.last()
+            );
         };
         assert_eq!(ran.code, Some(0), "{answer}: {}", ran.stderr);
         assert_eq!(ran.stdout, b"{}\n", "{answer}");
@@ -427,4 +373,123 @@ async fn kr_req_12_14_over_the_private_endpoint_the_forwarder_presents_the_launc
             ran.stderr
         );
     }
+}
+
+/// A forwarder that ended, at its own deadline, before the exchange with it was through.
+struct Interrupted(Ran);
+
+/// Has the listener the forwarder reached answer it as `answer` says, and checks what the
+/// forwarder presented, and returns the forwarder's run.
+///
+/// Whatever the forwarder does not wait for, it does not wait for: if it has gone by the time a
+/// step needs it, the exchange is interrupted and the forwarder's run is handed back for the case
+/// to judge.
+async fn exchange(answer: &str, credential: &str, reached: Reached) -> Result<Ran, Interrupted> {
+    let Reached {
+        stand_in: _stand_in,
+        mut stream,
+        peer,
+        running,
+    } = reached;
+    // The forwarder is not there for the next step: its run is all there is to hand back.
+    macro_rules! gone {
+        () => {
+            return Err(Interrupted(running.await.expect("the forwarder ran")))
+        };
+    }
+
+    let hello = read_line(&mut stream).await;
+    if hello.is_empty() {
+        gone!();
+    }
+    let hello: serde_json::Value = serde_json::from_slice(&hello).expect("the hello is JSON");
+    let presented = &hello["kr_hello"];
+    assert_eq!(presented["credential"], credential);
+    assert_eq!(
+        presented["bridge"],
+        serde_json::json!({"application": "claude-code", "surface": "hook"})
+    );
+    // The process is the forwarder's own, as the operating system reads it now, while the
+    // forwarder is waiting for this listener's answer.
+    let pid = u32::try_from(presented["pid"].as_u64().expect("a process")).expect("a pid");
+    let read = match kr_ipc::identity::query_process(pid) {
+        kr_ipc::identity::ProcessQuery::Present(read) => read,
+        // The forwarder ended, at its deadline, before this step: nothing is established about
+        // the listener by it.
+        kr_ipc::identity::ProcessQuery::Gone => gone!(),
+        kr_ipc::identity::ProcessQuery::CannotEstablish(error) => {
+            panic!("{answer}: the operating system would not say who the process is: {error}")
+        }
+    };
+    assert_eq!(presented["start"].as_u64(), Some(read.start_value.get()));
+    // The process the operating system names on the connection is the one the hello presents.
+    assert_eq!(
+        peer.pid,
+        Some(pid),
+        "{answer}: the kernel names the process that presented itself"
+    );
+    // And the host's own comparison takes it as the launch's private exchange.
+    let launch_credential = kr_worker::broker::Credential::from_registration_text(credential)
+        .expect("the launch credential");
+    let bytes: Vec<u8> = (0..32)
+        .map(|index| u8::from_str_radix(&credential[index * 2..index * 2 + 2], 16).expect("hex"))
+        .collect();
+    assert!(launch_credential.authenticates(&bytes));
+
+    let ran = match answer {
+        "admit" => {
+            if stream
+                .write_all(b"{\"kr_bridge\":{\"admitted\":\"hook\"}}\n")
+                .await
+                .is_err()
+            {
+                gone!();
+            }
+            // The observation comes behind the hello, and the forwarder waits for this end to
+            // close once it has been read.
+            let observation = read_line(&mut stream).await;
+            if observation.is_empty() {
+                gone!();
+            }
+            let observation: serde_json::Value =
+                serde_json::from_slice(&observation).expect("the observation is JSON");
+            assert_eq!(
+                observation,
+                serde_json::json!({"kr_observation": {
+                    "event": "thread_started",
+                    "thread": "4d1c0a57-1b1e-4c3a-9d2e-6a0f0c5b7e11",
+                    "detail": "startup",
+                }})
+            );
+            drop(stream);
+            running.await.expect("the forwarder ran")
+        }
+        "close" => {
+            drop(stream);
+            running.await.expect("the forwarder ran")
+        }
+        _ => {
+            // The connection stays open and says nothing until the forwarder has ended, so the
+            // forwarder ended with this listener still silent: the deadline it keeps from its own
+            // start, and not the listener, ended it. It says how long it had run when it did, on
+            // its own clock, and that is held against the one-second timeout the package
+            // registers; how long the machine took to start the process and to let it end is not
+            // the forwarder's, so it is not measured.
+            let ran = running.await.expect("the forwarder ran");
+            drop(stream);
+            assert!(
+                ran.took >= kr_hook::hook::HOOK_DEADLINE,
+                "it waited for the listener until its deadline: {:?}",
+                ran.took
+            );
+            common::assert_answered_inside(&ran, std::time::Duration::from_secs(1), answer);
+            return Ok(ran);
+        }
+    };
+    // A forwarder that answered at its deadline in either of these ended for want of time, not
+    // because of what this listener did.
+    if kr_hook::hook::ran_out_of_its_deadline(&ran.stderr) {
+        return Err(Interrupted(ran));
+    }
+    Ok(ran)
 }

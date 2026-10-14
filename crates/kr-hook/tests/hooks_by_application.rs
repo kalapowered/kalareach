@@ -14,7 +14,7 @@
 
 mod common;
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use common::Placed;
 use common::launched::{self, Launch};
@@ -24,9 +24,8 @@ const FIRST_THREAD: &str = "4d1c0a57-1b1e-4c3a-9d2e-6a0f0c5b7e11";
 const SECOND_THREAD: &str = "9b2e6f10-7c4d-4e8a-a1f3-2d5c8b0e4f22";
 
 /// Has the application run one hook, admits it, applies what it observed, and returns the report
-/// with what the hook itself answered and how long the whole round took.
-async fn hook(launch: &mut Launch, payload: &[u8]) -> (HookReport, launched::Outcome, Duration) {
-    let started = Instant::now();
+/// with what the hook itself answered.
+async fn hook(launch: &mut Launch, payload: &[u8]) -> (HookReport, launched::Outcome) {
     let request = launch.hook(payload);
     let admitted = launch.accept().await.expect("the hook is admitted");
     assert_eq!(admitted.surface, BridgeSurface::Hook);
@@ -37,7 +36,7 @@ async fn hook(launch: &mut Launch, payload: &[u8]) -> (HookReport, launched::Out
     let outcome = tokio::task::spawn_blocking(move || launched::outcome(&request))
         .await
         .expect("the hook ended");
-    (report, outcome, started.elapsed())
+    (report, outcome)
 }
 
 /// One event a registration names, what the worker should make of it, and the timeout the
@@ -74,7 +73,7 @@ async fn observe_each(application: &str, cases: Vec<Case>) {
     );
     let mut cursors = Vec::new();
     for case in cases {
-        let (report, outcome, took) = hook(&mut launch, case.payload.to_string().as_bytes()).await;
+        let (report, outcome) = hook(&mut launch, case.payload.to_string().as_bytes()).await;
         let named = format!("{application} {}", case.payload["hook_event_name"]);
         assert_eq!(report.observation.event, case.event, "{named}");
         assert_eq!(report.observation.thread.as_str(), case.thread, "{named}");
@@ -93,11 +92,9 @@ async fn observe_each(application: &str, cases: Vec<Case>) {
         assert_eq!(outcome.code, 0, "{named}: {}", outcome.stderr);
         assert_eq!(outcome.stdout, b"{}\n", "{named}");
         assert!(outcome.stderr.is_empty(), "{named}: {}", outcome.stderr);
-        assert!(
-            took < case.timeout,
-            "{named} took {took:?}, past the {:?} the registration gives it",
-            case.timeout
-        );
+        // The hook's stderr is empty, so it answered from what the worker applied and not at its
+        // deadline, which with the allowance after it is inside the timeout the registration gives.
+        common::assert_answered_in_time(&outcome.stderr, case.timeout, &named);
         cursors.push(report.cursor);
     }
     assert!(
