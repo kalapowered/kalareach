@@ -149,21 +149,12 @@ jobs:
         timeout-minutes: 5
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
-      - name: Survey the image
-        timeout-minutes: 20
-        run: |
-          df -h /System/Volumes/Data
-          diskutil apfs list | head -40 || true
-          xcode-select -p
-          ls -la /Applications | head -60
-          xcrun simctl runtime list 2>&1 | head -60 || true
-          hdiutil info 2>&1 | head -40 || true
-          echo "== top level"
-          sudo du -xk -d 1 /System/Volumes/Data 2>/dev/null | sort -nr | head -25
-          echo "== deep"
-          sudo du -xk -d 3 /System/Volumes/Data/Applications /System/Volumes/Data/Library /System/Volumes/Data/Users /System/Volumes/Data/opt /System/Volumes/Data/usr /System/Volumes/Data/private 2>/dev/null | sort -nr | head -160
-          echo "== runner home"
-          sudo du -xk -d 2 /Users/runner 2>/dev/null | sort -nr | head -60
+      # The disk as the image arrives and what takes the room on it, and from here to the last
+      # report the lowest free space, sampled every two seconds. The report below is one step of
+      # hours, so the free space through it is listed at ten-minute spacing against the log's times.
+      - name: What the disk holds
+        timeout-minutes: 10
+        run: bash scripts/disk-report.sh begin "the image as it arrives"
 
       - name: What this runner is
         timeout-minutes: 2
@@ -260,6 +251,11 @@ jobs:
             arguments+=(--group "$name")
           done
           bash scripts/run-conformance.sh ${arguments[@]+"${arguments[@]}"}
+
+      - name: What the disk has left
+        if: ${{ !cancelled() }}
+        timeout-minutes: 10
+        run: bash scripts/disk-report.sh end "what the disk has left"
 
       - name: Keep the result and the evidence
         if: ${{ !cancelled() }}

@@ -1421,6 +1421,12 @@ jobs:
       - name: Check out
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
+      # The disk as the image arrives, and from here to the last report the lowest free space in
+      # each stretch of the job, on the macOS leg.
+      - name: What the disk holds
+        if: runner.os == 'macOS'
+        run: bash scripts/disk-report.sh begin "the image as it arrives"
+
       - name: Install pnpm
         uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v4.4.0
         with:
@@ -1478,6 +1484,10 @@ jobs:
       - name: Test the native backend
         run: cargo test --locked -p companion-tauri -p kr-client
 
+      - name: What the disk holds after the native backend's tests
+        if: ${{ !cancelled() && runner.os == 'macOS' }}
+        run: bash scripts/disk-report.sh step "the native backend's tests"
+
       # A collection key belongs in the operating system's own credential store, and on this system
       # that is the login keychain. The one test that writes to it is ignored in an ordinary run and
       # fails before it writes unless the run sets the switch that says it may, because on a
@@ -1502,6 +1512,10 @@ jobs:
           KR_TEST_ARTIFACTS_DIR: /tmp/kr-test-artifacts
         run: pnpm -C apps/companion e2e
 
+      - name: What the disk holds after the browsers' run
+        if: ${{ !cancelled() && runner.os == 'macOS' }}
+        run: bash scripts/disk-report.sh step "the browsers' run"
+
       # The figures, the traces and the screenshots the run produced, kept whether it passed or not.
       - name: Keep the end-to-end evidence
         if: ${{ !cancelled() }}
@@ -1518,6 +1532,10 @@ jobs:
         run: |
           pnpm -C apps/companion build
           cargo build --locked -p companion-tauri --release --features custom-protocol
+
+      - name: What the disk has left
+        if: ${{ !cancelled() && runner.os == 'macOS' }}
+        run: bash scripts/disk-report.sh end "what the disk has left"
 
   # The whole workspace on macOS: the lint, the workspace's tests, the end-to-end demonstrations and
   # the performance measurements, on the platform whose service manager, process table, disk images
@@ -1560,6 +1578,14 @@ jobs:
       - name: Check out
         timeout-minutes: 5
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      # The disk as the image arrives and what takes the room on it, and from here to the last
+      # report the lowest free space in each stretch of the job, sampled every two seconds: the
+      # reading between two steps says nothing of how near a step came to the end of the disk while
+      # it ran. The reports below sit after the steps that write the most.
+      - name: What the disk holds
+        timeout-minutes: 10
+        run: bash scripts/disk-report.sh begin "the image as it arrives"
 
       # What this runner is, printed before anything asserts on it, so a pass or a failure below
       # names the system, the login session, the keychain and the disk it happened on. The two
@@ -1662,6 +1688,10 @@ jobs:
           name: macos-release
           paths: target/release
 
+      - name: What the disk holds with the caches restored
+        timeout-minutes: 10
+        run: bash scripts/disk-report.sh step "the caches restored"
+
       - name: Build the test components
         timeout-minutes: 10
         run: bash scripts/build-plugin-fixtures.sh
@@ -1727,6 +1757,11 @@ jobs:
         timeout-minutes: 30
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
+      - name: What the disk holds after the lint
+        if: ${{ !cancelled() && matrix.part == 'tests' }}
+        timeout-minutes: 10
+        run: bash scripts/disk-report.sh step "the lint"
+
       # The rust job's documentation step for this platform's own code: a doc comment on an item
       # only macOS compiles is read by this build and no other. The crates are that step's.
       - name: Documentation without warnings
@@ -1744,6 +1779,11 @@ jobs:
             -p kr-plugin-service -p kr-privacy-integration -p kr-project -p kr-protocol \
             -p kr-shell-integration -p kr-sync-integration -p kr-term -p kr-transfer \
             -p kr-transport -p kr-voice -p kr-worker
+
+      - name: What the disk holds after the documentation
+        if: ${{ !cancelled() && matrix.part == 'tests' }}
+        timeout-minutes: 10
+        run: bash scripts/disk-report.sh step "the documentation"
 
       # The workspace's tests, less what this runner cannot run, each left out by name here:
       #
@@ -1785,6 +1825,14 @@ jobs:
           --skip a_staged_name_on_another_filesystem_is_left_where_it_is_whatever_its_numbers
           --skip kr_req_11_38_every_export_is_stopped_by_its_own_deadline
           --skip kr_req_11_38_a_worker_is_told_when_the_queue_overflowed
+
+      # The lowest free space while the tests built and ran is the figure that says how much room
+      # the step needs: the cases that stage a release refuse to start with less than their own
+      # margin to spare.
+      - name: What the disk holds after the workspace's tests
+        if: ${{ !cancelled() && matrix.part == 'tests' }}
+        timeout-minutes: 10
+        run: bash scripts/disk-report.sh step "the workspace's tests"
 
       # The cases that put another filesystem in or beside a tree: a disk image attached inside a
       # location or a tree, a disk image attached where a directory a service recorded was, and a
@@ -1899,6 +1947,11 @@ jobs:
             fi
           done
 
+      - name: What the disk holds after the cases that need another filesystem
+        if: ${{ !cancelled() && matrix.part == 'tests' }}
+        timeout-minutes: 10
+        run: bash scripts/disk-report.sh step "the cases that need another filesystem"
+
       # The cases whose verdicts are timings: a queue that must overflow before a slow component
       # drains it, and every export stopped at its own deadline. They run here one at a time, as the
       # rust job runs its timed suites serially, so that no other case of their suites shares this
@@ -1935,6 +1988,11 @@ jobs:
         timeout-minutes: 75
         run: bash scripts/end-to-end.sh
 
+      - name: What the disk holds after the demonstrations
+        if: ${{ !cancelled() && matrix.part == 'demonstrations' }}
+        timeout-minutes: 10
+        run: bash scripts/disk-report.sh step "the demonstrations"
+
       # Everything the script below builds before it measures: the release profile of the
       # workspace, and the measurement suite and the input benchmark with their test dependencies.
       # Built here so that the script has as little left to build as it can: a figure taken while a
@@ -1945,6 +2003,11 @@ jobs:
         run: |
           cargo build --locked --release --workspace
           cargo test --locked --release -p kr-worker --test performance --bench input_latency --no-run
+
+      - name: What the disk holds after the release build
+        if: ${{ !cancelled() && matrix.part == 'demonstrations' }}
+        timeout-minutes: 10
+        run: bash scripts/disk-report.sh step "the release build"
 
       # The idle-resource and attach targets (KR-PERF-003, KR-PERF-004) and the input measurements,
       # in a release build, each figure printed with the conditions it was taken under and asserted
@@ -1973,11 +2036,12 @@ jobs:
           path: ${{ env.KR_TEST_ARTIFACTS_DIR }}
           if-no-files-found: ignore
 
-      # What the disk had left once every step above was done.
+      # What the disk had left once every step above was done, and the lowest free space of every
+      # stretch of the job.
       - name: What the disk has left
         if: ${{ !cancelled() }}
-        timeout-minutes: 2
-        run: df -h /System/Volumes/Data
+        timeout-minutes: 10
+        run: bash scripts/disk-report.sh end "what the disk has left"
 
       - name: Save the cargo cache
         if: ${{ success() && matrix.part == 'tests' }}
@@ -2015,6 +2079,12 @@ jobs:
         timeout-minutes: 5
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
+      # The disk as the image arrives, and from here to the last report the lowest free space in
+      # each stretch of the job.
+      - name: What the disk holds
+        timeout-minutes: 10
+        run: bash scripts/disk-report.sh begin "the image as it arrives"
+
       # What this runner is, printed before anything asserts on it, so a pass or a failure below
       # names the processor, the memory and the system it happened on. Every build here is given
       # one job per processor.
@@ -2050,6 +2120,11 @@ jobs:
           cargo build --locked --release --workspace
           cargo test --locked --release -p kr-worker --test performance --bench input_latency --no-run
 
+      - name: What the disk holds after the release build
+        if: ${{ !cancelled() }}
+        timeout-minutes: 10
+        run: bash scripts/disk-report.sh step "the release build"
+
       # The idle processor figure is asserted here because this host reports no shortfall against
       # the reference host; a shortfall the host reported would be recorded and named instead. The
       # script starts each measurement only once the one-minute load average is under the bound
@@ -2061,6 +2136,11 @@ jobs:
         env:
           KR_PERF_SETTLE_LOAD: "2.0"
         run: bash scripts/performance.sh
+
+      - name: What the disk has left
+        if: ${{ !cancelled() }}
+        timeout-minutes: 10
+        run: bash scripts/disk-report.sh end "what the disk has left"
 
       - name: Keep the test evidence
         if: ${{ !cancelled() }}
