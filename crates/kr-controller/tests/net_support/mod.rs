@@ -135,6 +135,14 @@ pub fn loopback() -> EndpointConfig {
     }
 }
 
+/// How long a Git read of a daemon these suites start may run before it is taken for hung.
+///
+/// The project service ends a Git read at a bound of its own, a minute, so that a wedged child is
+/// noticed. These suites are about what the network lets a device do, not about that bound, and a
+/// machine that does not run a Git child for a minute would end them for a reason they are not
+/// about. A read that finishes is answered whenever it does; this ends one that never does.
+const HUNG_GIT_READ: Duration = Duration::from_secs(600);
+
 /// One daemon, its local endpoint and its network, with a temporary environment of its own.
 pub struct Host {
     temp: kr_ipc::testing::TempHost,
@@ -412,35 +420,38 @@ impl Host {
             // The daemon's start is a large future. On the heap it does not count against the
             // 2 MiB stack of the test thread, which a test that restarts a daemon and has a large
             // body of its own comes close to filling.
-            kr_controller::testing::with_account_origin(
-                account_origin.clone(),
-                Box::pin(Controller::start_on_clocks(
-                    ControllerSetup {
-                        paths: environment.clone(),
-                        environment_id,
-                        identity: Box::new(move || {
-                            let store = open_store_in(&secrets)
-                                .expect("a secret store for the test environment");
-                            Ok(ControllerIdentity::open(
-                                store.store.as_ref(),
-                                environment_id,
-                                false,
-                            )
-                            .expect("an identity"))
-                        }),
-                        secret_store: StoreSelection::File,
-                        boot_identity: boot.clone().unwrap_or_else(|| {
-                            kr_ipc::identity::boot_identity().expect("a boot identity")
-                        }),
-                        supervisor: Box::new(RefusingSupervisor),
-                        worker_program: PathBuf::from("/nonexistent/kr-worker"),
-                        build_id: build(),
-                        release: "0".to_owned(),
-                        shell_packages: None,
-                        terminal: Box::new(kr_controller::supervision::NoTerminal),
-                    },
-                    clocks.clone(),
-                )),
+            kr_controller::testing::with_git_read_bound(
+                HUNG_GIT_READ,
+                kr_controller::testing::with_account_origin(
+                    account_origin.clone(),
+                    Box::pin(Controller::start_on_clocks(
+                        ControllerSetup {
+                            paths: environment.clone(),
+                            environment_id,
+                            identity: Box::new(move || {
+                                let store = open_store_in(&secrets)
+                                    .expect("a secret store for the test environment");
+                                Ok(ControllerIdentity::open(
+                                    store.store.as_ref(),
+                                    environment_id,
+                                    false,
+                                )
+                                .expect("an identity"))
+                            }),
+                            secret_store: StoreSelection::File,
+                            boot_identity: boot.clone().unwrap_or_else(|| {
+                                kr_ipc::identity::boot_identity().expect("a boot identity")
+                            }),
+                            supervisor: Box::new(RefusingSupervisor),
+                            worker_program: PathBuf::from("/nonexistent/kr-worker"),
+                            build_id: build(),
+                            release: "0".to_owned(),
+                            shell_packages: None,
+                            terminal: Box::new(kr_controller::supervision::NoTerminal),
+                        },
+                        clocks.clone(),
+                    )),
+                ),
             )
         })
         .await
