@@ -874,12 +874,19 @@ pub async fn connect(host: &Host, device: &Device, record: &DeviceRecord) -> Ses
     for socket in host.network.bound_sockets() {
         addr = addr.with_ip_addr(socket);
     }
-    let transport = NetworkTransport::connect(
-        &device.endpoint,
-        addr,
-        &device.paired_identity(record.device_id),
-        &host_record,
-        SendLimits::default(),
+    let identity = device.paired_identity(record.device_id);
+    let transport = pairing::until_answered(
+        async || {
+            NetworkTransport::connect(
+                &device.endpoint,
+                addr.clone(),
+                &identity,
+                &host_record,
+                SendLimits::default(),
+            )
+            .await
+        },
+        pairing::transport_gave_up_unanswered,
     )
     .await
     .expect("the paired device connects");
@@ -900,9 +907,12 @@ pub struct RawDevice {
 impl RawDevice {
     /// Connects a paired device and claims the receive side of its control stream.
     pub async fn connect(host: &Host, device: &Device, record: &DeviceRecord) -> Self {
-        Self::try_connect(host, device, record)
-            .await
-            .expect("the paired device connects")
+        pairing::until_answered(
+            async || Self::try_connect(host, device, record).await,
+            pairing::transport_gave_up_unanswered,
+        )
+        .await
+        .expect("the paired device connects")
     }
 
     /// Connects a device under the identity `record` gave it, and returns why the host did not let
