@@ -5,6 +5,7 @@ import java.util.concurrent.Executors
 import to.kala.reach.companion.mobile.CallBridge
 import to.kala.reach.companion.mobile.CallEvent
 import to.kala.reach.companion.mobile.CallMute
+import to.kala.reach.companion.mobile.CallNames
 import to.kala.reach.companion.mobile.CallNews
 import to.kala.reach.companion.mobile.CallNewsQueue
 import to.kala.reach.companion.mobile.CallRefused
@@ -23,13 +24,13 @@ import to.kala.reach.companion.mobile.VoiceCaptureState
 class VoiceCallBridge(context: Context) : CallBridge {
     private val context = context.applicationContext
 
-    private class Held(val name: String, val call: VoiceCall, val queue: CallNewsQueue) {
-        @Volatile
-        var capture: VoiceCaptureState = VoiceCaptureState.IDLE
-    }
+    private class Held(val name: String, val call: VoiceCall, val reporter: Reporter)
 
     private val lock = Any()
     private var held: Held? = null
+
+    /** The names of the call held and of those that ended, so a command can say which. */
+    private val names = CallNames()
 
     /** Sends a call's news one item at a time, off every thread a call reports on. */
     private val sender = Executors.newSingleThreadExecutor { task ->
@@ -37,24 +38,28 @@ class VoiceCallBridge(context: Context) : CallBridge {
     }
 
     override fun open(call: String, news: CallNews) {
-        synchronized(lock) {
-            if (held != null || VoiceCallHolder.current != null) {
-                throw CallRefused(CallRefused.ALREADY_RUNNING, "this device already holds a call")
-            }
+        // The name is taken before the call is made, so two openings cannot both go on to make one.
+        if (VoiceCallHolder.current != null || !names.hold(call)) {
+            throw CallRefused(CallRefused.ALREADY_RUNNING, "this device already holds a call")
         }
-        val queue = CallNewsQueue(call, news)
-        val reporter = Reporter(call, queue)
+        val reporter = Reporter(call, CallNewsQueue(call, news))
         val made = try {
             VoiceCall.start(context, reporter)
         } catch (failure: IllegalStateException) {
+            names.abandon(call)
             throw CallRefused(CallRefused.ENGINE, failure.message ?: "the media engine could not make a call")
         }
-        synchronized(lock) { held = Held(call, made, queue).also { reporter.mine = it } }
+        synchronized(lock) {
+            // A call that ended while it was being made has said so already, and is not held.
+            if (names.held() == call) held = Held(call, made, reporter)
+        }
     }
 
-    private fun named(call: String): Held =
-        synchronized(lock) { held }?.takeIf { it.name == call }
+    private fun named(call: String): Held {
+        names.refusal(call)?.let { throw it }
+        return synchronized(lock) { held }?.takeIf { it.name == call }
             ?: throw CallRefused(CallRefused.NO_SUCH_CALL, "no call by that name is held")
+    }
 
     override fun offer(call: String): String = named(call).call.offer()
 
@@ -80,20 +85,22 @@ class VoiceCallBridge(context: Context) : CallBridge {
     }
 
     override fun held(): HeldCall =
-        synchronized(lock) { held }?.let { HeldCall(it.name, it.capture, !it.call.isPlaybackMuted) }
-            ?: HeldCall(null, VoiceCaptureState.IDLE, playing = false)
+        synchronized(lock) { held }?.let {
+            HeldCall(it.name, it.reporter.capture, it.call.isMutedByPerson, !it.call.isPlaybackMuted)
+        } ?: HeldCall(null, VoiceCaptureState.IDLE, microphoneMuted = false, playing = false)
 
     /** What one call tells the bridge, which queues it for Rust. */
     private inner class Reporter(private val name: String, private val queue: CallNewsQueue) :
         VoiceCall.Observer {
-        /** The call's record, once it is made. */
+        /** What the microphone last reported, from the first report on. */
         @Volatile
-        var mine: Held? = null
+        var capture: VoiceCaptureState = VoiceCaptureState.IDLE
+            private set
 
         private fun tell(event: CallEvent) = queue.offer(event) { sender.execute(it) }
 
         override fun onCaptureState(state: VoiceCaptureState) {
-            mine?.capture = state
+            capture = state
             tell(CallEvent.Capture(state))
         }
 
@@ -104,11 +111,13 @@ class VoiceCallBridge(context: Context) : CallBridge {
         override fun onConnectionState(state: String) = tell(CallEvent.Connection(state))
 
         override fun onEnded() {
-            tell(CallEvent.Ended)
-            queue.close()
+            // The call is no longer held before the end is told, so a command that follows the
+            // news of the end finds the device free; the queue takes nothing after the end.
+            names.end(name)
             synchronized(lock) {
                 if (this@VoiceCallBridge.held?.name == name) this@VoiceCallBridge.held = null
             }
+            tell(CallEvent.Ended)
         }
     }
 }

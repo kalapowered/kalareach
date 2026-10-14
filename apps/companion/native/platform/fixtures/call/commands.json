@@ -42,11 +42,11 @@
   {
     "command": "callState",
     "request": {},
-    "response": { "call": "c1", "capture": "muted_by_person", "playing": true }
+    "response": { "call": "c1", "capture": "muted_by_person", "microphoneMuted": true, "playing": true }
   },
   {
     "command": "callState",
     "request": {},
-    "response": { "call": null, "capture": "idle", "playing": false }
+    "response": { "call": null, "capture": "idle", "microphoneMuted": false, "playing": false }
   }
 ]

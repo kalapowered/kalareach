@@ -1,0 +1,56 @@
+[
+  {
+    "name": "news within the limit comes out in the order it went in",
+    "limit": 3,
+    "ops": ["push provider", "push capture", "pop", "pop", "pop"],
+    "results": ["provider", "capture", "none"]
+  },
+  {
+    "name": "a provider event over the limit is dropped and the loss comes out where it happened",
+    "limit": 2,
+    "ops": ["push provider", "push provider", "push provider", "pop", "pop", "pop", "pop"],
+    "results": ["provider", "provider", "lost", "none"]
+  },
+  {
+    "name": "losses that follow one another come out as one",
+    "limit": 1,
+    "ops": ["push provider", "push provider", "push provider", "push provider", "pop", "pop", "pop"],
+    "results": ["provider", "lost", "none"]
+  },
+  {
+    "name": "news that follows a loss comes out after it",
+    "limit": 2,
+    "ops": ["push provider", "push provider", "push provider", "pop", "push capture", "pop", "pop", "pop", "pop"],
+    "results": ["provider", "provider", "lost", "capture", "none"]
+  },
+  {
+    "name": "a change of state over the limit takes the place of the oldest provider event",
+    "limit": 2,
+    "ops": ["push provider", "push provider", "push capture", "pop", "pop", "pop", "pop"],
+    "results": ["lost", "provider", "capture", "none"]
+  },
+  {
+    "name": "with no provider event queued a change of state over the limit takes the place of the oldest news",
+    "limit": 2,
+    "ops": ["push connection", "push capture", "push first_audio", "pop", "pop", "pop", "pop"],
+    "results": ["lost", "capture", "first_audio", "none"]
+  },
+  {
+    "name": "the end is never the news that is dropped",
+    "limit": 1,
+    "ops": ["push provider", "push ended", "pop", "pop", "pop"],
+    "results": ["lost", "ended", "none"]
+  },
+  {
+    "name": "a loss that sits beside a loss is one loss",
+    "limit": 2,
+    "ops": ["push provider", "push provider", "push provider", "pop", "push capture", "push first_audio", "pop", "pop", "pop", "pop"],
+    "results": ["provider", "lost", "capture", "first_audio", "none"]
+  },
+  {
+    "name": "nothing is queued after the end",
+    "limit": 3,
+    "ops": ["push ended", "push provider", "push capture", "pop", "pop", "pop"],
+    "results": ["ended", "none", "none"]
+  }
+]

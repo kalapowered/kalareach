@@ -1,0 +1,17 @@
+[
+  { "name": "a mute whose flag is text", "command": "callMute", "request": { "call": "c1", "what": "microphone", "muted": "true" } },
+  { "name": "a mute whose flag is a number", "command": "callMute", "request": { "call": "c1", "what": "microphone", "muted": 1 } },
+  { "name": "a mute that names something that is not text", "command": "callMute", "request": { "call": "c1", "what": 5, "muted": true } },
+  { "name": "a mute that names no call", "command": "callMute", "request": { "what": "microphone", "muted": true } },
+  { "name": "a mute of something else", "command": "callMute", "request": { "call": "c1", "what": "camera", "muted": true } },
+  { "name": "a permit whose closing moment is text", "command": "callPermit", "request": { "call": "c1", "voiceSessionId": "s", "closesAtEpochMs": "1760300000000" } },
+  { "name": "a permit whose closing moment is negative", "command": "callPermit", "request": { "call": "c1", "voiceSessionId": "s", "closesAtEpochMs": -1 } },
+  { "name": "a permit whose closing moment is not a whole number", "command": "callPermit", "request": { "call": "c1", "voiceSessionId": "s", "closesAtEpochMs": 1.5 } },
+  { "name": "a permit that names no session", "command": "callPermit", "request": { "call": "c1", "closesAtEpochMs": 1 } },
+  { "name": "a permit whose call is nothing", "command": "callPermit", "request": { "call": null, "voiceSessionId": "s", "closesAtEpochMs": 1 } },
+  { "name": "an answer that is a number", "command": "callAccept", "request": { "call": "c1", "sdp": 7 } },
+  { "name": "an answer that is missing", "command": "callAccept", "request": { "call": "c1" } },
+  { "name": "an offer whose call is a number", "command": "callOffer", "request": { "call": 1 } },
+  { "name": "an offer that names no call", "command": "callOffer", "request": {} },
+  { "name": "a stop that names no call", "command": "callStop", "request": {} }
+]

@@ -1,8 +1,152 @@
 [
-  { "name": "connection", "frame": { "call": "c1", "seq": 1, "kind": "connection", "state": "connecting" } },
-  { "name": "connected", "frame": { "call": "c1", "seq": 2, "kind": "connection", "state": "connected" } },
-  { "name": "a provider event", "frame": { "call": "c1", "seq": 3, "kind": "provider_event", "bytes": "eyJ0eXBlIjoic2Vzc2lvbi5jcmVhdGVkIn0=" } },
-  { "name": "the first audio", "frame": { "call": "c1", "seq": 4, "kind": "first_audio" } },
-  { "name": "what the microphone is doing", "frame": { "call": "c1", "seq": 5, "kind": "capture", "state": "route_changing" } },
-  { "name": "the end", "frame": { "call": "c1", "seq": 6, "kind": "ended" } }
+  {
+    "name": "a new connection",
+    "frame": {
+      "call": "c1",
+      "seq": 1,
+      "kind": "connection",
+      "state": "new"
+    }
+  },
+  {
+    "name": "connecting",
+    "frame": {
+      "call": "c1",
+      "seq": 2,
+      "kind": "connection",
+      "state": "connecting"
+    }
+  },
+  {
+    "name": "connected",
+    "frame": {
+      "call": "c1",
+      "seq": 3,
+      "kind": "connection",
+      "state": "connected"
+    }
+  },
+  {
+    "name": "disconnected",
+    "frame": {
+      "call": "c1",
+      "seq": 4,
+      "kind": "connection",
+      "state": "disconnected"
+    }
+  },
+  {
+    "name": "failed",
+    "frame": {
+      "call": "c1",
+      "seq": 5,
+      "kind": "connection",
+      "state": "failed"
+    }
+  },
+  {
+    "name": "closed",
+    "frame": {
+      "call": "c1",
+      "seq": 6,
+      "kind": "connection",
+      "state": "closed"
+    }
+  },
+  {
+    "name": "a provider event",
+    "frame": {
+      "call": "c1",
+      "seq": 7,
+      "kind": "provider_event",
+      "bytes": "eyJ0eXBlIjoic2Vzc2lvbi5jcmVhdGVkIn0="
+    }
+  },
+  {
+    "name": "the first audio",
+    "frame": {
+      "call": "c1",
+      "seq": 8,
+      "kind": "first_audio"
+    }
+  },
+  {
+    "name": "the microphone is capturing",
+    "frame": {
+      "call": "c1",
+      "seq": 9,
+      "kind": "capture",
+      "state": "capturing"
+    }
+  },
+  {
+    "name": "the microphone is muted_by_person",
+    "frame": {
+      "call": "c1",
+      "seq": 10,
+      "kind": "capture",
+      "state": "muted_by_person"
+    }
+  },
+  {
+    "name": "the microphone is interrupted",
+    "frame": {
+      "call": "c1",
+      "seq": 11,
+      "kind": "capture",
+      "state": "interrupted"
+    }
+  },
+  {
+    "name": "the microphone is route_changing",
+    "frame": {
+      "call": "c1",
+      "seq": 12,
+      "kind": "capture",
+      "state": "route_changing"
+    }
+  },
+  {
+    "name": "the microphone is suspended_by_system",
+    "frame": {
+      "call": "c1",
+      "seq": 13,
+      "kind": "capture",
+      "state": "suspended_by_system"
+    }
+  },
+  {
+    "name": "the microphone is unavailable",
+    "frame": {
+      "call": "c1",
+      "seq": 14,
+      "kind": "capture",
+      "state": "unavailable"
+    }
+  },
+  {
+    "name": "the microphone is idle",
+    "frame": {
+      "call": "c1",
+      "seq": 15,
+      "kind": "capture",
+      "state": "idle"
+    }
+  },
+  {
+    "name": "news was lost here",
+    "frame": {
+      "call": "c1",
+      "seq": 16,
+      "kind": "lost"
+    }
+  },
+  {
+    "name": "the end",
+    "frame": {
+      "call": "c1",
+      "seq": 17,
+      "kind": "ended"
+    }
+  }
 ]

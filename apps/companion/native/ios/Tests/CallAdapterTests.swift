@@ -39,6 +39,7 @@ private final class FakeEngine: CallEngine {
     var usesDtx: Bool? = true
     var permitted = true
     var isPlaybackMuted = false
+    var isMutedByPerson = false
 
     func offer() async throws -> String {
         asked.append("offer")
@@ -53,7 +54,10 @@ private final class FakeEngine: CallEngine {
         return permitted
     }
 
-    func setMutedByPerson(_ muted: Bool) { asked.append("microphone \(muted)") }
+    func setMutedByPerson(_ muted: Bool) {
+        asked.append("microphone \(muted)")
+        isMutedByPerson = muted
+    }
     func setPlaybackMuted(_ muted: Bool) {
         asked.append("playback \(muted)")
         isPlaybackMuted = muted
@@ -78,11 +82,9 @@ private final class FakeMaker: CallEngineMaker {
 private struct FakeDevice: CallDevice {
     var microphone = true
     var notifications = true
-    var capturing: VoiceCaptureState = .idle
 
     func requestMicrophone(_ answered: @escaping (Bool) -> Void) { answered(microphone) }
     func notificationsAllowed(_ answered: @escaping (Bool) -> Void) { answered(notifications) }
-    func capture() -> VoiceCaptureState { capturing }
 }
 
 /// What the adapter answered, and the news it was given to send.
@@ -157,7 +159,7 @@ final class CallAdapterTests: XCTestCase {
 
     func testEachCommandAnswersWhatTheFixtureHolds() async throws {
         let maker = FakeMaker()
-        let adapter = CallAdapter(maker: maker, device: FakeDevice(capturing: .mutedByPerson))
+        let adapter = CallAdapter(maker: maker, device: FakeDevice())
         let told = Told()
 
         let open = try Fixtures.command("callOpen")
@@ -186,6 +188,8 @@ final class CallAdapterTests: XCTestCase {
         XCTAssertTrue(maker.engine.asked.contains("microphone true"))
         XCTAssertTrue(maker.engine.asked.contains("playback false"))
 
+        // The gate shows the microphone muted, as it reports to the call.
+        maker.reporting?.capture(.mutedByPerson)
         let state = try Fixtures.command("callState", 0)
         let held = await ask(adapter, "callState", state.request)
         XCTAssertEqual(held.result, state.response)
@@ -246,7 +250,25 @@ final class CallAdapterTests: XCTestCase {
         XCTAssertEqual(ended.code, "ended")
     }
 
-    func testTheCallsNewsIsTheFixturesFramesInOrder() async throws {
+    func testEachItemOfNewsIsTheFixturesFrame() throws {
+        let items: [CallItem] = [
+            .connection("new"), .connection("connecting"), .connection("connected"),
+            .connection("disconnected"), .connection("failed"), .connection("closed"),
+            .providerEvent(Data(#"{"type":"session.created"}"#.utf8)), .firstAudio,
+            .capture(.capturing), .capture(.mutedByPerson), .capture(.interrupted),
+            .capture(.routeChanging), .capture(.suspendedBySystem), .capture(.unavailable),
+            .capture(.idle), .lost, .ended,
+        ]
+        let frames = (try Fixtures.json("events.json") as! [[String: Any]]).map { $0["frame"] as! NSDictionary }
+        XCTAssertEqual(frames.count, items.count)
+        for (index, item) in items.enumerated() {
+            let text = CallWire.frame(call: "c1", seq: UInt64(index + 1), item: item)
+            let made = try JSONSerialization.jsonObject(with: Data(text.utf8)) as! NSDictionary
+            XCTAssertEqual(made, frames[index], "item \(index + 1)")
+        }
+    }
+
+    func testTheCallsNewsIsSentInTheOrderItWasReportedAndNumberedAsItIsSent() async throws {
         let maker = FakeMaker()
         let adapter = CallAdapter(maker: maker, device: FakeDevice())
         let told = Told()
@@ -261,8 +283,67 @@ final class CallAdapterTests: XCTestCase {
         reporting.ended()
 
         await fulfillment(of: [told.expectation(frames: 6)], timeout: 10)
-        let expected = (try Fixtures.json("events.json") as! [[String: Any]]).map { $0["frame"] as! NSDictionary }
-        XCTAssertEqual(told.news, expected)
+        XCTAssertEqual(
+            told.news.map { $0["kind"] as? String },
+            ["connection", "connection", "provider_event", "first_audio", "capture", "ended"])
+        XCTAssertEqual(told.news.map { $0["seq"] as? Int }, [1, 2, 3, 4, 5, 6])
+    }
+
+    func testTheBufferKeepsTheOrderAndTellsALossWhereItHappened() throws {
+        let cases = try Fixtures.json("queue.json") as! [[String: Any]]
+        XCTAssertGreaterThanOrEqual(cases.count, 9)
+        func item(_ kind: String) -> CallItem {
+            switch kind {
+            case "provider": return .providerEvent(Data([1]))
+            case "connection": return .connection("connected")
+            case "capture": return .capture(.capturing)
+            case "first_audio": return .firstAudio
+            case "ended": return .ended
+            default: preconditionFailure("the fixture names news of a kind \(kind)")
+            }
+        }
+        func kind(_ entry: CallNewsBuffer.Entry?) -> String {
+            switch entry {
+            case nil: return "none"
+            case .lost?: return "lost"
+            case .news(let news)?:
+                switch news {
+                case .providerEvent: return "provider"
+                case .connection: return "connection"
+                case .capture: return "capture"
+                case .firstAudio: return "first_audio"
+                case .ended: return "ended"
+                case .lost: preconditionFailure("a loss is never queued as news")
+                }
+            }
+        }
+        for found in cases {
+            var buffer = CallNewsBuffer(limit: found["limit"] as! Int)
+            var popped: [String] = []
+            for op in found["ops"] as! [String] {
+                if op.hasPrefix("push ") {
+                    buffer.push(item(String(op.dropFirst(5))))
+                } else {
+                    popped.append(kind(buffer.pop()))
+                }
+            }
+            XCTAssertEqual(popped, found["results"] as! [String], found["name"] as! String)
+        }
+    }
+
+    func testARequestTheOtherHalvesRefuseIsRefusedHereToo() async throws {
+        let refusals = try Fixtures.json("refusals.json") as! [[String: Any]]
+        XCTAssertGreaterThanOrEqual(refusals.count, 15)
+        for found in refusals {
+            let arguments = Fixtures.text(found["request"]!)
+            let adapter = CallAdapter(maker: FakeMaker(), device: FakeDevice())
+            _ = await ask(adapter, "callOpen", #"{"call":"c1","events":"__CHANNEL__:7"}"#, told: Told())
+
+            let answered = await ask(adapter, found["command"] as! String, arguments)
+
+            XCTAssertNil(answered.result, found["name"] as! String)
+            XCTAssertNotNil(answered.code, found["name"] as! String)
+        }
     }
 
     func testNewsOfACallThatHasEndedIsNotNewsOfTheNextOne() async throws {
@@ -284,11 +365,11 @@ final class CallAdapterTests: XCTestCase {
         XCTAssertEqual(told.news.first?["seq"] as? Int, 1, "the new call's news is counted from one")
     }
 
-    func testAProviderEventThatFindsTheQueueFullIsDroppedAndItsNumberIsSpent() async throws {
+    func testAProviderEventDroppedAsTheLastNewsIsStillToldAsLost() async throws {
         let sent = Told()
         let taken = DispatchSemaphore(value: 0)
         let release = DispatchSemaphore(value: 0)
-        let queue = CallNewsQueue(call: "c1", capacity: 1) { text in
+        let queue = CallNewsQueue(call: "c1", limit: 1) { text in
             taken.signal()
             release.wait()
             sent.take(text)
@@ -296,14 +377,33 @@ final class CallAdapterTests: XCTestCase {
 
         queue.offer(.providerEvent(Data([1])))  // taken by the sender, which waits
         taken.wait()
-        queue.offer(.providerEvent(Data([2])))  // waits in the queue
-        queue.offer(.providerEvent(Data([3])))  // finds the queue full
-        queue.offer(.connection("failed"))  // kept whatever the queue holds
-        queue.offer(.ended)
-        for _ in 0..<4 { release.signal() }
+        queue.offer(.providerEvent(Data([2])))  // waits in the buffer
+        queue.offer(.providerEvent(Data([3])))  // finds the buffer full, and nothing follows
+        for _ in 0..<3 { release.signal() }
 
-        await fulfillment(of: [sent.expectation(frames: 4)], timeout: 10)
-        XCTAssertEqual(sent.news.map { $0["seq"] as? Int }, [1, 2, 4, 5], "the dropped event leaves a gap")
-        XCTAssertEqual(sent.news.last?["kind"] as? String, "ended")
+        await fulfillment(of: [sent.expectation(frames: 3)], timeout: 10)
+        XCTAssertEqual(sent.news.map { $0["kind"] as? String }, ["provider_event", "provider_event", "lost"])
+        XCTAssertEqual(sent.news.map { $0["seq"] as? Int }, [1, 2, 3])
+    }
+
+    func testTheEndIsSentWhenTheBufferIsFullAndNothingFollowsIt() async throws {
+        let sent = Told()
+        let taken = DispatchSemaphore(value: 0)
+        let release = DispatchSemaphore(value: 0)
+        let queue = CallNewsQueue(call: "c1", limit: 1) { text in
+            taken.signal()
+            release.wait()
+            sent.take(text)
+        }
+
+        queue.offer(.firstAudio)  // taken by the sender, which waits
+        taken.wait()
+        queue.offer(.providerEvent(Data([1])))  // waits in the buffer
+        queue.offer(.ended)  // takes the place of the provider event
+        queue.offer(.capture(.idle))  // after the end: not queued
+        for _ in 0..<3 { release.signal() }
+
+        await fulfillment(of: [sent.expectation(frames: 3)], timeout: 10)
+        XCTAssertEqual(sent.news.map { $0["kind"] as? String }, ["first_audio", "lost", "ended"])
     }
 }

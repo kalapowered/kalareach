@@ -136,21 +136,25 @@ run_android() {
     "$adb" -s "$serial" shell pm grant "$app_id" android.permission.RECORD_AUDIO
     "$adb" -s "$serial" shell pm grant "$app_id" android.permission.POST_NOTIFICATIONS 2>/dev/null
 
-    "$adb" -s "$serial" shell run-as "$app_id" mkdir -p files/kr-probe
-    "$adb" -s "$serial" shell "run-as $app_id sh -c 'printf \"{\\\"run\\\":\\\"$run\\\"}\" > files/kr-probe/request.json'"
+    # The application reads its data directory, which is the application's own directory on
+    # Android (`activity.dataDir`), and `run-as` starts there.
+    "$adb" -s "$serial" shell run-as "$app_id" mkdir -p kr-probe
+    "$adb" -s "$serial" shell "run-as $app_id sh -c 'printf \"{\\\"run\\\":\\\"$run\\\"}\" > kr-probe/request.json'"
     say "starting the application, run $run"
     "$adb" -s "$serial" shell am start -n "$app_id/.MainActivity" >/dev/null
 
     local waited=0 text=""
     while :; do
-        text="$("$adb" -s "$serial" shell run-as "$app_id" cat "files/kr-probe/$result_name" 2>/dev/null | tr -d '\r')"
+        text="$("$adb" -s "$serial" shell run-as "$app_id" cat "kr-probe/$result_name" 2>/dev/null | tr -d '\r')"
         case "$text" in *done=1*) break ;; esac
         sleep 2
         waited=$((waited + 2))
         [ "$waited" -lt 300 ] || break
     done
     printf '%s\n' "$text" >"$artefacts/$result_name"
-    "$adb" -s "$serial" logcat -d -s kr-voice-call-command:V 2>/dev/null | tail -20 >"$artefacts/logcat.log"
+    # What the application said while it ran, kept for a run that wrote no result.
+    "$adb" -s "$serial" logcat -d --pid="$("$adb" -s "$serial" shell pidof "$app_id" | tr -d '\r')" 2>/dev/null \
+        | tail -200 >"$artefacts/logcat.log"
     "$adb" -s "$serial" emu kill >/dev/null 2>&1
     wait "$emulator" 2>/dev/null
     judge "$artefacts/$result_name"

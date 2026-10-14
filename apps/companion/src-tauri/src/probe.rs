@@ -180,22 +180,22 @@ fn words(heard: &[Heard]) -> String {
             Heard::Event(CallEvent::FirstAudio) => "first_audio".to_owned(),
             Heard::Event(CallEvent::Capture { state }) => format!("capture:{state:?}"),
             Heard::Event(CallEvent::Ended) => "ended".to_owned(),
+            Heard::Event(CallEvent::Lost) => "lost".to_owned(),
         })
         .collect::<Vec<_>>()
         .join(",")
 }
 
-fn refused(
-    result: Result<impl std::fmt::Debug, CallFailure>,
-    kind: &[FailureKind],
-) -> (bool, String) {
+/// Whether a command was refused as one of `kind`. What a command that was not refused returned is
+/// not written down: it can be an offer, whose credentials a result file must not hold.
+fn refused<T>(result: Result<T, CallFailure>, kind: &[FailureKind]) -> (bool, String) {
     match result {
         Err(failure) if kind.contains(&failure.kind) => (true, format!("{:?}", failure.kind)),
         Err(failure) => (
             false,
             format!("refused as {:?}: {}", failure.kind, failure.message),
         ),
-        Ok(value) => (false, format!("was not refused: {value:?}")),
+        Ok(_) => (false, "was not refused".to_owned()),
     }
 }
 
@@ -420,11 +420,11 @@ pub async fn bridge_check(
         words(&settled),
     ));
 
-    // A mute is carried out whatever the microphone was doing. What it shows depends on the
-    // device: a microphone that is capturing reads as muted, and one with no recorder running (a
-    // call whose connection never carries media) stays unavailable, which says more. So the check
-    // holds what must be true either way: the command is accepted, the microphone is never
-    // reported as capturing afterwards, and the news and the state agree.
+    // A mute is carried out whatever the microphone was doing. What the gate shows of it depends on
+    // the device: a microphone that is capturing reads as muted, and one with no recorder running
+    // (a call whose connection never carries media) stays unavailable, which says more. So the
+    // check holds what must be true either way: the person's mute is held, the microphone is never
+    // shown as capturing afterwards, and the news and the state agree.
     match platform.mute(&call, Mute::Microphone, true).await {
         Ok(()) => {
             let heard = hear(&mut permitted.events, AFTER_PERMIT, |_| false).await;
@@ -434,21 +434,27 @@ pub async fn bridge_check(
             });
             match platform.held().await {
                 Ok(held) => checks.push(Check::found(
-                    "a muted microphone is never reported as capturing",
+                    "a muted microphone is held and never reported as capturing",
                     !heard.contains(&Heard::Lost)
+                        && held.microphone_muted
                         && held.capture != CaptureState::Capturing
                         && told.is_none_or(|state| state == held.capture),
-                    format!("state {:?}, news {}", held.capture, words(&heard)),
+                    format!(
+                        "muted {}, state {:?}, news {}",
+                        held.microphone_muted,
+                        held.capture,
+                        words(&heard)
+                    ),
                 )),
                 Err(failure) => checks.push(Check::found(
-                    "a muted microphone is never reported as capturing",
+                    "a muted microphone is held and never reported as capturing",
                     false,
                     failure.message,
                 )),
             }
         }
         Err(failure) => checks.push(Check::found(
-            "a muted microphone is never reported as capturing",
+            "a muted microphone is held and never reported as capturing",
             false,
             failure.message,
         )),
@@ -464,6 +470,16 @@ pub async fn bridge_check(
 struct Request {
     /// Names the run, which the result file's name and its first line repeat.
     run: String,
+}
+
+/// Whether `run` is a name a result file can carry: letters, digits and hyphens, and short.
+#[cfg(any(mobile, test))]
+fn is_a_run_name(run: &str) -> bool {
+    !run.is_empty()
+        && run.len() <= 64
+        && run
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
 }
 
 /// Runs the checks a script asked for, if it asked: the request is read once and taken away.
@@ -482,6 +498,9 @@ pub fn start<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
     let Ok(request) = serde_json::from_str::<Request>(&text) else {
         return;
     };
+    if !is_a_run_name(&request.run) {
+        return;
+    }
     let platform = companion_platform::call::NativeCalls::new(app.clone());
     tauri::async_runtime::spawn(async move {
         let closes_at = u64::try_from(
@@ -561,6 +580,10 @@ mod tests {
         capture: Mutex<CaptureState>,
         /// A bridge that takes the command and does nothing with it.
         ignores_mutes: bool,
+        /// A bridge whose recorder does not run: the gate shows the microphone unavailable.
+        recorder_stopped: bool,
+        /// Whether the person's mute is held.
+        muted: Mutex<bool>,
     }
 
     impl Native {
@@ -570,11 +593,18 @@ mod tests {
                 held: Mutex::new(None),
                 capture: Mutex::new(CaptureState::Idle),
                 ignores_mutes: false,
+                recorder_stopped: false,
+                muted: Mutex::new(false),
             }
         }
 
         fn ignoring_mutes(mut self) -> Self {
             self.ignores_mutes = true;
+            self
+        }
+
+        fn without_a_recorder(mut self) -> Self {
+            self.recorder_stopped = true;
             self
         }
 
@@ -608,6 +638,7 @@ mod tests {
                 self.tell(call, CallEvent::Ended);
             }
             *self.held.lock().unwrap() = None;
+            *self.muted.lock().unwrap() = false;
             self.is_now(CaptureState::Idle);
         }
     }
@@ -662,13 +693,13 @@ mod tests {
         ) -> CallFuture<'a, bool> {
             Box::pin(async move {
                 self.named(call)?;
-                self.is_now(CaptureState::Capturing);
-                self.tell(
-                    call,
-                    CallEvent::Capture {
-                        state: CaptureState::Capturing,
-                    },
-                );
+                let shown = if self.recorder_stopped {
+                    CaptureState::Unavailable
+                } else {
+                    CaptureState::Capturing
+                };
+                self.is_now(shown);
+                self.tell(call, CallEvent::Capture { state: shown });
                 Ok(true)
             })
         }
@@ -677,13 +708,16 @@ mod tests {
             Box::pin(async move {
                 self.named(call)?;
                 if what == Mute::Microphone && muted && !self.ignores_mutes {
-                    self.is_now(CaptureState::MutedByPerson);
-                    self.tell(
-                        call,
-                        CallEvent::Capture {
-                            state: CaptureState::MutedByPerson,
-                        },
-                    );
+                    *self.muted.lock().unwrap() = true;
+                    if !self.recorder_stopped {
+                        self.is_now(CaptureState::MutedByPerson);
+                        self.tell(
+                            call,
+                            CallEvent::Capture {
+                                state: CaptureState::MutedByPerson,
+                            },
+                        );
+                    }
                 }
                 Ok(())
             })
@@ -708,6 +742,7 @@ mod tests {
                 Ok(Held {
                     call,
                     capture: *self.capture.lock().unwrap(),
+                    microphone_muted: *self.muted.lock().unwrap(),
                     playing: false,
                 })
             })
@@ -756,6 +791,56 @@ mod tests {
         );
     }
 
+    /// A recorder that does not run shows the microphone unavailable whatever the person did: the
+    /// mute check passes when the person's mute is held and fails when it is not, so a state that
+    /// never changed cannot pass for a mute that was ignored.
+    #[tokio::test(start_paused = true)]
+    async fn the_mute_check_reads_the_held_mute_when_the_recorder_does_not_run() {
+        let kept = bridge_check(&Native::new(true).without_a_recorder(), 1, &mut |_| {}).await;
+        assert!(kept.iter().all(|check| check.ok), "{kept:#?}");
+
+        let ignored = bridge_check(
+            &Native::new(true).without_a_recorder().ignoring_mutes(),
+            1,
+            &mut |_| {},
+        )
+        .await;
+        let failed: Vec<&str> = ignored
+            .iter()
+            .filter(|check| !check.ok)
+            .map(|check| check.name)
+            .collect();
+        assert_eq!(
+            failed,
+            vec!["a muted microphone is held and never reported as capturing"]
+        );
+    }
+
+    /// A command that was not refused is not written down: an offer's credentials stay out of the
+    /// result file.
+    #[test]
+    fn a_command_that_was_not_refused_writes_down_nothing_it_returned() {
+        let (ok, detail) = refused(
+            Ok::<_, CallFailure>("a=ice-pwd:SECRET".to_owned()),
+            &[FailureKind::Ended],
+        );
+
+        assert!(!ok);
+        assert!(!detail.contains("SECRET"), "{detail}");
+    }
+
+    /// A run is named by letters, digits and hyphens, so the name cannot leave the directory its
+    /// result is written in.
+    #[test]
+    fn a_run_name_cannot_name_a_path() {
+        assert!(is_a_run_name("6250EC7D-2E3F-423D-AEE0-B89F7AEB7D4B"));
+        assert!(!is_a_run_name(""));
+        assert!(!is_a_run_name("../elsewhere"));
+        assert!(!is_a_run_name("a/b"));
+        assert!(!is_a_run_name("a b"));
+        assert!(!is_a_run_name(&"a".repeat(65)));
+    }
+
     /// Against a bridge that takes a mute and goes on reporting the microphone as capturing, the
     /// mute check fails: a command that was accepted and had no effect is not read as one that did.
     #[tokio::test(start_paused = true)]
@@ -769,7 +854,7 @@ mod tests {
             .collect();
         assert_eq!(
             failed,
-            vec!["a muted microphone is never reported as capturing"]
+            vec!["a muted microphone is held and never reported as capturing"]
         );
     }
 

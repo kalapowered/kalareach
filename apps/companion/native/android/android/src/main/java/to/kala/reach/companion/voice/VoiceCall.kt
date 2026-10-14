@@ -477,6 +477,10 @@ class VoiceCall private constructor(
         }
 
         override fun ended() {
+            // The holder is cleared before the end is told, so a command that follows the news of
+            // the end finds the device free. Cleared only if this call is the one published: a call
+            // that was already replaced must not take its replacement's place in the holder with it.
+            VoiceCallHolder.claimStopped(this@VoiceCall)
             observer.onEnded()
             val (open, callback) = synchronized(lock) {
                 val held = connection to routeCallback
@@ -494,9 +498,6 @@ class VoiceCall private constructor(
                 it.dispose()
             }
             events = null
-            // Cleared only if this call is the one published: a call that was already replaced
-            // must not take its replacement's place in the holder with it.
-            VoiceCallHolder.claimStopped(this@VoiceCall)
             callback?.let {
                 context.getSystemService(AudioManager::class.java)?.unregisterAudioDeviceCallback(it)
             }

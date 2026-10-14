@@ -13,8 +13,9 @@ class MainActivity : TauriActivity() {
   override fun onCreate(savedInstanceState: Bundle?) {
     enableEdgeToEdge()
     // Before the platform plugin loads, which finds the voice call through this. It holds the
-    // application's context and no activity, so a call outlives the activity that started it.
-    CallBridgeHolder.register(VoiceCallBridge(applicationContext))
+    // application's context and no activity, so a call outlives the activity that started it, and
+    // it is made once for the process: a recreated activity finds the bridge the call is held by.
+    CallBridgeHolder.registerOnce { VoiceCallBridge(applicationContext) }
     super.onCreate(savedInstanceState)
     // The web view draws behind the system bars and the display cutout, and how much of that a
     // page hears about depends on the web view's version: an older one reports no inset for the

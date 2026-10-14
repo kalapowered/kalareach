@@ -14,17 +14,20 @@
 //! tests of this crate, of the Swift package and of the Kotlin module decode alike.
 //!
 //! News arrives on a bounded queue, and each item carries a number from 1 that native code counts
-//! up. A gap in the numbers, or a queue that was full when news arrived, is reported as
-//! [`Heard::Lost`] and never as silence: a caller that cannot tell whether it missed a capture
-//! state, a connection failure or the end of the call must not carry on as if it had not.
+//! up. News that was lost (a skipped number, a queue that was full, text that is not news, or a
+//! loss native code reports itself) is reported as [`Heard::Lost`] where it was lost, after the
+//! news that came before it and before any that came after, and never as silence: a caller that
+//! cannot tell whether it missed a capture state, a connection failure or the end of the call must
+//! not carry on as if it had not.
 
+use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc;
+use tokio::sync::Notify;
 
 /// How many items of news may wait for the reader before the queue counts them as lost.
 pub const EVENT_QUEUE: usize = 256;
@@ -135,6 +138,9 @@ pub enum CallEvent {
     },
     /// The call ended, whatever ended it, and its microphone is given back.
     Ended,
+    /// Native code dropped some news here. It is told to the reader as [`Heard::Lost`] and is
+    /// never news of its own.
+    Lost,
 }
 
 /// One item of news as it crosses from native code, with the call it is about and its number.
@@ -178,32 +184,182 @@ mod base64_bytes {
     }
 }
 
+/// One place in a call's queue of news: news, or the mark of news that was lost there.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Entry {
+    /// News.
+    Event(CallEvent),
+    /// Some news was lost here.
+    Lost,
+}
+
+/// A call's news waiting for its reader: bounded, in order, with a loss kept in its place.
+///
+/// At most `limit` items of news wait. A provider event that finds the queue full is dropped. Any
+/// other news that finds it full takes the place of the oldest provider event waiting, or, when
+/// there is none, of the oldest news: what was displaced is lost, and the queue holds the mark of
+/// the loss where it happened, one mark for losses that sit together. The end of a call closes
+/// the queue, so nothing is queued after it.
+#[derive(Debug)]
+pub(crate) struct NewsBuffer {
+    entries: VecDeque<Entry>,
+    limit: usize,
+    events: usize,
+    closed: bool,
+}
+
+impl NewsBuffer {
+    pub(crate) fn new(limit: usize) -> Self {
+        Self {
+            entries: VecDeque::new(),
+            limit,
+            events: 0,
+            closed: false,
+        }
+    }
+
+    /// Queues one item of news.
+    pub(crate) fn push(&mut self, event: CallEvent) {
+        if self.closed {
+            return;
+        }
+        if self.events >= self.limit {
+            if matches!(event, CallEvent::ProviderEvent { .. }) {
+                self.mark_lost();
+                return;
+            }
+            let victim = self
+                .entries
+                .iter()
+                .position(|entry| matches!(entry, Entry::Event(CallEvent::ProviderEvent { .. })))
+                .or_else(|| {
+                    self.entries
+                        .iter()
+                        .position(|entry| matches!(entry, Entry::Event(_)))
+                });
+            if let Some(victim) = victim {
+                self.entries[victim] = Entry::Lost;
+                self.events -= 1;
+                self.merge_marks();
+            }
+        }
+        if matches!(event, CallEvent::Ended) {
+            self.closed = true;
+        }
+        self.entries.push_back(Entry::Event(event));
+        self.events += 1;
+    }
+
+    /// Records that news was lost after everything queued so far.
+    pub(crate) fn mark_lost(&mut self) {
+        if !self.closed && !matches!(self.entries.back(), Some(Entry::Lost)) {
+            self.entries.push_back(Entry::Lost);
+        }
+    }
+
+    fn merge_marks(&mut self) {
+        let mut merged = VecDeque::with_capacity(self.entries.len());
+        for entry in self.entries.drain(..) {
+            if entry == Entry::Lost && merged.back() == Some(&Entry::Lost) {
+                continue;
+            }
+            merged.push_back(entry);
+        }
+        self.entries = merged;
+    }
+
+    /// The next place, oldest first.
+    pub(crate) fn pop(&mut self) -> Option<Entry> {
+        let entry = self.entries.pop_front();
+        if matches!(entry, Some(Entry::Event(_))) {
+            self.events -= 1;
+        }
+        entry
+    }
+}
+
+/// What the writing and reading ends of a call's news share.
+#[derive(Debug)]
+struct Shared {
+    state: Mutex<State>,
+    ready: Notify,
+    writers: AtomicUsize,
+}
+
+#[derive(Debug)]
+struct State {
+    buffer: NewsBuffer,
+    /// The number the next item must have.
+    next: u64,
+    /// No writer is left: what is queued is the last there is.
+    closed: bool,
+}
+
+impl Shared {
+    fn state(&self) -> std::sync::MutexGuard<'_, State> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
 /// The writing end of a call's news, held by whatever receives it from native code.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct EventSink {
     call: CallId,
-    queue: mpsc::Sender<EventFrame>,
-    overflowed: Arc<AtomicBool>,
+    shared: Arc<Shared>,
+}
+
+impl Clone for EventSink {
+    fn clone(&self) -> Self {
+        self.shared.writers.fetch_add(1, Ordering::SeqCst);
+        Self {
+            call: self.call.clone(),
+            shared: Arc::clone(&self.shared),
+        }
+    }
+}
+
+impl Drop for EventSink {
+    fn drop(&mut self) {
+        if self.shared.writers.fetch_sub(1, Ordering::SeqCst) == 1 {
+            self.shared.state().closed = true;
+            self.shared.ready.notify_one();
+        }
+    }
 }
 
 impl EventSink {
-    /// Takes one item from native code. News of another call is a late message and is dropped; an
-    /// item that finds the queue full is counted as lost.
+    /// Takes one item from native code. News of another call is a late message and is dropped; a
+    /// number already heard is dropped; a number skipped is a loss, told before the item.
     pub fn deliver(&self, frame: EventFrame) {
         if frame.call != self.call {
             return;
         }
-        if let Err(mpsc::error::TrySendError::Full(_)) = self.queue.try_send(frame) {
-            self.overflowed.store(true, Ordering::SeqCst);
+        {
+            let mut state = self.shared.state();
+            if frame.seq < state.next {
+                return;
+            }
+            if frame.seq > state.next {
+                state.buffer.mark_lost();
+            }
+            state.next = frame.seq + 1;
+            match frame.event {
+                CallEvent::Lost => state.buffer.mark_lost(),
+                event => state.buffer.push(event),
+            }
         }
+        self.shared.ready.notify_one();
     }
 
     /// Takes one item from native code as the JSON text it arrives as. Text that is not an item is
-    /// news that was lost.
+    /// news that was lost, told to the reader where it arrived.
     pub fn deliver_json(&self, text: &str) {
         match serde_json::from_str::<EventFrame>(text) {
             Ok(frame) => self.deliver(frame),
-            Err(_) => self.overflowed.store(true, Ordering::SeqCst),
+            Err(_) => {
+                self.shared.state().buffer.mark_lost();
+                self.shared.ready.notify_one();
+            }
         }
     }
 }
@@ -211,41 +367,25 @@ impl EventSink {
 /// The reading end of a call's news.
 #[derive(Debug)]
 pub struct CallEvents {
-    queue: mpsc::Receiver<EventFrame>,
-    overflowed: Arc<AtomicBool>,
-    /// The number the next item must have.
-    next: u64,
-    /// An item that arrived after a gap, which is read after the gap is reported.
-    after_a_gap: Option<EventFrame>,
+    shared: Arc<Shared>,
 }
 
 impl CallEvents {
-    /// The next item of news, or [`Heard::Lost`] when some was lost, or nothing once the sink is
-    /// gone and the queue is empty.
+    /// The next item of news, or [`Heard::Lost`] where some was lost, or nothing once every sink is
+    /// gone and what was queued has been read. On a phone the channel native code writes to lives
+    /// as long as the process, so a reader there ends a call by reading its `Ended` news.
     pub async fn recv(&mut self) -> Option<Heard> {
         loop {
-            if self.overflowed.swap(false, Ordering::SeqCst) {
-                return Some(Heard::Lost);
-            }
-            let frame = match self.after_a_gap.take() {
-                Some(frame) => frame,
-                None => self.queue.recv().await?,
-            };
-            match frame.seq.cmp(&self.next) {
-                // Heard already.
-                std::cmp::Ordering::Less => {}
-                std::cmp::Ordering::Equal => {
-                    self.next += 1;
-                    return Some(Heard::Event(frame.event));
-                }
-                // Numbers were skipped: the news between is gone. This item is real news and is
-                // read next.
-                std::cmp::Ordering::Greater => {
-                    self.next = frame.seq;
-                    self.after_a_gap = Some(frame);
-                    return Some(Heard::Lost);
+            {
+                let mut state = self.shared.state();
+                match state.buffer.pop() {
+                    Some(Entry::Event(event)) => return Some(Heard::Event(event)),
+                    Some(Entry::Lost) => return Some(Heard::Lost),
+                    None if state.closed => return None,
+                    None => {}
                 }
             }
+            self.shared.ready.notified().await;
         }
     }
 }
@@ -253,20 +393,21 @@ impl CallEvents {
 /// A queue for one call's news, bounded at [`EVENT_QUEUE`].
 #[must_use]
 pub fn event_queue(call: CallId) -> (EventSink, CallEvents) {
-    let (queue, receiver) = mpsc::channel(EVENT_QUEUE);
-    let overflowed = Arc::new(AtomicBool::new(false));
+    let shared = Arc::new(Shared {
+        state: Mutex::new(State {
+            buffer: NewsBuffer::new(EVENT_QUEUE),
+            next: 1,
+            closed: false,
+        }),
+        ready: Notify::new(),
+        writers: AtomicUsize::new(1),
+    });
     (
         EventSink {
             call,
-            queue,
-            overflowed: Arc::clone(&overflowed),
+            shared: Arc::clone(&shared),
         },
-        CallEvents {
-            queue: receiver,
-            overflowed,
-            next: 1,
-            after_a_gap: None,
-        },
+        CallEvents { shared },
     )
 }
 
@@ -353,8 +494,11 @@ pub struct Answered {
 pub struct Held {
     /// The call, when one is held.
     pub call: Option<CallId>,
-    /// What the microphone is doing.
+    /// What the microphone is doing, as the gate shows it.
     pub capture: CaptureState,
+    /// Whether the person has muted their microphone. A fact of its own: a microphone that is not
+    /// running shows as unavailable whatever the person did.
+    pub microphone_muted: bool,
     /// Whether the person has left the model's voice on: false once they silenced it, and false
     /// when no call is held. It says nothing of whether audio is flowing.
     pub playing: bool,
@@ -372,11 +516,12 @@ pub trait CallPlatform: Send + Sync {
     /// Makes the call's offer.
     fn offer<'a>(&'a self, call: &'a CallId) -> CallFuture<'a, String>;
 
-    /// Applies the provider's answer. It starts nothing.
+    /// Applies the provider's answer. It starts nothing. An answer the call cannot use is a failure,
+    /// and the call ends: native code does not keep a call that is half made.
     fn accept<'a>(&'a self, call: &'a CallId, answer: &'a str) -> CallFuture<'a, Answered>;
 
     /// Lets the call carry the microphone until `closes_at_epoch_ms`, once the host has started
-    /// it. False, and nothing changed, when the call is not ready to be permitted.
+    /// it. False, and nothing started, when the call is not ready to be permitted or has ended.
     fn permit<'a>(
         &'a self,
         call: &'a CallId,
@@ -729,12 +874,14 @@ mod tests {
             Held {
                 call: Some(call),
                 capture: CaptureState::MutedByPerson,
+                microphone_muted: true,
                 playing: true
             }
         );
         let idle: Held = serde_json::from_value(of("callState", 1).response).expect("a state");
         assert_eq!(idle.call, None);
         assert_eq!(idle.capture, CaptureState::Idle);
+        assert!(!idle.microphone_muted);
     }
 
     /// Each item of news in the fixture is one Rust reads, and writes back as it is.
@@ -747,7 +894,7 @@ mod tests {
         }
         let news: Vec<News> =
             serde_json::from_str(include_str!("../fixtures/call/events.json")).expect("the news");
-        assert_eq!(news.len(), 6);
+        assert_eq!(news.len(), 17);
         for each in news {
             let frame: EventFrame = serde_json::from_value(each.frame.clone())
                 .unwrap_or_else(|error| panic!("{}: {error}", each.name));
@@ -755,7 +902,7 @@ mod tests {
         }
         let provider: EventFrame = serde_json::from_value(
             serde_json::from_str::<Vec<News>>(include_str!("../fixtures/call/events.json"))
-                .expect("the news")[2]
+                .expect("the news")[6]
                 .frame
                 .clone(),
         )
@@ -799,6 +946,65 @@ mod tests {
         }
     }
 
+    /// The kind of news a fixture's step names.
+    fn event_of(kind: &str) -> CallEvent {
+        match kind {
+            "provider" => CallEvent::ProviderEvent {
+                bytes: b"{}".to_vec(),
+            },
+            "connection" => CallEvent::Connection {
+                state: ConnectionState::Connected,
+            },
+            "capture" => CallEvent::Capture {
+                state: CaptureState::Capturing,
+            },
+            "first_audio" => CallEvent::FirstAudio,
+            "ended" => CallEvent::Ended,
+            other => panic!("the fixture names news of a kind {other}"),
+        }
+    }
+
+    fn kind_of(entry: Option<Entry>) -> &'static str {
+        match entry {
+            None => "none",
+            Some(Entry::Lost) => "lost",
+            Some(Entry::Event(CallEvent::ProviderEvent { .. })) => "provider",
+            Some(Entry::Event(CallEvent::Connection { .. })) => "connection",
+            Some(Entry::Event(CallEvent::Capture { .. })) => "capture",
+            Some(Entry::Event(CallEvent::FirstAudio)) => "first_audio",
+            Some(Entry::Event(CallEvent::Ended)) => "ended",
+            Some(Entry::Event(CallEvent::Lost)) => panic!("a loss is never queued as news"),
+        }
+    }
+
+    /// The buffer behaves as the fixture the Swift and Kotlin buffers are tested against says: the
+    /// order news went in is the order it comes out, a loss comes out where it happened, whatever
+    /// follows it, and the end is never what is dropped.
+    #[test]
+    fn the_buffer_keeps_the_order_and_tells_a_loss_where_it_happened() {
+        #[derive(Deserialize)]
+        struct Case {
+            name: String,
+            limit: usize,
+            ops: Vec<String>,
+            results: Vec<String>,
+        }
+        let cases: Vec<Case> =
+            serde_json::from_str(include_str!("../fixtures/call/queue.json")).expect("the queue");
+        assert!(cases.len() >= 9);
+        for case in cases {
+            let mut buffer = NewsBuffer::new(case.limit);
+            let mut popped = Vec::new();
+            for op in &case.ops {
+                match op.strip_prefix("push ") {
+                    Some(kind) => buffer.push(event_of(kind)),
+                    None => popped.push(kind_of(buffer.pop()).to_owned()),
+                }
+            }
+            assert_eq!(popped, case.results, "{}", case.name);
+        }
+    }
+
     /// The news of a call is read in the order native code numbered it.
     #[tokio::test]
     async fn news_is_read_in_order() {
@@ -814,7 +1020,8 @@ mod tests {
         assert_eq!(events.recv().await, Some(Heard::Event(CallEvent::Ended)));
     }
 
-    /// A skipped number is reported as lost news, once, and the item after the gap is still read.
+    /// A skipped number is reported as lost news where the gap is, once, and the item after the
+    /// gap is still read.
     #[tokio::test]
     async fn a_gap_in_the_numbers_is_reported_as_lost() {
         let call = CallId("c1".to_owned());
@@ -836,33 +1043,72 @@ mod tests {
         assert_eq!(events.recv().await, None, "and only once");
     }
 
-    /// A queue that is full when news arrives reports lost news: the reader is never left with a
-    /// quiet stream that dropped its end.
+    /// News that finds the queue full is lost, and the reader is told so where it was lost, after
+    /// the older news it had not read yet and before any later: the end of a call, the last news
+    /// there is, is never mistaken for the quiet of a call with nothing to say.
     #[tokio::test]
-    async fn news_that_finds_the_queue_full_is_reported_as_lost() {
+    async fn news_that_finds_the_queue_full_is_reported_as_lost_in_its_place() {
         let call = CallId("c1".to_owned());
         let (sink, mut events) = event_queue(call.clone());
+        let provider = || CallEvent::ProviderEvent { bytes: vec![1] };
         for seq in 1..=(EVENT_QUEUE as u64 + 5) {
-            sink.deliver(frame(&call, seq, CallEvent::FirstAudio));
+            sink.deliver(frame(&call, seq, provider()));
         }
+        drop(sink);
 
+        for _ in 0..EVENT_QUEUE {
+            assert_eq!(events.recv().await, Some(Heard::Event(provider())));
+        }
         assert_eq!(events.recv().await, Some(Heard::Lost));
+        assert_eq!(events.recv().await, None);
     }
 
-    /// News of another call, and text that is not news, change nothing but the second is lost.
+    /// News of another call is dropped, and text that is not news is lost where it arrived.
     #[tokio::test]
-    async fn news_of_another_call_is_dropped_and_text_that_is_not_news_is_lost() {
+    async fn news_of_another_call_is_dropped_and_text_that_is_not_news_is_lost_in_its_place() {
         let call = CallId("c1".to_owned());
         let other = CallId("c0".to_owned());
         let (sink, mut events) = event_queue(call.clone());
         sink.deliver(frame(&other, 1, CallEvent::Ended));
         sink.deliver(frame(&call, 1, CallEvent::FirstAudio));
         sink.deliver_json("not json");
+        sink.deliver(frame(&call, 2, CallEvent::Ended));
 
-        assert_eq!(events.recv().await, Some(Heard::Lost));
         assert_eq!(
             events.recv().await,
             Some(Heard::Event(CallEvent::FirstAudio))
         );
+        assert_eq!(events.recv().await, Some(Heard::Lost));
+        assert_eq!(events.recv().await, Some(Heard::Event(CallEvent::Ended)));
+    }
+
+    /// A reader that is already waiting is woken by news that is lost, not only by news.
+    #[tokio::test]
+    async fn a_reader_that_waits_is_woken_by_text_that_is_not_news() {
+        let call = CallId("c1".to_owned());
+        let (sink, mut events) = event_queue(call);
+        let reader = tokio::spawn(async move { events.recv().await });
+        tokio::task::yield_now().await;
+
+        sink.deliver_json("not json");
+
+        assert_eq!(reader.await.expect("the reader ends"), Some(Heard::Lost));
+    }
+
+    /// News native code says it lost is lost to the reader, in its place.
+    #[tokio::test]
+    async fn a_loss_native_code_reports_is_a_loss_to_the_reader() {
+        let call = CallId("c1".to_owned());
+        let (sink, mut events) = event_queue(call.clone());
+        sink.deliver(frame(&call, 1, CallEvent::FirstAudio));
+        sink.deliver(frame(&call, 2, CallEvent::Lost));
+        sink.deliver(frame(&call, 3, CallEvent::Ended));
+
+        assert_eq!(
+            events.recv().await,
+            Some(Heard::Event(CallEvent::FirstAudio))
+        );
+        assert_eq!(events.recv().await, Some(Heard::Lost));
+        assert_eq!(events.recv().await, Some(Heard::Event(CallEvent::Ended)));
     }
 }

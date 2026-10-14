@@ -27,6 +27,7 @@ public protocol CallEngine: AnyObject {
     func setMutedByPerson(_ muted: Bool)
     func setPlaybackMuted(_ muted: Bool)
     var isPlaybackMuted: Bool { get }
+    var isMutedByPerson: Bool { get }
     func stop()
 }
 
@@ -49,6 +50,7 @@ private final class BridgedCall: CallEngine {
     func setMutedByPerson(_ muted: Bool) { call.setMutedByPerson(muted) }
     func setPlaybackMuted(_ muted: Bool) { call.setPlaybackMuted(muted) }
     var isPlaybackMuted: Bool { call.isPlaybackMuted }
+    var isMutedByPerson: Bool { call.isMutedByPerson }
     func stop() { call.stop() }
 }
 
@@ -60,8 +62,6 @@ public protocol CallDevice {
     /// Answers whether the application may post notifications. A call on iOS needs none, so the
     /// person is not asked: this reports what they have already allowed.
     func notificationsAllowed(_ answered: @escaping (Bool) -> Void)
-    /// What the microphone is doing now.
-    func capture() -> VoiceCaptureState
 }
 
 /// What one call tells the adapter. Each call is given a reporter of its own, so a late report of a
@@ -123,8 +123,6 @@ struct ProductCalls: CallEngineMaker, CallDevice {
             }
         }
     }
-
-    func capture() -> VoiceCaptureState { AudioSession.shared.capture }
 }
 
 /// What a command could not do, with the code the plugin rejects it by.
@@ -146,41 +144,114 @@ enum CallItem {
     case firstAudio
     case capture(VoiceCaptureState)
     case ended
+    /// Some news was dropped here. Never queued as news: it marks a place in the queue.
+    case lost
+
+    var isProviderEvent: Bool {
+        if case .providerEvent = self { return true }
+        return false
+    }
 }
 
-/// A call's news on its way to Rust: numbered from 1, in order, and bounded.
+/// A call's news waiting for the sender: bounded, in order, with a loss kept in its place.
+///
+/// At most `limit` items of news wait. A provider event that finds the buffer full is dropped. Any
+/// other news that finds it full takes the place of the oldest provider event waiting, or, when
+/// there is none, of the oldest news: what was displaced is lost, and the buffer holds the mark of
+/// the loss where it happened, one mark for losses that sit together. The end of the call closes
+/// the buffer, so nothing is queued after it. It holds no thread: `CallNewsQueue` sends from it.
+struct CallNewsBuffer {
+    enum Entry {
+        case news(CallItem)
+        case lost
+    }
+
+    private var entries: [Entry] = []
+    private var events = 0
+    private var closed = false
+    private let limit: Int
+
+    init(limit: Int) { self.limit = limit }
+
+    /// Queues one item of news.
+    mutating func push(_ item: CallItem) {
+        if closed { return }
+        if events >= limit {
+            if item.isProviderEvent {
+                markLost()
+                return
+            }
+            let victim =
+                entries.firstIndex { entry in
+                    if case .news(let queued) = entry { return queued.isProviderEvent }
+                    return false
+                }
+                ?? entries.firstIndex { entry in
+                    if case .news = entry { return true }
+                    return false
+                }
+            if let victim = victim {
+                entries[victim] = .lost
+                events -= 1
+                mergeMarks()
+            }
+        }
+        if case .ended = item { closed = true }
+        entries.append(.news(item))
+        events += 1
+    }
+
+    /// Records that news was lost after everything queued so far.
+    mutating func markLost() {
+        if closed { return }
+        if case .lost? = entries.last { return }
+        entries.append(.lost)
+    }
+
+    private mutating func mergeMarks() {
+        var merged: [Entry] = []
+        for entry in entries {
+            if case .lost = entry, case .lost? = merged.last { continue }
+            merged.append(entry)
+        }
+        entries = merged
+    }
+
+    /// The next place, oldest first.
+    mutating func pop() -> Entry? {
+        if entries.isEmpty { return nil }
+        let entry = entries.removeFirst()
+        if case .news = entry { events -= 1 }
+        return entry
+    }
+}
+
+/// A call's news on its way to Rust: numbered from 1 as it is sent, in order, and bounded.
 ///
 /// A call reports from several threads, and sending on the channel Rust gave must not hold one of
-/// them, so news is queued here and sent one item at a time by a queue of its own. A provider event
-/// that finds the queue full is dropped and its number is spent, so Rust sees the gap as lost news
-/// and does not take the quiet for there being nothing to say. Every other kind of news is kept.
+/// them, so news is queued in a `CallNewsBuffer` and sent one item at a time by a queue of its own.
+/// News the buffer dropped is sent as a `lost` item in its place.
 final class CallNewsQueue {
     /// How many items may wait for the sender.
     static let capacity = 256
 
     private let call: String
     private let send: (String) -> Void
-    private let capacity: Int
     private let lock = NSLock()
     private let sender = DispatchQueue(label: "to.kala.reach.call-news")
-    private var pending: [String] = []
+    private var buffer: CallNewsBuffer
     private var seq: UInt64 = 0
     private var draining = false
 
-    init(call: String, capacity: Int = CallNewsQueue.capacity, send: @escaping (String) -> Void) {
+    init(call: String, limit: Int = CallNewsQueue.capacity, send: @escaping (String) -> Void) {
         self.call = call
-        self.capacity = capacity
+        self.buffer = CallNewsBuffer(limit: limit)
         self.send = send
     }
 
     func offer(_ item: CallItem) {
         lock.lock()
-        seq += 1
-        if case .providerEvent = item, pending.count >= capacity {
-            lock.unlock()
-            return
-        }
-        pending.append(CallWire.frame(call: call, seq: seq, item: item))
+        buffer.push(item)
         let start = !draining
         draining = true
         lock.unlock()
@@ -190,12 +261,15 @@ final class CallNewsQueue {
     private func drain() {
         while true {
             lock.lock()
-            guard !pending.isEmpty else {
+            guard let taken = buffer.pop() else {
                 draining = false
                 lock.unlock()
                 return
             }
-            let next = pending.removeFirst()
+            seq += 1
+            let item: CallItem
+            if case .news(let news) = taken { item = news } else { item = .lost }
+            let next = CallWire.frame(call: call, seq: seq, item: item)
             lock.unlock()
             send(next)
         }
@@ -270,6 +344,8 @@ enum CallWire {
             frame["state"] = captureWord(state)
         case .ended:
             frame["kind"] = "ended"
+        case .lost:
+            frame["kind"] = "lost"
         }
         return text(frame)
     }
@@ -299,7 +375,10 @@ public final class CallAdapter: NSObject {
     private let device: CallDevice
     /// Everything below is touched on this queue only, apart from the news, which has its own.
     private let queue = DispatchQueue(label: "to.kala.reach.call-adapter")
-    private var held: (id: String, engine: CallEngine, news: CallNewsQueue)?
+    /// Where the engine's calls that wait (a stop waits for the connection to close, a permit for
+    /// the audio session) run, so they never hold a thread of Swift's cooperative pool.
+    private let engineQueue = DispatchQueue(label: "to.kala.reach.call-engine", attributes: .concurrent)
+    private var held: (id: String, engine: CallEngine, news: CallNewsQueue, capture: VoiceCaptureState)?
     /// The call the observer's reports are for, so a late report of an ended call is not news.
     private var ended: Set<String> = []
 
@@ -344,8 +423,10 @@ public final class CallAdapter: NSObject {
         case "callPermit":
             let permit = try CallWire.decode(CallWire.Permit.self, arguments)
             let engine = try engine(permit.call)
-            let permitted = engine.permit(
-                voiceSessionId: permit.voiceSessionId, closesAtEpochMs: permit.closesAtEpochMs)
+            let permitted = await onTheEngineQueue {
+                engine.permit(
+                    voiceSessionId: permit.voiceSessionId, closesAtEpochMs: permit.closesAtEpochMs)
+            }
             return CallWire.text(["permitted": permitted])
         case "callMute":
             let mute = try CallWire.decode(CallWire.Mute.self, arguments)
@@ -358,7 +439,8 @@ public final class CallAdapter: NSObject {
             return "{}"
         case "callStop":
             let call = try CallWire.decode(CallWire.Call.self, arguments).call
-            try engine(call).stop()
+            let engine = try engine(call)
+            await onTheEngineQueue { engine.stop() }
             // The end is told once, and the call is let go of now, so that the next command to
             // open one does not meet it; the call's own report of its end finds it gone.
             queue.sync {
@@ -374,6 +456,13 @@ public final class CallAdapter: NSObject {
         }
     }
 
+    /// Runs `work`, which may wait, off Swift's cooperative pool, and answers when it is done.
+    private func onTheEngineQueue<T>(_ work: @escaping () -> T) async -> T {
+        await withCheckedContinuation { continuation in
+            engineQueue.async { continuation.resume(returning: work()) }
+        }
+    }
+
     /// The call by that name, or why there is none.
     private func engine(_ call: String) throws -> CallEngine {
         try queue.sync {
@@ -386,11 +475,11 @@ public final class CallAdapter: NSObject {
 
     private func state() -> String {
         queue.sync {
-            let playing = held.map { !$0.engine.isPlaybackMuted } ?? false
             return CallWire.text([
                 "call": held.map { $0.id as Any } ?? NSNull(),
-                "capture": CallWire.captureWord(held == nil ? .idle : device.capture()),
-                "playing": playing,
+                "capture": CallWire.captureWord(held?.capture ?? .idle),
+                "microphoneMuted": held?.engine.isMutedByPerson ?? false,
+                "playing": held.map { !$0.engine.isPlaybackMuted } ?? false,
             ])
         }
     }
@@ -417,7 +506,7 @@ public final class CallAdapter: NSObject {
             made = try queue.sync {
                 guard held == nil else { throw VoiceAudioError.callAlreadyRunning }
                 let engine = try maker.make(reporting: Reporter(call: call, adapter: self))
-                held = (call, engine, queued)
+                held = (call, engine, queued, .idle)
                 return engine
             }
         } catch VoiceAudioError.callAlreadyRunning {
@@ -452,6 +541,7 @@ public final class CallAdapter: NSObject {
         queue.async { [self] in
             guard let held = held, held.id == call else { return }
             if case .ended = item { finish(held.id) }
+            if case .capture(let state) = item { self.held?.capture = state }
             held.news.offer(item)
         }
     }

@@ -121,6 +121,12 @@ class PlatformPlugin(private val activity: Activity) : Plugin(activity) {
 
     @Command
     fun callOpen(invoke: Invoke) {
+        // One opening at a time: it may wait on the person's answer to a permission, and the
+        // platform keeps one answer for that question.
+        if (!CallBridgeHolder.reserveOpening()) {
+            invoke.reject("a call is already being opened", CallRefused.ALREADY_RUNNING)
+            return
+        }
         // The microphone is asked for here, and notifications from Android 13, before anything is
         // made. Refusing notifications does not refuse the call: it is reported, and Rust decides.
         val wanted = buildList {
@@ -131,7 +137,16 @@ class PlatformPlugin(private val activity: Activity) : Plugin(activity) {
                 add("notifications")
             }
         }
-        if (wanted.isEmpty()) openCall(invoke) else requestPermissionForAliases(wanted.toTypedArray(), invoke, "callPermissionsAnswered")
+        try {
+            if (wanted.isEmpty()) {
+                openCall(invoke)
+            } else {
+                requestPermissionForAliases(wanted.toTypedArray(), invoke, "callPermissionsAnswered")
+            }
+        } catch (failure: Throwable) {
+            CallBridgeHolder.releaseOpening()
+            invoke.reject(failure.message ?: failure.toString(), "engine")
+        }
     }
 
     @PermissionCallback
@@ -141,12 +156,19 @@ class PlatformPlugin(private val activity: Activity) : Plugin(activity) {
 
     private fun openCall(invoke: Invoke) {
         if (getPermissionState("microphone") != PermissionState.GRANTED) {
+            CallBridgeHolder.releaseOpening()
             invoke.reject("the microphone is not allowed", CallRefused.MICROPHONE_REFUSED)
             return
         }
-        val arguments = invoke.parseArgs(CallOpenArguments::class.java)
+        val arguments = try {
+            invoke.parseArgs(CallOpenArguments::class.java)
+        } catch (failure: Throwable) {
+            CallBridgeHolder.releaseOpening()
+            invoke.reject(failure.message ?: failure.toString(), "engine")
+            return
+        }
         val notifications = NotificationManagerCompat.from(activity).areNotificationsEnabled()
-        carryOut(invoke) { bridge ->
+        carryOut(invoke, afterwards = CallBridgeHolder::releaseOpening) { bridge ->
             bridge.open(arguments.call, CallNews { frame -> arguments.events.send(JSObject(frame)) })
             CallWire.opened(notifications)
         }
@@ -188,10 +210,14 @@ class PlatformPlugin(private val activity: Activity) : Plugin(activity) {
     @Command
     fun callState(invoke: Invoke) = carryOut(invoke) { bridge -> CallWire.held(bridge.held()) }
 
-    /** Runs one command on the registered bridge and answers `invoke` with its JSON result. */
-    private fun carryOut(invoke: Invoke, command: (CallBridge) -> String) {
+    /**
+     * Runs one command on the registered bridge and answers `invoke` with its JSON result, or with
+     * why it could not, once whatever happens. `afterwards` runs when the command is over.
+     */
+    private fun carryOut(invoke: Invoke, afterwards: () -> Unit = {}, command: (CallBridge) -> String) {
         val bridge = CallBridgeHolder.bridge
         if (bridge == null) {
+            afterwards()
             invoke.reject("this build holds no voice call", "unavailable")
             return
         }
@@ -200,8 +226,11 @@ class PlatformPlugin(private val activity: Activity) : Plugin(activity) {
                 invoke.resolve(JSObject(command(bridge)))
             } catch (refused: CallRefused) {
                 invoke.reject(refused.message, refused.code)
-            } catch (failure: Exception) {
+            } catch (failure: Throwable) {
+                // Anything the command throws is an answer: Rust waits for one and has no deadline.
                 invoke.reject(failure.message ?: failure.toString(), "engine")
+            } finally {
+                afterwards()
             }
         }
     }

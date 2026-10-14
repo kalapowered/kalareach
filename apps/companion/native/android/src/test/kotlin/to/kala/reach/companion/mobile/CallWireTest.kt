@@ -79,11 +79,11 @@ class CallWireTest {
     fun `what the call is doing is what Rust reads`() {
         same(
             cases("callState")[0].getJSONObject("response"),
-            CallWire.held(HeldCall("c1", VoiceCaptureState.MUTED_BY_PERSON, playing = true)),
+            CallWire.held(HeldCall("c1", VoiceCaptureState.MUTED_BY_PERSON, microphoneMuted = true, playing = true)),
         )
         same(
             cases("callState")[1].getJSONObject("response"),
-            CallWire.held(HeldCall(null, VoiceCaptureState.IDLE, playing = false)),
+            CallWire.held(HeldCall(null, VoiceCaptureState.IDLE, microphoneMuted = false, playing = false)),
         )
     }
 
@@ -92,11 +92,22 @@ class CallWireTest {
         val news = fixture("events.json")
         val frames = (0 until news.length()).map { news.getJSONObject(it).getJSONObject("frame") }
         val events = listOf(
+            CallEvent.Connection("new"),
             CallEvent.Connection("connecting"),
             CallEvent.Connection("connected"),
+            CallEvent.Connection("disconnected"),
+            CallEvent.Connection("failed"),
+            CallEvent.Connection("closed"),
             CallEvent.ProviderEvent("""{"type":"session.created"}""".toByteArray()),
             CallEvent.FirstAudio,
+            CallEvent.Capture(VoiceCaptureState.CAPTURING),
+            CallEvent.Capture(VoiceCaptureState.MUTED_BY_PERSON),
+            CallEvent.Capture(VoiceCaptureState.FOCUS_LOST),
             CallEvent.Capture(VoiceCaptureState.ROUTE_CHANGING),
+            CallEvent.Capture(VoiceCaptureState.SUSPENDED_BY_SYSTEM),
+            CallEvent.Capture(VoiceCaptureState.UNAVAILABLE),
+            CallEvent.Capture(VoiceCaptureState.IDLE),
+            CallEvent.Lost,
             CallEvent.Ended,
         )
         assertEquals(frames.size, events.size)
@@ -106,12 +117,78 @@ class CallWireTest {
     }
 
     @Test
+    fun `a request the other halves refuse is refused here too`() {
+        val refusals = fixture("refusals.json")
+        assertTrue(refusals.length() >= 15)
+        for (index in 0 until refusals.length()) {
+            val case = refusals.getJSONObject(index)
+            val request = case.getJSONObject("request").toString()
+            val refused = try {
+                when (case.getString("command")) {
+                    "callMute" -> CallWire.mute(request)
+                    "callPermit" -> CallWire.permit(request)
+                    "callAccept" -> CallWire.answer(request)
+                    "callOffer", "callStop" -> CallWire.call(request)
+                    else -> error("the fixture names a command ${case.getString("command")}")
+                }
+                false
+            } catch (_: IllegalArgumentException) {
+                true
+            }
+            assertTrue(case.getString("name"), refused)
+        }
+    }
+
+    @Test
     fun `focus lost is told as the microphone being interrupted`() {
         assertEquals("interrupted", CallWire.capture(VoiceCaptureState.FOCUS_LOST))
     }
 
+    private fun event(kind: String): CallEvent =
+        when (kind) {
+            "provider" -> CallEvent.ProviderEvent(byteArrayOf(1))
+            "connection" -> CallEvent.Connection("connected")
+            "capture" -> CallEvent.Capture(VoiceCaptureState.CAPTURING)
+            "first_audio" -> CallEvent.FirstAudio
+            "ended" -> CallEvent.Ended
+            else -> error("the fixture names news of a kind $kind")
+        }
+
+    private fun kind(entry: CallNewsBuffer.Entry?): String =
+        when (entry) {
+            null -> "none"
+            CallNewsBuffer.Entry.Lost -> "lost"
+            is CallNewsBuffer.Entry.News ->
+                when (entry.event) {
+                    is CallEvent.ProviderEvent -> "provider"
+                    is CallEvent.Connection -> "connection"
+                    is CallEvent.Capture -> "capture"
+                    CallEvent.FirstAudio -> "first_audio"
+                    CallEvent.Ended -> "ended"
+                    CallEvent.Lost -> error("a loss is never queued as news")
+                }
+        }
+
     @Test
-    fun `news is sent in order, one item at a time, from the thread the caller chose`() {
+    fun `the buffer keeps the order and tells a loss where it happened`() {
+        val cases = fixture("queue.json")
+        assertTrue(cases.length() >= 9)
+        for (index in 0 until cases.length()) {
+            val case = cases.getJSONObject(index)
+            val buffer = CallNewsBuffer(case.getInt("limit"))
+            val popped = mutableListOf<String>()
+            val ops = case.getJSONArray("ops")
+            for (at in 0 until ops.length()) {
+                val op = ops.getString(at)
+                if (op.startsWith("push ")) buffer.push(event(op.removePrefix("push "))) else popped += kind(buffer.pop())
+            }
+            val expected = case.getJSONArray("results")
+            assertEquals(case.getString("name"), (0 until expected.length()).map { expected.getString(it) }, popped)
+        }
+    }
+
+    @Test
+    fun `news is sent in order, numbered as it is sent, one item at a time, from the thread the caller chose`() {
         val sent = mutableListOf<String>()
         val queue = CallNewsQueue("c1", { sent += it })
         val later = ArrayDeque<Runnable>()
@@ -128,32 +205,95 @@ class CallWireTest {
     }
 
     @Test
-    fun `a provider event that finds the queue full is dropped and its number is spent`() {
+    fun `a provider event dropped as the last news is still told as lost`() {
         val sent = mutableListOf<String>()
-        val queue = CallNewsQueue("c1", { sent += it }, capacity = 1)
+        val queue = CallNewsQueue("c1", { sent += it }, limit = 1)
         val later = ArrayDeque<Runnable>()
         queue.offer(CallEvent.ProviderEvent(byteArrayOf(1))) { later.addLast(it) }
         queue.offer(CallEvent.ProviderEvent(byteArrayOf(2))) { later.addLast(it) }
-        queue.offer(CallEvent.Ended) { later.addLast(it) }
 
         later.removeFirst().run()
 
-        val numbers = sent.map { JSONObject(it).getLong("seq") }
-        assertEquals("the dropped event leaves a gap Rust reads as lost news", listOf(1L, 3L), numbers)
-        assertEquals("ended", JSONObject(sent.last()).getString("kind"))
+        assertEquals(listOf("provider_event", "lost"), sent.map { JSONObject(it).getString("kind") })
+        assertEquals(listOf(1L, 2L), sent.map { JSONObject(it).getLong("seq") })
     }
 
     @Test
-    fun `news that is not a provider event is kept whatever the queue holds`() {
+    fun `the end of the call is sent even when the queue is full of other news`() {
         val sent = mutableListOf<String>()
-        val queue = CallNewsQueue("c1", { sent += it }, capacity = 1)
+        val queue = CallNewsQueue("c1", { sent += it }, limit = 1)
         val later = ArrayDeque<Runnable>()
         queue.offer(CallEvent.ProviderEvent(byteArrayOf(1))) { later.addLast(it) }
-        queue.offer(CallEvent.Connection("failed")) { later.addLast(it) }
         queue.offer(CallEvent.Ended) { later.addLast(it) }
+        queue.offer(CallEvent.Capture(VoiceCaptureState.IDLE)) { later.addLast(it) }
 
         later.removeFirst().run()
 
-        assertEquals(listOf("provider_event", "connection", "ended"), sent.map { JSONObject(it).getString("kind") })
+        assertEquals("nothing follows the end", listOf("lost", "ended"), sent.map { JSONObject(it).getString("kind") })
+    }
+
+    @Test
+    fun `the first registration of the bridge stands`() {
+        val first = FakeBridge()
+        var made = 0
+        CallBridgeHolder.registerOnce { first }
+        CallBridgeHolder.registerOnce { made += 1; FakeBridge() }
+
+        assertTrue(CallBridgeHolder.bridge === first)
+        assertEquals("a second bridge is not even made", 0, made)
+    }
+
+    @Test
+    fun `only one opening of a call is under way at a time`() {
+        assertTrue(CallBridgeHolder.reserveOpening())
+        assertFalse(CallBridgeHolder.reserveOpening())
+        CallBridgeHolder.releaseOpening()
+        assertTrue(CallBridgeHolder.reserveOpening())
+        CallBridgeHolder.releaseOpening()
+    }
+
+    @Test
+    fun `a reservation of the opening that was never released lapses`() {
+        CallBridgeHolder.releaseOpening()
+        assertTrue(CallBridgeHolder.reserveOpening(nowMs = 1_000))
+        assertFalse(CallBridgeHolder.reserveOpening(nowMs = 1_000 + CallBridgeHolder.OPENING_LEASE_MS - 1))
+        assertTrue(CallBridgeHolder.reserveOpening(nowMs = 1_000 + CallBridgeHolder.OPENING_LEASE_MS))
+        CallBridgeHolder.releaseOpening()
+    }
+
+    @Test
+    fun `a call is held by one name at a time and one that could not be made is not remembered as ended`() {
+        val names = CallNames()
+        assertTrue(names.hold("c1"))
+        assertFalse(names.hold("c2"))
+
+        names.abandon("c1")
+
+        assertEquals(CallRefused.NO_SUCH_CALL, names.refusal("c1")?.code)
+        assertTrue(names.hold("c2"))
+    }
+
+    @Test
+    fun `a call that ended is told apart from one that never was`() {
+        val names = CallNames()
+        names.hold("c1")
+        assertEquals(null, names.refusal("c1"))
+        assertEquals(CallRefused.NO_SUCH_CALL, names.refusal("c2")?.code)
+
+        names.end("c1")
+
+        assertEquals(CallRefused.ENDED, names.refusal("c1")?.code)
+        assertEquals(CallRefused.NO_SUCH_CALL, names.refusal("c2")?.code)
+        assertFalse(names.isHeld())
+    }
+
+    private class FakeBridge : CallBridge {
+        override fun open(call: String, news: CallNews) = Unit
+        override fun offer(call: String) = ""
+        override fun accept(call: String, sdp: String) = false
+        override fun permit(call: String, voiceSessionId: String, closesAtEpochMs: Long) = false
+        override fun setMuted(call: String, what: CallMute, muted: Boolean) = Unit
+        override fun stop(call: String) = Unit
+        override fun held() = HeldCall(null, VoiceCaptureState.IDLE, microphoneMuted = false, playing = false)
     }
 }
