@@ -32,6 +32,27 @@ pub async fn with_account_origin<F: Future>(origin: Option<String>, start: F) ->
     }
 }
 
+tokio::task_local! {
+    /// The bound a brokered Git read is given, for the daemon being started in this task.
+    static GIT_READ_BOUND: Duration;
+}
+
+/// Runs `start` so that the daemon it starts ends a brokered Git read at `bound`, in place of the
+/// minute the project service gives one.
+///
+/// The service's own bound is its choice of how long a wedged Git child is waited for. A suite that
+/// is about something other than that choice should not end because a loaded machine did not run a
+/// Git child for a minute: it gives the daemon a bound that only ends a child that never finishes,
+/// and a child that finishes is answered whenever it does.
+pub async fn with_git_read_bound<F: Future>(bound: Duration, start: F) -> F::Output {
+    GIT_READ_BOUND.scope(bound, start).await
+}
+
+/// The bound a suite gave the Git reads of the daemon being started, when it did.
+pub(crate) fn git_read_bound() -> Option<Duration> {
+    GIT_READ_BOUND.try_with(|bound| *bound).ok()
+}
+
 /// The environment variable that stands the account service at an origin for a daemon a suite
 /// runs as a program of its own, which no task of the suite starts.
 pub const ACCOUNT_ORIGIN_VARIABLE: &str = "KR_TEST_ACCOUNT_ORIGIN";

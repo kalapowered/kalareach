@@ -143,6 +143,14 @@ pub fn loopback() -> EndpointConfig {
     }
 }
 
+/// How long a Git read of a daemon these suites start may run before it is taken for hung.
+///
+/// The project service ends a Git read at a bound of its own, a minute, so that a wedged child is
+/// noticed. These suites are about what the network lets a device do, not about that bound, and a
+/// machine that does not run a Git child for a minute would end them for a reason they are not
+/// about. A read that finishes is answered whenever it does; this ends one that never does.
+const HUNG_GIT_READ: Duration = Duration::from_secs(600);
+
 /// One daemon, its local endpoint and its network, with a temporary environment of its own.
 pub struct Host {
     temp: kr_ipc::testing::TempHost,
@@ -611,28 +619,31 @@ impl Host {
                 shell_packages: None,
                 terminal: Box::new(kr_controller::supervision::NoTerminal),
             };
-            kr_controller::testing::with_account_origin(account_origin.clone(), async {
-                match &waits.timer {
-                    Some(timer) if waits.reader_shares_the_timer => {
-                        Box::pin(Controller::start_on_clocks_and_timer(
-                            setup,
-                            clocks.clone(),
-                            Arc::clone(timer),
-                        ))
-                        .await
+            kr_controller::testing::with_git_read_bound(
+                HUNG_GIT_READ,
+                kr_controller::testing::with_account_origin(account_origin.clone(), async {
+                    match &waits.timer {
+                        Some(timer) if waits.reader_shares_the_timer => {
+                            Box::pin(Controller::start_on_clocks_and_timer(
+                                setup,
+                                clocks.clone(),
+                                Arc::clone(timer),
+                            ))
+                            .await
+                        }
+                        Some(timer) => {
+                            Box::pin(Controller::start_on_clocks_and_timers(
+                                setup,
+                                clocks.clone(),
+                                Arc::clone(timer),
+                                kr_controller::testing::HeldTimer::held(),
+                            ))
+                            .await
+                        }
+                        None => Box::pin(Controller::start_on_clocks(setup, clocks.clone())).await,
                     }
-                    Some(timer) => {
-                        Box::pin(Controller::start_on_clocks_and_timers(
-                            setup,
-                            clocks.clone(),
-                            Arc::clone(timer),
-                            kr_controller::testing::HeldTimer::held(),
-                        ))
-                        .await
-                    }
-                    None => Box::pin(Controller::start_on_clocks(setup, clocks.clone())).await,
-                }
-            })
+                }),
+            )
         })
         .await
         .unwrap_or_else(|error| panic!("the daemon starts: {error}"));
