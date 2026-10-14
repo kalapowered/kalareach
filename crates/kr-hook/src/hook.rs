@@ -577,10 +577,15 @@ mod tests {
     /// deadline.
     const ATTEMPTS: usize = 30;
 
+    /// How long a test waits for the writer of a line a run handed it. The run does not wait that
+    /// long: the figure only ends a writer that never finishes.
+    const HUNG_WRITER: Duration = Duration::from_secs(30);
+
     /// What one run did when its work reported at once.
     struct Immediate {
         answered: bool,
-        /// What was written to standard error, as text.
+        /// The whole of what the run handed its writer for standard error, as text, however late
+        /// that writer ran: empty when the run handed it nothing.
         said: String,
         /// How long the call took, from the run's start to its return.
         ran_for: Duration,
@@ -590,19 +595,30 @@ mod tests {
     ///
     /// The work is on a thread of its own, as in a run, and a machine that keeps it off the
     /// processor past the deadline makes the run answer at its deadline instead: such a run says
-    /// so, and shows nothing about the branch the caller is after.
+    /// so, and shows nothing about the branch the caller is after. A run does not wait for its
+    /// writer past its bound, so the writer says when it has written: the line is read once it
+    /// has, and a run that handed the writer nothing is the one whose writer was never given a
+    /// line.
     fn immediate(outcome: Result<(), String>) -> Immediate {
         let said = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let into = std::sync::Arc::clone(&said);
+        let (written, line) = std::sync::mpsc::channel::<()>();
         let started = std::time::Instant::now();
         let mut answered = false;
         run_with(
             started,
             move |_| outcome,
             || answered = true,
-            move |bytes| into.lock().expect("the line").extend_from_slice(bytes),
+            move |bytes| {
+                into.lock().expect("the line").extend_from_slice(bytes);
+                let _ = written.send(());
+            },
         );
         let ran_for = started.elapsed();
+        assert!(
+            line.recv_timeout(HUNG_WRITER) != Err(std::sync::mpsc::RecvTimeoutError::Timeout),
+            "the writer of the line the run handed it never finished"
+        );
         let said = String::from_utf8_lossy(&said.lock().expect("the line")).into_owned();
         Immediate {
             answered,
@@ -616,11 +632,13 @@ mod tests {
     /// what the machine takes to start the process and to let it end is not in it.
     #[test]
     fn a_run_whose_work_finishes_answers_inside_the_session_end_timeout_and_says_nothing() {
+        let mut last = String::new();
         for _ in 0..ATTEMPTS {
             let ran = immediate(Ok(()));
             assert!(ran.answered, "the answer is written");
             if ran_out_of_its_deadline(&ran.said) {
                 // The work thread was kept off the processor for the whole deadline.
+                last = ran.said;
                 continue;
             }
             assert_eq!(ran.said, "", "a diagnostic was written");
@@ -631,7 +649,9 @@ mod tests {
             );
             return;
         }
-        panic!("no run of {ATTEMPTS} had its work report before its deadline");
+        panic!(
+            "no run of {ATTEMPTS} had its work report before its deadline; the last said {last:?}"
+        );
     }
 
     /// A run whose work never finishes, with a standard error nobody reads, is held by neither
@@ -672,11 +692,13 @@ mod tests {
     /// A run whose work failed says why, with how long it had run when its answer was written.
     #[test]
     fn a_run_whose_work_failed_says_why_and_when_it_answered() {
+        let mut last = String::new();
         for _ in 0..ATTEMPTS {
             let ran = immediate(Err("the input was not an event".to_owned()));
             assert!(ran.answered, "the answer is written");
-            if ran.said.is_empty() || ran_out_of_its_deadline(&ran.said) {
-                // The work thread, or the writer's, was kept off the processor past the bound.
+            if ran_out_of_its_deadline(&ran.said) {
+                // The work thread was kept off the processor for the whole deadline.
+                last = ran.said;
                 continue;
             }
             assert!(
@@ -696,7 +718,9 @@ mod tests {
             );
             return;
         }
-        panic!("no run of {ATTEMPTS} had its work fail before its deadline");
+        panic!(
+            "no run of {ATTEMPTS} had its work fail before its deadline; the last said {last:?}"
+        );
     }
 
     /// Every application this forwarder serves.
