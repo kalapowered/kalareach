@@ -43,7 +43,7 @@ const SYMBOLS: usize = PAYLOAD_LEN * 8 / 5 + 1;
 const GROUP: usize = 4;
 
 /// Crockford's base32 alphabet: the digits and the letters, without `I`, `L`, `O` and `U`.
-const ALPHABET: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+pub(super) const ALPHABET: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 
 /// The most bytes a recovery kit may render to.
 ///

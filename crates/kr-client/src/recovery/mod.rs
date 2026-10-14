@@ -41,6 +41,7 @@ mod kit;
 mod record;
 mod restore;
 mod settings;
+mod setup;
 
 use kr_protocol::ids::SyncConflictId;
 use kr_protocol::scalars::Digest256;
@@ -68,6 +69,7 @@ pub use crate::recovery::restore::{FreshRestore, RetrievalPolicy, ServiceAccess,
 pub use crate::recovery::settings::{
     ExportedSettings, ImportedSettings, SETTINGS_FILENAME, export_settings, import_settings,
 };
+pub use crate::recovery::setup::{PreparedSetup, SetupInputs, kit_fingerprint, prepare_setup};
 // One definition of what a backup carries, in the crate that owns the backup layer. A device and a
 // host that answered this question separately could answer it differently; they ask the same table.
 pub use kr_crypto::backup::{

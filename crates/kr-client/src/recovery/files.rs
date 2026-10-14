@@ -1094,7 +1094,7 @@ fn is_an_identifier(text: &str) -> bool {
 /// A gateway origin has one canonical spelling, so the configured origin and the kit's entry for it
 /// are the same text. The bundle key is derived from that text byte for byte, so a kit that spells
 /// the origin another way names a service this host is not configured for.
-fn kit_origin_for(kit: &RecoveryKit, configured: &str) -> Option<String> {
+pub(super) fn kit_origin_for(kit: &RecoveryKit, configured: &str) -> Option<String> {
     GatewayOrigin::new(configured).ok()?;
     kit.service_origins
         .iter()
