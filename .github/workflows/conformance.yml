@@ -156,18 +156,6 @@ jobs:
         timeout-minutes: 10
         run: bash scripts/disk-report.sh begin "the image as it arrives"
 
-      - name: Probe the simulator tools
-        timeout-minutes: 15
-        run: |
-          echo "RUNNER_ENVIRONMENT=$RUNNER_ENVIRONMENT"
-          xcrun simctl runtime 2>&1 | head -80 || true
-          ls -la /Library/Developer/CoreSimulator /Library/Developer/CoreSimulator/Images 2>&1 | head -40 || true
-          sudo du -k -d 3 /Library/Developer/CoreSimulator/Caches 2>/dev/null | sort -nr | head -40 || true
-          xcrun simctl runtime list -j | head -60 || true
-          sudo -n true && echo "passwordless sudo"
-          xcodebuild -version
-          xcrun simctl list devices available 2>&1 | head -30 || true
-
       # The runner image carries a simulator runtime for each Xcode platform and release, about
       # 113 GB of disk images with 54 GB of caches made from them, and nothing in this job's
       # groups uses more than one: the iOS application's unit tests run in the simulator of the

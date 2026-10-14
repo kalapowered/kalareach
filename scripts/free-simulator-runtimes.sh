@@ -17,7 +17,8 @@
 #
 # This changes the machine it runs on, so it refuses to run anywhere but a GitHub-hosted runner,
 # whose disk is the job's own and is gone when the job ends. A runtime that cannot be removed is
-# named in a warning and left; the free space is printed before and after.
+# named in a warning and left; the free space is printed before and after. Removing a runtime also
+# removes the dyld shared cache made from it.
 
 set -euo pipefail
 
@@ -37,6 +38,7 @@ if [ "$(uname -s)" != Darwin ] || [ "${RUNNER_ENVIRONMENT:-}" != github-hosted ]
 fi
 
 volume=/System/Volumes/Data
+started_all=$SECONDS
 echo "== before: $(df -h "$volume" | awk 'NR == 2 { print $4 " free of " $2 }')"
 xcrun simctl runtime list || true
 
@@ -65,17 +67,31 @@ for runtime in runtimes:
 removed=0
 for identifier in $doomed; do
     started=$SECONDS
-    # The cache goes with the runtime that made it, and a runtime that stays keeps its own.
-    xcrun simctl runtime dyld_shared_cache remove "$identifier" || echo "no cache removed for $identifier"
     if xcrun simctl runtime delete "$identifier"; then
         removed=$((removed + 1))
-        echo "removed $identifier in $((SECONDS - started)) s"
+        echo "asked for $identifier to be removed in $((SECONDS - started)) s"
     else
         echo "::warning::the simulator runtime $identifier could not be removed"
     fi
 done
-echo "removed $removed of $(printf '%s\n' "$doomed" | grep -c .) simulator runtimes"
+echo "asked for $removed of $(printf '%s\n' "$doomed" | grep -c .) simulator runtimes to be removed"
 
-echo "== after: $(df -h "$volume" | awk 'NR == 2 { print $4 " free of " $2 }')"
+# A runtime is listed as Deleting until its image is gone, and the room comes back as the images go,
+# which takes minutes. The build waits for it, so that it does not compete with the removal for the
+# disk and so that the figures printed after this step are the last ones.
+deadline=$((SECONDS + 1200))
+while :; do
+    listing="$(xcrun simctl runtime list || true)"
+    case "$listing" in
+        *"(Deleting)"*) ;;
+        *) break ;;
+    esac
+    if [ "$SECONDS" -ge "$deadline" ]; then
+        echo "::warning::simulator runtimes were still being removed after twenty minutes"
+        break
+    fi
+    sleep 10
+done
+
+echo "== after, $((SECONDS - started_all)) s later: $(df -h "$volume" | awk 'NR == 2 { print $4 " free of " $2 }')"
 xcrun simctl runtime list || true
-du -skx /Library/Developer/CoreSimulator/Caches 2> /dev/null | awk '{ printf "the simulators'"'"' caches that remain: %.1f GiB\n", $1 / 1048576 }' || true
