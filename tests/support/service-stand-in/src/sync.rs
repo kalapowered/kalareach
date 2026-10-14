@@ -300,7 +300,7 @@ fn write(
     }
     if !funded {
         return refusal(
-            403,
+            402,
             "QUOTA_EXHAUSTED",
             "This account has no backup storage to write the recovery bundle to.",
         );
