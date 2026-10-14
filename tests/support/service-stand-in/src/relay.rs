@@ -120,7 +120,8 @@ pub struct RelayLeaseView {
     pub ended_for: Option<&'static str>,
 }
 
-/// What an account's authorisation gives a host: the ids a host names to be paid for by the account.
+/// What an account's authorisation gives a host: the ids a host names to be paid for by the
+/// account.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RelayPayerRecord {
     /// The account that pays.
