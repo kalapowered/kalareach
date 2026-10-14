@@ -1842,10 +1842,19 @@ fn sync_removal(path: &Path) -> Result<()> {
 /// Makes every removal under the staging root durable: the directory of each generation, then the
 /// root.
 pub(super) fn flush_staging_tree(root: &Path) -> Result<()> {
-    // A root that is gone has nothing in it to flush: the nearest directory that is there holds
-    // the removal, and the next write of a file makes the root again.
+    // A root that is gone has nothing in it to flush: the removal changed the entry in the nearest
+    // directory that is there, which is the only one to flush (none above it is changed), and the
+    // next write of a file makes the root again.
     if !root.exists() {
-        return sync_removal(root);
+        let mut directory = root.parent();
+        while let Some(current) = directory {
+            if current.exists() {
+                return flush_directory(current, NameKind::Directory)
+                    .map_err(ControllerError::registry);
+            }
+            directory = current.parent();
+        }
+        return Ok(());
     }
     for entry in std::fs::read_dir(root).map_err(ControllerError::registry)? {
         let path = entry.map_err(ControllerError::registry)?.path();
