@@ -1203,14 +1203,21 @@ pub struct PairedDial {
 }
 
 impl PairedDial {
-    /// One connection of the device's to the host, authorised as the device.
+    /// One connection of the device's to the host, authorised as the device. An attempt the
+    /// transport gave up on without an answer is made again; a connection the host refused is not.
     pub async fn dial(&self) -> NetworkTransport {
-        NetworkTransport::connect(
-            &self.endpoint,
-            self.addr.clone(),
-            &self.identity,
-            &self.host_record,
-            SendLimits::default(),
+        pairing::until_answered(
+            async || {
+                NetworkTransport::connect(
+                    &self.endpoint,
+                    self.addr.clone(),
+                    &self.identity,
+                    &self.host_record,
+                    SendLimits::default(),
+                )
+                .await
+            },
+            pairing::transport_gave_up_unanswered,
         )
         .await
         .expect("the paired device connects")
@@ -1255,9 +1262,12 @@ pub struct RawDevice {
 impl RawDevice {
     /// Connects a paired device and claims the receive side of its control stream.
     pub async fn connect(host: &Host, device: &Device, record: &DeviceRecord) -> Self {
-        Self::try_connect(host, device, record)
-            .await
-            .expect("the paired device connects")
+        pairing::until_answered(
+            async || Self::try_connect(host, device, record).await,
+            pairing::transport_gave_up_unanswered,
+        )
+        .await
+        .expect("the paired device connects")
     }
 
     /// Connects a device under the identity `record` gave it, and returns why the host did not let
