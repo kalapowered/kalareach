@@ -1892,11 +1892,7 @@ async fn refused_challenge(
     for socket in host.network().bound_sockets() {
         addr = addr.with_ip_addr(socket);
     }
-    let connection = candidate
-        .endpoint
-        .connect(addr, kr_protocol::hello::ALPN)
-        .await
-        .expect("the candidate reaches the host");
+    let connection = calls::dial_until_connected(candidate.endpoint, addr).await;
     let mut unpaired = kr_transport::handshake::connect_unpaired(&connection, candidate.identity)
         .await
         .expect("an unpaired connection");
@@ -1928,11 +1924,8 @@ async fn refused_direct_proof(
 
     let candidate = candidate.candidate();
     let payload = calls::direct_payload(open);
-    let connection = candidate
-        .endpoint
-        .connect(calls::host_addr(&payload), kr_protocol::hello::ALPN)
-        .await
-        .expect("the candidate reaches the host");
+    let connection =
+        calls::dial_until_connected(candidate.endpoint, calls::host_addr(&payload)).await;
     let mut unpaired = kr_transport::handshake::connect_unpaired(&connection, candidate.identity)
         .await
         .expect("an unpaired connection");
