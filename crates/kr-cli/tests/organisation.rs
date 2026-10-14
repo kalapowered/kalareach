@@ -383,7 +383,7 @@ async fn an_enrolment_stops_where_only_an_owner_device_can_go_on() {
 async fn an_invitation_for_an_organisation_the_host_is_not_enrolled_in_is_refused() {
     let host = Host::start().await;
     let organisation = OrganisationId::new(Uuid::from_bytes([0x21; 16])).to_string();
-    let output = host.kr(&["pair", "invite", "--view", "--organisation", &organisation]);
+    let output = host.kr(&["pair", "invite", "--guest", "--organisation", &organisation]);
     assert!(!output.status.success(), "nothing to name");
     let said = String::from_utf8_lossy(&output.stderr);
     assert!(
@@ -395,7 +395,7 @@ async fn an_invitation_for_an_organisation_the_host_is_not_enrolled_in_is_refuse
     let output = host.kr(&[
         "pair",
         "invite",
-        "--view",
+        "--guest",
         "--organisation",
         "not-an-identifier",
     ]);
