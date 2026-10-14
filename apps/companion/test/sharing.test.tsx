@@ -1351,7 +1351,10 @@ describe('what is left of the sharing page when a control goes', () => {
     await waitFor(() => {
       expect(screen.queryByTestId('screen-changed')).toBeNull()
     })
-    expect(document.body).not.toHaveFocus()
+    // The first invitation's own row went with its withdrawal and the second note was dismissed
+    // meanwhile, so focus goes to the row of the invitation that is still listed.
+    const remaining = screen.getByText('Guest tablet', { selector: '.access-name' }).closest('[data-nav]')
+    expect(remaining).toHaveFocus()
   })
 
   it('does not leave focus on the page behind the hand-over sheet when asking gives way to waiting', async () => {
