@@ -1011,6 +1011,206 @@ fn a_recovery_gap_survives_reopening_the_journal() {
 }
 
 // ---------------------------------------------------------------------------------------------
+// A journal opened while the process that held it is still letting go
+// ---------------------------------------------------------------------------------------------
+
+/// A mapping of a journal's index file, held by this test the way a process that is ending holds
+/// it: mapped, with no lock on the index.
+///
+/// The system removes a process's mappings after it has released its locks, so for that interval
+/// an index nobody has locked is one nobody may reset.
+#[cfg(windows)]
+mod held_index {
+    use std::os::windows::ffi::OsStrExt as _;
+    use std::path::Path;
+
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_ALWAYS,
+    };
+    use windows_sys::Win32::System::Memory::{
+        CreateFileMappingW, FILE_MAP_READ, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS,
+        MapViewOfFile, PAGE_READWRITE, UnmapViewOfFile,
+    };
+
+    /// The size of one region of a write-ahead index.
+    const REGION: u32 = 32 * 1024;
+
+    /// A file, a mapping of it and a view of the mapping, held until this is dropped.
+    ///
+    /// The three are kept as integers, so the value can be handed to the hook a test leaves for
+    /// the store's next wait.
+    pub struct HeldIndex {
+        file: usize,
+        mapping: usize,
+        view: usize,
+    }
+
+    impl HeldIndex {
+        /// Maps the index file at `index`, making it if it is not there.
+        #[expect(unsafe_code, reason = "mapping a file has no safe form")]
+        pub fn on(index: &Path) -> Self {
+            let name: Vec<u16> = index
+                .as_os_str()
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect();
+            // SAFETY: `name` is a terminated wide string that outlives the call, and the other
+            // arguments are plain values or null.
+            let file = unsafe {
+                CreateFileW(
+                    name.as_ptr(),
+                    0xC000_0000,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE,
+                    std::ptr::null(),
+                    OPEN_ALWAYS,
+                    FILE_ATTRIBUTE_NORMAL,
+                    std::ptr::null_mut(),
+                )
+            };
+            assert_ne!(file, INVALID_HANDLE_VALUE, "the index file opens");
+            // SAFETY: `file` is the open handle above; a mapping with a size extends the file to
+            // it.
+            let mapping = unsafe {
+                CreateFileMappingW(
+                    file,
+                    std::ptr::null(),
+                    PAGE_READWRITE,
+                    0,
+                    REGION,
+                    std::ptr::null(),
+                )
+            };
+            assert!(!mapping.is_null(), "the index file maps");
+            // SAFETY: `mapping` is the mapping above, and the view is of the region it maps.
+            let view = unsafe {
+                MapViewOfFile(
+                    mapping,
+                    FILE_MAP_READ | FILE_MAP_WRITE,
+                    0,
+                    0,
+                    REGION as usize,
+                )
+            };
+            assert!(!view.Value.is_null(), "the mapping has a view");
+            Self {
+                file: file as usize,
+                mapping: mapping as usize,
+                view: view.Value as usize,
+            }
+        }
+    }
+
+    impl Drop for HeldIndex {
+        #[expect(unsafe_code, reason = "releasing a mapping has no safe form")]
+        fn drop(&mut self) {
+            // SAFETY: each value is the one `on` made, released once and in the order the system
+            // needs: the view, then the mapping, then the file.
+            unsafe {
+                UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
+                    Value: self.view as *mut std::ffi::c_void,
+                });
+                CloseHandle(self.mapping as *mut std::ffi::c_void);
+                CloseHandle(self.file as *mut std::ffi::c_void);
+            }
+        }
+    }
+}
+
+/// A journal with one receipt in it, closed again, and the path of its index file.
+#[cfg(windows)]
+fn a_closed_journal(name: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+    let path = journal_path(name);
+    {
+        let mut journal = Journal::open(&path).expect("opens");
+        journal.accept(&submission(5, 5)).expect("accepts");
+    }
+    let mut index = path.clone().into_os_string();
+    index.push("-shm");
+    (path, std::path::PathBuf::from(index))
+}
+
+/// A process that is ending has released its locks on a journal's index and not yet its mapping
+/// of it, and a process that opens the journal then is told its disk failed. Every way of opening
+/// a journal asks again until the previous holder has let go, instead of reporting that.
+#[cfg(windows)]
+#[test]
+fn every_way_of_opening_a_journal_waits_for_a_holder_that_has_not_let_go_of_its_index() {
+    use std::path::Path;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let (path, index) = a_closed_journal("previous-holder-lets-go");
+    let openers: [(&str, fn(&Path) -> kr_worker::Result<()>); 4] = [
+        ("open", |path| Journal::open(path).map(drop)),
+        ("open_existing", |path| {
+            Journal::open_existing(path).map(drop)
+        }),
+        ("open_read_only", |path| {
+            Journal::open_read_only(path).map(drop)
+        }),
+        ("recorded_schema_version", |path| {
+            Journal::recorded_schema_version(path).map(drop)
+        }),
+    ];
+    for (name, open) in openers {
+        let held = held_index::HeldIndex::on(&index);
+        // The premise: the store itself refuses while the index is held this way.
+        let refused = rusqlite::Connection::open_with_flags(
+            &path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .and_then(|connection| {
+            connection.query_row("SELECT version FROM schema_version", [], |row| {
+                row.get::<_, i64>(0)
+            })
+        });
+        assert!(
+            matches!(
+                &refused,
+                Err(rusqlite::Error::SqliteFailure(failure, _))
+                    if failure.extended_code == rusqlite::ffi::SQLITE_IOERR_TRUNCATE
+            ),
+            "{name}: the held index makes the store refuse: {refused:?}"
+        );
+
+        let waited = Arc::new(AtomicBool::new(false));
+        let signal = Arc::clone(&waited);
+        kr_worker::persistence::release::on_the_next_wait(move || {
+            signal.store(true, Ordering::SeqCst);
+            drop(held);
+        });
+        let opened = open(&path);
+        // A refusal that was given at once leaves the hook for the next case to find.
+        kr_worker::persistence::release::on_the_next_wait(|| {});
+        assert!(
+            waited.load(Ordering::SeqCst),
+            "{name}: the open reported the refusal instead of waiting for the holder: {opened:?}"
+        );
+        opened.unwrap_or_else(|error| panic!("{name}: the open went on after the wait: {error}"));
+    }
+    std::fs::remove_dir_all(path.parent().expect("a parent")).ok();
+}
+
+/// A holder that does not let go is not waited for for ever: the open reports what the store said,
+/// with the store's own result code, which is what tells this failure from a disk that failed.
+#[cfg(windows)]
+#[test]
+fn an_open_that_a_holder_never_lets_go_of_reports_the_stores_result_code() {
+    let (path, index) = a_closed_journal("previous-holder-stays");
+    let held = held_index::HeldIndex::on(&index);
+    let refused = Journal::open_read_only(&path).expect_err("the index is still held");
+    let kr_worker::WorkerError::JournalUnavailable { detail } = &refused else {
+        panic!("a journal that cannot be read is unavailable: {refused:?}");
+    };
+    assert!(
+        detail.contains(&rusqlite::ffi::SQLITE_IOERR_TRUNCATE.to_string()),
+        "the refusal names the store's result code: {detail}"
+    );
+    drop(held);
+    std::fs::remove_dir_all(path.parent().expect("a parent")).ok();
+}
+
+// ---------------------------------------------------------------------------------------------
 // KR-REQ-24.30: forward-only migration, one current schema, an explicit importer
 // ---------------------------------------------------------------------------------------------
 
