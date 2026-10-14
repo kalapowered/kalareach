@@ -5,6 +5,7 @@
 //! socket; the candidate redeems over its own unpaired iroh connection. A suite that pairs a
 //! device therefore exercises exactly the path a person's pairing takes.
 
+use iroh::endpoint::{ConnectError, ConnectingError, ConnectionError};
 use iroh::{Endpoint, EndpointAddr};
 use kr_crypto::keys::{AuthorisationKeyPair, DeviceKeys};
 use kr_ipc::client::LocalClient;
@@ -68,6 +69,68 @@ pub fn host_addr(payload: &DirectQrPayload) -> EndpointAddr {
         }
     }
     addr
+}
+
+/// How long a case lets a candidate try to reach a host before it takes the case for hung.
+///
+/// It ends a case that never connects and decides nothing else: a dial that is answered ends the
+/// wait at once.
+const REACH_DEADLINE: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Dials `addr` from `endpoint` until a connection is made, and returns it.
+///
+/// An attempt that the transport gives up on because nothing answered inside its 30-second
+/// inactivity threshold is made again on a new connection, as a client reconnects
+/// once the transport is declared unavailable. Nothing the host keeps depends on such an attempt:
+/// it has not read a frame, so no invitation is spent by it. Any other failure is the case's
+/// failure.
+///
+/// # Panics
+///
+/// Panics when an attempt fails for any other reason, or when [`REACH_DEADLINE`] passes first.
+pub async fn dial_until_connected(
+    endpoint: &Endpoint,
+    addr: impl Into<EndpointAddr>,
+) -> iroh::endpoint::Connection {
+    let addr: EndpointAddr = addr.into();
+    let mut attempts = 0_u32;
+    let reached = tokio::time::timeout(REACH_DEADLINE, async {
+        loop {
+            attempts += 1;
+            match endpoint
+                .connect(addr.clone(), kr_protocol::hello::ALPN)
+                .await
+            {
+                Ok(connection) => return connection,
+                Err(error) if gave_up_unanswered(&error) => {}
+                Err(error) => panic!("the candidate reaches the host: {error}"),
+            }
+        }
+    })
+    .await;
+    reached.unwrap_or_else(|_| {
+        panic!(
+            "the candidate did not reach the host in {REACH_DEADLINE:?}: {attempts} attempts, \
+             each ended by the transport's inactivity threshold"
+        )
+    })
+}
+
+/// Whether the transport ended an attempt because nothing answered it.
+fn gave_up_unanswered(error: &ConnectError) -> bool {
+    matches!(
+        error,
+        ConnectError::Connecting {
+            source: ConnectingError::ConnectionError {
+                source: ConnectionError::TimedOut,
+                ..
+            },
+            ..
+        } | ConnectError::Connection {
+            source: ConnectionError::TimedOut,
+            ..
+        }
+    )
 }
 
 /// A candidate: its endpoint, the identity it presents before pairing and what it declares.
@@ -303,11 +366,7 @@ pub async fn redeem(
     invited: &PairInviteResult,
 ) -> (iroh::endpoint::Connection, CandidateConnection, String) {
     let payload = direct_payload(invited);
-    let connection = device
-        .endpoint
-        .connect(host_addr(&payload), kr_protocol::hello::ALPN)
-        .await
-        .expect("the candidate reaches the host");
+    let connection = dial_until_connected(device.endpoint, host_addr(&payload)).await;
     let mut candidate = handshake::connect_unpaired(&connection, device.identity)
         .await
         .expect("an unpaired connection");

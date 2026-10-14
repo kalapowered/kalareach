@@ -363,15 +363,8 @@ async fn redeem(
 ) {
     let payload = pairing::direct_payload(invited);
     let candidate = device.candidate();
-    let connection = tokio::time::timeout(
-        DEADLINE,
-        candidate
-            .endpoint
-            .connect(pairing::host_addr(&payload), kr_protocol::hello::ALPN),
-    )
-    .await
-    .expect("the candidate reaches the endpoint in time")
-    .expect("the candidate reaches the endpoint the invitation names");
+    let connection =
+        pairing::dial_until_connected(candidate.endpoint, pairing::host_addr(&payload)).await;
     let mut unpaired = handshake::connect_unpaired(&connection, candidate.identity)
         .await
         .expect("an unpaired connection");
@@ -574,15 +567,7 @@ async fn a_viewer_reaches_only_the_distribution_it_was_paired_with() {
     // Anyone can reach the other endpoint, and what answers there is the endpoint it names: the
     // address leads to it, so a refusal below is its decision and not a failed connection.
     let candidate = device.candidate();
-    let connection = tokio::time::timeout(
-        DEADLINE,
-        candidate
-            .endpoint
-            .connect(other.address(), kr_protocol::hello::ALPN),
-    )
-    .await
-    .expect("the other endpoint is reached in time")
-    .expect("the other endpoint is reachable from this distribution");
+    let connection = pairing::dial_until_connected(candidate.endpoint, other.address()).await;
     let mut unpaired = handshake::connect_unpaired(&connection, candidate.identity)
         .await
         .expect("the other endpoint serves an unpaired device");
