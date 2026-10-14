@@ -1008,8 +1008,9 @@ pub struct PairInviteArguments {
     /// The rendezvous origin a code is reserved at, instead of this host's default.
     #[arg(long)]
     pub origin: Option<String>,
-    /// Require membership of an organisation this host is enrolled in, by its identifier, so the
-    /// device's access answers to the organisation's lease for it.
+    /// Require membership of an organisation this host is enrolled in, by its identifier, so what
+    /// the device asks for under its pairing answers to the organisation's lease for it. A share
+    /// is personal, and answers to a lease only on an exclusively organisation-managed host.
     #[arg(long, value_name = "ORGANISATION", conflicts_with = "owner")]
     pub organisation: Option<String>,
     /// The environment to act in. Without it, this installation's own.

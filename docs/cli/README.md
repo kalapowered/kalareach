@@ -1279,7 +1279,7 @@ section 10's pairing; the new device runs its own side, in the companion applica
 | --- | --- |
 | `kr pair invite --owner` | Issue an invitation for an owner device: every right over this host, until it is revoked |
 | `kr pair invite --guest [MINUTES]` | Issue an invitation for a guest: a device that reaches no session until one is shared with it, for the minutes given (one day by default) |
-| `kr pair invite --guest [MINUTES] --organisation <id>` | Issue that invitation for a member of an organisation this host is enrolled in, so the device's access answers to the organisation's lease |
+| `kr pair invite --guest [MINUTES] --organisation <id>` | Issue that invitation for a member of an organisation this host is enrolled in, so what the device asks for under its pairing answers to the organisation's lease |
 | `kr pair confirm <invitation>` | Approve the device that answered, once it shows its verification value |
 | `kr pair cancel <invitation> [--deny]` | Withdraw the invitation, or deny the device that answered it |
 | `kr pair status <invitation>` | Show where the invitation has reached, and the device that answered it |
@@ -1918,6 +1918,10 @@ hold. The owner device that is asked to confirm the invitation is told that it a
 organisation's membership where the prompt's line has room, with the organisation and the enrolment
 revision or without them. A line with no room says nothing of it, and the companion always lists
 both in full.
+
+The requirement covers what the guest asks for under its pairing, such as accepting an offered
+session. A share is personal, and answers to a lease only on an exclusively organisation-managed
+host.
 
 ## `kr host import-journals`
 
