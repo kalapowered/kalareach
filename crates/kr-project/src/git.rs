@@ -748,6 +748,9 @@ pub struct RestrictedProfile {
     support: Arc<OnceLock<std::result::Result<Arc<SupportSet>, String>>>,
     #[cfg(feature = "git-fixtures")]
     interposition: Option<Interposition>,
+    /// The bound a test gives every brokered read in place of [`GIT_READ_DEADLINE`].
+    #[cfg(feature = "git-fixtures")]
+    read_deadline: Option<Duration>,
 }
 
 /// Something the fixtures do to a repository between the moment its configuration was read and the
@@ -1380,6 +1383,8 @@ impl RestrictedProfile {
             support: Arc::new(OnceLock::new()),
             #[cfg(feature = "git-fixtures")]
             interposition: None,
+            #[cfg(feature = "git-fixtures")]
+            read_deadline: None,
         })
     }
 
@@ -1403,6 +1408,19 @@ impl RestrictedProfile {
     #[cfg(feature = "git-fixtures")]
     pub fn interpose(&mut self, interposition: Interposition) {
         self.interposition = Some(interposition);
+    }
+
+    /// Gives every brokered read `deadline` in place of [`GIT_READ_DEADLINE`].
+    ///
+    /// The bound a read is given is this host's choice of how long a wedged subprocess is waited
+    /// for, and a case that is about something else than that choice should not end on a machine
+    /// that did not run its Git child for that long. It sets a figure that ends a child that never
+    /// finishes, and nothing else: a child that finishes is answered whenever it does.
+    ///
+    /// Compiled with the fixtures. Nothing in the service sets it.
+    #[cfg(feature = "git-fixtures")]
+    pub fn hold_read_deadline(&mut self, deadline: Duration) {
+        self.read_deadline = Some(deadline);
     }
 
     /// Returns the resolved Git program.
@@ -1521,7 +1539,15 @@ impl RestrictedProfile {
         )?;
         let out = child.stdout().map(read_bounded);
         let err = child.stderr().map(read_bounded);
-        let deadline = Instant::now() + request.deadline;
+        // How long this invocation may run: its own bound, or the one a test holds reads to.
+        #[cfg(feature = "git-fixtures")]
+        let allowed = self
+            .read_deadline
+            .filter(|_| request.deadline == Duration::from_millis(GIT_READ_DEADLINE.get()))
+            .unwrap_or(request.deadline);
+        #[cfg(not(feature = "git-fixtures"))]
+        let allowed = request.deadline;
+        let deadline = Instant::now() + allowed;
         let status = loop {
             // Completion is asked about first, and a child that has already exited is answered
             // with its own output however long it took. The deadline bounds what this host lets a
@@ -1571,7 +1597,7 @@ impl RestrictedProfile {
                 return Err(ProjectError::GitFailed {
                     detail: format!(
                         "{described} ran longer than {} milliseconds and was stopped{}",
-                        request.deadline.as_millis(),
+                        allowed.as_millis(),
                         if stopped {
                             ""
                         } else {
@@ -4359,6 +4385,8 @@ mod tests {
             support: Arc::new(OnceLock::new()),
             #[cfg(feature = "git-fixtures")]
             interposition: None,
+            #[cfg(feature = "git-fixtures")]
+            read_deadline: None,
         }
     }
 
