@@ -11,12 +11,14 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::time::Duration;
 
 use companion_platform::browser::{self, RawEvent, SessionEvent, SessionRequest};
 use kr_client::services::account::{Answer, Carrier as Delivery, PendingAuthorisation, Redirect};
 use tokio::sync::watch;
+
+#[cfg(desktop)]
+use std::sync::Arc;
 
 #[cfg(desktop)]
 use kr_loopback::{BindError, Listener};
