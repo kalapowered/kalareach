@@ -41,6 +41,50 @@ fn numbers_of(path: &std::path::Path) -> (i64, i64) {
     (metadata.dev() as i64, metadata.ino() as i64)
 }
 
+/// How many directories the recorded directory is made after, so that the inode it is given is
+/// further along than the one a new filesystem starts at. The number a new filesystem starts at is
+/// not the case's to fix: it depends on what the host put on the volume as it was attached.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const INODES_BEFORE_THE_RECORDED_ONE: usize = 128;
+
+/// How many attempts [`create_directory_with_inode`] makes before it gives up on a filesystem that
+/// does not hand out inodes in order.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const ATTEMPTS_AT_AN_INODE: usize = 1024;
+
+/// Makes the directory `name` in `parent`, and gives it the inode `wanted` where the filesystem
+/// can: it makes the directory, and where the filesystem gave it an earlier number moves it aside
+/// and makes it again, so that the filesystem's next number is one further on each time. Returns
+/// whether the directory has that inode.
+///
+/// A filesystem built in the same order gives its directories the same inodes, but a case cannot
+/// rely on the order: what a new filesystem has made before the case reaches it is the host's own
+/// business. So the case builds the collision it is about where it can. Where the filesystem has
+/// passed `wanted` already, or does not reach it in [`ATTEMPTS_AT_AN_INODE`] attempts, the
+/// directory is left as the filesystem made it, and the answer is `false`.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn create_directory_with_inode(parent: &std::path::Path, name: &str, wanted: u64) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let directory = parent.join(name);
+    for attempt in 0..ATTEMPTS_AT_AN_INODE {
+        std::fs::create_dir(&directory).expect("the directory");
+        let inode = std::fs::metadata(&directory)
+            .expect("the directory is there")
+            .ino();
+        if inode == wanted {
+            return true;
+        }
+        if inode > wanted {
+            return false;
+        }
+        std::fs::rename(&directory, parent.join(format!("beside-{attempt}")))
+            .expect("moves the directory aside, keeping its inode taken");
+    }
+    std::fs::create_dir(&directory).expect("the directory");
+    false
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn begin_from_scope(
     service: &TransferService,
@@ -264,6 +308,10 @@ fn a_directory_on_another_filesystem_is_not_the_recorded_one_whatever_its_number
                 kr_protocol::scalars::Uuid::from_bytes([3; 16]),
             );
             let directory = first.at().join("directory");
+            for earlier in 0..INODES_BEFORE_THE_RECORDED_ONE {
+                std::fs::create_dir(first.at().join(format!("earlier-{earlier}")))
+                    .expect("a directory that takes an inode");
+            }
             std::fs::create_dir(&directory).expect("the recorded directory");
             let recorded = AuthorisedDirectory::open_root(environment, &directory)
                 .expect("opens it")
@@ -280,11 +328,27 @@ fn a_directory_on_another_filesystem_is_not_the_recorded_one_whatever_its_number
             let second = first
                 .replace(scratch.path(), "second")
                 .unwrap_or_else(|| volumes::not_attachable());
-            std::fs::create_dir(&directory).expect("a directory at the same place");
+            // The directory at the same place is given the inode the recorded one had, as a
+            // filesystem built in the same order gives it, and the record carries the numbers it
+            // has now.
+            let same_inode =
+                create_directory_with_inode(second.at(), "directory", recorded.object.file_id);
             let found = AuthorisedDirectory::open_root(environment, &directory).expect("opens it");
-            // Built in the same order, so the directory has the inode the recorded one had, and
-            // the record carries the numbers it has now.
-            assert_eq!(found.identity().file_id, recorded.object.file_id);
+            if same_inode {
+                assert_eq!(found.identity().file_id, recorded.object.file_id);
+            } else {
+                // This filesystem gave the directory a number past the recorded one's before the
+                // case could stop it, and no directory made now can be given one before it. What
+                // the case is about does not rest on that premise: the record below carries the
+                // numbers the directory has, which is what a filesystem that numbered it like the
+                // first would have recorded.
+                eprintln!(
+                    "the second filesystem gave the directory inode {}, past the recorded {}, so \
+                     the numbers are made equal in the record and not in the filesystem",
+                    found.identity().file_id,
+                    recorded.object.file_id
+                );
+            }
             let same_numbers = RecordedIdentity {
                 object: found.identity(),
                 filesystem: recorded.filesystem,
