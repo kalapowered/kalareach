@@ -314,54 +314,57 @@ Leases are issued for fifteen minutes at a time. When ten minutes or less remain
 lease, the daemon will request a 'refill' of the lease, asking the managed service for more time on
 the same lease. The service raises the reservation it already has, and opens no second one for the
 pair. The deadline of the lease will only be moved if the ceiling of the reservation is increased.
-When asking for a refill, the daemon will ask for the greater of 512 KiB added to the amount the
-relay service had last counted for the lease when the managed service last enquired of it, or one
-byte more than the ceiling the lease currently holds. Leases that have been kept alive but were idle
-do not cost anything and are settled when the host ends the lease, but idle leases that are allowed
-to time out are charged in full. A pair that carries traffic is given a block beyond what the relay
-had counted at the last answer, about every five minutes, so a pair that carries a great deal is
-held to that rate. A pair that spends the whole of its block between two refills is given one byte
-at the first and a block at the second. An account can only have 8 MiB outstanding on leases at any
-one time (the difference between the ceilings of the reservations the managed service holds with the
-relay service, and what the relay service has counted for those reservations). As such, if no
-traffic goes through the relay service at all, no new lease will be issued after sixteen devices
-have been paired with, and with sixteen idle leases the sum is already 8 MiB, so none of them can be
-raised by a byte and each runs out at its whole hold. Fifteen or fewer can be kept alive.
+When asking for a refill, the daemon will ask for the greater of 512 KiB above what the relay
+service told the managed service was the last number of data it counted for the lease, or one byte
+above the current ceiling of the lease. Idle leases that are kept alive do not cost anything, and
+will be settled when the host ends the lease, but if the lease times out while it is idle, then it
+will be charged for in full. Non-idle pair will be given a block above what the relay service told
+the managed service was the last number of data it counted for the lease, every five minutes or so,
+so a pair that carries a great deal is held to that rate. A pair that spends the whole of its block
+between two refills is given one byte at the first and a block at the second. An account can only
+have 8 MiB outstanding on leases at any one time (the difference between the ceilings of the
+reservations the managed service holds with the relay service, and what the relay service has
+counted for those reservations). As such, if no traffic goes through the relay service at all, no
+new lease will be issued after sixteen devices have been paired with, and with sixteen idle leases
+the sum is already 8 MiB, so none of them can be raised by a byte and each runs out at its whole
+hold. However, the daemon will be able to keep 15 or fewer idle leases alive at a time.
 
 A host key has no allowance with the relay service, and the managed service will refuse to issue
 leases for a host that does not name an account to use. The `payer` key of the `relay` section must
 name an account to use to pay for relay usage, as well as an authorisation that the holder of the
 named account has given to the key of the host the document belongs to. This information will be
-sent with each request to the managed service to issue or extend a lease. The service labels such a
-lease as sponsored by the authorisation, because the host did not select it as its default. The
-account holder gives the authorisation through the relay service's payer-authorisation interface.
-They must name the signing key of the host that is to use the account, and they must name the
-maximum amount that can be outstanding on any one lease at any one time. This amount must be above
-512 KiB, because a lease is raised by at least one byte beyond its first block of 512 KiB and a
-bound of exactly 512 KiB refuses that raise: the lease runs out at its whole hold and `kr doctor`
-says so. 1 MiB is the smallest sensible value. An authorisation can be given for up to a year at a
-time. Withdrawing an authorisation will cause all leases issued under that authorisation to be
-ended, and the next time the host running the daemon asks for a lease to be issued or extended, it
-will be refused. Signing the host out with `kr account sign-out` does not end the leases, because
-the lease service does not read that sign-in.
+included in every request the daemon makes to the managed service to issue or extend a lease. The
+service labels such a lease as sponsored by the authorisation, because the host did not select it as
+its default. The account holder gives the authorisation through the relay service's
+payer-authorisation interface. They must name the signing key of the host that is to use the
+account, and they must name the maximum amount that can be outstanding on any one lease at any one
+time. This amount must be above 512 KiB, because a lease is raised by at least one byte beyond its
+first block of 512 KiB and a bound of exactly 512 KiB refuses that raise: the lease runs out at its
+whole hold and `kr doctor` says so. 1 MiB is the smallest sensible value. The authorisation can be
+given for up to a year at a time, and when the authorisation is withdrawn, all leases that were
+issued with the authorisation will be ended, and the next time the host running the daemon asks for
+any leases to be issued or extended, the managed service will refuse to, as the authorisation will
+have been withdrawn. However, signing the host out with `kr account sign-out` does not end the
+leases, as the lease service does not read that sign-in.
 
 When a device is unpaired with, the daemon will tell the managed service to end the lease it has for
-that device, and it will give the reason as "the pair is no longer paired". The ending is written to
-the host's record before it is sent, and it is sent again after a failure or a restart until the
-service answers. If the authorisation used to request a lease changes, the daemon will request that
-the old lease be ended and will then ask for a new lease for the pair. If the managed service says
-it has never issued a lease when asked to end one, the daemon asks again, no oftener than once a
-minute, and believes it only after three answers and once the longest a lease can live has passed
-since the first, because the service gives the same answer when a revocation raced a refill.
+the device, and it will give the reason as "the pair is no longer paired". The ending of the lease
+will be written to the host's record, and then sent to the managed service, and if it fails to be
+sent, or the host daemon restarts, then it will be sent again until the service answers. If the
+authorisation that is used to request leases is changed, the daemon will request that the old lease
+be ended, and then it will request a new lease for the pair. If the managed service says it has
+never issued a lease when asked to end one, the daemon asks again, no oftener than once a minute,
+and believes it only after three answers and once the longest a lease can live has passed since the
+first, because the service gives the same answer when a revocation raced a refill.
 
-It's possible that the service did issue a lease for a request, but that the answer never arrived.
-Since the daemon won't have written down any lease in that case, it will at some point ask for the
-same pair again, with the same request. Then the service will reply with a lease for a pair it
-already has, as if the answer to the original request had arrived just in time. The record keeps
-such a request until the longest a lease can live has passed, so a device unpaired in the meantime
-still has its lease ended. If the payer in the configuration document changes meanwhile, the daemon
-does not ask under the new payer until that time has passed, because the service would open a second
-reservation; the lease the first request may have issued runs out by itself.
+It is possible that a request results in a lease, but that the answer does not arrive. Since the
+daemon won't have written down any lease in that case, it will at some point ask for the same pair
+again, with the same request. Then the service will reply with a lease for a pair it already has, as
+if the answer to the original request had arrived just in time. The record keeps such a request
+until the longest a lease can live has passed, so a device unpaired in the meantime still has its
+lease ended. If the payer in the configuration document changes meanwhile, the daemon does not ask
+under the new payer until that time has passed, because the service would open a second reservation;
+the lease the first request may have issued runs out by itself.
 
 Three kinds of answers to lease requests are not treated as errors. A spent allowance, and a service
 that could not issue a lease because it has no relay to offer or no room for one more, are answers
@@ -371,18 +374,23 @@ between the devices or a relay you run yourself. A connection between two device
 directly to each other does not need a lease, and neither does a connection through a relay that one
 of the devices runs itself. The third kind of answer is a rejection that only the owner can remove,
 for example because the request did not mention any account that the service is willing to accept.
-`kr doctor` will indicate this kind of problem too. For all three kinds of answers, the daemon will
-wait before issuing a request for the same pair again, for the longer of five minutes and the delay
-the service names. A pairing or revocation while the daemon waits changes what it holds in its
-record, but sends nothing to the service any sooner. It refills a lease no oftener than once a
-minute, whatever the answer. Other kinds of problems, such as an unreachable service, will result in
-re-tries with a backoff, like for other carriers. A refill that the service turns back as
-`unavailable` or as invalid is followed by one request for the ceiling the lease already holds: if
-the service carries the lease, the daemon keeps it, `kr doctor` says why the raise was refused, and
-the raise is tried again after the wait. If the service says the relay carrying a lease is retired,
-the daemon ends the lease and requests a new one for the pair. A lease that has run out is ended at
-the service before the pair is asked for again. A lease that runs out in the meantime stops the
-relay carrying its pair and nothing else.
+`kr doctor` will indicate this kind of problem too, with its likely causes: the account, the
+authorisation, the clock of the machine and the service origin. The words the service used go to the
+daemon's log, because a diagnostic never repeats text that came from outside. In all these cases the
+daemon waits for the greater of five minutes and the delay provided in the answer, before issuing
+another request for the same pair. If a pairing or revocation changes the set of pairs to be leased,
+the request is not issued earlier. It refills a lease no oftener than once a minute, whatever the
+answer. Other problems with the service, such as being unable to reach it, are treated by re-trying
+after backoff periods, as for other carriers. A refill that the service turns back as `unavailable`
+or as invalid is followed by one request for the ceiling the lease already holds: if the service
+carries the lease, the daemon keeps it, `kr doctor` says why the raise was refused, and the raise is
+tried again after the wait. If the service says the relay carrying a lease is retired, the daemon
+ends the lease and requests a new one for the pair. A lease that has run out is ended at the service
+before the pair is asked for again. If the clock of the host is behind the clock of the service, a
+refill can reach the service after the lease has run out there. The service then opens a new lease
+at the ceiling the refill asked for, which for a pair that has carried traffic is more than a new
+lease needs, so the daemon ends that lease and asks for the pair again, and the pair holds one
+block. A lease that runs out in the meantime stops the relay carrying its pair and nothing else.
 
 The daemon writes down lease information in a file called `relay-leases.sqlite3` in its state
 directory. This information is only valid for one service and one host key. If you start a daemon
