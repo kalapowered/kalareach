@@ -1591,7 +1591,8 @@ jobs:
       # 113 GB of disk images with 54 GB of caches made from them. This job runs the workspace's
       # tests, demonstrations and measurements on the host: none of them builds with xcodebuild or
       # starts a simulator, so none of the runtimes is used and all of them are removed, with their
-      # caches. What the build leaves on the disk is all that is left to fit in the room.
+      # caches. The workspace's tests take more than 40 GB of the disk at their peak, and the image
+      # leaves 42 GB free; with the runtimes gone it leaves about 140 GB.
       - name: Free the disk the build needs
         timeout-minutes: 30
         run: bash scripts/free-simulator-runtimes.sh
