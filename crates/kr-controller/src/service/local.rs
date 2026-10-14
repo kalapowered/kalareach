@@ -5,6 +5,7 @@ use std::sync::Arc;
 use kr_ipc::endpoint::{Connection, Listener};
 use kr_ipc::framed::split;
 use kr_ipc::peer::PeerIdentity;
+use kr_protocol::authority::EffectClass;
 use kr_protocol::envelope::{ControlEvent, ControlFrame, MutationRequest, Outcome, Response};
 use kr_protocol::error::ErrorCode;
 use kr_protocol::frame::StreamKind;
@@ -207,10 +208,18 @@ impl Controller {
 
     /// What a local caller is told when the local owner's lease ended while its answer was being
     /// written.
-    fn lease_ended_reply(&self, request_id: RequestId) -> ControlFrame {
+    ///
+    /// A write's answer is withheld after its effect ran, so the caller is told its outcome is
+    /// unknown: a refusal of any other kind says nothing was done, which is false here. A read has
+    /// no effect to be unsure of and is refused.
+    fn lease_ended_reply(&self, request_id: RequestId, method: Option<Method>) -> ControlFrame {
+        let code = match method.map(|method| method.entry().effect) {
+            Some(EffectClass::Write) => ErrorCode::OutcomeUnknown,
+            Some(EffectClass::Read) | None => ErrorCode::PermissionDenied,
+        };
         error_reply(
             request_id,
-            ErrorCode::PermissionDenied,
+            code,
             "this host is exclusively organisation-managed and its local owner's membership lease \
              ended before this result could be sent, so the result is withheld; if the request \
              changed anything the change stands, and the request is not to be repeated under a new \
@@ -226,7 +235,7 @@ impl Controller {
     /// no room it is asked again each time the peer reads, so an answer that waited for a peer is
     /// not finished under a lease that ended meanwhile: one none of which has gone is taken back
     /// and its refusal written, and one the peer has part of ends the connection.
-    async fn write_answer(
+    pub(super) async fn write_answer(
         &self,
         writer: &mut kr_ipc::framed::FrameWriter,
         kind: StreamKind,
@@ -270,7 +279,7 @@ impl Controller {
                         continue;
                     }
                     return writer
-                        .write_message(&self.lease_ended_reply(request_id))
+                        .write_message(&self.lease_ended_reply(request_id, Some(method)))
                         .await
                         .is_ok();
                 }
@@ -628,7 +637,8 @@ impl Controller {
                                             };
                                             let lease = crate::attention::LeaseHold {
                                                 permitted: &permitted,
-                                                refusal: self.lease_ended_reply(request.request_id),
+                                                refusal: self
+                                                    .lease_ended_reply(request.request_id, method),
                                             };
                                             if self
                                                 .attention

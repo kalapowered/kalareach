@@ -484,8 +484,9 @@ impl Attempt {
     ///
     /// A result closes it as happened. A refusal in a category that never retries or that needs a
     /// change is the host's kept answer to the action (nothing committed, because every failure
-    /// after a commit in these methods is a transient one), and closes it as refused. Anything else
-    /// leaves it unfinished.
+    /// after a commit in these methods is a transient one, or is answered as an unknown outcome,
+    /// as the local door answers a result it withholds because the local owner's lease ended), and
+    /// closes it as refused. Anything else leaves it unfinished.
     ///
     /// A redemption is the exception: the paired door can replace the result of a redemption that
     /// committed with a refusal, when the bounds of its decision end before it writes the answer,

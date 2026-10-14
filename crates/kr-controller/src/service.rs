@@ -1156,6 +1156,11 @@ mod the_fence_at_every_effect;
 #[cfg(test)]
 mod a_peer_that_stops_reading;
 
+/// What a local caller is told when the local owner's lease ends before its mutation's answer is
+/// written.
+#[cfg(test)]
+mod a_result_the_lease_ended_over;
+
 /// This daemon's link to a worker, given up whenever what it carried did not end whole.
 #[cfg(test)]
 mod a_link_that_is_not_given_back;
