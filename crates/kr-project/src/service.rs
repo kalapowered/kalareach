@@ -243,6 +243,16 @@ impl ProjectService {
         self.profile.interpose(interposition);
     }
 
+    /// Gives every brokered Git read `deadline` in place of the bound the service gives it.
+    ///
+    /// Compiled with the fixtures, so that a case about something other than that bound is not
+    /// ended by a machine that did not run a Git child for as long as the bound. Nothing in the
+    /// service sets it.
+    #[cfg(feature = "git-fixtures")]
+    pub fn hold_git_read_deadline(&mut self, deadline: Duration) {
+        self.profile.hold_read_deadline(deadline);
+    }
+
     /// Runs something immediately before a reconciliation reads or removes anything beneath its
     /// location: a running operation's, between the question it asks first and the read that asks
     /// it again, and the owner's, between the claim of its action and the removal.
