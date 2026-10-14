@@ -819,6 +819,13 @@ fn a_fault_fences_rich_work_and_recovery_writes_the_interval_down_before_it_clea
         fault.durable_through > 0,
         "the mark is the last sequence this host really wrote"
     );
+    // What is recorded of a fault names the result code the store answered with, because its
+    // message names only the family of the failure.
+    assert!(
+        fault.detail.contains("result code 13"),
+        "the fault says which failure it was: {}",
+        fault.detail
+    );
     let posture = journal.health().posture();
     assert!(!posture.admits(WorkClass::RichMutation));
     assert!(posture.admits(WorkClass::AuthorisedStop));
@@ -853,6 +860,11 @@ fn a_fault_fences_rich_work_and_recovery_writes_the_interval_down_before_it_clea
     let recorded = journal.recovery_gaps().expect("reads the gaps");
     assert_eq!(recorded.len(), 1);
     assert_eq!(recorded[0].durable_through, gap.durable_through);
+    assert!(
+        recorded[0].detail.contains("result code 13"),
+        "and the gap that is kept says it too: {}",
+        recorded[0].detail
+    );
     // A second recovery has nothing to record.
     assert!(
         journal

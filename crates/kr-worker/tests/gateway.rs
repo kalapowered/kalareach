@@ -2471,6 +2471,12 @@ async fn kr_req_11_37_nothing_that_needs_its_record_is_taken_while_the_fence_is_
             "{what} is refused because nothing can be recorded: {error}"
         );
         assert_eq!(error.code(), ErrorCode::StorageUnavailable);
+        // And the refusal says which failure the host is waiting to recover from: the store was
+        // full, and the code is what tells that from a disk that failed.
+        assert!(
+            error.to_string().contains("result code 13"),
+            "{what} is refused with the store's failure named: {error}"
+        );
     };
     fenced(bind(3), "binding a component");
     assert!(
