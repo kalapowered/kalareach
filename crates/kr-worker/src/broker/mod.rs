@@ -4103,6 +4103,19 @@ impl BrokerState {
         Ok(done)
     }
 
+    /// What the store said when it failed, as a parenthesis for a refusal to carry, or nothing
+    /// when the journal's condition no longer holds the fault.
+    ///
+    /// A person who meets a refusal is told which failure the host is waiting to recover from.
+    fn fault_said(&self) -> String {
+        self.health
+            .condition()
+            .fault()
+            .map_or_else(String::new, |fault| {
+                format!(" ({}: {})", fault.kind.as_str(), fault.detail)
+            })
+    }
+
     /// Refuses a recovery that cannot begin now.
     ///
     /// The journal writes its own gap before it calls itself healthy, and the broker's recovery is
@@ -4160,19 +4173,11 @@ impl BrokerState {
         write: impl FnOnce(&mut Ledger) -> Result<T>,
     ) -> Result<T> {
         if !self.volatile.writes_are_durable() {
-            // What the store said when it failed is part of the refusal, so a person who meets it
-            // is told which failure the host is waiting to recover from.
-            let said = self
-                .health
-                .condition()
-                .fault()
-                .map_or_else(String::new, |fault| {
-                    format!(" ({}: {})", fault.kind.as_str(), fault.detail)
-                });
             return Err(BrokerError::LedgerUnavailable {
                 detail: format!(
-                    "the journal is faulted{said}, so {what} waits for the recovery that can \
-                     write it down"
+                    "the journal is faulted{}, so {what} waits for the recovery that can write it \
+                     down",
+                    self.fault_said()
                 ),
             });
         }
@@ -4932,7 +4937,8 @@ impl BrokerState {
         if on_fault == OnStoreFault::Refuse && !self.volatile.writes_are_durable() {
             return Err(BrokerError::LedgerUnavailable {
                 detail: format!(
-                    "the journal is faulted, and a {} is never taken without its record",
+                    "the journal is faulted{}, and a {} is never taken without its record",
+                    self.fault_said(),
                     cause.as_str().replace('_', " ")
                 ),
             });
