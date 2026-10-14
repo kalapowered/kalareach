@@ -4499,7 +4499,7 @@ async fn a_setup_under_way_is_told_by_status_and_the_doctor_at_each_point_of_the
 
     // The first call fails; the repeat gets its turn and is held at the enrolment, so it is still
     // under way when the first call's entry is gone, and is told alone.
-    web.fail(MANIFEST, 1, Moment::Hold);
+    web.fail(MANIFEST, 1, Moment::Slow);
     web.release_held();
     assert!(matches!(
         first.await.expect("the first call ends"),
@@ -4870,8 +4870,28 @@ async fn a_replacement_under_another_account_sends_nothing_for_the_earlier_archi
     let asked = web.arrived().len();
     web.set_daily_snapshots(2);
     timer.run_by_itself();
-    // The carrier looks at its work again, twice, and asks the service what the account records:
-    // that is the pass in which a host that kept deleting would delete.
+    // The new archive has a generation of its own to upload, which is when the carrier reads what
+    // the account records, and so the pass in which a host that kept deleting would delete the
+    // earlier archive's oldest generations.
+    seal_and_admit(
+        &rig.controller,
+        &rig.writer,
+        (&rig.sender, &rig.device),
+        archive_two(),
+        1,
+        &[(4, plaintext(2048))],
+        false,
+    );
+    rig.until("the new archive's generation is published", |rig| {
+        rig.controller
+            .backup()
+            .generation(archive_two(), BackupGeneration::new(1))
+            .expect("the store reads")
+            .is_some_and(|record| {
+                record.production == Production::Complete && record.remote == Remote::Published
+            })
+    })
+    .await;
     rig.carrier_passes(2).await;
     let since = rig.requested_since(asked);
     assert!(
