@@ -13,8 +13,16 @@
 //! the restriction on its runner and runs them. A host that gives no such namespace fails the case
 //! and says so, because a case that returned early would be counted as one that passed. On macOS a
 //! disk image is attached and detached with `hdiutil`.
+//!
+//! A disk image on macOS is made so that nothing indexes it, and is detached by asking, by its
+//! disk, until the system lets the disk go: a case holds handles on its volume when it detaches
+//! it, as the cases are about what is open there, so the detach is forced, and a forced detach
+//! unmounts the volume and then can fail to eject the disk when something else holds the disk's
+//! device open, which leaves the image attached with nothing mounted from it.
 
 use std::path::{Path, PathBuf};
+#[cfg(target_os = "macos")]
+use std::time::{Duration, Instant};
 
 /// Set in the environment of the half of a case that runs inside the mount namespace.
 #[cfg(target_os = "linux")]
@@ -191,11 +199,12 @@ impl Volume {
     /// Panics when it stays attached, so a case does not pass while it leaves one behind.
     pub fn detach(mut self) {
         self.attached = false;
-        assert!(
-            detach(&self.at),
-            "the filesystem attached at {} was not detached",
-            self.at.display()
-        );
+        if let Err(said) = detach(&self.at) {
+            panic!(
+                "the filesystem attached at {} was not detached: {said}",
+                self.at.display()
+            );
+        }
     }
 
     /// Returns where it is attached.
@@ -243,23 +252,69 @@ fn attach_new(at: &Path, _scratch: &Path, _tag: &str) -> bool {
 }
 
 #[cfg(target_os = "linux")]
-fn detach(at: &Path) -> bool {
+fn detach(at: &Path) -> Result<(), String> {
     // Lazily, so that a handle a case still holds does not keep the path from being given a new
     // filesystem.
-    std::process::Command::new("umount")
+    let ended = std::process::Command::new("umount")
         .arg("-l")
         .arg(at)
-        .status()
-        .is_ok_and(|status| status.success())
+        .output()
+        .map_err(|error| format!("umount could not be run: {error}"))?;
+    if ended.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "umount ended with {}: {}",
+            ended.status,
+            String::from_utf8_lossy(&ended.stderr).trim()
+        ))
+    }
+}
+
+/// The name of the file that keeps the system's indexer from reading a volume that holds it.
+#[cfg(target_os = "macos")]
+const NEVER_INDEXED: &str = ".metadata_never_index";
+
+/// Makes the directory `name` in `parent`, holding what a volume made from it is given so that
+/// nothing indexes it, and returns it.
+///
+/// The indexer is told by a file at the root of the volume, and it looks for it when the volume is
+/// attached, so the file has to be in the image already: written after the attach, it comes too
+/// late for an indexer that began at once. An image is made from this directory with
+/// `hdiutil create -srcfolder`, in the read and write format, which that option does not make
+/// unless it is asked to.
+///
+/// # Panics
+///
+/// Panics when the directory cannot be made.
+#[cfg(target_os = "macos")]
+#[must_use]
+pub fn never_indexed_contents(parent: &Path, name: &str) -> PathBuf {
+    let contents = parent.join(name);
+    std::fs::create_dir_all(&contents).expect("the contents of a volume nothing indexes");
+    std::fs::write(contents.join(NEVER_INDEXED), b"").expect("the file that keeps it unindexed");
+    contents
 }
 
 #[cfg(target_os = "macos")]
 fn attach_new(at: &Path, scratch: &Path, tag: &str) -> bool {
     let image = scratch.join(format!("volume-{tag}.dmg"));
+    let contents = never_indexed_contents(scratch, &format!("volume-{tag}-contents"));
     let made = std::process::Command::new("/usr/bin/hdiutil")
         .args([
-            "create", "-size", "8m", "-fs", "HFS+", "-volname", "volume", "-quiet",
+            "create",
+            "-size",
+            "8m",
+            "-fs",
+            "HFS+",
+            "-volname",
+            "volume",
+            "-format",
+            "UDRW",
+            "-quiet",
+            "-srcfolder",
         ])
+        .arg(&contents)
         .arg(&image)
         .status();
     if !made.is_ok_and(|status| status.success()) {
@@ -289,11 +344,123 @@ fn attach_new(at: &Path, scratch: &Path, tag: &str) -> bool {
     attached
 }
 
+/// How long a detach asks for a disk to be let go of before the volume is taken for stuck.
+///
+/// It decides nothing about a disk that is let go of, which is detached when it is. It ends the
+/// wait for one that is held for good.
 #[cfg(target_os = "macos")]
-fn detach(at: &Path) -> bool {
-    std::process::Command::new("/usr/bin/hdiutil")
-        .args(["detach", "-force", "-quiet"])
-        .arg(at)
-        .status()
-        .is_ok_and(|status| status.success())
+const DETACH_PATIENCE: Duration = Duration::from_secs(120);
+
+/// How long a detach waits before it asks again.
+#[cfg(target_os = "macos")]
+const DETACH_ASKS_AGAIN: Duration = Duration::from_millis(100);
+
+#[cfg(target_os = "macos")]
+fn detach(at: &Path) -> Result<(), String> {
+    detach_attached(at)
+}
+
+/// Takes the disk image attached at `at` off, as a case's volume is taken off, and returns why it
+/// did not come off.
+///
+/// # Errors
+///
+/// Returns why the disk did not come off, as [`detach_observed`] does.
+#[cfg(target_os = "macos")]
+pub fn detach_attached(at: &Path) -> Result<(), String> {
+    detach_observed(at, DETACH_PATIENCE, |_| {})
+}
+
+/// Takes the disk image attached at `at` off, asking again for as long as the system refuses, and
+/// returns why it did not come off.
+///
+/// The detach is forced, by the disk the volume is on: a case holds handles on its volume, and a
+/// plain detach could not take it off while it does. A forced detach unmounts the volume and then
+/// ejects the disk, and where something else has the disk's device open the eject is refused with
+/// the volume already unmounted and the image still attached. A detach by the mount point asked
+/// again would find nothing mounted, so the disk, which names the image whether or not anything is
+/// mounted from it, is what is asked about, until the system lets it go. The first refusal is said
+/// on standard error, with what the tool said, so that a run which needed the wait shows it.
+///
+/// `refused` is told what the tool said at each refusal.
+///
+/// # Errors
+///
+/// Returns what the tool last said when the disk is still attached after `patience`, or why the
+/// disk could not be named.
+#[cfg(target_os = "macos")]
+pub fn detach_observed(
+    at: &Path,
+    patience: Duration,
+    mut refused: impl FnMut(&str),
+) -> Result<(), String> {
+    let disk = disk_of(at)?;
+    let until = Instant::now() + patience;
+    let mut said_so = false;
+    loop {
+        // A refusal can come after the disk went, and the system can give its name to the next
+        // image: a name asked about again is asked about only while the device is still there.
+        if !Path::new(&disk).exists() {
+            return Ok(());
+        }
+        let ended = std::process::Command::new("/usr/bin/hdiutil")
+            .args(["detach", "-force"])
+            .arg(&disk)
+            .output()
+            .map_err(|error| format!("hdiutil could not be run: {error}"))?;
+        if ended.status.success() {
+            return Ok(());
+        }
+        let said = format!(
+            "hdiutil ended with {}: {}",
+            ended.status,
+            String::from_utf8_lossy(&ended.stderr).trim()
+        );
+        refused(&said);
+        if !said_so {
+            eprintln!(
+                "the volume at {} was forced off and {disk} was still held ({said}); asking again \
+                 until the system lets it go",
+                at.display()
+            );
+            said_so = true;
+        }
+        if Instant::now() >= until {
+            return Err(format!(
+                "{disk} stayed attached for {patience:?} after the detach was forced ({said})"
+            ));
+        }
+        std::thread::sleep(DETACH_ASKS_AGAIN);
+    }
+}
+
+/// Returns the whole disk (`/dev/diskN`) the volume mounted at `at` is on.
+///
+/// # Errors
+///
+/// Returns why the mounts could not be read, or that nothing is mounted at `at`.
+#[cfg(target_os = "macos")]
+pub fn disk_of(at: &Path) -> Result<String, String> {
+    let resolved = std::fs::canonicalize(at)
+        .map_err(|error| format!("{} could not be resolved: {error}", at.display()))?;
+    let listing = std::process::Command::new("/sbin/mount")
+        .output()
+        .map_err(|error| format!("mount could not be run: {error}"))?;
+    disk_in(&String::from_utf8_lossy(&listing.stdout), &resolved)
+        .ok_or_else(|| format!("nothing is mounted at {}", resolved.display()))
+}
+
+/// Returns the whole disk of the volume `listing`, as `mount` prints it, shows mounted at `at`.
+#[cfg(target_os = "macos")]
+fn disk_in(listing: &str, at: &Path) -> Option<String> {
+    let place = format!(" on {} (", at.display());
+    listing.lines().find_map(|line| {
+        let (device, _) = line.split_once(&place)?;
+        let number: String = device
+            .strip_prefix("/dev/disk")?
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect();
+        (!number.is_empty()).then(|| format!("/dev/disk{number}"))
+    })
 }
