@@ -4509,7 +4509,7 @@ async fn a_setup_under_way_is_told_by_status_and_the_doctor_at_each_point_of_the
     match rig.backup_status().await.setup {
         BackupSetupState::InProgress { kit_fingerprints } => assert_eq!(
             kit_fingerprints,
-            [made.kit_fingerprint.clone()],
+            vec![made.kit_fingerprint.clone()],
             "the repeat alone is told"
         ),
         other => panic!("the repeat is under way, and the status says {other:?}"),
@@ -4656,6 +4656,80 @@ async fn a_bundle_conflict_and_a_token_the_service_does_not_take_are_told_apart(
     );
     assert_eq!(web.requests_to(MANIFEST), 0, "nothing was enrolled");
     assert!(rig.controller.backup().setup().expect("a read").is_none());
+}
+
+/// KR-REQ-24.16: a setup's commit that is still to be made keeps the daemon, and with it the
+/// environment's lock, though the call that waited for it has stopped waiting. A commit that went on
+/// after the lock was let go could record a setup beside the next daemon's start, which reads the
+/// binding from the store as it stands then.
+///
+/// The commit is stopped on its thread before it commits, the call is aborted, and the test lets go
+/// of every holder of the daemon it has. The environment stays held, at each of many looks, while
+/// the commit waits; once the commit has ended it is let go. The daemon's own periodic tasks hold
+/// the daemon for a moment each time they run, so a daemon the commit did not hold would be let go
+/// at some of those looks.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_setup_commit_still_to_be_made_keeps_the_environment_held() {
+    use kr_controller::singleton::SingletonLock;
+
+    let timer = HeldTimer::held();
+    let (rig, _) = a_host_to_set_up(&timer).await;
+    let made = rig.prepared_setup(archive_id(), false);
+    let lock = rig.controller.paths().singleton_lock();
+    let environment_id = rig.host.environment_id();
+
+    let (arrived, go) = rig.controller.backup().pause_the_next_setup_commit();
+    let call = tokio::spawn({
+        let controller = Arc::clone(&rig.controller);
+        let params = made.params.clone();
+        async move { controller.enable_backups_for_a_test(params).await }
+    });
+    tokio::task::spawn_blocking(move || arrived.recv_timeout(Duration::from_secs(180)))
+        .await
+        .expect("the wait ends")
+        .expect("the commit is on its thread");
+    // The call stops waiting, and the test lets go of the daemon, keeping the tree it stands in.
+    call.abort();
+    assert!(call.await.expect_err("the call was ended").is_cancelled());
+    let Rig {
+        host,
+        controller,
+        serving,
+        served,
+        ..
+    } = rig;
+    for task in serving {
+        task.abort();
+        let _ = task.await;
+    }
+    drop(controller);
+
+    for look in 0..300 {
+        let taken = SingletonLock::hold(&lock, environment_id);
+        assert!(
+            matches!(
+                taken,
+                Err(kr_controller::ControllerError::AlreadyRunning { .. })
+            ),
+            "look {look}: the environment is held while the commit is still to be made: {:?}",
+            taken.map(|_| ())
+        );
+        tokio::task::yield_now().await;
+    }
+
+    go.send(()).expect("the commit is waiting");
+    within("the environment is let go", async {
+        loop {
+            match SingletonLock::hold(&lock, environment_id) {
+                Ok(held) => break held,
+                Err(_) => tokio::task::yield_now().await,
+            }
+        }
+    })
+    .await;
+    // The lock goes before the tree it is in.
+    drop(served);
+    drop(host);
 }
 
 /// A host signed in as another account while a call runs commits nothing: the request that carries

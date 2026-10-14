@@ -278,7 +278,15 @@ pub struct BackupService {
     /// The production passes that hold the staging directory. Always taken after the store, and
     /// never while waiting for it.
     leases: Arc<Mutex<lease::Leases>>,
+    /// Where a test stops the thread that commits a setup, before it commits.
+    #[cfg(feature = "testing")]
+    commit_pause: Mutex<Option<CommitPause>>,
 }
+
+/// The two ends of a pause in a setup's commit: the thread says it has arrived, and waits there
+/// until the test lets it go.
+#[cfg(feature = "testing")]
+type CommitPause = (std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>);
 
 /// What releasing the ciphertext of finished generations did.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -333,6 +341,8 @@ impl BackupService {
             binding,
             kit,
             leases: Arc::default(),
+            #[cfg(feature = "testing")]
+            commit_pause: Mutex::new(None),
         })
     }
 
@@ -354,6 +364,8 @@ impl BackupService {
             binding,
             kit,
             leases: Arc::default(),
+            #[cfg(feature = "testing")]
+            commit_pause: Mutex::new(None),
         })
     }
 
@@ -888,6 +900,16 @@ impl BackupService {
         replace: bool,
         now_ms: TimestampMs,
     ) -> Result<SetupCommit> {
+        #[cfg(feature = "testing")]
+        if let Some((arrived, go)) = self
+            .commit_pause
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            let _ = arrived.send(());
+            let _ = go.recv();
+        }
         let mut store = self.store();
         let commit = store.commit_setup(record, replace, now_ms)?;
         // Inside the hold in which the setup committed, and nowhere else: from here a request the
@@ -908,6 +930,21 @@ impl BackupService {
         self.signals.work.notify_one();
         self.signals.produce.notify_one();
         Ok(commit)
+    }
+
+    /// Stops the next commit of a setup on its thread, before it commits. Returns the end that
+    /// says the thread has arrived and the end that lets it go.
+    #[cfg(feature = "testing")]
+    pub fn pause_the_next_setup_commit(
+        &self,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (arrived, arrival) = std::sync::mpsc::channel();
+        let (go, going) = std::sync::mpsc::channel();
+        *self
+            .commit_pause
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((arrived, going));
+        (arrival, go)
     }
 
     /// Retires a backup writer for one archive, so its unfinished generations there stop being

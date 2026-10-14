@@ -2,7 +2,7 @@
 //! storage service, and the owner's setup of what the host backs up.
 
 use kr_protocol::backup_read::{BackupReadParams, BackupReadResult};
-use kr_protocol::backup_setup::{BackupEnableParams, BackupStatusParams};
+use kr_protocol::backup_setup::{BackupEnableParams, BackupEnableResult, BackupStatusParams};
 use kr_protocol::envelope::{MutationRequest, ParamsValue};
 
 use crate::error::{ControllerError, Result};
@@ -84,6 +84,12 @@ impl Controller {
     /// [`ControllerError::InvalidArgument`] for a call that is not well formed.
     pub(super) async fn backup_enable(&self, mutation: &MutationRequest) -> Result<ParamsValue> {
         let params: BackupEnableParams = parse(&mutation.params)?;
+        let answer = self.enable_backups(params).await?;
+        ParamsValue::from_typed(&answer)
+            .map_err(|error| ControllerError::InvalidArgument(error.to_string()))
+    }
+
+    async fn enable_backups(&self, params: BackupEnableParams) -> Result<BackupEnableResult> {
         let setup = self.backup_setup_of()?;
         // The setup is committed on a thread that this call can stop waiting for. The thread keeps
         // the daemon, and with it the environment's lock, until the commit has ended: a commit that
@@ -92,9 +98,21 @@ impl Controller {
             .me
             .upgrade()
             .map(|daemon| daemon as std::sync::Arc<dyn std::any::Any + Send + Sync>);
-        let answer = setup.enable(params, daemon).await?;
-        ParamsValue::from_typed(&answer)
-            .map_err(|error| ControllerError::InvalidArgument(error.to_string()))
+        setup.enable(params, daemon).await
+    }
+
+    /// Sets this host's backups up as `backup.enable` does, for a suite that stops waiting for the
+    /// call while its commit is still to be made.
+    ///
+    /// # Errors
+    ///
+    /// As `backup.enable`.
+    #[cfg(feature = "testing")]
+    pub async fn enable_backups_for_a_test(
+        &self,
+        params: BackupEnableParams,
+    ) -> Result<BackupEnableResult> {
+        self.enable_backups(params).await
     }
 
     fn backup_setup_of(&self) -> Result<&std::sync::Arc<crate::backup::setup::BackupSetup>> {
