@@ -4660,25 +4660,14 @@ impl Drop for Graft {
 /// process `hdiutil info` still shows serving the image.
 #[cfg(target_os = "macos")]
 fn take_off(source: &Path, at: &Path) -> Result<(), String> {
-    let said = match std::process::Command::new("/usr/bin/hdiutil")
-        .args(["detach", "-force"])
-        .arg(at)
-        .output()
-    {
-        Ok(output) if output.status.success() => return Ok(()),
-        Ok(output) => format!(
-            "hdiutil ended with {}: {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
-        ),
-        Err(error) => format!("hdiutil could not be run: {error}"),
-    };
-    Err(format!(
-        "the disk image {} did not detach from {} ({said}); {}",
-        source.display(),
-        at.display(),
-        serving(source)
-    ))
+    volumes::detach_attached(at).map_err(|said| {
+        format!(
+            "the disk image {} did not detach from {} ({said}); {}",
+            source.display(),
+            at.display(),
+            serving(source)
+        )
+    })
 }
 
 /// Says which processes `hdiutil info` shows serving `image`, by number and name.
@@ -4857,11 +4846,24 @@ fn a_graft_dropped_before_it_comes_off_fails_with_the_report() {
 #[cfg(target_os = "macos")]
 fn graft(at: &Path, scratch: &Path) -> Option<Graft> {
     std::fs::create_dir_all(at).expect("the mount point");
-    let image = scratch.join(format!("graft-{}.dmg", at.file_name()?.to_string_lossy()));
+    let name = at.file_name()?.to_string_lossy();
+    let image = scratch.join(format!("graft-{name}.dmg"));
+    let contents = volumes::never_indexed_contents(scratch, &format!("graft-{name}-contents"));
     let made = std::process::Command::new("/usr/bin/hdiutil")
         .args([
-            "create", "-size", "8m", "-fs", "HFS+", "-volname", "graft", "-quiet",
+            "create",
+            "-size",
+            "8m",
+            "-fs",
+            "HFS+",
+            "-volname",
+            "graft",
+            "-format",
+            "UDRW",
+            "-quiet",
+            "-srcfolder",
         ])
+        .arg(&contents)
         .arg(&image)
         .status();
     if !made.is_ok_and(|status| status.success()) {
