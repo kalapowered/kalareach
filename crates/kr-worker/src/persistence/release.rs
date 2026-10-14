@@ -4,13 +4,15 @@
 //! the store after every other holder has gone resets that file. On Windows the reset is refused
 //! while any process still has the file mapped, and a process that is ending releases its locks
 //! on the index before the system removes its mapping. A process that opens the store in that
-//! interval is told `SQLITE_IOERR_TRUNCATE`, which reads as "disk I/O error", although nothing is
-//! wrong with the disk and the same open succeeds a moment later. The interval is the end of the
+//! interval is told `SQLITE_IOERR_TRUNCATE`, which reads as "disk I/O error", although the disk
+//! has not failed and the same open succeeds a moment later. The interval is the end of the
 //! previous holder: a worker whose session has just closed, or a worker that was ended.
 //!
 //! SQLite does not retry this on Windows, so the openers do: they ask again for as long as the
 //! store gives that answer, and give the answer up once it has lasted [`PATIENCE`], which is the
-//! store being held by something that is not letting go.
+//! store being held by something that is not letting go. The same code is also what the store
+//! says when it cannot extend the index for want of room, and that refusal is then given up after
+//! [`PATIENCE`] as it was before the wait.
 
 use std::time::{Duration, Instant};
 

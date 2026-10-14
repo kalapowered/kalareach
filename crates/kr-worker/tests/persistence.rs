@@ -1050,8 +1050,8 @@ mod held_index {
 
     /// A file, a mapping of it and a view of the mapping, held until this is dropped.
     ///
-    /// The three are kept as integers, so the value can be handed to the hook a test leaves for
-    /// the store's next wait.
+    /// The three are kept as integers, which are the system's own values for them and can be
+    /// moved into the hook a test leaves for the store's next wait.
     pub struct HeldIndex {
         file: usize,
         mapping: usize,
