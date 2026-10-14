@@ -1408,6 +1408,56 @@ jobs:
       - name: Test
         run: pnpm -r test
 
+  # The companion ships on a phone, and every other job here builds for the machine it runs on: a
+  # crate the application links can stop building for Android, or gain a warning only Android's
+  # configuration reaches, while each of those jobs stays green. This lints the companion's library
+  # and every crate of this workspace it links for each of the four Android targets the bundle
+  # carries, with warnings refused, so a fault of the 32-bit targets is seen as well as the 64-bit
+  # ARM one. The runner's own Android NDK compiles the C library in that graph (the step names the
+  # toolchain itself and links nothing), so the job installs no toolchain beyond the targets.
+  android:
+    name: android
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      - name: Install the pinned toolchain
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustc --version
+
+      - name: Install the Android targets
+        run: |
+          rustup target add aarch64-linux-android armv7-linux-androideabi \
+            i686-linux-android x86_64-linux-android
+
+      - name: Restore the cargo cache
+        id: cargo-cache
+        uses: ./.github/actions/cargo-cache-restore
+        with:
+          name: android
+
+      # Every target is linted before the step reports, so one run names each target that fails.
+      - name: Lint the companion's Rust for Android
+        timeout-minutes: 45
+        run: |
+          failed=0
+          for target in aarch64-linux-android armv7-linux-androideabi \
+            i686-linux-android x86_64-linux-android; do
+            bash scripts/check-android.sh "$target" || {
+              echo "::error::the companion's Rust does not lint for $target"
+              failed=1
+            }
+          done
+          exit "$failed"
+
+      - name: Save the cargo cache
+        uses: ./.github/actions/cargo-cache-save
+        with:
+          primary-key: ${{ steps.cargo-cache.outputs.primary-key }}
+          cache-hit: ${{ steps.cargo-cache.outputs.cache-hit }}
+
   companion:
     name: companion
     strategy:

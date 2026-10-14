@@ -257,6 +257,12 @@ allows and retries it if it is interrupted.
 # The models, the surfaces and the accessibility rules that can be proved without a device.
 pnpm -C apps/companion test:mobile
 
+# The companion's Rust and every crate of this workspace it links, linted for an Android target
+# (default aarch64-linux-android) with warnings refused, which is what core-ci's android job runs
+# for each of the four. It compiles the C library with the NDK that `NDK_HOME` (or
+# `ANDROID_NDK_HOME`) names and links nothing, so any recent NDK will do.
+scripts/check-android.sh [<target>]
+
 # The packaged applications.
 pnpm -C apps/companion android --debug --target aarch64
 pnpm -C apps/companion exec tauri ios build --debug --target aarch64-sim
