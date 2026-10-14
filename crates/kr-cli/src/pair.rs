@@ -386,6 +386,20 @@ impl Ceremony<'_> {
         }
     }
 
+    /// What is confirmed at a terminal outside every session, as the clause that ends a refusal of
+    /// the guard.
+    const fn confirmed_at_a_terminal(&self) -> &'static str {
+        match self {
+            Self::EndExclusive => {
+                "ending exclusive management is confirmed at a terminal outside every session"
+            }
+            Self::Issue { .. } | Self::Approve { .. } | Self::EstablishClock { .. } => {
+                "what a host with no owner confirms is confirmed at a terminal outside every \
+                 session"
+            }
+        }
+    }
+
     /// What the person at this terminal is told while an owner device confirms.
     ///
     /// The owner device shows the new device's verification value in its own prompt; saying it
@@ -518,11 +532,7 @@ async fn confirmed(
     };
     if challenge.initial_bootstrap {
         ceremony.bootstrap_permits()?;
-        guard(
-            build_id,
-            "what a host with no owner confirms is confirmed at a terminal outside every session",
-        )
-        .await?;
+        guard(build_id, ceremony.confirmed_at_a_terminal()).await?;
         let mut terminal = Terminal::open()?;
         ceremony.confirm_at(&mut terminal, display?.as_ref())?;
         let key = AuthorisationKeyPair::generate().map_err(|error| {
