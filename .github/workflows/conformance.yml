@@ -137,7 +137,7 @@ jobs:
     name: macos
     if: github.event_name != 'workflow_dispatch' || inputs.macos
     runs-on: macos-15
-    timeout-minutes: 300
+    timeout-minutes: 330
     env:
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
@@ -153,20 +153,25 @@ jobs:
       # report the lowest free space, sampled every two seconds. The report below is one step of
       # hours, so the free space through it is listed at ten-minute spacing against the log's times.
       - name: What the disk holds
-        timeout-minutes: 10
+        continue-on-error: true
+        timeout-minutes: 5
         run: bash scripts/disk-report.sh begin "the image as it arrives"
 
-      # The runner image carries a simulator runtime for each Xcode platform and release, about
-      # 113 GB of disk images with 54 GB of caches made from them, and nothing in this job's
-      # groups uses more than one: the iOS application's unit tests run in the simulator of the
-      # newest iOS runtime, which is the one that stays. Every other runtime is removed, with its
-      # cache, so that the build has the disk to itself.
+      # The runner image carries a simulator runtime for each Xcode platform and release, 113 GB of
+      # disk images. The only group that drives a simulator is the phones group, whose iOS unit
+      # tests run in an iPhone simulator, so the iOS runtimes stay, and the tvOS, watchOS and
+      # visionOS runtimes, which nothing here uses, are removed. Freeing the disk is best effort
+      # and the job goes on if it fails, with the free space of the reports around it to show what
+      # was left.
       - name: Free the disk the build needs
-        timeout-minutes: 30
-        run: bash scripts/free-simulator-runtimes.sh --keep-newest-ios
+        continue-on-error: true
+        timeout-minutes: 8
+        run: bash scripts/free-simulator-runtimes.sh --keep-ios
 
       - name: What the disk holds with the runtimes cleared
-        timeout-minutes: 10
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        timeout-minutes: 2
         run: bash scripts/disk-report.sh step "the simulator runtimes cleared"
 
       - name: What this runner is
@@ -267,7 +272,8 @@ jobs:
 
       - name: What the disk has left
         if: ${{ !cancelled() }}
-        timeout-minutes: 10
+        continue-on-error: true
+        timeout-minutes: 2
         run: bash scripts/disk-report.sh end "what the disk has left"
 
       - name: Keep the result and the evidence

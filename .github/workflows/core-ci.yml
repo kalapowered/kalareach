@@ -1425,6 +1425,8 @@ jobs:
       # each stretch of the job, on the macOS leg.
       - name: What the disk holds
         if: runner.os == 'macOS'
+        continue-on-error: true
+        timeout-minutes: 5
         run: bash scripts/disk-report.sh begin "the image as it arrives"
 
       - name: Install pnpm
@@ -1486,6 +1488,8 @@ jobs:
 
       - name: What the disk holds after the native backend's tests
         if: ${{ !cancelled() && runner.os == 'macOS' }}
+        continue-on-error: true
+        timeout-minutes: 2
         run: bash scripts/disk-report.sh step "the native backend's tests"
 
       # A collection key belongs in the operating system's own credential store, and on this system
@@ -1514,6 +1518,8 @@ jobs:
 
       - name: What the disk holds after the browsers' run
         if: ${{ !cancelled() && runner.os == 'macOS' }}
+        continue-on-error: true
+        timeout-minutes: 2
         run: bash scripts/disk-report.sh step "the browsers' run"
 
       # The figures, the traces and the screenshots the run produced, kept whether it passed or not.
@@ -1535,6 +1541,8 @@ jobs:
 
       - name: What the disk has left
         if: ${{ !cancelled() && runner.os == 'macOS' }}
+        continue-on-error: true
+        timeout-minutes: 2
         run: bash scripts/disk-report.sh end "what the disk has left"
 
   # The whole workspace on macOS: the lint, the workspace's tests, the end-to-end demonstrations and
@@ -1584,21 +1592,26 @@ jobs:
       # reading between two steps says nothing of how near a step came to the end of the disk while
       # it ran. The reports below sit after the steps that write the most.
       - name: What the disk holds
-        timeout-minutes: 10
+        continue-on-error: true
+        timeout-minutes: 5
         run: bash scripts/disk-report.sh begin "the image as it arrives"
 
-      # The runner image carries a simulator runtime for each Xcode platform and release, about
-      # 113 GB of disk images with 54 GB of caches made from them. This job runs the workspace's
-      # tests, demonstrations and measurements on the host: none of them builds with xcodebuild or
-      # starts a simulator, so none of the runtimes is used and all of them are removed, with their
-      # caches. The workspace's tests take more than 40 GB of the disk at their peak, and the image
-      # leaves 42 GB free; with the runtimes gone it leaves about 140 GB.
+      # The runner image carries a simulator runtime for each Xcode platform and release, 113 GB of
+      # disk images. This job runs the workspace's tests, demonstrations and measurements on the
+      # host: none of them builds with xcodebuild or starts a simulator, so none of the runtimes is
+      # used and all of them are removed. The workspace's tests take more than 40 GB of the disk at
+      # their peak, and the image leaves 42 GB free; with the runtimes gone it leaves about 140 GB.
+      # Freeing the disk is best effort and the job goes on if it fails, with the free space of
+      # the reports around it to show what was left.
       - name: Free the disk the build needs
-        timeout-minutes: 30
+        continue-on-error: true
+        timeout-minutes: 8
         run: bash scripts/free-simulator-runtimes.sh
 
       - name: What the disk holds with the runtimes cleared
-        timeout-minutes: 10
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        timeout-minutes: 2
         run: bash scripts/disk-report.sh step "the simulator runtimes cleared"
 
       # What this runner is, printed before anything asserts on it, so a pass or a failure below
@@ -1703,7 +1716,9 @@ jobs:
           paths: target/release
 
       - name: What the disk holds with the caches restored
-        timeout-minutes: 10
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        timeout-minutes: 2
         run: bash scripts/disk-report.sh step "the caches restored"
 
       - name: Build the test components
@@ -1773,7 +1788,8 @@ jobs:
 
       - name: What the disk holds after the lint
         if: ${{ !cancelled() && matrix.part == 'tests' }}
-        timeout-minutes: 10
+        continue-on-error: true
+        timeout-minutes: 2
         run: bash scripts/disk-report.sh step "the lint"
 
       # The rust job's documentation step for this platform's own code: a doc comment on an item
@@ -1796,7 +1812,8 @@ jobs:
 
       - name: What the disk holds after the documentation
         if: ${{ !cancelled() && matrix.part == 'tests' }}
-        timeout-minutes: 10
+        continue-on-error: true
+        timeout-minutes: 2
         run: bash scripts/disk-report.sh step "the documentation"
 
       # The workspace's tests, less what this runner cannot run, each left out by name here:
@@ -1845,7 +1862,8 @@ jobs:
       # margin to spare.
       - name: What the disk holds after the workspace's tests
         if: ${{ !cancelled() && matrix.part == 'tests' }}
-        timeout-minutes: 10
+        continue-on-error: true
+        timeout-minutes: 2
         run: bash scripts/disk-report.sh step "the workspace's tests"
 
       # The cases that put another filesystem in or beside a tree: a disk image attached inside a
@@ -1963,7 +1981,8 @@ jobs:
 
       - name: What the disk holds after the cases that need another filesystem
         if: ${{ !cancelled() && matrix.part == 'tests' }}
-        timeout-minutes: 10
+        continue-on-error: true
+        timeout-minutes: 2
         run: bash scripts/disk-report.sh step "the cases that need another filesystem"
 
       # The cases whose verdicts are timings: a queue that must overflow before a slow component
@@ -2004,7 +2023,8 @@ jobs:
 
       - name: What the disk holds after the demonstrations
         if: ${{ !cancelled() && matrix.part == 'demonstrations' }}
-        timeout-minutes: 10
+        continue-on-error: true
+        timeout-minutes: 2
         run: bash scripts/disk-report.sh step "the demonstrations"
 
       # Everything the script below builds before it measures: the release profile of the
@@ -2018,10 +2038,13 @@ jobs:
           cargo build --locked --release --workspace
           cargo test --locked --release -p kr-worker --test performance --bench input_latency --no-run
 
+      # The measurements assert on an idle host, so the sampling of the free space ends here and
+      # the report after them reads the disk once.
       - name: What the disk holds after the release build
         if: ${{ !cancelled() && matrix.part == 'demonstrations' }}
-        timeout-minutes: 10
-        run: bash scripts/disk-report.sh step "the release build"
+        continue-on-error: true
+        timeout-minutes: 2
+        run: bash scripts/disk-report.sh end "the release build"
 
       # The idle-resource and attach targets (KR-PERF-003, KR-PERF-004) and the input measurements,
       # in a release build, each figure printed with the conditions it was taken under and asserted
@@ -2050,12 +2073,19 @@ jobs:
           path: ${{ env.KR_TEST_ARTIFACTS_DIR }}
           if-no-files-found: ignore
 
-      # What the disk had left once every step above was done, and the lowest free space of every
-      # stretch of the job.
+      # What the disk had left once every step above was done, and for the tests the lowest free
+      # space of every stretch of the job.
       - name: What the disk has left
-        if: ${{ !cancelled() }}
-        timeout-minutes: 10
+        if: ${{ !cancelled() && matrix.part == 'tests' }}
+        continue-on-error: true
+        timeout-minutes: 2
         run: bash scripts/disk-report.sh end "what the disk has left"
+
+      - name: What the disk has left after the measurements
+        if: ${{ !cancelled() && matrix.part == 'demonstrations' }}
+        continue-on-error: true
+        timeout-minutes: 2
+        run: bash scripts/disk-report.sh report "what the disk has left"
 
       - name: Save the cargo cache
         if: ${{ success() && matrix.part == 'tests' }}
@@ -2096,7 +2126,8 @@ jobs:
       # The disk as the image arrives, and from here to the last report the lowest free space in
       # each stretch of the job.
       - name: What the disk holds
-        timeout-minutes: 10
+        continue-on-error: true
+        timeout-minutes: 5
         run: bash scripts/disk-report.sh begin "the image as it arrives"
 
       # What this runner is, printed before anything asserts on it, so a pass or a failure below
@@ -2134,10 +2165,13 @@ jobs:
           cargo build --locked --release --workspace
           cargo test --locked --release -p kr-worker --test performance --bench input_latency --no-run
 
+      # The measurements assert on an idle host, so the sampling of the free space ends here and
+      # the report after them reads the disk once.
       - name: What the disk holds after the release build
         if: ${{ !cancelled() }}
-        timeout-minutes: 10
-        run: bash scripts/disk-report.sh step "the release build"
+        continue-on-error: true
+        timeout-minutes: 2
+        run: bash scripts/disk-report.sh end "the release build"
 
       # The idle processor figure is asserted here because this host reports no shortfall against
       # the reference host; a shortfall the host reported would be recorded and named instead. The
@@ -2153,8 +2187,9 @@ jobs:
 
       - name: What the disk has left
         if: ${{ !cancelled() }}
-        timeout-minutes: 10
-        run: bash scripts/disk-report.sh end "what the disk has left"
+        continue-on-error: true
+        timeout-minutes: 2
+        run: bash scripts/disk-report.sh report "what the disk has left"
 
       - name: Keep the test evidence
         if: ${{ !cancelled() }}
