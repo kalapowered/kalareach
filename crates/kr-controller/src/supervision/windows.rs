@@ -1068,18 +1068,27 @@ mod platform {
             .join("schtasks.exe")
     }
 
-    /// Runs one Task Scheduler command within the service-manager bound.
-    fn schtasks_within(
-        asked: Asked,
+    /// Runs one command of the Task Scheduler's, `program` being the Task Scheduler's own, and
+    /// gives it the bound every such command is given.
+    ///
+    /// Every call this host puts to the Task Scheduler runs through here.
+    pub(super) fn scheduler_within(
+        program: &std::path::Path,
         arguments: &[&str],
-    ) -> Result<std::process::Output, TaskError> {
-        let program = schtasks();
+    ) -> Result<std::process::Output, RunFailure> {
         command_within(
             &program.display().to_string(),
             arguments,
             SERVICE_MANAGER_BOUND,
         )
-        .map_err(|failure| TaskError::Scheduler {
+    }
+
+    /// Runs one Task Scheduler command within its bound.
+    fn schtasks_within(
+        asked: Asked,
+        arguments: &[&str],
+    ) -> Result<std::process::Output, TaskError> {
+        scheduler_within(&schtasks(), arguments).map_err(|failure| TaskError::Scheduler {
             asked,
             outcome: match failure {
                 RunFailure::NotRun(_) => Outcome::NotStarted,
@@ -1491,12 +1500,7 @@ mod platform {
     /// [`RunFailure::Failed`] when it was asked and did not start the run, which it may have begun
     /// first.
     pub fn run(definition: &TaskDefinition) -> Result<(), RunFailure> {
-        let program = schtasks();
-        let output = command_within(
-            &program.display().to_string(),
-            &["/Run", "/I", "/TN", &definition.name],
-            SERVICE_MANAGER_BOUND,
-        )?;
+        let output = scheduler_within(&schtasks(), &["/Run", "/I", "/TN", &definition.name])?;
         if output.status.success() {
             return Ok(());
         }
@@ -2249,6 +2253,23 @@ mod tests {
         );
         assert!(!read.triggered);
         assert_eq!(read.actions, 1);
+    }
+
+    /// A command the Task Scheduler answers late is waited for.
+    ///
+    /// The Task Scheduler answers slowly on a machine busy starting processes, and a start that
+    /// gave a question up after the ten seconds a service manager is given would fail for it. The
+    /// command here is `ping`, which answers once its twelve echoes, eleven seconds, are done.
+    #[cfg(windows)]
+    #[test]
+    fn a_task_scheduler_command_that_answers_late_is_waited_for() {
+        let root = std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into());
+        let ping = std::path::Path::new(&root)
+            .join("System32")
+            .join("ping.exe");
+        let output = platform::scheduler_within(&ping, &["-n", "12", "127.0.0.1"])
+            .expect("a command that answers after eleven seconds is waited for");
+        assert!(output.status.success(), "it answered: {:?}", output.status);
     }
 
     /// A test host, which has nobody signed in, registers the same definition with the other logon.
