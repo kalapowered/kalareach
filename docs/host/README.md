@@ -892,7 +892,9 @@ systemd drops a transient unit once its process has ended, and `--collect` makes
 unit whose process failed as well, which would otherwise stay listed as failed until somebody
 reset it. Every command put to launchd or to the user manager, whether it asks, loads, starts or
 removes, is given ten seconds to answer; one that does not is ended and counted as a failure of a
-command that may have reached the manager.
+command that may have reached the manager. A command put to the Windows Task Scheduler is given two
+minutes, because the Scheduler answers slowly on a machine that is busy starting processes. One that
+has not answered by then is ended the same way.
 
 The service manager reports a process identifier as soon as it has spawned the process, which can
 be before the kernel will describe it. The daemon retries briefly rather than refusing a worker

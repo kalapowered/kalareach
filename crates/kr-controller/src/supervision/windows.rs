@@ -1058,7 +1058,7 @@ mod platform {
         Asked, Foreign, ForeignReason, LastResult, Outcome, RegisteredTask, Standing, TaskChange,
         TaskDefinition, TaskError, decode_output, last_result_in,
     };
-    use crate::supervision::{RunFailure, SERVICE_MANAGER_BOUND, command_within};
+    use crate::supervision::{RunFailure, TASK_SCHEDULER_BOUND, command_within};
 
     /// The Task Scheduler's command, from the system directory and never from the search path.
     fn schtasks() -> std::path::PathBuf {
@@ -1069,7 +1069,7 @@ mod platform {
     }
 
     /// Runs one command of the Task Scheduler's, `program` being the Task Scheduler's own, and
-    /// gives it the bound every such command is given.
+    /// waits for its answer until [`TASK_SCHEDULER_BOUND`] takes it for hung.
     ///
     /// Every call this host puts to the Task Scheduler runs through here.
     pub(super) fn scheduler_within(
@@ -1079,7 +1079,7 @@ mod platform {
         command_within(
             &program.display().to_string(),
             arguments,
-            SERVICE_MANAGER_BOUND,
+            TASK_SCHEDULER_BOUND,
         )
     }
 

@@ -717,8 +717,19 @@ enum JobState {
 
 /// How long one command put to a service manager is given to answer: a question, a removal, a
 /// load or a start.
-#[cfg(any(target_os = "macos", target_os = "linux", windows))]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 const SERVICE_MANAGER_BOUND: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How long one command put to the Windows Task Scheduler is given before it is taken for hung.
+///
+/// The Task Scheduler answers slowly on a machine that is busy starting processes: with two dozen
+/// tasks being registered, run and read at once on a busy host, its answers took from a fraction
+/// of a second to ten seconds for a run, and to nearly fifty for the list of its tasks. A call put
+/// to it is waited for, because a start that gave its question up early fails although the
+/// Scheduler would have answered. The bound is only what ends a call that never will, and it is
+/// well past the slowest answer measured.
+#[cfg(windows)]
+const TASK_SCHEDULER_BOUND: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// How long a command that did not answer is given to be collected once it has been ended.
 #[cfg(any(target_os = "macos", target_os = "linux", windows))]
