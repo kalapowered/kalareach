@@ -96,10 +96,19 @@ struct Adopted {
     version: VersionRef,
 }
 
+/// How long a Git read of these cases may run before it is taken for hung.
+///
+/// The project service ends a Git read at a bound of its own, a minute, so that a wedged child is
+/// noticed. These cases are about the evidence a workflow binds to a version, not about that bound,
+/// and a machine that does not run a Git child for a minute would end them for a reason they are
+/// not about. A read that finishes is answered whenever it does; this ends one that never does.
+const HUNG_GIT_READ: std::time::Duration = std::time::Duration::from_secs(600);
+
 fn adopted_with_one_version() -> Adopted {
     let host = TempHost::create();
-    let project =
-        Arc::new(ProjectService::open(&host.environment()).expect("project service opens"));
+    let mut project = ProjectService::open(&host.environment()).expect("project service opens");
+    project.hold_git_read_deadline(HUNG_GIT_READ);
+    let project = Arc::new(project);
     let changesets = ChangeSetService::open(&host.environment(), Arc::clone(&project))
         .expect("changeset service opens");
 
