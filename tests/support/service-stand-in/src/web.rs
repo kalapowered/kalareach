@@ -368,8 +368,8 @@ impl ServiceWeb {
     }
 
     /// An account gives the host whose signing key is `host` leave to spend its relay allowance,
-    /// with at most `byte_ceiling` bytes outstanding for one lease, as an account's authorisation does.
-    /// Returns the ids a host names to be paid for.
+    /// with at most `byte_ceiling` bytes outstanding for one lease, as an account's authorisation
+    /// does. Returns the ids a host names to be paid for.
     pub fn authorise_relay_payer(
         &self,
         host: &kr_protocol::scalars::AuthorisationKey,
