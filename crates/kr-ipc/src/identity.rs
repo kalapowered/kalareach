@@ -519,7 +519,9 @@ pub enum Stopped {
 /// signal, so a number that passes to a different process between the two is never signalled:
 /// Linux holds it by a process descriptor, macOS by the kernel's own version of the process
 /// (which the kernel checks again as it signals) and Windows by an open handle. Where a system
-/// offers none of these, the process is not signalled at all, and the answer says so.
+/// offers none of these (Android, whose applications may not signal through a process descriptor
+/// on every release the product runs on, and iOS), the process is not signalled at all, and the
+/// answer says so.
 ///
 /// This process is never stopped by it.
 #[must_use]
@@ -629,7 +631,8 @@ fn unavailable(what: &'static str, detail: impl Into<String>) -> IpcError {
 
 // Android is Linux underneath: the same `/proc` entries, in the same format, with the same
 // meaning. It is named beside it rather than left to fall through, because a target with no
-// platform module at all is a target that does not compile.
+// platform module at all is a target that does not compile. It differs in stopping a process:
+// see `stop` below.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 mod platform {
     use super::{
@@ -1285,12 +1288,32 @@ mod platform {
         })
     }
 
+    /// Signals no process on Android, because there is no hold on one that every release of it
+    /// gives.
+    ///
+    /// The hold on Linux is a process descriptor. The kernel gives one from 5.3, but an
+    /// application's sandbox allows opening one only from Android 11 and signalling through one
+    /// only from Android 12: on the earlier releases the product runs on, a call the sandbox does
+    /// not allow ends the application that makes it. The system-call library offers both calls
+    /// for Linux alone as well. A system that cannot hold a process by more than its number does
+    /// not get to signal by the number, so the answer is that the process was not signalled.
+    /// Nothing on a phone records a process of a host to stop.
+    #[cfg(target_os = "android")]
+    pub(super) fn stop(_identity: &ProcessStartIdentity, _stop: super::Stop) -> super::Stopped {
+        super::Stopped::Unsafe(
+            "an Android application may not signal through a process descriptor on every release, \
+             so the process is not signalled by its number"
+                .to_owned(),
+        )
+    }
+
     /// Signals the process holding `identity`, through a process descriptor.
     ///
     /// The identity is read before the descriptor is opened and again after, and both readings
     /// must be the recorded one: a process that held the number through both is the one the
     /// descriptor refers to, because the descriptor was opened between them. A kernel that gives
     /// no descriptor (before 5.3, or a seccomp filter) gets no signal by number.
+    #[cfg(target_os = "linux")]
     pub(super) fn stop(identity: &ProcessStartIdentity, stop: super::Stop) -> super::Stopped {
         use rustix::io::Errno;
         use rustix::process::{Pid, PidfdFlags, Signal, pidfd_open, pidfd_send_signal};
