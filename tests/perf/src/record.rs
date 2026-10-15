@@ -20,6 +20,7 @@
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 #[path = "../../../crates/kr-transport/tests/support/conditions.rs"]
 mod conditions;
@@ -29,19 +30,80 @@ use conditions::{Host, MAX_STOLEN_SHARE, REFERENCE_CORES, REFERENCE_MEMORY_BYTES
 /// The variable that names where a run keeps its evidence.
 pub const ARTIFACTS: &str = "KR_TEST_ARTIFACTS_DIR";
 
+/// How many steps the fixed piece of work a host's speed is read by has.
+const SPEED_STEPS: u64 = 20_000_000;
+
+/// How many times that work is run at each edge of a measurement.
+const SPEED_READINGS: usize = 3;
+
+/// How long a host takes to run a fixed piece of single-threaded work.
+///
+/// A figure that is a share of one processor, or a time, is only as good as the processor it was
+/// taken on, and a hosted runner's processor is not always the same speed from one run to the
+/// next. This is the host's speed read in the same run, at both edges of what a measurement times,
+/// so that a figure which reads high can be told apart from a host that read slow: the work does
+/// not change, so a longer time is a slower host.
+#[derive(Clone, Copy, Debug)]
+pub struct Speed {
+    quickest: Duration,
+}
+
+impl Speed {
+    /// Runs the work [`SPEED_READINGS`] times and keeps the quickest, because a run that was
+    /// preempted says how busy the host was, and the time it takes to do the work at its best is
+    /// what its speed is.
+    #[must_use]
+    pub fn read() -> Self {
+        let quickest = (0..SPEED_READINGS)
+            .map(|_| {
+                let began = Instant::now();
+                std::hint::black_box(steps(std::hint::black_box(SPEED_STEPS)));
+                began.elapsed()
+            })
+            .min()
+            .unwrap_or_default();
+        Self { quickest }
+    }
+
+    /// The time the work took, in milliseconds.
+    #[must_use]
+    pub fn milliseconds(self) -> f64 {
+        self.quickest.as_secs_f64() * 1000.0
+    }
+}
+
+/// A chain of integer steps in which each one needs the result of the one before it, so that the
+/// time it takes is the time of the processor's own arithmetic and nothing a compiler or a core
+/// can do ahead of it.
+fn steps(count: u64) -> u64 {
+    let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+    for step in 0..count {
+        state =
+            state.rotate_left(13) ^ state.wrapping_mul(0xBF58_476D_1CE4_E5B9).wrapping_add(step);
+    }
+    state
+}
+
 /// The host as a measurement began, and the span the hypervisor's share is read over.
 #[derive(Debug)]
 pub struct Window {
     entering: Option<String>,
+    speed: Speed,
     stolen: StolenTime,
 }
 
 impl Window {
     /// Reads the host as a measurement begins.
+    ///
+    /// Its speed is read after the load average and before the span the hypervisor's share is
+    /// read over begins, so that the work that reads it is neither in the load nor in that span.
     #[must_use]
     pub fn open() -> Self {
+        let entering = load_average();
+        let speed = Speed::read();
         Self {
-            entering: load_average(),
+            entering,
+            speed,
             stolen: StolenTime::start(),
         }
     }
@@ -49,11 +111,14 @@ impl Window {
     /// Reads the host again as the measurement ends.
     #[must_use]
     pub fn close(mut self) -> Conditions {
+        let stolen = self.stolen.take();
+        let leaving = load_average();
         Conditions {
             host: Host::read(),
             entering: self.entering,
-            leaving: load_average(),
-            stolen: self.stolen.take(),
+            leaving,
+            speed: Some((self.speed, Speed::read())),
+            stolen,
         }
     }
 }
@@ -64,6 +129,8 @@ pub struct Conditions {
     host: Host,
     entering: Option<String>,
     leaving: Option<String>,
+    /// The host's speed at the two edges, where it was read.
+    speed: Option<(Speed, Speed)>,
     stolen: Option<f64>,
 }
 
@@ -115,6 +182,19 @@ impl Conditions {
                 self.leaving.clone().unwrap_or_else(unread)
             ),
             format!(
+                "  speed             {}",
+                self.speed.map_or_else(
+                    || "not read".to_owned(),
+                    |(entering, leaving)| format!(
+                        "a fixed run of {SPEED_STEPS} dependent integer steps took {:.1} ms \
+                         entering and {:.1} ms leaving, the quickest of {SPEED_READINGS} at each \
+                         edge",
+                        entering.milliseconds(),
+                        leaving.milliseconds()
+                    )
+                )
+            ),
+            format!(
                 "  stolen share      {}",
                 match self.stolen {
                     Some(share) => format!(
@@ -157,6 +237,7 @@ impl Conditions {
             },
             entering: None,
             leaving: None,
+            speed: None,
             stolen,
         }
     }
