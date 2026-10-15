@@ -36,7 +36,7 @@ has been matched. An idle shell costs no engine, no instance, no compiled cache 
 
 ## The engine
 
-The engine is Wasmtime 48.0.4, pinned to that exact release. The pin is part of the compiled-code
+The engine is Wasmtime 48.0.6, pinned to that exact release. The pin is part of the compiled-code
 cache key rather than a convenience: an artefact is filed under the release that compiled it, and a
 release reads only its own.
 

@@ -178,7 +178,7 @@ reqwest = { version = "=0.13.5", default-features = false, features = ["rustls-n
 # The TLS library the transport hands its provider to. `ring` is the provider every other TLS user
 # in this workspace is built on, and it is named here so the client carries one implementation of
 # the primitives rather than a second.
-rustls = { version = "=0.23.45", default-features = false, features = ["logging", "ring", "std", "tls12"] }
+rustls = { version = "=0.23.46", default-features = false, features = ["logging", "ring", "std", "tls12"] }
 # What `portable-pty`'s traits report a failure as. The worker implements two of them for its own
 # Windows pseudo-console.
 anyhow = "=1.0.104"
@@ -247,7 +247,7 @@ uuid = { version = "=1.26.1", features = ["v4"] }
 vtparse = { git = "https://github.com/kalapowered/wezterm", rev = "9a9015119497fd5803c35a10ea4ffc503f2a7dfb" }
 # The component engine, pinned to one exact release. A compiled-code cache entry is only valid for
 # the version that produced it, so the pin is part of the cache key rather than a convenience.
-wasmtime = { version = "=48.0.4", default-features = false, features = ["addr2line", "component-model", "cranelift", "demangle", "gc", "gc-drc", "gc-null", "runtime", "std"] }
+wasmtime = { version = "=48.0.6", default-features = false, features = ["addr2line", "component-model", "cranelift", "demangle", "gc", "gc-drc", "gc-null", "runtime", "std"] }
 # The pinned terminal library's cell crate, which holds the width function. The width model takes it
 # directly so a client that builds for Apple's mobile systems measures text with the same tables.
 wezterm-cell = { git = "https://github.com/kalapowered/wezterm", rev = "9a9015119497fd5803c35a10ea4ffc503f2a7dfb" }
