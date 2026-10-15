@@ -87,6 +87,12 @@ impl OwnedWriter {
         }
     }
 
+    /// Whether the thread's last attempt to write failed.
+    #[must_use]
+    pub fn last_write_failed(&self) -> bool {
+        self.failed.load(Ordering::Acquire)
+    }
+
     /// Returns the session this writer writes for.
     #[must_use]
     pub const fn session_id(&self) -> SessionId {
