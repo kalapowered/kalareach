@@ -160,11 +160,12 @@ impl Activity {
         true
     }
 
-    /// Leaves the supervision's mark unmade from now on, whatever the session does, for the host's
-    /// own tests: a case about how an exit is noticed leaves the supervision nothing to wake for
-    /// but the exit, a clock it has put out of reach and an observation the case asks for. The
-    /// adoption watch's mark is made as before. It compiles to nothing without the `testing`
-    /// feature, and no shipped build enables it.
+    /// Leaves the supervision's mark unmade, whatever the session does, for the host's own tests:
+    /// a case about how an exit is noticed leaves the supervision nothing to wake for but a
+    /// child's exit, a clock it has put out of reach and an observation the case asks for. Call it
+    /// before the session runs: a note already under way when it is called can still make the
+    /// mark. The adoption watch's mark is made as before. It compiles to nothing without the
+    /// `testing` feature, and no shipped build enables it.
     #[cfg(feature = "testing")]
     pub fn silence_marks(&self) {
         self.silenced.store(true, Ordering::Relaxed);
@@ -655,8 +656,8 @@ mod tests {
         );
     }
 
-    /// A supervision that hears no child signal, so that a child of another case in this test
-    /// process ending cannot be what wakes it, and whose sweep is an hour away.
+    /// A supervision that opens no child signal, so that a case that only calls it needs no
+    /// runtime, and whose sweep is an hour away.
     fn deaf(activity: Arc<Activity>, started: Instant) -> Supervision {
         #[cfg(unix)]
         let exits = ChildExits(None);
@@ -716,6 +717,12 @@ mod tests {
         assert!(
             marks.take_foreground(),
             "and the adoption watch still hears it"
+        );
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        let mut listening = std::pin::pin!(marks.marked());
+        assert!(
+            listening.as_mut().poll(&mut context).is_pending(),
+            "and the supervision is sent no wake"
         );
     }
 

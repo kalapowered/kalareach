@@ -1928,9 +1928,11 @@ async fn a_root_shell_that_exits_after_the_session_settles_is_noticed_by_its_own
     // is held at a gate. The host is asked to look at the session once the shell has named the
     // gate, and the gate is opened when the worker's record of the session names it and the look
     // that made the record has ended, which is after the shell was asked about and found alive,
-    // however long the start took. From then on the supervision has no wake but the shell's exit
-    // being reported, by the child signal where there is one and by the short poll of the shell's
-    // status where there is not, so a closure that follows the gate can only be that.
+    // however long the start took. From then on the supervision has no wake but a child's exit,
+    // by the child signal where there is one and by the short poll of the shell's status where
+    // there is not, so a closure that follows the gate is the shell's exit being reported. On Unix
+    // the signal also comes for a child of another case in this test process, which no case of
+    // this shape can tell from the shell's own.
     let host = kr_ipc::testing::TempHost::create();
     let gate_identifier = if cfg!(windows) {
         "$(cat /proc/$gate/winpid)"
