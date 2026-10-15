@@ -10,15 +10,15 @@
 //!
 //! All of it is on one monotonic clock in one process, so the intervals can be laid side by side.
 //!
-//! Nothing is recorded unless the measurement arms it. An unarmed site costs one relaxed load and a
-//! branch, and no site allocates. In a shipped build there is no recorder at all: the types below
-//! are empty and every call compiles to nothing.
+//! Nothing is recorded unless the measurement arms it, and no site reads the clock or allocates
+//! until it does: an unarmed site costs one relaxed load and a branch. In a shipped build there is
+//! no recorder at all: the types below are empty and every call compiles to nothing.
 
 #[cfg(feature = "testing")]
-pub use recording::{Acquisition, Event, LockTrace, Recording};
+pub use recording::{Acquisition, Event, LockTrace, Recording, Shared};
 
 #[cfg(not(feature = "testing"))]
-pub use shipped::LockTrace;
+pub use shipped::{LockTrace, Shared};
 
 /// Where on a keystroke's path an event happened.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -39,11 +39,7 @@ pub enum Site {
     Ingest,
     /// The supervision took the session for one wake.
     SupervisionWake,
-    /// An observation of the session's processes read them.
-    #[cfg_attr(
-        not(feature = "testing"),
-        expect(dead_code, reason = "only the recorder of a testing build names it")
-    )]
+    /// An observation of the session's processes read them, with the session let go.
     Observation,
 }
 
@@ -79,19 +75,22 @@ impl Site {
 
 #[cfg(feature = "testing")]
 mod recording {
-    use std::sync::OnceLock;
     use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+    use std::sync::{Arc, OnceLock};
     use std::time::Instant;
 
     use super::Site;
 
+    /// What a session's tasks share of the recorder.
+    pub type Shared = Arc<LockTrace>;
+
     /// The words one event takes: its site, then four instants or values.
     const WORDS: usize = 5;
 
-    /// How many events one recording holds. A recording that is full stops and says so; it never
+    /// How many events a recorder holds in all. A recorder that is full stops and says so; it never
     /// wraps, so an event that is missing from a recording that overflowed is not evidence that
     /// nothing happened.
-    const EVENTS: usize = 400;
+    const EVENTS: usize = 4096;
 
     /// One event of a recording, in nanoseconds since the recorder's epoch.
     ///
@@ -120,16 +119,23 @@ mod recording {
     pub struct Recording {
         /// The events, in the order they finished.
         pub events: Vec<Event>,
-        /// Whether events were lost because the recording was full.
+        /// Whether events were lost because the recorder was full.
         pub overflowed: bool,
     }
 
     /// The recorder one session carries.
+    ///
+    /// A slot is reserved once and written by one writer, and no slot is ever reused or cleared, so
+    /// a writer that is still storing when a new recording begins cannot disturb anyone's event. A
+    /// recording is the slots reserved since it began.
     #[derive(Debug)]
     pub struct LockTrace {
         epoch: Instant,
         armed: AtomicBool,
+        /// The slots reserved so far.
         taken: AtomicUsize,
+        /// The first slot of the recording that is being taken.
+        window: AtomicUsize,
         overflowed: AtomicBool,
         words: OnceLock<Box<[AtomicU64]>>,
     }
@@ -148,9 +154,16 @@ mod recording {
                 epoch: Instant::now(),
                 armed: AtomicBool::new(false),
                 taken: AtomicUsize::new(0),
+                window: AtomicUsize::new(0),
                 overflowed: AtomicBool::new(false),
                 words: OnceLock::new(),
             }
+        }
+
+        /// A recorder to share between a session's tasks.
+        #[must_use]
+        pub fn shared() -> Shared {
+            Arc::new(Self::new())
         }
 
         /// Starts recording. The first call allocates the space; nothing allocates after it.
@@ -161,20 +174,15 @@ mod recording {
             self.armed.store(true, Ordering::Release);
         }
 
-        /// Stops recording. What was recorded stays until it is read or restarted.
+        /// Stops recording. What was recorded stays until the recorder is dropped.
         pub fn disarm(&self) {
             self.armed.store(false, Ordering::Release);
         }
 
-        /// Forgets what has been recorded, so that the next recording begins here.
+        /// Begins a new recording: [`Self::recording`] gives what is stored from here on.
         pub fn restart(&self) {
-            self.overflowed.store(false, Ordering::Relaxed);
-            self.taken.store(0, Ordering::Release);
-            if let Some(words) = self.words.get() {
-                for word in words.iter() {
-                    word.store(0, Ordering::Relaxed);
-                }
-            }
+            self.window
+                .store(self.taken.load(Ordering::Acquire), Ordering::Release);
         }
 
         /// The instant this recorder counts from.
@@ -189,13 +197,17 @@ mod recording {
             u64::try_from(at.saturating_duration_since(self.epoch).as_nanos()).unwrap_or(u64::MAX)
         }
 
-        /// What has been recorded since it was armed or restarted.
+        /// What has been recorded since the recording began, in the order it finished.
+        ///
+        /// An event whose writer has not finished is not in it. One that began before the recording
+        /// did and finished after is.
         #[must_use]
         pub fn recording(&self) -> Recording {
             let mut events = Vec::new();
             if let Some(words) = self.words.get() {
                 let used = self.taken.load(Ordering::Acquire).min(EVENTS);
-                for slot in words.chunks(WORDS).take(used) {
+                let from = self.window.load(Ordering::Acquire).min(used);
+                for slot in words.chunks(WORDS).take(used).skip(from) {
                     // A slot is whole once its site is stored, which is the last store.
                     let Some(site) = Site::from_code(slot[0].load(Ordering::Acquire)) else {
                         continue;
@@ -224,10 +236,10 @@ mod recording {
             self.offset(Instant::now())
         }
 
-        /// Begins an acquisition of the session, if anything is being recorded.
+        /// Begins an acquisition of the session, or a span of work, if anything is being recorded.
         ///
-        /// The acquisition is recorded when it is dropped, so it is declared before the guard of
-        /// the session and ends after the guard has let go.
+        /// It is recorded when it is dropped, so it is declared before the guard of the session and
+        /// ends after the guard has let go.
         pub fn acquisition(&self, site: Site) -> Acquisition<'_> {
             if self.is_armed() {
                 Acquisition {
@@ -255,14 +267,6 @@ mod recording {
             }
         }
 
-        /// Records that an observation of the session's processes read them from `begun` until
-        /// now.
-        pub fn observed(&self, begun: Instant) {
-            if self.is_armed() {
-                self.store(Site::Observation, [self.offset(begun), self.now(), 0, 0]);
-            }
-        }
-
         /// Stores one event in the next free slot.
         fn store(&self, site: Site, values: [u64; 4]) {
             let Some(words) = self.words.get() else {
@@ -281,7 +285,7 @@ mod recording {
         }
     }
 
-    /// One acquisition of the session, recorded when it ends.
+    /// One acquisition of the session, or one span of work, recorded when it ends.
     #[derive(Debug)]
     pub struct Acquisition<'a> {
         recorder: Option<&'a LockTrace>,
@@ -292,7 +296,7 @@ mod recording {
     }
 
     impl Acquisition<'_> {
-        /// Says that the session is held now.
+        /// Says that the session is held now, or that the span's work has ended.
         pub fn held(&mut self) {
             if let Some(recorder) = self.recorder {
                 self.held = recorder.now();
@@ -330,14 +334,17 @@ mod shipped {
 
     use super::Site;
 
+    /// What a session's tasks share of the recorder, which in a shipped build is nothing.
+    pub type Shared = LockTrace;
+
     /// The recorder a shipped build carries, which records nothing.
-    #[derive(Debug, Default)]
+    #[derive(Clone, Debug, Default)]
     pub struct LockTrace;
 
     impl LockTrace {
-        /// A recorder that records nothing.
+        /// A recorder to share between a session's tasks.
         #[must_use]
-        pub const fn new() -> Self {
+        pub const fn shared() -> Shared {
             Self
         }
 
@@ -348,9 +355,6 @@ mod shipped {
 
         /// Does nothing.
         pub const fn timer_woke(&self, _deadline: Instant) {}
-
-        /// Does nothing.
-        pub const fn observed(&self, _begun: Instant) {}
     }
 
     /// An acquisition that is not recorded.

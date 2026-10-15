@@ -586,7 +586,7 @@ pub struct SessionRuntime {
     progress: ReadProgress,
     /// The instants of the session's acquisitions along a keystroke's path, which the input
     /// measurement records and nothing else does.
-    trace: Arc<crate::trace::LockTrace>,
+    trace: crate::trace::Shared,
 }
 
 impl SessionRuntime {
@@ -658,7 +658,7 @@ impl SessionRuntime {
             pauses: Arc::default(),
         };
         let counter = progress.counter();
-        let trace = Arc::new(crate::trace::LockTrace::new());
+        let trace = crate::trace::LockTrace::shared();
         let wake = Arc::new(Notify::new());
         let closed = Arc::new(Notify::new());
 
@@ -954,14 +954,14 @@ impl SessionRuntime {
             fence: Arc::clone(&fence),
             activity: Arc::clone(&activity),
             progress: progress.clone(),
-            trace: Arc::clone(&trace),
+            trace: trace.clone(),
         };
 
         let ingest_session = Arc::clone(&session);
         let ingest_closed = Arc::clone(&closed);
         let ingest_input = input_sender.clone();
         let ingest_activity = Arc::clone(&activity);
-        let ingest_trace = Arc::clone(&trace);
+        let ingest_trace = trace.clone();
         tokio::spawn(async move {
             while let Some(event) = output_receiver.recv().await {
                 match event {
@@ -1023,7 +1023,7 @@ impl SessionRuntime {
         let monitor_activity = Arc::clone(&activity);
         let monitor_clock = Arc::clone(&shared_clock);
         let monitor_progress = progress;
-        let monitor_trace = Arc::clone(&trace);
+        let monitor_trace = trace.clone();
         tokio::spawn(async move {
             // The monitor holds a runtime of its own so a closure it begins publishes its fence and
             // its paste terminator the same way a requested one does. Building it only once the
@@ -1039,7 +1039,7 @@ impl SessionRuntime {
                 fence: Arc::clone(&monitor_fence),
                 activity: Arc::clone(&monitor_activity),
                 progress: monitor_progress,
-                trace: Arc::clone(&monitor_trace),
+                trace: monitor_trace.clone(),
             });
             // Built here rather than by the caller: waiting for a child to end is the runtime's
             // own facility, and this is the task that does the waiting.
@@ -1074,7 +1074,7 @@ impl SessionRuntime {
                 // application produces. A reading that kept the session would move a prefix's
                 // deadline, or hold the prefix past it, by as long as the kernel took to answer.
                 let observation = if wake == crate::lifecycle::Wake::Ownership {
-                    let observation = {
+                    let copied = {
                         let mut acquisition = monitor_trace.acquisition(Site::SupervisionWake);
                         acquisition.note(SUPERVISION_COPIED_OUT);
                         monitor_session.lock().ok().and_then(|session| {
@@ -1082,14 +1082,27 @@ impl SessionRuntime {
                             session.begin_observation()
                         })
                     };
-                    observation.map(|mut observation| {
-                        #[cfg(feature = "testing")]
-                        runtime.progress.pauses.in_observation();
-                        let began = Instant::now();
-                        observation.read();
-                        monitor_trace.observed(began);
-                        observation
-                    })
+                    match copied {
+                        // On a thread for blocking work: a host with one processor has one thread
+                        // for the scheduler, and a reading made on it would hold the timer and
+                        // the write up for as long as the kernel took, as holding the session did.
+                        Some(mut observation) => {
+                            let reading_trace = monitor_trace.clone();
+                            #[cfg(feature = "testing")]
+                            let pauses = Arc::clone(&runtime.progress.pauses);
+                            tokio::task::spawn_blocking(move || {
+                                #[cfg(feature = "testing")]
+                                pauses.in_observation();
+                                let mut reading = reading_trace.acquisition(Site::Observation);
+                                observation.read();
+                                reading.held();
+                                observation
+                            })
+                            .await
+                            .ok()
+                        }
+                        None => None,
+                    }
                 } else {
                     None
                 };
@@ -1177,7 +1190,7 @@ impl SessionRuntime {
         let timer_session = Arc::clone(&session);
         let timer_input = input_sender;
         let timer_wake = Arc::clone(&wake);
-        let timer_trace = Arc::clone(&trace);
+        let timer_trace = trace.clone();
         tokio::spawn(async move {
             loop {
                 let deadline = {

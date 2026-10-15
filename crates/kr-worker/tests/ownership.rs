@@ -230,6 +230,70 @@ fn kr_req_07_60_the_observation_finds_every_process_the_session_started() {
     tree.end();
 }
 
+/// KR-REQ-07.60: an observation made on a copy of the record, with the session let go, records what
+/// one made on the record itself does, and putting it back does not undo what another observation
+/// found while it was reading.
+///
+/// A process is found by the copy, which knew nothing of it, and by a later observation on the
+/// record itself, which then finds it ended and drops it. When the copy is put back the process
+/// stays dropped: the record learnt of it from the later observation.
+#[test]
+fn kr_req_07_60_an_observation_made_on_a_copy_does_not_undo_a_newer_one_when_put_back() {
+    let _turn = turn();
+    let mut tree = Tree::start(KINDS, 3);
+    let job = tree.pid("a job");
+    let named = |tree: &Tree| {
+        tree.session
+            .owned()
+            .expect("a launched session owns its processes")
+            .record()
+            .processes
+            .into_iter()
+            .find(|identity| identity.pid.get() == u64::from(job))
+    };
+
+    // The copy is made while the record knows of nothing but the root shell, and reads the tree.
+    let mut copy = tree
+        .session
+        .begin_observation()
+        .expect("a launched session owns its processes");
+    assert!(named(&tree).is_none(), "the record has not seen the job");
+    copy.read();
+
+    // Meanwhile the record itself observes, finds the job, and then finds it ended.
+    tree.session.observe_owned();
+    let identity = named(&tree).expect("the observation on the record finds the job");
+    let me = rustix::process::Pid::from_raw(i32::try_from(job).expect("a process identifier"))
+        .expect("a process");
+    rustix::process::kill_process(me, rustix::process::Signal::KILL).expect("ends the job");
+    let deadline = Instant::now() + LIVENESS;
+    while !matches!(
+        kr_ipc::identity::process_state(&identity),
+        kr_ipc::identity::ProcessState::Ended
+    ) {
+        assert!(Instant::now() < deadline, "the job ends");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    tree.session.observe_owned();
+    assert!(
+        named(&tree).is_none(),
+        "the later observation drops the job it found ended"
+    );
+
+    tree.session.finish_observation(copy);
+    assert!(
+        named(&tree).is_none(),
+        "and putting the copy back does not name it again"
+    );
+    let recorded = tree.recorded();
+    assert!(
+        recorded.contains(&tree.root()),
+        "what else the copy read is as an observation on the record would have it: {recorded:?}"
+    );
+
+    tree.end();
+}
+
 /// KR-PERF-003: an idle session's observation reads nothing about any process outside the worker's
 /// own tree. Every session asks it on each idle sweep, so a reading that went through every process
 /// on the host would cost each session as much as the host had processes.

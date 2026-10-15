@@ -1268,6 +1268,11 @@ impl Session {
     /// puts the result back, and does what [`Self::observe_owned`] does after its own reading.
     #[must_use]
     pub fn begin_observation(&self) -> Option<crate::ownership::Observation> {
+        // A closed session has written its record, and a reading made for it now would be thrown
+        // away.
+        if self.state == SessionState::Closed {
+            return None;
+        }
         self.owned.as_ref().map(OwnedProcesses::begin_observation)
     }
 

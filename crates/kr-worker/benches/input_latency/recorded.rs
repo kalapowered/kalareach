@@ -21,7 +21,9 @@ use std::time::{Duration, Instant};
 
 use kr_ipc::client::LocalClient;
 use kr_protocol::ids::{AttachmentId, InputLeaseEpoch};
-use kr_worker::runtime::SessionRuntime;
+use kr_worker::runtime::{
+    SUPERVISION_COPIED_OUT as COPIED_OUT, SUPERVISION_PUT_BACK as PUT_BACK, SessionRuntime,
+};
 use kr_worker::trace::{Event, LockTrace, Recording, Site};
 
 use super::{Hosted, POLL, RECOGNISER_DEADLINE, contains, retained_in, write};
@@ -47,34 +49,19 @@ const OVER: Duration = Duration::from_millis(40);
 
 /// The processor time this process has used, user and system together, where the platform says.
 #[cfg(unix)]
-#[expect(
-    unsafe_code,
-    reason = "reading the process's own times has no safe form"
-)]
 mod process_time {
     use std::time::Duration;
 
     pub fn used() -> Option<Duration> {
-        let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
-        // SAFETY: `usage` is a live, writable `rusage`, which the call fills whole when it returns
-        // zero, and that is the only case in which it is read.
-        let read = unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) };
-        if read != 0 {
-            return None;
-        }
-        // SAFETY: the call returned zero, so it wrote the whole of `usage`.
-        let usage = unsafe { usage.assume_init() };
-        let time = |value: libc::timeval| {
-            Some(Duration::new(
-                u64::try_from(value.tv_sec).ok()?,
-                u32::try_from(value.tv_usec).ok()?.checked_mul(1_000)?,
-            ))
-        };
-        Some(time(usage.ru_utime)? + time(usage.ru_stime)?)
+        let used = rustix::time::clock_gettime(rustix::time::ClockId::ProcessCPUTime);
+        Some(Duration::new(
+            u64::try_from(used.tv_sec).ok()?,
+            u32::try_from(used.tv_nsec).ok()?,
+        ))
     }
 }
 
-/// The same, where the platform has no such call: nothing is said.
+/// The same, where the platform has no such clock: nothing is said.
 #[cfg(not(unix))]
 mod process_time {
     use std::time::Duration;
@@ -461,6 +448,37 @@ impl RecordedHold {
             line.push_str("; ");
             line.push_str(&describe(event, base));
         }
+        // The intervals themselves, for a hold that is to be read for what delayed it: every poll
+        // as wait/held/let go, and every wake of the witness in the hold's window as due/ran.
+        let longer_than = u64::try_from(LATE.as_nanos()).unwrap_or(u64::MAX);
+        if self.nanoseconds().is_none_or(|held| held > longer_than) {
+            line.push_str("; poll-intervals[");
+            line.push_str(
+                &self
+                    .polls
+                    .iter()
+                    .map(|poll| {
+                        format!(
+                            "{}/{}/{}",
+                            after(poll.begun, base),
+                            after(poll.held, base),
+                            after(poll.released, base)
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            );
+            line.push_str("]; witness-wakes[");
+            line.push_str(
+                &wakes
+                    .iter()
+                    .filter(|wake| wake.ran >= from && wake.due <= self.seen)
+                    .map(|wake| format!("{}/{}", after(wake.due, base), after(wake.ran, base)))
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            );
+            line.push(']');
+        }
         line
     }
 }
@@ -497,7 +515,8 @@ fn describe(event: &Event, base: u64) -> String {
                 Site::InputAcceptance if event.value != 0 => {
                     text.push_str(&format!(" deadline {}", after(event.value, base)));
                 }
-                Site::SupervisionWake if event.value != 0 => text.push_str(" observed"),
+                Site::SupervisionWake if event.value == COPIED_OUT => text.push_str(" copied-out"),
+                Site::SupervisionWake if event.value == PUT_BACK => text.push_str(" put-back"),
                 _ => {}
             }
             text.push(']');

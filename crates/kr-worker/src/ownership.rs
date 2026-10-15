@@ -146,6 +146,12 @@ pub struct OwnedProcesses {
     /// reading or [`Self::take`] removes it, and an observation that cannot list anything reaches
     /// neither, so [`Self::record`] leaves it out.
     live: BTreeMap<(u64, u64), ProcessStartIdentity>,
+    /// The processes of `seen` that have been read as having left the session, by key.
+    ///
+    /// `seen` only grows, and an observation has to be given the processes that left as well as the
+    /// live ones, because one that left can still be running and be met again. Keeping them apart
+    /// is what lets that be done without going through everything the session has ever owned.
+    departed: std::sync::Mutex<std::collections::BTreeSet<(u64, u64)>>,
     /// The boot this session began in. A process identity is only a statement about one boot.
     boot: Option<BootIdentity>,
     /// The control group the worker itself runs in, where the platform has one.
@@ -252,6 +258,7 @@ impl OwnedProcesses {
             unestablished: std::sync::Mutex::new(Vec::new()),
             boundary_empty: std::sync::Mutex::new(None),
             live: BTreeMap::new(),
+            departed: std::sync::Mutex::new(std::collections::BTreeSet::new()),
             boot: kr_ipc::identity::boot_identity().ok(),
             cgroup: own_cgroup(),
         };
@@ -271,25 +278,28 @@ impl OwnedProcesses {
     /// without the session being held.
     ///
     /// The copy holds the processes the record calls live and the ones it has read as having left,
-    /// which is all [`Self::observe`] looks at. [`Observation::read`] makes the reading on the copy
+    /// which is all [`Self::observe`] looks at, and so the work of making it follows those and not
+    /// everything the session has ever owned. [`Observation::read`] makes the reading on the copy
     /// and [`Self::finish_observation`] puts what it found back.
     #[must_use]
     pub fn begin_observation(&self) -> Observation {
         use std::sync::atomic::Ordering::Relaxed;
 
+        let departed = self.departed();
         let seen = self
-            .seen
-            .iter()
-            .filter(|(this, recorded)| recorded.left.load(Relaxed) || self.live.contains_key(this))
-            .map(|(this, recorded)| {
-                (
+            .live
+            .keys()
+            .chain(departed.iter())
+            .filter_map(|this| {
+                let recorded = self.seen.get(this)?;
+                Some((
                     *this,
                     Recorded {
                         identity: recorded.identity.clone(),
                         forced: recorded.forced,
                         left: std::sync::atomic::AtomicBool::new(recorded.left.load(Relaxed)),
                     },
-                )
+                ))
             })
             .collect();
         Observation {
@@ -300,6 +310,7 @@ impl OwnedProcesses {
                 unestablished: std::sync::Mutex::new(Vec::new()),
                 boundary_empty: std::sync::Mutex::new(None),
                 live: self.live.clone(),
+                departed: std::sync::Mutex::new(departed),
                 boot: self.boot.clone(),
                 cgroup: self.cgroup.clone(),
             },
@@ -312,8 +323,10 @@ impl OwnedProcesses {
     /// Every change a reading makes only moves the record the way the next reading would have: a
     /// process found is recorded, one read in a control daemon's own scope is flagged and dropped
     /// from the live ones, and one the kernel says has ended is dropped from them. So a record that
-    /// changed while the reading was made, through a closure's own observation, keeps its changes,
-    /// and a process the reading did not know of is left as it is for the next one.
+    /// changed while the reading was made, through a closure's own observation, keeps its changes.
+    /// A process the reading found that the record already knows of is not put back among the live
+    /// ones: the record learnt of it from another observation, which decided whether it was still
+    /// running.
     pub fn finish_observation(&mut self, observation: Observation) {
         use std::sync::atomic::Ordering::Relaxed;
 
@@ -321,6 +334,12 @@ impl OwnedProcesses {
         for note in copy.unestablished() {
             self.note_unestablished(note);
         }
+        let found: Vec<((u64, u64), ProcessStartIdentity)> = copy
+            .live
+            .iter()
+            .filter(|(this, _)| !live_then.contains(*this) && !self.seen.contains_key(*this))
+            .map(|(this, identity)| (*this, identity.clone()))
+            .collect();
         for (this, recorded) in copy.seen {
             let left = recorded.left.load(Relaxed);
             let ours = self.seen.entry(this).or_insert(Recorded {
@@ -329,7 +348,7 @@ impl OwnedProcesses {
                 left: std::sync::atomic::AtomicBool::new(false),
             });
             if left {
-                ours.left.store(true, Relaxed);
+                Self::mark_left(&self.departed, this, ours);
             }
         }
         for this in &live_then {
@@ -337,11 +356,35 @@ impl OwnedProcesses {
                 self.live.remove(this);
             }
         }
-        for (this, identity) in copy.live {
-            if !live_then.contains(&this) && !self.is_flagged(&this) {
+        for (this, identity) in found {
+            if !self.is_flagged(&this) {
                 self.live.insert(this, identity);
             }
         }
+    }
+
+    /// The keys of the processes read as having left the session.
+    fn departed(&self) -> std::collections::BTreeSet<(u64, u64)> {
+        self.departed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Records that a process has been read as having left the session, where `departed` can find
+    /// it without going through every process that was recorded.
+    fn mark_left(
+        departed: &std::sync::Mutex<std::collections::BTreeSet<(u64, u64)>>,
+        this: (u64, u64),
+        recorded: &Recorded,
+    ) {
+        recorded
+            .left
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        departed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(this);
     }
 
     /// Returns what a later control daemon needs to stop this session's processes if this worker
@@ -426,15 +469,12 @@ impl OwnedProcesses {
     /// process, takes the reading back.
     fn note_left(&mut self, identity: &ProcessStartIdentity) {
         let this = key(identity);
-        self.seen
-            .entry(this)
-            .or_insert(Recorded {
-                identity: identity.clone(),
-                forced: false,
-                left: std::sync::atomic::AtomicBool::new(false),
-            })
-            .left
-            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let recorded = self.seen.entry(this).or_insert(Recorded {
+            identity: identity.clone(),
+            forced: false,
+            left: std::sync::atomic::AtomicBool::new(false),
+        });
+        Self::mark_left(&self.departed, this, recorded);
         self.live.remove(&this);
     }
 
@@ -471,7 +511,7 @@ impl OwnedProcesses {
         let in_one = self.in_a_daemons_scope(&recorded.identity);
         if in_one {
             // Kept: the process can end before anything reads it again.
-            recorded.left.store(true, Relaxed);
+            Self::mark_left(&self.departed, key(&recorded.identity), recorded);
         }
         in_one
     }

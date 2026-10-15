@@ -2493,7 +2493,10 @@ async fn a_lone_escape_is_forwarded_at_its_deadline_while_the_session_s_processe
 
     let (reading, resume) = wired.runtime.pause_in_next_observation();
     wired.runtime.observe_now();
-    reading.await.expect("the observation is reading");
+    tokio::time::timeout(LIVENESS_DEADLINE, reading)
+        .await
+        .expect("the observation reached its reading")
+        .expect("the observation is reading");
 
     // A regression leaves the paused observation holding the session, and then the write waits for
     // it for as long as the pause lasts. A thread of its own lets the observation go after a while
@@ -2641,13 +2644,21 @@ async fn the_recorder_keeps_each_acquisition_on_a_held_prefix_s_path() {
 ///
 /// The observation reads the processes on a copy of the record and puts what it found back, so
 /// that the session is free while the kernel answers. What it found has to arrive in the record the
-/// way it did when the reading kept the session.
+/// way it did when the reading kept the session. The supervision observes on its own once the
+/// session has done something, and when it does is the machine's to say, so the case asks for one
+/// and waits for the process it was told of rather than for a change.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_process_the_session_started_is_recorded_by_an_observation_made_with_the_session_let_go()
 {
-    let wired = wired("stty raw -echo; sleep 600 & printf 'kr-ready.'; exec cat").await;
-    retained_within(&wired.runtime, b"kr-ready.", LIVENESS_DEADLINE).await;
+    let wired = wired("stty raw -echo; sleep 600 & printf 'kr-ready.%s;' \"$!\"; exec cat").await;
+    let told = retained_within(&wired.runtime, b";", LIVENESS_DEADLINE).await;
+    let told = String::from_utf8_lossy(&told).into_owned();
+    let job: u64 = told
+        .split_once("kr-ready.")
+        .and_then(|(_, rest)| rest.split_once(';'))
+        .and_then(|(pid, _)| pid.parse().ok())
+        .expect("the shell says which process it started");
     let recorded = |wired: &Wired| {
         wired
             .runtime
@@ -2656,13 +2667,13 @@ async fn a_process_the_session_started_is_recorded_by_an_observation_made_with_t
             .expect("the session records what it owns")
             .record()
             .processes
-            .len()
+            .iter()
+            .any(|identity| identity.pid.get() == job)
     };
-    let before = recorded(&wired);
 
     wired.runtime.observe_now();
     tokio::time::timeout(LIVENESS_DEADLINE, async {
-        while recorded(&wired) == before {
+        while !recorded(&wired) {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
     })

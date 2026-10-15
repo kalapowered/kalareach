@@ -305,7 +305,7 @@ impl PasteFramer {
         let mut expired = Vec::new();
         if self
             .held_since
-            .is_some_and(|since| now.duration_since(since) >= RECOGNISER_DEADLINE)
+            .is_some_and(|since| now.saturating_duration_since(since) >= RECOGNISER_DEADLINE)
         {
             expired = std::mem::take(&mut self.held);
             self.held_since = None;
