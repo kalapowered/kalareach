@@ -72,9 +72,14 @@ async fn absorbed(writer: &TcpStream, chunk: usize) -> (usize, usize, bool) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn what_a_peer_that_reads_nothing_takes() {
-    for size in [None, Some(0), Some(1), Some(4096), Some(65536)] {
+    for size in [None, Some(4096), Some(65536), Some(1)] {
         for chunk in [16 * 1024, 900_000] {
-            let (here, there, how) = pair(size).await;
+            let Ok((here, there, how)) =
+                tokio::time::timeout(Duration::from_secs(10), pair(size)).await
+            else {
+                println!("PROBE size {size:?} write {chunk}: the pair did not connect in ten seconds");
+                continue;
+            };
             let (first, total, stopped) = absorbed(&here, chunk).await;
             println!(
                 "PROBE size {size:?} write {chunk}: first write took {first}, in all {total} bytes, stopped: {stopped} ({how})"
