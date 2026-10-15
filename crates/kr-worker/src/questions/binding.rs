@@ -116,6 +116,46 @@ pub struct VerifiedSource {
     pub connection_id: ConnectionId,
 }
 
+/// What binding a caller to a session came to, kept so that it can be read again.
+///
+/// The kernel is asked once, before the session is taken, and the answer is read from here by the
+/// checks that need it while the session is held.
+#[derive(Clone, Debug)]
+pub enum Binding {
+    /// The caller is inside the session.
+    Verified(VerifiedSource),
+    /// The caller is established to be outside it, for the reason given.
+    Unbound(String),
+    /// Whether the caller is inside could not be established, for the reason given.
+    Undetermined(String),
+}
+
+impl Binding {
+    /// Keeps the answer of [`verify`].
+    #[must_use]
+    pub fn of(bound: Result<VerifiedSource>) -> Self {
+        match bound {
+            Ok(source) => Self::Verified(source),
+            Err(QuestionError::NotInSession { detail }) => Self::Unbound(detail),
+            Err(QuestionError::Undetermined { detail }) => Self::Undetermined(detail),
+            Err(other) => Self::Undetermined(other.to_string()),
+        }
+    }
+
+    /// Returns the answer [`verify`] gave.
+    ///
+    /// # Errors
+    ///
+    /// Returns the refusal [`verify`] returned when it refused.
+    pub fn source(&self) -> Result<VerifiedSource> {
+        match self {
+            Self::Verified(source) => Ok(source.clone()),
+            Self::Unbound(detail) => Err(QuestionError::unbound(detail)),
+            Self::Undetermined(detail) => Err(QuestionError::undetermined(detail)),
+        }
+    }
+}
+
 impl VerifiedSource {
     /// Returns the key that identifies this application across its calls.
     ///
