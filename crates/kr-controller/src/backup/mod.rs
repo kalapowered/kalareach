@@ -1868,6 +1868,15 @@ fn sync_removal(path: &Path) -> Result<()> {
     let mut kind = NameKind::File;
     while let Some(current) = directory {
         if current.exists() {
+            // A staging root that is gone changed the entry in the nearest directory that is
+            // there, and nothing above it: the walk up to the root has no root to stop at.
+            let root_gone = path.ancestors().any(|above| {
+                above.file_name().is_some_and(|name| name == "backup") && !above.exists()
+            });
+            if root_gone {
+                return flush_directory(current, NameKind::Directory)
+                    .map_err(ControllerError::registry);
+            }
             return flush_up_from(Some(current), kind);
         }
         kind = NameKind::Directory;
@@ -1883,15 +1892,7 @@ pub(super) fn flush_staging_tree(root: &Path) -> Result<()> {
     // directory that is there, which is the only one to flush (none above it is changed), and the
     // next write of a file makes the root again.
     if !root.exists() {
-        let mut directory = root.parent();
-        while let Some(current) = directory {
-            if current.exists() {
-                return flush_directory(current, NameKind::Directory)
-                    .map_err(ControllerError::registry);
-            }
-            directory = current.parent();
-        }
-        return Ok(());
+        return sync_removal(root);
     }
     for entry in std::fs::read_dir(root).map_err(ControllerError::registry)? {
         let path = entry.map_err(ControllerError::registry)?.path();
