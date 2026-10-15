@@ -372,6 +372,49 @@ impl Host {
         host
     }
 
+    /// Starts a daemon whose configuration document selects the authority feed at `origin`, whose
+    /// carriers wait by `timer`, with `owner` as its first owner.
+    ///
+    /// The host's own keys are `host_keys`, put where the daemon finds them when it starts, so a
+    /// suite can seal an item to the host's mailbox before the daemon reads it.
+    pub async fn start_with_feed_and_keys(
+        owner: &DeviceKeys,
+        host_keys: &DeviceKeys,
+        origin: &str,
+        timer: Arc<dyn kr_controller::quiet::Timer>,
+        clocks: Clocks,
+    ) -> Self {
+        let temp = kr_ipc::testing::TempHost::create();
+        let secrets = open_store_in(&temp.environment().secrets_dir())
+            .expect("a secret store for the test environment");
+        kr_crypto::store::store_device_keys(
+            secrets.store.as_ref(),
+            &net::device_key_scope(temp.environment_id()),
+            host_keys,
+        )
+        .expect("the host's keys are stored");
+        drop(secrets);
+        write_feed_document(&temp, Some(origin));
+        let mut host = Self::start_on(
+            temp,
+            room::TestRoom::new(),
+            NetworkSettings {
+                endpoint: loopback(),
+                ..NetworkSettings::default()
+            },
+            AccountAt::Managed,
+            Arc::new(MemoryStore::new()),
+            clocks,
+            None,
+            Waits { timer: Some(timer) },
+        )
+        .await;
+        let (device, record) = bootstrap_owner(&host, owner).await;
+        host.owner = Some(record);
+        host.owner_device = Some(device);
+        host
+    }
+
     /// Starts a daemon whose configuration document selects the relay lease service at `origin`,
     /// when it names one, paying as the account `payer` names, whose carriers wait by `timer`, with
     /// `owner` as its first owner.
