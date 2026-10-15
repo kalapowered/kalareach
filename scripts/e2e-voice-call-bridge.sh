@@ -25,6 +25,12 @@
 #   scripts/e2e-voice-call-bridge.sh ios
 #   scripts/e2e-voice-call-bridge.sh android
 #
+# On Android the script grants the microphone and notification permissions up front, so no
+# question stands between the call and its checks. `KR_PROBE_PERMISSIONS` runs the permission
+# question itself: `allow` answers the system's dialogs by tapping Allow, `deny` by tapping Don't
+# allow (the open is then refused for the microphone, which the first check shows), and `none`
+# answers nothing (the open goes on with what is allowed when its time for the answer is up).
+#
 # Exit codes: 0 every check passed, 2 bad usage or a failed check, 3 the device is not available.
 set -uo pipefail
 
@@ -107,6 +113,44 @@ run_ios() {
     judge "$artefacts/$result_name"
 }
 
+# Where to tap to answer the system's permission dialog that stands on the emulator's screen, as
+# two numbers, or nothing when none does. `allow` is the button that lets the application use the
+# microphone while it is open, or lets it post notifications; `deny` is Don't allow.
+permission_dialog_point() { # allow|deny
+    "$adb" -s "$serial" shell uiautomator dump /sdcard/kr-ui.xml >/dev/null 2>&1 || return 1
+    "$adb" -s "$serial" exec-out cat /sdcard/kr-ui.xml >"$artefacts/ui.xml" 2>/dev/null || return 1
+    python3 - "$1" "$artefacts/ui.xml" <<'PY'
+import re
+import sys
+
+buttons = {
+    "allow": ["permission_allow_foreground_only_button", "permission_allow_button"],
+    "deny": ["permission_deny_button"],
+}[sys.argv[1]]
+screen = open(sys.argv[2], encoding="utf-8").read()
+for button in buttons:
+    found = re.search(
+        r'resource-id="com\.android\.permissioncontroller:id/' + button
+        + r'"[^>]*?bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"',
+        screen,
+    )
+    if found:
+        left, top, right, bottom = map(int, found.groups())
+        print((left + right) // 2, (top + bottom) // 2)
+        sys.exit(0)
+sys.exit(1)
+PY
+}
+
+# Answers each permission dialog that appears, for as long as it runs; the caller ends it.
+answer_permission_dialogs() { # allow|deny
+    local point
+    while :; do
+        point="$(permission_dialog_point "$1")" && "$adb" -s "$serial" shell input tap $point
+        sleep 2
+    done
+}
+
 run_android() {
     local sdk="${ANDROID_HOME:-$HOME/Library/Android/sdk}" avd="${KR_ANDROID_AVD:-Nines_API_36_Play}"
     local adb="$sdk/platform-tools/adb" port=5586
@@ -133,8 +177,15 @@ run_android() {
 
     "$adb" -s "$serial" uninstall "$app_id" >/dev/null 2>&1
     "$adb" -s "$serial" install -r "$apk" >/dev/null || { say "the package did not install"; return 2; }
-    "$adb" -s "$serial" shell pm grant "$app_id" android.permission.RECORD_AUDIO
-    "$adb" -s "$serial" shell pm grant "$app_id" android.permission.POST_NOTIFICATIONS 2>/dev/null
+    local permissions="${KR_PROBE_PERMISSIONS:-granted}"
+    case "$permissions" in
+        granted)
+            "$adb" -s "$serial" shell pm grant "$app_id" android.permission.RECORD_AUDIO
+            "$adb" -s "$serial" shell pm grant "$app_id" android.permission.POST_NOTIFICATIONS 2>/dev/null
+            ;;
+        allow | deny | none) say "the permission question is left to the application, answer: $permissions" ;;
+        *) say "KR_PROBE_PERMISSIONS is granted, allow, deny or none"; return 2 ;;
+    esac
 
     # The application reads its data directory, which is the application's own directory on
     # Android (`activity.dataDir`), and `run-as` starts there.
@@ -150,6 +201,11 @@ run_android() {
         [ -n "$pid" ] || { sleep 1; tries=$((tries + 1)); }
     done
 
+    local answerer=""
+    case "$permissions" in
+        allow | deny) answer_permission_dialogs "$permissions" & answerer=$! ;;
+    esac
+
     local waited=0 text=""
     while :; do
         text="$("$adb" -s "$serial" shell run-as "$app_id" cat "kr-probe/$result_name" 2>/dev/null | tr -d '\r')"
@@ -159,6 +215,7 @@ run_android() {
         [ "$waited" -lt 300 ] || break
     done
     printf '%s\n' "$text" >"$artefacts/$result_name"
+    [ -z "$answerer" ] || kill "$answerer" 2>/dev/null
     # What the application said while it ran, kept for a run that wrote no result.
     if [ -n "$pid" ]; then
         "$adb" -s "$serial" logcat -d --pid="$pid" 2>/dev/null | tail -200 >"$artefacts/logcat.log"
