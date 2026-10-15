@@ -377,12 +377,15 @@ pub struct DeviceDirectory {
     ///
     /// It belongs to the set of devices and not to one handle on it: the daemon opens this
     /// directory more than once, and a grant's end is written through whichever handle finds it
-    /// first, so every handle raises the one signal ([`Self::open_beside`]).
+    /// first, so every handle the daemon keeps raises the one signal ([`Self::open_beside`]).
     changed: std::sync::Arc<tokio::sync::Notify>,
 }
 
 impl DeviceDirectory {
     /// Opens the directory in the daemon's registry database, creating its tables.
+    ///
+    /// The handle raises a signal of its own. A second handle on a directory the daemon keeps
+    /// comes from [`Self::open_beside`], or what waits on the signal misses what it writes.
     ///
     /// # Errors
     ///
