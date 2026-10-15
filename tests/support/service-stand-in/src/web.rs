@@ -414,6 +414,16 @@ impl ServiceWeb {
             .authorise_in(account_id, host, byte_ceiling)
     }
 
+    /// The authorisation's validity window ends: no request names it again, and the leases issued
+    /// under it stand until they run out, as the Worker leaves them.
+    pub fn lapse_relay_authorisation(&self, authorisation_id: &str) {
+        self.state
+            .lock()
+            .expect("the state")
+            .relay
+            .lapse(authorisation_id);
+    }
+
     /// The account withdraws an authorisation: the leases issued under it are revoked and no
     /// request names it again.
     pub fn withdraw_relay_authorisation(&self, authorisation_id: &str) {
@@ -577,6 +587,10 @@ impl ServiceWeb {
         nth: u32,
         moment: Moment,
     ) {
+        assert!(
+            matching.is_object(),
+            "a fault is matched by the members of an object"
+        );
         self.faults.lock().expect("the faults").push(Fault {
             path,
             nth,

@@ -62,6 +62,9 @@ struct Authorisation {
     /// The most one lease may hold outstanding under it.
     byte_ceiling: u64,
     withdrawn: bool,
+    /// Its validity window has ended. The service ends the leases of a withdrawn authorisation and
+    /// leaves those of one that lapsed to run out.
+    lapsed: bool,
 }
 
 /// What became of a lease.
@@ -215,6 +218,7 @@ impl Relay {
                 subject: crate::feed::key_text(host),
                 byte_ceiling,
                 withdrawn: false,
+                lapsed: false,
             },
         );
         RelayPayerRecord {
@@ -237,6 +241,14 @@ impl Relay {
                 lease.revision += 1;
                 lease.ended_for = Some(Reason::PayerWithdrew.as_str());
             }
+        }
+    }
+
+    /// The authorisation's validity window ends: it is not in force from now on, and the leases
+    /// issued under it are left alone, as the Worker leaves them.
+    pub(crate) fn lapse(&mut self, authorisation_id: &str) {
+        if let Some(held) = self.authorisations.get_mut(authorisation_id) {
+            held.lapsed = true;
         }
     }
 
@@ -583,6 +595,9 @@ pub(crate) fn issue(
                 );
             }
             if held.withdrawn {
+                return refusal(403, "FORBIDDEN", "That authorisation has been withdrawn.");
+            }
+            if held.lapsed {
                 return refusal(403, "FORBIDDEN", "That authorisation is not in force.");
             }
             (
