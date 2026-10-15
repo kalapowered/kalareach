@@ -855,11 +855,22 @@ impl Driver {
     /// Runs the control until it ends.
     async fn run(mut self) {
         let end = self.keep_attached().await;
+        // From here on nothing is taken. A request made now is lost at once, rather than left
+        // waiting for an owner that may be slow to read the end it is about to be told.
+        self.requests.close();
+        while let Ok(request) = self.requests.try_recv() {
+            match request {
+                Request::Send { reply, .. } => {
+                    let _ = reply.send(Err(SendError::Lost));
+                }
+                Request::Close { reply } => {
+                    let _ = reply.send(Err(SendError::Lost));
+                }
+            }
+        }
+        self.lose_everything_pending();
         if let Some(end) = end {
-            self.lose_everything_pending();
             let _ = self.told.send(ControlNews::Ended(end)).await;
-        } else {
-            self.lose_everything_pending();
         }
     }
 
