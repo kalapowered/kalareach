@@ -424,6 +424,130 @@ fn kr_req_12_27_a_standard_error_nobody_reads_cannot_hold_a_hook() {
     }
 }
 
+/// KR-REQ-12.27: a hook the system cannot start a thread for is answered at once, neutrally, and
+/// exits 0, in place of failing with nothing on standard output.
+///
+/// The forwarder is run under a limit of one process for its account (`prlimit`), which the system
+/// answers every new thread of it with a refusal. Where the account is not held to the limit (one
+/// that may exceed it) or there is no `prlimit`, no thread of the forwarder is refused and the case
+/// has nothing to show.
+#[cfg(target_os = "linux")]
+#[test]
+fn kr_req_12_27_a_hook_the_system_cannot_start_a_thread_for_is_answered_neutrally() {
+    use std::process::{Command, Stdio};
+
+    let limited = |program: &std::path::Path| {
+        let mut command = Command::new("prlimit");
+        command.args(["--nproc=1", "--"]).arg(program);
+        command
+    };
+    // A shell that has to start a second process under the limit says that it cannot.
+    let held_to_the_limit = limited(std::path::Path::new("/bin/sh"))
+        .args(["-c", "/bin/true && /bin/true"])
+        .stdout(Stdio::null())
+        .output()
+        .is_ok_and(|probe| {
+            !probe.status.success()
+                && String::from_utf8_lossy(&probe.stderr)
+                    .to_ascii_lowercase()
+                    .contains("fork")
+        });
+    if !held_to_the_limit {
+        eprintln!("skipping: this account is not held to a limit of one process by prlimit");
+        return;
+    }
+    let placed = Placed::new();
+    let hooks = &every_application()[0];
+    let mut command = limited(&placed.forwarder);
+    command
+        .args([hooks.application, "hook"])
+        .current_dir(placed.host.root());
+    for variable in common::FORWARDER_VARIABLES {
+        command.env_remove(variable);
+    }
+    let ran = run_with_input(command, hooks.events[0].1.to_string().as_bytes());
+    assert_eq!(ran.code, Some(0), "{}", ran.stderr);
+    assert_eq!(ran.stdout, b"{}\n");
+    assert_eq!(neutral(&ran.stdout, &ran.stderr), Ok(()));
+}
+
+/// KR-REQ-12.27: a hook of a release that an update holds is answered at its own
+/// deadline, whatever the update does next.
+///
+/// An update holds the release's manifest while it moves the release, and a program of the release
+/// waits for that to end before it starts. The update here ends only when the case lets go, after
+/// the hook has ended, so a hook that waited for it would not end: it answers neutrally and exits 0
+/// with the manifest still held.
+#[cfg(unix)]
+#[test]
+fn kr_req_12_27_a_release_an_update_holds_cannot_hold_its_hook() {
+    use kr_ipc::install::{Program, Store};
+
+    let placed = Placed::new();
+    let store = Store::at(placed.host.root().join("store"));
+    store.create_directories().expect("the store's directories");
+    std::fs::write(store.record(), b"{}\n").expect("the store's record");
+    let release = kr_protocol::update::ReleaseName::new("0.1.0+aaaaaaaaaaaa").expect("a release");
+    let directory = store.release_directory(&release);
+    std::fs::create_dir_all(directory.join("bin")).expect("the release's bin");
+    std::fs::write(
+        store.manifest(&release),
+        serde_json::json!({
+            "signed": {
+                "_type": "kalareach-release",
+                "release": release,
+                "sequence": "1",
+                "commit": "4254aa6e62e585478ff8dcff5518f23c7263f4ce",
+                "target": "aarch64-apple-darwin",
+                "os_floor": { "system": "macos", "version": "14.0" },
+                "protocol_version": { "major": 0, "minor": 48, "patch": 0 },
+                "public_majors": [1],
+                "retained_levels": ["0.48"],
+                "shells": [],
+                "stores": [{
+                    "store": "registry",
+                    "scope": "environment",
+                    "path": "registry.sqlite",
+                    "recording": { "kind": "sqlite_table", "table": "schema_version" },
+                    "version": 7,
+                    "migrates_from": 1,
+                }],
+                "files": [],
+            },
+            "signatures": [],
+        })
+        .to_string(),
+    )
+    .expect("the manifest");
+    let forwarder = directory.join("bin").join(Program::Hook.file_name());
+    kr_ipc::testing::place_program(&placed.forwarder, &forwarder);
+
+    let hooks = &every_application()[0];
+    let mut command = std::process::Command::new(&forwarder);
+    command
+        .args([hooks.application, "hook"])
+        .current_dir(placed.host.root());
+    for variable in common::FORWARDER_VARIABLES {
+        command.env_remove(variable);
+    }
+    let update = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(store.manifest(&release))
+        .expect("the manifest opens");
+    update.lock().expect("the update takes the manifest");
+    let ran = run_with_input(command, hooks.events[0].1.to_string().as_bytes());
+    drop(update);
+    assert_eq!(ran.code, Some(0), "{}", ran.stderr);
+    assert_eq!(ran.stdout, b"{}\n");
+    assert_eq!(neutral(&ran.stdout, &ran.stderr), Ok(()));
+    assert!(
+        ran.stderr.is_empty() || kr_hook::hook::ran_out_of_its_deadline(&ran.stderr),
+        "the hook says why it answered before its release was free: {:?}",
+        ran.stderr
+    );
+}
+
 /// What a hook did beside a standard error of the test's own.
 struct Held {
     /// Everything it wrote to standard output.
