@@ -964,6 +964,73 @@ async fn an_interrupt_while_the_daemon_has_the_call_says_to_keep_the_kit() {
     assert_eq!(rig.recorded_kit().await, Some(kit.fingerprint()));
 }
 
+/// Ctrl-C while the daemon has the call of a replacement names the earlier kit as the only one
+/// whose fingerprint in `kr doctor` voids the new kit, because the new setup may be made and then
+/// replaced by another before the person looks: a kit that opens nothing is the earlier setup
+/// standing, and any other fingerprint is a reason to keep the new kit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_interrupt_during_a_replacement_voids_the_new_kit_only_by_the_earlier_fingerprint() {
+    let rig = Rig::start().await;
+    let mut window = Window::run(&rig, &["backup", "setup"]);
+    let first = window.bring_up_the_kit();
+    window.confirm(&first);
+    window.wait_for("kr ended 0");
+    let first_fingerprint = first.fingerprint();
+
+    let (arrived, go) = rig.controller.backup().pause_the_next_setup_commit();
+    let mut window = Window::run(&rig, &["backup", "setup", "--replace"]);
+    let second = window.bring_up_the_kit();
+    window.confirm(&second);
+    tokio::task::spawn_blocking(move || arrived.recv_timeout(LIVENESS_DEADLINE))
+        .await
+        .expect("the wait ends")
+        .expect("the commit is on its thread");
+    window.type_bytes(&[0x03]);
+    let shown = window.wait_for("kr ended");
+    let said = shown
+        .rsplit_once("The command stopped while the setup was under way")
+        .expect("the interrupt is said")
+        .1;
+    assert!(said.contains("Keep the kit"), "{said}");
+    assert!(said.contains(&second.fingerprint()), "{said}");
+    assert!(
+        said.contains(&format!("earlier kit fingerprint {first_fingerprint}")),
+        "{said}"
+    );
+    assert!(
+        said.contains("any other fingerprint, keep the kit"),
+        "{said}"
+    );
+
+    go.send(()).expect("the commit is waiting");
+    tokio::time::timeout(LIVENESS_DEADLINE, async {
+        while rig.recorded_kit().await != Some(second.fingerprint()) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the replacement is recorded after the command has gone");
+}
+
+/// Ctrl-C while the command waits for a daemon that has accepted the connection and says nothing
+/// ends the command at once, and says that nothing was set up.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_interrupt_while_the_daemon_says_nothing_ends_the_command_at_once() {
+    let mut rig = Rig::start().await;
+    for task in std::mem::take(&mut rig.serving) {
+        task.abort();
+        let _ = task.await;
+    }
+    let silent = Listener::bind(&rig.endpoint).expect("binds the endpoint");
+    let mut window = Window::run(&rig, &["backup", "setup"]);
+    let _held = silent.accept().await.expect("the command connects");
+    window.type_bytes(&[0x03]);
+    let shown = window.wait_for("kr ended");
+    assert!(!shown.contains("kr ended 0"), "{shown}");
+    assert!(shown.contains("Nothing was set up."), "{shown}");
+    assert!(window.echoes(), "echo is on");
+}
+
 /// A daemon that cannot be reached when the call is to be made has been given nothing, so the kit
 /// that was shown opens nothing. The call is made over a connection of its own: one kept from the
 /// start of the dialogue would still reach the daemon here, and the setup would be made.
