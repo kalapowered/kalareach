@@ -42,11 +42,27 @@ function shot(name: string): string {
 
 /**
  * Photographs the whole of the settings sheet, which scrolls inside a window of its own: the page
- * is made tall enough for it to show everything at once, and given back its size after.
+ * is made tall enough for it to show everything at once, and given back its size after. Drawing a
+ * page that tall is slow in WebKit on Linux, where it takes seconds, so the page is made as tall as
+ * the sheet needs and no taller: the sheet is at most 88 per cent of the page, and what its panes
+ * hide is what it has to grow by. A sheet that needs more than the most a page is made is
+ * photographed as far as that allows.
  */
 async function photograph(page: Page, name: string): Promise<void> {
   const size = page.viewportSize() ?? { width: 1100, height: 900 }
-  await page.setViewportSize({ width: size.width, height: 6000 })
+  const needed = await page.evaluate(() => {
+    const sheet = document.querySelector<HTMLElement>('[data-testid="sheet"]')
+    if (sheet === null) return 0
+    let hidden = 0
+    for (const element of sheet.querySelectorAll<HTMLElement>('*')) {
+      const { overflowY } = getComputedStyle(element)
+      if ((overflowY === 'auto' || overflowY === 'scroll') && element.scrollHeight > element.clientHeight) {
+        hidden += element.scrollHeight - element.clientHeight
+      }
+    }
+    return Math.ceil((sheet.getBoundingClientRect().height + hidden) / 0.88) + 40
+  })
+  await page.setViewportSize({ width: size.width, height: Math.min(6000, Math.max(size.height, needed)) })
   await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))))
   await page.getByTestId('sheet').screenshot({ path: shot(name) })
   await page.setViewportSize(size)
@@ -92,6 +108,9 @@ async function overflowsSideways(page: Page, selector: string): Promise<string[]
 for (const size of SIZES) {
   test.describe(`sharing at the ${size.name} text size`, () => {
     test.beforeEach(async ({ page }) => {
+      // A test that photographs the sheet twice or more spends most of its time drawing a tall page
+      // in WebKit on Linux, which is slower than the default budget allows.
+      test.setTimeout(90_000)
       await withTextSize(page, size.root)
       await page.setViewportSize({ width: 1100, height: 900 })
     })
