@@ -22,6 +22,7 @@ use kr_client::services::account::{
     IssuedGrant, RefreshToken, Refreshed, StoredGrant,
 };
 use kr_controller::account::{HostAccount, Service};
+use kr_controller::backup::store::{Production, Remote};
 use kr_controller::quiet::Timer;
 use kr_controller::service::{Controller, ControllerSetup};
 use kr_controller::supervision::{LaunchOutcome, WorkerLaunch, WorkerSupervisor};
@@ -33,11 +34,12 @@ use kr_ipc::endpoint::Listener;
 use kr_ipc::paths::Endpoint;
 use kr_ipc::verify::ControllerIdentity;
 use kr_protocol::backup_setup::{BackupSetupState, BackupStatusParams, BackupStatusResult};
-use kr_protocol::ids::BuildId;
+use kr_protocol::ids::{ArchiveId, BackupGeneration, BuildId};
 use kr_protocol::local::LocalClientKind;
 use kr_protocol::method::Method;
 use kr_protocol::scalars::Nullable;
 use kr_service_stand_in::{Moment, Served, TOKEN, serve};
+use serde_json::Value;
 
 mod support;
 
@@ -112,9 +114,9 @@ impl AccountService for NeverAsked {
 /// commands it runs.
 struct Rig {
     temp: kr_ipc::testing::TempHost,
-    served: Served,
+    served: Arc<Served>,
     endpoint: Endpoint,
-    _controller: Arc<Controller>,
+    controller: Arc<Controller>,
     serving: Vec<tokio::task::JoinHandle<kr_controller::error::Result<()>>>,
     work: PathBuf,
     home: PathBuf,
@@ -130,7 +132,19 @@ impl Drop for Rig {
 
 impl Rig {
     async fn start() -> Self {
-        let served = serve().await;
+        Self::start_at(Arc::new(serve().await), |_| {}).await
+    }
+
+    /// A host that stands before its daemon starts as `prepare` leaves it.
+    async fn start_with(prepare: impl FnOnce(&kr_ipc::testing::TempHost)) -> Self {
+        Self::start_at(Arc::new(serve().await), prepare).await
+    }
+
+    /// A host configured for `served`, which may hold the backups of another host.
+    async fn start_at(
+        served: Arc<Served>,
+        prepare: impl FnOnce(&kr_ipc::testing::TempHost),
+    ) -> Self {
         let temp = kr_ipc::testing::TempHost::create();
         let work = temp.root().join("w");
         let home = temp.root().join("h");
@@ -142,6 +156,7 @@ impl Rig {
         let environment = temp.environment();
         let environment_id = temp.environment_id();
         environment.create().expect("the environment's directories");
+        prepare(&temp);
         let secrets = environment.secrets_dir();
         let timer = HeldTimer::automatic();
         let origin = served.origin().to_owned();
@@ -185,7 +200,7 @@ impl Rig {
             temp,
             served,
             endpoint,
-            _controller: controller,
+            controller,
             serving,
             work,
             home,
@@ -244,6 +259,45 @@ impl Rig {
             .expect("backup.status is served on the local socket")
             .to_typed()
             .expect("a result of the declared shape")
+    }
+
+    /// Whether the daemon's record shows `generation` of `archive` as made and published.
+    fn published(&self, archive: ArchiveId, generation: u64) -> bool {
+        self.controller
+            .backup()
+            .generation(archive, BackupGeneration::new(generation))
+            .expect("the store reads")
+            .is_some_and(|record| {
+                record.production == Production::Complete && record.remote == Remote::Published
+            })
+    }
+
+    /// Waits until `generation` of `archive` is published, looking again each time the daemon
+    /// finishes a pass.
+    async fn until_published(&self, archive: ArchiveId, generation: u64) {
+        self.until_published_within(archive, generation, LIVENESS_DEADLINE)
+            .await;
+    }
+
+    /// As [`Self::until_published`], with a deadline of the caller's.
+    async fn until_published_within(
+        &self,
+        archive: ArchiveId,
+        generation: u64,
+        deadline: Duration,
+    ) {
+        let mut passes = self
+            .controller
+            .backup_runtime()
+            .expect("a carrier")
+            .passes();
+        tokio::time::timeout(deadline, async {
+            while !self.published(archive, generation) {
+                passes.changed().await.expect("the carrier is running");
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("generation {generation} was never published"));
     }
 
     /// The fingerprint of the setup the daemon records, when it records one.
@@ -616,7 +670,7 @@ async fn the_kit_that_setup_shows_is_the_one_the_host_records_and_the_daemon_is_
         "{}",
         text(&doctor.stdout)
     );
-    // The bundle is where the kit says, and the kit's seed opens it.
+    // The bundle is where the kit says.
     let sealed = rig
         .served
         .web()
@@ -627,10 +681,6 @@ async fn the_kit_that_setup_shows_is_the_one_the_host_records_and_the_daemon_is_
         .context(rig.origin())
         .expect("the kit names the origin");
     let key = seed.bundle_key_for(&context).expect("a key");
-    let bundle = kr_crypto::archive::decrypt_recovery_bundle(&key, &sealed)
-        .expect("the bundle opens under the kit");
-    assert_eq!(bundle.trusted_writers.len(), 1);
-    assert_eq!(bundle.trusted_producers.len(), 1);
 
     // What the daemon was given, as it arrived.
     let calls = kr_controller::testing::tapped_backup_enable(rig.temp.environment_id());
@@ -656,6 +706,11 @@ async fn the_kit_that_setup_shows_is_the_one_the_host_records_and_the_daemon_is_
             assert!(!contains(&bytes, value), "{name} holds {what}");
         }
     }
+    // The bundle the daemon was given is the one the kit's seed opens.
+    let bundle = kr_crypto::archive::decrypt_recovery_bundle(&key, &sealed)
+        .expect("the bundle opens under the kit");
+    assert_eq!(bundle.trusted_writers.len(), 1);
+    assert_eq!(bundle.trusted_producers.len(), 1);
 }
 
 /// Typed at the question about the end of the seed three times wrongly, or with the end right and
@@ -871,4 +926,256 @@ async fn an_interrupt_at_a_question_sets_nothing_up_and_puts_the_terminal_back()
 
     assert_eq!(rig.requests_to(SYNC), 0);
     assert_eq!(rig.recorded_kit().await, None);
+}
+
+/// A closed session the registry holds a closure for, with output in its spool, written into the
+/// host's tree before its daemon starts.
+fn closed_session(
+    host: &kr_ipc::testing::TempHost,
+    output: &[u8],
+    closed_at_ms: u64,
+) -> kr_protocol::ids::SessionId {
+    closed_session_in(
+        host,
+        output,
+        closed_at_ms,
+        kr_worker::history::SpoolLayout::new(8, 1 << 20),
+    )
+}
+
+/// As [`closed_session`], with the layout its spool is kept in.
+fn closed_session_in(
+    host: &kr_ipc::testing::TempHost,
+    output: &[u8],
+    closed_at_ms: u64,
+    layout: kr_worker::history::SpoolLayout,
+) -> kr_protocol::ids::SessionId {
+    use kr_controller::registry::{LaunchPhase, Registry};
+    use kr_protocol::ids::{ActorId, SessionEpoch};
+    use kr_protocol::scalars::{Digest256, TimestampMs, U64};
+    use kr_protocol::session::{ClosureReason, ClosureRecord, Durability, OwnershipCoverage};
+
+    let mut registry = Registry::open(
+        host.environment().registry_database(),
+        host.environment_id(),
+    )
+    .expect("the registry");
+    let admission = registry
+        .reserve(
+            &ActorId::new("local:501").expect("a principal"),
+            kr_ipc::new_uuid(),
+            Digest256::from_bytes([1; 32]),
+            &[0xa0],
+            TimestampMs::new(1),
+        )
+        .expect("a reservation");
+    let session_id = admission.reservation.session_id;
+    registry
+        .set_phase(admission.reservation.reservation_id, LaunchPhase::Closed)
+        .expect("the session closes");
+    registry
+        .record_closure(&ClosureRecord {
+            session_id,
+            session_epoch: SessionEpoch::V1,
+            reason: ClosureReason::RootExit,
+            root_exit_code: Nullable::some(U64::new(0)),
+            root_signal: Nullable::null(),
+            terminated: Vec::new(),
+            surviving: Vec::new(),
+            ownership_coverage: OwnershipCoverage::Complete,
+            durability: Durability::Durable,
+            closed_at_ms: TimestampMs::new(closed_at_ms),
+        })
+        .expect("the closure");
+    let mut history = kr_worker::history::OutputHistory::with_spool(
+        8,
+        host.environment().session_spool(session_id),
+        layout,
+    )
+    .expect("a spool");
+    history.append(output);
+    session_id
+}
+
+/// KR-REQ-20.14, 20.15, 20.18, KR-REQ-24.16 and KR-ACC-033, end to end: a host is set up through
+/// `kr` at a terminal, its daemon makes a backup of the session that closed on it, and a fresh
+/// host, with a state directory of its own and nothing but the kit that was printed, restores the
+/// session's output and the configuration as readable files.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fresh_host_restores_the_session_a_set_up_host_backed_up_from_the_kit_setup_printed() {
+    let output = b"the output this session wrote\r\n";
+    let rig = Rig::start_with(|host| {
+        closed_session(host, output, 9_000);
+    })
+    .await;
+    let mut window = Window::run(&rig, &["backup", "setup"]);
+    let kit = window.bring_up_the_kit();
+    window.confirm(&kit);
+    window.wait_for("kr ended 0");
+
+    let BackupSetupState::Committed { archive_id, .. } = rig.status().await.setup else {
+        panic!("the host is set up");
+    };
+    rig.until_published(archive_id, 1).await;
+
+    // A fresh host on the same service: its own state directory, and the kit as the only thing it
+    // is given.
+    let fresh = Rig::start_at(Arc::clone(&rig.served), |_| {}).await;
+    let kit_file = fresh.work.join("kit.txt");
+    std::fs::write(&kit_file, &kit.text).expect("the kit file");
+    let into = fresh.work.join("restored");
+    std::fs::create_dir(&into).expect("a folder to fill");
+    let kit_arg = kit_file.display().to_string();
+    let into_arg = into.display().to_string();
+    let line = |more: &[&str]| -> Vec<String> {
+        let mut line: Vec<String> = [
+            "backup",
+            "restore",
+            "--into",
+            &into_arg,
+            "--kit-file",
+            &kit_arg,
+        ]
+        .iter()
+        .map(|word| (*word).to_owned())
+        .collect();
+        line.extend(more.iter().map(|word| (*word).to_owned()));
+        line
+    };
+    let run = |line: Vec<String>| {
+        let words: Vec<&str> = line.iter().map(String::as_str).collect();
+        fresh.run(&words)
+    };
+    let preview = run(line(&["--preview", "--json"]));
+    assert!(preview.status.success(), "{}", text(&preview.stderr));
+    let plan: Value = serde_json::from_slice(&preview.stdout).expect("the plan is JSON");
+    assert_eq!(plan["archive"], archive_id.get().to_string());
+    let digest = plan["digest"].as_str().expect("a digest").to_owned();
+    let restored = run(line(&["--confirm-plan", &digest, "--json"]));
+    assert!(restored.status.success(), "{}", text(&restored.stderr));
+
+    let files = tree(&into);
+    let names: Vec<&str> = files.keys().map(String::as_str).collect();
+    assert!(names.contains(&"session-0001.json"), "{names:?}");
+    assert!(names.contains(&"configuration.json"), "{names:?}");
+    // The session's document carries the output it wrote.
+    let document: Value = serde_json::from_slice(&files["session-0001.json"]).expect("a document");
+    let mut carried = Vec::new();
+    for chunk in document["output"]["chunks"]
+        .as_array()
+        .expect("the document's chunks")
+    {
+        carried.extend(
+            kr_protocol::scalars::from_base64url(chunk["base64url"].as_str().expect("text"))
+                .expect("base64url"),
+        );
+    }
+    assert!(
+        text(&carried).contains("the output this session wrote"),
+        "{}",
+        text(&carried)
+    );
+}
+
+/// The convention's sizes, at their real values: the producer packs sessions up to the total a
+/// restore accepts and leaves the rest out, and a restore of what it made accepts all of it.
+///
+/// Twelve closed sessions each hold output that alternates one byte of text with one byte a
+/// terminal engine drops, which is the shape that makes the most pieces from the least output: about
+/// 7 MB of spool for each, and a document of about 130 MiB. Together they are over the 1.5 GiB a
+/// restore accepts. The generation the host makes holds the newest that fit; the restore's plan of it
+/// lists every one as a file to restore and none as refused, and what it restores is under the
+/// total.
+///
+/// It packs, encrypts, uploads and restores more than a gigabyte, so it runs on the build box and
+/// only when asked: `cargo test -p kr-cli --test backup_setup -- --ignored the_bounds_hold`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "packs, uploads and restores about 1.4 GiB at the convention's real sizes; run it on the build box with --ignored"]
+async fn the_bounds_hold_at_the_real_scale_and_a_restore_accepts_what_the_producer_packed() {
+    /// What a restore accepts of all members together: the convention's 1.5 GiB.
+    const TOTAL: u64 = 3 << 29;
+    const SESSIONS: usize = 12;
+    let pairs = 3_500_000;
+    let mut output = Vec::with_capacity(pairs * 2);
+    for _ in 0..pairs {
+        output.extend_from_slice(&[b'x', 0x07]);
+    }
+    let rig = Rig::start_with(|host| {
+        for closed_at in 0..SESSIONS {
+            closed_session_in(
+                host,
+                &output,
+                9_000 + closed_at as u64,
+                kr_worker::history::SpoolLayout::new(8 << 20, 128 << 20),
+            );
+        }
+    })
+    .await;
+    let mut window = Window::run(&rig, &["backup", "setup"]);
+    let kit = window.bring_up_the_kit();
+    window.confirm(&kit);
+    window.wait_for("kr ended 0");
+    let BackupSetupState::Committed { archive_id, .. } = rig.status().await.setup else {
+        panic!("the host is set up");
+    };
+    rig.until_published_within(archive_id, 1, Duration::from_secs(3600))
+        .await;
+
+    let fresh = Rig::start_at(Arc::clone(&rig.served), |_| {}).await;
+    let kit_file = fresh.work.join("kit.txt");
+    std::fs::write(&kit_file, &kit.text).expect("the kit file");
+    let into = fresh.work.join("restored");
+    std::fs::create_dir(&into).expect("a folder to fill");
+    let kit_arg = kit_file.display().to_string();
+    let into_arg = into.display().to_string();
+    let preview = fresh.run(&[
+        "backup",
+        "restore",
+        "--into",
+        &into_arg,
+        "--kit-file",
+        &kit_arg,
+        "--preview",
+        "--json",
+    ]);
+    assert!(preview.status.success(), "{}", text(&preview.stderr));
+    let plan: Value = serde_json::from_slice(&preview.stdout).expect("the plan is JSON");
+    let files = plan["files"].as_array().expect("files");
+    let sessions: Vec<u64> = files
+        .iter()
+        .filter(|file| file["role"] == "a session's export")
+        .map(|file| file["bytes"].as_u64().expect("a size"))
+        .collect();
+    let packed: u64 = sessions.iter().sum();
+    assert!(
+        plan["not_restored"]
+            .as_array()
+            .expect("not restored")
+            .is_empty(),
+        "the restore refuses nothing the producer packed: {}",
+        plan["not_restored"]
+    );
+    assert!(packed <= TOTAL, "the members total {packed} bytes");
+    assert!(
+        sessions.len() < SESSIONS,
+        "the sessions together are over the total, so one is left out"
+    );
+    let largest = sessions.iter().copied().max().expect("a session");
+    assert!(
+        packed + largest > TOTAL,
+        "the producer left room for another session: {packed} bytes packed"
+    );
+    let digest = plan["digest"].as_str().expect("a digest").to_owned();
+    let restored = fresh.run(&[
+        "backup",
+        "restore",
+        "--into",
+        &into_arg,
+        "--kit-file",
+        &kit_arg,
+        "--confirm-plan",
+        &digest,
+        "--json",
+    ]);
+    assert!(restored.status.success(), "{}", text(&restored.stderr));
 }
