@@ -9842,9 +9842,9 @@ async fn retention_leaves_a_generation_privacy_mode_drew_a_line_under() {
     ask(4).expect("a generation of the generation in force, with two newer published");
 }
 
-/// The end of a production pass wakes what releases its ciphertext and what finishes the cleanup a
-/// fence owes, and does not wake the producer: a pass that failed would otherwise begin again at
-/// once and never wait out its delay.
+/// The end of a production pass that admitted nothing wakes what releases its ciphertext and what
+/// finishes the cleanup a fence owes, and does not wake the producer: a pass that failed would
+/// otherwise begin again at once and never wait out its delay.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_end_of_a_pass_does_not_wake_the_producer() {
     let environment = Environment::open();
@@ -9863,6 +9863,52 @@ async fn the_end_of_a_pass_does_not_wake_the_producer() {
     assert!(
         signals.produce.notified().now_or_never().is_none(),
         "the producer is not told"
+    );
+}
+
+/// A generation's admission wakes the carrier once, and the end of the pass that made it does not
+/// wake it again: a carrier that is told twice looks a second time at once, inside whatever it had
+/// been told to wait for. The first waiter takes the admission's wake and the second would take a
+/// second one.
+#[test]
+fn the_admission_of_a_generation_wakes_the_carrier_once() {
+    let root = tempfile::tempdir().expect("a disposable directory");
+    let service = BackupService::in_memory(&root.path().join("backup")).expect("a service");
+    service
+        .reconcile(TimestampMs::new(4_000))
+        .expect("reconciliation");
+    let producer = Producer::generate();
+    service
+        .commit_setup(
+            &a_setup(archive_id(), &producer, "ABCD2345"),
+            false,
+            TimestampMs::new(1_000),
+        )
+        .expect("written");
+    let signals = service.signals();
+    // What the setup woke is not what is counted.
+    assert!(signals.work.notified().now_or_never().is_some());
+    let mut first = std::pin::pin!(signals.work.notified());
+    first.as_mut().enable();
+    let mut second = std::pin::pin!(signals.work.notified());
+    second.as_mut().enable();
+
+    let objects = [stage(1, "a.cbor", b"one")];
+    service
+        .admit(
+            &producer.seal(1, &objects),
+            &objects,
+            producer.writer.key_id(),
+            TimestampMs::new(5_000),
+        )
+        .expect("the generation is admitted");
+    assert!(
+        first.as_mut().now_or_never().is_some(),
+        "the admission woke the carrier"
+    );
+    assert!(
+        second.as_mut().now_or_never().is_none(),
+        "the end of the pass did not wake it a second time"
     );
 }
 

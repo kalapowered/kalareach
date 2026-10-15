@@ -103,6 +103,9 @@ pub struct ProductionLease {
     read_under: u64,
     /// The files this pass wrote that no generation has claimed.
     unclaimed: Mutex<Vec<PathBuf>>,
+    /// Whether a generation has claimed files of this pass, which woke the carrier when it was
+    /// admitted.
+    admitted: AtomicBool,
 }
 
 impl std::fmt::Debug for ProductionLease {
@@ -133,6 +136,7 @@ impl ProductionLease {
             staging_root,
             read_under,
             unclaimed: Mutex::new(Vec::new()),
+            admitted: AtomicBool::new(false),
         }
     }
 
@@ -208,6 +212,7 @@ impl ProductionLease {
 
     /// Records that a generation has claimed these files, so ending the pass leaves them.
     pub(super) fn claim(&self, paths: &[PathBuf]) {
+        self.admitted.store(true, Ordering::SeqCst);
         self.unclaimed
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -249,8 +254,12 @@ impl Drop for ProductionLease {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .end(self.id);
-        // Production waits for the pass to be over, and so does the cleanup a fence owes.
-        self.signals.work.notify_one();
+        // What releases ciphertext waits for the pass to be over, and so does the cleanup a fence
+        // owes. A pass that admitted a generation woke the carrier at the admission, and a second
+        // wake would have it look again at once, whatever it had been told to wait for.
+        if !self.admitted.load(Ordering::SeqCst) {
+            self.signals.work.notify_one();
+        }
         self.signals.lease_ended.notify_one();
     }
 }
