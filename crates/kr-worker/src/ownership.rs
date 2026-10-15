@@ -482,18 +482,16 @@ impl OwnedProcesses {
         }
         // The places first read are added before any is checked, so the chain above each is there
         // to be followed whatever order they come in.
-        let added: Vec<(u64, u64)> = copy_under
-            .iter()
-            .filter(|(this, _)| {
-                !under_then.contains(*this)
-                    && !self.under_backends.contains_key(*this)
-                    && self.live.contains_key(*this)
-            })
-            .map(|(this, position)| {
+        let mut added = Vec::new();
+        for (this, position) in &copy_under {
+            if !under_then.contains(this)
+                && !self.under_backends.contains_key(this)
+                && self.live.contains_key(this)
+            {
                 self.under_backends.insert(*this, position.clone());
-                *this
-            })
-            .collect();
+                added.push(*this);
+            }
+        }
         for this in added {
             if let Some((identity, _, above)) = self.under_backends.get(&this).cloned()
                 && self.flagged_above(above)
