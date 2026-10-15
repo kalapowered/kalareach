@@ -97,8 +97,8 @@ mod recording {
     ///
     /// For an acquisition of the session `begun` is when the wait for it began, `held` when it was
     /// taken and `released` when it was let go. `value` is what the site added: the recogniser's
-    /// deadline after an input write, and for a supervision wake whether it observed the session's
-    /// processes (see [`crate::runtime::SUPERVISION_OBSERVED`]). For [`Site::TimerWake`],
+    /// deadline after an input write, and for a supervision wake which part of an observation it
+    /// was (see [`crate::runtime::SUPERVISION_COPIED_OUT`]), or zero. For [`Site::TimerWake`],
     /// `begun` is the deadline and `held` is when the timer woke; for [`Site::Observation`],
     /// `begun` and `held` are the start and the end of the reading.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]

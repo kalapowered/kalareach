@@ -1260,6 +1260,26 @@ impl Session {
         self.submit_owned();
     }
 
+    /// Copies out what an observation of the session's processes works on, so that the processes
+    /// can be read without holding the session.
+    ///
+    /// Reading them asks the kernel about every process the session might own. Nothing else that
+    /// happens to the session waits for that when it is made on the copy: [`Self::finish_observation`]
+    /// puts the result back, and does what [`Self::observe_owned`] does after its own reading.
+    #[must_use]
+    pub fn begin_observation(&self) -> Option<crate::ownership::Observation> {
+        self.owned.as_ref().map(OwnedProcesses::begin_observation)
+    }
+
+    /// Puts back what an observation made on a copy found, and writes the record of what the
+    /// session owns.
+    pub fn finish_observation(&mut self, observation: crate::ownership::Observation) {
+        if let Some(owned) = self.owned.as_mut() {
+            owned.finish_observation(observation);
+        }
+        self.submit_owned();
+    }
+
     /// Writes the record of what the session owns, once, and starts the thread that keeps it up to
     /// date.
     ///

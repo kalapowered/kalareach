@@ -30,8 +30,12 @@ use crate::trace::Site;
 /// How many read batches may wait for ingestion before the read loop slows down.
 pub const READ_QUEUE_DEPTH: usize = 64;
 
-/// What the trace notes of a supervision wake that observed the session's processes.
-pub const SUPERVISION_OBSERVED: u64 = 1;
+/// What the trace notes of a supervision wake that copied out what an observation of the session's
+/// processes works on.
+pub const SUPERVISION_COPIED_OUT: u64 = 1;
+
+/// What the trace notes of a supervision wake that put an observation's result back.
+pub const SUPERVISION_PUT_BACK: u64 = 2;
 
 /// The most input the writer offers the pseudo-terminal in one write, before any delimiter it has
 /// to finish.
@@ -433,7 +437,7 @@ struct ReadProgress {
     ingested: tokio::sync::watch::Receiver<u64>,
     /// The pauses this host's own tests arm inside a closure's drain.
     #[cfg(feature = "testing")]
-    pauses: Arc<DrainPauses>,
+    pauses: Arc<RuntimePauses>,
 }
 
 impl ReadProgress {
@@ -466,7 +470,7 @@ impl ReadProgress {
 struct ReadCounter {
     read: Arc<Mutex<u64>>,
     #[cfg(feature = "testing")]
-    pauses: Arc<DrainPauses>,
+    pauses: Arc<RuntimePauses>,
 }
 
 impl ReadCounter {
@@ -494,15 +498,17 @@ impl ReadCounter {
     }
 }
 
-/// The pauses this host's own tests arm inside a closure's drain. Compiled away in every shipped
-/// build.
+/// The pauses this host's own tests arm inside a closure's drain and inside an observation of the
+/// session's processes. Compiled away in every shipped build.
 ///
 /// A test cannot otherwise stand in the two moments a closure's drain turns on: a read that has
 /// returned and is not yet counted, and the end of the drain period, just before what has been
-/// read is measured.
+/// read is measured. Nor can it stand while the supervision is reading the processes the session
+/// owns, which is the moment a keystroke's deadline is most exposed to a lock held for the
+/// duration of a reading.
 #[cfg(feature = "testing")]
 #[derive(Debug, Default)]
-struct DrainPauses {
+struct RuntimePauses {
     /// Where the read loop says it has arrived after a read, and what lets it go on.
     after_read: Mutex<
         Option<(
@@ -512,14 +518,34 @@ struct DrainPauses {
     >,
     /// Where a closure says its drain period has ended.
     drain_ended: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    /// Where the supervision says it is reading the session's processes, and what lets it go on.
+    in_observation: Mutex<
+        Option<(
+            tokio::sync::oneshot::Sender<()>,
+            std::sync::mpsc::Receiver<()>,
+        )>,
+    >,
 }
 
 #[cfg(feature = "testing")]
-impl DrainPauses {
+impl RuntimePauses {
     /// Waits at the pause after a read, where one is armed.
     fn after_read(&self) {
         let armed = self
             .after_read
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some((arrived, go)) = armed {
+            let _ = arrived.send(());
+            let _ = go.recv();
+        }
+    }
+
+    /// Waits at the pause inside an observation, where one is armed.
+    fn in_observation(&self) {
+        let armed = self
+            .in_observation
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
@@ -1035,6 +1061,38 @@ impl SessionRuntime {
                 )>,
             > = None;
             loop {
+                // The set of processes the session owns is built up while it runs, on the cadence
+                // [`crate::lifecycle`] describes: a process that starts and ends between two
+                // observations is never recorded, and enumerating the boundary every time the
+                // shell is asked about would cost more than the whole host is allowed to spend
+                // while idle.
+                //
+                // They are read with the session let go. Reading them is a question to the kernel
+                // about every process the session might own, and everything else that happens to
+                // the session waits for the session meanwhile: a keystroke's write, the
+                // recogniser's timer that forwards a held prefix at its deadline, the output the
+                // application produces. A reading that kept the session would move a prefix's
+                // deadline, or hold the prefix past it, by as long as the kernel took to answer.
+                let observation = if wake == crate::lifecycle::Wake::Ownership {
+                    let observation = {
+                        let mut acquisition = monitor_trace.acquisition(Site::SupervisionWake);
+                        acquisition.note(SUPERVISION_COPIED_OUT);
+                        monitor_session.lock().ok().and_then(|session| {
+                            acquisition.held();
+                            session.begin_observation()
+                        })
+                    };
+                    observation.map(|mut observation| {
+                        #[cfg(feature = "testing")]
+                        runtime.progress.pauses.in_observation();
+                        let began = Instant::now();
+                        observation.read();
+                        monitor_trace.observed(began);
+                        observation
+                    })
+                } else {
+                    None
+                };
                 let mut wanted = None;
                 let initiated = {
                     let mut acquisition = monitor_trace.acquisition(Site::SupervisionWake);
@@ -1045,16 +1103,9 @@ impl SessionRuntime {
                     if session.state() == SessionState::Closed {
                         break;
                     }
-                    // The set of processes the session owns is built up while it runs, on the
-                    // cadence [`crate::lifecycle`] describes: a process that starts and ends
-                    // between two observations is never recorded, and enumerating the boundary
-                    // every time the shell is asked about would cost more than the whole host is
-                    // allowed to spend while idle.
-                    if wake == crate::lifecycle::Wake::Ownership {
-                        acquisition.note(SUPERVISION_OBSERVED);
-                        let began = Instant::now();
-                        session.observe_owned();
-                        monitor_trace.observed(began);
+                    if let Some(observation) = observation {
+                        acquisition.note(SUPERVISION_PUT_BACK);
+                        session.finish_observation(observation);
                     }
                     // What the watch wants to be asked next, decided here, on the lock this pass
                     // already holds: a second acquisition per wake would put this loop in front of
@@ -1299,6 +1350,36 @@ impl SessionRuntime {
         tokio::time::timeout(within, deliveries.settled())
             .await
             .is_ok()
+    }
+
+    /// Makes the supervision observe the session's processes now, for this host's own tests.
+    #[cfg(feature = "testing")]
+    pub fn observe_now(&self) {
+        self.activity.force_observation();
+    }
+
+    /// Stops the next observation of the session's processes while it is reading them, for this
+    /// host's own tests.
+    ///
+    /// Returns the end that says the observation has arrived, and the end that lets it go. The
+    /// pause fires once.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn pause_in_next_observation(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        let (arrived, watch) = tokio::sync::oneshot::channel();
+        let (release, go) = std::sync::mpsc::channel();
+        *self
+            .progress
+            .pauses
+            .in_observation
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((arrived, go));
+        (watch, release)
     }
 
     /// Stops the read loop after its next read that returns output, before that output is

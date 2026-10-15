@@ -1606,7 +1606,7 @@ async fn nothing_journals_a_keystroke_and_reaching_the_terminal_is_not_an_effect
 
 struct Wired {
     _temp: kr_ipc::testing::TempHost,
-    _service: Arc<WorkerService>,
+    service: Arc<WorkerService>,
     runtime: Arc<SessionRuntime>,
     session_id: SessionId,
     environment_id: kr_protocol::ids::EnvironmentId,
@@ -1687,7 +1687,7 @@ async fn wired(script: &str) -> Wired {
     tokio::spawn(Arc::clone(&service).serve(listener));
     Wired {
         _temp: temp,
-        _service: service,
+        service,
         runtime,
         session_id,
         environment_id,
@@ -2392,4 +2392,286 @@ async fn a_prefix_made_only_of_the_newer_bytes_keeps_the_newer_deadline() {
     );
 
     runtime.close(ClosureReason::CloseRequested).1.release();
+}
+
+// ---------------------------------------------------------------------------------------------
+// KR-PERF-002: what the recogniser's deadline does not wait for.
+// ---------------------------------------------------------------------------------------------
+
+/// The root program of the cases below: it echoes what it reads, with bracketed paste enabled, so
+/// the host holds a lone Escape for its deadline.
+const BRACKETED_ECHO: &str = "stty raw -echo; printf '\\033[?2004hkr-ready.'; exec cat";
+
+/// What the session's worker has written for the application once it is ready, and an attachment
+/// that holds the input lease.
+async fn typist(wired: &Wired) -> (LocalClient, AttachmentId, kr_protocol::ids::InputLeaseEpoch) {
+    retained_within(&wired.runtime, b"kr-ready.", LIVENESS_DEADLINE).await;
+    let mut client = LocalClient::connect(&wired.endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects");
+    let attachment = attach_over(&mut client, wired, Some("xterm-256color")).await;
+    let lease = acquire_over(&mut client, wired, attachment)
+        .await
+        .expect("acquires");
+    (client, attachment, lease.lease.epoch)
+}
+
+/// KR-PERF-002: a held prefix's deadline runs from the write's arrival at the worker, and not from
+/// the moment the session came free for it.
+///
+/// The session can be busy with something else when a lone Escape arrives. The application's wait
+/// for the Escape is bounded by the recogniser's deadline from the write, so a deadline that began
+/// when the session was taken would add the wait for the session to it. The write is stopped before
+/// it takes the session, which stands in for whatever held the session, and the deadline it set is
+/// read back from the instants the session's recorder kept.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    windows,
+    ignore = "a Windows pseudo-console begins its output with mode sequences of its own, so this case cannot tell the application's enabling of bracketed paste from them"
+)]
+async fn a_prefix_waits_for_its_deadline_from_the_write_whatever_held_the_session() {
+    let wired = wired(BRACKETED_ECHO).await;
+    let (mut client, attachment, epoch) = typist(&wired).await;
+    wired.runtime.trace().arm();
+
+    let (arrived, release) = wired.service.pause_input_before_the_session();
+    let write = write_over(&mut client, &wired, attachment, epoch, 0, b"\x1b");
+    let standing_in = tokio::task::spawn_blocking(move || {
+        arrived
+            .recv_timeout(LIVENESS_DEADLINE)
+            .expect("the write reached the pause");
+        // From here until the write is let go it is waiting for a session that is not free.
+        let session_came_free = Instant::now();
+        release.send(()).expect("lets the write go");
+        session_came_free
+    });
+    let (accepted, session_came_free) = tokio::join!(write, standing_in);
+    let accepted = accepted.expect("the write is accepted");
+    let session_came_free = session_came_free.expect("the pause ends");
+    assert_eq!(accepted.held_prefix_bytes.get(), 1, "the Escape is held");
+
+    let trace = wired.runtime.trace();
+    let recording = trace.recording();
+    let deadline = recording
+        .events
+        .iter()
+        .find(|event| event.site == kr_worker::trace::Site::InputAcceptance && event.value != 0)
+        .map(|event| event.value)
+        .expect("the acceptance of a held prefix recorded the deadline it set");
+    let began = deadline
+        - u64::try_from(kr_worker::input::RECOGNISER_DEADLINE.as_nanos()).expect("nanoseconds");
+    assert!(
+        began <= trace.offset(session_came_free),
+        "the deadline ran from {began} ns, after the write had waited until {} ns for the session",
+        trace.offset(session_came_free)
+    );
+
+    drop(client);
+    wired
+        .runtime
+        .close(ClosureReason::CloseRequested)
+        .1
+        .release();
+}
+
+/// KR-PERF-002: a lone Escape reaches the application at its deadline while the worker is reading
+/// the processes the session owns.
+///
+/// The observation is stopped while it reads, which is where a reading that kept the session would
+/// keep the write, and then the timer, out of it for as long as the kernel took to answer. Both
+/// have to get through while it is stopped, and the Escape has to arrive before it is let go.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    windows,
+    ignore = "a Windows pseudo-console holds back a lone Escape, which it cannot tell from the start of a sequence, so the Escape this case waits for does not come back"
+)]
+async fn a_lone_escape_is_forwarded_at_its_deadline_while_the_session_s_processes_are_being_read() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let wired = wired(BRACKETED_ECHO).await;
+    let (mut client, attachment, epoch) = typist(&wired).await;
+
+    let (reading, resume) = wired.runtime.pause_in_next_observation();
+    wired.runtime.observe_now();
+    reading.await.expect("the observation is reading");
+
+    // A regression leaves the paused observation holding the session, and then the write waits for
+    // it for as long as the pause lasts. A thread of its own lets the observation go after a while
+    // and says so, so that the case fails naming the wait instead of waiting with it.
+    let written = Arc::new(AtomicBool::new(false));
+    let let_go_by_the_watchdog = Arc::new(AtomicBool::new(false));
+    let watchdog = {
+        let (written, let_go) = (Arc::clone(&written), Arc::clone(&let_go_by_the_watchdog));
+        let resume = resume.clone();
+        std::thread::spawn(move || {
+            for _ in 0..300 {
+                if written.load(Ordering::Acquire) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            let_go.store(true, Ordering::Release);
+            let _ = resume.send(());
+        })
+    };
+    let accepted = write_over(&mut client, &wired, attachment, epoch, 0, b"\x1b")
+        .await
+        .expect("the write is accepted");
+    written.store(true, Ordering::Release);
+    assert!(
+        !let_go_by_the_watchdog.load(Ordering::Acquire),
+        "the write was kept waiting by the observation until it was let go"
+    );
+    assert_eq!(accepted.held_prefix_bytes.get(), 1, "the Escape is held");
+    let seen = retained_within(&wired.runtime, b"kr-ready.\x1b", LIVENESS_DEADLINE).await;
+    assert!(
+        contains(&seen, b"kr-ready.\x1b"),
+        "the Escape reached the application while the observation was still reading: {seen:?}"
+    );
+
+    resume.send(()).expect("lets the observation go");
+    watchdog.join().expect("the watchdog ends");
+    drop(client);
+    wired
+        .runtime
+        .close(ClosureReason::CloseRequested)
+        .1
+        .release();
+}
+
+/// What a held prefix's path records: each acquisition of the session with the instants it began
+/// to wait, held the session and let go of it, the timer's wake against its deadline, and the
+/// observation of the session's processes, in order.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    windows,
+    ignore = "a Windows pseudo-console holds back a lone Escape, which it cannot tell from the start of a sequence, so the Escape this case waits for does not come back"
+)]
+async fn the_recorder_keeps_each_acquisition_on_a_held_prefix_s_path() {
+    use kr_worker::trace::Site;
+
+    let wired = wired(BRACKETED_ECHO).await;
+    let (mut client, attachment, epoch) = typist(&wired).await;
+    let trace = wired.runtime.trace();
+    trace.arm();
+
+    write_over(&mut client, &wired, attachment, epoch, 0, b"\x1b")
+        .await
+        .expect("the write is accepted");
+    retained_within(&wired.runtime, b"kr-ready.\x1b", LIVENESS_DEADLINE).await;
+    wired.runtime.observe_now();
+    // The observation's result is put back by a wake of its own.
+    let put_back = tokio::time::timeout(LIVENESS_DEADLINE, async {
+        loop {
+            let recording = trace.recording();
+            if let Some(wake) = recording.events.iter().find(|event| {
+                event.site == Site::SupervisionWake
+                    && event.value == kr_worker::runtime::SUPERVISION_PUT_BACK
+            }) {
+                return *wake;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the observation's result was put back");
+    let recording = trace.recording();
+    assert!(!recording.overflowed, "a hold's events fit the recording");
+
+    let of = |site: Site| {
+        recording
+            .events
+            .iter()
+            .filter(move |event| event.site == site)
+            .copied()
+            .collect::<Vec<_>>()
+    };
+    for site in [
+        Site::InputAcceptance,
+        Site::TimerLook,
+        Site::TimerForward,
+        Site::Ingest,
+        Site::SupervisionWake,
+    ] {
+        let events = of(site);
+        assert!(!events.is_empty(), "{site:?} was recorded");
+        for event in events {
+            assert!(
+                event.begun <= event.held && event.held <= event.released,
+                "{site:?} began to wait, held the session and let go of it in that order: {event:?}"
+            );
+        }
+    }
+    let accepted = of(Site::InputAcceptance)[0];
+    assert!(
+        accepted.value != 0,
+        "the acceptance kept the deadline it set"
+    );
+    let woke = of(Site::TimerWake)[0];
+    assert_eq!(
+        woke.begun, accepted.value,
+        "the timer slept for that deadline"
+    );
+    assert!(woke.held >= woke.begun, "and woke at or after it");
+    let forwarded = of(Site::TimerForward)[0];
+    assert!(
+        forwarded.held >= woke.held,
+        "and took the session after waking"
+    );
+    let observation = of(Site::Observation)[0];
+    assert!(
+        observation.begun <= observation.held,
+        "the observation read for a span"
+    );
+    assert!(
+        put_back.held >= observation.held,
+        "and its result was put back after the reading ended"
+    );
+
+    drop(client);
+    wired
+        .runtime
+        .close(ClosureReason::CloseRequested)
+        .1
+        .release();
+}
+
+/// KR-REQ-07.13: a process the session started is recorded by an observation made with the session
+/// let go.
+///
+/// The observation reads the processes on a copy of the record and puts what it found back, so
+/// that the session is free while the kernel answers. What it found has to arrive in the record the
+/// way it did when the reading kept the session.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_process_the_session_started_is_recorded_by_an_observation_made_with_the_session_let_go()
+{
+    let wired = wired("stty raw -echo; sleep 600 & printf 'kr-ready.'; exec cat").await;
+    retained_within(&wired.runtime, b"kr-ready.", LIVENESS_DEADLINE).await;
+    let recorded = |wired: &Wired| {
+        wired
+            .runtime
+            .session()
+            .owned()
+            .expect("the session records what it owns")
+            .record()
+            .processes
+            .len()
+    };
+    let before = recorded(&wired);
+
+    wired.runtime.observe_now();
+    tokio::time::timeout(LIVENESS_DEADLINE, async {
+        while recorded(&wired) == before {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the process the shell started was recorded");
+
+    wired
+        .runtime
+        .close(ClosureReason::CloseRequested)
+        .1
+        .release();
 }

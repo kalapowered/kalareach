@@ -92,6 +92,9 @@ pub struct Activity {
     boundary: Mark,
     /// What the adoption watch takes.
     foreground: Mark,
+    /// An observation a test asked for, which the supervision makes at once.
+    #[cfg(feature = "testing")]
+    forced: Notify,
 }
 
 /// One reader's mark.
@@ -146,6 +149,25 @@ impl Activity {
         self.boundary.marked().await;
     }
 
+    /// Asks the supervision to observe what the session owns now, whatever the cadence says, for
+    /// this host's own tests.
+    #[cfg(feature = "testing")]
+    pub fn force_observation(&self) {
+        self.forced.notify_one();
+    }
+
+    /// Waits until a test asks for an observation.
+    #[cfg(feature = "testing")]
+    async fn forced(&self) {
+        self.forced.notified().await;
+    }
+
+    /// The same, without the feature: nobody can ask, so this never ends.
+    #[cfg(not(feature = "testing"))]
+    async fn forced(&self) {
+        std::future::pending::<()>().await;
+    }
+
     /// Takes the adoption watch's mark, and says whether there was one.
     #[must_use]
     pub fn take_foreground(&self) -> bool {
@@ -185,13 +207,18 @@ impl Sweep {
         }
     }
 
+    /// Records that the set of owned processes is being observed now, whatever was due.
+    fn observe_now(&mut self, now: Instant) {
+        self.observed = now;
+        self.marked = false;
+    }
+
     /// Returns whether the set of owned processes is due to be observed, and records that it was.
     pub fn observation_due(&mut self, now: Instant) -> bool {
         if now < self.next_observation() {
             return false;
         }
-        self.observed = now;
-        self.marked = false;
+        self.observe_now(now);
         true
     }
 
@@ -291,6 +318,16 @@ pub enum Wake {
     Ownership,
 }
 
+/// What ended a wait of the supervision.
+enum Cause {
+    /// The shell's child signal, or the time the cadence set.
+    Clock,
+    /// The session did something that can have started a process.
+    Activity,
+    /// A test asked for an observation.
+    Forced,
+}
+
 /// What one session's supervision waits on.
 ///
 /// The loop that owns it waits on [`Supervision::next`], which is also what decides whether this
@@ -332,13 +369,19 @@ impl Supervision {
         let marked = self.sweep.marked();
         let activity = Arc::clone(&self.sweep.activity);
         let exits = &mut self.exits;
-        let by_activity = tokio::select! {
-            () = exits.next() => false,
-            () = tokio::time::sleep_until(deadline) => false,
-            () = activity.marked(), if !marked => true,
+        let cause = tokio::select! {
+            () = exits.next() => Cause::Clock,
+            () = tokio::time::sleep_until(deadline) => Cause::Clock,
+            () = activity.marked(), if !marked => Cause::Activity,
+            () = activity.forced() => Cause::Forced,
         };
-        if by_activity {
-            self.sweep.marked = true;
+        match cause {
+            Cause::Clock => {}
+            Cause::Activity => self.sweep.marked = true,
+            Cause::Forced => {
+                self.sweep.observe_now(Instant::now());
+                return Wake::Ownership;
+            }
         }
         if self.sweep.observation_due(Instant::now()) {
             Wake::Ownership

@@ -7399,6 +7399,11 @@ impl WorkerService {
         params: &ParamsValue,
         caller: &Caller,
     ) -> Result<ParamsValue> {
+        // When the batch reached this handler. A held prefix's deadline runs from here and not from
+        // the moment the session comes free for it: the session may be busy with something else
+        // when a lone Escape arrives, and the application's wait for it, which section 27 puts at
+        // no more than the recogniser's deadline, began with the write.
+        let arrived = std::time::Instant::now();
         let params: InputWriteParams = parse(params)?;
         Self::check_attachment(state, params.attachment_id)?;
         // Raw input is its own stream with its own bound. Travelling inside a control frame does
@@ -7435,7 +7440,7 @@ impl WorkerService {
                     boot_ms: caller.authority_deadline_boot_ms,
                     utc_ms: caller.authority_utc_deadline_ms,
                 },
-                std::time::Instant::now(),
+                arrived,
             )?;
             acquisition.deadline(session.paste_deadline());
             // Handed to the writer while the session is still held, so two writers cannot

@@ -152,6 +152,28 @@ pub struct OwnedProcesses {
     cgroup: Option<String>,
 }
 
+/// The part of a session's record that one observation of its boundary works on, copied out of it.
+///
+/// Reading the boundary asks the kernel about every process the session might own, and how long
+/// that takes is the kernel's and the machine's to say. The record is held by the session, which
+/// everything else that happens to the session has to take: a keystroke's write, the recogniser's
+/// timer, the output the application produces. So the reading is made on this copy with the session
+/// let go, and its result is put back by [`OwnedProcesses::finish_observation`].
+#[derive(Debug)]
+pub struct Observation {
+    copy: OwnedProcesses,
+    /// The processes the record called live when the copy was made, to tell which the reading
+    /// dropped and which it added.
+    live_then: std::collections::BTreeSet<(u64, u64)>,
+}
+
+impl Observation {
+    /// Reads the boundary, as [`OwnedProcesses::observe`] does on the record itself.
+    pub fn read(&mut self) {
+        self.copy.observe();
+    }
+}
+
 /// What a worker knows about its session's processes, in the form a later control daemon reads
 /// after the worker has gone.
 ///
@@ -243,6 +265,83 @@ impl OwnedProcesses {
             },
         );
         owned
+    }
+
+    /// Copies out what an observation of the boundary works on, so that the kernel can be read
+    /// without the session being held.
+    ///
+    /// The copy holds the processes the record calls live and the ones it has read as having left,
+    /// which is all [`Self::observe`] looks at. [`Observation::read`] makes the reading on the copy
+    /// and [`Self::finish_observation`] puts what it found back.
+    #[must_use]
+    pub fn begin_observation(&self) -> Observation {
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let seen = self
+            .seen
+            .iter()
+            .filter(|(this, recorded)| recorded.left.load(Relaxed) || self.live.contains_key(this))
+            .map(|(this, recorded)| {
+                (
+                    *this,
+                    Recorded {
+                        identity: recorded.identity.clone(),
+                        forced: recorded.forced,
+                        left: std::sync::atomic::AtomicBool::new(recorded.left.load(Relaxed)),
+                    },
+                )
+            })
+            .collect();
+        Observation {
+            copy: Self {
+                boundary: self.boundary.clone(),
+                root: self.root.clone(),
+                seen,
+                unestablished: std::sync::Mutex::new(Vec::new()),
+                boundary_empty: std::sync::Mutex::new(None),
+                live: self.live.clone(),
+                boot: self.boot.clone(),
+                cgroup: self.cgroup.clone(),
+            },
+            live_then: self.live.keys().copied().collect(),
+        }
+    }
+
+    /// Puts what [`Observation::read`] found back into the record.
+    ///
+    /// Every change a reading makes only moves the record the way the next reading would have: a
+    /// process found is recorded, one read in a control daemon's own scope is flagged and dropped
+    /// from the live ones, and one the kernel says has ended is dropped from them. So a record that
+    /// changed while the reading was made, through a closure's own observation, keeps its changes,
+    /// and a process the reading did not know of is left as it is for the next one.
+    pub fn finish_observation(&mut self, observation: Observation) {
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let Observation { copy, live_then } = observation;
+        for note in copy.unestablished() {
+            self.note_unestablished(note);
+        }
+        for (this, recorded) in copy.seen {
+            let left = recorded.left.load(Relaxed);
+            let ours = self.seen.entry(this).or_insert(Recorded {
+                identity: recorded.identity,
+                forced: false,
+                left: std::sync::atomic::AtomicBool::new(false),
+            });
+            if left {
+                ours.left.store(true, Relaxed);
+            }
+        }
+        for this in &live_then {
+            if !copy.live.contains_key(this) {
+                self.live.remove(this);
+            }
+        }
+        for (this, identity) in copy.live {
+            if !live_then.contains(&this) && !self.is_flagged(&this) {
+                self.live.insert(this, identity);
+            }
+        }
     }
 
     /// Returns what a later control daemon needs to stop this session's processes if this worker
