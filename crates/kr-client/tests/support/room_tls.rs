@@ -20,6 +20,7 @@ use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use kr_client::pairing::room::{RoomConnector, RoomSocket};
+use kr_client::services::voice_control::ControlConnector;
 use kr_protocol::pairing::RendezvousOrigin;
 use kr_protocol::rendezvous::{decode_client_frame, encode_frame};
 use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, Issuer, KeyPair, KeyUsagePurpose};
@@ -77,8 +78,23 @@ impl Authority {
         )
     }
 
+    /// The product's control-socket connector, trusting this authority alone.
+    pub fn control_connector(&self) -> ControlConnector {
+        let mut roots = RootCertStore::empty();
+        roots.add(self.der.clone()).expect("a root");
+        ControlConnector::with_tls(
+            ClientConfig::builder_with_provider(Arc::new(
+                tokio_rustls::rustls::crypto::ring::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()
+            .expect("protocol versions")
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+        )
+    }
+
     /// A TLS acceptor presenting a certificate this authority issued for the loopback address.
-    fn acceptor(&self) -> TlsAcceptor {
+    pub fn acceptor(&self) -> TlsAcceptor {
         let key = KeyPair::generate().expect("a key pair");
         let leaf = CertificateParams::new(vec!["127.0.0.1".to_owned()])
             .expect("certificate parameters")

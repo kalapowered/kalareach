@@ -6,16 +6,18 @@
 //! storage, relay bandwidth and operation, and a fork can point these traits at its own
 //! infrastructure without changing anything else in the client.
 //!
-//! The traits and one null implementation live here, and eleven modules hold the managed
+//! The traits and one null implementation live here, and twelve modules hold the managed
 //! implementations this crate carries. [`account`] is the account sign-in: the request a system
 //! browser is handed, the checks on what comes back, and the grant a device keeps under one lock,
 //! with the account service's trait beside them. [`relay`] is the relay-lease client, because a lease is the
 //! one managed resource a client cannot do without and still use a relay at all. [`voice`] is the
 //! voice broker, because a managed call is created by one request whose exact shape both the host
-//! and the companion have to agree on. [`authority`] is the durable authority feed, where a remote
-//! owner publishes a signed revocation request and the host that owns the feed acknowledges what it
-//! applied. [`mailbox`] is the encrypted mailbox, where a device leaves a sealed item for a peer
-//! that is not connected and the peer reads its own. [`sync`] is settings sync, the
+//! and the companion have to agree on, and [`voice_control`] is the connection the device that
+//! holds that call's media keeps to the service for as long as the call runs. [`authority`] is the
+//! durable authority feed, where a remote owner publishes a signed revocation request and the host
+//! that owns the feed acknowledges what it applied. [`mailbox`] is the encrypted mailbox, where a
+//! device leaves a sealed item for a peer that is not connected and the peer reads its own. [`sync`]
+//! is settings sync, the
 //! compare-and-exchange service settings, a client's position and drafts are kept on. [`storage`] is
 //! managed storage, where an account's backup ciphertext is uploaded part by part and read back,
 //! and [`backup`] is the backup manifest, where a collection's writer is enrolled and each
@@ -52,6 +54,7 @@
 //! | [`account::IssuedGrant`], [`account::StoredGrant`] | Tokens and a nonce | The lifetime or the grant's identifier and revision, the client, the scopes |
 //! | [`voice::VoiceSessionRequest`], [`voice::VoiceSession`] | Session descriptions, which carry the connection's ICE credentials | What the call is and how long it lasts, and the description's length |
 //! | [`voice::VoiceContextFrame`] | What a person said to a call | The request, the command, the length |
+//! | [`voice_control::ControlNews`], [`voice_control::ControlEnd`], [`voice_control::Closure`], [`voice_control::Accepted`] | What the service and the provider said to a call: a reason, an identifier, a note, a delegation | Which kind it is and its numbers |
 //! | [`signed::SignedService`] | The key that signs a managed-service call | The gateway, the signer kind |
 //! | [`authority::FeedAnnouncement`] | A sealed announcement for a mailbox | What the item is, and its declared size |
 //! | [`authority::AuthorityFeedRecord`] | A revocation request signed by a remote owner | The position, the request identity, whether it is finished |
@@ -70,11 +73,13 @@
 //! A type that holds one of these only through one of these, as [`relay::RelayLeaseAnswer`] holds a
 //! grant, is safe to derive, because the rendering it composes is the redacted one.
 //!
-//! Eleven tests are that rule's proof:
+//! Twelve tests are that rule's proof:
 //! `a_rendering_of_a_request_a_grant_or_a_token_carries_none_of_them` in [`account`],
 //! `a_rendering_of_a_request_a_credential_or_an_answer_carries_none_of_it` and
 //! `a_rendering_of_an_issued_lease_carries_neither_the_lease_nor_its_signature` in [`relay`],
 //! `a_rendering_of_a_call_carries_neither_its_offer_its_answer_nor_what_was_said` in [`voice`],
+//! `a_rendering_of_the_controls_news_carries_neither_what_the_service_said_nor_an_identifier` in
+//! [`voice_control`],
 //! `a_rendering_of_a_signed_request_carries_neither_its_body_nor_its_credential` in [`signed`],
 //! `a_rendering_of_a_request_or_an_answer_carries_neither_a_signature_nor_a_sealed_item` in
 //! [`authority`], and
@@ -115,6 +120,7 @@ pub mod signed;
 pub mod storage;
 pub mod sync;
 pub mod voice;
+pub mod voice_control;
 
 use std::future::Future;
 use std::pin::Pin;
