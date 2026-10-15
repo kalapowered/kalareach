@@ -4239,26 +4239,68 @@ async fn kr_req_11_32_only_a_text_message_of_one_line_within_the_bound_crosses_a
 /// write deadline passes, with no later traffic to find out.
 ///
 /// The frame is the last thing the gateway has for the terminal, and it is larger than anything
-/// the sockets between them hold. A flush that returned when the frame was handed to a buffer would
-/// call it delivered; a flush that returns when the library has sent it keeps the deadline's
-/// meaning, so the frame is reported as not sent and the connection ends.
+/// the connection between them holds. That connection is a stream that holds 64 KiB and no more,
+/// whatever the platform: a socket takes what the system's buffers allow, which on Windows is a
+/// whole write of a megabyte and more, so a socket would take the frame and the deadline, which
+/// is on the frame reaching the connection and not on the terminal reading it, would never be
+/// reached. A flush that returned when the frame was handed to a buffer would call it delivered;
+/// a flush that returns when the library has sent it keeps the deadline's meaning, so the frame is
+/// reported as not sent and the connection ends.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_11_32_a_last_frame_the_terminal_does_not_read_ends_the_connection() {
     let broker = broker();
-    let up = upgraded(&broker, Framing::new(NativeFraming::JsonLines)).await;
+    let framing = Framing::new(NativeFraming::JsonLines);
+    let (terminal_end, gateway_end) = tokio::io::duplex(64 * 1024);
+    let accepting =
+        tokio::spawn(
+            async move { kr_worker::broker::websocket::accept(gateway_end, framing).await },
+        );
+    let (_terminal, _response) = tokio_websockets::ClientBuilder::new()
+        .uri("ws://localhost/rpc")
+        .expect("a URI")
+        .connect_on(terminal_end)
+        .await
+        .expect("the terminal upgrades");
+    let lines = accepting
+        .await
+        .expect("the accept task is joined")
+        .expect("the gateway accepts the upgrade");
+    let (upstream_here, _upstream_there) = socket_pair();
+    let (upstream_reads, upstream_writes) = tokio::io::split(upstream_here);
+    let (terminal_reads, terminal_writes) = tokio::io::split(lines);
+    let (owner, writes) = Duplex::new(
+        Arc::clone(&broker),
+        GatewayConnectionId::new(1),
+        framing,
+        upstream_writes,
+        terminal_writes,
+        site(),
+        "agent-user",
+    );
+    let drained = tokio::spawn(writes);
+    let _serving = [
+        {
+            let owner = Arc::clone(&owner);
+            tokio::spawn(async move { owner.serve(upstream_reads, true).await })
+        },
+        {
+            let owner = Arc::clone(&owner);
+            tokio::spawn(async move { owner.serve(terminal_reads, false).await })
+        },
+    ];
     let big = request_of(5, "session/update", 900_000);
-    up.owner
+    owner
         .from_upstream(big.as_bytes(), TimestampMs::new(2))
         .await
         .expect("the frame is queued for the terminal");
     // The terminal reads nothing. The deadline for the write is the owner's, and the writers end
     // when it has passed.
-    tokio::time::timeout(LIVENESS_DEADLINE, up.drained)
+    tokio::time::timeout(LIVENESS_DEADLINE, drained)
         .await
         .expect("a frame the terminal never read ends the writers")
         .expect("they are joined");
     assert!(
-        up.owner.stopping(),
+        owner.stopping(),
         "a frame the terminal never read ended the connection"
     );
 }
