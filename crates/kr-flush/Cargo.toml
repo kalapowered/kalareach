@@ -15,9 +15,9 @@ publish.workspace = true
 testing = []
 
 [target.'cfg(unix)'.dependencies]
-# A held directory is opened again relative to its own descriptor, and a store's lock is taken on
-# its file.
-rustix = { workspace = true, features = ["fs"] }
+# A held directory is opened again relative to its own descriptor, a store's lock is taken on its
+# file, and a directory that is another account's is told by the owner of the process.
+rustix = { workspace = true, features = ["fs", "process"] }
 
 [target.'cfg(windows)'.dependencies]
 # A held directory is opened again relative to its own handle, which only the native open offers.
