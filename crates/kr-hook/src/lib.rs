@@ -35,38 +35,62 @@ pub mod qoder_cli;
 pub mod registration;
 pub mod relay;
 
-/// Runs one parsed invocation and returns the exit code it ends with.
+/// Runs one parsed invocation, which started at `started`, and returns the exit code it ends with.
+///
+/// Every program of an installed release holds that release for as long as it runs, and does not
+/// start at all once the release is being removed ([`held`]). A hook takes its hold inside its
+/// deadline, as the rest of its work ([`hook::run`]); every other program takes it first.
 #[must_use]
-pub fn run(command: cli::Command) -> std::process::ExitCode {
+pub fn run(command: cli::Command, started: std::time::Instant) -> std::process::ExitCode {
     match command {
         cli::Command::ClaudeCode {
             surface: cli::ClaudeCode::Hook,
-        } => hook::run(&claude_code::HOOKS),
+        } => hook::run(&claude_code::HOOKS, started),
         cli::Command::ClaudeCode {
             surface: cli::ClaudeCode::Channel,
-        } => claude_code::channel::run(),
+        } => held(claude_code::channel::run),
         cli::Command::GeminiCli {
             surface: cli::Hooks::Hook,
-        } => hook::run(&gemini_cli::HOOKS),
+        } => hook::run(&gemini_cli::HOOKS, started),
         cli::Command::QoderCli {
             surface: cli::Hooks::Hook,
-        } => hook::run(&qoder_cli::HOOKS),
+        } => hook::run(&qoder_cli::HOOKS, started),
         cli::Command::Launch {
             hold_after_admission,
             hold_before_exec,
             invocation,
-        } => launch::run(
-            &invocation,
-            hold_after_admission.map(std::time::Duration::from_millis),
-            hold_before_exec.as_deref(),
-        ),
-        cli::Command::Relay { close_after_hello } => match relay::run(close_after_hello) {
+        } => held(|| {
+            launch::run(
+                &invocation,
+                hold_after_admission.map(std::time::Duration::from_millis),
+                hold_before_exec.as_deref(),
+            )
+        }),
+        cli::Command::Relay { close_after_hello } => held(|| match relay::run(close_after_hello) {
             Ok(()) => std::process::ExitCode::SUCCESS,
             Err(failure) => {
                 report(&failure);
                 std::process::ExitCode::from(cli::EXIT_FAILURE)
             }
-        },
+        }),
+    }
+}
+
+/// Runs `then` once this process holds its release, and refuses to start when it cannot.
+///
+/// A forwarder of an installed release holds that release for as long as it runs, and does not
+/// start at all once the release is being removed. It says so the way every failure of its own is
+/// said, with a code no application reads as a request to block what it observed.
+pub fn held(then: impl FnOnce() -> std::process::ExitCode) -> std::process::ExitCode {
+    match kr_ipc::install::this_process() {
+        Ok(_) => then(),
+        Err(error) => {
+            report_by(
+                &error.to_string(),
+                std::time::Instant::now() + std::time::Duration::from_millis(100),
+            );
+            std::process::ExitCode::from(cli::EXIT_FAILURE)
+        }
     }
 }
 
