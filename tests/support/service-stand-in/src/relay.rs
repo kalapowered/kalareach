@@ -195,6 +195,18 @@ impl Relay {
         byte_ceiling: u64,
     ) -> RelayPayerRecord {
         let account_id = self.identifier(1);
+        self.authorise_in(&account_id, host, byte_ceiling)
+    }
+
+    /// An account that has authorised a caller gives the same or another caller a further
+    /// authorisation, which the service keeps beside the first.
+    pub(crate) fn authorise_in(
+        &mut self,
+        account_id: &str,
+        host: &AuthorisationKey,
+        byte_ceiling: u64,
+    ) -> RelayPayerRecord {
+        let account_id = account_id.to_owned();
         let authorisation_id = self.identifier(2);
         self.authorisations.insert(
             authorisation_id.clone(),
