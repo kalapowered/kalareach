@@ -1714,7 +1714,7 @@ async fn a_row_that_aged_before_the_payer_changed_is_asked_under_its_own_payer_o
 /// the allowance, so nothing is left to learn: the row is let go with the answer, and the pair is
 /// asked for under the new payer once the allowance is back.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_row_that_aged_is_let_go_once_the_service_has_answered_about_the_pair() {
+async fn a_row_that_aged_is_let_go_by_the_answer_that_the_allowance_is_spent() {
     let rig = Rig::start().await;
     let (_phone, record, _first) = rig.pairs_and_loses_the_answer().await;
     let other = rig
@@ -1780,6 +1780,46 @@ async fn a_refused_first_request_does_not_hold_the_pair_when_the_payer_changes()
             })
         },
     )
+    .await;
+}
+
+/// KR-REQ-17.51: the bound of an authorisation is below the block a lease holds, so the service
+/// refuses every request under it as invalid, and the first request of a new device never reaches
+/// the service. The row is older than a lease lives when the owner names another account's
+/// authorisation: that account's payer is not held behind the old one's refusal, and the pair is
+/// given a lease under it in the next pass.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_aged_row_under_a_bound_too_small_for_a_block_does_not_hold_another_accounts_payer() {
+    let rig = Rig::start_bounded_naming(true, BLOCK_BYTES / 2).await;
+    rig.until("the service has turned the owner's device away", || {
+        rig.timer.asked_for().contains(&STANDING_RETRY)
+    })
+    .await;
+    // The standing wait holds the asks, so the new device's first request is the one that fails.
+    let (_phone, record) = rig.pairs().await;
+    rig.served.web().fail_matching(
+        ISSUE,
+        serde_json::json!({ "destination_endpoint_key": record.endpoint_id }),
+        1,
+        Moment::Before,
+    );
+    rig.timer.advance(STANDING_RETRY);
+    rig.until(
+        "the host has a row for the pair and a request it never saw answered",
+        || rig.row_written_at(&record).is_some_and(|at| at > 0),
+    )
+    .await;
+    rig.pass().await;
+    let other = rig
+        .served
+        .web()
+        .authorise_relay_payer(&rig.host_key, 8 * 1024 * 1024);
+    rig.time_passes(Duration::from_secs(u64::from(LEASE_SECONDS) + 200));
+
+    let rig = rig.restarted_naming(&other).await;
+    rig.until("the pair holds a lease under the new payer", || {
+        rig.holds_a_live_lease_under(&record, &other)
+    })
     .await;
 }
 
@@ -2853,6 +2893,8 @@ async fn a_row_the_service_cannot_answer_for_is_not_kept_alive_by_asking() {
         rig.lease_in_the_record(&record) == Some(None)
     })
     .await;
+    // The pass that met the failure has set its delay before the clocks move.
+    rig.pass().await;
     rig.served.web().withhold_relays(true);
     rig.host
         .network()
