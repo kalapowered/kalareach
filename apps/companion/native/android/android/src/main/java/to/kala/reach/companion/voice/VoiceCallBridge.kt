@@ -38,15 +38,13 @@ class VoiceCallBridge(context: Context) : CallBridge {
     }
 
     override fun open(call: String, news: CallNews) {
-        // The name is taken before the call is made, so two openings cannot both go on to make one.
-        if (VoiceCallHolder.current != null || !names.hold(call)) {
+        if (VoiceCallHolder.current != null) {
             throw CallRefused(CallRefused.ALREADY_RUNNING, "this device already holds a call")
         }
         val reporter = Reporter(call, CallNewsQueue(call, news))
         val made = try {
-            VoiceCall.start(context, reporter)
+            names.making(call) { VoiceCall.start(context, reporter) }
         } catch (failure: IllegalStateException) {
-            names.abandon(call)
             throw CallRefused(CallRefused.ENGINE, failure.message ?: "the media engine could not make a call")
         }
         synchronized(lock) {
@@ -55,10 +53,10 @@ class VoiceCallBridge(context: Context) : CallBridge {
         }
     }
 
+    /** The call by that name, or why there is none: it ended, or it never was held. */
     private fun named(call: String): Held {
-        names.refusal(call)?.let { throw it }
-        return synchronized(lock) { held }?.takeIf { it.name == call }
-            ?: throw CallRefused(CallRefused.NO_SUCH_CALL, "no call by that name is held")
+        synchronized(lock) { held }?.takeIf { it.name == call }?.let { return it }
+        throw names.refusal(call) ?: CallRefused(CallRefused.NO_SUCH_CALL, "no call by that name is held")
     }
 
     override fun offer(call: String): String = named(call).call.offer()

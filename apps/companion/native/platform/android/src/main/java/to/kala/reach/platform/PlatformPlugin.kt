@@ -8,6 +8,8 @@ import android.content.pm.verify.domain.DomainVerificationManager
 import android.content.pm.verify.domain.DomainVerificationUserState
 import android.net.Uri
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.util.Base64
 import android.util.Log
 import android.webkit.WebView
@@ -33,6 +35,7 @@ import java.util.concurrent.Executors
 import to.kala.reach.companion.mobile.CallBridge
 import to.kala.reach.companion.mobile.CallBridgeHolder
 import to.kala.reach.companion.mobile.CallNews
+import to.kala.reach.companion.mobile.CallOpenings
 import to.kala.reach.companion.mobile.CallRefused
 import to.kala.reach.companion.mobile.CallWire
 import to.kala.reach.companion.mobile.SecretFiles
@@ -96,6 +99,16 @@ class PlatformPlugin(private val activity: Activity) : Plugin(activity) {
         Thread(task, "kr-call-command").apply { isDaemon = true }
     }
 
+    /**
+     * The opening of a call that waits for the person's answer to the permission question, with the
+     * request that is waiting. The platform keeps one callback for the answer, so there is at most one.
+     */
+    private class Asking(val opening: CallOpenings.Opening, val invoke: Invoke)
+
+    private val askingLock = Any()
+    private var asking: Asking? = null
+    private val deadlines = Handler(Looper.getMainLooper())
+
     private val secrets by lazy {
         SecretFiles(File(activity.noBackupFilesDir, "secrets"), KeystoreSealer())
     }
@@ -123,7 +136,8 @@ class PlatformPlugin(private val activity: Activity) : Plugin(activity) {
     fun callOpen(invoke: Invoke) {
         // One opening at a time: it may wait on the person's answer to a permission, and the
         // platform keeps one answer for that question.
-        if (!CallBridgeHolder.reserveOpening()) {
+        val opening = CallBridgeHolder.openings.reserve()
+        if (opening == null) {
             invoke.reject("a call is already being opened", CallRefused.ALREADY_RUNNING)
             return
         }
@@ -139,36 +153,53 @@ class PlatformPlugin(private val activity: Activity) : Plugin(activity) {
         }
         try {
             if (wanted.isEmpty()) {
-                openCall(invoke)
+                openCall(invoke, opening)
             } else {
+                // The answer may never come (the activity that asked can be gone), and Rust waits
+                // for this one: the opening settles its request itself when the time is up.
+                opening.asks()
+                synchronized(askingLock) { asking = Asking(opening, invoke) }
+                deadlines.postDelayed({ giveUpAsking(opening) }, ASKING_DEADLINE_MS)
                 requestPermissionForAliases(wanted.toTypedArray(), invoke, "callPermissionsAnswered")
             }
         } catch (failure: Throwable) {
-            CallBridgeHolder.releaseOpening()
-            invoke.reject(failure.message ?: failure.toString(), "engine")
+            synchronized(askingLock) { if (asking?.opening === opening) asking = null }
+            if (opening.end()) invoke.reject(failure.message ?: failure.toString(), "engine")
+        }
+    }
+
+    /** The person did not answer in time: the opening ends and the request that waited is answered. */
+    private fun giveUpAsking(opening: CallOpenings.Opening) {
+        val waiting = synchronized(askingLock) {
+            asking?.takeIf { it.opening === opening }?.also { asking = null }
+        }
+        if (waiting != null && opening.expire()) {
+            waiting.invoke.reject("the person did not answer the permission question", "engine")
         }
     }
 
     @PermissionCallback
     fun callPermissionsAnswered(invoke: Invoke) {
-        openCall(invoke)
+        // The answer is for the opening that waits, whichever request the platform names: it is
+        // taken once, and only while the opening still waits for it.
+        val waiting = synchronized(askingLock) { asking.also { asking = null } } ?: return
+        if (!waiting.opening.answered()) return
+        openCall(waiting.invoke, waiting.opening)
     }
 
-    private fun openCall(invoke: Invoke) {
+    private fun openCall(invoke: Invoke, opening: CallOpenings.Opening) {
         if (getPermissionState("microphone") != PermissionState.GRANTED) {
-            CallBridgeHolder.releaseOpening()
-            invoke.reject("the microphone is not allowed", CallRefused.MICROPHONE_REFUSED)
+            if (opening.end()) invoke.reject("the microphone is not allowed", CallRefused.MICROPHONE_REFUSED)
             return
         }
         val arguments = try {
             invoke.parseArgs(CallOpenArguments::class.java)
         } catch (failure: Throwable) {
-            CallBridgeHolder.releaseOpening()
-            invoke.reject(failure.message ?: failure.toString(), "engine")
+            if (opening.end()) invoke.reject(failure.message ?: failure.toString(), "engine")
             return
         }
         val notifications = NotificationManagerCompat.from(activity).areNotificationsEnabled()
-        carryOut(invoke, afterwards = CallBridgeHolder::releaseOpening) { bridge ->
+        carryOut(invoke, afterwards = { opening.end() }) { bridge ->
             bridge.open(arguments.call, CallNews { frame -> arguments.events.send(JSObject(frame)) })
             CallWire.opened(notifications)
         }
@@ -212,7 +243,8 @@ class PlatformPlugin(private val activity: Activity) : Plugin(activity) {
 
     /**
      * Runs one command on the registered bridge and answers `invoke` with its JSON result, or with
-     * why it could not, once whatever happens. `afterwards` runs when the command is over.
+     * why it could not, once whatever happens. `afterwards` runs before the answer is sent, so
+     * whoever acts on the answer finds what `afterwards` released released.
      */
     private fun carryOut(invoke: Invoke, afterwards: () -> Unit = {}, command: (CallBridge) -> String) {
         val bridge = CallBridgeHolder.bridge
@@ -222,15 +254,20 @@ class PlatformPlugin(private val activity: Activity) : Plugin(activity) {
             return
         }
         calls.execute {
+            var result: JSObject? = null
+            var rejection: Pair<String, String>? = null
             try {
-                invoke.resolve(JSObject(command(bridge)))
+                result = JSObject(command(bridge))
             } catch (refused: CallRefused) {
-                invoke.reject(refused.message, refused.code)
+                rejection = Pair(refused.message ?: refused.code, refused.code)
             } catch (failure: Throwable) {
                 // Anything the command throws is an answer: Rust waits for one and has no deadline.
-                invoke.reject(failure.message ?: failure.toString(), "engine")
-            } finally {
+                rejection = Pair(failure.message ?: failure.toString(), "engine")
+            }
+            try {
                 afterwards()
+            } finally {
+                if (rejection != null) invoke.reject(rejection.first, rejection.second) else invoke.resolve(result)
             }
         }
     }
@@ -412,6 +449,10 @@ class PlatformPlugin(private val activity: Activity) : Plugin(activity) {
 
     private companion object {
         const val LOG_TAG = "KalaReach"
+
+        /** How long an opening waits for the person's answer to the permission question. */
+        const val ASKING_DEADLINE_MS = 120_000L
+
         const val CALLBACK_HOST = "reach.kala.to"
         const val CALLBACK_PATH = "/app/oauth/callback"
     }

@@ -172,7 +172,7 @@ class CallWireTest {
     @Test
     fun `the buffer keeps the order and tells a loss where it happened`() {
         val cases = fixture("queue.json")
-        assertTrue(cases.length() >= 9)
+        assertTrue(cases.length() >= 10)
         for (index in 0 until cases.length()) {
             val case = cases.getJSONObject(index)
             val buffer = CallNewsBuffer(case.getInt("limit"))
@@ -245,38 +245,78 @@ class CallWireTest {
 
     @Test
     fun `only one opening of a call is under way at a time`() {
-        assertTrue(CallBridgeHolder.reserveOpening())
-        assertFalse(CallBridgeHolder.reserveOpening())
-        CallBridgeHolder.releaseOpening()
-        assertTrue(CallBridgeHolder.reserveOpening())
-        CallBridgeHolder.releaseOpening()
+        val openings = CallOpenings()
+        val first = openings.reserve()
+        assertTrue(first != null)
+        assertEquals("another opening waits its turn", null, openings.reserve())
+
+        assertTrue(first!!.end())
+
+        assertTrue(openings.reserve() != null)
     }
 
     @Test
-    fun `a reservation of the opening that was never released lapses`() {
-        CallBridgeHolder.releaseOpening()
-        assertTrue(CallBridgeHolder.reserveOpening(nowMs = 1_000))
-        assertFalse(CallBridgeHolder.reserveOpening(nowMs = 1_000 + CallBridgeHolder.OPENING_LEASE_MS - 1))
-        assertTrue(CallBridgeHolder.reserveOpening(nowMs = 1_000 + CallBridgeHolder.OPENING_LEASE_MS))
-        CallBridgeHolder.releaseOpening()
+    fun `an opening that waits on the person ends once, by the answer or by the deadline`() {
+        val openings = CallOpenings()
+
+        val answered = openings.reserve()!!
+        answered.asks()
+        assertTrue("the answer is taken", answered.answered())
+        assertFalse("and only once", answered.answered())
+        assertFalse("a deadline after the answer does nothing", answered.expire())
+        assertEquals("the opening is still under way", null, openings.reserve())
+        assertTrue(answered.end())
+
+        val unanswered = openings.reserve()!!
+        unanswered.asks()
+        assertTrue("the deadline ends the opening that still waits", unanswered.expire())
+        assertFalse("a late answer is not taken", unanswered.answered())
+        assertFalse("the opening has ended", unanswered.end())
+        assertTrue("and another may begin", openings.reserve() != null)
+    }
+
+    @Test
+    fun `an opening that ended does not end the one that follows it`() {
+        val openings = CallOpenings()
+        val first = openings.reserve()!!
+        assertTrue(first.end())
+        val second = openings.reserve()!!
+
+        assertFalse("a second ending of the first does nothing", first.end())
+        assertEquals("the second is still the one under way", null, openings.reserve())
+        assertTrue(second.end())
     }
 
     @Test
     fun `a call is held by one name at a time and one that could not be made is not remembered as ended`() {
         val names = CallNames()
-        assertTrue(names.hold("c1"))
-        assertFalse(names.hold("c2"))
+        names.making("c1") {
+            val refused = try {
+                names.making("c2") { }
+                null
+            } catch (refused: CallRefused) {
+                refused
+            }
+            assertEquals(CallRefused.ALREADY_RUNNING, refused?.code)
+        }
+        names.end("c1")
+        assertEquals(CallRefused.ENDED, names.refusal("c1")?.code)
 
-        names.abandon("c1")
+        try {
+            names.making("c3") { throw LinkageError("the library did not load") }
+        } catch (_: LinkageError) {
+        }
 
-        assertEquals(CallRefused.NO_SUCH_CALL, names.refusal("c1")?.code)
-        assertTrue(names.hold("c2"))
+        assertEquals("a name whose call was never made is not held", false, names.isHeld())
+        assertEquals(CallRefused.NO_SUCH_CALL, names.refusal("c3")?.code)
+        names.making("c4") { }
+        assertTrue(names.isHeld())
     }
 
     @Test
     fun `a call that ended is told apart from one that never was`() {
         val names = CallNames()
-        names.hold("c1")
+        names.making("c1") { }
         assertEquals(null, names.refusal("c1"))
         assertEquals(CallRefused.NO_SUCH_CALL, names.refusal("c2")?.code)
 

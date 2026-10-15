@@ -89,37 +89,84 @@ object CallBridgeHolder {
     var bridge: CallBridge? = null
         private set
 
-    private var openingSinceMs: Long? = null
+    /** The one opening of a call that may be under way. */
+    val openings = CallOpenings()
 
     /** Registers the application's bridge, made only when none is registered yet. */
     @Synchronized
     fun registerOnce(make: () -> CallBridge) {
         if (bridge == null) bridge = make()
     }
+}
 
-    /**
-     * Reserves the one opening of a call that may be under way. False when another is: opening asks
-     * the person for permissions before anything is made, and the platform keeps one answer for
-     * that question, so a second opening must not start another while the first waits for it. A
-     * reservation is a lease of [OPENING_LEASE_MS]: the person's answer may never come, when the
-     * activity that asked is gone, and the device must not refuse every call for ever after.
-     */
+/**
+ * The one opening of a call that may be under way at a time.
+ *
+ * Opening may ask the person a permission question before anything is made, and the platform keeps
+ * one answer for that question: a second opening that asked it too would take the first one's
+ * answer, and the first would never get one. So an opening is refused while another is under way.
+ * An opening ends once. It ends when the call is made or refused ([Opening.end]), or when the
+ * person's answer does not come in time ([Opening.expire]). The person's answer ([Opening.answered])
+ * is taken once, and only while the opening still waits for it. Each of these says whether it was
+ * the one that acted, so whatever comes second does nothing: a late answer after the deadline, a
+ * deadline after the answer, a second ending. The caller answers whoever is waiting only when
+ * it was the one that acted.
+ */
+class CallOpenings {
+    private var current: Opening? = null
+
+    /** Starts an opening, or null when one is under way. */
     @Synchronized
-    fun reserveOpening(nowMs: Long = System.currentTimeMillis()): Boolean {
-        val since = openingSinceMs
-        if (since != null && nowMs - since < OPENING_LEASE_MS) return false
-        openingSinceMs = nowMs
-        return true
+    fun reserve(): Opening? {
+        if (current != null) return null
+        return Opening().also { current = it }
     }
 
-    /** Lets go of the reservation [reserveOpening] gave. */
-    @Synchronized
-    fun releaseOpening() {
-        openingSinceMs = null
-    }
+    private enum class Stage { STARTING, ASKING, MAKING, ENDED }
 
-    /** How long a reservation of the opening stands, in milliseconds. */
-    const val OPENING_LEASE_MS = 120_000L
+    /** One opening of a call. */
+    inner class Opening internal constructor() {
+        private var stage = Stage.STARTING
+
+        /** The opening now waits for the person's answer to the permission question. */
+        fun asks() {
+            synchronized(this@CallOpenings) {
+                if (stage == Stage.STARTING) stage = Stage.ASKING
+            }
+        }
+
+        /** The person answered: true once, and only if the opening still waited for the answer. */
+        fun answered(): Boolean {
+            synchronized(this@CallOpenings) {
+                if (stage != Stage.ASKING) return false
+                stage = Stage.MAKING
+                return true
+            }
+        }
+
+        /** The answer did not come in time: true, and the opening ends, only if it still waited. */
+        fun expire(): Boolean {
+            synchronized(this@CallOpenings) {
+                if (stage != Stage.ASKING) return false
+                finish()
+                return true
+            }
+        }
+
+        /** The call was made or refused: true, and the opening ends, only for the first ending. */
+        fun end(): Boolean {
+            synchronized(this@CallOpenings) {
+                if (stage == Stage.ENDED) return false
+                finish()
+                return true
+            }
+        }
+
+        private fun finish() {
+            stage = Stage.ENDED
+            current = null
+        }
+    }
 }
 
 /**
@@ -138,17 +185,31 @@ class CallNames {
     @Synchronized
     fun held(): String? = held
 
-    /** Takes [name] as the call held, unless one is held already. False when one is. */
+    /**
+     * Holds [name] as the call held while [make] makes the call, so that two openings cannot both
+     * go on to make one. Refuses with [CallRefused.ALREADY_RUNNING] when a call is held already.
+     * When [make] throws anything, the name is let go as the name of something that was never a
+     * call, and what was thrown goes on.
+     */
+    fun <T> making(name: String, make: () -> T): T {
+        if (!hold(name)) throw CallRefused(CallRefused.ALREADY_RUNNING, "this device already holds a call")
+        try {
+            return make()
+        } catch (failure: Throwable) {
+            abandon(name)
+            throw failure
+        }
+    }
+
     @Synchronized
-    fun hold(name: String): Boolean {
+    private fun hold(name: String): Boolean {
         if (held != null) return false
         held = name
         return true
     }
 
-    /** Lets go of [name] as the call held without it having been a call: it could not be made. */
     @Synchronized
-    fun abandon(name: String) {
+    private fun abandon(name: String) {
         if (held == name) held = null
     }
 
