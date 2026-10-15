@@ -2933,6 +2933,67 @@ mod tests {
         }
     }
 
+    /// KR-REQ-07.13 and KR-REQ-07.60: a process the record and a copy of it both found, which the
+    /// record then read as ended and a full record's trimming would have dropped, is not recorded
+    /// again as running when the copy is put back; and a server that ended while a copy that read
+    /// something below it was out is still the root of what was read below it. Control: with no
+    /// copy out the record drops both.
+    #[cfg(unix)]
+    #[test]
+    fn a_trimming_while_a_copy_is_out_forgets_neither_what_ended_nor_the_server_it_was_below() {
+        for copy_out in [false, true] {
+            let (mut alive, ids) = strangers(3);
+            let (server, found, below) = (&ids[0], &ids[1], &ids[2]);
+            let mut owned = session_with(server);
+            let observation = copy_out.then(|| {
+                let mut observation = owned.begin_observation();
+                // The copy finds a process below the server, and another the record will find too.
+                record_below(&mut observation.copy, below, server, server);
+                observation.copy.live.insert(key(found), found.clone());
+                observation.copy.seen.insert(
+                    key(found),
+                    Recorded {
+                        identity: found.clone(),
+                        forced: false,
+                        left: std::sync::atomic::AtomicBool::new(false),
+                    },
+                );
+                observation
+            });
+            owned.take([found.clone()]);
+            // The record reads `found` and the server as ended, and trims.
+            for index in [1, 0] {
+                let _ = alive[index].0.kill();
+                let _ = alive[index].0.wait();
+            }
+            owned.read_live();
+            owned.forget_ended();
+            if let Some(observation) = observation {
+                owned.finish_observation(observation);
+            }
+            let named = format!("(a copy was out: {copy_out})");
+            let recorded = owned.record().processes;
+            assert!(
+                !recorded.contains(found),
+                "a process the record read as ended is not recorded as running {named}: \
+                 {recorded:?}"
+            );
+            if copy_out {
+                assert!(
+                    owned.is_backend(server)
+                        && owned.below_backend(server).contains(below)
+                        && recorded.contains(below),
+                    "what the copy found below the server is still below it {named}"
+                );
+            } else {
+                assert!(
+                    !owned.is_backend(server),
+                    "the control: with no copy out the ended server is dropped {named}"
+                );
+            }
+        }
+    }
+
     /// KR-REQ-07.60: a reading put back into a record that is over its bound drops what ended from
     /// the record, from what the record already knows and without asking the kernel, and keeps
     /// what runs, what the reading found among it.
