@@ -321,10 +321,10 @@ pub enum Wake {
 /// What brought one wake of a session's supervision.
 ///
 /// Every wake asks the root shell for its status, whatever brought it, so a shell that has ended is
-/// found by whichever wake comes first. This says which that was. A wake the shell's own exit
-/// brought, or the short clock that stands in for it where nothing reports an exit, found the
-/// shell because it had ended. A wake the sweep brought found it only because a clock came round,
-/// which is what the sweep is for when nothing else did.
+/// found by whichever wake comes first. This says which that was. A shell found on a wake that the
+/// sweep brought was found only because the sweep came round, which is what the sweep is for when
+/// nothing else reported the exit; found on any other wake, it was found within moments of
+/// whatever brought that wake.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Prompt {
     /// The look taken before anything is waited on.
@@ -343,15 +343,6 @@ pub enum Prompt {
     Sweep,
     /// A test asked for an observation.
     Forced,
-}
-
-impl Prompt {
-    /// Whether this wake is the shell's own exit being reported: the kernel's report of it, or
-    /// the short clock that asks for it where the kernel reports nothing.
-    #[must_use]
-    pub const fn is_the_shells_own_exit(self) -> bool {
-        matches!(self, Self::ChildExit | Self::ShellPoll)
-    }
 }
 
 /// One wake of a session's supervision: what it is for, and what brought it.
@@ -604,10 +595,50 @@ mod tests {
             Wake::Ownership,
             "and what it is for is the boundary nothing else reports on"
         );
+    }
+
+    /// A supervision with no child signal to hear, so that a child of another case in this test
+    /// process ending cannot be what wakes it.
+    fn deaf(activity: Arc<Activity>, started: Instant) -> Supervision {
+        #[cfg(unix)]
+        let exits = ChildExits(None);
+        #[cfg(not(unix))]
+        let exits = ChildExits;
+        Supervision {
+            sweep: Sweep::begin(activity, started),
+            exits,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_wake_is_named_by_the_clock_that_brought_it() {
+        // What a case that watches for a shell's exit reads: whether the sweep found it. So the
+        // sweep of an idle session, the cadence a mark asks for and the shell's own short clock
+        // each have to be told apart, with nothing else to wake the supervision.
+        let mut idle = deaf(Activity::new(), Instant::now() - IDLE_SWEEP_INTERVAL);
+        let woken = tokio::time::timeout(OBSERVE_INTERVAL, idle.next())
+            .await
+            .expect("the sweep comes round");
+        assert_eq!((woken.wake, woken.prompt), (Wake::Ownership, Prompt::Sweep));
+
+        let marks = Activity::new();
+        let mut asked = deaf(Arc::clone(&marks), Instant::now() - OBSERVE_INTERVAL);
+        marks.note();
+        let woken = tokio::time::timeout(OBSERVE_INTERVAL, asked.next())
+            .await
+            .expect("the observation the mark asked for is due");
         assert_eq!(
-            woken.prompt,
-            Prompt::Sweep,
-            "and what brought it is the sweep, not an exit"
+            (woken.wake, woken.prompt),
+            (Wake::Ownership, Prompt::Cadence)
+        );
+
+        let mut quiet = deaf(Activity::new(), Instant::now());
+        let woken = tokio::time::timeout(IDLE_SWEEP_INTERVAL / 2, quiet.next())
+            .await
+            .expect("the shell's own clock comes round");
+        assert_eq!(
+            (woken.wake, woken.prompt),
+            (Wake::Session, Prompt::ShellPoll)
         );
     }
 

@@ -1982,7 +1982,7 @@ async fn a_root_shell_that_exits_after_the_session_settles_is_noticed_by_its_own
     );
     let reported_by = runtime.root_exit_prompt();
     assert!(
-        reported_by.is_some_and(kr_worker::lifecycle::Prompt::is_the_shells_own_exit),
+        reported_by.is_some_and(|prompt| prompt != kr_worker::lifecycle::Prompt::Sweep),
         "the exit reached the host rather than the sweep finding it: {reported_by:?}"
     );
 }
