@@ -218,20 +218,9 @@ impl Bundles {
         }
         let held = self.collections.entry(locator.clone()).or_default();
         match asked {
-            Asked::Exchange {
-                request_id,
-                expected,
-                object,
-                ..
-            } => held.exchange(
-                &locator,
-                account,
-                now_ms,
-                &request_id,
-                expected,
-                object,
-                funded,
-            ),
+            Asked::Exchange { write, .. } => {
+                held.exchange(&locator, account, now_ms, funded, write)
+            }
             Asked::Compare { .. } => held.compare(&locator),
             Asked::Status { request_id, .. } => held.status(&request_id),
             Asked::Fence { request_id, .. } => held.fence(&request_id, now_ms),
@@ -239,25 +228,19 @@ impl Bundles {
     }
 }
 
+/// A write of the bundle, once the contract has read it.
+struct Write {
+    request_id: String,
+    expected: Option<String>,
+    object: Value,
+}
+
 /// A request about the bundle, once the contract has read it.
 enum Asked {
-    Exchange {
-        request_id: String,
-        locator: String,
-        expected: Option<String>,
-        object: Value,
-    },
-    Compare {
-        locator: String,
-    },
-    Status {
-        request_id: String,
-        locator: String,
-    },
-    Fence {
-        request_id: String,
-        locator: String,
-    },
+    Exchange { locator: String, write: Write },
+    Compare { locator: String },
+    Status { request_id: String, locator: String },
+    Fence { request_id: String, locator: String },
 }
 
 impl Asked {
@@ -424,10 +407,12 @@ fn read(member: &str, value: &Value) -> Result<Asked, Unread> {
                 )));
             }
             Ok(Asked::Exchange {
-                request_id,
                 locator,
-                expected,
-                object,
+                write: Write {
+                    request_id,
+                    expected,
+                    object,
+                },
             })
         }
         "compare" => {
@@ -519,11 +504,15 @@ impl Collection {
         locator: &str,
         account: &str,
         now_ms: u64,
-        request_id: &str,
-        expected: Option<String>,
-        object: Value,
         funded: bool,
+        write: Write,
     ) -> ServiceHttpAnswer {
+        let Write {
+            request_id,
+            expected,
+            object,
+        } = write;
+        let request_id = request_id.as_str();
         let digest = json!({
             "locator": locator,
             "kind": "recovery_bundle",
