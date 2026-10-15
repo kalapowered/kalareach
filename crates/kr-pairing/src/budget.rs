@@ -545,7 +545,7 @@ fn flush_resolution(path: &Path) -> Result<()> {
             reached.pop();
             continue;
         }
-        sync_directory(&reached, NameKind::Directory)?;
+        sync_directory_on_the_way(&reached)?;
         let next = reached.join(&name);
         let metadata =
             std::fs::symlink_metadata(&next).map_err(|error| io_error("inspect", &next, &error))?;
@@ -617,6 +617,25 @@ fn sync_directory(directory: &Path, kind: NameKind) -> Result<()> {
     #[cfg(all(test, unix))]
     tests::flushed(directory);
     flush_directory(directory, kind).map_err(|error| io_error("flush", directory, &error))
+}
+
+/// Flushes a directory the walk to the budget's directory passes through, after a directory below
+/// it was created or looked up.
+///
+/// A directory that is another account's and that this account may not add to holds no name this
+/// account made, so what becomes of its flush is passed over: the system's own `/data` is one on
+/// Android, which an application may reach through and may not open. The failure to flush any other
+/// directory is reported.
+#[cfg(unix)]
+fn sync_directory_on_the_way(directory: &Path) -> Result<()> {
+    #[cfg(test)]
+    tests::flushed(directory);
+    match flush_directory(directory, NameKind::Directory) {
+        Err(error) if !kr_flush::may_pass_over(directory, &error) => {
+            Err(io_error("flush", directory, &error))
+        }
+        Err(_) | Ok(()) => Ok(()),
+    }
 }
 
 fn io_error(what: &str, path: &Path, error: &std::io::Error) -> PairingError {
@@ -1291,6 +1310,33 @@ mod tests {
             refused.to_string().contains("more than 40 links"),
             "{refused}"
         );
+    }
+
+    /// A directory on the way to the budget that this account owns and cannot read is not passed
+    /// over: the walk cannot make the names in it durable, so the budget is refused rather than
+    /// opened on a path that may not survive a crash. (A directory of the system's that this
+    /// account may not add to is passed over, as the host's walk of a path is.)
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_directory_of_this_accounts_own_on_the_way_refuses_the_budget() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        if kr_ipc::paths::current_uid() == 0 {
+            // A process that bypasses the mode bits cannot be told anything by them.
+            return;
+        }
+        let scratch = Scratch::new("unreadable");
+        let middle = scratch.0.join("middle");
+        std::fs::create_dir_all(middle.join("inner")).expect("the levels");
+        // Walked through but not read, which is what the middle of a chain can be.
+        std::fs::set_permissions(&middle, std::fs::Permissions::from_mode(0o111))
+            .expect("search but not read");
+        let outcome =
+            DurableClientBudgetStore::open(middle.join("inner").join("budget"), memory(), "client");
+        std::fs::set_permissions(&middle, std::fs::Permissions::from_mode(0o700))
+            .expect("readable again");
+        let refused = outcome.expect_err("a name on the way that cannot be flushed");
+        assert!(matches!(refused, PairingError::Store { .. }), "{refused}");
     }
 
     /// A link whose target is relative, and climbs with `..`, is resolved from the directory

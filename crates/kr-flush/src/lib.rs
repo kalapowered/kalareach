@@ -69,6 +69,50 @@ pub fn flush_directory(directory: &Path, kind: NameKind) -> std::io::Result<()> 
     }
 }
 
+/// Whether the failure `error` of the flush of `directory`, a directory on the way to a store's
+/// directory, may be passed over: `directory` can hold no name this account made.
+///
+/// A walk from the root of a path to a store makes each name on it durable with
+/// [`flush_directory`], and some of the directories on the way belong to the system: this account
+/// may reach through them, and may neither open them to flush nor add a name to them, as it may not
+/// open `/data` on Android or add to `C:\Users` on Windows. A directory that is another account's
+/// and that this account may not add to holds no name this account made, so what becomes of its
+/// flush is no concern of the walk's. The failure to flush a directory this account owns or may add
+/// to is reported, because the names in it are this account's own.
+///
+/// On Unix that is decided by the directory's owner and by the system's own answer to whether this
+/// account may write to it, whatever the error was: a refusal to open it (`/` is refused to an
+/// Android application by the security policy), or a filesystem that cannot flush a directory at
+/// all (the system's root, for another program). Only a refusal to write counts, the permission
+/// being denied or the filesystem being read-only; a failure to ask is not proof that writing is
+/// forbidden. Owner and answer are both about the real user, which is the user every process of
+/// this product runs as; the effective user is the same one.
+///
+/// The directory a store works in is not on the way: a failure there is always reported.
+#[cfg(unix)]
+#[must_use]
+pub fn may_pass_over(directory: &Path, _error: &std::io::Error) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let Ok(metadata) = std::fs::metadata(directory) else {
+        return false;
+    };
+    metadata.uid() != rustix::process::getuid().as_raw()
+        && matches!(
+            rustix::fs::access(directory, rustix::fs::Access::WRITE_OK),
+            Err(rustix::io::Errno::ACCESS | rustix::io::Errno::ROFS)
+        )
+}
+
+/// Whether the refusal `error` of the flush of `directory`, a directory on the way to a store's
+/// directory, may be passed over: on Windows the flush asks its handle for the right to add a name
+/// and nothing more, so a refusal says this account may not add one, whatever the directory is.
+#[cfg(windows)]
+#[must_use]
+pub fn may_pass_over(_directory: &Path, error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::PermissionDenied
+}
+
 /// How long [`retry_while_held`] goes on trying a rename again while another program holds a file
 /// it needs, counted on a monotonic clock from the first attempt.
 ///
@@ -605,6 +649,54 @@ mod tests {
     impl Drop for Scratch {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A failure to flush a directory is passed over only for one of the system's that this account
+    /// may not add to, whatever the failure was: the root belongs to the system account, which a
+    /// test run as that account cannot tell.
+    #[cfg(unix)]
+    #[test]
+    fn only_a_failure_of_a_directory_this_account_may_not_add_to_is_passed_over() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let system = Path::new("/");
+        let root = std::fs::metadata(system).expect("the root");
+        if root.uid() == rustix::process::getuid().as_raw()
+            || rustix::fs::access(system, rustix::fs::Access::WRITE_OK).is_ok()
+        {
+            return;
+        }
+        let refused = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        let unflushable = std::io::Error::from(std::io::ErrorKind::InvalidInput);
+        for failure in [&refused, &unflushable] {
+            assert!(
+                may_pass_over(system, failure),
+                "the system's own directory, {failure}"
+            );
+        }
+        let own = Scratch::new("pass-over");
+        for failure in [&refused, &unflushable] {
+            assert!(
+                !may_pass_over(&own.0, failure),
+                "a directory of this account's own, {failure}"
+            );
+        }
+        assert!(
+            !may_pass_over(&own.0.join("missing"), &refused),
+            "a directory that cannot be looked at"
+        );
+        // Another account's directory that this account may write to holds names it made, as the
+        // shared temporary directory does where it exists: a failure there is reported.
+        let shared = Path::new("/tmp");
+        if std::fs::metadata(shared)
+            .is_ok_and(|shared| shared.uid() != rustix::process::getuid().as_raw())
+            && rustix::fs::access(shared, rustix::fs::Access::WRITE_OK).is_ok()
+        {
+            assert!(
+                !may_pass_over(shared, &refused),
+                "another account's directory this account may write to"
+            );
         }
     }
 

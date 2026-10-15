@@ -2903,12 +2903,14 @@ pub const MAX_PATH_LINKS: usize = 40;
 /// the kernel applies rather than a count of repeated work.
 ///
 /// A failure is reported: a caller that cannot open the directories its own path is made of cannot
-/// establish that the path survives a crash. One failure is not, on Windows: there a directory is
-/// flushed only through a handle that may add to it, and a directory this account may not add a
-/// directory to, such as `C:\Users` for an account that does not administer the machine, holds no
-/// name any caller running as this account made. So a directory on the way whose flush is refused
-/// for want of that right is passed over. The directory at the end of the path is not: that is
-/// where the caller adds its files.
+/// establish that the path survives a crash. One failure is not: a directory this account may not
+/// add to and that is not its own holds no name any caller running as this account made, and
+/// [`kr_flush::may_pass_over`] says which those are. On Windows a directory is flushed only through
+/// a handle that may add to it, and `C:\Users` is one an account that does not administer the
+/// machine may not add a directory to; on Android `/data` and the directories below it down to an
+/// application's own are the system's, which the application may reach through and may not open.
+/// So a directory on the way whose flush fails for that reason is passed over. The directory at the
+/// end of the path is not: that is where the caller adds its files.
 ///
 /// # Errors
 ///
@@ -2979,13 +2981,10 @@ fn walk_path_names(
         // The directory this name lives in, which is what holds it.
         let holder = resolved.clone();
         if !flushed.contains(&holder) {
-            let outcome = flush_holder(&holder);
-            #[cfg(windows)]
-            let outcome = match outcome {
-                Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => Ok(()),
-                other => other,
-            };
-            outcome?;
+            match flush_holder(&holder) {
+                Err(error) if !kr_flush::may_pass_over(&holder, &error) => return Err(error),
+                Err(_) | Ok(()) => {}
+            }
             flushed.push(holder.clone());
         }
         resolved.push(&name);
@@ -4379,6 +4378,74 @@ mod tests {
             target.join("store").join("inner").is_dir(),
             "the levels are where the junction leads"
         );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A directory on the way that belongs to the system, and that this account may reach through
+    /// and may not add to or open, is passed over when its flush fails, as `/data` is on Android:
+    /// an application may not open it, and it holds no name the application made. The failure to
+    /// flush a directory this account owns is reported, because a name in it is this account's own,
+    /// whatever the failure was.
+    #[cfg(unix)]
+    #[test]
+    fn the_walk_passes_over_a_system_directory_it_may_not_add_to_and_reports_one_of_its_own() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        // The root of the filesystem belongs to the system account for everyone but that account.
+        let system = Path::new("/");
+        if std::fs::metadata(system).expect("the root").uid() == current_uid()
+            || rustix::fs::access(system, rustix::fs::Access::WRITE_OK).is_ok()
+        {
+            return;
+        }
+        let root = temporary_root("flush-walk");
+        // As the walk reaches it: through every link on the way, which a temporary directory is
+        // under on macOS.
+        let own = std::fs::canonicalize(&root).expect("the directory as the walk reaches it");
+        let store = own.join("store");
+        std::fs::create_dir_all(&store).expect("the store's directory");
+        let failures = || {
+            [
+                std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+                std::io::Error::other("the device did not answer"),
+            ]
+        };
+
+        for failure in failures() {
+            let kind = failure.kind();
+            let asked = std::cell::RefCell::new(Vec::new());
+            let resolved = walk_path_names(&store, &|holder: &Path| {
+                asked.borrow_mut().push(holder.to_path_buf());
+                if holder == system {
+                    Err(std::io::Error::new(kind, "refused"))
+                } else {
+                    Ok(())
+                }
+            })
+            .expect("the system's directory, whatever its failure, is passed over");
+            assert_eq!(resolved, store);
+            let asked = asked.into_inner();
+            assert!(asked.iter().any(|holder| holder == system), "{asked:?}");
+            assert!(
+                asked.iter().any(|holder| holder == &own),
+                "and the directory this account owns was flushed after it: {asked:?}"
+            );
+        }
+
+        for failure in failures() {
+            let kind = failure.kind();
+            let own_failed = walk_path_names(&store, &|holder: &Path| {
+                if holder == own {
+                    Err(std::io::Error::new(kind, "refused"))
+                } else {
+                    Ok(())
+                }
+            });
+            assert!(
+                own_failed.is_err_and(|error| error.kind() == kind),
+                "the failure to flush a directory this account owns is the answer, {kind:?}"
+            );
+        }
         std::fs::remove_dir_all(&root).ok();
     }
 
