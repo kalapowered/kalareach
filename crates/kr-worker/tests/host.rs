@@ -2139,12 +2139,72 @@ async fn until<T>(what: &str, mut check: impl FnMut() -> Option<T>) -> T {
     }
 }
 
-/// What the worker has recorded of its session's processes, read as the control daemon reads it.
+/// Waits until the worker's record of its session's processes names every member of `named`, read
+/// as the control daemon reads it.
+///
+/// Only the record decides, with a deadline that ends a wait nothing will answer. What each poll
+/// found is kept, so that a wait that does end says what the journal held and which members the
+/// record lacked. A member that has ended can never be in the record, which holds a process only
+/// until it is read as ended, so one found ended stops the wait at once and is named: that is a
+/// tree that did not stay up, which no wait on the worker's record can answer.
+async fn until_recorded(
+    host: &Host,
+    session_id: SessionId,
+    named: &[(&str, kr_protocol::identity::ProcessStartIdentity)],
+) {
+    let started = tokio::time::Instant::now();
+    loop {
+        let found = match read_record(host, session_id) {
+            Err(error) => format!("the journal could not be read: {error}"),
+            Ok(None) => "the journal held no record".to_owned(),
+            Ok(Some(record)) => {
+                let lacking: Vec<&(&str, kr_protocol::identity::ProcessStartIdentity)> = named
+                    .iter()
+                    .filter(|(_, identity)| !record.processes.contains(identity))
+                    .collect();
+                if lacking.is_empty() {
+                    return;
+                }
+                let names: Vec<&str> = lacking.iter().map(|(name, _)| *name).collect();
+                for (name, identity) in &lacking {
+                    assert_ne!(
+                        kr_ipc::identity::process_state(identity),
+                        kr_ipc::identity::ProcessState::Ended,
+                        "{name} had ended before the worker recorded it, so the tree did not stay \
+                         up: the record names {} processes and lacks {names:?}",
+                        record.processes.len(),
+                    );
+                }
+                format!(
+                    "the record names {} processes and lacks {names:?}; what the worker could not \
+                     establish: {:?}",
+                    record.processes.len(),
+                    record.limits
+                )
+            }
+        };
+        assert!(
+            started.elapsed() < LIVENESS_DEADLINE,
+            "waited {LIVENESS_DEADLINE:?} for the worker to record its session's processes: {found}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+/// What the worker has recorded of its session's processes, as the control daemon reads it, or why
+/// the journal would not say.
+fn read_record(
+    host: &Host,
+    session_id: SessionId,
+) -> kr_worker::error::Result<Option<kr_worker::ownership::OwnedRecord>> {
+    kr_worker::journal::Journal::open_read_only(host.paths().journal_database(session_id))?
+        .read_owned(session_id)
+}
+
+/// What the worker has recorded of its session's processes, if the journal says.
+#[cfg(unix)]
 fn recorded_by(host: &Host, session_id: SessionId) -> Option<kr_worker::ownership::OwnedRecord> {
-    let journal =
-        kr_worker::journal::Journal::open_read_only(host.paths().journal_database(session_id))
-            .ok()?;
-    journal.read_owned(session_id).ok().flatten()
+    read_record(host, session_id).ok().flatten()
 }
 
 /// The identity of a session's worker, from the registry the daemon wrote.
@@ -2351,14 +2411,7 @@ async fn a_crashed_workers_session_is_stopped_before_its_closure_is_recorded(
         members.0.push(escaped);
     }
     // The worker has recorded them: this is what the cleanup acts on.
-    until("the worker to record its session's processes", || {
-        let record = recorded_by(&host, session_id)?;
-        named
-            .iter()
-            .all(|(_, identity)| record.processes.contains(identity))
-            .then_some(())
-    })
-    .await;
+    until_recorded(&host, session_id, &named).await;
     let worker = worker_of(&host, session_id);
     // A process that is in no list of the session's tree and is in the service's control group.
     // The worker is held still first, so that it can look at nothing and write nothing while the
@@ -3048,14 +3101,7 @@ async fn a_worker_that_dies_after_its_claim_and_before_it_reports_has_its_tree_s
         ));
     }
     let _members = Members(named.iter().map(|(_, identity)| identity.clone()).collect());
-    until("the worker to record its session's processes", || {
-        let record = recorded_by(&host, session_id)?;
-        named
-            .iter()
-            .all(|(_, identity)| record.processes.contains(identity))
-            .then_some(())
-    })
-    .await;
+    until_recorded(&host, session_id, &named).await;
     let launcher = {
         let registry = Registry::open(host.paths().registry_database(), host.environment_id)
             .expect("opens the registry");
@@ -3137,14 +3183,7 @@ async fn a_worker_that_dies_after_accepting_a_close_has_its_tree_stopped_by_the_
         ));
     }
     let _members = Members(named.iter().map(|(_, identity)| identity.clone()).collect());
-    until("the worker to record its session's processes", || {
-        let record = recorded_by(&host, session_id)?;
-        named
-            .iter()
-            .all(|(_, identity)| record.processes.contains(identity))
-            .then_some(())
-    })
-    .await;
+    until_recorded(&host, session_id, &named).await;
     let worker = worker_of(&host, session_id);
     let pid = rustix::process::Pid::from_raw(i32::try_from(worker.pid.get()).expect("a pid"))
         .expect("a process number");
