@@ -393,6 +393,7 @@ pub fn collection_deleted() -> ClientError {
         ),
         retry_after_seconds: None,
         action: UserAction::FixConfiguration,
+        service_code: Some("COLLECTION_DELETED"),
     }
 }
 

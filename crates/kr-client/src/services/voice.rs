@@ -1449,6 +1449,7 @@ fn data_of(answer: &ServiceHttpAnswer) -> Result<serde_json::Value> {
     };
 
     Err(ClientError::Refused {
+        service_code: super::signed::named_code(&refusal.code),
         error: crate::error::refusal(
             classify(&refusal.code, refusal.reason, answer.status),
             Shown::service(&ServiceMessage::from_refusal(refusal.message)),
