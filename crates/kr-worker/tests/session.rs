@@ -1923,13 +1923,14 @@ async fn a_root_shell_that_exits_after_the_session_settles_is_noticed_by_its_own
     // what is left to report the exit is the exit itself, against a sweep that would not come
     // round for thirty seconds.
     //
-    // So the sweep is not left to be outwaited: this session is given one an hour long, and the
-    // shell is held at a gate until the worker's record of the session names the gate, which is
-    // after an observation that saw it, however long the start took, and until the supervision
-    // that made that observation is parked again with no mark left to take. It has looked at the
-    // shell by then, so a closure that follows the gate is started by the shell's exit being
-    // reported, by the child signal where there is one and by the short poll of the shell's status
-    // where there is not, and not by a sweep, a mark or a wake left behind.
+    // So nothing else is left to find it. The sweep is put an hour away, and the session's input
+    // and output no longer wake the supervision or bring its next observation forward. The shell
+    // is held at a gate. The host is asked to look at the session once the shell has named the
+    // gate, and the gate is opened when the worker's record of the session names it and the look
+    // that made the record has ended, which is after the shell was asked about and found alive,
+    // however long the start took. From then on the supervision has no wake but the shell's exit
+    // being reported, by the child signal where there is one and by the short poll of the shell's
+    // status where there is not, so a closure that follows the gate can only be that.
     let host = kr_ipc::testing::TempHost::create();
     let gate_identifier = if cfg!(windows) {
         "$(cat /proc/$gate/winpid)"
@@ -1940,8 +1941,7 @@ async fn a_root_shell_that_exits_after_the_session_settles_is_noticed_by_its_own
         &host,
         &format!(
             "sleep 600 & ( while [ ! -e kr-go ]; do sleep 0.2; done ) & gate=$!; \
-             printf '%s\\n' \"{gate_identifier}\" > kr-gate.pid; printf 'kr-settling\\n'; \
-             wait $gate; exit 7"
+             printf '%s\\n' \"{gate_identifier}\" > kr-gate.pid; wait $gate; exit 7"
         ),
     );
     config.shell.cwd = host.root().to_string_lossy().into_owned();
@@ -1950,6 +1950,7 @@ async fn a_root_shell_that_exits_after_the_session_settles_is_noticed_by_its_own
     let mut session = Session::open(config).expect("opens");
     session.launch().expect("launches");
     session.set_idle_sweep(Duration::from_secs(3600));
+    session.activity().silence_marks();
     let runtime = std::sync::Arc::new(
         SessionRuntime::start(
             session,
@@ -1967,6 +1968,7 @@ async fn a_root_shell_that_exits_after_the_session_settles_is_noticed_by_its_own
         kr_ipc::identity::process_start_identity(pid).ok()
     })
     .await;
+    runtime.observe_now();
     until("the supervision to have recorded the gate", || {
         kr_worker::journal::Journal::open_read_only(&journal)
             .ok()?
@@ -1977,10 +1979,9 @@ async fn a_root_shell_that_exits_after_the_session_settles_is_noticed_by_its_own
             .then_some(())
     })
     .await;
-    until(
-        "the supervision to be parked, with nothing left to take",
-        || runtime.supervision_is_waiting().then_some(()),
-    )
+    until("the supervision to have finished that look", || {
+        (!runtime.supervision_is_looking()).then_some(())
+    })
     .await;
     std::fs::write(host.root().join("kr-go"), b"").expect("opens the gate");
     let record = closure_record(&runtime, "the session closes on its own").await;
