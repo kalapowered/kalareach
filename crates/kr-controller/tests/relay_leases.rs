@@ -694,6 +694,17 @@ async fn a_lease_whose_answer_was_lost_is_still_ended_when_its_device_is_unpaire
     assert_eq!(leases[0].ended_for, Some("unpaired"));
 }
 
+/// The seconds of grace a doctor line says are left to a connection already running.
+fn grace_seconds(detail: &str) -> Option<u64> {
+    detail
+        .split("already running is ")
+        .nth(1)?
+        .split(' ')
+        .next()?
+        .parse()
+        .ok()
+}
+
 /// KR-REQ-17.40, KR-REQ-17.50, KR-REQ-17.52: an allowance that is spent is an answer about
 /// capacity and not a fault. The host holds the leases it has, issues no new one, tells the owner
 /// how much grace is left and that a direct connection and a relay of their own still work, asks
@@ -702,6 +713,7 @@ async fn a_lease_whose_answer_was_lost_is_still_ended_when_its_device_is_unpaire
 async fn an_allowance_that_is_spent_is_shown_to_the_owner_and_asked_again() {
     let rig = Rig::start().await;
     rig.served.web().exhaust_relay_allowance(true);
+    let began = kr_ipc::now_ms().get();
     let (_phone, record) = rig.pairs().await;
     rig.until("the keeper has been refused", || {
         rig.timer.asked_for().contains(&STANDING_RETRY)
@@ -718,12 +730,24 @@ async fn an_allowance_that_is_spent_is_shown_to_the_owner_and_asked_again() {
         rig.live_lease_for(&rig.owner_device()).is_some(),
         "a lease that is held is held"
     );
+    // The daemon's clock goes on, as it does between the answer and the owner's look.
+    let moved = Duration::from_secs(30);
+    rig.time_passes(moved);
     let shown = rig.check().await;
+    let ended = kr_ipc::now_ms().get();
     assert_eq!(shown.status, DoctorStatus::Warning);
     assert!(shown.detail().contains("allowance"), "{}", shown.detail());
+    // What is shown is what the answer announced less the time that has passed on the daemon's
+    // clock since it was read, so it is held to the readings of that clock and not to how long the
+    // machine took to get from one to the next.
+    let left = grace_seconds(shown.detail());
+    let announced = 600;
+    let passed_at_least = moved.as_secs();
+    let passed_at_most = passed_at_least + (ended - began).div_ceil(1000);
     assert!(
-        (shown.detail().contains("is 600 seconds") || shown.detail().contains("is 599 seconds"))
-            && shown.detail().contains("104857600 bytes"),
+        left.is_some_and(|left| {
+            left <= announced - passed_at_least && left + passed_at_most >= announced - 1
+        }) && shown.detail().contains("104857600 bytes"),
         "the grace left is shown: {}",
         shown.detail()
     );
