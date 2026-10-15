@@ -95,6 +95,9 @@ pub struct Activity {
     /// An observation a test asked for, which the supervision makes at once.
     #[cfg(feature = "testing")]
     forced: Notify,
+    /// Whether the supervision is parked in its wait with no mark to take.
+    #[cfg(feature = "testing")]
+    waiting: AtomicBool,
 }
 
 /// One reader's mark.
@@ -142,6 +145,38 @@ impl Activity {
     /// Takes the supervision's mark, and says whether there was one.
     fn take(&self) -> bool {
         self.boundary.take()
+    }
+
+    /// Whether the supervision is parked in its wait, with no mark made and none left behind, so
+    /// that only the shell's exit, a mark made from now on or a clock can wake it, for the host's
+    /// own tests: a case about how an exit is noticed waits for this before it lets the shell go.
+    /// It compiles to nothing without the `testing` feature, and no shipped build enables it.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn supervision_is_waiting(&self) -> bool {
+        self.waiting.load(Ordering::Acquire) && !self.boundary.happened.load(Ordering::Acquire)
+    }
+
+    /// Runs the supervision's wait, saying while it is pending whether it is listening for a mark.
+    /// The statement ends with the wait, however that ends.
+    #[cfg(feature = "testing")]
+    async fn parked<T>(&self, listening: bool, wait: impl std::future::Future<Output = T>) -> T {
+        struct Ended<'a>(&'a AtomicBool);
+        impl Drop for Ended<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::Release);
+            }
+        }
+        let _ended = Ended(&self.waiting);
+        let mut wait = std::pin::pin!(wait);
+        std::future::poll_fn(|context| {
+            let polled = wait.as_mut().poll(context);
+            if polled.is_pending() {
+                self.waiting.store(listening, Ordering::Release);
+            }
+            polled
+        })
+        .await
     }
 
     /// Waits for the supervision's mark to be made.
@@ -376,21 +411,21 @@ impl Supervision {
         let marked = self.sweep.marked();
         let activity = Arc::clone(&self.sweep.activity);
         let exits = &mut self.exits;
-        let cause = tokio::select! {
-            () = exits.next() => Cause::Clock,
-            () = tokio::time::sleep_until(deadline) => Cause::Clock,
-            () = activity.marked(), if !marked => Cause::Activity,
-            () = activity.forced() => Cause::Forced,
+        let wait = async {
+            tokio::select! {
+                () = exits.next() => Cause::Clock,
+                () = tokio::time::sleep_until(deadline) => Cause::Clock,
+                () = activity.marked(), if !marked => Cause::Activity,
+                () = activity.forced() => Cause::Forced,
+            }
         };
+        #[cfg(feature = "testing")]
+        let cause = activity.parked(!marked, wait).await;
+        #[cfg(not(feature = "testing"))]
+        let cause = wait.await;
         match cause {
             Cause::Clock => {}
-            Cause::Activity => {
-                // The wake can outlive the mark: a note made while nobody waited leaves its wake
-                // behind after the observation that took the mark has run. Only a mark that is
-                // still there asks for the short cadence, so a left-over wake does not bring one
-                // more observation a second after the last.
-                self.sweep.marked |= self.sweep.activity.take();
-            }
+            Cause::Activity => self.heard_a_mark(),
             Cause::Forced => {
                 self.sweep.observe_now(Instant::now());
                 return Wake::Ownership;
@@ -401,6 +436,16 @@ impl Supervision {
         } else {
             Wake::Session
         }
+    }
+
+    /// What a wake that a mark brought leaves to do with the mark itself.
+    ///
+    /// The wake can outlive the mark: a note made while nobody waited leaves its wake behind after
+    /// the observation that took the mark has run. Only a mark that is still there asks for the
+    /// short cadence, so a left-over wake does not bring one more observation a second after the
+    /// last.
+    fn heard_a_mark(&mut self) {
+        self.sweep.marked |= self.sweep.activity.take();
     }
 
     /// When this supervision wants to be woken, whatever else happens first.
@@ -590,43 +635,78 @@ mod tests {
     }
 
     /// A supervision that hears no child signal, so that a child of another case in this test
-    /// process ending cannot be what wakes it, and whose sweep is an hour away, so that no stall
-    /// of this test can bring the sweep round.
+    /// process ending cannot be what wakes it, and whose sweep is an hour away.
     fn deaf(activity: Arc<Activity>, started: Instant) -> Supervision {
         #[cfg(unix)]
         let exits = ChildExits(None);
         #[cfg(not(unix))]
         let exits = ChildExits;
         Supervision {
-            sweep: Sweep::begin(activity, started, IDLE_SWEEP_INTERVAL * 120),
+            sweep: Sweep::begin(activity, started, Duration::from_secs(3600)),
             exits,
         }
     }
 
-    #[tokio::test]
-    async fn a_wake_left_behind_by_a_mark_that_was_taken_asks_for_no_further_observation() {
+    #[test]
+    fn a_wake_left_behind_by_a_mark_that_was_taken_asks_for_no_further_observation() {
         // A note made while the supervision was not waiting leaves its wake behind, and the
         // observation the mark asked for takes the mark itself. The wake that is left must not
         // read as a second mark: the session has done nothing since, and the next observation is
-        // the sweep's.
+        // the sweep's. Instants are given, so nothing here reads a clock.
         let marks = Activity::new();
-        let started = Instant::now() - OBSERVE_INTERVAL;
+        let started = Instant::now();
         let mut supervision = deaf(Arc::clone(&marks), started);
         marks.note();
-
-        let first = tokio::time::timeout(IDLE_SWEEP_INTERVAL / 2, supervision.next())
-            .await
-            .expect("the observation the mark asked for is due");
-        assert_eq!(first, Wake::Ownership);
-
-        let second = tokio::time::timeout(IDLE_SWEEP_INTERVAL / 2, supervision.next())
-            .await
-            .expect("the wake that was left behind comes at once");
-        assert_eq!(second, Wake::Session, "it observes nothing");
-        assert!(
-            !supervision.sweep.marked(),
-            "and it is not taken for a mark that nothing made"
+        assert_eq!(
+            supervision.sweep.next_observation(),
+            started + OBSERVE_INTERVAL,
+            "the mark asks for the short cadence"
         );
+        assert!(
+            supervision
+                .sweep
+                .observation_due(started + OBSERVE_INTERVAL)
+        );
+
+        supervision.heard_a_mark();
+        assert_eq!(
+            supervision.sweep.next_observation(),
+            started + OBSERVE_INTERVAL + Duration::from_secs(3600),
+            "the wake that was left behind is no mark"
+        );
+
+        marks.note();
+        supervision.heard_a_mark();
+        assert_eq!(
+            supervision.sweep.next_observation(),
+            started + OBSERVE_INTERVAL + OBSERVE_INTERVAL,
+            "and a mark made since still is"
+        );
+    }
+
+    #[cfg(feature = "testing")]
+    #[tokio::test]
+    async fn the_supervision_says_when_it_is_parked_with_nothing_left_to_take() {
+        let marks = Activity::new();
+        let mut supervision = deaf(Arc::clone(&marks), Instant::now());
+        assert!(!marks.supervision_is_waiting(), "it has not begun to wait");
+        let waiting = tokio::spawn(async move { supervision.next().await });
+
+        tokio::time::timeout(IDLE_SWEEP_INTERVAL, async {
+            while !marks.supervision_is_waiting() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("it parks");
+
+        marks.note();
+        assert!(
+            !marks.supervision_is_waiting(),
+            "a mark made while it is parked ends that at once, before it has woken"
+        );
+        waiting.await.expect("the wake comes");
+        assert!(!marks.supervision_is_waiting(), "and it has ended its wait");
     }
 
     #[tokio::test]

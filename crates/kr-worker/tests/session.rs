@@ -1925,9 +1925,11 @@ async fn a_root_shell_that_exits_after_the_session_settles_is_noticed_by_its_own
     //
     // So the sweep is not left to be outwaited: this session is given one an hour long, and the
     // shell is held at a gate until the worker's record of the session names the gate, which is
-    // after an observation that saw it, however long the start took. A closure that follows the
-    // gate is then started by the shell's exit being reported, by the child signal where there is
-    // one and by the short poll of the shell's status where there is not, and not by a sweep.
+    // after an observation that saw it, however long the start took, and until the supervision
+    // that made that observation is parked again with no mark left to take. It has looked at the
+    // shell by then, so a closure that follows the gate is started by the shell's exit being
+    // reported, by the child signal where there is one and by the short poll of the shell's status
+    // where there is not, and not by a sweep, a mark or a wake left behind.
     let host = kr_ipc::testing::TempHost::create();
     let gate_identifier = if cfg!(windows) {
         "$(cat /proc/$gate/winpid)"
@@ -1974,6 +1976,11 @@ async fn a_root_shell_that_exits_after_the_session_settles_is_noticed_by_its_own
             .contains(&gate)
             .then_some(())
     })
+    .await;
+    until(
+        "the supervision to be parked, with nothing left to take",
+        || runtime.supervision_is_waiting().then_some(()),
+    )
     .await;
     std::fs::write(host.root().join("kr-go"), b"").expect("opens the gate");
     let record = closure_record(&runtime, "the session closes on its own").await;
