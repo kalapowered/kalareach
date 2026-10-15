@@ -66,6 +66,8 @@ struct Tokens {
     gate: Mutex<Option<Arc<tokio::sync::Notify>>>,
     /// How many requests for a token ran to their end.
     answered: AtomicUsize,
+    /// Whether a request for a token panics.
+    panics: std::sync::atomic::AtomicBool,
 }
 
 impl Tokens {
@@ -76,6 +78,7 @@ impl Tokens {
             failures: Mutex::new(VecDeque::new()),
             gate: Mutex::new(None),
             answered: AtomicUsize::new(0),
+            panics: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -109,6 +112,10 @@ impl AccountTokenSource for Tokens {
                 .lock()
                 .expect("the tokens")
                 .push(scope.to_owned());
+            assert!(
+                !self.panics.load(Ordering::SeqCst),
+                "the token source panics, as scripted"
+            );
             let gate = self.gate.lock().expect("the tokens").clone();
             if let Some(gate) = gate {
                 gate.notified().await;
@@ -849,7 +856,10 @@ async fn a_service_that_stays_unreachable_ends_the_control_when_the_absent_windo
         .send(VoiceCommand::Thinking, None, Some("too late"))
         .await;
     assert!(matches!(after, Err(SendError::NotSent)), "{after:?}");
-    assert!(news.next().await.is_none(), "nothing follows the end");
+    assert!(
+        within("the end of the news", news.next()).await.is_none(),
+        "nothing follows the end"
+    );
 }
 
 #[tokio::test]
@@ -871,7 +881,7 @@ async fn an_answer_that_reconnecting_cannot_change_ends_the_control_at_once() {
             1,
             "status {status} is not tried again"
         );
-        assert!(news.next().await.is_none());
+        assert!(within("the end of the news", news.next()).await.is_none());
     }
 }
 
@@ -953,7 +963,7 @@ async fn a_refresh_the_control_is_stopped_in_the_middle_of_still_runs_to_its_end
 
     control.stop();
     assert!(
-        news.next().await.is_none(),
+        within("the end of the news", news.next()).await.is_none(),
         "a stopped control tells nothing"
     );
     release.notify_one();
@@ -981,11 +991,13 @@ async fn a_service_that_ends_every_socket_as_it_opens_is_not_met_in_a_tight_loop
     };
     let route = ControlRoute::start().await;
     route.drop_after_ready(true);
-    let (control, news) = VoiceControl::open(
+    let (control, mut news) = VoiceControl::open(
         &connector().with_timings(timings),
         route.target(),
         Tokens::new(),
     );
+    // The owner reads what it is told, so that only the control's own pace limits the sockets.
+    tokio::spawn(async move { while news.next().await.is_some() {} });
 
     // The control goes on trying, as the service has not let it go; the request has a budget of
     // its own, and that ends it. The sockets that open are few: the wait between attempts holds
@@ -1000,9 +1012,8 @@ async fn a_service_that_ends_every_socket_as_it_opens_is_not_met_in_a_tight_loop
     );
     let upgrades = route.report().upgrades.len();
     assert!(upgrades > 1, "it did try again");
-    assert!(upgrades < 40, "{upgrades} sockets in a request's budget");
+    assert!(upgrades < 20, "{upgrades} sockets in a request's budget");
     control.stop();
-    drop(news);
 }
 
 #[tokio::test]
@@ -1020,6 +1031,91 @@ async fn a_request_made_while_no_socket_is_open_and_never_written_is_told_so() {
 
     assert!(matches!(sent, Err(SendError::NotSent)), "{sent:?}");
     assert_eq!(contexts(&route), 0);
+}
+
+#[tokio::test]
+async fn a_request_that_used_its_budget_before_any_socket_took_it_is_told_so_and_the_control_goes_on()
+ {
+    let timings = ControlTimings {
+        answer_within: ms(500),
+        absent: ms(60_000),
+        ..quick()
+    };
+    let route = ControlRoute::start().await;
+    let (control, mut news) = VoiceControl::open(
+        &connector().with_timings(timings),
+        route.target(),
+        Tokens::new(),
+    );
+    attached(&mut news).await;
+    route.refuse_all(Some(503));
+    route.drop_sockets();
+    assert!(matches!(next(&mut news).await, ControlNews::Detached));
+
+    let sent = control
+        .send(VoiceCommand::Thinking, None, Some("while away"))
+        .await;
+
+    // The budget ended it, not the control: the control is still opening a socket.
+    assert!(matches!(sent, Err(SendError::NotSent)), "{sent:?}");
+    route
+        .until("another refused attempt", |report| {
+            report.refused_upgrades >= 2
+        })
+        .await;
+    assert_eq!(contexts(&route), 0);
+}
+
+#[tokio::test]
+async fn a_token_source_that_panics_ends_the_control_and_is_not_asked_again() {
+    let route = ControlRoute::start().await;
+    let tokens = Tokens::new();
+    tokens.panics.store(true, Ordering::SeqCst);
+    let (_control, mut news) = open(&route, &tokens);
+
+    assert_eq!(ended(&mut news).await, ControlEnd::NoToken);
+
+    assert_eq!(tokens.scopes().len(), 1);
+    assert!(route.report().upgrades.is_empty());
+}
+
+#[tokio::test]
+async fn a_closure_goes_ahead_of_the_requests_that_wait_for_the_pacer() {
+    let route = ControlRoute::start_with(None, Some((ms(300), ms(1800)))).await;
+    let (control, mut news) = open(&route, &Tokens::new());
+    attached(&mut news).await;
+    tokio::spawn(async move { while news.next().await.is_some() {} });
+    // Twenty-five requests: ten go at once and the rest wait for the pacer.
+    let waiting: Vec<_> = (0..25)
+        .map(|number| {
+            let control = control.clone();
+            tokio::spawn(async move {
+                control
+                    .send(
+                        VoiceCommand::Thinking,
+                        None,
+                        Some(&format!("part {number}")),
+                    )
+                    .await
+            })
+        })
+        .collect();
+    route
+        .until("the first ten", |report| report.sent.len() >= 10)
+        .await;
+
+    let closure = control.close().await.expect("confirmed");
+
+    // It took the next free slot, which came before the last of the requests.
+    assert_eq!(closure.seconds, 42);
+    assert!(
+        route.report().sent.len() < 25,
+        "{:?}",
+        route.report().sent.len()
+    );
+    for waited in waiting {
+        let _ = waited.await.expect("the task");
+    }
 }
 
 #[tokio::test]
@@ -1121,7 +1217,7 @@ async fn usage_is_told_as_the_cumulative_figure_it_is_and_the_service_ending_the
             provisional: false
         }
     );
-    assert!(news.next().await.is_none());
+    assert!(within("the end of the news", news.next()).await.is_none());
     let after = control
         .send(VoiceCommand::Thinking, None, Some("late"))
         .await;

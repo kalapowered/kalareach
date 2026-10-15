@@ -168,7 +168,7 @@ impl Default for ControlTimings {
             absent: Duration::from_secs(u64::from(VOICE_CLIENT_ABSENT_SECONDS)),
             ready_within: PATIENCE,
             answer_within: Duration::from_secs(u64::from(VOICE_CLIENT_ABSENT_SECONDS)),
-            close_within: Duration::from_secs(30),
+            close_within: Duration::from_secs(40),
             write_within: PATIENCE,
             retry_first: Duration::from_millis(500),
             retry_most: Duration::from_secs(5),
@@ -912,6 +912,13 @@ enum Served {
     Lost,
 }
 
+/// What one turn of a served socket took up: a frame, a request, or the next write.
+enum Input {
+    Heard(Option<std::result::Result<Message, tokio_websockets::Error>>),
+    Request(Option<Request>),
+    Write,
+}
+
 /// How an attempt to attach failed.
 enum Attempt {
     /// Try again later.
@@ -1141,7 +1148,8 @@ impl Driver {
         delegation: Option<String>,
         content: Option<String>,
     ) -> std::result::Result<(String, String), SendError> {
-        if self.pending.len() >= MAX_IN_FLIGHT {
+        // The closure is never turned away for want of room: it is the one request that must go.
+        if command != VoiceCommand::Close && self.pending.len() >= MAX_IN_FLIGHT {
             return Err(SendError::Busy);
         }
         if let Some(named) = &delegation
@@ -1189,6 +1197,11 @@ impl Driver {
         while index < self.pending.len() {
             if self.pending[index].ends_at(&timings) <= now {
                 let gone = self.pending.remove(index);
+                if gone.written {
+                    // The service may still read it: it counts from now, which is not earlier
+                    // than the service counts it.
+                    self.pacer.record(&gone.id, now);
+                }
                 let error = gone.unanswered();
                 gone.kind.fail(error);
             } else {
@@ -1222,8 +1235,10 @@ impl Driver {
 
     /// Carries one open socket until it is lost or the control is over.
     ///
-    /// Each turn of the loop writes at most one frame, so the timers, a stop, the socket and the
-    /// requests are looked at between every two writes however many wait to be written.
+    /// Each turn of the loop does one thing. A stop, a heartbeat and the timer come first, so that
+    /// nothing that keeps arriving, or waits to be written, holds them back. What is left, the
+    /// socket's frames, the requests and the next write, is chosen among fairly, so none of the
+    /// three starves another however many of each are ready.
     async fn serve(&mut self, mut socket: Socket) -> Served {
         let timings = self.timings();
         let mut heartbeat =
@@ -1245,16 +1260,29 @@ impl Driver {
         let served = loop {
             let now = Instant::now();
             self.expire(now);
+            // One reading of the clock decides whether a write can go and when to look again, so
+            // a slot the pacer frees between two readings is never missed.
+            let held = self
+                .pending
+                .iter()
+                .any(|pending| pending.standing == Standing::Unsent)
+                .then(|| self.pacer.next_at(now))
+                .flatten();
             let writable = !repeats.is_empty()
-                || (self
-                    .pending
-                    .iter()
-                    .any(|pending| pending.standing == Standing::Unsent)
-                    && self.pacer.next_at(now).is_none());
-            let wake = self.next_wake(last_heard);
-            // A stop first, then the timers, so that frames and requests that keep arriving
-            // cannot hold back a heartbeat or the silence limit, then the writes, which are
-            // finite, then what arrives.
+                || (held.is_none()
+                    && self
+                        .pending
+                        .iter()
+                        .any(|pending| pending.standing == Standing::Unsent));
+            let wake = self.next_wake(last_heard, held);
+            let requests = &mut self.requests;
+            let input = async {
+                tokio::select! {
+                    heard = socket.next() => Input::Heard(heard),
+                    request = requests.recv() => Input::Request(request),
+                    () = std::future::ready(()), if writable => Input::Write,
+                }
+            };
             tokio::select! {
                 biased;
                 () = self.stop.notified() => break Served::Stopped,
@@ -1269,14 +1297,14 @@ impl Driver {
                         break Served::Lost;
                     }
                 }
-                () = std::future::ready(()), if writable => {
-                    if self.write_one(&mut socket, &mut repeats).await.is_err() {
-                        break Served::Lost;
+                input = input => match input {
+                    Input::Write => {
+                        if self.write_one(&mut socket, &mut repeats).await.is_err() {
+                            break Served::Lost;
+                        }
                     }
-                }
-                heard = socket.next() => match heard {
-                    None | Some(Err(_)) => break Served::Lost,
-                    Some(Ok(message)) => {
+                    Input::Heard(None | Some(Err(_))) => break Served::Lost,
+                    Input::Heard(Some(Ok(message))) => {
                         last_heard = Instant::now();
                         match self.on_message(&message).await {
                             Ok(Some(served)) => break served,
@@ -1284,10 +1312,8 @@ impl Driver {
                             Err(OwnerGone) => break Served::Stopped,
                         }
                     }
-                },
-                request = self.requests.recv() => match request {
-                    None => break Served::Stopped,
-                    Some(request) => self.take(request),
+                    Input::Request(None) => break Served::Stopped,
+                    Input::Request(Some(request)) => self.take(request),
                 },
             }
         };
@@ -1297,14 +1323,16 @@ impl Driver {
         served
     }
 
-    /// Writes one frame the pacer lets go: an admission's repeat, else the first request that was
-    /// not written to this socket.
+    /// Writes one frame the pacer lets go: an admission's repeat, else the closure if it has not
+    /// been written, else the first request that has not.
     ///
     /// Every request write is paced and counted, a request written again after a loss included:
     /// the service counts a request when it sends it on, so one that was lost before the service
     /// had it counts when it is written again. Counting a rewrite of one the service already had
     /// only delays the next request. An admission's repeat is neither: the service answers a
-    /// repeat before it looks at its rate.
+    /// repeat before it looks at its rate. A request counts, and is `written`, from the moment
+    /// its write is attempted: a write that fails or runs out of time may have put bytes on the
+    /// socket, and the request is then not one that is known to have gone nowhere.
     async fn write_one(
         &mut self,
         socket: &mut Socket,
@@ -1314,10 +1342,12 @@ impl Driver {
         if let Some(wire) = repeats.pop_front() {
             return write(socket, wire, within).await;
         }
+        let unsent = |pending: &&Pending| pending.standing == Standing::Unsent;
         let Some(at) = self
             .pending
             .iter()
-            .position(|pending| pending.standing == Standing::Unsent)
+            .position(|pending| unsent(&pending) && matches!(pending.kind, Kind::Close(_)))
+            .or_else(|| self.pending.iter().position(|pending| unsent(&pending)))
         else {
             return Ok(());
         };
@@ -1325,27 +1355,23 @@ impl Driver {
         if self.pacer.next_at(now).is_some() {
             return Ok(());
         }
-        write(socket, self.pending[at].wire.clone(), within).await?;
+        let wire = self.pending[at].wire.clone();
         self.pacer.record(&self.pending[at].id, now);
         let pending = &mut self.pending[at];
         pending.written = true;
         pending.standing = Standing::Awaiting;
-        Ok(())
+        write(socket, wire, within).await
     }
 
     /// The next moment something is due without a frame arriving: the silence limit, a request that
-    /// will have used its budget, or a request the pacer is holding.
-    fn next_wake(&mut self, last_heard: Instant) -> Instant {
+    /// will have used its budget, or the moment the pacer frees the request it is holding (`held`,
+    /// read with the same clock as the decision to write).
+    fn next_wake(&mut self, last_heard: Instant, held: Option<Instant>) -> Instant {
         let mut wake = last_heard + self.timings().silence;
         if let Some(due) = self.next_deadline() {
             wake = wake.min(due);
         }
-        if self
-            .pending
-            .iter()
-            .any(|pending| pending.standing == Standing::Unsent)
-            && let Some(until) = self.pacer.next_at(Instant::now())
-        {
+        if let Some(until) = held {
             wake = wake.min(until);
         }
         wake
@@ -1435,7 +1461,10 @@ impl Driver {
                         message: ServiceMessage::from_refusal(message),
                     };
                     self.pending.remove(at).kind.fail(refused);
-                } else if self.first_answer(&id) {
+                    // The sender has it, so the owner is not told it again when the service
+                    // answers a repeat with it.
+                    self.first_answer(&id);
+                } else if id.is_empty() || self.first_answer(&id) {
                     self.tell(ControlNews::Event(VoiceControlEvent::ContextRefused {
                         id,
                         reason,
