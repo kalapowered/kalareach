@@ -227,15 +227,20 @@ impl Mailboxes {
 /// for word as the deployment writes it: the outcome not known, and when to send it again.
 const NOT_FINISHED: &[u8] = br#"{"ok":false,"error":{"code":"SERVICE_UNAVAILABLE","message":"The mailbox did not finish answering that request, and what became of it is not known. Send it again shortly.","retryAfterSeconds":2}}"#;
 
+/// How many times the route carries a delivery to the deployment before it takes the network
+/// between them for down.
+const CARRIAGES: usize = 5;
+
 /// The deployment's transport with a mailbox in front of it that answers too late.
 ///
 /// For the next `stalls` deliveries it carries the delivery to the deployment, which stores it,
 /// and hands back the route's answer to a mailbox that had not answered by its deadline in place
 /// of the deployment's own: what a device sees when its mailbox stores an item after the route
-/// stopped waiting for it. That answer does not depend on what became of the carriage. A route
-/// whose mailbox it could not carry the delivery to, or whose answer it did not hear, is a route
-/// whose mailbox did not finish answering, so a carriage the network ended is the same answer.
-/// Everything else passes through as it came.
+/// stopped waiting for it. The carriage is the route's work: a carriage the network ended is made
+/// again until the deployment has answered it, so that what the deployment stores does not depend
+/// on the network between this machine and it. The deployment keys a delivery by its envelope
+/// identifier, so a delivery it takes twice is stored once. Everything else passes through as it
+/// came.
 #[derive(Debug)]
 struct LateMailbox {
     through: Arc<dyn ServiceHttp>,
@@ -267,9 +272,8 @@ impl ServiceHttp for LateMailbox {
         headers: &'a [(&'a str, &'a str)],
     ) -> ServiceFuture<'a, ServiceHttpAnswer> {
         Box::pin(async move {
-            let carried = self.through.post_json(url, body, headers).await;
             if !url.ends_with(MAILBOX_DELIVER_PATH) {
-                return carried;
+                return self.through.post_json(url, body, headers).await;
             }
             self.deliveries.fetch_add(1, Ordering::SeqCst);
             let late = self
@@ -278,17 +282,28 @@ impl ServiceHttp for LateMailbox {
                     left.checked_sub(1)
                 })
                 .is_ok();
-            if late {
-                // What became of the carriage is said, because it is no longer the answer.
-                if let Err(error) = &carried {
-                    eprintln!("a delivery the route could not carry or hear back: {error}");
-                }
-                return Ok(ServiceHttpAnswer {
-                    status: 503,
-                    body: NOT_FINISHED.to_vec(),
-                });
+            if !late {
+                return self.through.post_json(url, body, headers).await;
             }
-            carried
+            let mut carriages = 0;
+            loop {
+                carriages += 1;
+                match self.through.post_json(url, body, headers).await {
+                    Ok(_) => break,
+                    Err(error) => {
+                        assert!(
+                            carriages < CARRIAGES,
+                            "the route could not carry the delivery to the deployment in \
+                             {CARRIAGES} tries: {error}"
+                        );
+                        eprintln!("a delivery the route could not carry or hear back: {error}");
+                    }
+                }
+            }
+            Ok(ServiceHttpAnswer {
+                status: 503,
+                body: NOT_FINISHED.to_vec(),
+            })
         })
     }
 
