@@ -35,7 +35,6 @@ use std::sync::Arc;
 
 use iroh::EndpointAddr;
 use kr_client::session::Session;
-use kr_client::transport::NetworkTransport;
 use kr_crypto::connect::PairedPeer;
 use kr_crypto::keys::DeviceKeys;
 use kr_crypto::store::{load_device_keys, open_store_in, store_device_keys};
@@ -56,7 +55,6 @@ use kr_protocol::scalars::{AuthorisationKey, EndpointKey, Uuid};
 use kr_protocol::sharing::{DeviceListParams, DeviceListResult, GrantListParams, GrantListResult};
 use kr_transport::TransportError;
 use kr_transport::handshake;
-use kr_transport::scheduler::SendLimits;
 use net_support::{Device, build, pairing, proposal};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -525,18 +523,13 @@ async fn a_viewer_reaches_only_the_distribution_it_was_paired_with() {
     let device_id: DeviceId = viewer.device_id.parse().expect("a device identity");
 
     // Its own endpoint lets it in, and answers as the environment it was paired with.
-    let transport = tokio::time::timeout(
-        DEADLINE,
-        NetworkTransport::connect(
-            device.endpoint(),
-            viewer.endpoint.address(),
-            &device.paired_identity(device_id),
-            &viewer.endpoint.peer(),
-            SendLimits::default(),
-        ),
+    let transport = pairing::connect_until_answered(
+        device.endpoint(),
+        viewer.endpoint.address(),
+        &device.paired_identity(device_id),
+        &viewer.endpoint.peer(),
     )
     .await
-    .expect("the paired connection is made in time")
     .expect("the viewer is let into the distribution it was paired with");
     let session = Session::start(Arc::new(transport)).expect("a session");
     let info: HostInfoResult = tokio::time::timeout(DEADLINE, session.read(Method::HostInfo, &()))
@@ -595,16 +588,17 @@ async fn a_viewer_reaches_only_the_distribution_it_was_paired_with() {
     // unpaired peer. That close is the endpoint's own decision, read as a code: a connection that
     // timed out, was reset or could not be made carries none, and a viewer let in has no such
     // close.
-    let connection = tokio::time::timeout(
-        DEADLINE,
-        kr_transport::endpoint::connect(
-            device.endpoint(),
-            other.address(),
-            kr_protocol::hello::ALPN,
-        ),
+    let connection = pairing::until_answered(
+        || {
+            kr_transport::endpoint::connect(
+                device.endpoint(),
+                other.address(),
+                kr_protocol::hello::ALPN,
+            )
+        },
+        pairing::transport_error_gave_up_unanswered,
     )
     .await
-    .expect("the other endpoint is reached in time")
     .expect("the other endpoint is reachable from this distribution");
     let attempt = tokio::time::timeout(
         DEADLINE,

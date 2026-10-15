@@ -54,7 +54,6 @@ use kr_protocol::sharing::{
 };
 use kr_transport::config::EndpointConfig;
 use kr_transport::handshake::LocalIdentity;
-use kr_transport::scheduler::SendLimits;
 
 /// Writes the configuration document an environment's daemon reads when it starts.
 pub fn write_document(
@@ -1203,23 +1202,26 @@ pub struct PairedDial {
 }
 
 impl PairedDial {
-    /// One connection of the device's to the host, authorised as the device. An attempt the
-    /// transport gave up on without an answer is made again; a connection the host refused is not.
-    pub async fn dial(&self) -> NetworkTransport {
-        pairing::until_answered(
-            || {
-                NetworkTransport::connect(
-                    &self.endpoint,
-                    self.addr.clone(),
-                    &self.identity,
-                    &self.host_record,
-                    SendLimits::default(),
-                )
-            },
-            pairing::transport_gave_up_unanswered,
+    /// One connection of the device's to the host, authorised as the device, or the refusal the
+    /// host gave it. An attempt the transport gave up on is made again, so the outcome is what the
+    /// host decided and never that nothing answered.
+    ///
+    /// # Errors
+    ///
+    /// Returns the client's error when the host refuses the connection or it cannot be made.
+    pub async fn try_dial(&self) -> std::result::Result<NetworkTransport, kr_client::ClientError> {
+        pairing::connect_until_answered(
+            &self.endpoint,
+            self.addr.clone(),
+            &self.identity,
+            &self.host_record,
         )
         .await
-        .expect("the paired device connects")
+    }
+
+    /// One connection of the device's to the host, authorised as the device.
+    pub async fn dial(&self) -> NetworkTransport {
+        self.try_dial().await.expect("the paired device connects")
     }
 }
 
@@ -1261,47 +1263,24 @@ pub struct RawDevice {
 impl RawDevice {
     /// Connects a paired device and claims the receive side of its control stream.
     pub async fn connect(host: &Host, device: &Device, record: &DeviceRecord) -> Self {
-        pairing::until_answered(
-            || Self::try_connect(host, device, record),
-            pairing::transport_gave_up_unanswered,
-        )
-        .await
-        .expect("the paired device connects")
+        Self::admitted(host, device, record)
+            .await
+            .expect("the paired device connects")
     }
 
     /// Connects a device under the identity `record` gave it, and returns why the host did not let
-    /// it in where it did not: a device that is not paired with `host` is one such.
+    /// it in where it did not: a device that is not paired with `host` is one such. An attempt the
+    /// transport gave up on is made again, so a refusal is the host's own.
     ///
     /// # Errors
     ///
-    /// Returns the client's error when the connection is refused or cannot be made.
-    pub async fn try_connect(
+    /// Returns the client's error when the host refuses the connection or it cannot be made.
+    pub async fn admitted(
         host: &Host,
         device: &Device,
         record: &DeviceRecord,
     ) -> std::result::Result<Self, kr_client::ClientError> {
-        let pairing = host.network.pairing();
-        let host_record = PairedPeer {
-            device_id: pairing.identity().device_id,
-            device_key_revision: DeviceKeyRevision::new(1),
-            authorisation: pairing.identity().keys.authorisation,
-            endpoint_id: host.network.endpoint_id(),
-        };
-        let mut addr = EndpointAddr::new(
-            iroh::PublicKey::from_bytes(host.network.endpoint_id().as_bytes())
-                .expect("a usable endpoint identity"),
-        );
-        for socket in host.network.bound_sockets() {
-            addr = addr.with_ip_addr(socket);
-        }
-        let transport = NetworkTransport::connect(
-            &device.endpoint,
-            addr,
-            &device.paired_identity(record.device_id),
-            &host_record,
-            SendLimits::default(),
-        )
-        .await?;
+        let transport = paired_dial(host, device, record).try_dial().await?;
         let action_window_id = {
             use kr_client::transport::ControlTransport as _;
             transport.initial_action_window().action_window_id.clone()

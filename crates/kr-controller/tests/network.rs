@@ -83,7 +83,6 @@ use kr_protocol::session::{
 use kr_transport::clock::ManualClock;
 use kr_transport::config::EndpointConfig;
 use kr_transport::handshake::LocalIdentity;
-use kr_transport::scheduler::SendLimits;
 
 mod organisation_support;
 mod teardown;
@@ -701,12 +700,11 @@ async fn connect(daemon: &RunningDaemon, device: &Device, record: &DeviceRecord)
     for socket in daemon.network.bound_sockets() {
         addr = addr.with_ip_addr(socket);
     }
-    let transport = NetworkTransport::connect(
+    let transport = pairing_calls::connect_until_answered(
         &device.endpoint,
         addr,
         &device.paired_identity(record.device_id),
         &host_record,
-        SendLimits::default(),
     )
     .await
     .expect("the paired device connects");
@@ -1162,12 +1160,11 @@ async fn a_paired_device_attaches_subscribes_types_and_resumes_from_its_cursor()
 
     // A reconnect resumes the cursors it carried, and the subscription it opens is asked to start
     // from exactly them.
-    let transport = NetworkTransport::connect(
+    let transport = pairing_calls::connect_until_answered(
         &device.endpoint,
         host_addr_of(&daemon),
         &device.paired_identity(record.device_id),
         &host_paired_record(&daemon),
-        SendLimits::default(),
     )
     .await
     .expect("the device reconnects");
@@ -1414,7 +1411,7 @@ async fn a_revoked_device_is_fenced_before_it_is_served_again() {
     );
 
     // And it cannot come back: its record is withdrawn, so a fresh connection is not authorised.
-    let again = NetworkTransport::connect(
+    let again = pairing_calls::connect_until_answered(
         &device.endpoint,
         {
             let mut addr = EndpointAddr::new(
@@ -1428,7 +1425,6 @@ async fn a_revoked_device_is_fenced_before_it_is_served_again() {
         },
         &device.paired_identity(record.device_id),
         &host_paired_record(&daemon),
-        SendLimits::default(),
     )
     .await;
     assert!(
@@ -1745,12 +1741,11 @@ async fn a_grant_the_clock_floor_expired_ends_the_subscription_and_stays_expired
         stored.expired_at_ms.is_some(),
         "the expiry is written where a later connection is admitted from: {stored:?}"
     );
-    let again = NetworkTransport::connect(
+    let again = pairing_calls::connect_until_answered(
         &device.endpoint,
         host_addr_of(&daemon),
         &device.paired_identity(record.device_id),
         &host_paired_record(&daemon),
-        SendLimits::default(),
     )
     .await;
     assert!(
@@ -3103,12 +3098,11 @@ async fn a_device_pairs_and_attaches_through_a_relay_and_losing_it_leaves_the_se
             .expect("a usable endpoint identity"),
     );
     addr = addr.with_relay_url(relay.url.clone());
-    let transport = NetworkTransport::connect(
+    let transport = pairing_calls::connect_until_answered(
         &device.endpoint,
         addr,
         &device.paired_identity(record.device_id),
         &host_paired_record(&daemon),
-        SendLimits::default(),
     )
     .await
     .expect("the paired device connects over the relay");
@@ -3266,12 +3260,11 @@ async fn a_relay_quota_disconnect_leaves_the_terminal_worker_running() {
             .expect("a usable endpoint identity"),
     )
     .with_relay_url(relay.url.clone());
-    let transport = NetworkTransport::connect(
+    let transport = pairing_calls::connect_until_answered(
         &device.endpoint,
         addr,
         &device.paired_identity(record.device_id),
         &host_paired_record(&daemon),
-        SendLimits::default(),
     )
     .await
     .expect("the paired device connects over the relay");
@@ -3470,12 +3463,11 @@ async fn an_exhausted_relay_is_the_reported_reason_a_new_connection_fails() {
     for hint in &hints {
         by_hints = by_hints.with_ip_addr(*hint);
     }
-    let again = NetworkTransport::connect(
+    let again = pairing_calls::connect_until_answered(
         &direct.endpoint,
         by_hints,
         &direct.paired_identity(direct_record.device_id),
         &host_paired_record(&daemon),
-        SendLimits::default(),
     )
     .await
     .expect("a new connection by the invitation's direct addresses");
@@ -3483,12 +3475,11 @@ async fn an_exhausted_relay_is_the_reported_reason_a_new_connection_fails() {
 
     // A new connection that needs the relay fails, at once, and the failure says why.
     let started = tokio::time::Instant::now();
-    let refused = NetworkTransport::connect(
+    let refused = pairing_calls::connect_until_answered(
         &relayed.endpoint,
         EndpointAddr::new(host_id).with_relay_url(relay.url.clone()),
         &relayed.paired_identity(relayed_record.device_id),
         &host_paired_record(&daemon),
-        SendLimits::default(),
     )
     .await
     .expect_err("nothing reaches the host through a relay that refuses");
@@ -5107,12 +5098,11 @@ async fn a_reconnect_opens_a_new_input_stream_and_replays_no_input() {
 
     // The first connection attaches, takes the input lease and types on it. The client keeps its
     // own record of what it sent on this connection's input stream and what came back.
-    let first = NetworkTransport::connect(
+    let first = pairing_calls::connect_until_answered(
         &device.endpoint,
         host_addr_of(&daemon),
         &device.paired_identity(record.device_id),
         &host_paired_record(&daemon),
-        SendLimits::default(),
     )
     .await
     .expect("the device connects");
@@ -5170,12 +5160,11 @@ async fn a_reconnect_opens_a_new_input_stream_and_replays_no_input() {
     );
     drop(session);
 
-    let second = NetworkTransport::connect(
+    let second = pairing_calls::connect_until_answered(
         &device.endpoint,
         host_addr_of(&daemon),
         &device.paired_identity(record.device_id),
         &host_paired_record(&daemon),
-        SendLimits::default(),
     )
     .await
     .expect("the device reconnects");
