@@ -272,7 +272,7 @@ impl NewsBuffer {
     /// Closes the queue and lets go of what waits in it: nobody will read it, and nothing is
     /// queued after.
     pub(crate) fn close(&mut self) {
-        self.entries.clear();
+        self.entries = VecDeque::new();
         self.events = 0;
         self.closed = true;
     }
