@@ -54,7 +54,7 @@ private final class BridgedCall: CallEngine {
     func stop() { call.stop() }
 }
 
-/// What the adapter needs of the device: the person's permissions, and what the microphone is doing.
+/// What the adapter needs of the device: the person's permissions.
 public protocol CallDevice {
     /// Asks the person for the microphone when they have not been asked, and answers whether the
     /// application may use it.
@@ -375,8 +375,10 @@ public final class CallAdapter: NSObject {
     private let device: CallDevice
     /// Everything below is touched on this queue only, apart from the news, which has its own.
     private let queue = DispatchQueue(label: "to.kala.reach.call-adapter")
-    /// Where the engine's calls that wait (a stop waits for the connection to close, a permit for
-    /// the audio session) run, so they never hold a thread of Swift's cooperative pool.
+    /// Where every call into the engine's control runs. The control is one lock, and a stop holds
+    /// it while it waits for the connection to close, so a call that touches it (a stop, a permit,
+    /// a mute, a read of a mute) can wait: it runs here, and never holds a thread of Swift's
+    /// cooperative pool.
     private let engineQueue = DispatchQueue(label: "to.kala.reach.call-engine", attributes: .concurrent)
     private var held: (id: String, engine: CallEngine, news: CallNewsQueue, capture: VoiceCaptureState)?
     /// The call the observer's reports are for, so a late report of an ended call is not news.
@@ -432,8 +434,8 @@ public final class CallAdapter: NSObject {
             let mute = try CallWire.decode(CallWire.Mute.self, arguments)
             let engine = try engine(mute.call)
             switch mute.what {
-            case "microphone": engine.setMutedByPerson(mute.muted)
-            case "playback": engine.setPlaybackMuted(mute.muted)
+            case "microphone": await onTheEngineQueue { engine.setMutedByPerson(mute.muted) }
+            case "playback": await onTheEngineQueue { engine.setPlaybackMuted(mute.muted) }
             default: throw CallRefusal(code: CallRefusal.engine, message: "a mute is of the microphone or of playback")
             }
             return "{}"
@@ -450,7 +452,7 @@ public final class CallAdapter: NSObject {
             }
             return "{}"
         case "callState":
-            return state()
+            return await state()
         default:
             throw CallRefusal(code: CallRefusal.engine, message: "this build takes no such command")
         }
@@ -473,15 +475,17 @@ public final class CallAdapter: NSObject {
         }
     }
 
-    private func state() -> String {
-        queue.sync {
-            return CallWire.text([
-                "call": held.map { $0.id as Any } ?? NSNull(),
-                "capture": CallWire.captureWord(held?.capture ?? .idle),
-                "microphoneMuted": held?.engine.isMutedByPerson ?? false,
-                "playing": held.map { !$0.engine.isPlaybackMuted } ?? false,
-            ])
-        }
+    private func state() async -> String {
+        let seen = queue.sync { held.map { (id: $0.id, engine: $0.engine, capture: $0.capture) } }
+        // The engine's mutes are read where a stop that waits cannot hold them back.
+        let mutes = await onTheEngineQueue { (person: seen?.engine.isMutedByPerson ?? false,
+                                              playback: seen?.engine.isPlaybackMuted ?? true) }
+        return CallWire.text([
+            "call": seen.map { $0.id as Any } ?? NSNull(),
+            "capture": CallWire.captureWord(seen?.capture ?? .idle),
+            "microphoneMuted": mutes.person,
+            "playing": seen != nil && !mutes.playback,
+        ])
     }
 
     private func open(_ call: String, news: News?) async throws -> String {

@@ -291,7 +291,7 @@ final class CallAdapterTests: XCTestCase {
 
     func testTheBufferKeepsTheOrderAndTellsALossWhereItHappened() throws {
         let cases = try Fixtures.json("queue.json") as! [[String: Any]]
-        XCTAssertGreaterThanOrEqual(cases.count, 9)
+        XCTAssertGreaterThanOrEqual(cases.count, 10)
         func item(_ kind: String) -> CallItem {
             switch kind {
             case "provider": return .providerEvent(Data([1]))
@@ -342,7 +342,7 @@ final class CallAdapterTests: XCTestCase {
             let answered = await ask(adapter, found["command"] as! String, arguments)
 
             XCTAssertNil(answered.result, found["name"] as! String)
-            XCTAssertNotNil(answered.code, found["name"] as! String)
+            XCTAssertEqual(answered.code, "engine", found["name"] as! String)
         }
     }
 
