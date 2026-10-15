@@ -1711,16 +1711,18 @@ async fn a_row_that_aged_before_the_payer_changed_is_asked_under_its_own_payer_o
 
 /// KR-REQ-17.51: the last ask of a row that aged is its last. The allowance is spent, the service
 /// answers that ask as capacity, and the service answers a lease that ran out before it looks at
-/// the allowance, so nothing is left to learn: the row is let go with the answer, and the pair is
-/// asked for under the new payer once the allowance is back.
+/// the allowance, so nothing is left to learn: the row is let go with the answer, also where the
+/// new payer is another authorisation of the same account, and the pair is asked for under the new
+/// payer once the allowance is back.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_row_that_aged_is_let_go_by_the_answer_that_the_allowance_is_spent() {
     let rig = Rig::start().await;
     let (_phone, record, _first) = rig.pairs_and_loses_the_answer().await;
-    let other = rig
-        .served
-        .web()
-        .authorise_relay_payer(&rig.host_key, 8 * 1024 * 1024);
+    let other = rig.served.web().authorise_relay_payer_in(
+        &rig.payer.account_id,
+        &rig.host_key,
+        8 * 1024 * 1024,
+    );
     rig.time_passes(Duration::from_secs(u64::from(LEASE_SECONDS) + 200));
     rig.served.web().exhaust_relay_allowance(true);
 
@@ -1741,9 +1743,7 @@ async fn a_row_that_aged_is_let_go_by_the_answer_that_the_allowance_is_spent() {
     rig.timer.advance(STANDING_RETRY);
     rig.pass().await;
     rig.until("the pair holds a lease under the new payer", || {
-        rig.live_lease_for(&record).is_some_and(|lease| {
-            lease.authorisation_id.as_deref() == Some(other.authorisation_id.as_str())
-        })
+        rig.holds_a_live_lease_under(&record, &other)
     })
     .await;
 }
@@ -1781,6 +1781,32 @@ async fn a_refused_first_request_does_not_hold_the_pair_when_the_payer_changes()
         },
     )
     .await;
+}
+
+/// KR-REQ-17.51: where the new document names no account, a difference of accounts cannot be read,
+/// and a row the service could not answer for is kept: nothing is dropped on the strength of it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_aged_row_stays_when_the_new_document_names_no_account() {
+    let rig = Rig::start().await;
+    let (_phone, record, first) = rig.pairs_and_loses_the_answer().await;
+    let old = written_payer(&rig.payer);
+    rig.served.web().retire_relay_of(&first.lease_id);
+    rig.time_passes(Duration::from_secs(u64::from(LEASE_SECONDS) + 200));
+    let origin = rig.served.origin().to_owned();
+
+    let rig = rig
+        .restarted_after(|tree| {
+            net_support::write_relay_document(tree, Some(origin.as_str()), None);
+        })
+        .await;
+    rig.until(
+        "the keeper has been told the service could not issue a lease",
+        || rig.timer.asked_for().contains(&STANDING_RETRY),
+    )
+    .await;
+    rig.pass().await;
+    assert_eq!(rig.row_payer(&record), Some(Some(old)));
+    assert_eq!(rig.lease_in_the_record(&record), Some(None));
 }
 
 /// KR-REQ-17.51: the bound of an authorisation is below the block a lease holds, so the service
