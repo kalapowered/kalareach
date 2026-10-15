@@ -1039,6 +1039,8 @@ async fn an_interrupt_while_the_daemon_says_nothing_ends_the_command_at_once() {
     window.type_bytes(&[0x03]);
     let shown = window.wait_for("kr ended");
     assert!(!shown.contains("kr ended 0"), "{shown}");
+    // The interrupt ended it, and not the ten seconds the connection is given.
+    assert!(shown.contains("stopped before it finished"), "{shown}");
     assert_eq!(shown.matches("Nothing was set up.").count(), 1, "{shown}");
     assert!(window.echoes(), "echo is on");
 }
@@ -1064,6 +1066,7 @@ async fn an_interrupt_while_the_daemon_says_nothing_to_the_call_is_said_once() {
     window.type_bytes(&[0x03]);
     let shown = window.wait_for("kr ended");
     assert!(!shown.contains("kr ended 0"), "{shown}");
+    assert!(shown.contains("stopped before it finished"), "{shown}");
     assert_eq!(
         shown
             .matches("The kit that was shown opens nothing: delete it.")
@@ -1072,6 +1075,34 @@ async fn an_interrupt_while_the_daemon_says_nothing_to_the_call_is_said_once() {
         "{shown}"
     );
     assert_eq!(rig.requests_to(SYNC), 0, "nothing reached the service");
+}
+
+/// Two setups begun on one host: the one that finishes second is declined at its first try, which
+/// recorded nothing, so its kit opens nothing and the host stays set up under the first kit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_setup_declined_at_its_first_try_because_another_finished_first_opens_nothing() {
+    let rig = Rig::start().await;
+    let mut slow = Window::run(&rig, &["backup", "setup"]);
+    let slow_kit = slow.bring_up_the_kit();
+    slow.type_line(&slow_kit.end_as_typed());
+    slow.wait_for("Type yes when the kit is stored");
+
+    let mut quick = Window::run(&rig, &["backup", "setup"]);
+    let quick_kit = quick.bring_up_the_kit();
+    quick.confirm(&quick_kit);
+    quick.wait_for("kr ended 0");
+    assert_eq!(rig.recorded_kit().await, Some(quick_kit.fingerprint()));
+
+    // The slow window's kit was made before the other setup was recorded.
+    slow.type_line("yes");
+    let shown = slow.wait_for("kr ended");
+    assert!(!shown.contains("kr ended 0"), "{shown}");
+    assert!(
+        shown.contains("Nothing was set up. The kit that was shown opens nothing: delete it."),
+        "{shown}"
+    );
+    assert_eq!(rig.recorded_kit().await, Some(quick_kit.fingerprint()));
+    assert_ne!(slow_kit.fingerprint(), quick_kit.fingerprint());
 }
 
 /// A daemon that cannot be reached when the call is to be made has been given nothing, so the kit
@@ -1260,7 +1291,8 @@ async fn a_fresh_host_restores_the_session_a_set_up_host_backed_up_from_the_kit_
 ///
 /// Fourteen closed sessions each hold output that alternates one byte of text with one byte a
 /// terminal engine drops, which is the shape that makes the most pieces from the least output: about
-/// 7 MB of spool for each, and a document of about 127 MiB (each piece is an entry of 38 bytes).
+/// 7 MB of spool for each, and a document of about 126 MiB (each piece is an entry of at most 38
+/// bytes).
 /// Together they are over the 1.5 GiB a restore accepts, and twelve of them fit. The generation the
 /// host makes holds the newest that fit; the restore's plan of it lists every one as a file to
 /// restore and none as refused, and what it restores is under the total.

@@ -22,15 +22,18 @@
 //!
 //! The daemon answers one of three ways, and the command says what each means for the kit.
 //! *Enabled*: backups are set up and the kit is in use. *Declined*: the daemon confirmed that
-//! nothing was recorded, so the kit opens nothing; the same kit is offered again, three times at
-//! most, for a refusal a person can mend. *Unknown*: the daemon cannot say. The call is repeated
+//! nothing was recorded, so the kit opens nothing, unless an earlier try of the same call got an
+//! answer that was lost, which may have recorded the setup; the same kit is offered again, three
+//! times at most, for a refusal a person can mend. *Unknown*: the daemon cannot say. The call is repeated
 //! with the same bytes and a new action identity, as the answer says, up to five times; if the
 //! outcome stays unknown the person is told to keep the kit until `kr doctor` settles it.
 //!
-//! Only a *Declined* answer says that the kit opens nothing once the call has been sent. Any
-//! other end of a sent call is unknown: a refusal, a failed connection and an interrupt can each
-//! come after the daemon recorded the setup, for example a refusal of an answer that the daemon
-//! withheld because the local owner's membership lease ended while it was being written.
+//! Only a *Declined* answer to a call whose earlier tries, if any, were all answered says that the
+//! kit opens nothing once the call has been sent. Any other end of a sent call is unknown: a
+//! refusal, a failed connection and an interrupt can each come after the daemon recorded the
+//! setup, for example a refusal of an answer that the daemon withheld because the local owner's
+//! membership lease ended while it was being written, and a decline of a repeat cannot rule out
+//! that an earlier try, whose answer was lost, recorded it.
 
 use std::fs::File;
 use std::io::{IsTerminal as _, Write as _};
@@ -197,13 +200,6 @@ pub async fn run(
                 ));
                 return Ok(Completion::Done);
             }
-            Ended::Declined(cause) if kit_may_be_recorded(&cause) => {
-                report::say(&shown!(
-                    "The daemon declined the call: {}.",
-                    declined_words(&cause)
-                ));
-                return Err(dialogue.kit_may_be_in_use());
-            }
             Ended::Declined(cause) => {
                 report::say(&shown!(
                     "Backups were not set up: {}.",
@@ -340,6 +336,15 @@ impl Dialogue {
             drop(daemon);
             let delay = match answer_of(answer) {
                 Answer::Ended(Ended::Declined(cause)) => {
+                    // Decided here, before the stage says that the daemon recorded nothing.
+                    if !a_decline_voids_the_kit(repeats > 0, &cause) {
+                        report::say(&shown!(
+                            "The daemon declined the call: {}. An earlier try of this call may \
+                             have set backups up under this kit.",
+                            declined_words(&cause)
+                        ));
+                        return Ok(Ended::Unknown);
+                    }
                     self.stage = Stage::KitShown;
                     return Ok(Ended::Declined(cause));
                 }
@@ -426,16 +431,6 @@ impl Dialogue {
             }
         }
         interrupt::stopped()
-    }
-
-    /// The ending of a call the daemon declined for a cause that can follow its recording of this
-    /// kit's setup by an earlier try.
-    fn kit_may_be_in_use(&self) -> CliError {
-        report::say(&Shown::said(
-            "An earlier try of this call may have set backups up under this kit.",
-        ));
-        self.keep_the_kit();
-        CliError::Other(Shown::said("how the setup ended is not known"))
     }
 
     /// The ending of a call whose outcome stayed unknown.
@@ -686,15 +681,16 @@ fn declined_words(cause: &BackupEnableCause) -> Shown {
     }
 }
 
-/// Whether the daemon can decline with `cause` after an earlier try of the same call recorded the
-/// setup: the repeat is answered from the record when the setup stands, so it is declined only
-/// when the record has since been replaced or the archive already has generations. The kit then
-/// opens what the earlier try recorded, and is kept until `kr doctor` settles it.
-const fn kit_may_be_recorded(cause: &BackupEnableCause) -> bool {
-    matches!(
-        cause,
-        BackupEnableCause::AlreadySetUp {} | BackupEnableCause::ArchiveInUse {}
-    )
+/// Whether the daemon's decline of a try says that the kit opens nothing.
+///
+/// A decline says that this try recorded nothing. It says nothing of an earlier try of the same
+/// call whose answer was lost: that try may have recorded the setup, and then a repeat is declined
+/// for whatever has changed since (the sign-in, an allowance, another setup that replaced the
+/// first). So a decline voids the kit only when every earlier try was answered. A decline for an
+/// archive that already has generations never does: a new archive has none unless a try recorded
+/// it.
+const fn a_decline_voids_the_kit(earlier_try_unknown: bool, cause: &BackupEnableCause) -> bool {
+    !earlier_try_unknown && !matches!(cause, BackupEnableCause::ArchiveInUse {})
 }
 
 /// Whether the person can mend a refusal and try the same kit again: the kit and its bundle are
@@ -921,16 +917,11 @@ mod tests {
         ));
     }
 
-    /// A daemon declines with a cause that can follow a recording of this kit's setup only when the
-    /// record has been replaced or the archive already has generations; every other cause comes
-    /// before anything is recorded.
+    /// A decline voids the kit only when no earlier try of the call was left unknown: after a
+    /// lost answer, whatever the cause, the earlier try may have recorded the setup.
     #[test]
-    fn only_the_causes_that_follow_a_recording_keep_the_kit() {
-        let after_a_recording = [
-            BackupEnableCause::AlreadySetUp {},
-            BackupEnableCause::ArchiveInUse {},
-        ];
-        let before_any_recording = [
+    fn a_decline_after_a_lost_answer_never_voids_the_kit() {
+        let causes = [
             BackupEnableCause::NoService {},
             BackupEnableCause::SignIn {
                 sign_in: BackupSignIn::SignedOut,
@@ -938,6 +929,8 @@ mod tests {
             BackupEnableCause::AnotherAccount {},
             BackupEnableCause::KeysChanged {},
             BackupEnableCause::BundleTooLarge {},
+            BackupEnableCause::AlreadySetUp {},
+            BackupEnableCause::ArchiveInUse {},
             BackupEnableCause::NoAllowance {},
             BackupEnableCause::TokenNotAccepted {},
             BackupEnableCause::BundleConflict {},
@@ -945,7 +938,17 @@ mod tests {
                 code: ErrorCode::PermissionDenied,
             },
         ];
-        assert!(after_a_recording.iter().all(kit_may_be_recorded));
-        assert!(!before_any_recording.iter().any(kit_may_be_recorded));
+        for cause in &causes {
+            assert!(
+                !a_decline_voids_the_kit(true, cause),
+                "{cause:?} after a lost answer"
+            );
+        }
+        // At a first try the daemon's word is the word: a decline recorded nothing, except for an
+        // archive that already has generations.
+        for cause in &causes {
+            let archive_in_use = matches!(cause, BackupEnableCause::ArchiveInUse {});
+            assert_eq!(a_decline_voids_the_kit(false, cause), !archive_in_use);
+        }
     }
 }
