@@ -590,14 +590,15 @@ mod tests {
     }
 
     /// A supervision that hears no child signal, so that a child of another case in this test
-    /// process ending cannot be what wakes it.
+    /// process ending cannot be what wakes it, and whose sweep is an hour away, so that no stall
+    /// of this test can bring the sweep round.
     fn deaf(activity: Arc<Activity>, started: Instant) -> Supervision {
         #[cfg(unix)]
         let exits = ChildExits(None);
         #[cfg(not(unix))]
         let exits = ChildExits;
         Supervision {
-            sweep: Sweep::begin(activity, started, IDLE_SWEEP_INTERVAL),
+            sweep: Sweep::begin(activity, started, IDLE_SWEEP_INTERVAL * 120),
             exits,
         }
     }
