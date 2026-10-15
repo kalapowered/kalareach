@@ -374,6 +374,10 @@ pub struct DeviceDirectory {
     /// device was revoked, or a grant was found to have run out. What keeps a lease for each
     /// paired device waits on it, so a device is given its lease as it is paired and loses it as
     /// it is unpaired, and not at the next time the keeper happens to look.
+    ///
+    /// It belongs to the set of devices and not to one handle on it: the daemon opens this
+    /// directory more than once, and a grant's end is written through whichever handle finds it
+    /// first, so every handle raises the one signal ([`Self::open_beside`]).
     changed: std::sync::Arc<tokio::sync::Notify>,
 }
 
@@ -385,7 +389,18 @@ impl DeviceDirectory {
     /// Returns an error when the database cannot be opened or migrated.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let connection = Connection::open(path.as_ref()).map_err(ControllerError::registry)?;
-        Self::prepare(connection)
+        Self::prepare(connection, std::sync::Arc::default())
+    }
+
+    /// Opens another handle on the directory `beside` is a handle on, raising the same signal as
+    /// it does ([`Self::changed`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the database cannot be opened or migrated.
+    pub(crate) fn open_beside(path: impl AsRef<Path>, beside: &Self) -> Result<Self> {
+        let connection = Connection::open(path.as_ref()).map_err(ControllerError::registry)?;
+        Self::prepare(connection, std::sync::Arc::clone(&beside.changed))
     }
 
     /// Opens an in-memory directory, which is what a test uses.
@@ -394,10 +409,16 @@ impl DeviceDirectory {
     ///
     /// Returns an error when the tables cannot be created.
     pub fn in_memory() -> Result<Self> {
-        Self::prepare(Connection::open_in_memory().map_err(ControllerError::registry)?)
+        Self::prepare(
+            Connection::open_in_memory().map_err(ControllerError::registry)?,
+            std::sync::Arc::default(),
+        )
     }
 
-    fn prepare(connection: Connection) -> Result<Self> {
+    fn prepare(
+        connection: Connection,
+        changed: std::sync::Arc<tokio::sync::Notify>,
+    ) -> Result<Self> {
         // The same durability the rest of the daemon's state uses: write-ahead logging with full
         // synchronisation. A device record that a crash lost would leave a paired device unable to
         // connect and no record of why.
@@ -418,7 +439,7 @@ impl DeviceDirectory {
             .map_err(ControllerError::registry)?;
         let directory = Self {
             connection: std::sync::Mutex::new(connection),
-            changed: std::sync::Arc::new(tokio::sync::Notify::new()),
+            changed,
         };
         directory.migrate()?;
         Ok(directory)

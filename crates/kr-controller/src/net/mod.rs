@@ -1273,8 +1273,11 @@ fn refusal(error: &kr_protocol::error::ProtocolError) -> kr_protocol::envelope::
 pub async fn register(controller: &Arc<Controller>, setup: NetworkSetup) -> Result<Network> {
     let environment_id = controller.paths().environment_id();
     let keys = host_device_keys(setup.secrets.as_ref(), environment_id)?;
-    let devices = Arc::new(DeviceDirectory::open(
+    // Beside the daemon's own handle on the directory, which writes a grant's end when its
+    // lifetimes find one: what waits on the set of devices hears of a change through either.
+    let devices = Arc::new(DeviceDirectory::open_beside(
         controller.paths().registry_database(),
+        controller.devices(),
     )?);
     // The daemon's one record of every grant's lifetime, read by the connections this host admits
     // and by the owner confirmations it spends, on the daemon's own clocks.
