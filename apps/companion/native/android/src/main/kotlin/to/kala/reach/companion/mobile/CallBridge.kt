@@ -109,8 +109,10 @@ object CallBridgeHolder {
  * if the question had been answered. It ends when the call is made or refused ([Opening.end]).
  * The answer ([Opening.answered]), the person's or the time running out, is taken once, and only
  * while the opening still waits for it. Each of these says whether it was the one that acted, so
- * whatever comes second does nothing: a late answer after the time ran out, a second ending. The
- * caller answers whoever is waiting only when it was the one that acted.
+ * whatever comes second does nothing: a late answer after the time ran out, a second ending. A
+ * step that fails answers whoever is waiting only when it was the one that ended the opening. The
+ * command that makes the call always answers, because nothing else ends an opening that is making
+ * one.
  */
 class CallOpenings {
     private var current: Opening? = null
