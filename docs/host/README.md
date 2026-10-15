@@ -371,11 +371,18 @@ room, does not make the record younger. If the payer in the configuration docume
 meanwhile, the daemon asks again under the payer the request was made for, ends the lease it finds,
 and then asks under the new payer. The service will refuse another authorisation of the same account
 for a pair that still has a lease, even one that has run out and is yet to be ended. For a device
-that is still paired, the daemon makes this ask however old the record is, and drops the record once
-the service has answered about the pair. If the service answers that the old authorisation is not
-one it holds for this host's key, or is no longer in force, no lease can be alive under it and the
-daemon drops the record at once. Any other refusal says nothing about the pair, so the daemon keeps
-the record and waits as it does for any answer only the owner can change.
+that is still paired, the daemon makes this ask however old the record is. When the record is older
+than the longest a lease can live, an answer that the allowance is spent drops it, and so does an
+answer that the service could not issue a lease if the new payer is another account. If the new
+payer is the same account, the daemon keeps the record and asks again after the wait, because the
+service gives that answer too for a lease whose relay it can no longer bill through, and such a
+lease stands in the way of the new authorisation. If the service answers that the old authorisation
+is not one it holds for this host's key, or is no longer in force, it names no lease under it and
+the daemon drops the record at once. The service ends the leases of an authorisation that is
+withdrawn but not those of one that lapses, and a lease the daemon was never told of cannot be ended
+by asking, so a lease that lapsed with its authorisation runs out by itself. Any other refusal says
+nothing about the pair, so the daemon keeps the record and waits as it does for any answer only the
+owner can change.
 
 Three kinds of answers to lease requests are not treated as errors. A spent allowance, and a service
 that could not issue a lease because it has no relay to offer or no room for one more, are answers
