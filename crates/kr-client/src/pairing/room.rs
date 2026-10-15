@@ -266,8 +266,8 @@ impl RoomConnector {
     ///
     /// # Errors
     ///
-    /// Returns a [`RoomError`] saying how far the socket got. The whole attempt is bounded by
-    /// [`wss::OPEN_DEADLINE`].
+    /// Returns a [`RoomError`] saying how far the socket got. The whole attempt is bounded by ten
+    /// seconds.
     pub async fn open(
         &self,
         origin: &RendezvousOrigin,
