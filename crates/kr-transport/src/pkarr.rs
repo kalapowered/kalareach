@@ -32,6 +32,14 @@ use crate::config::{ProxyUrl, Url};
 /// iroh's own resolver labels it.
 const PROVENANCE: &str = "pkarr";
 
+/// How long one request to a Pkarr server may take, from its start to the last byte of its answer.
+///
+/// A server that takes a request and never answers would otherwise hold a lookup open for ever, and
+/// a publication with it: the publisher would never publish again, and the record it left would
+/// lapse after its time to live. A request that runs out of its time fails as any failed request
+/// does, and a lookup or a publication goes on from there.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// When a name that has had no answer is asked of the DNS resolver's servers again, in
 /// milliseconds after the first question: the delays iroh's own lookups use.
 const DNS_STAGGERING_MS: &[u64] = &[200, 300, 600, 1000, 2000, 3000];
@@ -296,6 +304,7 @@ fn http_client(
     proxy: Option<&ProxyUrl>,
 ) -> Result<reqwest::Client, AddressLookupBuilderError> {
     let builder = reqwest::Client::builder()
+        .timeout(REQUEST_TIMEOUT)
         .tls_backend_preconfigured(endpoint.tls_config().clone())
         .dns_resolver(EndpointDns(endpoint.dns_resolver()?.clone()));
     let builder = match proxy {

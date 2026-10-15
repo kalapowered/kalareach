@@ -122,6 +122,50 @@ async fn resolve_naming(endpoint: &Endpoint, id: EndpointId, relay: &RelayUrl) -
     }
 }
 
+/// A Pkarr server that takes a lookup and never answers it does not hold the lookup for ever: the
+/// lookup ends with a failure, as one a server refused does, and the server was asked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pkarr_server_that_never_answers_ends_the_lookup_with_a_failure() {
+    let stalled = PkarrRelay::spawn_stalled();
+    let asking = side(
+        &EndpointConfig {
+            discovery: DiscoveryConfig {
+                pkarr_resolver_url: Some(stalled.url.clone()),
+                ..DiscoveryConfig::default()
+            },
+            bind_addr: loopback(),
+            ..EndpointConfig::default()
+        },
+        1,
+        false,
+    )
+    .await;
+    let other = side(
+        &EndpointConfig {
+            bind_addr: loopback(),
+            ..EndpointConfig::default()
+        },
+        2,
+        false,
+    )
+    .await;
+    let id = other.endpoint.id();
+    let (answers, failures) = resolve(&asking.endpoint, id).await;
+    assert!(
+        answers.is_empty(),
+        "a server that said nothing found nothing: {answers:?}"
+    );
+    assert!(
+        !failures.is_empty(),
+        "the lookup that was never answered ended as a failure"
+    );
+    assert_eq!(
+        stalled.lookups(&id),
+        1,
+        "the server was asked for the record"
+    );
+}
+
 /// Accepts one connection on the host and authorises it against the one device it paired.
 fn accept_paired(
     host: &Side,
