@@ -698,6 +698,7 @@ impl Refusal {
             error: crate::error::refusal(code, message),
             retry_after_seconds: self.retry_after_seconds,
             action,
+            service_code: self.code,
         }
     }
 }
@@ -798,10 +799,7 @@ fn answer_of(answer: &ServiceHttpAnswer, repeat: Repeat) -> Result<Answer> {
     Ok(Answer::Refused(Refusal {
         repeat,
         status: answer.status,
-        code: SERVICE_CODES
-            .iter()
-            .copied()
-            .find(|known| *known == named.code),
+        code: named_code(&named.code),
         message: ServiceMessage::from_refusal(named.message),
         retry_after_seconds: named.retry_after_seconds,
         answer: answer.body.clone(),
@@ -852,6 +850,11 @@ const SERVICE_CODES: [&str; 20] = [
     "SERVICE_UNAVAILABLE",
     "OUTCOME_UNKNOWN",
 ];
+
+/// The code the contract names that `text` spells, as this client's own constant.
+pub(super) fn named_code(text: &str) -> Option<&'static str> {
+    SERVICE_CODES.iter().copied().find(|known| *known == text)
+}
 
 /// The protocol code one service error code means, and what a person does about it.
 ///
