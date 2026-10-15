@@ -30,7 +30,7 @@ use kr_client::pairing::invitation::{Invitation, InvitationSummary, origin_host,
 use kr_client::pairing::link::{EndpointPool, HostLink, IrohLink};
 use kr_client::pairing::paired::{PairedHost, PairedHosts};
 use kr_client::pairing::room::RoomConnector;
-use kr_crypto::store::{SecretStore, open_store};
+use kr_crypto::store::SecretStore;
 use kr_pairing::budget::DurableClientBudgetStore;
 use kr_pairing::code::EnteredCode;
 use kr_pairing::platform::PairingClock;
@@ -159,20 +159,15 @@ pub struct Parts {
 }
 
 impl Parts {
-    /// This computer's own parts: the platform's secret store, or the documented directory under
-    /// `data` where it has none; the pairing service over the platform's TLS verifier; endpoints on
-    /// every interface; and this boot's clock.
+    /// This computer's own parts: `secrets`, the application's one secure store
+    /// (`companion_platform::secrets::open`, the same store the account keeps its tokens in); the
+    /// pairing service over the platform's TLS verifier; endpoints on every interface; and this
+    /// boot's clock.
     ///
     /// # Errors
     ///
-    /// Returns a local failure when the secret store, the TLS verifier or the clock cannot be set.
-    pub fn platform(data: &Path) -> Result<Self> {
-        let opened =
-            open_store(identity::SECRET_SERVICE, &data.join("secrets")).map_err(|error| {
-                CommandError::local_failure(format!(
-                    "the secret store could not be opened: {error}"
-                ))
-            })?;
+    /// Returns a local failure when the TLS verifier or the clock cannot be set.
+    pub fn platform(secrets: Arc<dyn SecretStore>) -> Result<Self> {
         let clock = DeviceClock::current().map_err(CommandError::from)?;
         let room = RoomConnector::platform().map_err(|error| {
             CommandError::local_failure(format!(
@@ -180,7 +175,7 @@ impl Parts {
             ))
         })?;
         Ok(Self {
-            secrets: Arc::from(opened.store),
+            secrets,
             room: Arc::new(room),
             bind: None,
             clock: Arc::new(clock),

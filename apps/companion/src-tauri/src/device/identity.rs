@@ -1,9 +1,11 @@
 //! This computer's identity as it pairs with hosts.
 //!
 //! Section 10 asks a companion and a host on one computer to hold separate identities, so the
-//! companion keeps its keys in a store named for it: the platform's own secret store (the Keychain,
-//! the Credential Manager, the Secret Service), or the documented directory on a Linux desktop that
-//! has none. The daemon's store is `KalaReach`; this one is [`SECRET_SERVICE`].
+//! companion keeps its keys in a store named for it: the application's one secure store
+//! (`companion_platform::secrets`), which is the platform's own (the Keychain, the Credential
+//! Manager, the Secret Service, Keystore-protected files on Android), or the documented directory
+//! on a Linux desktop that has none. The daemon's store is `KalaReach`; this one is
+//! `companion_platform::secrets::STORE_NAME`.
 
 use std::sync::Arc;
 
@@ -12,9 +14,6 @@ use kr_crypto::store::{SecretStore, load_device_keys, store_device_keys};
 use kr_protocol::pairing::{DeviceName, DevicePlatform};
 
 use crate::error::{CommandError, Result};
-
-/// The secret store this application keeps its keys in.
-pub const SECRET_SERVICE: &str = "KalaReach Companion";
 
 /// The scope this computer's keys, and its attempt budget's key, are stored under.
 pub const SCOPE: &str = "device";
