@@ -286,8 +286,8 @@ impl ServiceWeb {
     /// A service holding nothing, with backup storage off, answering as `origin`, which every
     /// request it admits must name.
     ///
-    /// It knows one account, [`ACCOUNT`], and one token for it, [`TOKEN`], issued with
-    /// [`BACKUP_WRITE_SCOPE`].
+    /// It knows one account, [`ACCOUNT`], and two tokens for it: [`TOKEN`], issued with
+    /// [`BACKUP_WRITE_SCOPE`], and [`RESTORE_TOKEN`], issued with [`BACKUP_RESTORE_SCOPE`] alone.
     #[must_use]
     pub fn at(origin: impl Into<String>) -> Self {
         let web = Self {

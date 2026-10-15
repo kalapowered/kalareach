@@ -8,15 +8,15 @@
 //! copy. Every write names its request identity, and the collection keeps a receipt for it, so a
 //! write asked about or fenced after its answer was lost is settled by what the receipt holds.
 //!
-//! A write spends the account's backup storage, so an account the test has left with no allowance is
-//! answered `402 QUOTA_EXHAUSTED` once its request identity has no receipt.
+//! A write spends the account's backup storage, so an account the test has left with no allowance
+//! is answered `402 QUOTA_EXHAUSTED` once its request identity has no receipt.
 //!
 //! The account whose write first applies is the collection's owner, and every other account is
-//! answered as for a collection that does not exist. A collection put back from an archive names the
-//! history it is in, with or without a bundle. The service knows one account, so a test sets either
-//! up with [`crate::ServiceWeb::put_bundle`] and [`crate::ServiceWeb::put_bundle_back`], which leave
-//! what a write by the owner and a restore of the archive leave. It is not modelled what a sweep past
-//! the receipts' retention does to a request signed before it.
+//! answered as for a collection that does not exist. A collection put back from an archive names
+//! the history it is in, with or without a bundle. The service knows one account, so a test sets
+//! either up with [`crate::ServiceWeb::put_bundle`] and [`crate::ServiceWeb::put_bundle_back`],
+//! which leave what a write by the owner and a restore of the archive leave. It is not modelled
+//! what a sweep past the receipts' retention does to a request signed before it.
 //!
 //! The source is the web repository's `workers/api/src/sync/{index,collection}.ts` and
 //! `packages/service-contracts/src/sync.ts`. Settings-sync collections, drafts and key records use
@@ -121,9 +121,10 @@ impl Bundles {
         Some((kept.write_sequence, decode(text)?))
     }
 
-    /// A write by `account` of `ciphertext` has applied, as the owner's write leaves the bundle: the
-    /// account owns the locator if nobody did, and the stream is held under the next place in the
-    /// collection's order. Writing again replaces the stream, as a later write of the owner does.
+    /// A write by `account` of `ciphertext` has applied, as the owner's write leaves the bundle:
+    /// the account owns the locator if nobody did, and the stream is held under the next place in
+    /// the collection's order. Writing again replaces the stream, as a later write of the owner
+    /// does.
     pub(crate) fn put(&mut self, locator: &str, account: &str, ciphertext: &[u8], now_ms: u64) {
         let collection = self.collections.entry(locator.to_owned()).or_default();
         collection.owner.get_or_insert_with(|| account.to_owned());
@@ -183,8 +184,8 @@ impl Bundles {
             return refusal(
                 400,
                 "INVALID_REQUEST",
-                "This service answers the recovery bundle at its locator and no other settings-sync \
-                 request.",
+                "This service answers the recovery bundle at its locator and no other \
+                 settings-sync request.",
             );
         }
         let asked = match read(member, &body[*member]) {
@@ -462,7 +463,8 @@ fn decode(text: &str) -> Option<Vec<u8>> {
 fn instant(ms: u64) -> String {
     let days = i64::try_from(ms / 86_400_000).unwrap_or(i64::MAX);
     let in_day = ms % 86_400_000;
-    // Civil date from a day count: Howard Hinnant's algorithm, for the proleptic Gregorian calendar.
+    // Civil date from a day count: Howard Hinnant's algorithm, for the proleptic Gregorian
+    // calendar.
     let shifted = days + 719_468;
     let era = shifted.div_euclid(146_097);
     let day_of_era = shifted.rem_euclid(146_097);
