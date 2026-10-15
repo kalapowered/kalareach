@@ -1102,7 +1102,8 @@ async fn a_setup_declined_at_its_first_try_because_another_finished_first_opens_
         shown.contains("Nothing was set up. The kit that was shown opens nothing: delete it."),
         "{shown}"
     );
-    // The plan above says to keep the kit and its fingerprint together; the unknown ending does not.
+    // The plan above says to keep the kit and its fingerprint together; the unknown ending's
+    // words are different.
     assert!(!shown.contains("Keep the kit until kr doctor"), "{shown}");
     assert_eq!(rig.recorded_kit().await, Some(quick_kit.fingerprint()));
     assert_ne!(slow_kit.fingerprint(), quick_kit.fingerprint());
@@ -1147,6 +1148,10 @@ async fn a_decline_that_follows_a_lost_answer_says_to_keep_the_kit() {
     assert!(said.contains(&kit.fingerprint()), "{said}");
     assert!(!shown.contains("type retry"), "{shown}");
     assert!(!shown.contains("opens nothing: delete it"), "{shown}");
+    // The sequence the faults make: the write, the read that would settle it, and the repeat's
+    // write. The daemon recorded nothing, so this is a kit that may be in use and is not.
+    assert_eq!(rig.requests_to(SYNC), 3);
+    assert_eq!(rig.recorded_kit().await, None);
 }
 
 /// A daemon that cannot be reached when the call is to be made has been given nothing, so the kit
