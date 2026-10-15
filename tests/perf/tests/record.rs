@@ -80,6 +80,7 @@ fn the_conditions_name_the_host_and_the_reference_host_it_is_held_to() {
             "processors",
             "memory",
             "load",
+            "speed",
             "stolen",
             "reference"
         ],
@@ -102,11 +103,16 @@ fn the_conditions_name_the_host_and_the_reference_host_it_is_held_to() {
         lines[4]
     );
     assert!(lines[5].contains(" entering, "), "{}", lines[5]);
+    assert!(
+        lines[6].contains(" ms entering and ") && lines[6].contains(" ms leaving"),
+        "the host's speed is read at both edges: {}",
+        lines[6]
+    );
     if cfg!(debug_assertions) {
         assert!(
-            lines[7].contains("the build is not optimised"),
+            lines[8].contains("the build is not optimised"),
             "an unoptimised build is short of the reference host: {}",
-            lines[7]
+            lines[8]
         );
     }
 }
