@@ -587,6 +587,12 @@ pub struct SessionRuntime {
     /// The instants of the session's acquisitions along a keystroke's path, which the input
     /// measurement records and nothing else does.
     trace: crate::trace::Shared,
+    /// Held by the supervision from the moment it copies out what an observation of the session's
+    /// processes works on until it has put the result back, and taken by each step of a closure
+    /// that observes them. A closure step then falls wholly before or wholly after an observation,
+    /// as it did when the observation kept the session: a process a reading found is in the record
+    /// before the step that stops what the record names.
+    observing: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl SessionRuntime {
@@ -659,6 +665,7 @@ impl SessionRuntime {
         };
         let counter = progress.counter();
         let trace = crate::trace::LockTrace::shared();
+        let observing = Arc::new(tokio::sync::Mutex::new(()));
         let wake = Arc::new(Notify::new());
         let closed = Arc::new(Notify::new());
 
@@ -955,6 +962,7 @@ impl SessionRuntime {
             activity: Arc::clone(&activity),
             progress: progress.clone(),
             trace: trace.clone(),
+            observing: Arc::clone(&observing),
         };
 
         let ingest_session = Arc::clone(&session);
@@ -1024,6 +1032,7 @@ impl SessionRuntime {
         let monitor_clock = Arc::clone(&shared_clock);
         let monitor_progress = progress;
         let monitor_trace = trace.clone();
+        let monitor_observing = Arc::clone(&observing);
         tokio::spawn(async move {
             // The monitor holds a runtime of its own so a closure it begins publishes its fence and
             // its paste terminator the same way a requested one does. Building it only once the
@@ -1040,6 +1049,7 @@ impl SessionRuntime {
                 activity: Arc::clone(&monitor_activity),
                 progress: monitor_progress,
                 trace: monitor_trace.clone(),
+                observing: Arc::clone(&monitor_observing),
             });
             // Built here rather than by the caller: waiting for a child to end is the runtime's
             // own facility, and this is the task that does the waiting.
@@ -1073,7 +1083,9 @@ impl SessionRuntime {
                 // recogniser's timer that forwards a held prefix at its deadline, the output the
                 // application produces. A reading that kept the session would move a prefix's
                 // deadline, or hold the prefix past it, by as long as the kernel took to answer.
+                let mut observing = None;
                 let observation = if wake == crate::lifecycle::Wake::Ownership {
+                    observing = Some(monitor_observing.lock().await);
                     let copied = {
                         let mut acquisition = monitor_trace.acquisition(Site::SupervisionWake);
                         acquisition.note(SUPERVISION_COPIED_OUT);
@@ -1120,6 +1132,7 @@ impl SessionRuntime {
                         acquisition.note(SUPERVISION_PUT_BACK);
                         session.finish_observation(observation);
                     }
+                    drop(observing.take());
                     // What the watch wants to be asked next, decided here, on the lock this pass
                     // already holds: a second acquisition per wake would put this loop in front of
                     // the pseudo-terminal's own reader that many more times. The reading itself is
@@ -1655,6 +1668,7 @@ impl CloseGate {
         let runtime = self.runtime;
         tokio::spawn(async move {
             {
+                let _observed = runtime.observing.lock().await;
                 let mut session = runtime.session();
                 let _ = session.request_stop();
             }
@@ -1677,6 +1691,7 @@ impl CloseGate {
             {
                 // Whatever is left is forced. Which processes that reached is recorded there, while
                 // the kernel still names them.
+                let _observed = runtime.observing.lock().await;
                 let mut session = runtime.session();
                 let _ = session.force_close();
             }
@@ -1690,6 +1705,7 @@ impl CloseGate {
             // is past the drain.
             runtime.progress.ingested_what_was_read().await;
             {
+                let _observed = runtime.observing.lock().await;
                 let mut session = runtime.session();
                 session.finish_close();
             }

@@ -313,7 +313,6 @@ async fn hold(
     // Its own marker, because the wait searches everything the session has retained and would find
     // an earlier round's echo of the same prefix at once.
     let marker = format!("<{name}{length}.{round}>");
-    trace.restart();
     if let Err(failure) = write(
         hosted,
         client,

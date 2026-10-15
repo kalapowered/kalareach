@@ -2563,27 +2563,40 @@ async fn the_recorder_keeps_each_acquisition_on_a_held_prefix_s_path() {
         .expect("the write is accepted");
     retained_within(&wired.runtime, b"kr-ready.\x1b", LIVENESS_DEADLINE).await;
     wired.runtime.observe_now();
-    // The observation's result is put back by a wake of its own.
-    let put_back = tokio::time::timeout(LIVENESS_DEADLINE, async {
+    // The observation's result is put back by a wake of its own, after the reading. A recording
+    // gives each event once, so what it gives is kept here as it comes.
+    let mut events = Vec::new();
+    let mut overflowed = false;
+    let (observation, put_back) = tokio::time::timeout(LIVENESS_DEADLINE, async {
         loop {
             let recording = trace.recording();
-            if let Some(wake) = recording.events.iter().find(|event| {
-                event.site == Site::SupervisionWake
-                    && event.value == kr_worker::runtime::SUPERVISION_PUT_BACK
-            }) {
-                return *wake;
+            overflowed |= recording.overflowed;
+            events.extend(recording.events);
+            // An observation that was under way when the recorder was armed leaves a put-back and
+            // no reading, so the pair is the first reading and the first put-back after it.
+            if let Some(read) = events
+                .iter()
+                .position(|event| event.site == Site::Observation)
+                && let Some(wake) = events[read..].iter().find(|event| {
+                    event.site == Site::SupervisionWake
+                        && event.value == kr_worker::runtime::SUPERVISION_PUT_BACK
+                })
+            {
+                return (events[read], *wake);
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
     })
     .await
     .expect("the observation's result was put back");
-    let recording = trace.recording();
-    assert!(!recording.overflowed, "a hold's events fit the recording");
+    // What had not finished being stored when the pair was found.
+    let last = trace.recording();
+    overflowed |= last.overflowed;
+    events.extend(last.events);
+    assert!(!overflowed, "a hold's events fit the recorder");
 
     let of = |site: Site| {
-        recording
-            .events
+        events
             .iter()
             .filter(move |event| event.site == site)
             .copied()
@@ -2621,7 +2634,6 @@ async fn the_recorder_keeps_each_acquisition_on_a_held_prefix_s_path() {
         forwarded.held >= woke.held,
         "and took the session after waking"
     );
-    let observation = of(Site::Observation)[0];
     assert!(
         observation.begun <= observation.held,
         "the observation read for a span"
@@ -2652,13 +2664,22 @@ async fn the_recorder_keeps_each_acquisition_on_a_held_prefix_s_path() {
 async fn a_process_the_session_started_is_recorded_by_an_observation_made_with_the_session_let_go()
 {
     let wired = wired("stty raw -echo; sleep 600 & printf 'kr-ready.%s;' \"$!\"; exec cat").await;
-    let told = retained_within(&wired.runtime, b";", LIVENESS_DEADLINE).await;
-    let told = String::from_utf8_lossy(&told).into_owned();
-    let job: u64 = told
-        .split_once("kr-ready.")
-        .and_then(|(_, rest)| rest.split_once(';'))
-        .and_then(|(pid, _)| pid.parse().ok())
-        .expect("the shell says which process it started");
+    // The shell says which process it started, between `kr-ready.` and a semicolon.
+    let job: u64 = tokio::time::timeout(LIVENESS_DEADLINE, async {
+        loop {
+            let told = String::from_utf8_lossy(&retained(&wired.runtime.session())).into_owned();
+            if let Some(pid) = told
+                .split_once("kr-ready.")
+                .and_then(|(_, rest)| rest.split_once(';'))
+                .and_then(|(pid, _)| pid.parse().ok())
+            {
+                return pid;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the shell says which process it started");
     let recorded = |wired: &Wired| {
         wired
             .runtime
@@ -2685,4 +2706,33 @@ async fn a_process_the_session_started_is_recorded_by_an_observation_made_with_t
         .close(ClosureReason::CloseRequested)
         .1
         .release();
+}
+
+/// KR-REQ-07.13: a closure goes on once the observation of the session's processes that was under
+/// way when it began has been put back.
+///
+/// Each step of a closure that observes the processes waits for an observation that has copied the
+/// record out and not yet put its result back, so that the closure does not stop what the record
+/// names before the record names what that reading found. The observation is stopped while it
+/// reads, a close is begun and released, and the closure has to complete once the observation is
+/// let go.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_closure_goes_on_once_the_observation_under_way_has_been_put_back() {
+    let wired = wired("stty raw -echo; printf 'kr-ready.'; exec cat").await;
+    retained_within(&wired.runtime, b"kr-ready.", LIVENESS_DEADLINE).await;
+
+    let (reading, resume) = wired.runtime.pause_in_next_observation();
+    wired.runtime.observe_now();
+    tokio::time::timeout(LIVENESS_DEADLINE, reading)
+        .await
+        .expect("the observation reached its reading")
+        .expect("the observation is reading");
+    let (_, gate) = wired.runtime.close(ClosureReason::CloseRequested);
+    gate.release();
+    resume.send(()).expect("lets the observation go");
+
+    let record = tokio::time::timeout(LIVENESS_DEADLINE, wired.runtime.wait_closed())
+        .await
+        .expect("the closure completed");
+    assert_eq!(record.reason, ClosureReason::CloseRequested);
 }

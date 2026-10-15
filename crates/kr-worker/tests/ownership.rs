@@ -280,15 +280,26 @@ fn kr_req_07_60_an_observation_made_on_a_copy_does_not_undo_a_newer_one_when_put
         "the later observation drops the job it found ended"
     );
 
+    let before = tree
+        .session
+        .owned()
+        .expect("a launched session owns its processes")
+        .record()
+        .processes;
     tree.session.finish_observation(copy);
+    let after = tree
+        .session
+        .owned()
+        .expect("a launched session owns its processes")
+        .record()
+        .processes;
     assert!(
         named(&tree).is_none(),
-        "and putting the copy back does not name it again"
+        "putting the copy back does not name the job again"
     );
-    let recorded = tree.recorded();
-    assert!(
-        recorded.contains(&tree.root()),
-        "what else the copy read is as an observation on the record would have it: {recorded:?}"
+    assert_eq!(
+        after, before,
+        "and it adds nothing the record had not already seen and dropped"
     );
 
     tree.end();

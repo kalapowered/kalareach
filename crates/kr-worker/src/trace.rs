@@ -90,7 +90,7 @@ mod recording {
     /// How many events a recorder holds in all. A recorder that is full stops and says so; it never
     /// wraps, so an event that is missing from a recording that overflowed is not evidence that
     /// nothing happened.
-    const EVENTS: usize = 4096;
+    pub(super) const EVENTS: usize = 4096;
 
     /// One event of a recording, in nanoseconds since the recorder's epoch.
     ///
@@ -123,19 +123,23 @@ mod recording {
         pub overflowed: bool,
     }
 
+    /// Marks a slot whose event a recording has already given.
+    const GIVEN: u64 = 1 << 63;
+
     /// The recorder one session carries.
     ///
     /// A slot is reserved once and written by one writer, and no slot is ever reused or cleared, so
-    /// a writer that is still storing when a new recording begins cannot disturb anyone's event. A
-    /// recording is the slots reserved since it began.
+    /// a writer that is still storing when a recording is read cannot disturb anyone's event. A
+    /// recording is the events stored and not yet given: one whose writer had not finished when the
+    /// last recording was read is in the next.
     #[derive(Debug)]
     pub struct LockTrace {
         epoch: Instant,
         armed: AtomicBool,
         /// The slots reserved so far.
         taken: AtomicUsize,
-        /// The first slot of the recording that is being taken.
-        window: AtomicUsize,
+        /// The first slot whose event a recording has not yet given.
+        unread: AtomicUsize,
         overflowed: AtomicBool,
         words: OnceLock<Box<[AtomicU64]>>,
     }
@@ -154,7 +158,7 @@ mod recording {
                 epoch: Instant::now(),
                 armed: AtomicBool::new(false),
                 taken: AtomicUsize::new(0),
-                window: AtomicUsize::new(0),
+                unread: AtomicUsize::new(0),
                 overflowed: AtomicBool::new(false),
                 words: OnceLock::new(),
             }
@@ -170,19 +174,12 @@ mod recording {
         pub fn arm(&self) {
             self.words
                 .get_or_init(|| (0..EVENTS * WORDS).map(|_| AtomicU64::new(0)).collect());
-            self.restart();
             self.armed.store(true, Ordering::Release);
         }
 
         /// Stops recording. What was recorded stays until the recorder is dropped.
         pub fn disarm(&self) {
             self.armed.store(false, Ordering::Release);
-        }
-
-        /// Begins a new recording: [`Self::recording`] gives what is stored from here on.
-        pub fn restart(&self) {
-            self.window
-                .store(self.taken.load(Ordering::Acquire), Ordering::Release);
         }
 
         /// The instant this recorder counts from.
@@ -197,19 +194,32 @@ mod recording {
             u64::try_from(at.saturating_duration_since(self.epoch).as_nanos()).unwrap_or(u64::MAX)
         }
 
-        /// What has been recorded since the recording began, in the order it finished.
+        /// Gives the events stored since the last time it was called, in the order they finished.
         ///
-        /// An event whose writer has not finished is not in it. One that began before the recording
-        /// did and finished after is.
+        /// An event whose writer has not finished is not in it, and is in the next one. One reader
+        /// at a time: the measurement that armed the recorder.
         #[must_use]
         pub fn recording(&self) -> Recording {
             let mut events = Vec::new();
             if let Some(words) = self.words.get() {
                 let used = self.taken.load(Ordering::Acquire).min(EVENTS);
-                let from = self.window.load(Ordering::Acquire).min(used);
-                for slot in words.chunks(WORDS).take(used).skip(from) {
+                let first = self.unread.load(Ordering::Acquire).min(used);
+                let mut contiguous = true;
+                let mut next = first;
+                for (index, slot) in words.chunks(WORDS).enumerate().take(used).skip(first) {
                     // A slot is whole once its site is stored, which is the last store.
-                    let Some(site) = Site::from_code(slot[0].load(Ordering::Acquire)) else {
+                    let word = slot[0].load(Ordering::Acquire);
+                    if word == 0 {
+                        contiguous = false;
+                        continue;
+                    }
+                    if contiguous {
+                        next = index + 1;
+                    }
+                    if word & GIVEN != 0 {
+                        continue;
+                    }
+                    let Some(site) = Site::from_code(word) else {
                         continue;
                     };
                     events.push(Event {
@@ -219,7 +229,9 @@ mod recording {
                         released: slot[3].load(Ordering::Relaxed),
                         value: slot[4].load(Ordering::Relaxed),
                     });
+                    slot[0].store(word | GIVEN, Ordering::Release);
                 }
+                self.unread.store(next, Ordering::Release);
             }
             Recording {
                 events,
@@ -370,5 +382,67 @@ mod shipped {
 
         /// Does nothing.
         pub const fn note(&mut self, _value: u64) {}
+    }
+}
+
+#[cfg(all(test, feature = "testing"))]
+mod tests {
+    use super::{LockTrace, Site};
+
+    #[test]
+    fn a_recording_gives_each_event_once_and_an_event_that_ends_late_is_in_the_next() {
+        let trace = LockTrace::new();
+        trace.arm();
+
+        let mut late = trace.acquisition(Site::Ingest);
+        late.held();
+        drop(trace.acquisition(Site::TimerLook));
+        let first = trace.recording();
+        assert_eq!(
+            first
+                .events
+                .iter()
+                .map(|event| event.site)
+                .collect::<Vec<_>>(),
+            [Site::TimerLook],
+            "an acquisition that has not ended is not in it"
+        );
+
+        drop(late);
+        let second = trace.recording();
+        assert_eq!(
+            second
+                .events
+                .iter()
+                .map(|event| event.site)
+                .collect::<Vec<_>>(),
+            [Site::Ingest],
+            "and it is in the next, with the instants it kept"
+        );
+        assert!(second.events[0].begun <= second.events[0].held);
+        assert!(
+            trace.recording().events.is_empty(),
+            "nothing is given twice"
+        );
+    }
+
+    #[test]
+    fn a_full_recorder_stops_and_says_so_rather_than_wrap() {
+        let trace = LockTrace::new();
+        trace.arm();
+        for _ in 0..super::recording::EVENTS + 3 {
+            drop(trace.acquisition(Site::Ingest));
+        }
+        let recording = trace.recording();
+        assert_eq!(recording.events.len(), super::recording::EVENTS);
+        assert!(recording.overflowed, "the loss is marked");
+    }
+
+    #[test]
+    fn nothing_is_recorded_until_it_is_armed() {
+        let trace = LockTrace::new();
+        drop(trace.acquisition(Site::Ingest));
+        trace.arm();
+        assert!(trace.recording().events.is_empty());
     }
 }
