@@ -111,8 +111,10 @@ pub fn run() {
                     connection::this_machines_host,
                 );
             }
-            // The account is built off the thread the platform starts the application on: opening
-            // the secure store on a phone asks the native half, which runs on that thread.
+            // The account is built off the thread the platform starts the application on, so the
+            // window does not wait for it. The pairing records are opened below on this thread,
+            // because a phone's host list needs them at once; the secure store answers there, since
+            // the native half is called on a queue of its own and not on this thread.
             let handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 if let Err(error) = handle.state::<account::AccountSlot>().get().await {
@@ -291,7 +293,12 @@ fn open_pairing(app: &tauri::AppHandle) {
         tracing::warn!("no application data directory, so this computer cannot pair");
         return;
     };
-    let opened = device::Parts::platform(&data).and_then(|parts| {
+    // The application's one secure store, as the account opens it: on a phone the native one,
+    // which the keyring the host's own store goes through does not reach.
+    let secrets = companion_platform::secrets::open(app).map_err(|error| {
+        error::CommandError::local_failure(format!("the secret store could not be opened: {error}"))
+    });
+    let opened = secrets.and_then(device::Parts::platform).and_then(|parts| {
         start_pairing(
             app,
             &data,
