@@ -12,10 +12,10 @@
 //!
 //! * [`the_client_decodes_what_the_worker_answered`] replays the recorded bodies through the
 //!   client, with no stand-in between.
-//! * [`the_stand_in_answers_as_the_worker_did`] runs the scripts against the stand-in and holds each
-//!   status, shape and decoded value to the record. The write that puts the bundle in place for the
-//!   reads is that script's setup, so the stand-in is given the bundle it holds after that write
-//!   rather than answering the write.
+//! * [`the_stand_in_answers_as_the_worker_did`] runs the scripts against the stand-in and holds
+//!   each status, shape and decoded value to the record. The write that puts the bundle in place
+//!   for the reads is that script's setup, so the stand-in is given the bundle it holds after that
+//!   write rather than answering the write.
 //!
 //! The recording is made again when the route's contract changes:
 //!
