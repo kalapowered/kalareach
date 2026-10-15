@@ -42,6 +42,12 @@ case "$platform" in
     *) printf 'usage: %s ios|android\n' "$0" >&2; exit 2 ;;
 esac
 
+permissions="${KR_PROBE_PERMISSIONS:-granted}"
+case "$permissions" in
+    granted | allow | deny | none) ;;
+    *) printf 'KR_PROBE_PERMISSIONS is granted, allow, deny or none\n' >&2; exit 2 ;;
+esac
+
 artefacts="${KR_TEST_ARTIFACTS_DIR:-/tmp/kr-test-artifacts}/voice-call-bridge-$platform"
 mkdir -p "${artefacts:?}"
 run="$(uuidgen)"
@@ -153,14 +159,23 @@ answer_permission_dialogs() { # allow|deny <process of the script>
     done
 }
 
-# The process that answers the permission dialogs, if one runs.
+# The process that answers the permission dialogs, if one runs. It runs as the leader of a process
+# group of its own, so that everything it starts is in that group.
 answerer=""
 
-# Ends the answerer and what it is running, and waits for it, so none outlives the device it taps.
+# Starts the answerer in a process group of its own.
+start_answerer() { # allow|deny
+    set -m
+    answer_permission_dialogs "$1" "$$" &
+    answerer=$!
+    set +m
+}
+
+# Ends the answerer and every process of its group, in whatever step it is, and waits for it, so
+# nothing it started outlives the device it taps.
 stop_answerer() {
     [ -z "$answerer" ] && return 0
-    pkill -P "$answerer" 2>/dev/null
-    kill "$answerer" 2>/dev/null
+    kill -TERM -- "-$answerer" 2>/dev/null
     wait "$answerer" 2>/dev/null
     answerer=""
 }
@@ -170,7 +185,7 @@ trap 'exit 143' TERM
 
 run_android() {
     local sdk="${ANDROID_HOME:-$HOME/Library/Android/sdk}" avd="${KR_ANDROID_AVD:-Nines_API_36_Play}"
-    local adb="$sdk/platform-tools/adb" port=5586
+    local adb="${KR_ADB:-$sdk/platform-tools/adb}" port=5586
     local serial="emulator-$port"
     [ -x "$adb" ] || { say "no adb under $sdk"; return 3; }
 
@@ -194,14 +209,12 @@ run_android() {
 
     "$adb" -s "$serial" uninstall "$app_id" >/dev/null 2>&1
     "$adb" -s "$serial" install -r "$apk" >/dev/null || { say "the package did not install"; return 2; }
-    local permissions="${KR_PROBE_PERMISSIONS:-granted}"
     case "$permissions" in
         granted)
             "$adb" -s "$serial" shell pm grant "$app_id" android.permission.RECORD_AUDIO
             "$adb" -s "$serial" shell pm grant "$app_id" android.permission.POST_NOTIFICATIONS 2>/dev/null
             ;;
         allow | deny | none) say "the permission question is left to the application, answer: $permissions" ;;
-        *) say "KR_PROBE_PERMISSIONS is granted, allow, deny or none"; return 2 ;;
     esac
 
     # The application reads its data directory, which is the application's own directory on
@@ -219,7 +232,7 @@ run_android() {
     done
 
     case "$permissions" in
-        allow | deny) answer_permission_dialogs "$permissions" "$$" & answerer=$! ;;
+        allow | deny) start_answerer "$permissions" ;;
     esac
 
     local waited=0 text=""
