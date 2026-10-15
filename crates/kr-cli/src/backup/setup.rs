@@ -23,10 +23,11 @@
 //! The daemon answers one of three ways, and the command says what each means for the kit.
 //! *Enabled*: backups are set up and the kit is in use. *Declined*: the daemon confirmed that
 //! nothing was recorded, so the kit opens nothing, unless an earlier try of the same call got an
-//! answer that was lost, which may have recorded the setup; the same kit is offered again, three
-//! times at most, for a refusal a person can mend. *Unknown*: the daemon cannot say. The call is repeated
-//! with the same bytes and a new action identity, as the answer says, up to five times; if the
-//! outcome stays unknown the person is told to keep the kit until `kr doctor` settles it.
+//! answer that was lost, which may have recorded the setup. After a decline that voids the kit,
+//! the same kit is offered again, three times at most, for a refusal a person can mend.
+//! *Unknown*: the daemon cannot say. The call is repeated with the same bytes and a new action
+//! identity, as the answer says, up to five times; if the outcome stays unknown the person is told
+//! to keep the kit until `kr doctor` settles it.
 //!
 //! Only a *Declined* answer to a call whose earlier tries, if any, were all answered says that the
 //! kit opens nothing once the call has been sent. Any other end of a sent call is unknown: a
@@ -684,11 +685,10 @@ fn declined_words(cause: &BackupEnableCause) -> Shown {
 /// Whether the daemon's decline of a try says that the kit opens nothing.
 ///
 /// A decline says that this try recorded nothing. It says nothing of an earlier try of the same
-/// call whose answer was lost: that try may have recorded the setup, and then a repeat is declined
-/// for whatever has changed since (the sign-in, an allowance, another setup that replaced the
-/// first). So a decline voids the kit only when every earlier try was answered. A decline for an
-/// archive that already has generations never does: a new archive has none unless a try recorded
-/// it.
+/// call whose answer was lost: that try may have recorded the setup, and another setup may have
+/// replaced it since; the repeat then runs again and can be declined for any cause. So a decline
+/// voids the kit only when every earlier try was answered. A decline for an archive that already
+/// has generations never does: a new archive has none unless a try recorded it.
 const fn a_decline_voids_the_kit(earlier_try_unknown: bool, cause: &BackupEnableCause) -> bool {
     !earlier_try_unknown && !matches!(cause, BackupEnableCause::ArchiveInUse {})
 }
