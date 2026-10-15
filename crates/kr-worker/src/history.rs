@@ -1199,6 +1199,7 @@ impl Segment {
 /// The history hands it to its caller, who makes it with the session let go: the write is a call
 /// to the disk, and everything that waits for the session waits for it otherwise.
 #[derive(Debug)]
+#[must_use = "the spool counts these bytes as held, so the write has to be made"]
 pub struct SpoolWrite {
     file: Arc<std::fs::File>,
     /// The cursor the segment starts at, which says which segment this write belongs to.
@@ -1234,6 +1235,11 @@ impl SpoolWrite {
     ///
     /// Returns what the history needs to settle the write when it did not reach the file.
     pub fn perform(&self, bytes: &[u8]) -> std::result::Result<(), SpoolWriteFailed> {
+        debug_assert_eq!(
+            bytes.len() as u64,
+            self.len,
+            "the write is made with the bytes it was counted for"
+        );
         #[cfg(feature = "testing")]
         self.pause.wait();
         #[cfg(test)]
