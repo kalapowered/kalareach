@@ -543,10 +543,22 @@ impl ServiceWeb {
         self.state.lock().expect("the state").relay.views()
     }
 
+    /// The account's backup storage admits no write of a recovery bundle from now on, or admits
+    /// one again.
+    pub fn refuse_bundle_writes(&self, refused: bool) {
+        self.state.lock().expect("the state").bundle_writes_refused = refused;
+    }
+
+    /// The sealed bundle the service holds at `locator`, if it holds one.
+    #[must_use]
+    pub fn bundle(&self, locator: &str) -> Option<Vec<u8>> {
+        self.bundle_write(locator).map(|(_, stream)| stream)
+    }
+
     /// The write sequence and the sealed stream the recovery bundle at `locator` stands at, when
     /// one is held.
     #[must_use]
-    pub fn bundle(&self, locator: &str) -> Option<(u64, Vec<u8>)> {
+    pub fn bundle_write(&self, locator: &str) -> Option<(u64, Vec<u8>)> {
         self.state.lock().expect("the state").bundles.held(locator)
     }
 
@@ -702,12 +714,6 @@ impl ServiceWeb {
         let mut state = self.state.lock().expect("the state");
         state.daily_snapshots = daily_snapshots;
         state.revision += 1;
-    }
-
-    /// The account's backup storage admits no write of a recovery bundle from now on, or admits
-    /// one again.
-    pub fn refuse_bundle_writes(&self, refused: bool) {
-        self.state.lock().expect("the state").bundle_writes_refused = refused;
     }
 
     /// A week passes in every authority feed: the records their hosts finished with are dropped, as
@@ -946,9 +952,12 @@ impl ServiceWeb {
         }
         if method == "sync.compare_exchange" {
             let State {
-                bundles, tokens, ..
+                bundles,
+                tokens,
+                bundle_writes_refused,
+                ..
             } = &mut *state;
-            return bundles.handle(tokens, body, token, now_ms());
+            return bundles.handle(tokens, body, token, now_ms(), !*bundle_writes_refused);
         }
         if method == "mailbox.deliver" {
             return crate::mailbox::deliver(&mut state.mailboxes, &signature, body, now_ms());
