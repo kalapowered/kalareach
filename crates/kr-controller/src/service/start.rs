@@ -780,6 +780,39 @@ impl Controller {
                     ))
                 }
             };
+        // The mailbox this host reads: what a remote owner announces to its authority feed's
+        // changes reaches the host there. It signs as the host and reads the mailbox its own
+        // stored-envelope key addresses, through the proxy this daemon started with. Nothing
+        // runs until the daemon exists. The record of the items it has accepted is opened whether
+        // or not a service is selected, so the environment's stored formats do not depend on the
+        // configuration.
+        let mailbox_record = crate::mailbox_reader::record::Record::open(setup.paths.state_dir())?;
+        let mailbox_reader = match started.mailbox.origin() {
+            None => None,
+            Some(origin) => {
+                let origin = kr_protocol::service::GatewayOrigin::new(origin).map_err(|error| {
+                    ControllerError::NotConfigured(format!(
+                        "{} in this host's configuration document ({}) is not usable: {error}",
+                        kr_protocol::hostinfo::configuration::MAILBOX_ORIGIN.key,
+                        kr_protocol::hostinfo::configuration::FILE_NAME,
+                    ))
+                })?;
+                let client = crate::mailbox_reader::managed_client(
+                    &origin,
+                    Self::outbound_of(&started)?.proxy()?,
+                    Arc::new(crate::push::sender::HostSigner::new(
+                        device_keys.authorisation.clone(),
+                    )),
+                )?;
+                Some(crate::mailbox_reader::MailboxReader::new(
+                    client,
+                    &origin,
+                    device_keys.stored_envelope.clone(),
+                    mailbox_record,
+                    Arc::clone(&timer),
+                ))
+            }
+        };
         // External destinations' credentials are kept in the same store as this host's own keys,
         // in a scope of their own, and never in the delivery journal.
         let destination_secrets =
@@ -988,6 +1021,7 @@ impl Controller {
             backup_relay,
             feed_runtime,
             relay_keeper,
+            mailbox_reader,
             feed_notice_wake: Arc::new(tokio::sync::Notify::new()),
             feed_notice_task: std::sync::OnceLock::new(),
             feed_notice_attempts: tokio::sync::watch::channel(0).0,
@@ -1248,6 +1282,11 @@ impl Controller {
                 runtime.found_removed();
             }
             runtime.run(&controller);
+        }
+        // What a remote owner announces to the host's mailbox is read from here on, and wakes the
+        // carrier above. The devices it opens an item against are the ones this host has paired.
+        if let Some(reader) = &controller.mailbox_reader {
+            reader.run(&controller, Arc::clone(controller.devices()));
         }
         // The network comes up last. A paired device must not reach a daemon that has not yet
         // recovered its reservations and rebuilt its worker directory, because it would be told

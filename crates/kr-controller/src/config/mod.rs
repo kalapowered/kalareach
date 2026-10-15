@@ -423,7 +423,8 @@ pub struct Started {
     pub storage: configuration::StorageSelection,
     /// The authority feed this daemon reads its remote revocations from.
     pub authority: configuration::AuthoritySelection,
-    /// The mailbox service this daemon places the encrypted objects of its notifications in.
+    /// The mailbox service this daemon places the encrypted objects of its notifications in, and
+    /// reads its own mailbox from.
     pub mailbox: configuration::MailboxSelection,
     /// The relay lease service this daemon keeps a lease with for each paired device.
     pub relay: configuration::RelaySelection,

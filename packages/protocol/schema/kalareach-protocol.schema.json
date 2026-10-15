@@ -8614,7 +8614,7 @@
         },
         "mailbox": {
           "$ref": "#/$defs/MailboxSelection",
-          "description": "The mailbox service this host places the encrypted objects of its notifications in.\n\nA section of level 3: written only when it selects something, and ignored, with a\ncount, by a release that reads level 2. Read when the daemon starts, so a change applies\nat the next start. No environment variable reaches it."
+          "description": "The mailbox service this host places the encrypted objects of its notifications in, and\nreads its own mailbox from.\n\nA section of level 3: written only when it selects something, and ignored, with a\ncount, by a release that reads level 2. Read when the daemon starts, so a change applies\nat the next start. No environment variable reaches it."
         },
         "network": {
           "$ref": "#/$defs/NetworkSelection",
@@ -20364,7 +20364,7 @@
     },
     "MailboxSelection": {
       "additionalProperties": false,
-      "description": "The mailbox service this host places the encrypted objects of its notifications in.\n\nA notification whose detail does not fit in a push moves the detail into an encrypted\nobject sealed to the paired device. With a service selected here, the host places that\nobject in the device's mailbox before it presents the push that refers to it. A provider\norigin, so it is this document's to choose and no inherited variable's. The daemon reads it\nwhen it starts, so a change applies at the next start. Absent means this host places\nnothing: the push is presented as it always was, and a device that looks for the object\nfinds none.\n\nThe section arrived with level 3. A release that reads level 2 does not know it: it applies\nthe rest of the document, counts the section among the members it ignores, and does not\nedit the document, so a host rolled back to such a release places nothing until it is\nbrought forward again.",
+      "description": "The mailbox service this host places the encrypted objects of its notifications in, and\nreads its own mailbox from.\n\nA notification whose detail does not fit in a push moves the detail into an encrypted\nobject sealed to the paired device. With a service selected here, the host places that\nobject in the device's mailbox before it presents the push that refers to it. The host also\nreads its own mailbox there, where a remote owner announces that the host's authority feed\nchanged, and has the feed read at once. A provider origin, so it is this document's to\nchoose and no inherited variable's. The daemon reads it when it starts, so a change applies\nat the next start. Absent means this host places nothing and reads no mailbox: the push is\npresented as it always was, a device that looks for the object finds none, and the host\nlearns a change to its feed at the next poll.\n\nThe section arrived with level 3. A release that reads level 2 does not know it: it applies\nthe rest of the document, counts the section among the members it ignores, and does not\nedit the document, so a host rolled back to such a release places nothing until it is\nbrought forward again.",
       "properties": {
         "origin": {
           "anyOf": [

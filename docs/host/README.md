@@ -235,7 +235,7 @@ variables an older build read joins nothing because of them.
 | `voice.broker_origin` | the managed broker this host starts a device's voice session at, through the proxy `network.proxy_url` selects | an absolute `https` origin, or an `http` origin on `localhost`, `127.0.0.1` or `[::1]`, of at most 128 bytes, in lower case, with no path and no port its scheme already implies; a plain-HTTP origin cannot be combined with `network.proxy_url`, because the proxy would carry the account token in clear text |
 | `storage.origin` | the managed storage service this host uploads its backups to | an `https` origin, or an `http` origin on a loopback address, in the spelling a gateway origin has, with no path and no trailing slash; the daemon refuses to start unless it is the managed account service |
 | `authority.origin` | the authority feed this host reads its remote revocations from; a section of level 2: a release that reads level 1 ignores it, and its host takes a device's revocation only from the owner at the machine | an `https` origin, or an `http` origin on a loopback address, in the spelling a gateway origin has, with no path and no trailing slash |
-| `mailbox.origin` | the mailbox service this host places the encrypted objects of its notifications in; a section of level 3, so a release that reads level 2 ignores it and its host places nothing, which leaves a notification whose detail does not fit reaching a device without it | an `https` origin, or an `http` origin on a loopback address, in the spelling a gateway origin has, with no path and no trailing slash |
+| `mailbox.origin` | the mailbox service this host places the encrypted objects of its notifications in and reads its own mailbox from, where a remote owner announces a change to the host's authority feed; a section of level 3, so a release that reads level 2 ignores it, places nothing and reads no mailbox, which leaves a notification whose detail does not fit reaching a device without it | an `https` origin, or an `http` origin on a loopback address, in the spelling a gateway origin has, with no path and no trailing slash |
 | `relay.origin` | the relay lease service this host asks for a lease for each paired device; a section of level 4 | an `https` origin, or an `http` origin on a loopback address, in the spelling a gateway origin has, with no path and no trailing slash |
 | `relay.payer` | the account that pays for those leases and the authorisation it gave this host's key | an object with `account_id` and `authorisation_id`, each a lower-case hyphenated UUID; it needs `relay.origin` |
 
@@ -430,6 +430,32 @@ configuration document, it will also leave the leases alone. Removing `relay.ori
 document, or rolling back to a release that reads level 3, leaves the leases the host holds to run
 out within fifteen minutes, and the host sends no ending. The `relay-leases` check in `kr doctor`
 indicates how many paired devices have leases, and when the next refill is due.
+
+### The host's own mailbox
+
+A host whose configuration document names a mailbox service (`mailbox.origin`) reads its own mailbox
+there as well as placing objects in its devices' mailboxes. A remote owner who publishes a
+revocation to the host's authority feed can announce the change to the host's mailbox. The host then
+has the feed read at once instead of at the next poll. The announcement says that the feed changed
+and nothing about what changed. The feed is the record. A host that never sees an announcement still
+learns every revocation from the feed, and an announcement that is forged, repeated or lost changes
+nothing the feed does not already say.
+
+The daemon reads the mailbox when it starts and every ten seconds after that. It takes an item only
+if the item opens against the stored-envelope key of a device the host has paired and has not
+unpaired. It drops everything else: an item from any other key, an item whose routing record outside
+the envelope does not match what the box authenticated, an expired item, an item it accepted before,
+and any payload that claims authority of its own. An item that opens but is not an announcement that
+the feed changed is removed from the service and does nothing, because the mailbox carries no
+keystroke, command, decision or closure.
+
+The daemon writes down the identifier of each item it accepts before it acts on the item and before
+it tells the service the item can be removed. The record is a file called `mailbox-replay.sqlite3`
+in its state directory, and it keeps an identifier until the item's expiry and a day more. A daemon
+that stops between the two steps reads the item again after it starts and refuses it as a replay.
+The `mailbox-reader` check in `kr doctor` says when the mailbox was last read, how many
+announcements the daemon has taken, ignored and dropped since it started, and whether the service
+could not be reached or turned the host's request back.
 
 ### Account sign-in
 

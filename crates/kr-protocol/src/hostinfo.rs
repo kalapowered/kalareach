@@ -1976,7 +1976,8 @@ pub mod configuration {
         /// at the next start. No environment variable reaches it.
         #[serde(default, skip_serializing_if = "levels::is_unused")]
         pub authority: AuthoritySelection,
-        /// The mailbox service this host places the encrypted objects of its notifications in.
+        /// The mailbox service this host places the encrypted objects of its notifications in, and
+        /// reads its own mailbox from.
         ///
         /// A section of level 3: written only when it selects something, and ignored, with a
         /// count, by a release that reads level 2. Read when the daemon starts, so a change applies
@@ -2590,15 +2591,18 @@ pub mod configuration {
         }
     }
 
-    /// The mailbox service this host places the encrypted objects of its notifications in.
+    /// The mailbox service this host places the encrypted objects of its notifications in, and
+    /// reads its own mailbox from.
     ///
     /// A notification whose detail does not fit in a push moves the detail into an encrypted
     /// object sealed to the paired device. With a service selected here, the host places that
-    /// object in the device's mailbox before it presents the push that refers to it. A provider
-    /// origin, so it is this document's to choose and no inherited variable's. The daemon reads it
-    /// when it starts, so a change applies at the next start. Absent means this host places
-    /// nothing: the push is presented as it always was, and a device that looks for the object
-    /// finds none.
+    /// object in the device's mailbox before it presents the push that refers to it. The host also
+    /// reads its own mailbox there, where a remote owner announces that the host's authority feed
+    /// changed, and has the feed read at once. A provider origin, so it is this document's to
+    /// choose and no inherited variable's. The daemon reads it when it starts, so a change applies
+    /// at the next start. Absent means this host places nothing and reads no mailbox: the push is
+    /// presented as it always was, a device that looks for the object finds none, and the host
+    /// learns a change to its feed at the next poll.
     ///
     /// The section arrived with level 3. A release that reads level 2 does not know it: it applies
     /// the rest of the document, counts the section among the members it ignores, and does not
@@ -4526,10 +4530,12 @@ pub mod configuration {
         about: "the authority feed this host reads its remote revocations from",
     };
 
-    /// The mailbox service this host places the encrypted objects of its notifications in.
+    /// The mailbox service this host places the encrypted objects of its notifications in, and
+    /// reads its own mailbox from.
     pub const MAILBOX_ORIGIN: Selection = Selection {
         key: "mailbox.origin",
-        about: "the mailbox service this host places the encrypted objects of its notifications in",
+        about: "the mailbox service this host places the encrypted objects of its notifications \
+                in, and reads its own mailbox from",
     };
 
     /// The relay lease service this host asks for a lease for each paired device.
