@@ -406,6 +406,9 @@ pub struct Controller {
     /// What keeps a relay lease for each paired device, when this host's configuration document
     /// selects a relay lease service.
     relay_keeper: Option<crate::relay_leases::RelayKeeper>,
+    /// What reads this host's own mailbox, when its configuration document selects an authority
+    /// feed, whose service holds that mailbox.
+    mailbox_reader: Option<crate::mailbox_reader::MailboxReader>,
     /// Wakes the task that gives the owner's inbox its notices about the authority feed.
     feed_notice_wake: Arc<tokio::sync::Notify>,
     /// That task, which ends when the daemon is dropped.
@@ -1047,6 +1050,13 @@ impl Controller {
     #[must_use]
     pub const fn relay_keeper(&self) -> Option<&crate::relay_leases::RelayKeeper> {
         self.relay_keeper.as_ref()
+    }
+
+    /// What reads this host's own mailbox, when its configuration document selects an authority
+    /// feed, whose service holds that mailbox.
+    #[must_use]
+    pub const fn mailbox_reader(&self) -> Option<&crate::mailbox_reader::MailboxReader> {
+        self.mailbox_reader.as_ref()
     }
 }
 

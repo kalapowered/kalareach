@@ -222,6 +222,10 @@ pub struct Waits {
     /// with one also joins the network with its own key store, as a daemon's start does, so the
     /// host key it signs a service's requests with is the one its pairings recorded.
     pub timer: Option<Arc<dyn kr_controller::quiet::Timer>>,
+    /// Whether the reader of the host's own mailbox waits by `timer` too. When it does not, it
+    /// waits by a timer of its own that nothing releases, so that a suite reading the order of the
+    /// carriers' waits meets only theirs.
+    pub reader_shares_the_timer: bool,
 }
 
 impl Host {
@@ -363,7 +367,56 @@ impl Host {
             Arc::new(MemoryStore::new()),
             clocks,
             None,
-            Waits { timer: Some(timer) },
+            Waits {
+                timer: Some(timer),
+                reader_shares_the_timer: false,
+            },
+        )
+        .await;
+        let (device, record) = bootstrap_owner(&host, owner).await;
+        host.owner = Some(record);
+        host.owner_device = Some(device);
+        host
+    }
+
+    /// Starts a daemon whose configuration document selects the authority feed at `origin`, whose
+    /// carriers wait by `timer`, with `owner` as its first owner.
+    ///
+    /// The host's own keys are `host_keys`, put where the daemon finds them when it starts, so a
+    /// suite can seal an item to the host's mailbox before the daemon reads it.
+    pub async fn start_with_feed_and_keys(
+        owner: &DeviceKeys,
+        host_keys: &DeviceKeys,
+        origin: &str,
+        timer: Arc<dyn kr_controller::quiet::Timer>,
+        clocks: Clocks,
+    ) -> Self {
+        let temp = kr_ipc::testing::TempHost::create();
+        let secrets = open_store_in(&temp.environment().secrets_dir())
+            .expect("a secret store for the test environment");
+        kr_crypto::store::store_device_keys(
+            secrets.store.as_ref(),
+            &net::device_key_scope(temp.environment_id()),
+            host_keys,
+        )
+        .expect("the host's keys are stored");
+        drop(secrets);
+        write_feed_document(&temp, Some(origin));
+        let mut host = Self::start_on(
+            temp,
+            room::TestRoom::new(),
+            NetworkSettings {
+                endpoint: loopback(),
+                ..NetworkSettings::default()
+            },
+            AccountAt::Managed,
+            Arc::new(MemoryStore::new()),
+            clocks,
+            None,
+            Waits {
+                timer: Some(timer),
+                reader_shares_the_timer: true,
+            },
         )
         .await;
         let (device, record) = bootstrap_owner(&host, owner).await;
@@ -409,7 +462,10 @@ impl Host {
             Arc::new(MemoryStore::new()),
             clocks,
             None,
-            Waits { timer: Some(timer) },
+            Waits {
+                timer: Some(timer),
+                reader_shares_the_timer: false,
+            },
         )
         .await;
         let (device, record) = bootstrap_owner(&host, owner).await;
@@ -557,11 +613,20 @@ impl Host {
             };
             kr_controller::testing::with_account_origin(account_origin.clone(), async {
                 match &waits.timer {
-                    Some(timer) => {
+                    Some(timer) if waits.reader_shares_the_timer => {
                         Box::pin(Controller::start_on_clocks_and_timer(
                             setup,
                             clocks.clone(),
                             Arc::clone(timer),
+                        ))
+                        .await
+                    }
+                    Some(timer) => {
+                        Box::pin(Controller::start_on_clocks_and_timers(
+                            setup,
+                            clocks.clone(),
+                            Arc::clone(timer),
+                            kr_controller::testing::HeldTimer::held(),
                         ))
                         .await
                     }
@@ -788,8 +853,25 @@ impl Stopped {
     }
 
     /// Starts a daemon on the stopped one's environment tree as [`Self::start`] does, its carriers
-    /// waiting by `timer`.
+    /// waiting by `timer`. The reader of its own mailbox waits by a timer of its own that nothing
+    /// releases.
     pub async fn start_with_timer(self, timer: Arc<dyn kr_controller::quiet::Timer>) -> Host {
+        self.start_with_timer_and_reader(timer, false).await
+    }
+
+    /// As [`Self::start_with_timer`], the reader of the host's own mailbox waiting by `timer` too.
+    pub async fn start_with_timer_shared_with_the_reader(
+        self,
+        timer: Arc<dyn kr_controller::quiet::Timer>,
+    ) -> Host {
+        self.start_with_timer_and_reader(timer, true).await
+    }
+
+    async fn start_with_timer_and_reader(
+        self,
+        timer: Arc<dyn kr_controller::quiet::Timer>,
+        reader_shares_the_timer: bool,
+    ) -> Host {
         let Self {
             temp,
             room,
@@ -809,7 +891,10 @@ impl Stopped {
             secrets,
             clocks,
             boot,
-            Waits { timer: Some(timer) },
+            Waits {
+                timer: Some(timer),
+                reader_shares_the_timer,
+            },
         )
         .await;
         host.owner = owner;

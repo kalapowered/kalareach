@@ -24,6 +24,9 @@
 //! * **Every [`FEED_POLL_INTERVAL_MS`] after that**, while the daemon runs.
 //! * **When an owner is revoked**, so the key it held stops being named as one that may remove the
 //!   feed.
+//! * **When the host finds an announcement in its mailbox** ([`crate::mailbox_reader`]), so a
+//!   change a remote owner just published is read when the announcement is found and not at the
+//!   next poll.
 //!
 //! # What a record becomes
 //!
@@ -195,6 +198,10 @@ struct Shared {
     /// The newest request count that a pass which began after the request was made has finished.
     completed: tokio::sync::watch::Sender<u64>,
     wake: tokio::sync::Notify,
+    /// How many times something asked the carrier to look again now, for a suite that checks a
+    /// wake was or was not made.
+    #[cfg(feature = "testing")]
+    wakes: AtomicU64,
     removed: AtomicBool,
     /// The highest sequence of the feed up to which everything is settled, where a scan starts.
     settled_through: AtomicU64,
@@ -257,6 +264,8 @@ impl FeedRuntime {
                 requested: AtomicU64::new(0),
                 completed: tokio::sync::watch::channel(0).0,
                 wake: tokio::sync::Notify::new(),
+                #[cfg(feature = "testing")]
+                wakes: AtomicU64::new(0),
                 removed: AtomicBool::new(false),
                 settled_through: AtomicU64::new(0),
                 scan_cursor: AtomicU64::new(0),
@@ -345,7 +354,17 @@ impl FeedRuntime {
         if CARRYING_OUT.try_with(|()| ()).is_ok() {
             return;
         }
+        #[cfg(feature = "testing")]
+        self.shared.wakes.fetch_add(1, Ordering::SeqCst);
         self.shared.wake.notify_one();
+    }
+
+    /// How many times something has asked the carrier to look again now, without counting a wake
+    /// the carrier made of itself while carrying a request out.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn wakes(&self) -> u64 {
+        self.shared.wakes.load(Ordering::SeqCst)
     }
 
     /// Holds a connection that was just admitted until the host has synchronised the feed after

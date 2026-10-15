@@ -804,6 +804,20 @@ pub fn table() -> Vec<Store> {
             levels: None,
             writers: Writers::Daemon,
             entry: entry(
+                "mailbox-replay",
+                StoreScope::Environment,
+                "mailbox-replay.sqlite3",
+                sqlite_table("mailbox_replay_schema"),
+                version(kr_controller::mailbox_reader::record::SCHEMA_VERSION),
+                version(kr_controller::mailbox_reader::record::OLDEST_SCHEMA_VERSION),
+            ),
+            owned: Vec::new(),
+            kept: Vec::new(),
+        },
+        Store {
+            levels: None,
+            writers: Writers::Daemon,
+            entry: entry(
                 "relay-leases",
                 StoreScope::Environment,
                 "relay-leases.sqlite3",

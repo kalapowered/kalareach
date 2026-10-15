@@ -226,7 +226,7 @@ impl Controller {
     /// Returns an error when another daemon owns the environment, the registry cannot be opened,
     /// or the controller identity is missing.
     pub async fn start(setup: ControllerSetup) -> Result<Arc<Self>> {
-        Self::start_with(setup, Clocks::system(), Arc::new(RealTimer)).await
+        Self::start_with(setup, Clocks::system(), Arc::new(RealTimer), None).await
     }
 
     /// Starts the daemon on the clocks a test gives it, by the same path [`Self::start`] takes on
@@ -237,7 +237,7 @@ impl Controller {
     /// As [`Self::start`].
     #[cfg(feature = "testing")]
     pub async fn start_on_clocks(setup: ControllerSetup, clocks: Clocks) -> Result<Arc<Self>> {
-        Self::start_with(setup, clocks, Arc::new(RealTimer)).await
+        Self::start_with(setup, clocks, Arc::new(RealTimer), None).await
     }
 
     /// Starts the daemon with the wait between the passes of its backup carrier in the hands of
@@ -251,7 +251,7 @@ impl Controller {
         setup: ControllerSetup,
         timer: Arc<dyn Timer>,
     ) -> Result<Arc<Self>> {
-        Self::start_with(setup, Clocks::system(), timer).await
+        Self::start_with(setup, Clocks::system(), timer, None).await
     }
 
     /// Starts the daemon on the clocks a test gives it, with the waits of its carriers in the hands
@@ -266,13 +266,34 @@ impl Controller {
         clocks: Clocks,
         timer: Arc<dyn Timer>,
     ) -> Result<Arc<Self>> {
-        Self::start_with(setup, clocks, timer).await
+        Self::start_with(setup, clocks, timer, None).await
+    }
+
+    /// As [`Self::start_on_clocks_and_timer`], with the waits of the reader of the host's own
+    /// mailbox in the hands of `mailbox_timer` and not of `timer`.
+    ///
+    /// A suite that holds the carriers' waits and reads the order they were asked for in has no
+    /// use for the ten-second wait of a task it is not about, and gives that task a timer of its
+    /// own, which it never releases.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::start`].
+    #[cfg(feature = "testing")]
+    pub async fn start_on_clocks_and_timers(
+        setup: ControllerSetup,
+        clocks: Clocks,
+        timer: Arc<dyn Timer>,
+        mailbox_timer: Arc<dyn Timer>,
+    ) -> Result<Arc<Self>> {
+        Self::start_with(setup, clocks, timer, Some(mailbox_timer)).await
     }
 
     async fn start_with(
         setup: ControllerSetup,
         clocks: Clocks,
         timer: Arc<dyn Timer>,
+        mailbox_timer: Option<Arc<dyn Timer>>,
     ) -> Result<Arc<Self>> {
         // The start is a long chain of steps, and its state is large. It is kept on the heap, so
         // that a caller that polls it from a small stack, as a test's thread is, does not hold it.
@@ -281,6 +302,7 @@ impl Controller {
             clocks,
             PassSchedule::every(DEBT_PASS_INTERVAL),
             timer,
+            mailbox_timer,
         ))
         .await
     }
@@ -291,6 +313,7 @@ impl Controller {
         clocks: Clocks,
         passes: PassSchedule,
         timer: Arc<dyn Timer>,
+        mailbox_timer: Option<Arc<dyn Timer>>,
     ) -> Result<Arc<Self>> {
         let Clocks {
             continuous: clock,
@@ -800,6 +823,40 @@ impl Controller {
                     ))
                 }
             };
+        // The mailbox this host reads: a remote owner's announcement that the authority feed
+        // changed is placed in the mailbox of the service that holds the feed, so the host reads
+        // it at the service `authority.origin` names and at none other. It signs as the host and
+        // reads the mailbox its own stored-envelope key addresses, through the proxy this daemon
+        // started with. Nothing runs until the daemon exists. The record of the items it has
+        // accepted is opened whether or not a feed is selected, so the environment's stored
+        // formats do not depend on the configuration.
+        let mailbox_record = crate::mailbox_reader::record::Record::open(setup.paths.state_dir())?;
+        let mailbox_reader = match started.authority.origin() {
+            None => None,
+            Some(origin) => {
+                let origin = kr_protocol::service::GatewayOrigin::new(origin).map_err(|error| {
+                    ControllerError::NotConfigured(format!(
+                        "{} in this host's configuration document ({}) is not usable: {error}",
+                        kr_protocol::hostinfo::configuration::AUTHORITY_ORIGIN.key,
+                        kr_protocol::hostinfo::configuration::FILE_NAME,
+                    ))
+                })?;
+                let client = crate::mailbox_reader::managed_client(
+                    &origin,
+                    Self::outbound_of(&started)?.proxy()?,
+                    Arc::new(crate::push::sender::HostSigner::new(
+                        device_keys.authorisation.clone(),
+                    )),
+                )?;
+                Some(crate::mailbox_reader::MailboxReader::new(
+                    client,
+                    &origin,
+                    device_keys.stored_envelope.clone(),
+                    mailbox_record,
+                    mailbox_timer.unwrap_or_else(|| Arc::clone(&timer)),
+                ))
+            }
+        };
         // External destinations' credentials are kept in the same store as this host's own keys,
         // in a scope of their own, and never in the delivery journal.
         let destination_secrets =
@@ -1022,6 +1079,7 @@ impl Controller {
             backup_production,
             feed_runtime,
             relay_keeper,
+            mailbox_reader,
             feed_notice_wake: Arc::new(tokio::sync::Notify::new()),
             feed_notice_task: std::sync::OnceLock::new(),
             feed_notice_attempts: tokio::sync::watch::channel(0).0,
@@ -1296,6 +1354,11 @@ impl Controller {
                 runtime.found_removed();
             }
             runtime.run(&controller);
+        }
+        // What a remote owner announces to the host's mailbox is read from here on, and wakes the
+        // carrier above. The devices it opens an item against are the ones this host has paired.
+        if let Some(reader) = &controller.mailbox_reader {
+            reader.run(&controller, Arc::clone(controller.devices()));
         }
         // The network comes up last. A paired device must not reach a daemon that has not yet
         // recovered its reservations and rebuilt its worker directory, because it would be told
