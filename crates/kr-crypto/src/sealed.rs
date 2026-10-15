@@ -8,8 +8,9 @@
 //! and a notification-preview key are different types, so the compiler rejects a caller that seals
 //! archive material to the key the notification extension holds.
 //!
-//! [`answer_mailbox_claim`] is the one place a key agreement is taken on its own rather than
-//! inside a box. It exists for one question a mailbox asks, it answers that question with a value
+//! [`answer_mailbox_claim`] and [`expected_mailbox_claim`] are the only places a key agreement is
+//! taken on its own rather than inside a box, the first from the recipient's side and the second
+//! from the service's. They exist for one question a mailbox asks, they answer it with a value
 //! that means nothing anywhere else, and the agreement itself never leaves this module.
 
 use kr_protocol::mailbox::mailbox_claim_value;
@@ -123,7 +124,8 @@ pub fn open_notification_preview(
 /// paired peer knows that key: it is what they seal to. What distinguishes the recipient is the
 /// private half, so the service offers an ephemeral X25519 key and asks for
 /// [`kr_protocol::mailbox::mailbox_claim_value`] of the agreement. This is the recipient's side of
-/// that, and it is the only key agreement in this crate taken outside a box.
+/// that, and with [`expected_mailbox_claim`] it is the only key agreement in this crate taken
+/// outside a box.
 ///
 /// It gives back the value and never the agreement. A raw shared secret is a general-purpose key,
 /// and a function that handed one out would be a key-exchange surface that anything could build
@@ -144,6 +146,32 @@ pub fn answer_mailbox_claim(
 ) -> Result<Digest256> {
     let mut agreed = sodium::scalarmult(recipient.secret().expose(), ephemeral.as_bytes())?;
     let value = mailbox_claim_value(ephemeral, recipient.public(), &agreed);
+    sodium::memzero(&mut agreed);
+    Ok(value)
+}
+
+/// The value a service expects for a challenge it handed out, from the service's side of the
+/// agreement.
+///
+/// The service offered an ephemeral X25519 key pair and keeps the private half for the life of the
+/// challenge. It knows the recipient's public key, since that is what the mailbox is addressed by,
+/// and takes the agreement of the two the other way round from the recipient. The value is the one
+/// [`answer_mailbox_claim`] gives for the same challenge, and a key that does not hold the
+/// recipient's private half cannot make it.
+///
+/// The derivation is kept beside the recipient's so that the two sides cannot drift apart; a test
+/// double for the service takes its side from here.
+///
+/// # Errors
+///
+/// Returns an error when libsodium is unavailable, and when the recipient's key is one that agrees
+/// to nothing.
+pub fn expected_mailbox_claim(
+    ephemeral: &StoredEnvelopeKeyPair,
+    recipient: &StoredEnvelopeKey,
+) -> Result<Digest256> {
+    let mut agreed = sodium::scalarmult(ephemeral.secret().expose(), recipient.as_bytes())?;
+    let value = mailbox_claim_value(ephemeral.public(), recipient, &agreed);
     sodium::memzero(&mut agreed);
     Ok(value)
 }
@@ -213,19 +241,11 @@ mod tests {
 
         // The other side of the agreement, which is what the service holds: it knows the
         // ephemeral private half and the recipient's public key, and derives the same value.
-        let mut agreed =
-            crate::sodium::scalarmult(ephemeral.secret().expose(), recipient.public().as_bytes())
-                .expect("the agreement the service takes");
         assert_eq!(
             answer,
-            kr_protocol::mailbox::mailbox_claim_value(
-                ephemeral.public(),
-                recipient.public(),
-                &agreed
-            ),
+            expected_mailbox_claim(&ephemeral, recipient.public()).expect("the service's value"),
             "the value the recipient derives is the value the service expects"
         );
-        crate::sodium::memzero(&mut agreed);
 
         // A device that knows the recipient's public key and not its private half is exactly who
         // the challenge is there to turn away.
