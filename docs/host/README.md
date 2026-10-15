@@ -377,18 +377,19 @@ record go. An answer that the allowance is spent does, and so does any answer bu
 payer is another account, because a lease of another account's payer is no obstacle to the new one.
 If the new payer is the same account, the daemon keeps the record, because the service says it could
 not issue a lease also for a lease whose relay it can no longer bill through, and answers invalid
-also for a lease in its grace window whose grace ceiling passes the bound of the authorisation, and
-a lease behind either answer stands in the way of the new authorisation. The service answers invalid
-for a bound too small for a block only when it found no lease, and the daemon cannot tell the two
-apart, so the record stays. If the service answers that the old authorisation is not one it holds
-for this host's key, is no longer in force, or that the lease the pair holds belongs to another
-caller or another authorisation, it names no lease under that payer and the daemon drops the record
-at once. The service ends the leases of an authorisation that is withdrawn but not those of one that
-lapses, and a lease the daemon was never told of cannot be ended by asking, so a lease that lapsed
-with its authorisation runs out by itself. To clear a lease that stands in the way of the new
-authorisation, withdraw the authorisation you replaced: the service then ends its leases, also after
-a lapse. Any other refusal says nothing about the pair, so the daemon keeps the record and waits as
-it does for any answer only the owner can change.
+also for a lease in its grace window whose grace-raised hold passes the bound of the authorisation,
+and a lease behind either answer stands in the way of the new authorisation. The service answers
+invalid for a bound too small for a block only when it found no lease, and the daemon cannot tell
+the two apart, so the record stays. If the service answers that the old authorisation is not one it
+holds for this host's key, is no longer in force, or that the lease the pair holds belongs to
+another caller or another authorisation, it names no lease under that payer and the daemon drops the
+record at once. The service ends the leases of an authorisation that is withdrawn but not those of
+one that lapses, and a lease the daemon was never told of cannot be ended by asking, so a lease that
+lapsed with its authorisation runs out by itself. To clear a lease that stands in the way of the new
+authorisation, or a record the daemon keeps because it cannot tell, withdraw the authorisation you
+replaced: the service then ends its leases, also after a lapse, and refuses the next ask under it as
+forbidden, so the daemon drops the record. In any other case a refusal says nothing about the pair,
+so the daemon keeps the record and waits as it does for any answer only the owner can change.
 
 Three kinds of answers to lease requests are not treated as errors. A spent allowance, and a service
 that could not issue a lease because it has no relay to offer or no room for one more, are answers
