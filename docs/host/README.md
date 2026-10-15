@@ -234,8 +234,8 @@ variables an older build read joins nothing because of them.
 | `network.proxy_url` | the HTTP proxy this host's connections to services go through: the endpoint's relay connection, relay latency probe, captive-portal check and Pkarr servers, the rendezvous, delivery and webhooks, mail submission, the managed voice broker and account service, backups to the managed storage service, the authority feed, the mailbox service, the relay lease service, the model's files, and plugin repositories; the host's own name lookups do not use it, and absent everything goes directly, apart from the relay latency probe and captive-portal check, which then follow `HTTPS_PROXY`, `HTTP_PROXY` and `ALL_PROXY` when those are set | an absolute `http` or `https` origin, with no user information, no path and no trailing slash |
 | `voice.broker_origin` | the managed broker this host starts a device's voice session at, through the proxy `network.proxy_url` selects | an absolute `https` origin, or an `http` origin on `localhost`, `127.0.0.1` or `[::1]`, of at most 128 bytes, in lower case, with no path and no port its scheme already implies; a plain-HTTP origin cannot be combined with `network.proxy_url`, because the proxy would carry the account token in clear text |
 | `storage.origin` | the managed storage service this host uploads its backups to | an `https` origin, or an `http` origin on a loopback address, in the spelling a gateway origin has, with no path and no trailing slash; the daemon refuses to start unless it is the managed account service |
-| `authority.origin` | the authority feed this host reads its remote revocations from; a section of level 2: a release that reads level 1 ignores it, and its host takes a device's revocation only from the owner at the machine | an `https` origin, or an `http` origin on a loopback address, in the spelling a gateway origin has, with no path and no trailing slash |
-| `mailbox.origin` | the mailbox service this host places the encrypted objects of its notifications in and reads its own mailbox from, where a remote owner announces a change to the host's authority feed; a section of level 3, so a release that reads level 2 ignores it, places nothing and reads no mailbox, which leaves a notification whose detail does not fit reaching a device without it | an `https` origin, or an `http` origin on a loopback address, in the spelling a gateway origin has, with no path and no trailing slash |
+| `authority.origin` | the authority feed this host reads its remote revocations from, and where it reads its own mailbox, in which a remote owner announces a change to the feed; a section of level 2: a release that reads level 1 ignores it, and its host takes a device's revocation only from the owner at the machine | an `https` origin, or an `http` origin on a loopback address, in the spelling a gateway origin has, with no path and no trailing slash |
+| `mailbox.origin` | the mailbox service this host places the encrypted objects of its notifications in; a section of level 3, so a release that reads level 2 ignores it and its host places nothing, which leaves a notification whose detail does not fit reaching a device without it | an `https` origin, or an `http` origin on a loopback address, in the spelling a gateway origin has, with no path and no trailing slash |
 | `relay.origin` | the relay lease service this host asks for a lease for each paired device; a section of level 4 | an `https` origin, or an `http` origin on a loopback address, in the spelling a gateway origin has, with no path and no trailing slash |
 | `relay.payer` | the account that pays for those leases and the authorisation it gave this host's key | an object with `account_id` and `authorisation_id`, each a lower-case hyphenated UUID; it needs `relay.origin` |
 
@@ -433,29 +433,37 @@ indicates how many paired devices have leases, and when the next refill is due.
 
 ### The host's own mailbox
 
-A host whose configuration document names a mailbox service (`mailbox.origin`) reads its own mailbox
-there as well as placing objects in its devices' mailboxes. A remote owner who publishes a
-revocation to the host's authority feed can announce the change to the host's mailbox. The host then
-has the feed read at once instead of at the next poll. The announcement says that the feed changed
-and nothing about what changed. The feed is the record. A host that never sees an announcement still
-learns every revocation from the feed, and an announcement that is forged, repeated or lost changes
-nothing the feed does not already say.
+A host whose configuration document names an authority feed (`authority.origin`) also reads its own
+mailbox at that service. A remote owner who publishes a revocation to the host's feed can announce
+the change in that mailbox, and the host then has the feed read at once instead of at the next poll.
+The announcement says that the feed changed and nothing about what changed. The feed is the record.
+A host that never sees an announcement still learns every revocation from the feed, and an
+announcement that is forged, repeated or lost changes nothing the feed does not already say. A host
+with no feed reads no mailbox. The service that `mailbox.origin` names, where the host places the
+objects of its notifications, is a separate choice.
 
 The daemon reads the mailbox when it starts and every ten seconds after that. It takes an item only
-if the item opens against the stored-envelope key of a device the host has paired and has not
-unpaired. It drops everything else: an item from any other key, an item whose routing record outside
-the envelope does not match what the box authenticated, an expired item, an item it accepted before,
-and any payload that claims authority of its own. An item that opens but is not an announcement that
-the feed changed is removed from the service and does nothing, because the mailbox carries no
-keystroke, command, decision or closure.
+if the item opens against the stored-envelope key of a device the host has paired and whose pairing
+is in force: a device that is revoked, or whose grant has run out and the end is on record, is no
+sender. It drops everything else: an item from any other key, an item whose routing record outside
+the envelope does not match what the box authenticated, an item that has expired when the host opens
+it, an item it accepted before, and any payload that claims authority of its own. An item that opens
+but is not an announcement that the feed changed is removed from the service and does nothing,
+because the mailbox carries no keystroke, command, decision or closure.
 
 The daemon writes down the identifier of each item it accepts before it acts on the item and before
 it tells the service the item can be removed. The record is a file called `mailbox-replay.sqlite3`
 in its state directory, and it keeps an identifier until the item's expiry and a day more. A daemon
-that stops between the two steps reads the item again after it starts and refuses it as a replay.
-The `mailbox-reader` check in `kr doctor` says when the mailbox was last read, how many
-announcements the daemon has taken, ignored and dropped since it started, and whether the service
-could not be reached or turned the host's request back.
+that stops between the two steps reads the item again after it starts and refuses it as a replay. An
+item the daemon drops is removed from the service without a record, because nothing it could be
+replayed to do is done.
+
+The `mailbox-reader` check in `kr doctor` says when the mailbox was last read and how many
+announcements the daemon has taken, ignored and dropped since it started. It warns when the service
+could not be reached, when the service turned the host's request back, and when the host could not
+read its devices or write its record. A mailbox that another key has claimed stays claimed, so a
+host whose authorisation key changed is refused there for good. In each of these cases the host
+still reads the feed at its own poll, unless the feed was removed.
 
 ### Account sign-in
 
@@ -5727,8 +5735,9 @@ When the configuration document names an `authority.origin`, the daemon runs a c
 for as long as it lives. When it names none, no remote owner's revocation can reach the host, and
 only the owner at the machine revokes a device. The origin is read only once, at start. The carrier signs
 as the host, with the authorisation key its pairings recorded, which is what the feed is addressed
-by. It reads the feed at four moments: when the daemon starts, when a connection is established,
-every 30 seconds after that, and when an owner is paired or revoked. A connection waits for a read
+by. It reads the feed at five moments: when the daemon starts, when a connection is established,
+every 30 seconds after that, when an owner is paired or revoked, and when an announcement arrives in
+the host's own mailbox (see "The host's own mailbox"). A connection waits for a read
 that began after it was admitted, for at most five seconds, before anything it asks is answered. So
 a device the feed holds a revocation for is refused on its first request and not at the next poll. A
 feed that does not answer in that time leaves the connection served, and the status goes stale when

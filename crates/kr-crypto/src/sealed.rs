@@ -8,8 +8,9 @@
 //! and a notification-preview key are different types, so the compiler rejects a caller that seals
 //! archive material to the key the notification extension holds.
 //!
-//! [`answer_mailbox_claim`] is the one place a key agreement is taken on its own rather than
-//! inside a box. It exists for one question a mailbox asks, it answers that question with a value
+//! [`answer_mailbox_claim`] and [`expected_mailbox_claim`] are the only places a key agreement is
+//! taken on its own rather than inside a box, the first from the recipient's side and the second
+//! from the service's. They exist for one question a mailbox asks, they answer it with a value
 //! that means nothing anywhere else, and the agreement itself never leaves this module.
 
 use kr_protocol::mailbox::mailbox_claim_value;
@@ -123,7 +124,8 @@ pub fn open_notification_preview(
 /// paired peer knows that key: it is what they seal to. What distinguishes the recipient is the
 /// private half, so the service offers an ephemeral X25519 key and asks for
 /// [`kr_protocol::mailbox::mailbox_claim_value`] of the agreement. This is the recipient's side of
-/// that, and it is the only key agreement in this crate taken outside a box.
+/// that, and with [`expected_mailbox_claim`] it is the only key agreement in this crate taken
+/// outside a box.
 ///
 /// It gives back the value and never the agreement. A raw shared secret is a general-purpose key,
 /// and a function that handed one out would be a key-exchange surface that anything could build

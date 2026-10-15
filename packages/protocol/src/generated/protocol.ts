@@ -11723,8 +11723,7 @@ export interface DescriptionsSelection {
   on_battery?: boolean | null
 }
 /**
- * The mailbox service this host places the encrypted objects of its notifications in, and
- * reads its own mailbox from.
+ * The mailbox service this host places the encrypted objects of its notifications in.
  *
  * A section of level 3: written only when it selects something, and ignored, with a
  * count, by a release that reads level 2. Read when the daemon starts, so a change applies

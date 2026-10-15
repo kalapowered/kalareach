@@ -19,7 +19,7 @@ use kr_protocol::pairing::{
     AUTHORITY_REVISION_DOMAIN, AuthorityRevisionRecord, REVOCATION_DOMAIN,
     RevocationAcknowledgement, RevocationCompletion, RevocationRequest, RevocationTarget,
 };
-use kr_protocol::scalars::{AuthorisationKey, StoredEnvelopeKey};
+use kr_protocol::scalars::AuthorisationKey;
 use kr_protocol::service::{ServiceRequestSignature, ServiceRequestSigner};
 use serde_json::{Value, json};
 
@@ -265,7 +265,7 @@ pub(crate) fn sync(
             // of it is reported beside the change.
             if let Some((recipient, envelope)) = announcement {
                 state["announced"] =
-                    crate::mailbox::announce(mailboxes, signature, &recipient, envelope, now_ms);
+                    crate::mailbox::announce(mailboxes, signature, recipient, envelope, now_ms);
             }
             answered(state)
         }
@@ -276,11 +276,11 @@ pub(crate) fn sync(
 /// The announcement a publication, a revision or an acknowledgement carries, when it carries one
 /// this service will place: a sealed item for a recipient that says the feed changed and expires
 /// within an hour. Any other member carries none.
-fn read_announcement(
+fn read_announcement<'a>(
     operation: &str,
-    member: Option<&Value>,
+    member: Option<&'a Value>,
     now_ms: u64,
-) -> Result<Option<(StoredEnvelopeKey, SealedEnvelope)>, ServiceHttpAnswer> {
+) -> Result<Option<(&'a str, SealedEnvelope)>, ServiceHttpAnswer> {
     if !matches!(operation, "publish" | "revise" | "acknowledge") {
         return Ok(None);
     }
@@ -291,9 +291,9 @@ fn read_announcement(
         return Ok(None);
     };
     let sealed = "An announcement is a sealed item for a recipient.";
-    let Ok(recipient) =
-        serde_json::from_value::<StoredEnvelopeKey>(announce["recipient_key"].clone())
-    else {
+    // The route reads the recipient as text and no more: whether it is a key is found when the
+    // item is placed, and reported beside the change, which has committed by then.
+    let Some(recipient) = announce["recipient_key"].as_str() else {
         return Err(invalid(sealed));
     };
     let Ok(envelope) = serde_json::from_value::<SealedEnvelope>(announce["envelope"].clone())
@@ -875,5 +875,42 @@ impl Feed {
             "removal_keys": self.removal_keys.iter().collect::<Vec<_>>(),
             "poll_interval_seconds": FEED_POLL_INTERVAL_SECONDS,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+    use crate::mailbox::tests::{NOW, envelope_for};
+    use kr_crypto::keys::StoredEnvelopeKeyPair;
+
+    /// The route reads the recipient of an announcement as text and no more, so a change that
+    /// names one that is no key commits and the announcement is declined beside it.
+    #[test]
+    fn a_recipient_that_is_text_but_not_a_key_does_not_refuse_the_change() {
+        let recipient = StoredEnvelopeKeyPair::generate().expect("a key");
+        let envelope = envelope_for(recipient.public(), recipient.public(), NOW + 60_000);
+        let member = json!({ "announce": { "recipient_key": "not a key", "envelope": envelope } });
+        let read = read_announcement("publish", Some(&member), NOW);
+        assert!(
+            matches!(&read, Ok(Some(("not a key", _)))),
+            "the announcement is read and left for the mailbox to decline: {read:?}"
+        );
+    }
+
+    #[test]
+    fn a_recipient_that_is_not_text_refuses_the_change() {
+        let recipient = StoredEnvelopeKeyPair::generate().expect("a key");
+        let envelope = envelope_for(recipient.public(), recipient.public(), NOW + 60_000);
+        let member = json!({ "announce": { "recipient_key": 7, "envelope": envelope } });
+        let refused = read_announcement("publish", Some(&member), NOW).expect_err("a refusal");
+        assert_eq!(refused.status, 400);
+        assert!(
+            String::from_utf8_lossy(&refused.body)
+                .contains("An announcement is a sealed item for a recipient."),
+            "{refused:?}"
+        );
     }
 }

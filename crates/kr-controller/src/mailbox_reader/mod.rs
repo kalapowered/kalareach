@@ -9,35 +9,43 @@
 //! revocation from the feed, and an announcement that is forged, replayed or lost changes nothing
 //! the feed does not already say.
 //!
+//! # Where the host reads
+//!
+//! A feed places the announcement in the mailbox of its own service, so the host reads the mailbox
+//! at the service `authority.origin` names, and only when it selects one. `mailbox.origin` names
+//! where the host places the objects of its notifications, which is another choice: a host may put
+//! those in one service and read its feed at another.
+//!
 //! # What the host takes from the mailbox
 //!
 //! An item is taken only if it opens against the stored-envelope key of a device this host has
-//! paired and has not unpaired, under the rules of section 20 ([`kr_crypto::envelope`]): the
-//! routing record outside the envelope is untrusted and must match what the box authenticated, the
-//! expiry must not have passed, and an identifier the host has accepted before is refused. Anything
-//! else is dropped. An item that opens but is not an announcement that the feed changed is taken
-//! off the service and does nothing: the mailbox carries no keystroke, command, decision or
-//! closure, and nothing the host reads from it executes anything. A payload that bears authority is
-//! refused here whatever it says, because this host takes its authority from its feed and from its
-//! own records.
+//! paired and whose pairing is in force (a device that is revoked, or whose grant has run out and
+//! the end is on record, is no sender), under the rules of section 20 ([`kr_crypto::envelope`]):
+//! the routing record outside the envelope is untrusted and must match what the box authenticated,
+//! the expiry must not have passed at the moment the item is opened, and an identifier the host has
+//! accepted before is refused. Anything else is dropped. An item that opens but is not an
+//! announcement that the feed changed is taken off the service and does nothing: the mailbox
+//! carries no keystroke, command, decision or closure, and nothing the host reads from it executes
+//! anything. A payload that bears authority is refused here whatever it says, because this host
+//! takes its authority from its feed and from its own records.
 //!
 //! # What is durable, and in which order
 //!
 //! The identifier of an item the host accepted is written down ([`record::Record`]) before the host
-//! acts on the item, and the host acknowledges an item to the service only after that write. A host
-//! that stops between the two reads the item again and refuses it as a replay, and then
-//! acknowledges it. An acknowledgement whose answer was lost is made again by the next pass for the
-//! same reason. Nothing the service holds is removed before the host has it written down, and an
-//! identifier is forgotten a day after the item would have expired.
+//! acts on the item, and the host acknowledges a page to the service only after every accepted item
+//! on it is written down. A host that stops between the two reads the item again and refuses it as
+//! a replay, and then acknowledges it. An acknowledgement whose answer was lost is made again by the
+//! next pass for the same reason. No item the host accepted leaves the service before it is on
+//! record; an item the host dropped leaves it without a record, because nothing it could be
+//! replayed to do is done. An identifier is forgotten a day after the item would have expired.
 //!
 //! # When the host asks
 //!
-//! When the daemon starts, every [`POLL_INTERVAL`] after that, and when a pass is asked for. A
-//! service that asks to be left alone is left alone for as long as it asked.
+//! When the daemon starts and every [`POLL_INTERVAL`] after that. A service that asks to be left
+//! alone is left alone for as long as it asked.
 
 pub mod record;
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
 use std::time::Duration;
 
@@ -55,7 +63,7 @@ use kr_protocol::mailbox::MailboxPayloadType;
 use kr_protocol::service::GatewayOrigin;
 use kr_transport::config::ProxyUrl;
 use kr_transport::reconnect::Backoff;
-use tokio::sync::{Notify, watch};
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 use crate::error::{ControllerError, Result};
@@ -102,7 +110,7 @@ pub fn managed_client(
             ControllerError::NotConfigured(format!(
                 "{} in this host's configuration document ({}) names a service no transport \
                  reaches: {error}",
-                kr_protocol::hostinfo::configuration::MAILBOX_ORIGIN.key,
+                kr_protocol::hostinfo::configuration::AUTHORITY_ORIGIN.key,
                 kr_protocol::hostinfo::configuration::FILE_NAME,
             ))
         })?,
@@ -171,11 +179,6 @@ struct Shared {
     key: StoredEnvelopeKeyPair,
     record: Arc<Record>,
     quiet: Quiet,
-    wake: Notify,
-    /// How many passes have been asked for, by whoever needs to know the reader has looked since.
-    requested: AtomicU64,
-    /// The newest request count that a pass which began after the request was made has finished.
-    completed: watch::Sender<u64>,
     /// How many passes have finished.
     passes: watch::Sender<u64>,
     observed: Mutex<Observed>,
@@ -242,9 +245,6 @@ impl MailboxReader {
                 key,
                 record: Arc::new(record),
                 quiet: Quiet::new(Arc::clone(&timer)),
-                wake: Notify::new(),
-                requested: AtomicU64::new(0),
-                completed: watch::channel(0).0,
                 passes: watch::channel(0).0,
                 observed: Mutex::default(),
                 running: OnceLock::new(),
@@ -272,11 +272,6 @@ impl MailboxReader {
         *self.task.lock().unwrap_or_else(PoisonError::into_inner) = Some(task);
     }
 
-    /// Asks for a pass now, without waiting for it.
-    pub fn wake(&self) {
-        self.shared.wake.notify_one();
-    }
-
     /// A count of the passes the reader has finished, which changes each time one ends.
     #[must_use]
     pub fn passes(&self) -> watch::Receiver<u64> {
@@ -287,21 +282,6 @@ impl MailboxReader {
     #[must_use]
     pub fn record(&self) -> &Arc<Record> {
         &self.shared.record
-    }
-
-    /// Waits until the reader has finished a pass that began after this call, so that whatever
-    /// was true when it was made is what the pass read. For a suite that arranges the world and
-    /// then needs the reader to have looked at it.
-    #[cfg(feature = "testing")]
-    pub async fn after_a_pass(&self) {
-        let ticket = self.shared.requested.fetch_add(1, Ordering::SeqCst) + 1;
-        let mut completed = self.shared.completed.subscribe();
-        self.shared.wake.notify_one();
-        while *completed.borrow_and_update() < ticket {
-            if completed.changed().await.is_err() {
-                return;
-            }
-        }
     }
 
     /// What `kr doctor` says of the reader.
@@ -316,6 +296,20 @@ impl MailboxReader {
                 .stated(" seconds ago"),
             None => Sentence::new().stated("it has not been read yet"),
         };
+        // The announcement is a hint beside the feed, so what a reader that cannot read costs the
+        // host depends on whether the feed is still read.
+        let feed = if controller
+            .authority_feed()
+            .status()
+            .removed_at_ms
+            .0
+            .is_some()
+        {
+            "; the authority feed was removed, so no revocation reaches this host from it"
+        } else {
+            "; a remote owner's revocation still reaches this host from its authority feed at the \
+             feed's next poll"
+        };
         let reads = Sentence::new().stated("this host reads its own mailbox");
         let (status, detail, remedy): (DoctorStatus, Sentence, Option<&'static str>) =
             match observed.stopped {
@@ -323,33 +317,36 @@ impl MailboxReader {
                     DoctorStatus::Warning,
                     reads
                         .stated(", which could not be reached; ")
-                        .sentence(&read),
-                    Some(
-                        "This host asks again by itself. A remote owner's revocation still \
-                         reaches it from its authority feed: the mailbox only announces it.",
-                    ),
+                        .sentence(&read)
+                        .stated(feed),
+                    Some("This host asks again by itself."),
                 ),
                 Some(Stopped::Refused(_)) => (
                     DoctorStatus::Warning,
                     reads
-                        .stated(
-                            ", which turned a request back: another key may hold the mailbox, \
-                                 or this host's key is not one it accepts; ",
-                        )
-                        .sentence(&read),
+                        .stated(", which turned a request back; ")
+                        .sentence(&read)
+                        .stated(feed),
                     Some(
-                        "Check `mailbox.origin` in the configuration document. This host asks \
-                         again by itself, and a remote owner's revocation still reaches it from \
-                         its authority feed.",
+                        "Check that this host's clock is right and that `authority.origin` in the \
+                         configuration document names a service that accepts this host. A mailbox \
+                         that another key has claimed stays claimed, so a host whose \
+                         authorisation key changed is refused there for good. This host asks \
+                         again by itself.",
                     ),
                 ),
                 Some(Stopped::Local) => (
                     DoctorStatus::Warning,
                     reads
-                        .stated(", but could not use its record of the items it has accepted; ")
-                        .sentence(&read),
+                        .stated(
+                            ", but could not read its devices or write its record of the items \
+                             it has accepted; ",
+                        )
+                        .sentence(&read)
+                        .stated(feed),
                     Some(
-                        "This host reads nothing it cannot write down, and tries again by itself.",
+                        "This host accepts nothing it cannot write down, and asks again by \
+                         itself. Check the daemon's state directory for space and permissions.",
                     ),
                 ),
                 None => (DoctorStatus::Ok, reads.stated("; ").sentence(&read), None),
@@ -371,7 +368,7 @@ impl MailboxReader {
         )
     }
 
-    /// What `kr doctor` says of a host that selects no mailbox service.
+    /// What `kr doctor` says of a host that selects no authority feed.
     #[must_use]
     pub fn unconfigured_check() -> DoctorCheck {
         DoctorCheck::new(
@@ -379,8 +376,8 @@ impl MailboxReader {
             "This host reads its own mailbox",
             DoctorStatus::NotApplicable,
             Sentence::new().stated(
-                "no mailbox service is selected, so nothing is announced to this host; it learns \
-                 a remote owner's revocation from its authority feed at the next poll",
+                "no authority feed is selected, so this host reads no mailbox, nothing is \
+                 announced to it, and it learns no remote revocation",
             ),
             None,
         )
@@ -404,8 +401,6 @@ impl Drop for MailboxReader {
 async fn drive(shared: Arc<Shared>, timer: Arc<dyn Timer>) {
     let mut backoff = Backoff::default();
     loop {
-        // Every request made before this point is answered by the pass that follows it.
-        let target = shared.requested.load(Ordering::SeqCst);
         let Some(running) = shared.running.get() else {
             return;
         };
@@ -430,20 +425,11 @@ async fn drive(shared: Arc<Shared>, timer: Arc<dyn Timer>) {
             }
         };
         drop(controller);
-        shared.completed.send_replace(target);
+        // The wait is asked for before the pass is counted, so whoever sees the count change finds
+        // the reader waiting.
+        let sleeping = timer.sleep(wait);
         shared.passes.send_modify(|passes| *passes += 1);
-        // Interest in a wake is registered before the count of questions is read again, so a
-        // question asked in between is either seen by the read or wakes the wait: none is lost.
-        let woken = shared.wake.notified();
-        tokio::pin!(woken);
-        woken.as_mut().enable();
-        if shared.requested.load(Ordering::SeqCst) > target {
-            continue;
-        }
-        tokio::select! {
-            () = &mut woken => {}
-            () = timer.sleep(wait) => {}
-        }
+        sleeping.await;
     }
 }
 
@@ -477,7 +463,6 @@ async fn pass(
         .await
         .map_err(|error| Stopped::local(&error))?;
 
-    let mut announced = false;
     let mut read_through = false;
     for _ in 0..MOST_PAGES {
         let page = shared
@@ -489,13 +474,17 @@ async fn pass(
             read_through = true;
             break;
         };
+        let mut announced = false;
+        let mut unwritten = None;
         for item in &page.items {
+            // Read for each item: the expiry is judged at the moment the item is opened, not at
+            // the moment the pass began, which may be a page of exchanges ago.
             let opened = open_delivered_envelope(
                 &shared.key,
                 &senders,
                 &mut ledger,
                 &item.envelope,
-                now,
+                controller.wall_now_ms(),
                 // Authority comes to this host from its feed and its own records. An item that
                 // claims some in its payload is refused whoever sealed it.
                 |_| {
@@ -513,10 +502,13 @@ async fn pass(
                     let until = kr_protocol::mailbox::replay_id_retained_until_ms(
                         plaintext.expires_at_ms.get(),
                     );
-                    shared
+                    if let Err(error) = shared
                         .on_record(move |record| record.remember(id, until))
                         .await
-                        .map_err(|error| Stopped::local(&error))?;
+                    {
+                        unwritten = Some(Stopped::local(&error));
+                        break;
+                    }
                     if plaintext.payload_type == MailboxPayloadType::AuthorityFeedChange {
                         announced = true;
                         shared.observed().announcements += 1;
@@ -527,14 +519,15 @@ async fn pass(
                 Err(_) => shared.observed().dropped += 1,
             }
         }
+        // The announcement says the feed changed, and the carrier reads it now rather than at its
+        // next poll. What is on record is acted on even when a later item on the page could not
+        // be written down: that item is read again, and nothing is acknowledged until it is.
         if announced && let Some(feed) = controller.feed_runtime() {
-            // The announcement says the feed changed, and the carrier reads it now rather than at
-            // its next poll. It is made once the identifiers are on record and before the service
-            // is told, so that an acknowledgement the service does not hear costs the hint nothing:
-            // the item is read again and refused as a replay.
             feed.wake();
         }
-        announced = false;
+        if let Some(stopped) = unwritten {
+            return Err(stopped);
+        }
         // Everything on the page is written down or dropped, so the service may remove it.
         shared
             .client

@@ -24,5 +24,9 @@ serde_json.workspace = true
 # The loopback listener, and the pause a held request waits in.
 tokio = { workspace = true, features = ["io-util", "net", "rt", "sync"] }
 
+[dev-dependencies]
+# The identifiers of the envelopes a suite of the mailbox's own seals.
+uuid.workspace = true
+
 [lints]
 workspace = true

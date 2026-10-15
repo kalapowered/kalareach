@@ -1,5 +1,5 @@
-//! The encrypted mailbox, answering as the Worker's does: a delivery, and the recipient's claim, read
-//! and acknowledgement.
+//! The encrypted mailbox, answering as the Worker's does: a delivery, and the recipient's claim,
+//! read and acknowledgement.
 //!
 //! One mailbox per recipient, addressed by the identifier of the recipient's stored-envelope key.
 //! A host leaves a sealed item for a device that is not connected; the service stores ciphertext it
@@ -17,7 +17,8 @@ use std::collections::BTreeMap;
 use kr_client::services::ServiceHttpAnswer;
 use kr_crypto::keys::StoredEnvelopeKeyPair;
 use kr_protocol::mailbox::{
-    MAILBOX_CLAIM_LIFETIME_MS, MAX_MAILBOX_BYTES, MAX_MAILBOX_ITEMS, SealedEnvelope,
+    EnvelopeStructureError, MAILBOX_CLAIM_LIFETIME_MS, MAX_MAILBOX_BYTES,
+    MAX_MAILBOX_ITEM_LIFETIME_MS, MAX_MAILBOX_ITEMS, SealedEnvelope,
 };
 use kr_protocol::pairing::KeyPurpose;
 use kr_protocol::scalars::{Digest256, StoredEnvelopeKey};
@@ -169,17 +170,26 @@ pub(crate) fn deliver(
 /// ended up, or why it did not, in the shape the feed answers with.
 ///
 /// The change has committed by now, so nothing here turns its answer into a refusal: what stops
-/// the announcement is reported beside the change.
+/// the announcement is reported beside the change. The route checks only that the recipient is
+/// text; whether it is a key, and whether the item is routed to it, are found here, as the Worker
+/// finds them, and worded as it words them.
 pub(crate) fn announce(
     mailboxes: &mut BTreeMap<String, Mailbox>,
     signature: &ServiceRequestSignature,
-    recipient: &StoredEnvelopeKey,
+    recipient: &str,
     envelope: SealedEnvelope,
     now_ms: u64,
 ) -> Value {
-    let answer = place(mailboxes, signature, recipient, envelope, now_ms);
+    let declined = |reason: &str| json!({ "mailbox": "declined", "declined_reason": reason });
+    let Ok(recipient) = serde_json::from_value::<StoredEnvelopeKey>(json!(recipient)) else {
+        return declined("that is not a recipient key");
+    };
+    if routed_to(&envelope) != address_of(&recipient) {
+        return declined("that item is routed to another recipient");
+    }
+    let answer = place(mailboxes, signature, &recipient, envelope, now_ms);
     let Ok(body) = serde_json::from_slice::<Value>(&answer.body) else {
-        return json!({ "mailbox": "declined", "declined_reason": "the mailbox did not answer" });
+        return declined("the mailbox did not answer");
     };
     if body["ok"] == json!(true) {
         json!({ "mailbox": body["data"]["state"] })
@@ -191,6 +201,40 @@ pub(crate) fn announce(
     }
 }
 
+/// The mailbox an envelope's routing record says it is for.
+fn routed_to(envelope: &SealedEnvelope) -> String {
+    serde_json::to_value(envelope.routing.recipient_key_id)
+        .expect("a key identifier")
+        .as_str()
+        .expect("text")
+        .to_owned()
+}
+
+/// What a caller is told about an envelope the structure check refuses, in the Worker's words.
+fn structure_refusal(broken: EnvelopeStructureError) -> ServiceHttpAnswer {
+    invalid(&match broken {
+        EnvelopeStructureError::UndeclaredBucket { .. } => {
+            "A sealed item declares one of the size buckets section 20 defines.".to_owned()
+        }
+        EnvelopeStructureError::CiphertextLength { .. } => {
+            "A sealed item is its declared bucket plus the seal, and nothing else.".to_owned()
+        }
+        EnvelopeStructureError::AlreadyExpired { .. } => {
+            "That item has already expired.".to_owned()
+        }
+        EnvelopeStructureError::LifetimeTooLong { .. } => format!(
+            "A mailbox item expires within {} hours.",
+            MAX_MAILBOX_ITEM_LIFETIME_MS / 3_600_000
+        ),
+        EnvelopeStructureError::ItemTooLarge { .. } => {
+            "A stored item is at most the megabyte a control message may carry.".to_owned()
+        }
+        EnvelopeStructureError::AuthorityCoalesced => {
+            "A payload that carries authority names no coalescing thread.".to_owned()
+        }
+    })
+}
+
 /// Places one sealed envelope, as the mailbox does for a delivery.
 fn place(
     mailboxes: &mut BTreeMap<String, Mailbox>,
@@ -200,12 +244,7 @@ fn place(
     now_ms: u64,
 ) -> ServiceHttpAnswer {
     let address = address_of(recipient);
-    let routed = serde_json::to_value(envelope.routing.recipient_key_id)
-        .expect("a key identifier")
-        .as_str()
-        .expect("text")
-        .to_owned();
-    if routed != address {
+    if routed_to(&envelope) != address {
         return invalid("That envelope is routed to another recipient.");
     }
 
@@ -237,7 +276,7 @@ fn place(
     }
 
     if let Err(broken) = envelope.check_structure(now_ms) {
-        return invalid(&broken.to_string());
+        return structure_refusal(broken);
     }
 
     let stored_bytes = envelope.stored_bytes();
@@ -336,15 +375,30 @@ fn addressed(body: &Value) -> Result<(StoredEnvelopeKey, String), ServiceHttpAns
     Ok((recipient, address))
 }
 
-/// A position a mailbox has issued: a counter its arithmetic carries exactly, written as text.
+/// A position a mailbox has issued: a counter its arithmetic carries exactly, written as the
+/// canonical decimal text of a number the service's language holds exactly, and nothing else.
 fn position(value: &Value) -> Option<u64> {
     let text = value.as_str()?;
-    if text.is_empty() || (text.len() > 1 && text.starts_with('0')) || text.len() > 16 {
+    let canonical = text == "0"
+        || (!text.starts_with('0') && (1..=16).contains(&text.len()) && !text.is_empty());
+    if !canonical || !text.bytes().all(|byte| byte.is_ascii_digit()) {
         return None;
     }
     text.parse::<u64>()
         .ok()
         .filter(|position| *position < (1 << 53))
+}
+
+/// A JSON number the service's language holds as an exact integer, which is what it accepts as a
+/// page limit: `2.0` is one, `1.5` is not, and nothing beyond 2^53 - 1 is.
+fn safe_integer(value: &Value) -> Option<i64> {
+    let number = value.as_number()?;
+    if let Some(whole) = number.as_i64() {
+        return (whole.unsigned_abs() < (1 << 53)).then_some(whole);
+    }
+    let float = number.as_f64()?;
+    #[allow(clippy::cast_possible_truncation)]
+    (float.fract() == 0.0 && float.abs() < 9_007_199_254_740_992.0).then_some(float as i64)
 }
 
 fn not_yours() -> ServiceHttpAnswer {
@@ -375,22 +429,23 @@ pub(crate) fn read(
     };
     let limit = match body.get("limit") {
         None => 32,
-        Some(value) => match value.as_u64().filter(|limit| *limit >= 1) {
-            Some(limit) => limit.min(128),
+        Some(value) => match safe_integer(value).filter(|limit| *limit >= 1) {
+            Some(limit) => limit.min(128).unsigned_abs(),
             None => return invalid("A page holds at least one item."),
         },
     };
+    // The route reads a claim as an object with the two members as text, and nothing more of it:
+    // whether they are a key and a digest, and whether they answer the challenge standing, is for
+    // the mailbox, which hands a new challenge to an answer that does not.
     let claim = match body.get("claim") {
         None => None,
-        Some(claim) => {
-            let ephemeral =
-                serde_json::from_value::<StoredEnvelopeKey>(claim["ephemeral_key"].clone());
-            let value = serde_json::from_value::<Digest256>(claim["claim_value"].clone());
-            match (ephemeral, value) {
-                (Ok(ephemeral), Ok(value)) => Some((ephemeral, value)),
-                _ => return invalid("A claim answers the challenge a read handed back."),
-            }
-        }
+        Some(claim) => match (
+            claim.get("ephemeral_key").and_then(Value::as_str),
+            claim.get("claim_value").and_then(Value::as_str),
+        ) {
+            (Some(ephemeral), Some(value)) => Some((ephemeral, value)),
+            _ => return invalid("A claim answers the challenge a read handed back."),
+        },
     };
 
     let key = crate::feed::key_text(&signature.public_key);
@@ -403,6 +458,12 @@ pub(crate) fn read(
         }
     } else {
         let claimed = claim.is_some_and(|(ephemeral, value)| {
+            let (Ok(ephemeral), Ok(value)) = (
+                serde_json::from_value::<StoredEnvelopeKey>(json!(ephemeral)),
+                serde_json::from_value::<Digest256>(json!(value)),
+            ) else {
+                return false;
+            };
             mailbox.challenge.as_ref().is_some_and(|challenge| {
                 challenge.ephemeral.public() == &ephemeral
                     && now_ms < challenge.expires_at_ms
@@ -502,4 +563,312 @@ pub(crate) fn acknowledge(
         "acknowledged_through": through.to_string(),
         "stored": mailbox.usage(),
     }))
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use kr_crypto::envelope::seal_envelope;
+    use kr_crypto::keys::key_id;
+    use kr_protocol::ids::EnvelopeId;
+    use kr_protocol::mailbox::{EnvelopePlaintext, EnvelopeVersion, MailboxPayloadType};
+    use kr_protocol::method::Method;
+    use kr_protocol::scalars::{
+        AuthorisationKey, Bytes, Nonce256, Nullable, Signature64, TimestampMs,
+    };
+    use kr_protocol::service::{GatewayOrigin, ServiceRequestPayload};
+    use uuid::Uuid;
+
+    use super::*;
+
+    pub(crate) const NOW: u64 = 1_800_000_000_000;
+
+    fn caller(signer: ServiceRequestSigner, byte: u8) -> ServiceRequestSignature {
+        ServiceRequestSignature {
+            payload: ServiceRequestPayload {
+                body_digest: Digest256::from_bytes([0; 32]),
+                gateway_origin: GatewayOrigin::new("https://reach.kala.to").expect("an origin"),
+                method: Method::MailboxRead,
+                nonce: Nonce256::from_bytes([byte; 32]),
+                signed_at_ms: TimestampMs::new(NOW),
+            },
+            signer,
+            public_key: AuthorisationKey::from_bytes([byte; 32]),
+            signature: Signature64::from_bytes([byte; 64]),
+        }
+    }
+
+    fn host() -> ServiceRequestSignature {
+        caller(ServiceRequestSigner::Host, 0x11)
+    }
+
+    fn read_with(
+        mailboxes: &mut BTreeMap<String, Mailbox>,
+        recipient: &StoredEnvelopeKeyPair,
+        extra: Value,
+    ) -> Value {
+        let mut body = json!({ "recipient_key": recipient.public() });
+        for (member, value) in extra.as_object().expect("members") {
+            body[member] = value.clone();
+        }
+        let answer = read(mailboxes, &host(), &body, NOW);
+        serde_json::from_slice(&answer.body).expect("a JSON answer")
+    }
+
+    /// Claims the recipient's mailbox for `host()`, as the recipient's own read does.
+    fn claimed(mailboxes: &mut BTreeMap<String, Mailbox>, recipient: &StoredEnvelopeKeyPair) {
+        let challenge = read_with(mailboxes, recipient, json!({}));
+        assert_eq!(challenge["data"]["state"], "claim_required");
+        let ephemeral = challenge["data"]["challenge"]["ephemeral_key"].clone();
+        let key = serde_json::from_value::<StoredEnvelopeKey>(ephemeral.clone()).expect("a key");
+        let value = kr_crypto::sealed::answer_mailbox_claim(recipient, &key).expect("a value");
+        let read = read_with(
+            mailboxes,
+            recipient,
+            json!({ "claim": { "ephemeral_key": ephemeral, "claim_value": value } }),
+        );
+        assert_eq!(read["data"]["state"], "read", "{read}");
+    }
+
+    /// A sealed announcement from a fresh key to `recipient`, routed to `routed_to`, that expires
+    /// at `expires_at_ms`.
+    pub(crate) fn envelope_for(
+        recipient: &StoredEnvelopeKey,
+        routed_to: &StoredEnvelopeKey,
+        expires_at_ms: u64,
+    ) -> SealedEnvelope {
+        let sender = StoredEnvelopeKeyPair::generate().expect("a key");
+        seal_envelope(
+            &sender,
+            recipient,
+            &EnvelopePlaintext {
+                version: EnvelopeVersion::V1,
+                envelope_id: EnvelopeId::new(Uuid::from_bytes([7; 16])),
+                sender_key_id: key_id(KeyPurpose::StoredEnvelope, sender.public().as_bytes()),
+                recipient_key_id: key_id(KeyPurpose::StoredEnvelope, routed_to.as_bytes()),
+                payload_type: MailboxPayloadType::AuthorityFeedChange,
+                created_at_ms: TimestampMs::new(NOW - 120_000),
+                expires_at_ms: TimestampMs::new(expires_at_ms),
+                grant_id: Nullable::null(),
+                environment_id: Nullable::null(),
+                session_id: Nullable::null(),
+                session_epoch: Nullable::null(),
+                thread_id: Nullable::null(),
+                payload: Bytes::new(vec![0; 32]),
+            },
+        )
+        .expect("a sealed item")
+    }
+
+    fn refused(answer: &ServiceHttpAnswer) -> (u16, String) {
+        let body: Value = serde_json::from_slice(&answer.body).expect("a JSON answer");
+        (
+            answer.status,
+            body["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned(),
+        )
+    }
+
+    /// A position is the canonical decimal text of a counter the service's language holds exactly:
+    /// the Worker's `counter` reads `+1`, `01`, ` 1`, `1e3` and a number beyond 2^53 as none.
+    #[test]
+    fn a_position_is_canonical_decimal_text_or_none() {
+        for text in ["0", "1", "42", "9007199254740991"] {
+            assert!(position(&json!(text)).is_some(), "{text}");
+        }
+        for text in [
+            "",
+            "+1",
+            "-1",
+            "01",
+            " 1",
+            "1 ",
+            "1e3",
+            "0x1",
+            "1.0",
+            "٣",
+            "9007199254740992",
+            "99999999999999999",
+        ] {
+            assert_eq!(position(&json!(text)), None, "{text:?}");
+        }
+        assert_eq!(position(&json!(1)), None, "a number is not text");
+        assert_eq!(position(&Value::Null), None);
+    }
+
+    #[test]
+    fn a_cursor_or_a_position_that_is_not_canonical_is_refused() {
+        let recipient = StoredEnvelopeKeyPair::generate().expect("a key");
+        let mut mailboxes = BTreeMap::new();
+        claimed(&mut mailboxes, &recipient);
+        let answer = read(
+            &mut mailboxes,
+            &host(),
+            &json!({ "recipient_key": recipient.public(), "after_sequence": "+1" }),
+            NOW,
+        );
+        assert_eq!(
+            refused(&answer),
+            (
+                400,
+                "A cursor is a position this mailbox has issued.".to_owned()
+            )
+        );
+        let answer = acknowledge(
+            &mut mailboxes,
+            &host(),
+            &json!({ "recipient_key": recipient.public(), "through_sequence": "+0" }),
+            NOW,
+        );
+        assert_eq!(
+            refused(&answer),
+            (
+                400,
+                "An acknowledgement names a position this mailbox has issued.".to_owned()
+            )
+        );
+    }
+
+    #[test]
+    fn a_limit_is_an_exact_integer_of_at_least_one() {
+        let recipient = StoredEnvelopeKeyPair::generate().expect("a key");
+        let mut mailboxes = BTreeMap::new();
+        claimed(&mut mailboxes, &recipient);
+        for limit in [
+            json!(0),
+            json!(-1),
+            json!(1.5),
+            json!("2"),
+            json!(9_007_199_254_740_992_u64),
+            json!(1e300),
+            json!(null),
+        ] {
+            let answer = read(
+                &mut mailboxes,
+                &host(),
+                &json!({ "recipient_key": recipient.public(), "limit": limit }),
+                NOW,
+            );
+            assert_eq!(
+                refused(&answer),
+                (400, "A page holds at least one item.".to_owned()),
+                "{limit}"
+            );
+        }
+        for limit in [
+            json!(1),
+            json!(2.0),
+            json!(100_000),
+            json!(9_007_199_254_740_991_u64),
+        ] {
+            let read = read_with(&mut mailboxes, &recipient, json!({ "limit": limit }));
+            assert_eq!(read["data"]["state"], "read", "{limit}: {read}");
+        }
+    }
+
+    /// The route reads a claim as an object with two text members. What the text holds is for the
+    /// mailbox: an answer that is no key or no digest, or that does not match the challenge, is
+    /// answered with a new challenge on a mailbox nobody has claimed, and ignored on one somebody
+    /// has.
+    #[test]
+    fn a_claim_that_is_not_a_key_and_a_digest_is_a_new_challenge_not_a_refusal() {
+        let recipient = StoredEnvelopeKeyPair::generate().expect("a key");
+        let mut mailboxes = BTreeMap::new();
+        for claim in [
+            json!(null),
+            json!([]),
+            json!("x"),
+            json!({}),
+            json!({ "ephemeral_key": 1, "claim_value": "x" }),
+        ] {
+            let answer = read(
+                &mut mailboxes,
+                &host(),
+                &json!({ "recipient_key": recipient.public(), "claim": claim }),
+                NOW,
+            );
+            assert_eq!(
+                refused(&answer),
+                (
+                    400,
+                    "A claim answers the challenge a read handed back.".to_owned()
+                ),
+                "{claim}"
+            );
+        }
+        let first = read_with(&mut mailboxes, &recipient, json!({}));
+        for claim in [
+            json!({ "ephemeral_key": "not a key", "claim_value": "not a digest" }),
+            json!({ "ephemeral_key": first["data"]["challenge"]["ephemeral_key"], "claim_value": "AAAA" }),
+        ] {
+            let again = read_with(&mut mailboxes, &recipient, json!({ "claim": claim }));
+            assert_eq!(again["data"]["state"], "claim_required", "{again}");
+            assert_ne!(
+                again["data"]["challenge"]["ephemeral_key"],
+                first["data"]["challenge"]["ephemeral_key"],
+                "a new challenge replaces the one standing"
+            );
+        }
+
+        claimed(&mut mailboxes, &recipient);
+        let ignored = read_with(
+            &mut mailboxes,
+            &recipient,
+            json!({ "claim": { "ephemeral_key": "not a key", "claim_value": "not a digest" } }),
+        );
+        assert_eq!(
+            ignored["data"]["state"], "read",
+            "a claimed mailbox ignores the claim: {ignored}"
+        );
+    }
+
+    #[test]
+    fn an_announcement_to_what_is_not_a_key_or_to_another_recipient_is_declined() {
+        let recipient = StoredEnvelopeKeyPair::generate().expect("a key");
+        let other = StoredEnvelopeKeyPair::generate().expect("a key");
+        let recipient_text = serde_json::to_value(recipient.public()).expect("text");
+        let recipient_text = recipient_text.as_str().expect("text");
+        let envelope = envelope_for(recipient.public(), recipient.public(), NOW + 60_000);
+        let mut mailboxes = BTreeMap::new();
+
+        let outcome = announce(&mut mailboxes, &host(), "not a key", envelope.clone(), NOW);
+        assert_eq!(
+            outcome,
+            json!({ "mailbox": "declined", "declined_reason": "that is not a recipient key" })
+        );
+
+        let misrouted = envelope_for(other.public(), other.public(), NOW + 60_000);
+        let outcome = announce(&mut mailboxes, &host(), recipient_text, misrouted, NOW);
+        assert_eq!(
+            outcome,
+            json!({
+                "mailbox": "declined",
+                "declined_reason": "that item is routed to another recipient",
+            })
+        );
+        assert!(mailboxes.is_empty(), "nothing was placed");
+
+        let outcome = announce(&mut mailboxes, &host(), recipient_text, envelope, NOW);
+        assert_eq!(outcome, json!({ "mailbox": "stored" }));
+    }
+
+    /// What the mailbox refuses of an item it is handed is worded as the Worker words it.
+    #[test]
+    fn an_item_that_has_expired_is_declined_in_the_workers_words() {
+        let recipient = StoredEnvelopeKeyPair::generate().expect("a key");
+        let recipient_text = serde_json::to_value(recipient.public()).expect("text");
+        let stale = envelope_for(recipient.public(), recipient.public(), NOW - 60_000);
+        let outcome = announce(
+            &mut BTreeMap::new(),
+            &host(),
+            recipient_text.as_str().expect("text"),
+            stale,
+            NOW,
+        );
+        assert_eq!(
+            outcome,
+            json!({ "mailbox": "declined", "declined_reason": "That item has already expired." })
+        );
+    }
 }

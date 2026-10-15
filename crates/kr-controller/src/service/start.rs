@@ -780,20 +780,21 @@ impl Controller {
                     ))
                 }
             };
-        // The mailbox this host reads: what a remote owner announces to its authority feed's
-        // changes reaches the host there. It signs as the host and reads the mailbox its own
-        // stored-envelope key addresses, through the proxy this daemon started with. Nothing
-        // runs until the daemon exists. The record of the items it has accepted is opened whether
-        // or not a service is selected, so the environment's stored formats do not depend on the
-        // configuration.
+        // The mailbox this host reads: a remote owner's announcement that the authority feed changed
+        // is placed in the mailbox of the service that holds the feed, so the host reads it at the
+        // service `authority.origin` names and at none other. It signs as the host and reads the
+        // mailbox its own stored-envelope key addresses, through the proxy this daemon started
+        // with. Nothing runs until the daemon exists. The record of the items it has accepted is
+        // opened whether or not a feed is selected, so the environment's stored formats do not
+        // depend on the configuration.
         let mailbox_record = crate::mailbox_reader::record::Record::open(setup.paths.state_dir())?;
-        let mailbox_reader = match started.mailbox.origin() {
+        let mailbox_reader = match started.authority.origin() {
             None => None,
             Some(origin) => {
                 let origin = kr_protocol::service::GatewayOrigin::new(origin).map_err(|error| {
                     ControllerError::NotConfigured(format!(
                         "{} in this host's configuration document ({}) is not usable: {error}",
-                        kr_protocol::hostinfo::configuration::MAILBOX_ORIGIN.key,
+                        kr_protocol::hostinfo::configuration::AUTHORITY_ORIGIN.key,
                         kr_protocol::hostinfo::configuration::FILE_NAME,
                     ))
                 })?;
