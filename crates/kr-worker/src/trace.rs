@@ -6,7 +6,8 @@
 //! can lengthen the figure, and a figure alone cannot say which. This records, for each
 //! acquisition of the session that lies on that path, the instants it began to wait, held the
 //! session and let go of it; for the recogniser's timer, when it woke against the deadline it slept
-//! for; and for an observation of the session's processes, when it began and ended reading them.
+//! for; for an observation of the session's processes, when it began and ended reading them; and
+//! for the output ingest, the steps of its work and its write to the spool.
 //!
 //! All of it is on one monotonic clock in one process, so the intervals can be laid side by side.
 //!
@@ -33,6 +34,18 @@ pub enum Site {
     TimerForward,
     /// The output ingest took the session to record what the application wrote.
     Ingest,
+    /// The ingest kept a batch in the session's output history, in its resident window and in the
+    /// spool's account of it. A span of the work inside [`Site::Ingest`]: `begun` and `held` are
+    /// its start and end.
+    IngestRetain,
+    /// The ingest gave a batch to the terminal engine. A span of the work inside [`Site::Ingest`].
+    IngestInterpret,
+    /// The ingest handed an interpreted batch to the attachments. A span of the work inside
+    /// [`Site::Ingest`].
+    IngestDeliver,
+    /// The ingest wrote a batch to the spool, after it had let go of the session. A span:
+    /// `begun` and `held` are its start and end.
+    SpoolWrite,
     /// The supervision took the session for one wake.
     SupervisionWake,
     /// An observation of the session's processes read them, with the session let go.
@@ -51,6 +64,10 @@ impl Site {
             Self::Ingest => 5,
             Self::SupervisionWake => 6,
             Self::Observation => 7,
+            Self::IngestRetain => 8,
+            Self::IngestInterpret => 9,
+            Self::IngestDeliver => 10,
+            Self::SpoolWrite => 11,
         }
     }
 
@@ -64,6 +81,10 @@ impl Site {
             5 => Self::Ingest,
             6 => Self::SupervisionWake,
             7 => Self::Observation,
+            8 => Self::IngestRetain,
+            9 => Self::IngestInterpret,
+            10 => Self::IngestDeliver,
+            11 => Self::SpoolWrite,
             _ => return None,
         })
     }

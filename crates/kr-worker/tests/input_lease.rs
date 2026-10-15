@@ -2542,6 +2542,204 @@ async fn a_lone_escape_is_forwarded_at_its_deadline_while_the_session_s_processe
         .release();
 }
 
+/// A root program that keeps what it reads in `received` as well as echoing it, with bracketed
+/// paste enabled. What reached the application can then be read without the session's output,
+/// which a case that stops the output ingest cannot use.
+fn bracketed_recording(received: &std::path::Path) -> String {
+    format!(
+        "stty raw -echo; printf '\\033[?2004hkr-ready.'; exec tee '{}'",
+        received.display()
+    )
+}
+
+/// Lets the stopped step go, with `release`, after a while unless `done` says it is not needed, and
+/// says whether it had to.
+///
+/// A regression leaves the stopped step holding what the case waits for, and then the case waits
+/// for as long as the stop lasts. A thread of its own lets the step go after a while and says so,
+/// so that the case fails naming the wait instead of waiting with it.
+fn release_after_a_while(
+    release: impl Fn() + Send + 'static,
+    done: &Arc<std::sync::atomic::AtomicBool>,
+) -> (
+    Arc<std::sync::atomic::AtomicBool>,
+    std::thread::JoinHandle<()>,
+) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let let_go = Arc::new(AtomicBool::new(false));
+    let thread = {
+        let (done, let_go) = (Arc::clone(done), Arc::clone(&let_go));
+        std::thread::spawn(move || {
+            for _ in 0..300 {
+                if done.load(Ordering::Acquire) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            let_go.store(true, Ordering::Release);
+            release();
+        })
+    };
+    (let_go, thread)
+}
+
+/// Types ordinary bytes until the session's output is waiting on the disk, and returns what lets
+/// the write go and how many bytes were typed.
+///
+/// The write that opens the spool's segment again after a retention pass is made with the session
+/// held, and the host makes a pass as it starts, so how many bytes it takes for the output to wait
+/// is not for the case to say. Each byte the application echoes is output, and the first of them
+/// that the ingest hands to the disk is the write that is stopped.
+async fn until_the_output_waits_on_the_disk(
+    wired: &Wired,
+    client: &mut LocalClient,
+    attachment: AttachmentId,
+    epoch: kr_protocol::ids::InputLeaseEpoch,
+) -> (std::sync::mpsc::Sender<()>, u64) {
+    let (mut writing, resume) = wired.runtime.pause_in_next_spool_write();
+    for typed in 0..20 {
+        write_over(client, wired, attachment, epoch, typed, b".")
+            .await
+            .expect("the byte is accepted");
+        if tokio::time::timeout(Duration::from_millis(500), &mut writing)
+            .await
+            .is_ok()
+        {
+            return (resume, typed + 1);
+        }
+    }
+    panic!("the session's output never waited on the disk");
+}
+
+/// KR-PERF-002: a lone Escape reaches the application at its deadline while the session's output
+/// is waiting on the disk.
+///
+/// The spool takes every batch of output the application writes, and a disk that is busy with
+/// other work can keep a write waiting for as long as it likes. The write is stopped at that
+/// moment, which is where an ingest that kept the session across it would keep the Escape's write,
+/// and then the timer, out of the session for as long as the disk took to answer. The Escape has
+/// to arrive before the write is let go. What the application received is read from the file it
+/// keeps, because the session's output is what is stopped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    windows,
+    ignore = "a Windows pseudo-console holds back a lone Escape, which it cannot tell from the start of a sequence, so the Escape this case waits for does not come back"
+)]
+async fn a_lone_escape_reaches_the_application_while_the_session_s_output_is_waiting_on_the_disk() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let kept = tempfile::tempdir().expect("a directory for what the application keeps");
+    let received = kept.path().join("received");
+    let wired = wired(&bracketed_recording(&received)).await;
+    let (mut client, attachment, epoch) = typist(&wired).await;
+
+    let (resume, typed) =
+        until_the_output_waits_on_the_disk(&wired, &mut client, attachment, epoch).await;
+
+    let accepted_or_not = Arc::new(AtomicBool::new(false));
+    let (let_go, watchdog) = release_after_a_while(
+        {
+            let resume = resume.clone();
+            move || {
+                let _ = resume.send(());
+            }
+        },
+        &accepted_or_not,
+    );
+    let accepted = write_over(&mut client, &wired, attachment, epoch, typed, b"\x1b")
+        .await
+        .expect("the Escape is accepted");
+    accepted_or_not.store(true, Ordering::Release);
+    assert!(
+        !let_go.load(Ordering::Acquire),
+        "the Escape's write was kept waiting by the output's write to the disk until it was let go"
+    );
+    assert_eq!(accepted.held_prefix_bytes.get(), 1, "the Escape is held");
+
+    let arrived = tokio::time::timeout(LIVENESS_DEADLINE, async {
+        loop {
+            if std::fs::read(&received).is_ok_and(|seen| contains(&seen, b".\x1b")) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    assert!(
+        arrived.is_ok(),
+        "the Escape reached the application while the output was still being written"
+    );
+    assert!(
+        !let_go.load(Ordering::Acquire),
+        "and the write was not let go for it to"
+    );
+
+    resume.send(()).expect("lets the write go");
+    watchdog.join().expect("the watchdog ends");
+    drop(client);
+    wired
+        .runtime
+        .close(ClosureReason::CloseRequested)
+        .1
+        .release();
+}
+
+/// KR-PERF-002: the output that has been ingested can be read while it is waiting on the disk.
+///
+/// A reader of the session's retained output takes the session, as the input measurement's poll
+/// does. Output the application has written is retained when the ingest has recorded it, and the
+/// disk is a further step; a reader behind the disk would see the output as late as the disk is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn output_is_readable_from_the_session_while_it_is_waiting_on_the_disk() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let wired = wired(BRACKETED_ECHO).await;
+    let (mut client, attachment, epoch) = typist(&wired).await;
+
+    let (resume, typed) =
+        until_the_output_waits_on_the_disk(&wired, &mut client, attachment, epoch).await;
+
+    let read = Arc::new(AtomicBool::new(false));
+    let (let_go, watchdog) = release_after_a_while(
+        {
+            let resume = resume.clone();
+            move || {
+                let _ = resume.send(());
+            }
+        },
+        &read,
+    );
+    let runtime = Arc::clone(&wired.runtime);
+    let seen = tokio::task::spawn_blocking(move || retained(&runtime.session()))
+        .await
+        .expect("the read ends");
+    read.store(true, Ordering::Release);
+    assert!(
+        !let_go.load(Ordering::Acquire),
+        "the read of the retained output was kept waiting by the output's write to the disk until \
+         it was let go"
+    );
+    let echoed = [
+        b"kr-ready.".as_slice(),
+        &vec![b'.'; usize::try_from(typed).unwrap_or(0)],
+    ]
+    .concat();
+    assert!(
+        contains(&seen, &echoed),
+        "the echo was retained before the disk had taken it: {seen:?}"
+    );
+
+    resume.send(()).expect("lets the write go");
+    watchdog.join().expect("the watchdog ends");
+    drop(client);
+    wired
+        .runtime
+        .close(ClosureReason::CloseRequested)
+        .1
+        .release();
+}
+
 /// What a held prefix's path records: each acquisition of the session with the instants it began
 /// to wait, held the session and let go of it, the timer's wake against its deadline, and the
 /// observation of the session's processes, in order.

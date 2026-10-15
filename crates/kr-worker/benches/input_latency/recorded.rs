@@ -503,6 +503,19 @@ fn describe(event: &Event, base: u64) -> String {
             after(event.begun, base),
             after(event.held, base)
         ),
+        Site::IngestRetain | Site::IngestInterpret | Site::IngestDeliver | Site::SpoolWrite => {
+            format!(
+                "{}[{} to {}]",
+                match event.site {
+                    Site::IngestRetain => "ingest-retain",
+                    Site::IngestInterpret => "ingest-interpret",
+                    Site::IngestDeliver => "ingest-deliver",
+                    _ => "spool-write",
+                },
+                after(event.begun, base),
+                after(event.held, base)
+            )
+        }
         site => {
             let name = match site {
                 Site::InputAcceptance => "input",
@@ -510,7 +523,12 @@ fn describe(event: &Event, base: u64) -> String {
                 Site::TimerForward => "timer-forward",
                 Site::Ingest => "ingest",
                 Site::SupervisionWake => "supervision",
-                Site::TimerWake | Site::Observation => unreachable!("described above"),
+                Site::TimerWake
+                | Site::Observation
+                | Site::IngestRetain
+                | Site::IngestInterpret
+                | Site::IngestDeliver
+                | Site::SpoolWrite => unreachable!("described above"),
             };
             let mut text = format!(
                 "{name}[wait {} held {} let go {}",
