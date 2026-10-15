@@ -803,25 +803,44 @@ mod platform {
             read_process_file_opened(pid, "stat", between_opening_and_reading),
             pid,
             start_value,
+            || held(pid),
         )
     }
 
     /// What reading the entry that says whether a process whose identity matched is running comes
     /// to.
     ///
-    /// The kernel described this process a moment ago, so an entry that is not there, or one the
-    /// process leaves while it is read, is a process that has ended; the kernel gives the first
-    /// for an entry it cannot find and the second for one whose process has been collected since
-    /// it was opened. Every other failure - a descriptor limit, a permission, a kernel that would
-    /// not answer - proves nothing, and answering "ended" to it would retire a live worker or
-    /// leave a survivor out of a closure record.
+    /// The kernel described this process a moment ago, so one the process leaves while its entry is
+    /// read is a process that has ended: the kernel says so for an entry whose process has been
+    /// collected since it was opened. An entry that is not there is one only when the kernel
+    /// agrees, by saying that nobody holds the number (`held`): a `/proc` mounted to hide the
+    /// processes of other accounts (`hidepid`) shows no entry for a process that is carrying on.
+    /// Every other failure - a descriptor limit, a permission, a kernel that would not answer -
+    /// proves nothing, and answering "ended" to it would retire a live worker or leave a survivor
+    /// out of a closure record.
     fn liveness_from(
         read: std::io::Result<String>,
         pid: u32,
         start_value: u64,
+        held: impl FnOnce() -> Held,
     ) -> super::ProcessState {
         match read {
             Ok(text) => decide(&text, start_value),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => match held() {
+                Held::Nobody => super::ProcessState::Ended,
+                Held::Somebody => super::ProcessState::Unknown {
+                    detail: format!(
+                        "/proc/{pid}/stat is missing and a process holds {pid}, which /proc does \
+                         not show"
+                    ),
+                },
+                Held::Unknown(why) => super::ProcessState::Unknown {
+                    detail: format!(
+                        "/proc/{pid}/stat is missing and whether a process holds {pid} was not \
+                         answered: {why}"
+                    ),
+                },
+            },
             Err(error) if gone(&error) => super::ProcessState::Ended,
             Err(error) => super::ProcessState::Unknown {
                 detail: format!("/proc/{pid}/stat: {error}"),
@@ -1605,9 +1624,10 @@ mod platform {
             );
         }
 
-        /// A running check whose entry is not there, or whose process is collected after the entry
-        /// was opened, finds a process that has ended. Every other way the read can fail leaves the
-        /// question open: a process the kernel will not describe is not one that has gone.
+        /// A running check whose entry is not there while the kernel says nobody holds the number,
+        /// or whose process is collected after the entry was opened, finds a process that has
+        /// ended. Every other way the read can fail leaves the question open: a process the kernel
+        /// will not describe is not one that has gone.
         #[test]
         fn a_running_check_that_finds_the_process_gone_is_an_end_and_no_other_failure_is() {
             let error = |number: rustix::io::Errno| {
@@ -1617,7 +1637,10 @@ mod platform {
                 std::io::Error::from(std::io::ErrorKind::NotFound),
                 error(rustix::io::Errno::SRCH),
             ] {
-                assert_eq!(liveness_from(Err(gone), 4242, 1), ProcessState::Ended);
+                assert_eq!(
+                    liveness_from(Err(gone), 4242, 1, || Held::Nobody),
+                    ProcessState::Ended
+                );
             }
             for open in [
                 error(rustix::io::Errno::ACCESS),
@@ -1626,12 +1649,49 @@ mod platform {
             ] {
                 assert!(
                     matches!(
-                        liveness_from(Err(open), 4242, 1),
+                        liveness_from(Err(open), 4242, 1, || Held::Nobody),
                         ProcessState::Unknown { .. }
                     ),
                     "a failed read is not a death"
                 );
             }
+        }
+
+        /// A `/proc` that hides the processes of other accounts (`hidepid`) shows no entry for a
+        /// process that is carrying on, so an entry that is not there is a process that has ended
+        /// only when the kernel agrees. A process the kernel still holds the number for, or a
+        /// kernel that would not say, leaves the question open; a task collected while its entry
+        /// was read has ended whatever now holds the number.
+        #[test]
+        fn a_missing_entry_is_an_end_to_a_running_check_only_when_the_kernel_agrees() {
+            let missing = || std::io::Error::from(std::io::ErrorKind::NotFound);
+            assert_eq!(
+                liveness_from(Err(missing()), 4242, 1, || Held::Nobody),
+                ProcessState::Ended
+            );
+            assert!(
+                matches!(
+                    liveness_from(Err(missing()), 4242, 1, || Held::Somebody),
+                    ProcessState::Unknown { .. }
+                ),
+                "a process the kernel holds the number for, which /proc does not show, has not ended"
+            );
+            assert!(matches!(
+                liveness_from(Err(missing()), 4242, 1, || Held::Unknown("no".to_owned())),
+                ProcessState::Unknown { .. }
+            ));
+            assert_eq!(
+                liveness_from(
+                    Err(std::io::Error::from_raw_os_error(
+                        rustix::io::Errno::SRCH.raw_os_error()
+                    )),
+                    4242,
+                    1,
+                    || Held::Somebody
+                ),
+                ProcessState::Ended,
+                "a task collected while its entry was read has ended, whatever holds the number now"
+            );
         }
 
         /// Builds a `/proc/<pid>/stat` line with the state, thread count and start time given.
