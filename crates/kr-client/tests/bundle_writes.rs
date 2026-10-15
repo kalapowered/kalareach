@@ -354,6 +354,58 @@ async fn an_account_with_no_allowance_is_refused_the_write() {
     ));
 }
 
+/// An account that did not write a bundle is told there is nothing at its locator, for a read and
+/// for a write alike, and the owner's bundle is as it was (`sync/collection.ts`, the owner a first
+/// write records). The deployment signs one account in, so the Worker cannot be asked.
+#[tokio::test]
+async fn an_account_that_does_not_own_the_bundle_is_told_it_is_not_there() {
+    const OTHER_TOKEN: &str = "the-other-accounts-write-token";
+    let web = Arc::new(ServiceWeb::new());
+    web.issue_token(WRITE_TOKEN, ACCOUNT, &[BACKUP_WRITE_SCOPE]);
+    web.issue_token(OTHER_TOKEN, "account-two", &[BACKUP_WRITE_SCOPE]);
+    let origin = GatewayOrigin::new(web.origin()).expect("an origin");
+    let collection = bundle_collection(&RecoveryContext {
+        service_origin: origin.as_str().to_owned(),
+        bundle_locator: fresh_locator().expect("a locator"),
+    });
+    let http: Arc<dyn ServiceHttp> = Arc::clone(&web) as _;
+    let service = |token: &str| {
+        ManagedSyncService::new(
+            origin.clone(),
+            Arc::clone(&http),
+            keyed(ServiceRequestSigner::Installation) as _,
+        )
+        .presenting(Arc::new(Bearer(token.to_owned())), BACKUP_WRITE_SCOPE)
+    };
+    let identity = || kr_transport::random::fresh_uuid_v4().expect("an identity");
+    let owner = service(WRITE_TOKEN);
+    let other = service(OTHER_TOKEN);
+
+    assert!(matches!(
+        owner
+            .compare_exchange(&collection, identity(), now_ms(), None, &stream(2048, 0))
+            .await,
+        Ok(SyncExchanged::Applied { .. })
+    ));
+    let written = other
+        .compare_exchange(&collection, identity(), now_ms(), None, &stream(2048, 1))
+        .await
+        .expect_err("a write by an account that is not the owner");
+    assert_eq!(
+        written.code(),
+        kr_protocol::error::ErrorCode::UnknownSession
+    );
+    let read = other
+        .fetch(&collection)
+        .await
+        .expect_err("a read by an account that is not the owner");
+    assert_eq!(read.code(), kr_protocol::error::ErrorCode::UnknownSession);
+    assert!(
+        matches!(owner.fetch(&collection).await, Ok(SyncFetched::Held { .. })),
+        "the owner's bundle is as it was"
+    );
+}
+
 /// Runs the script against a local Worker and writes what it answered.
 ///
 /// It is ignored unless it is asked for, and then it needs the Worker to ask and the account

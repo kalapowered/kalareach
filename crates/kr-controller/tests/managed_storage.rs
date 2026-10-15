@@ -4063,16 +4063,13 @@ impl Rig {
 
     /// `backup.status`.
     async fn backup_status(&self) -> BackupStatusResult {
-        let mut client = LocalClient::connect(&self.client_endpoint, LocalClientKind::Cli, build())
-            .await
-            .expect("connects");
-        client
-            .request(Method::BackupStatus, &BackupStatusParams {})
-            .await
-            .expect("the call reaches the daemon")
-            .expect("backup.status is served on the local socket")
-            .to_typed()
-            .expect("a result of the declared shape")
+        status_at(&self.client_endpoint).await
+    }
+
+    /// `backup.status` in a task of its own, for a read the test holds while it runs.
+    fn status_in_the_background(&self) -> tokio::task::JoinHandle<BackupStatusResult> {
+        let endpoint = self.client_endpoint.clone();
+        tokio::spawn(async move { status_at(&endpoint).await })
     }
 
     /// Has the carrier look at its work `count` times, and waits until it has. The waits are on
@@ -4102,6 +4099,19 @@ impl Rig {
             .map(|arrived| arrived.path.clone())
             .collect()
     }
+}
+
+async fn status_at(endpoint: &kr_ipc::paths::Endpoint) -> BackupStatusResult {
+    let mut client = LocalClient::connect(endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects");
+    client
+        .request(Method::BackupStatus, &BackupStatusParams {})
+        .await
+        .expect("the call reaches the daemon")
+        .expect("backup.status is served on the local socket")
+        .to_typed()
+        .expect("a result of the declared shape")
 }
 
 async fn enable_at(
@@ -4460,9 +4470,9 @@ async fn a_second_archive_is_refused_without_replace_and_a_call_naming_other_key
 }
 
 /// `backup.status` and `kr doctor` tell a setup that is under way: while the call waits at the
-/// service, while a repeat waits for the mutex after the first call failed (the first call's entry
-/// is gone, the repeat's is not), and while the call is before its local transaction. The control is
-/// the status when no call is running.
+/// service, while a repeat that had its turn after the first call failed is held at the enrolment
+/// (the first call's entry is gone, the repeat's is not), and while the call is before its local
+/// transaction. The control is the status when no call is running.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_setup_under_way_is_told_by_status_and_the_doctor_at_each_point_of_the_call() {
     let timer = HeldTimer::held();
@@ -4541,6 +4551,113 @@ async fn a_setup_under_way_is_told_by_status_and_the_doctor_at_each_point_of_the
     assert!(other.controller.backup().setup().expect("a read").is_none());
     web.release_held();
     let _ = call.await.expect("the call ends");
+}
+
+/// A status read that has told the calls that are running does not then say that no setup is
+/// recorded for a call that has recorded its setup and ended in between. The read is stopped between
+/// its two reads, the call (held before its commit) commits and ends, and the read goes on: it
+/// tells the call that was under way, or the setup it recorded, and never neither. A status that
+/// read the recorded setup first would say that backups are not set up, and a person told that
+/// discards a kit that is in use.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_status_read_never_misses_a_call_that_ends_between_its_two_reads() {
+    let timer = HeldTimer::held();
+    let (rig, _) = a_host_to_set_up(&timer).await;
+    let made = rig.prepared_setup(archive_id(), false);
+
+    let (commit_reached, commit_go) = rig.controller.backup().pause_the_next_setup_commit();
+    let call = rig.enable_in_the_background(&made.params);
+    tokio::task::spawn_blocking(move || commit_reached.recv_timeout(Duration::from_secs(180)))
+        .await
+        .expect("the wait ends")
+        .expect("the commit is on its thread");
+
+    let (status_reached, status_go) = rig
+        .controller
+        .pause_the_next_status_between_its_reads()
+        .expect("the host has a setup service");
+    let status = rig.status_in_the_background();
+    within("the status between its reads", status_reached.notified()).await;
+
+    commit_go.send(()).expect("the commit is waiting");
+    assert!(matches!(
+        call.await.expect("the call ends"),
+        BackupEnableResult::Enabled { .. }
+    ));
+    status_go.notify_one();
+    let told = status.await.expect("the status ends");
+    assert!(
+        !matches!(told.setup, BackupSetupState::None {}),
+        "the status says nothing is set up or under way for a call that recorded its setup: {:?}",
+        told.setup
+    );
+    assert!(matches!(
+        rig.backup_status().await.setup,
+        BackupSetupState::Committed { .. }
+    ));
+}
+
+/// A try that found an unreadable session readable is not counted until the generation that holds
+/// it is made. The disk has too little room for it, so the pass stops after the try; the next look
+/// the same day tries again, and says the same, where a try counted at once would say that nothing
+/// has changed since the newest backup for a day.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_try_that_found_a_session_readable_is_made_again_when_the_pass_stops_after_it() {
+    let timer = HeldTimer::held();
+    let mut closed = None;
+    let rig = Rig::start_with(Arrangement::NORMAL, Arc::clone(&timer), |host| {
+        let session = closed_session(host, b"a session\r\n", 9_000);
+        set_spool_mode(host, session, 0o000);
+        closed = Some(session);
+    })
+    .await;
+    let session = closed.expect("a closed session");
+    let spool = rig.host.environment().session_spool(session);
+    let readable = std::fs::read_dir(&spool)
+        .expect("the spool")
+        .flatten()
+        .any(|entry| std::fs::File::open(entry.path()).is_ok());
+    if readable {
+        // A user that reads anywhere (root): the failure cannot be made.
+        return;
+    }
+    let web = Arc::clone(rig.served.web());
+    within("the first status read", web.requests_reach(STATUS, 1)).await;
+    rig.set_up();
+    rig.until("the first generation is published", |rig| rig.published(1))
+        .await;
+
+    // The spool is mended and the disk is short of room: a day on, the look finds the session
+    // readable and stops for the room.
+    set_spool_mode(&rig.host, session, 0o600);
+    rig.controller
+        .lower_producer_bounds(kr_controller::service::ProducerBounds {
+            disk_reserve_bytes: u64::MAX / 2,
+            ..kr_controller::service::ProducerBounds::PRODUCTION
+        });
+    timer.advance_day(Duration::from_secs(25 * 3600));
+    for look in 0..2 {
+        let looked = *rig.controller.production_looks().borrow();
+        rig.controller.backup().signals().produce.notify_one();
+        rig.production_looked(looked + 1).await;
+        let (_, detail) = rig.production_check().await;
+        assert!(
+            detail.contains("too little room"),
+            "look {look} the same day: {detail}"
+        );
+    }
+    assert_eq!(
+        rig.controller.backup().generations().expect("a read").len(),
+        1
+    );
+
+    // With room, the generation that holds the session is made.
+    rig.controller
+        .lower_producer_bounds(kr_controller::service::ProducerBounds::PRODUCTION);
+    timer.run_by_itself();
+    rig.controller.backup().signals().produce.notify_one();
+    rig.until("the second generation is published", |rig| rig.published(2))
+        .await;
 }
 
 /// A call that waits for another keeps the account it was admitted under. The host signs in as
