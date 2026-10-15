@@ -173,6 +173,7 @@ const EVERY_ORIGIN: &str = "every origin";
 
 /// The platform's certificate verifier could not be set up.
 const NO_VERIFIER: &str = "the platform's certificate verifier cannot be set up";
+
 /// What a room failure says of its origin: the address as a diagnostic names one, or that it
 /// concerns every origin.
 fn room_origin(origin: &str) -> Shown {

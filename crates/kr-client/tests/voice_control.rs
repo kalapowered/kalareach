@@ -6,6 +6,7 @@
 //! clock is the watchdog that ends a test that hangs.
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -18,7 +19,8 @@ use kr_client::services::voice::{
 };
 use kr_client::services::voice_control::{
     ContextRefusal, ControlConnector, ControlEnd, ControlEvents, ControlNews, ControlTarget,
-    ControlTimings, SendError, VOICE_KNOWN_DELEGATIONS, VoiceControl, call_start_appends,
+    ControlTimings, SendError, VOICE_KNOWN_DELEGATIONS, VoiceControl as ProductControl,
+    call_start_appends,
 };
 use kr_protocol::error::ErrorCode;
 use kr_protocol::voice::{VoiceContextClass, VoiceContextSelection, VoiceSelectedContent};
@@ -45,6 +47,7 @@ fn quick() -> ControlTimings {
         absent: ms(1500),
         ready_within: ms(2000),
         answer_within: ms(2000),
+        close_within: ms(2000),
         write_within: ms(2000),
         retry_first: ms(10),
         retry_most: ms(40),
@@ -59,6 +62,10 @@ struct Tokens {
     token: Mutex<String>,
     asked: Mutex<Vec<String>>,
     failures: Mutex<VecDeque<ErrorCode>>,
+    /// While set, a request for a token waits for it to be released before it answers.
+    gate: Mutex<Option<Arc<tokio::sync::Notify>>>,
+    /// How many requests for a token ran to their end.
+    answered: AtomicUsize,
 }
 
 impl Tokens {
@@ -67,7 +74,16 @@ impl Tokens {
             token: Mutex::new(TOKEN.to_owned()),
             asked: Mutex::new(Vec::new()),
             failures: Mutex::new(VecDeque::new()),
+            gate: Mutex::new(None),
+            answered: AtomicUsize::new(0),
         })
+    }
+
+    /// Makes the next requests for a token wait, and returns what releases them.
+    fn hold(&self) -> Arc<tokio::sync::Notify> {
+        let gate = Arc::new(tokio::sync::Notify::new());
+        *self.gate.lock().expect("the tokens") = Some(Arc::clone(&gate));
+        gate
     }
 
     fn replace(&self, token: &str) {
@@ -93,6 +109,11 @@ impl AccountTokenSource for Tokens {
                 .lock()
                 .expect("the tokens")
                 .push(scope.to_owned());
+            let gate = self.gate.lock().expect("the tokens").clone();
+            if let Some(gate) = gate {
+                gate.notified().await;
+            }
+            self.answered.fetch_add(1, Ordering::SeqCst);
             if let Some(code) = self.failures.lock().expect("the tokens").pop_front() {
                 return Err(ClientError::refusal(code, Shown::said("scripted")));
             }
@@ -112,6 +133,54 @@ fn connector() -> ControlConnector {
         .with_no_client_auth(),
     )
     .with_timings(quick())
+}
+
+/// The product's control with every wait of a test bounded by the watchdog: a request, a closure
+/// or a context that is never answered fails the test instead of hanging it.
+#[derive(Clone)]
+struct VoiceControl(ProductControl);
+
+impl VoiceControl {
+    fn open(
+        connector: &ControlConnector,
+        target: ControlTarget,
+        tokens: Arc<dyn AccountTokenSource>,
+    ) -> (Self, ControlEvents) {
+        let (control, news) = ProductControl::open(connector, target, tokens);
+        (Self(control), news)
+    }
+
+    async fn send(
+        &self,
+        command: VoiceCommand,
+        delegation: Option<&str>,
+        content: Option<&str>,
+    ) -> Result<kr_client::services::voice_control::Accepted, SendError> {
+        within(
+            "a request's outcome",
+            self.0.send(command, delegation, content),
+        )
+        .await
+    }
+
+    async fn close(&self) -> Result<kr_client::services::voice_control::Closure, SendError> {
+        within("a closure's outcome", self.0.close()).await
+    }
+
+    async fn send_call_start_context(
+        &self,
+        selection: &VoiceContextSelection,
+    ) -> Result<usize, SendError> {
+        within(
+            "the opening context",
+            self.0.send_call_start_context(selection),
+        )
+        .await
+    }
+
+    fn stop(&self) {
+        self.0.stop();
+    }
 }
 
 /// A control opened on `route` with the shortened timings.
@@ -467,6 +536,107 @@ async fn requests_keep_inside_the_services_rate_without_being_refused() {
 }
 
 #[tokio::test]
+async fn requests_keep_inside_the_services_per_minute_rate_without_being_refused() {
+    // The burst window is as short as can be, so that the minute's limit is the one that holds.
+    let route = ControlRoute::start_with(None, Some((ms(1), ms(1800)))).await;
+    let timings = ControlTimings {
+        burst_window: ms(1),
+        ..quick()
+    };
+    let (control, mut news) = VoiceControl::open(
+        &connector().with_timings(timings),
+        route.target(),
+        Tokens::new(),
+    );
+    attached(&mut news).await;
+    // Each request is admitted, and the owner of a control reads what it is told.
+    tokio::spawn(async move { while news.next().await.is_some() {} });
+
+    for number in 0..70 {
+        control
+            .send(
+                VoiceCommand::Thinking,
+                None,
+                Some(&format!("part {number}")),
+            )
+            .await
+            .expect("accepted");
+    }
+
+    let report = route.report();
+    assert_eq!(report.sent.len(), 70);
+    assert_eq!(report.rate_refusals, 0);
+}
+
+#[tokio::test]
+async fn requests_written_again_after_a_loss_count_against_the_rate_like_any_other() {
+    let timings = ControlTimings {
+        retry_first: ms(100),
+        retry_most: ms(100),
+        ..quick()
+    };
+    let route = ControlRoute::start_with(None, Some((ms(300), ms(1800)))).await;
+    let (control, mut news) = VoiceControl::open(
+        &connector().with_timings(timings),
+        route.target(),
+        Tokens::new(),
+    );
+    attached(&mut news).await;
+    // Ten requests reach a socket that is lost before the service has read any of them, and the
+    // loss lasts longer than the service's burst window.
+    route.drop_next_request_unread();
+    route.refuse_all(Some(503));
+    let first: Vec<_> = (0..10)
+        .map(|number| {
+            let control = control.clone();
+            tokio::spawn(async move {
+                control
+                    .send(
+                        VoiceCommand::Thinking,
+                        None,
+                        Some(&format!("first {number}")),
+                    )
+                    .await
+            })
+        })
+        .collect();
+    route
+        .until("eight refused attempts", |report| {
+            report.refused_upgrades >= 8
+        })
+        .await;
+    route.refuse_all(None);
+    route
+        .until("the socket opened again", |report| {
+            report.upgrades.len() >= 2
+        })
+        .await;
+
+    // The ten are written again and are the service's to count, so five more wait behind them.
+    let more: Vec<_> = (0..5)
+        .map(|number| {
+            let control = control.clone();
+            tokio::spawn(async move {
+                control
+                    .send(
+                        VoiceCommand::Thinking,
+                        None,
+                        Some(&format!("more {number}")),
+                    )
+                    .await
+            })
+        })
+        .collect();
+
+    for sent in first.into_iter().chain(more) {
+        sent.await.expect("the task").expect("accepted");
+    }
+    let report = route.report();
+    assert_eq!(report.rate_refusals, 0);
+    assert_eq!(report.sent.len(), 15);
+}
+
+#[tokio::test]
 async fn a_client_that_ignores_the_rate_is_refused_for_it() {
     // The control for the test above: the route does enforce the rate, and it is the client's
     // pacing that keeps a call inside it. The client here is told the windows are a millisecond.
@@ -776,6 +946,15 @@ async fn no_account_token_ends_the_control_and_a_service_that_is_down_does_not()
     assert_eq!(ended(&mut news).await, ControlEnd::NoToken);
     assert!(route.report().upgrades.is_empty());
 
+    // A refresh that ended with an unknown outcome may have rotated the token, and asking again
+    // presents the one it replaced: it is asked once.
+    let tokens = Tokens::new();
+    tokens.fail_with(&[ErrorCode::OutcomeUnknown]);
+    let (_control, mut news) = open(&route, &tokens);
+    assert_eq!(ended(&mut news).await, ControlEnd::NoToken);
+    assert_eq!(tokens.scopes().len(), 1);
+    assert!(route.report().upgrades.is_empty());
+
     let tokens = Tokens::new();
     tokens.fail_with(&[
         ErrorCode::UpstreamUnavailable,
@@ -784,6 +963,138 @@ async fn no_account_token_ends_the_control_and_a_service_that_is_down_does_not()
     let (_control, mut news) = open(&route, &tokens);
     attached(&mut news).await;
     assert_eq!(tokens.scopes().len(), 3);
+}
+
+#[tokio::test]
+async fn a_token_that_never_comes_ends_the_control_when_the_absent_window_passes() {
+    let route = ControlRoute::start().await;
+    let tokens = Tokens::new();
+    let _never = tokens.hold();
+    let (_control, mut news) = open(&route, &tokens);
+
+    assert_eq!(ended(&mut news).await, ControlEnd::Unreachable);
+
+    assert!(route.report().upgrades.is_empty());
+}
+
+#[tokio::test]
+async fn a_refresh_the_control_is_stopped_in_the_middle_of_still_runs_to_its_end() {
+    let route = ControlRoute::start().await;
+    let tokens = Tokens::new();
+    let release = tokens.hold();
+    let (control, mut news) = open(&route, &tokens);
+    within("the token being asked for", async {
+        while tokens.scopes().is_empty() {
+            tokio::time::sleep(ms(5)).await;
+        }
+    })
+    .await;
+
+    control.stop();
+    assert!(
+        news.next().await.is_none(),
+        "a stopped control tells nothing"
+    );
+    release.notify_one();
+
+    // The refresh was not cancelled with the control: it ends, and so keeps what it was given.
+    within("the refresh ending", async {
+        while tokens.answered.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(ms(5)).await;
+        }
+    })
+    .await;
+    assert!(route.report().upgrades.is_empty());
+}
+
+#[tokio::test]
+async fn a_service_that_ends_every_socket_as_it_opens_ends_the_control_and_the_requests_waiting() {
+    let route = ControlRoute::start().await;
+    route.drop_after_ready(true);
+    let (control, mut news) = open(&route, &Tokens::new());
+    let waiting = tokio::spawn({
+        let control = control.clone();
+        async move {
+            control
+                .send(VoiceCommand::Thinking, None, Some("never answered"))
+                .await
+        }
+    });
+
+    // Sockets that never serve for a heartbeat do not restart the absent window, so it runs out.
+    assert_eq!(ended(&mut news).await, ControlEnd::Unreachable);
+
+    let waited = waiting.await.expect("the task");
+    assert!(
+        matches!(waited, Err(SendError::Lost | SendError::Unanswered)),
+        "{waited:?}"
+    );
+    assert!(route.report().upgrades.len() > 1, "it did try again");
+}
+
+#[tokio::test]
+async fn an_admission_that_came_while_the_socket_was_down_is_heard_from_the_next_one() {
+    let route = ControlRoute::start().await;
+    let (control, mut news) = open(&route, &Tokens::new());
+    attached(&mut news).await;
+    route.accept_next_request_and_drop_before_its_admission();
+
+    let accepted = control
+        .send(VoiceCommand::Thinking, None, Some("the model hears this"))
+        .await
+        .expect("accepted");
+
+    let admitted = event_where(&mut news, |event| {
+        matches!(event, VoiceControlEvent::ContextAdmitted { .. })
+    })
+    .await;
+    assert!(matches!(
+        admitted,
+        VoiceControlEvent::ContextAdmitted { ref id, .. } if *id == accepted.id
+    ));
+    let report = route.report();
+    assert_eq!(report.sent.len(), 1, "sent to the provider once");
+    assert_eq!(report.repeats, 1);
+    assert_eq!(report.upgrades.len(), 2);
+}
+
+#[tokio::test]
+async fn frames_that_keep_arriving_do_not_hold_back_the_heartbeat() {
+    let route = ControlRoute::start().await;
+    let (_control, mut news) = open(&route, &Tokens::new());
+    attached(&mut news).await;
+    tokio::spawn(async move { while news.next().await.is_some() {} });
+
+    within("three heartbeats among the frames", async {
+        while route.report().heartbeats < 3 {
+            for _ in 0..50 {
+                route.usage(1, true);
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_ping_is_answered_at_once_and_not_with_the_next_heartbeat() {
+    // The heartbeat is a minute away and the silence limit a few seconds, so a pong that waited
+    // for a write would never come.
+    let timings = ControlTimings {
+        heartbeat: ms(60_000),
+        ..quick()
+    };
+    let route = ControlRoute::start().await;
+    let (_control, mut news) = VoiceControl::open(
+        &connector().with_timings(timings),
+        route.target(),
+        Tokens::new(),
+    );
+    attached(&mut news).await;
+
+    route.ping();
+
+    route.until("a pong", |report| report.pongs >= 1).await;
 }
 
 #[tokio::test]
@@ -860,7 +1171,7 @@ async fn a_closure_the_service_never_confirms_is_not_known_to_have_happened() {
     attached(&mut news).await;
     route.go_silent(true);
 
-    let closure = within("the closure's outcome", control.close()).await;
+    let closure = control.close().await;
 
     assert!(matches!(closure, Err(SendError::Unanswered)), "{closure:?}");
 }
@@ -893,6 +1204,14 @@ async fn stopping_the_control_leaves_the_call_open_and_the_waiting_requests_lost
         news.next().await.is_none(),
         "a stopped control tells nothing more"
     );
+    assert!(
+        !route
+            .report()
+            .frames
+            .iter()
+            .any(|frame| frame.contains(r#""command":"close""#)),
+        "stopping the control does not close the call"
+    );
     route
         .until("the socket gone", |report| report.open == 0)
         .await;
@@ -911,7 +1230,7 @@ fn selection(messages: usize) -> VoiceContextSelection {
             class: VoiceContextClass::TerminalScrollback,
             text: "line one\nline two".to_owned(),
         }],
-        text_tokens: 900,
+        text_tokens: 913,
         truncated: true,
         secrets_stripped: 0,
         stripping_note: "Stripping is a secondary measure.".to_owned(),
@@ -956,6 +1275,10 @@ async fn the_calls_opening_context_goes_as_thinking_within_the_bound_and_inside_
     }
     // What was sent is what the pure function says it is.
     assert_eq!(text, call_start_appends(&selection).concat());
+    // And none of the selection's accounting leaves the host.
+    for kept in ["Stripping is a secondary measure.", "913"] {
+        assert!(!text.contains(kept), "{kept}");
+    }
 }
 
 #[tokio::test]

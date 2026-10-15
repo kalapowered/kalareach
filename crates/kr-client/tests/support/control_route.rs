@@ -50,6 +50,7 @@ pub const WATCHDOG: Duration = Duration::from_secs(20);
 enum Outbound {
     Text(String),
     Binary(Vec<u8>),
+    Ping,
     /// Ends the connection with no closing frame.
     Drop,
     /// Ends the connection with a closing frame.
@@ -83,6 +84,8 @@ pub struct Report {
     pub open: usize,
     /// Heartbeats read.
     pub heartbeats: usize,
+    /// Pongs read: the device's answers to pings the route sent.
+    pub pongs: usize,
     /// Every text frame read from a device, whatever became of it.
     pub frames: Vec<String>,
     /// The requests it sent on to the provider, each once.
@@ -102,6 +105,9 @@ struct State {
     silent: bool,
     provider_down: bool,
     swallow_then_drop: bool,
+    accept_then_drop: bool,
+    drop_unread: bool,
+    drop_after_ready: bool,
     announced: Vec<String>,
     ready_call: String,
     windows: (Duration, Duration),
@@ -149,6 +155,9 @@ impl ControlRoute {
                 silent: false,
                 provider_down: false,
                 swallow_then_drop: false,
+                accept_then_drop: false,
+                drop_unread: false,
+                drop_after_ready: false,
                 announced: Vec::new(),
                 ready_call: CALL.to_owned(),
                 windows: windows.unwrap_or((Duration::from_secs(10), Duration::from_secs(60))),
@@ -258,6 +267,30 @@ impl ControlRoute {
     /// Sends the next request on to the provider and drops the connection without answering it.
     pub fn swallow_next_request_and_drop(&self) {
         self.edit(|state| state.swallow_then_drop = true);
+    }
+
+    /// Accepts the next request and sends it on to the provider, then drops the connection before
+    /// the provider's answer reaches the device.
+    pub fn accept_next_request_and_drop_before_its_admission(&self) {
+        self.edit(|state| state.accept_then_drop = true);
+    }
+
+    /// Drops the connection when the next request arrives, before the route has read it: the
+    /// service never had it.
+    pub fn drop_next_request_unread(&self) {
+        self.edit(|state| state.drop_unread = true);
+    }
+
+    /// Ends every connection as soon as it has said `ready`, until told not to.
+    pub fn drop_after_ready(&self, drop: bool) {
+        self.edit(|state| state.drop_after_ready = drop);
+    }
+
+    /// Sends a ping to every open socket.
+    pub fn ping(&self) {
+        self.each_socket(|socket| {
+            let _ = socket.send(Outbound::Ping);
+        });
     }
 
     /// Makes the next `ready` name another call.
@@ -394,7 +427,10 @@ where
     let (id, ready) = {
         let mut state = shared.state.lock().expect("the route's state");
         state.report.upgrades.push(Upgrade {
-            path: request.uri().path().to_owned(),
+            path: request
+                .uri()
+                .path_and_query()
+                .map_or_else(String::new, ToString::to_string),
             authorization: request
                 .headers()
                 .get("authorization")
@@ -416,12 +452,26 @@ where
     };
     let _ = socket.send(Message::text(ready.to_string())).await;
     shared.changed.notify_waiters();
+    let drop_now = shared
+        .state
+        .lock()
+        .expect("the route's state")
+        .drop_after_ready;
+    // A socket that is to end as it opens is never read, so its connection closes at once.
     loop {
+        if drop_now {
+            break;
+        }
         tokio::select! {
             read = socket.next() => {
                 let Some(Ok(message)) = read else { break };
                 if message.is_close() {
                     break;
+                }
+                if message.is_pong() {
+                    shared.state.lock().expect("the route's state").report.pongs += 1;
+                    shared.changed.notify_waiters();
+                    continue;
                 }
                 let Some(text) = message.as_text() else { continue };
                 let (answers, drop_after) = answer(&shared, text);
@@ -437,6 +487,11 @@ where
             }
             told = inbound.recv() => match told {
                 None | Some(Outbound::Drop) => break,
+                Some(Outbound::Ping) => {
+                    if socket.send(Message::ping("route")).await.is_err() {
+                        break;
+                    }
+                }
                 Some(Outbound::Close) => {
                     let _ = socket.close().await;
                     break;
@@ -467,6 +522,10 @@ where
 /// the connection.
 fn answer(shared: &Shared, text: &str) -> (Vec<Value>, bool) {
     let mut state = shared.state.lock().expect("the route's state");
+    if state.drop_unread && text.contains(r#""type":"context""#) {
+        state.drop_unread = false;
+        return (Vec::new(), true);
+    }
     state.report.frames.push(text.to_owned());
     if state.silent {
         return (Vec::new(), false);
@@ -569,7 +628,7 @@ fn answer(shared: &Shared, text: &str) -> (Vec<Value>, bool) {
             vec![json!({
                 "type": "context_refused", "id": id, "reason": "rate",
                 "message": "That is more context than this call may send in a minute.",
-                "retryAfterSeconds": 10
+                "retryAfterSeconds": if in_minute >= 60 { 60 } else { 10 }
             })],
             false,
         );
@@ -612,6 +671,10 @@ fn answer(shared: &Shared, text: &str) -> (Vec<Value>, bool) {
         return (Vec::new(), true);
     }
     state.answers.insert(id.to_owned(), admitted.clone());
+    if std::mem::take(&mut state.accept_then_drop) {
+        // The provider has it and the device was told it was accepted, and the answer is lost.
+        return (vec![json!({ "type": "context_accepted", "id": id })], true);
+    }
     (
         vec![json!({ "type": "context_accepted", "id": id }), admitted],
         false,

@@ -14,8 +14,9 @@
 //! * **The token.** The upgrade carries the account token for the `voice` scope as a bearer
 //!   header, taken from the [`AccountTokenSource`] on every attempt, so a token that was replaced
 //!   while a call ran is the one a reconnection presents. It goes nowhere else.
-//! * **The call.** The service answers with `ready` first. A `ready` that names another call is
-//!   not this call's socket, and the control ends.
+//! * **The call.** The service sends `ready` once a socket is open, and the control waits for it
+//!   and ignores what comes before. A `ready` that names another call is not this call's socket,
+//!   and the control ends.
 //! * **Four client rules**, which stand whatever the service would accept. A frame is at most
 //!   [`VOICE_CONTROL_FRAME_BYTES`] bytes, and an append at most [`VOICE_CONTEXT_BYTES`]. A
 //!   request names a delegation only if this call heard it announced: a delegation identifier is
@@ -32,21 +33,27 @@
 //!
 //! # A request has an identifier for the call's life
 //!
-//! The service answers a request that it saw before, with the same command, delegation and text
-//! length, with `context_accepted` and then the first request's answer, and sends nothing to the
-//! provider again. So a request that was written to a socket which then dropped is written again,
-//! with its identifier, after the next `ready`, and the model is told once. Identifiers carry a
-//! prefix chosen when the control opens, so a control opened again for the same call cannot reuse
-//! one.
+//! The service keeps each request it sent on to the provider, with its command, delegation and
+//! text length, and answers a request that repeats one of those with `context_accepted` and then
+//! what the first was given, and sends nothing to the provider again. So a request that was
+//! written to a socket which then dropped is written again, with its identifier, after the next
+//! `ready`, and the model is told once. So is a request the service accepted whose admission has
+//! not come: the service tells the provider's answer only to the sockets open when it arrives, and
+//! the repeat is how the next socket hears it. Identifiers carry a prefix chosen when the control
+//! opens, so a control opened again for the same call cannot reuse one.
 //!
 //! # When the socket is lost
 //!
 //! The service closes a call whose client has been absent for [`VOICE_CLIENT_ABSENT_SECONDS`]
-//! seconds, so a lost socket is opened again with a short, growing wait between attempts until
-//! that long has passed since it was lost. A socket that has said nothing for longer than two
-//! heartbeats is lost. An answer that says the call is not this account's, or is over, ends the
-//! control at once: reconnecting cannot change it. Everything the control tells its owner is a
-//! [`ControlNews`], and the last is always [`ControlNews::Ended`].
+//! seconds, so a lost socket is opened again until that long has passed since it was lost: at once
+//! after a socket that served for a heartbeat or more, and after a wait that grows from half a
+//! second to five between attempts that failed, or that were lost as soon as they opened. The
+//! window bounds an attempt as well as the waits between them. A socket from which nothing has
+//! been heard for longer than two heartbeats is lost. An answer that says the call is not this
+//! account's, or is over, ends the control at once: reconnecting cannot change it. A request is
+//! given up on once that same window has passed since it was made, however many sockets came and
+//! went. Everything the control tells its owner is a [`ControlNews`], and the last is
+//! [`ControlNews::Ended`] unless the owner stopped the control.
 //!
 //! A control that is not read stops its own reading and, with it, its heartbeats: its owner reads
 //! its news in a task of its own.
@@ -96,6 +103,9 @@ const MAX_START_APPENDS: usize = 64;
 /// one's does not count a request this client counted as outside.
 const PACE_MARGIN: Duration = Duration::from_millis(250);
 
+/// The most accepted requests a control keeps to write again for their admission.
+const MAX_ADMITTING: usize = 64;
+
 /// How many requests wait between a handle and its control.
 const REQUEST_QUEUE: usize = 8;
 
@@ -119,12 +129,17 @@ pub struct ControlTimings {
     /// It has to be longer than `answer_within`, or a service that accepts sockets and answers
     /// nothing would end each socket before any request ran out its limit.
     pub silence: Duration,
-    /// How long after the socket is lost the control keeps opening it again.
+    /// How long after the socket is lost the control keeps opening it again, and the most that a
+    /// request waits for the service whatever sockets come and go meanwhile.
     pub absent: Duration,
     /// How long a socket that opened has to say `ready`.
     pub ready_within: Duration,
-    /// How long a request has to be answered, and a closure to be confirmed.
+    /// How long a request has to be answered once it was written to an open socket.
     pub answer_within: Duration,
+    /// How long a closure has to be confirmed once it was written to an open socket. The service
+    /// finishes the call's accounts before it confirms, which takes longer than answering a
+    /// request.
+    pub close_within: Duration,
     /// How long a write to the socket may take.
     pub write_within: Duration,
     /// The wait before the first new attempt after a loss; each next one doubles.
@@ -146,6 +161,7 @@ impl Default for ControlTimings {
             absent: Duration::from_secs(u64::from(VOICE_CLIENT_ABSENT_SECONDS)),
             ready_within: PATIENCE,
             answer_within: PATIENCE,
+            close_within: Duration::from_secs(30),
             write_within: PATIENCE,
             retry_first: Duration::from_millis(500),
             retry_most: Duration::from_secs(5),
@@ -271,7 +287,9 @@ pub enum ControlEnd {
     NoSuchCall,
     /// The service did not accept the account token.
     NotAuthorised,
-    /// There is no account token to present, and none can be had.
+    /// There is no account token to present, and none can be had safely: no account is signed in,
+    /// the sign-in does not carry the scope, or a refresh ended with an unknown outcome, which is
+    /// never tried again.
     NoToken,
     /// The service refused the upgrade with a status that reconnecting does not change.
     Refused(u16),
@@ -562,6 +580,7 @@ impl VoiceControl {
             stop: Arc::clone(&stop),
             known: VecDeque::new(),
             pending: Vec::new(),
+            admitting: VecDeque::new(),
             pacer: Pacer::new(&connector.timings),
             id_prefix: prefix.iter().map(|byte| format!("{byte:02x}")).collect(),
             next_id: 1,
@@ -805,9 +824,11 @@ struct Pending {
     kind: Kind,
     standing: Standing,
     /// When the service's answer is due: a window after the request was last written to an open
-    /// socket. A request that was never written has none, and one that was written before spends
-    /// none of the rate when it is written again.
+    /// socket. A request that was never written has none.
     due: Option<Instant>,
+    /// When it was made. However many sockets come and go, a request is given up on once the
+    /// absent window has passed since.
+    born: Instant,
 }
 
 /// How a socket's service ended.
@@ -841,6 +862,10 @@ struct Driver {
     /// The delegations this call heard announced, oldest first.
     known: VecDeque<String>,
     pending: Vec<Pending>,
+    /// Requests the service accepted whose admission or refusal has not come, as their wire text.
+    /// The service tells the provider's answer only to the sockets open when it comes, and answers
+    /// a repeat from what it kept, so these are written again to the next socket.
+    admitting: VecDeque<(String, String)>,
     pacer: Pacer,
     id_prefix: String,
     next_id: u64,
@@ -880,7 +905,10 @@ impl Driver {
         let mut lost_at = Instant::now();
         let mut failures = 0_u32;
         loop {
-            if lost_at.elapsed() >= self.timings().absent {
+            // The window bounds the attempt as well as the wait between attempts, so a service
+            // that answers slowly cannot hold the control open past it.
+            let deadline = lost_at + self.timings().absent;
+            if Instant::now() >= deadline {
                 return Some(ControlEnd::Unreachable);
             }
             let attempt = attach(
@@ -888,17 +916,19 @@ impl Driver {
                 self.target.clone(),
                 Arc::clone(&self.tokens),
             );
-            let attached = match self.while_taking_requests(attempt).await? {
-                Ok(attached) => attached,
-                Err(Attempt::End(end)) => return Some(end),
-                Err(Attempt::Retry) => {
-                    let wait = self.retry_wait(failures);
-                    failures = failures.saturating_add(1);
-                    self.while_taking_requests(tokio::time::sleep(wait)).await?;
+            let attached = match self
+                .while_taking_requests(tokio::time::timeout_at(deadline, attempt))
+                .await?
+            {
+                Err(_) => return Some(ControlEnd::Unreachable),
+                Ok(Ok(attached)) => attached,
+                Ok(Err(Attempt::End(end))) => return Some(end),
+                Ok(Err(Attempt::Retry)) => {
+                    self.back_off(&mut failures, deadline).await?;
                     continue;
                 }
             };
-            failures = 0;
+            let attached_at = Instant::now();
             let (socket, delegations) = attached;
             self.set_known(&delegations);
             let news = ControlNews::Attached {
@@ -913,13 +943,34 @@ impl Driver {
                 Served::Stopped => return None,
                 Served::Ended(end) => return Some(end),
                 Served::Lost => {
-                    lost_at = Instant::now();
+                    let stable = attached_at.elapsed() >= self.timings().heartbeat;
                     if self.tell(ControlNews::Detached).await.is_err() {
                         return None;
+                    }
+                    if stable {
+                        // A socket that served for a while: the window counts from this loss, and
+                        // the next attempt is at once.
+                        lost_at = Instant::now();
+                        failures = 0;
+                    } else {
+                        // One that was lost as soon as it opened is a service or a network that
+                        // is not holding sockets, and is not met with an attempt a moment later.
+                        self.back_off(&mut failures, lost_at + self.timings().absent)
+                            .await?;
                     }
                 }
             }
         }
+    }
+
+    /// Waits before the next attempt, longer for each failure in a row and never past `deadline`.
+    /// `None` once the owner stopped the control or went away.
+    async fn back_off(&mut self, failures: &mut u32, deadline: Instant) -> Option<()> {
+        let wait = self
+            .retry_wait(*failures)
+            .min(deadline.saturating_duration_since(Instant::now()));
+        *failures = failures.saturating_add(1);
+        self.while_taking_requests(tokio::time::sleep(wait)).await
     }
 
     /// The wait before attempt number `failures` + 1.
@@ -977,6 +1028,7 @@ impl Driver {
                     kind: Kind::Send(reply),
                     standing: Standing::Unsent,
                     due: None,
+                    born: Instant::now(),
                 }),
                 Err(refused) => {
                     let _ = reply.send(Err(refused));
@@ -989,6 +1041,7 @@ impl Driver {
                     kind: Kind::Close(reply),
                     standing: Standing::Unsent,
                     due: None,
+                    born: Instant::now(),
                 }),
                 Err(refused) => {
                     let _ = reply.send(Err(refused));
@@ -1054,9 +1107,23 @@ impl Driver {
         heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut last_heard = Instant::now();
         // What the last socket was owed an answer for is written again: the service answers a
-        // repeat without sending it twice, and its deadline stays what it was.
+        // repeat without sending it twice.
         for pending in &mut self.pending {
             pending.standing = Standing::Unsent;
+        }
+        // So is what the service accepted and has not yet told the provider's answer to: it
+        // answers the repeat with that answer, and spends none of its rate on it.
+        let repeats: Vec<String> = self
+            .admitting
+            .iter()
+            .map(|(_, wire)| wire.clone())
+            .collect();
+        for wire in repeats {
+            let sent =
+                tokio::time::timeout(timings.write_within, socket.send(Message::text(wire))).await;
+            if !matches!(sent, Ok(Ok(()))) {
+                return Served::Lost;
+            }
         }
         let served = loop {
             match self.write_due(&mut socket).await {
@@ -1064,24 +1131,10 @@ impl Driver {
                 Err(()) => break Served::Lost,
             }
             let wake = self.next_wake(last_heard);
+            // The timers come first, so frames and requests that keep arriving cannot hold back a
+            // heartbeat or the silence limit.
             tokio::select! {
                 biased;
-                () = self.stop.notified() => break Served::Stopped,
-                heard = socket.next() => match heard {
-                    None | Some(Err(_)) => break Served::Lost,
-                    Some(Ok(message)) => {
-                        last_heard = Instant::now();
-                        match self.on_message(&message).await {
-                            Ok(Some(served)) => break served,
-                            Ok(None) => {}
-                            Err(OwnerGone) => break Served::Stopped,
-                        }
-                    }
-                },
-                request = self.requests.recv() => match request {
-                    None => break Served::Stopped,
-                    Some(request) => self.take(request),
-                },
                 _ = heartbeat.tick() => {
                     let sent = tokio::time::timeout(
                         timings.write_within,
@@ -1098,6 +1151,32 @@ impl Driver {
                     }
                     self.expire_answers();
                 }
+                () = self.stop.notified() => break Served::Stopped,
+                heard = socket.next() => match heard {
+                    None | Some(Err(_)) => break Served::Lost,
+                    Some(Ok(message)) => {
+                        last_heard = Instant::now();
+                        if message.is_ping() {
+                            // The library answers a ping itself and holds the answer until
+                            // something is written, so a service that pings would grow that
+                            // queue between heartbeats.
+                            let flushed =
+                                tokio::time::timeout(timings.write_within, socket.flush()).await;
+                            if !matches!(flushed, Ok(Ok(()))) {
+                                break Served::Lost;
+                            }
+                        }
+                        match self.on_message(&message).await {
+                            Ok(Some(served)) => break served,
+                            Ok(None) => {}
+                            Err(OwnerGone) => break Served::Stopped,
+                        }
+                    }
+                },
+                request = self.requests.recv() => match request {
+                    None => break Served::Stopped,
+                    Some(request) => self.take(request),
+                },
             }
         };
         if !matches!(served, Served::Lost) {
@@ -1107,6 +1186,11 @@ impl Driver {
     }
 
     /// Writes the requests the pacer lets go, in the order they were made.
+    ///
+    /// Every write is paced and counted, a request written again after a loss included: the
+    /// service counts a request when it sends it on, so one that was lost before the service had it
+    /// counts when it is written again. Counting a rewrite of one the service already had only
+    /// delays the next request.
     async fn write_due(&mut self, socket: &mut Socket) -> std::result::Result<(), ()> {
         let timings = self.timings();
         loop {
@@ -1118,8 +1202,7 @@ impl Driver {
                 return Ok(());
             };
             let now = Instant::now();
-            let again = self.pending[at].due.is_some();
-            if !again && self.pacer.next_at(now).is_some() {
+            if self.pacer.next_at(now).is_some() {
                 return Ok(());
             }
             let wire = self.pending[at].wire.clone();
@@ -1128,41 +1211,50 @@ impl Driver {
             if !matches!(sent, Ok(Ok(()))) {
                 return Err(());
             }
-            let pending = &mut self.pending[at];
-            if !again {
-                self.pacer.record(now);
-            }
+            self.pacer.record(now);
             // The service's answer is due a window after the request reached a socket that is
             // open, so a loss that outlasts the window does not expire what the next socket is
             // about to answer.
-            pending.due = Some(now + timings.answer_within);
+            let pending = &mut self.pending[at];
+            let within = match pending.kind {
+                Kind::Send(_) => timings.answer_within,
+                Kind::Close(_) => timings.close_within,
+            };
+            pending.due = Some(now + within);
             pending.standing = Standing::Awaiting;
         }
     }
 
     /// The next moment something is due without a frame arriving: the silence limit, an answer
-    /// that has waited long enough, or a request the pacer is holding.
+    /// that has waited long enough, a request that has used its budget, or a request the pacer is
+    /// holding.
     fn next_wake(&mut self, last_heard: Instant) -> Instant {
+        let absent = self.timings().absent;
         let mut wake = last_heard + self.timings().silence;
         let mut held = false;
         for pending in &self.pending {
+            wake = wake.min(pending.born + absent);
             if let Some(due) = pending.due {
                 wake = wake.min(due);
             }
-            held |= pending.standing == Standing::Unsent && pending.due.is_none();
+            held |= pending.standing == Standing::Unsent;
         }
-        if held && let Some(until) = self.pacer.next_at(Instant::now()) {
-            wake = wake.min(until);
+        if held {
+            let now = Instant::now();
+            wake = wake.min(self.pacer.next_at(now).unwrap_or(now));
         }
         wake
     }
 
-    /// Gives up on the answers that did not come in time.
+    /// Gives up on the answers that did not come in time, and on requests that have waited out the
+    /// absent window.
     fn expire_answers(&mut self) {
         let now = Instant::now();
+        let absent = self.timings().absent;
         let mut index = 0;
         while index < self.pending.len() {
-            if self.pending[index].due.is_some_and(|due| due <= now) {
+            let pending = &self.pending[index];
+            if pending.due.is_some_and(|due| due <= now) || pending.born + absent <= now {
                 match self.pending.remove(index).kind {
                     Kind::Send(reply) => {
                         let _ = reply.send(Err(SendError::Unanswered));
@@ -1202,25 +1294,39 @@ impl Driver {
             }
             VoiceControlEvent::ContextAccepted { id } => {
                 if let Some(at) = self.pending.iter().position(|pending| pending.id == id) {
-                    let timings = self.timings();
+                    let close_within = self.timings().close_within;
                     match self.pending[at].kind {
                         Kind::Send(_) => {
-                            if let Kind::Send(reply) = self.pending.remove(at).kind {
+                            let accepted = self.pending.remove(at);
+                            if self.admitting.len() >= MAX_ADMITTING {
+                                self.admitting.pop_front();
+                            }
+                            self.admitting.push_back((id.clone(), accepted.wire));
+                            if let Kind::Send(reply) = accepted.kind {
                                 let _ = reply.send(Ok(Accepted { id }));
                             }
                         }
                         Kind::Close(_) => {
                             self.pending[at].standing = Standing::Closing;
-                            self.pending[at].due = Some(Instant::now() + timings.answer_within);
+                            self.pending[at].due = Some(Instant::now() + close_within);
                         }
                     }
                 }
+            }
+            VoiceControlEvent::ContextAdmitted { id, note } => {
+                self.admitting.retain(|(kept, _)| *kept != id);
+                self.tell(ControlNews::Event(VoiceControlEvent::ContextAdmitted {
+                    id,
+                    note,
+                }))
+                .await?;
             }
             VoiceControlEvent::ContextRefused {
                 id,
                 reason,
                 message,
             } => {
+                self.admitting.retain(|(kept, _)| *kept != id);
                 if let Some(at) = self.pending.iter().position(|pending| pending.id == id) {
                     // A closure written again after a loss meets a call that is already closing.
                     // That is the closure it asked for, and its confirmation is what follows.
@@ -1228,7 +1334,7 @@ impl Driver {
                         && ContextRefusal::from_wire(&reason) == ContextRefusal::Closed
                     {
                         self.pending[at].standing = Standing::Closing;
-                        self.pending[at].due = Some(Instant::now() + self.timings().answer_within);
+                        self.pending[at].due = Some(Instant::now() + self.timings().close_within);
                         return Ok(None);
                     }
                     let refused = SendError::Refused {
@@ -1306,22 +1412,26 @@ async fn attach(
     tokens: Arc<dyn AccountTokenSource>,
 ) -> std::result::Result<(Socket, Vec<String>), Attempt> {
     let timings = connector.timings;
-    let token = match tokens.token(VOICE_SCOPE).await {
-        Ok(token) => token,
-        Err(error) => {
-            // Not being able to reach the account service is a reason to try again; not having an
-            // account, or a token for the scope, is not.
-            return Err(
-                if matches!(
-                    error.code(),
-                    ErrorCode::UpstreamUnavailable | ErrorCode::OutcomeUnknown
-                ) {
-                    Attempt::Retry
-                } else {
-                    Attempt::End(ControlEnd::NoToken)
-                },
-            );
+    // The token is taken on a task of its own. A refresh that is stopped part way can leave the
+    // rotation the service made unkept, so this control being stopped, or running out its window,
+    // must not stop it.
+    let asked = {
+        let tokens = Arc::clone(&tokens);
+        tokio::spawn(async move { tokens.token(VOICE_SCOPE).await })
+    };
+    let token = match asked.await {
+        Ok(Ok(token)) => token,
+        Ok(Err(error)) => {
+            // An account service that cannot be reached is a reason to try again. An unknown
+            // outcome is not: the refresh may have rotated the token, and asking again presents
+            // the one it replaced. Not having an account, or a token for the scope, is not either.
+            return Err(if error.code() == ErrorCode::UpstreamUnavailable {
+                Attempt::Retry
+            } else {
+                Attempt::End(ControlEnd::NoToken)
+            });
         }
+        Err(_) => return Err(Attempt::Retry),
     };
     // The one place the token is read. It goes into a header value and nowhere else.
     let authorisation = format!("Bearer {}", token.expose());
