@@ -90,26 +90,29 @@ async fn host() -> Host {
     let environment_id = temp.environment_id();
     let controller = kr_controller::testing::taken_over(|| {
         let secrets = environment.secrets_dir();
-        Controller::start(ControllerSetup {
-            paths: environment.clone(),
-            environment_id,
-            identity: Box::new(move || {
-                let store =
-                    open_store_in(&secrets).expect("a secret store for the test environment");
-                Ok(
-                    ControllerIdentity::open(store.store.as_ref(), environment_id, false)
-                        .expect("an identity"),
-                )
+        kr_controller::testing::with_git_read_bound(
+            kr_controller::testing::HUNG_GIT_READ,
+            Controller::start(ControllerSetup {
+                paths: environment.clone(),
+                environment_id,
+                identity: Box::new(move || {
+                    let store =
+                        open_store_in(&secrets).expect("a secret store for the test environment");
+                    Ok(
+                        ControllerIdentity::open(store.store.as_ref(), environment_id, false)
+                            .expect("an identity"),
+                    )
+                }),
+                secret_store: StoreSelection::File,
+                boot_identity: kr_ipc::identity::boot_identity().expect("a boot identity"),
+                supervisor: Box::new(RefusingSupervisor),
+                worker_program: PathBuf::from("/nonexistent/kr-worker"),
+                build_id: build(),
+                release: "0".to_owned(),
+                shell_packages: None,
+                terminal: Box::new(kr_controller::supervision::NoTerminal),
             }),
-            secret_store: StoreSelection::File,
-            boot_identity: kr_ipc::identity::boot_identity().expect("a boot identity"),
-            supervisor: Box::new(RefusingSupervisor),
-            worker_program: PathBuf::from("/nonexistent/kr-worker"),
-            build_id: build(),
-            release: "0".to_owned(),
-            shell_packages: None,
-            terminal: Box::new(kr_controller::supervision::NoTerminal),
-        })
+        )
     })
     .await
     .unwrap_or_else(|error| panic!("the daemon starts: {error}"));
