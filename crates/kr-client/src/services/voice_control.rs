@@ -116,6 +116,8 @@ pub struct ControlTimings {
     /// Between heartbeats.
     pub heartbeat: Duration,
     /// How long a socket may say nothing before it counts as lost: two heartbeats and a margin.
+    /// It has to be longer than `answer_within`, or a service that accepts sockets and answers
+    /// nothing would end each socket before any request ran out its limit.
     pub silence: Duration,
     /// How long after the socket is lost the control keeps opening it again.
     pub absent: Duration,
@@ -585,6 +587,11 @@ impl VoiceControl {
         delegation: Option<&str>,
         content: Option<&str>,
     ) -> std::result::Result<Accepted, SendError> {
+        if command == VoiceCommand::Close {
+            return Err(SendError::Invalid(Shown::said(
+                "a call is closed by close, which waits for the service's confirmation",
+            )));
+        }
         let (reply, answer) = oneshot::channel();
         self.requests
             .send(Request::Send {
@@ -797,10 +804,9 @@ struct Pending {
     wire: String,
     kind: Kind,
     standing: Standing,
-    /// When the service's answer is due. Set when the request is first written and kept when it is
-    /// written again after a loss, so that a socket that keeps dropping cannot keep an answer
-    /// from ever being late. A request that was never written has none, and spends no rate when
-    /// it is.
+    /// When the service's answer is due: a window after the request was last written to an open
+    /// socket. A request that was never written has none, and one that was written before spends
+    /// none of the rate when it is written again.
     due: Option<Instant>,
 }
 
@@ -1114,8 +1120,11 @@ impl Driver {
             let pending = &mut self.pending[at];
             if !again {
                 self.pacer.record(now);
-                pending.due = Some(now + timings.answer_within);
             }
+            // The service's answer is due a window after the request reached a socket that is
+            // open, so a loss that outlasts the window does not expire what the next socket is
+            // about to answer.
+            pending.due = Some(now + timings.answer_within);
             pending.standing = Standing::Awaiting;
         }
     }
