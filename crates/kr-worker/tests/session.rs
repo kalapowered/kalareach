@@ -1919,14 +1919,15 @@ async fn a_root_shell_that_exits_at_once_is_noticed_before_the_first_wait() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_root_shell_that_exits_after_the_session_settles_is_noticed_by_its_own_exit() {
-    // The case the child signal is actually for. The session is quiet before the shell exits, so
-    // nothing the session does can be what wakes the host, and a descendant holds the terminal
-    // open across the exit, so the terminal hanging up is not the evidence either. What is left is
-    // the exit itself, against a sweep that would not come round for thirty seconds.
+    // The case the child signal is actually for. The session is quiet before the shell exits, and
+    // a descendant holds the terminal open across the exit, so the terminal hanging up is not the
+    // evidence either. What is left is the exit itself, against a sweep that would not come round
+    // for thirty seconds.
     //
-    // The shell is held at a gate until the supervision has recorded the session with the gate in
-    // it, so the exit comes after the host has looked and gone back to waiting however long the
-    // start took, and what reported it is read from the session rather than from the time it took.
+    // So the sweep is not left to be outwaited: this session is given one an hour long, and the
+    // shell is held at a gate until the supervision has recorded the session with the gate in it,
+    // which is after it has looked once and gone back to waiting, however long the start took.
+    // The closure that follows the gate can then only have been started by the exit.
     let host = kr_ipc::testing::TempHost::create();
     let gate_identifier = if cfg!(windows) {
         "$(cat /proc/$gate/winpid)"
@@ -1944,12 +1945,15 @@ async fn a_root_shell_that_exits_after_the_session_settles_is_noticed_by_its_own
     config.shell.cwd = host.root().to_string_lossy().into_owned();
     let session_id = config.session_id;
     let journal = config.journal_path.clone().expect("a journal of its own");
+    let mut session = Session::open(config).expect("opens");
+    session.launch().expect("launches");
+    session.set_idle_sweep(Duration::from_secs(3600));
     let runtime = std::sync::Arc::new(
-        kr_worker::runtime::start(
-            config,
+        SessionRuntime::start(
+            session,
             std::sync::Arc::new(kr_ipc::clock::SystemSharedClock),
         )
-        .expect("starts a session"),
+        .expect("starts"),
     );
 
     let gate = until("the shell to name its gate", || {
@@ -1979,11 +1983,6 @@ async fn a_root_shell_that_exits_after_the_session_settles_is_noticed_by_its_own
         record.root_exit_code.0.map(kr_protocol::scalars::U64::get),
         Some(7),
         "the shell's own status"
-    );
-    let reported_by = runtime.root_exit_prompt();
-    assert!(
-        reported_by.is_some_and(|prompt| prompt != kr_worker::lifecycle::Prompt::Sweep),
-        "the exit reached the host rather than the sweep finding it: {reported_by:?}"
     );
 }
 

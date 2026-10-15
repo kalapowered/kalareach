@@ -58,7 +58,7 @@ use tokio::sync::Notify;
 /// output. This is that cadence: after input or output, the next observation happens within it.
 pub const OBSERVE_INTERVAL: Duration = Duration::from_secs(1);
 
-/// How long a session with nothing happening goes between sweeps.
+/// How long a session with nothing happening goes between sweeps, unless it was given another.
 ///
 /// One wake serves every question left without an event source: a process that started without
 /// producing output or consuming input, the login a desktop-bound session is tied to, and the root
@@ -191,19 +191,23 @@ pub struct Sweep {
     observed: Instant,
     /// Whether the session has accepted input or produced output since then.
     marked: bool,
+    /// How long a session with nothing happening goes between observations.
+    idle: Duration,
 }
 
 impl Sweep {
-    /// Begins sweeping a session whose shell has just started.
+    /// Begins sweeping a session whose shell has just started, with `idle` between the sweeps of
+    /// a session that does nothing ([`IDLE_SWEEP_INTERVAL`] unless the session was given another).
     ///
     /// The boundary was recorded as it was established, so the first observation is due an interval
     /// from here rather than at once.
     #[must_use]
-    pub fn begin(activity: Arc<Activity>, started: Instant) -> Self {
+    pub const fn begin(activity: Arc<Activity>, started: Instant, idle: Duration) -> Self {
         Self {
             activity,
             observed: started,
             marked: false,
+            idle,
         }
     }
 
@@ -236,7 +240,7 @@ impl Sweep {
             + if self.marked {
                 OBSERVE_INTERVAL
             } else {
-                IDLE_SWEEP_INTERVAL
+                self.idle
             }
     }
 
@@ -262,10 +266,12 @@ impl ChildExits {
         Self(tokio::signal::unix::signal(tokio::signal::unix::SignalKind::child()).ok())
     }
 
-    /// How long the supervision may wait before it asks the shell for its status anyway.
-    fn patience(&self) -> Duration {
+    /// How long the supervision may wait before it asks the shell for its status anyway: as long as
+    /// an idle session goes between sweeps where the signal is there, and the short poll where it
+    /// is not.
+    fn patience(&self, idle: Duration) -> Duration {
         if self.0.is_some() {
-            IDLE_SWEEP_INTERVAL
+            idle
         } else {
             CHILD_POLL_INTERVAL
         }
@@ -295,7 +301,7 @@ impl ChildExits {
         Self
     }
 
-    const fn patience(&self) -> Duration {
+    const fn patience(&self, _idle: Duration) -> Duration {
         CHILD_POLL_INTERVAL
     }
 
@@ -318,40 +324,14 @@ pub enum Wake {
     Ownership,
 }
 
-/// What brought one wake of a session's supervision.
-///
-/// Every wake asks the root shell for its status, whatever brought it, so a shell that has ended is
-/// found by whichever wake comes first. This says which that was. A shell found on a wake that the
-/// sweep brought was found only because the sweep came round, which is what the sweep is for when
-/// nothing else reported the exit; found on any other wake, it was found within moments of
-/// whatever brought that wake.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Prompt {
-    /// The look taken before anything is waited on.
-    FirstLook,
-    /// A child of this process ended and the kernel said so.
-    ChildExit,
-    /// The shell's status came due on its short clock, where nothing reports its exit.
-    ShellPoll,
-    /// The session accepted input or produced output.
+/// What ended a wait of the supervision.
+enum Cause {
+    /// The shell's child signal, or the time the cadence set.
+    Clock,
+    /// The session did something that can have started a process.
     Activity,
-    /// A reading of the desktop came back.
-    DesktopReading,
-    /// The observation of the ownership boundary came due on the short cadence after a mark.
-    Cadence,
-    /// The observation of the ownership boundary came due on the slow sweep of an idle session.
-    Sweep,
     /// A test asked for an observation.
     Forced,
-}
-
-/// One wake of a session's supervision: what it is for, and what brought it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Woken {
-    /// What the loop does on this wake.
-    pub wake: Wake,
-    /// What brought it.
-    pub prompt: Prompt,
 }
 
 /// What one session's supervision waits on.
@@ -377,76 +357,57 @@ impl std::fmt::Debug for Supervision {
 }
 
 impl Supervision {
-    /// Begins watching a session whose shell has just started.
+    /// Begins watching a session whose shell has just started, sweeping it every `idle` while it
+    /// does nothing.
     #[must_use]
-    pub fn begin(activity: Arc<Activity>, started: Instant) -> Self {
+    pub fn begin(activity: Arc<Activity>, started: Instant, idle: Duration) -> Self {
         Self {
-            sweep: Sweep::begin(activity, started),
+            sweep: Sweep::begin(activity, started, idle),
             exits: ChildExits::open(),
         }
     }
 
     /// Waits until something this supervision has to look at can have changed, and says what the
-    /// wake is for and what brought it.
-    pub async fn next(&mut self) -> Woken {
-        let (due, clock) = self.deadline(Instant::now());
-        let deadline = tokio::time::Instant::from_std(due);
+    /// wake is for.
+    pub async fn next(&mut self) -> Wake {
+        let deadline = tokio::time::Instant::from_std(self.deadline(Instant::now()));
         // A session already waiting for its next observation has nothing to learn from another
         // mark, so it stops listening for one until that observation has been taken.
         let marked = self.sweep.marked();
         let activity = Arc::clone(&self.sweep.activity);
         let exits = &mut self.exits;
-        // The exit is asked about first, so that when it has been reported and a clock has also
-        // come round, the wake is the exit's: the record of what found the shell gone does not
-        // depend on which of two things that are ready the runtime happens to pick.
-        let prompt = tokio::select! {
-            biased;
-            () = exits.next() => Prompt::ChildExit,
-            () = tokio::time::sleep_until(deadline) => clock,
-            () = activity.marked(), if !marked => Prompt::Activity,
-            () = activity.forced() => Prompt::Forced,
+        let cause = tokio::select! {
+            () = exits.next() => Cause::Clock,
+            () = tokio::time::sleep_until(deadline) => Cause::Clock,
+            () = activity.marked(), if !marked => Cause::Activity,
+            () = activity.forced() => Cause::Forced,
         };
-        match prompt {
-            Prompt::Activity => self.sweep.marked = true,
-            Prompt::Forced => {
+        match cause {
+            Cause::Clock => {}
+            Cause::Activity => self.sweep.marked = true,
+            Cause::Forced => {
                 self.sweep.observe_now(Instant::now());
-                return Woken {
-                    wake: Wake::Ownership,
-                    prompt,
-                };
+                return Wake::Ownership;
             }
-            _ => {}
         }
-        let wake = if self.sweep.observation_due(Instant::now()) {
+        if self.sweep.observation_due(Instant::now()) {
             Wake::Ownership
         } else {
             Wake::Session
-        };
-        Woken { wake, prompt }
+        }
     }
 
-    /// When this supervision wants to be woken, whatever else happens first, and which clock that
-    /// is. The observation is named when it is due no later than the shell's own status.
-    fn deadline(&mut self, now: Instant) -> (Instant, Prompt) {
+    /// When this supervision wants to be woken, whatever else happens first.
+    fn deadline(&mut self, now: Instant) -> Instant {
         let observation = self.sweep.next_observation();
-        let poll = now + self.exits.patience();
-        if observation <= poll {
-            let clock = if self.sweep.marked() {
-                Prompt::Cadence
-            } else {
-                Prompt::Sweep
-            };
-            (observation, clock)
-        } else {
-            (poll, Prompt::ShellPoll)
-        }
+        observation.min(now + self.exits.patience(self.sweep.idle))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        Activity, CHILD_POLL_INTERVAL, ChildExits, IDLE_SWEEP_INTERVAL, OBSERVE_INTERVAL, Prompt,
+        Activity, CHILD_POLL_INTERVAL, ChildExits, IDLE_SWEEP_INTERVAL, OBSERVE_INTERVAL,
         Supervision, Sweep, Wake,
     };
     use std::sync::Arc;
@@ -455,7 +416,7 @@ mod tests {
     #[test]
     fn a_session_with_nothing_happening_is_only_swept() {
         let started = Instant::now();
-        let mut sweep = Sweep::begin(Activity::new(), started);
+        let mut sweep = Sweep::begin(Activity::new(), started, IDLE_SWEEP_INTERVAL);
 
         assert_eq!(
             sweep.next_observation(),
@@ -473,10 +434,24 @@ mod tests {
     }
 
     #[test]
+    fn a_session_given_another_sweep_goes_that_long_between_observations() {
+        let started = Instant::now();
+        let idle = IDLE_SWEEP_INTERVAL * 4;
+        let mut sweep = Sweep::begin(Activity::new(), started, idle);
+
+        assert_eq!(sweep.next_observation(), started + idle);
+        assert!(
+            !sweep.observation_due(started + IDLE_SWEEP_INTERVAL),
+            "the default interval is not what it waits for"
+        );
+        assert!(sweep.observation_due(started + idle));
+    }
+
+    #[test]
     fn input_or_output_brings_the_next_observation_forward() {
         let started = Instant::now();
         let activity = Activity::new();
-        let mut sweep = Sweep::begin(Arc::clone(&activity), started);
+        let mut sweep = Sweep::begin(Arc::clone(&activity), started, IDLE_SWEEP_INTERVAL);
 
         activity.note();
         assert!(
@@ -500,7 +475,7 @@ mod tests {
     fn a_mark_made_during_an_observation_is_not_lost() {
         let started = Instant::now();
         let activity = Activity::new();
-        let mut sweep = Sweep::begin(Arc::clone(&activity), started);
+        let mut sweep = Sweep::begin(Arc::clone(&activity), started, IDLE_SWEEP_INTERVAL);
 
         activity.note();
         assert!(sweep.observation_due(started + OBSERVE_INTERVAL));
@@ -546,7 +521,7 @@ mod tests {
     /// than the moment a mark is made.
     async fn observation(supervision: &mut Supervision) -> Instant {
         loop {
-            if supervision.next().await.wake == Wake::Ownership {
+            if supervision.next().await == Wake::Ownership {
                 return Instant::now();
             }
         }
@@ -560,20 +535,28 @@ mod tests {
         #[cfg(unix)]
         {
             assert_eq!(
-                ChildExits(None).patience(),
+                ChildExits(None).patience(IDLE_SWEEP_INTERVAL),
                 CHILD_POLL_INTERVAL,
                 "a signal this host would not deliver leaves the shell's status on the clock"
             );
             assert_eq!(
-                ChildExits::open().patience(),
+                ChildExits::open().patience(IDLE_SWEEP_INTERVAL),
                 IDLE_SWEEP_INTERVAL,
                 "and where the signal is there, the clock is only the backstop behind it"
+            );
+            assert_eq!(
+                ChildExits::open().patience(IDLE_SWEEP_INTERVAL * 4),
+                IDLE_SWEEP_INTERVAL * 4,
+                "a backstop as long as the sweep the session was given"
             );
         }
         // Windows reports a process ending on a handle this module cannot wait on, so the poll is
         // the whole answer there rather than a fallback.
         #[cfg(not(unix))]
-        assert_eq!(ChildExits::open().patience(), CHILD_POLL_INTERVAL);
+        assert_eq!(
+            ChildExits::open().patience(IDLE_SWEEP_INTERVAL),
+            CHILD_POLL_INTERVAL
+        );
     }
 
     #[tokio::test]
@@ -583,62 +566,20 @@ mod tests {
         // so the deadline is already due, because a test that waited out the real one would take
         // half a minute to say this.
         let activity = Activity::new();
-        let mut supervision =
-            Supervision::begin(Arc::clone(&activity), Instant::now() - IDLE_SWEEP_INTERVAL);
+        let mut supervision = Supervision::begin(
+            Arc::clone(&activity),
+            Instant::now() - IDLE_SWEEP_INTERVAL,
+            IDLE_SWEEP_INTERVAL,
+        );
 
-        let woken = tokio::time::timeout(OBSERVE_INTERVAL, supervision.next())
+        let wake = tokio::time::timeout(OBSERVE_INTERVAL, supervision.next())
             .await
             .expect("the sweep comes round");
 
         assert_eq!(
-            woken.wake,
+            wake,
             Wake::Ownership,
             "and what it is for is the boundary nothing else reports on"
-        );
-    }
-
-    /// A supervision with no child signal to hear, so that a child of another case in this test
-    /// process ending cannot be what wakes it.
-    fn deaf(activity: Arc<Activity>, started: Instant) -> Supervision {
-        #[cfg(unix)]
-        let exits = ChildExits(None);
-        #[cfg(not(unix))]
-        let exits = ChildExits;
-        Supervision {
-            sweep: Sweep::begin(activity, started),
-            exits,
-        }
-    }
-
-    #[tokio::test]
-    async fn a_wake_is_named_by_the_clock_that_brought_it() {
-        // What a case that watches for a shell's exit reads: whether the sweep found it. So the
-        // sweep of an idle session, the cadence a mark asks for and the shell's own short clock
-        // each have to be told apart, with nothing else to wake the supervision.
-        let mut idle = deaf(Activity::new(), Instant::now() - IDLE_SWEEP_INTERVAL);
-        let woken = tokio::time::timeout(OBSERVE_INTERVAL, idle.next())
-            .await
-            .expect("the sweep comes round");
-        assert_eq!((woken.wake, woken.prompt), (Wake::Ownership, Prompt::Sweep));
-
-        let marks = Activity::new();
-        let mut asked = deaf(Arc::clone(&marks), Instant::now() - OBSERVE_INTERVAL);
-        marks.note();
-        let woken = tokio::time::timeout(OBSERVE_INTERVAL, asked.next())
-            .await
-            .expect("the observation the mark asked for is due");
-        assert_eq!(
-            (woken.wake, woken.prompt),
-            (Wake::Ownership, Prompt::Cadence)
-        );
-
-        let mut quiet = deaf(Activity::new(), Instant::now());
-        let woken = tokio::time::timeout(IDLE_SWEEP_INTERVAL / 2, quiet.next())
-            .await
-            .expect("the shell's own clock comes round");
-        assert_eq!(
-            (woken.wake, woken.prompt),
-            (Wake::Session, Prompt::ShellPoll)
         );
     }
 
@@ -646,8 +587,11 @@ mod tests {
     async fn output_wakes_the_supervision_and_the_wake_observes() {
         let activity = Activity::new();
         // Begun an interval ago, so the observation the mark asks for is due when it arrives.
-        let mut supervision =
-            Supervision::begin(Arc::clone(&activity), Instant::now() - OBSERVE_INTERVAL);
+        let mut supervision = Supervision::begin(
+            Arc::clone(&activity),
+            Instant::now() - OBSERVE_INTERVAL,
+            IDLE_SWEEP_INTERVAL,
+        );
         let noted = Arc::clone(&activity);
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -664,7 +608,8 @@ mod tests {
     async fn a_marked_session_is_observed_on_the_cadence_rather_than_at_once() {
         let activity = Activity::new();
         let started = Instant::now();
-        let mut supervision = Supervision::begin(Arc::clone(&activity), started);
+        let mut supervision =
+            Supervision::begin(Arc::clone(&activity), started, IDLE_SWEEP_INTERVAL);
         activity.note();
 
         let observed = tokio::time::timeout(IDLE_SWEEP_INTERVAL / 2, observation(&mut supervision))
