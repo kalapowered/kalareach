@@ -1744,8 +1744,8 @@ async fn a_service_that_does_not_say_what_became_of_a_publication_does_not_hold_
 /// The ciphertext of a published generation is given back by the carrier's own pass, whether or not
 /// the production pass that admitted it has ended: what releases it reads the store, and the pass's
 /// lease is not in it. The test keeps the pass's lease while the carrier, woken by the admission,
-/// carries the generation, and the timer holds every wait, so that nothing but the carrier's
-/// iteration that published it, and the pass that follows, can have given the ciphertext back.
+/// carries the generation, and the timer holds every wait and nothing else wakes the carrier, so
+/// that only the iteration that published the generation can have given the ciphertext back.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_ciphertext_of_a_published_generation_is_given_back_while_the_pass_that_admitted_it_still_runs()
  {
@@ -1796,15 +1796,14 @@ async fn the_ciphertext_of_a_published_generation_is_given_back_while_the_pass_t
         .expect("the generation is admitted");
 
     assert!(backup.production_running(), "the pass has not ended");
-    rig.until("the generation is published", |rig| rig.published(1))
-        .await;
-    // The carrier gives the ciphertext back in the iteration that published it, and a pass that
-    // finishes after that has looked again.
-    rig.carrier_passes(1).await;
-    assert!(
-        !backup.holds_finished_ciphertext().expect("a read"),
-        "the ciphertext is given back"
-    );
+    // The carrier gives the ciphertext back in the iteration that published it. Nothing wakes it
+    // again, and the timer holds its waits, so a ciphertext still on the disk after that iteration
+    // would stay there.
+    rig.until(
+        "the published generation's ciphertext is given back",
+        |rig| rig.published(1) && !backup.holds_finished_ciphertext().expect("a read"),
+    )
+    .await;
     assert!(
         backup.production_running(),
         "the ciphertext was given back while the pass still held its lease"

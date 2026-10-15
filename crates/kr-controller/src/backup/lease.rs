@@ -103,9 +103,6 @@ pub struct ProductionLease {
     read_under: u64,
     /// The files this pass wrote that no generation has claimed.
     unclaimed: Mutex<Vec<PathBuf>>,
-    /// Whether a generation has claimed files of this pass, which woke the carrier when it was
-    /// admitted.
-    admitted: AtomicBool,
 }
 
 impl std::fmt::Debug for ProductionLease {
@@ -136,7 +133,6 @@ impl ProductionLease {
             staging_root,
             read_under,
             unclaimed: Mutex::new(Vec::new()),
-            admitted: AtomicBool::new(false),
         }
     }
 
@@ -212,7 +208,6 @@ impl ProductionLease {
 
     /// Records that a generation has claimed these files, so ending the pass leaves them.
     pub(super) fn claim(&self, paths: &[PathBuf]) {
-        self.admitted.store(true, Ordering::SeqCst);
         self.unclaimed
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -254,14 +249,10 @@ impl Drop for ProductionLease {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .end(self.id);
-        // The cleanup a fence owes waits for the pass to be over, and is told. The carrier is told
-        // too, unless the pass admitted a generation: that woke it when its rows were written, and
-        // giving back the ciphertext is the carrier's own look at the store, which does not wait
-        // for the pass to end. A second wake would have it look again at once, inside whatever it
-        // had been told to wait for.
-        if !self.admitted.load(Ordering::SeqCst) {
-            self.signals.work.notify_one();
-        }
+        // The cleanup a fence owes waits for the pass to be over, and is told. The carrier is not:
+        // what it reads is the store and the files its rows name, which the end of a pass does not
+        // change, and a generation the pass admitted woke it when its rows were written. A wake
+        // here would have it look again at once, inside a wait it had been given.
         self.signals.lease_ended.notify_one();
     }
 }

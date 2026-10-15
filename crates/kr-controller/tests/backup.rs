@@ -9842,11 +9842,12 @@ async fn retention_leaves_a_generation_privacy_mode_drew_a_line_under() {
     ask(4).expect("a generation of the generation in force, with two newer published");
 }
 
-/// The end of a production pass that admitted nothing wakes the carrier and what finishes the
-/// cleanup a fence owes, and does not wake the producer: a pass that failed would otherwise begin
-/// again at once and never wait out its delay.
+/// The end of a production pass tells the cleanup a fence owes, and wakes neither the producer nor
+/// the carrier: a pass that failed would otherwise begin again at once and never wait out its
+/// delay, and a carrier woken at the end of a pass looks again inside whatever wait it was in, when
+/// nothing it reads has changed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn the_end_of_a_pass_does_not_wake_the_producer() {
+async fn the_end_of_a_pass_tells_the_cleanup_a_fence_owes_and_wakes_nothing_else() {
     let environment = Environment::open();
     let service = environment.service();
     let signals = service.signals();
@@ -9857,8 +9858,8 @@ async fn the_end_of_a_pass_does_not_wake_the_producer() {
         "the cleanup a fence owes is told the pass is over"
     );
     assert!(
-        signals.work.notified().now_or_never().is_some(),
-        "the carrier is told"
+        signals.work.notified().now_or_never().is_none(),
+        "the carrier is not told"
     );
     assert!(
         signals.produce.notified().now_or_never().is_none(),
@@ -9868,8 +9869,8 @@ async fn the_end_of_a_pass_does_not_wake_the_producer() {
 
 /// A generation's admission wakes the carrier once, and the end of the pass that made it does not
 /// wake it again: a carrier that is told twice looks a second time at once, inside whatever it had
-/// been told to wait for. The first waiter takes the admission's wake and the second would take a
-/// second one.
+/// been told to wait for. The pass's lease is kept across the admission, so that the wake that is
+/// counted is the admission's and the end of the pass is seen apart from it.
 #[test]
 fn the_admission_of_a_generation_wakes_the_carrier_once() {
     let root = tempfile::tempdir().expect("a disposable directory");
@@ -9893,12 +9894,33 @@ fn the_admission_of_a_generation_wakes_the_carrier_once() {
     let mut second = std::pin::pin!(signals.work.notified());
     second.as_mut().enable();
 
+    let lease = service.begin_production().expect("a lease");
     let objects = [stage(1, "a.cbor", b"one")];
+    let sealed = producer.seal(1, &objects);
+    let generation = BackupGeneration::new(1);
+    for member in &objects {
+        lease
+            .stage(archive_id(), generation, member.object_id(), member.bytes())
+            .expect("a member is staged");
+    }
+    lease
+        .stage(
+            archive_id(),
+            generation,
+            sealed.descriptor.encrypted_manifest.object_id,
+            &sealed.encrypted_manifest,
+        )
+        .expect("the manifest is staged");
     service
-        .admit(
-            &producer.seal(1, &objects),
+        .admit_produced(
+            &lease,
+            &sealed,
             &objects,
             producer.writer.key_id(),
+            MadeFrom {
+                fingerprint: Digest256::from_bytes([9; 32]),
+                unreadable: Vec::new(),
+            },
             TimestampMs::new(5_000),
         )
         .expect("the generation is admitted");
@@ -9908,7 +9930,17 @@ fn the_admission_of_a_generation_wakes_the_carrier_once() {
     );
     assert!(
         second.as_mut().now_or_never().is_none(),
+        "nothing else has woken it while the pass runs"
+    );
+
+    drop(lease);
+    assert!(
+        second.as_mut().now_or_never().is_none(),
         "the end of the pass did not wake it a second time"
+    );
+    assert!(
+        signals.lease_ended.notified().now_or_never().is_some(),
+        "the cleanup a fence owes is told the pass is over"
     );
 }
 
