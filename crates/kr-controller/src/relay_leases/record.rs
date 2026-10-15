@@ -6,11 +6,12 @@
 //! lease ran out. So the record holds two things: the lease each paired device has, and the endings
 //! the service has not yet answered.
 //!
-//! A row is written before the request that may create its lease is sent, with no lease identifier
-//! in it and the time it was written. The service answers a request for a pair that already holds a
-//! lease with that lease, so asking again after a restart is how the host learns the identifier a
-//! lost answer carried. Such a row is kept until the longest a lease can live has passed since it
-//! was written, because until then the pair may still hold a lease the host has not been told of.
+//! A row is written before every request that may create or revise its lease is sent, with the
+//! time it was written, and again with no time once the answer is seen. The service answers a
+//! request for a pair that already holds a lease with that lease, so asking again after a restart
+//! is how the host learns the identifier a lost answer carried. A row that holds the time of a
+//! request is kept until the longest a lease can live has passed since then, because until then the
+//! pair may still hold a lease the host has not been told of.
 //!
 //! Everything in the record belongs to one service and one host key. The record names the scope it
 //! was kept for, and a daemon started for another scope, or for none, discards what it holds: a
@@ -69,8 +70,10 @@ pub struct Row {
     pub consumed: u64,
     /// When the lease stops being valid, in UTC milliseconds on the service's clock.
     pub expires_at_ms: u64,
-    /// When the latest request that may have issued a lease was written down, in UTC milliseconds
-    /// on this host's clock. Meaningful only while the row names no lease.
+    /// When the latest request whose answer the host has not seen was written down, in UTC
+    /// milliseconds on this host's clock, or zero when every request has been answered. Until the
+    /// longest a lease can live has passed since then, the pair may hold a lease the host does not
+    /// know of, whether or not the row names one.
     pub written_at_ms: u64,
 }
 
