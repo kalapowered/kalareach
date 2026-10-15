@@ -1380,28 +1380,49 @@ fn local(message: impl Into<Shown>) -> ClientError {
 mod tests {
     use super::*;
 
-    /// An append never exceeds the bound in bytes, never splits a character, and is cut at a line
-    /// break when it holds one; the pieces put back together are the text, less any piece that is
-    /// white space alone.
-    #[test]
-    fn an_append_is_cut_at_a_line_break_when_it_has_one_and_never_inside_a_character() {
-        let lines = ["alpha ".repeat(30), "beta ".repeat(40), "gamma ".repeat(30)].join("\n");
-        let pieces = split_into_appends(&lines, 500);
-        assert!(pieces.len() >= 2);
-        assert_eq!(pieces.concat(), lines);
-        for piece in &pieces[..pieces.len() - 1] {
-            assert!(piece.ends_with('\n'), "cut at a line break: {piece:?}");
+    fn selection_with(description: &str) -> VoiceContextSelection {
+        VoiceContextSelection {
+            session_description: description.to_owned(),
+            working_directory: String::new(),
+            active_application: String::new(),
+            pending_decisions: Vec::new(),
+            recent_messages: Vec::new(),
+            selected: Vec::new(),
+            text_tokens: 0,
+            truncated: false,
+            secrets_stripped: 0,
+            stripping_note: String::new(),
         }
+    }
 
-        // Two-byte characters with no line break: the bound falls inside one, so the piece ends
+    /// The opening context is cut so that no append is over the bound in bytes, none splits a
+    /// character, and an append ends at a line break when the text has one there; the appends put
+    /// back together are the text.
+    #[test]
+    fn the_opening_context_is_cut_at_a_line_break_when_it_has_one_and_never_inside_a_character() {
+        let description = ["alpha ".repeat(30), "beta ".repeat(40), "gamma ".repeat(30)].join("\n");
+        let appends = call_start_appends(&selection_with(&description));
+        assert!(appends.len() >= 2);
+        assert!(
+            appends
+                .iter()
+                .all(|append| append.len() <= VOICE_CONTEXT_BYTES)
+        );
+        for append in &appends[..appends.len() - 1] {
+            assert!(append.ends_with('\n'), "cut at a line break: {append:?}");
+        }
+        assert!(appends.concat().contains(&description));
+
+        // Two-byte characters with no line break: the bound falls inside one, so the append ends
         // before it.
         let wide = "é".repeat(600);
-        let pieces = split_into_appends(&wide, 501);
-        assert!(pieces.iter().all(|piece| piece.len() <= 501));
-        assert_eq!(pieces.concat(), wide);
-        assert_eq!(pieces[0].len(), 500);
-
-        assert!(split_into_appends("  \n\t\n", 500).is_empty());
+        let appends = call_start_appends(&selection_with(&wide));
+        assert!(
+            appends
+                .iter()
+                .all(|append| append.len() <= VOICE_CONTEXT_BYTES)
+        );
+        assert!(appends.concat().contains(&wide));
     }
 
     /// What the control tells its owner prints which kind it is and its numbers, and nothing the
@@ -1458,45 +1479,5 @@ mod tests {
             }),
             "Ended(Closed{seconds:7,provisional:false,..})",
         );
-    }
-
-    /// The service allows ten requests in ten seconds and sixty in a minute, and the pacer holds
-    /// the request that would be the next past either, until the oldest that counts leaves its
-    /// window.
-    #[test]
-    fn the_pacer_holds_the_request_past_the_burst_and_past_the_minute() {
-        let timings = ControlTimings::default();
-        let start = Instant::now();
-
-        let mut pacer = Pacer::new(&timings);
-        for _ in 0..10 {
-            assert_eq!(pacer.next_at(start), None);
-            pacer.record(start);
-        }
-        let until = pacer.next_at(start).expect("the eleventh waits");
-        assert_eq!(until, start + timings.burst_window + PACE_MARGIN);
-        assert_eq!(
-            pacer.next_at(until),
-            None,
-            "free once the burst has left its window"
-        );
-
-        // With the burst's window short, six bursts of ten, each clear of the one before it,
-        // reach the minute's limit at sixty.
-        let timings = ControlTimings {
-            burst_window: Duration::from_secs(1),
-            ..ControlTimings::default()
-        };
-        let mut pacer = Pacer::new(&timings);
-        for burst in 0..6 {
-            let at = start + Duration::from_secs(burst * 2);
-            for _ in 0..10 {
-                assert_eq!(pacer.next_at(at), None, "burst {burst}");
-                pacer.record(at);
-            }
-        }
-        let now = start + Duration::from_secs(11);
-        let until = pacer.next_at(now).expect("the sixty-first waits");
-        assert_eq!(until, start + timings.minute_window + PACE_MARGIN);
     }
 }

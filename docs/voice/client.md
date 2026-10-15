@@ -55,6 +55,16 @@ Each item of news carries the call's name and a number, counted from one as nati
 
 On iOS the call lives in a target the platform plugin cannot see, so the plugin finds the application's adapter by the name of its class. On Android the application registers its bridge once, when its first activity starts, and the plugin finds it there. No class is looked up by name, so a minified build cannot break the link, and an activity that the system recreates still reaches a call that is running. The shapes of every request and every item of news, and the rule that queues news, are fixtures that the Rust, Swift and Kotlin tests all read; the Swift and Kotlin tests also read the requests that must be refused. The state of a call reports the person's own mute apart from what the gate shows of the microphone, so a microphone that is not running does not hide a mute. On Android the permission question is asked when a call is opened. If nobody answers in two minutes, the call goes on with what is allowed, and is refused if that leaves out the microphone. On iOS the application does not ask the person for notifications, since a call there needs none; it reports what the person has already allowed. A debug build can drive the interface on a simulator or an emulator with `scripts/e2e-voice-call-bridge.sh`. The voice screen still starts no call.
 
+## The control socket
+
+For each ongoing call, the device that holds the call's media will maintain an open WebSocket connection to the managed service. The relevant source code for the logic on the device side can be found in the shared client crate, in `crates/kr-client/src/services/voice_control.rs`. The device will open a `wss://` WebSocket at the control path that the call's creation answered. Plain `ws://` is permitted only for a development service on a loopback address, and no other address can be reached that way. The WebSocket will be opened with an upgrade header carrying a bearer token for the `voice` scope, taken from the account's token source on each connection attempt, so a reconnection presents whichever token the device holds at that moment. The first frame on the WebSocket has to be `ready`, and it has to name this call. Any other first frame will lead to the control being closed.
+
+Heartbeats will be sent every 20 seconds whilst the WebSocket is open, and if 45 seconds pass with no activity on the socket, it will be considered lost. If this happens, the device will attempt to re-open the connection after a period, increasing from half a second to 5 seconds, until 120 seconds have elapsed from the time the socket was lost - this is because the managed service will close a call after this period if the device has gone. If the socket is lost after a request was sent and before it was answered, that same request with the same identifier will be written again. If a request is received with an identifier that has already been received for that call, the service answers it as it answered the first, without forwarding the request to the provider a second time, so the model hears the request once. Some answers cannot be changed by trying again and will lead to the control closing immediately (a refused token, or a call the service does not have for this account), while a busy or slow service is tried again.
+
+These rules hold whatever the service would accept. A frame is at most 4,096 bytes, and an append is at most 500 bytes of UTF-8. A request may name a delegation only if the call heard it announced, and each call will remember the newest 256. Requests will be spaced to fit within the limits imposed by the managed service (10 per 10 seconds, 60 per minute), so a long opening context is paced instead of refused. The device will record the type of any frame received which it does not recognise, and discard the frame. Likewise, if a frame of a known type does not match the expected format, it will be discarded, as will any object that names a member twice.
+
+The host's selected context is sent as the call's opening context, appended using `thinking` frames. The first line of the opening context says that the text is data about the person's work and not instructions, and the selected text follows. Where possible, splitting will be done at line breaks, and each chunk will be at most 500 bytes. If the selection would require more than 64 chunks of opening context, the whole selection will be rejected.
+
 ## Screen lock and background audio
 
 Section 15 ¶21: live voice stays usable after screen lock through the native iOS audio session and
@@ -120,8 +130,9 @@ Whenever capture is in any state other than `capturing`, the UI displays:
 ## Context requests and admission
 
 `VoiceContextFrame::new` (`crates/kr-client/src/services/voice.rs`) refuses an append over
-`VOICE_CONTEXT_BYTES` (500) rather than truncating it. No code in the companion application builds
-a context request. Reading what the host selected for a call is a read from the host, and the
+`VOICE_CONTEXT_BYTES` (500) rather than truncating it. The control client
+above builds every context request, and the companion application's own process opens no control
+socket. Reading what the host selected for a call is a read from the host, and the
 screen shows it as the host's selection.
 
 A delegation the host admits without performing it is shown as **admission**, never as execution

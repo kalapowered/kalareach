@@ -119,21 +119,32 @@ fn open(route: &ControlRoute, tokens: &Arc<Tokens>) -> (VoiceControl, ControlEve
 
 /// The next news of any kind.
 async fn raw(news: &mut ControlEvents) -> ControlNews {
-    tokio::time::timeout(WATCHDOG, news.next())
+    news.next()
         .await
-        .expect("news within the watchdog")
         .expect("the control ended without telling its owner")
+}
+
+/// Runs a wait that can go on reading news for ever, because the service answers heartbeats on a
+/// schedule, and fails the test when it has not ended within the watchdog. The bound is on the
+/// whole wait, not on each piece of news.
+async fn within<T>(what: &str, wait: impl std::future::Future<Output = T>) -> T {
+    tokio::time::timeout(WATCHDOG, wait)
+        .await
+        .unwrap_or_else(|_| panic!("{what} did not come within the watchdog"))
 }
 
 /// The next news that is not the service answering a heartbeat, which comes whenever the socket
 /// has been quiet for an interval.
 async fn next(news: &mut ControlEvents) -> ControlNews {
-    loop {
-        match raw(news).await {
-            ControlNews::Event(VoiceControlEvent::HeartbeatAcknowledged { .. }) => {}
-            other => return other,
+    within("the next news", async {
+        loop {
+            match raw(news).await {
+                ControlNews::Event(VoiceControlEvent::HeartbeatAcknowledged { .. }) => {}
+                other => return other,
+            }
         }
-    }
+    })
+    .await
 }
 
 /// The next news is the attachment; returns whether it was a reattachment, and the delegations.
@@ -152,21 +163,28 @@ async fn event_where(
     news: &mut ControlEvents,
     wanted: impl Fn(&VoiceControlEvent) -> bool,
 ) -> VoiceControlEvent {
-    loop {
-        if let ControlNews::Event(event) = raw(news).await
-            && wanted(&event)
-        {
-            return event;
+    within("the event", async {
+        loop {
+            if let ControlNews::Event(event) = raw(news).await
+                && wanted(&event)
+            {
+                return event;
+            }
         }
-    }
+    })
+    .await
 }
 
+/// Reads news until the control is over, and returns how.
 async fn ended(news: &mut ControlEvents) -> ControlEnd {
-    loop {
-        if let ControlNews::Ended(end) = next(news).await {
-            return end;
+    within("the end of the control", async {
+        loop {
+            if let ControlNews::Ended(end) = raw(news).await {
+                return end;
+            }
         }
-    }
+    })
+    .await
 }
 
 /// How many context requests the route read.
