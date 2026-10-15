@@ -318,14 +318,49 @@ pub enum Wake {
     Ownership,
 }
 
-/// What ended a wait of the supervision.
-enum Cause {
-    /// The shell's child signal, or the time the cadence set.
-    Clock,
-    /// The session did something that can have started a process.
+/// What brought one wake of a session's supervision.
+///
+/// Every wake asks the root shell for its status, whatever brought it, so a shell that has ended is
+/// found by whichever wake comes first. This says which that was. A wake the shell's own exit
+/// brought, or the short clock that stands in for it where nothing reports an exit, found the
+/// shell because it had ended. A wake the sweep brought found it only because a clock came round,
+/// which is what the sweep is for when nothing else did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Prompt {
+    /// The look taken before anything is waited on.
+    FirstLook,
+    /// A child of this process ended and the kernel said so.
+    ChildExit,
+    /// The shell's status came due on its short clock, where nothing reports its exit.
+    ShellPoll,
+    /// The session accepted input or produced output.
     Activity,
+    /// A reading of the desktop came back.
+    DesktopReading,
+    /// The observation of the ownership boundary came due on the short cadence after a mark.
+    Cadence,
+    /// The observation of the ownership boundary came due on the slow sweep of an idle session.
+    Sweep,
     /// A test asked for an observation.
     Forced,
+}
+
+impl Prompt {
+    /// Whether this wake is the shell's own exit being reported: the kernel's report of it, or
+    /// the short clock that asks for it where the kernel reports nothing.
+    #[must_use]
+    pub const fn is_the_shells_own_exit(self) -> bool {
+        matches!(self, Self::ChildExit | Self::ShellPoll)
+    }
+}
+
+/// One wake of a session's supervision: what it is for, and what brought it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Woken {
+    /// What the loop does on this wake.
+    pub wake: Wake,
+    /// What brought it.
+    pub prompt: Prompt,
 }
 
 /// What one session's supervision waits on.
@@ -361,46 +396,66 @@ impl Supervision {
     }
 
     /// Waits until something this supervision has to look at can have changed, and says what the
-    /// wake is for.
-    pub async fn next(&mut self) -> Wake {
-        let deadline = tokio::time::Instant::from_std(self.deadline(Instant::now()));
+    /// wake is for and what brought it.
+    pub async fn next(&mut self) -> Woken {
+        let (due, clock) = self.deadline(Instant::now());
+        let deadline = tokio::time::Instant::from_std(due);
         // A session already waiting for its next observation has nothing to learn from another
         // mark, so it stops listening for one until that observation has been taken.
         let marked = self.sweep.marked();
         let activity = Arc::clone(&self.sweep.activity);
         let exits = &mut self.exits;
-        let cause = tokio::select! {
-            () = exits.next() => Cause::Clock,
-            () = tokio::time::sleep_until(deadline) => Cause::Clock,
-            () = activity.marked(), if !marked => Cause::Activity,
-            () = activity.forced() => Cause::Forced,
+        // The exit is asked about first, so that when it has been reported and a clock has also
+        // come round, the wake is the exit's: the record of what found the shell gone does not
+        // depend on which of two things that are ready the runtime happens to pick.
+        let prompt = tokio::select! {
+            biased;
+            () = exits.next() => Prompt::ChildExit,
+            () = tokio::time::sleep_until(deadline) => clock,
+            () = activity.marked(), if !marked => Prompt::Activity,
+            () = activity.forced() => Prompt::Forced,
         };
-        match cause {
-            Cause::Clock => {}
-            Cause::Activity => self.sweep.marked = true,
-            Cause::Forced => {
+        match prompt {
+            Prompt::Activity => self.sweep.marked = true,
+            Prompt::Forced => {
                 self.sweep.observe_now(Instant::now());
-                return Wake::Ownership;
+                return Woken {
+                    wake: Wake::Ownership,
+                    prompt,
+                };
             }
+            _ => {}
         }
-        if self.sweep.observation_due(Instant::now()) {
+        let wake = if self.sweep.observation_due(Instant::now()) {
             Wake::Ownership
         } else {
             Wake::Session
-        }
+        };
+        Woken { wake, prompt }
     }
 
-    /// When this supervision wants to be woken, whatever else happens first.
-    fn deadline(&mut self, now: Instant) -> Instant {
+    /// When this supervision wants to be woken, whatever else happens first, and which clock that
+    /// is. The observation is named when it is due no later than the shell's own status.
+    fn deadline(&mut self, now: Instant) -> (Instant, Prompt) {
         let observation = self.sweep.next_observation();
-        observation.min(now + self.exits.patience())
+        let poll = now + self.exits.patience();
+        if observation <= poll {
+            let clock = if self.sweep.marked() {
+                Prompt::Cadence
+            } else {
+                Prompt::Sweep
+            };
+            (observation, clock)
+        } else {
+            (poll, Prompt::ShellPoll)
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        Activity, CHILD_POLL_INTERVAL, ChildExits, IDLE_SWEEP_INTERVAL, OBSERVE_INTERVAL,
+        Activity, CHILD_POLL_INTERVAL, ChildExits, IDLE_SWEEP_INTERVAL, OBSERVE_INTERVAL, Prompt,
         Supervision, Sweep, Wake,
     };
     use std::sync::Arc;
@@ -500,7 +555,7 @@ mod tests {
     /// than the moment a mark is made.
     async fn observation(supervision: &mut Supervision) -> Instant {
         loop {
-            if supervision.next().await == Wake::Ownership {
+            if supervision.next().await.wake == Wake::Ownership {
                 return Instant::now();
             }
         }
@@ -540,14 +595,19 @@ mod tests {
         let mut supervision =
             Supervision::begin(Arc::clone(&activity), Instant::now() - IDLE_SWEEP_INTERVAL);
 
-        let wake = tokio::time::timeout(OBSERVE_INTERVAL, supervision.next())
+        let woken = tokio::time::timeout(OBSERVE_INTERVAL, supervision.next())
             .await
             .expect("the sweep comes round");
 
         assert_eq!(
-            wake,
+            woken.wake,
             Wake::Ownership,
             "and what it is for is the boundary nothing else reports on"
+        );
+        assert_eq!(
+            woken.prompt,
+            Prompt::Sweep,
+            "and what brought it is the sweep, not an exit"
         );
     }
 
