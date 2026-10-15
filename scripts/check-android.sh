@@ -10,6 +10,9 @@
 # links, and stops at the first error or warning. It does not build the packaged application:
 # `pnpm -C apps/companion android` does that.
 #
+# It also refuses the standard library's file lock and a hard link made through the standard
+# library, tokio or rustix in that code, with the reason and the call to use instead.
+#
 # It needs the target (`rustup target add <target>`) and an Android NDK, named by `NDK_HOME`,
 # `ANDROID_NDK_HOME` or `ANDROID_NDK_ROOT`. The NDK is what the C library the graph builds from
 # source (libsodium) is compiled with; nothing is linked, so the NDK that `apps/companion` pins
@@ -59,6 +62,13 @@ export AR="$tools/llvm-ar"
 export RANLIB="$tools/llvm-ranlib"
 export NM="$tools/llvm-nm"
 export STRIP="$tools/llvm-strip"
+
+# The lint also refuses the two kinds of call an Android phone cannot make and the stores must not:
+# the standard library's file lock, which Android does not support, and a hard link, which the
+# security policy refuses in an application's own directory. scripts/android-clippy/clippy.toml names them
+# and what to call instead. It is used for this run in place of the repository's own clippy.toml,
+# which the desktop crates' tests and host programs are linted with, where both calls work.
+export CLIPPY_CONF_DIR="$PWD/scripts/android-clippy"
 
 # The companion alone is named: Cargo lints every crate of this workspace that it links as well,
 # each with the features the companion asks of it. Naming those crates one by one would turn on

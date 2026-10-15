@@ -1,0 +1,16 @@
+# The lint configuration of scripts/check-android.sh, used in place of the repository's own
+# clippy.toml for that run alone. It sets no minimum Rust version of its own: each crate's
+# `rust-version` is the one Clippy then uses, which is the version the repository's clippy.toml
+# names. It adds the calls a phone cannot make.
+
+disallowed-methods = [
+    { path = "std::fs::File::lock", reason = "Android does not support the standard library's file lock; take a store's lock with kr_flush::lock::exclusive" },
+    { path = "std::fs::File::lock_shared", reason = "Android does not support the standard library's file lock; take a store's lock with kr_flush::lock::shared" },
+    { path = "std::fs::File::try_lock", reason = "Android does not support the standard library's file lock; take a store's lock with kr_flush::lock::try_exclusive" },
+    { path = "std::fs::File::try_lock_shared", reason = "Android does not support the standard library's file lock; take a store's lock with kr_flush::lock" },
+    { path = "std::fs::File::unlock", reason = "Android does not support the standard library's file lock; let go of a store's lock with kr_flush::lock::release" },
+    { path = "std::fs::hard_link", reason = "Android's security policy refuses a hard link in an application's own directory; give a new file its first name with kr_flush::publish_without_replacing" },
+    { path = "tokio::fs::hard_link", reason = "Android's security policy refuses a hard link in an application's own directory; give a new file its first name with kr_flush::publish_without_replacing" },
+    { path = "rustix::fs::link", reason = "Android's security policy refuses a hard link in an application's own directory; give a new file its first name with kr_flush::publish_without_replacing" },
+    { path = "rustix::fs::linkat", reason = "Android's security policy refuses a hard link in an application's own directory; give a new file its first name with kr_flush::publish_without_replacing" },
+]
