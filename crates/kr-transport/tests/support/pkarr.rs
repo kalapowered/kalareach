@@ -28,6 +28,8 @@ struct Held {
     records: HashMap<String, Vec<u8>>,
     publications: HashMap<String, usize>,
     lookups: HashMap<String, usize>,
+    /// Whether the relay takes a request and never answers it.
+    stalled: bool,
 }
 
 /// The connections the relay accepted: a handle to close each one, and the thread serving it.
@@ -47,9 +49,23 @@ pub struct PkarrRelay {
 impl PkarrRelay {
     /// Starts a relay on a free loopback port.
     pub fn spawn() -> Self {
+        Self::start(false)
+    }
+
+    /// Starts a relay that takes every request and never answers one.
+    ///
+    /// A lookup is counted when it arrives, so a case can tell that the relay was asked.
+    pub fn spawn_stalled() -> Self {
+        Self::start(true)
+    }
+
+    fn start(stalled: bool) -> Self {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("a Pkarr listener");
         let addr = listener.local_addr().expect("a bound address");
-        let held = Arc::new(Mutex::new(Held::default()));
+        let held = Arc::new(Mutex::new(Held {
+            stalled,
+            ..Held::default()
+        }));
         let stopping = Arc::new(AtomicBool::new(false));
         let connections = Connections::default();
         let accepting = {
@@ -190,6 +206,21 @@ fn serve(stream: TcpStream, held: &Mutex<Held>) {
             return;
         }
         let key = path.strip_prefix("/pkarr/").map(ToOwned::to_owned);
+        let stalled = held.lock().expect("the records").stalled;
+        if stalled {
+            if let ("GET", Some(key)) = (method.as_str(), &key) {
+                *held
+                    .lock()
+                    .expect("the records")
+                    .lookups
+                    .entry(key.clone())
+                    .or_default() += 1;
+            }
+            // Nothing is ever said: the connection stays open until the client or the relay ends it.
+            let mut byte = [0_u8; 1];
+            while matches!(reader.read(&mut byte), Ok(1..)) {}
+            return;
+        }
         let (status, reason, payload) = match (method.as_str(), key) {
             ("PUT", Some(key)) => {
                 let mut held = held.lock().expect("the records");
