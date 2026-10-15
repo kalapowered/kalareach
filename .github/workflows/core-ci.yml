@@ -490,6 +490,18 @@ jobs:
         id: libsodium
         uses: ./.github/actions/libsodium-archive
 
+      - name: Probe the sockets and the unread-frame case
+        if: ${{ matrix.part == 'second' }}
+        run: |
+          cargo test --locked -p kr-worker --test probe_socket -- --nocapture
+          cargo test --locked -p kr-worker --test transport -- a_last_frame_the_terminal_does_not_read
+
+      - name: Probe the documentation of the worker
+        if: ${{ !cancelled() && matrix.part == 'second' }}
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+        run: cargo doc --locked --no-deps -p kr-worker
+
       # What this runner is, printed before anything asserts on it: a pass or a failure below then
       # names the Windows build, the console host, the shells it happened on and the privileges its
       # account holds, which decide whether an access-control list binds that account at all.
