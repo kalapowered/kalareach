@@ -593,6 +593,8 @@ pub struct SessionRuntime {
     /// as it did when the observation kept the session: a process a reading found is in the record
     /// before the step that stops what the record names.
     observing: Arc<tokio::sync::Mutex<()>>,
+    /// What woke the supervision when it found the root shell had ended, once it has.
+    root_exit_prompt: Arc<std::sync::OnceLock<crate::lifecycle::Prompt>>,
 }
 
 impl SessionRuntime {
@@ -963,6 +965,7 @@ impl SessionRuntime {
             progress: progress.clone(),
             trace: trace.clone(),
             observing: Arc::clone(&observing),
+            root_exit_prompt: Arc::default(),
         };
 
         let ingest_session = Arc::clone(&session);
@@ -1033,6 +1036,7 @@ impl SessionRuntime {
         let monitor_progress = progress;
         let monitor_trace = trace.clone();
         let monitor_observing = Arc::clone(&observing);
+        let monitor_root_exit = Arc::clone(&runtime.root_exit_prompt);
         tokio::spawn(async move {
             // The monitor holds a runtime of its own so a closure it begins publishes its fence and
             // its paste terminator the same way a requested one does. Building it only once the
@@ -1050,6 +1054,7 @@ impl SessionRuntime {
                 progress: monitor_progress,
                 trace: monitor_trace.clone(),
                 observing: Arc::clone(&monitor_observing),
+                root_exit_prompt: Arc::clone(&monitor_root_exit),
             });
             // Built here rather than by the caller: waiting for a child to end is the runtime's
             // own facility, and this is the task that does the waiting.
@@ -1060,6 +1065,7 @@ impl SessionRuntime {
             // here instead. Nothing is observed on this first look; the boundary was recorded as it
             // was established.
             let mut wake = crate::lifecycle::Wake::Session;
+            let mut prompt = crate::lifecycle::Prompt::FirstLook;
             // One probe at a time. A reading that is still being taken is not asked for again,
             // whatever the cadence says: the platform is answering slowly, and a second question
             // would only wait beside the first.
@@ -1146,8 +1152,12 @@ impl SessionRuntime {
                     // session ends with it, with the reason that says so.
                     let initiated = if session.desktop_lost() {
                         session.begin_close(ClosureReason::DesktopLost).initiated
+                    } else if session.poll_root_exit() {
+                        // Kept for whoever asks how the exit reached the host.
+                        let _ = monitor_root_exit.set(prompt);
+                        true
                     } else {
-                        session.poll_root_exit()
+                        false
                     };
                     if initiated {
                         // Admission released the lease and may have produced a paste terminator.
@@ -1178,7 +1188,7 @@ impl SessionRuntime {
                 // this loop for, so a desktop that has gone is found when it is said to have gone.
                 // The wake this loop is on is unchanged by a probe: what the probe decides is the
                 // watch, and the root shell is asked about on this loop's own schedule either way.
-                wake = match probing.as_mut() {
+                let woken = match probing.as_mut() {
                     Some(running) => {
                         tokio::select! {
                             biased;
@@ -1189,13 +1199,17 @@ impl SessionRuntime {
                                 {
                                     session.apply_desktop_reading(at, &probe, &sample);
                                 }
-                                wake
+                                crate::lifecycle::Woken {
+                                    wake,
+                                    prompt: crate::lifecycle::Prompt::DesktopReading,
+                                }
                             }
                             next = supervision.next() => next,
                         }
                     }
                     None => supervision.next().await,
                 };
+                (wake, prompt) = (woken.wake, woken.prompt);
             }
         });
 
@@ -1350,6 +1364,16 @@ impl SessionRuntime {
             initiated: acceptance.initiated,
         };
         (acceptance, gate)
+    }
+
+    /// What woke the supervision when it found that the root shell had ended, or `None` while it
+    /// has not found that.
+    ///
+    /// A shell that ended on its own is found on whichever wake comes first, so this is how the
+    /// host learned of it: the exit itself, or a clock that came round for another reason.
+    #[must_use]
+    pub fn root_exit_prompt(&self) -> Option<crate::lifecycle::Prompt> {
+        self.root_exit_prompt.get().copied()
     }
 
     /// Waits until the session has finished closing and returns its record.
