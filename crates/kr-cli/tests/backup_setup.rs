@@ -1102,7 +1102,8 @@ async fn a_setup_declined_at_its_first_try_because_another_finished_first_opens_
         shown.contains("Nothing was set up. The kit that was shown opens nothing: delete it."),
         "{shown}"
     );
-    assert!(!shown.contains("Keep the kit"), "{shown}");
+    // The plan above says to keep the kit and its fingerprint together; the unknown ending does not.
+    assert!(!shown.contains("Keep the kit until kr doctor"), "{shown}");
     assert_eq!(rig.recorded_kit().await, Some(quick_kit.fingerprint()));
     assert_ne!(slow_kit.fingerprint(), quick_kit.fingerprint());
     // The decline came before the bundle was written: the service holds nothing for the slow kit.
