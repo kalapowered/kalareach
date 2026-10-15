@@ -4601,6 +4601,7 @@ async fn a_status_read_never_misses_a_call_that_ends_between_its_two_reads() {
 /// it is made. The disk has too little room for it, so the pass stops after the try; the next look
 /// the same day tries again, and says the same, where a try counted at once would say that nothing
 /// has changed since the newest backup for a day.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_try_that_found_a_session_readable_is_made_again_when_the_pass_stops_after_it() {
     let timer = HeldTimer::held();
