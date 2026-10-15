@@ -2571,6 +2571,12 @@ pub mod configuration {
     /// a remote owner's revocation cannot reach it, and only the owner at the machine revokes a
     /// device.
     ///
+    /// The service that holds the feed also holds this host's own mailbox. A remote owner who
+    /// publishes a revocation can announce in that mailbox that the feed changed, and the host then
+    /// reads the feed at once instead of at its next poll. The announcement says nothing of what
+    /// changed, so a host that never sees one still learns every revocation from the feed. With no
+    /// feed the host reads no mailbox.
+    ///
     /// The section arrived with level 2. A release that reads level 1 does not know it: it
     /// applies the rest of the document, counts the section among the members it ignores, and
     /// does not edit the document.
