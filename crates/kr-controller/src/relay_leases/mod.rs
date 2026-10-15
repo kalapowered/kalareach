@@ -92,10 +92,13 @@
 //! has run out and is not yet ended. A device that is still paired is asked this way whatever the
 //! age of the row. Once the row is older than the longest a lease can live, it is asked again
 //! after each wait until the answer that the allowance is spent drops it, or, where the new payer
-//! is another account, any answer: a lease of another account's payer is no obstacle. Where it is
-//! the same account the row stays, because the service answers that it could not issue a lease
-//! also for a lease whose relay it can no longer bill through, and that lease stands in the new
-//! payer's way, and answers a bound too small for a block as invalid. If the service answers
+//! is another account, any answer but a delay: a lease of another account's payer is no obstacle.
+//! Where it is the same account the row stays, because the service answers that it could not issue
+//! a lease also for a lease whose relay it can no longer bill through, and answers invalid also for
+//! a lease in its grace window whose grace ceiling passes the authorisation's bound, and a lease
+//! behind either answer stands in the new payer's way. It answers invalid for a bound too small for
+//! a block only when it found no lease, and the two cannot be told apart, so the row stays; a
+//! withdrawal clears both. If the service answers
 //! `FORBIDDEN`, the old authorisation is not one it holds for this host's key, is no longer in
 //! force, or the pair's lease belongs to another caller or another authorisation: it names no
 //! lease under that payer and the row is dropped at once. The service ends the leases of an
@@ -870,12 +873,12 @@ async fn reconcile(
     // service finds a pair's lease within the account that pays, and refuses another authorisation
     // of that account for as long as it stands, also when it has run out and is not yet ended. For
     // a device that is no longer paired, and for one whose payer changed, the ask ends what it
-    // finds. A device that is still paired is asked for under the new payer once the old one has
-    // been asked, so a row of one whose payer changed is asked whatever its age: a row older than
-    // a lease lives is asked again after each wait until an answer lets it go, and the ask is the
-    // one that clears a lease that ran out before the host could end it, where the service
-    // answers it. Where the host's own endpoint has changed the pair cannot be asked for at all,
-    // and the row is dropped; the lease, if there was one, runs out by itself.
+    // finds. A device that is still paired is asked for under the new payer only once the row
+    // kept for the old one is gone, so a row of one whose payer changed is asked whatever its
+    // age: a row older than a lease lives is asked again after each wait until an answer lets it
+    // go, and the ask is the one that clears a lease that ran out before the host could end it,
+    // where the service answers it. Where the host's own endpoint has changed the pair cannot be
+    // asked for at all, and the row is dropped; the lease, if there was one, runs out by itself.
     let mut unwanted = Vec::new();
     for row in shared.on_record(Record::rows).await? {
         let same_source = row.source == running.endpoint;
@@ -983,9 +986,10 @@ async fn reconcile(
                     break;
                 }
                 // The service says the old payer's authorisation is not one it holds for this
-                // host's key, or is not in force: it will name no lease under it, and a lease
-                // the host was never told of cannot be ended by asking. The row is done with.
-                // Any other refusal says nothing of the pair, and the row stays.
+                // host's key, is not in force, or the pair's lease belongs to another caller or
+                // another authorisation: it will name no lease under it, and a lease the host was
+                // never told of cannot be ended by asking. The row is done with. Any other
+                // refusal says nothing of the pair, and the row stays.
                 Asked::Disowned(_) if foreign => {
                     shared
                         .on_record(move |record| record.forget(&destination))
@@ -999,14 +1003,15 @@ async fn reconcile(
                         .on_record(move |record| record.forget(&destination))
                         .await?;
                 }
-                // Any other answer of the service to the last ask. The row is older than a lease
-                // lives, and a lease of another account's payer is no obstacle to the new payer's,
-                // whatever the service said of it: the row is done with. Where the new payer is
-                // the same account the service refuses it for as long as the old lease stands, and
-                // it answers "could not issue a lease" too for a lease whose relay it can no
-                // longer bill through, before it looks at the lease's deadline, and "invalid" for a
-                // bound too small for a block: the row stays and is asked again after the wait,
-                // and the owner clears such a lease by withdrawing the authorisation replaced.
+                // Any other answer of the service to the last ask, but a delay. The row is older
+                // than a lease lives, and a lease of another account's payer is no obstacle to the
+                // new payer's, whatever the service said of it: the row is done with. Where the
+                // new payer is the same account the service refuses it for as long as the old
+                // lease stands, and it answers "could not issue a lease" too for a lease whose
+                // relay it can no longer bill through, before it looks at the lease's deadline,
+                // and "invalid" for a lease in its grace window and for a bound too small for a
+                // block, which cannot be told apart: the row stays and is asked again after the
+                // wait, and the owner clears the lease by withdrawing the authorisation replaced.
                 Asked::Standing(_) if last && other_account => {
                     shared
                         .on_record(move |record| record.forget(&destination))
@@ -1044,8 +1049,9 @@ async fn reconcile(
         // The leases the host holds are refilled before a pair with none is asked for, so a pair
         // the service has no room for does not keep the rest from being refilled.
         // A device whose row was kept for another payer is not asked for under this one until that
-        // row is resolved: the service refuses it for as long as a lease of the old payer stands,
-        // and asking under the old payer is the recovery's, which ends what it finds.
+        // row is resolved: for the same account the service refuses it for as long as a lease of
+        // the old payer stands, and for any payer the record holds one row for each device. Asking
+        // under the old payer is the recovery's, which ends what it finds.
         let mut ordered: Vec<&DeviceRecord> = paired
             .iter()
             .filter(|device| {
@@ -1325,7 +1331,7 @@ struct Recovery {
     /// Whether the row has aged past the longest a lease lives. A row of a device that is still
     /// paired is asked whatever its age. A young one goes when the service names no lease under
     /// its payer. An old one is asked again after each wait until an answer lets it go: the
-    /// allowance being spent, or any answer where the new payer is another account.
+    /// allowance being spent, or any answer but a delay where the new payer is another account.
     last: bool,
 }
 
