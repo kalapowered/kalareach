@@ -872,6 +872,8 @@ impl ServiceWeb {
             "/api/authority/sync" => "authority.sync",
             crate::sync::PATH => "sync.compare_exchange",
             "/api/mailbox/deliver" => "mailbox.deliver",
+            "/api/mailbox/read" => "mailbox.read",
+            "/api/mailbox/acknowledge" => "mailbox.acknowledge",
             other => panic!("no route at {other}"),
         };
         let Ok(signature) =
@@ -940,7 +942,10 @@ impl ServiceWeb {
             return manifest(&mut state, &signature, body, account.is_some());
         }
         if method == "authority.sync" {
-            return crate::feed::sync(&mut state.feeds, &signature, body, now_ms());
+            let State {
+                feeds, mailboxes, ..
+            } = &mut *state;
+            return crate::feed::sync(feeds, mailboxes, &signature, body, now_ms());
         }
         if method == "sync.compare_exchange" {
             let State {
@@ -951,8 +956,22 @@ impl ServiceWeb {
             } = &mut *state;
             return bundles.handle(tokens, body, token, now_ms(), !*bundle_writes_refused);
         }
-        if method == "mailbox.deliver" {
-            return crate::mailbox::deliver(&mut state.mailboxes, &signature, body, now_ms());
+        match method {
+            "mailbox.deliver" => {
+                return crate::mailbox::deliver(&mut state.mailboxes, &signature, body, now_ms());
+            }
+            "mailbox.read" => {
+                return crate::mailbox::read(&mut state.mailboxes, &signature, body, now_ms());
+            }
+            "mailbox.acknowledge" => {
+                return crate::mailbox::acknowledge(
+                    &mut state.mailboxes,
+                    &signature,
+                    body,
+                    now_ms(),
+                );
+            }
+            _ => {}
         }
         if body["installation_id"].as_str() != Some(caller.as_str()) {
             return refusal(
