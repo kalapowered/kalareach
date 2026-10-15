@@ -6,11 +6,11 @@
 //! that holds a connection beside the journal's. Only the latest record matters: a record that
 //! has been replaced before it was written is dropped.
 //!
-//! A record that could not be written is tried again by the thread, every second, until the
-//! journal takes it or a newer record replaces it. The record is what a crash's cleanup acts on,
-//! and an idle session is observed only on the sweep, so waiting for the next observation would
-//! leave a stall of the journal's a sweep long in what the cleanup knows. A record that could not
-//! be written is also sent again at the next observation, changed or not.
+//! A record that could not be written is tried again by the thread, a second after each refused
+//! attempt, until the journal takes it or a newer record replaces it. The record is what a crash's
+//! cleanup acts on, and an idle session is observed only on the sweep, so waiting for the next
+//! observation would leave a stall of the journal's a sweep long in what the cleanup knows. A
+//! record that could not be written is also sent again at the next observation, changed or not.
 //!
 //! The thread ends when the writer is dropped.
 
