@@ -1322,7 +1322,7 @@ async fn the_bounds_hold_at_the_real_scale_and_a_restore_accepts_what_the_produc
 
     // What was left out is the oldest: the sessions restored are the newest that fit.
     let mut newest = closed.into_inner().unwrap_or_else(PoisonError::into_inner);
-    newest.sort_by(|left, right| right.0.cmp(&left.0));
+    newest.sort_by_key(|(closed_at, _)| std::cmp::Reverse(*closed_at));
     let expected: std::collections::BTreeSet<String> = newest
         .into_iter()
         .take(sessions.len())
