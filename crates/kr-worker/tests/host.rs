@@ -2144,9 +2144,10 @@ async fn until<T>(what: &str, mut check: impl FnMut() -> Option<T>) -> T {
 ///
 /// Only the record decides, with a deadline that ends a wait nothing will answer. What each poll
 /// found is kept, so that a wait that does end says what the journal held and which members the
-/// record lacked. A member that has ended can never be in the record, which holds a process only
-/// until it is read as ended, so one found ended stops the wait at once and is named: that is a
-/// tree that did not stay up, which no wait on the worker's record can answer.
+/// record lacked. Every member of these trees runs for minutes, and the record holds a process
+/// only until it is read as ended, so a member that the record lacks and that has ended stops the
+/// wait at once and is named: the tree did not stay up, which no wait on the worker's record can
+/// answer.
 async fn until_recorded(
     host: &Host,
     session_id: SessionId,
@@ -2170,8 +2171,8 @@ async fn until_recorded(
                     assert_ne!(
                         kr_ipc::identity::process_state(identity),
                         kr_ipc::identity::ProcessState::Ended,
-                        "{name} had ended before the worker recorded it, so the tree did not stay \
-                         up: the record names {} processes and lacks {names:?}",
+                        "{name} is no longer running, so the tree did not stay up: the record names \
+                         {} processes and lacks {names:?}",
                         record.processes.len(),
                     );
                 }
