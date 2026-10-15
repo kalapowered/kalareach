@@ -987,19 +987,12 @@ const fn cause_words(cause: &BackupEnableCause) -> &'static str {
         BackupEnableCause::ArchiveInUse {} => {
             " did not finish: this host already records generations of that archive"
         }
-        BackupEnableCause::NoAllowance {} => {
-            " did not finish: the account has no backup allowance; that kit opens nothing"
-        }
+        BackupEnableCause::NoAllowance {} => " did not finish: the account has no backup allowance",
         BackupEnableCause::TokenNotAccepted {} => {
-            " did not finish: the service did not take this host's account token; that kit opens \
-             nothing"
+            " did not finish: the service did not take this host's account token"
         }
-        BackupEnableCause::BundleConflict {} => {
-            " did not finish: the locator holds another bundle; that kit opens nothing"
-        }
-        BackupEnableCause::ServiceRefused { .. } => {
-            " did not finish: the service refused it; that kit opens nothing"
-        }
+        BackupEnableCause::BundleConflict {} => " did not finish: the locator holds another bundle",
+        BackupEnableCause::ServiceRefused { .. } => " did not finish: the service refused it",
     }
 }
 
