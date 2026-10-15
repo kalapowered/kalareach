@@ -421,6 +421,51 @@ fn socket_pair() -> (SocketStream, SocketStream) {
     (ready(here), ready(there))
 }
 
+/// Makes one connected pair of local sockets that hold less than a frame of a few hundred
+/// kilobytes: what a peer that reads nothing takes before a write to it stops being taken.
+///
+/// A pair of Unix sockets holds a few hundred kilobytes at most.
+#[cfg(unix)]
+async fn socket_pair_holding_little() -> (SocketStream, SocketStream) {
+    socket_pair()
+}
+
+/// The same, over loopback, where the system lets a connection that nobody reads take megabytes
+/// unless the buffers of both ends are set small before they connect.
+#[cfg(not(unix))]
+async fn socket_pair_holding_little() -> (SocketStream, SocketStream) {
+    use tokio::net::TcpSocket;
+
+    const LITTLE: u32 = 4096;
+    let small = || {
+        let socket = TcpSocket::new_v4().expect("a socket is made");
+        socket
+            .set_send_buffer_size(LITTLE)
+            .expect("the send buffer is set");
+        socket
+            .set_recv_buffer_size(LITTLE)
+            .expect("the receive buffer is set");
+        socket
+    };
+    let listening = small();
+    listening
+        .bind((std::net::Ipv4Addr::LOCALHOST, 0).into())
+        .expect("a loopback listener binds");
+    let listener = listening.listen(1).expect("it listens");
+    let address = listener.local_addr().expect("it has an address");
+    let (here, there) = tokio::join!(small().connect(address), listener.accept());
+    let ready = |stream: SocketStream| {
+        stream
+            .set_nodelay(true)
+            .expect("the connection sends at once");
+        stream
+    };
+    (
+        ready(here.expect("the loopback connection is made")),
+        ready(there.expect("the loopback connection is accepted").0),
+    )
+}
+
 /// Builds one connection's owner over two real socket pairs and returns the ends a test drives.
 async fn duplex_over_sockets(
     broker: &Arc<Broker>,
@@ -3896,7 +3941,16 @@ async fn upgraded_with(
     framing: Framing,
     terminal: tokio_websockets::Config,
 ) -> Upgraded {
-    let (terminal_end, gateway_end) = socket_pair();
+    upgraded_over(broker, framing, terminal, socket_pair()).await
+}
+
+/// The same, over the pair of sockets the terminal and the gateway are given.
+async fn upgraded_over(
+    broker: &Arc<Broker>,
+    framing: Framing,
+    terminal: tokio_websockets::Config,
+    (terminal_end, gateway_end): (SocketStream, SocketStream),
+) -> Upgraded {
     let accepting =
         tokio::spawn(
             async move { kr_worker::broker::websocket::accept(gateway_end, framing).await },
@@ -4239,13 +4293,22 @@ async fn kr_req_11_32_only_a_text_message_of_one_line_within_the_bound_crosses_a
 /// write deadline passes, with no later traffic to find out.
 ///
 /// The frame is the last thing the gateway has for the terminal, and it is larger than anything
-/// the sockets between them hold. A flush that returned when the frame was handed to a buffer would
-/// call it delivered; a flush that returns when the library has sent it keeps the deadline's
-/// meaning, so the frame is reported as not sent and the connection ends.
+/// the sockets between them hold: the sockets are made to hold little on every platform, because
+/// the deadline is on the frame reaching the socket and not on the terminal reading it, and a
+/// system that lets an unread connection take megabytes takes the frame whole. A flush that
+/// returned when the frame was handed to a buffer would call it delivered; a flush that returns
+/// when the library has sent it keeps the deadline's meaning, so the frame is reported as not sent
+/// and the connection ends.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_11_32_a_last_frame_the_terminal_does_not_read_ends_the_connection() {
     let broker = broker();
-    let up = upgraded(&broker, Framing::new(NativeFraming::JsonLines)).await;
+    let up = upgraded_over(
+        &broker,
+        Framing::new(NativeFraming::JsonLines),
+        tokio_websockets::Config::default(),
+        socket_pair_holding_little().await,
+    )
+    .await;
     let big = request_of(5, "session/update", 900_000);
     up.owner
         .from_upstream(big.as_bytes(), TimestampMs::new(2))
