@@ -1031,7 +1031,7 @@ fn hold_across_windows(root: &Path, patience: Duration) -> Result<std::fs::File>
     let file = options.open(root.join(WINDOWS_LOCK)).map_err(unusable)?;
     let deadline = std::time::Instant::now() + patience;
     loop {
-        match file.try_lock() {
+        match kr_flush::lock::try_exclusive(&file) {
             Ok(()) => return Ok(file),
             Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
                 std::thread::sleep(Duration::from_millis(25));

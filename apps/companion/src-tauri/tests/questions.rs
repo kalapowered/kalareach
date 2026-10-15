@@ -607,7 +607,7 @@ async fn kept_answers_are_not_changed_while_another_window_is_changing_them() {
         .truncate(false)
         .open(page.kept.path().join("kept-answers").join(".windows.lock"))
         .expect("the file every window holds");
-    other_window.try_lock().expect("the other window has it");
+    kr_flush::lock::try_exclusive(&other_window).expect("the other window has it");
     page.app
         .state::<companion_tauri::AppState>()
         .questions()

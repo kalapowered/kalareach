@@ -177,7 +177,7 @@ impl DraftDesk {
             .write(true)
             .open(data.join("drafts-removals.lock"))
             .map_err(unavailable)?;
-        lock.lock().map_err(unavailable)?;
+        kr_flush::lock::exclusive(&lock).map_err(unavailable)?;
         // No other writer is between writing a ledger and putting it in place while the lock is
         // held, so a file staged under the ledger's name is one a crash left.
         if let Ok(entries) = std::fs::read_dir(&data) {

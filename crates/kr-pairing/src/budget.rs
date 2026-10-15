@@ -153,12 +153,12 @@ impl DurableClientBudgetStore {
             .truncate(false)
             .open(&path)
             .map_err(|error| io_error("open", &path, &error))?;
-        match file.try_lock() {
+        match kr_flush::lock::try_exclusive(&file) {
             Ok(()) => {}
             Err(std::fs::TryLockError::WouldBlock) => {
                 #[cfg(test)]
                 tests::found_held();
-                file.lock()
+                kr_flush::lock::exclusive(&file)
                     .map_err(|error| io_error("lock", &path, &error))?;
             }
             Err(std::fs::TryLockError::Error(error)) => {

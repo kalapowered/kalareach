@@ -540,7 +540,7 @@ impl AnswerDrafts {
         })?;
         let deadline = Instant::now() + LOCK_PATIENCE;
         loop {
-            match file.try_lock() {
+            match kr_flush::lock::try_exclusive(&file) {
                 Ok(()) => return Ok(file),
                 Err(std::fs::TryLockError::WouldBlock) if Instant::now() < deadline => {
                     std::thread::sleep(Duration::from_millis(10));

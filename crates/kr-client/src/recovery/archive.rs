@@ -705,7 +705,7 @@ impl Drop for Held {
     /// Releases the lock itself rather than leaving it to the file's closing, which a descriptor
     /// copied into a child process would delay.
     fn drop(&mut self) {
-        let _ = self.0.unlock();
+        let _ = kr_flush::lock::release(&self.0);
     }
 }
 
@@ -731,7 +731,7 @@ impl Journal {
             .write(true)
             .open(&self.lock)
             .map_err(storage)?;
-        file.lock().map_err(storage)?;
+        kr_flush::lock::exclusive(&file).map_err(storage)?;
         Ok(Held(file))
     }
 

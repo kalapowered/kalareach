@@ -1236,9 +1236,9 @@ impl Lock {
             .open(path)
             .map_err(|source| storage(stored(path), source))?;
         let taken = if exclusive {
-            file.lock()
+            kr_flush::lock::exclusive(&file)
         } else {
-            file.lock_shared()
+            kr_flush::lock::shared(&file)
         };
         taken.map_err(|source| storage(stored(path), source))?;
         Ok(Self { _file: file })
