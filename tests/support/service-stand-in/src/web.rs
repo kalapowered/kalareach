@@ -382,6 +382,22 @@ impl ServiceWeb {
             .authorise(host, byte_ceiling)
     }
 
+    /// An account that has authorised a host gives it a further authorisation, as the account's
+    /// owner does to change the bound or to replace one that is about to lapse. The service keeps
+    /// both, and a pair's lease belongs to the one it was issued under.
+    pub fn authorise_relay_payer_in(
+        &self,
+        account_id: &str,
+        host: &kr_protocol::scalars::AuthorisationKey,
+        byte_ceiling: u64,
+    ) -> crate::relay::RelayPayerRecord {
+        self.state
+            .lock()
+            .expect("the state")
+            .relay
+            .authorise_in(account_id, host, byte_ceiling)
+    }
+
     /// The account withdraws an authorisation: the leases issued under it are revoked and no
     /// request names it again.
     pub fn withdraw_relay_authorisation(&self, authorisation_id: &str) {

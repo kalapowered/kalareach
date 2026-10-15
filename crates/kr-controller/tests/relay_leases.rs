@@ -1378,7 +1378,11 @@ async fn a_refill_the_service_has_no_room_for_keeps_the_lease_it_has() {
     assert_eq!(rig.leases_for(&owner).len(), 1);
     let shown = rig.check().await;
     assert_eq!(shown.status, DoctorStatus::Warning);
-    assert!(shown.detail().contains("no room"), "{}", shown.detail());
+    assert!(
+        shown.detail().contains("could not raise a lease"),
+        "{}",
+        shown.detail()
+    );
 
     rig.served.web().limit_relay_aggregate(8 * 1024 * 1024);
     rig.time_passes(STANDING_RETRY);
@@ -1510,12 +1514,77 @@ async fn a_request_asked_again_after_a_long_failure_is_written_with_the_time_of_
     );
 }
 
+impl Rig {
+    /// A request for a device's lease is answered by the service and the answer is lost, and the
+    /// daemon is started again with a document that names another authorisation: of the same
+    /// account when `same_account` is true. The service finds a pair's lease within the account, and
+    /// refuses another authorisation of that account for as long as the lease stands.
+    async fn payer_changed_over_a_lost_answer(same_account: bool) {
+        let rig = Rig::start().await;
+        rig.served.web().fail(ISSUE, 1, Moment::After);
+        let (_phone, record) = rig.pairs().await;
+        rig.until("the host has a row for the pair and no lease in it", || {
+            rig.lease_in_the_record(&record) == Some(None) && rig.live_lease_for(&record).is_some()
+        })
+        .await;
+        let first = rig
+            .live_lease_for(&record)
+            .expect("the lease the first request issued");
+        let other = if same_account {
+            rig.served.web().authorise_relay_payer_in(
+                &rig.payer.account_id,
+                &rig.host_key,
+                8 * 1024 * 1024,
+            )
+        } else {
+            rig.served
+                .web()
+                .authorise_relay_payer(&rig.host_key, 8 * 1024 * 1024)
+        };
+
+        let rig = rig.restarted_naming(&other).await;
+        rig.until("the pair holds a lease under the new payer", || {
+            rig.live_lease_for(&record).is_some_and(|lease| {
+                lease.authorisation_id.as_deref() == Some(other.authorisation_id.as_str())
+            })
+        })
+        .await;
+        let ended = rig
+            .leases_for(&record)
+            .into_iter()
+            .find(|lease| lease.lease_id == first.lease_id)
+            .expect("the lease the first request issued");
+        assert!(!ended.live);
+        assert_eq!(
+            ended.ended_for,
+            Some("payer_withdrew"),
+            "it was found under the payer it was asked for and ended"
+        );
+        assert_eq!(rig.endings_owed(), 0);
+    }
+}
+
 /// KR-REQ-17.51: a request whose answer was lost may have issued a lease under the payer it was
-/// asked under. A host started with another payer does not ask under the new one until the longest
-/// a lease lives has passed, because the service would open a second reservation that the first
-/// payer's lease would not show; it then asks, and the pair is given a lease under the new payer.
+/// asked under. A host started with another payer asks again under the first payer, which finds the
+/// lease and ends it, and then asks under the new payer: the pair is given a lease under it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_payer_changed_over_a_request_whose_answer_was_lost_waits_for_the_first_to_run_out() {
+async fn a_payer_changed_over_a_request_whose_answer_was_lost_ends_what_the_first_issued() {
+    Rig::payer_changed_over_a_lost_answer(false).await;
+}
+
+/// KR-REQ-17.51: the same when the new payer is another authorisation of the same account, which
+/// the service refuses for a pair whose lease was issued under the first for as long as it stands.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn another_authorisation_of_the_account_is_given_the_pair_once_the_first_lease_is_ended() {
+    Rig::payer_changed_over_a_lost_answer(true).await;
+}
+
+/// KR-REQ-17.51: the authorisation a request whose answer was lost was made under is withdrawn
+/// before the host is started with another. The service turns the old payer back, no lease can be
+/// alive under it, and the host lets the row go instead of holding every ask for the standing wait:
+/// the pair is given a lease under the new payer at once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_withdrawn_payer_over_a_request_whose_answer_was_lost_does_not_hold_the_pair() {
     let rig = Rig::start().await;
     rig.served.web().fail(ISSUE, 1, Moment::After);
     let (_phone, record) = rig.pairs().await;
@@ -1523,38 +1592,23 @@ async fn a_payer_changed_over_a_request_whose_answer_was_lost_waits_for_the_firs
         rig.lease_in_the_record(&record) == Some(None) && rig.live_lease_for(&record).is_some()
     })
     .await;
+    rig.served
+        .web()
+        .withdraw_relay_authorisation(&rig.payer.authorisation_id);
     let other = rig
         .served
         .web()
         .authorise_relay_payer(&rig.host_key, 8 * 1024 * 1024);
 
     let rig = rig.restarted_naming(&other).await;
-    let owner = rig.owner_device();
-    rig.until(
-        "the owner's device holds a lease under the new payer",
-        || {
-            rig.live_lease_for(&owner).is_some_and(|lease| {
-                lease.authorisation_id.as_deref() == Some(other.authorisation_id.as_str())
-            })
-        },
-    )
+    rig.until("the pair holds a lease under the new payer", || {
+        rig.live_lease_for(&record).is_some_and(|lease| {
+            lease.authorisation_id.as_deref() == Some(other.authorisation_id.as_str())
+        })
+    })
     .await;
-    rig.pass().await;
-    assert_eq!(
-        rig.leases_for(&record).len(),
-        1,
-        "the pair is not asked for under the new payer while the first request may stand"
-    );
-
-    rig.time_passes(Duration::from_secs(u64::from(LEASE_SECONDS) + 200));
-    rig.timer.advance(Duration::from_secs(60));
-    rig.pass().await;
-    let under_the_new_payer = rig
-        .leases_for(&record)
-        .into_iter()
-        .find(|lease| lease.authorisation_id.as_deref() == Some(other.authorisation_id.as_str()))
-        .expect("a lease under the new payer");
-    assert!(under_the_new_payer.live);
+    assert!(rig.holds(&record));
+    assert_eq!(rig.endings_owed(), 0);
 }
 
 /// KR-REQ-17.51: an ending the service turns back for a reason only the owner can change is not
@@ -1666,25 +1720,49 @@ async fn a_host_that_selects_no_lease_service_says_so() {
 }
 
 impl Rig {
-    /// The owner's lease after it has carried traffic for three refills, so that its ceiling is far
-    /// above a block.
-    async fn owner_lease_that_carried_traffic(&self) -> RelayLeaseView {
-        let owner = self.owner_device();
+    /// A device's lease after it has carried traffic through three refills, so that its ceiling is
+    /// far above a block.
+    async fn lease_that_carried_traffic(&self, device: &DeviceRecord) -> RelayLeaseView {
         for _ in 0..3 {
-            let lease = self.live_lease_for(&owner).expect("a lease");
+            let lease = self.live_lease_for(device).expect("a lease");
             self.served
                 .web()
                 .relay_counts(&lease.lease_id, u64::MAX / 4);
             self.time_passes(Duration::from_secs(301));
             self.pass().await;
         }
-        let carried = self.live_lease_for(&owner).expect("the lease");
+        let carried = self.live_lease_for(device).expect("the lease");
         assert!(
             carried.byte_ceiling > 2 * BLOCK_BYTES,
             "the pair has carried traffic: {}",
             carried.byte_ceiling
         );
         carried
+    }
+
+    /// The refill of a lease falls due while the service cannot be reached; by the time the host
+    /// asks again its clock says the lease has a little life left, and the service's, which runs a
+    /// few minutes ahead, says it has none. `before` is how many requests a pass makes ahead of
+    /// that lease's, and `then` what happens to the refill that reaches the service: it is the
+    /// lease's request of the second pass, after the `before` of that pass and the two of the
+    /// first.
+    async fn refill_reaching_a_service_that_finds_the_lease_expired(
+        &self,
+        before: u32,
+        then: Option<Moment>,
+    ) {
+        self.served.web().fail(ISSUE, before + 1, SERVICE_DOWN);
+        if let Some(then) = then {
+            self.served.web().fail(ISSUE, 2 * before + 2, then);
+        }
+        self.time_passes(Duration::from_secs(301));
+        self.pass().await;
+        self.served
+            .web()
+            .advance_relay_clock(Duration::from_secs(290));
+        self.time_passes(Duration::from_secs(499));
+        self.timer.advance(Duration::from_secs(60));
+        self.pass().await;
     }
 
     /// The live leases of a device and the ones the host ended as finished.
@@ -1711,20 +1789,9 @@ impl Rig {
 async fn a_refill_the_service_finds_expired_does_not_leave_the_old_ceiling_held() {
     let rig = Rig::start().await;
     let owner = rig.owner_device();
-    let carried = rig.owner_lease_that_carried_traffic().await;
-
-    // The refill falls due and the service cannot be reached. By the time the host asks again its
-    // clock says the lease has a little life left, and the service's, which runs a few minutes
-    // ahead, says it has none.
-    rig.served.web().fail(ISSUE, 1, SERVICE_DOWN);
-    rig.time_passes(Duration::from_secs(301));
-    rig.pass().await;
-    rig.served
-        .web()
-        .advance_relay_clock(Duration::from_secs(290));
-    rig.time_passes(Duration::from_secs(499));
-    rig.timer.advance(Duration::from_secs(60));
-    rig.pass().await;
+    let carried = rig.lease_that_carried_traffic(&owner).await;
+    rig.refill_reaching_a_service_that_finds_the_lease_expired(0, None)
+        .await;
 
     let (live, finished) = rig.live_and_finished(&owner);
     assert_eq!(live.len(), 1, "one lease carries the pair");
@@ -1752,14 +1819,9 @@ async fn a_refill_the_service_finds_expired_does_not_leave_the_old_ceiling_held(
 async fn a_replacement_whose_answer_was_lost_is_found_and_ended_too() {
     let rig = Rig::start().await;
     let owner = rig.owner_device();
-    let carried = rig.owner_lease_that_carried_traffic().await;
-
-    rig.served
-        .web()
-        .advance_relay_clock(Duration::from_secs(u64::from(LEASE_SECONDS)));
-    rig.served.web().fail(ISSUE, 1, Moment::After);
-    rig.time_passes(Duration::from_secs(301));
-    rig.pass().await;
+    let carried = rig.lease_that_carried_traffic(&owner).await;
+    rig.refill_reaching_a_service_that_finds_the_lease_expired(0, Some(Moment::After))
+        .await;
     assert!(
         rig.leases_for(&owner)
             .iter()
@@ -1779,6 +1841,47 @@ async fn a_replacement_whose_answer_was_lost_is_found_and_ended_too() {
     );
 }
 
+/// KR-REQ-17.51: a replacement whose opening the host was not told of is ended also when its device
+/// is unpaired before the host asks again. The row of the lease the host knew names the request
+/// whose answer was lost, so the lease it ends is the old one and the pair is asked for once more,
+/// which finds the replacement and ends it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_replacement_whose_answer_was_lost_is_ended_when_its_device_is_unpaired() {
+    let rig = Rig::start().await;
+    let (_phone, record) = rig.pairs().await;
+    rig.until("the paired device holds a lease", || rig.holds(&record))
+        .await;
+    let carried = rig.lease_that_carried_traffic(&record).await;
+    rig.refill_reaching_a_service_that_finds_the_lease_expired(1, Some(Moment::After))
+        .await;
+    assert!(
+        rig.leases_for(&record)
+            .iter()
+            .any(|lease| lease.live && lease.lease_id != carried.lease_id),
+        "the service opened the replacement and the host was not told"
+    );
+
+    rig.host
+        .network()
+        .revoke_device(record.device_id)
+        .await
+        .expect("the device is revoked");
+    rig.timer.advance(Duration::from_secs(60));
+    rig.pass().await;
+    rig.until("no lease carries the pair and nothing is owed", || {
+        rig.live_lease_for(&record).is_none()
+            && rig.endings_owed() == 0
+            && rig.lease_in_the_record(&record).is_none()
+    })
+    .await;
+    assert!(
+        rig.leases_for(&record)
+            .iter()
+            .all(|lease| lease.ended_for.is_some()),
+        "every lease the pair held was ended"
+    );
+}
+
 /// KR-REQ-17.51: when the service does not take the revocation of that replacement, because the
 /// lease kept changing under it, the replacement is the lease the pair holds: the host keeps it,
 /// owes no ending for it, and asks for nothing else, so that its record and the service agree.
@@ -1786,22 +1889,13 @@ async fn a_replacement_whose_answer_was_lost_is_found_and_ended_too() {
 async fn a_replacement_the_service_will_not_end_is_kept_and_not_owed_an_ending() {
     let rig = Rig::start().await;
     let owner = rig.owner_device();
-    let carried = rig.owner_lease_that_carried_traffic().await;
+    let carried = rig.lease_that_carried_traffic(&owner).await;
 
-    rig.served
-        .web()
-        .advance_relay_clock(Duration::from_secs(u64::from(LEASE_SECONDS)));
     rig.served.web().fail(REVOKE, 1, NOT_CARRIED);
-    let issued = rig.requests(ISSUE);
-    rig.time_passes(Duration::from_secs(301));
-    rig.pass().await;
+    rig.refill_reaching_a_service_that_finds_the_lease_expired(0, None)
+        .await;
 
     assert_eq!(rig.requests(REVOKE), 1);
-    assert_eq!(
-        rig.requests(ISSUE),
-        issued + 1,
-        "the pair is not asked for afresh"
-    );
     let (live, _) = rig.live_and_finished(&owner);
     assert_eq!(live.len(), 1);
     assert_ne!(live[0].lease_id, carried.lease_id, "it is the replacement");
@@ -1811,6 +1905,77 @@ async fn a_replacement_the_service_will_not_end_is_kept_and_not_owed_an_ending()
         "the record names the lease the service carries"
     );
     assert_eq!(rig.endings_owed(), 0, "and owes no ending for it");
+}
+
+/// KR-REQ-17.51: what the service answered about the revocation of a replacement the host kept is
+/// forgotten with the ending: a lease that was kept, refilled for longer than a lease lives and then
+/// unpaired is a new question, and two further answers that it is not carried do not prove it
+/// absent while the service still carries it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_kept_replacement_is_not_believed_absent_on_the_answers_given_before_it_was_kept() {
+    let rig = Rig::start().await;
+    let (_phone, record) = rig.pairs().await;
+    rig.until("the paired device holds a lease", || rig.holds(&record))
+        .await;
+    rig.lease_that_carried_traffic(&record).await;
+    rig.served.web().fail(REVOKE, 1, NOT_CARRIED);
+    rig.refill_reaching_a_service_that_finds_the_lease_expired(1, None)
+        .await;
+    let kept = rig.live_lease_for(&record).expect("the replacement");
+
+    // It is refilled for longer than the longest a lease lives.
+    for _ in 0..4 {
+        rig.time_passes(Duration::from_secs(301));
+        rig.timer.advance(Duration::from_secs(301));
+        rig.pass().await;
+    }
+    assert_eq!(
+        rig.live_lease_for(&record).expect("still carried").lease_id,
+        kept.lease_id
+    );
+
+    rig.served.web().fail(REVOKE, 1, NOT_CARRIED);
+    rig.served.web().fail(REVOKE, 2, NOT_CARRIED);
+    rig.host
+        .network()
+        .revoke_device(record.device_id)
+        .await
+        .expect("the device is revoked");
+    rig.until("the first answer", || rig.requests(REVOKE) == 2)
+        .await;
+    rig.pass().await;
+    rig.time_passes(Duration::from_secs(60));
+    rig.timer.advance(Duration::from_secs(60));
+    rig.pass().await;
+    assert_eq!(rig.requests(REVOKE), 3);
+    assert_eq!(rig.endings_owed(), 1, "two answers do not prove it absent");
+    assert!(rig.live_lease_for(&record).is_some());
+}
+
+/// KR-REQ-17.51: a lease the host raised is not a replacement, whichever request returns it. A
+/// refill and the request for the ceiling the lease holds are both answered that the lease changed
+/// while the request was handled, the pair is asked for afresh, and the service answers with the
+/// lease it still carries: the host keeps it and ends nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lease_that_was_raised_is_kept_when_the_ask_for_the_pair_returns_it() {
+    let rig = Rig::start().await;
+    let owner = rig.owner_device();
+    let carried = rig.lease_that_carried_traffic(&owner).await;
+
+    rig.served.web().fail(ISSUE, 1, NOT_CARRIED);
+    rig.served.web().fail(ISSUE, 2, NOT_CARRIED);
+    rig.time_passes(Duration::from_secs(301));
+    rig.pass().await;
+
+    assert_eq!(rig.requests(REVOKE), 0, "nothing is ended");
+    let kept = rig.live_lease_for(&owner).expect("the lease");
+    assert_eq!(kept.lease_id, carried.lease_id);
+    assert_eq!(
+        rig.lease_in_the_record(&owner),
+        Some(Some(carried.lease_id)),
+        "and the record names it again"
+    );
+    assert_eq!(rig.endings_owed(), 0);
 }
 
 /// KR-REQ-17.51: an answer only the owner or the calendar can change holds the asks for the
