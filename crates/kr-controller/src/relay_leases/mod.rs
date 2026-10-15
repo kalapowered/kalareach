@@ -308,6 +308,9 @@ struct Shared {
     requested: AtomicU64,
     /// The newest request count that a pass which began after the request was made has finished.
     completed: watch::Sender<u64>,
+    /// Whether the keeper waits for a change with no wake stored for it.
+    #[cfg(feature = "testing")]
+    waiting: watch::Sender<bool>,
     holds: Mutex<Holds>,
     /// When each pair was last asked for, in UTC milliseconds on this host's clock.
     asked_at: Mutex<BTreeMap<[u8; 32], u64>>,
@@ -416,6 +419,8 @@ impl RelayKeeper {
                 passes: watch::channel(0).0,
                 requested: AtomicU64::new(0),
                 completed: watch::channel(0).0,
+                #[cfg(feature = "testing")]
+                waiting: watch::channel(false).0,
                 holds: Mutex::default(),
                 asked_at: Mutex::default(),
                 unknown_endings: Mutex::default(),
@@ -454,6 +459,15 @@ impl RelayKeeper {
     #[must_use]
     pub fn passes(&self) -> watch::Receiver<u64> {
         self.shared.passes.subscribe()
+    }
+
+    /// Waits until the keeper waits for a change with no wake stored for it, so that the next pass
+    /// can only be started by something done after this returns. For a suite that makes the
+    /// change itself and needs it to be what the keeper hears.
+    #[cfg(feature = "testing")]
+    pub async fn until_waiting(&self) {
+        let mut waiting = self.shared.waiting.subscribe();
+        let _ = waiting.wait_for(|waiting| *waiting).await;
     }
 
     /// Waits until the keeper has finished a pass that began after this call, so that whatever
@@ -732,15 +746,23 @@ async fn drive(shared: Arc<Shared>) {
         let changed = running.devices.changed();
         let device_changed = changed.notified();
         tokio::pin!(device_changed);
-        device_changed.as_mut().enable();
+        let device_change_stored = device_changed.as_mut().enable();
         let woken = shared.wake.notified();
         tokio::pin!(woken);
-        woken.as_mut().enable();
+        let wake_stored = woken.as_mut().enable();
+        #[cfg(feature = "testing")]
+        shared
+            .waiting
+            .send_replace(!(device_change_stored || wake_stored));
+        #[cfg(not(feature = "testing"))]
+        let _ = (device_change_stored, wake_stored);
         tokio::select! {
             () = &mut device_changed => {}
             () = &mut woken => {}
             () = &mut sleeping => {}
         }
+        #[cfg(feature = "testing")]
+        shared.waiting.send_replace(false);
     }
 }
 
