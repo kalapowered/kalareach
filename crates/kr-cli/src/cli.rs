@@ -123,6 +123,26 @@ pub enum BackupCommand {
     /// never an argument. The command shows what it would write and a digest of that, and writes
     /// only after you confirm it. Nothing is imported into this host: the files are copies to read.
     Restore(BackupRestoreArguments),
+    /// Set this host's backups up: make the recovery kit, show it once, and turn the backups on.
+    ///
+    /// The kit is the only way to read the backups if this host is lost, and KalaReach keeps no
+    /// copy. The command runs at a terminal outside every session, shows what it will do, shows
+    /// the kit once, and sets nothing up until you have typed back the end of the kit's seed and
+    /// said that the kit is stored. It works on Unix.
+    Setup(BackupSetupArguments),
+}
+
+/// `kr backup setup`.
+#[derive(Args)]
+pub struct BackupSetupArguments {
+    /// Replace the backups that are set up already with new ones under a new kit. The earlier kit
+    /// stops being the kit of new backups, the earlier archive's unfinished uploads are stopped,
+    /// and the earlier archive stays at the service until you delete it.
+    #[arg(long)]
+    pub replace: bool,
+    /// The environment.
+    #[command(flatten)]
+    pub selector: EnvironmentSelector,
 }
 
 /// `kr backup restore`.

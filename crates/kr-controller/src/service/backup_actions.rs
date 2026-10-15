@@ -88,6 +88,8 @@ impl Controller {
         self: &std::sync::Arc<Self>,
         mutation: &MutationRequest,
     ) -> Result<ParamsValue> {
+        #[cfg(any(test, feature = "testing"))]
+        crate::testing::note_backup_enable(self.paths.environment_id(), &mutation.params);
         let params: BackupEnableParams = parse(&mutation.params)?;
         let answer = self.enable_backups(params).await?;
         ParamsValue::from_typed(&answer)

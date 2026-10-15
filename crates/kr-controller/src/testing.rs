@@ -140,6 +140,51 @@ pub(crate) fn supplied_stop(
     Some(answer)
 }
 
+/// The parameters of the `backup.enable` calls a suite asked to read, as the daemon received them
+/// (canonical bytes), by environment. An environment is present once a suite asked.
+static ENABLE_TAPS: std::sync::Mutex<
+    std::collections::BTreeMap<kr_protocol::ids::EnvironmentId, Vec<Vec<u8>>>,
+> = std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// Has the daemon of `environment` keep the parameters of every `backup.enable` call it receives
+/// from now on, for [`tapped_backup_enable`].
+///
+/// What the setup command keeps from the daemon is the claim under test: the call carries nothing
+/// that opens a backup. Only the bytes that reached the daemon show it.
+pub fn tap_backup_enable(environment: kr_protocol::ids::EnvironmentId) {
+    ENABLE_TAPS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .entry(environment)
+        .or_default();
+}
+
+/// The parameters of the `backup.enable` calls the daemon of `environment` has received since
+/// [`tap_backup_enable`], oldest first, each as the canonical bytes that arrived.
+#[must_use]
+pub fn tapped_backup_enable(environment: kr_protocol::ids::EnvironmentId) -> Vec<Vec<u8>> {
+    ENABLE_TAPS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&environment)
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// Keeps the parameters of a `backup.enable` call when a suite asked to see them.
+pub(crate) fn note_backup_enable(
+    environment: kr_protocol::ids::EnvironmentId,
+    params: &kr_protocol::envelope::ParamsValue,
+) {
+    if let Some(kept) = ENABLE_TAPS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get_mut(&environment)
+    {
+        kept.push(kr_cbor::encode(params.as_value()));
+    }
+}
+
 /// How long a start waits before it tries again.
 const RETRY_INTERVAL: Duration = Duration::from_millis(20);
 

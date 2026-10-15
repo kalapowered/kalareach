@@ -728,6 +728,26 @@ pub fn locator_start(text: &str) -> Shown {
     }
 }
 
+/// What a recovery kit's fingerprint that arrived as text says: itself, when it is two groups of four
+/// symbols of the recovery alphabet joined by a dash, and that it is not an identifier otherwise.
+///
+/// The fingerprint is public: it names a kit to the host that was set up with it and says nothing
+/// of the seed.
+#[must_use]
+pub fn kit_fingerprint(text: &str) -> Shown {
+    /// The recovery kit's alphabet: digits and capital letters without `I`, `L`, `O` and `U`.
+    const SYMBOLS: &str = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+    let well_formed = text.len() == 9
+        && text.char_indices().all(|(at, character)| {
+            if at == 4 {
+                character == '-'
+            } else {
+                SYMBOLS.contains(character)
+            }
+        });
+    checked(text, well_formed)
+}
+
 /// What a build identifier that arrived as text says: itself, when it is one this build reads
 /// (`kr/0.46.0`), and that it is not an identifier otherwise.
 #[must_use]
