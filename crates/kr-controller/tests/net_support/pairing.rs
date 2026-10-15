@@ -91,10 +91,13 @@ const REACH_DEADLINE: std::time::Duration = std::time::Duration::from_secs(300);
 /// # Panics
 ///
 /// Panics when [`REACH_DEADLINE`] passes before an attempt is answered.
-pub async fn until_answered<T, E>(
-    mut attempt: impl AsyncFnMut() -> Result<T, E>,
+pub async fn until_answered<T, E, Attempt>(
+    mut attempt: impl FnMut() -> Attempt,
     unanswered: impl Fn(&E) -> bool,
-) -> Result<T, E> {
+) -> Result<T, E>
+where
+    Attempt: Future<Output = Result<T, E>>,
+{
     let mut attempts = 0_u32;
     let answered = tokio::time::timeout(REACH_DEADLINE, async {
         loop {
@@ -128,11 +131,7 @@ pub async fn dial_until_connected(
 ) -> iroh::endpoint::Connection {
     let addr: EndpointAddr = addr.into();
     until_answered(
-        async || {
-            endpoint
-                .connect(addr.clone(), kr_protocol::hello::ALPN)
-                .await
-        },
+        || endpoint.connect(addr.clone(), kr_protocol::hello::ALPN),
         gave_up_unanswered,
     )
     .await
