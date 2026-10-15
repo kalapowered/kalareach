@@ -1286,6 +1286,29 @@ mod tests {
         assert!(path.symlink_metadata().is_ok(), "the link is still there");
     }
 
+    /// A write goes through the store's lock: while another handle on the lock file holds it, a
+    /// write is refused and writes nothing, and once that handle lets go the write goes on.
+    #[test]
+    fn a_write_is_refused_while_another_handle_holds_the_stores_lock_and_goes_on_when_it_lets_go() {
+        let directory = kr_ipc::testing::PrivateTempDir::create();
+        let root = directory.path().join("attempts");
+        let store = AttemptStore::open(&root).expect("opens");
+        let holder = kr_ipc::paths::open_lock_file(&root.join(LOCK_NAME)).expect("the lock file");
+        kr_flush::lock::try_exclusive(&holder).expect("a free lock is taken");
+        let kept = attempt(Kind::Invite);
+        assert!(
+            matches!(store.keep(&kept), Err(AttemptError::Store { .. })),
+            "a held lock keeps a write out"
+        );
+        assert!(
+            store.attempts().expect("listed").is_empty(),
+            "and nothing was written meanwhile"
+        );
+        kr_flush::lock::release(&holder).expect("let go");
+        store.keep(&kept).expect("kept once the lock is free");
+        assert_eq!(store.attempts().expect("listed").len(), 1);
+    }
+
     /// The transfer of control a host describes, with keys that do not change between runs.
     fn plan() -> TransferControlPlan {
         use kr_protocol::grant::{EnvironmentSelector, GrantExpiry, HistoryScope};

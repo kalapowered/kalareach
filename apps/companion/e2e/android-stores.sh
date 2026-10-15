@@ -1,8 +1,8 @@
 #!/bin/bash
 # Holds, on the Android emulator, that the packaged application keeps what it stores on the phone:
 # the drafts and the device that owns them, the removals still to be made, and the pairing records
-# and their attempt budget, and that a store's lock holds against a second process, the lock of the
-# answers kept on the device among them.
+# and their attempt budget, and that the lock of the answers kept on the device holds against a
+# second process.
 #
 # It installs the debug application, opens the page's debugging socket, and calls the application's
 # own commands the way the page does. It keeps no answer and no attempt, which need a host: a
