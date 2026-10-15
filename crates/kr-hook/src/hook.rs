@@ -128,11 +128,17 @@ pub enum Report {
     Notification,
 }
 
-/// Runs one hook of `application` and answers neutrally.
+/// Runs one hook of `application`, which started at `started`, and answers neutrally.
+///
+/// The run's clock is the process's: what a hook waits for before it reads its input, taking the
+/// hold on its release included, counts against its deadline.
 #[must_use]
-pub fn run(application: &'static Application) -> std::process::ExitCode {
+pub fn run(
+    application: &'static Application,
+    started: std::time::Instant,
+) -> std::process::ExitCode {
     run_with(
-        std::time::Instant::now(),
+        started,
         move |started| observe(application, started),
         answer,
         |bytes| {
@@ -147,7 +153,8 @@ pub fn run(application: &'static Application) -> std::process::ExitCode {
 ///
 /// The work runs on its own thread so the deadline is kept whatever it is waiting on. When the
 /// deadline passes the answer is written and the process ends, which ends that thread too. The
-/// wait ends the deadline after the hook's own start, not after the thread started.
+/// wait ends the deadline after the hook's own start, not after the thread started. A system that
+/// will not start the thread is a run that could not do its work: it is answered at once.
 ///
 /// The application waits for the answer, and a standard error nobody reads can hold a write to it
 /// for as long as nobody reads it. So the answer goes first, and the diagnostic, if there is one,
@@ -161,16 +168,19 @@ fn run_with(
     write: impl FnOnce(&[u8]) + Send + 'static,
 ) {
     let (finished, outcome) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
+    let working = std::thread::Builder::new().spawn(move || {
         let _ = finished.send(work(started));
     });
-    let failure = match outcome.recv_timeout(HOOK_DEADLINE.saturating_sub(started.elapsed())) {
-        Ok(Ok(())) => None,
-        Ok(Err(failure)) => Some(failure),
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Some(deadline_diagnostic()),
-        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-            Some("the hook's work ended without saying how".to_owned())
-        }
+    let failure = match working {
+        Err(error) => Some(format!("the hook's work could not be started: {error}")),
+        Ok(_) => match outcome.recv_timeout(HOOK_DEADLINE.saturating_sub(started.elapsed())) {
+            Ok(Ok(())) => None,
+            Ok(Err(failure)) => Some(failure),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Some(deadline_diagnostic()),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                Some("the hook's work ended without saying how".to_owned())
+            }
+        },
     };
     answer();
     let answered = std::time::Instant::now();
@@ -240,7 +250,13 @@ pub fn answered_after(diagnostic: &str) -> Option<Duration> {
     Some(Duration::from_millis(milliseconds))
 }
 
-/// Reads the event the application wrote and, inside a launch, reaches the worker with it.
+/// Takes the hold on the hook's release, then reads the event the application wrote and, inside a
+/// launch, reaches the worker with it.
+///
+/// The hold is taken here, inside the deadline. An update that moves the release holds its manifest
+/// for as long as half a minute, and a program of the release waits for it, which no application
+/// gives a hook: past the deadline the answer is written without the hold, and the process ends. A
+/// hook of a release that is being removed does none of its work and says why on standard error.
 ///
 /// The observation goes straight behind the hello. The worker reads nothing past the hello until
 /// it has admitted the connection, and then reads the observation, applies it and closes the
@@ -249,6 +265,7 @@ pub fn answered_after(diagnostic: &str) -> Option<Duration> {
 /// its session-start hooks have finished. A thread's report is then held until
 /// [`THREAD_REPORT_LINGER`] after `started`.
 fn observe(application: &Application, started: std::time::Instant) -> Result<(), String> {
+    kr_ipc::install::this_process().map_err(|error| error.to_string())?;
     let input = read_input(std::io::stdin().lock())?;
     // Outside a launch there is nobody to tell, and the answer is the same neutral one.
     let Some(paths) = Paths::from_environment() else {
