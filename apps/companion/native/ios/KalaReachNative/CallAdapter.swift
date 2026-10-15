@@ -375,10 +375,10 @@ public final class CallAdapter: NSObject {
     private let device: CallDevice
     /// Everything below is touched on this queue only, apart from the news, which has its own.
     private let queue = DispatchQueue(label: "to.kala.reach.call-adapter")
-    /// Where every call into the engine's control runs. The control is one lock, and a stop holds
-    /// it while it waits for the connection to close, so a call that touches it (a stop, a permit,
-    /// a mute, a read of a mute) can wait: it runs here, and never holds a thread of Swift's
-    /// cooperative pool.
+    /// Where the adapter's calls into the engine's control run. The control is one lock, and a stop
+    /// holds it while it waits for the connection to close, so a call that touches it (a stop, a
+    /// permit, a mute, a read of a mute) can wait behind a stop. It waits here, on a thread of
+    /// this queue, and never on a thread of Swift's cooperative pool.
     private let engineQueue = DispatchQueue(label: "to.kala.reach.call-engine", attributes: .concurrent)
     private var held: (id: String, engine: CallEngine, news: CallNewsQueue, capture: VoiceCaptureState)?
     /// The call the observer's reports are for, so a late report of an ended call is not news.
@@ -477,7 +477,7 @@ public final class CallAdapter: NSObject {
 
     private func state() async -> String {
         let seen = queue.sync { held.map { (id: $0.id, engine: $0.engine, capture: $0.capture) } }
-        // The engine's mutes are read where a stop that waits cannot hold them back.
+        // The engine's mutes are read here: a read can wait behind a stop, and waits on this queue.
         let mutes = await onTheEngineQueue { (person: seen?.engine.isMutedByPerson ?? false,
                                               playback: seen?.engine.isPlaybackMuted ?? true) }
         return CallWire.text([
