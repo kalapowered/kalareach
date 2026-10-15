@@ -477,7 +477,7 @@ public final class CallAdapter: NSObject {
 
     private func state() async -> String {
         let seen = queue.sync { held.map { (id: $0.id, engine: $0.engine, capture: $0.capture) } }
-        // The engine's mutes are read here: a read can wait behind a stop, and waits on this queue.
+        // The engine's mutes are read on the engine queue: a read can wait behind a stop there.
         let mutes = await onTheEngineQueue { (person: seen?.engine.isMutedByPerson ?? false,
                                               playback: seen?.engine.isPlaybackMuted ?? true) }
         return CallWire.text([
