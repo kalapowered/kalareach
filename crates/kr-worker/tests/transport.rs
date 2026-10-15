@@ -3872,14 +3872,14 @@ async fn kr_req_11_32_a_frame_above_the_bound_tells_the_terminal_what_it_was_wai
 /// A WebSocket client of the kind a native terminal is, over a real local socket.
 type TerminalClient = tokio_websockets::WebSocketStream<SocketStream>;
 
-/// One owner whose terminal speaks WebSocket over a real socket, with the upstream's own end and
-/// the terminal's client.
-struct Upgraded {
+/// One owner whose terminal speaks WebSocket over a real socket, or over the connection a test
+/// gives it, with the upstream's own end and the terminal's client.
+struct Upgraded<S = SocketStream> {
     owner: Arc<Duplex>,
     /// The upstream's end of its connection.
     upstream: SocketStream,
     /// The native terminal.
-    terminal: TerminalClient,
+    terminal: tokio_websockets::WebSocketStream<S>,
     drained: tokio::task::JoinHandle<()>,
     /// The two reader tasks, upstream then terminal.
     serving: [tokio::task::JoinHandle<()>; 2],
@@ -3896,7 +3896,19 @@ async fn upgraded_with(
     framing: Framing,
     terminal: tokio_websockets::Config,
 ) -> Upgraded {
-    let (terminal_end, gateway_end) = socket_pair();
+    upgraded_over(broker, framing, terminal, socket_pair()).await
+}
+
+/// The same, over the pair of connections the terminal and the gateway are given.
+async fn upgraded_over<S>(
+    broker: &Arc<Broker>,
+    framing: Framing,
+    terminal: tokio_websockets::Config,
+    (terminal_end, gateway_end): (S, S),
+) -> Upgraded<S>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
     let accepting =
         tokio::spawn(
             async move { kr_worker::broker::websocket::accept(gateway_end, framing).await },
@@ -4249,58 +4261,26 @@ async fn kr_req_11_32_only_a_text_message_of_one_line_within_the_bound_crosses_a
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_11_32_a_last_frame_the_terminal_does_not_read_ends_the_connection() {
     let broker = broker();
-    let framing = Framing::new(NativeFraming::JsonLines);
-    let (terminal_end, gateway_end) = tokio::io::duplex(64 * 1024);
-    let accepting =
-        tokio::spawn(
-            async move { kr_worker::broker::websocket::accept(gateway_end, framing).await },
-        );
-    let (_terminal, _response) = tokio_websockets::ClientBuilder::new()
-        .uri("ws://localhost/rpc")
-        .expect("a URI")
-        .connect_on(terminal_end)
-        .await
-        .expect("the terminal upgrades");
-    let lines = accepting
-        .await
-        .expect("the accept task is joined")
-        .expect("the gateway accepts the upgrade");
-    let (upstream_here, _upstream_there) = socket_pair();
-    let (upstream_reads, upstream_writes) = tokio::io::split(upstream_here);
-    let (terminal_reads, terminal_writes) = tokio::io::split(lines);
-    let (owner, writes) = Duplex::new(
-        Arc::clone(&broker),
-        GatewayConnectionId::new(1),
-        framing,
-        upstream_writes,
-        terminal_writes,
-        site(),
-        "agent-user",
-    );
-    let drained = tokio::spawn(writes);
-    let _serving = [
-        {
-            let owner = Arc::clone(&owner);
-            tokio::spawn(async move { owner.serve(upstream_reads, true).await })
-        },
-        {
-            let owner = Arc::clone(&owner);
-            tokio::spawn(async move { owner.serve(terminal_reads, false).await })
-        },
-    ];
+    let up = upgraded_over(
+        &broker,
+        Framing::new(NativeFraming::JsonLines),
+        tokio_websockets::Config::default(),
+        tokio::io::duplex(64 * 1024),
+    )
+    .await;
     let big = request_of(5, "session/update", 900_000);
-    owner
+    up.owner
         .from_upstream(big.as_bytes(), TimestampMs::new(2))
         .await
         .expect("the frame is queued for the terminal");
     // The terminal reads nothing. The deadline for the write is the owner's, and the writers end
     // when it has passed.
-    tokio::time::timeout(LIVENESS_DEADLINE, drained)
+    tokio::time::timeout(LIVENESS_DEADLINE, up.drained)
         .await
         .expect("a frame the terminal never read ends the writers")
         .expect("they are joined");
     assert!(
-        owner.stopping(),
+        up.owner.stopping(),
         "a frame the terminal never read ended the connection"
     );
 }
