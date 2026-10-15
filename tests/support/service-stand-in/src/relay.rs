@@ -674,7 +674,7 @@ pub(crate) fn issue(
         {
             return invalid("That lease binds another pair, or another direction.");
         }
-        if lease.retired {
+        if lease.retired || relay.no_relay {
             return refused_answer(
                 relay,
                 &payer,
