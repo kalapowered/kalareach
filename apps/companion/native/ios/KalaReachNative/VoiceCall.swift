@@ -263,12 +263,21 @@ public final class VoiceCall: NSObject {
             try await connection.setLocalDescription(description)
             // WebRTC cannot withdraw that success, and an offer for a call that ended would be
             // sent on, so the call is asked again once it is back.
-            guard !control.isStopped else { throw VoiceAudioError.callEnded }
+            guard await onTheCallQueue({ !self.control.isStopped }) else { throw VoiceAudioError.callEnded }
             return description.sdp
         } catch {
             // A call that cannot make its offer has nothing to wait for, and gives the audio back.
-            stop()
+            await onTheCallQueue { self.stop() }
             throw error
+        }
+    }
+
+    /// Runs `work` on this call's queue and answers when it is done. The control is one lock, and a
+    /// stop holds it while it waits for the connection to close, so a read of the control or a stop
+    /// made after an `await` runs here, and never holds a thread of Swift's cooperative pool.
+    private func onTheCallQueue<T>(_ work: @escaping () -> T) async -> T {
+        await withCheckedContinuation { continuation in
+            queue.async { continuation.resume(returning: work()) }
         }
     }
 
@@ -283,7 +292,7 @@ public final class VoiceCall: NSObject {
             negotiation.unlock()
         } catch {
             // The same: a call whose answer does not apply ends, and gives the audio back.
-            stop()
+            await onTheCallQueue { self.stop() }
             throw VoiceAudioError.answerNotApplicable(error.localizedDescription)
         }
     }
