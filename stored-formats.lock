@@ -321,6 +321,21 @@
     },
     {
       "entry": {
+        "store": "mailbox-replay",
+        "scope": "environment",
+        "path": "mailbox-replay.sqlite3",
+        "recording": {
+          "kind": "sqlite_table",
+          "table": "mailbox_replay_schema"
+        },
+        "version": 1,
+        "migrates_from": 1
+      },
+      "digest": "bc2856484535bf890723e1ce9726c4a3d2d2281bb6b8e091d2aa12d2acfd4e80",
+      "kept": []
+    },
+    {
+      "entry": {
         "store": "native-bridges",
         "scope": "environment",
         "path": "native-bridges/*.json",

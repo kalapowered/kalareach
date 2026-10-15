@@ -53,6 +53,7 @@ pub mod directory;
 pub mod error;
 pub mod grants;
 pub mod machine;
+pub mod mailbox_reader;
 pub mod managed_transport;
 pub mod privacy;
 pub mod project;
