@@ -516,7 +516,9 @@ async fn turning_recovery_on_puts_the_bundle_at_the_service_and_hands_over_a_kit
         write["locator"].as_str().expect("a locator")
     );
     assert_eq!(kit.service_origins, [computer.served.origin().to_owned()]);
-    let (sequence, _) = web.bundle(&kit.bundle_locator).expect("the bundle is held");
+    let (sequence, _) = web
+        .bundle_write(&kit.bundle_locator)
+        .expect("the bundle is held");
     assert_eq!(sequence, 1);
     let bundle = read_with_only_the_kit(&computer.served, &kit).await;
     assert_eq!(bundle.revision.get(), 1);
@@ -621,7 +623,7 @@ async fn a_writer_is_declared_enabled_only_once_the_bundle_naming_it_has_landed(
     let (sequence, _) = computer
         .served
         .web()
-        .bundle(&kit.bundle_locator)
+        .bundle_write(&kit.bundle_locator)
         .expect("the bundle");
     assert_eq!(sequence, 2);
     let bundle = read_with_only_the_kit(&computer.served, &kit).await;
@@ -818,7 +820,11 @@ async fn a_start_that_stopped_after_the_bundle_landed_adopts_it() {
     assert_eq!(page.view()["state"], "unfinished");
     let on = page.call("recovery_turn_on", json!({})).expect("on");
     assert_eq!(on["state"], "on");
-    let (sequence, _) = computer.served.web().bundle(LOCATOR).expect("the bundle");
+    let (sequence, _) = computer
+        .served
+        .web()
+        .bundle_write(LOCATOR)
+        .expect("the bundle");
     assert_eq!(sequence, 1, "nothing was written over the bundle");
     let out = tempfile::tempdir().expect("a directory");
     let (_, kit) = page.kit(out.path());
@@ -833,13 +839,21 @@ async fn a_bundle_the_seed_does_not_open_is_neither_adopted_nor_written_over() {
     let ours = RecoverySeed::generate().expect("a seed");
     let another = RecoverySeed::generate().expect("a seed");
     left_by_an_earlier_run(&computer, &ours, &another).await;
-    let (_, held) = computer.served.web().bundle(LOCATOR).expect("the bundle");
+    let (_, held) = computer
+        .served
+        .web()
+        .bundle_write(LOCATOR)
+        .expect("the bundle");
 
     let page = computer.page().await;
     page.call("recovery_turn_on", json!({}))
         .expect_err("the bundle is not this seed's");
     assert_eq!(page.view()["state"], "unfinished");
-    let (sequence, still) = computer.served.web().bundle(LOCATOR).expect("the bundle");
+    let (sequence, still) = computer
+        .served
+        .web()
+        .bundle_write(LOCATOR)
+        .expect("the bundle");
     assert_eq!((sequence, still), (1, held), "the bundle is as it was");
     let out = tempfile::tempdir().expect("a directory");
     let path = out.path().join("kit.txt");
