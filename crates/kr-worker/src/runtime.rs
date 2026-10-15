@@ -1353,6 +1353,16 @@ impl SessionRuntime {
         (acceptance, gate)
     }
 
+    /// Whether the supervision of the root shell and of what the session owns is parked in its
+    /// wait with no mark made and none left behind, so that only the shell's exit, a mark made from
+    /// now on or a clock can wake it, for the host's own tests. It compiles to nothing without the
+    /// `testing` feature, and no shipped build enables it.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn supervision_is_waiting(&self) -> bool {
+        self.activity.supervision_is_waiting()
+    }
+
     /// Waits until the session has finished closing and returns its record.
     pub async fn wait_closed(&self) -> ClosureRecord {
         loop {
