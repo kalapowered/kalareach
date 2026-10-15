@@ -170,7 +170,9 @@ where and why. The conformance report attaches each section to its identifier (s
 
 A measurement's own section starts with its host: the build, the operating system and architecture,
 the processor, the processors and the memory against the reference host's, the load average entering
-and leaving, the stolen share, and which of those fall short. For each identifier the run measured,
+and leaving, the time a fixed piece of single-threaded work took entering and leaving (the host's
+speed, so that a figure which reads high can be told from a host that ran slow), the stolen share,
+and which of those fall short. For each identifier the run measured,
 `bench-all.md` adds a conditions section. It gives each step that measured the identifier, with its
 exit status, the load average at both edges, the other work over the ten seconds before the step and
 through it (the bound on its busiest five seconds, how much of that the allowances make up, its
