@@ -8,6 +8,9 @@
 //! copy. Every write names its request identity, and the collection keeps a receipt for it, so a
 //! write asked about or fenced after its answer was lost is settled by what the receipt holds.
 //!
+//! A write spends the account's backup storage, so an account the test has left with no allowance is
+//! answered `402 QUOTA_EXHAUSTED` once its request identity has no receipt.
+//!
 //! The account whose write first applies is the collection's owner, and every other account is
 //! answered as for a collection that does not exist. A collection put back from an archive names the
 //! history it is in, with or without a bundle. The service knows one account, so a test sets either
@@ -148,14 +151,15 @@ impl Bundles {
 
     /// What the service answers one request that carries a locator.
     ///
-    /// `now_ms` is the service's own clock. The kind of key that signed the request is read before
-    /// the route is reached.
+    /// `now_ms` is the service's own clock, and `funded` whether the account's backup storage
+    /// admits a write. The kind of key that signed the request is read before the route is reached.
     pub(crate) fn handle(
         &mut self,
         tokens: &BTreeMap<String, Token>,
         body: &Value,
         token: Option<&str>,
         now_ms: u64,
+        funded: bool,
     ) -> ServiceHttpAnswer {
         let named: Vec<&str> = MEMBERS
             .into_iter()
@@ -219,7 +223,15 @@ impl Bundles {
                 expected,
                 object,
                 ..
-            } => held.exchange(&locator, account, now_ms, &request_id, expected, object),
+            } => held.exchange(
+                &locator,
+                account,
+                now_ms,
+                &request_id,
+                expected,
+                object,
+                funded,
+            ),
             Asked::Compare { .. } => held.compare(&locator),
             Asked::Status { request_id, .. } => held.status(&request_id),
             Asked::Fence { request_id, .. } => held.fence(&request_id, now_ms),
@@ -510,6 +522,7 @@ impl Collection {
         request_id: &str,
         expected: Option<String>,
         object: Value,
+        funded: bool,
     ) -> ServiceHttpAnswer {
         let digest = json!({
             "locator": locator,
@@ -533,6 +546,15 @@ impl Collection {
                 );
             }
             return answered(receipt.answer.clone().unwrap_or(Value::Null));
+        }
+        // A write spends the account's backup storage, so an account with no allowance is turned
+        // away before the comparison.
+        if !funded {
+            return refusal(
+                402,
+                "QUOTA_EXHAUSTED",
+                "This account has no backup storage to write the recovery bundle to.",
+            );
         }
         let recorded_at = instant(now_ms);
         let current = self.kept.clone();
