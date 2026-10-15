@@ -45,11 +45,12 @@
 //! # When the socket is lost
 //!
 //! The service closes a call whose client has been absent for [`VOICE_CLIENT_ABSENT_SECONDS`]
-//! seconds since it last heard from or lost a socket of this client, so a lost socket is opened again until that long has
-//! passed since it was lost: at once after a socket that served for a heartbeat or more, and after
-//! a wait that grows from half a second to five between attempts that failed, or that were lost as
-//! soon as they opened. The window bounds an attempt as well as the waits between them. A socket
-//! from which nothing has been heard for longer than two heartbeats is lost. An answer that says
+//! seconds since it last heard from or lost a socket of this client, so a lost socket is opened
+//! again until that long has passed since it was lost: at once after a socket that served for a
+//! heartbeat or more, and after a wait that grows from half a second to five between attempts that
+//! failed, or that were lost as soon as they opened. The window bounds an attempt as well as the
+//! waits between them. A socket from which nothing has been heard for longer than two heartbeats
+//! is lost. An answer that says
 //! the call is not this account's, or is over, ends the control at once: reconnecting cannot change
 //! it.
 //!
@@ -97,7 +98,8 @@ pub const VOICE_KNOWN_DELEGATIONS: usize = 256;
 /// The service's list of announced delegations in `ready` is the longest it writes.
 pub const VOICE_EVENT_FRAME_BYTES: usize = 64 * 1024;
 
-/// The most requests a control holds that the service has not yet answered.
+/// The most requests a control holds that the service has not yet answered. The closure is the
+/// one request that is not counted here, and only one waits at a time.
 const MAX_IN_FLIGHT: usize = 32;
 
 /// The most appends a call's opening context is cut into.
@@ -876,7 +878,8 @@ struct Pending {
     /// however many sockets come and go ([`ControlTimings::answer_within`] and
     /// [`ControlTimings::close_within`]), and nothing else gives it up.
     born: Instant,
-    /// Whether it was ever written to a socket.
+    /// Whether a write of it to a socket was ever attempted: a write that failed or ran out of
+    /// time may have put it on the socket, so it counts as written.
     written: bool,
 }
 
@@ -1035,8 +1038,8 @@ impl Driver {
                 Served::Ended(end) => return Some(end),
                 Served::Lost => {
                     // The service restarts its clock for an absent client when it accepts a socket
-                    // and when it loses one, so the window counts from this loss. The loss is read before the
-                    // owner is told: a slow owner does not move it.
+                    // and when it loses one, so the window counts from this loss. The loss is
+                    // read before the owner is told: a slow owner does not move it.
                     lost_at = Instant::now();
                     let served = lost_at.saturating_duration_since(attached_at);
                     if self.tell(ControlNews::Detached).await.is_err() {
@@ -1154,7 +1157,17 @@ impl Driver {
         content: Option<String>,
     ) -> std::result::Result<(String, String), SendError> {
         // The closure is never turned away for want of room: it is the one request that must go.
-        if command != VoiceCommand::Close && self.pending.len() >= MAX_IN_FLIGHT {
+        // But one waits at a time: a second is turned away while the first is, and the first's
+        // confirmation is the answer to both.
+        let closing = self
+            .pending
+            .iter()
+            .any(|pending| matches!(pending.kind, Kind::Close(_)));
+        if command == VoiceCommand::Close {
+            if closing {
+                return Err(SendError::Busy);
+            }
+        } else if self.pending.len() >= MAX_IN_FLIGHT {
             return Err(SendError::Busy);
         }
         if let Some(named) = &delegation
@@ -1203,8 +1216,10 @@ impl Driver {
             if self.pending[index].ends_at(&timings) <= now {
                 let gone = self.pending.remove(index);
                 if gone.written {
-                    // The service may still read it: it counts from now, which is not earlier
-                    // than the service counts it.
+                    // The service may still read it. Counting it from now is the cautious
+                    // reading: it holds the next requests back a little longer, and it can
+                    // count the request earlier than the service does only if the service
+                    // reads it after now, which is the rarer case.
                     self.pacer.record(&gone.id, now);
                 }
                 let error = gone.unanswered();
@@ -1371,7 +1386,7 @@ impl Driver {
     /// The next moment something is due without a frame arriving: the silence limit, a request that
     /// will have used its budget, or the moment the pacer frees the request it is holding (`held`,
     /// read with the same clock as the decision to write).
-    fn next_wake(&mut self, last_heard: Instant, held: Option<Instant>) -> Instant {
+    fn next_wake(&self, last_heard: Instant, held: Option<Instant>) -> Instant {
         let mut wake = last_heard + self.timings().silence;
         if let Some(due) = self.next_deadline() {
             wake = wake.min(due);

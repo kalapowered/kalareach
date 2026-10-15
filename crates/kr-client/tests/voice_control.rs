@@ -1091,14 +1091,61 @@ async fn a_request_that_used_its_budget_before_any_socket_took_it_is_told_so_and
         .send(VoiceCommand::Thinking, None, Some("while away"))
         .await;
 
-    // The budget ended it, not the control: the control is still opening a socket.
+    // The budget ended it, not the control: the control is still opening sockets, and goes on.
     assert!(matches!(sent, Err(SendError::NotSent)), "{sent:?}");
+    let refused = route.report().refused_upgrades;
     route
-        .until("another refused attempt", |report| {
-            report.refused_upgrades >= 2
+        .until("more refused attempts", |report| {
+            report.refused_upgrades >= refused + 2
         })
         .await;
     assert_eq!(contexts(&route), 0);
+}
+
+#[tokio::test]
+async fn a_second_closure_is_turned_away_while_the_first_waits() {
+    let route = ControlRoute::start().await;
+    let (control, mut news) = open(&route, &Tokens::new());
+    attached(&mut news).await;
+    route.go_silent(true);
+
+    // The two requests go to the control in the order they are polled.
+    let (first, second) = tokio::join!(control.close(), control.close());
+
+    assert!(matches!(first, Err(SendError::Unanswered)), "{first:?}");
+    assert!(matches!(second, Err(SendError::Busy)), "{second:?}");
+}
+
+#[tokio::test]
+async fn a_refusal_of_a_frame_no_request_made_is_told_each_time() {
+    let route = ControlRoute::start().await;
+    let (_control, mut news) = open(&route, &Tokens::new());
+    attached(&mut news).await;
+    let refusal = serde_json::json!({
+        "type": "context_refused", "id": "", "reason": "invalid_request",
+        "message": "That is not a frame this socket carries."
+    });
+
+    // The service gives every frame it cannot read the same empty identifier.
+    route.say(&refusal);
+    route.say(&refusal);
+    route.usage(1, true);
+
+    let mut told = 0;
+    within("the frame after the refusals", async {
+        loop {
+            match raw(&mut news).await {
+                ControlNews::Event(VoiceControlEvent::ContextRefused { id, .. }) => {
+                    assert!(id.is_empty());
+                    told += 1;
+                }
+                ControlNews::Event(VoiceControlEvent::Usage { .. }) => return,
+                _ => {}
+            }
+        }
+    })
+    .await;
+    assert_eq!(told, 2);
 }
 
 #[tokio::test]
@@ -1141,7 +1188,8 @@ async fn a_closure_goes_ahead_of_the_requests_that_wait_for_the_pacer() {
 
     let closure = control.close().await.expect("confirmed");
 
-    // It took the next free slot, which came before the last of the requests.
+    // It took a free slot ahead of the requests still waiting: it was not the last to be written
+    // (the bound shows that it overtook the last burst, not which slot it took).
     assert_eq!(closure.seconds, 42);
     assert!(
         route.report().sent.len() < 25,
