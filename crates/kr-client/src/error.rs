@@ -44,6 +44,11 @@ pub enum ClientError {
         /// caller that is not signed in and for an account that may not do this; the code cannot
         /// carry the difference and the service already knows it.
         action: UserAction,
+        /// The code the service named, when it is one this client's contract names.
+        ///
+        /// A caller whose decision turns on which refusal it was reads it here: two service codes
+        /// can share one protocol code and one action.
+        service_code: Option<&'static str>,
     },
     /// A value could not be encoded or decoded as KR-CBOR-1.
     ///
@@ -123,6 +128,15 @@ impl ClientError {
             Self::ResyncRequired => ErrorCode::ResyncRequired,
             Self::ServiceNotConfigured(_) => ErrorCode::HostNotConfigured,
             Self::Draft(error) => error.code(),
+        }
+    }
+
+    /// The code a managed service named when it refused, when this client's contract names it.
+    #[must_use]
+    pub const fn service_code(&self) -> Option<&'static str> {
+        match self {
+            Self::Refused { service_code, .. } => *service_code,
+            _ => None,
         }
     }
 
