@@ -142,14 +142,31 @@ sys.exit(1)
 PY
 }
 
-# Answers each permission dialog that appears, for as long as it runs; the caller ends it.
-answer_permission_dialogs() { # allow|deny
+# Answers each permission dialog that appears, for as long as the script that started it runs
+# (`$2` is that script's process): it ends by itself when the script is gone, however the script
+# ended, and `stop_answerer` ends it when the script says so.
+answer_permission_dialogs() { # allow|deny <process of the script>
     local point
-    while :; do
+    while kill -0 "$2" 2>/dev/null; do
         point="$(permission_dialog_point "$1")" && "$adb" -s "$serial" shell input tap $point
         sleep 2
     done
 }
+
+# The process that answers the permission dialogs, if one runs.
+answerer=""
+
+# Ends the answerer and what it is running, and waits for it, so none outlives the device it taps.
+stop_answerer() {
+    [ -z "$answerer" ] && return 0
+    pkill -P "$answerer" 2>/dev/null
+    kill "$answerer" 2>/dev/null
+    wait "$answerer" 2>/dev/null
+    answerer=""
+}
+trap stop_answerer EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 run_android() {
     local sdk="${ANDROID_HOME:-$HOME/Library/Android/sdk}" avd="${KR_ANDROID_AVD:-Nines_API_36_Play}"
@@ -201,9 +218,8 @@ run_android() {
         [ -n "$pid" ] || { sleep 1; tries=$((tries + 1)); }
     done
 
-    local answerer=""
     case "$permissions" in
-        allow | deny) answer_permission_dialogs "$permissions" & answerer=$! ;;
+        allow | deny) answer_permission_dialogs "$permissions" "$$" & answerer=$! ;;
     esac
 
     local waited=0 text=""
@@ -215,7 +231,7 @@ run_android() {
         [ "$waited" -lt 300 ] || break
     done
     printf '%s\n' "$text" >"$artefacts/$result_name"
-    [ -z "$answerer" ] || kill "$answerer" 2>/dev/null
+    stop_answerer
     # What the application said while it ran, kept for a run that wrote no result.
     if [ -n "$pid" ]; then
         "$adb" -s "$serial" logcat -d --pid="$pid" 2>/dev/null | tail -200 >"$artefacts/logcat.log"
