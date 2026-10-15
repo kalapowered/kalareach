@@ -562,8 +562,13 @@ impl Controller {
                     production.hold(Held::Interrupted);
                     return Some(RELEASE_WAIT);
                 };
-                production.observed().probed_at_ms = Some(now);
                 unchanged = !readable;
+                // A try that found a session readable is not counted until the generation that
+                // holds it is admitted (below): a pass that then stops, for the disk or for
+                // privacy mode, leaves the next look to try again.
+                if unchanged {
+                    production.observed().probed_at_ms = Some(now);
+                }
             }
         }
         if unchanged {
