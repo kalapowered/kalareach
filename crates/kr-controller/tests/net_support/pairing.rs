@@ -8,6 +8,8 @@
 use iroh::endpoint::{ConnectError, ConnectingError, ConnectionError};
 use iroh::{Endpoint, EndpointAddr};
 use kr_client::ClientError;
+use kr_client::transport::NetworkTransport;
+use kr_crypto::connect::PairedPeer;
 use kr_crypto::keys::{AuthorisationKeyPair, DeviceKeys};
 use kr_ipc::client::LocalClient;
 use kr_pairing::confirm::sign_confirmation;
@@ -36,6 +38,7 @@ use kr_protocol::preauth::{
 use kr_protocol::scalars::{AuthorisationKey, Nullable};
 use kr_transport::TransportError;
 use kr_transport::handshake::{self, CandidateConnection, LocalIdentity};
+use kr_transport::scheduler::SendLimits;
 
 /// The host as the candidate sees it: the endpoint identity the invitation pinned.
 #[derive(Debug)]
@@ -142,11 +145,46 @@ pub async fn dial_until_connected(
 /// transport reports the connection that timed out before it was established as such, and a
 /// failure of any other kind is the host's answer or something else.
 pub fn transport_gave_up_unanswered(error: &ClientError) -> bool {
+    matches!(error, ClientError::Transport(error) if transport_error_gave_up_unanswered(error))
+}
+
+/// [`transport_gave_up_unanswered`] for the transport's own error, as `kr_transport` returns it.
+pub fn transport_error_gave_up_unanswered(error: &TransportError) -> bool {
     matches!(
         error,
-        ClientError::Transport(TransportError::Connect(message))
+        TransportError::Connect(message)
             if *message == ConnectingError::from(ConnectionError::TimedOut).to_string()
     )
+}
+
+/// Connects a paired device to the host at `addr`, and returns the host's answer: a connection, or
+/// the refusal the host gave.
+///
+/// An attempt the transport gave up on is made again ([`until_answered`]), so the outcome is what
+/// the host decided and never that nothing answered.
+///
+/// # Panics
+///
+/// Panics when [`REACH_DEADLINE`] passes before an attempt is answered.
+pub async fn connect_until_answered(
+    endpoint: &Endpoint,
+    addr: EndpointAddr,
+    identity: &LocalIdentity,
+    host: &PairedPeer,
+) -> Result<NetworkTransport, ClientError> {
+    until_answered(
+        || {
+            NetworkTransport::connect(
+                endpoint,
+                addr.clone(),
+                identity,
+                host,
+                SendLimits::default(),
+            )
+        },
+        transport_gave_up_unanswered,
+    )
+    .await
 }
 
 /// Whether the transport ended an attempt because nothing answered it.
