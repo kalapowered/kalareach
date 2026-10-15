@@ -116,11 +116,27 @@ pub enum StaleRefusal {
 }
 
 /// One fault a test arranged: the `nth` request to `path` from now on, counting from one, fails.
-#[derive(Clone, Copy, Debug)]
+/// When it names `matching`, only the requests whose body carries every one of its members count.
+#[derive(Clone, Debug)]
 struct Fault {
     path: &'static str,
     nth: u32,
     moment: Moment,
+    matching: Option<serde_json::Value>,
+}
+
+impl Fault {
+    /// Whether a request to `path` with this body is one this fault counts.
+    fn counts(&self, path: &str, body: &serde_json::Value) -> bool {
+        path == self.path
+            && self.matching.as_ref().is_none_or(|wanted| {
+                wanted.as_object().is_some_and(|members| {
+                    members
+                        .iter()
+                        .all(|(name, value)| body.get(name) == Some(value))
+                })
+            })
+    }
 }
 
 /// One request as the transport was given it.
@@ -541,10 +557,29 @@ impl ServiceWeb {
 
     /// The `nth` request to `path` from now on fails at `moment`.
     pub fn fail(&self, path: &'static str, nth: u32, moment: Moment) {
-        self.faults
-            .lock()
-            .expect("the faults")
-            .push(Fault { path, nth, moment });
+        self.faults.lock().expect("the faults").push(Fault {
+            path,
+            nth,
+            moment,
+            matching: None,
+        });
+    }
+
+    /// As [`Self::fail`], counting only the requests to `path` whose body carries every member of
+    /// `matching`, so a fault meets one pair's request however many others the daemon sends.
+    pub fn fail_matching(
+        &self,
+        path: &'static str,
+        matching: serde_json::Value,
+        nth: u32,
+        moment: Moment,
+    ) {
+        self.faults.lock().expect("the faults").push(Fault {
+            path,
+            nth,
+            moment,
+            matching: Some(matching),
+        });
     }
 
     /// Every request the transport was given, in order.
@@ -668,7 +703,10 @@ impl ServiceWeb {
         let moment = {
             let mut faults = self.faults.lock().expect("the faults");
             let mut met = None;
-            for fault in faults.iter_mut().filter(|fault| path == fault.path) {
+            for fault in faults
+                .iter_mut()
+                .filter(|fault| fault.counts(path, &document["body"]))
+            {
                 fault.nth -= 1;
                 if fault.nth == 0 {
                     met = Some(fault.moment);
