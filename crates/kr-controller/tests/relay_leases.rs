@@ -1849,9 +1849,10 @@ async fn an_aged_row_under_a_bound_too_small_for_a_block_does_not_hold_another_a
 }
 
 /// KR-REQ-17.51: where the new payer is another authorisation of the same account, the row under a
-/// bound too small for a block stays, because the service cannot say that no lease stands in the
-/// way, and the owner clears it by withdrawing the authorisation replaced: the next ask under it
-/// is refused as forbidden, the row goes, and the pair is given a lease under the new payer.
+/// bound too small for a block stays, because the service answers invalid in the same words for a
+/// lease in its grace window whose hold passes the bound, and the keeper cannot tell the two
+/// apart. The owner clears the row by withdrawing the authorisation replaced: the next ask under
+/// it is refused as forbidden, the row goes, and the pair is given a lease under the new payer.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_aged_row_of_the_same_account_stays_until_the_authorisation_it_replaced_is_withdrawn() {
     let rig = Rig::start_bounded_naming(true, BLOCK_BYTES / 2).await;
