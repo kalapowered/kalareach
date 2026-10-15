@@ -1072,6 +1072,10 @@ impl SessionRuntime {
                 )>,
             > = None;
             loop {
+                // The look this wake begins, which a test that must know the root shell has been
+                // asked about waits to see end.
+                #[cfg(feature = "testing")]
+                let look = runtime.activity.begin_look();
                 // The set of processes the session owns is built up while it runs, on the cadence
                 // [`crate::lifecycle`] describes: a process that starts and ends between two
                 // observations is never recorded, and enumerating the boundary every time the
@@ -1174,6 +1178,8 @@ impl SessionRuntime {
                     .release();
                     break;
                 }
+                #[cfg(feature = "testing")]
+                drop(look);
                 // The next wake, or the probe coming back first. A reading is applied as soon as
                 // the platform answers rather than at whatever the cadence would next have woken
                 // this loop for, so a desktop that has gone is found when it is said to have gone.
@@ -1353,14 +1359,12 @@ impl SessionRuntime {
         (acceptance, gate)
     }
 
-    /// Whether the supervision of the root shell and of what the session owns is parked in its
-    /// wait with no mark made and none left behind, so that only the shell's exit, a mark made from
-    /// now on or a clock can wake it, for the host's own tests. It compiles to nothing without the
-    /// `testing` feature, and no shipped build enables it.
+    /// Whether the supervision is in the middle of a look at the session, for the host's own tests.
+    /// It compiles to nothing without the `testing` feature, and no shipped build enables it.
     #[cfg(feature = "testing")]
     #[must_use]
-    pub fn supervision_is_waiting(&self) -> bool {
-        self.activity.supervision_is_waiting()
+    pub fn supervision_is_looking(&self) -> bool {
+        self.activity.supervision_is_looking()
     }
 
     /// Waits until the session has finished closing and returns its record.
