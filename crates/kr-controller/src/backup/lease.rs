@@ -252,7 +252,7 @@ impl Drop for ProductionLease {
         // The cleanup a fence owes waits for the pass to be over, and is told. The carrier is not:
         // what it reads is the store and the files its rows name, which the end of a pass does not
         // change, and a generation the pass admitted woke it when its rows were written. A wake
-        // here would have it look again at once, inside a wait it had been given.
+        // here would have it look again at once, inside a wait that listens for work.
         self.signals.lease_ended.notify_one();
     }
 }

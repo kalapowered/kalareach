@@ -9844,8 +9844,8 @@ async fn retention_leaves_a_generation_privacy_mode_drew_a_line_under() {
 
 /// The end of a production pass tells the cleanup a fence owes, and wakes neither the producer nor
 /// the carrier: a pass that failed would otherwise begin again at once and never wait out its
-/// delay, and a carrier woken at the end of a pass looks again inside whatever wait it was in, when
-/// nothing it reads has changed.
+/// delay, and a carrier woken at the end of a pass looks again at once, inside a wait that listens
+/// for work, when nothing it reads has changed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_end_of_a_pass_tells_the_cleanup_a_fence_owes_and_wakes_nothing_else() {
     let environment = Environment::open();
@@ -9865,11 +9865,15 @@ async fn the_end_of_a_pass_tells_the_cleanup_a_fence_owes_and_wakes_nothing_else
         signals.produce.notified().now_or_never().is_none(),
         "the producer is not told"
     );
+    assert!(
+        signals.fence.notified().now_or_never().is_none(),
+        "nothing is told of a fence"
+    );
 }
 
 /// A generation's admission wakes the carrier once, and the end of the pass that made it does not
-/// wake it again: a carrier that is told twice looks a second time at once, inside whatever it had
-/// been told to wait for. The pass's lease is kept across the admission, so that the wake that is
+/// wake it again: a carrier that is told twice looks a second time at once, inside a wait that
+/// listens for work. The pass's lease is kept across the admission, so that the wake that is
 /// counted is the admission's and the end of the pass is seen apart from it.
 #[test]
 fn the_admission_of_a_generation_wakes_the_carrier_once() {
