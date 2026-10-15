@@ -72,6 +72,7 @@ use crate::output::OutputDelivery;
 use crate::runtime::SessionRuntime;
 use crate::session::DETACH_HINT;
 use crate::session::Session;
+use crate::trace::Site;
 
 /// How often the worker replaces a live connection's action window.
 ///
@@ -7410,7 +7411,9 @@ impl WorkerService {
         }
         self.wait_before_the_input_session();
         let accepted = {
+            let mut acquisition = self.runtime.trace().acquisition(Site::InputAcceptance);
             let mut session = self.runtime.session();
+            acquisition.held();
             // Inside the session's own boundary, where the lease and the fence are: a forwarded
             // batch can wait here while the controller installs a newer authority revision or the
             // grant behind it runs out, and what the boundary decides is what actually reaches the
@@ -7434,6 +7437,7 @@ impl WorkerService {
                 },
                 std::time::Instant::now(),
             )?;
+            acquisition.deadline(session.paste_deadline());
             // Handed to the writer while the session is still held, so two writers cannot
             // interleave their batches after releasing the lock.
             self.runtime.flush_locked(&mut session);

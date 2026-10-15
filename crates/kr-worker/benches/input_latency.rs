@@ -53,6 +53,9 @@ use kr_worker::session::{Session, SessionConfig};
 #[path = "../../../tests/perf/src/record.rs"]
 mod record;
 
+#[path = "input_latency/recorded.rs"]
+mod recorded;
+
 /// The record these measurements' figures are kept in, under `KR_TEST_ARTIFACTS_DIR`.
 const RECORD: &str = "kr-worker-input.md";
 
@@ -401,7 +404,11 @@ async fn close(hosted: &Hosted) -> Result<(), String> {
 
 /// Reads everything the session has retained, which is what the application produced.
 fn retained(runtime: &SessionRuntime) -> Vec<u8> {
-    let session = runtime.session();
+    retained_in(&runtime.session())
+}
+
+/// Reads everything a session that is already held has retained.
+fn retained_in(session: &Session) -> Vec<u8> {
     let mut seen = Vec::new();
     let mut cursor = 0_u64;
     loop {
@@ -820,6 +827,9 @@ fn paste_prefix_recogniser_deadline() {
             "the target is not met on this host"
         }
     ));
+    // Rounds that are recorded and not asserted: where the time of a hold went, for the one that
+    // takes longer than the allowance.
+    lines.extend(report.recorded.lines());
     // Before anything is asserted, so a run whose target failed keeps the figure.
     record::report(
         RECORD,
@@ -868,6 +878,8 @@ struct Recogniser {
     paste_open_after_split: bool,
     /// The host while the prefixes were measured.
     conditions: record::Conditions,
+    /// The rounds taken after them, which are recorded and not asserted.
+    recorded: recorded::Recorded,
 }
 
 async fn measure_recogniser() -> (Result<Recogniser, String>, Result<(), String>) {
@@ -1002,12 +1014,15 @@ async fn recogniser_samples(hosted: &Hosted) -> Result<Recogniser, String> {
     // forwarded the same bytes without recognising them would look identical in the output.
     let paste_open_after_split = hosted.runtime.session().paste_open();
     let conditions = window.close();
+    let recorded =
+        recorded::record_rounds(hosted, &mut client, attachment_id, epoch, &mut sequence).await;
     drop(client);
     Ok(Recogniser {
         holds,
         split,
         paste_open_after_split,
         conditions,
+        recorded,
     })
 }
 

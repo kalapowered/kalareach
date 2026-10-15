@@ -71,6 +71,10 @@ pub mod service;
 pub mod session;
 pub mod snapshot;
 pub mod testing;
+#[cfg(feature = "testing")]
+pub mod trace;
+#[cfg(not(feature = "testing"))]
+mod trace;
 pub mod windows;
 
 pub use crate::error::{Result, WorkerError};

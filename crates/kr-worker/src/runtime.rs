@@ -25,9 +25,13 @@ use crate::error::{Result, WorkerError};
 use crate::session::{
     CloseAcceptance, DRAIN_PERIOD, GRACE_PERIOD, InputBatch, PasteTransition, Session,
 };
+use crate::trace::Site;
 
 /// How many read batches may wait for ingestion before the read loop slows down.
 pub const READ_QUEUE_DEPTH: usize = 64;
+
+/// What the trace notes of a supervision wake that observed the session's processes.
+pub const SUPERVISION_OBSERVED: u64 = 1;
 
 /// The most input the writer offers the pseudo-terminal in one write, before any delimiter it has
 /// to finish.
@@ -554,6 +558,9 @@ pub struct SessionRuntime {
     activity: Arc<crate::lifecycle::Activity>,
     /// How far ingestion is behind the terminal, which the closure waits out.
     progress: ReadProgress,
+    /// The instants of the session's acquisitions along a keystroke's path, which the input
+    /// measurement records and nothing else does.
+    trace: Arc<crate::trace::LockTrace>,
 }
 
 impl SessionRuntime {
@@ -625,6 +632,7 @@ impl SessionRuntime {
             pauses: Arc::default(),
         };
         let counter = progress.counter();
+        let trace = Arc::new(crate::trace::LockTrace::new());
         let wake = Arc::new(Notify::new());
         let closed = Arc::new(Notify::new());
 
@@ -920,12 +928,14 @@ impl SessionRuntime {
             fence: Arc::clone(&fence),
             activity: Arc::clone(&activity),
             progress: progress.clone(),
+            trace: Arc::clone(&trace),
         };
 
         let ingest_session = Arc::clone(&session);
         let ingest_closed = Arc::clone(&closed);
         let ingest_input = input_sender.clone();
         let ingest_activity = Arc::clone(&activity);
+        let ingest_trace = Arc::clone(&trace);
         tokio::spawn(async move {
             while let Some(event) = output_receiver.recv().await {
                 match event {
@@ -933,19 +943,24 @@ impl SessionRuntime {
                         // Something in this session is running. Whatever it is may be a process
                         // that was not there at the last observation.
                         ingest_activity.note();
-                        if let Ok(mut session) = ingest_session.lock() {
-                            session.ingest_output(&bytes);
-                            // Nothing else is waiting, so the terminal has gone quiet and the
-                            // screen is settled. The engine holds the last scalar of a run back in
-                            // case a combining mark follows it, and this is what releases it.
-                            if output_receiver.is_empty() {
-                                session.quiesce_output();
-                            }
-                            // What the host owes the application goes back into its terminal
-                            // input. An application that asked the terminal a question is waiting
-                            // for the answer, and nothing else can supply it.
-                            for batch in session.take_pending_input() {
-                                let _ = ingest_input.send(batch);
+                        {
+                            let mut acquisition = ingest_trace.acquisition(Site::Ingest);
+                            if let Ok(mut session) = ingest_session.lock() {
+                                acquisition.held();
+                                session.ingest_output(&bytes);
+                                // Nothing else is waiting, so the terminal has gone quiet and the
+                                // screen is settled. The engine holds the last scalar of a run back
+                                // in case a combining mark follows it, and this is what releases
+                                // it.
+                                if output_receiver.is_empty() {
+                                    session.quiesce_output();
+                                }
+                                // What the host owes the application goes back into its terminal
+                                // input. An application that asked the terminal a question is
+                                // waiting for the answer, and nothing else can supply it.
+                                for batch in session.take_pending_input() {
+                                    let _ = ingest_input.send(batch);
+                                }
                             }
                         }
                         // Every attachment has been handed this batch, so a closure recorded from
@@ -982,6 +997,7 @@ impl SessionRuntime {
         let monitor_activity = Arc::clone(&activity);
         let monitor_clock = Arc::clone(&shared_clock);
         let monitor_progress = progress;
+        let monitor_trace = Arc::clone(&trace);
         tokio::spawn(async move {
             // The monitor holds a runtime of its own so a closure it begins publishes its fence and
             // its paste terminator the same way a requested one does. Building it only once the
@@ -997,6 +1013,7 @@ impl SessionRuntime {
                 fence: Arc::clone(&monitor_fence),
                 activity: Arc::clone(&monitor_activity),
                 progress: monitor_progress,
+                trace: Arc::clone(&monitor_trace),
             });
             // Built here rather than by the caller: waiting for a child to end is the runtime's
             // own facility, and this is the task that does the waiting.
@@ -1020,9 +1037,11 @@ impl SessionRuntime {
             loop {
                 let mut wanted = None;
                 let initiated = {
+                    let mut acquisition = monitor_trace.acquisition(Site::SupervisionWake);
                     let Ok(mut session) = monitor_session.lock() else {
                         break;
                     };
+                    acquisition.held();
                     if session.state() == SessionState::Closed {
                         break;
                     }
@@ -1032,7 +1051,10 @@ impl SessionRuntime {
                     // every time the shell is asked about would cost more than the whole host is
                     // allowed to spend while idle.
                     if wake == crate::lifecycle::Wake::Ownership {
+                        acquisition.note(SUPERVISION_OBSERVED);
+                        let began = Instant::now();
                         session.observe_owned();
+                        monitor_trace.observed(began);
                     }
                     // What the watch wants to be asked next, decided here, on the lock this pass
                     // already holds: a second acquisition per wake would put this loop in front of
@@ -1104,12 +1126,16 @@ impl SessionRuntime {
         let timer_session = Arc::clone(&session);
         let timer_input = input_sender;
         let timer_wake = Arc::clone(&wake);
+        let timer_trace = Arc::clone(&trace);
         tokio::spawn(async move {
             loop {
-                let deadline = timer_session
-                    .lock()
-                    .ok()
-                    .and_then(|session| session.paste_deadline());
+                let deadline = {
+                    let mut acquisition = timer_trace.acquisition(Site::TimerLook);
+                    timer_session.lock().ok().and_then(|session| {
+                        acquisition.held();
+                        session.paste_deadline()
+                    })
+                };
                 match deadline {
                     Some(deadline) => {
                         let now = Instant::now();
@@ -1118,7 +1144,10 @@ impl SessionRuntime {
                             () = tokio::time::sleep(wait) => {}
                             () = timer_wake.notified() => continue,
                         }
+                        timer_trace.timer_woke(deadline);
+                        let mut acquisition = timer_trace.acquisition(Site::TimerForward);
                         if let Ok(mut session) = timer_session.lock() {
+                            acquisition.held();
                             session.expire_paste_prefix(Instant::now());
                             for batch in session.take_pending_input() {
                                 let _ = timer_input.send(batch);
@@ -1137,6 +1166,21 @@ impl SessionRuntime {
     #[must_use]
     pub fn shared_clock(&self) -> Arc<dyn kr_ipc::clock::SharedClock> {
         Arc::clone(&self.shared_clock)
+    }
+
+    /// Returns the recorder of the session's acquisitions along a keystroke's path, for the input
+    /// measurement.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn trace(&self) -> &crate::trace::LockTrace {
+        &self.trace
+    }
+
+    /// The same, without the feature: the recorder is there for the sites to call, and records
+    /// nothing.
+    #[cfg(not(feature = "testing"))]
+    pub(crate) fn trace(&self) -> &crate::trace::LockTrace {
+        &self.trace
     }
 
     /// Locks the session for one operation.
