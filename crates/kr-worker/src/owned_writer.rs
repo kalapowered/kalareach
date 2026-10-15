@@ -4,14 +4,19 @@
 //! session is locked while it is observed. A write waits for the disk, and the lock is the one
 //! input acceptance and the terminal's reader take, so the write is handed to a thread of its own
 //! that holds a connection beside the journal's. Only the latest record matters: a record that
-//! has been replaced before it was written is dropped, and a record that could not be written is
-//! sent again at the next observation, changed or not.
+//! has been replaced before it was written is dropped.
+//!
+//! A record that could not be written is tried again by the thread, every second, until the
+//! journal takes it or a newer record replaces it. The record is what a crash's cleanup acts on,
+//! and an idle session is observed only on the sweep, so waiting for the next observation would
+//! leave a stall of the journal's a sweep long in what the cleanup knows. A record that could not
+//! be written is also sent again at the next observation, changed or not.
 //!
 //! The thread ends when the writer is dropped.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Sender, channel};
+use std::sync::mpsc::{RecvTimeoutError, Sender, channel};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -21,6 +26,9 @@ use crate::ownership::OwnedRecord;
 
 /// How long a write waits for a lock another connection to the journal holds.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long the thread waits before it tries again a record the journal refused.
+const RETRY: Duration = Duration::from_secs(1);
 
 /// A writer of one session's [`OwnedRecord`].
 #[derive(Debug)]
@@ -47,7 +55,20 @@ impl OwnedWriter {
             .name("kr-owned-record".to_owned())
             .spawn(move || {
                 let mut connection: Option<rusqlite::Connection> = None;
-                while let Ok(mut record) = receiver.recv() {
+                // The record the journal refused, until it takes it or a newer one comes.
+                let mut refused: Option<OwnedRecord> = None;
+                loop {
+                    let mut record = match refused.take() {
+                        Some(refused) => match receiver.recv_timeout(RETRY) {
+                            Ok(newer) => newer,
+                            Err(RecvTimeoutError::Timeout) => refused,
+                            Err(RecvTimeoutError::Disconnected) => return,
+                        },
+                        None => match receiver.recv() {
+                            Ok(record) => record,
+                            Err(_) => return,
+                        },
+                    };
                     // Only the latest matters.
                     while let Ok(newer) = receiver.try_recv() {
                         record = newer;
@@ -64,6 +85,7 @@ impl OwnedWriter {
                     })();
                     if written.is_err() {
                         connection = None;
+                        refused = Some(record);
                     }
                     outcome.store(written.is_err(), Ordering::Release);
                 }
