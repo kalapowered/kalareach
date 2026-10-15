@@ -171,7 +171,7 @@ impl RecordFile {
             .truncate(false)
             .open(&lock_path)
             .map_err(|source| storage(stored(&lock_path), source))?;
-        match lock.try_lock() {
+        match kr_flush::lock::try_exclusive(&lock) {
             Ok(()) => {}
             Err(std::fs::TryLockError::WouldBlock) => {
                 return Err(RecoveryError::BundleStoreInUse {

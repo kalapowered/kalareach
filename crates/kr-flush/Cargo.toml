@@ -1,6 +1,6 @@
 [package]
 name = "kr-flush"
-description = "KalaReach's directory flush: how every local store makes a name it changed survive a crash"
+description = "KalaReach's directory flush and file lock: how every local store makes a name it changed survive a crash and keeps two processes from writing one store"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -15,7 +15,8 @@ publish.workspace = true
 testing = []
 
 [target.'cfg(unix)'.dependencies]
-# A held directory is opened again relative to its own descriptor.
+# A held directory is opened again relative to its own descriptor, and a store's lock is taken on
+# its file.
 rustix = { workspace = true, features = ["fs"] }
 
 [target.'cfg(windows)'.dependencies]

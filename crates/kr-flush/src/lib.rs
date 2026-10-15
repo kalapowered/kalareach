@@ -1,12 +1,21 @@
-//! The directory flush every local store makes a name it changed durable with.
+//! The directory flush and the file lock every local store makes its files safe with.
 //!
 //! A file's contents are flushed through the file itself. Its name is an entry in the directory that
 //! holds it, so a creation, a replacement or a removal is on disk only once that directory is. Every
 //! store on this host flushes its directories here, on every platform, so what a flush opens and
 //! what it asks for is decided in one place.
 //!
+//! Two stores never write one set of files at once, and a file that was published is never
+//! replaced by a later publication. Both rules are kept here, one way for each need of a platform:
+//! [`lock`] holds a store's lock, and [`publish_without_replacing`] gives a complete file its first
+//! name. Neither is left to the standard library's file lock or to a hard link, because a phone
+//! running Android has neither: its file lock is not supported, and its security policy refuses a
+//! hard link inside an application's own directory.
+//!
 //! This crate depends on no other crate of this host, so every one of them can reach it, the
 //! cryptography crate's directory store included.
+
+pub mod lock;
 
 use std::path::Path;
 
@@ -156,26 +165,45 @@ pub fn retry_while_held_until(
 /// Gives the complete file `from` the name `to`, unless something is named `to` already: a first
 /// publication, which never replaces what another writer published first.
 ///
-/// On Windows this is a rename that does not replace. A link does the same everywhere, but on
-/// Windows a file that has just been given a name by a link can be held by the system, where a
-/// scanner such as Defender reads it, for a minute and more (see [`HELD_RENAME_BOUND`]), and a
-/// rename over it is refused all that time. Elsewhere it is a link, and `from` keeps its name too
-/// until the caller removes it; on Windows `from` no longer names anything once this succeeds.
-/// Windows is given each name as the standard library's own file calls give it: a name that holds
-/// a NUL is refused, and one past the old limit of 260 characters is made absolute and given the
-/// prefix that lifts the limit.
+/// On Windows this is a rename that does not replace. On Android it is a rename that does not
+/// replace either, `renameat2` with `RENAME_NOREPLACE`, because the security policy there refuses a
+/// hard link inside an application's own directory; the kernel has taken the flag since Linux 3.15
+/// and checks the name and moves the file as one step, and the platform's application filter
+/// allows the call from Android 10, though its C library has a wrapper only from Android 11. A
+/// filesystem that does not take the flag refuses the call, which is reported as it is, as a FAT
+/// volume is on a desktop. Elsewhere it is a link, which does the same: `from` keeps its name too
+/// until the caller removes it.
+///
+/// A link made on Windows leaves a file that the system can hold, where a scanner such as Defender
+/// reads it, for a minute and more (see [`HELD_RENAME_BOUND`]), and a rename over it is refused all
+/// that time; so a new file there is given its name by a rename. On Windows and Android `from` no
+/// longer names anything once this succeeds. Windows is given each name as the standard library's
+/// own file calls give it: a name that holds a NUL is refused, and one past the old limit of 260
+/// characters is made absolute and given the prefix that lifts the limit.
 ///
 /// # Errors
 ///
 /// Returns an error of kind [`std::io::ErrorKind::AlreadyExists`] when something is named `to`,
-/// of kind [`std::io::ErrorKind::InvalidInput`] when a name holds a NUL, and the operating
-/// system's error when the name cannot be given otherwise.
+/// of kind [`std::io::ErrorKind::InvalidInput`] when a name holds a NUL (and, on Android, when the
+/// filesystem does not take the flag), and the operating system's error when the name cannot be
+/// given otherwise.
 pub fn publish_without_replacing(from: &Path, to: &Path) -> std::io::Result<()> {
     #[cfg(windows)]
     {
         self::windows::move_without_replacing(from, to)
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "android")]
+    {
+        rustix::fs::renameat_with(
+            rustix::fs::CWD,
+            from,
+            rustix::fs::CWD,
+            to,
+            rustix::fs::RenameFlags::NOREPLACE,
+        )
+        .map_err(std::io::Error::from)
+    }
+    #[cfg(not(any(windows, target_os = "android")))]
     {
         std::fs::hard_link(from, to)
     }
@@ -738,9 +766,14 @@ mod tests {
         std::fs::write(&second, b"second").expect("the second file");
         publish_without_replacing(&first, &name).expect("the name is free");
         assert_eq!(std::fs::read(&name).expect("readable"), b"first");
-        // On Windows the name moved, since no link was made; elsewhere the file keeps both names
-        // until the caller removes one.
-        assert_eq!(first.exists(), !cfg!(windows), "{}", first.display());
+        // On Windows and Android the name moved, since no link was made; elsewhere the file keeps
+        // both names until the caller removes one.
+        assert_eq!(
+            first.exists(),
+            !cfg!(any(windows, target_os = "android")),
+            "{}",
+            first.display()
+        );
         let taken = publish_without_replacing(&second, &name).expect_err("the name is taken");
         assert_eq!(taken.kind(), std::io::ErrorKind::AlreadyExists, "{taken}");
         assert_eq!(std::fs::read(&name).expect("readable"), b"first");

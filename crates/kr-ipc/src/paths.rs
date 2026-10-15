@@ -2816,10 +2816,12 @@ pub fn write_owner_only_file(path: &Path, contents: &[u8]) -> Result<()> {
 /// This is the publication a racing caller must lose rather than win. `rename` always replaces, so
 /// it cannot answer "who got there first"; a publication that never replaces can.
 ///
-/// On Windows the file is given its name by a rename that does not replace, tried again while
-/// another program holds it, as [`kr_flush::retry_while_held`] says; elsewhere by a link. A file
-/// given its name by a link there can be held by the system, where a scanner reads it, for a minute
-/// and more, and whoever later replaces or removes it is refused all that time.
+/// The file is given its name by [`kr_flush::publish_without_replacing`], tried again while another
+/// program holds it, as [`kr_flush::retry_while_held`] says: a rename that does not replace on
+/// Windows and on Android, and a link elsewhere. A file given its name by a link on Windows can be
+/// held by the system, where a scanner reads it, for a minute and more, and whoever later replaces
+/// or removes it is refused all that time; on Android the security policy refuses a link in an
+/// application's own directory.
 ///
 /// # Errors
 ///

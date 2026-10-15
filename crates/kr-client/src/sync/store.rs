@@ -3574,22 +3574,21 @@ impl Drop for Lock {
     fn drop(&mut self) {
         // A release the system refused leaves the lock to the closing that follows, which is the
         // most that can be done from a destructor; there is nobody to report the refusal to.
-        let _ = self.file.unlock();
+        let _ = kr_flush::lock::release(&self.file);
     }
 }
 
 impl Lock {
     pub(super) fn take(path: &Path) -> Result<Self> {
         let file = Self::open(path)?;
-        file.lock()
-            .map_err(|source| storage(Shown::root(path), source))?;
+        kr_flush::lock::exclusive(&file).map_err(|source| storage(Shown::root(path), source))?;
         Ok(Self { file })
     }
 
     /// Takes the lock when it is free, and answers rather than waiting when it is not.
     pub(super) fn try_take(path: &Path) -> Result<Option<Self>> {
         let file = Self::open(path)?;
-        match file.try_lock() {
+        match kr_flush::lock::try_exclusive(&file) {
             Ok(()) => Ok(Some(Self { file })),
             Err(std::fs::TryLockError::WouldBlock) => Ok(None),
             Err(std::fs::TryLockError::Error(source)) => Err(storage(Shown::root(path), source)),

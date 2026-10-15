@@ -317,9 +317,10 @@ fn read_seed(path: &Path, _owner: u32) -> Result<Option<Secret<RELAY_SEED_LEN>>>
 /// Writes the seed to a staging file, flushes it, and publishes it without replacing a key.
 ///
 /// The final name appears only once its contents are on the device, so a crash halfway through the
-/// first start leaves no truncated key for every later start to fail on. Publishing with a link
-/// rather than a rename is what makes it refuse to replace an existing key: a second process that
-/// got there first keeps its key, and this one reads that instead.
+/// first start leaves no truncated key for every later start to fail on. Publishing with
+/// [`kr_flush::publish_without_replacing`] rather than a plain rename is what makes it refuse to
+/// replace an existing key: a second process that got there first keeps its key, and this one reads
+/// that instead.
 #[cfg(unix)]
 fn publish_seed(directory: &Path, path: &Path, seed: &[u8]) -> Result<()> {
     // A staging name, unique to this process and this moment. Both keys kept here stage the same
@@ -333,9 +334,9 @@ fn publish_seed(directory: &Path, path: &Path, seed: &[u8]) -> Result<()> {
             .unwrap_or_default()
     ));
     write_owner_only(&staging, seed)?;
-    let linked = std::fs::hard_link(&staging, path);
+    let published = kr_flush::publish_without_replacing(&staging, path);
     let _ = std::fs::remove_file(&staging);
-    match linked {
+    match published {
         Ok(()) => sync_directory(directory),
         // Somebody else published one first. Theirs is the key this host has, and the caller reads
         // it back rather than overwriting it.

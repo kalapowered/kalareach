@@ -1901,7 +1901,7 @@ struct Held<'a> {
 impl Drop for Held<'_> {
     fn drop(&mut self) {
         if let Some(file) = self.file.take() {
-            let _ = file.unlock();
+            let _ = kr_flush::lock::release(&file);
         }
     }
 }
@@ -2042,14 +2042,14 @@ impl SignedInAccount {
                             options.mode(0o600);
                         }
                         let file = options.open(&path)?;
-                        match file.try_lock() {
+                        match kr_flush::lock::try_exclusive(&file) {
                             Ok(()) => {}
                             Err(std::fs::TryLockError::WouldBlock) => {
                                 #[cfg(feature = "testing")]
                                 if let Some(notice) = &waiting {
                                     notice();
                                 }
-                                file.lock()?;
+                                kr_flush::lock::exclusive(&file)?;
                             }
                             Err(std::fs::TryLockError::Error(error)) => return Err(error),
                         }
