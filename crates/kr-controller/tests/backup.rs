@@ -5957,6 +5957,7 @@ fn refused(code: ErrorCode, message: &str) -> ClientError {
         error: ProtocolError::new(code, message),
         retry_after_seconds: None,
         action: UserAction::Nothing,
+        service_code: None,
     }
 }
 

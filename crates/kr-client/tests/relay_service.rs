@@ -427,6 +427,9 @@ async fn a_refusal_arrives_as_the_code_the_service_named() {
         .await
         .expect_err("a refusal");
     assert_eq!(error.code(), ErrorCode::PermissionDenied);
+    // The code and the action are shared with a credential the service did not admit, so the
+    // service's own code is what tells the two apart.
+    assert_eq!(error.service_code(), Some("FORBIDDEN"));
     // A refusal the service named no delay for is still the service's own, rather than one that
     // reads as the host's.
     assert!(matches!(
@@ -466,6 +469,7 @@ async fn a_refusal_arrives_as_the_code_the_service_named() {
         .expect_err("a refusal");
     assert_eq!(error.code(), ErrorCode::PermissionDenied);
     assert_eq!(error.user_action(), UserAction::FixConfiguration);
+    assert_eq!(error.service_code(), Some("UNAUTHENTICATED"));
 
     // And the one that is a login: an account session the service will not renew by itself.
     http.answer_with(
