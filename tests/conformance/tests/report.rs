@@ -3,7 +3,8 @@
 //! Each tree under `tests/fixtures/` is a Cargo workspace of its own, so the repository's
 //! workspace never builds it: `forms` keys rows in every form the report reads, ignores nothing
 //! and has a documentation test, `outcomes` has a test that passes, one that fails and ones that
-//! are ignored, `known` has a test that records a known difference, `refused` names a row past the
+//! are ignored or panic as they should, `interleaved` has a test that leaves half a line on the
+//! standard error, `known` has a test that records a known difference, `refused` names a row past the
 //! end of section 21's table and a bare section, `expansions`, which is read and never built,
 //! calls cases through macros and attributes the report cannot see into, and `conventions`, read
 //! and never built as well, steps outside the conventions a helper key relies on. The runs build
@@ -77,6 +78,21 @@ fn keyed(map: &Map) -> BTreeMap<String, Vec<(String, Binding)>> {
 
 /// Runs the report over `name` with its tests as the only step.
 fn run(name: &str) -> Result<(Document, tempfile::TempDir), Stopped> {
+    run_step(name, &["test", "--locked", "--workspace", "--no-fail-fast"])
+}
+
+/// Runs the report over `name` with one `cargo` command as the only step.
+fn run_step(name: &str, arguments: &[&str]) -> Result<(Document, tempfile::TempDir), Stopped> {
+    run_step_through(name, arguments, lister())
+}
+
+/// Runs the report over `name` with one `cargo` command as the only step, `lister` being the
+/// program Cargo runs each test binary through.
+fn run_step_through(
+    name: &str,
+    arguments: &[&str],
+    lister: PathBuf,
+) -> Result<(Document, tempfile::TempDir), Stopped> {
     let evidence = tempfile::Builder::new()
         .prefix("kr-conformance-evidence.")
         .tempdir()
@@ -95,9 +111,9 @@ fn run(name: &str) -> Result<(Document, tempfile::TempDir), Stopped> {
         steps: Some(vec![Step::cargo(
             Group::Rust,
             "the tree's tests",
-            &["test", "--locked", "--workspace", "--no-fail-fast"],
+            arguments,
         )]),
-        lister: lister(),
+        lister,
         environment: vec![(
             "CARGO_TARGET_DIR".to_owned(),
             target.to_string_lossy().into_owned(),
@@ -609,8 +625,8 @@ fn a_test_record_takes_its_command_and_what_it_needs_from_the_same_run() {
                 executable: "kr_client-0.exe".to_owned(),
                 source: "src/lib.rs".to_owned(),
                 tests: [(name.to_owned(), outcome)].into(),
-                summary: None,
                 readable: true,
+                ..Binary::default()
             },
         )],
         built: vec![target.clone()],
@@ -730,6 +746,105 @@ fn an_ignored_test_is_not_counted_and_a_failing_test_fails_its_identifier() {
         early.tests[0].reason.as_deref(),
         Some("it returned early and said why: skipped: OUTCOMES_DEVICE names no device to drive")
     );
+    // The harness prints the name of a test that should panic with " - should panic" after it,
+    // which is no name in the test's binary.
+    let panics = &document.identifiers["KR-REQ-04.08"];
+    assert_eq!(panics.verdict, Verdict::Passed, "{:?}", panics.tests);
+    // An ignore reason of two lines, the second of which starts as an entry of the harness's record
+    // does.
+    let two_lines = &document.identifiers["KR-REQ-04.09"].tests[0];
+    assert_eq!(two_lines.outcome, Outcome::Ignored, "{two_lines:?}");
+    assert_eq!(
+        two_lines.reason.as_deref(),
+        Some("needs a device\nok when one is named")
+    );
+}
+
+#[test]
+fn a_result_line_that_follows_half_a_line_of_standard_error_is_still_the_tests_result() {
+    // Two test threads, so that the harness reports the result of the one test as it comes,
+    // whatever the machine's processors are.
+    let (document, evidence) = run_step(
+        "interleaved",
+        &[
+            "test",
+            "--locked",
+            "--workspace",
+            "--no-fail-fast",
+            "--",
+            "--test-threads=2",
+        ],
+    )
+    .unwrap_or_else(|stopped| panic!("{stopped:?}"));
+    // The run is the one this test is for: the half line and the harness's result line are one
+    // line of the step's log.
+    let log = std::fs::read_to_string(evidence.path().join(&document.steps[0].log))
+        .expect("the step's log");
+    assert!(
+        log.lines()
+            .any(|line| line.starts_with("this host has no model file, test ")),
+        "the half line is not followed by a result on its line:\n{log}"
+    );
+    assert!(document.steps[0].error.is_none(), "{:?}", document.steps[0]);
+    let tests = &document.identifiers["KR-REQ-04.11"].tests;
+    assert_eq!(tests.len(), 1, "{tests:?}");
+    assert_eq!(tests[0].outcome, Outcome::Passed, "{:?}", tests[0]);
+    assert!(document.passed());
+}
+
+/// A program to stand where the report's own does as Cargo's runner: it lists the tests as the
+/// report's does, and runs each test binary without the harness's option to write a record. It
+/// leaves `record` as each binary's record when that is given.
+#[cfg(unix)]
+fn runner_that_asks_for_no_record(directory: &Path, record: Option<&str>) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = directory.join("runner");
+    let leave = record.map_or_else(String::new, |text| {
+        format!("printf '%s\\n' '{text}' > \"$KR_CONFORMANCE_RECORDS/$(basename \"$2\")\"\n")
+    });
+    let script = format!(
+        "#!/bin/sh\ncase \"$1\" in\n  run-one)\n{leave}    shift\n    exec \"$@\" ;;\n  *) exec '{}' \"$@\" ;;\nesac\n",
+        lister().display()
+    );
+    std::fs::write(&path, script).expect("a runner");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("executable");
+    path
+}
+
+#[cfg(unix)]
+#[test]
+fn a_binary_that_left_no_record_that_can_be_used_is_not_read_from_its_output() {
+    let directory = tempfile::tempdir().expect("a directory");
+    for (record, why) in [
+        (None, "the harness left no record of its run"),
+        (Some("this is not an entry"), "its record could not be read"),
+    ] {
+        let lister = runner_that_asks_for_no_record(directory.path(), record);
+        let (document, _evidence) = run_step_through(
+            "forms",
+            &["test", "--locked", "--workspace", "--no-fail-fast"],
+            lister,
+        )
+        .unwrap_or_else(|stopped| panic!("{stopped:?}"));
+        let error = document.steps[0].error.as_deref().unwrap_or_default();
+        assert!(error.contains(why), "{error}");
+        let tests: Vec<_> = document
+            .identifiers
+            .values()
+            .flat_map(|identifier| &identifier.tests)
+            .collect();
+        assert!(!tests.is_empty());
+        for test in tests {
+            assert_eq!(test.outcome, Outcome::Failed, "{test:?}");
+            assert!(
+                test.reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains(why)),
+                "{test:?}"
+            );
+        }
+        assert!(!document.passed());
+    }
 }
 
 #[test]

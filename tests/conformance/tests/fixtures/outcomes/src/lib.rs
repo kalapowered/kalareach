@@ -27,6 +27,18 @@ mod tests {
     #[ignore = "needs a device; the device lane runs it"]
     fn is_ignored_too() {}
 
+    /// KR-REQ-04.08.
+    #[test]
+    #[should_panic(expected = "this case panics on purpose")]
+    fn panics_as_it_should() {
+        panic!("this case panics on purpose");
+    }
+
+    /// KR-REQ-04.09.
+    #[test]
+    #[ignore = "needs a device\nok when one is named"]
+    fn is_ignored_for_a_reason_over_two_lines() {}
+
     /// KR-REQ-04.05.
     #[test]
     fn returns_early() {
