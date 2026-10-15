@@ -1087,7 +1087,7 @@ impl CommandBackends {
     ///
     /// No program is stopped here: the session's own closure owns the programs, and the servers
     /// that backends run are ended by it after the acceptance of the close has been delivered
-    /// ([`CommandBackends::end_servers`]), since the requester may be a command that a server
+    /// (`CommandBackends::end_servers`), since the requester may be a command that a server
     /// started. What ends here is each committed launch's instance, with its grant, since the
     /// session is ending its program, and every instance the session adopted. It is called with
     /// the session's lock held, so nothing here takes it: the session announces what this returns.
