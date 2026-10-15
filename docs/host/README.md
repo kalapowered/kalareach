@@ -3559,6 +3559,33 @@ Each step gives the same result when it is made again, so a call whose answer wa
 
 The call is held to the account that was signed in when it began. A sign-in as another account during the call stops the next request that carries a token. The enrolment carries none, so the account is compared again before the setup is recorded. Setting up is allowed while privacy mode is on, because the bundle holds keys and no session content. Nothing is backed up until privacy mode is off.
 
+### Making backups
+
+Once the owner has used `kr backup setup` to set backups up, a task on the daemon's reactor runs each day to create one full backup. A backup is a generation of the archive, and each generation holds every member in full, so nothing is incremental. The daemon holds no seed. The only things it kept from the setup are the public half of the recovery key and a fingerprint of it, and every generation wraps its keys for that public half.
+
+Each generation holds `sessions/<session uuid>.json` for each closed session, with the most recently closed session first, and, if the daemon accepts it, the host's configuration document as `host/configuration.json`. Each session document is the one `kr export` writes. A session is packed when its closure is recorded, its worker is confirmed ended, it owes privacy mode no cleanup, and the archive holds output for it. A session that is still open is in no backup until it closes, and `kr doctor` counts the sessions that have not closed. A session whose output cannot be read is left out and counted by `kr doctor`, and the daemon tries it again once a day. The members follow the restore's limits: a session at most 192 MiB, the configuration at most 1 MiB, all members together at most 1.5 GiB, and at most 4,096 members. A session that would take the total past its limit is left out of that generation whole, a smaller one after it may still fit, and `kr doctor` counts what was left out. With nothing to pack, there is no generation.
+
+A pass makes a generation only when all of these hold:
+
+- a setup is recorded and privacy mode is off;
+- the account signed in and the service selected are the setup's, and the writer and the producer are the keys it names;
+- the writer is still enrolled for the archive, which a collection deleted from the account console ends, and the remedy is `kr backup setup --replace`;
+- no earlier generation is still being made, uploaded or published, and the ciphertext of no finished generation is still on the disk;
+- the disk holds what the pass can need plus one gibibyte;
+- a day has passed since the newest generation, and what would be packed differs from what that generation was made from.
+
+A stored time that lies ahead of the clock is ignored when the day is counted. A session that cannot be read counts in that comparison like any other, so an unreadable session does not make a new generation each day. A pass that fails removes the files it wrote and tries again after a wait that doubles from one minute to one hour.
+
+Generation numbers come from a counter in the setup that never goes down, so a number that privacy cleanup freed is not used again. A state directory restored from an older copy would otherwise upload a whole generation for each number it is behind. Instead, one generation is refused as passed by a newer one, and the counter rises to the number the service names, once that publication's signature has been checked against the setup's writer key.
+
+A pass reads a closed session, encrypts it, and writes the ciphertext to the staging directory before the store admits anything. While it does, it holds a lease, which is granted only when the daemon's backup service is ready and no privacy fence is up. The lease keeps the cleanup that privacy mode owes open: the cleanup does not discharge its scan of the staging directory while a lease is live, so privacy mode does not report complete until the pass has stopped and its files are gone. A fence cancels the lease, and the pass checks the flag before and after each write. Content is held to the privacy generation it was read under, and the store refuses to admit a generation whose content was read under an earlier one.
+
+When a generation's production is over and nothing of it is open, the daemon unlinks its staged ciphertext one object at a time, marks each object absent, and removes the staging directory with the last object. The carrier does this at the top of every iteration, before it asks for a token or reads the service, so a host that is signed out or has no service in reach still gives its disk back. No new generation is staged until it is done. The rows, the descriptor and the attempts stay.
+
+The service records how many daily snapshots the account keeps and prunes nothing. The host keeps the newest K published generations of its archive and deletes the objects of older ones, where K is the recorded figure held between two and 16. The floor of two keeps the generation a restore may be reading when the next one is published, and 16 is the number of descriptors the service's manifest keeps. The uploader sends `storage.object.delete` for each object of an older generation, the encrypted manifest included, one at a time, and the store records each confirmed deletion. The store decides each deletion in the transaction that writes it. It refuses when an attempt or upload of the generation is open, when a fence stands, when the generation lies under a privacy line, when fewer than K newer generations are published here, when another generation names the object, when the writer is not enrolled, and when the archive is not the setup's. The service goes on charging for a deleted object for seven more days. Its descriptors for deleted generations stay in its chain as obsolete records, and a restore reads the newest.
+
+The bundle belongs to the account whose token wrote it, and a stored object belongs to the account that paid for it. If the host signs in as another account after its setup, the two differ. Without the binding described next, a deletion asked of the service under the wrong account would be answered "not found" and written down as done. So the setup records a mark of the account and the service, a digest computed inside the sign-in so that the account's identifier never leaves it. The backup clients receive a token only when the grant's mark equals the setup's, and answer "signed in as another account" otherwise. A replacement switches the binding in the same transaction that records it, and a request that passed its checks before the switch and asks for its token after it is refused before it is signed. `kr doctor` then says that the host is signed in as another account than the one its backups belong to, and tells you to sign in as that account again or to run `kr backup setup --replace`.
+
 ### The uploader
 
 `backup::uploader` is the executor the outbox waits for. It takes the attempts in order, dispatches
@@ -3700,9 +3727,7 @@ holds that task and not the daemon, and stopping the daemon ends the exchange in
 the middle of a store write finishes first. The uploader reaches the backup store through one handle that gives the reactor thread's other tasks to
 another thread while a store call blocks.
 
-The carrier produces no generation. Sealing one from the host's state, the schedule it is made on,
-the owner's confirmed enrolment of the writer and a restore belong to the host-backup work, which
-admits generations to the outbox this carries. It serves no method of its own: `storage.*` and
+The carrier makes no generation of its own: the producer described under "Making backups" admits generations to the outbox this carries. It serves no method of its own: `storage.*` and
 `backup.manifest` are *service* methods, which this host calls rather than answers.
 
 `kr doctor` reports the service as the `managed-storage` check. The detail says whether the account

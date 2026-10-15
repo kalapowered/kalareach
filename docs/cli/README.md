@@ -11,6 +11,7 @@ worker directly for what a session owns.
 | `kr attach <id>` | `kr a` | Attach to an existing session. It never resumes or creates a replacement |
 | `kr detach [--attachment <id>]` | `kr d` | Remove an attachment |
 | `kr export <id> --output <file>` | — | Write a closed session's retained output to a file you name, in this environment or an enrolled one |
+| `kr backup setup [--replace]` | — | Set this host's backups up: show a recovery kit once and turn on a daily backup of closed sessions and the host's configuration |
 | `kr backup restore --into <folder>` | — | Open a backup of this host's data with the recovery kit and write it as readable files into a folder you made; nothing is imported |
 | `kr close [id]` | `kr c` | Close a session and terminate the processes it owns |
 | `kr list` | `kr l` | List sessions with their display numbers, states and shells |
@@ -751,6 +752,38 @@ is chosen for you.
 With `--json` the command prints one document: `ok`, `session_id`, `display_number`, `path`,
 `format`, `bytes_read`, `bytes_carried`, `gaps`, `truncated`, and `omissions`, the kinds the file
 declares. As in every other command, its counts are numbers.
+
+## `kr backup setup`
+
+`kr backup setup` sets up backups for this host. It displays a recovery kit once and configures a daily backup of closed sessions and the host's configuration. The kit is the only way to read those backups if you lose this host, and KalaReach does not store a copy of it.
+
+```text
+kr backup setup [--replace] [--environment <id>]
+```
+
+`--environment` names the environment to act in by identifier. Without it, the command acts in this installation's own.
+
+This command requires that this host has chosen a storage service (set by `storage.origin`), and that you are signed in to an account on that service with the backup scope (see `kr account sign-in`). It runs at a Unix terminal: natively on macOS or Linux, or on a Linux host under WSL. If you run it natively on Windows, it makes nothing and says so. It must be run with standard input, standard output and standard error attached to a terminal, and it has no `--json` form. It must not be run inside a KalaReach session, because the session worker's retained output would contain the recovery kit and would be accessible to the agents in the session.
+
+Until this command has created a recovery seed, it tries to prevent itself from being core-dumped, to reduce the risk of the seed being recorded on disk. It sets the process resource limit for core size to 0 and, on Linux, it also sets the process to non-dumpable, because a core pattern that pipes to a handler ignores the limit. If either of these operations fails, the command makes nothing.
+
+The command asks the daemon where this host stands. It stops, and says why, if no storage service has been chosen for this host, if you are not signed in or are signed in in a way that cannot carry a backup request, or if a setup is already under way for this host. If backups are already set up for this host, it names the fingerprint of the kit in use and tells you to use `--replace` if you want a new kit. Otherwise, it prints a plan and asks for `yes`. The plan states that the retained output of closed sessions and the host's configuration will be backed up once a day, and that a session that is still open is not backed up until it closes. It states that everything is encrypted on this host and that the service holds ciphertext only. It states that setup turns managed backup storage on for the account when it is off, that nothing is read while privacy mode is on, and that the backups belong to the account signed in now, so that if this host signs in as another account, it stops backing up until it signs in as this one again or is set up again with `--replace`. It also states that the host keeps the newest backups the account's retention records, at least two and at most 16, and deletes the older ones at the service, which charges for deleted storage for seven more days. A backup that privacy mode has drawn a line under stays until you delete it.
+
+If you answer `yes`, the kit is written straight to the terminal, once. The terminal's scrollback keeps it until you clear the scrollback. Below the kit, the command prints the kit fingerprint: eight symbols in two groups of four, taken from a hash of the recovery key's public half. The fingerprint says nothing about the seed. It tells you which host a kit belongs to only if you keep the two together. The kit contains the recovery seed, the bundle's locator and the service's origin.
+
+To show that you read the kit, type the last eight symbols of its `seed:` line. It does not matter whether you get the case wrong, or whether you include or leave out dashes or spaces. You get three tries. Then type `yes` to say that the kit is stored. Until you have done both, nothing is sent to the service and this host records nothing. The daemon never sees the seed. It is given the recovery key's public half, the bundle's locator and the sealed bundle, and it keeps the public key and the kit fingerprint.
+
+The daemon then writes the bundle to the service, has this host's owner key enrol the host's writer for the archive, turns managed backup storage on if it is off, and records the setup. The command ends in one of three ways.
+
+If the host is set up, the command prints the fingerprint, and the kit is in use.
+
+If the daemon confirmed that it recorded nothing, the kit opens nothing and you can delete it. If you can mend the cause (the sign-in, an account with no allowance for backup storage, a change of account during the call, or a refusal by the service), the command offers the same kit again. Type `retry` once you have mended it. The command makes this offer three times at most.
+
+If the daemon could not say how the call ended, the command repeats the call with the same bytes, waiting as the answer says, up to five times. If the outcome stays unknown, keep the kit until `kr doctor` settles it. If `kr doctor` shows backups set up with the kit's fingerprint, the kit is in use. If it shows no setup and none in progress, the kit opens nothing.
+
+With `--replace`, the command sets backups up again under a new kit. The earlier kit stops being the kit of new backups, and the earlier archive's unfinished uploads are stopped. The earlier archive and its bundle stay at the service until you delete them. If the outcome of a `--replace` stays unknown, a setup committed with another fingerprint and none in progress also means that the new kit opens nothing.
+
+However the command ends, it puts the terminal back and throws away input still waiting, so text you pasted past your last answer never reaches your shell or its history. Ctrl-C stops the command at any point. If the kit had been shown by then, the command says whether the kit opens nothing or must be kept.
 
 ## `kr backup restore`
 
