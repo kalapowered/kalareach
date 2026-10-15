@@ -19,8 +19,9 @@
 //! reading takes that as the rule: an entry ends at the first line that ends with a listed test's
 //! name, and a second line that ends with the same name is an error. A line of a message that ends
 //! with the name of a test therefore ends its entry too early in one of two ways, and neither
-//! passes: the test it names ran, so its own entry ends with that name a second time; or it did
-//! not run, so the record has more entries than the summary counts.
+//! passes: the test it names has an entry of its own, which ends with that name a second time; or
+//! it has none, because the step's filter left it out, so the record has more entries than the
+//! summary counts.
 //!
 //! The harness calls the option deprecated and says so on its standard error before each run, so
 //! the log of a binary opens with ``warning: `--logfile` is deprecated``. A toolchain that has
@@ -35,7 +36,9 @@
 //! writer breaks them: the binary is unreadable or the step is in error. A line a test wrote when it
 //! returned early is lost when another writer breaks it in a step that shows the output as it is
 //! written (`--nocapture`); in a step that captures it, the harness prints it with the test's name
-//! in one write after the last test has ended.
+//! in one write after the last test has ended. A line a test prints that looks like one of the
+//! harness's section lines (`successes:`, `failures:`, `---- <name> stdout ----`, the summary) is
+//! taken for it, and can move or lose the early-return lines that follow it.
 //!
 //! The programs rustdoc runs for a crate's documentation tests have no record of their own. They
 //! are read from the lines the harness prints for each test (`test <name> ... ok`, `... FAILED`,
@@ -263,8 +266,9 @@ pub fn read<'r>(output: &str, recording_of: impl Fn(&str) -> Recording<'r>) -> V
                 settled = true;
             } else if reading.output_of.is_none() {
                 // A summary quoted in a test's output is not where the harness's own sections
-                // end. Inside the captured output of a test it is that output; anywhere else, the
-                // section a quoted `failures:` or `successes:` line opened ends with it.
+                // end. Inside the captured output of a test, which passed or failed, it is that
+                // output; anywhere else, the section a quoted `failures:` or `successes:` line
+                // opened ends with it.
                 reading.in_successes = false;
                 reading.in_failures = false;
             }
@@ -299,7 +303,13 @@ pub fn read<'r>(output: &str, recording_of: impl Fn(&str) -> Recording<'r>) -> V
             continue;
         }
         if reading.in_failures {
-            if let Some(name) = line.strip_prefix("    ").filter(|name| !name.contains(' ')) {
+            if let Some(name) = line
+                .strip_prefix("---- ")
+                .and_then(|rest| rest.strip_suffix(" stdout ----"))
+            {
+                reading.output_of = Some(name.to_owned());
+            } else if let Some(name) = line.strip_prefix("    ").filter(|name| !name.contains(' '))
+            {
                 reading.failures.push(name.to_owned());
             }
             continue;
@@ -955,6 +965,7 @@ failures:
 ---- quotes_a_run stdout ----
 the child run said:
 test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+skipped: the child has no device
 
 failures:
     quotes_a_run

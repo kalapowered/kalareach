@@ -1037,13 +1037,12 @@ impl<'a> Resolver<'a> {
         let mut runs = Vec::new();
         for (index, binary) in self.ran.get(target).into_iter().flatten() {
             let step = &self.executed[*index].step;
-            let record = if !binary.readable() {
+            let record = if let Some(problem) = &binary.problem {
                 RunRecord {
                     step: index + 1,
                     outcome: Outcome::Failed,
                     reason: Some(format!(
-                        "the run of {target} in this step could not be read: {}",
-                        binary.problem.as_deref().unwrap_or_default()
+                        "the run of {target} in this step could not be read: {problem}"
                     )),
                 }
             } else if let Some(outcome) = binary.tests.get(name) {
