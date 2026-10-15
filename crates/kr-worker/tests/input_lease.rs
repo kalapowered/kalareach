@@ -2685,6 +2685,175 @@ async fn a_lone_escape_reaches_the_application_while_the_session_s_output_is_wai
         .release();
 }
 
+/// KR-PERF-002: a lone Escape reaches the application while a question's caller is being
+/// identified.
+///
+/// A question or an alert names the session it is asked in, and the worker asks the kernel who the
+/// caller is before it creates anything. The kernel's answer is a walk up the caller's parents,
+/// and it takes as long as the kernel takes. The binding is stopped at that moment, which is where
+/// a worker that kept the session across it would keep the Escape's write, and then the timer, out
+/// of the session for as long as the kernel took to answer. The Escape has to arrive before the
+/// binding is let go.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    windows,
+    ignore = "a Windows pseudo-console holds back a lone Escape, which it cannot tell from the start of a sequence, so the Escape this case waits for does not come back"
+)]
+async fn a_lone_escape_reaches_the_application_while_a_question_s_caller_is_being_identified() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let kept = tempfile::tempdir().expect("a directory for what the application keeps");
+    let received = kept.path().join("received");
+    let wired = wired(&bracketed_recording(&received)).await;
+    let (mut client, attachment, epoch) = typist(&wired).await;
+
+    let (arrived, release) = wired.service.pause_in_binding();
+    let mut asker = LocalClient::connect(&wired.endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects");
+    let (target, session_id) = (wired.target(), wired.session_id);
+    let asking = tokio::spawn(async move {
+        asker
+            .mutate(
+                Method::QuestionCreate,
+                ActionId::new(kr_ipc::new_uuid()),
+                target,
+                &kr_protocol::question::QuestionCreateParams {
+                    session_id,
+                    request_id: "push-anyway".to_owned(),
+                    agent_name: Nullable::some("kr-test-agent".to_owned()),
+                    context: "The build finished with two failing tests.".to_owned(),
+                    question: "Push the branch anyway?".to_owned(),
+                    kind: kr_protocol::question::QuestionKind::Confirm,
+                    choices: Vec::new(),
+                    requested_expiry_ms: Nullable::null(),
+                    wait_ms: Nullable::null(),
+                },
+            )
+            .await
+    });
+    tokio::task::spawn_blocking(move || arrived.recv_timeout(LIVENESS_DEADLINE))
+        .await
+        .expect("the wait ends")
+        .expect("the question's caller is being identified");
+
+    let accepted_or_not = Arc::new(AtomicBool::new(false));
+    let (let_go, watchdog) = release_after_a_while(
+        {
+            let release = release.clone();
+            move || {
+                let _ = release.send(());
+            }
+        },
+        &accepted_or_not,
+    );
+    let accepted = write_over(&mut client, &wired, attachment, epoch, 0, b"\x1b")
+        .await
+        .expect("the Escape is accepted");
+    accepted_or_not.store(true, Ordering::Release);
+    assert!(
+        !let_go.load(Ordering::Acquire),
+        "the Escape's write was kept waiting by the identification of a question's caller until \
+         it was let go"
+    );
+    assert_eq!(accepted.held_prefix_bytes.get(), 1, "the Escape is held");
+    let arrived = tokio::time::timeout(LIVENESS_DEADLINE, async {
+        loop {
+            if std::fs::read(&received).is_ok_and(|seen| contains(&seen, b"\x1b")) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    assert!(
+        arrived.is_ok(),
+        "the Escape reached the application while the caller was still being identified"
+    );
+    assert!(
+        !let_go.load(Ordering::Acquire),
+        "and the identification was not let go for it to"
+    );
+
+    release.send(()).expect("lets the identification go");
+    watchdog.join().expect("the watchdog ends");
+    let _ = asking.await;
+    drop(client);
+    wired
+        .runtime
+        .close(ClosureReason::CloseRequested)
+        .1
+        .release();
+}
+
+/// KR-PERF-002: a close that is admitted discards the prefix the recogniser holds and accepts no
+/// input after it.
+///
+/// A closing session reads the processes it owns with the session held, for as long as the kernel
+/// takes, while it waits out its grace period. No keystroke can be waiting for that: from the
+/// moment the close is admitted what the recogniser held goes with the lease, nothing is forwarded
+/// at a deadline, and a write is refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    windows,
+    ignore = "a Windows pseudo-console holds back a lone Escape, which it cannot tell from the start of a sequence, so the Escape this case waits for does not come back"
+)]
+async fn a_close_discards_the_prefix_the_recogniser_holds_and_accepts_no_input() {
+    let host = kr_ipc::testing::TempHost::create();
+    let config = configuration(&host, BRACKETED_ECHO);
+    let session_id = config.session_id;
+    let mut session = Session::open(config).expect("opens");
+    session.launch().expect("launches");
+    let attachment = attach(&mut session, &terminal(session_id, Some("xterm-256color")));
+    let epoch = session
+        .acquire_input(attachment, connection(), None)
+        .expect("the keys")
+        .lease
+        .epoch
+        .get();
+    let runtime = Arc::new(
+        SessionRuntime::start(
+            session,
+            std::sync::Arc::new(kr_ipc::clock::SystemSharedClock),
+        )
+        .expect("starts"),
+    );
+    retained_within(&runtime, b"kr-ready.", LIVENESS_DEADLINE).await;
+
+    // One boundary for all of it: the recogniser's own timer would otherwise forward the Escape
+    // before the close is admitted.
+    let gate = {
+        let mut session = runtime.session();
+        let accepted = session
+            .write_input(attachment, epoch, 0, b"\x1b", None, Instant::now())
+            .expect("accepted");
+        assert_eq!(accepted.held_prefix_bytes, 1, "the Escape is held");
+        let (acceptance, gate) = runtime.close_locked(&mut session, ClosureReason::CloseRequested);
+        assert!(acceptance.initiated, "the close is admitted");
+        assert!(
+            session.paste_deadline().is_none(),
+            "nothing is held for a deadline to forward"
+        );
+        assert!(
+            session
+                .write_input(attachment, epoch, 1, b"x", None, Instant::now())
+                .is_err(),
+            "and no further input is accepted"
+        );
+        gate
+    };
+    gate.release();
+    let record = tokio::time::timeout(LIVENESS_DEADLINE, runtime.wait_closed())
+        .await
+        .expect("the closure completed");
+    assert_eq!(record.reason, ClosureReason::CloseRequested);
+    let seen = retained(&runtime.session());
+    assert!(
+        !contains(&seen, b"kr-ready.\x1b"),
+        "the application never received the Escape: {seen:?}"
+    );
+}
+
 /// KR-PERF-002: the output that has been ingested can be read while it is waiting on the disk.
 ///
 /// A reader of the session's retained output takes the session, as the input measurement's poll
