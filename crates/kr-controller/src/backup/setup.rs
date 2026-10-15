@@ -15,7 +15,8 @@
 //!    its locator, signed as an installation by a key made for the call and never kept. A repeat
 //!    carries the same identity and the same bytes. A write the service refused or did not answer
 //!    is settled by reading the bundle: the same bytes are there when an earlier try applied, and
-//!    anything else stops the call.
+//!    anything else stops the call. When the service named a delay with its answer, the read
+//!    waits for it: the call ends as unknown with the delay, and the command repeats it.
 //! 2. **The writer's enrolment.** The host's owner key signs the writer's record, at revision one,
 //!    with the instant the command chose, so a repeat sends the same bytes and is answered
 //!    `unchanged`.
@@ -150,6 +151,9 @@ pub struct BackupSetup {
     /// One call at a time reaches the service.
     serial: tokio::sync::Mutex<()>,
     calls: Arc<Mutex<Calls>>,
+    /// Where a test stops the next `backup.status` between its two reads.
+    #[cfg(feature = "testing")]
+    status_pause: Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
 }
 
 impl std::fmt::Debug for BackupSetup {
@@ -193,7 +197,27 @@ impl BackupSetup {
             quiet,
             serial: tokio::sync::Mutex::new(()),
             calls: Arc::new(Mutex::new(Calls::default())),
+            #[cfg(feature = "testing")]
+            status_pause: Mutex::new(None),
         }
+    }
+
+    /// Stops the next `backup.status` between its two reads. Returns the end that says it has
+    /// arrived and the end that lets it go.
+    #[cfg(feature = "testing")]
+    pub fn pause_the_next_status_between_its_reads(
+        &self,
+    ) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
+        let (arrived, go) = (
+            Arc::new(tokio::sync::Notify::new()),
+            Arc::new(tokio::sync::Notify::new()),
+        );
+        *self
+            .status_pause
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) =
+            Some((Arc::clone(&arrived), Arc::clone(&go)));
+        (arrived, go)
     }
 
     fn calls(&self) -> std::sync::MutexGuard<'_, Calls> {
@@ -225,6 +249,18 @@ impl BackupSetup {
     /// is not set up is the store's own fact, and a store that could not be read says nothing.
     pub async fn status(&self, privacy_mode: bool) -> Result<BackupStatusResult> {
         let (running, last) = self.progress();
+        #[cfg(feature = "testing")]
+        {
+            let pause = self
+                .status_pause
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take();
+            if let Some((arrived, go)) = pause {
+                arrived.notify_one();
+                go.notified().await;
+            }
+        }
         let backup = Arc::clone(&self.backup);
         let (setup, enrolled) = tokio::task::spawn_blocking(move || {
             Ok::<_, ControllerError>((backup.setup()?, backup.authorised_writers()?))
@@ -288,13 +324,17 @@ impl BackupSetup {
     /// Whether this host holds an account token a request may carry, and why not when it does not.
     ///
     /// Asking for a token can wait for the account's lock, which a call that is refreshing the
-    /// grant holds, so the wait is bounded; a token that could not be had in time is told as one
-    /// that was not renewed.
+    /// grant holds, so the wait is bounded. The token is asked for in a task of its own and only
+    /// the wait for its answer is cut: a renewal that is under way at the limit is not dropped,
+    /// because the account service treats a refresh token it already rotated as a replay and ends
+    /// the sign-in. A token that could not be had in time is told as one that was not renewed.
     async fn sign_in(&self, tokens: &Arc<dyn AccountTokenSource>) -> BackupSignIn {
-        match tokio::time::timeout(STATUS_READ, tokens.token(BACKUP_WRITE_SCOPE)).await {
-            Ok(Ok(_)) => BackupSignIn::Usable,
-            Ok(Err(_)) => self.sign_in_cause(),
-            Err(_) => BackupSignIn::NotRenewed,
+        let tokens = Arc::clone(tokens);
+        let asked = tokio::spawn(async move { tokens.token(BACKUP_WRITE_SCOPE).await.map(|_| ()) });
+        match tokio::time::timeout(STATUS_READ, asked).await {
+            Ok(Ok(Ok(()))) => BackupSignIn::Usable,
+            Ok(Ok(Err(_))) => self.sign_in_cause(),
+            Ok(Err(_)) | Err(_) => BackupSignIn::NotRenewed,
         }
     }
 
@@ -371,7 +411,7 @@ impl BackupSetup {
     pub async fn enable(
         &self,
         params: BackupEnableParams,
-        daemon: Option<Arc<dyn Any + Send + Sync>>,
+        daemon: Arc<dyn Any + Send + Sync>,
     ) -> Result<BackupEnableResult> {
         if params.kit_fingerprint != kit_fingerprint(&params.recovery_public_key) {
             return Err(ControllerError::InvalidArgument(
@@ -381,7 +421,10 @@ impl BackupSetup {
         // The account the call begins under is the one it was admitted under, and not the one that
         // is signed in when it gets its turn: a call that waits behind another must not start its
         // requests under an account that signed in meanwhile.
-        let mark = self.account.mark_at(self.origin.as_str());
+        let mark = self
+            .account
+            .mark_at(self.origin.as_str())
+            .ok_or_else(|| self.sign_in_cause());
         // Recorded when the call is admitted, before it waits for another call or for a token.
         let entry = {
             let mut calls = self.calls();
@@ -418,8 +461,8 @@ impl BackupSetup {
     async fn run(
         &self,
         params: &BackupEnableParams,
-        mark: Option<kr_client::services::AccountMark>,
-        daemon: Option<Arc<dyn Any + Send + Sync>>,
+        mark: std::result::Result<kr_client::services::AccountMark, BackupSignIn>,
+        daemon: Arc<dyn Any + Send + Sync>,
     ) -> BackupEnableResult {
         match self.steps(params, mark, daemon).await {
             Ok(done) | Err(done) => done,
@@ -429,8 +472,8 @@ impl BackupSetup {
     async fn steps(
         &self,
         params: &BackupEnableParams,
-        mark: Option<kr_client::services::AccountMark>,
-        daemon: Option<Arc<dyn Any + Send + Sync>>,
+        mark: std::result::Result<kr_client::services::AccountMark, BackupSignIn>,
+        daemon: Arc<dyn Any + Send + Sync>,
     ) -> std::result::Result<BackupEnableResult, Ended> {
         let origin = self.origin.as_str();
         let backup = Arc::clone(&self.backup);
@@ -461,11 +504,8 @@ impl BackupSetup {
         if params.sealed_bundle.as_slice().len() as u64 > MAX_SEALED_RECOVERY_BUNDLE_BYTES {
             return Err(declined(BackupEnableCause::BundleTooLarge {}));
         }
-        let Some(mark) = mark else {
-            return Err(declined(BackupEnableCause::SignIn {
-                sign_in: self.sign_in_cause(),
-            }));
-        };
+        // A call admitted while no account was signed in says why, as it was then.
+        let mark = mark.map_err(|sign_in| declined(BackupEnableCause::SignIn { sign_in }))?;
         let tokens = self.account.tokens_fixed_to(origin, mark);
         if let Err(error) = tokens.token(BACKUP_WRITE_SCOPE).await {
             return Err(self.ended_by(&error, mark, true));
@@ -494,26 +534,20 @@ impl BackupSetup {
         let backup = Arc::clone(&self.backup);
         let replace = params.replace;
         let at = params.enabled_at_ms;
-        let committed = match daemon {
-            // The thread keeps the daemon until the commit has ended, though this call stops
-            // waiting for it.
-            Some(daemon) => {
-                let record = record.clone();
-                tokio::task::spawn_blocking(move || {
-                    let _daemon = daemon;
-                    backup.commit_setup(&record, replace, at)
-                })
-                .await
-                .ok()
-            }
-            // A daemon that is being let go commits on the thread it is on, which it keeps until
-            // the commit ends.
-            None => Some(backup.commit_setup(&record, replace, at)),
+        // The thread keeps the daemon until the commit has ended, though this call stops waiting
+        // for it.
+        let committed = {
+            let record = record.clone();
+            tokio::task::spawn_blocking(move || {
+                let _daemon = daemon;
+                backup.commit_setup(&record, replace, at)
+            })
+            .await
         };
         match committed {
-            Some(Ok(_)) => Ok(enabled(&record)),
+            Ok(Ok(_)) => Ok(enabled(&record)),
             // A store that refuses the setup as it stands: the archive has generations here.
-            Some(Err(ControllerError::InvalidArgument(_))) => {
+            Ok(Err(ControllerError::InvalidArgument(_))) => {
                 Err(declined(BackupEnableCause::ArchiveInUse {}))
             }
             _ => Err(unknown(None)),

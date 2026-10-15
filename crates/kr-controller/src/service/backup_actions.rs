@@ -62,8 +62,10 @@ impl Controller {
     ///
     /// # Errors
     ///
-    /// Returns [`ControllerError::NotConfigured`] when the host selects no storage service, and
-    /// [`ControllerError::InvalidArgument`] for parameters that are not empty.
+    /// Returns [`ControllerError::NotConfigured`] when the host selects no storage service,
+    /// [`ControllerError::InvalidArgument`] for parameters that are not empty, and
+    /// [`ControllerError::RegistryUnavailable`] when the record of the setup cannot be read: a
+    /// store that could not be read does not say that the host is not set up.
     pub(super) async fn backup_status(&self, params: &ParamsValue) -> Result<ParamsValue> {
         let _: BackupStatusParams = parse(params)?;
         let setup = self.backup_setup_of()?;
@@ -82,22 +84,25 @@ impl Controller {
     ///
     /// Returns [`ControllerError::NotConfigured`] when the host selects no storage service, and
     /// [`ControllerError::InvalidArgument`] for a call that is not well formed.
-    pub(super) async fn backup_enable(&self, mutation: &MutationRequest) -> Result<ParamsValue> {
+    pub(super) async fn backup_enable(
+        self: &std::sync::Arc<Self>,
+        mutation: &MutationRequest,
+    ) -> Result<ParamsValue> {
         let params: BackupEnableParams = parse(&mutation.params)?;
         let answer = self.enable_backups(params).await?;
         ParamsValue::from_typed(&answer)
             .map_err(|error| ControllerError::InvalidArgument(error.to_string()))
     }
 
-    async fn enable_backups(&self, params: BackupEnableParams) -> Result<BackupEnableResult> {
+    async fn enable_backups(
+        self: &std::sync::Arc<Self>,
+        params: BackupEnableParams,
+    ) -> Result<BackupEnableResult> {
         let setup = self.backup_setup_of()?;
         // The setup is committed on a thread that this call can stop waiting for. The thread keeps
         // the daemon, and with it the environment's lock, until the commit has ended: a commit that
         // went on after the lock was let go could land beside the next daemon's start.
-        let daemon: Option<std::sync::Arc<dyn std::any::Any + Send + Sync>> = self
-            .me
-            .upgrade()
-            .map(|daemon| daemon as std::sync::Arc<dyn std::any::Any + Send + Sync>);
+        let daemon = std::sync::Arc::clone(self) as std::sync::Arc<dyn std::any::Any + Send + Sync>;
         setup.enable(params, daemon).await
     }
 
@@ -109,10 +114,25 @@ impl Controller {
     /// As `backup.enable`.
     #[cfg(feature = "testing")]
     pub async fn enable_backups_for_a_test(
-        &self,
+        self: &std::sync::Arc<Self>,
         params: BackupEnableParams,
     ) -> Result<BackupEnableResult> {
         self.enable_backups(params).await
+    }
+
+    /// Stops the next `backup.status` between its two reads, for a suite that holds a call before
+    /// its commit and lets it end in the gap. Returns the end that says the status has arrived and
+    /// the end that lets it go.
+    #[cfg(feature = "testing")]
+    pub fn pause_the_next_status_between_its_reads(
+        &self,
+    ) -> Option<(
+        std::sync::Arc<tokio::sync::Notify>,
+        std::sync::Arc<tokio::sync::Notify>,
+    )> {
+        self.backup_setup
+            .as_ref()
+            .map(|setup| setup.pause_the_next_status_between_its_reads())
     }
 
     fn backup_setup_of(&self) -> Result<&std::sync::Arc<crate::backup::setup::BackupSetup>> {
