@@ -1411,12 +1411,15 @@ fn paired_with(host: &Host, record: &kr_controller::service::net::devices::Devic
 }
 
 /// Whether `host` lets `device`, which presents the identity `record` gave it, in and answer it.
+///
+/// A host that does not let a device in refuses it, and an attempt nothing answered is made again,
+/// so `false` is always the host's decision.
 async fn lets_in(
     host: &Host,
     device: &Device,
     record: &kr_controller::service::net::devices::DeviceRecord,
 ) -> bool {
-    match RawDevice::try_connect(host, device, record).await {
+    match RawDevice::admitted(host, device, record).await {
         Ok(connection) => {
             let answered = connection.read(Method::HostInfo, &()).await.is_ok();
             connection.close();
