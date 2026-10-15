@@ -384,7 +384,13 @@ impl Supervision {
         };
         match cause {
             Cause::Clock => {}
-            Cause::Activity => self.sweep.marked = true,
+            Cause::Activity => {
+                // The wake can outlive the mark: a note made while nobody waited leaves its wake
+                // behind after the observation that took the mark has run. Only a mark that is
+                // still there asks for the short cadence, so a left-over wake does not bring one
+                // more observation a second after the last.
+                self.sweep.marked |= self.sweep.activity.take();
+            }
             Cause::Forced => {
                 self.sweep.observe_now(Instant::now());
                 return Wake::Ownership;
@@ -580,6 +586,45 @@ mod tests {
             wake,
             Wake::Ownership,
             "and what it is for is the boundary nothing else reports on"
+        );
+    }
+
+    /// A supervision that hears no child signal, so that a child of another case in this test
+    /// process ending cannot be what wakes it.
+    fn deaf(activity: Arc<Activity>, started: Instant) -> Supervision {
+        #[cfg(unix)]
+        let exits = ChildExits(None);
+        #[cfg(not(unix))]
+        let exits = ChildExits;
+        Supervision {
+            sweep: Sweep::begin(activity, started, IDLE_SWEEP_INTERVAL),
+            exits,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_wake_left_behind_by_a_mark_that_was_taken_asks_for_no_further_observation() {
+        // A note made while the supervision was not waiting leaves its wake behind, and the
+        // observation the mark asked for takes the mark itself. The wake that is left must not
+        // read as a second mark: the session has done nothing since, and the next observation is
+        // the sweep's.
+        let marks = Activity::new();
+        let started = Instant::now() - OBSERVE_INTERVAL;
+        let mut supervision = deaf(Arc::clone(&marks), started);
+        marks.note();
+
+        let first = tokio::time::timeout(IDLE_SWEEP_INTERVAL / 2, supervision.next())
+            .await
+            .expect("the observation the mark asked for is due");
+        assert_eq!(first, Wake::Ownership);
+
+        let second = tokio::time::timeout(IDLE_SWEEP_INTERVAL / 2, supervision.next())
+            .await
+            .expect("the wake that was left behind comes at once");
+        assert_eq!(second, Wake::Session, "it observes nothing");
+        assert!(
+            !supervision.sweep.marked(),
+            "and it is not taken for a mark that nothing made"
         );
     }
 
