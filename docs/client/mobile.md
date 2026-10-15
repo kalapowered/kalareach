@@ -272,6 +272,10 @@ scripts/e2e-mobile.sh              # both
 scripts/e2e-mobile.sh ios
 scripts/e2e-mobile.sh android
 
+# The stores on an Android emulator: the drafts, the pairing records, the kept answers, and the lock
+# between two processes. It runs inside the device lease and takes the packaged application.
+apps/companion/e2e/android-stores.sh path/to/app-universal-debug.apk
+
 # The page's text at each Dynamic Type size on the iOS Simulator, and at each font scale on the
 # Android emulator, with the setting changed while the application is open.
 pnpm -C apps/companion build:harness
@@ -322,6 +326,20 @@ does not assert what is on the screen, drive typing, rotate a device or exercise
 Screenshots go to `/tmp`; everything else goes to
 `${KR_TEST_ARTIFACTS_DIR:-/tmp/kr-test-artifacts}`. `KR_IOS_DEVICE` and `KR_ANDROID_AVD` choose the
 device.
+
+## Files and locks on Android
+
+All the stores used in the application write into the application's directory. For example the drafts and the device that owns them, the answers kept for a host, and the pairing records with their attempt budget. Android differs from a desktop in three ways that matter there, and each has one rule.
+
+On other Unix systems a new file gets its first name with a hard link, but on Android it gets it with a rename that fails if the name is taken. The reason is Android's security policy, which prohibits hard linking in the application's directory. The rename uses `renameat2` with the `RENAME_NOREPLACE` flag, which is allowed by Android's syscall filter starting with Android 10 and is supported by the filesystems (ext4 and f2fs) used in the application's directory. If the filesystem does not support the flag it will indicate that, in which case the stores will indicate the same. On Windows the rename also does not replace an existing file. `kr_flush::publish_without_replacing` is the one place that chooses.
+
+The locking of stores, done in `kr_flush::lock`, calls `flock` on all Unix systems, because the standard library's file locking indicates it is unsupported on Android. On Windows it uses that operating system's method of locking. Its purpose is to prevent multiple processes from writing to the same store at the same time, but it also prevents the same from happening in multiple threads.
+
+If a store makes the names on the way down to its directory durable, the store will pass over a directory that belongs to a different account and that the application may not write to, whatever went wrong when it tried to flush it, because the application made no name in it. On Android, `/` and `/data` are such directories, which the application can reach through but not open. A directory that the application owns, or to which it has write permission, is never passed over. The rule is the same on every Unix system; on Windows it is a directory the account may not add to.
+
+The pairing records keep the device's keys in the application's one secure store, the same one the account uses, which on Android is files protected by Keystore.
+
+The script `scripts/check-android.sh` checks that the Rust code used for Android in the companion does not use the standard library's file lock or hard link. The script `apps/companion/e2e/android-stores.sh` runs the stores in an Android emulator.
 
 ## Checking it on an iPhone
 
