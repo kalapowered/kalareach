@@ -887,7 +887,7 @@ impl PairedDial {
     /// transport gave up on without an answer is made again; a connection the host refused is not.
     pub async fn dial(&self) -> NetworkTransport {
         pairing::until_answered(
-            async || {
+            || {
                 NetworkTransport::connect(
                     &self.endpoint,
                     self.addr.clone(),
@@ -895,7 +895,6 @@ impl PairedDial {
                     &self.host_record,
                     SendLimits::default(),
                 )
-                .await
             },
             pairing::transport_gave_up_unanswered,
         )
@@ -943,7 +942,7 @@ impl RawDevice {
     /// Connects a paired device and claims the receive side of its control stream.
     pub async fn connect(host: &Host, device: &Device, record: &DeviceRecord) -> Self {
         pairing::until_answered(
-            async || Self::try_connect(host, device, record).await,
+            || Self::try_connect(host, device, record),
             pairing::transport_gave_up_unanswered,
         )
         .await
