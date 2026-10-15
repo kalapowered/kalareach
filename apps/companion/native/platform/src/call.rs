@@ -1005,11 +1005,13 @@ mod tests {
         }
     }
 
-    /// The news of a call is read in the order native code numbered it.
+    /// The news of a call is read in the order native code numbered it, and a number that arrives
+    /// a second time is not read a second time.
     #[tokio::test]
     async fn news_is_read_in_order() {
         let call = CallId("c1".to_owned());
         let (sink, mut events) = event_queue(call.clone());
+        sink.deliver(frame(&call, 1, CallEvent::FirstAudio));
         sink.deliver(frame(&call, 1, CallEvent::FirstAudio));
         sink.deliver(frame(&call, 2, CallEvent::Ended));
 
@@ -1018,6 +1020,8 @@ mod tests {
             Some(Heard::Event(CallEvent::FirstAudio))
         );
         assert_eq!(events.recv().await, Some(Heard::Event(CallEvent::Ended)));
+        drop(sink);
+        assert_eq!(events.recv().await, None, "the repeat was not queued");
     }
 
     /// A skipped number is reported as lost news where the gap is, once, and the item after the
