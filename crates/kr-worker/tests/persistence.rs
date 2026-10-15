@@ -41,8 +41,9 @@ use kr_worker::session::{Session, SessionConfig};
 
 mod common;
 
+use common::LIVENESS_DEADLINE;
 #[cfg(unix)]
-use common::{LIVENESS_DEADLINE, carried_times, carries, produced, retained};
+use common::{carried_times, carries, produced, retained};
 
 // ---------------------------------------------------------------------------------------------
 // The harness
@@ -1342,6 +1343,60 @@ fn a_version_six_journal_gains_the_record_of_its_processes_seeded_with_its_root_
         drop(journal);
         std::fs::remove_dir_all(path.parent().expect("a parent")).ok();
     }
+}
+
+#[test]
+fn a_record_the_journal_refused_is_written_once_it_answers_without_another_observation() {
+    // The record of what a session owns is what a crash's cleanup acts on, so a write the journal
+    // refused is not left until the session is next observed, which for an idle session is the
+    // sweep. Another connection holds the journal's write lock until the writer has been refused,
+    // then lets go, and nothing is submitted after that.
+    let path = journal_path("owned-refused");
+    let session_id = fixture_session();
+    let journal = Journal::open(&path).expect("opens");
+    let writer = kr_worker::owned_writer::OwnedWriter::start(path.clone(), session_id)
+        .expect("starts the writer");
+    let holder = rusqlite::Connection::open(&path).expect("opens a second connection");
+    holder
+        .execute_batch("BEGIN IMMEDIATE")
+        .expect("takes the write lock");
+    let identity = |pid: u64| {
+        kr_protocol::identity::ProcessStartIdentity::new(
+            pid,
+            kr_protocol::identity::ProcessStartSource::MacosProcBsdInfo,
+            pid * 3,
+        )
+    };
+    let record = kr_worker::ownership::OwnedRecord {
+        boot: None,
+        root: identity(10),
+        processes: vec![identity(10), identity(11)],
+        cgroup: None,
+        boundary: "the terminal's process group".to_owned(),
+        limits: Vec::new(),
+    };
+    writer.submit(record.clone());
+    let started = std::time::Instant::now();
+    while !writer.last_write_failed() {
+        assert!(
+            started.elapsed() < LIVENESS_DEADLINE,
+            "waited {LIVENESS_DEADLINE:?} for the journal to refuse the write"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    holder.execute_batch("COMMIT").expect("lets go");
+    let released = std::time::Instant::now();
+    while journal.read_owned(session_id).expect("reads") != Some(record.clone()) {
+        assert!(
+            released.elapsed() < LIVENESS_DEADLINE,
+            "waited {LIVENESS_DEADLINE:?} for the refused record to be written"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    drop(writer);
+    drop(holder);
+    drop(journal);
+    std::fs::remove_dir_all(path.parent().expect("a parent")).ok();
 }
 
 #[test]
