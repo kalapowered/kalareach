@@ -109,7 +109,9 @@ impl OwnedWriter {
         }
     }
 
-    /// Whether the thread's last attempt to write failed.
+    /// Whether the thread's last attempt to write failed, for the host's own tests. It compiles to
+    /// nothing without the `testing` feature.
+    #[cfg(feature = "testing")]
     #[must_use]
     pub fn last_write_failed(&self) -> bool {
         self.failed.load(Ordering::Acquire)

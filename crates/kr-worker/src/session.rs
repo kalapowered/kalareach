@@ -3935,9 +3935,11 @@ impl Session {
     }
 
     /// Sets how long the supervision lets this session go between observations while nothing is
-    /// happening in it, before the session is run. The default is
-    /// [`crate::lifecycle::IDLE_SWEEP_INTERVAL`]; a longer one leaves the shell's exit to be
-    /// reported by the exit itself for that much longer.
+    /// happening in it, before the session is run, for the host's own tests: a case about how an
+    /// exit is noticed puts the sweep out of reach. The default is
+    /// [`crate::lifecycle::IDLE_SWEEP_INTERVAL`]. It compiles to nothing without the `testing`
+    /// feature, and no shipped build enables it.
+    #[cfg(feature = "testing")]
     pub const fn set_idle_sweep(&mut self, interval: std::time::Duration) {
         self.idle_sweep = interval;
     }
