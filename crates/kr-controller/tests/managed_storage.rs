@@ -410,6 +410,21 @@ impl Rig {
             })
     }
 
+    /// How many generations of `archive` the daemon's store holds as published.
+    fn published_of(&self, archive: ArchiveId) -> usize {
+        self.controller
+            .backup()
+            .generations()
+            .expect("the store reads")
+            .iter()
+            .filter(|record| {
+                record.archive_id == archive
+                    && record.production == Production::Complete
+                    && record.remote == Remote::Published
+            })
+            .count()
+    }
+
     /// Waits until `done` holds, looking again each time the daemon finishes a pass.
     async fn until(&self, what: &str, mut done: impl FnMut(&Self) -> bool) {
         let runtime = self.controller.backup_runtime().expect("a carrier");
@@ -4099,6 +4114,18 @@ impl Rig {
             .map(|arrived| arrived.path.clone())
             .collect()
     }
+
+    /// The enrolments the stand-in has been given, which a setup sends, and not the publications
+    /// the carrier sends to the same path.
+    fn enrolments(&self) -> Vec<serde_json::Value> {
+        self.served
+            .web()
+            .arrived()
+            .into_iter()
+            .filter(|arrived| arrived.path == MANIFEST)
+            .filter_map(|arrived| arrived.body.get("enrol").cloned())
+            .collect()
+    }
 }
 
 async fn status_at(endpoint: &kr_ipc::paths::Endpoint) -> BackupStatusResult {
@@ -4292,7 +4319,9 @@ async fn the_owners_setup_writes_the_bundle_then_enrols_the_writer_and_the_host_
     );
     assert!(members.contains_key(&format!("sessions/{session}.json")));
 
-    // Made again with the same bytes: answered from the record, with nothing sent.
+    // Made again with the same bytes: answered from the record, with nothing sent. The carrier has
+    // finished with the generation first, so that what it sends is not counted for the call.
+    rig.carrier_passes(2).await;
     let asked = web.arrived().len();
     assert_eq!(rig.enable(&made.params).await, result);
     assert_eq!(
@@ -4339,7 +4368,7 @@ async fn a_bundle_the_service_refuses_is_followed_by_no_enrolment_and_no_setup()
         BackupEnableResult::Enabled { .. }
     ));
     assert!(rig.backup_status().await.last_attempt.0.is_none());
-    assert_eq!(web.requests_to(MANIFEST), 1);
+    assert_eq!(rig.enrolments().len(), 1);
 }
 
 /// A write whose answer was lost is settled by reading the bundle: the same bytes are there, and
@@ -4418,11 +4447,10 @@ async fn an_enrolment_whose_answer_was_lost_is_sent_again_with_the_same_bytes() 
         rig.enable(&made.params).await,
         BackupEnableResult::Enabled { .. }
     ));
-    let bodies: Vec<serde_json::Value> = web
-        .arrived()
+    let bodies: Vec<serde_json::Value> = rig
+        .enrolments()
         .iter()
-        .filter(|arrived| arrived.path == MANIFEST)
-        .map(|arrived| arrived.body["enrol"]["record"]["payload"].clone())
+        .map(|enrol| enrol["record"]["payload"].clone())
         .collect();
     assert_eq!(bodies.len(), 2);
     assert_eq!(bodies[0], bodies[1]);
@@ -4430,18 +4458,25 @@ async fn an_enrolment_whose_answer_was_lost_is_sent_again_with_the_same_bytes() 
 
 /// Another archive is refused without `replace` and sends nothing; a call that is not the setup's
 /// own keys is refused; the host's keys are named by `backup.status`.
+///
+/// The first call is followed by the host's first backup, which the carrier sends to the service
+/// as soon as it is made. That backup is held where the producer has staged its first member until
+/// the two refused calls have been answered, so that what reaches the service in between is what
+/// those calls send.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_second_archive_is_refused_without_replace_and_a_call_naming_other_keys_is_refused() {
     let timer = HeldTimer::held();
     let (rig, _) = a_host_to_set_up(&timer).await;
-    let web = Arc::clone(rig.served.web());
+    rig.production_looked(1).await;
+    let first_backup = rig.controller.pause_the_next_pass_after_its_first_member();
     let first = rig.prepared_setup(archive_id(), false);
     assert!(matches!(
         rig.enable(&first.params).await,
         BackupEnableResult::Enabled { .. }
     ));
+    within("the first backup is held", first_backup.reached()).await;
 
-    let asked = web.arrived().len();
+    let asked = rig.served.web().arrived().len();
     let second = rig.prepared_setup(archive_two(), false);
     assert_eq!(
         rig.enable(&second.params).await,
@@ -4449,7 +4484,11 @@ async fn a_second_archive_is_refused_without_replace_and_a_call_naming_other_key
             cause: BackupEnableCause::AlreadySetUp {}
         }
     );
-    assert_eq!(web.arrived().len(), asked, "nothing was sent");
+    assert_eq!(
+        rig.requested_since(asked),
+        Vec::<String>::new(),
+        "nothing was sent"
+    );
 
     // Keys other than the ones the host holds.
     let mut wrong = rig.prepared_setup(archive_two(), true);
@@ -4466,7 +4505,15 @@ async fn a_second_archive_is_refused_without_replace_and_a_call_naming_other_key
             cause: BackupEnableCause::KeysChanged {}
         }
     );
-    assert_eq!(web.arrived().len(), asked);
+    assert_eq!(
+        rig.requested_since(asked),
+        Vec::<String>::new(),
+        "nothing was sent"
+    );
+
+    first_backup.resume();
+    rig.until("the first backup is published", |rig| rig.published(1))
+        .await;
 }
 
 /// `backup.status` and `kr doctor` tell a setup that is under way: while the call waits at the
@@ -5018,11 +5065,35 @@ async fn a_replacement_retires_the_earlier_writer_and_takes_back_its_unfinished_
     assert!(rig.published(1));
     web.release_held();
     timer.run_by_itself();
+    // The replacement is followed by the new archive's first backup. Once it is published, and the
+    // carrier has looked again, what the service was sent is the earlier archive's first
+    // generation and the new archive's, and the earlier archive's second generation is in neither.
+    rig.until("the new archive's first backup is published", |rig| {
+        rig.published_of(archive_two()) > 0
+    })
+    .await;
     rig.carrier_passes(2).await;
+    let new_objects: usize = rig
+        .controller
+        .backup()
+        .generations()
+        .expect("a read")
+        .iter()
+        .filter(|generation| generation.archive_id == archive_two())
+        .map(|generation| {
+            rig.controller
+                .backup()
+                .objects(generation.archive_id, generation.backup_generation)
+                .expect("a read")
+                .len()
+        })
+        .sum();
+    assert!(new_objects > 0, "the new archive's backup has objects");
     assert_eq!(
         web.requests_to(PART) + web.requests_to(COMPLETE),
-        sent_before,
-        "nothing of the earlier archive's second generation is sent"
+        sent_before + 2 * new_objects,
+        "each of the new archive's objects was sent in a part and completed, and nothing of the \
+         earlier archive's second generation was"
     );
 }
 
