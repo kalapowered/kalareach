@@ -345,7 +345,8 @@ async fn keep_sign_in(host: &kr_ipc::testing::TempHost, origin: &str) {
     account
         .keep_for_test(IssuedGrant {
             access_token: AccountToken::new(TOKEN).expect("a token"),
-            expires_in_seconds: 3600,
+            // Long enough that a slow run is not ended by a token that nothing here can renew.
+            expires_in_seconds: 86_400,
             refresh_token: RefreshToken::new("a-refresh-token").expect("a token"),
             scopes: ["openid", "voice", "backup.write"]
                 .iter()
@@ -928,6 +929,64 @@ async fn an_interrupt_at_a_question_sets_nothing_up_and_puts_the_terminal_back()
     assert_eq!(rig.recorded_kit().await, None);
 }
 
+/// Ctrl-C while the daemon has the call says to keep the kit, and the kit is in use: the daemon
+/// records the setup after the command has gone. A command that told the person to delete the kit
+/// here would have them delete the only way to read these backups.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_interrupt_while_the_daemon_has_the_call_says_to_keep_the_kit() {
+    let rig = Rig::start().await;
+    let (arrived, go) = rig.controller.backup().pause_the_next_setup_commit();
+    let mut window = Window::run(&rig, &["backup", "setup"]);
+    let kit = window.bring_up_the_kit();
+    window.confirm(&kit);
+    tokio::task::spawn_blocking(move || arrived.recv_timeout(LIVENESS_DEADLINE))
+        .await
+        .expect("the wait ends")
+        .expect("the commit is on its thread");
+
+    window.type_bytes(&[0x03]);
+    let shown = window.wait_for("kr ended");
+    assert!(!shown.contains("kr ended 0"), "{shown}");
+    assert!(shown.contains("Keep the kit"), "{shown}");
+    assert!(shown.contains(&kit.fingerprint()), "{shown}");
+    assert!(!shown.contains("Nothing was set up"), "{shown}");
+    assert!(!shown.contains("opens nothing: delete it"), "{shown}");
+    assert!(window.echoes(), "echo is on");
+
+    go.send(()).expect("the commit is waiting");
+    tokio::time::timeout(LIVENESS_DEADLINE, async {
+        while rig.recorded_kit().await.is_none() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the daemon records the setup the command stopped waiting for");
+    assert_eq!(rig.recorded_kit().await, Some(kit.fingerprint()));
+}
+
+/// A daemon that cannot be reached when the call is to be made has been given nothing, so the kit
+/// that was shown opens nothing. The call is made over a connection of its own: one kept from the
+/// start of the dialogue would still reach the daemon here, and the setup would be made.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_daemon_that_cannot_be_reached_when_the_call_is_made_has_been_given_nothing() {
+    let mut rig = Rig::start().await;
+    let mut window = Window::run(&rig, &["backup", "setup"]);
+    let kit = window.bring_up_the_kit();
+    for task in std::mem::take(&mut rig.serving) {
+        task.abort();
+        let _ = task.await;
+    }
+    window.confirm(&kit);
+    let shown = window.wait_for("kr ended");
+    assert!(!shown.contains("kr ended 0"), "{shown}");
+    assert!(
+        shown.contains("Nothing was set up. The kit that was shown opens nothing: delete it."),
+        "{shown}"
+    );
+    assert_eq!(rig.requests_to(SYNC), 0, "nothing reached the service");
+    assert!(window.echoes(), "echo is on");
+}
+
 /// A closed session the registry holds a closure for, with output in its spool, written into the
 /// host's tree before its daemon starts.
 fn closed_session(
@@ -1058,6 +1117,15 @@ async fn a_fresh_host_restores_the_session_a_set_up_host_backed_up_from_the_kit_
     let names: Vec<&str> = files.keys().map(String::as_str).collect();
     assert!(names.contains(&"session-0001.json"), "{names:?}");
     assert!(names.contains(&"configuration.json"), "{names:?}");
+    // The configuration is the document the set up host reads, and not an empty file.
+    let source: Value = serde_json::from_slice(
+        &std::fs::read(kr_worker::config::document_path(&rig.temp.environment()))
+            .expect("the set up host's document"),
+    )
+    .expect("the source is JSON");
+    let restored_configuration: Value =
+        serde_json::from_slice(&files["configuration.json"]).expect("the configuration is JSON");
+    assert_eq!(restored_configuration, source);
     // The session's document carries the output it wrote.
     let document: Value = serde_json::from_slice(&files["session-0001.json"]).expect("a document");
     let mut carried = Vec::new();
@@ -1100,14 +1168,20 @@ async fn the_bounds_hold_at_the_real_scale_and_a_restore_accepts_what_the_produc
     for _ in 0..pairs {
         output.extend_from_slice(&[b'x', 0x07]);
     }
+    // Each session with the time it closed at.
+    let closed: Mutex<Vec<(u64, String)>> = Mutex::new(Vec::new());
     let rig = Rig::start_with(|host| {
-        for closed_at in 0..SESSIONS {
-            closed_session_in(
+        for closed_at in (9_000..).take(SESSIONS) {
+            let id = closed_session_in(
                 host,
                 &output,
-                9_000 + closed_at as u64,
+                closed_at,
                 kr_worker::history::SpoolLayout::new(8 << 20, 128 << 20),
             );
+            closed.lock().unwrap_or_else(PoisonError::into_inner).push((
+                closed_at,
+                serde_json::to_value(id).expect("an id").to_string(),
+            ));
         }
     })
     .await;
@@ -1178,4 +1252,35 @@ async fn the_bounds_hold_at_the_real_scale_and_a_restore_accepts_what_the_produc
         "--json",
     ]);
     assert!(restored.status.success(), "{}", text(&restored.stderr));
+
+    // What was left out is the oldest: the sessions restored are the newest that fit.
+    let mut newest = closed.into_inner().unwrap_or_else(PoisonError::into_inner);
+    newest.sort_by(|left, right| right.0.cmp(&left.0));
+    let expected: std::collections::BTreeSet<String> = newest
+        .into_iter()
+        .take(sessions.len())
+        .map(|(_, id)| id)
+        .collect();
+    let restored_ids: std::collections::BTreeSet<String> = std::fs::read_dir(&into)
+        .expect("the folder")
+        .flatten()
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with("session-"))
+        .map(|entry| session_id_at_the_head_of(&entry.path()))
+        .collect();
+    assert_eq!(restored_ids, expected);
+}
+
+/// The identifier a restored session document names, read from the head of the file: a document
+/// of this size is not read whole to find it.
+fn session_id_at_the_head_of(path: &Path) -> String {
+    let mut head = vec![0_u8; 8192];
+    let read = std::fs::File::open(path)
+        .and_then(|mut file| file.read(&mut head))
+        .expect("the document's head");
+    let head = String::from_utf8_lossy(&head[..read]);
+    let key = "\"session_id\":";
+    let at = head.find(key).expect("the document names its session") + key.len();
+    let value = head[at..].trim_start();
+    let end = value[1..].find('"').expect("a closing quote") + 2;
+    value[..end].to_owned()
 }

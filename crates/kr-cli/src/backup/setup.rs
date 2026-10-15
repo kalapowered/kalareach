@@ -26,6 +26,11 @@
 //! most, for a refusal a person can mend. *Unknown*: the daemon cannot say. The call is repeated
 //! with the same bytes and a new action identity, as the answer says, up to five times; if the
 //! outcome stays unknown the person is told to keep the kit until `kr doctor` settles it.
+//!
+//! Only a *Declined* answer says that the kit opens nothing once the call has been sent. Any
+//! other end of a sent call is unknown: a refusal, a failed connection and an interrupt can each
+//! come after the daemon recorded the setup, for example a refusal of an answer that the daemon
+//! withheld because the local owner's membership lease ended while it was being written.
 
 use std::fs::File;
 use std::io::{IsTerminal as _, Write as _};
@@ -34,7 +39,7 @@ use std::time::Duration;
 
 use kr_client::recovery::{SetupInputs, prepare_setup};
 use kr_client::shown;
-use kr_client::shown::Shown;
+use kr_client::shown::{Said as _, Shown};
 use kr_ipc::paths::HostPaths;
 use kr_protocol::backup_read::BackupSignIn;
 use kr_protocol::backup_setup::{
@@ -49,7 +54,7 @@ use zeroize::Zeroizing;
 
 use super::interrupt::{self, Interrupt};
 use super::kit::ask_line;
-use crate::cli::BackupSetupArguments;
+use crate::cli::{BackupSetupArguments, EnvironmentSelector};
 use crate::daemon::Daemon;
 use crate::error::{CliError, Result};
 use crate::output;
@@ -67,7 +72,8 @@ const REPEATS: usize = 5;
 /// How many times the same kit is offered again after a refusal a person can mend.
 const OFFERS: usize = 3;
 
-/// The longest the command waits for a delay the service named: the daemon never names a longer one.
+/// The longest the command waits for a delay the service named. The daemon passes on the delay it
+/// was given, so a longer one is cut here; the repeat then meets the delay again and ends unknown.
 const LONGEST_WAIT: u64 = 3600;
 
 /// How long the command waits before it repeats a call whose outcome is unknown and named no delay.
@@ -107,16 +113,21 @@ pub async fn run(
     let mut dialogue = Dialogue {
         interrupt,
         stage: Stage::Asking,
-        replacing: false,
+        replacing: None,
+        kit: None,
     };
 
-    let mut daemon = Daemon::open(paths, &arguments.selector).await?;
-    let status = tokio::select! {
-        status = daemon.read::<_, BackupStatusResult>(Method::BackupStatus, &BackupStatusParams {}) => status?,
-        () = dialogue.interrupt.arrived() => return Err(dialogue.stopped()),
+    // The connection that reads the status is let go of before the dialogue begins: a person can
+    // take longer over it than a connection nobody reads from is kept.
+    let status = {
+        let mut daemon = dialogue.connect(paths, &arguments.selector).await?;
+        tokio::select! {
+            status = daemon.read::<_, BackupStatusResult>(Method::BackupStatus, &BackupStatusParams {}) => status?,
+            () = dialogue.interrupt.arrived() => return Err(dialogue.stopped()),
+        }
     };
     let ready = Ready::of(&status, arguments.replace)?;
-    dialogue.replacing = ready.replacing.is_some();
+    dialogue.replacing = ready.replacing.clone();
 
     show_the_plan(&ready);
     let go = dialogue
@@ -153,7 +164,8 @@ pub async fn run(
     let shown_fingerprint = crate::shown::kit_fingerprint(&fingerprint);
 
     dialogue.stage = Stage::KitShown;
-    show_the_kit(&kit, &shown_fingerprint)?;
+    dialogue.kit = Some(shown_fingerprint.clone());
+    show_the_kit(&kit, &shown_fingerprint).map_err(|error| dialogue.failed(error))?;
     // The kit has been shown once. It is cleared now, and the seed lives on only as the end the
     // person types back.
     drop(kit);
@@ -172,15 +184,16 @@ pub async fn run(
     let mut offers = OFFERS;
     loop {
         report::say(&Shown::said("Setting backups up."));
-        match dialogue.call(&mut daemon, &params).await? {
+        match dialogue.call(paths, &arguments.selector, &params).await? {
             Ended::Enabled { fingerprint } => {
                 output::say(&shown!(
                     "Backups are set up. The kit's fingerprint is {}.",
                     crate::shown::kit_fingerprint(&fingerprint)
                 ));
                 output::say(&Shown::said(
-                    "Closed sessions and this host's configuration are backed up once a day; \
-                     kr doctor shows the newest backup. Keep the kit and its fingerprint together.",
+                    "Closed sessions and this host's configuration are backed up at most once a \
+                     day, when something has changed; kr doctor shows the newest backup. Keep the \
+                     kit and its fingerprint together.",
                 ));
                 return Ok(Completion::Done);
             }
@@ -207,13 +220,7 @@ pub async fn run(
                 }
                 return Err(dialogue.nothing_done());
             }
-            Ended::Refused(error) => {
-                for line in dialogue.nothing_set_up() {
-                    report::say(&line);
-                }
-                return Err(error);
-            }
-            Ended::Unknown => return Err(dialogue.outcome_unknown(&shown_fingerprint)),
+            Ended::Unknown => return Err(dialogue.outcome_unknown()),
         }
     }
 }
@@ -224,9 +231,10 @@ pub async fn run(
 enum Stage {
     /// No kit has been shown: nothing is made.
     Asking,
-    /// The kit has been shown and the daemon has not been given the call, or it refused it.
+    /// The kit has been shown and no call has been sent, or the daemon confirmed that it recorded
+    /// nothing.
     KitShown,
-    /// The daemon has the call, and how it ended is not known.
+    /// A call has been sent, and the daemon has not confirmed that it recorded nothing.
     Sending,
 }
 
@@ -234,8 +242,10 @@ enum Stage {
 struct Dialogue {
     interrupt: Interrupt,
     stage: Stage,
-    /// Whether the setup replaces one that is set up.
-    replacing: bool,
+    /// The fingerprint of the setup this one replaces, when it replaces one.
+    replacing: Option<String>,
+    /// The fingerprint of the kit, once it has been shown.
+    kit: Option<Shown>,
 }
 
 impl Dialogue {
@@ -243,10 +253,22 @@ impl Dialogue {
     /// input. A line is cleared when dropped.
     async fn ask(&mut self, question: &Shown) -> Result<Option<Zeroizing<String>>> {
         let answer = tokio::select! {
-            answer = ask_line(question) => answer?,
+            answer = ask_line(question) => answer.map_err(|error| self.failed(error))?,
             () = self.interrupt.arrived() => return Err(self.stopped()),
         };
         Ok(answer.map(Zeroizing::new))
+    }
+
+    /// Opens a connection to the daemon, which the person can interrupt.
+    async fn connect(
+        &mut self,
+        paths: &HostPaths,
+        selector: &EnvironmentSelector,
+    ) -> Result<Daemon> {
+        tokio::select! {
+            daemon = Daemon::open(paths, selector) => daemon,
+            () = self.interrupt.arrived() => Err(self.stopped()),
+        }
     }
 
     /// Asks for the end of the seed line until it is typed or the tries are used.
@@ -275,39 +297,40 @@ impl Dialogue {
     }
 
     /// Calls `backup.enable`, and again with the same bytes while the outcome is unknown.
-    async fn call(&mut self, daemon: &mut Daemon, params: &BackupEnableParams) -> Result<Ended> {
-        self.stage = Stage::Sending;
+    ///
+    /// Each attempt has a connection of its own: the one that read the status, or the one before,
+    /// has had nobody reading from it for as long as the person took over the questions or the
+    /// wait took, and the daemon ends a connection that stops reading.
+    async fn call(
+        &mut self,
+        paths: &HostPaths,
+        selector: &EnvironmentSelector,
+        params: &BackupEnableParams,
+    ) -> Result<Ended> {
         let mut repeats = 0;
         loop {
+            let mut daemon = match self.connect(paths, selector).await {
+                Ok(daemon) => daemon,
+                // Nothing has been sent when the first attempt cannot reach the daemon.
+                Err(error) if self.stage != Stage::Sending => return Err(self.failed(error)),
+                // A repeat: the earlier attempt may have been run.
+                Err(_) => return Ok(Ended::Unknown),
+            };
+            self.stage = Stage::Sending;
             // A new action identity each time: a claimed action keeps no result for an error that
             // can be tried again, and would answer "outcome unknown" for ever.
             let answer = tokio::select! {
                 answer = daemon.mutate::<_, BackupEnableResult>(Method::BackupEnable, params) => answer,
                 () = self.interrupt.arrived() => return Err(self.stopped()),
             };
-            let delay = match answer {
-                Ok(BackupEnableResult::Enabled {
-                    kit_fingerprint, ..
-                }) => {
-                    return Ok(Ended::Enabled {
-                        fingerprint: kit_fingerprint,
-                    });
-                }
-                Ok(BackupEnableResult::Declined { cause }) => {
+            drop(daemon);
+            let delay = match answer_of(answer) {
+                Answer::Ended(Ended::Declined(cause)) => {
                     self.stage = Stage::KitShown;
                     return Ok(Ended::Declined(cause));
                 }
-                Ok(BackupEnableResult::Unknown {
-                    retry_after_seconds,
-                }) => retry_after_seconds.as_ref().map(|seconds| seconds.get()),
-                Err(CliError::Refused(error)) if error.code == ErrorCode::OutcomeUnknown => None,
-                // The daemon refused the call before it did anything.
-                Err(refused @ (CliError::Refused(_) | CliError::ServiceRefused { .. })) => {
-                    self.stage = Stage::KitShown;
-                    return Ok(Ended::Refused(refused));
-                }
-                // The connection failed: the daemon may have the call and may be running it.
-                Err(_) => return Ok(Ended::Unknown),
+                Answer::Ended(ended) => return Ok(ended),
+                Answer::Again { delay } => delay,
             };
             repeats += 1;
             if repeats > REPEATS {
@@ -329,18 +352,21 @@ impl Dialogue {
         }
     }
 
-    /// What is said when the person stops the command or the dialogue ends without a setup.
+    /// What is said when the dialogue ends before any call was sent, or after the daemon confirmed
+    /// that it recorded nothing.
     fn nothing_set_up(&self) -> Vec<Shown> {
         let mut lines = Vec::new();
         match self.stage {
             Stage::Asking => lines.push(Shown::said("Nothing was set up.")),
-            Stage::KitShown | Stage::Sending => {
+            Stage::KitShown => {
                 lines.push(Shown::said(
                     "Nothing was set up. The kit that was shown opens nothing: delete it.",
                 ));
             }
+            // A call is on its way: only the daemon's own word makes the kit void.
+            Stage::Sending => {}
         }
-        if self.replacing {
+        if self.replacing.is_some() {
             lines.push(Shown::said("The earlier setup is as it was."));
         }
         lines
@@ -354,6 +380,16 @@ impl Dialogue {
         CliError::Other(Shown::said("backups were not set up"))
     }
 
+    /// The ending of a failure that is not the daemon's answer to the call, such as a terminal
+    /// that could not be read: no call was sent, so the kit that was shown, if one was, opens
+    /// nothing.
+    fn failed(&self, error: CliError) -> CliError {
+        for line in self.nothing_set_up() {
+            report::say(&line);
+        }
+        error
+    }
+
     /// The ending of a command that was interrupted, with what it means for the kit.
     fn stopped(&self) -> CliError {
         match self.stage {
@@ -362,38 +398,91 @@ impl Dialogue {
                     report::say(&line);
                 }
             }
-            Stage::Sending => report::say(&Shown::said(
-                "The command stopped while the setup was under way, so how it ended is not known. \
-                 Keep the kit until kr doctor settles it: it shows the setup with the kit's \
-                 fingerprint when the kit is in use, or no setup and none in progress when it \
-                 opens nothing.",
-            )),
+            Stage::Sending => {
+                report::say(&Shown::said(
+                    "The command stopped while the setup was under way, so how it ended is not \
+                     known.",
+                ));
+                self.keep_the_kit();
+            }
         }
         interrupt::stopped()
     }
 
     /// The ending of a call whose outcome stayed unknown.
-    fn outcome_unknown(&self, fingerprint: &Shown) -> CliError {
-        report::say(&Shown::said(
-            "How the setup ended is not known. Keep the kit until kr doctor settles it.",
-        ));
-        report::say(&shown!(
-            "If kr doctor shows backups set up with kit fingerprint {}, the kit is in use: keep it.",
-            fingerprint.clone()
-        ));
-        report::say(&Shown::said(
-            "If it shows no setup and none in progress, the kit opens nothing and you can delete it.",
-        ));
-        if self.replacing {
-            report::say(&Shown::said(
-                "If it shows a setup with another fingerprint and none in progress, the kit \
-                 opens nothing as well.",
+    fn outcome_unknown(&self) -> CliError {
+        report::say(&Shown::said("How the setup ended is not known."));
+        self.keep_the_kit();
+        CliError::Other(Shown::said("how the setup ended is not known"))
+    }
+
+    /// What the person does with a kit whose setup may or may not have been recorded.
+    fn keep_the_kit(&self) {
+        report::say(&Shown::said("Keep the kit until kr doctor settles it."));
+        if let Some(fingerprint) = &self.kit {
+            report::say(&shown!(
+                "If kr doctor shows backups set up with kit fingerprint {}, the kit is in use: \
+                 keep it.",
+                fingerprint.clone()
             ));
+        }
+        match &self.replacing {
+            None => report::say(&Shown::said(
+                "If it shows no setup and none in progress, the kit opens nothing and you can \
+                 delete it.",
+            )),
+            Some(earlier) => report::say(&shown!(
+                "If it shows backups set up with the earlier kit fingerprint {} and none in \
+                 progress, the earlier setup stands and the kit opens nothing: you can delete it.",
+                crate::shown::kit_fingerprint(earlier)
+            )),
         }
         report::say(&Shown::said(
             "If it shows a setup in progress, run kr doctor again a little later.",
         ));
-        CliError::Other(Shown::said("how the setup ended is not known"))
+        report::say(&Shown::said(
+            "If it shows any other fingerprint, keep the kit: its setup may have been made and \
+             replaced since.",
+        ));
+    }
+}
+
+/// What an answer to a sent `backup.enable` comes to.
+enum Answer {
+    /// The call ended.
+    Ended(Ended),
+    /// The daemon could not say, and the call is made again after `delay` seconds, when the answer
+    /// names one.
+    Again { delay: Option<u64> },
+}
+
+/// Sorts the daemon's answer to a sent call.
+///
+/// Only a confirmed refusal ([`BackupEnableResult::Declined`]) says that nothing was recorded.
+/// A refusal in an error, and a connection that failed, can each follow the daemon's recording of
+/// the setup, so they end the call as unknown; a refusal is not made again, because a withheld
+/// answer is not to be repeated under a new identity.
+fn answer_of(answer: Result<BackupEnableResult>) -> Answer {
+    match answer {
+        Ok(BackupEnableResult::Enabled {
+            kit_fingerprint, ..
+        }) => Answer::Ended(Ended::Enabled {
+            fingerprint: kit_fingerprint,
+        }),
+        Ok(BackupEnableResult::Declined { cause }) => Answer::Ended(Ended::Declined(cause)),
+        Ok(BackupEnableResult::Unknown {
+            retry_after_seconds,
+        }) => Answer::Again {
+            delay: retry_after_seconds.as_ref().map(|seconds| seconds.get()),
+        },
+        Err(CliError::Refused(error)) if error.code == ErrorCode::OutcomeUnknown => {
+            Answer::Again { delay: None }
+        }
+        Err(refused @ (CliError::Refused(_) | CliError::ServiceRefused { .. })) => {
+            report::say(&shown!("The daemon refused the call: {}", refused.said()));
+            Answer::Ended(Ended::Unknown)
+        }
+        Err(_) => Answer::Ended(Ended::Unknown),
     }
 }
 
@@ -403,8 +492,6 @@ enum Ended {
     Enabled { fingerprint: String },
     /// The daemon confirmed that nothing was recorded.
     Declined(BackupEnableCause),
-    /// The daemon refused the call before it did anything.
-    Refused(CliError),
     /// The daemon could not say how it ended.
     Unknown,
 }
@@ -589,7 +676,8 @@ fn show_the_plan(ready: &Ready) {
         "",
         "What this does:",
         "  - It backs up the retained output of closed sessions and this host's configuration, \
-         once a day. A session that is still open is not backed up until it closes.",
+         at most once a day and when something has changed. A session that is still open is not \
+         backed up until it closes.",
         "  - It encrypts everything on this host. The service holds ciphertext only.",
         "  - It turns managed backup storage on for the account when it is off.",
         "  - It reads nothing while privacy mode is on.",
@@ -669,20 +757,18 @@ fn end_of_the_seed(kit: &str) -> Option<Zeroizing<Vec<u8>>> {
 }
 
 /// Whether `typed` is `end`, read as a kit's seed is read: either case, dashes and spaces
-/// ignored, `I` and `L` for `1`, and `O` for `0`.
+/// ignored, `I` and `L` for `1`, and `O` for `0`. The typed line is compared as it is read and
+/// never collected, so no copy of it is left behind.
 fn matches_the_end(typed: &str, end: &[u8]) -> bool {
-    let read: Zeroizing<Vec<u8>> = Zeroizing::new(
-        typed
-            .bytes()
-            .filter(|byte| *byte != b'-' && !byte.is_ascii_whitespace())
-            .map(|byte| match byte.to_ascii_uppercase() {
-                b'I' | b'L' => b'1',
-                b'O' => b'0',
-                other => other,
-            })
-            .collect(),
-    );
-    read.as_slice() == end
+    typed
+        .bytes()
+        .filter(|byte| *byte != b'-' && !byte.is_ascii_whitespace())
+        .map(|byte| match byte.to_ascii_uppercase() {
+            b'I' | b'L' => b'1',
+            b'O' => b'0',
+            other => other,
+        })
+        .eq(end.iter().copied())
 }
 
 /// Whether the person's line is the word yes.
@@ -752,5 +838,42 @@ impl Drop for Terminal {
         while let Err(rustix::io::Errno::INTR) =
             rustix::termios::tcsetattr(&self.input, OptionalActions::Flush, &self.saved)
         {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use kr_protocol::error::ProtocolError;
+
+    use super::*;
+
+    /// A kit that was shown is told to be deleted only when the daemon confirmed that it recorded
+    /// nothing. A refusal can follow a recording (an answer the daemon withheld because the local
+    /// owner's membership lease ended while it was written), so it ends the call as unknown, and so
+    /// does a connection that failed.
+    #[test]
+    fn only_a_confirmed_refusal_says_that_nothing_was_recorded() {
+        let refusals = [
+            ErrorCode::PermissionDenied,
+            ErrorCode::InvalidArgument,
+            ErrorCode::StorageUnavailable,
+        ];
+        for code in refusals {
+            let refused = CliError::Refused(ProtocolError::new(code, "refused"));
+            assert!(
+                matches!(answer_of(Err(refused)), Answer::Ended(Ended::Unknown)),
+                "{code:?} is not a confirmed refusal"
+            );
+        }
+        assert!(matches!(
+            answer_of(Err(CliError::Other(Shown::said("the connection failed")))),
+            Answer::Ended(Ended::Unknown)
+        ));
+        assert!(matches!(
+            answer_of(Ok(BackupEnableResult::Declined {
+                cause: BackupEnableCause::NoAllowance {}
+            })),
+            Answer::Ended(Ended::Declined(BackupEnableCause::NoAllowance {}))
+        ));
     }
 }
