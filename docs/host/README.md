@@ -359,16 +359,19 @@ the daemon asks again, no oftener than once a minute, and believes it only after
 once the longest a lease can live has passed since the first, because the service gives the same
 answer when a revocation raced a refill.
 
-It is possible that a request results in a lease, but that the answer does not arrive. Since the
-daemon won't have written down any lease in that case, it will at some point ask for the same pair
-again, with the same request. Then the service will reply with a lease for a pair it already has, as
-if the answer to the original request had arrived just in time. The record keeps such a request
-until the longest a lease can live has passed, so a device unpaired in the meantime still has its
-lease ended. A request that the service answers as having issued nothing, such as one for a device
-that is no longer paired when the service has no room, does not make the record younger. If the
-payer in the configuration document changes meanwhile, the daemon does not ask under the new payer
-until that time has passed, because the service would open a second reservation; the lease the first
-request may have issued runs out by itself.
+It is possible that a request results in a lease, but that the answer does not arrive. The same
+holds for a refill that the service answers with another lease, as it does when the lease has run
+out at the service. Since the daemon won't have written down the lease in either case, it will at
+some point ask for the same pair again. Then the service will reply with the lease the pair already
+holds, as if the answer to the original request had arrived just in time. The record keeps the time
+of every such request until the longest a lease can live has passed, so a device unpaired in the
+meantime still has the lease ended that the service may have opened. A request that the service
+answers as having issued nothing, such as one for a device that is no longer paired when the service
+has no room, does not make the record younger. If the payer in the configuration document changes
+meanwhile, the daemon asks again under the payer the request was made for, ends the lease it finds,
+and then asks under the new payer, because the service refuses another authorisation of the same
+account for a pair whose lease stands. If the service turns the old payer back, the daemon drops the
+record, because no lease can be alive under an authorisation the service does not accept.
 
 Three kinds of answers to lease requests are not treated as errors. A spent allowance, and a service
 that could not issue a lease because it has no relay to offer or no room for one more, are answers
@@ -397,9 +400,9 @@ ceiling the refill asked for, up to the bound of the authorisation, which for a 
 carried traffic is more than a new lease needs, so the daemon ends that lease and asks for the pair
 again, and the pair holds one block. The service holds the bytes of the ended lease until it has
 settled it, so for about a minute the account can have no room for the new lease, and the pair then
-waits as for any answer about capacity. If the service does not take the revocation, the daemon
-keeps the lease. A lease that runs out in the meantime stops the relay carrying its pair and nothing
-else.
+waits as for any answer about capacity. If the service answers the revocation as a lease it does not
+carry, which it does when the lease changed meanwhile, the daemon keeps the lease. A lease that runs
+out in the meantime stops the relay carrying its pair and nothing else.
 
 The daemon writes down lease information in a file called `relay-leases.sqlite3` in its state
 directory. This information is only valid for one service and one host key. If you start a daemon
