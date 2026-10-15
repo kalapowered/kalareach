@@ -19,6 +19,7 @@ use kr_client::services::account::{
     AccountIdentity, AccountService, AccountToken, AccountUsage, AuthorisationGrant, Exchanged,
     IssuedGrant, RefreshToken, Refreshed, StoredGrant,
 };
+use kr_client::services::storage::STORAGE_PART_SIZE_BYTES;
 use kr_client::services::{
     BackupManifestService, HttpService, ManagedBackupManifestService, ServiceFuture, ServiceHttp,
     ServiceSigner, managed_response_limits,
@@ -4991,8 +4992,9 @@ async fn a_replacement_retires_the_earlier_writer_and_takes_back_its_unfinished_
     // Work of the earlier archive that has not left: its upload waits at the service.
     let sent_before = web.requests_to(PART) + web.requests_to(COMPLETE);
     web.fail(CREATE, 1, Moment::Hold);
+    let creates = web.requests_to(CREATE);
     rig.admit_to_an_enrolled_archive(2, &[(2, plaintext(2048))]);
-    within("the upload begins", web.requests_reach(CREATE, 2)).await;
+    within("the upload begins", web.requests_reach(CREATE, creates + 1)).await;
     let epoch = rig.controller.backup().binding().read().epoch;
 
     // A replacement the service refuses changes nothing.
@@ -5066,34 +5068,43 @@ async fn a_replacement_retires_the_earlier_writer_and_takes_back_its_unfinished_
     web.release_held();
     timer.run_by_itself();
     // The replacement is followed by the new archive's first backup. Once it is published, and the
-    // carrier has looked again, what the service was sent is the earlier archive's first
-    // generation and the new archive's, and the earlier archive's second generation is in neither.
+    // carrier has looked again, what the service was sent in parts and completions is those of the
+    // earlier archive's first generation and of the new archive's, and none of the earlier
+    // archive's second generation.
     rig.until("the new archive's first backup is published", |rig| {
         rig.published_of(archive_two()) > 0
     })
     .await;
     rig.carrier_passes(2).await;
-    let new_objects: usize = rig
+    // Each object is sent in as many parts as its ciphertext fills, and completed once.
+    let sent_for_the_new_archive: usize = rig
         .controller
         .backup()
         .generations()
         .expect("a read")
         .iter()
         .filter(|generation| generation.archive_id == archive_two())
-        .map(|generation| {
+        .flat_map(|generation| {
             rig.controller
                 .backup()
                 .objects(generation.archive_id, generation.backup_generation)
                 .expect("a read")
-                .len()
+        })
+        .map(|object| {
+            usize::try_from(object.encrypted_len.div_ceil(STORAGE_PART_SIZE_BYTES))
+                .expect("a count of parts")
+                + 1
         })
         .sum();
-    assert!(new_objects > 0, "the new archive's backup has objects");
+    assert!(
+        sent_for_the_new_archive > 0,
+        "the new archive's backup has objects"
+    );
     assert_eq!(
         web.requests_to(PART) + web.requests_to(COMPLETE),
-        sent_before + 2 * new_objects,
-        "each of the new archive's objects was sent in a part and completed, and nothing of the \
-         earlier archive's second generation was"
+        sent_before + sent_for_the_new_archive,
+        "the new archive's objects were sent once each, and nothing of the earlier archive's \
+         second generation was"
     );
 }
 
