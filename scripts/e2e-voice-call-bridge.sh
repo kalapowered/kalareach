@@ -29,7 +29,8 @@
 # question stands between the call and its checks. `KR_PROBE_PERMISSIONS` runs the permission
 # question itself: `allow` answers the system's dialogs by tapping Allow, `deny` by tapping Don't
 # allow (the open is then refused for the microphone, which the first check shows), and `none`
-# answers nothing (the open goes on with what is allowed when its time for the answer is up).
+# answers nothing (the open goes on with what is allowed when its time for the answer is up). The
+# dialogs are answered in the script's own wait for the result: nothing runs in the background.
 #
 # Exit codes: 0 every check passed, 2 bad usage or a failed check, 3 the device is not available.
 set -uo pipefail
@@ -47,6 +48,9 @@ case "$permissions" in
     granted | allow | deny | none) ;;
     *) printf 'KR_PROBE_PERMISSIONS is granted, allow, deny or none\n' >&2; exit 2 ;;
 esac
+[ "$platform" = android ] || [ "$permissions" = granted ] || {
+    printf 'KR_PROBE_PERMISSIONS is for the Android leg only\n' >&2; exit 2
+}
 
 artefacts="${KR_TEST_ARTIFACTS_DIR:-/tmp/kr-test-artifacts}/voice-call-bridge-$platform"
 mkdir -p "${artefacts:?}"
@@ -148,46 +152,19 @@ sys.exit(1)
 PY
 }
 
-# Answers each permission dialog that appears, for as long as the script that started it runs
-# (`$2` is that script's process): it ends by itself when the script is gone, however the script
-# ended, and `stop_answerer` ends it when the script says so.
-answer_permission_dialogs() { # allow|deny <process of the script>
+# Answers the permission dialog that stands on the screen, if one does, once. The script asks in
+# its own wait for the result, so nothing runs in the background and nothing outlives the script.
+answer_permission_dialog() { # allow|deny
     local point
-    while kill -0 "$2" 2>/dev/null; do
-        point="$(permission_dialog_point "$1")" && "$adb" -s "$serial" shell input tap $point
-        sleep 2
-    done
+    point="$(permission_dialog_point "$1")" && "$adb" -s "$serial" shell input tap $point
+    return 0
 }
-
-# The process that answers the permission dialogs, if one runs. It runs as the leader of a process
-# group of its own, so that everything it starts is in that group.
-answerer=""
-
-# Starts the answerer in a process group of its own.
-start_answerer() { # allow|deny
-    set -m
-    answer_permission_dialogs "$1" "$$" &
-    answerer=$!
-    set +m
-}
-
-# Ends the answerer and every process of its group, in whatever step it is, and waits for it, so
-# nothing it started outlives the device it taps.
-stop_answerer() {
-    [ -z "$answerer" ] && return 0
-    kill -TERM -- "-$answerer" 2>/dev/null
-    wait "$answerer" 2>/dev/null
-    answerer=""
-}
-trap stop_answerer EXIT
-trap 'exit 130' INT
-trap 'exit 143' TERM
 
 run_android() {
     local sdk="${ANDROID_HOME:-$HOME/Library/Android/sdk}" avd="${KR_ANDROID_AVD:-Nines_API_36_Play}"
     local adb="${KR_ADB:-$sdk/platform-tools/adb}" port=5586
     local serial="emulator-$port"
-    [ -x "$adb" ] || { say "no adb under $sdk"; return 3; }
+    [ -x "$adb" ] || { say "no adb at $adb"; return 3; }
 
     say "building the debug application for the emulator"
     ( cd "$companion" && pnpm android --debug --target aarch64 ) >"$artefacts/build.log" 2>&1 \
@@ -231,20 +208,17 @@ run_android() {
         [ -n "$pid" ] || { sleep 1; tries=$((tries + 1)); }
     done
 
-    case "$permissions" in
-        allow | deny) start_answerer "$permissions" ;;
-    esac
-
-    local waited=0 text=""
+    local text="" until=$((SECONDS + 300))
     while :; do
         text="$("$adb" -s "$serial" shell run-as "$app_id" cat "kr-probe/$result_name" 2>/dev/null | tr -d '\r')"
         case "$text" in *done=1*) break ;; esac
+        case "$permissions" in
+            allow | deny) answer_permission_dialog "$permissions" ;;
+        esac
         sleep 2
-        waited=$((waited + 2))
-        [ "$waited" -lt 300 ] || break
+        [ "$SECONDS" -lt "$until" ] || break
     done
     printf '%s\n' "$text" >"$artefacts/$result_name"
-    stop_answerer
     # What the application said while it ran, kept for a run that wrote no result.
     if [ -n "$pid" ]; then
         "$adb" -s "$serial" logcat -d --pid="$pid" 2>/dev/null | tail -200 >"$artefacts/logcat.log"
