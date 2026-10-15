@@ -16,7 +16,7 @@ import to.kala.reach.companion.mobile.VoiceCaptureState
  * What the platform plugin asks of the voice call, carried out on the call.
  *
  * The plugin cannot see this module, so the application registers this at start
- * ([to.kala.reach.companion.mobile.CallBridgeHolder]) and the plugin finds it there. It holds one
+ * ([CallBridgeHolder]) and the plugin finds it there. It holds one
  * call, the one the plugin named, and tells that call's news to Rust through a queue of its own,
  * numbered and bounded. It reports facts and carries out requests: nothing here decides when a
  * call opens, is permitted or ends.
