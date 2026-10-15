@@ -2977,8 +2977,10 @@ async fn a_delay_the_service_names_to_a_restores_read_is_owed_to_every_later_rea
     let rig = Rig::start(Arrangement::NORMAL, Arc::clone(&timer)).await;
     let web = Arc::clone(rig.served.web());
     rig.admit(1, &[(1, plaintext(4096))]);
-    // The first generation is published with the timer let go, so the passes need no hand.
-    timer.run_by_itself();
+    // The timer holds every wait of the carrier for the whole case. A wait that ended by itself
+    // would end the delay the relay met as well, whenever the carrier looked inside it (the tail of
+    // the iteration that published may): the carrier waits out a delay it finds owed, and counts it
+    // as passed when its wait ends.
     rig.until("generation 1 is published", |rig| rig.published(1))
         .await;
 
