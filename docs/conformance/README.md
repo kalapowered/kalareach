@@ -28,6 +28,8 @@ cargo run --locked -p kr-conformance --bin kr-conformance -- run --root . --evid
 ```
  The result is
 `<evidence>/conformance/result.json`, and each step's log is under `<evidence>/conformance/logs/`.
+Beside the log of a `cargo test` step is a directory named for it with `.records` in place of `.log`.
+It holds `binaries.txt` and, for each test binary under the standard harness, what the harness wrote.
 
 The evidence directory is `KR_TEST_ARTIFACTS_DIR`, or a new directory under the platform's temporary
 directory when that is not set. The report refuses one outside the temporary directory (`/tmp` or
@@ -346,7 +348,7 @@ Each keyed test has one outcome on this platform:
 | Outcome | Meaning |
 | --- | --- |
 | `passed` | A step ran it and it passed |
-| `failed` | A step ran it and it failed, or its binary's output could not be read against the summary the harness printed |
+| `failed` | A step ran it and it failed, or the run of its binary could not be read, and the reason says why |
 | `ignored` | Every step that listed it left it out, with the reason its `#[ignore]` gives |
 | `not_run` | No step of this run ran it here: a step's own flags left it out, no selected group runs its target on this platform, another platform's report runs its lane, the step that built it failed before a run of it could be read, or it returned early and said why. The reason says which |
 | `not_built` | A step ran its target and this platform's build of it has no such test, or a Playwright test, which only the landing workflow's companion job builds |

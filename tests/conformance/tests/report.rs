@@ -625,7 +625,6 @@ fn a_test_record_takes_its_command_and_what_it_needs_from_the_same_run() {
                 executable: "kr_client-0.exe".to_owned(),
                 source: "src/lib.rs".to_owned(),
                 tests: [(name.to_owned(), outcome)].into(),
-                readable: true,
                 ..Binary::default()
             },
         )],

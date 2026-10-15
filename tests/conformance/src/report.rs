@@ -630,7 +630,7 @@ pub fn assemble(
                     target
                         .as_ref()
                         .is_some_and(|target| run::has_harness(&map.packages, target))
-                        && !binary.readable
+                        && !binary.readable()
                 })
         })
         .map(|(index, _)| index + 1)
@@ -1037,12 +1037,13 @@ impl<'a> Resolver<'a> {
         let mut runs = Vec::new();
         for (index, binary) in self.ran.get(target).into_iter().flatten() {
             let step = &self.executed[*index].step;
-            let record = if !binary.readable {
+            let record = if !binary.readable() {
                 RunRecord {
                     step: index + 1,
                     outcome: Outcome::Failed,
                     reason: Some(format!(
-                        "the output of {target} in this step could not be read against its summary"
+                        "the run of {target} in this step could not be read: {}",
+                        binary.problem.as_deref().unwrap_or_default()
                     )),
                 }
             } else if let Some(outcome) = binary.tests.get(name) {

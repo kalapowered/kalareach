@@ -35,9 +35,12 @@ fn main() -> ExitCode {
     let Some(command) = arguments.first() else {
         return usage("no command");
     };
-    // Cargo's runner for one test binary while a step's tests are listed.
+    // Cargo's runner for one test binary while a step's tests are listed, and while they are run.
     if command == "list-one" {
         return ExitCode::from(kr_conformance::run::list_one(&arguments[1..]));
+    }
+    if command == "run-one" {
+        return ExitCode::from(kr_conformance::run::run_one(&arguments[1..]));
     }
     let mut root = None;
     let mut evidence_directory = None;

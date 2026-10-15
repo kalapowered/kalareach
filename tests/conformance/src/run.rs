@@ -14,6 +14,13 @@
 //! so the listing passes over them. A target with a harness of its own (`harness = false`) is a
 //! program that prints neither a list nor verdicts: the runner does not run it while the tests are
 //! listed, it is run with the step, and only its exit status, which is the step's, counts.
+//!
+//! The step then runs with this program as Cargo's runner again, and the runner gives each test
+//! binary of the build's that runs under the standard harness the harness's option to write a
+//! record of its own: what each test came to, in a file of its own in a directory beside the step's
+//! log. The log is shared by everything the tests and the programs they start write, so a line of
+//! it can begin in the middle of another; the record has one writer. A binary that ran and left no
+//! record that can be read, and a binary the log runs twice, are the step's error.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
@@ -22,7 +29,7 @@ use std::process::{Command, Stdio};
 use std::time::Instant;
 
 use crate::lane;
-use crate::libtest::{self, Binary};
+use crate::libtest::{self, Binary, Recording};
 use crate::plan::{Reading, Step, Tests};
 use crate::vitest;
 use crate::workspace::{Package, TargetId};
@@ -132,16 +139,24 @@ pub fn execute(step: &Step, number: usize, place: &Place<'_>, packages: &[Packag
     }
     let started = Instant::now();
     let mut executables: BTreeMap<String, TargetId> = BTreeMap::new();
+    let mut environment: Vec<(String, String)> = Vec::new();
+    let records = logs.join(format!("{}.records", log_name.trim_end_matches(".log")));
     let tests =
         step.reading == Reading::Cargo && step.command.get(1).is_some_and(|word| word == "test");
     if tests {
-        let listed = build_first(step, place, &log_path, packages).and_then(|(built, map)| {
-            executed.built = built;
-            let listed = list(step, place, &map, packages);
-            executables = map;
-            listed
-        });
-        match listed {
+        let prepared = build_first(step, place, &log_path, packages)
+            .and_then(|(built, map)| {
+                executed.built = built;
+                let listed = list(step, place, &map, packages)?;
+                executables = map;
+                Ok(listed)
+            })
+            .and_then(|listed| {
+                environment =
+                    recording(place, &standard_harness(&executables, packages), &records)?;
+                Ok(listed)
+            });
+        match prepared {
             Ok(listed) => executed.listed = listed,
             Err(error) => {
                 executed.seconds = started.elapsed().as_secs();
@@ -150,7 +165,7 @@ pub fn execute(step: &Step, number: usize, place: &Place<'_>, packages: &[Packag
             }
         }
     }
-    let status = run_logged(&step.command, place, &log_path);
+    let status = run_logged(&step.command, place, &log_path, &environment);
     executed.seconds = started.elapsed().as_secs();
     match status {
         Ok(code) => executed.exit = code,
@@ -183,12 +198,29 @@ pub fn execute(step: &Step, number: usize, place: &Place<'_>, packages: &[Packag
     };
     match &step.reading {
         Reading::Cargo => {
-            for binary in libtest::read(&output) {
+            let records = if tests {
+                read_records(
+                    &records,
+                    &standard_harness(&executables, packages),
+                    &executables,
+                    &executed.listed,
+                )
+            } else {
+                BTreeMap::new()
+            };
+            for binary in libtest::read(&output, |executable| {
+                match records.get(&file_name(executable)) {
+                    Some(Ok(record)) => Recording::Record(record),
+                    Some(Err(why)) => Recording::Lost(why),
+                    None => Recording::None,
+                }
+            }) {
                 let target = executables.get(&file_name(&binary.executable)).cloned();
                 executed.binaries.push((target, binary));
             }
             if tests {
-                executed.error = reconcile(&executables, &executed.binaries, executed.exit);
+                executed.error = reconcile(&executables, &executed.binaries, executed.exit)
+                    .or_else(|| unrecorded(&records, &executed.binaries));
             }
         }
         Reading::Build => {}
@@ -327,6 +359,170 @@ pub fn list_one(arguments: &[String]) -> u8 {
     u8::from(!matches!(status.as_str(), "0" | "skipped"))
 }
 
+/// Runs one program for Cargo, as its runner, while a step's tests are run, and returns its exit
+/// status: `arguments` are the program and what Cargo passes it. Cargo runs every test binary and,
+/// for a crate's documentation tests, rustdoc's programs through it. A binary that the run's
+/// [`RECORDED_BINARIES`] names is given the option to write its record to a file of its own in
+/// [`RECORDS_VARIABLE`]'s directory; any other program runs as it is.
+#[must_use]
+pub fn run_one(arguments: &[String]) -> u8 {
+    let Some((executable, rest)) = arguments.split_first() else {
+        eprintln!("kr-conformance run-one: no test binary to run");
+        return 2;
+    };
+    let name = file_name(executable);
+    let mut command = Command::new(executable);
+    if let Some(records) = std::env::var_os(RECORDS_VARIABLE).map(PathBuf::from)
+        && std::fs::read_to_string(records.join(RECORDED_BINARIES))
+            .is_ok_and(|list| list.lines().any(|line| line == name))
+    {
+        command.arg("--logfile").arg(records.join(&name));
+    }
+    match command.args(rest).status() {
+        Ok(status) => status
+            .code()
+            .and_then(|code| u8::try_from(code).ok())
+            .unwrap_or_else(|| {
+                // Cargo shows the status of the runner, so the status of the program is said here.
+                eprintln!("kr-conformance run-one: {executable} ended with {status}");
+                1
+            }),
+        Err(error) => {
+            eprintln!("kr-conformance run-one: {executable} could not start: {error}");
+            1
+        }
+    }
+}
+
+/// The variable that makes Cargo run each test binary through this program's `command`, and its
+/// value.
+fn runner(place: &Place<'_>, command: &str) -> Result<(String, String), String> {
+    let lister = place
+        .lister
+        .to_str()
+        .filter(|path| !path.chars().any(char::is_whitespace))
+        .ok_or_else(|| {
+            format!(
+                "{} cannot be Cargo's runner: its path has a space in it",
+                place.lister.display()
+            )
+        })?;
+    let variable = format!(
+        "CARGO_TARGET_{}_RUNNER",
+        host(place)?.to_ascii_uppercase().replace(['-', '.'], "_")
+    );
+    Ok((variable, format!("{lister} {command}")))
+}
+
+/// The file names of the binaries of a build that run under the standard harness.
+fn standard_harness(
+    executables: &BTreeMap<String, TargetId>,
+    packages: &[Package],
+) -> BTreeSet<String> {
+    executables
+        .iter()
+        .filter(|(_, target)| has_harness(packages, target))
+        .map(|(executable, _)| executable.clone())
+        .collect()
+}
+
+/// The variable naming the directory a run keeps the harness's records in: [`RECORDED_BINARIES`],
+/// and one file for each of the binaries it lists, named as the binary is.
+pub const RECORDS_VARIABLE: &str = "KR_CONFORMANCE_RECORDS";
+
+/// The file, in the directory [`RECORDS_VARIABLE`] names, that lists by file name the binaries a
+/// step's build made that run under the standard harness, one on each line.
+pub const RECORDED_BINARIES: &str = "binaries.txt";
+
+/// Makes the directory for the harness's records, and lists in it the binaries of `harness`. It
+/// returns the variables that make Cargo run every test binary, and rustdoc's programs, through this
+/// program, which gives the binaries listed the option to write a record there.
+fn recording(
+    place: &Place<'_>,
+    harness: &BTreeSet<String>,
+    records: &Path,
+) -> Result<Vec<(String, String)>, String> {
+    let (variable, runner) = runner(place, "run-one")?;
+    let list: String = harness.iter().map(|name| format!("{name}\n")).collect();
+    std::fs::create_dir(records)
+        .and_then(|()| std::fs::write(records.join(RECORDED_BINARIES), list))
+        .map_err(|error| format!("{} could not be made: {error}", records.display()))?;
+    Ok(vec![
+        (variable, runner),
+        (
+            RECORDS_VARIABLE.to_owned(),
+            records.to_string_lossy().into_owned(),
+        ),
+    ])
+}
+
+/// What each binary of `standard`, the build's that run under the standard harness, left as its
+/// record, by file name: the record, or why there is none that can be used. `listed` has the tests
+/// each target holds, which tell the entries of a record apart.
+fn read_records(
+    directory: &Path,
+    standard: &BTreeSet<String>,
+    executables: &BTreeMap<String, TargetId>,
+    listed: &BTreeMap<TargetId, BTreeSet<String>>,
+) -> BTreeMap<String, Result<libtest::Record, String>> {
+    standard
+        .iter()
+        .map(|name| {
+            let record = match std::fs::read(directory.join(name)) {
+                Ok(bytes) => {
+                    let known = executables
+                        .get(name)
+                        .and_then(|target| listed.get(target))
+                        .cloned()
+                        .unwrap_or_default();
+                    libtest::read_record(&String::from_utf8_lossy(&bytes), &known)
+                        .map_err(|error| format!("its record could not be read: {error}"))
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    Err("the harness left no record of its run".to_owned())
+                }
+                Err(error) => Err(format!("its record could not be read: {error}")),
+            };
+            (name.clone(), record)
+        })
+        .collect()
+}
+
+/// The step's error when a binary that ran under the standard harness has no record that can be
+/// used, or when one record would stand for two runs.
+fn unrecorded(
+    records: &BTreeMap<String, Result<libtest::Record, String>>,
+    binaries: &[(Option<TargetId>, Binary)],
+) -> Option<String> {
+    let mut seen = BTreeSet::new();
+    let mut twice = Vec::new();
+    let mut lost = Vec::new();
+    for (_, binary) in binaries {
+        if binary.executable.starts_with("doc-tests ") {
+            continue;
+        }
+        let name = file_name(&binary.executable);
+        if !seen.insert(name.clone()) {
+            twice.push(name.clone());
+        }
+        if let Some(Err(why)) = records.get(&name) {
+            lost.push(format!("{name}: {why}"));
+        }
+    }
+    if !twice.is_empty() {
+        return Some(format!(
+            "the step's log runs {} more than once, and one record cannot stand for each run",
+            twice.join(", ")
+        ));
+    }
+    (!lost.is_empty()).then(|| {
+        format!(
+            "what the tests of a binary came to is not known: {}",
+            lost.join("; ")
+        )
+    })
+}
+
 /// The host's target triple, as the toolchain the step builds with names it.
 fn host(place: &Place<'_>) -> Result<String, String> {
     let output = place
@@ -359,20 +555,7 @@ fn list(
     executables: &BTreeMap<String, TargetId>,
     packages: &[Package],
 ) -> Result<BTreeMap<TargetId, BTreeSet<String>>, String> {
-    let lister = place
-        .lister
-        .to_str()
-        .filter(|path| !path.chars().any(char::is_whitespace))
-        .ok_or_else(|| {
-            format!(
-                "{} cannot be Cargo's runner: its path has a space in it",
-                place.lister.display()
-            )
-        })?;
-    let variable = format!(
-        "CARGO_TARGET_{}_RUNNER",
-        host(place)?.to_ascii_uppercase().replace(['-', '.'], "_")
-    );
+    let (variable, runner) = runner(place, "list-one")?;
     let own: Vec<&str> = executables
         .iter()
         .filter(|(_, target)| !has_harness(packages, target))
@@ -387,7 +570,7 @@ fn list(
     command.extend(["--".to_owned(), "--list".to_owned()]);
     let output = place
         .command(&command)
-        .env(&variable, format!("{lister} list-one"))
+        .env(&variable, runner)
         .env(OWN_HARNESS_VARIABLE, own.join(","))
         .stdin(Stdio::null())
         .stderr(Stdio::piped())
@@ -595,6 +778,7 @@ fn run_logged(
     command: &[String],
     place: &Place<'_>,
     log_path: &Path,
+    environment: &[(String, String)],
 ) -> Result<Option<i32>, String> {
     let mut log = std::fs::OpenOptions::new()
         .create(true)
@@ -605,6 +789,7 @@ fn run_logged(
     let errors = log.try_clone().map_err(|error| error.to_string())?;
     let status = place
         .command(command)
+        .envs(environment.iter().map(|(name, value)| (name, value)))
         .stdin(Stdio::null())
         .stdout(Stdio::from(log))
         .stderr(Stdio::from(errors))
@@ -617,7 +802,10 @@ fn run_logged(
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
 
-    use super::{Binary, LISTING_BEGIN, LISTING_END, file_name, is_count, read_listing, reconcile};
+    use super::{
+        Binary, LISTING_BEGIN, LISTING_END, file_name, is_count, libtest, read_listing, reconcile,
+        unrecorded,
+    };
     use crate::workspace::{TargetId, TargetKind};
 
     fn test_target(name: &str) -> TargetId {
@@ -820,6 +1008,27 @@ mod tests {
             ),
             None,
             "a crate's documentation tests are no binary of the build's"
+        );
+    }
+
+    #[test]
+    fn a_binary_the_log_runs_twice_is_the_steps_error() {
+        let ran = |executable: &str| {
+            (
+                None,
+                Binary {
+                    executable: executable.to_owned(),
+                    ..Binary::default()
+                },
+            )
+        };
+        let records = BTreeMap::from([("t-1".to_owned(), Ok(libtest::Record::new()))]);
+        let once = [ran("target/debug/deps/t-1"), ran("doc-tests p")];
+        assert_eq!(unrecorded(&records, &once), None);
+        let twice = [ran("target/debug/deps/t-1"), ran("target/debug/deps/t-1")];
+        assert!(
+            unrecorded(&records, &twice).is_some_and(|error| error.contains("more than once")),
+            "one record would stand for two runs"
         );
     }
 
