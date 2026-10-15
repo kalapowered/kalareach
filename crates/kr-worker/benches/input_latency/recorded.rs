@@ -273,9 +273,11 @@ pub async fn record_rounds(
             }
         }
     }
-    let wakes = witness.finish();
+    // Disarmed first, so that nothing begins while the witness is joined, and then read once more
+    // for what the last hold's path stored after its own line was taken. A writer still storing
+    // when this reads is not in the record.
     trace.disarm();
-    // What the last hold's path stored after its own line was taken.
+    let wakes = witness.finish();
     let left_over = trace.recording();
     if let Some(last) = holds.last_mut() {
         last.recording.events.extend(left_over.events);

@@ -28,10 +28,6 @@ pub enum Site {
     /// The recogniser's timer took the session to read the deadline of the prefix it holds.
     TimerLook,
     /// The recogniser's timer woke from its sleep, against the deadline it slept for.
-    #[cfg_attr(
-        not(feature = "testing"),
-        expect(dead_code, reason = "only the recorder of a testing build names it")
-    )]
     TimerWake,
     /// The recogniser's timer took the session to forward the prefix it held.
     TimerForward,
@@ -177,7 +173,8 @@ mod recording {
             self.armed.store(true, Ordering::Release);
         }
 
-        /// Stops recording. What was recorded stays until the recorder is dropped.
+        /// Stops recording. What was recorded stays until the recorder is dropped. An acquisition
+        /// that began before this is still stored when it ends.
         pub fn disarm(&self) {
             self.armed.store(false, Ordering::Release);
         }
