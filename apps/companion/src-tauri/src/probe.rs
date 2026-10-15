@@ -341,10 +341,7 @@ pub async fn bridge_check(
 
     // A call that was never permitted ends when it is stopped, and then refuses commands.
     end_and_check(platform, &call, &mut opened.events, &mut checks).await;
-    let (ok, detail) = refused(
-        platform.offer(&call).await,
-        &[FailureKind::Ended, FailureKind::NoSuchCall],
-    );
+    let (ok, detail) = refused(platform.offer(&call).await, &[FailureKind::Ended]);
     checks.push(Check::found(
         "a command to an ended call is refused",
         ok,

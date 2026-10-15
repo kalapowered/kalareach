@@ -142,6 +142,13 @@ run_android() {
     "$adb" -s "$serial" shell "run-as $app_id sh -c 'printf \"{\\\"run\\\":\\\"$run\\\"}\" > kr-probe/request.json'"
     say "starting the application, run $run"
     "$adb" -s "$serial" shell am start -n "$app_id/.MainActivity" >/dev/null
+    # The process is named while it runs: a log read by pid after the application has ended has
+    # no pid to read.
+    local pid="" tries=0
+    while [ -z "$pid" ] && [ "$tries" -lt 20 ]; do
+        pid="$("$adb" -s "$serial" shell pidof "$app_id" 2>/dev/null | tr -d '\r')"
+        [ -n "$pid" ] || { sleep 1; tries=$((tries + 1)); }
+    done
 
     local waited=0 text=""
     while :; do
@@ -153,8 +160,11 @@ run_android() {
     done
     printf '%s\n' "$text" >"$artefacts/$result_name"
     # What the application said while it ran, kept for a run that wrote no result.
-    "$adb" -s "$serial" logcat -d --pid="$("$adb" -s "$serial" shell pidof "$app_id" | tr -d '\r')" 2>/dev/null \
-        | tail -200 >"$artefacts/logcat.log"
+    if [ -n "$pid" ]; then
+        "$adb" -s "$serial" logcat -d --pid="$pid" 2>/dev/null | tail -200 >"$artefacts/logcat.log"
+    else
+        "$adb" -s "$serial" logcat -d 2>/dev/null | tail -200 >"$artefacts/logcat.log"
+    fi
     "$adb" -s "$serial" emu kill >/dev/null 2>&1
     wait "$emulator" 2>/dev/null
     judge "$artefacts/$result_name"
