@@ -30,6 +30,12 @@
     "results": ["lost", "provider", "capture", "none"]
   },
   {
+    "name": "a provider event is displaced before older news that is not one",
+    "limit": 2,
+    "ops": ["push capture", "push provider", "push first_audio", "pop", "pop", "pop", "pop"],
+    "results": ["capture", "lost", "first_audio", "none"]
+  },
+  {
     "name": "with no provider event queued a change of state over the limit takes the place of the oldest news",
     "limit": 2,
     "ops": ["push connection", "push capture", "push first_audio", "pop", "pop", "pop", "pop"],

@@ -160,8 +160,9 @@ pub struct EventFrame {
 pub enum Heard {
     /// The next item, in order.
     Event(CallEvent),
-    /// Some news was lost: the queue was full, or the numbers skipped. What the call did since the
-    /// last item read is not known.
+    /// Some news was lost: the queue was full, a number was skipped, the text that arrived was not
+    /// news, or native code said it had dropped some. What the call did since the last item read is
+    /// not known.
     Lost,
 }
 
@@ -268,6 +269,14 @@ impl NewsBuffer {
         self.entries = merged;
     }
 
+    /// Closes the queue and lets go of what waits in it: nobody will read it, and nothing is
+    /// queued after.
+    pub(crate) fn close(&mut self) {
+        self.entries.clear();
+        self.events = 0;
+        self.closed = true;
+    }
+
     /// The next place, oldest first.
     pub(crate) fn pop(&mut self) -> Option<Entry> {
         let entry = self.entries.pop_front();
@@ -368,6 +377,15 @@ impl EventSink {
 #[derive(Debug)]
 pub struct CallEvents {
     shared: Arc<Shared>,
+}
+
+impl Drop for CallEvents {
+    /// A reader that is gone leaves the news nobody to read. On a phone the channel native code
+    /// writes to, and the sink with it, lives as long as the process, so what is queued after the
+    /// reader is gone would be kept for that long: it is let go of, and nothing more is queued.
+    fn drop(&mut self) {
+        self.shared.state().buffer.close();
+    }
 }
 
 impl CallEvents {
@@ -521,7 +539,9 @@ pub trait CallPlatform: Send + Sync {
     fn accept<'a>(&'a self, call: &'a CallId, answer: &'a str) -> CallFuture<'a, Answered>;
 
     /// Lets the call carry the microphone until `closes_at_epoch_ms`, once the host has started
-    /// it. False, and nothing started, when the call is not ready to be permitted or has ended.
+    /// it. False, and nothing started, when the call is not ready to be permitted (the provider's
+    /// answer is not applied yet), is permitted already, or has ended. False with the call ended,
+    /// and the news saying so, when the moment has passed or the device refused the audio.
     fn permit<'a>(
         &'a self,
         call: &'a CallId,
@@ -991,7 +1011,7 @@ mod tests {
         }
         let cases: Vec<Case> =
             serde_json::from_str(include_str!("../fixtures/call/queue.json")).expect("the queue");
-        assert!(cases.len() >= 9);
+        assert!(cases.len() >= 10);
         for case in cases {
             let mut buffer = NewsBuffer::new(case.limit);
             let mut popped = Vec::new();
@@ -1022,6 +1042,62 @@ mod tests {
         assert_eq!(events.recv().await, Some(Heard::Event(CallEvent::Ended)));
         drop(sink);
         assert_eq!(events.recv().await, None, "the repeat was not queued");
+    }
+
+    /// Nothing follows the end of a call, not even the report of a loss: the end is the last news
+    /// there is, and what is told after it would be told of a call that is over.
+    #[tokio::test]
+    async fn nothing_follows_the_end_of_a_call_not_even_a_loss() {
+        let call = CallId("c1".to_owned());
+        let (sink, mut events) = event_queue(call.clone());
+        sink.deliver(frame(&call, 1, CallEvent::Ended));
+        sink.deliver(frame(&call, 3, CallEvent::FirstAudio));
+        sink.deliver(frame(&call, 4, CallEvent::Lost));
+        sink.deliver_json("not news");
+        drop(sink);
+
+        assert_eq!(events.recv().await, Some(Heard::Event(CallEvent::Ended)));
+        assert_eq!(events.recv().await, None);
+    }
+
+    /// The reader is told the news has ended only when every sink is gone, however many were made.
+    #[tokio::test]
+    async fn the_news_has_not_ended_while_a_sink_is_left() {
+        let call = CallId("c1".to_owned());
+        let (sink, mut events) = event_queue(call.clone());
+        let other = sink.clone();
+        let reader = tokio::spawn(async move { events.recv().await });
+        drop(sink);
+        tokio::task::yield_now().await;
+        assert!(!reader.is_finished(), "a sink is left, so the reader waits");
+
+        other.deliver(frame(&call, 1, CallEvent::FirstAudio));
+        drop(other);
+
+        assert_eq!(
+            reader.await.expect("the reader ends"),
+            Some(Heard::Event(CallEvent::FirstAudio))
+        );
+    }
+
+    /// News that arrives after the reader is gone is let go of: a sink that outlives its reader
+    /// (a phone's channel lives as long as the process) must not keep it.
+    #[tokio::test]
+    async fn news_is_not_kept_for_a_reader_that_is_gone() {
+        let call = CallId("c1".to_owned());
+        let (sink, events) = event_queue(call.clone());
+        sink.deliver(frame(&call, 1, CallEvent::FirstAudio));
+        let kept = || sink.shared.state().buffer.pop().is_some();
+
+        drop(events);
+        sink.deliver(frame(
+            &call,
+            2,
+            CallEvent::ProviderEvent { bytes: vec![0; 16] },
+        ));
+        sink.deliver_json("not news");
+
+        assert!(!kept(), "nothing waits for a reader that is gone");
     }
 
     /// A skipped number is reported as lost news where the gap is, once, and the item after the
