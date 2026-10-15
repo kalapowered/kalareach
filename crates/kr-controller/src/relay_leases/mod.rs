@@ -88,8 +88,13 @@
 //! lease ended, also when the lease the row names is another. The same holds after a restart, and
 //! for a change of payer: the pair is asked again under the payer the row was kept for, the lease
 //! it finds is ended, and only then is the pair asked for under the new payer, because the service
-//! refuses another authorisation of the same account for a pair whose lease stands. If the service
-//! turns the old payer back, no lease can be alive under it and the row is dropped.
+//! refuses another authorisation of the same account for a pair whose lease stands, also when it
+//! has run out and is not yet ended. A device that is still paired is asked this way whatever the
+//! age of the row, and the row is dropped once the service has answered about the pair and named
+//! no lease. If the service answers that the old authorisation is not one it holds for this host's
+//! key, or is no longer in force, no lease can be alive under it and the row is dropped at once.
+//! Any other refusal says nothing of the pair: the row stays, and so does the wait before the next
+//! ask.
 
 pub mod record;
 
@@ -854,10 +859,13 @@ async fn reconcile(
     // longest a lease lives has passed since that request. Asking is how the host learns which, and
     // the ask is made under the payer the row was kept for, never under the current one: the
     // service finds a pair's lease within the account that pays, and refuses another authorisation
-    // of that account for as long as it stands. For a device that is no longer paired, and for one
-    // whose payer changed, the ask ends what it finds. Where the host's own endpoint has changed
-    // the pair cannot be asked for at all, and the row is dropped; the lease, if there was one,
-    // runs out by itself.
+    // of that account for as long as it stands, also when it has run out and is not yet ended. For
+    // a device that is no longer paired, and for one whose payer changed, the ask ends what it
+    // finds. A device that is still paired is asked for under the new payer once the old one has
+    // been asked, so a row of one whose payer changed is asked whatever its age: its last ask is
+    // the one that clears a lease that ran out before the host could end it. Where the host's own
+    // endpoint has changed the pair cannot be asked for at all, and the row is dropped; the lease,
+    // if there was one, runs out by itself.
     let mut unwanted = Vec::new();
     for row in shared.on_record(Record::rows).await? {
         let same_source = row.source == running.endpoint;
@@ -881,11 +889,13 @@ async fn reconcile(
         } else {
             LeaseEndReason::Unpaired
         };
-        let may_hold_another = row.written_at_ms > 0
-            && now.saturating_sub(row.written_at_ms) <= LONGEST_LEASE_MS
-            && same_source;
+        let young = now.saturating_sub(row.written_at_ms) <= LONGEST_LEASE_MS;
+        let may_hold_another = row.written_at_ms > 0 && same_source && (young || device_is_paired);
         match row.lease_id {
-            Some(lease) => {
+            // The lease the row names is ended, and the row stays as the request that may have
+            // opened another: both in one step, so that no stop leaves the ending owed and the
+            // request forgotten. It is asked about in this pass, after the ending is sent.
+            Some(lease) if may_hold_another => {
                 let recovery = Row {
                     lease_id: None,
                     ceiling: BLOCK_BYTES,
@@ -893,20 +903,28 @@ async fn reconcile(
                     expires_at_ms: 0,
                     ..row
                 };
+                let kept = recovery.clone();
                 shared
                     .on_record(move |record| {
-                        record.end(&destination, lease, reason)?;
-                        if may_hold_another {
-                            record.save(&recovery)?;
-                        }
-                        Ok(())
+                        record.end_keeping(&destination, lease, reason, Some(&kept))
                     })
                     .await?;
-                if may_hold_another {
-                    shared.wake.notify_one();
-                }
+                unwanted.push(Recovery {
+                    row: recovery,
+                    reason,
+                    last: !young,
+                });
             }
-            None if may_hold_another => unwanted.push((row, reason)),
+            Some(lease) => {
+                shared
+                    .on_record(move |record| record.end(&destination, lease, reason))
+                    .await?;
+            }
+            None if may_hold_another => unwanted.push(Recovery {
+                row,
+                reason,
+                last: !young,
+            }),
             None => {
                 shared
                     .on_record(move |record| record.forget(&destination))
@@ -933,7 +951,7 @@ async fn reconcile(
     // requests: what else it would ask is turned back for the same reason.
     if asks_held_ms == 0 && !unreachable && !refused_an_ending {
         let mut recovered = false;
-        for (row, reason) in unwanted {
+        for Recovery { row, reason, last } in unwanted {
             asked = true;
             let foreign = row.payer != payer_key;
             let destination = row.destination;
@@ -948,12 +966,24 @@ async fn reconcile(
                     refused_an_ending = true;
                     break;
                 }
-                // The service turns the old payer back: the authorisation is withdrawn or was
-                // never the host's, and no lease can be alive under it. The row is done with.
-                Asked::Standing(Standing::Refused(_)) if foreign => {
+                // The service says the old payer's authorisation is not one it holds for this
+                // host's key, or is not in force: no lease can be alive under it. The row is done
+                // with. Any other refusal says nothing of the pair, and the row stays.
+                Asked::Disowned(_) if foreign => {
                     shared
                         .on_record(move |record| record.forget(&destination))
                         .await?;
+                }
+                // The row's last ask, and the service answered about the pair: it holds no lease
+                // under the old payer that it will name, so nothing is left to learn by asking.
+                Asked::Standing(Standing::Exhausted { .. } | Standing::NoLease) if last => {
+                    shared
+                        .on_record(move |record| record.forget(&destination))
+                        .await?;
+                }
+                Asked::Disowned(code) => {
+                    standing = Some(Standing::Refused(code));
+                    break;
                 }
                 Asked::Standing(why) => {
                     standing = Some(why);
@@ -982,7 +1012,17 @@ async fn reconcile(
     if !unreachable && !refused_an_ending {
         // The leases the host holds are refilled before a pair with none is asked for, so a pair
         // the service has no room for does not keep the rest from being refilled.
-        let mut ordered: Vec<&DeviceRecord> = paired.iter().collect();
+        // A device whose row was kept for another payer is not asked for under this one until that
+        // row is resolved: the service refuses it for as long as a lease of the old payer stands,
+        // and asking under the old payer is the recovery's, which ends what it finds.
+        let mut ordered: Vec<&DeviceRecord> = paired
+            .iter()
+            .filter(|device| {
+                !rows
+                    .iter()
+                    .any(|row| row.destination == device.endpoint_id && row.payer != payer_key)
+            })
+            .collect();
         ordered.sort_by_key(|device| {
             !rows
                 .iter()
@@ -1043,7 +1083,7 @@ async fn reconcile(
                 {
                     standing = Some(why);
                 }
-                Asked::Standing(Standing::Refused(code)) => {
+                Asked::Standing(Standing::Refused(code)) | Asked::Disowned(code) => {
                     // A refusal can be about one pair, so the next device is asked; two in one pass
                     // are the account or the host's key being turned away, and the rest wait.
                     standing = Some(Standing::Refused(code));
@@ -1235,8 +1275,23 @@ enum Asked {
     Later,
     /// The service turned back the ending of a lease for a reason only the owner can change.
     EndingRefused(ErrorCode),
+    /// The service answered `FORBIDDEN` to a request that only learns the lease a row may stand
+    /// for: the authorisation it was made under is not one the service holds for this host's key,
+    /// or is no longer in force.
+    Disowned(ErrorCode),
     /// The service answered something the owner or the calendar must change.
     Standing(Standing),
+}
+
+/// A row that stands for a request whose answer the host has not seen, and the reason its pair is
+/// asked about instead of asked for.
+struct Recovery {
+    row: Row,
+    reason: LeaseEndReason,
+    /// Whether the row has aged past the longest a lease lives. A row of a device that is still
+    /// paired is asked once more whatever its age, and is done with once the service has answered
+    /// about the pair.
+    last: bool,
 }
 
 /// A named lease at the start of a new reservation: nothing counted, no deadline.
@@ -1303,10 +1358,12 @@ enum Turned {
 /// pair asked for afresh; a lease the service does not carry is dropped and the pair asked for
 /// afresh.
 ///
-/// A lease the answer names that the row does not, with a ceiling above a block, is a replacement
-/// the service opened for a refill it found past its deadline, or one it opened for a refill whose
-/// answer was lost. It holds the ceiling the refill asked for, which for a pair that has carried
-/// traffic is far more than a new reservation needs, so it is ended and the pair asked afresh.
+/// A lease that was never revised and holds a ceiling above a block, returned to a request that is
+/// not ending the pair, is a replacement the service opened for a refill it found past its
+/// deadline, or one it opened for a refill whose answer was lost. It holds the ceiling the refill
+/// asked for, which for a pair that has carried traffic is far more than a new reservation needs,
+/// so it is ended and the pair asked afresh. A lease the host has raised has been revised, and is
+/// left alone, whichever request returns it.
 #[allow(clippy::too_many_lines)]
 async fn ask(
     shared: &Arc<Shared>,
@@ -1467,7 +1524,15 @@ async fn ask(
                 Failure::NotActed(code) if needs_the_owner(code) => {
                     log_refusal(&error);
                     let_the_time_stand(shared, &row, original, dropped).await?;
-                    return Ok(Asked::Standing(Standing::Refused(code)));
+                    // `UNAUTHENTICATED` shares the protocol code and the action with `FORBIDDEN`,
+                    // and says nothing of the authorisation: the credential was not admitted.
+                    return Ok(
+                        if ending.is_some() && error.service_code() == Some("FORBIDDEN") {
+                            Asked::Disowned(code)
+                        } else {
+                            Asked::Standing(Standing::Refused(code))
+                        },
+                    );
                 }
                 Failure::NotActed(ErrorCode::QuotaExceeded) => {
                     let_the_time_stand(shared, &row, original, dropped).await?;

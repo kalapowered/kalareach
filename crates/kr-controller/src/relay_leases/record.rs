@@ -7,11 +7,14 @@
 //! the service has not yet answered.
 //!
 //! A row is written before every request that may create or revise its lease is sent, with the
-//! time it was written, and again with no time once the answer is seen. The service answers a
-//! request for a pair that already holds a lease with that lease, so asking again after a restart
-//! is how the host learns the identifier a lost answer carried. A row that holds the time of a
-//! request is kept until the longest a lease can live has passed since then, because until then the
-//! pair may still hold a lease the host has not been told of.
+//! time of that request. An answer that names a lease writes the row again with no time. An answer
+//! that says the request issued nothing puts back the time the row held before it, because the
+//! latest request that may have issued a lease is then the earlier one. A request that went
+//! unanswered keeps its time, and so does one that followed a lease the host dropped without
+//! ending. The service answers a request for a pair that already holds a lease with that lease, so
+//! asking again after a restart is how the host learns the identifier a lost answer carried. A row
+//! that holds the time of a request is kept until the longest a lease can live has passed since
+//! then, because until then the pair may still hold a lease the host has not been told of.
 //!
 //! Everything in the record belongs to one service and one host key. The record names the scope it
 //! was kept for, and a daemon started for another scope, or for none, discards what it holds: a
@@ -125,6 +128,26 @@ fn endpoint_of(bytes: Vec<u8>) -> rusqlite::Result<EndpointKey> {
     <[u8; 32]>::try_from(bytes)
         .map(EndpointKey::from_bytes)
         .map_err(|_| rusqlite::Error::InvalidQuery)
+}
+
+fn write_row(connection: &Connection, row: &Row) -> rusqlite::Result<()> {
+    connection.execute(
+        "INSERT OR REPLACE INTO relay_leases
+             (destination, source, lease_id, payer, ceiling, consumed, expires_at_ms,
+              written_at_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            row.destination.as_bytes().as_slice(),
+            row.source.as_bytes().as_slice(),
+            row.lease_id.map(|lease| lease.get().to_string()),
+            row.payer,
+            counter(row.ceiling),
+            counter(row.consumed),
+            counter(row.expires_at_ms),
+            counter(row.written_at_ms),
+        ],
+    )?;
+    Ok(())
 }
 
 fn counter(value: u64) -> i64 {
@@ -318,25 +341,7 @@ impl Record {
     ///
     /// Returns an error when the record cannot be written.
     pub fn save(&self, row: &Row) -> Result<()> {
-        self.with(|connection| {
-            connection.execute(
-                "INSERT OR REPLACE INTO relay_leases
-                     (destination, source, lease_id, payer, ceiling, consumed, expires_at_ms,
-                      written_at_ms)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                params![
-                    row.destination.as_bytes().as_slice(),
-                    row.source.as_bytes().as_slice(),
-                    row.lease_id.map(|lease| lease.get().to_string()),
-                    row.payer,
-                    counter(row.ceiling),
-                    counter(row.consumed),
-                    counter(row.expires_at_ms),
-                    counter(row.written_at_ms),
-                ],
-            )?;
-            Ok(())
-        })
+        self.with(|connection| write_row(connection, row))
     }
 
     /// Forgets what the host held for one device, when it holds no lease the service could still
@@ -367,16 +372,39 @@ impl Record {
         lease: RelayLeaseId,
         reason: LeaseEndReason,
     ) -> Result<()> {
+        self.end_keeping(destination, lease, reason, None)
+    }
+
+    /// As [`Self::end`], and puts `kept` in the place of the device's row in the same step, for a
+    /// row that stands for a request whose answer the host has not seen. A stop, or a failed write,
+    /// leaves the lease in its row and nothing owed, or the ending owed and the row kept: never the
+    /// ending owed and the request forgotten.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the record cannot be written.
+    pub fn end_keeping(
+        &self,
+        destination: &EndpointKey,
+        lease: RelayLeaseId,
+        reason: LeaseEndReason,
+        kept: Option<&Row>,
+    ) -> Result<()> {
         self.with(|connection| {
             let transaction = connection.unchecked_transaction()?;
             transaction.execute(
                 "INSERT OR IGNORE INTO relay_endings (lease_id, reason) VALUES (?1, ?2)",
                 params![lease.get().to_string(), text_of(reason)],
             )?;
-            transaction.execute(
-                "DELETE FROM relay_leases WHERE destination = ?1",
-                params![destination.as_bytes().as_slice()],
-            )?;
+            match kept {
+                Some(row) => write_row(&transaction, row)?,
+                None => {
+                    transaction.execute(
+                        "DELETE FROM relay_leases WHERE destination = ?1",
+                        params![destination.as_bytes().as_slice()],
+                    )?;
+                }
+            }
             transaction.commit()
         })
     }
