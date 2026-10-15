@@ -185,7 +185,7 @@ impl Backend {
     }
 
     /// Ends the server, unless the session is closing, whose closure ends the servers after the
-    /// acceptance of its close has been delivered ([`CommandBackends::end_servers`]), since the
+    /// acceptance of its close has been delivered (`CommandBackends::end_servers`), since the
     /// command that asked for the close may be one the server started. It is what the end of the
     /// program's connection, the end of the program and a retirement ask for; a launch that had
     /// not committed has no such command and ends its server outright ([`Backend::end_gateway`]).
