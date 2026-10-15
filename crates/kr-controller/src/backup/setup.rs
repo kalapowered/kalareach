@@ -39,6 +39,7 @@
 //! for a token and removed by a guard when the call ends however it ends. `backup.status` reads the
 //! entries without waiting for any call, so a setup that is under way is told so.
 
+use std::any::Any;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
@@ -211,20 +212,31 @@ impl BackupSetup {
     }
 
     /// Answers `backup.status`.
-    pub async fn status(&self, privacy_mode: bool) -> BackupStatusResult {
+    ///
+    /// The calls that are running are read first, and without waiting for any of them. The
+    /// recorded setup is read next: a call records its setup and then ends, so a call that had
+    /// ended when the first read was made has recorded its setup by the time the second is, and a
+    /// kit that is in use is never told as "not set up, and none in progress". Everything after
+    /// that is bounded and waits for no call.
+    ///
+    /// # Errors
+    ///
+    /// Returns the store's failure when the recorded setup cannot be read: an answer that the host
+    /// is not set up is the store's own fact, and a store that could not be read says nothing.
+    pub async fn status(&self, privacy_mode: bool) -> Result<BackupStatusResult> {
+        let (running, last) = self.progress();
+        let backup = Arc::clone(&self.backup);
+        let (setup, enrolled) = tokio::task::spawn_blocking(move || {
+            Ok::<_, ControllerError>((backup.setup()?, backup.authorised_writers()?))
+        })
+        .await
+        .map_err(|_| ControllerError::RegistryUnavailable {
+            detail: "the thread that reads the recorded setup did not finish".to_owned(),
+        })??;
+
         let tokens = self.account.tokens_for(self.origin.as_str());
         let sign_in = self.sign_in(&tokens).await;
         let mark = self.account.mark_at(self.origin.as_str());
-        let backup = Arc::clone(&self.backup);
-        let read = tokio::task::spawn_blocking(move || {
-            Ok::<_, ControllerError>((backup.setup()?, backup.authorised_writers()?))
-        })
-        .await;
-        let (setup, enrolled) = match read {
-            Ok(Ok(read)) => read,
-            _ => (None, Vec::new()),
-        };
-        let (running, last) = self.progress();
         let state = if let Some(Setup { record, .. }) = &setup {
             BackupSetupState::Committed {
                 archive_id: record.archive_id,
@@ -252,12 +264,12 @@ impl BackupSetup {
             }
         };
         let storage = match mark {
-            None => BackupStorageState::Unread {
+            Some(mark) if sign_in == BackupSignIn::Usable => self.read_storage(mark).await,
+            _ => BackupStorageState::Unread {
                 why: BackupStorageUnread::NoToken,
             },
-            Some(mark) => self.read_storage(mark).await,
         };
-        BackupStatusResult {
+        Ok(BackupStatusResult {
             service: Nullable::some(self.origin.as_str().to_owned()),
             sign_in,
             privacy_mode,
@@ -270,15 +282,20 @@ impl BackupSetup {
             }),
             storage,
             last_attempt: Nullable::from(last),
-        }
+        })
     }
 
     /// Whether this host holds an account token a request may carry, and why not when it does not.
+    ///
+    /// Asking for a token can wait for the account's lock, which a call that is refreshing the
+    /// grant holds, so the wait is bounded; a token that could not be had in time is told as one
+    /// that was not renewed.
     async fn sign_in(&self, tokens: &Arc<dyn AccountTokenSource>) -> BackupSignIn {
-        if tokens.token(BACKUP_WRITE_SCOPE).await.is_ok() {
-            return BackupSignIn::Usable;
+        match tokio::time::timeout(STATUS_READ, tokens.token(BACKUP_WRITE_SCOPE)).await {
+            Ok(Ok(_)) => BackupSignIn::Usable,
+            Ok(Err(_)) => self.sign_in_cause(),
+            Err(_) => BackupSignIn::NotRenewed,
         }
-        self.sign_in_cause()
     }
 
     /// Why no token can be had, in the words of `backup.read`.
@@ -351,12 +368,20 @@ impl BackupSetup {
     ///
     /// Returns [`ControllerError::InvalidArgument`] for a call whose fingerprint is not the one its
     /// recovery public key has. Every other way the call can end is one of its answers.
-    pub async fn enable(&self, params: BackupEnableParams) -> Result<BackupEnableResult> {
+    pub async fn enable(
+        &self,
+        params: BackupEnableParams,
+        daemon: Option<Arc<dyn Any + Send + Sync>>,
+    ) -> Result<BackupEnableResult> {
         if params.kit_fingerprint != kit_fingerprint(&params.recovery_public_key) {
             return Err(ControllerError::InvalidArgument(
                 "the kit fingerprint is not the recovery public key's".to_owned(),
             ));
         }
+        // The account the call begins under is the one it was admitted under, and not the one that
+        // is signed in when it gets its turn: a call that waits behind another must not start its
+        // requests under an account that signed in meanwhile.
+        let mark = self.account.mark_at(self.origin.as_str());
         // Recorded when the call is admitted, before it waits for another call or for a token.
         let entry = {
             let mut calls = self.calls();
@@ -369,7 +394,7 @@ impl BackupSetup {
             }
         };
         let serial = self.serial.lock().await;
-        let ended = self.run(&params).await;
+        let ended = self.run(&params, mark, daemon).await;
         drop(serial);
         {
             let mut calls = self.calls();
@@ -390,8 +415,13 @@ impl BackupSetup {
     }
 
     /// Everything a call does, ending as one of its answers.
-    async fn run(&self, params: &BackupEnableParams) -> BackupEnableResult {
-        match self.steps(params).await {
+    async fn run(
+        &self,
+        params: &BackupEnableParams,
+        mark: Option<kr_client::services::AccountMark>,
+        daemon: Option<Arc<dyn Any + Send + Sync>>,
+    ) -> BackupEnableResult {
+        match self.steps(params, mark, daemon).await {
             Ok(done) | Err(done) => done,
         }
     }
@@ -399,6 +429,8 @@ impl BackupSetup {
     async fn steps(
         &self,
         params: &BackupEnableParams,
+        mark: Option<kr_client::services::AccountMark>,
+        daemon: Option<Arc<dyn Any + Send + Sync>>,
     ) -> std::result::Result<BackupEnableResult, Ended> {
         let origin = self.origin.as_str();
         let backup = Arc::clone(&self.backup);
@@ -429,7 +461,7 @@ impl BackupSetup {
         if params.sealed_bundle.as_slice().len() as u64 > MAX_SEALED_RECOVERY_BUNDLE_BYTES {
             return Err(declined(BackupEnableCause::BundleTooLarge {}));
         }
-        let Some(mark) = self.account.mark_at(origin) else {
+        let Some(mark) = mark else {
             return Err(declined(BackupEnableCause::SignIn {
                 sign_in: self.sign_in_cause(),
             }));
@@ -462,14 +494,26 @@ impl BackupSetup {
         let backup = Arc::clone(&self.backup);
         let replace = params.replace;
         let at = params.enabled_at_ms;
-        let committed = {
-            let record = record.clone();
-            tokio::task::spawn_blocking(move || backup.commit_setup(&record, replace, at)).await
+        let committed = match daemon {
+            // The thread keeps the daemon until the commit has ended, though this call stops
+            // waiting for it.
+            Some(daemon) => {
+                let record = record.clone();
+                tokio::task::spawn_blocking(move || {
+                    let _daemon = daemon;
+                    backup.commit_setup(&record, replace, at)
+                })
+                .await
+                .ok()
+            }
+            // A daemon that is being let go commits on the thread it is on, which it keeps until
+            // the commit ends.
+            None => Some(backup.commit_setup(&record, replace, at)),
         };
         match committed {
-            Ok(Ok(_)) => Ok(enabled(&record)),
+            Some(Ok(_)) => Ok(enabled(&record)),
             // A store that refuses the setup as it stands: the archive has generations here.
-            Ok(Err(ControllerError::InvalidArgument(_))) => {
+            Some(Err(ControllerError::InvalidArgument(_))) => {
                 Err(declined(BackupEnableCause::ArchiveInUse {}))
             }
             _ => Err(unknown(None)),
@@ -532,6 +576,9 @@ impl BackupSetup {
         collection: &str,
         params: &BackupEnableParams,
     ) -> std::result::Result<(), Ended> {
+        // A delay the service named with the answer that brought the call here is owed to the
+        // read as much as to any other request.
+        self.wait_out_delay()?;
         match sync.fetch(collection).await {
             Ok(SyncFetched::Held { ciphertext, .. }) => {
                 if ciphertext == params.sealed_bundle.as_slice() {

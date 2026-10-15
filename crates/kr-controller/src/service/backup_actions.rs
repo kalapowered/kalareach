@@ -67,7 +67,7 @@ impl Controller {
     pub(super) async fn backup_status(&self, params: &ParamsValue) -> Result<ParamsValue> {
         let _: BackupStatusParams = parse(params)?;
         let setup = self.backup_setup_of()?;
-        let answer = setup.status(self.privacy.state().now().private).await;
+        let answer = setup.status(self.privacy.state().now().private).await?;
         ParamsValue::from_typed(&answer)
             .map_err(|error| ControllerError::InvalidArgument(error.to_string()))
     }
@@ -85,7 +85,14 @@ impl Controller {
     pub(super) async fn backup_enable(&self, mutation: &MutationRequest) -> Result<ParamsValue> {
         let params: BackupEnableParams = parse(&mutation.params)?;
         let setup = self.backup_setup_of()?;
-        let answer = setup.enable(params).await?;
+        // The setup is committed on a thread that this call can stop waiting for. The thread keeps
+        // the daemon, and with it the environment's lock, until the commit has ended: a commit that
+        // went on after the lock was let go could land beside the next daemon's start.
+        let daemon: Option<std::sync::Arc<dyn std::any::Any + Send + Sync>> = self
+            .me
+            .upgrade()
+            .map(|daemon| daemon as std::sync::Arc<dyn std::any::Any + Send + Sync>);
+        let answer = setup.enable(params, daemon).await?;
         ParamsValue::from_typed(&answer)
             .map_err(|error| ControllerError::InvalidArgument(error.to_string()))
     }

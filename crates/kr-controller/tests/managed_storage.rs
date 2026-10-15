@@ -4075,6 +4075,26 @@ impl Rig {
             .expect("a result of the declared shape")
     }
 
+    /// Has the carrier look at its work `count` times, and waits until it has. The waits are on
+    /// the passes the carrier finishes, and not on a number of turns of the scheduler.
+    async fn carrier_passes(&self, count: u64) {
+        let mut passes = self
+            .controller
+            .backup_runtime()
+            .expect("a carrier")
+            .passes();
+        let before = *passes.borrow_and_update();
+        for step in 1..=count {
+            self.controller.backup().signals().work.notify_one();
+            within("the carrier's pass", async {
+                while *passes.borrow_and_update() < before + step {
+                    passes.changed().await.expect("the carrier is running");
+                }
+            })
+            .await;
+        }
+    }
+
     /// The paths of the requests the stand-in has been given, in order, from `from` on.
     fn requested_since(&self, from: usize) -> Vec<String> {
         self.served.web().arrived()[from..]
@@ -4477,14 +4497,29 @@ async fn a_setup_under_way_is_told_by_status_and_the_doctor_at_each_point_of_the
         "{detail}"
     );
 
-    // The first call fails; the repeat is still under way, and is told alone.
+    // The first call fails; the repeat gets its turn and is held at the enrolment, so it is still
+    // under way when the first call's entry is gone, and is told alone.
+    web.fail(MANIFEST, 1, Moment::Hold);
     web.release_held();
     assert!(matches!(
         first.await.expect("the first call ends"),
         BackupEnableResult::Unknown { .. }
     ));
-    // The repeat goes on to finish while the status is read. The state it is in is told, whichever
-    // point it has reached: held, or done.
+    within("the repeat's enrolment", web.requests_reach(MANIFEST, 1)).await;
+    match rig.backup_status().await.setup {
+        BackupSetupState::InProgress { kit_fingerprints } => assert_eq!(
+            kit_fingerprints,
+            [made.kit_fingerprint.clone()],
+            "the repeat alone is told"
+        ),
+        other => panic!("the repeat is under way, and the status says {other:?}"),
+    }
+    let (_, detail) = rig.production_check().await;
+    assert!(
+        detail.contains("a setup is in progress with the kit"),
+        "{detail}"
+    );
+    web.release_held();
     let finished = second.await.expect("the repeat ends");
     assert!(matches!(finished, BackupEnableResult::Enabled { .. }));
     assert!(matches!(
@@ -4506,6 +4541,121 @@ async fn a_setup_under_way_is_told_by_status_and_the_doctor_at_each_point_of_the
     assert!(other.controller.backup().setup().expect("a read").is_none());
     web.release_held();
     let _ = call.await.expect("the call ends");
+}
+
+/// A call that waits for another keeps the account it was admitted under. The host signs in as
+/// another account while the call waits behind one that is held at the service: when its turn comes
+/// no request of it leaves under the new account, and nothing is recorded. A call that took its
+/// account when its turn came would write the bundle under the account that signed in meanwhile.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_call_that_waits_for_another_keeps_the_account_it_was_admitted_under() {
+    let timer = HeldTimer::held();
+    let (rig, _) = a_host_to_set_up(&timer).await;
+    let web = Arc::clone(rig.served.web());
+    web.issue_token("the-second-token", "account-two", &["backup.write"]);
+    let made = rig.prepared_setup(archive_id(), false);
+
+    web.fail(SYNC, 1, Moment::Hold);
+    let first = rig.enable_in_the_background(&made.params);
+    within("the bundle write", web.requests_reach(SYNC, 1)).await;
+    let second = rig.enable_in_the_background(&made.params);
+    within("both calls are told", async {
+        loop {
+            if let BackupSetupState::InProgress { kit_fingerprints } =
+                rig.backup_status().await.setup
+                && kit_fingerprints.len() == 2
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+
+    rig.sign_in_with("account-two", "the-second-token").await;
+    web.release_held();
+    let another_account = BackupEnableResult::Declined {
+        cause: BackupEnableCause::AnotherAccount {},
+    };
+    assert_eq!(first.await.expect("the first call ends"), another_account);
+    assert_eq!(second.await.expect("the second call ends"), another_account);
+    assert_eq!(
+        web.requests_to(SYNC),
+        1,
+        "nothing of either call left under the account that signed in"
+    );
+    assert!(rig.controller.backup().setup().expect("a read").is_none());
+    assert!(
+        web.bundle(&made.params.bundle_locator.to_string())
+            .is_none()
+    );
+}
+
+/// A bundle write the service answers with a delay is not followed by the read that settles it
+/// until the delay has passed: the call ends with the delay, and the service is asked nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_delay_the_service_names_to_the_bundle_write_is_owed_to_the_read_that_settles_it() {
+    let timer = HeldTimer::held();
+    let (rig, _) = a_host_to_set_up(&timer).await;
+    let web = Arc::clone(rig.served.web());
+    let made = rig.prepared_setup(archive_id(), false);
+    web.fail(
+        SYNC,
+        1,
+        Moment::Refuse {
+            status: 429,
+            code: "RATE_LIMITED",
+            retry_after_seconds: Some(30),
+        },
+    );
+    let result = rig.enable(&made.params).await;
+    assert!(
+        matches!(
+            &result,
+            BackupEnableResult::Unknown { retry_after_seconds }
+                if retry_after_seconds.0.is_some()
+        ),
+        "{result:?}"
+    );
+    assert_eq!(
+        web.requests_to(SYNC),
+        1,
+        "the read that settles the write waits for the delay"
+    );
+}
+
+/// The causes of a bundle write the service refuses, each with its own answer and nothing recorded
+/// or enrolled: a locator that holds another bundle, and a token the service does not take as an
+/// account's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_bundle_conflict_and_a_token_the_service_does_not_take_are_told_apart() {
+    let timer = HeldTimer::held();
+    let (rig, _) = a_host_to_set_up(&timer).await;
+    let web = Arc::clone(rig.served.web());
+    let made = rig.prepared_setup(archive_id(), false);
+
+    web.put_bundle(
+        &made.params.bundle_locator.to_string(),
+        ACCOUNT,
+        vec![1, 2, 3],
+    );
+    assert_eq!(
+        rig.enable(&made.params).await,
+        BackupEnableResult::Declined {
+            cause: BackupEnableCause::BundleConflict {}
+        }
+    );
+
+    let other = rig.prepared_setup(archive_two(), false);
+    web.expire_token(TOKEN);
+    assert_eq!(
+        rig.enable(&other.params).await,
+        BackupEnableResult::Declined {
+            cause: BackupEnableCause::TokenNotAccepted {}
+        }
+    );
+    assert_eq!(web.requests_to(MANIFEST), 0, "nothing was enrolled");
+    assert!(rig.controller.backup().setup().expect("a read").is_none());
 }
 
 /// A host signed in as another account while a call runs commits nothing: the request that carries
@@ -4675,9 +4825,8 @@ async fn a_replacement_retires_the_earlier_writer_and_takes_back_its_unfinished_
     // What was published stays published, and its objects stay at the service.
     assert!(rig.published(1));
     web.release_held();
-    for _ in 0..100 {
-        tokio::task::yield_now().await;
-    }
+    timer.run_by_itself();
+    rig.carrier_passes(2).await;
     assert_eq!(
         web.requests_to(PART) + web.requests_to(COMPLETE),
         sent_before,
@@ -4723,22 +4872,12 @@ async fn a_replacement_under_another_account_sends_nothing_for_the_earlier_archi
     timer.run_by_itself();
     // The carrier looks at its work again, twice, and asks the service what the account records:
     // that is the pass in which a host that kept deleting would delete.
-    let mut passes = rig.controller.backup_runtime().expect("a carrier").passes();
-    let before = *passes.borrow_and_update();
-    for step in 1..=2 {
-        rig.controller.backup().signals().work.notify_one();
-        within("the carrier's pass", async {
-            while *passes.borrow_and_update() < before + step {
-                passes.changed().await.expect("the carrier is running");
-            }
-        })
-        .await;
-    }
-    assert!(
-        web.requests_to(STATUS) > 1,
-        "the pass asked the service what the account records"
-    );
+    rig.carrier_passes(2).await;
     let since = rig.requested_since(asked);
+    assert!(
+        since.iter().any(|path| path == STATUS),
+        "the pass asked the service what the account records: {since:?}"
+    );
     assert!(
         since.iter().all(|path| path != DELETE),
         "no deletion left for the earlier archive: {since:?}"

@@ -910,13 +910,16 @@ impl Controller {
         if observed.left_out_configuration {
             detail = detail.stated("; the configuration document was not packed");
         }
+        // The calls that are running are read before the recorded setup: a call records its setup
+        // and then ends, so one that had ended when the first was read has recorded its setup by
+        // the time the second is, and the check never shows neither for a kit that is in use.
+        let progress = self.backup_setup.as_ref().map(|setup| setup.progress());
         if let Some(fingerprint) = self.backup.recorded_kit() {
             detail = detail
                 .stated("; set up with the kit ")
                 .kit_fingerprint(&fingerprint);
         }
-        if let Some(setup) = &self.backup_setup {
-            let (running, last) = setup.progress();
+        if let Some((running, last)) = progress {
             for fingerprint in &running {
                 detail = detail
                     .stated("; a setup is in progress with the kit ")
