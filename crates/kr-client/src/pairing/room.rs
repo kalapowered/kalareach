@@ -23,10 +23,9 @@
 //! this socket now, which is why a refused upgrade keeps its status.
 
 use std::future::Future;
-use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context, Poll, ready};
+use std::task::Poll;
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
@@ -38,30 +37,20 @@ use kr_protocol::rendezvous::{
 };
 use kr_protocol::scalars::to_base64url;
 use kr_transport::config::ProxyUrl;
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::net::TcpStream;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc;
-use tokio_rustls::TlsConnector;
 use tokio_rustls::rustls::ClientConfig;
-use tokio_rustls::rustls::pki_types::ServerName;
-use tokio_websockets::{ClientBuilder, Limits, Message, WebSocketStream};
+use tokio_websockets::{Message, WebSocketStream};
 
 use crate::shown::{Said, Shown};
-use crate::tunnel::{self, Carrier};
-
-/// How long opening a room socket may take: the name, the connection, TLS and the upgrade.
-pub const OPEN_DEADLINE: Duration = Duration::from_secs(10);
+use crate::tunnel;
+use crate::wss::{self, Failure, Upgrade};
 
 /// How many frames wait in each direction between a room socket and its caller.
 const ROOM_QUEUE: usize = 16;
 
 /// How long a socket may take to close once its pump is done with it.
 const CLOSE_DEADLINE: Duration = Duration::from_secs(1);
-
-/// The most of a room's answer to the upgrade that is read before its head is complete.
-///
-/// A real answer's head is a few hundred bytes.
-pub const MAX_UPGRADE_ANSWER_BYTES: usize = 16 * 1024;
 
 /// How many of the room's pings may arrive while the socket cannot take the answers to them.
 ///
@@ -184,76 +173,6 @@ const EVERY_ORIGIN: &str = "every origin";
 
 /// The platform's certificate verifier could not be set up.
 const NO_VERIFIER: &str = "the platform's certificate verifier cannot be set up";
-/// The origin is not an https origin.
-const NOT_HTTPS: &str = "a rendezvous origin is an https origin";
-/// An IPv6 origin's brackets do not close.
-const OPEN_BRACKETS: &str = "an IPv6 origin closes its brackets";
-/// The origin's port is not a number a port can be.
-const NOT_A_PORT: &str = "the origin's port is not a port number";
-/// The origin's host is not a name TLS can verify.
-const NOT_A_TLS_NAME: &str = "the origin's host is not a name TLS can verify";
-/// The room's address cannot be written as a request.
-const NOT_AN_ADDRESS: &str = "the room's address cannot be written as a request";
-/// The control token's header cannot be sent.
-const NO_TOKEN_HEADER: &str = "the control token header cannot be sent";
-/// The control token cannot be sent.
-const NO_TOKEN: &str = "the control token cannot be sent";
-/// The socket did not open within [`OPEN_DEADLINE`].
-const TOO_SLOW: &str = "the socket did not open within its deadline";
-/// The connection to the origin's host failed.
-const NO_CONNECTION: &str = "the connection failed";
-/// The TLS handshake failed.
-const NO_TLS: &str = "the TLS handshake failed";
-/// The upgrade did not finish.
-const UNFINISHED: &str = "the upgrade did not finish";
-/// The answer does not begin with a status line.
-const NO_STATUS_LINE: &str = "the room's answer to the upgrade does not begin with a status line";
-/// The answer is longer than [`MAX_UPGRADE_ANSWER_BYTES`].
-const TOO_LONG: &str = "the room's answer to the upgrade is longer than an answer may be";
-/// The answer carries an accept value that is not one SHA-1 digest.
-const NOT_A_DIGEST: &str =
-    "the room's answer to the upgrade carries an accept value that is no SHA-1 digest";
-/// The answer lacks a header an upgrade needs.
-const MISSING_HEADER: &str = "the answer lacks a header an upgrade needs";
-/// The answer's `Upgrade` header is not `websocket`.
-const NOT_WEBSOCKET: &str = "the answer upgrades to another protocol than WebSocket";
-/// The answer's `Connection` header does not upgrade.
-const NO_UPGRADE: &str = "the answer's connection header does not upgrade";
-/// The answer names a WebSocket version this client does not speak.
-const OTHER_VERSION: &str = "the answer names a WebSocket version this client does not speak";
-/// The answer is not a response that can be read.
-const UNPARSED: &str = "the answer is not a response this client can read";
-/// The answer's accept value is not the one the key this client sent asks for.
-const WRONG_ACCEPT: &str = "the answer's accept value does not match the key this client sent";
-/// Any other answer that is not an upgrade.
-const NOT_ACCEPTED: &str = "the answer is not an upgrade this client accepts";
-
-/// The reasons this client gives a room failure, which are the only reasons a failure says.
-const ROOM_REASONS: [&str; 22] = [
-    NO_VERIFIER,
-    NOT_HTTPS,
-    OPEN_BRACKETS,
-    NOT_A_PORT,
-    NOT_A_TLS_NAME,
-    NOT_AN_ADDRESS,
-    NO_TOKEN_HEADER,
-    NO_TOKEN,
-    TOO_SLOW,
-    NO_CONNECTION,
-    NO_TLS,
-    UNFINISHED,
-    NO_STATUS_LINE,
-    TOO_LONG,
-    NOT_A_DIGEST,
-    MISSING_HEADER,
-    NOT_WEBSOCKET,
-    NO_UPGRADE,
-    OTHER_VERSION,
-    UNPARSED,
-    WRONG_ACCEPT,
-    NOT_ACCEPTED,
-];
-
 /// What a room failure says of its origin: the address as a diagnostic names one, or that it
 /// concerns every origin.
 fn room_origin(origin: &str) -> Shown {
@@ -275,8 +194,9 @@ fn room_reason(reason: &str) -> Shown {
     if let Some(status) = refused {
         return crate::shown!("{} {}", tunnel::REFUSED, status);
     }
-    ROOM_REASONS
+    wss::REASONS
         .iter()
+        .chain(std::iter::once(&NO_VERIFIER))
         .chain(tunnel::REASONS.iter())
         .find(|known| **known == reason)
         .map_or_else(
@@ -322,11 +242,9 @@ impl RoomConnector {
     /// A connector that verifies rooms with `tls`, for a service whose certificates come from an
     /// authority the platform does not hold, and opens them directly.
     #[must_use]
-    pub fn with_tls(mut tls: ClientConfig) -> Self {
-        // The upgrade is an HTTP/1.1 request, so that is the one protocol offered.
-        tls.alpn_protocols = vec![b"http/1.1".to_vec()];
+    pub fn with_tls(tls: ClientConfig) -> Self {
         Self {
-            tls: Arc::new(tls),
+            tls: wss::for_upgrade(tls),
             proxy: None,
         }
     }
@@ -349,7 +267,7 @@ impl RoomConnector {
     /// # Errors
     ///
     /// Returns a [`RoomError`] saying how far the socket got. The whole attempt is bounded by
-    /// [`OPEN_DEADLINE`].
+    /// [`wss::OPEN_DEADLINE`].
     pub async fn open(
         &self,
         origin: &RendezvousOrigin,
@@ -360,342 +278,42 @@ impl RoomConnector {
             RoomRole::Host(token) => Some(to_base64url(token.expose())),
             RoomRole::Candidate => None,
         };
-        let opened = tokio::time::timeout(
-            OPEN_DEADLINE,
-            open_socket(
-                Arc::clone(&self.tls),
-                self.proxy.as_ref(),
-                origin,
-                locator,
-                role.path(),
-                token.as_deref(),
-            ),
+        let path = format!("/api/pair/room/{}/{}", locator.as_str(), role.path());
+        let headers = token
+            .as_deref()
+            .map(|token| [(CONTROL_TOKEN_HEADER, token)]);
+        let opened = wss::open(
+            &self.tls,
+            &Upgrade {
+                origin: origin.as_str(),
+                path: &path,
+                headers: headers.as_ref().map_or(&[], |headers| headers.as_slice()),
+                max_payload: MAX_FRAME_BYTES,
+                proxy: self.proxy.as_ref(),
+                loopback_plain: false,
+            },
         )
         .await
-        .map_err(|_| RoomError::Unreachable {
-            origin: origin.as_str().to_owned(),
-            reason: TOO_SLOW.to_owned(),
-        })??;
+        .map_err(|failure| room_failure(origin, failure))?;
         Ok(pump(opened))
     }
 }
 
-/// Opens one socket: the connection, directly or through `proxy`, TLS verified for the origin's
-/// host, and the upgrade, with the control token when the role has one.
-async fn open_socket(
-    tls: Arc<ClientConfig>,
-    proxy: Option<&ProxyUrl>,
-    origin: &RendezvousOrigin,
-    locator: &Locator,
-    role: &str,
-    token: Option<&str>,
-) -> Result<WebSocketStream<UpgradeGuard<tokio_rustls::client::TlsStream<Carrier>>>, RoomError> {
-    let configuration = |reason: &'static str| RoomError::Configuration {
-        origin: origin.as_str().to_owned(),
-        reason: reason.to_owned(),
-    };
-    let unreachable = |reason: &'static str| RoomError::Unreachable {
-        origin: origin.as_str().to_owned(),
-        reason: reason.to_owned(),
-    };
-    let authority = origin
-        .as_str()
-        .strip_prefix("https://")
-        .ok_or_else(|| configuration(NOT_HTTPS))?;
-    let (host, port) = host_and_port(authority).map_err(configuration)?;
-    let server_name =
-        ServerName::try_from(host.to_owned()).map_err(|_| configuration(NOT_A_TLS_NAME))?;
-    let connection = match proxy {
-        None => Carrier::Plain(
-            TcpStream::connect((host, port))
-                .await
-                .map_err(|_| unreachable(NO_CONNECTION))?,
-        ),
-        Some(proxy) => tunnel::through(proxy, host, port, &tls)
-            .await
-            .map_err(|failure| RoomError::Unreachable {
-                origin: origin.as_str().to_owned(),
-                reason: failure.reason(),
-            })?,
-    };
-    let stream = TlsConnector::from(tls)
-        .connect(server_name, connection)
-        .await
-        .map_err(|_| unreachable(NO_TLS))?;
-    let address = format!(
-        "wss://{authority}/api/pair/room/{}/{role}",
-        locator.as_str()
-    );
-    let mut builder = ClientBuilder::new()
-        .uri(&address)
-        .map_err(|_| configuration(NOT_AN_ADDRESS))?;
-    if let Some(token) = token {
-        builder = builder
-            .add_header(
-                CONTROL_TOKEN_HEADER
-                    .parse()
-                    .map_err(|_| configuration(NO_TOKEN_HEADER))?,
-                token.parse().map_err(|_| configuration(NO_TOKEN))?,
-            )
-            .map_err(|_| configuration(NO_TOKEN_HEADER))?;
-    }
-    let (socket, _) = builder
-        .limits(Limits::default().max_payload_len(Some(MAX_FRAME_BYTES)))
-        .connect_on(UpgradeGuard::new(stream))
-        .await
-        .map_err(|error| upgrade_failed(origin, error))?;
-    Ok(socket)
-}
-
-/// Says how far an upgrade that failed got.
-///
-/// A status other than switching protocols is the room's answer, whatever it is. An answer that
-/// is not an upgrade, or that the guard refused, is not one either. Anything else is the
-/// connection failing part way through, TLS included: its failures after the handshake reach this
-/// as input errors of the same kind the guard's do, so the guard's are told apart by their own
-/// type rather than by their kind.
-fn upgrade_failed(origin: &RendezvousOrigin, error: tokio_websockets::Error) -> RoomError {
-    use tokio_websockets::upgrade;
-
+/// What a room failure says for a socket that did not open at `origin`.
+fn room_failure(origin: &RendezvousOrigin, failure: Failure) -> RoomError {
     let origin = origin.as_str().to_owned();
-    match error {
-        tokio_websockets::Error::Upgrade(upgrade::Error::DidNotSwitchProtocols(status)) => {
-            RoomError::Refused { origin, status }
-        }
-        tokio_websockets::Error::Upgrade(error) => RoomError::NotAnUpgrade {
+    match failure {
+        Failure::Configuration(reason) => RoomError::Configuration {
             origin,
-            reason: match error {
-                upgrade::Error::MissingHeader(_) => MISSING_HEADER,
-                upgrade::Error::UpgradeNotWebSocket => NOT_WEBSOCKET,
-                upgrade::Error::ConnectionNotUpgrade => NO_UPGRADE,
-                upgrade::Error::UnsupportedWebSocketVersion => OTHER_VERSION,
-                upgrade::Error::Parsing(_) => UNPARSED,
-                upgrade::Error::WrongWebSocketAccept => WRONG_ACCEPT,
-                _ => NOT_ACCEPTED,
-            }
-            .to_owned(),
+            reason: reason.to_owned(),
         },
-        tokio_websockets::Error::Io(error) => match GuardRefusal::of(&error) {
-            Some(refusal) => RoomError::NotAnUpgrade {
-                origin,
-                reason: refusal.to_owned(),
-            },
-            None => RoomError::Unreachable {
-                origin,
-                reason: UNFINISHED.to_owned(),
-            },
-        },
-        _ => RoomError::Unreachable {
+        Failure::Unreachable(reason) => RoomError::Unreachable { origin, reason },
+        Failure::Refused(status) => RoomError::Refused { origin, status },
+        Failure::NotAnUpgrade(reason) => RoomError::NotAnUpgrade {
             origin,
-            reason: UNFINISHED.to_owned(),
+            reason: reason.to_owned(),
         },
     }
-}
-
-/// A room socket's stream, which holds the room's answer to the upgrade back until it is whole and
-/// safe to parse.
-///
-/// The WebSocket library reads an answer's head for as long as it is incomplete, however long it
-/// grows, and decodes `Sec-WebSocket-Accept` into a digest's twenty bytes on the assumption that
-/// the value fits. So the answer is read here first, into a buffer of at most
-/// [`MAX_UPGRADE_ANSWER_BYTES`], and handed on only once its head is complete and every accept
-/// value in it is one SHA-1 digest in base64; anything else is an error of the stream, which ends
-/// the attempt. The answer must begin with its status line: the library skips blank lines in
-/// front of one, and they would put the end of a head where this guard looks for it. After the
-/// head, reads and writes go straight to the stream.
-struct UpgradeGuard<S> {
-    stream: S,
-    answer: Answered,
-}
-
-/// The guard refusing the room's answer to the upgrade.
-///
-/// It travels inside an input error, the only kind of error a stream can return, and is its own
-/// type so that a refusal of the answer is never confused with the stream failing underneath: TLS
-/// reports a corrupt record after the handshake with the same error kind.
-struct GuardRefusal(&'static str);
-
-impl GuardRefusal {
-    /// Returns the input error that carries this refusal.
-    fn error(reason: &'static str) -> io::Error {
-        io::Error::new(io::ErrorKind::InvalidData, Self(reason))
-    }
-
-    /// The reason the guard gave, when `error` carries the guard's refusal.
-    fn of(error: &io::Error) -> Option<&'static str> {
-        error
-            .get_ref()
-            .and_then(|inner| inner.downcast_ref::<Self>())
-            .map(|refusal| refusal.0)
-    }
-}
-
-impl Said for GuardRefusal {
-    fn said(&self) -> Shown {
-        Shown::said(self.0)
-    }
-}
-
-crate::display_as_said!(GuardRefusal);
-crate::debug_as_display!(GuardRefusal);
-
-impl std::error::Error for GuardRefusal {}
-
-/// How far the room's answer to the upgrade has come.
-enum Answered {
-    /// Its head is still arriving.
-    Reading(Vec<u8>),
-    /// Its head was whole and acceptable: what was read is being handed on, from `at`.
-    Handing { read: Vec<u8>, at: usize },
-    /// Everything read ahead has been handed on.
-    Through,
-}
-
-impl<S> UpgradeGuard<S> {
-    const fn new(stream: S) -> Self {
-        Self {
-            stream,
-            answer: Answered::Reading(Vec::new()),
-        }
-    }
-}
-
-impl<S: AsyncRead + Unpin> AsyncRead for UpgradeGuard<S> {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        let this = self.get_mut();
-        loop {
-            match &mut this.answer {
-                Answered::Through => return Pin::new(&mut this.stream).poll_read(cx, buf),
-                Answered::Handing { read, at } => {
-                    let count = (read.len() - *at).min(buf.remaining());
-                    buf.put_slice(&read[*at..*at + count]);
-                    *at += count;
-                    if *at == read.len() {
-                        this.answer = Answered::Through;
-                    }
-                    return Poll::Ready(Ok(()));
-                }
-                Answered::Reading(head) => {
-                    let mut chunk = [0; 1024];
-                    let room = (MAX_UPGRADE_ANSWER_BYTES - head.len()).min(chunk.len());
-                    let mut into = ReadBuf::new(&mut chunk[..room]);
-                    ready!(Pin::new(&mut this.stream).poll_read(cx, &mut into))?;
-                    if into.filled().is_empty() {
-                        // The room ended the stream part way through its answer, which the
-                        // library reads as the end it is.
-                        return Poll::Ready(Ok(()));
-                    }
-                    head.extend_from_slice(into.filled());
-                    let start = head.len().min(STATUS_LINE_START.len());
-                    if head[..start] != STATUS_LINE_START[..start] {
-                        return Poll::Ready(Err(GuardRefusal::error(NO_STATUS_LINE)));
-                    }
-                    if let Some(end) = head.windows(4).position(|window| window == b"\r\n\r\n") {
-                        check_upgrade_head(&head[..end + 4])?;
-                        let read = std::mem::take(head);
-                        this.answer = Answered::Handing { read, at: 0 };
-                    } else if head.len() >= MAX_UPGRADE_ANSWER_BYTES {
-                        return Poll::Ready(Err(GuardRefusal::error(TOO_LONG)));
-                    }
-                }
-            }
-        }
-    }
-}
-
-impl<S: AsyncWrite + Unpin> AsyncWrite for UpgradeGuard<S> {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.get_mut().stream).poll_write(cx, buf)
-    }
-
-    fn poll_write_vectored(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        bufs: &[io::IoSlice<'_>],
-    ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut self.get_mut().stream).poll_write_vectored(cx, bufs)
-    }
-
-    fn is_write_vectored(&self) -> bool {
-        self.stream.is_write_vectored()
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.get_mut().stream).poll_flush(cx)
-    }
-
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.get_mut().stream).poll_shutdown(cx)
-    }
-}
-
-/// How an answer to the upgrade begins: its status line.
-const STATUS_LINE_START: &[u8] = b"HTTP/";
-
-/// Refuses an answer carrying a `Sec-WebSocket-Accept` that is anything but one SHA-1 digest in
-/// padded base64, on whichever line it appears: the value is decoded into twenty bytes, and a
-/// longer one does not fit. A value is trimmed exactly as the library's parser trims it (spaces
-/// and tabs in front, spaces, tabs and line ends behind), so what is checked here is what the
-/// library decodes.
-fn check_upgrade_head(head: &[u8]) -> io::Result<()> {
-    for line in head.split(|byte| *byte == b'\n') {
-        let Some(colon) = line.iter().position(|byte| *byte == b':') else {
-            continue;
-        };
-        if !line[..colon]
-            .trim_ascii()
-            .eq_ignore_ascii_case(b"sec-websocket-accept")
-        {
-            continue;
-        }
-        let value = &line[colon + 1..];
-        let start = value
-            .iter()
-            .position(|byte| !matches!(byte, b' ' | b'\t'))
-            .unwrap_or(value.len());
-        let end = value
-            .iter()
-            .rposition(|byte| !matches!(byte, b' ' | b'\t' | b'\r' | b'\n'))
-            .map_or(start, |last| last + 1)
-            .max(start);
-        let value = &value[start..end];
-        let digest = value.len() == 28
-            && value[27] == b'='
-            && value[..27]
-                .iter()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/'));
-        if !digest {
-            return Err(GuardRefusal::error(NOT_A_DIGEST));
-        }
-    }
-    Ok(())
-}
-
-/// Splits an origin's authority into its host, without an IPv6 literal's brackets, and its port.
-fn host_and_port(authority: &str) -> Result<(&str, u16), &'static str> {
-    let (host, port) = match authority.strip_prefix('[') {
-        Some(bracketed) => {
-            let (host, rest) = bracketed.split_once(']').ok_or(OPEN_BRACKETS)?;
-            (host, rest.strip_prefix(':'))
-        }
-        None => match authority.rsplit_once(':') {
-            Some((host, port)) => (host, Some(port)),
-            None => (authority, None),
-        },
-    };
-    let port = match port {
-        Some(port) => port.parse().map_err(|_| NOT_A_PORT)?,
-        None => 443,
-    };
-    Ok((host, port))
 }
 
 /// Starts the task that carries one room socket's frames, and returns the caller's ends of it.
@@ -830,54 +448,6 @@ mod tests {
 
     use super::*;
 
-    /// The guard trims an accept value as the library's parser does, so a correct digest with
-    /// optional whitespace around it passes, and anything that is not one digest does not.
-    #[test]
-    fn an_accept_value_is_checked_as_the_library_reads_it() {
-        let head = |value: &str| {
-            format!(
-                "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\
-                 Sec-WebSocket-Accept:{value}\r\n\r\n"
-            )
-        };
-        let digest = "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=";
-        for passes in [
-            format!(" {digest}"),
-            digest.to_owned(),
-            format!(" \t{digest} \t"),
-            format!("{digest}\t"),
-        ] {
-            assert!(
-                check_upgrade_head(head(&passes).as_bytes()).is_ok(),
-                "{passes:?}"
-            );
-        }
-        for refused in [
-            format!(" {digest}A"),
-            " AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
-            " s3pPLMBiTxaQ9kYGzzhZRbK+xOoA".to_owned(),
-            " s3pPLMBiTxaQ 9kYGzzhZRbK+xO=".to_owned(),
-            String::new(),
-        ] {
-            assert!(
-                check_upgrade_head(head(&refused).as_bytes()).is_err(),
-                "{refused:?}"
-            );
-        }
-    }
-
-    /// An origin's authority splits into the host TLS verifies and the port, with an IPv6 literal's
-    /// brackets removed and 443 when none is named.
-    #[test]
-    fn an_authority_splits_into_its_host_and_port() {
-        assert_eq!(host_and_port("reach.kala.to"), Ok(("reach.kala.to", 443)));
-        assert_eq!(host_and_port("127.0.0.1:8443"), Ok(("127.0.0.1", 8443)));
-        assert_eq!(host_and_port("[::1]:8443"), Ok(("::1", 8443)));
-        assert_eq!(host_and_port("[::1]"), Ok(("::1", 443)));
-        assert!(host_and_port("[::1:8443").is_err());
-        assert!(host_and_port("pair.example.org:port").is_err());
-    }
-
     /// A control token never reaches a rendering of the role that carries it.
     #[test]
     fn a_role_never_prints_its_token() {
@@ -920,7 +490,7 @@ mod tests {
         assert_eq!(
             RoomError::Unreachable {
                 origin: "https://rendezvous.example:8443".to_owned(),
-                reason: NO_TLS.to_owned(),
+                reason: wss::NO_TLS.to_owned(),
             }
             .to_string(),
             "the room at https://rendezvous.example:8443 could not be reached: the TLS handshake \

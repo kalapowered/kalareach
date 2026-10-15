@@ -73,6 +73,7 @@ pub mod transport;
 pub mod tunnel;
 pub mod uploads;
 pub mod viewport;
+mod wss;
 
 pub use error::{ClientError, Result};
 pub use session::{Session, Settled};
