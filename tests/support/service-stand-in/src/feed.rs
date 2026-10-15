@@ -13,6 +13,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use base64::Engine as _;
 use kr_client::services::ServiceHttpAnswer;
+use kr_client::services::authority::ANNOUNCEMENT_LIFETIME_MS;
+use kr_protocol::mailbox::{MailboxPayloadType, SealedEnvelope};
 use kr_protocol::pairing::{
     AUTHORITY_REVISION_DOMAIN, AuthorityRevisionRecord, REVOCATION_DOMAIN,
     RevocationAcknowledgement, RevocationCompletion, RevocationRequest, RevocationTarget,
@@ -211,6 +213,7 @@ pub(crate) fn key_text(key: &AuthorisationKey) -> String {
 /// do. `feeds` holds every feed this service keeps, by the identifier of the host key.
 pub(crate) fn sync(
     feeds: &mut BTreeMap<String, Feed>,
+    mailboxes: &mut BTreeMap<String, crate::mailbox::Mailbox>,
     signature: &ServiceRequestSignature,
     body: &Value,
     now_ms: u64,
@@ -249,11 +252,63 @@ pub(crate) fn sync(
         Ok(built) => built,
         Err(answer) => return answer,
     };
+    // Read before the feed is asked, as the Worker's route reads it: a change that carries an
+    // announcement the service will not carry is refused whole.
+    let announcement = match read_announcement(operation, member, now_ms) {
+        Ok(announcement) => announcement,
+        Err(answer) => return answer,
+    };
     let feed = feeds.entry(host_key_id.clone()).or_default();
     match feed.run(&host_key_id, &call, &caller) {
-        Ok(state) => answered(state),
+        Ok(mut state) => {
+            // The change has committed, so the announcement is placed after it and what becomes
+            // of it is reported beside the change.
+            if let Some((recipient, envelope)) = announcement {
+                state["announced"] =
+                    crate::mailbox::announce(mailboxes, signature, recipient, envelope, now_ms);
+            }
+            answered(state)
+        }
         Err(answer) => answer,
     }
+}
+
+/// The announcement a publication, a revision or an acknowledgement carries, when it carries one
+/// this service will place: a sealed item for a recipient that says the feed changed and expires
+/// within an hour. Any other member carries none.
+fn read_announcement<'a>(
+    operation: &str,
+    member: Option<&'a Value>,
+    now_ms: u64,
+) -> Result<Option<(&'a str, SealedEnvelope)>, ServiceHttpAnswer> {
+    if !matches!(operation, "publish" | "revise" | "acknowledge") {
+        return Ok(None);
+    }
+    let Some(announce) = member
+        .map(|member| &member["announce"])
+        .filter(|announce| !announce.is_null())
+    else {
+        return Ok(None);
+    };
+    let sealed = "An announcement is a sealed item for a recipient.";
+    // The route reads the recipient as text and no more: whether it is a key is found when the
+    // item is placed, and reported beside the change, which has committed by then.
+    let Some(recipient) = announce["recipient_key"].as_str() else {
+        return Err(invalid(sealed));
+    };
+    let Ok(envelope) = serde_json::from_value::<SealedEnvelope>(announce["envelope"].clone())
+    else {
+        return Err(invalid(sealed));
+    };
+    if envelope.routing.payload_type != MailboxPayloadType::AuthorityFeedChange {
+        return Err(invalid(
+            "An announcement carries that the feed changed and nothing about what changed.",
+        ));
+    }
+    if envelope.routing.expires_at_ms.get() > now_ms + ANNOUNCEMENT_LIFETIME_MS {
+        return Err(invalid("An announcement expires within 60 minutes."));
+    }
+    Ok(Some((recipient, envelope)))
 }
 
 /// What the route checks before the feed decides, and the call it makes of the feed.
@@ -820,5 +875,42 @@ impl Feed {
             "removal_keys": self.removal_keys.iter().collect::<Vec<_>>(),
             "poll_interval_seconds": FEED_POLL_INTERVAL_SECONDS,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+    use crate::mailbox::tests::{NOW, envelope_for};
+    use kr_crypto::keys::StoredEnvelopeKeyPair;
+
+    /// The route reads the recipient of an announcement as text and no more, so a change that
+    /// names one that is no key commits and the announcement is declined beside it.
+    #[test]
+    fn a_recipient_that_is_text_but_not_a_key_does_not_refuse_the_change() {
+        let recipient = StoredEnvelopeKeyPair::generate().expect("a key");
+        let envelope = envelope_for(recipient.public(), recipient.public(), NOW + 60_000);
+        let member = json!({ "announce": { "recipient_key": "not a key", "envelope": envelope } });
+        let read = read_announcement("publish", Some(&member), NOW);
+        assert!(
+            matches!(&read, Ok(Some(("not a key", _)))),
+            "the announcement is read and left for the mailbox to decline: {read:?}"
+        );
+    }
+
+    #[test]
+    fn a_recipient_that_is_not_text_refuses_the_change() {
+        let recipient = StoredEnvelopeKeyPair::generate().expect("a key");
+        let envelope = envelope_for(recipient.public(), recipient.public(), NOW + 60_000);
+        let member = json!({ "announce": { "recipient_key": 7, "envelope": envelope } });
+        let refused = read_announcement("publish", Some(&member), NOW).expect_err("a refusal");
+        assert_eq!(refused.status, 400);
+        assert!(
+            String::from_utf8_lossy(&refused.body)
+                .contains("An announcement is a sealed item for a recipient."),
+            "{refused:?}"
+        );
     }
 }
