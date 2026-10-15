@@ -608,7 +608,7 @@ impl SessionRuntime {
     ///
     /// Returns an error when the terminal's reader or writer cannot be taken.
     pub fn start(
-        session: Session,
+        mut session: Session,
         shared_clock: Arc<dyn kr_ipc::clock::SharedClock>,
     ) -> Result<Self> {
         let reader = session.output_reader()?;
@@ -648,6 +648,8 @@ impl SessionRuntime {
         // The mark is the session's own, because a command its shell's integration reports
         // starting is marked there.
         let activity = session.activity();
+        let trace = crate::trace::LockTrace::shared();
+        session.record_into(trace.clone());
         let session = Arc::new(Mutex::new(session));
         let (input_sender, mut input_receiver) = mpsc::unbounded_channel::<InputBatch>();
         // Bounded on purpose. Section 9 says a slow *client* must never hold the read loop, and it
@@ -664,7 +666,6 @@ impl SessionRuntime {
             pauses: Arc::default(),
         };
         let counter = progress.counter();
-        let trace = crate::trace::LockTrace::shared();
         let observing = Arc::new(tokio::sync::Mutex::new(()));
         let wake = Arc::new(Notify::new());
         let closed = Arc::new(Notify::new());
@@ -977,11 +978,12 @@ impl SessionRuntime {
                         // Something in this session is running. Whatever it is may be a process
                         // that was not there at the last observation.
                         ingest_activity.note();
-                        {
+                        let length = bytes.len() as u64;
+                        let owed = {
                             let mut acquisition = ingest_trace.acquisition(Site::Ingest);
                             if let Ok(mut session) = ingest_session.lock() {
                                 acquisition.held();
-                                session.ingest_output(&bytes);
+                                let (_, owed) = session.ingest_output_deferring_the_spool(&bytes);
                                 // Nothing else is waiting, so the terminal has gone quiet and the
                                 // screen is settled. The engine holds the last scalar of a run back
                                 // in case a combining mark follows it, and this is what releases
@@ -995,11 +997,42 @@ impl SessionRuntime {
                                 for batch in session.take_pending_input() {
                                     let _ = ingest_input.send(batch);
                                 }
+                                owed
+                            } else {
+                                None
+                            }
+                        };
+                        // The disk is waited for with the session let go, and on a thread for
+                        // blocking work: a write to a disk that is busy with other work can take
+                        // as long as the disk likes, and everything that needs the session, or
+                        // the scheduler, would wait for it too. The output is in the session's
+                        // resident window meanwhile, and the next batch is not taken until this
+                        // one is written, so the spool receives the output in the order it came.
+                        if let Some(write) = owed {
+                            let lost =
+                                write.failed("the write to the spool did not complete".to_owned());
+                            let writing_trace = ingest_trace.clone();
+                            let written = tokio::task::spawn_blocking(move || {
+                                let mut span = writing_trace.acquisition(Site::SpoolWrite);
+                                let written = write.perform(&bytes);
+                                span.held();
+                                written
+                            })
+                            .await;
+                            let failed = match written {
+                                Ok(Ok(())) => None,
+                                Ok(Err(failed)) => Some(failed),
+                                Err(_) => Some(lost),
+                            };
+                            if let Some(failed) = failed
+                                && let Ok(mut session) = ingest_session.lock()
+                            {
+                                session.settle_failed_spool_write(failed);
                             }
                         }
-                        // Every attachment has been handed this batch, so a closure recorded from
-                        // here on follows it.
-                        ingested_sender.send_modify(|ingested| *ingested += bytes.len() as u64);
+                        // Every attachment has been handed this batch and the spool has it, so a
+                        // closure recorded from here on follows it.
+                        ingested_sender.send_modify(|ingested| *ingested += length);
                     }
                     ReadEvent::Ended => {
                         // The terminal is finished. Whether the root shell has ended is a separate
@@ -1406,6 +1439,23 @@ impl SessionRuntime {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((arrived, go));
         (watch, release)
+    }
+
+    /// Stops the next write of the session's output to its spool that the ingest makes with the
+    /// session let go, while the write is being made, for this host's own tests.
+    ///
+    /// Returns the end that says the write has arrived, and the end that lets it go. The pause
+    /// fires once. The write that opens a segment again after a retention pass is made with the
+    /// session held and is not the one this stops.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn pause_in_next_spool_write(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        self.session().pause_next_spool_write()
     }
 
     /// Stops the read loop after its next read that returns output, before that output is

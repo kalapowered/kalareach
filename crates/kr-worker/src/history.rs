@@ -17,6 +17,7 @@
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use kr_protocol::recovery::{
     HistoryGap, HistoryGapCause, HistoryPageResult, MAX_HISTORY_PAGE_BYTES,
@@ -26,6 +27,55 @@ use kr_protocol::scalars::{Bytes, Nullable, TimestampMs, U64};
 use crate::persistence::retention::{Eviction, OutputRetention, Pressure, RetentionLimit};
 
 use crate::error::{Result, WorkerError};
+
+/// A stop in the next write the output ingest makes to the spool with the session let go, for this
+/// host's own tests. Compiled away in every shipped build.
+///
+/// A test cannot otherwise stand in the one moment a session's output waits on the disk: the file
+/// has taken the call and has not answered it.
+#[cfg(feature = "testing")]
+#[derive(Clone, Debug, Default)]
+pub(crate) struct SpoolPause(std::sync::Arc<std::sync::Mutex<Option<ArmedPause>>>);
+
+/// The ends of an armed pause: the one that says a write has arrived, and the one that lets it go.
+#[cfg(feature = "testing")]
+type ArmedPause = (
+    tokio::sync::oneshot::Sender<()>,
+    std::sync::mpsc::Receiver<()>,
+);
+
+#[cfg(feature = "testing")]
+impl SpoolPause {
+    /// Arms the pause, and returns the end that says a write has arrived and the end that lets it
+    /// go.
+    pub(crate) fn arm(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        let (arrived, watch) = tokio::sync::oneshot::channel();
+        let (release, go) = std::sync::mpsc::channel();
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((arrived, go));
+        (watch, release)
+    }
+
+    /// Waits here, where a pause is armed. It fires once.
+    pub(crate) fn wait(&self) {
+        let armed = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some((arrived, go)) = armed {
+            let _ = arrived.send(());
+            let _ = go.recv();
+        }
+    }
+}
 
 /// The resident history cache of one session, in bytes.
 pub const DEFAULT_RESIDENT_BYTES: usize = 8 * 1024 * 1024;
@@ -257,6 +307,21 @@ impl OutputHistory {
 
     /// Appends output and returns the cursor those bytes start at.
     ///
+    /// The write to the spool is made before this returns. A caller that cannot wait for the disk
+    /// uses [`Self::append_deferred`] and makes the write itself.
+    pub fn append(&mut self, bytes: &[u8]) -> u64 {
+        let (start, owed) = self.append_deferred(bytes);
+        if let Some(write) = owed
+            && let Err(failed) = write.perform(bytes)
+        {
+            self.settle_failed_spool_write(failed);
+        }
+        start
+    }
+
+    /// Appends output, and returns the cursor those bytes start at and the write to the spool that
+    /// is still owed, when there is one.
+    ///
     /// The session cap holds before the write, not after it: the spool gives up its oldest
     /// segments to make room for each piece of an append before that piece is written, so one
     /// large append never stands over the bound, and the range it gave up reads as a gap that
@@ -270,10 +335,16 @@ impl OutputHistory {
     /// resident window only as far as the spool's remaining room allows, so the two layers
     /// together stay within the cap, and the range neither holds reads as a gap whose cause is the
     /// spool rather than a bound.
-    pub fn append(&mut self, bytes: &[u8]) -> u64 {
+    ///
+    /// The write that is owed is the one an append that continues the newest segment needs, and it
+    /// is the caller's to make with [`SpoolWrite::perform`] once it has let go of whatever it holds
+    /// that the disk should not be able to keep waiting. The resident window holds the bytes until
+    /// it is made, so a reader finds them there. A write that fails is settled with
+    /// [`Self::settle_failed_spool_write`].
+    pub fn append_deferred(&mut self, bytes: &[u8]) -> (u64, Option<SpoolWrite>) {
         let start = self.next_cursor;
         if bytes.is_empty() {
-            return start;
+            return (start, None);
         }
         if !self.retaining {
             // Privacy mode has disabled retention. The cursor still advances, because it is the
@@ -288,7 +359,7 @@ impl OutputHistory {
             if let Some(spool) = self.spool.as_mut() {
                 spool.note_position(self.next_cursor);
             }
-            return start;
+            return (start, None);
         }
         // A spool stopped for want of its boundary is tried again before this append takes its
         // bytes: one write that is never waited for, so a boundary that is still held costs the
@@ -298,16 +369,20 @@ impl OutputHistory {
             self.try_resume();
         }
         let now = kr_ipc::now_ms();
-        if let Some(spool) = self.spool.as_mut()
-            && let Some((from_cursor, to_cursor, gone)) = spool.append(start, bytes)
-        {
-            self.record_eviction(Eviction {
-                limit: RetentionLimit::SessionCap,
-                from_cursor,
-                to_cursor,
-                bytes: gone,
-                at_ms: now,
-            });
+        let mut owed = None;
+        if let Some(spool) = self.spool.as_mut() {
+            owed = spool.take_plain_append(start, bytes, now.get());
+            if owed.is_none()
+                && let Some((from_cursor, to_cursor, gone)) = spool.append(start, bytes)
+            {
+                self.record_eviction(Eviction {
+                    limit: RetentionLimit::SessionCap,
+                    from_cursor,
+                    to_cursor,
+                    bytes: gone,
+                    at_ms: now,
+                });
+            }
         }
         self.resident.extend(bytes.iter().copied());
         self.next_cursor += bytes.len() as u64;
@@ -327,13 +402,33 @@ impl OutputHistory {
             }),
         }
         while self.resident.len() > self.resident_capacity {
-            let excess = self.resident.len() - self.resident_capacity;
+            let mut excess = self.resident.len() - self.resident_capacity;
+            if owed.is_some() {
+                // What the spool has not been written yet is held by the window alone, so the
+                // window does not move past it: a reader of the cursors before the window is
+                // served from the spool, and the spool has them.
+                excess = excess.min(usize::try_from(start - self.resident_start).unwrap_or(0));
+                if excess == 0 {
+                    break;
+                }
+            }
             self.resident.drain(..excess);
             self.resident_start += excess as u64;
         }
         self.bound_past_suspension();
         self.trim_marks();
-        start
+        (start, owed)
+    }
+
+    /// Settles a write [`Self::append_deferred`] owed and the disk did not take.
+    ///
+    /// The spool stops where the write began, as it does for a write it makes itself, and keeps
+    /// everything it holds.
+    pub fn settle_failed_spool_write(&mut self, failed: SpoolWriteFailed) {
+        if let Some(spool) = self.spool.as_mut() {
+            spool.settle_failed_write_of(failed);
+        }
+        self.bound_past_suspension();
     }
 
     /// Keeps the output a stopped spool could not take within the room the spool has left.
@@ -424,6 +519,24 @@ impl OutputHistory {
             while self.unretained.len() > MAX_RECORDED_EVICTIONS {
                 self.unretained.pop_front();
             }
+        }
+    }
+
+    /// Stops the next write to the spool that is made with the session let go, for this host's own
+    /// tests.
+    ///
+    /// Returns the end that says a write has arrived, and the end that lets it go. The pause fires
+    /// once. A history with no spool is never written to, so it never arrives.
+    #[cfg(feature = "testing")]
+    pub(crate) fn pause_next_spool_write(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        match self.spool.as_ref() {
+            Some(spool) => spool.pause.arm(),
+            None => SpoolPause::default().arm(),
         }
     }
 
@@ -957,7 +1070,7 @@ struct Spool {
     /// Terminal output arrives in small batches — often one line at a time — and opening and
     /// closing a file for each of them makes the session's own output path the slowest thing in
     /// the host. The handle is kept for as long as the segment is the one being appended to.
-    open_segment: Option<(PathBuf, std::fs::File)>,
+    open_segment: Option<(PathBuf, Arc<std::fs::File>)>,
     /// Where this spool stopped taking output, and why, when it has.
     ///
     /// A spool that could not make room, open or write a segment, or publish its boundary takes
@@ -966,6 +1079,9 @@ struct Spool {
     /// take its files out of the account while they were still on the disk, and out of reach of
     /// the passes that collect them.
     suspended: Option<Suspension>,
+    /// The stop a test arranges in the next write made with the session let go.
+    #[cfg(feature = "testing")]
+    pause: SpoolPause,
     /// A write that stops part way, which a test arranges: the next write lays down this many
     /// bytes and then fails.
     #[cfg(test)]
@@ -1078,6 +1194,77 @@ impl Segment {
     }
 }
 
+/// A write of output to the newest spool segment that has been counted and not yet made.
+///
+/// The history hands it to its caller, who makes it with the session let go: the write is a call
+/// to the disk, and everything that waits for the session waits for it otherwise.
+#[derive(Debug)]
+pub struct SpoolWrite {
+    file: Arc<std::fs::File>,
+    /// The cursor the segment starts at, which says which segment this write belongs to.
+    segment_start: u64,
+    /// The segment's file name, for the words a failure is reported in.
+    segment_name: String,
+    /// The cursor the bytes start at.
+    cursor: u64,
+    /// How many bytes the segment held before this write.
+    counted: u64,
+    /// How many bytes this write lays down.
+    len: u64,
+    #[cfg(feature = "testing")]
+    pause: SpoolPause,
+    #[cfg(test)]
+    short: Option<usize>,
+}
+
+/// A write that did not reach the file, and what the history needs to settle it.
+#[derive(Debug)]
+pub struct SpoolWriteFailed {
+    segment_start: u64,
+    cursor: u64,
+    counted: u64,
+    attempted: u64,
+    reason: String,
+}
+
+impl SpoolWrite {
+    /// Makes the write. `bytes` are the ones the history was given.
+    ///
+    /// # Errors
+    ///
+    /// Returns what the history needs to settle the write when it did not reach the file.
+    pub fn perform(&self, bytes: &[u8]) -> std::result::Result<(), SpoolWriteFailed> {
+        #[cfg(feature = "testing")]
+        self.pause.wait();
+        #[cfg(test)]
+        let written = match self.short {
+            Some(keep) => append_open(&self.file, &bytes[..keep.min(bytes.len())])
+                .and_then(|()| Err(std::io::Error::other("the write stopped part way"))),
+            None => append_open(&self.file, bytes),
+        };
+        #[cfg(not(test))]
+        let written = append_open(&self.file, bytes);
+        written.map_err(|error| {
+            self.failed(format!(
+                "segment {} could not be written: {error}",
+                self.segment_name
+            ))
+        })
+    }
+
+    /// The failure of this write, for `reason`.
+    #[must_use]
+    pub fn failed(&self, reason: String) -> SpoolWriteFailed {
+        SpoolWriteFailed {
+            segment_start: self.segment_start,
+            cursor: self.cursor,
+            counted: self.counted,
+            attempted: self.len,
+            reason,
+        }
+    }
+}
+
 impl Spool {
     fn open(directory: PathBuf, layout: SpoolLayout) -> Result<Self> {
         create_owner_only(&directory)
@@ -1161,6 +1348,8 @@ impl Spool {
             },
             open_segment: None,
             suspended: None,
+            #[cfg(feature = "testing")]
+            pause: SpoolPause::default(),
             #[cfg(test)]
             short_write: None,
             #[cfg(test)]
@@ -1239,7 +1428,7 @@ impl Spool {
                 let path = self.directory.join(format!("{cursor:020}.out"));
                 match open_segment(&path, true) {
                     Ok(file) => {
-                        self.open_segment = Some((path.clone(), file));
+                        self.open_segment = Some((path.clone(), Arc::new(file)));
                         self.segments.push_back(Segment {
                             start: cursor,
                             len: 0,
@@ -1290,16 +1479,13 @@ impl Spool {
         let holds_bytes = counted > 0 || segment.uncertain > 0;
         // Borrowed separately from the segment, because the handle lives beside the index rather
         // than inside it: a segment that is evicted takes its entry, not this handle.
-        let handle = match self.open_segment.as_mut() {
-            Some((open, file)) if *open == path => file,
+        let handle = match self.open_segment.as_ref() {
+            Some((open, file)) if *open == path => Arc::clone(file),
             _ => match open_segment(&path, !holds_bytes) {
                 Ok(file) => {
-                    self.open_segment = Some((path.clone(), file));
-                    &mut self
-                        .open_segment
-                        .as_mut()
-                        .expect("the handle was just installed")
-                        .1
+                    let file = Arc::new(file);
+                    self.open_segment = Some((path.clone(), Arc::clone(&file)));
+                    file
                 }
                 Err(error) => {
                     return Err(WriteFailure {
@@ -1315,12 +1501,12 @@ impl Spool {
         };
         #[cfg(test)]
         let written = match self.short_write.take() {
-            Some(keep) => append_open(handle, &bytes[..keep.min(bytes.len())])
+            Some(keep) => append_open(&handle, &bytes[..keep.min(bytes.len())])
                 .and_then(|()| Err(std::io::Error::other("the write stopped part way"))),
-            None => append_open(handle, bytes),
+            None => append_open(&handle, bytes),
         };
         #[cfg(not(test))]
-        let written = append_open(handle, bytes);
+        let written = append_open(&handle, bytes);
         if let Err(error) = written {
             let reason = format!(
                 "segment {} could not be written: {error}",
@@ -1328,15 +1514,87 @@ impl Spool {
             );
             return Err(self.settle_failed_write(counted, bytes.len() as u64, reason));
         }
+        self.count_written(bytes.len() as u64);
+        Ok(())
+    }
+
+    /// Counts bytes as held by the newest segment.
+    fn count_written(&mut self, len: u64) {
         let segment = self.segments.back_mut().expect("a segment exists");
-        segment.len += bytes.len() as u64;
+        segment.len += len;
         self.boundary = self.boundary.max(segment.end());
         // The newest byte's time, not the oldest: a segment is past its retention only when
         // everything in it is, which is the direction that cannot delete output too early.
         segment.written_at_ms = kr_ipc::now_ms().get();
-        self.total_bytes += bytes.len() as u64;
+        self.total_bytes += len;
         self.peak_bytes = self.peak_bytes.max(self.total_bytes);
-        Ok(())
+    }
+
+    /// Takes an append that needs nothing but a write to the open segment, and leaves the write to
+    /// the caller.
+    ///
+    /// That is nearly every append: the bytes continue the newest segment, fit in it, and fit
+    /// within the capacity, so no segment has to be opened and none given up. The caller makes the
+    /// write when it has let go of whatever it was holding, because a write to a disk that is busy
+    /// with other work can take as long as the disk likes. The bytes are counted as held now, as
+    /// they will be once the write is made, and [`Spool::settle_failed_write_of`] takes them back
+    /// if it fails. Anything else - a segment to open, room to make, a spool that has stopped -
+    /// returns `None` and is made by [`Spool::append`] as before.
+    fn take_plain_append(&mut self, start: u64, bytes: &[u8], now_ms: u64) -> Option<SpoolWrite> {
+        if self.suspended.is_some() {
+            return None;
+        }
+        let segment = self.segments.back()?;
+        let len = bytes.len() as u64;
+        if segment.sealed
+            || segment.end() != start
+            || len > self.layout.segment_bytes.saturating_sub(segment.len)
+            || now_ms.saturating_sub(segment.started_at_ms) >= SEGMENT_ROTATION_MS
+            || self.total_bytes.saturating_add(len) > self.layout.capacity_bytes
+        {
+            return None;
+        }
+        let (open, file) = self.open_segment.as_ref()?;
+        if *open != segment.path {
+            return None;
+        }
+        let write = SpoolWrite {
+            file: Arc::clone(file),
+            segment_start: segment.start,
+            segment_name: segment_name(&segment.path),
+            cursor: start,
+            counted: segment.len,
+            len,
+            #[cfg(feature = "testing")]
+            pause: self.pause.clone(),
+            #[cfg(test)]
+            short: self.short_write.take(),
+        };
+        self.count_written(len);
+        Some(write)
+    }
+
+    /// Takes back the bytes of a write that was counted and did not reach the file, and settles
+    /// the failure as [`Spool::append`] settles one it makes itself.
+    ///
+    /// A segment that retention has removed since is not written to, and there is nothing left to
+    /// settle; neither is one a newer segment has followed.
+    fn settle_failed_write_of(&mut self, failed: SpoolWriteFailed) {
+        let Some(segment) = self.segments.back_mut() else {
+            return;
+        };
+        if segment.start != failed.segment_start || segment.sealed {
+            return;
+        }
+        segment.len = segment.len.saturating_sub(failed.attempted);
+        self.total_bytes = self.total_bytes.saturating_sub(failed.attempted);
+        let outcome = self.settle_failed_write(failed.counted, failed.attempted, failed.reason);
+        self.suspend(
+            failed.cursor + outcome.kept,
+            outcome.reason,
+            outcome.resumable,
+            false,
+        );
     }
 
     /// Settles a write that failed part way, so that the index and the file agree again.
@@ -1885,9 +2143,10 @@ fn cut_back(path: &Path, len: u64) -> bool {
         .is_ok_and(|metadata| metadata.len() == len)
 }
 
-fn append_open(file: &mut std::fs::File, bytes: &[u8]) -> std::io::Result<()> {
+fn append_open(file: &std::fs::File, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write as _;
 
+    let mut file = file;
     file.write_all(bytes)
 }
 
@@ -2395,6 +2654,54 @@ mod tests {
         let (gap, bytes) = read_back(&directory, 0);
         assert!(gap.is_none(), "{gap:?}");
         assert_eq!(bytes, b"abcdefghij", "every byte once, and in its place");
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    #[test]
+    fn output_whose_write_to_the_disk_is_owed_is_served_from_the_window_and_then_from_the_file() {
+        // The write to the spool is made after the session is let go, so for a while the output is
+        // only in the resident window. The window does not move past it, and a reader finds every
+        // byte in its place before the write and after it, even where the output is larger than
+        // the window.
+        let directory = spool_directory("owed-write");
+        let mut history =
+            OutputHistory::with_spool(4, directory.clone(), SpoolLayout::new(8, 1 << 20))
+                .expect("a spool");
+        history.append(b"ab");
+        let (start, owed) = history.append_deferred(b"cdefgh");
+        assert_eq!(start, 2);
+        let write = owed.expect("the bytes continue the newest segment, so their write is owed");
+        let (gap, bytes) = read_to_end(&history, 0);
+        assert!(gap.is_none(), "{gap:?}");
+        assert_eq!(bytes, b"abcdefgh", "before the write is made");
+        write.perform(b"cdefgh").expect("the write is made");
+        let (gap, bytes) = read_to_end(&history, 0);
+        assert!(gap.is_none(), "{gap:?}");
+        assert_eq!(bytes, b"abcdefgh", "after it");
+        let (gap, bytes) = read_back(&directory, 0);
+        assert!(gap.is_none(), "{gap:?}");
+        assert_eq!(bytes, b"abcdefgh", "and the file holds them");
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    #[test]
+    fn a_write_owed_to_a_segment_that_has_been_removed_is_settled_without_it() {
+        // Privacy mode removes every segment while a write to the newest one is owed. The write
+        // then reaches a file nobody indexes, and failing there has nothing left to settle: the
+        // spool is not stopped for a segment it no longer has.
+        let directory = spool_directory("owed-write-removed");
+        let mut history =
+            OutputHistory::with_spool(64, directory.clone(), SpoolLayout::new(8, 1 << 20))
+                .expect("a spool");
+        history.append(b"ab");
+        let (_, owed) = history.append_deferred(b"cd");
+        let mut write = owed.expect("the write is owed");
+        history.discard_retained();
+        write.short = Some(1);
+        let failed = write.perform(b"cd").expect_err("the write stops part way");
+        history.settle_failed_spool_write(failed);
+        assert!(history.suspended().is_none());
+        assert_eq!(history.spool.as_ref().expect("a spool").total_bytes, 0);
         std::fs::remove_dir_all(&directory).ok();
     }
 

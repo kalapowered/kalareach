@@ -511,6 +511,8 @@ pub struct Session {
     /// the same question again. It is what keeps a caller that takes and releases the lease in a
     /// loop from queueing without bound.
     lease_change_queued: Arc<std::sync::atomic::AtomicBool>,
+    /// Where the output ingest writes down the spans of its work, for the input measurement.
+    trace: crate::trace::Shared,
 }
 
 impl std::fmt::Debug for Session {
@@ -754,8 +756,26 @@ impl Session {
             input_fence: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             delivered_paste_open: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             lease_change_queued: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            trace: crate::trace::LockTrace::shared(),
             config,
         })
+    }
+
+    /// Stops the next write of the session's output to its spool, for this host's own tests.
+    #[cfg(feature = "testing")]
+    pub(crate) fn pause_next_spool_write(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        self.history.pause_next_spool_write()
+    }
+
+    /// Gives the session the recorder its runtime's tasks share, so the ingest's spans fall beside
+    /// theirs.
+    pub(crate) fn record_into(&mut self, trace: crate::trace::Shared) {
+        self.trace = trace;
     }
 
     /// Starts the root shell and moves the session to `live`.
@@ -3185,6 +3205,21 @@ impl Session {
 
     /// Records output from the terminal, interprets it and delivers what each attachment may see.
     ///
+    /// The write to the spool is made before this returns. The read loop uses
+    /// [`Session::ingest_output_deferring_the_spool`], which leaves it to the caller.
+    pub fn ingest_output(&mut self, bytes: &[u8]) -> Vec<AttachmentId> {
+        let (attachments, owed) = self.ingest_output_deferring_the_spool(bytes);
+        if let Some(write) = owed
+            && let Err(failed) = write.perform(bytes)
+        {
+            self.history.settle_failed_spool_write(failed);
+        }
+        attachments
+    }
+
+    /// Records output from the terminal, interprets it and delivers what each attachment may see,
+    /// and returns the write to the spool that is still owed instead of making it.
+    ///
     /// This is the read loop's only entry point. It never waits for a client: a subscriber that
     /// cannot keep up is told to resynchronise and the loop continues.
     ///
@@ -3200,13 +3235,32 @@ impl Session {
     /// 3. **Each attachment is given what it can take.** A terminal of the session's own size is
     ///    handed the spans the engine says a terminal may take unchanged; a terminal of any other
     ///    size is drawn the canonical screen clipped to the size it has.
-    pub fn ingest_output(&mut self, bytes: &[u8]) -> Vec<AttachmentId> {
+    ///
+    /// The write to the spool is a call to the disk, and a disk that is busy with other work can
+    /// keep it waiting as long as it likes. The read loop makes it with the session let go, so
+    /// that a keystroke's write, the recogniser's timer and every reader of the session do not
+    /// wait for it. The bytes are in the resident window until it is made, and
+    /// [`Session::settle_failed_spool_write`] takes the result of one that fails.
+    pub fn ingest_output_deferring_the_spool(
+        &mut self,
+        bytes: &[u8],
+    ) -> (Vec<AttachmentId>, Option<crate::history::SpoolWrite>) {
         if bytes.is_empty() {
-            return Vec::new();
+            return (Vec::new(), None);
         }
-        let cursor = self.history.append(bytes);
-        let gate = self.lane_gate();
-        let filtered = self.engine.feed(cursor, bytes, gate);
+        let (cursor, owed) = {
+            let mut span = self.trace.acquisition(crate::trace::Site::IngestRetain);
+            let appended = self.history.append_deferred(bytes);
+            span.held();
+            appended
+        };
+        let filtered = {
+            let mut span = self.trace.acquisition(crate::trace::Site::IngestInterpret);
+            let gate = self.lane_gate();
+            let filtered = self.engine.feed(cursor, bytes, gate);
+            span.held();
+            filtered
+        };
         // The application is the only thing that decides whether bracketed paste is on, and the
         // canonical parser is the only thing that knows what it decided: a sequence split across
         // two reads, and one that appears inside a string and sets nothing, are both answered
@@ -3219,7 +3273,17 @@ impl Session {
         // The same batch may have changed the keyboard negotiation, and whoever holds the keys has
         // to be able to produce whatever it changed to.
         self.reevaluate_lease();
-        self.deliver(filtered)
+        let trace = self.trace.clone();
+        let mut span = trace.acquisition(crate::trace::Site::IngestDeliver);
+        let delivered = self.deliver(filtered);
+        span.held();
+        (delivered, owed)
+    }
+
+    /// Settles a write to the spool that [`Session::ingest_output_deferring_the_spool`] owed and
+    /// the disk did not take.
+    pub fn settle_failed_spool_write(&mut self, failed: crate::history::SpoolWriteFailed) {
+        self.history.settle_failed_spool_write(failed);
     }
 
     /// Takes the keys from a holder that can no longer supply what the application reads.
