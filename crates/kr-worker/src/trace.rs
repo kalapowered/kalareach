@@ -137,11 +137,11 @@ mod recording {
         epoch: Instant,
         armed: AtomicBool,
         /// The slots reserved so far.
-        taken: AtomicUsize,
+        pub(super) taken: AtomicUsize,
         /// The first slot whose event a recording has not yet given.
         unread: AtomicUsize,
         overflowed: AtomicBool,
-        words: OnceLock<Box<[AtomicU64]>>,
+        pub(super) words: OnceLock<Box<[AtomicU64]>>,
     }
 
     impl Default for LockTrace {
@@ -387,7 +387,13 @@ mod shipped {
 
 #[cfg(all(test, feature = "testing"))]
 mod tests {
+    use std::sync::atomic::Ordering;
+
     use super::{LockTrace, Site};
+
+    fn sites(recording: &super::Recording) -> Vec<Site> {
+        recording.events.iter().map(|event| event.site).collect()
+    }
 
     #[test]
     fn a_recording_gives_each_event_once_and_an_event_that_ends_late_is_in_the_next() {
@@ -397,13 +403,8 @@ mod tests {
         let mut late = trace.acquisition(Site::Ingest);
         late.held();
         drop(trace.acquisition(Site::TimerLook));
-        let first = trace.recording();
         assert_eq!(
-            first
-                .events
-                .iter()
-                .map(|event| event.site)
-                .collect::<Vec<_>>(),
+            sites(&trace.recording()),
             [Site::TimerLook],
             "an acquisition that has not ended is not in it"
         );
@@ -411,11 +412,7 @@ mod tests {
         drop(late);
         let second = trace.recording();
         assert_eq!(
-            second
-                .events
-                .iter()
-                .map(|event| event.site)
-                .collect::<Vec<_>>(),
+            sites(&second),
             [Site::Ingest],
             "and it is in the next, with the instants it kept"
         );
@@ -426,23 +423,62 @@ mod tests {
         );
     }
 
+    /// A slot reserved and not yet published, with a later one published before a recording is
+    /// read: the earlier one is given once it is published, and the later one is not given twice.
+    #[test]
+    fn a_slot_reserved_before_a_published_one_is_given_when_it_is_published() {
+        let trace = LockTrace::new();
+        trace.arm();
+
+        // A writer that has reserved its slot and has not stored its event.
+        let reserved = trace.taken.fetch_add(1, Ordering::AcqRel);
+        assert_eq!(reserved, 0);
+        drop(trace.acquisition(Site::TimerLook));
+        assert_eq!(
+            sites(&trace.recording()),
+            [Site::TimerLook],
+            "the slot after the unpublished one is given"
+        );
+
+        trace.words.get().expect("armed")[0].store(Site::Ingest.code(), Ordering::Release);
+        assert_eq!(
+            sites(&trace.recording()),
+            [Site::Ingest],
+            "and the unpublished one, once it is published, in the next"
+        );
+        assert!(
+            trace.recording().events.is_empty(),
+            "and neither of them again"
+        );
+    }
+
     #[test]
     fn a_full_recorder_stops_and_says_so_rather_than_wrap() {
         let trace = LockTrace::new();
         trace.arm();
+        drop(trace.acquisition(Site::TimerLook));
         for _ in 0..super::recording::EVENTS + 3 {
             drop(trace.acquisition(Site::Ingest));
         }
         let recording = trace.recording();
         assert_eq!(recording.events.len(), super::recording::EVENTS);
+        assert_eq!(
+            recording.events[0].site,
+            Site::TimerLook,
+            "the first event is kept, not written over"
+        );
         assert!(recording.overflowed, "the loss is marked");
     }
 
     #[test]
-    fn nothing_is_recorded_until_it_is_armed() {
+    fn nothing_is_recorded_while_it_is_not_armed() {
         let trace = LockTrace::new();
-        drop(trace.acquisition(Site::Ingest));
         trace.arm();
+        trace.disarm();
+        let mut acquisition = trace.acquisition(Site::Ingest);
+        acquisition.held();
+        drop(acquisition);
+        trace.timer_woke(std::time::Instant::now());
         assert!(trace.recording().events.is_empty());
     }
 }

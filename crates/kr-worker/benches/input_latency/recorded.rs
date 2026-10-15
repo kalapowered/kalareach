@@ -275,6 +275,12 @@ pub async fn record_rounds(
     }
     let wakes = witness.finish();
     trace.disarm();
+    // What the last hold's path stored after its own line was taken.
+    let left_over = trace.recording();
+    if let Some(last) = holds.last_mut() {
+        last.recording.events.extend(left_over.events);
+        last.recording.overflowed |= left_over.overflowed;
+    }
     Recorded {
         holds,
         wakes,
