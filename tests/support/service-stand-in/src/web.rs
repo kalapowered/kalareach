@@ -218,6 +218,9 @@ struct State {
     feeds: BTreeMap<String, crate::feed::Feed>,
     /// The recovery bundles, by locator.
     bundles: crate::sync::Bundles,
+    /// Whether the account's backup storage refuses the write of a bundle, as an account with no
+    /// allowance does.
+    bundle_writes_refused: bool,
 }
 
 /// What the service did with one request.
@@ -353,10 +356,22 @@ impl ServiceWeb {
         );
     }
 
+    /// The account's backup storage admits no write of a recovery bundle from now on, or admits
+    /// one again.
+    pub fn refuse_bundle_writes(&self, refused: bool) {
+        self.state.lock().expect("the state").bundle_writes_refused = refused;
+    }
+
+    /// The sealed bundle the service holds at `locator`, if it holds one.
+    #[must_use]
+    pub fn bundle(&self, locator: &str) -> Option<Vec<u8>> {
+        self.bundle_write(locator).map(|(_, stream)| stream)
+    }
+
     /// The write sequence and the sealed stream the recovery bundle at `locator` stands at, when
     /// one is held.
     #[must_use]
-    pub fn bundle(&self, locator: &str) -> Option<(u64, Vec<u8>)> {
+    pub fn bundle_write(&self, locator: &str) -> Option<(u64, Vec<u8>)> {
         self.state.lock().expect("the state").bundles.held(locator)
     }
 
@@ -696,9 +711,12 @@ impl ServiceWeb {
         }
         if method == "sync.compare_exchange" {
             let State {
-                bundles, tokens, ..
+                bundles,
+                tokens,
+                bundle_writes_refused,
+                ..
             } = &mut *state;
-            return bundles.handle(tokens, body, token, now_ms());
+            return bundles.handle(tokens, body, token, now_ms(), !*bundle_writes_refused);
         }
         if body["installation_id"].as_str() != Some(caller.as_str()) {
             return refusal(
