@@ -41,8 +41,6 @@ const fn ms(count: u64) -> Duration {
 fn quick() -> ControlTimings {
     ControlTimings {
         heartbeat: ms(50),
-        // Longer than the answer limit, as the product's is: a service that accepts sockets and
-        // answers nothing must run out the request's limit before the silence ends the socket.
         silence: ms(3000),
         absent: ms(1500),
         ready_within: ms(2000),
@@ -1031,6 +1029,43 @@ async fn a_request_made_while_no_socket_is_open_and_never_written_is_told_so() {
 
     assert!(matches!(sent, Err(SendError::NotSent)), "{sent:?}");
     assert_eq!(contexts(&route), 0);
+}
+
+#[tokio::test]
+async fn a_service_that_keeps_accepting_sockets_does_not_let_the_control_go_however_short_they_are()
+{
+    // The absent window is 1.5 s and the waits are 100 ms, so twenty sockets take longer than the
+    // window. The service restarts its clock for an absent client at each socket, so the control
+    // goes on for as long as it does.
+    let timings = ControlTimings {
+        retry_first: ms(100),
+        retry_most: ms(100),
+        ..quick()
+    };
+    let route = ControlRoute::start().await;
+    route.drop_after_ready(true);
+    let (_control, mut news) = VoiceControl::open(
+        &connector().with_timings(timings),
+        route.target(),
+        Tokens::new(),
+    );
+    let ended = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    tokio::spawn({
+        let ended = Arc::clone(&ended);
+        async move {
+            while let Some(told) = news.next().await {
+                if matches!(told, ControlNews::Ended(_)) {
+                    ended.store(true, Ordering::SeqCst);
+                }
+            }
+        }
+    });
+
+    route
+        .until("twenty sockets", |report| report.upgrades.len() >= 20)
+        .await;
+
+    assert!(!ended.load(Ordering::SeqCst), "the control let go");
 }
 
 #[tokio::test]

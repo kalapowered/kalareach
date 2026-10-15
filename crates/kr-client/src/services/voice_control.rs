@@ -45,7 +45,7 @@
 //! # When the socket is lost
 //!
 //! The service closes a call whose client has been absent for [`VOICE_CLIENT_ABSENT_SECONDS`]
-//! seconds after the last socket it accepted, so a lost socket is opened again until that long has
+//! seconds since it last heard from or lost a socket of this client, so a lost socket is opened again until that long has
 //! passed since it was lost: at once after a socket that served for a heartbeat or more, and after
 //! a wait that grows from half a second to five between attempts that failed, or that were lost as
 //! soon as they opened. The window bounds an attempt as well as the waits between them. A socket
@@ -107,8 +107,9 @@ const MAX_START_APPENDS: usize = 64;
 /// one's does not count a request this client counted as outside.
 const PACE_MARGIN: Duration = Duration::from_millis(250);
 
-/// The most accepted requests a control keeps to write again for their admission. The service's
-/// rate, and the absent window after which one is forgotten, keep the number well below this.
+/// The most accepted requests a control keeps to write again for their admission. The service
+/// accepts at most sixty a minute, and an entry is forgotten after the absent window, so about a
+/// hundred and twenty can wait at the most: this is above that, and the cap never decides.
 const MAX_ADMITTING: usize = 128;
 
 /// The most identifiers a control remembers having told its owner an admission or a refusal for.
@@ -136,7 +137,8 @@ pub struct ControlTimings {
     /// How long a socket may say nothing before it counts as lost: two heartbeats and a margin.
     pub silence: Duration,
     /// How long after a socket is lost the control keeps opening one again: how long the service
-    /// waits, after the last socket it accepted, before it closes a call whose client is absent.
+    /// waits, since it last heard from or lost a socket of this client, before it closes a call
+    /// whose client is absent.
     pub absent: Duration,
     /// How long a socket that opened has to say `ready`.
     pub ready_within: Duration,
@@ -695,7 +697,8 @@ impl VoiceControl {
     /// Ends the control without closing the call.
     ///
     /// For an owner that closes the call another way. Nothing more is told, and requests that
-    /// waited are [`SendError::Lost`].
+    /// waited are [`SendError::Lost`] if they were written to a socket and [`SendError::NotSent`]
+    /// if they were not.
     pub fn stop(&self) {
         self.stop.notify_one();
     }
@@ -818,7 +821,9 @@ impl Pacer {
     }
 
     /// Counts the request `id` from `now`. A request already counted is counted from `now`
-    /// instead: the service counts it once, and the later moment is never earlier than its own.
+    /// instead: the service counts it once. The moment of a write is earlier than the service's
+    /// own, so a request is counted again from the moment its acceptance arrives, which is later,
+    /// and from the moment it is given up on after a write.
     fn record(&mut self, id: &str, now: Instant) {
         self.sent.retain(|(counted, _)| counted != id);
         self.sent.push_back((id.to_owned(), now));
@@ -1029,8 +1034,8 @@ impl Driver {
                 Served::Stopped => return None,
                 Served::Ended(end) => return Some(end),
                 Served::Lost => {
-                    // The service restarts its clock for an absent client at every socket it
-                    // accepts, so the window counts from this loss. The loss is read before the
+                    // The service restarts its clock for an absent client when it accepts a socket
+                    // and when it loses one, so the window counts from this loss. The loss is read before the
                     // owner is told: a slow owner does not move it.
                     lost_at = Instant::now();
                     let served = lost_at.saturating_duration_since(attached_at);
@@ -1323,8 +1328,8 @@ impl Driver {
         served
     }
 
-    /// Writes one frame the pacer lets go: an admission's repeat, else the closure if it has not
-    /// been written, else the first request that has not.
+    /// Writes one frame: an admission's repeat, else the closure if it has not been written and the
+    /// pacer lets it go, else the first request that has not been and the pacer lets go.
     ///
     /// Every request write is paced and counted, a request written again after a loss included:
     /// the service counts a request when it sends it on, so one that was lost before the service
@@ -1410,10 +1415,10 @@ impl Driver {
                     match self.pending[at].kind {
                         Kind::Send(_) => {
                             let accepted = self.pending.remove(at);
-                            // The service counts the request from when it read it, which is
-                            // not before this answer was written: the pacer counts it from
-                            // when the answer came, so that a slow path cannot leave it
-                            // counting fewer than the service does.
+                            // The service counted the request when it read it, which is before it
+                            // wrote this answer. The pacer counts it from when the answer came,
+                            // which is later than that however slow the path, so it never counts
+                            // the request earlier than the service does.
                             self.pacer.record(&id, Instant::now());
                             if self.admitting.len() >= MAX_ADMITTING {
                                 self.admitting.pop_front();
