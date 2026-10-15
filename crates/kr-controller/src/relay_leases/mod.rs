@@ -95,18 +95,19 @@
 //! is another account, any answer but a delay: a lease of another account's payer is no obstacle.
 //! Where it is the same account the row stays, because the service answers that it could not issue
 //! a lease also for a lease whose relay it can no longer bill through, and answers invalid also for
-//! a lease in its grace window whose grace ceiling passes the authorisation's bound, and a lease
-//! behind either answer stands in the new payer's way. It answers invalid for a bound too small for
-//! a block only when it found no lease, and the two cannot be told apart, so the row stays; a
-//! withdrawal clears both. If the service answers
-//! `FORBIDDEN`, the old authorisation is not one it holds for this host's key, is no longer in
-//! force, or the pair's lease belongs to another caller or another authorisation: it names no
-//! lease under that payer and the row is dropped at once. The service ends the leases of an
-//! authorisation that is withdrawn but not those of one that lapses, and a lease the host was
-//! never told of cannot be ended by asking, so one that lapsed with its authorisation runs out by
-//! itself. The owner clears a lease that stands in the new payer's way by withdrawing the
-//! authorisation it replaced: the service then ends its leases, also after a lapse. Any other
-//! refusal says nothing of the pair: the row stays, and so does the wait before the next ask.
+//! a lease in its grace window whose grace-raised hold passes the authorisation's bound, and a
+//! lease behind either answer stands in the new payer's way. It answers invalid for a bound too
+//! small for a block only when it found no lease, and the two cannot be told apart, so the row
+//! stays; a withdrawal clears both. If the service answers `FORBIDDEN`, the old authorisation is
+//! not one it holds for this host's key, is no longer in force, or the pair's lease belongs to
+//! another caller or another authorisation: it names no lease under that payer and the row is
+//! dropped at once. The service ends the leases of an authorisation that is withdrawn but not
+//! those of one that lapses, and a lease the host was never told of cannot be ended by asking, so
+//! one that lapsed with its authorisation runs out by itself. The owner clears a lease that stands
+//! in the new payer's way, or a row kept because the two answers cannot be told apart, by
+//! withdrawing the authorisation it replaced: the service then ends its leases, also after a
+//! lapse, and refuses the next ask under it as forbidden. In any other case a refusal says nothing
+//! of the pair: the row stays, and so does the wait before the next ask.
 
 pub mod record;
 
@@ -988,8 +989,9 @@ async fn reconcile(
                 // The service says the old payer's authorisation is not one it holds for this
                 // host's key, is not in force, or the pair's lease belongs to another caller or
                 // another authorisation: it will name no lease under it, and a lease the host was
-                // never told of cannot be ended by asking. The row is done with. Any other
-                // refusal says nothing of the pair, and the row stays.
+                // never told of cannot be ended by asking. The row is done with. In any other
+                // case a refusal says nothing of the pair, and the row stays, unless the arm below
+                // lets an aged row go.
                 Asked::Disowned(_) if foreign => {
                     shared
                         .on_record(move |record| record.forget(&destination))
@@ -1009,9 +1011,10 @@ async fn reconcile(
                 // new payer is the same account the service refuses it for as long as the old
                 // lease stands, and it answers "could not issue a lease" too for a lease whose
                 // relay it can no longer bill through, before it looks at the lease's deadline,
-                // and "invalid" for a lease in its grace window and for a bound too small for a
-                // block, which cannot be told apart: the row stays and is asked again after the
-                // wait, and the owner clears the lease by withdrawing the authorisation replaced.
+                // and "invalid" for a lease in its grace window whose grace-raised hold passes
+                // the bound and for a bound too small for a block when it found no lease, which
+                // cannot be told apart: the row stays and is asked again after the wait, and the
+                // owner clears either by withdrawing the authorisation replaced.
                 Asked::Standing(_) if last && other_account => {
                     shared
                         .on_record(move |record| record.forget(&destination))
