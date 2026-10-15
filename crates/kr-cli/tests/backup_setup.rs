@@ -859,9 +859,13 @@ async fn an_outcome_that_stays_unknown_says_to_keep_the_kit_until_the_doctor_set
     window.confirm(&kit);
     let shown = window.wait_for("kr ended");
     assert!(!shown.contains("kr ended 0"), "{shown}");
-    assert!(shown.contains("Keep the kit"), "{shown}");
-    assert!(shown.contains(&kit.fingerprint()), "{shown}");
-    assert!(shown.contains("kr doctor"), "{shown}");
+    let said = shown
+        .rsplit_once("How the setup ended is not known.")
+        .expect("the ending is said")
+        .1;
+    assert!(said.contains("Keep the kit"), "{said}");
+    assert!(said.contains(&kit.fingerprint()), "{said}");
+    assert!(said.contains("kr doctor"), "{said}");
     assert_eq!(rig.recorded_kit().await, None);
 }
 
@@ -947,8 +951,13 @@ async fn an_interrupt_while_the_daemon_has_the_call_says_to_keep_the_kit() {
     window.type_bytes(&[0x03]);
     let shown = window.wait_for("kr ended");
     assert!(!shown.contains("kr ended 0"), "{shown}");
-    assert!(shown.contains("Keep the kit"), "{shown}");
-    assert!(shown.contains(&kit.fingerprint()), "{shown}");
+    // The kit was printed with its fingerprint above; what the interrupt says is what follows it.
+    let said = shown
+        .rsplit_once("The command stopped while the setup was under way")
+        .expect("the interrupt is said")
+        .1;
+    assert!(said.contains("Keep the kit"), "{said}");
+    assert!(said.contains(&kit.fingerprint()), "{said}");
     assert!(!shown.contains("Nothing was set up"), "{shown}");
     assert!(!shown.contains("opens nothing: delete it"), "{shown}");
     assert!(window.echoes(), "echo is on");
@@ -1023,12 +1032,46 @@ async fn an_interrupt_while_the_daemon_says_nothing_ends_the_command_at_once() {
     }
     let silent = Listener::bind(&rig.endpoint).expect("binds the endpoint");
     let mut window = Window::run(&rig, &["backup", "setup"]);
-    let _held = silent.accept().await.expect("the command connects");
+    let _held = tokio::time::timeout(LIVENESS_DEADLINE, silent.accept())
+        .await
+        .expect("the command connects")
+        .expect("accepts");
     window.type_bytes(&[0x03]);
     let shown = window.wait_for("kr ended");
     assert!(!shown.contains("kr ended 0"), "{shown}");
-    assert!(shown.contains("Nothing was set up."), "{shown}");
+    assert_eq!(shown.matches("Nothing was set up.").count(), 1, "{shown}");
     assert!(window.echoes(), "echo is on");
+}
+
+/// As the case above, after the kit was shown and `yes` was typed: the call's own connection is the
+/// one that waits. The interrupt is said once, and says that the kit opens nothing, because
+/// nothing has been sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_interrupt_while_the_daemon_says_nothing_to_the_call_is_said_once() {
+    let mut rig = Rig::start().await;
+    let mut window = Window::run(&rig, &["backup", "setup"]);
+    let kit = window.bring_up_the_kit();
+    for task in std::mem::take(&mut rig.serving) {
+        task.abort();
+        let _ = task.await;
+    }
+    let silent = Listener::bind(&rig.endpoint).expect("binds the endpoint");
+    window.confirm(&kit);
+    let _held = tokio::time::timeout(LIVENESS_DEADLINE, silent.accept())
+        .await
+        .expect("the command connects")
+        .expect("accepts");
+    window.type_bytes(&[0x03]);
+    let shown = window.wait_for("kr ended");
+    assert!(!shown.contains("kr ended 0"), "{shown}");
+    assert_eq!(
+        shown
+            .matches("The kit that was shown opens nothing: delete it.")
+            .count(),
+        1,
+        "{shown}"
+    );
+    assert_eq!(rig.requests_to(SYNC), 0, "nothing reached the service");
 }
 
 /// A daemon that cannot be reached when the call is to be made has been given nothing, so the kit
@@ -1225,7 +1268,7 @@ async fn a_fresh_host_restores_the_session_a_set_up_host_backed_up_from_the_kit_
 /// It packs, encrypts, uploads and restores more than a gigabyte, so it runs on the build box and
 /// only when asked: `cargo test -p kr-cli --test backup_setup -- --ignored the_bounds_hold`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "packs, uploads and restores about 1.4 GiB at the convention's real sizes; run it on the build box with --ignored"]
+#[ignore = "packs, uploads and restores about 1.5 GiB at the convention's real sizes; run it on the build box with --ignored"]
 async fn the_bounds_hold_at_the_real_scale_and_a_restore_accepts_what_the_producer_packed() {
     /// What a restore accepts of all members together: the convention's 1.5 GiB.
     const TOTAL: u64 = 3 << 29;
@@ -1299,7 +1342,8 @@ async fn the_bounds_hold_at_the_real_scale_and_a_restore_accepts_what_the_produc
     assert!(packed <= TOTAL, "the members total {packed} bytes");
     assert!(
         sessions.len() < SESSIONS,
-        "the sessions together are over the total, so one is left out"
+        "the sessions together are over the total, so one is left out: {} packed, {packed} bytes",
+        sessions.len()
     );
     let largest = sessions.iter().copied().max().expect("a session");
     assert!(

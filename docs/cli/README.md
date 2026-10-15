@@ -11,7 +11,7 @@ worker directly for what a session owns.
 | `kr attach <id>` | `kr a` | Attach to an existing session. It never resumes or creates a replacement |
 | `kr detach [--attachment <id>]` | `kr d` | Remove an attachment |
 | `kr export <id> --output <file>` | — | Write a closed session's retained output to a file you name, in this environment or an enrolled one |
-| `kr backup setup [--replace]` | — | Set this host's backups up: show a recovery kit once and turn on a daily backup of closed sessions and the host's configuration |
+| `kr backup setup [--replace]` | — | Set this host's backups up: show a recovery kit once and turn on a backup of closed sessions and the host's configuration, made at most once a day |
 | `kr backup restore --into <folder>` | — | Open a backup of this host's data with the recovery kit and write it as readable files into a folder you made; nothing is imported |
 | `kr close [id]` | `kr c` | Close a session and terminate the processes it owns |
 | `kr list` | `kr l` | List sessions with their display numbers, states and shells |
@@ -755,7 +755,7 @@ declares. As in every other command, its counts are numbers.
 
 ## `kr backup setup`
 
-`kr backup setup` sets up backups for this host. It displays a recovery kit once and configures a daily backup of closed sessions and the host's configuration. The kit is the only way to read those backups if you lose this host, and KalaReach does not store a copy of it.
+`kr backup setup` sets up backups for this host. It displays a recovery kit once and configures a backup of closed sessions and the host's configuration, made at most once a day. The kit is the only way to read those backups if you lose this host, and KalaReach does not store a copy of it.
 
 ```text
 kr backup setup [--replace] [--environment <id>]
@@ -779,7 +779,7 @@ If the host is set up, the command prints the fingerprint, and the kit is in use
 
 If the daemon confirmed that it recorded nothing, the kit opens nothing and you can delete it. If you can mend the cause (the sign-in, an account with no allowance for backup storage, a change of account during the call, or a refusal by the service), the command offers the same kit again. Type `retry` once you have mended it. The command makes this offer three times at most.
 
-If the daemon could not say how the call ended, the command repeats the call with the same bytes, waiting as the answer says, up to five times. A refusal after the call was sent, a connection that fails and Ctrl-C all count as not knowing, because each can follow the daemon recording the setup; only the daemon's confirmation that it recorded nothing says that the kit opens nothing. If the outcome stays unknown, keep the kit until `kr doctor` settles it. If `kr doctor` shows backups set up with the kit's fingerprint, the kit is in use. If it shows no setup and none in progress, the kit opens nothing.
+If the daemon could not say how the call ended, the command repeats the call with the same bytes, waiting as the answer says, up to five times. A refusal after the call was sent, a connection that fails and Ctrl-C are not repeated: the command stops and says that the outcome is not known, because each can follow the daemon recording the setup. A daemon that declines because this host already records that archive, or because another setup is in place, is treated the same way. Only the daemon's confirmation that it recorded nothing says that the kit opens nothing. If the outcome stays unknown, keep the kit until `kr doctor` settles it. If `kr doctor` shows backups set up with the kit's fingerprint, the kit is in use. If it shows no setup and none in progress, the kit opens nothing. Any other fingerprint may be a later setup that replaced this one, so keep the kit.
 
 With `--replace`, the command sets backups up again under a new kit. The earlier kit stops being the kit of new backups, and the earlier archive's unfinished uploads are stopped. The earlier archive and its bundle stay at the service until you delete them. If the outcome of a `--replace` stays unknown, the new kit opens nothing only when `kr doctor` shows the earlier kit's fingerprint and no setup in progress. Any other fingerprint may be a later replacement of the new setup, so keep the new kit.
 

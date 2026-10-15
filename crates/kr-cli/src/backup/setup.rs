@@ -120,7 +120,7 @@ pub async fn run(
     // The connection that reads the status is let go of before the dialogue begins: a person can
     // take longer over it than a connection nobody reads from is kept.
     let status = {
-        let mut daemon = dialogue.connect(paths, &arguments.selector).await?;
+        let mut daemon = dialogue.connect(paths, &arguments.selector).await??;
         tokio::select! {
             status = daemon.read::<_, BackupStatusResult>(Method::BackupStatus, &BackupStatusParams {}) => status?,
             () = dialogue.interrupt.arrived() => return Err(dialogue.stopped()),
@@ -197,6 +197,13 @@ pub async fn run(
                 ));
                 return Ok(Completion::Done);
             }
+            Ended::Declined(cause) if kit_may_be_recorded(&cause) => {
+                report::say(&shown!(
+                    "The daemon declined the call: {}.",
+                    declined_words(&cause)
+                ));
+                return Err(dialogue.kit_may_be_in_use());
+            }
             Ended::Declined(cause) => {
                 report::say(&shown!(
                     "Backups were not set up: {}.",
@@ -259,14 +266,15 @@ impl Dialogue {
         Ok(answer.map(Zeroizing::new))
     }
 
-    /// Opens a connection to the daemon, which the person can interrupt.
+    /// Opens a connection to the daemon, which the person can interrupt. The outer error is the
+    /// interrupt, already said; the inner result is the connection's own.
     async fn connect(
         &mut self,
         paths: &HostPaths,
         selector: &EnvironmentSelector,
-    ) -> Result<Daemon> {
+    ) -> Result<Result<Daemon>> {
         tokio::select! {
-            daemon = Daemon::open(paths, selector) => daemon,
+            daemon = Daemon::open(paths, selector) => Ok(daemon),
             () = self.interrupt.arrived() => Err(self.stopped()),
         }
     }
@@ -309,12 +317,18 @@ impl Dialogue {
     ) -> Result<Ended> {
         let mut repeats = 0;
         loop {
-            let mut daemon = match self.connect(paths, selector).await {
+            let mut daemon = match self.connect(paths, selector).await? {
                 Ok(daemon) => daemon,
                 // Nothing has been sent when the first attempt cannot reach the daemon.
                 Err(error) if self.stage != Stage::Sending => return Err(self.failed(error)),
                 // A repeat: the earlier attempt may have been run.
-                Err(_) => return Ok(Ended::Unknown),
+                Err(error) => {
+                    report::say(&shown!(
+                        "The command could not reach the daemon again: {}",
+                        error.said()
+                    ));
+                    return Ok(Ended::Unknown);
+                }
             };
             self.stage = Stage::Sending;
             // A new action identity each time: a claimed action keeps no result for an error that
@@ -330,6 +344,10 @@ impl Dialogue {
                     return Ok(Ended::Declined(cause));
                 }
                 Answer::Ended(ended) => return Ok(ended),
+                Answer::Failed(said) => {
+                    report::say(&said);
+                    return Ok(Ended::Unknown);
+                }
                 Answer::Again { delay } => delay,
             };
             repeats += 1;
@@ -363,8 +381,9 @@ impl Dialogue {
                     "Nothing was set up. The kit that was shown opens nothing: delete it.",
                 ));
             }
-            // A call is on its way: only the daemon's own word makes the kit void.
-            Stage::Sending => {}
+            // A call has been sent: only the daemon's own word makes the kit void, and it is
+            // given through `Declined`, which leaves this stage first.
+            Stage::Sending => return lines,
         }
         if self.replacing.is_some() {
             lines.push(Shown::said("The earlier setup is as it was."));
@@ -380,8 +399,8 @@ impl Dialogue {
         CliError::Other(Shown::said("backups were not set up"))
     }
 
-    /// The ending of a failure that is not the daemon's answer to the call, such as a terminal
-    /// that could not be read: no call was sent, so the kit that was shown, if one was, opens
+    /// The ending of a failure that is not the daemon's answer to a sent call, such as a terminal
+    /// that could not be read: no call is on its way, so the kit that was shown, if one was, opens
     /// nothing.
     fn failed(&self, error: CliError) -> CliError {
         for line in self.nothing_set_up() {
@@ -407,6 +426,16 @@ impl Dialogue {
             }
         }
         interrupt::stopped()
+    }
+
+    /// The ending of a call the daemon declined for a cause that can follow its recording of this
+    /// kit's setup by an earlier try.
+    fn kit_may_be_in_use(&self) -> CliError {
+        report::say(&Shown::said(
+            "An earlier try of this call may have set backups up under this kit.",
+        ));
+        self.keep_the_kit();
+        CliError::Other(Shown::said("how the setup ended is not known"))
     }
 
     /// The ending of a call whose outcome stayed unknown.
@@ -454,6 +483,9 @@ enum Answer {
     /// The daemon could not say, and the call is made again after `delay` seconds, when the answer
     /// names one.
     Again { delay: Option<u64> },
+    /// The call failed in a way that may follow the daemon's recording of the setup, and is not
+    /// made again. The sentence says what failed.
+    Failed(Shown),
 }
 
 /// Sorts the daemon's answer to a sent call.
@@ -478,11 +510,13 @@ fn answer_of(answer: Result<BackupEnableResult>) -> Answer {
         Err(CliError::Refused(error)) if error.code == ErrorCode::OutcomeUnknown => {
             Answer::Again { delay: None }
         }
-        Err(refused @ (CliError::Refused(_) | CliError::ServiceRefused { .. })) => {
-            report::say(&shown!("The daemon refused the call: {}", refused.said()));
-            Answer::Ended(Ended::Unknown)
-        }
-        Err(_) => Answer::Ended(Ended::Unknown),
+        Err(refused @ (CliError::Refused(_) | CliError::ServiceRefused { .. })) => Answer::Failed(
+            shown!("The daemon answered with a refusal: {}", refused.said()),
+        ),
+        Err(lost) => Answer::Failed(shown!(
+            "The connection to the daemon failed: {}",
+            lost.said()
+        )),
     }
 }
 
@@ -630,13 +664,12 @@ fn declined_words(cause: &BackupEnableCause) -> Shown {
         BackupEnableCause::BundleTooLarge {} => {
             Shown::said("the recovery bundle is larger than the service accepts")
         }
-        BackupEnableCause::AlreadySetUp {} => Shown::said(
-            "backups are set up on this host for another archive: run with --replace to replace \
-             them",
-        ),
-        BackupEnableCause::ArchiveInUse {} => Shown::said(
-            "this host already records backups of that archive: run this again for a new kit",
-        ),
+        BackupEnableCause::AlreadySetUp {} => {
+            Shown::said("backups are set up on this host for another archive")
+        }
+        BackupEnableCause::ArchiveInUse {} => {
+            Shown::said("this host already records backups of that archive")
+        }
         BackupEnableCause::NoAllowance {} => {
             Shown::said("the account has no allowance for backup storage")
         }
@@ -651,6 +684,17 @@ fn declined_words(cause: &BackupEnableCause) -> Shown {
             shown!("the service refused the setup ({})", *code)
         }
     }
+}
+
+/// Whether the daemon can decline with `cause` after an earlier try of the same call recorded the
+/// setup: the repeat is answered from the record when the setup stands, so it is declined only
+/// when the record has since been replaced or the archive already has generations. The kit then
+/// opens what the earlier try recorded, and is kept until `kr doctor` settles it.
+const fn kit_may_be_recorded(cause: &BackupEnableCause) -> bool {
+    matches!(
+        cause,
+        BackupEnableCause::AlreadySetUp {} | BackupEnableCause::ArchiveInUse {}
+    )
 }
 
 /// Whether the person can mend a refusal and try the same kit again: the kit and its bundle are
@@ -861,13 +905,13 @@ mod tests {
         for code in refusals {
             let refused = CliError::Refused(ProtocolError::new(code, "refused"));
             assert!(
-                matches!(answer_of(Err(refused)), Answer::Ended(Ended::Unknown)),
+                matches!(answer_of(Err(refused)), Answer::Failed(_)),
                 "{code:?} is not a confirmed refusal"
             );
         }
         assert!(matches!(
             answer_of(Err(CliError::Other(Shown::said("the connection failed")))),
-            Answer::Ended(Ended::Unknown)
+            Answer::Failed(_)
         ));
         assert!(matches!(
             answer_of(Ok(BackupEnableResult::Declined {
@@ -875,5 +919,33 @@ mod tests {
             })),
             Answer::Ended(Ended::Declined(BackupEnableCause::NoAllowance {}))
         ));
+    }
+
+    /// A daemon declines with a cause that can follow a recording of this kit's setup only when the
+    /// record has been replaced or the archive already has generations; every other cause comes
+    /// before anything is recorded.
+    #[test]
+    fn only_the_causes_that_follow_a_recording_keep_the_kit() {
+        let after_a_recording = [
+            BackupEnableCause::AlreadySetUp {},
+            BackupEnableCause::ArchiveInUse {},
+        ];
+        let before_any_recording = [
+            BackupEnableCause::NoService {},
+            BackupEnableCause::SignIn {
+                sign_in: BackupSignIn::SignedOut,
+            },
+            BackupEnableCause::AnotherAccount {},
+            BackupEnableCause::KeysChanged {},
+            BackupEnableCause::BundleTooLarge {},
+            BackupEnableCause::NoAllowance {},
+            BackupEnableCause::TokenNotAccepted {},
+            BackupEnableCause::BundleConflict {},
+            BackupEnableCause::ServiceRefused {
+                code: ErrorCode::PermissionDenied,
+            },
+        ];
+        assert!(after_a_recording.iter().all(kit_may_be_recorded));
+        assert!(!before_any_recording.iter().any(kit_may_be_recorded));
     }
 }
