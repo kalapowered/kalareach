@@ -91,8 +91,8 @@ class WrittenArguments {
 )
 class PlatformPlugin(private val activity: Activity) : Plugin(activity) {
     /**
-     * Where a command to the voice call waits for the media engine. A command arrives on the thread
-     * Rust's runtime called from, which must not be held, and a stop must be able to run while an
+     * Where a command to the voice call waits for the media engine. A command arrives on the
+     * application's main thread, which must not be held, and a stop must be able to run while an
      * offer is still being made, so each command has a thread of its own.
      */
     private val calls = Executors.newCachedThreadPool { task ->
@@ -141,50 +141,61 @@ class PlatformPlugin(private val activity: Activity) : Plugin(activity) {
             invoke.reject("a call is already being opened", CallRefused.ALREADY_RUNNING)
             return
         }
-        // The microphone is asked for here, and notifications from Android 13, before anything is
-        // made. Refusing notifications does not refuse the call: it is reported, and Rust decides.
-        val wanted = buildList {
-            if (getPermissionState("microphone") != PermissionState.GRANTED) add("microphone")
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
-                getPermissionState("notifications") != PermissionState.GRANTED
-            ) {
-                add("notifications")
+        guarded(opening, invoke) {
+            // The microphone is asked for here, and notifications from Android 13, before anything
+            // is made. Refusing notifications does not refuse the call: it is reported, and Rust
+            // decides.
+            val wanted = buildList {
+                if (getPermissionState("microphone") != PermissionState.GRANTED) add("microphone")
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+                    getPermissionState("notifications") != PermissionState.GRANTED
+                ) {
+                    add("notifications")
+                }
             }
-        }
-        try {
             if (wanted.isEmpty()) {
                 openCall(invoke, opening)
             } else {
                 // The answer may never come (the activity that asked can be gone), and Rust waits
-                // for this one: the opening settles its request itself when the time is up.
+                // for this one: when the time is up the opening goes on with what is allowed then.
                 opening.asks()
                 synchronized(askingLock) { asking = Asking(opening, invoke) }
-                deadlines.postDelayed({ giveUpAsking(opening) }, ASKING_DEADLINE_MS)
+                deadlines.postDelayed({ goOnWithAsking(opening) }, ASKING_DEADLINE_MS)
                 requestPermissionForAliases(wanted.toTypedArray(), invoke, "callPermissionsAnswered")
             }
+        }
+    }
+
+    /**
+     * Runs one step of an opening. A step that throws ends the opening, so that the next one is
+     * not refused for ever, and answers its request, unless something has answered it already.
+     */
+    private fun guarded(opening: CallOpenings.Opening, invoke: Invoke, step: () -> Unit) {
+        try {
+            step()
         } catch (failure: Throwable) {
             synchronized(askingLock) { if (asking?.opening === opening) asking = null }
             if (opening.end()) invoke.reject(failure.message ?: failure.toString(), "engine")
         }
     }
 
-    /** The person did not answer in time: the opening ends and the request that waited is answered. */
-    private fun giveUpAsking(opening: CallOpenings.Opening) {
+    /**
+     * The question was answered, or the time for it is up: the opening that waits goes on with what
+     * is allowed now, once, whichever of the two comes first. The request it answers is the one
+     * that waits, not the one the platform names: the platform keeps one callback, and a request it
+     * names may be one that was answered already.
+     */
+    private fun goOnWithAsking(only: CallOpenings.Opening?) {
         val waiting = synchronized(askingLock) {
-            asking?.takeIf { it.opening === opening }?.also { asking = null }
-        }
-        if (waiting != null && opening.expire()) {
-            waiting.invoke.reject("the person did not answer the permission question", "engine")
-        }
+            asking?.takeIf { only == null || it.opening === only }?.also { asking = null }
+        } ?: return
+        if (!waiting.opening.answered()) return
+        guarded(waiting.opening, waiting.invoke) { openCall(waiting.invoke, waiting.opening) }
     }
 
     @PermissionCallback
     fun callPermissionsAnswered(invoke: Invoke) {
-        // The answer is for the opening that waits, whichever request the platform names: it is
-        // taken once, and only while the opening still waits for it.
-        val waiting = synchronized(askingLock) { asking.also { asking = null } } ?: return
-        if (!waiting.opening.answered()) return
-        openCall(waiting.invoke, waiting.opening)
+        goOnWithAsking(only = null)
     }
 
     private fun openCall(invoke: Invoke, opening: CallOpenings.Opening) {

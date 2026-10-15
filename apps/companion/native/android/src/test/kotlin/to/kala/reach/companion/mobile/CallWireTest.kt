@@ -256,22 +256,17 @@ class CallWireTest {
     }
 
     @Test
-    fun `an opening that waits on the person ends once, by the answer or by the deadline`() {
+    fun `the answer to the question an opening waits on is taken once`() {
         val openings = CallOpenings()
+        val opening = openings.reserve()!!
+        assertFalse("an opening that asks nothing has no answer to take", opening.answered())
+        opening.asks()
 
-        val answered = openings.reserve()!!
-        answered.asks()
-        assertTrue("the answer is taken", answered.answered())
-        assertFalse("and only once", answered.answered())
-        assertFalse("a deadline after the answer does nothing", answered.expire())
+        assertTrue("the answer is taken", opening.answered())
+        assertFalse("and only once, whoever gives it", opening.answered())
         assertEquals("the opening is still under way", null, openings.reserve())
-        assertTrue(answered.end())
-
-        val unanswered = openings.reserve()!!
-        unanswered.asks()
-        assertTrue("the deadline ends the opening that still waits", unanswered.expire())
-        assertFalse("a late answer is not taken", unanswered.answered())
-        assertFalse("the opening has ended", unanswered.end())
+        assertTrue(opening.end())
+        assertFalse("an answer after the end is not taken", opening.answered())
         assertTrue("and another may begin", openings.reserve() != null)
     }
 
@@ -288,7 +283,7 @@ class CallWireTest {
     }
 
     @Test
-    fun `a call is held by one name at a time and one that could not be made is not remembered as ended`() {
+    fun `a call is held by one name at a time and a name whose call could not be made is let go`() {
         val names = CallNames()
         names.making("c1") {
             val refused = try {

@@ -105,12 +105,12 @@ object CallBridgeHolder {
  * Opening may ask the person a permission question before anything is made, and the platform keeps
  * one answer for that question: a second opening that asked it too would take the first one's
  * answer, and the first would never get one. So an opening is refused while another is under way.
- * An opening ends once. It ends when the call is made or refused ([Opening.end]), or when the
- * person's answer does not come in time ([Opening.expire]). The person's answer ([Opening.answered])
- * is taken once, and only while the opening still waits for it. Each of these says whether it was
- * the one that acted, so whatever comes second does nothing: a late answer after the deadline, a
- * deadline after the answer, a second ending. The caller answers whoever is waiting only when
- * it was the one that acted.
+ * An opening waits on the question for a stated time and then goes on with what is allowed, as
+ * if the question had been answered. It ends when the call is made or refused ([Opening.end]).
+ * The answer ([Opening.answered]), the person's or the time running out, is taken once, and only
+ * while the opening still waits for it. Each of these says whether it was the one that acted, so
+ * whatever comes second does nothing: a late answer after the time ran out, a second ending. The
+ * caller answers whoever is waiting only when it was the one that acted.
  */
 class CallOpenings {
     private var current: Opening? = null
@@ -128,14 +128,14 @@ class CallOpenings {
     inner class Opening internal constructor() {
         private var stage = Stage.STARTING
 
-        /** The opening now waits for the person's answer to the permission question. */
+        /** The opening now waits for the answer to the permission question. */
         fun asks() {
             synchronized(this@CallOpenings) {
                 if (stage == Stage.STARTING) stage = Stage.ASKING
             }
         }
 
-        /** The person answered: true once, and only if the opening still waited for the answer. */
+        /** The question was answered: true once, and only if the opening still waited for it. */
         fun answered(): Boolean {
             synchronized(this@CallOpenings) {
                 if (stage != Stage.ASKING) return false
@@ -144,27 +144,14 @@ class CallOpenings {
             }
         }
 
-        /** The answer did not come in time: true, and the opening ends, only if it still waited. */
-        fun expire(): Boolean {
-            synchronized(this@CallOpenings) {
-                if (stage != Stage.ASKING) return false
-                finish()
-                return true
-            }
-        }
-
         /** The call was made or refused: true, and the opening ends, only for the first ending. */
         fun end(): Boolean {
             synchronized(this@CallOpenings) {
                 if (stage == Stage.ENDED) return false
-                finish()
+                stage = Stage.ENDED
+                current = null
                 return true
             }
-        }
-
-        private fun finish() {
-            stage = Stage.ENDED
-            current = null
         }
     }
 }
@@ -188,8 +175,8 @@ class CallNames {
     /**
      * Holds [name] as the call held while [make] makes the call, so that two openings cannot both
      * go on to make one. Refuses with [CallRefused.ALREADY_RUNNING] when a call is held already.
-     * When [make] throws anything, the name is let go as the name of something that was never a
-     * call, and what was thrown goes on.
+     * When [make] throws anything, the name is no longer held, and what was thrown goes on. An end
+     * that the call itself reported while it was being made stays recorded by [end].
      */
     fun <T> making(name: String, make: () -> T): T {
         if (!hold(name)) throw CallRefused(CallRefused.ALREADY_RUNNING, "this device already holds a call")
