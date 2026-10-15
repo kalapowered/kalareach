@@ -780,10 +780,17 @@ const fn declined(cause: BackupEnableCause) -> BackupEnableResult {
     BackupEnableResult::Declined { cause }
 }
 
+/// The answer that the daemon cannot say how the call ended. A delay is named in whole seconds,
+/// rounded up: a caller that waits the seconds named must not meet the delay again.
 fn unknown(retry_after: Option<Duration>) -> BackupEnableResult {
     BackupEnableResult::Unknown {
-        retry_after_seconds: Nullable::from(
-            retry_after.map(|delay| U64::new(delay.as_secs().max(1))),
-        ),
+        retry_after_seconds: Nullable::from(retry_after.map(|delay| {
+            U64::new(
+                delay
+                    .as_secs()
+                    .saturating_add(u64::from(delay.subsec_nanos() > 0))
+                    .max(1),
+            )
+        })),
     }
 }
