@@ -105,6 +105,7 @@ struct State {
     accept_then_drop: bool,
     drop_unread: bool,
     drop_after_ready: bool,
+    admissions_twice: bool,
     announced: Vec<String>,
     ready_call: String,
     windows: (Duration, Duration),
@@ -155,6 +156,7 @@ impl ControlRoute {
                 accept_then_drop: false,
                 drop_unread: false,
                 drop_after_ready: false,
+                admissions_twice: false,
                 announced: Vec::new(),
                 ready_call: CALL.to_owned(),
                 windows: windows.unwrap_or((Duration::from_secs(10), Duration::from_secs(60))),
@@ -281,6 +283,12 @@ impl ControlRoute {
     /// Ends every connection as soon as it has said `ready`, until told not to.
     pub fn drop_after_ready(&self, drop: bool) {
         self.edit(|state| state.drop_after_ready = drop);
+    }
+
+    /// Sends the provider's admission of every request twice, as a socket opened just before the
+    /// answer comes hears it when the service broadcasts it and again when it answers a repeat.
+    pub fn send_admissions_twice(&self, twice: bool) {
+        self.edit(|state| state.admissions_twice = twice);
     }
 
     /// Makes the next `ready` name another call.
@@ -655,8 +663,12 @@ fn answer(shared: &Shared, text: &str) -> (Vec<Value>, bool) {
         // The provider has it and the device was told it was accepted, and the answer is lost.
         return (vec![json!({ "type": "context_accepted", "id": id })], true);
     }
-    (
-        vec![json!({ "type": "context_accepted", "id": id }), admitted],
-        false,
-    )
+    let mut answers = vec![
+        json!({ "type": "context_accepted", "id": id }),
+        admitted.clone(),
+    ];
+    if state.admissions_twice {
+        answers.push(admitted);
+    }
+    (answers, false)
 }

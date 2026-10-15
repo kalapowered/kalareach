@@ -518,6 +518,8 @@ async fn requests_keep_inside_the_services_rate_without_being_refused() {
     let route = ControlRoute::start_with(None, Some((ms(300), ms(1800)))).await;
     let (control, mut news) = open(&route, &Tokens::new());
     attached(&mut news).await;
+    // The owner of a control reads what it is told.
+    tokio::spawn(async move { while news.next().await.is_some() {} });
 
     for number in 0..25 {
         control
@@ -573,6 +575,8 @@ async fn requests_written_again_after_a_loss_count_against_the_rate_like_any_oth
     let timings = ControlTimings {
         retry_first: ms(100),
         retry_most: ms(100),
+        absent: ms(4000),
+        answer_within: ms(6000),
         ..quick()
     };
     let route = ControlRoute::start_with(None, Some((ms(300), ms(1800)))).await;
@@ -783,49 +787,6 @@ async fn a_request_the_socket_dropped_on_is_written_again_and_the_model_hears_it
 }
 
 #[tokio::test]
-async fn a_request_waiting_out_a_loss_longer_than_the_answer_window_is_still_answered() {
-    // The window is shorter than five waits between attempts, so the loss outlasts it.
-    let timings = ControlTimings {
-        answer_within: ms(150),
-        retry_first: ms(100),
-        retry_most: ms(100),
-        ..quick()
-    };
-    let route = ControlRoute::start().await;
-    let (control, mut news) = VoiceControl::open(
-        &connector().with_timings(timings),
-        route.target(),
-        Tokens::new(),
-    );
-    attached(&mut news).await;
-    route.swallow_next_request_and_drop();
-    route.refuse_all(Some(503));
-    let waiting = tokio::spawn({
-        let control = control.clone();
-        async move {
-            control
-                .send(VoiceCommand::Thinking, None, Some("across a long loss"))
-                .await
-        }
-    });
-    route
-        .until("five refused attempts", |report| {
-            report.refused_upgrades >= 5
-        })
-        .await;
-    route.refuse_all(None);
-
-    let accepted = waiting
-        .await
-        .expect("the task")
-        .expect("accepted after the loss");
-
-    let report = route.report();
-    assert_eq!(report.sent.len(), 1, "sent to the provider once");
-    assert_eq!(report.sent[0].id, accepted.id);
-}
-
-#[tokio::test]
 async fn a_request_made_while_the_socket_is_down_waits_for_it() {
     let route = ControlRoute::start().await;
     let (control, mut news) = open(&route, &Tokens::new());
@@ -879,7 +840,7 @@ async fn a_service_that_stays_unreachable_ends_the_control_when_the_absent_windo
     assert_eq!(ended(&mut news).await, ControlEnd::Unreachable);
 
     let waited = waiting.await.expect("the task");
-    assert!(matches!(waited, Err(SendError::Lost)), "{waited:?}");
+    assert!(matches!(waited, Err(SendError::NotSent)), "{waited:?}");
     assert!(
         route.report().refused_upgrades >= 2,
         "it tried again before it gave up"
@@ -887,7 +848,7 @@ async fn a_service_that_stays_unreachable_ends_the_control_when_the_absent_windo
     let after = control
         .send(VoiceCommand::Thinking, None, Some("too late"))
         .await;
-    assert!(matches!(after, Err(SendError::Lost)), "{after:?}");
+    assert!(matches!(after, Err(SendError::NotSent)), "{after:?}");
     assert!(news.next().await.is_none(), "nothing follows the end");
 }
 
@@ -1008,28 +969,88 @@ async fn a_refresh_the_control_is_stopped_in_the_middle_of_still_runs_to_its_end
 }
 
 #[tokio::test]
-async fn a_service_that_ends_every_socket_as_it_opens_ends_the_control_and_the_requests_waiting() {
+async fn a_service_that_ends_every_socket_as_it_opens_is_not_met_in_a_tight_loop_and_a_request_is_given_up_on()
+ {
+    let timings = ControlTimings {
+        retry_first: ms(100),
+        retry_most: ms(100),
+        answer_within: ms(1200),
+        // Long enough that only the request's own budget can end the wait.
+        absent: ms(60_000),
+        ..quick()
+    };
     let route = ControlRoute::start().await;
     route.drop_after_ready(true);
-    let (control, mut news) = open(&route, &Tokens::new());
-    let waiting = tokio::spawn({
-        let control = control.clone();
-        async move {
-            control
-                .send(VoiceCommand::Thinking, None, Some("never answered"))
-                .await
-        }
-    });
+    let (control, news) = VoiceControl::open(
+        &connector().with_timings(timings),
+        route.target(),
+        Tokens::new(),
+    );
 
-    // Sockets that never serve for a heartbeat do not restart the absent window, so it runs out.
-    assert_eq!(ended(&mut news).await, ControlEnd::Unreachable);
+    // The control goes on trying, as the service has not let it go; the request has a budget of
+    // its own, and that ends it. The sockets that open are few: the wait between attempts holds
+    // even when each attempt is answered at once.
+    let waited = control
+        .send(VoiceCommand::Thinking, None, Some("never answered"))
+        .await;
 
-    let waited = waiting.await.expect("the task");
     assert!(
-        matches!(waited, Err(SendError::Lost | SendError::Unanswered)),
+        matches!(waited, Err(SendError::NotSent | SendError::Unanswered)),
         "{waited:?}"
     );
-    assert!(route.report().upgrades.len() > 1, "it did try again");
+    let upgrades = route.report().upgrades.len();
+    assert!(upgrades > 1, "it did try again");
+    assert!(upgrades < 40, "{upgrades} sockets in a request's budget");
+    control.stop();
+    drop(news);
+}
+
+#[tokio::test]
+async fn a_request_made_while_no_socket_is_open_and_never_written_is_told_so() {
+    let route = ControlRoute::start().await;
+    let (control, mut news) = open(&route, &Tokens::new());
+    attached(&mut news).await;
+    route.refuse_all(Some(503));
+    route.drop_sockets();
+    assert!(matches!(next(&mut news).await, ControlNews::Detached));
+
+    let sent = control
+        .send(VoiceCommand::Thinking, None, Some("while away"))
+        .await;
+
+    assert!(matches!(sent, Err(SendError::NotSent)), "{sent:?}");
+    assert_eq!(contexts(&route), 0);
+}
+
+#[tokio::test]
+async fn an_admission_the_service_sends_twice_is_told_once() {
+    let route = ControlRoute::start().await;
+    route.send_admissions_twice(true);
+    let (control, mut news) = open(&route, &Tokens::new());
+    attached(&mut news).await;
+
+    let accepted = control
+        .send(VoiceCommand::Thinking, None, Some("the model hears this"))
+        .await
+        .expect("accepted");
+    // A frame the service sends after both admissions, to stop reading at.
+    route.usage(1, true);
+
+    let mut admissions = 0;
+    within("the frame after the admissions", async {
+        loop {
+            match raw(&mut news).await {
+                ControlNews::Event(VoiceControlEvent::ContextAdmitted { id, .. }) => {
+                    assert_eq!(id, accepted.id);
+                    admissions += 1;
+                }
+                ControlNews::Event(VoiceControlEvent::Usage { .. }) => return,
+                _ => {}
+            }
+        }
+    })
+    .await;
+    assert_eq!(admissions, 1);
 }
 
 #[tokio::test]
@@ -1104,7 +1125,7 @@ async fn usage_is_told_as_the_cumulative_figure_it_is_and_the_service_ending_the
     let after = control
         .send(VoiceCommand::Thinking, None, Some("late"))
         .await;
-    assert!(matches!(after, Err(SendError::Lost)), "{after:?}");
+    assert!(matches!(after, Err(SendError::NotSent)), "{after:?}");
 }
 
 #[tokio::test]
@@ -1162,7 +1183,7 @@ async fn stopping_the_control_leaves_the_call_open_and_the_waiting_requests_lost
     let waited = waiting.await.expect("the task");
     assert!(matches!(waited, Err(SendError::Lost)), "{waited:?}");
     assert!(
-        news.next().await.is_none(),
+        within("the end of the news", news.next()).await.is_none(),
         "a stopped control tells nothing more"
     );
     assert!(

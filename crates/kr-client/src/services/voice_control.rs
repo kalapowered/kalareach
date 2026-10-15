@@ -45,15 +45,19 @@
 //! # When the socket is lost
 //!
 //! The service closes a call whose client has been absent for [`VOICE_CLIENT_ABSENT_SECONDS`]
-//! seconds, so a lost socket is opened again until that long has passed since it was lost: at once
-//! after a socket that served for a heartbeat or more, and after a wait that grows from half a
-//! second to five between attempts that failed, or that were lost as soon as they opened. The
-//! window bounds an attempt as well as the waits between them. A socket from which nothing has
-//! been heard for longer than two heartbeats is lost. An answer that says the call is not this
-//! account's, or is over, ends the control at once: reconnecting cannot change it. A request is
-//! given up on once that same window has passed since it was made, however many sockets came and
-//! went. Everything the control tells its owner is a [`ControlNews`], and the last is
-//! [`ControlNews::Ended`] unless the owner stopped the control.
+//! seconds after the last socket it accepted, so a lost socket is opened again until that long has
+//! passed since it was lost: at once after a socket that served for a heartbeat or more, and after
+//! a wait that grows from half a second to five between attempts that failed, or that were lost as
+//! soon as they opened. The window bounds an attempt as well as the waits between them. A socket
+//! from which nothing has been heard for longer than two heartbeats is lost. An answer that says
+//! the call is not this account's, or is over, ends the control at once: reconnecting cannot change
+//! it.
+//!
+//! A request has one budget, from the moment it was made: [`ControlTimings::answer_within`], or
+//! [`ControlTimings::close_within`] for the closure. However many sockets come and go, it is given
+//! up on when the budget is used, with [`SendError::NotSent`] if it was never written to a socket
+//! and [`SendError::Unanswered`] if it was. Everything the control tells its owner is a
+//! [`ControlNews`], and the last is [`ControlNews::Ended`] unless the owner stopped the control.
 //!
 //! A control that is not read stops its own reading and, with it, its heartbeats: its owner reads
 //! its news in a task of its own.
@@ -103,8 +107,12 @@ const MAX_START_APPENDS: usize = 64;
 /// one's does not count a request this client counted as outside.
 const PACE_MARGIN: Duration = Duration::from_millis(250);
 
-/// The most accepted requests a control keeps to write again for their admission.
-const MAX_ADMITTING: usize = 64;
+/// The most accepted requests a control keeps to write again for their admission. The service's
+/// rate, and the absent window after which one is forgotten, keep the number well below this.
+const MAX_ADMITTING: usize = 128;
+
+/// The most identifiers a control remembers having told its owner an admission or a refusal for.
+const MAX_ANSWERED: usize = 256;
 
 /// How many requests wait between a handle and its control.
 const REQUEST_QUEUE: usize = 8;
@@ -126,18 +134,17 @@ pub struct ControlTimings {
     /// Between heartbeats.
     pub heartbeat: Duration,
     /// How long a socket may say nothing before it counts as lost: two heartbeats and a margin.
-    /// It has to be longer than `answer_within`, or a service that accepts sockets and answers
-    /// nothing would end each socket before any request ran out its limit.
     pub silence: Duration,
-    /// How long after the socket is lost the control keeps opening it again, and the most that a
-    /// request waits for the service whatever sockets come and go meanwhile.
+    /// How long after a socket is lost the control keeps opening one again: how long the service
+    /// waits, after the last socket it accepted, before it closes a call whose client is absent.
     pub absent: Duration,
     /// How long a socket that opened has to say `ready`.
     pub ready_within: Duration,
-    /// How long a request has to be answered once it was written to an open socket.
+    /// The most a request waits, from the moment it was made, for the service to accept it,
+    /// however many sockets come and go meanwhile.
     pub answer_within: Duration,
-    /// How long a closure has to be confirmed once it was written to an open socket. The service
-    /// finishes the call's accounts before it confirms, which takes longer than answering a
+    /// The most a closure waits, from the moment it was made, to be confirmed. The service
+    /// finishes the call's accounts before it confirms, which takes longer than accepting a
     /// request.
     pub close_within: Duration,
     /// How long a write to the socket may take.
@@ -160,7 +167,7 @@ impl Default for ControlTimings {
             silence: heartbeat * 2 + Duration::from_secs(5),
             absent: Duration::from_secs(u64::from(VOICE_CLIENT_ABSENT_SECONDS)),
             ready_within: PATIENCE,
-            answer_within: PATIENCE,
+            answer_within: Duration::from_secs(u64::from(VOICE_CLIENT_ABSENT_SECONDS)),
             close_within: Duration::from_secs(30),
             write_within: PATIENCE,
             retry_first: Duration::from_millis(500),
@@ -288,14 +295,16 @@ pub enum ControlEnd {
     /// The service did not accept the account token.
     NotAuthorised,
     /// There is no account token to present, and none can be had safely: no account is signed in,
-    /// the sign-in does not carry the scope, or a refresh ended with an unknown outcome, which is
-    /// never tried again.
+    /// the sign-in does not carry the scope, the sign-in could not be read or kept, or a refresh
+    /// ended with an unknown outcome (or a panic), which is never tried again. Only an account
+    /// service that cannot be reached is tried again.
     NoToken,
     /// The service refused the upgrade with a status that reconnecting does not change.
     Refused(u16),
     /// The service's address cannot be opened as a socket.
     Misconfigured,
-    /// No socket opened for as long as the service waits before it closes a call.
+    /// No socket was open for as long as the service waits before it closes a call, counted from
+    /// the last one lost.
     Unreachable,
 }
 
@@ -333,7 +342,7 @@ pub enum ControlNews {
         /// [`VOICE_KNOWN_DELEGATIONS`] of them: the newest are kept.
         delegations: Vec<String>,
     },
-    /// The socket was lost. The control is opening it again until the service would close the call.
+    /// The socket was lost. The control is opening it again until the absent window has passed.
     Detached,
     /// A frame from the service that is not `ready` and not the closure.
     ///
@@ -455,10 +464,14 @@ pub enum SendError {
         /// What the service says a person is told.
         message: ServiceMessage,
     },
-    /// The control ended before the request was answered, so its outcome is not known.
+    /// Nothing went to the service: the control ended, or the request used its budget, before it
+    /// was written to a socket. Asking again is safe.
+    NotSent,
+    /// The control ended after the request was written and before the service answered, so its
+    /// outcome is not known.
     Lost,
-    /// The service did not answer in time, so its outcome is not known. Asking again as a new
-    /// request may give the model the context twice.
+    /// The service did not answer within the request's budget, so its outcome is not known.
+    /// Asking again as a new request may give the model the context twice.
     Unanswered,
     /// Too many requests wait for the service.
     Busy,
@@ -484,6 +497,7 @@ impl Said for SendError {
                 }),
                 Shown::service(message)
             ),
+            Self::NotSent => Shown::said("the request did not reach the managed service"),
             Self::Lost => Shown::said("the call's control ended before the service answered"),
             Self::Unanswered => Shown::said("the managed service did not answer in time"),
             Self::Busy => Shown::said("the call's control holds as many requests as it can"),
@@ -508,10 +522,14 @@ enum Request {
         delegation: Option<String>,
         content: Option<String>,
         reply: oneshot::Sender<std::result::Result<Accepted, SendError>>,
+        /// When it was made.
+        made: Instant,
     },
     /// The closure.
     Close {
         reply: oneshot::Sender<std::result::Result<Closure, SendError>>,
+        /// When it was made.
+        made: Instant,
     },
 }
 
@@ -581,6 +599,7 @@ impl VoiceControl {
             known: VecDeque::new(),
             pending: Vec::new(),
             admitting: VecDeque::new(),
+            answered: VecDeque::new(),
             pacer: Pacer::new(&connector.timings),
             id_prefix: prefix.iter().map(|byte| format!("{byte:02x}")).collect(),
             next_id: 1,
@@ -618,9 +637,10 @@ impl VoiceControl {
                 delegation: delegation.map(str::to_owned),
                 content: content.map(str::to_owned),
                 reply,
+                made: Instant::now(),
             })
             .await
-            .map_err(|_| SendError::Lost)?;
+            .map_err(|_| SendError::NotSent)?;
         answer.await.map_err(|_| SendError::Lost)?
     }
 
@@ -663,9 +683,12 @@ impl VoiceControl {
     pub async fn close(&self) -> std::result::Result<Closure, SendError> {
         let (reply, answer) = oneshot::channel();
         self.requests
-            .send(Request::Close { reply })
+            .send(Request::Close {
+                reply,
+                made: Instant::now(),
+            })
             .await
-            .map_err(|_| SendError::Lost)?;
+            .map_err(|_| SendError::NotSent)?;
         answer.await.map_err(|_| SendError::Lost)?
     }
 
@@ -747,7 +770,9 @@ fn split_into_appends(text: &str, limit: usize) -> Vec<String> {
 struct Pacer {
     burst_window: Duration,
     minute_window: Duration,
-    sent: VecDeque<Instant>,
+    /// When each request that counts against the rate was written or, once the service answered,
+    /// answered, oldest first, each request once.
+    sent: VecDeque<(String, Instant)>,
 }
 
 impl Pacer {
@@ -765,13 +790,14 @@ impl Pacer {
         while self
             .sent
             .front()
-            .is_some_and(|sent| now.saturating_duration_since(*sent) > longest)
+            .is_some_and(|(_, sent)| now.saturating_duration_since(*sent) > longest)
         {
             self.sent.pop_front();
         }
         let within = |window: Duration| {
             self.sent
                 .iter()
+                .map(|(_, sent)| sent)
                 .filter(move |sent| now.saturating_duration_since(**sent) < window + PACE_MARGIN)
         };
         let per_minute = usize::try_from(VOICE_CONTEXT_PER_MINUTE).unwrap_or(usize::MAX);
@@ -791,8 +817,11 @@ impl Pacer {
         wait.filter(|until| *until > now)
     }
 
-    fn record(&mut self, now: Instant) {
-        self.sent.push_back(now);
+    /// Counts the request `id` from `now`. A request already counted is counted from `now`
+    /// instead: the service counts it once, and the later moment is never earlier than its own.
+    fn record(&mut self, id: &str, now: Instant) {
+        self.sent.retain(|(counted, _)| counted != id);
+        self.sent.push_back((id.to_owned(), now));
     }
 }
 
@@ -806,14 +835,28 @@ enum Kind {
     Close(oneshot::Sender<std::result::Result<Closure, SendError>>),
 }
 
+impl Kind {
+    /// Tells the request's sender how it ended.
+    fn fail(self, error: SendError) {
+        match self {
+            Self::Send(reply) => {
+                let _ = reply.send(Err(error));
+            }
+            Self::Close(reply) => {
+                let _ = reply.send(Err(error));
+            }
+        }
+    }
+}
+
 /// How far a request has got.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Standing {
     /// Not written to the socket that is open now.
     Unsent,
-    /// Written to it; the service's answer is due.
+    /// Written to it; the service's answer is awaited.
     Awaiting,
-    /// A closure the service accepted; its confirmation is due.
+    /// A closure the service accepted; its confirmation is awaited.
     Closing,
 }
 
@@ -823,11 +866,39 @@ struct Pending {
     wire: String,
     kind: Kind,
     standing: Standing,
-    /// When the service's answer is due: a window after the request was last written to an open
-    /// socket. A request that was never written has none.
-    due: Option<Instant>,
-    /// When it was made. However many sockets come and go, a request is given up on once the
-    /// absent window has passed since.
+    /// When the request was made, which is when its waiting begins: not when it reached the
+    /// control's task and not when it was last written. A request has one budget from then,
+    /// however many sockets come and go ([`ControlTimings::answer_within`] and
+    /// [`ControlTimings::close_within`]), and nothing else gives it up.
+    born: Instant,
+    /// Whether it was ever written to a socket.
+    written: bool,
+}
+
+impl Pending {
+    /// When the request is given up on.
+    fn ends_at(&self, timings: &ControlTimings) -> Instant {
+        self.born
+            + match self.kind {
+                Kind::Send(_) => timings.answer_within,
+                Kind::Close(_) => timings.close_within,
+            }
+    }
+
+    /// How a request that ends without an answer ends: nothing went to the service, or it may have.
+    fn unanswered(&self) -> SendError {
+        if self.written {
+            SendError::Unanswered
+        } else {
+            SendError::NotSent
+        }
+    }
+}
+
+/// A request the service accepted, which the provider has not yet answered.
+struct Admitting {
+    id: String,
+    wire: String,
     born: Instant,
 }
 
@@ -852,6 +923,14 @@ enum Attempt {
 /// What the owner went away from.
 struct OwnerGone;
 
+/// Writes one text frame, within `within`.
+async fn write(socket: &mut Socket, wire: String, within: Duration) -> std::result::Result<(), ()> {
+    match tokio::time::timeout(within, socket.send(Message::text(wire))).await {
+        Ok(Ok(())) => Ok(()),
+        _ => Err(()),
+    }
+}
+
 struct Driver {
     connector: ControlConnector,
     target: ControlTarget,
@@ -862,10 +941,14 @@ struct Driver {
     /// The delegations this call heard announced, oldest first.
     known: VecDeque<String>,
     pending: Vec<Pending>,
-    /// Requests the service accepted whose admission or refusal has not come, as their wire text.
-    /// The service tells the provider's answer only to the sockets open when it comes, and answers
-    /// a repeat from what it kept, so these are written again to the next socket.
-    admitting: VecDeque<(String, String)>,
+    /// Requests the service accepted whose admission or refusal has not come. The service tells
+    /// the provider's answer only to the sockets open when it comes, and answers a repeat from
+    /// what it kept, so each is written again to the next socket. One is forgotten once the absent
+    /// window has passed since it was made, which at the service's rate bounds how many there are.
+    admitting: VecDeque<Admitting>,
+    /// The identifiers whose admission or refusal the owner has been told, so that an answer that
+    /// reaches a socket twice (once as the provider's, once as a repeat's) is told once.
+    answered: VecDeque<String>,
     pacer: Pacer,
     id_prefix: String,
     next_id: u64,
@@ -885,12 +968,8 @@ impl Driver {
         self.requests.close();
         while let Ok(request) = self.requests.try_recv() {
             match request {
-                Request::Send { reply, .. } => {
-                    let _ = reply.send(Err(SendError::Lost));
-                }
-                Request::Close { reply } => {
-                    let _ = reply.send(Err(SendError::Lost));
-                }
+                Request::Send { reply, .. } => Kind::Send(reply).fail(SendError::NotSent),
+                Request::Close { reply, .. } => Kind::Close(reply).fail(SendError::NotSent),
             }
         }
         self.lose_everything_pending();
@@ -943,18 +1022,19 @@ impl Driver {
                 Served::Stopped => return None,
                 Served::Ended(end) => return Some(end),
                 Served::Lost => {
-                    let stable = attached_at.elapsed() >= self.timings().heartbeat;
+                    // The service restarts its clock for an absent client at every socket it
+                    // accepts, so the window counts from this loss. The loss is read before the
+                    // owner is told: a slow owner does not move it.
+                    lost_at = Instant::now();
+                    let served = lost_at.saturating_duration_since(attached_at);
                     if self.tell(ControlNews::Detached).await.is_err() {
                         return None;
                     }
-                    if stable {
-                        // A socket that served for a while: the window counts from this loss, and
-                        // the next attempt is at once.
-                        lost_at = Instant::now();
+                    if served >= self.timings().heartbeat {
                         failures = 0;
                     } else {
-                        // One that was lost as soon as it opened is a service or a network that
-                        // is not holding sockets, and is not met with an attempt a moment later.
+                        // A socket lost as soon as it opened is a service or a network that is
+                        // not holding sockets, and is not met with another a moment later.
                         self.back_off(&mut failures, lost_at + self.timings().absent)
                             .await?;
                     }
@@ -982,14 +1062,16 @@ impl Driver {
             .min(timings.retry_most)
     }
 
-    /// Waits for `work`, taking requests meanwhile. `None` once the owner stopped the control or
-    /// went away.
+    /// Waits for `work`, taking requests meanwhile and giving up on the ones that have used their
+    /// budget. `None` once the owner stopped the control or went away.
     async fn while_taking_requests<F: std::future::Future>(
         &mut self,
         work: F,
     ) -> Option<F::Output> {
         tokio::pin!(work);
         loop {
+            self.expire(Instant::now());
+            let due = self.next_deadline();
             tokio::select! {
                 biased;
                 () = self.stop.notified() => return None,
@@ -998,6 +1080,12 @@ impl Driver {
                     None => return None,
                     Some(request) => self.take(request),
                 },
+                () = async {
+                    match due {
+                        Some(at) => tokio::time::sleep_until(at).await,
+                        None => std::future::pending().await,
+                    }
+                } => {}
             }
         }
     }
@@ -1015,38 +1103,34 @@ impl Driver {
 
     /// Takes a request: checks the client's own rules, and queues it to be written.
     fn take(&mut self, request: Request) {
-        match request {
+        let (built, kind, made) = match request {
             Request::Send {
                 command,
                 delegation,
                 content,
                 reply,
-            } => match self.build(command, delegation, content) {
-                Ok((id, wire)) => self.pending.push(Pending {
-                    id,
-                    wire,
-                    kind: Kind::Send(reply),
-                    standing: Standing::Unsent,
-                    due: None,
-                    born: Instant::now(),
-                }),
-                Err(refused) => {
-                    let _ = reply.send(Err(refused));
-                }
-            },
-            Request::Close { reply } => match self.build(VoiceCommand::Close, None, None) {
-                Ok((id, wire)) => self.pending.push(Pending {
-                    id,
-                    wire,
-                    kind: Kind::Close(reply),
-                    standing: Standing::Unsent,
-                    due: None,
-                    born: Instant::now(),
-                }),
-                Err(refused) => {
-                    let _ = reply.send(Err(refused));
-                }
-            },
+                made,
+            } => (
+                self.build(command, delegation, content),
+                Kind::Send(reply),
+                made,
+            ),
+            Request::Close { reply, made } => (
+                self.build(VoiceCommand::Close, None, None),
+                Kind::Close(reply),
+                made,
+            ),
+        };
+        match built {
+            Ok((id, wire)) => self.pending.push(Pending {
+                id,
+                wire,
+                kind,
+                standing: Standing::Unsent,
+                born: made,
+                written: false,
+            }),
+            Err(refused) => kind.fail(refused),
         }
     }
 
@@ -1087,19 +1171,59 @@ impl Driver {
 
     /// Ends every request that waits, as not known to have gone through.
     fn lose_everything_pending(&mut self) {
-        for pending in self.pending.drain(..) {
-            match pending.kind {
-                Kind::Send(reply) => {
-                    let _ = reply.send(Err(SendError::Lost));
-                }
-                Kind::Close(reply) => {
-                    let _ = reply.send(Err(SendError::Lost));
-                }
-            }
+        for pending in std::mem::take(&mut self.pending) {
+            let error = if pending.written {
+                SendError::Lost
+            } else {
+                SendError::NotSent
+            };
+            pending.kind.fail(error);
         }
     }
 
+    /// Gives up on the requests that have used their budget, and forgets the admissions that have
+    /// waited out the absent window.
+    fn expire(&mut self, now: Instant) {
+        let timings = self.timings();
+        let mut index = 0;
+        while index < self.pending.len() {
+            if self.pending[index].ends_at(&timings) <= now {
+                let gone = self.pending.remove(index);
+                let error = gone.unanswered();
+                gone.kind.fail(error);
+            } else {
+                index += 1;
+            }
+        }
+        self.admitting
+            .retain(|waiting| now.saturating_duration_since(waiting.born) < timings.absent);
+    }
+
+    /// When the first request that waits will have used its budget.
+    fn next_deadline(&self) -> Option<Instant> {
+        let timings = self.timings();
+        self.pending
+            .iter()
+            .map(|pending| pending.ends_at(&timings))
+            .min()
+    }
+
+    /// Whether the owner has been told how `id` was answered, and, when not, that it now has.
+    fn first_answer(&mut self, id: &str) -> bool {
+        if self.answered.iter().any(|told| told == id) {
+            return false;
+        }
+        if self.answered.len() >= MAX_ANSWERED {
+            self.answered.pop_front();
+        }
+        self.answered.push_back(id.to_owned());
+        true
+    }
+
     /// Carries one open socket until it is lost or the control is over.
+    ///
+    /// Each turn of the loop writes at most one frame, so the timers, a stop, the socket and the
+    /// requests are looked at between every two writes however many wait to be written.
     async fn serve(&mut self, mut socket: Socket) -> Served {
         let timings = self.timings();
         let mut heartbeat =
@@ -1107,41 +1231,36 @@ impl Driver {
         heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut last_heard = Instant::now();
         // What the last socket was owed an answer for is written again: the service answers a
-        // repeat without sending it twice.
+        // repeat without sending it twice. So is what it accepted and has not admitted: it answers
+        // the repeat with the provider's answer, which it tells only the sockets open when it
+        // comes, and spends none of its rate on it.
         for pending in &mut self.pending {
             pending.standing = Standing::Unsent;
         }
-        // So is what the service accepted and has not yet told the provider's answer to: it
-        // answers the repeat with that answer, and spends none of its rate on it.
-        let repeats: Vec<String> = self
+        let mut repeats: VecDeque<String> = self
             .admitting
             .iter()
-            .map(|(_, wire)| wire.clone())
+            .map(|waiting| waiting.wire.clone())
             .collect();
-        for wire in repeats {
-            let sent =
-                tokio::time::timeout(timings.write_within, socket.send(Message::text(wire))).await;
-            if !matches!(sent, Ok(Ok(()))) {
-                return Served::Lost;
-            }
-        }
         let served = loop {
-            match self.write_due(&mut socket).await {
-                Ok(()) => {}
-                Err(()) => break Served::Lost,
-            }
+            let now = Instant::now();
+            self.expire(now);
+            let writable = !repeats.is_empty()
+                || (self
+                    .pending
+                    .iter()
+                    .any(|pending| pending.standing == Standing::Unsent)
+                    && self.pacer.next_at(now).is_none());
             let wake = self.next_wake(last_heard);
-            // The timers come first, so frames and requests that keep arriving cannot hold back a
-            // heartbeat or the silence limit.
+            // A stop first, then the timers, so that frames and requests that keep arriving
+            // cannot hold back a heartbeat or the silence limit, then the writes, which are
+            // finite, then what arrives.
             tokio::select! {
                 biased;
+                () = self.stop.notified() => break Served::Stopped,
                 _ = heartbeat.tick() => {
-                    let sent = tokio::time::timeout(
-                        timings.write_within,
-                        socket.send(Message::text(r#"{"type":"heartbeat"}"#)),
-                    )
-                    .await;
-                    if !matches!(sent, Ok(Ok(()))) {
+                    let beat = r#"{"type":"heartbeat"}"#.to_owned();
+                    if write(&mut socket, beat, timings.write_within).await.is_err() {
                         break Served::Lost;
                     }
                 }
@@ -1149,9 +1268,12 @@ impl Driver {
                     if last_heard.elapsed() >= timings.silence {
                         break Served::Lost;
                     }
-                    self.expire_answers();
                 }
-                () = self.stop.notified() => break Served::Stopped,
+                () = std::future::ready(()), if writable => {
+                    if self.write_one(&mut socket, &mut repeats).await.is_err() {
+                        break Served::Lost;
+                    }
+                }
                 heard = socket.next() => match heard {
                     None | Some(Err(_)) => break Served::Lost,
                     Some(Ok(message)) => {
@@ -1175,88 +1297,58 @@ impl Driver {
         served
     }
 
-    /// Writes the requests the pacer lets go, in the order they were made.
+    /// Writes one frame the pacer lets go: an admission's repeat, else the first request that was
+    /// not written to this socket.
     ///
-    /// Every write is paced and counted, a request written again after a loss included: the
-    /// service counts a request when it sends it on, so one that was lost before the service had it
-    /// counts when it is written again. Counting a rewrite of one the service already had only
-    /// delays the next request.
-    async fn write_due(&mut self, socket: &mut Socket) -> std::result::Result<(), ()> {
-        let timings = self.timings();
-        loop {
-            let Some(at) = self
-                .pending
-                .iter()
-                .position(|pending| pending.standing == Standing::Unsent)
-            else {
-                return Ok(());
-            };
-            let now = Instant::now();
-            if self.pacer.next_at(now).is_some() {
-                return Ok(());
-            }
-            let wire = self.pending[at].wire.clone();
-            let sent =
-                tokio::time::timeout(timings.write_within, socket.send(Message::text(wire))).await;
-            if !matches!(sent, Ok(Ok(()))) {
-                return Err(());
-            }
-            self.pacer.record(now);
-            // The service's answer is due a window after the request reached a socket that is
-            // open, so a loss that outlasts the window does not expire what the next socket is
-            // about to answer.
-            let pending = &mut self.pending[at];
-            let within = match pending.kind {
-                Kind::Send(_) => timings.answer_within,
-                Kind::Close(_) => timings.close_within,
-            };
-            pending.due = Some(now + within);
-            pending.standing = Standing::Awaiting;
+    /// Every request write is paced and counted, a request written again after a loss included:
+    /// the service counts a request when it sends it on, so one that was lost before the service
+    /// had it counts when it is written again. Counting a rewrite of one the service already had
+    /// only delays the next request. An admission's repeat is neither: the service answers a
+    /// repeat before it looks at its rate.
+    async fn write_one(
+        &mut self,
+        socket: &mut Socket,
+        repeats: &mut VecDeque<String>,
+    ) -> std::result::Result<(), ()> {
+        let within = self.timings().write_within;
+        if let Some(wire) = repeats.pop_front() {
+            return write(socket, wire, within).await;
         }
+        let Some(at) = self
+            .pending
+            .iter()
+            .position(|pending| pending.standing == Standing::Unsent)
+        else {
+            return Ok(());
+        };
+        let now = Instant::now();
+        if self.pacer.next_at(now).is_some() {
+            return Ok(());
+        }
+        write(socket, self.pending[at].wire.clone(), within).await?;
+        self.pacer.record(&self.pending[at].id, now);
+        let pending = &mut self.pending[at];
+        pending.written = true;
+        pending.standing = Standing::Awaiting;
+        Ok(())
     }
 
-    /// The next moment something is due without a frame arriving: the silence limit, an answer
-    /// that has waited long enough, a request that has used its budget, or a request the pacer is
-    /// holding.
+    /// The next moment something is due without a frame arriving: the silence limit, a request that
+    /// will have used its budget, or a request the pacer is holding.
     fn next_wake(&mut self, last_heard: Instant) -> Instant {
-        let absent = self.timings().absent;
         let mut wake = last_heard + self.timings().silence;
-        let mut held = false;
-        for pending in &self.pending {
-            wake = wake.min(pending.born + absent);
-            if let Some(due) = pending.due {
-                wake = wake.min(due);
-            }
-            held |= pending.standing == Standing::Unsent;
+        if let Some(due) = self.next_deadline() {
+            wake = wake.min(due);
         }
-        if held {
-            let now = Instant::now();
-            wake = wake.min(self.pacer.next_at(now).unwrap_or(now));
+        if self
+            .pending
+            .iter()
+            .any(|pending| pending.standing == Standing::Unsent)
+            && let Some(until) = self.pacer.next_at(Instant::now())
+        {
+            wake = wake.min(until);
         }
         wake
-    }
-
-    /// Gives up on the answers that did not come in time, and on requests that have waited out the
-    /// absent window.
-    fn expire_answers(&mut self) {
-        let now = Instant::now();
-        let absent = self.timings().absent;
-        let mut index = 0;
-        while index < self.pending.len() {
-            let pending = &self.pending[index];
-            if pending.due.is_some_and(|due| due <= now) || pending.born + absent <= now {
-                match self.pending.remove(index).kind {
-                    Kind::Send(reply) => {
-                        let _ = reply.send(Err(SendError::Unanswered));
-                    }
-                    Kind::Close(reply) => {
-                        let _ = reply.send(Err(SendError::Unanswered));
-                    }
-                }
-            } else {
-                index += 1;
-            }
-        }
     }
 
     /// Reads one message of the socket. `Some` ends the service of this socket.
@@ -1278,45 +1370,57 @@ impl Driver {
             return Ok(None);
         };
         match event {
-            VoiceControlEvent::Ready { delegations, .. } => {
+            VoiceControlEvent::Ready {
+                call_id,
+                delegations,
+            } => {
                 // A second `ready` on an open socket is the service restating what it announced.
-                self.set_known(&delegations);
+                if call_id == self.target.call_id {
+                    self.set_known(&delegations);
+                }
             }
             VoiceControlEvent::ContextAccepted { id } => {
                 if let Some(at) = self.pending.iter().position(|pending| pending.id == id) {
-                    let close_within = self.timings().close_within;
                     match self.pending[at].kind {
                         Kind::Send(_) => {
                             let accepted = self.pending.remove(at);
+                            // The service counts the request from when it read it, which is
+                            // not before this answer was written: the pacer counts it from
+                            // when the answer came, so that a slow path cannot leave it
+                            // counting fewer than the service does.
+                            self.pacer.record(&id, Instant::now());
                             if self.admitting.len() >= MAX_ADMITTING {
                                 self.admitting.pop_front();
                             }
-                            self.admitting.push_back((id.clone(), accepted.wire));
+                            self.admitting.push_back(Admitting {
+                                id: id.clone(),
+                                wire: accepted.wire,
+                                born: accepted.born,
+                            });
                             if let Kind::Send(reply) = accepted.kind {
                                 let _ = reply.send(Ok(Accepted { id }));
                             }
                         }
-                        Kind::Close(_) => {
-                            self.pending[at].standing = Standing::Closing;
-                            self.pending[at].due = Some(Instant::now() + close_within);
-                        }
+                        Kind::Close(_) => self.pending[at].standing = Standing::Closing,
                     }
                 }
             }
             VoiceControlEvent::ContextAdmitted { id, note } => {
-                self.admitting.retain(|(kept, _)| *kept != id);
-                self.tell(ControlNews::Event(VoiceControlEvent::ContextAdmitted {
-                    id,
-                    note,
-                }))
-                .await?;
+                self.admitting.retain(|waiting| waiting.id != id);
+                if self.first_answer(&id) {
+                    self.tell(ControlNews::Event(VoiceControlEvent::ContextAdmitted {
+                        id,
+                        note,
+                    }))
+                    .await?;
+                }
             }
             VoiceControlEvent::ContextRefused {
                 id,
                 reason,
                 message,
             } => {
-                self.admitting.retain(|(kept, _)| *kept != id);
+                self.admitting.retain(|waiting| waiting.id != id);
                 if let Some(at) = self.pending.iter().position(|pending| pending.id == id) {
                     // A closure written again after a loss meets a call that is already closing.
                     // That is the closure it asked for, and its confirmation is what follows.
@@ -1324,22 +1428,14 @@ impl Driver {
                         && ContextRefusal::from_wire(&reason) == ContextRefusal::Closed
                     {
                         self.pending[at].standing = Standing::Closing;
-                        self.pending[at].due = Some(Instant::now() + self.timings().close_within);
                         return Ok(None);
                     }
                     let refused = SendError::Refused {
                         reason: ContextRefusal::from_wire(&reason),
                         message: ServiceMessage::from_refusal(message),
                     };
-                    match self.pending.remove(at).kind {
-                        Kind::Send(reply) => {
-                            let _ = reply.send(Err(refused));
-                        }
-                        Kind::Close(reply) => {
-                            let _ = reply.send(Err(refused));
-                        }
-                    }
-                } else {
+                    self.pending.remove(at).kind.fail(refused);
+                } else if self.first_answer(&id) {
                     self.tell(ControlNews::Event(VoiceControlEvent::ContextRefused {
                         id,
                         reason,
@@ -1353,7 +1449,7 @@ impl Driver {
                 seconds,
                 provisional,
             } => {
-                for pending in self.pending.drain(..) {
+                for pending in std::mem::take(&mut self.pending) {
                     match pending.kind {
                         Kind::Close(reply) => {
                             let _ = reply.send(Ok(Closure {
@@ -1363,7 +1459,12 @@ impl Driver {
                             }));
                         }
                         Kind::Send(reply) => {
-                            let _ = reply.send(Err(SendError::Lost));
+                            let error = if pending.written {
+                                SendError::Lost
+                            } else {
+                                SendError::NotSent
+                            };
+                            let _ = reply.send(Err(error));
                         }
                     }
                 }
@@ -1421,7 +1522,9 @@ async fn attach(
                 Attempt::End(ControlEnd::NoToken)
             });
         }
-        Err(_) => return Err(Attempt::Retry),
+        // A task that panicked may have done so after the service rotated the token and before it
+        // was kept, which is an unknown outcome as well.
+        Err(_) => return Err(Attempt::End(ControlEnd::NoToken)),
     };
     // The one place the token is read. It goes into a header value and nowhere else.
     let authorisation = format!("Bearer {}", token.expose());
@@ -1460,29 +1563,16 @@ async fn attach(
                 .and_then(|text| json::read::<serde_json::Value>(text.as_bytes()).ok())
                 .as_ref()
                 .and_then(read_control_event);
-            match event {
-                Some(VoiceControlEvent::Ready {
-                    call_id,
-                    delegations,
-                }) => {
-                    return if call_id == target.call_id {
-                        Ok(delegations)
-                    } else {
-                        Err(Attempt::End(ControlEnd::NoSuchCall))
-                    };
-                }
-                Some(VoiceControlEvent::Closed {
-                    reason,
-                    seconds,
-                    provisional,
-                }) => {
-                    return Err(Attempt::End(ControlEnd::Closed {
-                        reason,
-                        seconds,
-                        provisional,
-                    }));
-                }
-                _ => {}
+            if let Some(VoiceControlEvent::Ready {
+                call_id,
+                delegations,
+            }) = event
+            {
+                return if call_id == target.call_id {
+                    Ok(delegations)
+                } else {
+                    Err(Attempt::End(ControlEnd::NoSuchCall))
+                };
             }
         }
     })
