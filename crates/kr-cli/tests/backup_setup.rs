@@ -1258,12 +1258,12 @@ async fn a_fresh_host_restores_the_session_a_set_up_host_backed_up_from_the_kit_
 /// The convention's sizes, at their real values: the producer packs sessions up to the total a
 /// restore accepts and leaves the rest out, and a restore of what it made accepts all of it.
 ///
-/// Twelve closed sessions each hold output that alternates one byte of text with one byte a
+/// Fourteen closed sessions each hold output that alternates one byte of text with one byte a
 /// terminal engine drops, which is the shape that makes the most pieces from the least output: about
-/// 7 MB of spool for each, and a document of about 130 MiB. Together they are over the 1.5 GiB a
-/// restore accepts. The generation the host makes holds the newest that fit; the restore's plan of it
-/// lists every one as a file to restore and none as refused, and what it restores is under the
-/// total.
+/// 7 MB of spool for each, and a document of about 127 MiB (each piece is an entry of 38 bytes).
+/// Together they are over the 1.5 GiB a restore accepts, and twelve of them fit. The generation the
+/// host makes holds the newest that fit; the restore's plan of it lists every one as a file to
+/// restore and none as refused, and what it restores is under the total.
 ///
 /// It packs, encrypts, uploads and restores more than a gigabyte, so it runs on the build box and
 /// only when asked: `cargo test -p kr-cli --test backup_setup -- --ignored the_bounds_hold`.
@@ -1272,7 +1272,7 @@ async fn a_fresh_host_restores_the_session_a_set_up_host_backed_up_from_the_kit_
 async fn the_bounds_hold_at_the_real_scale_and_a_restore_accepts_what_the_producer_packed() {
     /// What a restore accepts of all members together: the convention's 1.5 GiB.
     const TOTAL: u64 = 3 << 29;
-    const SESSIONS: usize = 12;
+    const SESSIONS: usize = 14;
     let pairs = 3_500_000;
     let mut output = Vec::with_capacity(pairs * 2);
     for _ in 0..pairs {
