@@ -2960,6 +2960,39 @@ async fn a_device_whose_grant_runs_out_has_its_lease_ended() {
     assert_eq!(rig.lease_in_the_record(&record), None);
 }
 
+/// KR-REQ-17.51: the daemon holds more than one handle on its directory of paired devices, and a
+/// grant's end is written through whichever of them finds it first: its own lifetimes write it
+/// through the daemon's handle, and a connection through the network's. The lease is ended when
+/// either records it, with no other change for the keeper to notice.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_grant_the_daemons_own_handle_records_as_run_out_has_its_lease_ended() {
+    let rig = Rig::start().await;
+    let (_phone, record) = rig.pairs().await;
+    rig.until("the paired device holds a lease", || rig.holds(&record))
+        .await;
+    // The keeper has looked at the pairing and waits for the next change.
+    rig.pass().await;
+    assert!(rig.live_lease_for(&record).is_some());
+
+    rig.host
+        .controller()
+        .devices()
+        .record_expiry(record.device_id, kr_ipc::now_ms())
+        .expect("the end of the grant is recorded");
+
+    rig.until("the lease is ended at the service", || {
+        rig.leases_for(&record).iter().all(|lease| !lease.live) && rig.endings_owed() == 0
+    })
+    .await;
+    assert!(
+        rig.leases_for(&record)
+            .iter()
+            .any(|lease| lease.ended_for == Some("unpaired")),
+        "it is ended as a lease of a pair that is no longer paired"
+    );
+    assert_eq!(rig.lease_in_the_record(&record), None);
+}
+
 /// KR-REQ-17.51: a request for a device that is no longer paired, made to learn a lease the host
 /// was never told of, is held back by the standing wait when the service has no room, and it does
 /// not make the row younger when it issues nothing: the row is forgotten once no lease its first
