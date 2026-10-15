@@ -1,7 +1,7 @@
 //! Measures what a loopback connection whose peer reads nothing takes before a write stops being
 //! taken, for the buffer sizes a pair can be given before it connects.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::net::{TcpListener, TcpSocket, TcpStream};
 
 async fn pair(size: Option<u32>) -> (TcpStream, TcpStream, String) {
@@ -39,35 +39,47 @@ async fn pair(size: Option<u32>) -> (TcpStream, TcpStream, String) {
     )
 }
 
-/// Writes 16 KiB at a time until the system stops taking bytes and nothing more is taken for a
-/// while, and says how many it took.
-async fn absorbed(writer: &TcpStream) -> usize {
-    let chunk = vec![b'x'; 16 * 1024];
+/// Writes `chunk` bytes at a time until the system stops taking bytes for a second, or ten
+/// seconds have passed, and says how many it took, and how many the first write took.
+async fn absorbed(writer: &TcpStream, chunk: usize) -> (usize, usize, bool) {
+    let data = vec![b'x'; chunk];
+    let started = Instant::now();
     let mut total = 0;
+    let mut first = None;
     loop {
-        match writer.try_write(&chunk) {
-            Ok(n) => total += n,
+        if started.elapsed() > Duration::from_secs(10) {
+            return (first.unwrap_or(0), total, false);
+        }
+        match writer.try_write(&data) {
+            Ok(n) => {
+                first.get_or_insert(n);
+                total += n;
+                if total > 32 * 1024 * 1024 {
+                    return (first.unwrap_or(0), total, false);
+                }
+            }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                // Writable again within a few seconds means the system took more.
-                match tokio::time::timeout(Duration::from_secs(3), writer.writable()).await {
+                first.get_or_insert(0);
+                match tokio::time::timeout(Duration::from_secs(1), writer.writable()).await {
                     Ok(Ok(())) => {}
-                    _ => return total,
+                    _ => return (first.unwrap_or(0), total, true),
                 }
             }
             Err(error) => panic!("a write failed: {error}"),
-        }
-        if total > 64 * 1024 * 1024 {
-            return total;
         }
     }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn what_a_peer_that_reads_nothing_takes() {
-    for size in [None, Some(0), Some(1), Some(4096), Some(65536), Some(262_144)] {
-        let (here, there, how) = pair(size).await;
-        let took = absorbed(&here).await;
-        println!("PROBE size {size:?}: {took} bytes absorbed ({how})");
-        drop(there);
+    for size in [None, Some(0), Some(1), Some(4096), Some(65536)] {
+        for chunk in [16 * 1024, 900_000] {
+            let (here, there, how) = pair(size).await;
+            let (first, total, stopped) = absorbed(&here, chunk).await;
+            println!(
+                "PROBE size {size:?} write {chunk}: first write took {first}, in all {total} bytes, stopped: {stopped} ({how})"
+            );
+            drop(there);
+        }
     }
 }
