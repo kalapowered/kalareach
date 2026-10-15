@@ -2965,32 +2965,43 @@ async fn a_device_whose_grant_runs_out_has_its_lease_ended() {
 /// through the daemon's handle, and a connection through the network's. The lease is ended when
 /// either records it, with no other change for the keeper to notice.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_grant_the_daemons_own_handle_records_as_run_out_has_its_lease_ended() {
-    let rig = Rig::start().await;
-    let (_phone, record) = rig.pairs().await;
-    rig.until("the paired device holds a lease", || rig.holds(&record))
+async fn a_grant_recorded_as_run_out_through_either_handle_has_its_lease_ended() {
+    for through_the_network in [false, true] {
+        let which = if through_the_network {
+            "the network's handle"
+        } else {
+            "the daemon's handle"
+        };
+        let rig = Rig::start().await;
+        let (_phone, record) = rig.pairs().await;
+        rig.until("the paired device holds a lease", || rig.holds(&record))
+            .await;
+        // The keeper takes in the pairing and waits with no wake stored: what it hears next is
+        // what is written below.
+        rig.keeper().until_waiting().await;
+        assert!(rig.live_lease_for(&record).is_some(), "{which}");
+
+        let directory = if through_the_network {
+            rig.host.network().devices()
+        } else {
+            rig.host.controller().devices()
+        };
+        directory
+            .record_expiry(record.device_id, kr_ipc::now_ms())
+            .expect("the end of the grant is recorded");
+
+        rig.until("the lease is ended at the service", || {
+            rig.leases_for(&record).iter().all(|lease| !lease.live) && rig.endings_owed() == 0
+        })
         .await;
-    // The keeper has looked at the pairing and waits for the next change.
-    rig.pass().await;
-    assert!(rig.live_lease_for(&record).is_some());
-
-    rig.host
-        .controller()
-        .devices()
-        .record_expiry(record.device_id, kr_ipc::now_ms())
-        .expect("the end of the grant is recorded");
-
-    rig.until("the lease is ended at the service", || {
-        rig.leases_for(&record).iter().all(|lease| !lease.live) && rig.endings_owed() == 0
-    })
-    .await;
-    assert!(
-        rig.leases_for(&record)
-            .iter()
-            .any(|lease| lease.ended_for == Some("unpaired")),
-        "it is ended as a lease of a pair that is no longer paired"
-    );
-    assert_eq!(rig.lease_in_the_record(&record), None);
+        assert!(
+            rig.leases_for(&record)
+                .iter()
+                .any(|lease| lease.ended_for == Some("unpaired")),
+            "it is ended as a lease of a pair that is no longer paired, through {which}"
+        );
+        assert_eq!(rig.lease_in_the_record(&record), None, "{which}");
+    }
 }
 
 /// KR-REQ-17.51: a request for a device that is no longer paired, made to learn a lease the host
