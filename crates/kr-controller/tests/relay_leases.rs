@@ -1804,12 +1804,12 @@ async fn an_aged_row_under_a_bound_too_small_for_a_block_does_not_hold_another_a
         Moment::Before,
     );
     rig.timer.advance(STANDING_RETRY);
+    rig.pass().await;
     rig.until(
         "the host has a row for the pair and a request it never saw answered",
         || rig.row_written_at(&record).is_some_and(|at| at > 0),
     )
     .await;
-    rig.pass().await;
     let other = rig
         .served
         .web()
