@@ -524,7 +524,7 @@ pub struct Held {
 
 /// What a caller asks of the voice call native code holds.
 ///
-/// A phone's implementation is [`NativeCalls`]. A test gives its own, which answers as scripted.
+/// A phone's implementation is `NativeCalls`. A test gives its own, which answers as scripted.
 pub trait CallPlatform: Send + Sync {
     /// Opens a call: asks for the microphone and for notifications, makes the connection and the
     /// provider's events channel, and keeps every device input off. Nothing is carried until the
