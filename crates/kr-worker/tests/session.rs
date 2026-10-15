@@ -1919,15 +1919,15 @@ async fn a_root_shell_that_exits_at_once_is_noticed_before_the_first_wait() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_root_shell_that_exits_after_the_session_settles_is_noticed_by_its_own_exit() {
-    // The case the child signal is actually for. The session is quiet before the shell exits, and
-    // a descendant holds the terminal open across the exit, so the terminal hanging up is not the
-    // evidence either. What is left is the exit itself, against a sweep that would not come round
-    // for thirty seconds.
+    // The case the child signal is actually for. The session is quiet before the shell exits, so
+    // what is left to report the exit is the exit itself, against a sweep that would not come
+    // round for thirty seconds.
     //
     // So the sweep is not left to be outwaited: this session is given one an hour long, and the
-    // shell is held at a gate until the supervision has recorded the session with the gate in it,
-    // which is after it has looked once and gone back to waiting, however long the start took.
-    // The closure that follows the gate can then only have been started by the exit.
+    // shell is held at a gate until the worker's record of the session names the gate, which is
+    // after an observation that saw it, however long the start took. A closure that follows the
+    // gate is then started by the shell's exit being reported, by the child signal where there is
+    // one and by the short poll of the shell's status where there is not, and not by a sweep.
     let host = kr_ipc::testing::TempHost::create();
     let gate_identifier = if cfg!(windows) {
         "$(cat /proc/$gate/winpid)"
