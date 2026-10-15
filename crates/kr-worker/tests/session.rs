@@ -82,6 +82,21 @@ async fn closure_record(runtime: &SessionRuntime, what: &str) -> ClosureRecord {
     }
 }
 
+/// Waits for `check` to give something, polling, for at most [`LIVENESS_DEADLINE`].
+async fn until<T>(what: &str, mut check: impl FnMut() -> Option<T>) -> T {
+    let started = tokio::time::Instant::now();
+    loop {
+        if let Some(found) = check() {
+            return found;
+        }
+        assert!(
+            started.elapsed() < LIVENESS_DEADLINE,
+            "waited {LIVENESS_DEADLINE:?} for {what}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 /// Collects a session's output until `marker` arrives.
 ///
 /// A marker that never arrives is a failure here rather than partial output a caller has to make
@@ -1904,13 +1919,31 @@ async fn a_root_shell_that_exits_at_once_is_noticed_before_the_first_wait() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_root_shell_that_exits_after_the_session_settles_is_noticed_by_its_own_exit() {
-    // The case the child signal is actually for. The session is quiet for seconds before the shell
-    // exits, so nothing the session does can be what wakes the host, and a descendant holds the
-    // terminal open across the exit, so the terminal hanging up is not the evidence either. What is
-    // left is the exit itself, against a sweep that would not come round for thirty seconds.
+    // The case the child signal is actually for. The session is quiet before the shell exits, so
+    // nothing the session does can be what wakes the host, and a descendant holds the terminal
+    // open across the exit, so the terminal hanging up is not the evidence either. What is left is
+    // the exit itself, against a sweep that would not come round for thirty seconds.
+    //
+    // The shell is held at a gate until the supervision has recorded the session with the gate in
+    // it, so the exit comes after the host has looked and gone back to waiting however long the
+    // start took, and what reported it is read from the session rather than from the time it took.
     let host = kr_ipc::testing::TempHost::create();
-    let config = configuration(&host, "sleep 30 & printf 'kr-settling\\n'; sleep 3; exit 7");
-    let started = tokio::time::Instant::now();
+    let gate_identifier = if cfg!(windows) {
+        "$(cat /proc/$gate/winpid)"
+    } else {
+        "$gate"
+    };
+    let mut config = configuration(
+        &host,
+        &format!(
+            "sleep 600 & ( while [ ! -e kr-go ]; do sleep 0.2; done ) & gate=$!; \
+             printf '%s\\n' \"{gate_identifier}\" > kr-gate.pid; printf 'kr-settling\\n'; \
+             wait $gate; exit 7"
+        ),
+    );
+    config.shell.cwd = host.root().to_string_lossy().into_owned();
+    let session_id = config.session_id;
+    let journal = config.journal_path.clone().expect("a journal of its own");
     let runtime = std::sync::Arc::new(
         kr_worker::runtime::start(
             config,
@@ -1918,8 +1951,28 @@ async fn a_root_shell_that_exits_after_the_session_settles_is_noticed_by_its_own
         )
         .expect("starts a session"),
     );
+
+    let gate = until("the shell to name its gate", || {
+        let pid = std::fs::read_to_string(host.root().join("kr-gate.pid"))
+            .ok()?
+            .trim()
+            .parse::<u32>()
+            .ok()?;
+        kr_ipc::identity::process_start_identity(pid).ok()
+    })
+    .await;
+    until("the supervision to have recorded the gate", || {
+        kr_worker::journal::Journal::open_read_only(&journal)
+            .ok()?
+            .read_owned(session_id)
+            .ok()??
+            .processes
+            .contains(&gate)
+            .then_some(())
+    })
+    .await;
+    std::fs::write(host.root().join("kr-go"), b"").expect("opens the gate");
     let record = closure_record(&runtime, "the session closes on its own").await;
-    let taken = started.elapsed();
 
     assert_eq!(record.reason, ClosureReason::RootExit);
     assert_eq!(
@@ -1927,9 +1980,10 @@ async fn a_root_shell_that_exits_after_the_session_settles_is_noticed_by_its_own
         Some(7),
         "the shell's own status"
     );
+    let reported_by = runtime.root_exit_prompt();
     assert!(
-        taken < kr_worker::lifecycle::IDLE_SWEEP_INTERVAL / 2,
-        "the exit reached the host rather than the sweep finding it: {taken:?}"
+        reported_by.is_some_and(kr_worker::lifecycle::Prompt::is_the_shells_own_exit),
+        "the exit reached the host rather than the sweep finding it: {reported_by:?}"
     );
 }
 
