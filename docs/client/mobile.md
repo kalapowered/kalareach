@@ -329,7 +329,7 @@ device.
 
 ## Files and locks on Android
 
-All the stores used in the application write into the application's directory. For example the drafts and the device that owns them, the answers kept for a host, and the pairing records with their attempt budget. Android differs from a desktop in three ways that matter there, and each has one rule.
+All the stores used in the application write into the application's directory. For example the drafts and the device that owns them, the answers kept for a host, the attempts kept for a share's actions, and the pairing records with their attempt budget. Android differs from a desktop in three ways that matter there, and each has one rule.
 
 On other Unix systems a new file gets its first name with a hard link, but on Android it gets it with a rename that fails if the name is taken. The reason is Android's security policy, which prohibits hard linking in the application's directory. The rename uses `renameat2` with the `RENAME_NOREPLACE` flag, which is allowed by Android's syscall filter starting with Android 10 and is supported by the filesystems (ext4 and f2fs) used in the application's directory. If the filesystem does not support the flag it will indicate that, in which case the stores will indicate the same. On Windows the rename also does not replace an existing file. `kr_flush::publish_without_replacing` is the one place that chooses.
 
@@ -339,7 +339,7 @@ If a store makes the names on the way down to its directory durable, the store w
 
 The pairing records keep the device's keys in the application's one secure store, the same one the account uses, which on Android is files protected by Keystore.
 
-The script `scripts/check-android.sh` checks that the Rust code used for Android in the companion does not use the standard library's file lock or hard link. The script `apps/companion/e2e/android-stores.sh` runs the stores in an Android emulator.
+The script `scripts/check-android.sh` checks that the Rust code used for Android in the companion does not use the standard library's file lock, or a hard link made through the standard library, tokio or rustix. The script `apps/companion/e2e/android-stores.sh` runs the stores that need no host in an Android emulator.
 
 ## Checking it on an iPhone
 

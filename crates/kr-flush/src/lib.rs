@@ -690,7 +690,7 @@ mod tests {
         // shared temporary directory does where it exists: a failure there is reported.
         let shared = Path::new("/tmp");
         if std::fs::metadata(shared)
-            .is_ok_and(|shared| shared.uid() != rustix::process::getuid().as_raw())
+            .is_ok_and(|metadata| metadata.uid() != rustix::process::getuid().as_raw())
             && rustix::fs::access(shared, rustix::fs::Access::WRITE_OK).is_ok()
         {
             assert!(

@@ -65,9 +65,10 @@ export STRIP="$tools/llvm-strip"
 
 # The lint also refuses the two kinds of call an Android phone cannot make and the stores must not:
 # the standard library's file lock, which Android does not support, and a hard link, which the
-# security policy refuses in an application's own directory. scripts/android-clippy/clippy.toml names them
-# and what to call instead. It is used for this run in place of the repository's own clippy.toml,
-# which the desktop crates' tests and host programs are linted with, where both calls work.
+# security policy refuses in an application's own directory. scripts/android-clippy/clippy.toml
+# names them and what to call instead. It is used for this run in place of the repository's own
+# clippy.toml, which the desktop crates' tests and host programs are linted with, where both calls
+# work.
 export CLIPPY_CONF_DIR="$PWD/scripts/android-clippy"
 
 # The companion alone is named: Cargo lints every crate of this workspace that it links as well,

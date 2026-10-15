@@ -1,16 +1,18 @@
 #!/bin/bash
 # Holds, on the Android emulator, that the packaged application keeps what it stores on the phone:
-# the drafts and the device that owns them, the removals still to be made, the pairing records and
-# their attempt budget, and the answers kept on the device, and that a store's lock holds against a
-# second process.
+# the drafts and the device that owns them, the removals still to be made, and the pairing records
+# and their attempt budget, and that a store's lock holds against a second process, the lock of the
+# answers kept on the device among them.
 #
 # It installs the debug application, opens the page's debugging socket, and calls the application's
-# own commands the way the page does. It keeps no answer, which needs a host: the kept answers are
-# reached through the lock every window takes before it looks for one. A store the phone cannot use answers with the failure the
-# command carries, and the run says which one. The lock between processes is checked with the
-# system's own `flock` run under the application's identity: that process holds the kept answers'
-# lock file, and the application's command for dismissing a kept answer, which takes that lock
-# first, must refuse to go on while it is held and go on once it is let go.
+# own commands the way the page does. It keeps no answer and no attempt, which need a host: a
+# kept answer is reached through the lock a window takes before it changes one, and the attempts
+# kept for a share's actions only through a connection to a host. A store the phone cannot use
+# answers with the failure the command carries, and the run says which one. The lock between
+# processes is checked with the system's own `flock` run under the application's identity: that
+# process holds the kept answers' lock file, and the application's command for dismissing a kept
+# answer, which takes that lock first, must refuse to go on while it is held and go on once it is
+# let go.
 #
 # It must run inside the device lease, which also stops what it started:
 #
