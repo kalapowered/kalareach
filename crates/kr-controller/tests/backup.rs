@@ -9842,9 +9842,9 @@ async fn retention_leaves_a_generation_privacy_mode_drew_a_line_under() {
     ask(4).expect("a generation of the generation in force, with two newer published");
 }
 
-/// The end of a production pass that admitted nothing wakes what releases its ciphertext and what
-/// finishes the cleanup a fence owes, and does not wake the producer: a pass that failed would
-/// otherwise begin again at once and never wait out its delay.
+/// The end of a production pass that admitted nothing wakes the carrier and what finishes the
+/// cleanup a fence owes, and does not wake the producer: a pass that failed would otherwise begin
+/// again at once and never wait out its delay.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_end_of_a_pass_does_not_wake_the_producer() {
     let environment = Environment::open();
@@ -9858,7 +9858,7 @@ async fn the_end_of_a_pass_does_not_wake_the_producer() {
     );
     assert!(
         signals.work.notified().now_or_never().is_some(),
-        "what releases ciphertext is told"
+        "the carrier is told"
     );
     assert!(
         signals.produce.notified().now_or_never().is_none(),

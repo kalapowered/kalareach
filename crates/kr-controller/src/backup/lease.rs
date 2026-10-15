@@ -254,9 +254,11 @@ impl Drop for ProductionLease {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .end(self.id);
-        // What releases ciphertext waits for the pass to be over, and so does the cleanup a fence
-        // owes. A pass that admitted a generation woke the carrier at the admission, and a second
-        // wake would have it look again at once, whatever it had been told to wait for.
+        // The cleanup a fence owes waits for the pass to be over, and is told. The carrier is told
+        // too, unless the pass admitted a generation: that woke it when its rows were written, and
+        // giving back the ciphertext is the carrier's own look at the store, which does not wait
+        // for the pass to end. A second wake would have it look again at once, inside whatever it
+        // had been told to wait for.
         if !self.admitted.load(Ordering::SeqCst) {
             self.signals.work.notify_one();
         }

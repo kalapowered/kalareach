@@ -26,7 +26,7 @@ use kr_client::services::{
 };
 use kr_controller::account::{HostAccount, Service};
 use kr_controller::backup::runtime::{OPERATOR_CEILING, TOKEN_CHECK};
-use kr_controller::backup::store::{AttemptStatus, Production, Remote};
+use kr_controller::backup::store::{AttemptStatus, MadeFrom, Production, Remote};
 use kr_controller::quiet::{LONGEST_DELAY, Timer};
 use kr_controller::service::{Controller, ControllerSetup};
 use kr_controller::supervision::{LaunchOutcome, WorkerLaunch, WorkerSupervisor};
@@ -857,12 +857,33 @@ fn admit(
 fn seal_and_admit(
     controller: &Controller,
     writer: &AuthorisationKeyPair,
-    (sender, device): (&StoredEnvelopeKeyPair, &StoredEnvelopeKeyPair),
+    sealing: (&StoredEnvelopeKeyPair, &StoredEnvelopeKeyPair),
     archive: ArchiveId,
     generation: u64,
     objects: &[(u8, Vec<u8>)],
     enrolling: bool,
 ) {
+    let (sealed, staged) = seal_generation(writer, sealing, archive, generation, objects);
+    let backup = controller.backup();
+    let now = kr_ipc::now_ms();
+    if enrolling {
+        backup
+            .enrol_writer(writer.key_id(), archive, now)
+            .expect("the daemon enrols its own writer for the archive");
+    }
+    backup
+        .admit(&sealed, &staged, writer.key_id(), now)
+        .expect("the generation is admitted");
+}
+
+/// One generation as `writer` would seal it: the sealed archive and the objects it names.
+fn seal_generation(
+    writer: &AuthorisationKeyPair,
+    (sender, device): (&StoredEnvelopeKeyPair, &StoredEnvelopeKeyPair),
+    archive: ArchiveId,
+    generation: u64,
+    objects: &[(u8, Vec<u8>)],
+) -> (SealedArchive, Vec<StagedObject>) {
     let staged: Vec<StagedObject> = objects
         .iter()
         .map(|(seed, plaintext)| {
@@ -896,16 +917,7 @@ fn seal_and_admit(
         &staged,
     )
     .expect("a sealed archive");
-    let backup = controller.backup();
-    let now = kr_ipc::now_ms();
-    if enrolling {
-        backup
-            .enrol_writer(writer.key_id(), archive, now)
-            .expect("the daemon enrols its own writer for the archive");
-    }
-    backup
-        .admit(&sealed, &staged, writer.key_id(), now)
-        .expect("the generation is admitted");
+    (sealed, staged)
 }
 
 /// 3 MiB of bytes that do not compress to nothing.
@@ -1727,6 +1739,78 @@ async fn a_service_that_does_not_say_what_became_of_a_publication_does_not_hold_
         Remote::Unknown,
         "the daemon started while the service had not said"
     );
+}
+
+/// The ciphertext of a published generation is given back by the carrier's own pass, whether or not
+/// the production pass that admitted it has ended: what releases it reads the store, and the pass's
+/// lease is not in it. The test keeps the pass's lease while the carrier, woken by the admission,
+/// carries the generation, and the timer holds every wait, so that nothing but the carrier's
+/// iteration that published it, and the pass that follows, can have given the ciphertext back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_ciphertext_of_a_published_generation_is_given_back_while_the_pass_that_admitted_it_still_runs()
+ {
+    let timer = HeldTimer::held();
+    let rig = Rig::start(Arrangement::NORMAL, Arc::clone(&timer)).await;
+    within(
+        "the first status read",
+        rig.served.web().requests_reach(STATUS, 1),
+    )
+    .await;
+    rig.enrol_the_writer_and_let_the_carrier_settle().await;
+
+    let backup = rig.controller.backup();
+    let generation = BackupGeneration::new(1);
+    let lease = backup.begin_production().expect("a lease");
+    let (sealed, staged) = seal_generation(
+        &rig.writer,
+        (&rig.sender, &rig.device),
+        archive_id(),
+        1,
+        &[(1, plaintext(2048))],
+    );
+    for member in &staged {
+        lease
+            .stage(archive_id(), generation, member.object_id(), member.bytes())
+            .expect("a member is staged");
+    }
+    lease
+        .stage(
+            archive_id(),
+            generation,
+            sealed.descriptor.encrypted_manifest.object_id,
+            &sealed.encrypted_manifest,
+        )
+        .expect("the manifest is staged");
+    backup
+        .admit_produced(
+            &lease,
+            &sealed,
+            &staged,
+            rig.writer.key_id(),
+            MadeFrom {
+                fingerprint: kr_protocol::scalars::Digest256::from_bytes([9; 32]),
+                unreadable: Vec::new(),
+            },
+            kr_ipc::now_ms(),
+        )
+        .expect("the generation is admitted");
+
+    assert!(backup.production_running(), "the pass has not ended");
+    rig.until("the generation is published", |rig| rig.published(1))
+        .await;
+    // The carrier gives the ciphertext back in the iteration that published it, and a pass that
+    // finishes after that has looked again.
+    rig.carrier_passes(1).await;
+    assert!(
+        !backup.holds_finished_ciphertext().expect("a read"),
+        "the ciphertext is given back"
+    );
+    assert!(
+        backup.production_running(),
+        "the ciphertext was given back while the pass still held its lease"
+    );
+    drop(lease);
+    assert!(!backup.production_running());
 }
 
 /// A carrier woken inside a delay waits only for what is left of it: the delay is counted from when
