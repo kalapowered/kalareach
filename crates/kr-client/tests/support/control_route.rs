@@ -50,7 +50,6 @@ pub const WATCHDOG: Duration = Duration::from_secs(20);
 enum Outbound {
     Text(String),
     Binary(Vec<u8>),
-    Ping,
     /// Ends the connection with no closing frame.
     Drop,
     /// Ends the connection with a closing frame.
@@ -84,8 +83,6 @@ pub struct Report {
     pub open: usize,
     /// Heartbeats read.
     pub heartbeats: usize,
-    /// Pongs read: the device's answers to pings the route sent.
-    pub pongs: usize,
     /// Every text frame read from a device, whatever became of it.
     pub frames: Vec<String>,
     /// The requests it sent on to the provider, each once.
@@ -286,13 +283,6 @@ impl ControlRoute {
         self.edit(|state| state.drop_after_ready = drop);
     }
 
-    /// Sends a ping to every open socket.
-    pub fn ping(&self) {
-        self.each_socket(|socket| {
-            let _ = socket.send(Outbound::Ping);
-        });
-    }
-
     /// Makes the next `ready` name another call.
     pub fn name_another_call(&self) {
         self.edit(|state| state.ready_call = "call-2".to_owned());
@@ -468,11 +458,6 @@ where
                 if message.is_close() {
                     break;
                 }
-                if message.is_pong() {
-                    shared.state.lock().expect("the route's state").report.pongs += 1;
-                    shared.changed.notify_waiters();
-                    continue;
-                }
                 let Some(text) = message.as_text() else { continue };
                 let (answers, drop_after) = answer(&shared, text);
                 for answer in answers {
@@ -487,11 +472,6 @@ where
             }
             told = inbound.recv() => match told {
                 None | Some(Outbound::Drop) => break,
-                Some(Outbound::Ping) => {
-                    if socket.send(Message::ping("route")).await.is_err() {
-                        break;
-                    }
-                }
                 Some(Outbound::Close) => {
                     let _ = socket.close().await;
                     break;

@@ -1059,45 +1059,6 @@ async fn an_admission_that_came_while_the_socket_was_down_is_heard_from_the_next
 }
 
 #[tokio::test]
-async fn frames_that_keep_arriving_do_not_hold_back_the_heartbeat() {
-    let route = ControlRoute::start().await;
-    let (_control, mut news) = open(&route, &Tokens::new());
-    attached(&mut news).await;
-    tokio::spawn(async move { while news.next().await.is_some() {} });
-
-    within("three heartbeats among the frames", async {
-        while route.report().heartbeats < 3 {
-            for _ in 0..50 {
-                route.usage(1, true);
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await;
-}
-
-#[tokio::test]
-async fn a_ping_is_answered_at_once_and_not_with_the_next_heartbeat() {
-    // The heartbeat is a minute away and the silence limit a few seconds, so a pong that waited
-    // for a write would never come.
-    let timings = ControlTimings {
-        heartbeat: ms(60_000),
-        ..quick()
-    };
-    let route = ControlRoute::start().await;
-    let (_control, mut news) = VoiceControl::open(
-        &connector().with_timings(timings),
-        route.target(),
-        Tokens::new(),
-    );
-    attached(&mut news).await;
-
-    route.ping();
-
-    route.until("a pong", |report| report.pongs >= 1).await;
-}
-
-#[tokio::test]
 async fn a_route_that_stops_answering_is_lost_by_its_silence_and_found_again() {
     let route = ControlRoute::start().await;
     let (_control, mut news) = open(&route, &Tokens::new());

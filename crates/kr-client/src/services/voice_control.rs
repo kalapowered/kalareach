@@ -1156,16 +1156,6 @@ impl Driver {
                     None | Some(Err(_)) => break Served::Lost,
                     Some(Ok(message)) => {
                         last_heard = Instant::now();
-                        if message.is_ping() {
-                            // The library answers a ping itself and holds the answer until
-                            // something is written, so a service that pings would grow that
-                            // queue between heartbeats.
-                            let flushed =
-                                tokio::time::timeout(timings.write_within, socket.flush()).await;
-                            if !matches!(flushed, Ok(Ok(()))) {
-                                break Served::Lost;
-                            }
-                        }
                         match self.on_message(&message).await {
                             Ok(Some(served)) => break served,
                             Ok(None) => {}
