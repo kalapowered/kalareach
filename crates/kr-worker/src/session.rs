@@ -394,6 +394,9 @@ pub struct Session {
     /// The runtime marks it for the input this session accepts and the output it produces, and the
     /// session itself for a command the shell's integration reports starting.
     activity: Arc<crate::lifecycle::Activity>,
+    /// How long the supervision lets this session go between observations of what it owns while
+    /// nothing is happening in it.
+    idle_sweep: std::time::Duration,
     /// When the terminal's foreground has been read, for this host's own tests.
     #[cfg(feature = "testing")]
     foreground_reads: std::sync::Mutex<Vec<std::time::Instant>>,
@@ -735,6 +738,7 @@ impl Session {
             command_blocks: std::collections::VecDeque::new(),
             answered: Answered::default(),
             activity: crate::lifecycle::Activity::new(),
+            idle_sweep: crate::lifecycle::IDLE_SWEEP_INTERVAL,
             #[cfg(feature = "testing")]
             foreground_reads: std::sync::Mutex::new(Vec::new()),
             agent_instances: AgentInstances::default(),
@@ -3921,6 +3925,21 @@ impl Session {
     #[must_use]
     pub fn activity(&self) -> Arc<crate::lifecycle::Activity> {
         Arc::clone(&self.activity)
+    }
+
+    /// Returns how long the supervision lets this session go between observations while nothing
+    /// is happening in it.
+    #[must_use]
+    pub const fn idle_sweep(&self) -> std::time::Duration {
+        self.idle_sweep
+    }
+
+    /// Sets how long the supervision lets this session go between observations while nothing is
+    /// happening in it, before the session is run. The default is
+    /// [`crate::lifecycle::IDLE_SWEEP_INTERVAL`]; a longer one leaves the shell's exit to be
+    /// reported by the exit itself for that much longer.
+    pub const fn set_idle_sweep(&mut self, interval: std::time::Duration) {
+        self.idle_sweep = interval;
     }
 
     /// Returns the process group the terminal has in the foreground, for the adoption watch: all a
