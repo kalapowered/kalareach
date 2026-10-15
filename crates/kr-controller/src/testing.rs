@@ -48,6 +48,12 @@ pub async fn with_git_read_bound<F: Future>(bound: Duration, start: F) -> F::Out
     GIT_READ_BOUND.scope(bound, start).await
 }
 
+/// A Git read bound that only ends a child that never finishes.
+///
+/// The one a suite that is about something other than the project service's own bound gives its
+/// daemons through [`with_git_read_bound`]: a read that finishes is answered whenever it does.
+pub const HUNG_GIT_READ: Duration = Duration::from_secs(600);
+
 /// The bound a suite gave the Git reads of the daemon being started, when it did.
 pub(crate) fn git_read_bound() -> Option<Duration> {
     GIT_READ_BOUND.try_with(|bound| *bound).ok()
