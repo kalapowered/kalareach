@@ -4327,8 +4327,7 @@ async fn the_owners_setup_writes_the_bundle_then_enrols_the_writer_and_the_host_
     assert!(at(SYNC, 0) < at(MANIFEST, 0), "{paths:?}");
     assert!(at(MANIFEST, 0) < at(RETENTION, 0), "{paths:?}");
     assert_eq!(
-        web.bundle(&made.params.bundle_locator.to_string())
-            .map(|(_, stream)| stream),
+        web.bundle(&made.params.bundle_locator.to_string()),
         Some(made.params.sealed_bundle.as_slice().to_vec())
     );
     let sent = web.arrived();
