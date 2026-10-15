@@ -316,6 +316,16 @@ pub struct WorkerService {
             std::sync::mpsc::Receiver<()>,
         )>,
     >,
+    /// A pause in the binding of a question's or an alert's source to the session, which this
+    /// host's own tests arm to stand a caller there while a keystroke arrives. It is compiled
+    /// away in every shipped build.
+    #[cfg(feature = "testing")]
+    binding_pause: Mutex<
+        Option<(
+            std::sync::mpsc::SyncSender<()>,
+            std::sync::mpsc::Receiver<()>,
+        )>,
+    >,
     /// How many announcements of an authority revision have been refused because the dispatch
     /// boundary was held, for this host's own tests. It is compiled away in every shipped build.
     #[cfg(feature = "testing")]
@@ -584,6 +594,8 @@ impl WorkerService {
             prepared_first: std::sync::atomic::AtomicBool::new(false),
             #[cfg(feature = "testing")]
             input_pause: Mutex::new(None),
+            #[cfg(feature = "testing")]
+            binding_pause: Mutex::new(None),
             #[cfg(feature = "testing")]
             refused_for_the_boundary: tokio::sync::watch::Sender::new(0),
             #[cfg(feature = "testing")]
@@ -1090,6 +1102,49 @@ impl WorkerService {
     ) -> Option<ReadyPreparation> {
         None
     }
+
+    /// Stops the next binding of a question's or an alert's source to the session while the
+    /// kernel is being asked about the caller, for this host's own tests.
+    ///
+    /// Returns the end that says the binding has arrived, and the end that lets it go. The pause
+    /// fires once.
+    #[cfg(feature = "testing")]
+    pub fn pause_in_binding(
+        &self,
+    ) -> (
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::SyncSender<()>,
+    ) {
+        let (arrived, watch) = std::sync::mpsc::sync_channel(1);
+        let (release, go) = std::sync::mpsc::sync_channel(1);
+        *self
+            .binding_pause
+            .lock()
+            .expect("the pause is not poisoned") = Some((arrived, go));
+        (watch, release)
+    }
+
+    /// Waits at the pause above, where one is armed. Compiled away in every shipped build.
+    #[cfg(feature = "testing")]
+    fn wait_in_binding(&self) {
+        let armed = self
+            .binding_pause
+            .lock()
+            .expect("the pause is not poisoned")
+            .take();
+        if let Some((arrived, go)) = armed {
+            let _ = arrived.send(());
+            let _ = go.recv();
+        }
+    }
+
+    /// The same, without the feature: there is no pause.
+    #[cfg(not(feature = "testing"))]
+    #[expect(
+        clippy::unused_self,
+        reason = "it is the shipped form of a method that reads this service's own pause"
+    )]
+    const fn wait_in_binding(&self) {}
 
     /// Stops the next raw input write after it has passed the check that holds a local owner to
     /// its lease and before it takes the session, for this host's own tests.
@@ -4985,6 +5040,11 @@ impl WorkerService {
             now_ms: kr_ipc::now_ms(),
         };
 
+        // A caller that is bound to the session is bound before the session is taken. Who it is
+        // and whether it is inside is the kernel's answer, and the checks below read that answer
+        // while the session is held; the walk that finds it is not a thing to hold the session for.
+        state.binding = Self::binds_its_caller(method).then(|| self.bind_caller(state));
+
         // From here the session is locked and stays locked. Admission, the final revalidation, the
         // dispatch marker, the effect and the recorded outcome are one serial boundary: nothing
         // the mutation was validated against — the geometry, the lease, the output cursor, the
@@ -5039,7 +5099,7 @@ impl WorkerService {
             }
         };
 
-        self.dispatch_accepted(
+        let answered = self.dispatch_accepted(
             session,
             state,
             mutation,
@@ -5049,7 +5109,9 @@ impl WorkerService {
             admitted,
             volatile_permitted,
             None,
-        )
+        );
+        state.binding = None;
+        answered
     }
 
     /// Everything a mutation does once its intent is committed: the revalidation inside the
@@ -5853,14 +5915,14 @@ impl WorkerService {
             Method::QuestionCreate => {
                 let params: kr_protocol::question::QuestionCreateParams = parse(&mutation.params)?;
                 Self::check_session(session, params.session_id)?;
-                let source = self.bind_source_in(session, state)?;
+                let source = Self::bound_source(state)?;
                 Ok(self.questions.check_create(&source, &params)?)
             }
             Method::QuestionCancelOwn => {
                 let params: kr_protocol::question::QuestionCancelOwnParams =
                     parse(&mutation.params)?;
                 Self::check_session(session, params.session_id)?;
-                let source = self.bind_source_in(session, state)?;
+                let source = Self::bound_source(state)?;
                 self.questions
                     .check_own(&source, params.question_id, &params.caller_token)?;
                 let revision = self.questions.question(params.question_id)?.revision;
@@ -5874,7 +5936,7 @@ impl WorkerService {
             Method::AlertCreate => {
                 let params: kr_protocol::question::AlertCreateParams = parse(&mutation.params)?;
                 Self::check_session(session, params.session_id)?;
-                self.bind_source_in(session, state)?;
+                Self::bound_source(state)?;
                 Ok(())
             }
             // The answering surface needs `question.respond` and nothing else, so what is decided
@@ -7359,30 +7421,46 @@ impl WorkerService {
 
     /// Binds the caller on this connection to this session, for a source-side question method.
     fn bind_source(&self, state: &ConnectionState) -> Result<crate::questions::VerifiedSource> {
-        let boundary = Self::session_boundary(&self.runtime.session());
-        Ok(crate::questions::binding::verify(
-            state.peer_pid,
-            state.peer_process.as_ref(),
-            state.connection_id,
-            boundary.as_ref(),
-            Some(self.broker.as_ref()),
-        )?)
+        Ok(self.bind_caller(state).source()?)
     }
 
-    /// Binds the caller on this connection, with the session already held.
-    fn bind_source_in(
-        &self,
-        session: &Session,
-        state: &ConnectionState,
-    ) -> Result<crate::questions::VerifiedSource> {
-        let boundary = Self::session_boundary(session);
-        Ok(crate::questions::binding::verify(
+    /// Asks the kernel who the caller on this connection is, and whether it is inside this session.
+    ///
+    /// The session is taken for the copy of its boundary and let go before the kernel is asked: the
+    /// answer is a walk up the caller's parents, and everything that needs the session, a
+    /// keystroke's write and the recogniser's timer among it, would wait for the walk.
+    fn bind_caller(&self, state: &ConnectionState) -> crate::questions::binding::Binding {
+        let boundary = Self::session_boundary(&self.runtime.session());
+        self.wait_in_binding();
+        crate::questions::binding::Binding::of(crate::questions::binding::verify(
             state.peer_pid,
             state.peer_process.as_ref(),
             state.connection_id,
             boundary.as_ref(),
             Some(self.broker.as_ref()),
-        )?)
+        ))
+    }
+
+    /// Whether a mutation binds its caller to the session before it is dispatched.
+    const fn binds_its_caller(method: Method) -> bool {
+        matches!(
+            method,
+            Method::QuestionCreate | Method::QuestionCancelOwn | Method::AlertCreate
+        )
+    }
+
+    /// Returns what binding the caller of the mutation being dispatched came to.
+    fn bound_source(state: &ConnectionState) -> Result<crate::questions::VerifiedSource> {
+        state
+            .binding
+            .as_ref()
+            .ok_or_else(|| WorkerError::PreconditionFailed {
+                detail: "this caller was not bound to the session before the mutation was \
+                         dispatched"
+                    .to_owned(),
+            })?
+            .source()
+            .map_err(WorkerError::from)
     }
 
     /// Returns the process boundary this session owns, when its root shell is running.
@@ -7731,7 +7809,7 @@ impl WorkerService {
             }
             Method::QuestionCreate => {
                 let params: kr_protocol::question::QuestionCreateParams = parse(params)?;
-                let source = self.bind_source_in(session, state)?;
+                let source = Self::bound_source(state)?;
                 let (result, _) = self
                     .questions
                     .create(&source, &params, self.question_clock())?;
@@ -7739,7 +7817,7 @@ impl WorkerService {
             }
             Method::QuestionCancelOwn => {
                 let params: kr_protocol::question::QuestionCancelOwnParams = parse(params)?;
-                let source = self.bind_source_in(session, state)?;
+                let source = Self::bound_source(state)?;
                 let (result, _) =
                     self.questions
                         .cancel_own(&source, &params, self.question_clock())?;
@@ -7747,7 +7825,7 @@ impl WorkerService {
             }
             Method::AlertCreate => {
                 let params: kr_protocol::question::AlertCreateParams = parse(params)?;
-                let source = self.bind_source_in(session, state)?;
+                let source = Self::bound_source(state)?;
                 let result = self
                     .questions
                     .alert(&source, &params, self.question_clock())?;
@@ -8465,6 +8543,12 @@ pub struct ConnectionState {
     /// Pinning it here is what stops a process identifier the kernel recycles while this
     /// connection is open from being answered as though it were the caller that opened it.
     pub peer_process: Option<kr_protocol::identity::ProcessStartIdentity>,
+    /// What binding the caller to this session came to, for the mutation being dispatched now.
+    ///
+    /// Asking the kernel who the caller is takes as long as the kernel takes, so it is done before
+    /// the mutation takes the session, and the checks that run while the session is held read the
+    /// answer from here. Set for each mutation, and read only by the ones that bind their caller.
+    pub(crate) binding: Option<crate::questions::binding::Binding>,
     next_request: u64,
 }
 
@@ -8518,6 +8602,7 @@ impl ConnectionState {
             peer_process: peer
                 .pid
                 .and_then(|pid| kr_ipc::identity::process_start_identity(pid).ok()),
+            binding: None,
             next_request: 0,
         }
     }
