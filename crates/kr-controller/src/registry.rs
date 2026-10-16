@@ -4002,6 +4002,57 @@ mod tests {
         }
     }
 
+    /// A daemon that ended by a kill has released its locks on the registry's index and not yet
+    /// its mapping of it, and the daemon that takes the environment the moment the lock is free
+    /// opens the registry then. The store tells it its disk failed, although the same open
+    /// succeeds a moment later. Opening the registry asks again until the previous holder has let
+    /// go, instead of reporting that.
+    #[cfg(windows)]
+    #[test]
+    fn a_registry_opened_while_its_previous_daemon_is_letting_go_is_waited_for() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        use kr_worker::persistence::release::{held_index::HeldIndex, on_the_next_wait};
+
+        let directory = tempfile::tempdir().expect("a directory");
+        let path = directory.path().join("registry.sqlite3");
+        drop(Registry::open(&path, environment()).expect("a registry"));
+        let mut index = path.clone().into_os_string();
+        index.push("-shm");
+        let held = HeldIndex::on(std::path::Path::new(&index));
+        // The premise: the store itself refuses while the index is held this way.
+        let refused =
+            Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .and_then(|connection| {
+                    connection.query_row("SELECT COUNT(*) FROM sqlite_master", [], |row| {
+                        row.get::<_, i64>(0)
+                    })
+                });
+        assert!(
+            matches!(
+                &refused,
+                Err(rusqlite::Error::SqliteFailure(failure, _))
+                    if failure.extended_code == rusqlite::ffi::SQLITE_IOERR_TRUNCATE
+            ),
+            "the held index makes the store refuse: {refused:?}"
+        );
+
+        let waited = Arc::new(AtomicBool::new(false));
+        let signal = Arc::clone(&waited);
+        on_the_next_wait(move || {
+            signal.store(true, Ordering::SeqCst);
+            drop(held);
+        });
+        let opened = Registry::open(&path, environment());
+        assert!(
+            waited.load(Ordering::SeqCst),
+            "the open reported the refusal instead of waiting for the holder: {:?}",
+            opened.as_ref().err()
+        );
+        opened.expect("the open went on after the wait");
+    }
+
     #[test]
     fn a_registry_opened_to_read_is_read_as_it_is_or_refused() {
         let directory = tempfile::tempdir().expect("a directory");
