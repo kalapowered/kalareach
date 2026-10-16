@@ -1679,8 +1679,8 @@ mod launching {
         /// Makes the daemon answer a starter `extra` after it has received and checked the
         /// starter's hello, for this host's own tests: the wait a starter has for that answer is
         /// what a Task Scheduler slow to answer the run it carried out holds it in. The starter's
-        /// wait begins when it sends the hello, which is before the daemon has it, so the delay
-        /// falls inside the wait whenever the starter sent it. It compiles to nothing without the
+        /// wait is measured from before it writes the hello, so the delay, which begins once the
+        /// daemon has the hello, always falls inside the wait. It compiles to nothing without the
         /// `testing` feature, and no shipped build enables it.
         #[cfg(feature = "testing")]
         #[must_use]
@@ -1982,6 +1982,9 @@ mod launching {
         let Ok(bytes) = encode(&hello) else {
             return StarterExit::Declined;
         };
+        // The wait for the answer is measured from before the hello is written, so the daemon
+        // cannot have the hello, and begin to answer, before the wait has begun.
+        let answer_by = Instant::now() + ANSWER_BOUND;
         if stream
             .send(&bytes, Instant::now() + EXCHANGE_BOUND)
             .is_err()
@@ -1989,7 +1992,7 @@ mod launching {
             return StarterExit::Declined;
         }
         let answer = stream
-            .receive(Instant::now() + ANSWER_BOUND)
+            .receive(answer_by)
             .map_err(|error| error.to_string())
             .and_then(|bytes| decode::<Answer>(&bytes));
         let launch = match answer {
