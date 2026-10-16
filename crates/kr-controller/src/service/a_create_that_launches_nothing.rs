@@ -155,9 +155,28 @@ async fn daemon_running(
     program: std::path::PathBuf,
     shell_packages: Option<std::path::PathBuf>,
 ) -> (Arc<Controller>, Arc<Mutex<Vec<WorkerLaunch>>>) {
+    let asked = Arc::new(Mutex::new(Vec::new()));
+    let controller = daemon_supervised(
+        temp,
+        program,
+        shell_packages,
+        Box::new(RecordingSupervisor {
+            asked: Arc::clone(&asked),
+        }),
+    )
+    .await;
+    (controller, asked)
+}
+
+/// Starts a daemon as [`daemon_running`] does, with the supervisor a test gives it.
+async fn daemon_supervised(
+    temp: &kr_ipc::testing::TempHost,
+    program: std::path::PathBuf,
+    shell_packages: Option<std::path::PathBuf>,
+    supervisor: Box<dyn WorkerSupervisor>,
+) -> Arc<Controller> {
     let environment = temp.environment();
     let environment_id = temp.environment_id();
-    let asked = Arc::new(Mutex::new(Vec::new()));
     let controller =
         Controller::start(ControllerSetup {
             paths: environment.clone(),
@@ -172,9 +191,7 @@ async fn daemon_running(
             }),
             secret_store: kr_crypto::store::StoreSelection::File,
             boot_identity: kr_ipc::identity::boot_identity().expect("a boot identity"),
-            supervisor: Box::new(RecordingSupervisor {
-                asked: Arc::clone(&asked),
-            }),
+            supervisor,
             worker_program: program,
             build_id: BuildId::new("kr-test/0").expect("a build identifier"),
             release: "0".to_owned(),
@@ -183,7 +200,7 @@ async fn daemon_running(
         })
         .await
         .expect("the daemon starts");
-    (controller, asked)
+    controller
 }
 
 /// Registers one connection, the way a caller's handshake does.
@@ -2946,4 +2963,90 @@ async fn the_hosts_environment_is_the_daemons_with_the_owners_additions_over_it(
         ]),
         "an addition is added, and wins over the daemon's value of its name"
     );
+}
+
+/// A supervisor that waits inside its start until the test lets it go, as a service manager that
+/// is slow to answer does.
+#[derive(Debug)]
+struct SlowSupervisor {
+    entered: std::sync::mpsc::Sender<()>,
+    release: Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+impl WorkerSupervisor for SlowSupervisor {
+    fn start(&self, _launch: &WorkerLaunch) -> LaunchOutcome {
+        self.entered.send(()).expect("the test is waiting");
+        // Ends when the test sends or drops its end, so a test that fails does not leave the
+        // launch waiting for ever.
+        let _ = self
+            .release
+            .lock()
+            .expect("the receiver is not poisoned")
+            .recv();
+        LaunchOutcome::NotStarted {
+            detail: "this test starts no workers".to_owned(),
+        }
+    }
+
+    fn describe(&self) -> &'static str {
+        "a supervisor that waits until the test lets it go"
+    }
+}
+
+/// A launch that waits on the platform's service manager does not hold up the daemon's other
+/// work: with one thread to run on, a request made meanwhile is still served.
+///
+/// The service manager is asked from the create, and a manager busy starting processes answers in
+/// seconds. The daemon's tasks, the rendezvous of the worker it is starting among them, run on the
+/// runtime's threads, and a create that kept its thread through the wait would hold them all back
+/// on a host with few processors.
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn a_launch_waiting_on_the_service_manager_does_not_hold_up_the_daemon() {
+    let temp = kr_ipc::testing::TempHost::create();
+    let (entered, entered_receiver) = std::sync::mpsc::channel();
+    let (release, release_receiver) = std::sync::mpsc::channel::<()>();
+    let controller = daemon_supervised(
+        &temp,
+        temp.root().join("kr-worker"),
+        None,
+        Box::new(SlowSupervisor {
+            entered,
+            release: Mutex::new(release_receiver),
+        }),
+    )
+    .await;
+    let environment_id = temp.environment_id();
+    let (connection_id, actor_id) = admitted(&controller).await;
+    let accepted = AcceptedDeadline {
+        deadline: controller
+            .clock
+            .now()
+            .checked_add(Duration::from_secs(60))
+            .expect("a deadline a minute out"),
+        bound: DeadlineBound::RequestedTtl,
+    };
+    let creating = {
+        let controller = Arc::clone(&controller);
+        let carried = carried(&controller, connection_id, accepted);
+        tokio::spawn(async move {
+            controller
+                .session_create(&actor_id, &create_request(environment_id), carried)
+                .await
+        })
+    };
+    tokio::task::spawn_blocking(move || entered_receiver.recv())
+        .await
+        .expect("the wait for the launch ends")
+        .expect("the create reaches the supervisor");
+
+    // Work that needs this runtime's one thread, made while the launch is waiting.
+    let meanwhile = tokio::spawn(async { tokio::time::sleep(Duration::from_millis(20)).await });
+    let served = tokio::time::timeout(Duration::from_secs(30), meanwhile).await;
+    drop(release);
+    assert!(
+        served.is_ok(),
+        "a task of the daemon's was served while a launch waited on the service manager"
+    );
+    let outcome = creating.await.expect("the create finishes");
+    assert!(outcome.is_err(), "this test's supervisor starts nothing");
 }
