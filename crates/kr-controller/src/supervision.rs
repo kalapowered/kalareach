@@ -368,6 +368,24 @@ pub trait WorkerSupervisor: Send + Sync + std::fmt::Debug {
     }
 }
 
+/// Runs `start`, a call to a supervisor that blocks on the platform's service manager, without
+/// holding a thread the daemon's other tasks run on.
+///
+/// A service manager can take seconds to answer, and on a machine busy starting processes
+/// longer. The runtime hands the thread's other tasks to its peers while this one waits, so a
+/// launch in step does not stop a request, a timer or a worker's rendezvous from being served. A
+/// current-thread runtime, which no daemon here is, has no peer to hand them to and starts where
+/// it stands.
+pub(crate) fn blocking_start<T>(start: impl FnOnce() -> T) -> T {
+    if tokio::runtime::Handle::try_current()
+        .is_ok_and(|handle| handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread)
+    {
+        tokio::task::block_in_place(start)
+    } else {
+        start()
+    }
+}
+
 /// Chooses the supervisor this host can actually use.
 ///
 /// The choice is made by asking the platform, not by assuming it: a macOS host without a GUI login

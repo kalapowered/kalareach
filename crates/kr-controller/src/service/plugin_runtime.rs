@@ -399,16 +399,9 @@ impl HostSupervisor for ServiceStarter {
             jobs_directory: plan.jobs_directory.clone(),
             working_directory: plan.working_directory.clone(),
         };
-        // `launchctl` and `systemd-run` block, and this is called on an executor thread. A runtime
-        // that can hand its thread's other work to its peers does so; one that cannot (a current
-        // thread runtime, which no daemon here is) starts the job where it stands.
-        let started = if tokio::runtime::Handle::try_current().is_ok_and(|handle| {
-            handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread
-        }) {
-            tokio::task::block_in_place(|| self.supervisor.start_service(&launch))
-        } else {
-            self.supervisor.start_service(&launch)
-        };
+        // `launchctl`, `systemd-run` and the Task Scheduler block, and this is called on an
+        // executor thread.
+        let started = crate::supervision::blocking_start(|| self.supervisor.start_service(&launch));
         match started {
             LaunchOutcome::Started(identity) => HostStartOutcome::Started(identity),
             LaunchOutcome::NotStarted { detail } => HostStartOutcome::NotStarted { detail },
