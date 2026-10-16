@@ -2885,7 +2885,6 @@ async fn a_process_that_outlasts_the_cleanup_is_named_and_cannot_act_as_the_sess
 
 /// Adds one variable to the environment of the worker the daemon starts, as every supervisor here
 /// hands the process it starts.
-#[cfg(unix)]
 #[derive(Debug)]
 struct WorkerWithVariable {
     name: &'static str,
@@ -2893,7 +2892,6 @@ struct WorkerWithVariable {
     inner: Box<dyn WorkerSupervisor>,
 }
 
-#[cfg(unix)]
 impl WorkerSupervisor for WorkerWithVariable {
     fn start(&self, launch: &WorkerLaunch) -> LaunchOutcome {
         let mut told = launch.clone();
@@ -2919,7 +2917,6 @@ impl WorkerSupervisor for WorkerWithVariable {
 /// its endpoint already bound, so the window is reached by construction: a local client on that
 /// endpoint is refused a read that is held, and is not refused what is the session's own tooling.
 /// Once the daemon has recorded the worker and told it, the same client is served.
-#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_worker_serves_no_held_method_to_a_local_caller_before_its_daemon_has_told_it() {
     let host = Host::create();
@@ -2928,7 +2925,7 @@ async fn a_worker_serves_no_held_method_to_a_local_caller_before_its_daemon_has_
     let supervisor = host.temp.supervisor(Box::new(WorkerWithVariable {
         name: "KR_TEST_HOLD_READY",
         value: release.display().to_string(),
-        inner: Box::new(DetachedSupervisor::new()),
+        inner: host.platform_supervisor(),
     }));
     let daemon = start_daemon(&environment, supervisor, host.worker.clone(), None)
         .await
