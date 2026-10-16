@@ -88,3 +88,108 @@ fn announce_the_wait() {
         hook();
     }
 }
+
+/// A mapping of a store's index file, held the way a process that is ending holds it: mapped, with
+/// no lock on the index, for this host's own tests.
+///
+/// The system removes a process's mappings after it has released its locks, so for that interval
+/// an index nobody has locked is one nobody may reset. A test holds one to stand a store in that
+/// interval on purpose. It compiles to nothing without the `testing` feature, and no shipped build
+/// enables it.
+#[cfg(all(windows, feature = "testing"))]
+pub mod held_index {
+    use std::os::windows::ffi::OsStrExt as _;
+    use std::path::Path;
+
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_ALWAYS,
+    };
+    use windows_sys::Win32::System::Memory::{
+        CreateFileMappingW, FILE_MAP_READ, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS,
+        MapViewOfFile, PAGE_READWRITE, UnmapViewOfFile,
+    };
+
+    /// The size of one region of a write-ahead index.
+    const REGION: u32 = 32 * 1024;
+
+    /// A file, a mapping of it and a view of the mapping, held until this is dropped.
+    ///
+    /// The three are kept as integers, which are the system's own values for them and can be
+    /// moved into the hook a test leaves for the store's next wait.
+    pub struct HeldIndex {
+        file: usize,
+        mapping: usize,
+        view: usize,
+    }
+
+    impl HeldIndex {
+        /// Maps the index file at `index`, making it if it is not there.
+        #[expect(unsafe_code, reason = "mapping a file has no safe form")]
+        pub fn on(index: &Path) -> Self {
+            let name: Vec<u16> = index
+                .as_os_str()
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect();
+            // SAFETY: `name` is a terminated wide string that outlives the call, and the other
+            // arguments are plain values or null.
+            let file = unsafe {
+                CreateFileW(
+                    name.as_ptr(),
+                    0xC000_0000,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE,
+                    std::ptr::null(),
+                    OPEN_ALWAYS,
+                    FILE_ATTRIBUTE_NORMAL,
+                    std::ptr::null_mut(),
+                )
+            };
+            assert_ne!(file, INVALID_HANDLE_VALUE, "the index file opens");
+            // SAFETY: `file` is the open handle above; a mapping with a size extends the file to
+            // it.
+            let mapping = unsafe {
+                CreateFileMappingW(
+                    file,
+                    std::ptr::null(),
+                    PAGE_READWRITE,
+                    0,
+                    REGION,
+                    std::ptr::null(),
+                )
+            };
+            assert!(!mapping.is_null(), "the index file maps");
+            // SAFETY: `mapping` is the mapping above, and the view is of the region it maps.
+            let view = unsafe {
+                MapViewOfFile(
+                    mapping,
+                    FILE_MAP_READ | FILE_MAP_WRITE,
+                    0,
+                    0,
+                    REGION as usize,
+                )
+            };
+            assert!(!view.Value.is_null(), "the mapping has a view");
+            Self {
+                file: file as usize,
+                mapping: mapping as usize,
+                view: view.Value as usize,
+            }
+        }
+    }
+
+    impl Drop for HeldIndex {
+        #[expect(unsafe_code, reason = "releasing a mapping has no safe form")]
+        fn drop(&mut self) {
+            // SAFETY: each value is the one `on` made, released once and in the order the system
+            // needs: the view, then the mapping, then the file.
+            unsafe {
+                UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
+                    Value: self.view as *mut std::ffi::c_void,
+                });
+                CloseHandle(self.mapping as *mut std::ffi::c_void);
+                CloseHandle(self.file as *mut std::ffi::c_void);
+            }
+        }
+    }
+}

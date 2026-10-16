@@ -54,7 +54,9 @@ tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-th
 # be set on a pipe after it exists. `windows-sys` is what creates it; `anyhow` is only what the
 # terminal library's traits report a failure as.
 anyhow.workspace = true
-windows-sys.workspace = true
+# `Win32_System_Memory` is for the test seam that holds a store's index mapped the way a process that
+# is ending does (`persistence::release`), which no shipped build compiles.
+windows-sys = { workspace = true, features = ["Win32_System_Memory"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # The question ledger records the executable and the parent of a calling process, which macOS
