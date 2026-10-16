@@ -588,7 +588,10 @@ impl Controller {
             // does not decide.
             profile: create.worker_profile,
         };
-        let identity = match self.supervisor.start(&launch) {
+        // The platform's service manager is asked from here, and answers in its own time. The
+        // thread is given up meanwhile, so a create waiting on it does not hold back the requests
+        // and the rendezvous of the workers around it.
+        let identity = match crate::supervision::blocking_start(|| self.supervisor.start(&launch)) {
             LaunchOutcome::Started(identity) => identity,
             // Nothing started, so the reservation is resolved as a confirmed failure and stops
             // occupying the environment. It is never resumed.
