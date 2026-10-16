@@ -441,6 +441,27 @@ fn desktop_columns(desktop: &DesktopBinding) -> (Option<String>, Option<i64>) {
     )
 }
 
+/// Opens the registry's file, with `flags` or the ones that create it, and reads its first page.
+///
+/// The first read is what maps the store's write-ahead index, so it is where a store whose
+/// previous holder is still letting go of that index refuses: a daemon that ended by a kill, and
+/// whose successor takes the environment the moment the lock is free. The whole open is asked
+/// again for as long as the store says so ([`kr_worker::persistence::release`]); opening the file
+/// alone would not meet the refusal, and the first statement after it would.
+fn open_connection(
+    path: &std::path::Path,
+    flags: Option<rusqlite::OpenFlags>,
+) -> rusqlite::Result<Connection> {
+    kr_worker::persistence::release::once_the_previous_holder_has_let_go(|| {
+        let connection = match flags {
+            Some(flags) => Connection::open_with_flags(path, flags)?,
+            None => Connection::open(path)?,
+        };
+        connection.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?;
+        Ok(connection)
+    })
+}
+
 impl Registry {
     /// Opens the registry for an environment, creating it on first use.
     ///
@@ -449,7 +470,7 @@ impl Registry {
     /// Returns [`ControllerError::RegistryUnavailable`] when the database cannot be opened or
     /// migrated.
     pub fn open(path: impl AsRef<std::path::Path>, environment_id: EnvironmentId) -> Result<Self> {
-        let connection = Connection::open(path.as_ref()).map_err(ControllerError::registry)?;
+        let connection = open_connection(path.as_ref(), None).map_err(ControllerError::registry)?;
         Self::prepare(connection, environment_id)
     }
 
@@ -505,9 +526,12 @@ impl Registry {
         if !holds {
             return Ok(false);
         }
-        let connection = Connection::open_with_flags(
+        let connection = open_connection(
             path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            Some(
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+                    | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            ),
         )
         .map_err(ControllerError::registry)?;
         // A journal that a stopped writer left is rolled back by the first read; a log is taken in
@@ -619,9 +643,12 @@ impl Registry {
         Self::refuse_a_lost_table(&peek, from)?;
         drop(peek);
         // Without the flag that creates a file: a registry removed meanwhile is not made again.
-        let connection = Connection::open_with_flags(
+        let connection = open_connection(
             path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            Some(
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+                    | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            ),
         )
         .map_err(ControllerError::registry)?;
         let changed = || ControllerError::RegistryUnavailable {
