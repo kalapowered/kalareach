@@ -1642,10 +1642,9 @@ mod launching {
         environment: EnvironmentPaths,
         expected: TaskDefinition,
         reach_bound: Duration,
-        /// How long a test makes the call that runs the task take to return after the task has
-        /// been started.
+        /// How long a test makes the daemon take to answer a starter that has reached the launch.
         #[cfg(feature = "testing")]
-        slow_run: Duration,
+        slow_answer: Duration,
     }
 
     impl TaskSupervisor {
@@ -1673,18 +1672,19 @@ mod launching {
                 expected,
                 reach_bound: REACH_BOUND,
                 #[cfg(feature = "testing")]
-                slow_run: Duration::ZERO,
+                slow_answer: Duration::ZERO,
             }
         }
 
-        /// Makes the call that runs the task return `extra` after the task has been started, for
-        /// this host's own tests: a Task Scheduler that is slow to answer a run it has carried out,
-        /// which the starter the task started waits through. It compiles to nothing without the
-        /// `testing` feature, and no shipped build enables it.
+        /// Makes the daemon answer a starter that has reached the launch `extra` later than it
+        /// would, for this host's own tests: the wait a starter has for that answer is what a Task
+        /// Scheduler slow to answer the run it carried out holds it in, and a test cannot otherwise
+        /// stand the starter there, since it connects as soon as the task has started it. It
+        /// compiles to nothing without the `testing` feature, and no shipped build enables it.
         #[cfg(feature = "testing")]
         #[must_use]
-        pub const fn after_a_slow_run(mut self, extra: Duration) -> Self {
-            self.slow_run = extra;
+        pub const fn answering_late(mut self, extra: Duration) -> Self {
+            self.slow_answer = extra;
             self
         }
 
@@ -1776,8 +1776,6 @@ mod launching {
                 };
                 return not_started(detail);
             }
-            #[cfg(feature = "testing")]
-            std::thread::sleep(self.slow_run);
             let mut stream = match listener.accept(Instant::now() + self.reach_bound) {
                 Ok(Some(stream)) => stream,
                 Ok(None) => {
@@ -1791,6 +1789,10 @@ mod launching {
                     return not_started(format!("waiting for the starter failed: {error}"));
                 }
             };
+            // The starter has reached the launch and says who it is at once; it then waits for this
+            // answer.
+            #[cfg(feature = "testing")]
+            std::thread::sleep(self.slow_answer);
             if let Err(reason) = self.accept_starter(&mut stream, session) {
                 // Best effort: a starter that is told why logs nothing and starts nothing either way.
                 if let Ok(declined) = encode(&Answer::Declined {
