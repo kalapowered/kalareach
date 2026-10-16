@@ -1542,7 +1542,8 @@ mod launching {
 
     use super::{Standing, TaskDefinition, run, standing};
     use crate::supervision::{
-        LaunchOutcome, RunFailure, ServiceLaunch, WorkerLaunch, WorkerSupervisor,
+        LaunchOutcome, RunFailure, ServiceLaunch, TASK_SCHEDULER_BOUND, WorkerLaunch,
+        WorkerSupervisor,
     };
 
     /// The version of the exchange on the launch pipe.
@@ -1554,6 +1555,16 @@ mod launching {
 
     /// How long each message of the exchange is given.
     const EXCHANGE_BOUND: Duration = Duration::from_secs(10);
+
+    /// How long a starter waits for the daemon's answer to its hello.
+    ///
+    /// The task starts the starter while the call that runs the task is still waiting for the Task
+    /// Scheduler, and the daemon answers only once that call has returned. The call is given
+    /// [`TASK_SCHEDULER_BOUND`] before it is taken for hung, so a starter that gave up after the
+    /// ten seconds a message of the exchange is given would leave without its launch whenever the
+    /// Scheduler was slow to answer a run it had already carried out.
+    const ANSWER_BOUND: Duration =
+        Duration::from_secs(TASK_SCHEDULER_BOUND.as_secs() + EXCHANGE_BOUND.as_secs());
 
     /// How long a starter is given to create the process and report it.
     const REPORT_BOUND: Duration = Duration::from_secs(30);
@@ -1977,7 +1988,7 @@ mod launching {
             return StarterExit::Declined;
         }
         let answer = stream
-            .receive(Instant::now() + EXCHANGE_BOUND)
+            .receive(Instant::now() + ANSWER_BOUND)
             .map_err(|error| error.to_string())
             .and_then(|bytes| decode::<Answer>(&bytes));
         let launch = match answer {
