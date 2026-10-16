@@ -177,30 +177,30 @@ async fn daemon_supervised(
 ) -> Arc<Controller> {
     let environment = temp.environment();
     let environment_id = temp.environment_id();
-    let controller =
-        Controller::start(ControllerSetup {
-            paths: environment.clone(),
-            environment_id,
-            identity: Box::new(move || {
-                Ok(kr_ipc::verify::ControllerIdentity::open(
+    Controller::start(ControllerSetup {
+        paths: environment.clone(),
+        environment_id,
+        identity: Box::new(move || {
+            Ok(
+                kr_ipc::verify::ControllerIdentity::open(
                     &MemoryStore::new(),
                     environment_id,
                     false,
                 )
-                .expect("an identity"))
-            }),
-            secret_store: kr_crypto::store::StoreSelection::File,
-            boot_identity: kr_ipc::identity::boot_identity().expect("a boot identity"),
-            supervisor,
-            worker_program: program,
-            build_id: BuildId::new("kr-test/0").expect("a build identifier"),
-            release: "0".to_owned(),
-            shell_packages,
-            terminal: Box::new(crate::supervision::NoTerminal),
-        })
-        .await
-        .expect("the daemon starts");
-    controller
+                .expect("an identity"),
+            )
+        }),
+        secret_store: kr_crypto::store::StoreSelection::File,
+        boot_identity: kr_ipc::identity::boot_identity().expect("a boot identity"),
+        supervisor,
+        worker_program: program,
+        build_id: BuildId::new("kr-test/0").expect("a build identifier"),
+        release: "0".to_owned(),
+        shell_packages,
+        terminal: Box::new(crate::supervision::NoTerminal),
+    })
+    .await
+    .expect("the daemon starts")
 }
 
 /// Registers one connection, the way a caller's handshake does.

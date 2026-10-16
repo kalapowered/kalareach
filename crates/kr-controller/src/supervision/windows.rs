@@ -1631,6 +1631,10 @@ mod launching {
         environment: EnvironmentPaths,
         expected: TaskDefinition,
         reach_bound: Duration,
+        /// How long a test makes the call that runs the task take to return after the task has
+        /// been started.
+        #[cfg(feature = "testing")]
+        slow_run: Duration,
     }
 
     impl TaskSupervisor {
@@ -1657,7 +1661,20 @@ mod launching {
                 environment,
                 expected,
                 reach_bound: REACH_BOUND,
+                #[cfg(feature = "testing")]
+                slow_run: Duration::ZERO,
             }
+        }
+
+        /// Makes the call that runs the task return `extra` after the task has been started, for
+        /// this host's own tests: a Task Scheduler that is slow to answer a run it has carried out,
+        /// which the starter the task started waits through. It compiles to nothing without the
+        /// `testing` feature, and no shipped build enables it.
+        #[cfg(feature = "testing")]
+        #[must_use]
+        pub const fn after_a_slow_run(mut self, extra: Duration) -> Self {
+            self.slow_run = extra;
+            self
         }
 
         /// Gives a starter `bound`, rather than the usual half minute, to reach a launch once the
@@ -1748,6 +1765,8 @@ mod launching {
                 };
                 return not_started(detail);
             }
+            #[cfg(feature = "testing")]
+            std::thread::sleep(self.slow_run);
             let mut stream = match listener.accept(Instant::now() + self.reach_bound) {
                 Ok(Some(stream)) => stream,
                 Ok(None) => {
