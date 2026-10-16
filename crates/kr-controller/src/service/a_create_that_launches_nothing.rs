@@ -3034,10 +3034,21 @@ async fn a_launch_waiting_on_the_service_manager_does_not_hold_up_the_daemon() {
                 .await
         })
     };
-    tokio::task::spawn_blocking(move || entered_receiver.recv())
-        .await
-        .expect("the wait for the launch ends")
-        .expect("the create reaches the supervisor");
+    // Bounded: a create that ends before it reaches the supervisor holds the sender through the
+    // controller, so the wait would otherwise never end.
+    let entered =
+        tokio::task::spawn_blocking(move || entered_receiver.recv_timeout(Duration::from_secs(30)))
+            .await
+            .expect("the wait for the launch ends");
+    if entered.is_err() {
+        drop(release);
+        let ended = if creating.is_finished() {
+            Some(creating.await)
+        } else {
+            None
+        };
+        panic!("the create did not reach the supervisor: {ended:?}");
+    }
 
     // Work that needs this runtime's one thread, made while the launch is waiting. It is waited
     // for from this thread, which is not the runtime's: a runtime whose one thread is held has
