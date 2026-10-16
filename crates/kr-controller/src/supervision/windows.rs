@@ -1642,7 +1642,7 @@ mod launching {
         environment: EnvironmentPaths,
         expected: TaskDefinition,
         reach_bound: Duration,
-        /// How long a test makes the daemon take to answer a starter that has reached the launch.
+        /// How long a test makes the daemon take to answer a starter whose hello it has received.
         #[cfg(feature = "testing")]
         slow_answer: Duration,
     }
@@ -1676,11 +1676,12 @@ mod launching {
             }
         }
 
-        /// Makes the daemon answer a starter that has reached the launch `extra` later than it
-        /// would, for this host's own tests: the wait a starter has for that answer is what a Task
-        /// Scheduler slow to answer the run it carried out holds it in, and a test cannot otherwise
-        /// stand the starter there, since it connects as soon as the task has started it. It
-        /// compiles to nothing without the `testing` feature, and no shipped build enables it.
+        /// Makes the daemon answer a starter `extra` after it has received and checked the
+        /// starter's hello, for this host's own tests: the wait a starter has for that answer is
+        /// what a Task Scheduler slow to answer the run it carried out holds it in. The starter's
+        /// wait begins when it sends the hello, which is before the daemon has it, so the delay
+        /// falls inside the wait whenever the starter sent it. It compiles to nothing without the
+        /// `testing` feature, and no shipped build enables it.
         #[cfg(feature = "testing")]
         #[must_use]
         pub const fn answering_late(mut self, extra: Duration) -> Self {
@@ -1789,10 +1790,6 @@ mod launching {
                     return not_started(format!("waiting for the starter failed: {error}"));
                 }
             };
-            // The starter has reached the launch and says who it is at once; it then waits for this
-            // answer.
-            #[cfg(feature = "testing")]
-            std::thread::sleep(self.slow_answer);
             if let Err(reason) = self.accept_starter(&mut stream, session) {
                 // Best effort: a starter that is told why logs nothing and starts nothing either way.
                 if let Ok(declined) = encode(&Answer::Declined {
@@ -1802,6 +1799,8 @@ mod launching {
                 }
                 return not_started(reason);
             }
+            #[cfg(feature = "testing")]
+            std::thread::sleep(self.slow_answer);
             let handed = Launch {
                 program: program.to_owned(),
                 arguments: launch.arguments.clone(),

@@ -122,11 +122,10 @@ fn a_service_is_started_by_the_environments_task_and_not_by_this_process() {
 /// A start is carried out when the daemon answers its starter late.
 ///
 /// The task starts its starter while the call that ran the task is still waiting, and the daemon
-/// answers the starter only once that call has returned. A Task Scheduler can answer a run
-/// later than a starter waits for any one message of the exchange, and then the starter went
-/// without its launch and the start failed although the task had run. The starter here has
-/// reached the launch and said who it is when the daemon is made to take fourteen seconds to
-/// answer it.
+/// answers the starter only once that call has returned. A Task Scheduler can answer a run later
+/// than a starter waits for any one message of the exchange; a starter that waited only that
+/// long would go without its launch, and the start would fail although the task had run. Here
+/// the daemon takes fourteen seconds to answer a starter whose hello it has received.
 #[test]
 fn a_start_is_carried_out_when_the_daemon_answers_its_starter_late() {
     let host = TempHost::create();
