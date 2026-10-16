@@ -3039,12 +3039,17 @@ async fn a_launch_waiting_on_the_service_manager_does_not_hold_up_the_daemon() {
         .expect("the wait for the launch ends")
         .expect("the create reaches the supervisor");
 
-    // Work that needs this runtime's one thread, made while the launch is waiting.
-    let meanwhile = tokio::spawn(async { tokio::time::sleep(Duration::from_millis(20)).await });
-    let served = tokio::time::timeout(Duration::from_secs(30), meanwhile).await;
+    // Work that needs this runtime's one thread, made while the launch is waiting. It is waited
+    // for from this thread, which is not the runtime's: a runtime whose one thread is held has
+    // no timer to end the wait with either, so the bound is a std one.
+    let (served, was_served) = std::sync::mpsc::channel();
+    tokio::spawn(async move {
+        let _ = served.send(());
+    });
+    let waited = was_served.recv_timeout(Duration::from_secs(30));
     drop(release);
     assert!(
-        served.is_ok(),
+        waited.is_ok(),
         "a task of the daemon's was served while a launch waited on the service manager"
     );
     let outcome = creating.await.expect("the create finishes");
