@@ -1,4 +1,4 @@
-//! Opening a journal whose previous holder is still letting go of it.
+//! Opening a store whose previous holder is still letting go of it.
 //!
 //! A store in write-ahead mode keeps an index in a file of its own, and the first process to open
 //! the store after every other holder has gone resets that file. On Windows the reset is refused
@@ -6,7 +6,8 @@
 //! on the index before the system removes its mapping. A process that opens the store in that
 //! interval is told `SQLITE_IOERR_TRUNCATE`, which reads as "disk I/O error", although the disk
 //! has not failed and the same open succeeds a moment later. The interval is the end of the
-//! previous holder: a worker whose session has just closed, or a worker that was ended.
+//! previous holder: a worker whose session has just closed, a daemon that was killed and whose
+//! successor took the environment the moment its lock was free, or any process that was ended.
 //!
 //! SQLite does not retry this on Windows, so the openers do: they ask again for as long as the
 //! store gives that answer, and give the answer up once it has lasted [`PATIENCE`], which is the
@@ -15,6 +16,33 @@
 //! [`PATIENCE`] as it was before the wait.
 
 use std::time::{Duration, Instant};
+
+use rusqlite::Connection;
+
+/// Opens the store at `path`, with `flags` or the ones that create it, and reads its first page.
+///
+/// The first read is what maps the store's write-ahead index, so it is where a store whose
+/// previous holder is still letting go of that index refuses, and the whole open is asked again
+/// for as long as it does ([`once_the_previous_holder_has_let_go`]). Opening the file alone would
+/// not meet the refusal, and the caller's first query would.
+///
+/// # Errors
+///
+/// Returns the store's refusal: the last one when it still says its previous holder has not let
+/// go after [`PATIENCE`], and any other the first time it is given.
+pub fn open_connection(
+    path: &std::path::Path,
+    flags: Option<rusqlite::OpenFlags>,
+) -> rusqlite::Result<Connection> {
+    once_the_previous_holder_has_let_go(|| {
+        let connection = match flags {
+            Some(flags) => Connection::open_with_flags(path, flags)?,
+            None => Connection::open(path)?,
+        };
+        connection.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?;
+        Ok(connection)
+    })
+}
 
 /// How long an open that is told the previous holder has not let go yet asks again before it
 /// reports the refusal.

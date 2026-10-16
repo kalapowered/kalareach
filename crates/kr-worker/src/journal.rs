@@ -254,7 +254,8 @@ impl Journal {
     ///
     /// Returns [`WorkerError::JournalUnavailable`] when the database cannot be opened or migrated.
     pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self> {
-        let connection = open_connection(path.as_ref(), None).map_err(unavailable)?;
+        let connection = crate::persistence::release::open_connection(path.as_ref(), None)
+            .map_err(unavailable)?;
         Self::prepare(connection)
     }
 
@@ -270,7 +271,7 @@ impl Journal {
     /// Returns [`WorkerError::JournalUnavailable`] when there is no journal there, or when the
     /// one that is there cannot be opened or migrated.
     pub fn open_existing(path: impl AsRef<std::path::Path>) -> Result<Self> {
-        let connection = open_connection(
+        let connection = crate::persistence::release::open_connection(
             path.as_ref(),
             Some(
                 rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
@@ -2959,7 +2960,7 @@ impl Journal {
     /// Returns [`WorkerError::JournalUnavailable`] when the file cannot be opened or records no
     /// version.
     pub fn recorded_schema_version(path: impl AsRef<std::path::Path>) -> Result<i64> {
-        let connection = open_connection(
+        let connection = crate::persistence::release::open_connection(
             path.as_ref(),
             Some(
                 rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
@@ -2983,7 +2984,7 @@ impl Journal {
     /// Returns [`WorkerError::JournalUnavailable`] when the file cannot be opened or is not a
     /// journal this build reads.
     pub fn open_read_only(path: impl AsRef<std::path::Path>) -> Result<Self> {
-        let connection = open_connection(
+        let connection = crate::persistence::release::open_connection(
             path.as_ref(),
             Some(
                 rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
@@ -4378,26 +4379,6 @@ fn unavailable(error: rusqlite::Error) -> WorkerError {
     WorkerError::JournalUnavailable {
         detail: crate::persistence::fault::describe(&error),
     }
-}
-
-/// Opens the store at `path`, with `flags` or the ones that create it, and reads its first page.
-///
-/// The first read is what maps the store's write-ahead index, so it is where a store whose
-/// previous holder is still letting go of that index refuses, and the whole open is asked again
-/// for as long as it does ([`crate::persistence::release`]). Opening the file alone would not meet
-/// the refusal, and the caller's first query would.
-fn open_connection(
-    path: &std::path::Path,
-    flags: Option<rusqlite::OpenFlags>,
-) -> rusqlite::Result<Connection> {
-    crate::persistence::release::once_the_previous_holder_has_let_go(|| {
-        let connection = match flags {
-            Some(flags) => Connection::open_with_flags(path, flags)?,
-            None => Connection::open(path)?,
-        };
-        connection.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?;
-        Ok(connection)
-    })
 }
 
 fn unavailable_detail(detail: &str) -> WorkerError {
