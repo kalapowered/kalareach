@@ -119,6 +119,27 @@ fn a_service_is_started_by_the_environments_task_and_not_by_this_process() {
     assert_eq!(recorded.session, session);
 }
 
+/// A start is carried out when the Task Scheduler is slow to answer the call that ran the task.
+///
+/// The task starts its starter while that call is still waiting, and the daemon answers the
+/// starter only once the call has returned. A Task Scheduler busy starting processes took ten
+/// seconds and more to answer a run, longer than a starter waits for any one message of the
+/// exchange, so the starter went without its launch and the start failed although the task had
+/// run. The run here is made to return fourteen seconds after the task was started.
+#[test]
+fn a_start_is_carried_out_when_the_run_call_answers_late() {
+    let host = TempHost::create();
+    let task = registered(&host, &starter());
+    let supervisor = task
+        .supervisor(&host.environment())
+        .after_a_slow_run(Duration::from_secs(14));
+    let outcome = supervisor.start_service(&waiting_service(&host));
+    let LaunchOutcome::Started(identity) = outcome else {
+        panic!("the service was started although the run call answered late: {outcome:?}");
+    };
+    end(&identity);
+}
+
 /// With no task registered, a start names the setup step and creates nothing: no launch is left
 /// waiting for a starter that might come later. This process is in a job that kills on close and
 /// forbids breakaway, and the start still does not create anything inside it.
