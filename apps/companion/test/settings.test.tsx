@@ -17,6 +17,7 @@ import { App } from '../src/App'
 import { AppProvider } from '../src/app/state'
 import { ThemeChooser } from '../src/components/ui'
 import { fakeHost } from '../src/host/fake'
+import type { SettingsView } from '../src/host/port'
 import { applyMode } from '../src/theme-init'
 
 describe('the colour mode', () => {
@@ -81,6 +82,31 @@ describe('the window\'s own mode', () => {
     await act(async () => {
       await Promise.resolve()
       controls.settings.change({ colour_mode: 'dark' })
+    })
+    expect(document.documentElement.dataset.preference).toBe('dark')
+  })
+
+  it('is not undone by a first read that answers after the person chose', async () => {
+    const person = userEvent.setup()
+    const { port } = fakeHost()
+    let answer: (view: SettingsView) => void = () => undefined
+    const late = new Promise<SettingsView>((resolve) => {
+      answer = resolve
+    })
+    const slow = { ...port, settingsView: () => late }
+    render(
+      <AppProvider port={slow}>
+        <ThemeChooser port={port} />
+      </AppProvider>
+    )
+    await person.click(screen.getByRole('radio', { name: /Dark/ }))
+    expect(document.documentElement.dataset.preference).toBe('dark')
+
+    // What the first read found was true before the press, and is not applied over it.
+    const found = await port.settingsView()
+    await act(async () => {
+      answer({ ...found, colour_mode: 'system' })
+      await Promise.resolve()
     })
     expect(document.documentElement.dataset.preference).toBe('dark')
   })

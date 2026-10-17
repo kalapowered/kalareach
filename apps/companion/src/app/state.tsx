@@ -28,7 +28,7 @@ import { QuestionForms } from '../model/question-forms'
 import { Openings } from '../model/openings'
 import { SessionStates, type SessionState } from '../model/sessions'
 import { ConfirmationStore } from '../pairing/confirmationStore'
-import { applyMode } from '../theme-init'
+import { applyMode, modeApplications } from '../theme-init'
 
 /** The screens the navigation model has. */
 export type Place =
@@ -143,26 +143,30 @@ export function AppProvider({
   // The window is in the colour mode native code keeps, whoever changed it and whatever is on
   // screen: one made on another device and followed, a choice kept in the account sheet, and the
   // mode as it stands when the window starts, which a reload would otherwise leave as the window
-  // was first opened. A change heard before the first read answers is newer than the read.
+  // was first opened. The first read is made once the listener is live, so no change falls between
+  // them, and its answer is dropped when a mode was applied after it was asked for: a press or a
+  // change heard since is newer than it.
   useEffect(() => {
     let stop: (() => void) | null = null
     let ended = false
-    let heard = false
     void port
       .onSettings((view) => {
-        heard = true
         applyMode(view.colour_mode)
       })
       .then((unlisten) => {
-        if (ended) unlisten()
-        else stop = unlisten
+        if (ended) {
+          unlisten()
+          return
+        }
+        stop = unlisten
+        const asked = modeApplications()
+        port
+          .settingsView()
+          .then((view) => {
+            if (!ended && modeApplications() === asked) applyMode(view.colour_mode)
+          })
+          .catch(() => undefined)
       })
-    port
-      .settingsView()
-      .then((view) => {
-        if (!ended && !heard) applyMode(view.colour_mode)
-      })
-      .catch(() => undefined)
     return () => {
       ended = true
       stop?.()

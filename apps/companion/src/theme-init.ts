@@ -37,8 +37,17 @@ export function shownMode(): ColourMode {
   return isColourMode(mode) ? mode : openedMode()
 }
 
+/** How many times a mode has been applied, so that an answer can tell whether one came after it. */
+let applications = 0
+
+/** The number of modes applied so far in this window. */
+export function modeApplications(): number {
+  return applications
+}
+
 /** Applies a preference to the document and the browser chrome. */
 export function applyMode(mode: ColourMode): void {
+  applications += 1
   const root = document.documentElement
   const resolved =
     mode === 'system'
