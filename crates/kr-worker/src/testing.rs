@@ -381,3 +381,109 @@ mod tests {
         );
     }
 }
+
+/// A stop this host's own tests arm inside one step of the worker, and the way back out of it.
+///
+/// A test cannot otherwise stand in the middle of a commit, a pass of maintenance or a hold of the
+/// session, which is where a keystroke's wait is most exposed to whatever the disk is doing. The
+/// step calls [`Stall::stand`] at the moment the test wants it stopped; the test arms the stall
+/// before it starts the step, learns that the step has arrived, and lets it go. The stop fires
+/// once. Compiled away in every shipped build.
+#[cfg(feature = "testing")]
+#[derive(Debug, Default)]
+pub struct Stall {
+    armed: std::sync::Mutex<Option<Armed>>,
+}
+
+/// A stop that is armed: where it says it has arrived, what lets it go, and whether the thread
+/// that stands in it is handed back to its runtime.
+#[cfg(feature = "testing")]
+type Armed = (
+    tokio::sync::oneshot::Sender<()>,
+    std::sync::mpsc::Receiver<()>,
+    bool,
+);
+
+#[cfg(feature = "testing")]
+impl Stall {
+    /// Arms the stop, and returns the end that says the step has arrived and the end that lets it
+    /// go. Dropping the second lets it go too.
+    #[must_use]
+    pub fn arm(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        self.arm_for(true)
+    }
+
+    /// Arms the stop as a call that blocks its thread and hands nothing off, which is what a
+    /// commit to a busy disk does, and returns the same two ends.
+    #[must_use]
+    pub fn arm_blocking(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        self.arm_for(false)
+    }
+
+    fn arm_for(
+        &self,
+        hands_off: bool,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        let (arrived, watch) = tokio::sync::oneshot::channel();
+        let (release, go) = std::sync::mpsc::channel();
+        *self
+            .armed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((arrived, go, hands_off));
+        (watch, release)
+    }
+
+    /// Returns whether a stop is armed and has not fired.
+    #[must_use]
+    pub fn is_armed(&self) -> bool {
+        self.armed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some()
+    }
+
+    /// Stands here until the stop is let go, where one is armed.
+    ///
+    /// The wait holds a thread of the runtime the step runs on. A task that thread has just
+    /// spawned waits in a slot only that thread runs from, so a wait that simply blocked would
+    /// leave that task, and whatever needs it, behind the release. Unless it was armed as a call
+    /// that blocks its thread, the thread hands what it holds to another before it blocks. A
+    /// runtime that is not multi-threaded has nothing to hand it to, and there the wait only
+    /// blocks.
+    pub fn stand(&self) {
+        let armed = self
+            .armed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        let Some((arrived, go, hands_off)) = armed else {
+            return;
+        };
+        let _ = arrived.send(());
+        let wait = move || {
+            let _ = go.recv();
+        };
+        let several = hands_off
+            && tokio::runtime::Handle::try_current().is_ok_and(|runtime| {
+                runtime.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread
+            });
+        if several {
+            tokio::task::block_in_place(wait);
+        } else {
+            wait();
+        }
+    }
+}

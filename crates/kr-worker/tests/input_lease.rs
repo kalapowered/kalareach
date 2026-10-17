@@ -3099,3 +3099,1005 @@ async fn a_closure_goes_on_once_the_observation_under_way_has_been_put_back() {
         .expect("the closure completed");
     assert_eq!(record.reason, ClosureReason::CloseRequested);
 }
+
+// ---------------------------------------------------------------------------------------------
+// KR-PERF-002: a keystroke waits behind no disk work.
+// ---------------------------------------------------------------------------------------------
+
+/// What keeps the session, or something under it, busy while a held prefix waits.
+#[derive(Clone, Copy, Debug)]
+enum Stalled {
+    /// The commit of a mutation's dispatch marker, which the mutation makes with the session held.
+    Marker,
+    /// The same commit, made by a thread that blocks and hands nothing off, as a commit to a busy
+    /// disk does.
+    BlockedMarker,
+    /// The commit of the maintenance pass that prunes the receipt journal.
+    Prune,
+    /// The commit of a question to the ledger, made with the session held as a mutation makes it.
+    Question,
+    /// The commit of a host event the output ingest records with the session held.
+    HostEvent,
+    /// The session itself, held by something that takes as long as it likes.
+    Session,
+}
+
+/// Where a held prefix's deadline falls in relation to the stall.
+#[derive(Clone, Copy, Debug)]
+enum Timing {
+    /// The write arrives while the stall is in force.
+    Arrives,
+    /// The write was accepted before the stall began and is held; its deadline passes inside it.
+    DeadlineFalls,
+}
+
+/// A root program that keeps what it reads in a file as well as echoing it, with bracketed paste
+/// enabled, and that writes a sequence of its own into its output when a named pipe is written to.
+///
+/// What reached the application can then be read without the worker, which a case that stops the
+/// worker's session cannot use.
+fn triggered_recording(
+    received: &std::path::Path,
+    trigger: &std::path::Path,
+    output: &str,
+) -> String {
+    format!(
+        "stty raw -echo; printf '\\033[?2004hkr-ready.'; \
+         ( while cat '{}' >/dev/null; do printf '{output}'; done ) & exec tee '{}'",
+        trigger.display(),
+        received.display()
+    )
+}
+
+/// A worker with a session whose application keeps what it is typed, and the attachment typing.
+struct Rig {
+    _kept: tempfile::TempDir,
+    received: std::path::PathBuf,
+    trigger: std::path::PathBuf,
+    wired: Wired,
+    client: LocalClient,
+    attachment: AttachmentId,
+    epoch: kr_protocol::ids::InputLeaseEpoch,
+    sequence: u64,
+    /// What the application has been typed so far, in the order it was handed to the worker.
+    typed: Vec<u8>,
+    questions: u32,
+}
+
+impl Rig {
+    /// Starts the worker. `output` is what the application prints when the trigger is pulled.
+    async fn start(output: &str) -> Self {
+        Self::from_script(|received, trigger| triggered_recording(received, trigger, output)).await
+    }
+
+    /// Starts the worker with an application that reads nothing until the trigger is pulled, and
+    /// keeps all it reads.
+    async fn start_late() -> Self {
+        Self::from_script(|received, trigger| {
+            format!(
+                "stty raw -echo; printf '\\033[?2004hkr-ready.'; cat '{}' >/dev/null; \
+                 exec tee '{}'",
+                trigger.display(),
+                received.display()
+            )
+        })
+        .await
+    }
+
+    async fn from_script(
+        script: impl FnOnce(&std::path::Path, &std::path::Path) -> String,
+    ) -> Self {
+        let kept = tempfile::tempdir().expect("a directory for what the application keeps");
+        let received = kept.path().join("received");
+        let trigger = kept.path().join("trigger");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&trigger)
+            .status()
+            .expect("mkfifo runs");
+        assert!(made.success(), "the trigger is made");
+        let wired = wired(&script(&received, &trigger)).await;
+        let (client, attachment, epoch) = typist(&wired).await;
+        Self {
+            _kept: kept,
+            received,
+            trigger,
+            wired,
+            client,
+            attachment,
+            epoch,
+            sequence: 0,
+            typed: Vec::new(),
+            questions: 0,
+        }
+    }
+
+    /// Hands the worker one write, and returns what it answered and when the write began.
+    async fn write(&mut self, bytes: &[u8]) -> (InputWriteResult, Instant) {
+        let began = Instant::now();
+        let accepted = write_over(
+            &mut self.client,
+            &self.wired,
+            self.attachment,
+            self.epoch,
+            self.sequence,
+            bytes,
+        )
+        .await
+        .expect("the write is accepted");
+        self.sequence += 1;
+        self.typed.extend_from_slice(bytes);
+        (accepted, began)
+    }
+
+    /// What the application has received, read from the file it keeps.
+    fn received(&self) -> Vec<u8> {
+        std::fs::read(&self.received).unwrap_or_default()
+    }
+
+    /// Waits until the application has received everything typed so far, and says when that was.
+    async fn until_everything_typed_arrived(&self) -> Option<Instant> {
+        tokio::time::timeout(LIVENESS_DEADLINE, async {
+            loop {
+                if self.received() == self.typed {
+                    return Instant::now();
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .ok()
+    }
+
+    /// Pulls the trigger: the application prints what it was told to.
+    async fn pull_the_trigger(&self) {
+        let trigger = self.trigger.clone();
+        tokio::task::spawn_blocking(move || std::fs::write(trigger, b"x"))
+            .await
+            .expect("the trigger task ends")
+            .expect("the trigger is pulled");
+    }
+
+    async fn close(self) {
+        let Self { client, wired, .. } = self;
+        drop(client);
+        wired
+            .runtime
+            .close(ClosureReason::CloseRequested)
+            .1
+            .release();
+    }
+}
+
+/// A stall that has begun: what lets it go, and the work that is stopped in it.
+struct Standing {
+    release: std::sync::mpsc::Sender<()>,
+    stopped: Option<tokio::task::JoinHandle<()>>,
+}
+
+/// Begins `stalled` and returns once the work is stopped in it.
+async fn stall(rig: &mut Rig, stalled: Stalled) -> Standing {
+    let wired = &rig.wired;
+    let (reached, release, stopped) = match stalled {
+        Stalled::Marker | Stalled::BlockedMarker => {
+            let (reached, release) = {
+                let mut session = wired.runtime.session();
+                let journal = session.journal_mut().expect("this session keeps a journal");
+                if matches!(stalled, Stalled::Marker) {
+                    journal.stall_next_marker()
+                } else {
+                    journal.stall_next_marker_blocking()
+                }
+            };
+            let mut other = LocalClient::connect(&wired.endpoint, LocalClientKind::Cli, build())
+                .await
+                .expect("connects");
+            let (target, session_id) = (wired.target(), wired.session_id);
+            let attaching = tokio::spawn(async move {
+                let _ = other
+                    .mutate(
+                        Method::SessionAttach,
+                        ActionId::new(kr_ipc::new_uuid()),
+                        target,
+                        &terminal(session_id, Some("xterm-256color")),
+                    )
+                    .await;
+            });
+            (reached, release, Some(attaching))
+        }
+        Stalled::Prune => {
+            let (reached, release) = wired
+                .runtime
+                .session()
+                .journal_mut()
+                .expect("this session keeps a journal")
+                .stall_next_prune();
+            let service = Arc::clone(&wired.service);
+            let pass = tokio::task::spawn_blocking(move || service.maintain_now());
+            let pass = tokio::spawn(async move {
+                let _ = pass.await;
+            });
+            (reached, release, Some(pass))
+        }
+        Stalled::Question => {
+            let (reached, release) = wired.service.questions().stall_next_commit();
+            // As a question's creation is made: with the session held, by a source that is inside
+            // it. A caller outside the session is refused before anything is committed.
+            rig.questions += 1;
+            let request_id = format!("push-anyway-{}", rig.questions);
+            let (service, runtime) = (Arc::clone(&wired.service), Arc::clone(&wired.runtime));
+            let session_id = wired.session_id;
+            let asking = tokio::task::spawn_blocking(move || {
+                let _session = runtime.session();
+                let source = kr_worker::questions::VerifiedSource {
+                    process: kr_ipc::identity::current_process_start_identity()
+                        .expect("a process identity"),
+                    executable: Some("kr-test-agent".to_owned()),
+                    session_member: true,
+                    ancestry: true,
+                    launch_channel: false,
+                    connection_id: ConnectionId::new(kr_ipc::new_uuid()),
+                };
+                let now = kr_worker::questions::Now {
+                    utc_ms: kr_ipc::now_ms(),
+                    boot_ms: kr_ipc::clock::boot_elapsed_ms(),
+                };
+                let _ = service.questions().create(
+                    &source,
+                    &kr_protocol::question::QuestionCreateParams {
+                        session_id,
+                        request_id,
+                        agent_name: Nullable::some("kr-test-agent".to_owned()),
+                        context: "The build finished with two failing tests.".to_owned(),
+                        question: "Push the branch anyway?".to_owned(),
+                        kind: kr_protocol::question::QuestionKind::Confirm,
+                        choices: Vec::new(),
+                        requested_expiry_ms: Nullable::null(),
+                        wait_ms: Nullable::null(),
+                    },
+                    now,
+                );
+            });
+            let asking = tokio::spawn(async move {
+                let _ = asking.await;
+            });
+            (reached, release, Some(asking))
+        }
+        Stalled::HostEvent => {
+            // The attachment's terminal takes no clipboard writes, so one the application asks for
+            // is a host event, and the ingest records it with the session held.
+            let (reached, release) = {
+                let mut session = wired.runtime.session();
+                session.decline_clipboard_writes(rig.attachment);
+                session
+                    .journal_mut()
+                    .expect("this session keeps a journal")
+                    .stall_next_host_events()
+            };
+            rig.pull_the_trigger().await;
+            (reached, release, None)
+        }
+        Stalled::Session => {
+            let (reached, release) = wired.runtime.hold_the_session();
+            (reached, release, None)
+        }
+    };
+    tokio::time::timeout(LIVENESS_DEADLINE, reached)
+        .await
+        .unwrap_or_else(|_| panic!("{stalled:?}: the work did not reach its stall"))
+        .unwrap_or_else(|_| panic!("{stalled:?}: the stall was dropped before it was reached"));
+    Standing { release, stopped }
+}
+
+/// Lets a stall go after a while, and says whether it had to.
+///
+/// A regression leaves the stall holding what the case waits for, and the case then fails naming
+/// the wait: the stall is let go after `after`, and what arrives later arrives too late.
+struct LetGo {
+    done: Arc<std::sync::atomic::AtomicBool>,
+    let_go: Arc<std::sync::atomic::AtomicBool>,
+    thread: std::thread::JoinHandle<()>,
+}
+
+impl LetGo {
+    fn after(release: std::sync::mpsc::Sender<()>, after: Duration) -> Self {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let (done, let_go) = (
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let thread = {
+            let (done, let_go) = (Arc::clone(&done), Arc::clone(&let_go));
+            std::thread::spawn(move || {
+                let began = Instant::now();
+                while began.elapsed() < after {
+                    if done.load(Ordering::Acquire) {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                if !done.load(Ordering::Acquire) {
+                    let_go.store(true, Ordering::Release);
+                    let _ = release.send(());
+                }
+            })
+        };
+        Self {
+            done,
+            let_go,
+            thread,
+        }
+    }
+
+    /// Says the stall is no longer needed, and returns whether it had to be let go.
+    fn finish(self) -> bool {
+        use std::sync::atomic::Ordering;
+
+        self.done.store(true, Ordering::Release);
+        self.thread.join().expect("the watchdog ends");
+        self.let_go.load(Ordering::Acquire)
+    }
+}
+
+/// Something that writes to the disk the test runs on for as long as it lives, the way a process
+/// beside the worker does.
+struct DiskWriter {
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    thread: std::thread::JoinHandle<()>,
+}
+
+impl DiskWriter {
+    fn beside(directory: &std::path::Path) -> Self {
+        use std::io::Write as _;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let path = directory.join("disk-writer");
+        let thread = {
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                let block = vec![0x5a_u8; 4 * 1024 * 1024];
+                while !stop.load(Ordering::Acquire) {
+                    if let Ok(mut file) = std::fs::File::create(&path) {
+                        let _ = file.write_all(&block);
+                        let _ = file.sync_all();
+                    }
+                }
+                let _ = std::fs::remove_file(&path);
+            })
+        };
+        Self { stop, thread }
+    }
+
+    fn stop(self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Release);
+        self.thread.join().expect("the disk writer ends");
+    }
+}
+
+/// One prefix typed under one stall: the bytes the application has received once the prefix has
+/// been handed to it, and how long after the write began that was.
+///
+/// What the application received is read from the file it keeps, which touches nothing of the
+/// worker's, so the observation waits for no lock of the session's. The stall is let go only after
+/// the prefix has been seen, or after `stalled_for` where a case bounds it; a prefix that arrives
+/// after the stall was let go has waited for it.
+async fn a_prefix_meets(
+    rig: &mut Rig,
+    stalled: Stalled,
+    timing: Timing,
+    prefix: &[u8],
+    stalled_for: Duration,
+) -> Duration {
+    // A held prefix whose deadline falls inside the stall is accepted first, and the recogniser's
+    // timer is stopped at that deadline, so that the stall can begin before the prefix is
+    // forwarded.
+    let at_deadline = match timing {
+        Timing::Arrives => None,
+        Timing::DeadlineFalls => {
+            let (reached, go) = rig.wired.runtime.pause_the_timer_at_its_deadline();
+            let (accepted, _) = rig.write(prefix).await;
+            assert_eq!(
+                accepted.held_prefix_bytes.get(),
+                prefix.len() as u64,
+                "{stalled:?}, {timing:?}: the prefix {prefix:?} is held"
+            );
+            tokio::time::timeout(LIVENESS_DEADLINE, reached)
+                .await
+                .expect("the timer reached the deadline")
+                .expect("the timer is waiting");
+            Some(go)
+        }
+    };
+
+    let standing = stall(rig, stalled).await;
+    let letting_go = LetGo::after(standing.release.clone(), stalled_for);
+    let began = match at_deadline {
+        Some(go) => {
+            let began = Instant::now();
+            go.send(()).expect("lets the timer go on");
+            began
+        }
+        None => {
+            let (accepted, began) = rig.write(prefix).await;
+            assert_eq!(
+                accepted.held_prefix_bytes.get(),
+                prefix.len() as u64,
+                "{stalled:?}, {timing:?}: the prefix {prefix:?} is held"
+            );
+            began
+        }
+    };
+    let arrived = rig.until_everything_typed_arrived().await;
+    let had_to_be_let_go = letting_go.finish();
+    let arrived = arrived.unwrap_or_else(|| {
+        panic!(
+            "{stalled:?}, {timing:?}: the application never received {prefix:?}: {:?}",
+            rig.received()
+        )
+    });
+    let hold = arrived.duration_since(began);
+    eprintln!("{stalled:?}, {timing:?}, {prefix:?}: received {hold:?} after the write began");
+    assert!(
+        !had_to_be_let_go,
+        "{stalled:?}, {timing:?}: {prefix:?} was kept waiting by the stall until it was let go \
+         ({hold:?})"
+    );
+
+    standing.release.send(()).expect("lets the stall go");
+    if let Some(stopped) = standing.stopped {
+        let _ = stopped.await;
+    }
+    hold
+}
+
+/// The case behind the first three forced cases: a lone Escape under one stall, with the stall
+/// let go after `stalled_for` at the latest.
+async fn a_lone_escape_meets(stalled: Stalled, timing: Timing, stalled_for: Duration) {
+    let mut rig = Rig::start(HOST_EVENT_OUTPUT).await;
+    a_prefix_meets(&mut rig, stalled, timing, b"\x1b", stalled_for).await;
+    rig.close().await;
+}
+
+/// What the application prints when its trigger is pulled: a clipboard write.
+const HOST_EVENT_OUTPUT: &str = "\\033]52;c;aGk=\\007";
+
+/// Every prefix of the bracketed-paste start delimiter that the recogniser holds, shortest first.
+fn the_held_prefixes() -> Vec<&'static [u8]> {
+    (1..PASTE_START.len())
+        .map(|length| &PASTE_START[..length])
+        .collect()
+}
+
+/// KR-PERF-002: every prefix length of the start delimiter, and the delimiter split across two
+/// writes, reaches the application while `stalled` is in force, with a disk writer beside the
+/// worker when `beside_a_disk_writer` says so.
+async fn every_prefix_meets(stalled: Stalled, beside_a_disk_writer: bool) {
+    let mut rig = Rig::start(HOST_EVENT_OUTPUT).await;
+    let writer = beside_a_disk_writer.then(|| DiskWriter::beside(rig._kept.path()));
+    for timing in [Timing::Arrives, Timing::DeadlineFalls] {
+        for prefix in the_held_prefixes() {
+            a_prefix_meets(&mut rig, stalled, timing, prefix, Duration::from_secs(5)).await;
+        }
+    }
+    // The delimiter split across two writes, with the stall in force. The first part is held; the
+    // second arrives within the recogniser's deadline and completes it, so the delimiter is
+    // forwarded once whole and the paste it opens is recognised. A watchdog lets the stall go if
+    // either write waits for it.
+    let standing = stall(&mut rig, stalled).await;
+    let letting_go = LetGo::after(standing.release.clone(), Duration::from_secs(5));
+    let (first, _) = rig.write(&PASTE_START[..4]).await;
+    assert_eq!(
+        first.held_prefix_bytes.get(),
+        4,
+        "{stalled:?}: the first part is held"
+    );
+    let (second, _) = rig.write(&PASTE_START[4..]).await;
+    assert_eq!(
+        second.forwarded_bytes.get(),
+        PASTE_START.len() as u64,
+        "{stalled:?}: the second part reached the worker inside the recogniser's deadline and \
+         completes the delimiter, which is forwarded whole"
+    );
+    let arrived = rig.until_everything_typed_arrived().await;
+    assert!(
+        !letting_go.finish(),
+        "{stalled:?}: the split delimiter was kept waiting by the stall until it was let go"
+    );
+    assert!(
+        arrived.is_some(),
+        "{stalled:?}: the delimiter did not reach the application whole while the stall was in force: {:?}",
+        rig.received()
+    );
+    standing.release.send(()).expect("lets the stall go");
+    if let Some(stopped) = standing.stopped {
+        let _ = stopped.await;
+    }
+    assert_eq!(
+        count(&rig.received(), PASTE_START),
+        1,
+        "{stalled:?}: the delimiter was forwarded once"
+    );
+    if let Some(writer) = writer {
+        writer.stop();
+    }
+    rig.close().await;
+}
+
+macro_rules! forced_cases {
+    ($($(#[$meta:meta])* $name:ident: $stalled:expr, $timing:expr, $millis:expr;)*) => {
+        $(
+            $(#[$meta])*
+            #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+            #[cfg_attr(
+                windows,
+                ignore = "a Windows pseudo-console holds back a lone Escape, which it cannot tell from the start of a sequence, so the Escape this case waits for does not come back"
+            )]
+            async fn $name() {
+                a_lone_escape_meets($stalled, $timing, Duration::from_millis($millis)).await;
+            }
+        )*
+    };
+}
+
+forced_cases! {
+    /// KR-PERF-002: a lone Escape that arrives while a mutation's marker commit is stalled for
+    /// 100 ms reaches the application before the stall ends.
+    a_lone_escape_arriving_during_a_marker_commit_stalled_100_ms_reaches_the_application:
+        Stalled::Marker, Timing::Arrives, 100;
+    /// KR-PERF-002: the same, stalled for 300 ms.
+    a_lone_escape_arriving_during_a_marker_commit_stalled_300_ms_reaches_the_application:
+        Stalled::Marker, Timing::Arrives, 300;
+    /// KR-PERF-002: a held Escape whose deadline passes inside a marker commit stalled for 100 ms.
+    a_held_escape_whose_deadline_falls_in_a_marker_commit_stalled_100_ms_reaches_the_application:
+        Stalled::Marker, Timing::DeadlineFalls, 100;
+    /// KR-PERF-002: the same, stalled for 300 ms.
+    a_held_escape_whose_deadline_falls_in_a_marker_commit_stalled_300_ms_reaches_the_application:
+        Stalled::Marker, Timing::DeadlineFalls, 300;
+    /// KR-PERF-002: a lone Escape that arrives while the maintenance prune's commit is stalled.
+    a_lone_escape_arriving_during_a_stalled_maintenance_prune_reaches_the_application:
+        Stalled::Prune, Timing::Arrives, 300;
+    /// KR-PERF-002: a held Escape whose deadline passes inside a stalled maintenance prune.
+    a_held_escape_whose_deadline_falls_in_a_stalled_maintenance_prune_reaches_the_application:
+        Stalled::Prune, Timing::DeadlineFalls, 300;
+    /// KR-PERF-002: a lone Escape that arrives while a question's commit is stalled.
+    a_lone_escape_arriving_during_a_stalled_question_commit_reaches_the_application:
+        Stalled::Question, Timing::Arrives, 300;
+    /// KR-PERF-002: a held Escape whose deadline passes inside a stalled question commit.
+    a_held_escape_whose_deadline_falls_in_a_stalled_question_commit_reaches_the_application:
+        Stalled::Question, Timing::DeadlineFalls, 300;
+    /// KR-PERF-002: a lone Escape that arrives while the ingest's host-event commit is stalled.
+    a_lone_escape_arriving_during_a_stalled_host_event_commit_reaches_the_application:
+        Stalled::HostEvent, Timing::Arrives, 300;
+    /// KR-PERF-002: a held Escape whose deadline passes inside a stalled host-event commit.
+    a_held_escape_whose_deadline_falls_in_a_stalled_host_event_commit_reaches_the_application:
+        Stalled::HostEvent, Timing::DeadlineFalls, 300;
+    /// KR-PERF-002: a lone Escape that arrives while the session is held for 100 ms.
+    a_lone_escape_arriving_while_the_session_is_held_100_ms_reaches_the_application:
+        Stalled::Session, Timing::Arrives, 100;
+    /// KR-PERF-002: the same, held for 300 ms.
+    a_lone_escape_arriving_while_the_session_is_held_300_ms_reaches_the_application:
+        Stalled::Session, Timing::Arrives, 300;
+    /// KR-PERF-002: a held Escape whose deadline passes while the session is held for 100 ms.
+    a_held_escape_whose_deadline_falls_while_the_session_is_held_100_ms_reaches_the_application:
+        Stalled::Session, Timing::DeadlineFalls, 100;
+    /// KR-PERF-002: the same, held for 300 ms.
+    a_held_escape_whose_deadline_falls_while_the_session_is_held_300_ms_reaches_the_application:
+        Stalled::Session, Timing::DeadlineFalls, 300;
+}
+
+/// KR-PERF-002: a lone Escape reaches the application while a commit blocks the one thread the
+/// worker's runtime has.
+///
+/// A commit to a busy disk blocks the thread it is made on and hands nothing back. On a host with
+/// one processor the runtime has one thread for its tasks, so a mutation that made its commits on
+/// that thread would stop the connection reading the Escape and the timer forwarding it, whatever
+/// the input path takes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[cfg_attr(
+    windows,
+    ignore = "a Windows pseudo-console holds back a lone Escape, which it cannot tell from the start of a sequence, so the Escape this case waits for does not come back"
+)]
+async fn a_lone_escape_reaches_the_application_while_a_commit_blocks_the_only_thread_of_the_runtime()
+ {
+    a_lone_escape_meets(Stalled::BlockedMarker, Timing::Arrives, LIVENESS_DEADLINE).await;
+}
+
+macro_rules! every_prefix_cases {
+    ($($name:ident: $stalled:expr, $disk:expr;)*) => {
+        $(
+            /// KR-PERF-002: every prefix length of the start delimiter, and the delimiter split
+            /// across two writes, reach the application while the stall is in force.
+            #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+            #[cfg_attr(
+                windows,
+                ignore = "a Windows pseudo-console holds back a lone Escape, which it cannot tell from the start of a sequence, so the Escape this case waits for does not come back"
+            )]
+            async fn $name() {
+                every_prefix_meets($stalled, $disk).await;
+            }
+        )*
+    };
+}
+
+every_prefix_cases! {
+    every_held_prefix_reaches_the_application_during_a_stalled_marker_commit:
+        Stalled::Marker, false;
+    every_held_prefix_reaches_the_application_during_a_stalled_maintenance_prune:
+        Stalled::Prune, false;
+    every_held_prefix_reaches_the_application_during_a_stalled_question_commit:
+        Stalled::Question, false;
+    every_held_prefix_reaches_the_application_during_a_stalled_host_event_commit:
+        Stalled::HostEvent, false;
+    every_held_prefix_reaches_the_application_while_the_session_is_held:
+        Stalled::Session, false;
+    every_held_prefix_reaches_the_application_during_a_stalled_marker_commit_beside_a_disk_writer:
+        Stalled::Marker, true;
+    every_held_prefix_reaches_the_application_during_a_stalled_maintenance_prune_beside_a_disk_writer:
+        Stalled::Prune, true;
+    every_held_prefix_reaches_the_application_during_a_stalled_question_commit_beside_a_disk_writer:
+        Stalled::Question, true;
+    every_held_prefix_reaches_the_application_during_a_stalled_host_event_commit_beside_a_disk_writer:
+        Stalled::HostEvent, true;
+    every_held_prefix_reaches_the_application_while_the_session_is_held_beside_a_disk_writer:
+        Stalled::Session, true;
+}
+
+// ---------------------------------------------------------------------------------------------
+// KR-PERF-002, KR-REQ-08: what the input domain keeps exact while the session is busy.
+// ---------------------------------------------------------------------------------------------
+
+/// As [`write_over`], for a connection moved into a task of its own.
+async fn write_in(
+    client: &mut LocalClient,
+    session_id: SessionId,
+    attachment_id: AttachmentId,
+    epoch: kr_protocol::ids::InputLeaseEpoch,
+    sequence: u64,
+    bytes: &[u8],
+) -> Result<InputWriteResult, kr_protocol::error::ProtocolError> {
+    client
+        .request(
+            Method::InputWrite,
+            &InputWriteParams {
+                session_id,
+                attachment_id,
+                epoch,
+                sequence: kr_protocol::ids::InputSequence::new(sequence),
+                bytes: Bytes::new(bytes.to_vec()),
+            },
+        )
+        .await
+        .expect("reaches the worker")
+        .map(|value| value.to_typed().expect("decodes"))
+}
+
+/// KR-PERF-002, KR-REQ-08.62: a takeover in the middle of a burst of keystrokes counts exactly what
+/// it discards, whether or not the session is held while the burst runs.
+///
+/// One attachment types a burst while the application reads nothing, and another takes the lease
+/// part way through. Every byte the first was told was accepted is either in the application's
+/// file or in the count the takeover reports, once. With the session held, the takeover waits for
+/// it while the keystrokes go on without it, and takes the lease when the session comes free.
+async fn a_takeover_in_a_burst_counts_what_it_discards(hold_the_session: bool) {
+    const WRITES: usize = 4_000;
+    const LENGTH: usize = 200;
+    const BEFORE_THE_TAKEOVER: usize = 100;
+
+    let mut rig = Rig::start_late().await;
+    let mut other = LocalClient::connect(&rig.wired.endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects");
+    let second = attach_over(&mut other, &rig.wired, Some("xterm-256color")).await;
+
+    let held = hold_the_session.then(|| rig.wired.runtime.hold_the_session());
+    let held = match held {
+        Some((reached, release)) => {
+            tokio::time::timeout(LIVENESS_DEADLINE, reached)
+                .await
+                .expect("the session is held")
+                .expect("the holder holds it");
+            Some(release)
+        }
+        None => None,
+    };
+
+    let progress = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (session_id, attachment, epoch) = (rig.wired.session_id, rig.attachment, rig.epoch);
+    // The first attachment's connection goes to the task that types the burst, and the rig keeps
+    // one that nothing uses.
+    let spare = LocalClient::connect(&rig.wired.endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects");
+    let mut first = std::mem::replace(&mut rig.client, spare);
+    let bursting = {
+        let progress = Arc::clone(&progress);
+        tokio::spawn(async move {
+            let bytes = [b'k'; LENGTH];
+            let mut accepted = 0_u64;
+            for sequence in 0..WRITES {
+                let Ok(written) = write_in(
+                    &mut first,
+                    session_id,
+                    attachment,
+                    epoch,
+                    sequence as u64,
+                    &bytes,
+                )
+                .await
+                else {
+                    break;
+                };
+                accepted += written.forwarded_bytes.get() + written.held_prefix_bytes.get();
+                progress.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            }
+            (accepted, first)
+        })
+    };
+    let begun = async {
+        while progress.load(std::sync::atomic::Ordering::Acquire) < BEFORE_THE_TAKEOVER {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    };
+    let taking = acquire_over(&mut other, &rig.wired, second);
+    let taken = if let Some(release) = held {
+        // The takeover waits for the session. The burst has gone on without it: a watchdog lets
+        // the session go after a while, and then the burst has waited for it.
+        let letting_go = LetGo::after(release.clone(), Duration::from_secs(10));
+        let (taken, began) = tokio::join!(taking, async {
+            let began = tokio::time::timeout(Duration::from_secs(20), begun).await;
+            let _ = release.send(());
+            began
+        });
+        assert!(
+            !letting_go.finish(),
+            "the burst was kept waiting by the held session until it was let go"
+        );
+        began.expect("the burst went on while the session was held");
+        taken
+    } else {
+        tokio::time::timeout(LIVENESS_DEADLINE, begun)
+            .await
+            .expect("the burst began");
+        taking.await
+    }
+    .expect("the takeover is granted");
+    let (accepted, first) = bursting.await.expect("the burst ends");
+    let discarded = taken.discarded_bytes.get();
+
+    rig.pull_the_trigger().await;
+    tokio::time::timeout(LIVENESS_DEADLINE, async {
+        loop {
+            let delivered = rig.received().len() as u64;
+            assert!(
+                delivered + discarded <= accepted,
+                "more bytes are accounted for ({delivered} kept and {discarded} discarded) than \
+                 were accepted ({accepted})"
+            );
+            if delivered + discarded == accepted {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "{accepted} bytes were accepted and {} are in the application's file with {discarded} \
+             discarded",
+            rig.received().len()
+        )
+    });
+    assert!(
+        discarded > 0,
+        "the case is about bytes the application had not read, and none was left"
+    );
+
+    drop((first, other));
+    rig.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    windows,
+    ignore = "the application's input is read through a named pipe trigger"
+)]
+async fn a_takeover_in_a_burst_counts_exactly_what_it_discards() {
+    a_takeover_in_a_burst_counts_what_it_discards(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    windows,
+    ignore = "the application's input is read through a named pipe trigger"
+)]
+async fn a_takeover_waiting_for_a_held_session_counts_exactly_what_it_discards() {
+    a_takeover_in_a_burst_counts_what_it_discards(true).await;
+}
+
+/// KR-PERF-002: output that turns bracketed paste off while a prefix is held releases
+/// the prefix at once, and the application receives it once.
+///
+/// The recogniser's timer is stopped at the prefix's deadline, so only the mode change can have let
+/// it go, and it is let go on after the application has the prefix: the timer then finds nothing
+/// to forward.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    windows,
+    ignore = "a Windows pseudo-console holds back a lone Escape, which it cannot tell from the start of a sequence, so the Escape this case waits for does not come back"
+)]
+async fn output_that_turns_paste_mode_off_releases_a_held_prefix_once() {
+    let mut rig = Rig::start("\\033[?2004l").await;
+    let (reached, go) = rig.wired.runtime.pause_the_timer_at_its_deadline();
+    let (held, _) = rig.write(b"\x1b").await;
+    assert_eq!(held.held_prefix_bytes.get(), 1, "the Escape is held");
+    tokio::time::timeout(LIVENESS_DEADLINE, reached)
+        .await
+        .expect("the timer reached the deadline")
+        .expect("the timer is waiting");
+
+    rig.pull_the_trigger().await;
+    assert!(
+        rig.until_everything_typed_arrived().await.is_some(),
+        "the mode change did not release the prefix: {:?}",
+        rig.received()
+    );
+    go.send(()).expect("lets the timer go on");
+    // Whatever the timer does now, it is ahead of this byte, and the application receives the
+    // Escape once.
+    rig.write(b"m").await;
+    assert!(
+        rig.until_everything_typed_arrived().await.is_some(),
+        "the application received {:?}",
+        rig.received()
+    );
+    rig.close().await;
+}
+
+/// KR-PERF-002: a reply the application is owed waits for an open paste, and the
+/// keystroke that closes the paste lets it out, wherever the session is meanwhile.
+///
+/// The application asks the terminal a question inside a paste. The answer must not land in the
+/// middle of what the person is pasting; once the paste ends it is written without anything else
+/// happening. With the session held, the keystroke that ends the paste is accepted without it and
+/// the answer, which needs it, follows when it comes free.
+async fn a_reply_waits_for_an_open_paste(hold_the_session_when_it_closes: bool) {
+    let mut rig = Rig::start("\\033[ckr-asked.").await;
+    let (opened, _) = rig.write(b"\x1b[200~hello").await;
+    assert_eq!(
+        opened.forwarded_bytes.get(),
+        11,
+        "the paste is opened and forwarded"
+    );
+    assert!(rig.until_everything_typed_arrived().await.is_some());
+
+    rig.pull_the_trigger().await;
+    retained_within(&rig.wired.runtime, b"kr-asked.", LIVENESS_DEADLINE).await;
+    assert_eq!(
+        rig.received(),
+        rig.typed,
+        "the answer was written into the middle of the paste"
+    );
+
+    let held = if hold_the_session_when_it_closes {
+        let (reached, release) = rig.wired.runtime.hold_the_session();
+        tokio::time::timeout(LIVENESS_DEADLINE, reached)
+            .await
+            .expect("the session is held")
+            .expect("the holder holds it");
+        Some(release)
+    } else {
+        None
+    };
+    let letting_go = held
+        .as_ref()
+        .map(|release| LetGo::after(release.clone(), Duration::from_secs(10)));
+    rig.write(b"\x1b[201~").await;
+    let typed = rig.typed.clone();
+    tokio::time::timeout(LIVENESS_DEADLINE, async {
+        while !rig.received().starts_with(&typed) {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("the end of the paste reached the application");
+    if let Some(letting_go) = letting_go {
+        assert!(
+            !letting_go.finish(),
+            "the end of the paste was kept waiting by the held session until it was let go"
+        );
+    }
+    if let Some(release) = held {
+        assert_eq!(
+            rig.received(),
+            typed,
+            "the answer was written while the session was held, which it cannot be"
+        );
+        release.send(()).expect("lets the session go");
+    }
+    tokio::time::timeout(LIVENESS_DEADLINE, async {
+        while rig.received().len() <= typed.len() {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("the answer was written once the paste had ended");
+    let received = rig.received();
+    assert!(
+        received.starts_with(&typed) && received[typed.len()..].starts_with(b"\x1b[?"),
+        "the answer follows the end of the paste: {received:?}"
+    );
+    rig.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    windows,
+    ignore = "the application's input is read through a named pipe trigger"
+)]
+async fn a_reply_waits_for_an_open_paste_and_the_end_of_the_paste_lets_it_out() {
+    a_reply_waits_for_an_open_paste(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    windows,
+    ignore = "the application's input is read through a named pipe trigger"
+)]
+async fn the_end_of_a_paste_lets_a_reply_out_when_the_session_comes_free() {
+    a_reply_waits_for_an_open_paste(true).await;
+}
+
+/// KR-PERF-002: once a close is admitted a keystroke is refused at once, and it does
+/// not wait for the session to be free to hear so.
+///
+/// The close takes the lease and the held prefix with it and moves the lifecycle, all in the input
+/// domain. A write that arrives while the session is busy with the closure's own work is refused
+/// from that domain, and what the recogniser held is never forwarded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    windows,
+    ignore = "a Windows pseudo-console holds back a lone Escape, which it cannot tell from the start of a sequence, so the Escape this case waits for does not come back"
+)]
+async fn a_keystroke_after_a_close_is_refused_without_waiting_for_the_session() {
+    let mut rig = Rig::start(HOST_EVENT_OUTPUT).await;
+    let (reached, go) = rig.wired.runtime.pause_the_timer_at_its_deadline();
+    let (held, _) = rig.write(b"\x1b").await;
+    assert_eq!(held.held_prefix_bytes.get(), 1, "the Escape is held");
+    tokio::time::timeout(LIVENESS_DEADLINE, reached)
+        .await
+        .expect("the timer reached the deadline")
+        .expect("the timer is waiting");
+
+    let (_, gate) = rig.wired.runtime.close(ClosureReason::CloseRequested);
+    let (held_session, release) = rig.wired.runtime.hold_the_session();
+    tokio::time::timeout(LIVENESS_DEADLINE, held_session)
+        .await
+        .expect("the session is held")
+        .expect("the holder holds it");
+    let letting_go = LetGo::after(release.clone(), Duration::from_millis(300));
+    go.send(()).expect("lets the timer go on");
+    let refused = write_over(
+        &mut rig.client,
+        &rig.wired,
+        rig.attachment,
+        rig.epoch,
+        1,
+        b"x",
+    )
+    .await
+    .expect_err("a keystroke after a close is refused");
+    assert!(
+        !letting_go.finish(),
+        "the refusal waited for the session to come free ({refused:?})"
+    );
+    release.send(()).expect("lets the session go");
+    gate.release();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        rig.received().is_empty(),
+        "what the recogniser held, or the refused byte, reached the application: {:?}",
+        rig.received()
+    );
+    rig.close().await;
+}

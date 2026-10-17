@@ -525,6 +525,14 @@ struct RuntimePauses {
             std::sync::mpsc::Receiver<()>,
         )>,
     >,
+    /// Where the recogniser's timer says its deadline has passed, and what lets it go on to
+    /// forward what it held.
+    at_timer_deadline: Mutex<
+        Option<(
+            tokio::sync::oneshot::Sender<()>,
+            tokio::sync::oneshot::Receiver<()>,
+        )>,
+    >,
 }
 
 #[cfg(feature = "testing")]
@@ -552,6 +560,20 @@ impl RuntimePauses {
         if let Some((arrived, go)) = armed {
             let _ = arrived.send(());
             let _ = go.recv();
+        }
+    }
+
+    /// Waits at the pause the recogniser's timer takes when its deadline has passed, where one is
+    /// armed.
+    async fn at_timer_deadline(&self) {
+        let armed = self
+            .at_timer_deadline
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some((arrived, go)) = armed {
+            let _ = arrived.send(());
+            let _ = go.await;
         }
     }
 
@@ -1059,6 +1081,8 @@ impl SessionRuntime {
         let monitor_fence = Arc::clone(&fence);
         let monitor_activity = Arc::clone(&activity);
         let monitor_clock = Arc::clone(&shared_clock);
+        #[cfg(feature = "testing")]
+        let timer_pauses = Arc::clone(&progress.pauses);
         let monitor_progress = progress;
         let monitor_trace = trace.clone();
         let monitor_observing = Arc::clone(&observing);
@@ -1257,6 +1281,8 @@ impl SessionRuntime {
                             () = timer_wake.notified() => continue,
                         }
                         timer_trace.timer_woke(deadline);
+                        #[cfg(feature = "testing")]
+                        timer_pauses.at_timer_deadline().await;
                         let mut acquisition = timer_trace.acquisition(Site::TimerForward);
                         if let Ok(mut session) = timer_session.lock() {
                             acquisition.held();
@@ -1474,6 +1500,58 @@ impl SessionRuntime {
         std::sync::mpsc::Sender<()>,
     ) {
         self.session().pause_next_spool_write()
+    }
+
+    /// Holds the session on a thread of its own until it is let go, for this host's own tests.
+    ///
+    /// It stands for whatever keeps the session busy for as long as it likes: a commit that waits
+    /// on the disk, a pass of maintenance, a reading of the history. Returns the end that says the
+    /// session is held, and the end that lets it go; dropping the second lets it go too.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn hold_the_session(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        let session = Arc::clone(&self.session);
+        let (held, watch) = tokio::sync::oneshot::channel();
+        let (release, go) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let guard = session
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _ = held.send(());
+            let _ = go.recv();
+            drop(guard);
+        });
+        (watch, release)
+    }
+
+    /// Stops the recogniser's timer when its deadline has passed, before it takes anything to
+    /// forward what it held, for this host's own tests.
+    ///
+    /// Returns the end that says the timer has arrived, and the end that lets it go on. The stop
+    /// fires once. It is how a test makes a held prefix's deadline fall inside something else that
+    /// begins afterwards.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn pause_the_timer_at_its_deadline(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (arrived, watch) = tokio::sync::oneshot::channel();
+        let (release, go) = tokio::sync::oneshot::channel();
+        *self
+            .progress
+            .pauses
+            .at_timer_deadline
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((arrived, go));
+        (watch, release)
     }
 
     /// Stops the read loop after its next read that returns output, before that output is
