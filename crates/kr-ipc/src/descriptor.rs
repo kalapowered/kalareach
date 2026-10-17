@@ -12,6 +12,7 @@
 use std::path::Path;
 
 use kr_protocol::ids::SessionId;
+use kr_protocol::retained::Level;
 use kr_protocol::worker::WorkerDescriptor;
 
 use crate::error::{IpcError, Result};
@@ -29,10 +30,46 @@ pub const MAX_DESCRIPTOR_LEN: u64 = 16 * 1024;
 ///
 /// Returns an error when the descriptor cannot be encoded or the file cannot be published.
 pub fn publish(paths: &EnvironmentPaths, descriptor: &WorkerDescriptor) -> Result<()> {
-    let bytes = kr_cbor::to_canonical_vec(descriptor)
-        .map_err(|error| IpcError::Frame(kr_protocol::frame::FrameError::Cbor(error)))?;
+    publish_for(Level::this(), paths, descriptor)
+}
+
+/// Writes a descriptor as the worker it describes reads it: in the shape of `level`.
+///
+/// A control daemon republishes the descriptor of a worker it adopted, and a command of that
+/// worker's release reads it, so it is written in the worker's level and not in the daemon's.
+///
+/// # Errors
+///
+/// Returns an error when the descriptor cannot be encoded for the level or the file cannot be
+/// published.
+pub fn publish_for(
+    level: Level,
+    paths: &EnvironmentPaths,
+    descriptor: &WorkerDescriptor,
+) -> Result<()> {
+    let value = level.encode_value(descriptor)?;
+    let bytes = kr_cbor::encode(value.as_value());
     let path = paths.descriptor_file(descriptor.session_id);
     write_owner_only_file(&path, &bytes)
+}
+
+/// Reads the bytes of a descriptor file in the shape of this release or of a level it retains.
+fn decode(bytes: &[u8]) -> Result<WorkerDescriptor> {
+    let value = kr_cbor::decode(bytes, &kr_cbor::Limits::DEFAULT)
+        .map_err(|error| IpcError::Frame(kr_protocol::frame::FrameError::Cbor(error)))?;
+    let value = kr_protocol::envelope::ParamsValue::new(value);
+    let levels = std::iter::once(Level::this())
+        .chain(kr_protocol::retained::RETAINED.iter().map(Level::retained));
+    let mut first = None;
+    for level in levels {
+        match level.decode_value::<WorkerDescriptor>(&value) {
+            Ok(descriptor) => return Ok(descriptor),
+            Err(error) => {
+                first.get_or_insert(error);
+            }
+        }
+    }
+    Err(first.map_or(IpcError::UnexpectedMessage("a descriptor"), IpcError::from))
 }
 
 /// Reads one session's descriptor, or `None` when there is none.
@@ -414,9 +451,7 @@ impl DescriptorDirectory {
                 reason: "a descriptor is larger than any descriptor this host writes",
             });
         }
-        kr_cbor::from_canonical_slice(&bytes, &kr_cbor::Limits::DEFAULT)
-            .map(Some)
-            .map_err(|error| IpcError::Frame(kr_protocol::frame::FrameError::Cbor(error)))
+        decode(&bytes).map(Some)
     }
 
     #[cfg(unix)]

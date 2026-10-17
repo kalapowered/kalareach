@@ -14,7 +14,7 @@
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
-use kr_ipc::client::LocalClient;
+use kr_ipc::client::BoundLink;
 use kr_protocol::ids::{DeviceId, SessionId};
 use kr_protocol::scalars::U64;
 use kr_protocol::worker::{LocalAccess, LocalBound};
@@ -275,7 +275,7 @@ impl Controller {
     pub(crate) async fn tell_link(
         &self,
         session_id: SessionId,
-        client: &mut LocalClient,
+        client: &mut BoundLink,
     ) -> Result<Option<u64>> {
         let states = kr_protocol::local::holds_local_access(&client.acknowledgement().capabilities);
         self.local_access.note_worker(session_id, states, None);

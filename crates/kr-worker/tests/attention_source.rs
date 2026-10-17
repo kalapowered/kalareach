@@ -9,7 +9,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use kr_ipc::client::LocalClient;
+use kr_ipc::client::{BoundLink, Client, Codec, LocalClient};
 use kr_ipc::endpoint::Listener;
 use kr_ipc::verify::{ControllerIdentity, WorkerIdentity};
 use kr_protocol::attention::{
@@ -142,15 +142,15 @@ async fn host_with(journal: bool) -> Host {
 ///
 /// Like the daemon, it records the greatest privacy generation the worker states, pages and
 /// answers with, and [`page`] and [`text`] name it on the requests they send.
-struct Link {
-    client: LocalClient,
+struct Link<C: Codec = kr_ipc::client::Bound> {
+    client: Client<C>,
     recorded: Option<u64>,
     /// The worker's statements of its privacy fence, in the order they arrived.
     statements: Vec<AttentionBarrier>,
 }
 
-impl Link {
-    const fn of(client: LocalClient) -> Self {
+impl<C: Codec> Link<C> {
+    const fn of(client: Client<C>) -> Self {
         Self {
             client,
             recorded: None,
@@ -189,8 +189,7 @@ impl Link {
     /// Acknowledges a statement, as the daemon does once it has applied one.
     async fn acknowledge(&mut self, statement: &AttentionBarrier) {
         self.client
-            .writer()
-            .write_message(&ControlFrame::AttentionBarrierAcknowledged(
+            .send(&ControlFrame::AttentionBarrierAcknowledged(
                 kr_protocol::attention::AttentionBarrierAcknowledged {
                     request_id: statement.request_id,
                     sequence: statement.sequence,
@@ -201,16 +200,16 @@ impl Link {
     }
 }
 
-impl std::ops::Deref for Link {
-    type Target = LocalClient;
+impl<C: Codec> std::ops::Deref for Link<C> {
+    type Target = Client<C>;
 
-    fn deref(&self) -> &LocalClient {
+    fn deref(&self) -> &Client<C> {
         &self.client
     }
 }
 
-impl std::ops::DerefMut for Link {
-    fn deref_mut(&mut self) -> &mut LocalClient {
+impl<C: Codec> std::ops::DerefMut for Link<C> {
+    fn deref_mut(&mut self) -> &mut Client<C> {
         &mut self.client
     }
 }
@@ -229,17 +228,11 @@ async fn daemon_receiving(
     role: ControllerConnectionRole,
     limits: kr_protocol::hello::ReceiveLimits,
 ) -> Link {
-    let mut client = LocalClient::connect_receiving(
-        &host.endpoint,
-        LocalClientKind::Controller,
-        build(),
-        limits,
-    )
-    .await
-    .expect("connects");
+    let mut client = BoundLink::connect_receiving(&host.endpoint, build(), limits)
+        .await
+        .expect("connects");
     client
-        .writer()
-        .write_message(&ControlFrame::ControllerRole(role))
+        .send(&ControlFrame::ControllerRole(role))
         .await
         .expect("declares the role");
     match client.recv().await.expect("the worker answers") {
@@ -300,7 +293,7 @@ enum Answer {
     Refused(RequestId, ErrorCode),
 }
 
-async fn next_answer(link: &mut Link) -> Answer {
+async fn next_answer(link: &mut Link<impl Codec>) -> Answer {
     loop {
         match link.client.recv().await.expect("the worker answers") {
             ControlFrame::AttentionBarrier(statement) => {
@@ -327,13 +320,15 @@ async fn next_answer(link: &mut Link) -> Answer {
     }
 }
 
-async fn page(link: &mut Link, request: AttentionSourcesRequest) -> AttentionSourcePage {
+async fn page(
+    link: &mut Link<impl Codec>,
+    request: AttentionSourcesRequest,
+) -> AttentionSourcePage {
     let request = AttentionSourcesRequest {
         recorded_generation: link.named(),
         ..request
     };
-    link.writer()
-        .write_message(&ControlFrame::AttentionSources(request))
+    link.send(&ControlFrame::AttentionSources(request))
         .await
         .expect("writes the request");
     match next_answer(link).await {
@@ -342,13 +337,12 @@ async fn page(link: &mut Link, request: AttentionSourcesRequest) -> AttentionSou
     }
 }
 
-async fn text(link: &mut Link, request: AttentionTextRequest) -> AttentionTextAnswer {
+async fn text(link: &mut Link<impl Codec>, request: AttentionTextRequest) -> AttentionTextAnswer {
     let request = AttentionTextRequest {
         recorded_generation: link.named(),
         ..request
     };
-    link.writer()
-        .write_message(&ControlFrame::AttentionText(request))
+    link.send(&ControlFrame::AttentionText(request))
         .await
         .expect("writes the request");
     match next_answer(link).await {
@@ -564,8 +558,7 @@ async fn a_held_page_answers_when_a_question_is_committed() {
     notify(&host, "the build finished");
     let mut link = daemon(&host, ControllerConnectionRole::Attention).await;
     let held_before = host.service.held_attention_requests();
-    link.writer()
-        .write_message(&ControlFrame::AttentionSources(sources(0, 1, 20_000)))
+    link.send(&ControlFrame::AttentionSources(sources(0, 1, 20_000)))
         .await
         .expect("writes the request");
     // Nothing is past the cursors, so the worker holds the request.
@@ -595,8 +588,7 @@ async fn a_held_page_answers_when_a_host_event_is_committed() {
     let host = host().await;
     let mut link = daemon(&host, ControllerConnectionRole::Attention).await;
     let held_before = host.service.held_attention_requests();
-    link.writer()
-        .write_message(&ControlFrame::AttentionSources(sources(0, 0, 20_000)))
+    link.send(&ControlFrame::AttentionSources(sources(0, 0, 20_000)))
         .await
         .expect("writes the request");
     until_held_again(&host, held_before).await;
@@ -665,8 +657,7 @@ async fn a_held_page_answers_when_an_approval_is_committed() {
     let mut bound = Channel::open(launch(2), 2, launched(2));
     let mut link = daemon(&host, ControllerConnectionRole::Attention).await;
     let held_before = host.service.held_attention_requests();
-    link.writer()
-        .write_message(&ControlFrame::AttentionSources(sources(0, 0, 20_000)))
+    link.send(&ControlFrame::AttentionSources(sources(0, 0, 20_000)))
         .await
         .expect("writes the request");
     until_held_again(&host, held_before).await;
@@ -720,13 +711,12 @@ async fn a_held_page_answers_when_an_approval_waits_behind_a_full_page() {
     let mut bound = Channel::open(launch(2), 2, launched(2));
     let mut link = daemon(&host, ControllerConnectionRole::Attention).await;
     let held_before = host.service.held_attention_requests();
-    link.writer()
-        .write_message(&ControlFrame::AttentionSources(AttentionSourcesRequest {
-            max_records: U64::new(1),
-            ..sources(0, 0, 20_000)
-        }))
-        .await
-        .expect("writes the request");
+    link.send(&ControlFrame::AttentionSources(AttentionSourcesRequest {
+        max_records: U64::new(1),
+        ..sources(0, 0, 20_000)
+    }))
+    .await
+    .expect("writes the request");
     until_held_again(&host, held_before).await;
 
     unbound.relay("fghij").await;
@@ -853,8 +843,7 @@ async fn a_broker_transition_serves_no_text_whatever_privacy_mode_says() {
 async fn a_held_page_answers_when_privacy_mode_changes() {
     let host = host().await;
     let mut link = daemon(&host, ControllerConnectionRole::Attention).await;
-    link.writer()
-        .write_message(&ControlFrame::AttentionSources(sources(0, 0, 20_000)))
+    link.send(&ControlFrame::AttentionSources(sources(0, 0, 20_000)))
         .await
         .expect("writes the request");
     assert!(
@@ -891,20 +880,18 @@ async fn a_held_page_answers_at_its_bound() {
 async fn a_newer_request_replaces_a_held_one() {
     let host = host().await;
     let mut link = daemon(&host, ControllerConnectionRole::Attention).await;
-    link.writer()
-        .write_message(&ControlFrame::AttentionSources(AttentionSourcesRequest {
-            request_id: RequestId::new(31),
-            ..sources(0, 0, 20_000)
-        }))
-        .await
-        .expect("writes the first request");
-    link.writer()
-        .write_message(&ControlFrame::AttentionSources(AttentionSourcesRequest {
-            request_id: RequestId::new(32),
-            ..sources(0, 0, 0)
-        }))
-        .await
-        .expect("writes the second request");
+    link.send(&ControlFrame::AttentionSources(AttentionSourcesRequest {
+        request_id: RequestId::new(31),
+        ..sources(0, 0, 20_000)
+    }))
+    .await
+    .expect("writes the first request");
+    link.send(&ControlFrame::AttentionSources(AttentionSourcesRequest {
+        request_id: RequestId::new(32),
+        ..sources(0, 0, 0)
+    }))
+    .await
+    .expect("writes the second request");
     let Answer::Page(page) = within(&mut link, Duration::from_secs(5)).await else {
         panic!("expected the second request's page");
     };
@@ -919,21 +906,19 @@ async fn a_newer_request_replaces_a_held_one() {
 
     // Nor does one replaced as its bound runs out.
     for round in 0..5_u64 {
-        link.writer()
-            .write_message(&ControlFrame::AttentionSources(AttentionSourcesRequest {
-                request_id: RequestId::new(100 + round),
-                ..sources(0, 1, 50)
-            }))
-            .await
-            .expect("writes the held request");
+        link.send(&ControlFrame::AttentionSources(AttentionSourcesRequest {
+            request_id: RequestId::new(100 + round),
+            ..sources(0, 1, 50)
+        }))
+        .await
+        .expect("writes the held request");
         tokio::time::sleep(Duration::from_millis(50)).await;
-        link.writer()
-            .write_message(&ControlFrame::AttentionSources(AttentionSourcesRequest {
-                request_id: RequestId::new(200 + round),
-                ..sources(0, 1, 0)
-            }))
-            .await
-            .expect("writes the replacement");
+        link.send(&ControlFrame::AttentionSources(AttentionSourcesRequest {
+            request_id: RequestId::new(200 + round),
+            ..sources(0, 1, 0)
+        }))
+        .await
+        .expect("writes the replacement");
         let Answer::Page(page) = within(&mut link, Duration::from_secs(5)).await else {
             panic!("expected a page");
         };
@@ -971,8 +956,7 @@ async fn the_attention_requests_travel_on_the_attention_connection_alone() {
     ] {
         let mut other = daemon(&host, role).await;
         other
-            .writer()
-            .write_message(&ControlFrame::AttentionSources(sources(0, 0, 0)))
+            .send(&ControlFrame::AttentionSources(sources(0, 0, 0)))
             .await
             .expect("writes");
         assert!(matches!(
@@ -980,8 +964,7 @@ async fn the_attention_requests_travel_on_the_attention_connection_alone() {
             Answer::Refused(_, ErrorCode::PermissionDenied)
         ));
         other
-            .writer()
-            .write_message(&ControlFrame::AttentionText(texts(&[])))
+            .send(&ControlFrame::AttentionText(texts(&[])))
             .await
             .expect("writes");
         assert!(matches!(
@@ -994,28 +977,25 @@ async fn the_attention_requests_travel_on_the_attention_connection_alone() {
             .await
             .expect("connects"),
     );
-    cli.writer()
-        .write_message(&ControlFrame::AttentionSources(sources(0, 0, 0)))
+    cli.send(&ControlFrame::AttentionSources(sources(0, 0, 0)))
         .await
         .expect("writes");
     assert!(matches!(next_answer(&mut cli).await, Answer::Refused(..)));
-    cli.writer()
-        .write_message(&ControlFrame::AttentionText(texts(&[])))
+    cli.send(&ControlFrame::AttentionText(texts(&[])))
         .await
         .expect("writes");
     assert!(matches!(next_answer(&mut cli).await, Answer::Refused(..)));
 
     // And the attention connection is not a way to read anything else.
     let mut link = daemon(&host, ControllerConnectionRole::Attention).await;
-    link.writer()
-        .write_message(&ControlFrame::Request(Request {
-            request_id: RequestId::new(5),
-            method: Method::SessionRead.into(),
-            method_version: MethodVersion::V1,
-            params: ParamsValue::empty(),
-        }))
-        .await
-        .expect("writes");
+    link.send(&ControlFrame::Request(Request {
+        request_id: RequestId::new(5),
+        method: Method::SessionRead.into(),
+        method_version: MethodVersion::V1,
+        params: ParamsValue::empty(),
+    }))
+    .await
+    .expect("writes");
     assert!(
         matches!(
             next_answer(&mut link).await,
@@ -1034,8 +1014,7 @@ async fn a_newer_attention_connection_replaces_the_older() {
     let mut newer = daemon(&host, ControllerConnectionRole::Attention).await;
     let _ = page(&mut newer, sources(0, 0, 0)).await;
     older
-        .writer()
-        .write_message(&ControlFrame::AttentionSources(sources(0, 0, 0)))
+        .send(&ControlFrame::AttentionSources(sources(0, 0, 0)))
         .await
         .ok();
     let answer = tokio::time::timeout(Duration::from_secs(5), older.recv()).await;
@@ -1255,13 +1234,12 @@ async fn an_answer_fits_the_frame_the_connection_can_receive() {
     let every: Vec<(AttentionSource, u64)> = (1..=40)
         .map(|sequence| (AttentionSource::HostEvents, sequence))
         .collect();
-    link.writer()
-        .write_message(&ControlFrame::AttentionText(AttentionTextRequest {
-            request_id: RequestId::new(41),
-            ..texts(&every)
-        }))
-        .await
-        .expect("writes");
+    link.send(&ControlFrame::AttentionText(AttentionTextRequest {
+        request_id: RequestId::new(41),
+        ..texts(&every)
+    }))
+    .await
+    .expect("writes");
     assert!(
         matches!(
             next_answer(&mut link).await,
@@ -1278,8 +1256,7 @@ async fn an_answer_fits_the_frame_the_connection_can_receive() {
     };
     let mut cramped = daemon_receiving(&host, ControllerConnectionRole::Attention, tiny).await;
     cramped
-        .writer()
-        .write_message(&ControlFrame::AttentionSources(AttentionSourcesRequest {
+        .send(&ControlFrame::AttentionSources(AttentionSourcesRequest {
             request_id: RequestId::new(42),
             ..sources(0, 0, 0)
         }))
@@ -1385,7 +1362,7 @@ async fn a_fingerprint_is_the_same_across_privacy_transitions() {
 // ---------------------------------------------------------------------------------------------
 
 /// Asks for pages from the start until one carries `wanted` host events, within the suite's bound.
-async fn page_of(link: &mut Link, wanted: usize) -> AttentionSourcePage {
+async fn page_of(link: &mut Link<impl Codec>, wanted: usize) -> AttentionSourcePage {
     let started = tokio::time::Instant::now();
     loop {
         let answered = page(link, sources(0, 0, 0)).await;
@@ -1889,13 +1866,12 @@ async fn a_request_behind_the_worker_s_generation_gets_no_text_and_its_page_at_o
         "the first statement names the generation"
     );
 
-    link.writer()
-        .write_message(&ControlFrame::AttentionText(AttentionTextRequest {
-            recorded_generation: Nullable::some(U64::ZERO),
-            ..texts(&[(AttentionSource::HostEvents, 1)])
-        }))
-        .await
-        .expect("writes the request");
+    link.send(&ControlFrame::AttentionText(AttentionTextRequest {
+        recorded_generation: Nullable::some(U64::ZERO),
+        ..texts(&[(AttentionSource::HostEvents, 1)])
+    }))
+    .await
+    .expect("writes the request");
     let Answer::Texts(behind) = within(&mut link, Duration::from_secs(5)).await else {
         panic!("expected text");
     };
@@ -1904,13 +1880,12 @@ async fn a_request_behind_the_worker_s_generation_gets_no_text_and_its_page_at_o
     let current = text(&mut link, texts(&[(AttentionSource::HostEvents, 1)])).await;
     assert_eq!(current.texts[0].text, Nullable::some(said("after")));
 
-    link.writer()
-        .write_message(&ControlFrame::AttentionSources(AttentionSourcesRequest {
-            recorded_generation: Nullable::some(U64::new(1)),
-            ..sources(0, 1, 20_000)
-        }))
-        .await
-        .expect("writes the request");
+    link.send(&ControlFrame::AttentionSources(AttentionSourcesRequest {
+        recorded_generation: Nullable::some(U64::new(1)),
+        ..sources(0, 1, 20_000)
+    }))
+    .await
+    .expect("writes the request");
     let Answer::Page(page) = within(&mut link, Duration::from_secs(2)).await else {
         panic!("expected the page at once");
     };
@@ -1931,8 +1906,7 @@ async fn privacy_mode_completes_once_the_current_connection_names_the_generation
     );
 
     // A request naming the generation before it completes nothing.
-    link.writer()
-        .write_message(&ControlFrame::AttentionText(texts(&[])))
+    link.send(&ControlFrame::AttentionText(texts(&[])))
         .await
         .expect("writes the request");
     let _ = within(&mut link, Duration::from_secs(5)).await;
@@ -2194,13 +2168,12 @@ async fn a_disable_between_a_raise_and_its_enable_keeps_the_transition_raised() 
     disable_privacy(&host);
     notify(&host, "after the disable");
     // Named at the generation the disable committed, so nothing but the raise can withhold it.
-    link.writer()
-        .write_message(&ControlFrame::AttentionText(AttentionTextRequest {
-            recorded_generation: Nullable::some(U64::new(1)),
-            ..texts(&[(AttentionSource::HostEvents, 1)])
-        }))
-        .await
-        .expect("writes the request");
+    link.send(&ControlFrame::AttentionText(AttentionTextRequest {
+        recorded_generation: Nullable::some(U64::new(1)),
+        ..texts(&[(AttentionSource::HostEvents, 1)])
+    }))
+    .await
+    .expect("writes the request");
     let Answer::Texts(during) = within(&mut link, Duration::from_secs(5)).await else {
         panic!("expected text");
     };
@@ -2233,13 +2206,12 @@ async fn text_withheld_only_by_a_raise_is_served_once_it_is_settled() {
     notify(&host, "after the disable");
     transition.settle().await;
     let _ = link.statement(Duration::from_secs(5)).await;
-    link.writer()
-        .write_message(&ControlFrame::AttentionText(AttentionTextRequest {
-            recorded_generation: Nullable::some(U64::new(1)),
-            ..texts(&[(AttentionSource::HostEvents, 1)])
-        }))
-        .await
-        .expect("writes the request");
+    link.send(&ControlFrame::AttentionText(AttentionTextRequest {
+        recorded_generation: Nullable::some(U64::new(1)),
+        ..texts(&[(AttentionSource::HostEvents, 1)])
+    }))
+    .await
+    .expect("writes the request");
     let Answer::Texts(after) = within(&mut link, Duration::from_secs(5)).await else {
         panic!("expected text");
     };

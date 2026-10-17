@@ -2,11 +2,10 @@
 
 use std::sync::Arc;
 
-use kr_ipc::client::LocalClient;
+use kr_ipc::client::BoundLink;
 use kr_ipc::paths::Endpoint;
 use kr_protocol::identity::WorkerProfile;
 use kr_protocol::ids::{SessionEpoch, SessionId};
-use kr_protocol::local::LocalClientKind;
 use kr_protocol::session::{ClosureReason, SessionState, SessionSummary};
 use kr_protocol::worker::{ReservationId, WorkerDescriptor};
 
@@ -219,7 +218,7 @@ impl Controller {
         if let Some(Err(refused)) = &challenged {
             report_unretained(reservation.display_number, refused);
         }
-        if let Some(Ok((proof, described))) = challenged
+        if let Some(Ok((proof, described, level))) = challenged
             && let Some(key) = reservation.claimed_key
         {
             // The worker is alive and is the one this reservation admitted. Its descriptor and its
@@ -229,7 +228,7 @@ impl Controller {
                 &key,
                 &proof,
                 &endpoint,
-                described,
+                (described, level),
                 held,
             )
             .await?;
@@ -427,13 +426,13 @@ impl Controller {
                 .challenge(&endpoint, &row.public_key, row.session_id)
                 .await
             {
-                Ok((proof, described)) => {
+                Ok((proof, described, level)) => {
                     self.adopt(
                         row.display_number,
                         &row.public_key,
                         &proof,
                         &endpoint,
-                        described,
+                        (described, level),
                         &held,
                     )
                     .await?;
@@ -467,6 +466,7 @@ impl Controller {
     ) -> Result<(
         kr_protocol::worker::WorkerVerifyProof,
         Option<SessionSummary>,
+        kr_protocol::retained::Level,
     )> {
         let identity = &self.identity;
         let generation = self.generation;
@@ -474,12 +474,7 @@ impl Controller {
         let endpoint_text = endpoint.as_text();
         let (proof, mut client) =
             tokio::time::timeout(crate::directory::RECONNECT_TIMEOUT, async move {
-                let mut client = LocalClient::connect(
-                    endpoint,
-                    LocalClientKind::Controller,
-                    self.build_id.clone(),
-                )
-                .await?;
+                let mut client = BoundLink::connect(endpoint, self.build_id.clone()).await?;
                 let proof = client
                     .challenge_worker(
                         worker_public_key,
@@ -502,7 +497,7 @@ impl Controller {
                 ControllerError::supervision("the worker did not answer its challenge in time")
             })??;
         let described = crate::directory::describe(&mut client, session_id).await;
-        Ok((proof, described))
+        Ok((proof, described, client.level()))
     }
 
     /// Records a recovered worker and republishes its descriptor, and admits the worker with the
@@ -516,7 +511,7 @@ impl Controller {
         worker_public_key: &kr_protocol::scalars::AuthorisationKey,
         proof: &kr_protocol::worker::WorkerVerifyProof,
         endpoint: &Endpoint,
-        described: Option<SessionSummary>,
+        (described, level): (Option<SessionSummary>, kr_protocol::retained::Level),
         held: &ReservationHold,
     ) -> Result<()> {
         let record = WorkerRecord {
@@ -569,6 +564,7 @@ impl Controller {
             KnownWorker {
                 descriptor,
                 endpoint: endpoint.clone(),
+                level,
             },
             described,
             held,

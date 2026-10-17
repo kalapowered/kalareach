@@ -19,7 +19,7 @@ use kr_controller::attention::{AttentionModule, Caller, Reach};
 use kr_controller::authority::AdmittedMutation;
 use kr_controller::directory::KnownWorker;
 use kr_crypto::keys::DeviceKeys;
-use kr_ipc::client::LocalClient;
+use kr_ipc::client::{BoundLink, LocalClient};
 use kr_ipc::endpoint::Listener;
 use kr_ipc::verify::{ControllerIdentity, WorkerIdentity};
 use kr_protocol::attention::{
@@ -40,7 +40,7 @@ use kr_protocol::ids::{
     ActionId, ActorId, AgentTurnId, BuildId, CausalRootId, ConnectionId, ControllerGeneration,
     GrantId, RequestId, SessionEpoch, SessionId, WorkflowId, WorkflowRunId,
 };
-use kr_protocol::local::{ControllerConnectionRole, LocalClientKind};
+use kr_protocol::local::ControllerConnectionRole;
 use kr_protocol::method::{Method, MethodGroup, MethodVersion, REGISTRY};
 use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::{DurationMs, Nullable, TimestampMs, U64};
@@ -144,6 +144,7 @@ async fn worker_for(session_id: SessionId) -> Worker {
     );
     tokio::spawn(Arc::clone(&service).serve(listener));
     let known = KnownWorker {
+        level: kr_protocol::retained::Level::this(),
         descriptor: kr_protocol::worker::WorkerDescriptor {
             session_id,
             session_epoch: SessionEpoch::V1,
@@ -297,9 +298,7 @@ impl Reach for TestReach {
         &'a self,
         worker: &'a KnownWorker,
     ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<Output = kr_controller::error::Result<LocalClient>> + Send + 'a,
-        >,
+        Box<dyn std::future::Future<Output = kr_controller::error::Result<BoundLink>> + Send + 'a>,
     > {
         Box::pin(async move {
             let stalled = self
@@ -322,12 +321,9 @@ impl Reach for TestReach {
                 .get(&worker.descriptor.session_id)
                 .cloned()
                 .ok_or_else(|| kr_controller::error::ControllerError::supervision("unknown"))?;
-            let mut client =
-                LocalClient::connect(&worker.endpoint, LocalClientKind::Controller, build())
-                    .await?;
+            let mut client = BoundLink::connect(&worker.endpoint, build()).await?;
             client
-                .writer()
-                .write_message(&ControlFrame::ControllerRole(
+                .send(&ControlFrame::ControllerRole(
                     ControllerConnectionRole::Attention,
                 ))
                 .await?;
@@ -2581,14 +2577,12 @@ where
 
 /// A daemon's attention connection to `worker` that acknowledges nothing, as a daemon that has
 /// stopped answering does. It takes the worker's attention link from whichever it replaces.
-async fn silent_daemon(worker: &Worker) -> LocalClient {
-    let mut client =
-        LocalClient::connect(&worker.known.endpoint, LocalClientKind::Controller, build())
-            .await
-            .expect("connects");
+async fn silent_daemon(worker: &Worker) -> BoundLink {
+    let mut client = BoundLink::connect(&worker.known.endpoint, build())
+        .await
+        .expect("connects");
     client
-        .writer()
-        .write_message(&ControlFrame::ControllerRole(
+        .send(&ControlFrame::ControllerRole(
             ControllerConnectionRole::Attention,
         ))
         .await

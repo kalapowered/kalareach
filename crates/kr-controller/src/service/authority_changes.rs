@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use kr_ipc::client::LocalClient;
+use kr_ipc::client::BoundLink;
 use kr_protocol::agent::{AgentApprovalInspectParams, AgentApprovalInspectResult, AgentSubject};
 use kr_protocol::broker::{DecoderLedgerEntry, MAX_PROJECTION_SUMMARY_LEN};
 use kr_protocol::envelope::{ControlFrame, MutationRequest, ParamsValue};
@@ -2654,7 +2654,7 @@ fn answered_as<T: kr_protocol::wire::WireMessage>(
 /// prevent. A worker of an earlier build does not know the read, and the screen is not shared
 /// through it.
 async fn read_screen(
-    client: &mut LocalClient,
+    client: &mut BoundLink,
     session_id: SessionId,
     selection: &RoleSelection,
 ) -> std::result::Result<kr_protocol::sharing::LiveScreenPreview, PreviewFailure> {
@@ -2702,7 +2702,7 @@ async fn read_screen(
 /// broker recorded it. The state and the moment are the record's own, read after the snapshot that
 /// found it, so an approval that ended in between is not shown.
 async fn read_previews(
-    client: &mut LocalClient,
+    client: &mut BoundLink,
     session_id: SessionId,
     selection: &RoleSelection,
 ) -> std::result::Result<NamedPreviews, PreviewFailure> {
@@ -2796,7 +2796,7 @@ async fn read_previews(
 /// ended before its last page was read is read again from its first, within the exchange's bound:
 /// a part of one snapshot says nothing of what the rest of it held.
 async fn holding(
-    client: &mut LocalClient,
+    client: &mut BoundLink,
     session_id: SessionId,
     named: &CanonicalSet<PendingResourceId>,
 ) -> std::result::Result<BTreeMap<PendingResourceId, PendingResource>, PreviewFailure> {

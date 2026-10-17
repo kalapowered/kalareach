@@ -302,8 +302,7 @@ async fn no_frame_a_worker_receives_carries_a_voice_right() {
         use kr_protocol::local::ForwardedMutation as Built;
 
         let written = link
-            .writer()
-            .write_message(&ControlFrame::Forwarded(Box::new(Built {
+            .send(&ControlFrame::Forwarded(Box::new(Built {
                 mutation: fake::close_request(world.environment_id, world.session_id),
                 actor: world.actor.clone(),
                 grant_rights: with_voice.clone(),

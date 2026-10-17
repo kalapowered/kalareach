@@ -438,6 +438,14 @@ fn unavailable(reason: &str, retry_after: Duration) -> PluginRuntimeState {
     })
 }
 
+/// The answer to a running worker whose session has no worker recorded yet: ask again.
+pub(super) fn not_recorded_yet() -> PluginRuntimeState {
+    unavailable(
+        "the daemon has not recorded that session's worker yet",
+        NOT_RECORDED_RETRY,
+    )
+}
+
 /// Why a request on the rendezvous endpoint was not taken from the process that made it.
 #[derive(Debug)]
 pub(super) enum Asker {

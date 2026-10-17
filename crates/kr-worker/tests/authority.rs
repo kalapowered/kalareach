@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 
-use kr_ipc::client::LocalClient;
+use kr_ipc::client::{BoundLink, Client, Codec, LocalClient};
 use kr_ipc::endpoint::Listener;
 use kr_ipc::verify::{ControllerIdentity, WorkerIdentity};
 use kr_protocol::error::ErrorCode;
@@ -125,8 +125,8 @@ async fn host_producing(generation: u64, script: &str) -> Host {
     }
 }
 
-async fn controller_client(host: &Host, generation: u64) -> LocalClient {
-    let mut client = LocalClient::connect(&host.endpoint, LocalClientKind::Controller, build())
+async fn controller_client(host: &Host, generation: u64) -> BoundLink {
+    let mut client = BoundLink::connect(&host.endpoint, build())
         .await
         .expect("connects");
     let identity = Arc::clone(&host.controller);
@@ -153,7 +153,7 @@ enum Refused {
 }
 
 async fn read_session(
-    client: &mut LocalClient,
+    client: &mut Client<impl Codec>,
     session_id: SessionId,
 ) -> std::result::Result<(), Refused> {
     match client
@@ -214,7 +214,7 @@ async fn a_superseded_generation_cannot_dispatch_afterwards() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_controller_that_has_not_proved_a_generation_is_refused() {
     let host = host(1).await;
-    let mut client = LocalClient::connect(&host.endpoint, LocalClientKind::Controller, build())
+    let mut client = BoundLink::connect(&host.endpoint, build())
         .await
         .expect("connects");
     assert_eq!(
@@ -318,11 +318,7 @@ async fn a_mutation_that_quotes_an_unknown_window_is_not_admitted() {
             params,
         },
     ));
-    client
-        .writer()
-        .write_message(&mutation)
-        .await
-        .expect("writes the mutation");
+    client.send(&mutation).await.expect("writes the mutation");
     let reply = client.recv().await.expect("the worker answers");
     let kr_protocol::envelope::ControlFrame::Response(response) = reply else {
         panic!("the worker answered something other than a response");
@@ -375,12 +371,11 @@ fn target(
 
 /// Sends one prepared mutation on a live connection and returns what the worker answered.
 async fn send_mutation(
-    client: &mut LocalClient,
+    client: &mut Client<impl Codec>,
     mutation: kr_protocol::envelope::MutationRequest,
 ) -> kr_protocol::envelope::Outcome {
     client
-        .writer()
-        .write_message(&kr_protocol::envelope::ControlFrame::Mutation(Box::new(
+        .send(&kr_protocol::envelope::ControlFrame::Mutation(Box::new(
             mutation,
         )))
         .await
@@ -534,8 +529,7 @@ async fn a_second_hello_cannot_change_what_a_connection_is() {
     // The first connection is fenced. Announcing itself as an ordinary local client would be a way
     // round the authority check, so a second hello is refused outright.
     first
-        .writer()
-        .write_message(&kr_protocol::envelope::ControlFrame::Hello(
+        .send(&kr_protocol::envelope::ControlFrame::Hello(
             kr_protocol::local::LocalHello {
                 offered_versions: vec![PROTOCOL_VERSION],
                 build_id: build(),
@@ -606,11 +600,7 @@ async fn a_read_admitted_under_a_revision_the_worker_has_passed_keeps_its_link()
         authority_deadline_boot_ms: Nullable::null(),
         history: None,
     }));
-    controller
-        .writer()
-        .write_message(&read)
-        .await
-        .expect("writes the read");
+    controller.send(&read).await.expect("writes the read");
     let ControlFrame::Response(response) = controller.recv().await.expect("the worker answers")
     else {
         panic!("a read is answered with a response");
@@ -640,12 +630,11 @@ async fn only_the_controller_that_holds_authority_announces_a_revision() {
         reach: kr_protocol::worker::RevisionReach::Host,
         evidence_from: 0,
     };
-    cli.writer()
-        .write_message(&kr_protocol::envelope::ControlFrame::AuthorityRevision(
-            notice.clone(),
-        ))
-        .await
-        .expect("writes the notice");
+    cli.send(&kr_protocol::envelope::ControlFrame::AuthorityRevision(
+        notice.clone(),
+    ))
+    .await
+    .expect("writes the notice");
     let reply = cli.recv().await.expect("the worker answers");
     assert!(
         matches!(
@@ -661,8 +650,7 @@ async fn only_the_controller_that_holds_authority_announces_a_revision() {
 
     let mut controller = controller_client(&host, 1).await;
     controller
-        .writer()
-        .write_message(&kr_protocol::envelope::ControlFrame::AuthorityRevision(
+        .send(&kr_protocol::envelope::ControlFrame::AuthorityRevision(
             notice,
         ))
         .await
@@ -754,7 +742,11 @@ async fn a_subscription_on_a_fenced_connection_stops_delivering() {
 const LIVENESS_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// Waits for session output to reach this client, and fails with how long it waited when none does.
-async fn expect_output_within(client: &mut LocalClient, window: std::time::Duration, what: &str) {
+async fn expect_output_within(
+    client: &mut Client<impl Codec>,
+    window: std::time::Duration,
+    what: &str,
+) {
     let started = tokio::time::Instant::now();
     assert!(
         output_within(client, window).await,
@@ -764,7 +756,7 @@ async fn expect_output_within(client: &mut LocalClient, window: std::time::Durat
 }
 
 /// Returns whether any session output reaches this client inside `window`.
-async fn output_within(client: &mut LocalClient, window: std::time::Duration) -> bool {
+async fn output_within(client: &mut Client<impl Codec>, window: std::time::Duration) -> bool {
     let deadline = tokio::time::Instant::now() + window;
     while tokio::time::Instant::now() < deadline {
         let remaining = deadline - tokio::time::Instant::now();
@@ -928,7 +920,7 @@ async fn withdrawal_completes_while_the_peer_has_stopped_reading() {
 ///
 /// Returns whether the pipeline filled: the worker's replies no longer fit in the socket, so its
 /// connection loop is waiting inside a write, and this client's own writes stop going through too.
-async fn saturate(client: &mut LocalClient, session_id: SessionId) -> bool {
+async fn saturate(client: &mut Client<impl Codec>, session_id: SessionId) -> bool {
     let params = kr_protocol::envelope::ParamsValue::from_typed(&SessionReadParams { session_id })
         .expect("encodes");
     for index in 0..20_000_u64 {
@@ -939,11 +931,9 @@ async fn saturate(client: &mut LocalClient, session_id: SessionId) -> bool {
                 method_version: kr_protocol::method::MethodVersion::V1,
                 params: params.clone(),
             });
-        let written = tokio::time::timeout(
-            std::time::Duration::from_millis(500),
-            client.writer().write_message(&request),
-        )
-        .await;
+        let written =
+            tokio::time::timeout(std::time::Duration::from_millis(500), client.send(&request))
+                .await;
         match written {
             // This client's own write is now waiting, which means the worker has stopped reading,
             // which means the worker is waiting inside a write of its own.

@@ -19,7 +19,7 @@
 use std::sync::Arc;
 
 use kr_client::ipc::IpcTransport;
-use kr_ipc::client::LocalClient;
+use kr_ipc::client::{BoundLink, Client, Codec, LocalClient};
 use kr_ipc::endpoint::Listener;
 use kr_ipc::verify::{ControllerIdentity, WorkerIdentity};
 use kr_protocol::actor::{ActorEnvelope, ActorIngress};
@@ -468,20 +468,15 @@ async fn inspect(
 }
 
 /// Connects as the control daemon and proves the generation this worker accepts.
-async fn daemon(host: &Host) -> LocalClient {
+async fn daemon(host: &Host) -> BoundLink {
     daemon_receiving(host, kr_protocol::hello::ReceiveLimits::default()).await
 }
 
 /// Connects as the control daemon declaring what it receives, and proves the generation.
-async fn daemon_receiving(host: &Host, limits: kr_protocol::hello::ReceiveLimits) -> LocalClient {
+async fn daemon_receiving(host: &Host, limits: kr_protocol::hello::ReceiveLimits) -> BoundLink {
     let mut daemon = within(
         "the daemon's connection",
-        LocalClient::connect_receiving(
-            &host.endpoint,
-            LocalClientKind::Controller,
-            build(),
-            limits,
-        ),
+        BoundLink::connect_receiving(&host.endpoint, build(), limits),
     )
     .await
     .expect("connects as the daemon");
@@ -501,13 +496,9 @@ async fn daemon_receiving(host: &Host, limits: kr_protocol::hello::ReceiveLimits
 }
 
 /// Writes one frame and returns the worker's answer to it.
-async fn exchange(client: &mut LocalClient, frame: ControlFrame) -> Outcome {
+async fn exchange(client: &mut Client<impl Codec>, frame: ControlFrame) -> Outcome {
     within("the worker's answer", async {
-        client
-            .writer()
-            .write_message(&frame)
-            .await
-            .expect("writes the frame");
+        client.send(&frame).await.expect("writes the frame");
         loop {
             match client.recv().await.expect("the worker answers") {
                 ControlFrame::Response(response) => return response.outcome,
@@ -1696,7 +1687,7 @@ async fn a_worker_states_that_it_reads_a_forwarded_scope() {
     let host = host().await;
     let client = within(
         "a local connection",
-        LocalClient::connect(&host.endpoint, LocalClientKind::Controller, build()),
+        BoundLink::connect(&host.endpoint, build()),
     )
     .await
     .expect("connects");

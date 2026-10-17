@@ -17,7 +17,7 @@
 
 use std::sync::Arc;
 
-use kr_ipc::client::LocalClient;
+use kr_ipc::client::{BoundLink, Client, Codec, LocalClient};
 use kr_ipc::endpoint::Listener;
 use kr_ipc::verify::{ControllerIdentity, WorkerIdentity};
 use kr_protocol::actor::{ActorEnvelope, ActorIngress};
@@ -193,15 +193,10 @@ async fn owner(host: &Host, limits: ReceiveLimits) -> LocalClient {
 }
 
 /// Connects as the control daemon declaring what it receives, and proves the generation.
-async fn daemon(host: &Host, limits: ReceiveLimits) -> LocalClient {
+async fn daemon(host: &Host, limits: ReceiveLimits) -> BoundLink {
     let mut daemon = within(
         "the daemon's connection",
-        LocalClient::connect_receiving(
-            &host.endpoint,
-            LocalClientKind::Controller,
-            build(),
-            limits,
-        ),
+        BoundLink::connect_receiving(&host.endpoint, build(), limits),
     )
     .await
     .expect("connects as the daemon");
@@ -275,7 +270,7 @@ fn fits(answer: &ParamsValue, frame: usize) {
 
 /// Reads one part on the owner's own connection, and holds it to the frame.
 async fn part(
-    client: &mut LocalClient,
+    client: &mut Client<impl Codec>,
     host: &Host,
     from_node: Option<u64>,
 ) -> AgentSnapshotResult {
@@ -294,7 +289,7 @@ async fn part(
 ///
 /// A continuation that does not move past where its own part started would have the reader ask
 /// for the same part for ever, so that fails here rather than looping.
-async fn every_part(client: &mut LocalClient, host: &Host) -> Vec<AgentSnapshotResult> {
+async fn every_part(client: &mut Client<impl Codec>, host: &Host) -> Vec<AgentSnapshotResult> {
     let mut parts = Vec::new();
     let mut from = None;
     loop {
@@ -457,11 +452,7 @@ async fn a_narrowed_part_counts_what_it_withheld_and_spends_nothing_on_it() {
         history: Some(reaching_back_to(2_000)),
     }));
     let outcome = within("the worker's answer", async {
-        daemon
-            .writer()
-            .write_message(&read)
-            .await
-            .expect("writes the read");
+        daemon.send(&read).await.expect("writes the read");
         loop {
             match daemon.recv().await.expect("the worker answers") {
                 ControlFrame::Response(response) => return response.outcome,
@@ -505,7 +496,7 @@ fn million(number: usize) -> String {
 
 /// Reads one part on the owner's own connection, and holds it to the usual frame.
 async fn usual_part(
-    client: &mut LocalClient,
+    client: &mut Client<impl Codec>,
     host: &Host,
     from_node: Option<u64>,
 ) -> AgentSnapshotResult {
@@ -628,7 +619,7 @@ fn second_device() -> ActorEnvelope {
 /// Forwards one device's read of a part as the daemon does, and holds the answer to the usual
 /// frame.
 async fn forwarded_part(
-    daemon: &mut LocalClient,
+    daemon: &mut Client<impl Codec>,
     host: &Host,
     actor: &ActorEnvelope,
     from_node: Option<u64>,
@@ -648,11 +639,7 @@ async fn forwarded_part(
         history: Some(reaching_back_to(0)),
     }));
     let outcome = within("the worker's answer", async {
-        daemon
-            .writer()
-            .write_message(&read)
-            .await
-            .expect("writes the read");
+        daemon.send(&read).await.expect("writes the read");
         loop {
             match daemon.recv().await.expect("the worker answers") {
                 ControlFrame::Response(response) => return response.outcome,

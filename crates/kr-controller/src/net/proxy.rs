@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use kr_ipc::client::LocalClient;
+use kr_ipc::client::BoundLink;
 use kr_protocol::actor::ActorEnvelope;
 use kr_protocol::envelope::{
     ControlEvent, ControlFrame, MutationRequest, ParamsValue, Request, Response,
@@ -24,7 +24,7 @@ use kr_protocol::envelope::{
 use kr_protocol::grant::HistoryScope;
 use kr_protocol::ids::{RequestId, SessionId};
 use kr_protocol::local::{
-    ControllerConnectionRole, ForwardedMutation, ForwardedRequest, LocalClientKind, ScreenBasis,
+    ControllerConnectionRole, ForwardedMutation, ForwardedRequest, ScreenBasis,
 };
 use kr_protocol::method::Method;
 use kr_protocol::rights::ActionRight;
@@ -212,7 +212,7 @@ pub struct WorkerProxy {
     /// A link that has ended closes its socket, which is what the worker reads as the connection
     /// going: that is how the attachment this link held is detached. A closed link that kept its
     /// writer would keep the attachment as well.
-    writer: Mutex<Option<kr_ipc::framed::FrameWriter>>,
+    writer: Mutex<Option<kr_ipc::client::LinkWriter>>,
     /// Shared with the reader task, because a response and the request that is waiting for it are
     /// one fact. Two maps would let a response arrive for a request that was never recorded.
     waiters: Arc<std::sync::Mutex<Waiters>>,
@@ -292,16 +292,10 @@ impl WorkerProxy {
         budget: Arc<RelayBudget>,
         lost: Arc<tokio::sync::Notify>,
     ) -> Result<Arc<Self>> {
-        let mut client = LocalClient::connect(
-            &worker.endpoint,
-            LocalClientKind::Controller,
-            controller.build_id.clone(),
-        )
-        .await?;
+        let mut client = BoundLink::connect(&worker.endpoint, controller.build_id.clone()).await?;
         client.verify_worker(&worker.descriptor).await?;
         client
-            .writer()
-            .write_message(&ControlFrame::ControllerRole(
+            .send(&ControlFrame::ControllerRole(
                 ControllerConnectionRole::Proxy,
             ))
             .await?;
@@ -590,7 +584,7 @@ impl WorkerProxy {
                     false,
                 );
             };
-            let written = writer.write_message(frame).await;
+            let written = writer.write(frame).await;
             let interrupted = writer.is_mid_frame();
             // A frame that stopped part way through leaves the stream in pieces, and the writer
             // refuses to continue one. A frame that could not be encoded at all left the stream
@@ -682,14 +676,14 @@ impl Drop for WorkerProxy {
 
 /// Reads one proxy link and routes what arrives.
 async fn read_loop(
-    mut reader: kr_ipc::framed::FrameReader,
+    mut reader: kr_ipc::client::LinkReader,
     waiters: Arc<std::sync::Mutex<Waiters>>,
     notifications: tokio::sync::mpsc::Sender<Relayed>,
     budget: Arc<RelayBudget>,
     lost: Arc<tokio::sync::Notify>,
 ) {
     loop {
-        let frame: ControlFrame = match reader.read_message().await {
+        let frame: ControlFrame = match reader.read().await {
             Ok(frame) => frame,
             Err(_) => break,
         };

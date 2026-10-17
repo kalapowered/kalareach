@@ -11,7 +11,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use kr_ipc::client::LocalClient;
+use kr_ipc::client::{BoundLink, LocalClient};
 use kr_ipc::endpoint::Listener;
 use kr_ipc::verify::{ControllerIdentity, WorkerIdentity};
 use kr_protocol::admission::{
@@ -132,8 +132,8 @@ async fn host() -> Host {
 }
 
 /// Connects as the daemon of `generation`, on the authority connection, and proves it.
-async fn daemon(host: &Host, generation: u64) -> LocalClient {
-    let mut client = LocalClient::connect(&host.endpoint, LocalClientKind::Controller, build())
+async fn daemon(host: &Host, generation: u64) -> BoundLink {
+    let mut client = BoundLink::connect(&host.endpoint, build())
         .await
         .expect("connects");
     let identity = Arc::clone(&host.controller);
@@ -292,7 +292,7 @@ async fn a_snapshot_applies_only_whole_and_never_from_a_connection_that_ended_pa
     let partial = daemon(&host, 1).await;
     let (reader, mut writer, _) = partial.into_halves();
     writer
-        .write_message(&ControlFrame::PluginAdmissions(Box::new(whole[0].clone())))
+        .write(&ControlFrame::PluginAdmissions(Box::new(whole[0].clone())))
         .await
         .expect("the first part is written");
     // Given the part time to arrive, and then the connection ends before the second part.

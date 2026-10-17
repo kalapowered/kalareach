@@ -14,7 +14,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use kr_ipc::client::LocalClient;
+use kr_ipc::client::{Client, Codec, LocalClient};
 use kr_plugin_sdk::identity::PluginIdentity;
 use kr_plugin_sdk::ids::RepositoryGeneration;
 use kr_plugin_sdk::version::PackageVersion;
@@ -396,7 +396,7 @@ impl Acting {
 
     pub fn invocation(
         &self,
-        client: &LocalClient,
+        client: &Client<impl Codec>,
         action: &str,
         parameters: &[u8],
     ) -> MutationRequest {
@@ -435,7 +435,7 @@ impl Acting {
     /// records the draft as sent and passes the prompt to this worker.
     pub fn prompting(
         &self,
-        client: &LocalClient,
+        client: &Client<impl Codec>,
         draft_id: kr_protocol::ids::DraftId,
     ) -> MutationRequest {
         let mut mutation = self.invocation(client, "turn.cancel", b"{}");
@@ -639,10 +639,9 @@ pub async fn scripted_upstream(
     }
 }
 
-pub async fn send(client: &mut LocalClient, mutation: MutationRequest) -> Outcome {
+pub async fn send(client: &mut Client<impl Codec>, mutation: MutationRequest) -> Outcome {
     client
-        .writer()
-        .write_message(&ControlFrame::Mutation(Box::new(mutation)))
+        .send(&ControlFrame::Mutation(Box::new(mutation)))
         .await
         .expect("writes the mutation");
     answer(client, None).await
@@ -650,7 +649,7 @@ pub async fn send(client: &mut LocalClient, mutation: MutationRequest) -> Outcom
 
 /// Reads frames until the response to `request_id` (or to the next request, where none is named)
 /// arrives.
-pub async fn answer(client: &mut LocalClient, request_id: Option<u64>) -> Outcome {
+pub async fn answer(client: &mut Client<impl Codec>, request_id: Option<u64>) -> Outcome {
     loop {
         match client.recv().await.expect("the worker answers") {
             ControlFrame::Response(response)
@@ -671,10 +670,9 @@ pub async fn answer(client: &mut LocalClient, request_id: Option<u64>) -> Outcom
 }
 
 /// Asks for an action's receipt on `client`, and does not wait for the answer.
-pub async fn ask_for_receipt(client: &mut LocalClient, action_id: ActionId) {
+pub async fn ask_for_receipt(client: &mut Client<impl Codec>, action_id: ActionId) {
     client
-        .writer()
-        .write_message(&ControlFrame::Request(kr_protocol::envelope::Request {
+        .send(&ControlFrame::Request(kr_protocol::envelope::Request {
             request_id: RequestId::new(900),
             method: Method::ActionRead.into(),
             method_version: MethodVersion::V1,
@@ -690,7 +688,7 @@ pub async fn ask_for_receipt(client: &mut LocalClient, action_id: ActionId) {
 
 /// Reads the answer to a request that [`ask_for_receipt`] made: the receipt, or what the worker
 /// said instead of one.
-pub async fn receipt_or_refusal(client: &mut LocalClient) -> Result<Receipt, String> {
+pub async fn receipt_or_refusal(client: &mut Client<impl Codec>) -> Result<Receipt, String> {
     match answer(client, Some(900)).await {
         Outcome::Ok(value) => Ok(value
             .to_typed::<ActionReadResult>()
@@ -701,18 +699,18 @@ pub async fn receipt_or_refusal(client: &mut LocalClient) -> Result<Receipt, Str
 }
 
 /// Reads the answer to a request that [`ask_for_receipt`] made.
-pub async fn receipt_answered(client: &mut LocalClient) -> Option<Receipt> {
+pub async fn receipt_answered(client: &mut Client<impl Codec>) -> Option<Receipt> {
     receipt_or_refusal(client).await.ok()
 }
 
 /// Asks for an action's receipt on `client`.
-pub async fn read_receipt(client: &mut LocalClient, action_id: ActionId) -> Option<Receipt> {
+pub async fn read_receipt(client: &mut Client<impl Codec>, action_id: ActionId) -> Option<Receipt> {
     ask_for_receipt(client, action_id).await;
     receipt_answered(client).await
 }
 
 /// Waits until the action's receipt is in any state but `accepted`, and returns it.
-pub async fn until_settled(client: &mut LocalClient, action_id: ActionId) -> Receipt {
+pub async fn until_settled(client: &mut Client<impl Codec>, action_id: ActionId) -> Receipt {
     let deadline = tokio::time::Instant::now() + PATIENCE;
     loop {
         ask_for_receipt(client, action_id).await;
@@ -731,7 +729,7 @@ pub async fn until_settled(client: &mut LocalClient, action_id: ActionId) -> Rec
 
 /// Waits until the action's receipt is in `state`.
 pub async fn until_receipt(
-    client: &mut LocalClient,
+    client: &mut Client<impl Codec>,
     action_id: ActionId,
     state: ReceiptState,
 ) -> Receipt {
@@ -937,7 +935,7 @@ impl Acting {
     /// The call that offers `attachment` of `draft_id` to the agent through `action`.
     pub fn offering(
         &self,
-        client: &LocalClient,
+        client: &Client<impl Codec>,
         action: &str,
         draft_id: kr_protocol::ids::DraftId,
         attachment: kr_protocol::ids::TransferId,

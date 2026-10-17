@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use common::{LIVENESS_DEADLINE, carries, produced, retained};
-use kr_ipc::client::LocalClient;
+use kr_ipc::client::{BoundLink, Client, Codec, LocalClient};
 use kr_ipc::clock::ManualSharedClock;
 use kr_ipc::endpoint::Listener;
 use kr_ipc::verify::{ControllerIdentity, WorkerIdentity};
@@ -243,13 +243,12 @@ impl World {
     }
 
     /// One of the control daemon's connections, for `generation`, in `role`.
-    async fn daemon(&self, generation: u64, role: ControllerConnectionRole) -> LocalClient {
-        let mut daemon = LocalClient::connect(&self.endpoint, LocalClientKind::Controller, build())
+    async fn daemon(&self, generation: u64, role: ControllerConnectionRole) -> BoundLink {
+        let mut daemon = BoundLink::connect(&self.endpoint, build())
             .await
             .expect("connects as the daemon");
         daemon
-            .writer()
-            .write_message(&ControlFrame::ControllerRole(role))
+            .send(&ControlFrame::ControllerRole(role))
             .await
             .expect("declares the role");
         match daemon.recv().await.expect("the worker answers") {
@@ -270,7 +269,7 @@ impl World {
     }
 
     /// The daemon's authority connection for `generation`.
-    async fn authority(&self, generation: u64) -> LocalClient {
+    async fn authority(&self, generation: u64) -> BoundLink {
         self.daemon(generation, ControllerConnectionRole::Authority)
             .await
     }
@@ -286,7 +285,7 @@ impl World {
     }
 
     /// A read of the session, which is held to the lease. Returns what the worker answered.
-    async fn read(&self, window: &mut LocalClient) -> Result<(), ProtocolError> {
+    async fn read(&self, window: &mut Client<impl Codec>) -> Result<(), ProtocolError> {
         window
             .request(
                 Method::SessionRead,
@@ -300,7 +299,7 @@ impl World {
     }
 
     /// Attaches a terminal that observes and types, in one of the owner's windows.
-    async fn attach(&self, window: &mut LocalClient) -> AttachmentId {
+    async fn attach(&self, window: &mut Client<impl Codec>) -> AttachmentId {
         let mut requested = CanonicalSet::new();
         requested.insert(AttachmentCapability::ObserveTerminal);
         requested.insert(AttachmentCapability::Input);
@@ -327,7 +326,7 @@ impl World {
     }
 
     /// Takes the input lease for `attachment_id` and returns its epoch.
-    async fn acquire(&self, window: &mut LocalClient, attachment_id: AttachmentId) -> u64 {
+    async fn acquire(&self, window: &mut Client<impl Codec>, attachment_id: AttachmentId) -> u64 {
         let acquired: kr_protocol::input::InputAcquireResult = window
             .mutate(
                 Method::InputAcquire,
@@ -348,7 +347,7 @@ impl World {
     }
 
     /// Subscribes `attachment_id` to the session's output.
-    async fn subscribe(&self, window: &mut LocalClient, attachment_id: AttachmentId) {
+    async fn subscribe(&self, window: &mut Client<impl Codec>, attachment_id: AttachmentId) {
         let mut streams = CanonicalSet::new();
         streams.insert(EventStream::Output);
         window
@@ -369,7 +368,7 @@ impl World {
     /// Types `bytes` as the lease holder.
     async fn type_as(
         &self,
-        window: &mut LocalClient,
+        window: &mut Client<impl Codec>,
         attachment_id: AttachmentId,
         epoch: u64,
         sequence: u64,
@@ -406,7 +405,7 @@ impl World {
 }
 
 /// Tells the worker over `daemon` and returns the sequence it holds afterwards.
-async fn tell(daemon: &mut LocalClient, access: LocalAccess) -> u64 {
+async fn tell(daemon: &mut Client<impl Codec>, access: LocalAccess) -> u64 {
     daemon
         .announce_local_access(access)
         .await
@@ -446,8 +445,7 @@ async fn only_the_daemons_authority_connection_says_what_the_local_owner_may_do(
     refused(world.read(&mut window).await, "not yet told");
 
     window
-        .writer()
-        .write_message(&ControlFrame::LocalAccess(open(1)))
+        .send(&ControlFrame::LocalAccess(open(1)))
         .await
         .expect("writes the statement");
     let ControlFrame::Response(response) = window.recv().await.expect("the worker answers") else {

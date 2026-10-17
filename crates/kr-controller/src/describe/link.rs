@@ -128,7 +128,7 @@ impl Drop for Links {
 
 /// Keeps one request held over an open connection until it fails, handing each page to the host.
 async fn read(
-    mut client: kr_ipc::client::LocalClient,
+    mut client: kr_ipc::client::BoundLink,
     host: &Weak<DescribeHost>,
     session_id: SessionId,
 ) {
@@ -149,8 +149,7 @@ async fn read(
             generation: Nullable(named.map(U64::new)),
         };
         if client
-            .writer()
-            .write_message(&ControlFrame::DescriptionFacts(asked))
+            .send(&ControlFrame::DescriptionFacts(asked))
             .await
             .is_err()
         {

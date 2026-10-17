@@ -2,9 +2,8 @@
 
 use std::sync::{Arc, Weak};
 
-use kr_ipc::client::LocalClient;
+use kr_ipc::client::BoundLink;
 use kr_protocol::ids::SessionId;
-use kr_protocol::local::LocalClientKind;
 use kr_protocol::method::Method;
 use kr_protocol::session::{SessionReadParams, SessionReadResult, SessionSummary};
 use kr_transport::lease::WorkerBinding;
@@ -13,8 +12,8 @@ use crate::directory::{KnownWorker, Reconnect};
 use crate::error::{ControllerError, Result};
 use crate::service::net::proxy::{Purpose, WorkerProxy};
 
+use super::Controller;
 use super::recovery::ReservationHold;
-use super::{Controller, reported_read};
 
 /// The resource kind a closure uses to say its worker was never confirmed gone.
 ///
@@ -62,16 +61,16 @@ pub(crate) struct WorkerLink {
     binding: WorkerBinding,
     /// The link, out of the slot. It is declared before `slot`, so it is closed before the slot is
     /// released.
-    client: Option<LocalClient>,
+    client: Option<BoundLink>,
     /// Whether the link went back whole, or was never put at risk.
     returned: bool,
     /// The slot, held from taking the link until the link is dropped.
-    slot: tokio::sync::OwnedMutexGuard<Option<LocalClient>>,
+    slot: tokio::sync::OwnedMutexGuard<Option<BoundLink>>,
 }
 
 impl WorkerLink {
     /// The link, for the exchange. It was opened when the slot was empty.
-    pub(crate) fn client(&mut self) -> &mut LocalClient {
+    pub(crate) fn client(&mut self) -> &mut BoundLink {
         self.client.as_mut().expect("the link is out of its slot")
     }
 
@@ -244,16 +243,18 @@ impl Controller {
     /// is already being let go writes on the thread it is on, which it keeps until the write ends.
     pub(super) async fn write_descriptor(&self, worker: &KnownWorker) -> Result<()> {
         let Some(daemon) = self.me.upgrade() else {
-            return Ok(kr_ipc::descriptor::publish(
+            return Ok(kr_ipc::descriptor::publish_for(
+                worker.level,
                 &self.paths,
                 &worker.descriptor,
             )?);
         };
         let descriptor = worker.descriptor.clone();
+        let level = worker.level;
         tokio::task::spawn_blocking(move || {
             #[cfg(test)]
             daemon.before_a_descriptor_is_written.wait();
-            kr_ipc::descriptor::publish(&daemon.paths, &descriptor)
+            kr_ipc::descriptor::publish_for(level, &daemon.paths, &descriptor)
         })
         .await
         .map_err(|_| {
@@ -410,9 +411,11 @@ impl Controller {
         // the path rather than outliving it: the link is dropped, which does both. An answer
         // that is a refusal is a whole exchange, and the link goes back.
         let result = result?;
+        let level = link.client().level();
         link.give_back();
         let read = match result {
-            Ok(value) => reported_read(&value)
+            Ok(value) => level
+                .decode_value::<SessionReadResult>(&value)
                 .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?,
             Err(error) => return Err(ControllerError::InvalidArgument(error.to_string())),
         };
@@ -479,7 +482,7 @@ impl Controller {
     pub(super) fn link_in(
         &self,
         session_id: SessionId,
-        mut slot: tokio::sync::OwnedMutexGuard<Option<LocalClient>>,
+        mut slot: tokio::sync::OwnedMutexGuard<Option<BoundLink>>,
     ) -> Option<WorkerLink> {
         let client = slot.take()?;
         Some(WorkerLink {
@@ -505,13 +508,8 @@ impl Controller {
         self.worker_client(&worker).await
     }
 
-    async fn open_worker(&self, worker: &KnownWorker) -> Result<LocalClient> {
-        let mut client = LocalClient::connect(
-            &worker.endpoint,
-            LocalClientKind::Controller,
-            self.build_id.clone(),
-        )
-        .await?;
+    async fn open_worker(&self, worker: &KnownWorker) -> Result<BoundLink> {
+        let mut client = BoundLink::connect(&worker.endpoint, self.build_id.clone()).await?;
         // Two proofs, both required: the worker proves it is the one the descriptor names, and
         // this daemon proves which generation it speaks for.
         client.verify_worker(&worker.descriptor).await?;

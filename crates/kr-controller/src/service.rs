@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use kr_ipc::client::LocalClient;
+use kr_ipc::client::BoundLink;
 use kr_ipc::paths::EnvironmentPaths;
 use kr_ipc::verify::ControllerIdentity;
 use kr_protocol::envelope::{ControlFrame, Outcome, ParamsValue, Response};
@@ -19,8 +19,7 @@ use kr_protocol::identity::BootIdentity;
 use kr_protocol::ids::{
     BootEpoch, BuildId, ConnectionId, ControllerGeneration, RequestId, SessionId,
 };
-use kr_protocol::scalars::{CanonicalSet, Nullable, TimestampMs};
-use kr_protocol::session::{SessionReadResult, SessionSummary};
+use kr_protocol::scalars::{CanonicalSet, TimestampMs};
 use kr_protocol::worker::ReservationId;
 use kr_transport::clock::{ContinuousClock, SystemContinuousClock};
 use kr_transport::window::ActionWindowIssuer;
@@ -323,7 +322,7 @@ pub struct Controller {
     /// a daemon that opened a fresh connection for every call would spend its time fencing itself:
     /// a status read would invalidate a close that had already been authorised. One connection per
     /// worker, used in order, is what stops that.
-    connections: Mutex<BTreeMap<SessionId, Arc<tokio::sync::Mutex<Option<LocalClient>>>>>,
+    connections: Mutex<BTreeMap<SessionId, Arc<tokio::sync::Mutex<Option<BoundLink>>>>>,
     /// The links remote connections hold to each session's worker, which the session's closure
     /// ends. Weakly, because a link belongs to the connection that opened it.
     ///
@@ -1057,56 +1056,6 @@ impl Controller {
     #[must_use]
     pub const fn mailbox_reader(&self) -> Option<&crate::mailbox_reader::MailboxReader> {
         self.mailbox_reader.as_ref()
-    }
-}
-
-/// Reads a worker's answer to `session.read`.
-///
-/// A daemon is replaced without its workers: an upgrade restarts this process and leaves every
-/// live session's worker running the build that started it. Such a worker answers with the fields
-/// its own build has, and the three this build added are not among them: the launch profile, the
-/// last command block and the outstanding launch count. It is read through [`ReportedRead`]
-/// instead, which is that answer with those three absent, so an upgraded daemon goes on listing
-/// and describing the sessions it inherited.
-///
-/// Remove `ReportedRead` and this fallback once no worker from a build before those fields can
-/// still be running, which is when every session that was live across the upgrade has closed.
-///
-/// # Errors
-///
-/// Returns the decoding failure when the answer is neither shape.
-pub(crate) fn reported_read(value: &ParamsValue) -> std::result::Result<SessionReadResult, String> {
-    match value.to_typed::<SessionReadResult>() {
-        Ok(read) => Ok(read),
-        // The older shape is checked against its own schema before it is decoded, like any
-        // answer: an answer with a field neither shape declares is refused, not read as this.
-        Err(error) => match value.to_typed::<ReportedRead>() {
-            Ok(reported) => Ok(reported.into()),
-            // Neither shape, so it is reported as the answer this build cannot read rather than
-            // as an older worker's.
-            Err(_) => Err(error.to_string()),
-        },
-    }
-}
-
-/// A session read as a worker from a build before the launch profile answers it.
-#[derive(serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
-#[serde(deny_unknown_fields)]
-struct ReportedRead {
-    session: SessionSummary,
-    endpoint: Nullable<String>,
-}
-
-impl From<ReportedRead> for SessionReadResult {
-    fn from(reported: ReportedRead) -> Self {
-        Self {
-            session: reported.session,
-            endpoint: reported.endpoint,
-            // A worker that does not report these says nothing about them, which is what null is.
-            launch_profile: Nullable::null(),
-            last_command_block: Nullable::null(),
-            outstanding_launches: Nullable::null(),
-        }
     }
 }
 

@@ -149,6 +149,13 @@ pub enum IpcError {
         /// The level this daemon's release retains.
         level: String,
     },
+    /// A frame this release would write to a worker carries what the worker's level cannot read,
+    /// so it is not written.
+    #[error("{0}")]
+    NotInLevel(String),
+    /// A worker sent what the surface of its own level does not admit.
+    #[error("{0}")]
+    OutsideLevel(String),
     /// A worker refused a request because this connection no longer speaks for the controller
     /// generation that holds its authority ([`ProtocolError::link_fenced`]).
     ///
@@ -211,9 +218,10 @@ impl IpcError {
             Self::Frame(error) => error.code(),
             Self::UnexpectedMessage(_) | Self::TruncatedFrame { .. } => ErrorCode::InvalidArgument,
             Self::PeerClosed => ErrorCode::ResourceUnavailable,
-            Self::VersionMismatch { .. } | Self::UnretainedLevel { .. } => {
+            Self::VersionMismatch { .. } | Self::UnretainedLevel { .. } | Self::OutsideLevel(_) => {
                 ErrorCode::UnsupportedSchema
             }
+            Self::NotInLevel(_) => ErrorCode::UnsupportedCapability,
         }
     }
 
@@ -264,5 +272,18 @@ mod tests {
             std::io::Error::from(std::io::ErrorKind::PermissionDenied),
         );
         assert_eq!(denied.code(), ErrorCode::ResourceUnavailable);
+    }
+}
+
+impl From<kr_protocol::retained::CodecError> for IpcError {
+    fn from(error: kr_protocol::retained::CodecError) -> Self {
+        use kr_protocol::retained::CodecError;
+        match error {
+            CodecError::Cbor(error) => Self::Frame(kr_protocol::frame::FrameError::Cbor(error)),
+            CodecError::NotInLevel { .. } => Self::NotInLevel(error.to_string()),
+            CodecError::OutsideLevel { .. } | CodecError::NotInSurface(_) => {
+                Self::OutsideLevel(error.to_string())
+            }
+        }
     }
 }

@@ -2,10 +2,9 @@
 
 use std::sync::Arc;
 
-use kr_ipc::client::LocalClient;
+use kr_ipc::client::BoundLink;
 use kr_protocol::envelope::ControlFrame;
 use kr_protocol::ids::SessionId;
-use kr_protocol::local::LocalClientKind;
 
 use crate::directory::KnownWorker;
 use crate::error::{ControllerError, Result};
@@ -24,19 +23,15 @@ impl Controller {
         me: &std::sync::Weak<Self>,
         worker: &KnownWorker,
         role: kr_protocol::local::ControllerConnectionRole,
-    ) -> Result<LocalClient> {
+    ) -> Result<BoundLink> {
         let stopping = || ControllerError::supervision("the daemon is stopping");
         let build_id = me
             .upgrade()
             .map(|controller| controller.build_id.clone())
             .ok_or_else(stopping)?;
-        let mut client =
-            LocalClient::connect(&worker.endpoint, LocalClientKind::Controller, build_id).await?;
+        let mut client = BoundLink::connect(&worker.endpoint, build_id).await?;
         client.verify_worker(&worker.descriptor).await?;
-        client
-            .writer()
-            .write_message(&ControlFrame::ControllerRole(role))
-            .await?;
+        client.send(&ControlFrame::ControllerRole(role)).await?;
         match client.recv().await? {
             ControlFrame::ControllerRole(declared) if declared == role => {}
             _ => {
@@ -165,7 +160,7 @@ impl crate::attention::Reach for AttentionReach {
     fn connect<'a>(
         &'a self,
         worker: &'a KnownWorker,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<LocalClient>> + Send + 'a>> {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<BoundLink>> + Send + 'a>> {
         Box::pin(Controller::connect_role(
             &self.0,
             worker,

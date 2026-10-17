@@ -426,8 +426,7 @@ async fn kr_req_23_30_a_forwarded_action_revoked_while_the_component_prepared_is
     let action_id = mutation.action_id;
     let host = acting.stop_host();
     proxy
-        .writer()
-        .write_message(&ControlFrame::Forwarded(Box::new(
+        .send(&ControlFrame::Forwarded(Box::new(
             kr_protocol::local::ForwardedMutation {
                 mutation,
                 actor: device.clone(),
@@ -449,8 +448,7 @@ async fn kr_req_23_30_a_forwarded_action_revoked_while_the_component_prepared_is
     let mut accepted = false;
     for _ in 0..2_400 {
         proxy
-            .writer()
-            .write_message(&ControlFrame::ForwardedRead(Box::new(
+            .send(&ControlFrame::ForwardedRead(Box::new(
                 kr_protocol::local::ForwardedRequest {
                     request: kr_protocol::envelope::Request {
                         request_id: RequestId::new(900),

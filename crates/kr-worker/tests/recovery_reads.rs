@@ -22,7 +22,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use kr_ipc::client::LocalClient;
+use kr_ipc::client::{BoundLink, Client, Codec, LocalClient};
 use kr_ipc::endpoint::Listener;
 use kr_ipc::verify::{ControllerIdentity, WorkerIdentity};
 use kr_protocol::actor::{ActorEnvelope, ActorIngress};
@@ -424,20 +424,15 @@ async fn owner(host: &Host, limits: ReceiveLimits) -> LocalClient {
 }
 
 /// Connects as the control daemon and proves the generation, to forward a device's reads.
-async fn daemon(host: &Host) -> LocalClient {
+async fn daemon(host: &Host) -> BoundLink {
     daemon_receiving(host, ReceiveLimits::default()).await
 }
 
 /// Connects as the control daemon receiving `limits`, and proves the generation.
-async fn daemon_receiving(host: &Host, limits: ReceiveLimits) -> LocalClient {
+async fn daemon_receiving(host: &Host, limits: ReceiveLimits) -> BoundLink {
     let mut daemon = within(
         "the daemon's connection",
-        LocalClient::connect_receiving(
-            &host.endpoint,
-            LocalClientKind::Controller,
-            build(),
-            limits,
-        ),
+        BoundLink::connect_receiving(&host.endpoint, build(), limits),
     )
     .await
     .expect("connects as the daemon");
@@ -481,7 +476,7 @@ fn reaching_back_to(lower_bound_ms: u64) -> HistoryScope {
 
 /// Forwards one device's read as the daemon does, with the scope of the device's grant.
 async fn forwarded<T: serde::Serialize>(
-    daemon: &mut LocalClient,
+    daemon: &mut Client<impl Codec>,
     scope: Option<HistoryScope>,
     method: Method,
     params: &T,
@@ -501,11 +496,7 @@ async fn forwarded<T: serde::Serialize>(
         history: scope,
     }));
     within("the worker's answer", async {
-        daemon
-            .writer()
-            .write_message(&read)
-            .await
-            .expect("writes the read");
+        daemon.send(&read).await.expect("writes the read");
         loop {
             match daemon.recv().await.expect("the worker answers") {
                 ControlFrame::Response(response) if response.request_id == request_id => {
@@ -524,7 +515,7 @@ async fn forwarded<T: serde::Serialize>(
 /// Forwards one of the device's mutations as the daemon does, admitted under a grant that lets it
 /// watch the session.
 async fn forwarded_mutation<T: serde::Serialize>(
-    daemon: &mut LocalClient,
+    daemon: &mut Client<impl Codec>,
     host: &Host,
     method: Method,
     params: &T,
@@ -551,11 +542,7 @@ async fn forwarded_mutation<T: serde::Serialize>(
         screen_basis: None,
     }));
     within("the worker's answer", async {
-        daemon
-            .writer()
-            .write_message(&mutation)
-            .await
-            .expect("writes the mutation");
+        daemon.send(&mutation).await.expect("writes the mutation");
         loop {
             match daemon.recv().await.expect("the worker answers") {
                 ControlFrame::Response(response) if response.request_id == request_id => {
@@ -590,7 +577,7 @@ fn fits(answer: &ParamsValue, frame: usize) {
 /// `frame`, and returns the resources in the order the pages carried them and how many pages it
 /// took.
 async fn every_page(
-    reader: &mut LocalClient,
+    reader: &mut Client<impl Codec>,
     host: &Host,
     frame: usize,
 ) -> (Vec<PendingResourceId>, usize) {

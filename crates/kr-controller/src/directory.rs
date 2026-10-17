@@ -20,13 +20,13 @@
 
 use std::collections::BTreeMap;
 
-use kr_ipc::client::LocalClient;
+use kr_ipc::client::BoundLink;
 use kr_ipc::paths::{Endpoint, EnvironmentPaths};
 use kr_ipc::verify::ControllerIdentity;
 use kr_protocol::identity::BootIdentity;
 use kr_protocol::ids::{BuildId, ControllerGeneration, SessionId};
-use kr_protocol::local::LocalClientKind;
 use kr_protocol::method::Method;
+use kr_protocol::retained::Level;
 use kr_protocol::scalars::Nullable;
 use kr_protocol::session::{SessionReadParams, SessionReadResult, SessionState, SessionSummary};
 use kr_protocol::worker::WorkerDescriptor;
@@ -48,6 +48,10 @@ pub struct KnownWorker {
     pub descriptor: WorkerDescriptor,
     /// The worker's endpoint.
     pub endpoint: Endpoint,
+    /// The level the worker stated when this daemon met it, which every frame to and from it is
+    /// read and written under. Kept in memory only: a daemon that starts again meets the worker
+    /// again and reads it from its answer.
+    pub level: Level,
 }
 
 /// Why a descriptor is not in the directory.
@@ -164,11 +168,12 @@ impl Directory {
                 continue;
             }
             match reconnect_to(&descriptor, reconnect).await {
-                Ok((endpoint, described)) => {
+                Ok((endpoint, described, level)) => {
                     directory.insert(
                         KnownWorker {
                             descriptor,
                             endpoint,
+                            level,
                         },
                         described,
                     );
@@ -310,18 +315,14 @@ pub struct Reconnect<'a> {
 async fn reconnect_to(
     descriptor: &WorkerDescriptor,
     reconnect: &Reconnect<'_>,
-) -> std::result::Result<(Endpoint, Option<SessionSummary>), String> {
+) -> std::result::Result<(Endpoint, Option<SessionSummary>, Level), String> {
     let endpoint = Endpoint::from_path(&descriptor.endpoint).map_err(|error| error.to_string())?;
     // Bounded, because starting the daemon must not depend on a worker that never answers. A
     // descriptor that runs out of time is quarantined like any other that fails its challenge.
     let mut client = tokio::time::timeout(RECONNECT_TIMEOUT, async {
-        let mut client = LocalClient::connect(
-            &endpoint,
-            LocalClientKind::Controller,
-            reconnect.build_id.clone(),
-        )
-        .await
-        .map_err(|error| error.to_string())?;
+        let mut client = BoundLink::connect(&endpoint, reconnect.build_id.clone())
+            .await
+            .map_err(|error| error.to_string())?;
         client
             .verify_worker(descriptor)
             .await
@@ -342,7 +343,7 @@ async fn reconnect_to(
     .await
     .map_err(|_| "the worker did not answer its challenge in time".to_owned())??;
     let described = describe(&mut client, descriptor.session_id).await;
-    Ok((endpoint, described))
+    Ok((endpoint, described, client.level()))
 }
 
 /// Asks a worker this daemon has just verified to describe its session, over the connection it
@@ -351,10 +352,10 @@ async fn reconnect_to(
 /// The description is what a read that later meets the worker on its way out is answered from
 /// ([`Directory::ending`]). It is asked for with a bound of its own, after the worker has proved
 /// itself, and a worker that does not give one in time, or refuses, is admitted without it: a
-/// close has to be able to reach it all the same. An answer from a worker of an earlier build is
-/// read as that build wrote it.
+/// close has to be able to reach it all the same. The answer is read as the worker's level
+/// writes it.
 pub(crate) async fn describe(
-    client: &mut LocalClient,
+    client: &mut BoundLink,
     session_id: SessionId,
 ) -> Option<SessionSummary> {
     let answer = tokio::time::timeout(
@@ -365,7 +366,8 @@ pub(crate) async fn describe(
     .ok()?
     .ok()?
     .ok()?;
-    crate::service::reported_read(&answer)
+    client
+        .decode::<SessionReadResult>(&answer)
         .ok()
         .map(|read| read.session)
 }
@@ -392,6 +394,7 @@ mod tests {
             .worker_endpoint(DisplayNumber::new(1))
             .expect("an endpoint");
         KnownWorker {
+            level: kr_protocol::retained::Level::this(),
             descriptor: WorkerDescriptor {
                 session_id,
                 session_epoch: SessionEpoch::V1,

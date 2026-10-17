@@ -316,8 +316,7 @@ async fn a_subscription_replaced_part_way_through_a_frame_leaves_the_stream_whol
     let pause = host.service.pause_before_replacing_delivery();
     let params = ParamsValue::from_typed(&subscription(&host, second)).expect("encodes");
     client
-        .writer()
-        .write_message(&ControlFrame::Request(Request {
+        .send(&ControlFrame::Request(Request {
             request_id: RequestId::new(REPLACING),
             method: Method::EventsSubscribe.into(),
             method_version: MethodVersion::V1,
@@ -480,8 +479,7 @@ async fn replaced_while_delivering(produce: impl FnOnce(&Host)) -> Sent {
     let pause = host.service.pause_before_replacing_delivery();
     let params = ParamsValue::from_typed(&subscription(&host, second)).expect("encodes");
     client
-        .writer()
-        .write_message(&ControlFrame::Request(Request {
+        .send(&ControlFrame::Request(Request {
             request_id: RequestId::new(REPLACING),
             method: Method::EventsSubscribe.into(),
             method_version: MethodVersion::V1,
@@ -662,8 +660,7 @@ async fn replaced_before_it_wrote_anything(holder_dimensions: Dimensions) {
     for (request, attachment) in [(REPLACING, holder), (REPLACING + 1, watcher)] {
         let params = ParamsValue::from_typed(&subscription(&host, attachment)).expect("encodes");
         client
-            .writer()
-            .write_message(&ControlFrame::Request(Request {
+            .send(&ControlFrame::Request(Request {
                 request_id: RequestId::new(request),
                 method: Method::EventsSubscribe.into(),
                 method_version: MethodVersion::V1,

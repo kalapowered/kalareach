@@ -17,7 +17,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use kr_ipc::client::LocalClient;
+use kr_ipc::client::{BoundLink, Client, Codec, LocalClient};
 use kr_ipc::endpoint::Listener;
 use kr_ipc::verify::{ControllerIdentity, WorkerIdentity};
 use kr_protocol::actor::{ActorEnvelope, ActorIngress};
@@ -180,10 +180,10 @@ async fn host() -> Host {
 }
 
 /// A control daemon of generation 1, which the worker accepts.
-async fn daemon(host: &Host) -> LocalClient {
+async fn daemon(host: &Host) -> BoundLink {
     let mut daemon = within(
         "the daemon's connection",
-        LocalClient::connect(&host.endpoint, LocalClientKind::Controller, build()),
+        BoundLink::connect(&host.endpoint, build()),
     )
     .await
     .expect("connects as the daemon");
@@ -250,16 +250,12 @@ fn reaching(bound: u64) -> Grant {
 }
 
 async fn exchange(
-    daemon: &mut LocalClient,
+    daemon: &mut Client<impl Codec>,
     frame: ControlFrame,
     request_id: RequestId,
 ) -> Result<ParamsValue, ProtocolError> {
     within("the worker's answer", async {
-        daemon
-            .writer()
-            .write_message(&frame)
-            .await
-            .expect("writes the frame");
+        daemon.send(&frame).await.expect("writes the frame");
         loop {
             match daemon.recv().await.expect("the worker answers") {
                 ControlFrame::Response(response) if response.request_id == request_id => {
@@ -300,7 +296,7 @@ fn mutation_of<T: serde::Serialize>(
 }
 
 async fn forward<T: serde::Serialize>(
-    daemon: &mut LocalClient,
+    daemon: &mut Client<impl Codec>,
     host: &Host,
     actor: &ActorEnvelope,
     grant: &Grant,
@@ -323,7 +319,7 @@ async fn forward<T: serde::Serialize>(
 
 /// A read the daemon forwards for a device, holding it to the history scope of its grant.
 async fn forward_read<T: serde::Serialize>(
-    daemon: &mut LocalClient,
+    daemon: &mut Client<impl Codec>,
     actor: &ActorEnvelope,
     grant: &Grant,
     method: Method,
@@ -902,7 +898,7 @@ async fn kr_req_10_49_a_retried_cancellation_is_shown_as_an_answer_is() {
 // ---------------------------------------------------------------------------------------------
 
 async fn read_action(
-    daemon: &mut LocalClient,
+    daemon: &mut Client<impl Codec>,
     actor: &ActorEnvelope,
     grant: &Grant,
     action_id: ActionId,

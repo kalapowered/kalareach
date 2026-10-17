@@ -15,7 +15,7 @@
 
 use std::sync::Arc;
 
-use kr_ipc::client::LocalClient;
+use kr_ipc::client::{BoundLink, Client, Codec, LocalClient};
 use kr_ipc::endpoint::Listener;
 use kr_ipc::verify::{ControllerIdentity, WorkerIdentity};
 use kr_protocol::action::{
@@ -199,7 +199,7 @@ async fn cli(host: &Host) -> LocalClient {
         .expect("connects")
 }
 
-async fn controller_client(host: &Host) -> LocalClient {
+async fn controller_client(host: &Host) -> BoundLink {
     controller_client_declaring(host, None).await
 }
 
@@ -208,14 +208,13 @@ async fn controller_client(host: &Host) -> LocalClient {
 async fn controller_client_declaring(
     host: &Host,
     role: Option<ControllerConnectionRole>,
-) -> LocalClient {
-    let mut client = LocalClient::connect(&host.endpoint, LocalClientKind::Controller, build())
+) -> BoundLink {
+    let mut client = BoundLink::connect(&host.endpoint, build())
         .await
         .expect("connects");
     if let Some(role) = role {
         client
-            .writer()
-            .write_message(&ControlFrame::ControllerRole(role))
+            .send(&ControlFrame::ControllerRole(role))
             .await
             .expect("declares the role");
         match client.recv().await.expect("the worker answers") {
@@ -248,7 +247,7 @@ fn target(host: &Host) -> ActionTarget {
 
 /// A `session.close` mutation, which is the one mutation every worker serves.
 fn close_mutation(
-    client: &LocalClient,
+    client: &Client<impl Codec>,
     host: &Host,
     ttl_ms: u64,
     expected: ParamsValue,
@@ -270,10 +269,9 @@ fn close_mutation(
     }
 }
 
-async fn send_mutation(client: &mut LocalClient, mutation: MutationRequest) -> Outcome {
+async fn send_mutation(client: &mut Client<impl Codec>, mutation: MutationRequest) -> Outcome {
     client
-        .writer()
-        .write_message(&ControlFrame::Mutation(Box::new(mutation)))
+        .send(&ControlFrame::Mutation(Box::new(mutation)))
         .await
         .expect("writes the mutation");
     loop {
@@ -285,12 +283,8 @@ async fn send_mutation(client: &mut LocalClient, mutation: MutationRequest) -> O
     }
 }
 
-async fn send_frame(client: &mut LocalClient, frame: ControlFrame) -> Outcome {
-    client
-        .writer()
-        .write_message(&frame)
-        .await
-        .expect("writes the frame");
+async fn send_frame(client: &mut Client<impl Codec>, frame: ControlFrame) -> Outcome {
+    client.send(&frame).await.expect("writes the frame");
     loop {
         match client.recv().await.expect("the worker answers") {
             ControlFrame::Response(response) => return response.outcome,
@@ -301,12 +295,8 @@ async fn send_frame(client: &mut LocalClient, frame: ControlFrame) -> Outcome {
 }
 
 /// The frame that answers `frame`, whichever kind of response it is.
-async fn answer_to(client: &mut LocalClient, frame: ControlFrame) -> ControlFrame {
-    client
-        .writer()
-        .write_message(&frame)
-        .await
-        .expect("writes the frame");
+async fn answer_to(client: &mut Client<impl Codec>, frame: ControlFrame) -> ControlFrame {
+    client.send(&frame).await.expect("writes the frame");
     loop {
         match client.recv().await.expect("the worker answers") {
             answer @ (ControlFrame::Response(_) | ControlFrame::RetainedResponse(_)) => {
@@ -318,10 +308,9 @@ async fn answer_to(client: &mut LocalClient, frame: ControlFrame) -> ControlFram
     }
 }
 
-async fn send_request(client: &mut LocalClient, request: Request) -> Outcome {
+async fn send_request(client: &mut Client<impl Codec>, request: Request) -> Outcome {
     client
-        .writer()
-        .write_message(&ControlFrame::Request(request))
+        .send(&ControlFrame::Request(request))
         .await
         .expect("writes the request");
     loop {
@@ -1303,11 +1292,7 @@ async fn the_host_authorises_against_current_state_and_a_relayed_envelope_grants
         history: None,
         screen_basis: None,
     }));
-    client
-        .writer()
-        .write_message(&forwarded)
-        .await
-        .expect("writes the frame");
+    client.send(&forwarded).await.expect("writes the frame");
     let answer = loop {
         match client.recv().await.expect("the worker answers") {
             ControlFrame::Response(response) => break response.outcome,
@@ -3207,7 +3192,7 @@ async fn a_ninth_outstanding_mutation_is_refused() {
 }
 
 /// An ordinary mutation the outstanding-mutation limit bounds.
-fn bounded_mutation(client: &LocalClient, host: &Host) -> MutationRequest {
+fn bounded_mutation(client: &Client<impl Codec>, host: &Host) -> MutationRequest {
     let mut requested = kr_protocol::scalars::CanonicalSet::new();
     requested.insert(kr_protocol::attachment::AttachmentCapability::ObserveTerminal);
     MutationRequest {
@@ -3531,7 +3516,7 @@ async fn a_reconnect_discards_unsent_keystrokes_rather_than_replaying_them() {
     assert_eq!(error.code, ErrorCode::LeaseLost);
 }
 
-async fn attach(client: &mut LocalClient, host: &Host) -> kr_protocol::ids::AttachmentId {
+async fn attach(client: &mut Client<impl Codec>, host: &Host) -> kr_protocol::ids::AttachmentId {
     let mut requested = kr_protocol::scalars::CanonicalSet::new();
     requested.insert(kr_protocol::attachment::AttachmentCapability::ObserveTerminal);
     requested.insert(kr_protocol::attachment::AttachmentCapability::Input);
@@ -3557,7 +3542,7 @@ async fn attach(client: &mut LocalClient, host: &Host) -> kr_protocol::ids::Atta
 }
 
 async fn acquire(
-    client: &mut LocalClient,
+    client: &mut Client<impl Codec>,
     host: &Host,
     attachment_id: kr_protocol::ids::AttachmentId,
 ) -> kr_protocol::ids::InputLeaseEpoch {
@@ -3580,7 +3565,7 @@ async fn acquire(
 }
 
 async fn write_input(
-    client: &mut LocalClient,
+    client: &mut Client<impl Codec>,
     host: &Host,
     attachment_id: kr_protocol::ids::AttachmentId,
     epoch: kr_protocol::ids::InputLeaseEpoch,

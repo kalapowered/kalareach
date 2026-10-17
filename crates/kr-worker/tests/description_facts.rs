@@ -10,7 +10,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use kr_ipc::client::LocalClient;
+use kr_ipc::client::BoundLink;
 use kr_ipc::endpoint::Listener;
 use kr_ipc::verify::{ControllerIdentity, WorkerIdentity};
 use kr_protocol::describe::{
@@ -23,7 +23,7 @@ use kr_protocol::identity::{DesktopBinding, WorkerProfile};
 use kr_protocol::ids::{
     AttachmentId, BuildId, ControllerGeneration, EnvironmentId, RequestId, SessionEpoch, SessionId,
 };
-use kr_protocol::local::{ControllerConnectionRole, LocalClientKind};
+use kr_protocol::local::ControllerConnectionRole;
 use kr_protocol::privacy::PrivacyGenerationNotice;
 use kr_protocol::root::{
     CwdRevision, PromptGeneration, RootCommandBlockParams, RootCommandResolveParams,
@@ -173,13 +173,12 @@ async fn host(script: &str) -> Host {
 }
 
 /// A connection of the daemon's, declared for `role` and speaking for generation one.
-async fn daemon(host: &Host, role: ControllerConnectionRole) -> LocalClient {
-    let mut client = LocalClient::connect(&host.endpoint, LocalClientKind::Controller, build())
+async fn daemon(host: &Host, role: ControllerConnectionRole) -> BoundLink {
+    let mut client = BoundLink::connect(&host.endpoint, build())
         .await
         .expect("connects");
     client
-        .writer()
-        .write_message(&ControlFrame::ControllerRole(role))
+        .send(&ControlFrame::ControllerRole(role))
         .await
         .expect("declares the role");
     match client.recv().await.expect("the worker answers") {
@@ -206,7 +205,7 @@ enum Answer {
     Refused(RequestId, ErrorCode),
 }
 
-async fn next_answer(link: &mut LocalClient) -> Answer {
+async fn next_answer(link: &mut BoundLink) -> Answer {
     loop {
         match link.recv().await.expect("the worker answers") {
             ControlFrame::DescriptionFactsPage(page) => return Answer::Page(page),
@@ -231,16 +230,15 @@ fn request(id: u64, after: u64, wait_ms: u64, generation: Option<u64>) -> Descri
     }
 }
 
-async fn send(link: &mut LocalClient, request: DescriptionFactsRequest) {
-    link.writer()
-        .write_message(&ControlFrame::DescriptionFacts(request))
+async fn send(link: &mut BoundLink, request: DescriptionFactsRequest) {
+    link.send(&ControlFrame::DescriptionFacts(request))
         .await
         .expect("writes the request");
 }
 
 /// Asks once and reads the page that answers, which has to arrive within [`LIVENESS`].
 async fn ask(
-    link: &mut LocalClient,
+    link: &mut BoundLink,
     id: u64,
     after: u64,
     wait_ms: u64,
@@ -250,7 +248,7 @@ async fn ask(
     page(link).await
 }
 
-async fn page(link: &mut LocalClient) -> DescriptionFactsPage {
+async fn page(link: &mut BoundLink) -> DescriptionFactsPage {
     match tokio::time::timeout(LIVENESS, next_answer(link))
         .await
         .expect("the worker answers in time")
@@ -393,10 +391,9 @@ fn type_in(host: &mut Host, sequence: u64, bytes: &[u8]) {
 
 /// Tells the session its privacy generation, on the daemon's authority connection, as the daemon
 /// does, and returns once the worker has answered.
-async fn tell_privacy(host: &Host, authority: &mut LocalClient, generation: u64, enabled: bool) {
+async fn tell_privacy(host: &Host, authority: &mut BoundLink, generation: u64, enabled: bool) {
     authority
-        .writer()
-        .write_message(&ControlFrame::PrivacyGeneration(PrivacyGenerationNotice {
+        .send(&ControlFrame::PrivacyGeneration(PrivacyGenerationNotice {
             environment_id: host.environment_id,
             generation: U64::new(generation),
             enabled,
@@ -438,8 +435,7 @@ async fn the_descriptions_connection_carries_facts_requests_only_and_a_newer_one
     // Anything else on it is refused, and the refusal names the request: a read the daemon's
     // other connections may make, and an attention request.
     older
-        .writer()
-        .write_message(&ControlFrame::Request(kr_protocol::envelope::Request {
+        .send(&ControlFrame::Request(kr_protocol::envelope::Request {
             request_id: RequestId::new(5),
             method: kr_protocol::method::Method::SessionRead.into(),
             method_version: kr_protocol::method::MethodVersion::V1,
@@ -476,8 +472,7 @@ async fn the_descriptions_connection_carries_facts_requests_only_and_a_newer_one
     let second = ask(&mut newer, 2, 0, 0, None).await;
     assert_eq!(second.request_id, RequestId::new(2));
     older
-        .writer()
-        .write_message(&ControlFrame::DescriptionFacts(request(3, 0, 0, None)))
+        .send(&ControlFrame::DescriptionFacts(request(3, 0, 0, None)))
         .await
         .ok();
     // Fenced is an explicit refusal or a closed connection; a connection that says nothing at all

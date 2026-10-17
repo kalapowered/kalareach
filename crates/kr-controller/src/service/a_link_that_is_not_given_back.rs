@@ -687,6 +687,7 @@ impl Served {
                 .expect("the worker is started")
         };
         let worker = crate::directory::KnownWorker {
+            level: kr_protocol::retained::Level::this(),
             descriptor: kr_protocol::worker::WorkerDescriptor {
                 session_id,
                 session_epoch: SessionEpoch::V1,
@@ -801,15 +802,12 @@ impl Served {
 
     /// A control daemon of the next generation takes the worker over, which fences every
     /// connection of this daemon's generation. Returns its connection, which holds the worker.
-    pub(super) async fn a_newer_generation_takes_over(&self) -> kr_ipc::client::LocalClient {
+    pub(super) async fn a_newer_generation_takes_over(&self) -> kr_ipc::client::BoundLink {
         let controller = &self.controller;
-        let mut client = kr_ipc::client::LocalClient::connect(
-            &self.worker.endpoint,
-            kr_protocol::local::LocalClientKind::Controller,
-            controller.build_id.clone(),
-        )
-        .await
-        .expect("connects");
+        let mut client =
+            kr_ipc::client::BoundLink::connect(&self.worker.endpoint, controller.build_id.clone())
+                .await
+                .expect("connects");
         let newer = kr_protocol::ids::ControllerGeneration::new(controller.generation.get() + 1);
         let boot = controller.boot_identity.clone();
         let identity = &controller.identity;

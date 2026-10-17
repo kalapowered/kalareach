@@ -20,12 +20,14 @@ use kr_protocol::envelope::{
     ControlEvent, ControlFrame, MutationRequest, Outcome, ParamsValue, Request, Response,
 };
 use kr_protocol::error::ProtocolError;
-use kr_protocol::frame::{FRAME_LENGTH_PREFIX_LEN, StreamKind};
+use kr_protocol::frame::{FRAME_LENGTH_PREFIX_LEN, FrameCodec, StreamKind};
 use kr_protocol::hello::{PROTOCOL_VERSION, ReceiveLimits};
 use kr_protocol::ids::{ActionId, BuildId, RequestId};
 use kr_protocol::local::{BridgeOrigin, LocalClientKind, LocalHello, LocalHelloAck};
 use kr_protocol::method::{Method, MethodVersion};
+use kr_protocol::retained::Level;
 use kr_protocol::scalars::{CanonicalSet, DurationMs, Nullable};
+use kr_protocol::wire::WireMessage;
 use kr_protocol::worker::{
     ControllerGenerationToken, GenerationAccepted, WorkerDescriptor, WorkerVerifyProof,
 };
@@ -36,9 +38,48 @@ use crate::framed::{FrameReader, FrameWriter, split};
 use crate::paths::Endpoint;
 use crate::verify::{check_proof, fresh_challenge};
 
+/// How a client reads and writes its frames.
+///
+/// A client is under this release's own level ([`ThisLevel`]), as every client of the host is but
+/// one kind; or it is a control daemon's link to a worker ([`Bound`]), and speaks the level that
+/// worker stated, through the retained codec of that level. The two differ in their types, and not
+/// in a value tried at run time, so that a link to a worker has no way to the raw halves of its
+/// stream: a frame written to a worker is written through its level or not at all.
+pub trait Codec: Copy + std::fmt::Debug + Send + Sync + 'static {
+    /// The level frames are read and written under.
+    fn level(self) -> Level;
+}
+
+/// This release's own level.
+#[derive(Clone, Copy, Debug)]
+pub struct ThisLevel;
+
+impl Codec for ThisLevel {
+    fn level(self) -> Level {
+        Level::this()
+    }
+}
+
+/// The level of the worker a control daemon's link speaks to.
+#[derive(Clone, Copy, Debug)]
+pub struct Bound(Level);
+
+impl Codec for Bound {
+    fn level(self) -> Level {
+        self.0
+    }
+}
+
 /// A connected local client.
+pub type LocalClient = Client<ThisLevel>;
+
+/// A control daemon's link to one worker, bound to the level the worker stated.
+pub type BoundLink = Client<Bound>;
+
+/// A connected local client, under a codec.
 #[derive(Debug)]
-pub struct LocalClient {
+pub struct Client<C: Codec> {
+    codec: C,
     reader: FrameReader,
     writer: FrameWriter,
     acknowledgement: LocalHelloAck,
@@ -48,9 +89,8 @@ pub struct LocalClient {
     ///
     /// A call reads frames until its answer arrives, and what it reads on the way is this
     /// connection's subscription, not an answer to anything: it is kept here, oldest first, and
-    /// handed back by [`LocalClient::take_held`] or by the next [`LocalClient::recv`]. Both drain
-    /// this before the socket, so a frame the host sent first is never delivered after one it sent
-    /// afterwards.
+    /// handed back by [`Client::take_held`] or by the next [`Client::recv`]. Both drain this before
+    /// the socket, so a frame the host sent first is never delivered after one it sent afterwards.
     held: VecDeque<Held>,
     /// What those frames occupy on the wire, length prefixes included.
     held_bytes: usize,
@@ -140,44 +180,150 @@ impl LocalClient {
         max_receive: ReceiveLimits,
         origin: Option<BridgeOrigin>,
     ) -> Result<Self> {
-        let connection = Connection::connect(endpoint).await?;
-        let (mut reader, mut writer) = split(connection, StreamKind::Control);
-        writer
-            .write_message(&ControlFrame::Hello(LocalHello {
-                offered_versions: vec![PROTOCOL_VERSION],
-                build_id,
-                client: kind,
-                capabilities: CanonicalSet::new(),
-                max_receive,
-                origin,
-            }))
-            .await?;
-        // The acknowledgement is read before the client exists, so there is never a moment when a
-        // `LocalClient` holds an invented connection identity or an invented action window.
-        let acknowledgement = match reader.read_message().await? {
-            ControlFrame::HelloAck(acknowledgement) => *acknowledgement,
-            ControlFrame::Response(Response {
-                outcome: Outcome::Error(error),
-                ..
-            }) => {
-                return Err(IpcError::IdentityUnavailable {
-                    what: "the host refused the connection",
-                    detail: error.to_string(),
-                });
-            }
-            _ => {
-                return Err(IpcError::UnexpectedMessage(
-                    "the host did not acknowledge the hello",
-                ));
-            }
-        };
-        if acknowledgement.selected_version.major != PROTOCOL_VERSION.major {
-            return Err(IpcError::VersionMismatch {
-                host: PROTOCOL_VERSION.to_string(),
-                offered: acknowledgement.selected_version.to_string(),
+        if kind == LocalClientKind::Controller {
+            return Err(IpcError::UnexpectedMessage(
+                "a control daemon's link to a worker is made with BoundLink, which speaks the \
+                 worker's level",
+            ));
+        }
+        let (reader, writer, acknowledgement) =
+            hello(endpoint, kind, build_id, max_receive, origin).await?;
+        Ok(Self {
+            codec: ThisLevel,
+            reader,
+            writer,
+            acknowledgement,
+            generation_challenge: None,
+            next_request: 0,
+            held: VecDeque::new(),
+            held_bytes: 0,
+        })
+    }
+
+    /// Returns the writing half, for a caller that streams input.
+    pub const fn writer(&mut self) -> &mut FrameWriter {
+        &mut self.writer
+    }
+
+    /// Splits the client into its two halves.
+    ///
+    /// A caller that takes the halves takes the stream itself, so anything this client is still
+    /// holding for it has to be collected first: drain [`Client::take_held`] until it is empty, or
+    /// split before the first call. Both callers in this workspace split a connection they have
+    /// only just opened, where nothing has been pushed yet.
+    #[must_use]
+    pub fn into_halves(self) -> (FrameReader, FrameWriter, LocalHelloAck) {
+        debug_assert!(
+            self.held.is_empty(),
+            "the halves are taken with {} frame(s) still held for this caller",
+            self.held.len()
+        );
+        (self.reader, self.writer, self.acknowledgement)
+    }
+}
+
+/// Opens a connection and says hello, as every client does, and returns the halves of the stream
+/// and the host's answer. The hello and its answer are read in this release's own shape: they are
+/// what tells a control daemon the level of a worker.
+async fn hello(
+    endpoint: &Endpoint,
+    kind: LocalClientKind,
+    build_id: BuildId,
+    max_receive: ReceiveLimits,
+    origin: Option<BridgeOrigin>,
+) -> Result<(FrameReader, FrameWriter, LocalHelloAck)> {
+    let connection = Connection::connect(endpoint).await?;
+    let (mut reader, mut writer) = split(connection, StreamKind::Control);
+    writer
+        .write_message(&ControlFrame::Hello(LocalHello {
+            offered_versions: vec![PROTOCOL_VERSION],
+            build_id,
+            client: kind,
+            capabilities: CanonicalSet::new(),
+            max_receive,
+            origin,
+        }))
+        .await?;
+    // The acknowledgement is read before the client exists, so there is never a moment when a
+    // client holds an invented connection identity or an invented action window.
+    let acknowledgement = match reader.read_message().await? {
+        ControlFrame::HelloAck(acknowledgement) => *acknowledgement,
+        ControlFrame::Response(Response {
+            outcome: Outcome::Error(error),
+            ..
+        }) => {
+            return Err(IpcError::IdentityUnavailable {
+                what: "the host refused the connection",
+                detail: error.to_string(),
             });
         }
-        let mut client = Self {
+        _ => {
+            return Err(IpcError::UnexpectedMessage(
+                "the host did not acknowledge the hello",
+            ));
+        }
+    };
+    if acknowledgement.selected_version.major != PROTOCOL_VERSION.major {
+        return Err(IpcError::VersionMismatch {
+            host: PROTOCOL_VERSION.to_string(),
+            offered: acknowledgement.selected_version.to_string(),
+        });
+    }
+    Ok((reader, writer, acknowledgement))
+}
+
+impl BoundLink {
+    /// Connects a control daemon to a worker and binds the link to the level the worker states.
+    ///
+    /// The worker's answer to the hello says its level before anything else is exchanged, so a
+    /// worker at a level this release does not speak at is refused here, before its challenge is
+    /// read and before any generation is presented: no path that adopts a worker can take one this
+    /// daemon cannot read or write the frames of. The worker offers its generation challenge as
+    /// soon as a controller announces itself, so the nonce is bound to this connection from its
+    /// first frame. It is held until the token is presented and used exactly once.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IpcError::UnretainedLevel`] naming what the worker stated, an error when nothing
+    /// is listening or the peer is refused, and the worker's refusal of the controller connection.
+    pub async fn connect(endpoint: &Endpoint, build_id: BuildId) -> Result<Self> {
+        Self::connecting(endpoint, build_id, ReceiveLimits::default()).await
+    }
+
+    /// Connects and says the link can receive `max_receive`, rather than the usual limits.
+    ///
+    /// A host cuts what it answers to fit what the peer said it can receive, and a peer that can
+    /// receive far less than usual is how that cutting is proved. Every link this product makes
+    /// connects with the usual limits; this is compiled away outside this repository's own tests.
+    ///
+    /// # Errors
+    ///
+    /// Returns what [`BoundLink::connect`] returns.
+    #[cfg(feature = "testing")]
+    pub async fn connect_receiving(
+        endpoint: &Endpoint,
+        build_id: BuildId,
+        max_receive: ReceiveLimits,
+    ) -> Result<Self> {
+        Self::connecting(endpoint, build_id, max_receive).await
+    }
+
+    async fn connecting(
+        endpoint: &Endpoint,
+        build_id: BuildId,
+        max_receive: ReceiveLimits,
+    ) -> Result<Self> {
+        let (reader, writer, acknowledgement) = hello(
+            endpoint,
+            LocalClientKind::Controller,
+            build_id,
+            max_receive,
+            None,
+        )
+        .await?;
+        let level = retained_level(acknowledgement.build.as_ref())?;
+        let mut link = Self {
+            codec: Bound(level),
             reader,
             writer,
             acknowledgement,
@@ -186,39 +332,61 @@ impl LocalClient {
             held: VecDeque::new(),
             held_bytes: 0,
         };
-        if kind == LocalClientKind::Controller {
-            // A control daemon speaks to a worker only at a compatibility level its release
-            // retains, and this release retains its own. The worker's answer says its level before
-            // anything else is exchanged, so a worker at another level is refused here, before its
-            // challenge is read and before any generation is presented: no path that adopts a
-            // worker can take one this daemon cannot read or write the frames of.
-            refuse_an_unretained_level(client.acknowledgement.build.as_ref())?;
-            // A worker offers its generation challenge as soon as a controller announces itself, so
-            // the nonce is bound to this connection from its first frame. It is held until the
-            // token is presented and used exactly once.
-            match client.read_frame().await? {
-                ControlFrame::GenerationChallenge(challenge) => {
-                    client.generation_challenge = Some(challenge);
-                }
-                ControlFrame::Response(Response {
-                    outcome: Outcome::Error(error),
-                    ..
-                }) => {
-                    return Err(IpcError::IdentityUnavailable {
-                        what: "the worker refused the controller connection",
-                        detail: error.to_string(),
-                    });
-                }
-                _ => {
-                    return Err(IpcError::UnexpectedMessage(
-                        "the worker did not offer a generation challenge",
-                    ));
-                }
+        match link.read_frame().await? {
+            ControlFrame::GenerationChallenge(challenge) => {
+                link.generation_challenge = Some(challenge);
+            }
+            ControlFrame::Response(Response {
+                outcome: Outcome::Error(error),
+                ..
+            }) => {
+                return Err(IpcError::IdentityUnavailable {
+                    what: "the worker refused the controller connection",
+                    detail: error.to_string(),
+                });
+            }
+            _ => {
+                return Err(IpcError::UnexpectedMessage(
+                    "the worker did not offer a generation challenge",
+                ));
             }
         }
-        Ok(client)
+        Ok(link)
     }
 
+    /// The level this link speaks.
+    #[must_use]
+    pub const fn level(&self) -> Level {
+        self.codec.0
+    }
+
+    /// Splits the link into its two halves, which keep the level.
+    ///
+    /// A caller that takes the halves takes the stream itself, so anything this link is still
+    /// holding for it has to be collected first, as for [`LocalClient::into_halves`].
+    #[must_use]
+    pub fn into_halves(self) -> (LinkReader, LinkWriter, LocalHelloAck) {
+        debug_assert!(
+            self.held.is_empty(),
+            "the halves are taken with {} frame(s) still held for this caller",
+            self.held.len()
+        );
+        let level = self.codec.0;
+        (
+            LinkReader {
+                level,
+                reader: self.reader,
+            },
+            LinkWriter {
+                level,
+                writer: self.writer,
+            },
+            self.acknowledgement,
+        )
+    }
+}
+
+impl<C: Codec> Client<C> {
     /// Returns what the host said about this connection.
     #[must_use]
     pub const fn acknowledgement(&self) -> &LocalHelloAck {
@@ -236,9 +404,7 @@ impl LocalClient {
         descriptor: &WorkerDescriptor,
     ) -> Result<WorkerVerifyProof> {
         let challenge = fresh_challenge().map_err(IpcError::from)?;
-        self.writer
-            .write_message(&ControlFrame::VerifyChallenge(challenge))
-            .await?;
+        self.send(&ControlFrame::VerifyChallenge(challenge)).await?;
         let ControlFrame::VerifyProof(proof) = self.read_frame().await? else {
             return Err(IpcError::UnexpectedMessage(
                 "the worker did not answer the challenge",
@@ -266,9 +432,7 @@ impl LocalClient {
         endpoint: &str,
     ) -> Result<WorkerVerifyProof> {
         let challenge = fresh_challenge().map_err(IpcError::from)?;
-        self.writer
-            .write_message(&ControlFrame::VerifyChallenge(challenge))
-            .await?;
+        self.send(&ControlFrame::VerifyChallenge(challenge)).await?;
         let ControlFrame::VerifyProof(proof) = self.read_frame().await? else {
             return Err(IpcError::UnexpectedMessage(
                 "the worker did not answer the challenge",
@@ -302,8 +466,7 @@ impl LocalClient {
                 "the worker did not issue a generation challenge",
             ))?;
         let token = sign(&challenge.nonce)?;
-        self.writer
-            .write_message(&ControlFrame::GenerationToken(Box::new(token)))
+        self.send(&ControlFrame::GenerationToken(Box::new(token)))
             .await?;
         match self.read_frame().await? {
             ControlFrame::GenerationAccepted(accepted) => Ok(accepted),
@@ -342,16 +505,14 @@ impl LocalClient {
         params: &T,
     ) -> Result<std::result::Result<ParamsValue, ProtocolError>> {
         let request_id = self.next_id();
-        let params = ParamsValue::from_typed(params)
-            .map_err(|error| IpcError::Frame(kr_protocol::frame::FrameError::Cbor(error)))?;
-        self.writer
-            .write_message(&ControlFrame::Request(Request {
-                request_id,
-                method: method.into(),
-                method_version: MethodVersion::V1,
-                params,
-            }))
-            .await?;
+        let params = self.codec.level().encode_params(method, params)?;
+        self.send(&ControlFrame::Request(Request {
+            request_id,
+            method: method.into(),
+            method_version: MethodVersion::V1,
+            params,
+        }))
+        .await?;
         self.await_response(request_id).await
     }
 
@@ -373,8 +534,7 @@ impl LocalClient {
         // The window this mutation will quote is taken after everything the host has already
         // pushed has been applied.
         let mutation = self.compose(method, action_id, target, params).await?;
-        self.writer
-            .write_message(&ControlFrame::Mutation(Box::new(mutation.clone())))
+        self.send(&ControlFrame::Mutation(Box::new(mutation.clone())))
             .await?;
         self.await_response(mutation.request_id).await
     }
@@ -397,8 +557,7 @@ impl LocalClient {
         // The window this mutation will quote is taken after everything the host has already
         // pushed has been applied.
         self.absorb_pending().await?;
-        let params = ParamsValue::from_typed(params)
-            .map_err(|error| IpcError::Frame(kr_protocol::frame::FrameError::Cbor(error)))?;
+        let params = self.codec.level().encode_params(method, params)?;
         Ok(MutationRequest {
             request_id: self.next_id(),
             method: method.into(),
@@ -436,8 +595,7 @@ impl LocalClient {
         // The only field that is this connection's rather than the action's. A response correlates
         // a request on one connection; the durable identity is the action identifier.
         mutation.request_id = request_id;
-        self.writer
-            .write_message(&ControlFrame::Mutation(Box::new(mutation)))
+        self.send(&ControlFrame::Mutation(Box::new(mutation)))
             .await?;
         self.await_response(request_id).await
     }
@@ -448,8 +606,7 @@ impl LocalClient {
     ///
     /// Returns a transport failure.
     pub async fn confirm_delivery(&mut self, action_id: ActionId) -> Result<()> {
-        self.writer
-            .write_message(&ControlFrame::AcceptanceDelivered(action_id))
+        self.send(&ControlFrame::AcceptanceDelivered(action_id))
             .await
     }
 
@@ -532,7 +689,7 @@ impl LocalClient {
         refused: &'static str,
         acknowledgement: impl FnOnce(ControlFrame) -> Option<T>,
     ) -> Result<T> {
-        self.writer.write_message(notice).await?;
+        self.send(notice).await?;
         loop {
             match self.read_socket_frame().await? {
                 ControlFrame::Notification(notification) => {
@@ -583,8 +740,7 @@ impl LocalClient {
         for part in parts {
             tokio::time::timeout(
                 per_part,
-                self.writer
-                    .write_message(&ControlFrame::PluginAdmissions(Box::new(part))),
+                self.send(&ControlFrame::PluginAdmissions(Box::new(part))),
             )
             .await
             .map_err(|_| late())??;
@@ -672,18 +828,17 @@ impl LocalClient {
             ));
         }
         let request_id = mutation.request_id;
-        self.writer
-            .write_message(&ControlFrame::Forwarded(Box::new(
-                kr_protocol::local::ForwardedMutation {
-                    mutation: mutation.clone(),
-                    actor: actor.clone(),
-                    grant_rights: grant_rights.clone(),
-                    accepted_deadline_boot_ms,
-                    history: None,
-                    screen_basis: None,
-                },
-            )))
-            .await?;
+        self.send(&ControlFrame::Forwarded(Box::new(
+            kr_protocol::local::ForwardedMutation {
+                mutation: mutation.clone(),
+                actor: actor.clone(),
+                grant_rights: grant_rights.clone(),
+                accepted_deadline_boot_ms,
+                history: None,
+                screen_basis: None,
+            },
+        )))
+        .await?;
         self.await_response(request_id).await
     }
 
@@ -718,27 +873,6 @@ impl LocalClient {
         Some(held.frame)
     }
 
-    /// Returns the writing half, for a caller that streams input.
-    pub const fn writer(&mut self) -> &mut FrameWriter {
-        &mut self.writer
-    }
-
-    /// Splits the client into its two halves.
-    ///
-    /// A caller that takes the halves takes the stream itself, so anything this client is still
-    /// holding for it has to be collected first: drain [`Self::take_held`] until it is empty, or
-    /// split before the first call. Both callers in this workspace split a connection they have
-    /// only just opened, where nothing has been pushed yet.
-    #[must_use]
-    pub fn into_halves(self) -> (FrameReader, FrameWriter, LocalHelloAck) {
-        debug_assert!(
-            self.held.is_empty(),
-            "the halves are taken with {} frame(s) still held for this caller",
-            self.held.len()
-        );
-        (self.reader, self.writer, self.acknowledgement)
-    }
-
     /// Returns the next frame of this connection's stream, held or freshly read.
     ///
     /// What a call kept comes first, because it arrived first. Only when nothing is held does this
@@ -764,7 +898,7 @@ impl LocalClient {
     /// already held instead of being read back out in front of it.
     async fn read_socket_frame(&mut self) -> Result<ControlFrame> {
         loop {
-            let frame: ControlFrame = self.reader.read_message().await?;
+            let frame: ControlFrame = self.receive().await?;
             match frame {
                 ControlFrame::Event(ControlEvent::ActionWindowRenewed(window)) => {
                     self.acknowledgement.action_window = window;
@@ -829,7 +963,7 @@ impl LocalClient {
             // part way through a frame costs nothing.
             let frame: Option<ControlFrame> = tokio::select! {
                 biased;
-                frame = self.reader.read_message::<ControlFrame>() => Some(frame?),
+                frame = self.receive() => Some(frame?),
                 () = std::future::ready(()) => None,
             };
             match frame {
@@ -882,10 +1016,65 @@ impl LocalClient {
         }
     }
 
+    /// Reads a worker's answer, or the parameters of a request, as the type `T` under the level
+    /// this client is under. A value that does not decode is an error, never passed on.
+    ///
+    /// # Errors
+    ///
+    /// Returns what the level's surface or this build's decoder refuses.
+    pub fn decode<T: WireMessage>(&self, value: &ParamsValue) -> Result<T> {
+        Ok(self.codec.level().decode_value::<T>(value)?)
+    }
+
+    /// Writes one frame, as the level this client is under reads it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IpcError::NotInLevel`] for a frame the level cannot read, which is then not
+    /// written, and a transport failure.
+    pub async fn send(&mut self, frame: &ControlFrame) -> Result<()> {
+        let payload = self
+            .codec
+            .level()
+            .encode(frame, &StreamKind::Control.cbor_limits())?;
+        let framed = FrameCodec::new(StreamKind::Control).encode(&payload)?;
+        self.writer.write_frame(&framed).await
+    }
+
+    /// Reads one frame, as the level this client is under writes it. The reader keeps its place in
+    /// a frame, so a read that is cancelled resumes.
+    async fn receive(&mut self) -> Result<ControlFrame> {
+        let payload = self.reader.read_payload().await?;
+        Ok(self
+            .codec
+            .level()
+            .decode(&payload, &StreamKind::Control.cbor_limits())?)
+    }
+
     fn next_id(&mut self) -> RequestId {
         self.next_request += 1;
         RequestId::new(self.next_request)
     }
+}
+
+/// The level a worker is at, from what it stated in its answer to the hello.
+///
+/// This release speaks to a worker at its own level and at the levels it retains
+/// ([`kr_protocol::retained::levels`]); a worker at any other level, and one that states no build,
+/// is one an update to this release waits for rather than meets.
+///
+/// # Errors
+///
+/// Returns [`IpcError::UnretainedLevel`] naming what the worker stated.
+pub fn retained_level(stated: Option<&kr_protocol::local::LocalBuild>) -> Result<Level> {
+    Level::of(stated).map_err(|unretained| IpcError::UnretainedLevel {
+        worker: unretained.to_string(),
+        level: kr_protocol::retained::levels()
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(" and "),
+    })
 }
 
 /// What a frame occupies on the wire, its four-byte length prefix included.
@@ -893,35 +1082,75 @@ impl LocalClient {
 /// A count of frames is not a bound on memory: one notification can carry a whole batch of output,
 /// so the bound is in the same bytes section 9 states a send queue in. A frame that cannot be
 /// encoded is charged everything, which refuses it rather than admitting something unmeasured.
-/// Refuses a worker whose stated build is at a compatibility level this build's control daemon
-/// does not retain, and a worker that states no build, which is of a build before the statement.
-///
-/// This release retains only its own level ([`kr_protocol::update::THIS_LEVEL`]): the frames of any
-/// other are frames this build may not read, and a worker of another level is one an update to
-/// this release waits for rather than meets.
-///
-/// # Errors
-///
-/// Returns [`IpcError::UnretainedLevel`] naming what the worker stated.
-pub fn refuse_an_unretained_level(stated: Option<&kr_protocol::local::LocalBuild>) -> Result<()> {
-    match stated {
-        Some(build) if kr_protocol::update::THIS_LEVEL.admits(build.protocol_version) => Ok(()),
-        Some(build) => Err(IpcError::UnretainedLevel {
-            worker: format!(
-                "{} with protocol {}",
-                build.build_id, build.protocol_version
-            ),
-            level: kr_protocol::update::THIS_LEVEL.to_string(),
-        }),
-        None => Err(IpcError::UnretainedLevel {
-            worker: "a build that states no protocol version".to_owned(),
-            level: kr_protocol::update::THIS_LEVEL.to_string(),
-        }),
-    }
-}
-
 fn charge(frame: &ControlFrame) -> usize {
     kr_cbor::to_canonical_value(frame)
         .map(|value| kr_cbor::encoded_len(&value).saturating_add(FRAME_LENGTH_PREFIX_LEN))
         .unwrap_or(usize::MAX)
+}
+
+/// The reading half of a control daemon's link to a worker.
+#[derive(Debug)]
+pub struct LinkReader {
+    level: Level,
+    reader: FrameReader,
+}
+
+impl LinkReader {
+    /// A reading half over a stream a test holds the other end of, under `level`.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub const fn over(level: Level, reader: FrameReader) -> Self {
+        Self { level, reader }
+    }
+
+    /// Reads the next frame, as the worker's level writes it.
+    ///
+    /// # Errors
+    ///
+    /// Returns a transport failure, or a frame the level's surface does not admit.
+    pub async fn read(&mut self) -> Result<ControlFrame> {
+        let payload = self.reader.read_payload().await?;
+        Ok(self
+            .level
+            .decode(&payload, &StreamKind::Control.cbor_limits())?)
+    }
+}
+
+/// The writing half of a control daemon's link to a worker.
+///
+/// It writes a [`ControlFrame`] and nothing else, as the worker's level reads it: there is no way
+/// to it for bytes.
+#[derive(Debug)]
+pub struct LinkWriter {
+    level: Level,
+    writer: FrameWriter,
+}
+
+impl LinkWriter {
+    /// A writing half over a stream a test holds the other end of, under `level`.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub const fn over(level: Level, writer: FrameWriter) -> Self {
+        Self { level, writer }
+    }
+
+    /// Writes one frame, as the worker's level reads it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IpcError::NotInLevel`] for a frame the level cannot read, which is then not
+    /// written, and a transport failure.
+    pub async fn write(&mut self, frame: &ControlFrame) -> Result<()> {
+        let payload = self
+            .level
+            .encode(frame, &StreamKind::Control.cbor_limits())?;
+        let framed = FrameCodec::new(StreamKind::Control).encode(&payload)?;
+        self.writer.write_frame(&framed).await
+    }
+
+    /// Whether a frame stopped part way through, which leaves the stream in pieces.
+    #[must_use]
+    pub fn is_mid_frame(&self) -> bool {
+        self.writer.is_mid_frame()
+    }
 }

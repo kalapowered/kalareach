@@ -3,17 +3,20 @@
 
 use std::sync::Arc;
 
+use kr_cbor::CanonicalValue;
 use kr_ipc::endpoint::{Connection, Listener};
 use kr_ipc::framed::split;
 use kr_ipc::paths::Endpoint;
 use kr_ipc::peer::PeerIdentity;
 use kr_ipc::verify::check_rendezvous;
 use kr_protocol::envelope::ControlFrame;
-use kr_protocol::error::ProtocolError;
-use kr_protocol::frame::StreamKind;
+use kr_protocol::error::{ErrorCode, ProtocolError};
+use kr_protocol::frame::{FrameCodec, StreamKind};
 use kr_protocol::hello::PROTOCOL_VERSION;
-use kr_protocol::ids::{ConnectionId, SessionEpoch};
+use kr_protocol::ids::{ConnectionId, SessionEpoch, SessionId};
+use kr_protocol::insertion::DraftAnswer;
 use kr_protocol::local::{LocalClientKind, LocalRole};
+use kr_protocol::retained::Level;
 use kr_protocol::scalars::Nullable;
 use kr_protocol::session::SessionState;
 use kr_protocol::worker::{
@@ -97,27 +100,36 @@ impl Controller {
             )))
             .await?;
 
-        let claim: ControlFrame = reader.read_message().await?;
+        // A running worker asks about its own session, and what it sends is in the shape of the
+        // level the daemon recorded for that session when it met the worker: the frame is decoded
+        // under that level, and answered under it. Every other first frame is a launching worker's,
+        // of this daemon's own release.
+        let payload = reader.read_payload().await?;
+        let (claim, level) = match self.rendezvous_claim(&payload).await? {
+            Claimed::Frame(frame, level) => (frame, level),
+            Claimed::NotYet(answer) => {
+                // The daemon has not recorded that worker yet: it is told to ask again, in the
+                // shape every release reads such a refusal in.
+                write_under(writer, Level::this(), &answer).await?;
+                return Ok(());
+            }
+        };
         let claim = match claim {
-            ControlFrame::Rendezvous(claim) => claim,
             // A worker that is already running asking for the plugin runtime: one request and
             // one answer, from the process this daemon recorded for the session.
             ControlFrame::PluginRuntimeWanted(wanted) => {
                 let answer = self.plugin_runtime_wanted(wanted, peer).await;
-                writer
-                    .write_message(&ControlFrame::PluginRuntimeState(answer))
-                    .await?;
+                write_under(writer, level, &ControlFrame::PluginRuntimeState(answer)).await?;
                 return Ok(());
             }
             // A running worker asking about a draft: one question and one answer, from the process
             // this daemon recorded for the session.
             ControlFrame::DraftWanted(wanted) => {
                 let answer = self.draft_wanted(*wanted, peer).await;
-                writer
-                    .write_message(&ControlFrame::DraftAnswer(Box::new(answer)))
-                    .await?;
+                write_under(writer, level, &ControlFrame::DraftAnswer(Box::new(answer))).await?;
                 return Ok(());
             }
+            ControlFrame::Rendezvous(claim) => claim,
             _ => {
                 return Err(ControllerError::rendezvous(
                     "the worker did not present a startup claim",
@@ -164,6 +176,52 @@ impl Controller {
             _ => Err(ControllerError::rendezvous(
                 "the worker did not report whether it started",
             )),
+        }
+    }
+
+    /// Reads a worker's first frame after its hello, under the level it is at.
+    ///
+    /// The frames a running worker asks with name its session, and the level of that session's
+    /// worker is the one recorded when this daemon met it. The payload is read for that name alone
+    /// first, so the frame is decoded once, under the right level. A session with no worker
+    /// recorded yet is answered that the worker should ask again, which every release reads.
+    async fn rendezvous_claim(&self, payload: &[u8]) -> Result<Claimed> {
+        let limits = StreamKind::Control.cbor_limits();
+        let value = kr_cbor::decode(payload, &limits).map_err(|error| {
+            kr_ipc::IpcError::Frame(kr_protocol::frame::FrameError::Cbor(error))
+        })?;
+        let Some((kind, session_id)) = asked_about(&value) else {
+            return Ok(Claimed::Frame(
+                Level::this()
+                    .decode(payload, &limits)
+                    .map_err(kr_ipc::IpcError::from)?,
+                Level::this(),
+            ));
+        };
+        let recorded = self
+            .directory
+            .lock()
+            .await
+            .get(session_id)
+            .map(|worker| worker.level);
+        match recorded {
+            Some(level) => Ok(Claimed::Frame(
+                level
+                    .decode(payload, &limits)
+                    .map_err(kr_ipc::IpcError::from)?,
+                level,
+            )),
+            None => Ok(Claimed::NotYet(match kind {
+                Asked::PluginRuntime => {
+                    ControlFrame::PluginRuntimeState(super::plugin_runtime::not_recorded_yet())
+                }
+                Asked::Draft => {
+                    ControlFrame::DraftAnswer(Box::new(DraftAnswer::Refused(ProtocolError::new(
+                        ErrorCode::ResourceUnavailable,
+                        "the daemon has not recorded that session's worker yet",
+                    ))))
+                }
+            })),
         }
     }
 
@@ -521,6 +579,8 @@ impl Controller {
             KnownWorker {
                 descriptor,
                 endpoint,
+                // A worker this daemon launched is of this daemon's own release.
+                level: kr_protocol::retained::Level::this(),
             },
             Some(ready.session.as_ref().clone()),
             &held,
@@ -537,4 +597,56 @@ impl Controller {
             let _ = pending.ready.send(outcome);
         }
     }
+}
+
+/// What a worker's first frame, read under a level, is.
+enum Claimed {
+    /// The frame, and the level it was read under.
+    Frame(ControlFrame, Level),
+    /// The answer to a worker whose session has no worker recorded yet.
+    NotYet(ControlFrame),
+}
+
+/// Which question a running worker asks.
+#[derive(Clone, Copy)]
+enum Asked {
+    PluginRuntime,
+    Draft,
+}
+
+/// The session a running worker's request is about, from the canonical value of its frame: the one
+/// member `session_id` of the one variant that names the request. Nothing else of the frame is
+/// read.
+fn asked_about(value: &CanonicalValue) -> Option<(Asked, SessionId)> {
+    let CanonicalValue::Map(frame) = value else {
+        return None;
+    };
+    let [(variant, CanonicalValue::Map(request))] = frame.entries() else {
+        return None;
+    };
+    let kind = match variant.as_str() {
+        "plugin_runtime_wanted" => Asked::PluginRuntime,
+        "draft_wanted" => Asked::Draft,
+        _ => return None,
+    };
+    let session = request.get("session_id")?;
+    kr_cbor::from_canonical_value::<SessionId>(session)
+        .ok()
+        .map(|session_id| (kind, session_id))
+}
+
+/// Writes one frame to a worker under its level.
+async fn write_under(
+    writer: &mut kr_ipc::framed::FrameWriter,
+    level: Level,
+    frame: &ControlFrame,
+) -> Result<()> {
+    let payload = level
+        .encode(frame, &StreamKind::Control.cbor_limits())
+        .map_err(kr_ipc::IpcError::from)?;
+    let framed = FrameCodec::new(StreamKind::Control)
+        .encode(&payload)
+        .map_err(kr_ipc::IpcError::from)?;
+    writer.write_frame(&framed).await?;
+    Ok(())
 }

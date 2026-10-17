@@ -12,7 +12,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use kr_ipc::client::LocalClient;
+use kr_ipc::client::{BoundLink, Client, Codec, LocalClient};
 use kr_ipc::endpoint::Listener;
 use kr_ipc::verify::{ControllerIdentity, WorkerIdentity};
 use kr_protocol::actor::ActorIngress;
@@ -845,7 +845,7 @@ async fn a_forwarded_caller_claiming_a_network_ingress_is_refused_the_lease() {
     let attachment_id = attach_over(&mut local, &wired, Some("xterm-256color")).await;
 
     // A control daemon's own connection, proved for the generation this worker accepts.
-    let mut daemon = LocalClient::connect(&wired.endpoint, LocalClientKind::Controller, build())
+    let mut daemon = BoundLink::connect(&wired.endpoint, build())
         .await
         .expect("connects");
     let identity = Arc::clone(&wired.controller);
@@ -1711,7 +1711,7 @@ struct InventedInterrupt<'a> {
 
 /// Attaches a terminal declaring `profile` over `client`, and returns its identifier.
 async fn attach_over(
-    client: &mut LocalClient,
+    client: &mut Client<impl Codec>,
     wired: &Wired,
     profile: Option<&str>,
 ) -> AttachmentId {
@@ -1732,7 +1732,7 @@ async fn attach_over(
 
 /// Takes the input lease over `client`.
 async fn acquire_over(
-    client: &mut LocalClient,
+    client: &mut Client<impl Codec>,
     wired: &Wired,
     attachment_id: AttachmentId,
 ) -> Result<kr_protocol::input::InputAcquireResult, kr_protocol::error::ProtocolError> {
@@ -1754,7 +1754,7 @@ async fn acquire_over(
 
 /// Writes input over `client`.
 async fn write_over(
-    client: &mut LocalClient,
+    client: &mut Client<impl Codec>,
     wired: &Wired,
     attachment_id: AttachmentId,
     epoch: kr_protocol::ids::InputLeaseEpoch,
@@ -2595,7 +2595,7 @@ fn release_after_a_while(
 /// opening output is waited for first, so that it is not the one the pause stops.
 async fn until_the_output_waits_on_the_disk(
     wired: &Wired,
-    client: &mut LocalClient,
+    client: &mut Client<impl Codec>,
     attachment: AttachmentId,
     epoch: kr_protocol::ids::InputLeaseEpoch,
 ) -> std::sync::mpsc::Sender<()> {

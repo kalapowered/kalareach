@@ -398,6 +398,7 @@ pub(super) async fn fake_world_on(
     let listener = Listener::bind(&worker_endpoint).expect("binds the worker endpoint");
     let serving = serve(listener, Arc::clone(&identity), worker_endpoint.as_text());
     let worker = KnownWorker {
+        level: kr_protocol::retained::Level::this(),
         descriptor,
         endpoint: worker_endpoint,
     };

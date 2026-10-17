@@ -38,6 +38,7 @@ use thiserror::Error;
 
 use crate::envelope::{ControlFrame, ParamsValue};
 use crate::local::LocalBuild;
+use crate::method::Method;
 use crate::update::{CompatibilityLevel, THIS_LEVEL};
 use crate::wire::{self, WireMessage};
 pub use surface::{
@@ -122,6 +123,21 @@ pub const FROZEN_VARIANTS: &[&str] = &[
 /// meet a host of another and a worker of one release a host of another. The name is part of what
 /// a retained level records (`PLUGIN_HOST`), and a bump needs the retained levels to speak both.
 pub const PLUGIN_HOST_PROTOCOL: &str = "kr-plugin-host/2";
+
+/// The definition that names the parameters of a read the control daemon makes of a worker itself,
+/// by the method it makes it with.
+#[must_use]
+pub const fn params_root(method: Method) -> Option<&'static str> {
+    match method {
+        Method::SessionRead => Some("SessionReadParams"),
+        Method::SessionScreenPreview => Some("SessionScreenPreviewParams"),
+        Method::QuestionRead => Some("QuestionReadParams"),
+        Method::AgentApprovalInspect => Some("AgentApprovalInspectParams"),
+        Method::EventsSnapshot => Some("EventsSnapshotParams"),
+        Method::ActionRead => Some("ActionReadParams"),
+        _ => None,
+    }
+}
 
 /// A rewrite of the value of one definition on its way to or from a retained level.
 pub type Rewrite = fn(&mut CanonicalValue) -> Result<(), String>;
@@ -584,6 +600,28 @@ impl Level {
                 Ok(wire::from_value::<T>(&canonical)?)
             }
         }
+    }
+
+    /// Writes the parameters of a request the control daemon makes of a worker as this level reads
+    /// them.
+    ///
+    /// The daemon's own reads of a worker have parameters on the surface ([`params_root`]); every
+    /// other method is passed through for a caller, whose parameters are opaque to the daemon and
+    /// are written as they were given.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CodecError::NotInLevel`] for parameters the level cannot read.
+    pub fn encode_params<T: serde::Serialize + ?Sized>(
+        self,
+        method: Method,
+        params: &T,
+    ) -> Result<ParamsValue, CodecError> {
+        let mut value = kr_cbor::to_canonical_value(params)?;
+        if let (Which::Retained(retained), Some(root)) = (self.0, params_root(method)) {
+            self.write(root, &mut value, retained)?;
+        }
+        Ok(ParamsValue::new(value))
     }
 
     /// Writes parameters, or an answer, of the type `T` as this level reads them.

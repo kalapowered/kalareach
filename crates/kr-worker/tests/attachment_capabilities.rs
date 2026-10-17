@@ -12,7 +12,7 @@
 
 use std::sync::Arc;
 
-use kr_ipc::client::LocalClient;
+use kr_ipc::client::{BoundLink, LocalClient};
 use kr_ipc::endpoint::Listener;
 use kr_ipc::verify::{ControllerIdentity, WorkerIdentity};
 use kr_protocol::actor::{ActorEnvelope, ActorIngress};
@@ -108,8 +108,8 @@ impl Wired {
     }
 
     /// Connects as the control daemon and proves the generation this worker accepts.
-    async fn daemon(&self) -> LocalClient {
-        let mut daemon = LocalClient::connect(&self.endpoint, LocalClientKind::Controller, build())
+    async fn daemon(&self) -> BoundLink {
+        let mut daemon = BoundLink::connect(&self.endpoint, build())
             .await
             .expect("connects as the daemon");
         let identity = Arc::clone(&self.controller);
@@ -128,7 +128,7 @@ impl Wired {
     /// Forwards one attach for a paired device acting under `grant_rights`.
     async fn attach_as_device(
         &self,
-        daemon: &mut LocalClient,
+        daemon: &mut BoundLink,
         request_id: u64,
         grant_rights: &CanonicalSet<ActionRight>,
     ) -> SessionAttachResult {
@@ -148,7 +148,7 @@ impl Wired {
     /// Forwards one mutation for a paired device acting under `grant_rights`.
     async fn forward_as_device(
         &self,
-        daemon: &mut LocalClient,
+        daemon: &mut BoundLink,
         request_id: u64,
         grant_rights: &CanonicalSet<ActionRight>,
         method: Method,

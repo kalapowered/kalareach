@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use kr_ipc::client::LocalClient;
+use kr_ipc::client::BoundLink;
 use kr_protocol::envelope::{MutationRequest, ParamsValue};
 use kr_protocol::identity::WorkerProfile;
 use kr_protocol::ids::{SessionEpoch, SessionId};
@@ -43,7 +43,7 @@ impl Controller {
     /// The worker cannot know when the daemon finished passing the reply on, and it must not
     /// signal a process group whose command is still waiting to read its own answer.
     pub(super) async fn confirm_delivery(&self, action_id: kr_protocol::ids::ActionId) {
-        let links: Vec<(SessionId, Arc<tokio::sync::Mutex<Option<LocalClient>>>)> = self
+        let links: Vec<(SessionId, Arc<tokio::sync::Mutex<Option<BoundLink>>>)> = self
             .connections
             .lock()
             .await

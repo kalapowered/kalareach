@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 
-use kr_ipc::client::LocalClient;
+use kr_ipc::client::{BoundLink, Client, Codec, LocalClient};
 use kr_ipc::endpoint::Listener;
 use kr_ipc::verify::{ControllerIdentity, WorkerIdentity};
 use kr_protocol::agent::{AgentMutationTarget, AgentPromptParams, PromptText};
@@ -453,10 +453,9 @@ fn prompt_mutation(client: &LocalClient, host: &Host, request_id: u64) -> Mutati
     }
 }
 
-async fn send(client: &mut LocalClient, mutation: MutationRequest) -> Outcome {
+async fn send(client: &mut Client<impl Codec>, mutation: MutationRequest) -> Outcome {
     client
-        .writer()
-        .write_message(&ControlFrame::Mutation(Box::new(mutation)))
+        .send(&ControlFrame::Mutation(Box::new(mutation)))
         .await
         .expect("writes the mutation");
     loop {
@@ -468,11 +467,13 @@ async fn send(client: &mut LocalClient, mutation: MutationRequest) -> Outcome {
     }
 }
 
-async fn receipt(client: &mut LocalClient, action_id: ActionId) -> kr_protocol::receipt::Receipt {
+async fn receipt(
+    client: &mut Client<impl Codec>,
+    action_id: ActionId,
+) -> kr_protocol::receipt::Receipt {
     let outcome = {
         client
-            .writer()
-            .write_message(&ControlFrame::Request(Request {
+            .send(&ControlFrame::Request(Request {
                 request_id: RequestId::new(900),
                 method: Method::ActionRead.into(),
                 method_version: MethodVersion::V1,
@@ -1451,8 +1452,7 @@ async fn kr_req_11_32_input_interrupt_and_keepalive_are_served_during_a_pending_
 
     // The prompt goes, and nothing is read for it yet: it is with the upstream.
     client
-        .writer()
-        .write_message(&ControlFrame::Mutation(Box::new(mutation)))
+        .send(&ControlFrame::Mutation(Box::new(mutation)))
         .await
         .expect("writes the prompt");
     // The transport has the operation before anything else is asked of this connection.
@@ -1489,8 +1489,7 @@ async fn kr_req_11_32_input_interrupt_and_keepalive_are_served_during_a_pending_
         .expect("encodes"),
     };
     client
-        .writer()
-        .write_message(&ControlFrame::Mutation(Box::new(lease)))
+        .send(&ControlFrame::Mutation(Box::new(lease)))
         .await
         .expect("writes the lease request");
 
@@ -1505,8 +1504,7 @@ async fn kr_req_11_32_input_interrupt_and_keepalive_are_served_during_a_pending_
 
     // Keystrokes, under the lease this connection holds.
     client
-        .writer()
-        .write_message(&ControlFrame::Request(Request {
+        .send(&ControlFrame::Request(Request {
             request_id: RequestId::new(24),
             method: Method::InputWrite.into(),
             method_version: MethodVersion::V1,
@@ -1554,8 +1552,7 @@ async fn kr_req_11_32_input_interrupt_and_keepalive_are_served_during_a_pending_
         .expect("encodes"),
     };
     client
-        .writer()
-        .write_message(&ControlFrame::Mutation(Box::new(interrupt)))
+        .send(&ControlFrame::Mutation(Box::new(interrupt)))
         .await
         .expect("writes the interrupt");
     let interrupted: kr_protocol::input::InputLeaseResult =
@@ -1643,7 +1640,7 @@ fn terminal_attachment(session_id: SessionId) -> kr_protocol::attachment::Sessio
 
 /// Reads this connection's answer to one request, ignoring everything else it carries.
 async fn answer_to(
-    client: &mut LocalClient,
+    client: &mut Client<impl Codec>,
     request_id: RequestId,
     deadline: tokio::time::Instant,
 ) -> Result<ParamsValue, kr_protocol::error::ProtocolError> {
@@ -2137,7 +2134,7 @@ fn offer_elsewhere(host: &Host) -> kr_protocol::ids::PendingResourceId {
 /// Sends one `plugin.action.invoke` naming a pending resource, or none, and returns the refusal
 /// code and the state of the receipt it left.
 async fn plugin_answer(
-    client: &mut LocalClient,
+    client: &mut Client<impl Codec>,
     host: &Host,
     request_id: u64,
     resource_id: Nullable<kr_protocol::ids::PendingResourceId>,
@@ -2149,7 +2146,7 @@ async fn plugin_answer(
 /// Sends one `plugin.action.invoke` naming a pending resource, or none, and returns its refusal
 /// and the action it was.
 async fn plugin_refusal(
-    client: &mut LocalClient,
+    client: &mut Client<impl Codec>,
     host: &Host,
     request_id: u64,
     resource_id: Nullable<kr_protocol::ids::PendingResourceId>,
@@ -2779,8 +2776,8 @@ async fn kr_req_09_an_answer_never_acknowledged_is_uncertain_before_its_caller_h
 }
 
 /// Connects as the control daemon and proves the generation this worker accepts.
-async fn daemon(host: &Host) -> LocalClient {
-    let mut daemon = LocalClient::connect(&host.endpoint, LocalClientKind::Controller, build())
+async fn daemon(host: &Host) -> BoundLink {
+    let mut daemon = BoundLink::connect(&host.endpoint, build())
         .await
         .expect("connects as the daemon");
     let identity = Arc::clone(&host.controller);
@@ -2850,7 +2847,7 @@ fn expected_refusal(action: &str) -> ErrorCode {
 /// Forwards one mutation as the control daemon does for a paired device acting under a grant
 /// that carries `grant_rights`.
 async fn forward_as_device(
-    daemon: &mut LocalClient,
+    daemon: &mut BoundLink,
     mutation: &MutationRequest,
     grant_rights: &[kr_protocol::rights::ActionRight],
 ) -> std::result::Result<ParamsValue, kr_protocol::error::ProtocolError> {

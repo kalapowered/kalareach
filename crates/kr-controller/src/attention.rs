@@ -66,7 +66,7 @@ use kr_attention::{
 };
 use kr_automation::store::{ATTENTION_CONSUMER, ATTENTION_EVENTS};
 use kr_automation::{AttentionOutboxRecord, AttentionSubject, JournalEvent, WorkflowStore};
-use kr_ipc::client::LocalClient;
+use kr_ipc::client::BoundLink;
 use kr_ipc::framed::CheckedWrite;
 use kr_protocol::attention::ChangeSummary;
 use kr_protocol::attention::{
@@ -263,7 +263,7 @@ pub trait Reach: Send + Sync {
     fn connect<'a>(
         &'a self,
         worker: &'a KnownWorker,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<LocalClient>> + Send + 'a>>;
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<BoundLink>> + Send + 'a>>;
 
     /// Answers whether the closure this host recorded for a session leaves a worker it could not
     /// account for: one written over a death this host did not confirm. A closure it cannot read
@@ -2202,7 +2202,7 @@ impl AttentionModule {
         module: &std::sync::Weak<Self>,
         session_id: SessionId,
         revision: u64,
-        client: LocalClient,
+        client: BoundLink,
     ) {
         let (reader, writer, _acknowledgement) = client.into_halves();
         let link = Arc::new(Link::new(writer, session_id, module.clone()));
@@ -3138,7 +3138,7 @@ struct Link {
     session_id: SessionId,
     /// The module the worker's statements of its privacy fence are applied to.
     module: std::sync::Weak<AttentionModule>,
-    writer: tokio::sync::Mutex<kr_ipc::framed::FrameWriter>,
+    writer: tokio::sync::Mutex<kr_ipc::client::LinkWriter>,
     waiters: std::sync::Mutex<BTreeMap<u64, tokio::sync::oneshot::Sender<ControlFrame>>>,
     closed: std::sync::atomic::AtomicBool,
     /// The latest statement applied from this link, which a statement has to come after.
@@ -3147,7 +3147,7 @@ struct Link {
 
 impl Link {
     fn new(
-        writer: kr_ipc::framed::FrameWriter,
+        writer: kr_ipc::client::LinkWriter,
         session_id: SessionId,
         module: std::sync::Weak<AttentionModule>,
     ) -> Self {
@@ -3172,7 +3172,7 @@ impl Link {
                 return false;
             }
             writing.store(true, Ordering::SeqCst);
-            let written = writer.write_message(frame).await;
+            let written = writer.write(frame).await;
             writing.store(false, Ordering::SeqCst);
             if written.is_err() {
                 self.close();
@@ -3259,7 +3259,7 @@ impl Link {
                     return None;
                 }
                 writing.store(true, Ordering::SeqCst);
-                let written = writer.write_message(&frame).await;
+                let written = writer.write(&frame).await;
                 writing.store(false, Ordering::SeqCst);
                 if written.is_err() {
                     self.close();
@@ -3287,9 +3287,9 @@ impl Link {
     /// applied before the next frame is read, and the generation an answer was decided under is
     /// recorded before the answer is handed on, so a new connection's first statement is in place
     /// before anything it carries is served.
-    async fn read_loop(link: Arc<Self>, mut reader: kr_ipc::framed::FrameReader) {
+    async fn read_loop(link: Arc<Self>, mut reader: kr_ipc::client::LinkReader) {
         loop {
-            let Ok(frame) = reader.read_message::<ControlFrame>().await else {
+            let Ok(frame) = reader.read().await else {
                 break;
             };
             let request_id = match &frame {
@@ -4149,7 +4149,7 @@ pub(crate) mod tests {
         fn connect<'a>(
             &'a self,
             _worker: &'a KnownWorker,
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<LocalClient>> + Send + 'a>>
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<BoundLink>> + Send + 'a>>
         {
             Box::pin(async { Err(ControllerError::supervision("this test connects nothing")) })
         }
@@ -4201,9 +4201,16 @@ pub(crate) mod tests {
         let far = accepting.await.expect("accepted");
         let (near_reader, near_writer) = kr_ipc::framed::split(near, StreamKind::Control);
         let (far_reader, far_writer) = kr_ipc::framed::split(far, StreamKind::Control);
-        let link = Arc::new(Link::new(near_writer, session_id, Arc::downgrade(module)));
+        let link = Arc::new(Link::new(
+            kr_ipc::client::LinkWriter::over(kr_protocol::retained::Level::this(), near_writer),
+            session_id,
+            Arc::downgrade(module),
+        ));
         module.origins().links.insert(session_id, Arc::clone(&link));
-        tokio::spawn(Link::read_loop(Arc::clone(&link), near_reader));
+        tokio::spawn(Link::read_loop(
+            Arc::clone(&link),
+            kr_ipc::client::LinkReader::over(kr_protocol::retained::Level::this(), near_reader),
+        ));
         (link, far_reader, far_writer)
     }
 
@@ -5892,7 +5899,7 @@ pub(crate) mod tests {
         fn connect<'a>(
             &'a self,
             _worker: &'a KnownWorker,
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<LocalClient>> + Send + 'a>>
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<BoundLink>> + Send + 'a>>
         {
             Box::pin(async { Err(ControllerError::supervision("this test connects nothing")) })
         }
@@ -5936,6 +5943,7 @@ pub(crate) mod tests {
             .worker_endpoint(DisplayNumber::new(5))
             .expect("an endpoint");
         KnownWorker {
+            level: kr_protocol::retained::Level::this(),
             descriptor: kr_protocol::worker::WorkerDescriptor {
                 session_id,
                 session_epoch: kr_protocol::ids::SessionEpoch::V1,
@@ -7267,7 +7275,7 @@ pub(crate) mod tests {
         fn connect<'a>(
             &'a self,
             _worker: &'a KnownWorker,
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<LocalClient>> + Send + 'a>>
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<BoundLink>> + Send + 'a>>
         {
             Box::pin(async { Err(ControllerError::supervision("this test connects nothing")) })
         }

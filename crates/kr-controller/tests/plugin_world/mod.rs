@@ -24,7 +24,7 @@ use std::time::Duration;
 use kr_controller::service::{Controller, ControllerSetup};
 use kr_controller::supervision::{LaunchOutcome, ServiceLaunch, WorkerLaunch, WorkerSupervisor};
 use kr_crypto::store::{StoreSelection, open_store_in};
-use kr_ipc::client::LocalClient;
+use kr_ipc::client::{BoundLink, Client, Codec, LocalClient};
 use kr_ipc::endpoint::Listener;
 use kr_ipc::identity::ProcessState;
 use kr_ipc::paths::EnvironmentPaths;
@@ -347,19 +347,18 @@ impl Hosted {
     /// The daemon does not hold the worker here, so a test that needs the worker to be told
     /// something only its daemon says (an authority revision, over the authority connection) or to
     /// be forwarded a paired device's action (over a proxy) says it over this.
-    pub async fn daemon_connection(&self, role: ControllerConnectionRole) -> LocalClient {
+    pub async fn daemon_connection(&self, role: ControllerConnectionRole) -> BoundLink {
         let secrets = self.environment().secrets_dir();
         let store = open_store_in(&secrets).expect("a secret store");
         let identity = ControllerIdentity::open(store.store.as_ref(), self.environment_id, true)
             .expect("the daemon's identity");
         let boot = kr_ipc::identity::boot_identity().expect("a boot identity");
         let generation = self.controller_generation;
-        let mut client = LocalClient::connect(&self.endpoint, LocalClientKind::Controller, build())
+        let mut client = BoundLink::connect(&self.endpoint, build())
             .await
             .expect("connects to the worker");
         client
-            .writer()
-            .write_message(&ControlFrame::ControllerRole(role))
+            .send(&ControlFrame::ControllerRole(role))
             .await
             .expect("declares the role");
         match client.recv().await.expect("the worker answers") {
@@ -823,10 +822,9 @@ pub fn install(environment: &EnvironmentPaths, wasm: &[u8]) -> ComponentSource {
 }
 
 /// Sends one mutation and returns the daemon's answer to it.
-pub async fn submit(client: &mut LocalClient, mutation: MutationRequest) -> Outcome {
+pub async fn submit(client: &mut Client<impl Codec>, mutation: MutationRequest) -> Outcome {
     client
-        .writer()
-        .write_message(&ControlFrame::Mutation(Box::new(mutation)))
+        .send(&ControlFrame::Mutation(Box::new(mutation)))
         .await
         .expect("writes the mutation");
     loop {

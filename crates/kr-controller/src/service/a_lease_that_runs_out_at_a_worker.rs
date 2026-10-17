@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use kr_crypto::store::open_store_in;
-use kr_ipc::client::LocalClient;
+use kr_ipc::client::BoundLink;
 use kr_ipc::endpoint::Listener;
 use kr_ipc::verify::{ControllerIdentity, WorkerIdentity};
 use kr_protocol::actor::{ActorEnvelope, ActorIngress};
@@ -32,7 +32,6 @@ use kr_protocol::ids::{
     ActionId, ActionWindowId, ActorId, ConnectionId, ControllerGeneration, DeviceId, EnvironmentId,
     RequestId, SessionEpoch, SessionId,
 };
-use kr_protocol::local::LocalClientKind;
 use kr_protocol::method::{Method, MethodVersion};
 use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::{CanonicalSet, Nullable, U64, Uuid};
@@ -147,7 +146,7 @@ struct World {
     session_id: SessionId,
     environment_id: EnvironmentId,
     /// The link the worker has to a daemon of generation one, over which a forward is sent.
-    link: Option<LocalClient>,
+    link: Option<BoundLink>,
     actor: ActorEnvelope,
 }
 
@@ -262,7 +261,7 @@ async fn world(steps: &Steps) -> World {
     };
 
     steps.at("connecting to the worker");
-    let mut link = LocalClient::connect(&endpoint, LocalClientKind::Controller, build)
+    let mut link = BoundLink::connect(&endpoint, build)
         .await
         .expect("connects");
     let proving = Arc::clone(&controller_identity);
@@ -395,7 +394,7 @@ impl World {
     fn forward_in_the_background(
         &mut self,
         deadline: U64,
-    ) -> tokio::task::JoinHandle<(LocalClient, Result<ParamsValue, ProtocolError>)> {
+    ) -> tokio::task::JoinHandle<(BoundLink, Result<ParamsValue, ProtocolError>)> {
         let mut link = self.link.take().expect("the link is free");
         let mutation = self.attach();
         let actor = self.actor.clone();
@@ -432,8 +431,8 @@ impl World {
 
 /// Waits for a forward to end, and fails the test when it does not within [`WAIT`].
 async fn ended(
-    forward: tokio::task::JoinHandle<(LocalClient, Result<ParamsValue, ProtocolError>)>,
-) -> (LocalClient, Result<ParamsValue, ProtocolError>) {
+    forward: tokio::task::JoinHandle<(BoundLink, Result<ParamsValue, ProtocolError>)>,
+) -> (BoundLink, Result<ParamsValue, ProtocolError>) {
     tokio::time::timeout(WAIT, forward)
         .await
         .unwrap_or_else(|_| panic!("the forward did not end within {WAIT:?}"))

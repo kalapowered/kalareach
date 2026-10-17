@@ -1828,8 +1828,7 @@ async fn reported_and_told(
         .expect("composes the report");
     let request_id = mutation.request_id;
     client
-        .writer()
-        .write_message(&ControlFrame::Mutation(Box::new(mutation)))
+        .send(&ControlFrame::Mutation(Box::new(mutation)))
         .await
         .expect("reaches the worker");
 

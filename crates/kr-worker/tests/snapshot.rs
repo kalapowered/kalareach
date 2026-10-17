@@ -12,7 +12,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use kr_ipc::client::LocalClient;
+use kr_ipc::client::{BoundLink, Client, Codec, LocalClient};
 use kr_ipc::endpoint::Listener;
 use kr_ipc::verify::WorkerIdentity;
 use kr_protocol::attachment::{
@@ -2923,13 +2923,12 @@ async fn a_terminal_a_resize_leaves_projected_is_installed_once() {
 }
 
 /// A paired device's connection, as the control daemon opens one for it.
-async fn device_connection(host: &Host) -> LocalClient {
-    let mut client = LocalClient::connect(&host.endpoint, LocalClientKind::Controller, build())
+async fn device_connection(host: &Host) -> BoundLink {
+    let mut client = BoundLink::connect(&host.endpoint, build())
         .await
         .expect("connects as the daemon");
     client
-        .writer()
-        .write_message(&ControlFrame::ControllerRole(
+        .send(&ControlFrame::ControllerRole(
             kr_protocol::local::ControllerConnectionRole::Proxy,
         ))
         .await
@@ -2954,7 +2953,7 @@ async fn device_connection(host: &Host) -> LocalClient {
 /// One mutation forwarded for a paired device, as the control daemon forwards it, and its answer.
 async fn forwarded_for_device<T: serde::Serialize>(
     host: &Host,
-    client: &mut LocalClient,
+    client: &mut Client<impl Codec>,
     method: Method,
     params: &T,
 ) -> kr_protocol::envelope::ParamsValue {
@@ -2972,7 +2971,7 @@ async fn forwarded_for_device<T: serde::Serialize>(
 /// nothing of when it is `None`, as a daemon of an earlier build does.
 async fn forwarded_for_device_under<T: serde::Serialize>(
     host: &Host,
-    client: &mut LocalClient,
+    client: &mut Client<impl Codec>,
     method: Method,
     params: &T,
     basis: Option<kr_protocol::local::ScreenBasis>,
@@ -2986,7 +2985,7 @@ async fn forwarded_for_device_under<T: serde::Serialize>(
 /// As [`forwarded_for_device_under`], and the refusal a worker gave where it gave one.
 async fn forwarded_outcome_for_device<T: serde::Serialize>(
     host: &Host,
-    client: &mut LocalClient,
+    client: &mut Client<impl Codec>,
     method: Method,
     params: &T,
     basis: Option<kr_protocol::local::ScreenBasis>,
@@ -3034,11 +3033,7 @@ async fn forwarded_outcome_for_device<T: serde::Serialize>(
         history: None,
         screen_basis: basis,
     }));
-    client
-        .writer()
-        .write_message(&frame)
-        .await
-        .expect("writes the request");
+    client.send(&frame).await.expect("writes the request");
     loop {
         match client.recv().await.expect("the worker answers") {
             ControlFrame::Response(response) if response.request_id == request_id => {

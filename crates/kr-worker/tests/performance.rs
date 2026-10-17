@@ -1892,14 +1892,12 @@ async fn send_and_wait(
     let deadline = tokio::time::Instant::from_std(started + Duration::from_secs(10));
     tokio::time::timeout_at(
         deadline,
-        client
-            .writer()
-            .write_message(&ControlFrame::Request(Request {
-                request_id,
-                method: Method::InputWrite.into(),
-                method_version: kr_protocol::method::MethodVersion::V1,
-                params: encoded,
-            })),
+        client.send(&ControlFrame::Request(Request {
+            request_id,
+            method: Method::InputWrite.into(),
+            method_version: kr_protocol::method::MethodVersion::V1,
+            params: encoded,
+        })),
     )
     .await
     .map_err(|_| "the write did not reach the worker within ten seconds".to_owned())?

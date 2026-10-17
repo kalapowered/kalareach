@@ -11,7 +11,7 @@
 use std::time::Duration;
 
 use kr_ipc::IpcError;
-use kr_ipc::client::LocalClient;
+use kr_ipc::client::{BoundLink, LocalClient};
 use kr_ipc::endpoint::Listener;
 use kr_ipc::framed::split;
 use kr_protocol::envelope::ControlFrame;
@@ -100,6 +100,15 @@ impl Worker {
         }
     }
 
+    /// A control daemon's link to the worker, which binds the level the worker states.
+    async fn connect_as_daemon(&self) -> kr_ipc::Result<BoundLink> {
+        BoundLink::connect(
+            &self.endpoint,
+            BuildId::new("kr-controller/0").expect("a build identifier"),
+        )
+        .await
+    }
+
     async fn connect(&self, kind: LocalClientKind) -> kr_ipc::Result<LocalClient> {
         LocalClient::connect(
             &self.endpoint,
@@ -150,7 +159,7 @@ async fn a_daemon_meets_only_a_worker_at_a_level_its_release_retains() {
     ] {
         let worker = Worker::start(stating(version));
         let client = worker
-            .connect(LocalClientKind::Controller)
+            .connect_as_daemon()
             .await
             .unwrap_or_else(|error| panic!("a worker at {version} is met: {error}"));
         drop(client);
@@ -159,7 +168,7 @@ async fn a_daemon_meets_only_a_worker_at_a_level_its_release_retains() {
     for stated in [stating(another_level()), None] {
         let worker = Worker::start(stated.clone());
         let refused = worker
-            .connect(LocalClientKind::Controller)
+            .connect_as_daemon()
             .await
             .expect_err("a worker at another level is refused");
         assert!(

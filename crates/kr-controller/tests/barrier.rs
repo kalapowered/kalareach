@@ -20,7 +20,7 @@ use kr_controller::registry::{LaunchPhase, Registry};
 use kr_controller::service::{Clocks, Controller, ControllerSetup, WallClock};
 use kr_controller::supervision::{LaunchOutcome, WorkerLaunch, WorkerSupervisor};
 use kr_crypto::store::{StoreSelection, open_store_in};
-use kr_ipc::client::LocalClient;
+use kr_ipc::client::{BoundLink, LocalClient};
 use kr_ipc::endpoint::Listener;
 use kr_ipc::verify::{ControllerIdentity, WorkerIdentity};
 use kr_protocol::action::BarrierState;
@@ -243,8 +243,8 @@ async fn worker_serving(apart: bool) -> Worker {
 }
 
 /// Connects as the control daemon of `generation` and proves it.
-async fn daemon(worker: &Worker, generation: u64) -> LocalClient {
-    let mut client = LocalClient::connect(&worker.endpoint, LocalClientKind::Controller, build())
+async fn daemon(worker: &Worker, generation: u64) -> BoundLink {
+    let mut client = BoundLink::connect(&worker.endpoint, build())
         .await
         .expect("connects");
     let identity = Arc::clone(&worker.controller);

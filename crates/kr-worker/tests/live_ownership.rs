@@ -25,7 +25,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use kr_controller::archive::{ArchiveService, OwnershipRefusal};
-use kr_ipc::client::LocalClient;
+use kr_ipc::client::{BoundLink, Client, Codec, LocalClient};
 use kr_ipc::endpoint::Listener;
 use kr_ipc::verify::{ControllerIdentity, WorkerIdentity};
 use kr_protocol::actor::{ActorEnvelope, ActorIngress};
@@ -515,12 +515,12 @@ async fn prove(
     host: &Host,
     generation: u8,
 ) -> (
-    LocalClient,
+    BoundLink,
     Result<kr_protocol::worker::GenerationAccepted, kr_ipc::IpcError>,
 ) {
     let mut daemon = within(
         "the daemon's connection",
-        LocalClient::connect(&host.endpoint, LocalClientKind::Controller, build()),
+        BoundLink::connect(&host.endpoint, build()),
     )
     .await
     .expect("connects as the daemon");
@@ -543,7 +543,7 @@ async fn prove(
 }
 
 /// A control daemon of `generation`, which the worker accepts.
-async fn daemon(host: &Host, generation: u8) -> LocalClient {
+async fn daemon(host: &Host, generation: u8) -> BoundLink {
     let (daemon, accepted) = prove(host, generation).await;
     accepted.expect("the worker accepts the generation");
     daemon
@@ -569,16 +569,12 @@ fn person_id() -> ActorId {
 
 /// Writes one frame to the worker and returns its answer to `request_id`.
 async fn exchange(
-    daemon: &mut LocalClient,
+    daemon: &mut Client<impl Codec>,
     frame: ControlFrame,
     request_id: RequestId,
 ) -> Result<ParamsValue, ProtocolError> {
     within("the worker's answer", async {
-        daemon
-            .writer()
-            .write_message(&frame)
-            .await
-            .expect("writes the frame");
+        daemon.send(&frame).await.expect("writes the frame");
         loop {
             match daemon.recv().await.expect("the worker answers") {
                 ControlFrame::Response(response) if response.request_id == request_id => {
@@ -596,7 +592,7 @@ async fn exchange(
 
 /// Forwards one of a person's mutations, as the daemon does.
 async fn forward<T: serde::Serialize>(
-    daemon: &mut LocalClient,
+    daemon: &mut Client<impl Codec>,
     host: &Host,
     person: &ActorEnvelope,
     action_id: ActionId,
@@ -631,7 +627,7 @@ async fn forward<T: serde::Serialize>(
 /// daemon forwarding a person's reads.
 enum Reader<'a> {
     Owner(&'a mut LocalClient),
-    Daemon(&'a mut LocalClient, ActorEnvelope),
+    Daemon(&'a mut BoundLink, ActorEnvelope),
 }
 
 impl Reader<'_> {

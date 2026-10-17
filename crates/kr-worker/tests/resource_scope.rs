@@ -26,7 +26,7 @@ use std::collections::{BTreeSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use kr_ipc::client::LocalClient;
+use kr_ipc::client::{BoundLink, LocalClient};
 use kr_ipc::endpoint::Listener;
 use kr_ipc::verify::{ControllerIdentity, WorkerIdentity};
 use kr_protocol::actor::{ActorEnvelope, ActorIngress};
@@ -587,10 +587,46 @@ fn device() -> ActorEnvelope {
     }
 }
 
+/// A connection to the worker: a window of the local owner, or the link a control daemon opens for
+/// a paired device.
+enum Wire {
+    Window(LocalClient),
+    Daemon(BoundLink),
+}
+
+impl Wire {
+    async fn send(&mut self, frame: &ControlFrame) -> kr_ipc::Result<()> {
+        match self {
+            Self::Window(client) => client.send(frame).await,
+            Self::Daemon(link) => link.send(frame).await,
+        }
+    }
+
+    async fn recv(&mut self) -> kr_ipc::Result<ControlFrame> {
+        match self {
+            Self::Window(client) => client.recv().await,
+            Self::Daemon(link) => link.recv().await,
+        }
+    }
+
+    async fn mutate<T: serde::Serialize + ?Sized>(
+        &mut self,
+        method: Method,
+        action_id: ActionId,
+        target: ActionTarget,
+        params: &T,
+    ) -> kr_ipc::Result<Result<ParamsValue, ProtocolError>> {
+        match self {
+            Self::Window(client) => client.mutate(method, action_id, target, params).await,
+            Self::Daemon(link) => link.mutate(method, action_id, target, params).await,
+        }
+    }
+}
+
 /// One view of the session: a connection, who it reads as, and the resource events it has been
 /// sent that the test has not looked at yet.
 struct Viewer {
-    client: LocalClient,
+    client: Wire,
     /// The device the daemon forwards this connection's requests for; `None` is the local owner in
     /// a window of its own.
     device: Option<ActorEnvelope>,
@@ -607,13 +643,13 @@ impl Viewer {
     async fn device(host: &Host, scope: Option<HistoryScope>) -> Self {
         let mut client = within(
             "the daemon's connection",
-            LocalClient::connect(&host.endpoint, LocalClientKind::Controller, build()),
+            BoundLink::connect(&host.endpoint, build()),
         )
         .await
         .expect("connects as the daemon");
         within(
             "the role",
-            client.writer().write_message(&ControlFrame::ControllerRole(
+            client.send(&ControlFrame::ControllerRole(
                 ControllerConnectionRole::Proxy,
             )),
         )
@@ -639,7 +675,7 @@ impl Viewer {
         .await
         .expect("the worker accepts the generation");
         Self {
-            client,
+            client: Wire::Daemon(client),
             device: Some(device()),
             scope,
             attachment: None,
@@ -656,7 +692,7 @@ impl Viewer {
         .await
         .expect("connects");
         Self {
-            client,
+            client: Wire::Window(client),
             device: None,
             scope: None,
             attachment: None,
@@ -672,11 +708,7 @@ impl Viewer {
         request_id: RequestId,
     ) -> Result<ParamsValue, ProtocolError> {
         within("the worker's answer", async {
-            self.client
-                .writer()
-                .write_message(&frame)
-                .await
-                .expect("writes the request");
+            self.client.send(&frame).await.expect("writes the request");
             loop {
                 match self.client.recv().await.expect("the worker answers") {
                     ControlFrame::Response(response) if response.request_id == request_id => {

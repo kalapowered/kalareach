@@ -35,7 +35,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use common::{LIVENESS_DEADLINE, carries};
-use kr_ipc::client::LocalClient;
+use kr_ipc::client::{BoundLink, Client, Codec, LocalClient};
 use kr_ipc::endpoint::Listener;
 use kr_ipc::verify::{ControllerIdentity, WorkerIdentity};
 use kr_protocol::actor::{ActorEnvelope, ActorIngress};
@@ -240,8 +240,12 @@ fn cancelled(receipt: &Receipt) {
 /// attach. The screen a subscription joins on paints the buffer that is not showing before the
 /// one that is, so any of [`BEHIND`] this caller is drawn has arrived by the time [`SHOWN`] has,
 /// and the wait ends on something the application printed rather than on a length of time.
-async fn drawn(client: &mut LocalClient, frame: ControlFrame, request_id: RequestId) -> Vec<u8> {
-    within("the subscription", client.writer().write_message(&frame))
+async fn drawn(
+    client: &mut Client<impl Codec>,
+    frame: ControlFrame,
+    request_id: RequestId,
+) -> Vec<u8> {
+    within("the subscription", client.send(&frame))
         .await
         .expect("writes the subscription");
     let started = tokio::time::Instant::now();
@@ -345,16 +349,12 @@ fn reaching(lower_bound_ms: Option<u64>) -> HistoryScope {
 
 /// Writes one request and returns the worker's answer to it.
 async fn answer(
-    client: &mut LocalClient,
+    client: &mut Client<impl Codec>,
     frame: ControlFrame,
     request_id: RequestId,
 ) -> Result<ParamsValue, ProtocolError> {
     within("the worker's answer", async {
-        client
-            .writer()
-            .write_message(&frame)
-            .await
-            .expect("writes the request");
+        client.send(&frame).await.expect("writes the request");
         loop {
             if let ControlFrame::Response(response) =
                 client.recv().await.expect("the worker answers")
@@ -441,21 +441,16 @@ impl Wired {
     ///
     /// The daemon forwards each caller over a proxy of that caller's own, which owns the caller's
     /// attachments, and it announces authority revisions over its authority connection.
-    async fn daemon(&self, role: ControllerConnectionRole) -> LocalClient {
+    async fn daemon(&self, role: ControllerConnectionRole) -> BoundLink {
         let mut daemon = within(
             "the daemon's connection",
-            LocalClient::connect(&self.endpoint, LocalClientKind::Controller, build()),
+            BoundLink::connect(&self.endpoint, build()),
         )
         .await
         .expect("connects as the daemon");
-        within(
-            "the role",
-            daemon
-                .writer()
-                .write_message(&ControlFrame::ControllerRole(role)),
-        )
-        .await
-        .expect("declares the role");
+        within("the role", daemon.send(&ControlFrame::ControllerRole(role)))
+            .await
+            .expect("declares the role");
         match within("the worker's answer to the role", daemon.recv())
             .await
             .expect("the worker answers")
@@ -481,7 +476,7 @@ impl Wired {
     /// Forwards one mutation for `actor`, admitted under a grant that carries `rights`.
     async fn forward<T: serde::Serialize>(
         &self,
-        daemon: &mut LocalClient,
+        daemon: &mut Client<impl Codec>,
         actor: &ActorEnvelope,
         rights: &[ActionRight],
         method: Method,
@@ -501,7 +496,7 @@ impl Wired {
     /// Forwards one mutation for `actor` as [`Self::forward`] does, as the action `action_id`.
     async fn forward_action<T: serde::Serialize>(
         &self,
-        daemon: &mut LocalClient,
+        daemon: &mut Client<impl Codec>,
         actor: &ActorEnvelope,
         rights: &[ActionRight],
         method: Method,
@@ -536,7 +531,7 @@ impl Wired {
     /// Forwards an attach for `actor` of a terminal of the session's own size.
     async fn attach_for(
         &self,
-        daemon: &mut LocalClient,
+        daemon: &mut Client<impl Codec>,
         actor: &ActorEnvelope,
         rights: &[ActionRight],
         requested: &[AttachmentCapability],
@@ -557,7 +552,7 @@ impl Wired {
     /// Attaches a terminal of the session's own size in one of the owner's windows.
     async fn attach_in(
         &self,
-        window: &mut LocalClient,
+        window: &mut Client<impl Codec>,
         requested: &[AttachmentCapability],
     ) -> SessionAttachResult {
         within(
@@ -583,7 +578,7 @@ impl Wired {
     /// screen arrives as rows (and its attach says so) or as the stream's bytes.
     async fn drawn_for(
         &self,
-        daemon: &mut LocalClient,
+        daemon: &mut Client<impl Codec>,
         actor: &ActorEnvelope,
         narrowed: bool,
     ) -> Vec<u8> {
@@ -611,7 +606,7 @@ impl Wired {
 
     /// Attaches a terminal in one of the owner's windows, subscribes it, and returns the screen it
     /// is drawn.
-    async fn drawn_in(&self, window: &mut LocalClient) -> Vec<u8> {
+    async fn drawn_in(&self, window: &mut Client<impl Codec>) -> Vec<u8> {
         let attached = self
             .attach_in(window, &[AttachmentCapability::ObserveTerminal])
             .await;
@@ -640,7 +635,7 @@ impl Wired {
     /// Forwards a read of the session's retained output for `actor`.
     async fn page_for(
         &self,
-        daemon: &mut LocalClient,
+        daemon: &mut Client<impl Codec>,
         actor: &ActorEnvelope,
     ) -> Result<HistoryPageResult, ProtocolError> {
         let request_id = next_request();
@@ -651,7 +646,10 @@ impl Wired {
     }
 
     /// Reads the session's retained output in one of the owner's windows.
-    async fn page_in(&self, window: &mut LocalClient) -> Result<HistoryPageResult, ProtocolError> {
+    async fn page_in(
+        &self,
+        window: &mut Client<impl Codec>,
+    ) -> Result<HistoryPageResult, ProtocolError> {
         let request_id = next_request();
         let frame = ControlFrame::Request(self.page(request_id));
         answer(window, frame, request_id)
@@ -681,7 +679,7 @@ impl Wired {
     /// Forwards a read of the screen preview for `actor`.
     async fn preview_for(
         &self,
-        daemon: &mut LocalClient,
+        daemon: &mut Client<impl Codec>,
         actor: &ActorEnvelope,
     ) -> Result<kr_protocol::sharing::SessionScreenPreviewResult, ProtocolError> {
         let request_id = next_request();
@@ -694,7 +692,7 @@ impl Wired {
     /// Reads the screen preview in one of the owner's windows.
     async fn preview_in(
         &self,
-        window: &mut LocalClient,
+        window: &mut Client<impl Codec>,
     ) -> Result<kr_protocol::sharing::SessionScreenPreviewResult, ProtocolError> {
         let request_id = next_request();
         let frame = ControlFrame::Request(self.preview(request_id));
@@ -755,7 +753,7 @@ impl Wired {
     /// when one travels with it.
     async fn read_for(
         &self,
-        daemon: &mut LocalClient,
+        daemon: &mut Client<impl Codec>,
         actor: &ActorEnvelope,
         history: Option<HistoryScope>,
     ) -> SessionReadResult {
@@ -846,7 +844,7 @@ impl Wired {
     /// when one travels with it, and returns the questions it is answered with.
     async fn questions_for(
         &self,
-        daemon: &mut LocalClient,
+        daemon: &mut Client<impl Codec>,
         actor: &ActorEnvelope,
         history: Option<HistoryScope>,
         question_id: Option<QuestionId>,
@@ -857,7 +855,7 @@ impl Wired {
     }
 
     /// Reads the session's questions in one of the owner's windows.
-    async fn questions_in(&self, window: &mut LocalClient) -> Vec<QuestionId> {
+    async fn questions_in(&self, window: &mut Client<impl Codec>) -> Vec<QuestionId> {
         let request_id = next_request();
         let frame = ControlFrame::Request(self.question_read(request_id, None));
         asked(
@@ -868,7 +866,7 @@ impl Wired {
     }
 
     /// Reads the session in one of the owner's windows.
-    async fn read_in(&self, window: &mut LocalClient) -> SessionReadResult {
+    async fn read_in(&self, window: &mut Client<impl Codec>) -> SessionReadResult {
         let request_id = next_request();
         let frame = ControlFrame::Request(self.session_read(request_id));
         answer(window, frame, request_id)
@@ -881,7 +879,7 @@ impl Wired {
     /// Forwards a request for the input lease for `actor`'s attachment.
     async fn acquire_for(
         &self,
-        daemon: &mut LocalClient,
+        daemon: &mut Client<impl Codec>,
         actor: &ActorEnvelope,
         rights: &[ActionRight],
         attachment_id: AttachmentId,
@@ -921,7 +919,7 @@ impl Wired {
     ///
     /// A worker inside a dispatch transition answers that the revision is still pending for it, and
     /// the daemon announces it again. So does this.
-    async fn revise(&self, authority: &mut LocalClient, revision: u64) {
+    async fn revise(&self, authority: &mut Client<impl Codec>, revision: u64) {
         self.revise_within(authority, revision, RevisionReach::Host)
             .await;
     }
@@ -929,7 +927,7 @@ impl Wired {
     /// As [`Self::revise`], for a revision that withdrew only the authority `reach` names.
     async fn revise_within(
         &self,
-        authority: &mut LocalClient,
+        authority: &mut Client<impl Codec>,
         revision: u64,
         reach: RevisionReach,
     ) {
@@ -1695,7 +1693,7 @@ async fn a_worker_states_that_it_holds_a_question_read_to_its_scope() {
     let wired = wired("sleep 120").await;
     let daemon = within(
         "the daemon's connection",
-        LocalClient::connect(&wired.endpoint, LocalClientKind::Controller, build()),
+        BoundLink::connect(&wired.endpoint, build()),
     )
     .await
     .expect("connects as the daemon");
@@ -2275,8 +2273,8 @@ fn device_reach(since: u64, device_id: DeviceId) -> RevisionReach {
 /// [`device`]'s grant, at that revision.
 struct Typing {
     wired: Wired,
-    authority: LocalClient,
-    phone: LocalClient,
+    authority: BoundLink,
+    phone: BoundLink,
     attachment: AttachmentId,
 }
 
@@ -2470,7 +2468,7 @@ impl Wired {
     /// answers with.
     async fn announced_and_refused(
         &self,
-        authority: &mut LocalClient,
+        authority: &mut Client<impl Codec>,
         revision: u64,
         reach: RevisionReach,
     ) {
