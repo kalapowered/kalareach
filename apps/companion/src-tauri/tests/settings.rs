@@ -495,6 +495,108 @@ async fn a_change_here_is_sent_and_a_change_elsewhere_is_followed() {
     assert_eq!(computer.start().view()["colour_mode"], "dark");
 }
 
+/// Checking with nothing changed on either side writes nothing, so a change another device makes
+/// after any number of checks is a change this computer follows, and not one it answers with a
+/// write of its own against the old place.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_check_that_finds_nothing_new_writes_nothing_and_a_later_change_is_still_followed() {
+    let computer = Computer::new().await;
+    let page = computer.start();
+    page.choose("dark");
+    page.turn_on();
+    let elsewhere = computer.elsewhere();
+
+    for _ in 0..3 {
+        let view = page.sync_now();
+        assert_eq!(view["colour_mode"], "dark");
+        assert_eq!(view["sync"]["conflicts"], 0);
+    }
+    assert_eq!(elsewhere.copies_kept().await, 0);
+
+    assert!(matches!(
+        elsewhere.write("light").await,
+        Published::Accepted { .. }
+    ));
+    let view = page.sync_now();
+    assert_eq!(
+        view["colour_mode"], "light",
+        "the other device's change is followed"
+    );
+    assert_eq!(view["sync"]["conflicts"], 0, "and asks the person nothing");
+    assert_eq!(elsewhere.copies_kept().await, 0);
+}
+
+/// Two companions on one computer share the settings file, and neither answers from what it read
+/// when it started: the one that did not make a change finds it, and does not write what it held
+/// before over it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_second_companion_on_this_computer_does_not_write_over_the_first_ones_choice() {
+    let computer = Computer::new().await;
+    let first = computer.start();
+    first.choose("dark");
+    first.turn_on();
+    let second = computer.start();
+    assert_eq!(second.view()["colour_mode"], "dark");
+    let elsewhere = computer.elsewhere();
+
+    first.choose("light");
+    assert_eq!(elsewhere.colour().await, "light");
+    assert_eq!(
+        second.view()["colour_mode"],
+        "light",
+        "the second one reads the file"
+    );
+    let view = second.sync_now();
+    assert_eq!(view["colour_mode"], "light");
+    assert_eq!(view["sync"]["conflicts"], 0);
+    assert_eq!(
+        elsewhere.colour().await,
+        "light",
+        "nothing was written over it"
+    );
+    assert_eq!(elsewhere.copies_kept().await, 0);
+}
+
+/// A replacement that names the choice it expects does not replace a choice made since: the
+/// answer says it did not, and the file holds the newer choice.
+#[test]
+fn a_replacement_that_expected_an_earlier_choice_leaves_the_later_one() {
+    use companion_tauri::settings::{ColourMode, LocalSettings};
+    let directory = tempfile::tempdir().expect("a directory");
+    let settings = LocalSettings::open(directory.path());
+    settings
+        .set_colour_mode(ColourMode::Dark)
+        .expect("a choice");
+
+    assert!(
+        settings
+            .replace_colour_mode(Some(ColourMode::Dark), ColourMode::Light)
+            .expect("a replacement"),
+        "the choice that was expected is replaced"
+    );
+    settings
+        .set_colour_mode(ColourMode::System)
+        .expect("a later choice");
+    assert!(
+        !settings
+            .replace_colour_mode(Some(ColourMode::Light), ColourMode::Dark)
+            .expect("a refusal that is no failure"),
+        "a choice made since is not replaced"
+    );
+    assert_eq!(settings.chosen_colour_mode(), Some(ColourMode::System));
+    assert!(
+        !settings
+            .replace_colour_mode(None, ColourMode::Dark)
+            .expect("a refusal that is no failure"),
+        "nothing chosen was expected, and something has been"
+    );
+    // The file says so too: a second reader opened later finds the same.
+    assert_eq!(
+        LocalSettings::open(directory.path()).chosen_colour_mode(),
+        Some(ColourMode::System)
+    );
+}
+
 /// A change made here while another device changed the same setting is kept for the person: the
 /// mode this computer is in stays what the person chose, what the other device wrote is kept
 /// beside it, and neither this step nor any later one picks between them.

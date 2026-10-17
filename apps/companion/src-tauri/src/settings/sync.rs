@@ -57,7 +57,7 @@ use kr_client::services::{
 };
 use kr_client::sync::membership::{DeviceDirectory, HostAnswers, KeyRecordService, SyncMembership};
 use kr_client::sync::{
-    CollectionKeys, CollectionSealer, Published, Restored, SettingValue, SharedCollectionService,
+    CollectionKeys, Published, Restored, SettingValue, SharedCollectionService,
     StoredCollectionKeys, SyncBody, SyncCheckpoint, SyncClient, SyncError, SyncObject,
     SyncSettings, SyncStore, fresh_object_id, fresh_revision,
 };
@@ -67,7 +67,7 @@ use kr_ipc::paths::{
     create_private_directory, flush_path_names, read_owner_only_file, write_owner_only_file,
 };
 use kr_protocol::error::ErrorCode;
-use kr_protocol::ids::{DeviceId, SyncCollectionId, SyncConflictId, SyncObjectId};
+use kr_protocol::ids::{DeviceId, SyncCollectionId, SyncConflictId, SyncObjectId, SyncRevisionId};
 use kr_protocol::scalars::{Nullable, TimestampMs};
 use kr_protocol::service::{GatewayOrigin, installation_id};
 use kr_protocol::sync::SyncObjectKind;
@@ -314,19 +314,7 @@ impl SettingsSync {
     async fn step(&self) -> Result<Step<'_>> {
         let turn = self.steps.lock().await;
         let path = self.directory.join(LOCK);
-        let file =
-            tauri::async_runtime::spawn_blocking(move || -> std::io::Result<std::fs::File> {
-                let mut options = std::fs::OpenOptions::new();
-                options.create(true).truncate(false).write(true);
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::OpenOptionsExt as _;
-                    options.mode(0o600);
-                }
-                let file = options.open(path)?;
-                kr_flush::lock::exclusive(&file)?;
-                Ok(file)
-            })
+        let file = tauri::async_runtime::spawn_blocking(move || super::locked_file(&path))
             .await
             .map_err(|error| {
                 CommandError::local_failure(format!("settings sync was not started: {error}"))
@@ -578,7 +566,8 @@ impl SettingsSync {
     /// # Errors
     ///
     /// Returns a refusal when no such content waits or what was chosen is not content this build
-    /// reads, and a local failure when a record cannot be kept. Nothing is changed then.
+    /// reads, which changes nothing, and a local failure when a record cannot be kept, after which
+    /// the choice made so far stands and the next step carries on from it.
     pub async fn resolve(&self, keep: Keep) -> Result<()> {
         self.resolve_in_a_step(keep).await
     }
@@ -713,17 +702,18 @@ impl SettingsSync {
             .await
         {
             Ok(Restored::Settings { object, copy }) => match (held, copy) {
-                // The service holds what this computer last agreed with, or nothing this computer
-                // has not seen.
-                (Some(_), None) | (None, Some(_)) => Ok(()),
+                // The service holds what this computer holds: they agree, and the note says so.
+                (Some(held), None) => Self::agreed(store, object_id, held.revision),
+                // A device that held nothing is seeing the object for the first time.
+                (None, Some(_)) => Ok(()),
                 // This computer has changed nothing since it last agreed, and another device has
                 // written since: the other device's settings continue this computer's.
                 (Some(_), Some(copy)) => {
-                    client.resolve(copy).await.map_err(sync_failure)?;
-                    self.follow(store, object_id, &object, chosen)
+                    self.follow(client, object_id, &object, chosen, Some(copy))
+                        .await
                 }
                 // This computer has chosen nothing, and the service holds settings.
-                (None, None) => self.follow(store, object_id, &object, chosen),
+                (None, None) => self.follow(client, object_id, &object, chosen, None).await,
             },
             Ok(Restored::ClientSelection { .. }) => Ok(()),
             // The collection holds no such object yet: there is nothing to follow.
@@ -732,36 +722,59 @@ impl SettingsSync {
         }
     }
 
-    /// Takes the settings another device published as this computer's own, without choosing
-    /// anything: the settings file, the object this computer holds and the note of where it stands
-    /// all say the same thing afterwards.
-    ///
-    /// Not when the person has chosen another colour mode since the step began: that choice is
-    /// newer than anything read from the service, and the next step publishes it.
-    fn follow(
-        &self,
-        store: &SyncStore,
-        object_id: SyncObjectId,
-        object: &SyncObject,
-        chosen: Option<ColourMode>,
-    ) -> Result<()> {
-        if self.local.chosen_colour_mode() != chosen {
-            return Ok(());
-        }
-        store.put_object(object).map_err(sync_failure)?;
+    /// Notes that this computer holds `revision` and the service holds it too, so that a step that
+    /// finds nothing new is not taken for one that found a change here.
+    fn agreed(store: &SyncStore, object_id: SyncObjectId, revision: SyncRevisionId) -> Result<()> {
         if let Some(note) = store.checkpoint(object_id).map_err(sync_failure)? {
             store
                 .record_checkpoint(
                     object_id,
                     SyncCheckpoint {
                         position: note.position,
-                        published_revision: Nullable::from(Some(object.revision)),
+                        published_revision: Nullable::from(Some(revision)),
                     },
                 )
                 .map_err(sync_failure)?;
         }
-        if let Some(mode) = colour_mode_of(object) {
-            self.local.set_colour_mode(mode)?;
+        Ok(())
+    }
+
+    /// Takes the settings another device published as this computer's own, without choosing
+    /// anything: the settings file, the object this computer holds and the note of where it stands
+    /// all say the same thing afterwards.
+    ///
+    /// Not when the person has chosen another colour mode since the step began: that choice is
+    /// newer than anything read from the service, and what the other device wrote stays beside it
+    /// for the person. The settings file is the first thing written, and it is written only if it
+    /// still holds what the step began with, so a choice made while the service was being read is
+    /// never replaced. The version the fetch kept is let go last, after everything else is in
+    /// place: a step that stops before it finds the same content waiting, and lets it go as
+    /// content that says what this computer says.
+    async fn follow(
+        &self,
+        client: &SyncClient,
+        object_id: SyncObjectId,
+        object: &SyncObject,
+        chosen: Option<ColourMode>,
+        copy: Option<SyncConflictId>,
+    ) -> Result<()> {
+        match colour_mode_of(object) {
+            Some(mode) => {
+                if !self.local.replace_colour_mode(chosen, mode)? {
+                    return Ok(());
+                }
+            }
+            None => {
+                if self.local.chosen_colour_mode() != chosen {
+                    return Ok(());
+                }
+            }
+        }
+        let store = client.store();
+        store.put_object(object).map_err(sync_failure)?;
+        Self::agreed(store, object_id, object.revision)?;
+        if let Some(copy) = copy {
+            client.resolve(copy).await.map_err(sync_failure)?;
         }
         self.told.tell();
         Ok(())
@@ -879,17 +892,11 @@ impl SettingsSync {
         collection: kr_client::sync::membership::CollectionRef,
         epoch: u64,
     ) -> Result<SyncClient> {
+        let shared = SharedCollectionService::new(Arc::clone(service), collection, epoch);
+        let sealer = shared.sealer(Arc::new(self.keys()) as Arc<dyn CollectionKeys>);
         Ok(SyncClient::new(
-            Arc::new(SharedCollectionService::new(
-                Arc::clone(service),
-                collection,
-                epoch,
-            )),
-            Arc::new(CollectionSealer::new(
-                Arc::new(self.keys()) as Arc<dyn CollectionKeys>,
-                &collection.collection_id.to_string(),
-                epoch,
-            )),
+            Arc::new(shared),
+            Arc::new(sealer),
             self.store()?,
         ))
     }

@@ -29,6 +29,21 @@ use crate::error::{CommandError, Result};
 
 pub mod sync;
 
+/// Opens `path`, making it when it is not there, and takes the exclusive lock on it. The lock is
+/// held for as long as the returned file is.
+pub(crate) fn locked_file(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).truncate(false).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let file = options.open(path)?;
+    kr_flush::lock::exclusive(&file)?;
+    Ok(file)
+}
+
 pub use sync::{
     Candidate, ConflictView, Keep, Other, SettingsSync, SyncParts, SyncState, SyncView,
 };
@@ -38,6 +53,9 @@ pub const SETTINGS_EVENT: &str = "kr://settings";
 
 /// The file the settings are kept in, in the application's data directory.
 pub const FILE: &str = "settings.json";
+
+/// The file whose lock makes a change to the settings file one act across companions.
+const LOCK: &str = "settings.lock";
 
 /// The most the file may hold, in bytes. It is a few lines of text.
 const LIMIT: u64 = 16 * 1024;
@@ -96,12 +114,17 @@ impl Kept {
 }
 
 /// The settings kept on this computer.
+///
+/// The file is the one source, and every read goes to it: a second companion on this computer
+/// writes the same file, and a value read once and kept would be the one it held when it started.
+/// What was last read or written is kept only as the answer for a moment the file cannot be read.
 #[derive(Debug)]
 pub struct LocalSettings {
     file: PathBuf,
+    lock: PathBuf,
     kept: Mutex<Kept>,
-    /// Held from the moment a change is written to the moment it is the one in memory, so that
-    /// two changes made together leave the file and this run saying the same thing.
+    /// Held from the moment a change is begun to the moment it is written, so that two changes
+    /// made together in this run are made one after the other.
     keeping: Mutex<()>,
 }
 
@@ -115,30 +138,41 @@ impl LocalSettings {
     /// still finds what it wrote.
     #[must_use]
     pub fn open(data: &Path) -> Self {
-        let file = data.join(FILE);
-        let kept = match read_owner_only_file(&file, LIMIT) {
-            Ok(None) => Kept::default(),
+        let settings = Self {
+            file: data.join(FILE),
+            lock: data.join(LOCK),
+            kept: Mutex::new(Kept::default()),
+            keeping: Mutex::new(()),
+        };
+        settings.read();
+        settings
+    }
+
+    /// What the file holds now, or what was last read or written when it cannot be read.
+    fn read(&self) -> Kept {
+        let read = match read_owner_only_file(&self.file, LIMIT) {
+            Ok(None) => Some(Kept::default()),
             Ok(Some(bytes)) => match serde_json::from_slice::<Kept>(&bytes) {
-                Ok(kept) if kept.version == Kept::VERSION => kept,
+                Ok(kept) if kept.version == Kept::VERSION => Some(kept),
                 Ok(_) => {
                     tracing::warn!("the settings file is of a version this build does not read");
-                    Kept::default()
+                    None
                 }
                 Err(error) => {
                     tracing::warn!(%error, "the settings file is not one this build reads");
-                    Kept::default()
+                    None
                 }
             },
             Err(error) => {
                 tracing::warn!(%error, "the settings file could not be read");
-                Kept::default()
+                None
             }
         };
-        Self {
-            file,
-            kept: Mutex::new(kept),
-            keeping: Mutex::new(()),
+        let mut kept = self.kept.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(read) = read {
+            *kept = read;
         }
+        kept.clone()
     }
 
     /// The colour mode the window is shown in: the one the person chose, or the device's.
@@ -150,10 +184,7 @@ impl LocalSettings {
     /// The colour mode the person chose, when they have.
     #[must_use]
     pub fn chosen_colour_mode(&self) -> Option<ColourMode> {
-        self.kept
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .colour_mode
+        self.read().colour_mode
     }
 
     /// Keeps the person's choice of colour mode.
@@ -164,14 +195,41 @@ impl LocalSettings {
     /// # Errors
     ///
     /// Returns a local failure when the choice cannot be kept, and then the earlier choice
-    /// stands in this run.
+    /// stands.
     pub fn set_colour_mode(&self, mode: ColourMode) -> Result<()> {
+        self.change(None, mode).map(|_| ())
+    }
+
+    /// Keeps `mode` as the choice if the choice now is `expected`, and says whether it did.
+    ///
+    /// This is how a mode that was read from elsewhere takes the place of the choice it was read
+    /// against without taking the place of a choice made since: the comparison and the write are
+    /// one act, across every companion on this computer.
+    ///
+    /// # Errors
+    ///
+    /// Returns a local failure when the choice cannot be kept.
+    pub fn replace_colour_mode(
+        &self,
+        expected: Option<ColourMode>,
+        mode: ColourMode,
+    ) -> Result<bool> {
+        self.change(Some(expected), mode)
+    }
+
+    fn change(&self, expected: Option<Option<ColourMode>>, mode: ColourMode) -> Result<bool> {
         let _keeping = self.keeping.lock().unwrap_or_else(PoisonError::into_inner);
-        let mut next = self
-            .kept
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone();
+        let _lock = locked_file(&self.lock).map_err(|error| {
+            CommandError::local_failure(format!(
+                "the settings could not be locked on this computer: {error}"
+            ))
+        })?;
+        let mut next = self.read();
+        if let Some(expected) = expected
+            && next.colour_mode != expected
+        {
+            return Ok(false);
+        }
         next.version = Kept::VERSION;
         next.colour_mode = Some(mode);
         let text = serde_json::to_vec_pretty(&next).map_err(|error| {
@@ -183,7 +241,7 @@ impl LocalSettings {
             ))
         })?;
         *self.kept.lock().unwrap_or_else(PoisonError::into_inner) = next;
-        Ok(())
+        Ok(true)
     }
 
     /// The script that puts the settings in the window's document before the page's own scripts
