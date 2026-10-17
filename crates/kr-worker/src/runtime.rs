@@ -1698,8 +1698,6 @@ impl SessionRuntime {
         watch
     }
 
-    /// Returns the session's current lifecycle state.
-    #[must_use]
     /// Applies one fence stimulus and everything that came of it, as one step.
     ///
     /// The session is taken first and the input domain inside it, as every other change to the
