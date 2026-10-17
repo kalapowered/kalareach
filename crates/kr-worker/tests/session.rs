@@ -1892,28 +1892,38 @@ async fn a_root_shell_that_exits_at_once_is_noticed_before_the_first_wait() {
     // gone by the time the supervision has opened the child signal it would have been reported on.
     // So the shell's status is asked for once before that supervision waits at all, and this is the
     // case that proves it.
+    //
+    // So nothing else is left to find it. The shell is gone before the supervision starts, so the
+    // signal of its exit has been and gone; a descendant holds the terminal open, so the terminal
+    // hanging up is not the evidence either; the sweep is an hour away; and the session's input
+    // and output no longer wake the supervision. A closure at all is therefore the supervision's
+    // first look at the shell, and the shell was gone when it looked, however long the start took.
     let host = kr_ipc::testing::TempHost::create();
-    let config = configuration(&host, "printf 'kr-leaving\\n'; exit 7");
-    let started = tokio::time::Instant::now();
+    let config = configuration(&host, "sleep 600 & printf 'kr-leaving\\n'; exit 7");
+    let mut session = Session::open(config).expect("opens");
+    session.launch().expect("launches");
+    session.set_idle_sweep(Duration::from_secs(3600));
+    session.activity().silence_marks();
+    let shell = session.root_identity().expect("a root shell");
+    until("the shell to have gone", || {
+        (kr_ipc::identity::process_state(&shell) == kr_ipc::identity::ProcessState::Ended)
+            .then_some(())
+    })
+    .await;
     let runtime = std::sync::Arc::new(
-        kr_worker::runtime::start(
-            config,
+        SessionRuntime::start(
+            session,
             std::sync::Arc::new(kr_ipc::clock::SystemSharedClock),
         )
-        .expect("starts a session"),
+        .expect("starts"),
     );
     let record = closure_record(&runtime, "the session closes on its own").await;
-    let taken = started.elapsed();
 
     assert_eq!(record.reason, ClosureReason::RootExit);
     assert_eq!(
         record.root_exit_code.0.map(kr_protocol::scalars::U64::get),
         Some(7),
         "the shell's own status"
-    );
-    assert!(
-        taken < kr_worker::lifecycle::IDLE_SWEEP_INTERVAL / 2,
-        "and nothing waited for the sweep to come round: {taken:?}"
     );
 }
 
