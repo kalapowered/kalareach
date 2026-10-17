@@ -7,6 +7,8 @@
 
 #![allow(dead_code)]
 
+pub mod call;
+
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -428,6 +430,28 @@ impl Companion {
         ceremony: Arc<dyn kr_client::pairing::owner::Ceremony>,
         paste: Arc<dyn companion_tauri::pairing::PastePlatform>,
     ) -> Self {
+        Self::start_with_voice(
+            data,
+            parts,
+            ceremony,
+            paste,
+            companion_tauri::voice::Calls::absent(),
+            companion_tauri::account::AccountSlot::new(Box::new(|| {
+                Box::pin(async { Err("no account runs in this suite".to_owned()) })
+            })),
+        )
+    }
+
+    /// Starts the backend as [`Self::start`] does, holding the voice calls `calls` and the account
+    /// `account`.
+    pub fn start_with_voice(
+        data: &std::path::Path,
+        parts: Parts,
+        ceremony: Arc<dyn kr_client::pairing::owner::Ceremony>,
+        paste: Arc<dyn companion_tauri::pairing::PastePlatform>,
+        calls: companion_tauri::voice::Calls,
+        account: companion_tauri::account::AccountSlot,
+    ) -> Self {
         use tauri::Listener as _;
 
         let state = companion_tauri::AppState::new();
@@ -437,6 +461,8 @@ impl Companion {
         let heard_on_channels = Arc::clone(&channels);
         let builder = tauri::test::mock_builder()
             .manage(state)
+            .manage(calls)
+            .manage(account)
             .manage(companion_tauri::agent::WorkerLinks::local())
             .channel_interceptor(move |_webview, callback, _index, body| {
                 if let tauri::ipc::InvokeResponseBody::Json(json) = body {
@@ -506,6 +532,10 @@ impl Companion {
                 companion_tauri::commands::voice_prepare,
                 companion_tauri::commands::voice_allow,
                 companion_tauri::commands::voice_scope,
+                companion_tauri::commands::voice_start,
+                companion_tauri::commands::voice_stop,
+                companion_tauri::commands::voice_set_muted,
+                companion_tauri::commands::voice_call_state,
             ]);
         let app = companion_tauri::terminal::install(
             builder,

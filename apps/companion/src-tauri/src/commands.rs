@@ -162,7 +162,6 @@ pub const NAMED_COMMANDS: &[(&str, Option<Method>)] = &[
     ("voice_stop", Some(Method::VoiceStop)),
     ("voice_allow", Some(Method::VoiceGrant)),
     ("voice_scope", None),
-    ("voice_delegate", Some(Method::VoiceDelegate)),
     ("voice_context", Some(Method::VoiceContext)),
     // The two local silences and the call's own state. They reach no service at all. This process
     // holds no call, so the silences are refused and the state is a device holding none.
@@ -476,7 +475,6 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'static
         voice_stop,
         voice_allow,
         voice_scope,
-        voice_delegate,
         voice_context,
         voice_set_muted,
         voice_call_state,
@@ -1568,16 +1566,19 @@ read_command!(
     kr_protocol::voice::VoicePrepareParams => kr_protocol::voice::VoicePrepareResult
 );
 
-/// Refuses to start a voice session from this application.
+/// Starts a voice call on this device.
 ///
-/// Section 15 ¶2 puts capture, playback and the connection in native WebRTC and platform audio,
-/// and this process holds neither, so it has no offer to give. The phone applications' Swift and
-/// Kotlin calls are their own. A start is refused before anything is submitted, because the broker
-/// creates a metered provider session the moment a start reaches it, and a session created for a
-/// device that can carry no audio is one a person pays for and cannot use.
+/// The call is this application's own: native code holds its media, and the task that owns it
+/// asks the host to create it, applies the provider's answer, permits it and opens its control
+/// at the voice service. A start is refused before the host is asked for anything when this
+/// device cannot control the call afterwards, which is when it has no account token for the voice
+/// scope: the service closes a call nobody controls, and a person pays for the seconds it ran.
 #[tauri::command]
-pub async fn voice_start(
-    state: State<'_, AppState>,
+#[allow(clippy::too_many_arguments)]
+pub async fn voice_start<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    calls: State<'_, crate::voice::Calls>,
+    account: State<'_, crate::account::AccountSlot>,
     subject: Subject,
     session_ids: Vec<String>,
     duration_seconds: u32,
@@ -1585,18 +1586,52 @@ pub async fn voice_start(
     prepared: kr_protocol::scalars::Digest256,
     expected_rate_version: Option<String>,
 ) -> Result<VoiceStarted> {
-    let _ = (
-        state,
-        subject,
-        session_ids,
-        duration_seconds,
-        reasoning_budget_minor,
-        prepared,
-        expected_rate_version,
-    );
-    Err(CommandError::unsupported(
-        "this application cannot open a voice call on this device",
-    ))
+    let session_ids = session_ids
+        .iter()
+        .map(|id| {
+            id.parse()
+                .map_err(|_| CommandError::invalid("that is not a session identifier"))
+        })
+        .collect::<Result<Vec<kr_protocol::ids::SessionId>>>()?;
+    let reasoning_budget_minor = reasoning_budget_minor
+        .map(|minor| {
+            minor
+                .parse::<u64>()
+                .map_err(|_| CommandError::invalid("a reasoning budget is a whole number"))
+        })
+        .transpose()?;
+    let tokens = account.get().await?.tokens();
+    let started = calls
+        .start(
+            crate::voice::StartRequest {
+                session_ids,
+                duration_seconds,
+                reasoning_budget_minor,
+                prepared,
+                expected_rate_version,
+                subject,
+            },
+            std::sync::Arc::new(crate::voice::AppReach::new(app)),
+            tokens,
+        )
+        .await?;
+    Ok(match started {
+        crate::voice::Started::Result(value) => VoiceStarted {
+            receipt: None,
+            value: Some(value),
+            action_id: None,
+        },
+        crate::voice::Started::Receipt(receipt) => VoiceStarted {
+            action_id: Some(receipt.action_id.to_string()),
+            receipt: Some(*receipt),
+            value: None,
+        },
+        crate::voice::Started::Unknown { action_id } => VoiceStarted {
+            receipt: None,
+            value: None,
+            action_id: Some(action_id.to_string()),
+        },
+    })
 }
 
 /// What a start answered, in the method's own shape.
@@ -1615,46 +1650,29 @@ pub struct VoiceStarted {
     pub action_id: Option<String>,
 }
 
-/// Asks the host to revoke the voice session's grant.
+/// Ends the call this device holds, and asks the host to revoke its grant.
 ///
-/// This process holds no call, so there is no local call to close first, and the answer says so.
-/// Section 15 ¶10 keeps local mute and transport closure working
-/// when the broker fails, and a closure that waited for a service to answer before silencing a
-/// microphone would fail at exactly the moment a person most wants it to work. What the host said
-/// is reported beside the local closure rather than in place of it, so nothing here can report a
-/// grant as revoked because a microphone stopped.
+/// The media stops first and the host is asked at once, each with a bound of its own, so a call
+/// that cannot be stopped locally never holds a revocation, and a host that cannot be reached
+/// never holds the media (section 15 paragraph 10). The answer keeps the two apart: what was done
+/// here, and what the host said. The voice service is finalised after that, and the screen does
+/// not wait for it. A page that names a call this device does not hold asks the host about that
+/// one and closes nothing here.
 #[tauri::command]
-pub async fn voice_stop(
-    state: State<'_, AppState>,
-    subject: Subject,
-    voice_session_id: String,
+pub async fn voice_stop<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    calls: State<'_, crate::voice::Calls>,
+    voice_session_id: Option<String>,
 ) -> Result<VoiceClosure> {
-    let closed_locally = crate::audio::stop_active_call();
-
-    let typed = kr_protocol::voice::VoiceStopParams {
-        voice_session_id: voice_session_id
-            .parse()
-            .map_err(|_| CommandError::invalid("that is not a voice session identifier"))?,
-    };
-    let told_the_host = async {
-        let target = subject.target(state.environment_id()?)?;
-        let session = state.session()?;
-        let answer = session
-            .mutate(
-                Method::VoiceStop,
-                target,
-                None,
-                &NoPreconditions {},
-                &typed,
-                MUTATION_TTL,
-            )
-            .await
-            .map_err(CommandError::from)?;
-        fence_of(&answer)
-    }
-    .await;
-
-    Ok(VoiceClosure::of(closed_locally, told_the_host))
+    let named = voice_session_id
+        .map(|id| {
+            id.parse()
+                .map_err(|_| CommandError::invalid("that is not a voice session identifier"))
+        })
+        .transpose()?;
+    let reach = crate::voice::AppReach::new(app);
+    let closed = calls.stop(named, &reach).await?;
+    Ok(VoiceClosure::from_closed(closed))
 }
 
 /// What a stop's answer shows of the fence its withdrawal owed, as the page is given it.
@@ -1668,7 +1686,7 @@ pub async fn voice_stop(
 /// or that this build cannot read is not "owed none": it is reported as unreadable, because
 /// whether a worker may still take up what the call sent is then not known here. An answer that is
 /// a receipt is not a stop's result, and is a failure to read what the host said.
-fn fence_of(answer: &kr_client::Settled) -> Result<VoiceFence> {
+pub(crate) fn fence_of(answer: &kr_client::Settled) -> Result<VoiceFence> {
     let kr_client::Settled::Result(value) = answer else {
         return Err(CommandError::local_failure(
             "the host answered the stop with a receipt, not with its result",
@@ -1705,7 +1723,7 @@ fn allowed_for_the_page(granted: kr_protocol::voice::VoiceGrantResult) -> VoiceA
 }
 
 /// What the host's answer to a stop showed of the fence its withdrawal owed (read by `fence_of`).
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum VoiceFence {
     /// The host said it owed no fence.
@@ -1734,6 +1752,25 @@ pub struct VoiceClosure {
 }
 
 impl VoiceClosure {
+    /// The closure for what ending a call did here and at the host.
+    fn from_closed(closed: crate::voice::Closed) -> Self {
+        use crate::voice::HostEnd;
+        let told = match closed.host {
+            HostEnd::Revoked { fence, .. } => Ok(Some(fence)),
+            HostEnd::NotNeeded => Ok(None),
+            HostEnd::Refused { words } => Err(CommandError::refused(words)),
+            HostEnd::NotTold { words } => Err(CommandError::unavailable(words)),
+        };
+        match told {
+            Ok(fence) => Self {
+                closed_locally: closed.local,
+                fence,
+                host_failure: None,
+            },
+            Err(error) => Self::of(closed.local, Err(error)),
+        }
+    }
+
     /// The closure for what the host said, or for why it could not be told.
     fn of(closed_locally: bool, told_the_host: Result<VoiceFence>) -> Self {
         match told_the_host {
@@ -1765,20 +1802,42 @@ pub enum VoiceMute {
     Playback,
 }
 
-/// Refuses to silence the microphone or the speaker: this process holds no call to act on.
+/// Silences the microphone or the model's voice on this device, or ends the silence.
 ///
-/// Local and immediate, and it contacts nothing, which is why this is not a mutation.
+/// Local and immediate: native code carries it out, and the voice service is only told of a
+/// microphone's mute as advice to the provider.
 #[tauri::command]
-pub fn voice_set_muted(what: VoiceMute, muted: bool) -> Result<crate::audio::VoiceCallState> {
-    let _ = (what, muted);
-    crate::audio::set_muted()
+pub async fn voice_set_muted(
+    calls: State<'_, crate::voice::Calls>,
+    what: VoiceMute,
+    muted: bool,
+) -> Result<crate::voice::VoiceCallState> {
+    let what = match what {
+        VoiceMute::Microphone => companion_platform::call::Mute::Microphone,
+        VoiceMute::Playback => companion_platform::call::Mute::Playback,
+    };
+    calls.set_muted(what, muted).await
 }
 
-/// What a call on this device is doing. This process holds none, so it reports a device holding no
-/// call.
+/// What the call this device holds is doing, how the last one ended, and what a person is told
+/// before starting another.
 #[tauri::command]
-pub fn voice_call_state() -> Result<crate::audio::VoiceCallState> {
-    crate::audio::call_state()
+pub async fn voice_call_state(
+    state: State<'_, AppState>,
+    calls: State<'_, crate::voice::Calls>,
+    account: State<'_, crate::account::AccountSlot>,
+) -> Result<crate::voice::VoiceCallState> {
+    let generation = match account.get().await {
+        Ok(account) => match account.tokens().status() {
+            Ok(kr_client::services::account::AccountStatus::SignedIn { generation, .. }) => {
+                Some(generation)
+            }
+            _ => None,
+        },
+        Err(_) => None,
+    };
+    let environment = state.environment_id().ok().map(|id| id.to_string());
+    Ok(calls.state(calls.note_key(environment, generation).as_ref()))
 }
 
 /// One action a voice grant permits, as the person is shown it before allowing it.
@@ -1927,67 +1986,6 @@ pub async fn voice_allow(
         }
         other => submitted(other),
     }
-}
-
-/// The request a delegation continues, when it carries the evidence a host asked for.
-///
-/// `None` is a first submission, which is a new intent and takes a new identity.
-fn delegation_continues(
-    params: &kr_protocol::voice::VoiceDelegateParams,
-) -> Option<kr_protocol::ids::ActionId> {
-    params
-        .confirmation
-        .as_ref()
-        .map(|proof: &kr_protocol::voice::VoiceConfirmationProof| proof.request.action_id)
-}
-
-/// Submits a voice delegation, with the confirmation the host asked for when it asked for one.
-///
-/// A delegation the host will not act on without a confirmation on this device's unlocked screen
-/// is answered with a challenge rather than a receipt, and that challenge names the request it was
-/// issued for. The signed proof therefore has to come back as that same request: a second intent
-/// with a fresh identity is a delegation the host never challenged, and it refuses it.
-///
-/// The identity comes out of the proof itself, so the only request this can continue is the one
-/// whose challenge is being answered. The host still checks the proof against the challenge it
-/// issued, and this changes nothing about that.
-#[tauri::command]
-pub async fn voice_delegate(
-    state: State<'_, AppState>,
-    subject: Subject,
-    params: Value,
-) -> Result<Settled> {
-    let typed: kr_protocol::voice::VoiceDelegateParams = decode(params)?;
-    let target = subject.target(state.environment_id()?)?;
-    let session = state.session()?;
-    let answer = match delegation_continues(&typed) {
-        Some(action_id) => {
-            session
-                .mutate_continuing(
-                    action_id,
-                    Method::VoiceDelegate,
-                    target,
-                    None,
-                    &NoPreconditions {},
-                    &typed,
-                    MUTATION_TTL,
-                )
-                .await
-        }
-        None => {
-            session
-                .mutate(
-                    Method::VoiceDelegate,
-                    target,
-                    None,
-                    &NoPreconditions {},
-                    &typed,
-                    MUTATION_TTL,
-                )
-                .await
-        }
-    };
-    submitted(answer)
 }
 
 read_command!(
@@ -2643,43 +2641,6 @@ mod tests {
     use super::*;
     use std::collections::BTreeSet;
 
-    /// A delegation, with the confirmation a host's challenge asked for when one is supplied.
-    fn delegation(
-        confirmation: Option<kr_protocol::ids::ActionId>,
-    ) -> kr_protocol::voice::VoiceDelegateParams {
-        use kr_protocol::ids::{ConfirmationId, DeviceId, VoiceSessionId};
-        use kr_protocol::scalars::{Digest256, Nonce256, Nullable, TimestampMs, Uuid};
-
-        let proof = confirmation.map(|action_id| kr_protocol::voice::VoiceConfirmationProof {
-            request: kr_protocol::voice::VoiceConfirmationRequest {
-                confirmation_id: ConfirmationId::new(Uuid::from_bytes([7; 16])),
-                voice_session_id: VoiceSessionId::new(Uuid::from_bytes([8; 16])),
-                action: kr_protocol::voice::VoiceAction::ApplyDiff,
-                action_digest: Digest256::from_bytes([3; 32]),
-                action_id,
-                host_device_id: DeviceId::new(Uuid::from_bytes([1; 16])),
-                device_id: DeviceId::new(Uuid::from_bytes([2; 16])),
-                nonce: Nonce256::from_bytes([4; 32]),
-                expires_at_ms: TimestampMs::new(1_700_000_000_000),
-            },
-            signer_key_id: kr_protocol::scalars::KeyId::from_bytes([5; 32]),
-            signature: kr_protocol::scalars::Signature64::from_bytes([6; 64]),
-        });
-
-        kr_protocol::voice::VoiceDelegateParams {
-            voice_session_id: VoiceSessionId::new(Uuid::from_bytes([8; 16])),
-            delegation_id: kr_protocol::voice::VoiceDelegationId::new("d-1".to_owned())
-                .expect("a delegation identifier"),
-            offset_ms: kr_protocol::scalars::U64::new(1_200),
-            fragments: vec![kr_protocol::voice::TranscriptFragment {
-                start_ms: kr_protocol::scalars::U64::new(1_000),
-                end_ms: kr_protocol::scalars::U64::new(1_200),
-                text: kr_protocol::voice::FragmentText::new("apply the diff").expect("a fragment"),
-            }],
-            confirmation: Nullable(proof),
-        }
-    }
-
     /// The barrier of a fence that named the device's own close, with one worker in this state.
     fn a_barrier_with(
         state: kr_protocol::action::BarrierState,
@@ -2784,11 +2745,7 @@ mod tests {
     /// What the page is given for a stop answered with this result, as the command encodes it.
     fn the_closure_for(result: kr_cbor::CanonicalMap) -> serde_json::Value {
         let answered = kr_client::Settled::Result(kr_cbor::CanonicalValue::Map(result).into());
-        serde_json::to_value(VoiceClosure::of(
-            crate::audio::stop_active_call(),
-            fence_of(&answered),
-        ))
-        .expect("it encodes")
+        serde_json::to_value(VoiceClosure::of(false, fence_of(&answered))).expect("it encodes")
     }
 
     /// Section 9: a stop answered with a worker that has not held reaches the page as pending, with
@@ -2876,11 +2833,8 @@ mod tests {
             );
             assert_eq!(closure["fence"].as_object().map(|each| each.len()), Some(1));
         }
-        let closure = serde_json::to_value(VoiceClosure::of(
-            crate::audio::stop_active_call(),
-            fence_of(&not_a_map),
-        ))
-        .expect("it encodes");
+        let closure = serde_json::to_value(VoiceClosure::of(false, fence_of(&not_a_map)))
+            .expect("it encodes");
         assert_eq!(closure["fence"]["kind"], "unreadable", "{closure}");
     }
 
@@ -2906,7 +2860,7 @@ mod tests {
         };
 
         let closure = serde_json::to_value(VoiceClosure::of(
-            crate::audio::stop_active_call(),
+            false,
             fence_of(&kr_client::Settled::Receipt(Box::new(receipt))),
         ))
         .expect("it encodes");
@@ -3028,24 +2982,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_confirmed_delegation_continues_the_request_the_challenge_names() {
-        use kr_protocol::ids::ActionId;
-        use kr_protocol::scalars::Uuid;
-
-        // A first submission is a new intent, so it takes a new identity.
-        assert_eq!(delegation_continues(&delegation(None)), None);
-
-        // The confirmed submission answers one challenge, and that challenge was issued for one
-        // request. Continuing anything else would be answering for a delegation the host never
-        // challenged, and the host refuses that.
-        let challenged = ActionId::new(Uuid::from_bytes([0xab; 16]));
-        assert_eq!(
-            delegation_continues(&delegation(Some(challenged))),
-            Some(challenged)
-        );
-    }
-
     /// An application whose commands are `handler`, with no host configured, and the window its
     /// page runs in.
     fn page_with(
@@ -3056,6 +2992,11 @@ mod tests {
     ) {
         let app = tauri::test::mock_builder()
             .manage(AppState::new())
+            // This window holds no call, and no account is signed in.
+            .manage(crate::voice::Calls::absent())
+            .manage(crate::account::AccountSlot::new(Box::new(|| {
+                Box::pin(async { Err("no account runs in this test".to_owned()) })
+            })))
             // No host runs here, so no session's worker can be reached either.
             .manage(crate::agent::WorkerLinks::with(std::sync::Arc::new(|| {
                 Err("this test runs no host".to_owned())
@@ -3187,7 +3128,6 @@ mod tests {
         "voice_stop",
         "voice_allow",
         "voice_scope",
-        "voice_delegate",
         "voice_context",
         "voice_set_muted",
         "voice_call_state",
@@ -3574,8 +3514,8 @@ mod tests {
     /// reads that take nothing from the page go straight to that question, and the upload, which
     /// takes a path rather than a map, refuses one that nobody dropped. A voice stop takes its
     /// values one by one rather than as a map, and refuses values that are not what they claim to
-    /// be in the same way; a voice start refuses every request before reading it, because this
-    /// application opens no call.
+    /// be in the same way, and so does a voice start, which parses its sessions before it asks
+    /// for an account or a host.
     #[test]
     fn parameters_that_are_not_the_methods_shape_are_refused_before_anything_is_sent() {
         let refusal: Result<kr_protocol::session::SessionReadParams> =
@@ -3635,14 +3575,12 @@ mod tests {
             voice_start,
             voice_stop,
             voice_allow,
-            voice_delegate,
             voice_context,
         ]);
         // One body for every command: each reads the arguments it takes and nothing else. The
-        // voice stop reads its own one by one, and the voice start reads none after the invoke
-        // layer has typed them. The identifier the stop parses itself is not an identifier, and the
-        // values the invoke layer types are of their types, so the refusal is the command's own
-        // rather than the invoke layer's.
+        // voice stop and the voice start read their own one by one. The identifiers they parse
+        // themselves are not identifiers, and the values the invoke layer types are of their types,
+        // so the refusal is the command's own rather than the invoke layer's.
         let prepared = serde_json::to_value(kr_protocol::scalars::Digest256::from_bytes([0; 32]))
             .expect("a digest");
         let foreign = serde_json::json!({
@@ -3665,8 +3603,6 @@ mod tests {
                     "HOST_NOT_CONFIGURED"
                 }
                 "attachment_upload" => "PERMISSION_DENIED",
-                // This application opens no call, so it refuses every start before it reads one.
-                "voice_start" => "RESOURCE_UNAVAILABLE",
                 _ => "INVALID_ARGUMENT",
             };
             assert_eq!(

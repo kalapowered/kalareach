@@ -57,9 +57,8 @@ pub mod target;
 pub mod terminal;
 pub mod transfers;
 pub mod verify;
+pub mod voice;
 pub mod worker;
-
-pub mod audio;
 
 pub use error::{CommandError, Result};
 pub use state::AppState;
@@ -131,6 +130,7 @@ pub fn run() {
                     tracing::warn!(%error, "the account is not available on this device");
                 }
             });
+            app.manage(voice_calls(app.handle()));
             watch_drops(app.handle());
             open_pairing(app.handle());
             #[cfg(mobile)]
@@ -203,6 +203,32 @@ fn open_main_window(app: &tauri::AppHandle) -> tauri::Result<()> {
     )
     .build()?;
     Ok(())
+}
+
+/// The voice calls of this application: a phone's own through native code, and none on a desktop,
+/// which negotiates no media connection.
+#[cfg(mobile)]
+fn voice_calls(app: &tauri::AppHandle) -> voice::Calls {
+    use std::sync::Arc;
+
+    use companion_platform::call::{NativeCalls, PluginCommands};
+
+    match voice::Service::managed() {
+        Ok(service) => voice::Calls::on_phone(
+            Arc::new(NativeCalls::new(PluginCommands::new(app.clone()))),
+            service,
+            voice::Timings::default(),
+        ),
+        Err(error) => {
+            tracing::warn!(%error, "this device cannot reach the voice service, so it holds no call");
+            voice::Calls::absent()
+        }
+    }
+}
+
+#[cfg(desktop)]
+fn voice_calls(_app: &tauri::AppHandle) -> voice::Calls {
+    voice::Calls::absent()
 }
 
 /// Builds the account: the managed service on its fixed origin, the device's secure store, and

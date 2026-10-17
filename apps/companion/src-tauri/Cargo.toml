@@ -111,6 +111,11 @@ kr-ipc = { workspace = true, features = ["testing"] }
 # was recorded.
 kr-service-stand-in = { path = "../../../tests/support/service-stand-in" }
 kr-transport.workspace = true
+# The voice service's stand-in, which serves the control socket of a call on the daemon's behalf: its
+# route is kr-client's, included by path.
+futures-util.workspace = true
+tokio-rustls.workspace = true
+tokio-websockets = { workspace = true, features = ["server"] }
 # The registry reader of the shared teardown module, which ends every worker a case's daemon started.
 rusqlite = { workspace = true, features = ["bundled"] }
 # A real session worker, with its question ledger, its broker and its admission of every caller, for
