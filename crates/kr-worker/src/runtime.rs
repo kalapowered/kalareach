@@ -1448,8 +1448,8 @@ impl SessionRuntime {
     /// session let go, while the write is being made, for this host's own tests.
     ///
     /// Returns the end that says the write has arrived, and the end that lets it go. The pause
-    /// fires once. The segment's first write and one that opens a new segment are made with the
-    /// session held and are not the ones this stops.
+    /// fires once. Only a write that the spool owes the caller is made with the session let go;
+    /// every other write to the spool is made with the session held, and this stops none of them.
     #[cfg(feature = "testing")]
     #[must_use]
     pub fn pause_in_next_spool_write(
