@@ -434,7 +434,8 @@ impl OwnedProcesses {
     ///   live ones if the reading found it running. One the record knows of is left as the record
     ///   has it: the record learnt of it from another observation, which decided whether it was
     ///   still running. They are recorded nearest the server first, up to the room the record has,
-    ///   so a process refused for want of room is never the parent of one that is recorded.
+    ///   so a process the reading found is never recorded without the one it was read below, and a
+    ///   process refused for want of room refuses everything read further from the server.
     /// - A process the reading found ended, or in a daemon's scope, is dropped from the live ones.
     /// - A process the reading found below another is recorded where it was first read, or below
     ///   the nearest process above it that the record holds when it had no room for the one it was
@@ -472,8 +473,8 @@ impl OwnedProcesses {
         }
         // Nearest to the server first. The room only runs out, so a refusal refuses every process
         // after it, and a process is only admitted once the one it was read below has been: what
-        // is recorded always has the chain above it to its server, or the one that was already in
-        // the record.
+        // the reading found is never recorded without the chain above it to its server. A process
+        // the record holds by another route is not in this list; its place is made below.
         let mut found: Vec<((u64, u64), Recorded)> = copy_seen
             .into_iter()
             .filter(|(this, _)| !self.seen.contains_key(this) && !live_then.contains(this))
@@ -585,6 +586,10 @@ impl OwnedProcesses {
 
     /// The nearest process to `above`, `above` itself first, up the chain of `places`, that the
     /// record holds; none when the chain ends before it meets one.
+    ///
+    /// A process placed below it stays there: if the process the record had no room for is read
+    /// later and recorded, the departure of that one does not reach what was placed below its
+    /// parent. The record says that it was full when it refused the process.
     fn recorded_above(
         &self,
         places: &BTreeMap<(u64, u64), ReadBelow>,
@@ -3247,44 +3252,58 @@ mod tests {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn a_process_read_below_one_the_record_had_no_room_for_leaves_with_the_daemon_above() {
-        let (_alive, ids) = strangers(4);
-        let (server, daemon, parent, child) = (&ids[0], &ids[1], &ids[2], &ids[3]);
-        let mut owned = session_with(server);
-        owned.cap = 3;
-        record_below(&mut owned, daemon, server, server);
-        let mut observation = owned.begin_observation();
-        record_below(&mut observation.copy, parent, server, daemon);
-        record_below(&mut observation.copy, child, server, parent);
-        // The record meanwhile takes in the child on its own, with no place, and fills up.
-        owned.take([child.clone()]);
-        let mut number = 0;
-        while owned.seen.len() < owned.room() {
-            number += 1;
-            let ended = kr_ipc::identity::ended_process_identity(4_500_000 + number);
-            owned.seen.insert(
-                key(&ended),
-                Recorded {
-                    identity: ended,
-                    forced: false,
-                    left: std::sync::atomic::AtomicBool::new(false),
-                },
-            );
-        }
-        owned.note_left(daemon);
-        owned.finish_observation(observation);
+        for departs in [true, false] {
+            let (_alive, ids) = strangers(4);
+            let (server, daemon, parent, child) = (&ids[0], &ids[1], &ids[2], &ids[3]);
+            let mut owned = session_with(server);
+            owned.cap = 3;
+            record_below(&mut owned, daemon, server, server);
+            let mut observation = owned.begin_observation();
+            record_below(&mut observation.copy, parent, server, daemon);
+            record_below(&mut observation.copy, child, server, parent);
+            // The record meanwhile takes in the child on its own, with no place, and fills up.
+            owned.take([child.clone()]);
+            let mut number = 0;
+            while owned.seen.len() < owned.room() {
+                number += 1;
+                let ended = kr_ipc::identity::ended_process_identity(4_500_000 + number);
+                owned.seen.insert(
+                    key(&ended),
+                    Recorded {
+                        identity: ended,
+                        forced: false,
+                        left: std::sync::atomic::AtomicBool::new(false),
+                    },
+                );
+            }
+            if departs {
+                owned.note_left(daemon);
+            }
+            owned.finish_observation(observation);
 
-        assert!(
-            !owned.seen.contains_key(&key(parent)),
-            "the parent was refused for want of room"
-        );
-        assert!(
-            owned.is_flagged(&key(child)),
-            "and the child, read below the daemon that left, left with it"
-        );
-        assert!(
-            !owned.record().processes.contains(child),
-            "so the record does not name it"
-        );
+            let named = format!("(the daemon left: {departs})");
+            assert!(
+                !owned.seen.contains_key(&key(parent)),
+                "the parent was refused for want of room {named}"
+            );
+            if departs {
+                assert!(
+                    owned.is_flagged(&key(child)),
+                    "and the child, read below the daemon that left, left with it {named}"
+                );
+                assert!(
+                    !owned.record().processes.contains(child),
+                    "so the record does not name it {named}"
+                );
+            } else {
+                assert!(
+                    !owned.is_flagged(&key(child))
+                        && owned.under_backends[&key(child)].2 == key(daemon)
+                        && owned.record().processes.contains(child),
+                    "the control: with no departure the child runs, below the daemon {named}"
+                );
+            }
+        }
     }
 
     /// KR-REQ-07.60: the record is let hold twice its bound while a copy of it is out, and no more,
@@ -3498,8 +3517,20 @@ mod tests {
         let (_alive, ids) = strangers(2);
         let (server, running) = (&ids[0], &ids[1]);
         let ended = kr_ipc::identity::ended_process_identity(4_400_000);
+        let gone = kr_ipc::identity::ended_process_identity(4_400_001);
         let mut owned = session_with(server);
+        // A process the record holds as running, which the copy reads as ended.
+        owned.seen.insert(
+            key(&gone),
+            Recorded {
+                identity: gone.clone(),
+                forced: false,
+                left: std::sync::atomic::AtomicBool::new(false),
+            },
+        );
+        owned.live.insert(key(&gone), gone.clone());
         let mut observation = owned.begin_observation();
+        observation.copy.live.remove(&key(&gone));
         record_below(&mut observation.copy, &ended, server, server);
         observation.copy.live.remove(&key(&ended));
         record_below(&mut observation.copy, running, server, &ended);
@@ -3517,6 +3548,10 @@ mod tests {
         assert!(
             owned.below_backend(server).contains(running),
             "it is recorded below the server"
+        );
+        assert!(
+            !owned.record().processes.contains(&gone),
+            "and a process the copy read as ended is no longer among those the record names"
         );
     }
 
