@@ -3915,5 +3915,66 @@ async fn kr_req_07_60_the_writer_of_the_owned_record_says_whether_a_record_was_w
         !answer,
         "a directory is not a journal, and the answer says so"
     );
+    drop(unwritable);
+    std::fs::remove_dir_all(path.parent().expect("a parent")).ok();
+}
+
+/// A caller that hands over a newer record and asks to be told while a refused record waits to be
+/// tried again is told what became of the newer one, which is written; the refused record is not
+/// written over it.
+#[tokio::test]
+async fn kr_req_07_60_a_request_to_be_told_that_comes_while_a_refused_record_waits_is_answered() {
+    let path = journal_path("owned-refused-then-asked");
+    let session_id = fixture_session();
+    let journal = Journal::open(&path).expect("opens");
+    let writer = kr_worker::owned_writer::OwnedWriter::start(path.clone(), session_id)
+        .expect("starts the writer");
+    let holder = rusqlite::Connection::open(&path).expect("opens a second connection");
+    holder
+        .execute_batch("BEGIN IMMEDIATE")
+        .expect("takes the write lock");
+    let identity = |pid: u64| {
+        kr_protocol::identity::ProcessStartIdentity::new(
+            pid,
+            kr_protocol::identity::ProcessStartSource::MacosProcBsdInfo,
+            pid * 3,
+        )
+    };
+    let refused = kr_worker::ownership::OwnedRecord {
+        boot: None,
+        root: identity(10),
+        processes: vec![identity(10), identity(11)],
+        cgroup: None,
+        boundary: "the terminal's process group".to_owned(),
+        limits: Vec::new(),
+        backends: Vec::new(),
+    };
+    let newer = kr_worker::ownership::OwnedRecord {
+        processes: vec![identity(10)],
+        ..refused.clone()
+    };
+    writer.submit(refused);
+    let started = std::time::Instant::now();
+    while !writer.last_write_failed() {
+        assert!(
+            started.elapsed() < LIVENESS_DEADLINE,
+            "waited {LIVENESS_DEADLINE:?} for the journal to refuse the write"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    holder.execute_batch("COMMIT").expect("lets go");
+    let answer = tokio::time::timeout(LIVENESS_DEADLINE, writer.submit_acknowledged(newer.clone()))
+        .await
+        .expect("an answer comes")
+        .expect("the thread answers");
+    assert!(answer, "the newer record was written");
+    assert_eq!(
+        journal.read_owned(session_id).expect("reads"),
+        Some(newer),
+        "and it is the record on disk"
+    );
+    drop(writer);
+    drop(holder);
+    drop(journal);
     std::fs::remove_dir_all(path.parent().expect("a parent")).ok();
 }
