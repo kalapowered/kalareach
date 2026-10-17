@@ -1,6 +1,6 @@
 //! What the screen is told of the call this application holds.
 
-use kr_protocol::ids::{ActionId, VoiceSessionId};
+use kr_protocol::ids::{ActionId, DeviceId, EnvironmentId, VoiceSessionId};
 use kr_protocol::voice::VoiceSessionDescriptor;
 use serde::Serialize;
 
@@ -120,6 +120,10 @@ pub struct OwedView {
     pub host_reference: String,
     /// The name the host gives people.
     pub host_name: String,
+    /// The host's identity and environment, which this device asks again when it reaches the host.
+    /// Kept with the entry from one launch to the next, and never sent to the page.
+    #[serde(skip)]
+    pub host: Option<(DeviceId, EnvironmentId)>,
 }
 
 impl OwedView {
@@ -171,6 +175,7 @@ impl OwedView {
                 .name
                 .clone()
                 .unwrap_or_else(|| UNNAMED_HOST.to_owned()),
+            host: Some((host.paired.host_device_id, host.environment_id)),
         }
     }
 }
@@ -249,6 +254,7 @@ mod tests {
             until_ms,
             host_reference: "a-host".to_owned(),
             host_name: "A host".to_owned(),
+            host: None,
         }
     }
 

@@ -452,10 +452,20 @@ pub async fn keep<R, A, F>(
             Attempt::Reached(connection) => {
                 let session = connection.session();
                 let environment_id = connection.environment_id();
+                let paired_host = match connection.standing() {
+                    Standing::Paired { host, .. } => Some(host.host_device_id),
+                    Standing::Owner => None,
+                };
                 if !state.connected_for(choice, connection) {
                     return;
                 }
                 let _ = app.emit(CONNECTION_EVENT, state.connection_state());
+                // A host that is reached again is asked once more for what a call left owed it.
+                if let (Some(host), Some(calls)) =
+                    (paired_host, app.try_state::<crate::voice::Calls>())
+                {
+                    calls.host_reached(host, environment_id, Arc::clone(&session));
+                }
                 if let Some(first) = first.take() {
                     let _ = first.send(());
                 }

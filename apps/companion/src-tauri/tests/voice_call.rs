@@ -48,7 +48,7 @@ use std::time::Duration;
 use companion_platform::call::{CallEvent, FailureKind};
 use companion_tauri::account::carrier::{Boxed, Carrier, Ending, Plan, Unavailable};
 use companion_tauri::account::{Account, AccountSlot};
-use companion_tauri::voice::{Calls, Service, Timings};
+use companion_tauri::voice::{Calls, Kept, Service, Timings};
 use kr_client::services::ServiceFuture;
 use kr_client::services::account::{
     AccountIdentity, AccountService, AccountToken, AccountUsage, AuthorisationGrant, Client,
@@ -177,6 +177,22 @@ fn document_naming(origin: &str) -> ConfigurationDocument {
     document
 }
 
+/// The voice service at `origin`, reached the way the application reaches it.
+fn service_at(origin: &str) -> Service {
+    Service {
+        origin: origin.to_owned(),
+        http: Arc::new(
+            HttpService::with(
+                kr_protocol::service::GatewayOrigin::new(origin).expect("an origin"),
+                HttpDeadlines::default(),
+                managed_response_limits(),
+            )
+            .expect("a transport"),
+        ),
+        connector: ControlConnector::platform().expect("a connector"),
+    }
+}
+
 /// Everything one test holds.
 struct Scene {
     /// The daemon, until a test stops it.
@@ -297,29 +313,14 @@ async fn scene_with(
         Arc::new(|_| {}),
     ));
     let platform = ScriptedCalls::new();
+    let data = tempfile::tempdir().expect("a directory");
     let calls = Calls::on_phone(
         Arc::clone(&platform) as Arc<dyn companion_platform::call::CallPlatform>,
-        Service {
-            origin: account_origin
-                .unwrap_or_else(|| stand_in.origin())
-                .to_owned(),
-            http: Arc::new(
-                HttpService::with(
-                    kr_protocol::service::GatewayOrigin::new(
-                        account_origin.unwrap_or_else(|| stand_in.origin()),
-                    )
-                    .expect("an origin"),
-                    HttpDeadlines::default(),
-                    managed_response_limits(),
-                )
-                .expect("a transport"),
-            ),
-            connector: ControlConnector::platform().expect("a connector"),
-        },
+        service_at(account_origin.unwrap_or_else(|| stand_in.origin())),
         timings,
+        Kept::at(data.path()),
     );
 
-    let data = tempfile::tempdir().expect("a directory");
     let secrets: Arc<dyn kr_crypto::store::SecretStore> = Arc::new(MemoryStore::new());
     let room: Arc<dyn kr_client::pairing::candidate::CandidateRoom> = Arc::new(host.room.clone());
     let paste = StubPaste::holding("", false);
@@ -2110,5 +2111,131 @@ async fn a_failed_open_says_it_is_ending_while_it_cleans_up() {
         .await
         .expect("the start ran")
         .expect_err("a call that could not be opened is not a call started");
+    scene.stop_host().await;
+}
+
+/// The note that the voice service had no such call for this account outlives the process: a
+/// device launched again finds it standing for the same host, account and service, and not for
+/// another.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_note_that_the_service_had_no_such_call_survives_a_launch() {
+    let mut scene = scene().await;
+    scene.stand_in.treat_as_another_account(PHONE_TOKEN);
+    scene.start().await;
+    scene
+        .state_where("a call that ended with the note", |state| {
+            state["ended"]["cause"] == "no_such_call" && state["warning"].is_string()
+        })
+        .await;
+    let generation = match scene.tokens.status() {
+        Ok(kr_client::services::account::AccountStatus::SignedIn { generation, .. }) => {
+            Some(generation)
+        }
+        other => panic!("the phone is signed in: {other:?}"),
+    };
+    let relaunched = Calls::on_phone(
+        ScriptedCalls::new() as Arc<dyn companion_platform::call::CallPlatform>,
+        service_at(scene.stand_in.origin()),
+        quick(),
+        Kept::at(scene.phone.data.path()),
+    );
+
+    let same = relaunched.note_key(
+        Some(scene.host().environment_id.to_string()),
+        generation.clone(),
+    );
+    let other = relaunched.note_key(Some("another-environment".to_owned()), generation);
+
+    assert!(
+        relaunched.state(same.as_ref()).warning.is_some(),
+        "the note stands for the same host, account and service"
+    );
+    assert!(
+        relaunched.state(other.as_ref()).warning.is_none(),
+        "and for no other"
+    );
+    scene.stop_host().await;
+}
+
+/// A revocation this device could not tell its host is kept across a launch, and is asked again when
+/// the host is reached: an answer of any kind settles it. A host that did not answer in time, and
+/// that knows no such call when it is asked again, is no longer owed a revocation. (The connection
+/// loop's own call of `host_reached` is six lines; the host is reached again here by that call, as
+/// the loop makes it, since a restarted host in this suite is at an address the phone cannot reach.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_revocation_owed_to_a_host_survives_a_launch_and_is_asked_again_when_the_host_is_reached()
+{
+    let timings = Timings {
+        host_within: Duration::from_secs(2),
+        ..quick()
+    };
+    let mut scene = scene_with(timings, Some(phone_grant(PHONE_TOKEN, 3600)), None).await;
+    let started = scene.start().await;
+    let voice_session_id =
+        started["value"]["outcome"]["started"]["session"]["voice_session_id"].clone();
+    scene
+        .state_where("an attached control", |state| {
+            state["control"] == "connected"
+        })
+        .await;
+    // The host does not answer the stop in time: it waits for the service to close the call.
+    scene.stand_in.hold_closes();
+    let closure = scene
+        .call("voice_stop", json!({ "voiceSessionId": null }))
+        .expect("the stop is answered");
+    scene.stand_in.release_closes();
+    assert!(closure["host_failure"].is_object(), "{closure}");
+    let owed = scene
+        .state_where("a revocation owed", |state| {
+            state["owed"][0]["kind"] == "revocation"
+        })
+        .await;
+    assert_eq!(owed["owed"].as_array().map(Vec::len), Some(1), "{owed}");
+
+    // A device launched again over the same directory holds the same debt, with the host's name.
+    let relaunched = Calls::on_phone(
+        ScriptedCalls::new() as Arc<dyn companion_platform::call::CallPlatform>,
+        service_at(scene.stand_in.origin()),
+        quick(),
+        Kept::at(scene.phone.data.path()),
+    );
+    let state = relaunched.state(None);
+    assert_eq!(state.owed.len(), 1, "{state:?}");
+    assert_eq!(
+        serde_json::to_value(&state.owed[0].voice_session_id).expect("a value"),
+        voice_session_id
+    );
+    assert!(!state.owed[0].host_name.is_empty());
+
+    // The host did revoke the grant: only its answer was late. The phone reaches the host, and the
+    // host is asked again, answers that it knows no such voice session, and the entry is settled.
+    let connection = scene
+        .phone
+        .companion
+        .app
+        .state::<companion_tauri::AppState>()
+        .connection()
+        .expect("the phone is connected");
+    let companion_tauri::connection::Standing::Paired { host, .. } = connection.standing() else {
+        panic!("the phone is a paired device");
+    };
+    scene.phone.companion.app.state::<Calls>().host_reached(
+        host.host_device_id,
+        connection.environment_id(),
+        connection.session(),
+    );
+    scene
+        .state_where("the host asked again and the entry settled", |state| {
+            state["owed"].as_array().is_some_and(Vec::is_empty)
+        })
+        .await;
+    // What was settled is not owed after the next launch either.
+    let again = Calls::on_phone(
+        ScriptedCalls::new() as Arc<dyn companion_platform::call::CallPlatform>,
+        service_at(scene.stand_in.origin()),
+        quick(),
+        Kept::at(scene.phone.data.path()),
+    );
+    assert!(again.state(None).owed.is_empty());
     scene.stop_host().await;
 }

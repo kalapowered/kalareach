@@ -17,6 +17,7 @@
 
 mod cause;
 mod host;
+mod kept;
 mod owner;
 mod view;
 
@@ -35,6 +36,7 @@ use tokio::sync::{mpsc, oneshot};
 
 pub use cause::Cause;
 pub use host::{AppReach, CallHost, HostReach, Pairing, Reaching};
+pub use kept::{Kept, KeptVoice};
 pub use view::{DelegationRow, EndedView, HostEnd, OwedView, VoiceCallState};
 
 use crate::error::{CommandError, Result};
@@ -166,7 +168,7 @@ pub(crate) enum Cmd {
 }
 
 /// What a remembered "no such call" is about: the same host, account grant and service.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct NoteKey {
     /// The host's environment.
     pub environment: Option<String>,
@@ -209,6 +211,8 @@ pub(crate) struct Shared {
     view: Mutex<VoiceCallState>,
     note: Mutex<Option<NoteKey>>,
     emergency: Mutex<Option<(u64, Emergency)>>,
+    /// Where what outlives a launch is kept.
+    kept: Kept,
 }
 
 impl Shared {
@@ -222,11 +226,65 @@ impl Shared {
     }
 
     pub(crate) fn clear_note(&self) {
-        *self.note.lock().expect("the note lock is not poisoned") = None;
+        let had = self
+            .note
+            .lock()
+            .expect("the note lock is not poisoned")
+            .take()
+            .is_some();
+        if had {
+            self.keep();
+        }
     }
 
     pub(crate) fn remember_no_such_call(&self, key: NoteKey) {
         *self.note.lock().expect("the note lock is not poisoned") = Some(key);
+        self.keep();
+    }
+
+    /// Notes something owed, and keeps it for the next launch.
+    pub(crate) fn owe(&self, owed: OwedView) {
+        self.view
+            .lock()
+            .expect("the view lock is not poisoned")
+            .owe(now_ms(), owed);
+        self.keep();
+    }
+
+    /// Writes what outlives a launch: what is owed, and the note. A write that fails is logged and
+    /// leaves the record in memory, which is what the screen reads: ending a call is never stopped
+    /// by a file.
+    pub(crate) fn keep(&self) {
+        let owed = self
+            .view
+            .lock()
+            .expect("the view lock is not poisoned")
+            .owed
+            .clone();
+        let note = self
+            .note
+            .lock()
+            .expect("the note lock is not poisoned")
+            .clone();
+        if let Err(error) = self.kept.write(&KeptVoice { owed, note }) {
+            tracing::warn!(%error, "what a voice call left owed could not be kept");
+        }
+    }
+
+    /// Takes a revocation out of what is owed, because its host has answered about it.
+    fn settled(&self, voice_session_id: &str) {
+        let removed = {
+            let mut view = self.view.lock().expect("the view lock is not poisoned");
+            let before = view.owed.len();
+            view.owed.retain(|owed| {
+                owed.kind != "revocation"
+                    || owed.voice_session_id.as_deref() != Some(voice_session_id)
+            });
+            view.owed.len() != before
+        };
+        if removed {
+            self.keep();
+        }
     }
 
     /// Keeps what the supervisor needs to end the call if its owner fails.
@@ -423,6 +481,7 @@ impl Shared {
         }
         let (closed_locally, host_end) = tokio::join!(local, toward_host);
         let toward_host_asked = host_end.is_some();
+        let mut owed = Vec::new();
         // A start the host was not heard to answer may have made a call, so it is not a host that
         // was never asked: it has said nothing.
         let host_end = host_end.unwrap_or_else(|| {
@@ -496,14 +555,14 @@ impl Shared {
                 &kept.host,
                 toward_host_asked,
             ) {
-                view.owe(
-                    now_ms(),
-                    OwedView::revocation(words.clone(), id, *until_ms, host),
-                );
+                owed.push(OwedView::revocation(words.clone(), id, *until_ms, host));
             }
             if let (Some((action_id, until_ms)), Some(host)) = (kept.pending_start, &kept.host) {
-                view.owe(now_ms(), OwedView::start_unknown(action_id, until_ms, host));
+                owed.push(OwedView::start_unknown(action_id, until_ms, host));
             }
+        }
+        for each in owed {
+            self.owe(each);
         }
         self.release(owner);
     }
@@ -521,9 +580,18 @@ impl Calls {
         Self { shared: None }
     }
 
-    /// The calls of a phone, made through `platform` and controlled at `service`.
+    /// The calls of a phone, made through `platform` and controlled at `service`, taking up what
+    /// the calls before this launch left in `kept`: what is still owed, and the note.
     #[must_use]
-    pub fn on_phone(platform: Arc<dyn CallPlatform>, service: Service, timings: Timings) -> Self {
+    pub fn on_phone(
+        platform: Arc<dyn CallPlatform>,
+        service: Service,
+        timings: Timings,
+        kept: Kept,
+    ) -> Self {
+        let before = kept.read(now_ms());
+        let mut view = VoiceCallState::no_call();
+        view.owed = before.owed;
         Self {
             shared: Some(Arc::new(Shared {
                 platform,
@@ -531,11 +599,54 @@ impl Calls {
                 timings,
                 slot: Mutex::new(None),
                 next_owner: std::sync::atomic::AtomicU64::new(1),
-                view: Mutex::new(VoiceCallState::no_call()),
-                note: Mutex::new(None),
+                view: Mutex::new(view),
+                note: Mutex::new(before.note),
                 emergency: Mutex::new(None),
+                kept,
             })),
         }
+    }
+
+    /// Tells the host a call left a grant at that it is reached, over `session`, so that what this
+    /// device owes it is asked once more: each revocation owed to `host` in `environment` goes to
+    /// the host again, and an answer of any kind, that it revoked the grant or that it knows no such
+    /// call, settles it. A host that does not answer leaves it owed until the grant lapses. It runs
+    /// on a task of its own and the screen does not wait for it.
+    pub fn host_reached(
+        &self,
+        host: kr_protocol::ids::DeviceId,
+        environment: kr_protocol::ids::EnvironmentId,
+        session: Arc<kr_client::Session>,
+    ) {
+        let Some(shared) = self.shared.clone() else {
+            return;
+        };
+        let owed: Vec<VoiceSessionId> = shared
+            .view
+            .lock()
+            .expect("the view lock is not poisoned")
+            .owed
+            .iter()
+            .filter(|owed| owed.kind == "revocation" && owed.host == Some((host, environment)))
+            .filter_map(|owed| owed.voice_session_id.as_deref()?.parse().ok())
+            .collect();
+        if owed.is_empty() {
+            return;
+        }
+        tokio::spawn(async move {
+            for voice_session_id in owed {
+                let end = host::revoke(
+                    &session,
+                    environment,
+                    voice_session_id,
+                    shared.timings.host_within,
+                )
+                .await;
+                if !matches!(end, HostEnd::NotTold { .. }) {
+                    shared.settled(&voice_session_id.to_string());
+                }
+            }
+        });
     }
 
     /// What a remembered "no such call" would have to be about to apply to a call started now, or

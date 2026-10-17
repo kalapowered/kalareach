@@ -638,23 +638,21 @@ impl Owner {
         if !matches!(created, Reached::Unknown) {
             self.shared.start_was_answered(self.id);
         }
-        let result =
-            match created {
-                Reached::Receipt(receipt) => {
-                    self.stop_native(HostEnd::NotNeeded).await;
-                    return Ok(Outcome::Over(Started::Receipt(receipt)));
-                }
-                Reached::Unknown => {
-                    let local = self
-                        .stop_native(HostEnd::NotTold {
-                            words:
-                                "The host never said whether it created the call, so a grant it \
+        let result = match created {
+            Reached::Receipt(receipt) => {
+                self.stop_native(HostEnd::NotNeeded).await;
+                return Ok(Outcome::Over(Started::Receipt(receipt)));
+            }
+            Reached::Unknown => {
+                let local = self
+                    .stop_native(HostEnd::NotTold {
+                        words: "The host never said whether it created the call, so a grant it \
                                 made may still be open until the moment the call was to close."
-                                    .to_owned(),
-                        })
-                        .await;
-                    let owner = self.id;
-                    self.view(|state| {
+                            .to_owned(),
+                    })
+                    .await;
+                let owner = self.id;
+                self.view(|state| {
                     state.running = false;
                     state.ended = Some(EndedView {
                         owner,
@@ -675,13 +673,14 @@ impl Owner {
                         // The service may hold a call this device cannot name.
                         broker: "unknown".to_owned(),
                     });
-                    state.owe(now_ms(), OwedView::start_unknown(action_id, until_ms, &host));
                 });
-                    self.shared.start_was_answered(self.id);
-                    return Ok(Outcome::Over(Started::Unknown { action_id }));
-                }
-                Reached::Result(result) => result,
-            };
+                self.shared
+                    .owe(OwedView::start_unknown(action_id, until_ms, &host));
+                self.shared.start_was_answered(self.id);
+                return Ok(Outcome::Over(Started::Unknown { action_id }));
+            }
+            Reached::Result(result) => result,
+        };
         let VoiceStartOutcome::Started { session } = &result.outcome else {
             self.stop_native(HostEnd::NotNeeded).await;
             return Ok(Outcome::Over(Started::Result(result)));
@@ -1463,7 +1462,7 @@ impl Owner {
                 owed_until(descriptor.closes_at_ms.get()),
                 host,
             );
-            self.view(|state| state.owe(now_ms(), owed));
+            self.shared.owe(owed);
         }
         if matches!(cause, Cause::Control(ControlEnd::NoSuchCall)) {
             self.shared.remember_no_such_call(self.note_key());
