@@ -105,6 +105,7 @@ struct State {
     accept_then_drop: bool,
     drop_unread: bool,
     drop_after_ready: bool,
+    closure_delay: Option<Duration>,
     admissions_twice: bool,
     announced: Vec<String>,
     ready_call: String,
@@ -179,6 +180,7 @@ impl ControlRoute {
                 accept_then_drop: false,
                 drop_unread: false,
                 drop_after_ready: false,
+                closure_delay: None,
                 admissions_twice: false,
                 announced: Vec::new(),
                 ready_call: CALL.to_owned(),
@@ -295,6 +297,12 @@ impl ControlRoute {
     /// Ends every connection as soon as it has said `ready`, until told not to.
     pub fn drop_after_ready(&self, drop: bool) {
         self.edit(|state| state.drop_after_ready = drop);
+    }
+
+    /// Holds the service's answer to a closure for `delay` after it read the request, as a busy
+    /// service does: the closure is read at once and confirmed late.
+    pub fn confirm_closures_after(&self, delay: Duration) {
+        self.edit(|state| state.closure_delay = Some(delay));
     }
 
     /// Sends the provider's admission of every request twice, as a socket opened just before the
@@ -480,6 +488,15 @@ where
                 }
                 let Some(text) = message.as_text() else { continue };
                 let (answers, drop_after) = answer(&shared, text);
+                let late = shared
+                    .state
+                    .lock()
+                    .expect("the route's state")
+                    .closure_delay
+                    .filter(|_| text.contains(r#""command":"close""#));
+                if let Some(delay) = late {
+                    tokio::time::sleep(delay).await;
+                }
                 for answer in answers {
                     if socket.send(Message::text(answer.to_string())).await.is_err() {
                         break;
