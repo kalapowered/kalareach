@@ -388,3 +388,37 @@ pub fn differences(held: &[(String, String)], ran: &[(String, String)]) -> Vec<S
     }
     differing
 }
+
+/// The exchanges at which `ran` differs from `held` in status or in the shape of the answer, in
+/// words.
+pub fn exchange_differences(held: &serde_json::Value, ran: &serde_json::Value) -> Vec<String> {
+    let held_exchanges = held["exchanges"].as_array().expect("recorded exchanges");
+    let ran_exchanges = ran["exchanges"].as_array().expect("exchanges");
+    let mut differing = Vec::new();
+    for (index, held) in held_exchanges.iter().enumerate() {
+        match ran_exchanges.get(index) {
+            Some(ran) if ran["step"] == held["step"] && ran["path"] == held["path"] => {
+                for member in ["status", "shape"] {
+                    if ran[member] != held[member] {
+                        differing.push(format!(
+                            "{}: {member} was {} and the Worker's was {}",
+                            held["step"], ran[member], held[member]
+                        ));
+                    }
+                }
+            }
+            other => differing.push(format!(
+                "{}: the stand-in made {other:?} where the Worker was asked {}",
+                held["step"], held["path"]
+            )),
+        }
+    }
+    if ran_exchanges.len() > held_exchanges.len() {
+        differing.push(format!(
+            "the stand-in answered {} requests and the recording holds {}",
+            ran_exchanges.len(),
+            held_exchanges.len()
+        ));
+    }
+    differing
+}

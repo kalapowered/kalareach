@@ -1,0 +1,3015 @@
+{
+  "decoded": [
+    {
+      "outcome": "applied at write 1",
+      "step": "write a new object against no revision"
+    },
+    {
+      "outcome": "applied at write 1",
+      "step": "write the same request again"
+    },
+    {
+      "outcome": "refused IdConflict, Update, after None",
+      "step": "write other content under the same request identity"
+    },
+    {
+      "outcome": "refused the comparison, copy kept true, object write 1",
+      "step": "write against no revision while the object is held"
+    },
+    {
+      "outcome": "1 objects at [1], 1 copies (more false), stored 1 objects, 1 copies, 2640 bytes, collection unclaimed",
+      "step": "read the collection with its copies"
+    },
+    {
+      "outcome": "applied at write 1",
+      "step": "ask what became of the first write"
+    },
+    {
+      "outcome": "refused, copy kept true",
+      "step": "ask what became of the write that lost"
+    },
+    {
+      "outcome": "unknown",
+      "step": "ask about a request nothing was recorded for"
+    },
+    {
+      "outcome": "fenced, never ran true",
+      "step": "fence a request nothing was recorded for"
+    },
+    {
+      "outcome": "refused PermissionDenied, Nothing, after None",
+      "step": "write under the fenced identity"
+    },
+    {
+      "outcome": "applied at write 1",
+      "step": "fence a write the service applied"
+    },
+    {
+      "outcome": "refused InvalidArgument, Update, after None",
+      "step": "fence a request naming a time the service cannot keep a refusal for"
+    },
+    {
+      "outcome": "true",
+      "step": "choose against the copy"
+    },
+    {
+      "outcome": "false",
+      "step": "choose against a copy nobody kept"
+    },
+    {
+      "outcome": "1 objects at [1], 0 copies (more false), stored 1 objects, 0 copies, 1320 bytes, collection unclaimed",
+      "step": "read the collection without its copies"
+    },
+    {
+      "outcome": "applied at write 2",
+      "step": "replace the object against its revision"
+    },
+    {
+      "outcome": "1 objects at [2], 0 copies (more false), stored 1 objects, 0 copies, 1320 bytes, collection unclaimed, 1 removed, at [None]",
+      "step": "read naming an object the collection never held as held"
+    },
+    {
+      "outcome": "the collection is absent",
+      "step": "read another device's collection"
+    },
+    {
+      "outcome": "applied at write 1",
+      "step": "write a new object to be crowded"
+    },
+    {
+      "outcome": "refused the comparison, copy kept true, object write 1",
+      "step": "write against no revision, turn 0"
+    },
+    {
+      "outcome": "refused the comparison, copy kept true, object write 1",
+      "step": "write against no revision, turn 1"
+    },
+    {
+      "outcome": "refused the comparison, copy kept true, object write 1",
+      "step": "write against no revision, turn 2"
+    },
+    {
+      "outcome": "refused the comparison, copy kept true, object write 1",
+      "step": "write against no revision, turn 3"
+    },
+    {
+      "outcome": "refused the comparison, copy kept true, object write 1",
+      "step": "write against no revision, turn 4"
+    },
+    {
+      "outcome": "refused the comparison, copy kept true, object write 1",
+      "step": "write against no revision, turn 5"
+    },
+    {
+      "outcome": "refused the comparison, copy kept true, object write 1",
+      "step": "write against no revision, turn 6"
+    },
+    {
+      "outcome": "refused the comparison, copy kept true, object write 1",
+      "step": "write against no revision, turn 7"
+    },
+    {
+      "outcome": "refused QuotaExceeded, Wait, after None",
+      "step": "write against no revision, turn 8"
+    },
+    {
+      "outcome": "1 objects at [1], 8 copies (more false), stored 1 objects, 8 copies, 11880 bytes, collection unclaimed",
+      "step": "read the crowded collection with its copies"
+    },
+    {
+      "outcome": "Records { records: [], recovery: None }",
+      "step": "read the records of a collection nothing has claimed"
+    },
+    {
+      "outcome": "started true, reconciled true, publishes Some(true)",
+      "step": "start a collection and send its claim"
+    },
+    {
+      "outcome": "1 records, the newest at epoch 0 and revision 1",
+      "step": "read the key records"
+    },
+    {
+      "outcome": "0 records",
+      "step": "read the key records after the newest"
+    },
+    {
+      "outcome": "1 collections, the first at epoch 0 and record 1",
+      "step": "list the collections the home is a member of"
+    },
+    {
+      "outcome": "0 collections",
+      "step": "list the collections a stranger is a member of"
+    },
+    {
+      "outcome": "refused InvalidArgument, Update, after None",
+      "step": "write under an epoch the collection has never had"
+    },
+    {
+      "outcome": "applied at write 1, collection at epoch 0 and record 1",
+      "step": "write under the collection's epoch"
+    },
+    {
+      "outcome": "applied at write 1, collection at epoch 0 and record 1",
+      "step": "write the same request again"
+    },
+    {
+      "outcome": "applied at write 1, collection at epoch 0 and record 1",
+      "step": "ask what became of the write"
+    },
+    {
+      "outcome": "1 objects at [1], 0 copies (more false), stored 1 objects, 0 copies, 2128 bytes, collection at epoch 0 and record 1",
+      "step": "read the collection as a member"
+    },
+    {
+      "outcome": "the collection is absent",
+      "step": "read the collection as a stranger"
+    },
+    {
+      "outcome": "the collection is absent",
+      "step": "write as a stranger"
+    },
+    {
+      "outcome": "the collection is absent",
+      "step": "fence a request as a stranger"
+    },
+    {
+      "outcome": "Absent",
+      "step": "read the key records as a stranger"
+    },
+    {
+      "outcome": "Applied { revision: 2, recovery: None }",
+      "step": "offer the record that follows"
+    },
+    {
+      "outcome": "Applied { revision: 2, recovery: None }",
+      "step": "offer the same record again"
+    },
+    {
+      "outcome": "Applied { revision: 2, recovery: None }",
+      "step": "ask what became of the record"
+    },
+    {
+      "outcome": "refused IdConflict, Update, after None",
+      "step": "offer other content under the same request identity"
+    },
+    {
+      "outcome": "Refused { revision: 2, recovery: None }",
+      "step": "offer a record that does not follow the newest"
+    },
+    {
+      "outcome": "retired, the collection is at epoch 1 and record 2",
+      "step": "write under the epoch the collection has moved past"
+    },
+    {
+      "outcome": "retired, the collection is at epoch 1 and record 2",
+      "step": "write the retired request again"
+    },
+    {
+      "outcome": "retired, the collection is at epoch 1 and record 2",
+      "step": "ask what became of the retired request"
+    },
+    {
+      "outcome": "applied at write 2, collection at epoch 1 and record 2",
+      "step": "write under the new epoch"
+    },
+    {
+      "outcome": "2 records",
+      "step": "read the key records again"
+    },
+    {
+      "outcome": "Refused { revision: 0, recovery: None }",
+      "step": "claim a collection that holds an object"
+    },
+    {
+      "outcome": "Fenced { never_ran: true, recovery: None }",
+      "step": "fence a record offer nothing was recorded for"
+    }
+  ],
+  "exchanges": [
+    {
+      "body": {
+        "data": {
+          "conflict": null,
+          "current_revision": "736274a9-1b2c-4ce2-b142-1191e34a6ff9",
+          "current_write_sequence": "1",
+          "record": {
+            "bytes": "1320",
+            "kind": "settings",
+            "object_id": "dd55f8bd-dbda-40fe-aa73-d26c4d91ea48",
+            "revision": "736274a9-1b2c-4ce2-b142-1191e34a6ff9",
+            "updated_at": "2026-10-17T16:00:00.870Z",
+            "write_sequence": "1"
+          },
+          "recovery_id": null,
+          "state": "written",
+          "stored": {
+            "allowance_bytes": null,
+            "bytes": "1320",
+            "conflicts": "0",
+            "object_limit": "256",
+            "objects": "1"
+          }
+        },
+        "ok": true
+      },
+      "path": "/api/sync/exchange",
+      "shape": {
+        "data": {
+          "conflict": "null",
+          "current_revision": "string",
+          "current_write_sequence": "string",
+          "record": {
+            "bytes": "string",
+            "kind": "string",
+            "object_id": "string",
+            "revision": "string",
+            "updated_at": "string",
+            "write_sequence": "string"
+          },
+          "recovery_id": "null",
+          "state": "written",
+          "stored": {
+            "allowance_bytes": "null",
+            "bytes": "string",
+            "conflicts": "string",
+            "object_limit": "string",
+            "objects": "string"
+          }
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "write a new object against no revision"
+    },
+    {
+      "body": {
+        "data": {
+          "conflict": null,
+          "current_revision": "736274a9-1b2c-4ce2-b142-1191e34a6ff9",
+          "current_write_sequence": "1",
+          "record": {
+            "bytes": "1320",
+            "kind": "settings",
+            "object_id": "dd55f8bd-dbda-40fe-aa73-d26c4d91ea48",
+            "revision": "736274a9-1b2c-4ce2-b142-1191e34a6ff9",
+            "updated_at": "2026-10-17T16:00:00.870Z",
+            "write_sequence": "1"
+          },
+          "recovery_id": null,
+          "state": "written",
+          "stored": {
+            "allowance_bytes": null,
+            "bytes": "1320",
+            "conflicts": "0",
+            "object_limit": "256",
+            "objects": "1"
+          }
+        },
+        "ok": true
+      },
+      "path": "/api/sync/exchange",
+      "shape": {
+        "data": {
+          "conflict": "null",
+          "current_revision": "string",
+          "current_write_sequence": "string",
+          "record": {
+            "bytes": "string",
+            "kind": "string",
+            "object_id": "string",
+            "revision": "string",
+            "updated_at": "string",
+            "write_sequence": "string"
+          },
+          "recovery_id": "null",
+          "state": "written",
+          "stored": {
+            "allowance_bytes": "null",
+            "bytes": "string",
+            "conflicts": "string",
+            "object_limit": "string",
+            "objects": "string"
+          }
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "write the same request again"
+    },
+    {
+      "body": {
+        "error": {
+          "code": "ID_CONFLICT",
+          "message": "That request identity was used for a different settings-sync request."
+        },
+        "ok": false
+      },
+      "path": "/api/sync/exchange",
+      "shape": {
+        "error": {
+          "code": "ID_CONFLICT",
+          "message": "string"
+        },
+        "ok": false
+      },
+      "status": 409,
+      "step": "write other content under the same request identity"
+    },
+    {
+      "body": {
+        "data": {
+          "conflict": {
+            "conflict_id": "6503d082-c91a-4a7b-8c83-7b6aae6c085c",
+            "current_revision": "736274a9-1b2c-4ce2-b142-1191e34a6ff9",
+            "current_write_sequence": "1",
+            "expected_revision": null,
+            "object_id": "dd55f8bd-dbda-40fe-aa73-d26c4d91ea48",
+            "recorded_at": "2026-10-17T16:00:00.895Z",
+            "sequence": "1"
+          },
+          "current_revision": "736274a9-1b2c-4ce2-b142-1191e34a6ff9",
+          "current_write_sequence": "1",
+          "record": {
+            "bytes": "1320",
+            "kind": "settings",
+            "object_id": "dd55f8bd-dbda-40fe-aa73-d26c4d91ea48",
+            "revision": "736274a9-1b2c-4ce2-b142-1191e34a6ff9",
+            "updated_at": "2026-10-17T16:00:00.870Z",
+            "write_sequence": "1"
+          },
+          "recovery_id": null,
+          "state": "conflict",
+          "stored": {
+            "allowance_bytes": null,
+            "bytes": "2640",
+            "conflicts": "1",
+            "object_limit": "256",
+            "objects": "1"
+          }
+        },
+        "ok": true
+      },
+      "path": "/api/sync/exchange",
+      "shape": {
+        "data": {
+          "conflict": {
+            "conflict_id": "string",
+            "current_revision": "string",
+            "current_write_sequence": "string",
+            "expected_revision": "null",
+            "object_id": "string",
+            "recorded_at": "string",
+            "sequence": "string"
+          },
+          "current_revision": "string",
+          "current_write_sequence": "string",
+          "record": {
+            "bytes": "string",
+            "kind": "string",
+            "object_id": "string",
+            "revision": "string",
+            "updated_at": "string",
+            "write_sequence": "string"
+          },
+          "recovery_id": "null",
+          "state": "conflict",
+          "stored": {
+            "allowance_bytes": "null",
+            "bytes": "string",
+            "conflicts": "string",
+            "object_limit": "string",
+            "objects": "string"
+          }
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "write against no revision while the object is held"
+    },
+    {
+      "body": {
+        "data": {
+          "changed": [
+            {
+              "kind": "settings",
+              "object": {
+                "ciphertext": "NjdyFNlzpJYE6EDizifkjP0S9IV-VwkHM6Rdg-ArE4n_6uBtCjyelQC_d-DjpZr0tzLzmpzKCgYLPUQfJl2fJ06EUJ3_NNTYyM27nEK1lvmRwX1ZndTgbBgjdWlkBsKf70oA4dcoQuwEO2rY48HPOdQZZePKdxsCBoO1FOspJGWnD89CgKiyChSwz8gnJQovcCN4vu5HifD-d6-wwiDCuEm3RhdjsUUcu8C4Aa8NELRvxEgppGhbRqiDDd2Lf2VBfaUDd7t-QpkVcN4SitmuG0lZTemk7dRzrrswiBGlOs6zeo760M3T2xCbNTGxov9kFAul2RLX-c3iiru8v_AlqePnqfSbEJw_Lx4kseDbPBomoarJLksga6IsadlW5DUKuiyIQrWx-U_8L7wOujt7PKfGz6AST2tdamMb4Iy4DCTmmG9015UO_4pRRc2ppJcqmR3jHLB9yeKl4ZEAV7FAKhjnalbf_r23KbfvI1G2gCQKT25f9fFMi60HJ-vtr9UcDvYAI5lyDZMsGD3M59CKziLTykXfXqP9zxQ127qfIA427bLmzi5f6kaD7zBJW60Cvhr6cXN8Zw9sXKkQO8w2srG6xk6CGgSgsOiq9yZSxV3-BScNcIxw41ko_0un866I0nmDbvanxe4Jm1oT2uRq8dGc311mmQU6i7SvEfoqOE7422Da_2OmRknpY9V-zi0cc_5cX2NynOat01hwMMbXgULfcptawEkFAU4lcKfKkIXa7moZ1troQBNyp_HNiLjYCHYwescqVbV5jA1dIhG3C_LvEuQvxcUaEOUhmsSX2Uv5acNin-Ls_D_Q0nHPxl5ijRy6gIg4cC0rSfqFwHTc2ENwG1g9dwPW247plK9sAwI7Pkqd2_sdqGlkafC66-qkFuS7_xjdgxo0fJAOFcVP0p3S2teNyQtM0o-x8TDCf4Nblo5oqrONrr7NhZ4s-eJmMslhWRO6GO9fghx47mtVMOZ8BFdkCXUs67V8aNKuHL-pjKaznyI6V3P8l5jMBieuxbld2qhlGRjOj-JSnyj33g-tnuofl_pNZCep1tVh7GCySji3c9dU9cAx3vY9wYhhtGWZMLVl6oL2gqCedhHcbjuiWnnsCJ0kXzYmVExjhMQ9mKo_bjy80gGpb3kMDBFkcUqTLYHWsN60GaUlq_MsU95D2x8ZHkDMZR9ADetyNeYHBRle-yDx-lmvceocPoH7ZXrvGWDmFffkANV4F7uvbcRF_BngCNbNpLmzReYNbUoMipC597tQhQDGbL3MMkPYIrc56c6yo98FpIpvsM2tCBSfeBCHHB_9cPp799yX_4_jyIaatymiXAukhs9ZTJKxCAaQjsy_eqeuE_P628HRd9nYd0yYJSyp0r2Y7_Xl4vk",
+                "nonce": "VBF7ZViVXQpJX3800d_WdrXklMYHIzA2",
+                "size_bucket_bytes": "1024"
+              },
+              "object_id": "dd55f8bd-dbda-40fe-aa73-d26c4d91ea48",
+              "revision": "736274a9-1b2c-4ce2-b142-1191e34a6ff9",
+              "updated_at": "2026-10-17T16:00:00.870Z",
+              "write_sequence": "1"
+            }
+          ],
+          "conflicts": [
+            {
+              "conflict_id": "6503d082-c91a-4a7b-8c83-7b6aae6c085c",
+              "current_revision": "736274a9-1b2c-4ce2-b142-1191e34a6ff9",
+              "current_write_sequence": "1",
+              "expected_revision": null,
+              "kind": "settings",
+              "object": {
+                "ciphertext": "RyGDg0DBZ1IRtbvErGNGe3KhxxK-VXnkCefkbI7JORYXhglq-VfLbTsgxTKt-pYW-Tt0-9-KHuIX1S1Emg31CE8HQYVmWFg-X00iRvLAY97T9vxIKZb3tjMqAE9qbL54_tDPyw6hdt9dDRUZ4AmYrPpkOxX0hnqh2aE5-h3cne4u7q7Ik81_IJf4AiNce_m3yisfqNbUntrF21Aet_6xIKutpFkQH0UyqxCY5DS5-ipv1JLRLJAQZg1O6DvMV62to3BJsogrFyk73KAYKiq8HM5TyBeXgn4Zuis-UEOxQsDS7Fqd5P7IWHgsjz42yOeFPtsAO4p8DkdAXXNIcqRDaWHeUVAM-XNja7cw1-SZ4pbcT33EhJ69nBRIqlgj2IobShYNtm818pA2FehW35mzzPUNIyXMxdastUY-mQ1uiSe8TGgFFLFPcVygbUWJmxkcbOrQyTDHmR-hRX2rUE6IZ_Q-beEBJC5XcIG1yw3UaSePMQeb5c_w1lFW0HY2KUCvLj1PyqZkuTF9R7AMF1SpyLFKEgSwGAlDS6yFtLCp0KzRmzXKcUDlt7mKD_M1UdFleUe3JqeqPzuN-OKBd3X2VGG7kpCdrMEDqx9CYHWktHjyP-inR8hLRSn1gkvhI_u6TNBVWp2ALIMRT27NxicnSKpmp3e9BNTgW-VNYobGCYPVYAky2XvNXXkw0N8HN7DffC-RYcsv2flGGxXzIJn2KjOtjc1i8KQwOmc_3wKDIDBc35J1_v3idWHAdgYWWhWEGj3ZBLkyXkB7eDelLfuNmgrV31XtfJUj9EESwD8rpvLRsrffVlm83u7c3YbtDdk4BDFIUOhhEoV2vQ2_4GkFr-_RRnXWAgCHdAJhp9BHiu6PAUrNBBWlroo4OZzBh_QcEOkYM8svd16lWIR5_xMvqVxCrIyRyuYFV8oFFoPPFJzt3OuyFCKg-ytzUQCCPgCkMlKs5qV5f0ydZg0nRteTzgUG6Zu12Yx5f4wwmpYZ6NbxCsIOaC1HhNKO6f2WSRF1r-APSGAYIU8QOAXGWPW7dRMk4fGZoQpbzHcNbrI65sJblfoLqZrn16BDZGX2MZBj7wKoGELGYqhW67JrtL6vhwV8XGNeaprSqQoYkbVLKRryAuGKgU2Mg0b0rFh_4hUflkYxjhMzpCSSTgQJYLSovPToFd6DRoM3uOdBy25Mv40YXQ4cNak8csutek-ZuaE1MYnbcTohqA5TcgtCOX99BOLTP0b87qlkqXn85nYvyZIJQCGKaXyawDXRTJAFc5Fvn4HI2lx3w8ncGe_arLd2yamwAeu4ahmWjk4tR1H2oK1MO7UhO0C7prMCPb_vTg5lhJFWj2bZYW42QhC2kwoPgRpfPxFYwRq-QoPpmIhXw5k",
+                "nonce": "87jvaqsFRNPJny7ZQzeabhdc8heqlGsO",
+                "size_bucket_bytes": "1024"
+              },
+              "object_id": "dd55f8bd-dbda-40fe-aa73-d26c4d91ea48",
+              "recorded_at": "2026-10-17T16:00:00.895Z",
+              "sequence": "1"
+            }
+          ],
+          "more_conflicts": false,
+          "next_conflicts_after_sequence": "1",
+          "recovery_id": null,
+          "removed": [],
+          "revisions": [
+            {
+              "object_id": "dd55f8bd-dbda-40fe-aa73-d26c4d91ea48",
+              "revision": "736274a9-1b2c-4ce2-b142-1191e34a6ff9",
+              "write_sequence": "1"
+            }
+          ],
+          "stored": {
+            "allowance_bytes": "33554432",
+            "bytes": "2640",
+            "conflicts": "1",
+            "object_limit": "256",
+            "objects": "1"
+          }
+        },
+        "ok": true
+      },
+      "path": "/api/sync/exchange",
+      "shape": {
+        "data": {
+          "changed": {
+            "array": {
+              "kind": "string",
+              "object": {
+                "ciphertext": "string",
+                "nonce": "string",
+                "size_bucket_bytes": "string"
+              },
+              "object_id": "string",
+              "revision": "string",
+              "updated_at": "string",
+              "write_sequence": "string"
+            }
+          },
+          "conflicts": {
+            "array": {
+              "conflict_id": "string",
+              "current_revision": "string",
+              "current_write_sequence": "string",
+              "expected_revision": "null",
+              "kind": "string",
+              "object": {
+                "ciphertext": "string",
+                "nonce": "string",
+                "size_bucket_bytes": "string"
+              },
+              "object_id": "string",
+              "recorded_at": "string",
+              "sequence": "string"
+            }
+          },
+          "more_conflicts": "boolean",
+          "next_conflicts_after_sequence": "string",
+          "recovery_id": "null",
+          "removed": {
+            "array": null
+          },
+          "revisions": {
+            "array": {
+              "object_id": "string",
+              "revision": "string",
+              "write_sequence": "string"
+            }
+          },
+          "stored": {
+            "allowance_bytes": "string",
+            "bytes": "string",
+            "conflicts": "string",
+            "object_limit": "string",
+            "objects": "string"
+          }
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "read the collection with its copies"
+    },
+    {
+      "body": {
+        "data": {
+          "conflict_id": null,
+          "current_revision": "736274a9-1b2c-4ce2-b142-1191e34a6ff9",
+          "current_write_sequence": "1",
+          "never_ran": false,
+          "outcome": "written",
+          "record": {
+            "bytes": "1320",
+            "kind": "settings",
+            "object_id": "dd55f8bd-dbda-40fe-aa73-d26c4d91ea48",
+            "revision": "736274a9-1b2c-4ce2-b142-1191e34a6ff9",
+            "updated_at": "2026-10-17T16:00:00.870Z",
+            "write_sequence": "1"
+          },
+          "recorded_at": "2026-10-17T16:00:00.880Z",
+          "recovery_id": null,
+          "request_id": "7c48e3ab-4c95-4117-99b6-3ca64e355446",
+          "state": "applied"
+        },
+        "ok": true
+      },
+      "path": "/api/sync/exchange",
+      "shape": {
+        "data": {
+          "conflict_id": "null",
+          "current_revision": "string",
+          "current_write_sequence": "string",
+          "never_ran": "boolean",
+          "outcome": "string",
+          "record": {
+            "bytes": "string",
+            "kind": "string",
+            "object_id": "string",
+            "revision": "string",
+            "updated_at": "string",
+            "write_sequence": "string"
+          },
+          "recorded_at": "string",
+          "recovery_id": "null",
+          "request_id": "string",
+          "state": "applied"
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "ask what became of the first write"
+    },
+    {
+      "body": {
+        "data": {
+          "conflict_id": "6503d082-c91a-4a7b-8c83-7b6aae6c085c",
+          "current_revision": "736274a9-1b2c-4ce2-b142-1191e34a6ff9",
+          "current_write_sequence": "1",
+          "never_ran": false,
+          "outcome": "conflict",
+          "record": {
+            "bytes": "1320",
+            "kind": "settings",
+            "object_id": "dd55f8bd-dbda-40fe-aa73-d26c4d91ea48",
+            "revision": "736274a9-1b2c-4ce2-b142-1191e34a6ff9",
+            "updated_at": "2026-10-17T16:00:00.870Z",
+            "write_sequence": "1"
+          },
+          "recorded_at": "2026-10-17T16:00:00.897Z",
+          "recovery_id": null,
+          "request_id": "f899f062-97db-4cd5-9ef0-23e3bae760c3",
+          "state": "refused"
+        },
+        "ok": true
+      },
+      "path": "/api/sync/exchange",
+      "shape": {
+        "data": {
+          "conflict_id": "string",
+          "current_revision": "string",
+          "current_write_sequence": "string",
+          "never_ran": "boolean",
+          "outcome": "string",
+          "record": {
+            "bytes": "string",
+            "kind": "string",
+            "object_id": "string",
+            "revision": "string",
+            "updated_at": "string",
+            "write_sequence": "string"
+          },
+          "recorded_at": "string",
+          "recovery_id": "null",
+          "request_id": "string",
+          "state": "refused"
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "ask what became of the write that lost"
+    },
+    {
+      "body": {
+        "data": {
+          "conflict_id": null,
+          "current_revision": null,
+          "current_write_sequence": null,
+          "never_ran": false,
+          "outcome": null,
+          "record": null,
+          "recorded_at": null,
+          "recovery_id": null,
+          "request_id": "b47a2582-8564-45c6-8430-e8bb97c7f75a",
+          "state": "unknown"
+        },
+        "ok": true
+      },
+      "path": "/api/sync/exchange",
+      "shape": {
+        "data": {
+          "conflict_id": "null",
+          "current_revision": "null",
+          "current_write_sequence": "null",
+          "never_ran": "boolean",
+          "outcome": "null",
+          "record": "null",
+          "recorded_at": "null",
+          "recovery_id": "null",
+          "request_id": "string",
+          "state": "unknown"
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "ask about a request nothing was recorded for"
+    },
+    {
+      "body": {
+        "data": {
+          "conflict_id": null,
+          "current_revision": null,
+          "current_write_sequence": null,
+          "never_ran": true,
+          "outcome": "fenced",
+          "record": null,
+          "recorded_at": "2026-10-17T16:00:00.914Z",
+          "recovery_id": null,
+          "request_id": "b47a2582-8564-45c6-8430-e8bb97c7f75a",
+          "state": "fenced"
+        },
+        "ok": true
+      },
+      "path": "/api/sync/exchange",
+      "shape": {
+        "data": {
+          "conflict_id": "null",
+          "current_revision": "null",
+          "current_write_sequence": "null",
+          "never_ran": "boolean",
+          "outcome": "string",
+          "record": "null",
+          "recorded_at": "string",
+          "recovery_id": "null",
+          "request_id": "string",
+          "state": "fenced"
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "fence a request nothing was recorded for"
+    },
+    {
+      "body": {
+        "error": {
+          "code": "REQUEST_FENCED",
+          "message": "That settings-sync request identity has been fenced and will not be run."
+        },
+        "ok": false
+      },
+      "path": "/api/sync/exchange",
+      "shape": {
+        "error": {
+          "code": "REQUEST_FENCED",
+          "message": "string"
+        },
+        "ok": false
+      },
+      "status": 409,
+      "step": "write under the fenced identity"
+    },
+    {
+      "body": {
+        "data": {
+          "conflict_id": null,
+          "current_revision": "736274a9-1b2c-4ce2-b142-1191e34a6ff9",
+          "current_write_sequence": "1",
+          "never_ran": false,
+          "outcome": "written",
+          "record": {
+            "bytes": "1320",
+            "kind": "settings",
+            "object_id": "dd55f8bd-dbda-40fe-aa73-d26c4d91ea48",
+            "revision": "736274a9-1b2c-4ce2-b142-1191e34a6ff9",
+            "updated_at": "2026-10-17T16:00:00.870Z",
+            "write_sequence": "1"
+          },
+          "recorded_at": "2026-10-17T16:00:00.880Z",
+          "recovery_id": null,
+          "request_id": "7c48e3ab-4c95-4117-99b6-3ca64e355446",
+          "state": "applied"
+        },
+        "ok": true
+      },
+      "path": "/api/sync/exchange",
+      "shape": {
+        "data": {
+          "conflict_id": "null",
+          "current_revision": "string",
+          "current_write_sequence": "string",
+          "never_ran": "boolean",
+          "outcome": "string",
+          "record": {
+            "bytes": "string",
+            "kind": "string",
+            "object_id": "string",
+            "revision": "string",
+            "updated_at": "string",
+            "write_sequence": "string"
+          },
+          "recorded_at": "string",
+          "recovery_id": "null",
+          "request_id": "string",
+          "state": "applied"
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "fence a write the service applied"
+    },
+    {
+      "body": {
+        "error": {
+          "code": "INVALID_ARGUMENT",
+          "message": "A fence names when it signed within the time this service keeps a refusal for."
+        },
+        "ok": false
+      },
+      "path": "/api/sync/exchange",
+      "shape": {
+        "error": {
+          "code": "INVALID_ARGUMENT",
+          "message": "string"
+        },
+        "ok": false
+      },
+      "status": 400,
+      "step": "fence a request naming a time the service cannot keep a refusal for"
+    },
+    {
+      "body": {
+        "data": {
+          "resolved": "1",
+          "stored": {
+            "allowance_bytes": null,
+            "bytes": "1320",
+            "conflicts": "0",
+            "object_limit": "256",
+            "objects": "1"
+          }
+        },
+        "ok": true
+      },
+      "path": "/api/sync/exchange",
+      "shape": {
+        "data": {
+          "resolved": "string",
+          "stored": {
+            "allowance_bytes": "null",
+            "bytes": "string",
+            "conflicts": "string",
+            "object_limit": "string",
+            "objects": "string"
+          }
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "choose against the copy"
+    },
+    {
+      "body": {
+        "data": {
+          "resolved": "0",
+          "stored": {
+            "allowance_bytes": null,
+            "bytes": "1320",
+            "conflicts": "0",
+            "object_limit": "256",
+            "objects": "1"
+          }
+        },
+        "ok": true
+      },
+      "path": "/api/sync/exchange",
+      "shape": {
+        "data": {
+          "resolved": "string",
+          "stored": {
+            "allowance_bytes": "null",
+            "bytes": "string",
+            "conflicts": "string",
+            "object_limit": "string",
+            "objects": "string"
+          }
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "choose against a copy nobody kept"
+    },
+    {
+      "body": {
+        "data": {
+          "changed": [
+            {
+              "kind": "settings",
+              "object": {
+                "ciphertext": "NjdyFNlzpJYE6EDizifkjP0S9IV-VwkHM6Rdg-ArE4n_6uBtCjyelQC_d-DjpZr0tzLzmpzKCgYLPUQfJl2fJ06EUJ3_NNTYyM27nEK1lvmRwX1ZndTgbBgjdWlkBsKf70oA4dcoQuwEO2rY48HPOdQZZePKdxsCBoO1FOspJGWnD89CgKiyChSwz8gnJQovcCN4vu5HifD-d6-wwiDCuEm3RhdjsUUcu8C4Aa8NELRvxEgppGhbRqiDDd2Lf2VBfaUDd7t-QpkVcN4SitmuG0lZTemk7dRzrrswiBGlOs6zeo760M3T2xCbNTGxov9kFAul2RLX-c3iiru8v_AlqePnqfSbEJw_Lx4kseDbPBomoarJLksga6IsadlW5DUKuiyIQrWx-U_8L7wOujt7PKfGz6AST2tdamMb4Iy4DCTmmG9015UO_4pRRc2ppJcqmR3jHLB9yeKl4ZEAV7FAKhjnalbf_r23KbfvI1G2gCQKT25f9fFMi60HJ-vtr9UcDvYAI5lyDZMsGD3M59CKziLTykXfXqP9zxQ127qfIA427bLmzi5f6kaD7zBJW60Cvhr6cXN8Zw9sXKkQO8w2srG6xk6CGgSgsOiq9yZSxV3-BScNcIxw41ko_0un866I0nmDbvanxe4Jm1oT2uRq8dGc311mmQU6i7SvEfoqOE7422Da_2OmRknpY9V-zi0cc_5cX2NynOat01hwMMbXgULfcptawEkFAU4lcKfKkIXa7moZ1troQBNyp_HNiLjYCHYwescqVbV5jA1dIhG3C_LvEuQvxcUaEOUhmsSX2Uv5acNin-Ls_D_Q0nHPxl5ijRy6gIg4cC0rSfqFwHTc2ENwG1g9dwPW247plK9sAwI7Pkqd2_sdqGlkafC66-qkFuS7_xjdgxo0fJAOFcVP0p3S2teNyQtM0o-x8TDCf4Nblo5oqrONrr7NhZ4s-eJmMslhWRO6GO9fghx47mtVMOZ8BFdkCXUs67V8aNKuHL-pjKaznyI6V3P8l5jMBieuxbld2qhlGRjOj-JSnyj33g-tnuofl_pNZCep1tVh7GCySji3c9dU9cAx3vY9wYhhtGWZMLVl6oL2gqCedhHcbjuiWnnsCJ0kXzYmVExjhMQ9mKo_bjy80gGpb3kMDBFkcUqTLYHWsN60GaUlq_MsU95D2x8ZHkDMZR9ADetyNeYHBRle-yDx-lmvceocPoH7ZXrvGWDmFffkANV4F7uvbcRF_BngCNbNpLmzReYNbUoMipC597tQhQDGbL3MMkPYIrc56c6yo98FpIpvsM2tCBSfeBCHHB_9cPp799yX_4_jyIaatymiXAukhs9ZTJKxCAaQjsy_eqeuE_P628HRd9nYd0yYJSyp0r2Y7_Xl4vk",
+                "nonce": "VBF7ZViVXQpJX3800d_WdrXklMYHIzA2",
+                "size_bucket_bytes": "1024"
+              },
+              "object_id": "dd55f8bd-dbda-40fe-aa73-d26c4d91ea48",
+              "revision": "736274a9-1b2c-4ce2-b142-1191e34a6ff9",
+              "updated_at": "2026-10-17T16:00:00.870Z",
+              "write_sequence": "1"
+            }
+          ],
+          "conflicts": [],
+          "more_conflicts": false,
+          "next_conflicts_after_sequence": "0",
+          "recovery_id": null,
+          "removed": [],
+          "revisions": [
+            {
+              "object_id": "dd55f8bd-dbda-40fe-aa73-d26c4d91ea48",
+              "revision": "736274a9-1b2c-4ce2-b142-1191e34a6ff9",
+              "write_sequence": "1"
+            }
+          ],
+          "stored": {
+            "allowance_bytes": "33554432",
+            "bytes": "1320",
+            "conflicts": "0",
+            "object_limit": "256",
+            "objects": "1"
+          }
+        },
+        "ok": true
+      },
+      "path": "/api/sync/exchange",
+      "shape": {
+        "data": {
+          "changed": {
+            "array": {
+              "kind": "string",
+              "object": {
+                "ciphertext": "string",
+                "nonce": "string",
+                "size_bucket_bytes": "string"
+              },
+              "object_id": "string",
+              "revision": "string",
+              "updated_at": "string",
+              "write_sequence": "string"
+            }
+          },
+          "conflicts": {
+            "array": null
+          },
+          "more_conflicts": "boolean",
+          "next_conflicts_after_sequence": "string",
+          "recovery_id": "null",
+          "removed": {
+            "array": null
+          },
+          "revisions": {
+            "array": {
+              "object_id": "string",
+              "revision": "string",
+              "write_sequence": "string"
+            }
+          },
+          "stored": {
+            "allowance_bytes": "string",
+            "bytes": "string",
+            "conflicts": "string",
+            "object_limit": "string",
+            "objects": "string"
+          }
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "read the collection without its copies"
+    },
+    {
+      "body": {
+        "data": {
+          "conflict": null,
+          "current_revision": "ab516eff-1ac0-4e5c-b855-86e86f0a6b91",
+          "current_write_sequence": "2",
+          "record": {
+            "bytes": "1320",
+            "kind": "settings",
+            "object_id": "dd55f8bd-dbda-40fe-aa73-d26c4d91ea48",
+            "revision": "ab516eff-1ac0-4e5c-b855-86e86f0a6b91",
+            "updated_at": "2026-10-17T16:00:00.935Z",
+            "write_sequence": "2"
+          },
+          "recovery_id": null,
+          "state": "written",
+          "stored": {
+            "allowance_bytes": null,
+            "bytes": "1320",
+            "conflicts": "0",
+            "object_limit": "256",
+            "objects": "1"
+          }
+        },
+        "ok": true
+      },
+      "path": "/api/sync/exchange",
+      "shape": {
+        "data": {
+          "conflict": "null",
+          "current_revision": "string",
+          "current_write_sequence": "string",
+          "record": {
+            "bytes": "string",
+            "kind": "string",
+            "object_id": "string",
+            "revision": "string",
+            "updated_at": "string",
+            "write_sequence": "string"
+          },
+          "recovery_id": "null",
+          "state": "written",
+          "stored": {
+            "allowance_bytes": "null",
+            "bytes": "string",
+            "conflicts": "string",
+            "object_limit": "string",
+            "objects": "string"
+          }
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "replace the object against its revision"
+    },
+    {
+      "body": {
+        "data": {
+          "changed": [
+            {
+              "kind": "settings",
+              "object": {
+                "ciphertext": "IiFoinbaSV69qVZnkeP6v1JjhPySHO-YQLn2nJ68vkvQqobW5i9Gz-4rAIMm53Wx4_oO8ZUz3aP5qNq3082gAFJICbVp31kizFZiFiI90KSxH8Dd4SlPxAMTPT7aCpjV9yd3zCmXFUJ_KblQaffiwHHYPh4jVOLbJGGl555HNyGd46WFHyUagIrF32av6tk_NmeO1uqXarI1jrXmRg5g6-bcvr7d36YWhJU9ludrErbQ-Wc2FsFqQEMKCpFSW34dSoDBIGXcSEkt8B26Gl9-CIFd1Jnl6Wcp_Eq_37u-cfiyc_OPpPC2K3a5TMSRjYCCj7hn94EkoavoWNEm1YejTPkZ0VTjejdWDAbiJ-q8dKqLQqjZUC156WvGsYi_zq0vIlb_mhk2hgVzuaut7Rvsxg7tgvPUL4zXzJRez8XHc-zlpjIax35fqfQVclOSkfX95b33LMriplYAcnxsm58jDKME6ZVm52eJ6HkO6QdEXTT7XmOGTBVZplsFw4AsFHqqPrQifOUHiPe-YhQb4qIIC35R48ada62GwqEuFV8s5oFKP655X45bH6yzFudneqMj7mdcjn0z_8FQN0Q7I3O-n6JZvNO0npbQ8qJ-n5Rp44jRD9Fdst8_2UdNVEnKY32viDnbbTPq2Yd1cIX7YwNcghgu43xBeHBqVm7JAHFmY_PuDkdNXQJVz7_EGw7dg_8EsAfDWMsYXgRJj7R9OD6FIQIa1kHGe7ml9Qu4dpwZh9KEqc9v5vx2dtiL2AZbrOnc2IHGObaYZLA6KVNeeJkQ1a3dtmrgkxAL2v9mU-rMbTS8FEV2X2sKwOtISQ-GiAhdhZBfFM2oHAyFhsIuSZwQlX3k0FLb4ioVoCVSooBl1iygLUh3n5Kj4lYtBnnIYeI_Cp8rbY_HX_fkgfAsGUTj08uM9BEdzsNMZXmlUi9Ojc1_L6NZJwbE_C24-6TbdloRGEo8u2Tf-S5Ug-8g3wVTPqreto3XwxAkUZhvBufop1BBwjK7bjqHlxAQnOsz4angZp99r4FPgR_KVGxZpjucmz2EUclWM4qlPiu_E8bPNCyZ02QKlZ97h0UtqbWk5Nu24h1-E8e01BmiZxocjShwP7hGa0XYsZ2t17GMKGWteAmkEmscC6phO4uSxal7r0il-Xdgw8gWPUcNhA-MWbNQBIr27pEvI4333O5rlOVP5GeneOZ0NgYRFNFUL2pMwqfJUI1gSq6gijuuUFvJ1bZEX3IsMKQWFZyMU_XKuZrU5ZeymZ6omFOG0zAGG2W-hYS4q1sW0aFklQNyEUV0tr7PLH5ONKwsyjrPs6p61PCqozwHrqWLzrM70PIPDzRyXz4P79qtZvE2RUlTzPF6mOcsi0qoUFSqBrCK8TtXVGXsvUg",
+                "nonce": "3lpkGlDp1AWbUjjI8A4FD_H08RsTEBCw",
+                "size_bucket_bytes": "1024"
+              },
+              "object_id": "dd55f8bd-dbda-40fe-aa73-d26c4d91ea48",
+              "revision": "ab516eff-1ac0-4e5c-b855-86e86f0a6b91",
+              "updated_at": "2026-10-17T16:00:00.935Z",
+              "write_sequence": "2"
+            }
+          ],
+          "conflicts": [],
+          "more_conflicts": false,
+          "next_conflicts_after_sequence": "0",
+          "recovery_id": null,
+          "removed": [
+            {
+              "object_id": "b1142a13-3f26-426c-b390-91cbbf373d23",
+              "write_sequence": "0"
+            }
+          ],
+          "revisions": [
+            {
+              "object_id": "dd55f8bd-dbda-40fe-aa73-d26c4d91ea48",
+              "revision": "ab516eff-1ac0-4e5c-b855-86e86f0a6b91",
+              "write_sequence": "2"
+            }
+          ],
+          "stored": {
+            "allowance_bytes": "33554432",
+            "bytes": "1320",
+            "conflicts": "0",
+            "object_limit": "256",
+            "objects": "1"
+          }
+        },
+        "ok": true
+      },
+      "path": "/api/sync/exchange",
+      "shape": {
+        "data": {
+          "changed": {
+            "array": {
+              "kind": "string",
+              "object": {
+                "ciphertext": "string",
+                "nonce": "string",
+                "size_bucket_bytes": "string"
+              },
+              "object_id": "string",
+              "revision": "string",
+              "updated_at": "string",
+              "write_sequence": "string"
+            }
+          },
+          "conflicts": {
+            "array": null
+          },
+          "more_conflicts": "boolean",
+          "next_conflicts_after_sequence": "string",
+          "recovery_id": "null",
+          "removed": {
+            "array": {
+              "object_id": "string",
+              "write_sequence": "string"
+            }
+          },
+          "revisions": {
+            "array": {
+              "object_id": "string",
+              "revision": "string",
+              "write_sequence": "string"
+            }
+          },
+          "stored": {
+            "allowance_bytes": "string",
+            "bytes": "string",
+            "conflicts": "string",
+            "object_limit": "string",
+            "objects": "string"
+          }
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "read naming an object the collection never held as held"
+    },
+    {
+      "body": {
+        "error": {
+          "code": "COLLECTION_ABSENT",
+          "message": "That collection does not exist, or this installation is not one of its members."
+        },
+        "ok": false
+      },
+      "path": "/api/sync/exchange",
+      "shape": {
+        "error": {
+          "code": "COLLECTION_ABSENT",
+          "message": "string"
+        },
+        "ok": false
+      },
+      "status": 404,
+      "step": "read another device's collection"
+    },
+    {
+      "body": {
+        "data": {
+          "conflict": null,
+          "current_revision": "9d6a1772-d2a1-4050-be2b-48babd26df03",
+          "current_write_sequence": "1",
+          "record": {
+            "bytes": "1320",
+            "kind": "settings",
+            "object_id": "9424e185-c8b7-48c1-8221-f35ea4628f61",
+            "revision": "9d6a1772-d2a1-4050-be2b-48babd26df03",
+            "updated_at": "2026-10-17T16:00:00.956Z",
+            "write_sequence": "1"
+          },
+          "recovery_id": null,
+          "state": "written",
+          "stored": {
+            "allowance_bytes": null,
+            "bytes": "1320",
+            "conflicts": "0",
+            "object_limit": "256",
+            "objects": "1"
+          }
+        },
+        "ok": true
+      },
+      "path": "/api/sync/exchange",
+      "shape": {
+        "data": {
+          "conflict": "null",
+          "current_revision": "string",
+          "current_write_sequence": "string",
+          "record": {
+            "bytes": "string",
+            "kind": "string",
+            "object_id": "string",
+            "revision": "string",
+            "updated_at": "string",
+            "write_sequence": "string"
+          },
+          "recovery_id": "null",
+          "state": "written",
+          "stored": {
+            "allowance_bytes": "null",
+            "bytes": "string",
+            "conflicts": "string",
+            "object_limit": "string",
+            "objects": "string"
+          }
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "write a new object to be crowded"
+    },
+    {
+      "body": {
+        "data": {
+          "conflict": {
+            "conflict_id": "af02cd17-4ab1-4f41-b375-d46fb886b0aa",
+            "current_revision": "9d6a1772-d2a1-4050-be2b-48babd26df03",
+            "current_write_sequence": "1",
+            "expected_revision": null,
+            "object_id": "9424e185-c8b7-48c1-8221-f35ea4628f61",
+            "recorded_at": "2026-10-17T16:00:00.967Z",
+            "sequence": "1"
+          },
+          "current_revision": "9d6a1772-d2a1-4050-be2b-48babd26df03",
+          "current_write_sequence": "1",
+          "record": {
+            "bytes": "1320",
+            "kind": "settings",
+            "object_id": "9424e185-c8b7-48c1-8221-f35ea4628f61",
+            "revision": "9d6a1772-d2a1-4050-be2b-48babd26df03",
+            "updated_at": "2026-10-17T16:00:00.956Z",
+            "write_sequence": "1"
+          },
+          "recovery_id": null,
+          "state": "conflict",
+          "stored": {
+            "allowance_bytes": null,
+            "bytes": "2640",
+            "conflicts": "1",
+            "object_limit": "256",
+            "objects": "1"
+          }
+        },
+        "ok": true
+      },
+      "path": "/api/sync/exchange",
+      "shape": {
+        "data": {
+          "conflict": {
+            "conflict_id": "string",
+            "current_revision": "string",
+            "current_write_sequence": "string",
+            "expected_revision": "null",
+            "object_id": "string",
+            "recorded_at": "string",
+            "sequence": "string"
+          },
+          "current_revision": "string",
+          "current_write_sequence": "string",
+          "record": {
+            "bytes": "string",
+            "kind": "string",
+            "object_id": "string",
+            "revision": "string",
+            "updated_at": "string",
+            "write_sequence": "string"
+          },
+          "recovery_id": "null",
+          "state": "conflict",
+          "stored": {
+            "allowance_bytes": "null",
+            "bytes": "string",
+            "conflicts": "string",
+            "object_limit": "string",
+            "objects": "string"
+          }
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "write against no revision, turn 0"
+    },
+    {
+      "body": {
+        "data": {
+          "conflict": {
+            "conflict_id": "5f8692d3-b46e-4efa-873e-7f3cd29fe865",
+            "current_revision": "9d6a1772-d2a1-4050-be2b-48babd26df03",
+            "current_write_sequence": "1",
+            "expected_revision": null,
+            "object_id": "9424e185-c8b7-48c1-8221-f35ea4628f61",
+            "recorded_at": "2026-10-17T16:00:00.977Z",
+            "sequence": "2"
+          },
+          "current_revision": "9d6a1772-d2a1-4050-be2b-48babd26df03",
+          "current_write_sequence": "1",
+          "record": {
+            "bytes": "1320",
+            "kind": "settings",
+            "object_id": "9424e185-c8b7-48c1-8221-f35ea4628f61",
+            "revision": "9d6a1772-d2a1-4050-be2b-48babd26df03",
+            "updated_at": "2026-10-17T16:00:00.956Z",
+            "write_sequence": "1"
+          },
+          "recovery_id": null,
+          "state": "conflict",
+          "stored": {
+            "allowance_bytes": null,
+            "bytes": "3960",
+            "conflicts": "2",
+            "object_limit": "256",
+            "objects": "1"
+          }
+        },
+        "ok": true
+      },
+      "path": "/api/sync/exchange",
+      "shape": {
+        "data": {
+          "conflict": {
+            "conflict_id": "string",
+            "current_revision": "string",
+            "current_write_sequence": "string",
+            "expected_revision": "null",
+            "object_id": "string",
+            "recorded_at": "string",
+            "sequence": "string"
+          },
+          "current_revision": "string",
+          "current_write_sequence": "string",
+          "record": {
+            "bytes": "string",
+            "kind": "string",
+            "object_id": "string",
+            "revision": "string",
+            "updated_at": "string",
+            "write_sequence": "string"
+          },
+          "recovery_id": "null",
+          "state": "conflict",
+          "stored": {
+            "allowance_bytes": "null",
+            "bytes": "string",
+            "conflicts": "string",
+            "object_limit": "string",
+            "objects": "string"
+          }
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "write against no revision, turn 1"
+    },
+    {
+      "body": {
+        "data": {
+          "conflict": {
+            "conflict_id": "5b3fdf69-e243-4ee3-88f2-a2a15edad92f",
+            "current_revision": "9d6a1772-d2a1-4050-be2b-48babd26df03",
+            "current_write_sequence": "1",
+            "expected_revision": null,
+            "object_id": "9424e185-c8b7-48c1-8221-f35ea4628f61",
+            "recorded_at": "2026-10-17T16:00:00.984Z",
+            "sequence": "3"
+          },
+          "current_revision": "9d6a1772-d2a1-4050-be2b-48babd26df03",
+          "current_write_sequence": "1",
+          "record": {
+            "bytes": "1320",
+            "kind": "settings",
+            "object_id": "9424e185-c8b7-48c1-8221-f35ea4628f61",
+            "revision": "9d6a1772-d2a1-4050-be2b-48babd26df03",
+            "updated_at": "2026-10-17T16:00:00.956Z",
+            "write_sequence": "1"
+          },
+          "recovery_id": null,
+          "state": "conflict",
+          "stored": {
+            "allowance_bytes": null,
+            "bytes": "5280",
+            "conflicts": "3",
+            "object_limit": "256",
+            "objects": "1"
+          }
+        },
+        "ok": true
+      },
+      "path": "/api/sync/exchange",
+      "shape": {
+        "data": {
+          "conflict": {
+            "conflict_id": "string",
+            "current_revision": "string",
+            "current_write_sequence": "string",
+            "expected_revision": "null",
+            "object_id": "string",
+            "recorded_at": "string",
+            "sequence": "string"
+          },
+          "current_revision": "string",
+          "current_write_sequence": "string",
+          "record": {
+            "bytes": "string",
+            "kind": "string",
+            "object_id": "string",
+            "revision": "string",
+            "updated_at": "string",
+            "write_sequence": "string"
+          },
+          "recovery_id": "null",
+          "state": "conflict",
+          "stored": {
+            "allowance_bytes": "null",
+            "bytes": "string",
+            "conflicts": "string",
+            "object_limit": "string",
+            "objects": "string"
+          }
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "write against no revision, turn 2"
+    },
+    {
+      "body": {
+        "data": {
+          "conflict": {
+            "conflict_id": "d607c126-cfd9-42c0-ade0-ee4ccf057213",
+            "current_revision": "9d6a1772-d2a1-4050-be2b-48babd26df03",
+            "current_write_sequence": "1",
+            "expected_revision": null,
+            "object_id": "9424e185-c8b7-48c1-8221-f35ea4628f61",
+            "recorded_at": "2026-10-17T16:00:00.992Z",
+            "sequence": "4"
+          },
+          "current_revision": "9d6a1772-d2a1-4050-be2b-48babd26df03",
+          "current_write_sequence": "1",
+          "record": {
+            "bytes": "1320",
+            "kind": "settings",
+            "object_id": "9424e185-c8b7-48c1-8221-f35ea4628f61",
+            "revision": "9d6a1772-d2a1-4050-be2b-48babd26df03",
+            "updated_at": "2026-10-17T16:00:00.956Z",
+            "write_sequence": "1"
+          },
+          "recovery_id": null,
+          "state": "conflict",
+          "stored": {
+            "allowance_bytes": null,
+            "bytes": "6600",
+            "conflicts": "4",
+            "object_limit": "256",
+            "objects": "1"
+          }
+        },
+        "ok": true
+      },
+      "path": "/api/sync/exchange",
+      "shape": {
+        "data": {
+          "conflict": {
+            "conflict_id": "string",
+            "current_revision": "string",
+            "current_write_sequence": "string",
+            "expected_revision": "null",
+            "object_id": "string",
+            "recorded_at": "string",
+            "sequence": "string"
+          },
+          "current_revision": "string",
+          "current_write_sequence": "string",
+          "record": {
+            "bytes": "string",
+            "kind": "string",
+            "object_id": "string",
+            "revision": "string",
+            "updated_at": "string",
+            "write_sequence": "string"
+          },
+          "recovery_id": "null",
+          "state": "conflict",
+          "stored": {
+            "allowance_bytes": "null",
+            "bytes": "string",
+            "conflicts": "string",
+            "object_limit": "string",
+            "objects": "string"
+          }
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "write against no revision, turn 3"
+    },
+    {
+      "body": {
+        "data": {
+          "conflict": {
+            "conflict_id": "4ce2d115-61c2-420a-a92d-25369d179c9f",
+            "current_revision": "9d6a1772-d2a1-4050-be2b-48babd26df03",
+            "current_write_sequence": "1",
+            "expected_revision": null,
+            "object_id": "9424e185-c8b7-48c1-8221-f35ea4628f61",
+            "recorded_at": "2026-10-17T16:00:00.999Z",
+            "sequence": "5"
+          },
+          "current_revision": "9d6a1772-d2a1-4050-be2b-48babd26df03",
+          "current_write_sequence": "1",
+          "record": {
+            "bytes": "1320",
+            "kind": "settings",
+            "object_id": "9424e185-c8b7-48c1-8221-f35ea4628f61",
+            "revision": "9d6a1772-d2a1-4050-be2b-48babd26df03",
+            "updated_at": "2026-10-17T16:00:00.956Z",
+            "write_sequence": "1"
+          },
+          "recovery_id": null,
+          "state": "conflict",
+          "stored": {
+            "allowance_bytes": null,
+            "bytes": "7920",
+            "conflicts": "5",
+            "object_limit": "256",
+            "objects": "1"
+          }
+        },
+        "ok": true
+      },
+      "path": "/api/sync/exchange",
+      "shape": {
+        "data": {
+          "conflict": {
+            "conflict_id": "string",
+            "current_revision": "string",
+            "current_write_sequence": "string",
+            "expected_revision": "null",
+            "object_id": "string",
+            "recorded_at": "string",
+            "sequence": "string"
+          },
+          "current_revision": "string",
+          "current_write_sequence": "string",
+          "record": {
+            "bytes": "string",
+            "kind": "string",
+            "object_id": "string",
+            "revision": "string",
+            "updated_at": "string",
+            "write_sequence": "string"
+          },
+          "recovery_id": "null",
+          "state": "conflict",
+          "stored": {
+            "allowance_bytes": "null",
+            "bytes": "string",
+            "conflicts": "string",
+            "object_limit": "string",
+            "objects": "string"
+          }
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "write against no revision, turn 4"
+    },
+    {
+      "body": {
+        "data": {
+          "conflict": {
+            "conflict_id": "f5bf5a80-f702-4a50-bad3-2cd995272963",
+            "current_revision": "9d6a1772-d2a1-4050-be2b-48babd26df03",
+            "current_write_sequence": "1",
+            "expected_revision": null,
+            "object_id": "9424e185-c8b7-48c1-8221-f35ea4628f61",
+            "recorded_at": "2026-10-17T16:00:01.006Z",
+            "sequence": "6"
+          },
+          "current_revision": "9d6a1772-d2a1-4050-be2b-48babd26df03",
+          "current_write_sequence": "1",
+          "record": {
+            "bytes": "1320",
+            "kind": "settings",
+            "object_id": "9424e185-c8b7-48c1-8221-f35ea4628f61",
+            "revision": "9d6a1772-d2a1-4050-be2b-48babd26df03",
+            "updated_at": "2026-10-17T16:00:00.956Z",
+            "write_sequence": "1"
+          },
+          "recovery_id": null,
+          "state": "conflict",
+          "stored": {
+            "allowance_bytes": null,
+            "bytes": "9240",
+            "conflicts": "6",
+            "object_limit": "256",
+            "objects": "1"
+          }
+        },
+        "ok": true
+      },
+      "path": "/api/sync/exchange",
+      "shape": {
+        "data": {
+          "conflict": {
+            "conflict_id": "string",
+            "current_revision": "string",
+            "current_write_sequence": "string",
+            "expected_revision": "null",
+            "object_id": "string",
+            "recorded_at": "string",
+            "sequence": "string"
+          },
+          "current_revision": "string",
+          "current_write_sequence": "string",
+          "record": {
+            "bytes": "string",
+            "kind": "string",
+            "object_id": "string",
+            "revision": "string",
+            "updated_at": "string",
+            "write_sequence": "string"
+          },
+          "recovery_id": "null",
+          "state": "conflict",
+          "stored": {
+            "allowance_bytes": "null",
+            "bytes": "string",
+            "conflicts": "string",
+            "object_limit": "string",
+            "objects": "string"
+          }
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "write against no revision, turn 5"
+    },
+    {
+      "body": {
+        "data": {
+          "conflict": {
+            "conflict_id": "d1de8343-3c42-4b17-9e09-23e5aea03d37",
+            "current_revision": "9d6a1772-d2a1-4050-be2b-48babd26df03",
+            "current_write_sequence": "1",
+            "expected_revision": null,
+            "object_id": "9424e185-c8b7-48c1-8221-f35ea4628f61",
+            "recorded_at": "2026-10-17T16:00:01.040Z",
+            "sequence": "7"
+          },
+          "current_revision": "9d6a1772-d2a1-4050-be2b-48babd26df03",
+          "current_write_sequence": "1",
+          "record": {
+            "bytes": "1320",
+            "kind": "settings",
+            "object_id": "9424e185-c8b7-48c1-8221-f35ea4628f61",
+            "revision": "9d6a1772-d2a1-4050-be2b-48babd26df03",
+            "updated_at": "2026-10-17T16:00:00.956Z",
+            "write_sequence": "1"
+          },
+          "recovery_id": null,
+          "state": "conflict",
+          "stored": {
+            "allowance_bytes": null,
+            "bytes": "10560",
+            "conflicts": "7",
+            "object_limit": "256",
+            "objects": "1"
+          }
+        },
+        "ok": true
+      },
+      "path": "/api/sync/exchange",
+      "shape": {
+        "data": {
+          "conflict": {
+            "conflict_id": "string",
+            "current_revision": "string",
+            "current_write_sequence": "string",
+            "expected_revision": "null",
+            "object_id": "string",
+            "recorded_at": "string",
+            "sequence": "string"
+          },
+          "current_revision": "string",
+          "current_write_sequence": "string",
+          "record": {
+            "bytes": "string",
+            "kind": "string",
+            "object_id": "string",
+            "revision": "string",
+            "updated_at": "string",
+            "write_sequence": "string"
+          },
+          "recovery_id": "null",
+          "state": "conflict",
+          "stored": {
+            "allowance_bytes": "null",
+            "bytes": "string",
+            "conflicts": "string",
+            "object_limit": "string",
+            "objects": "string"
+          }
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "write against no revision, turn 6"
+    },
+    {
+      "body": {
+        "data": {
+          "conflict": {
+            "conflict_id": "b2017539-4ae7-4c45-9283-7dd02e639c8a",
+            "current_revision": "9d6a1772-d2a1-4050-be2b-48babd26df03",
+            "current_write_sequence": "1",
+            "expected_revision": null,
+            "object_id": "9424e185-c8b7-48c1-8221-f35ea4628f61",
+            "recorded_at": "2026-10-17T16:00:01.049Z",
+            "sequence": "8"
+          },
+          "current_revision": "9d6a1772-d2a1-4050-be2b-48babd26df03",
+          "current_write_sequence": "1",
+          "record": {
+            "bytes": "1320",
+            "kind": "settings",
+            "object_id": "9424e185-c8b7-48c1-8221-f35ea4628f61",
+            "revision": "9d6a1772-d2a1-4050-be2b-48babd26df03",
+            "updated_at": "2026-10-17T16:00:00.956Z",
+            "write_sequence": "1"
+          },
+          "recovery_id": null,
+          "state": "conflict",
+          "stored": {
+            "allowance_bytes": null,
+            "bytes": "11880",
+            "conflicts": "8",
+            "object_limit": "256",
+            "objects": "1"
+          }
+        },
+        "ok": true
+      },
+      "path": "/api/sync/exchange",
+      "shape": {
+        "data": {
+          "conflict": {
+            "conflict_id": "string",
+            "current_revision": "string",
+            "current_write_sequence": "string",
+            "expected_revision": "null",
+            "object_id": "string",
+            "recorded_at": "string",
+            "sequence": "string"
+          },
+          "current_revision": "string",
+          "current_write_sequence": "string",
+          "record": {
+            "bytes": "string",
+            "kind": "string",
+            "object_id": "string",
+            "revision": "string",
+            "updated_at": "string",
+            "write_sequence": "string"
+          },
+          "recovery_id": "null",
+          "state": "conflict",
+          "stored": {
+            "allowance_bytes": "null",
+            "bytes": "string",
+            "conflicts": "string",
+            "object_limit": "string",
+            "objects": "string"
+          }
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "write against no revision, turn 7"
+    },
+    {
+      "body": {
+        "error": {
+          "code": "QUOTA_EXHAUSTED",
+          "message": "This object holds 8 copies nobody has chosen between yet."
+        },
+        "ok": false
+      },
+      "path": "/api/sync/exchange",
+      "shape": {
+        "error": {
+          "code": "QUOTA_EXHAUSTED",
+          "message": "string"
+        },
+        "ok": false
+      },
+      "status": 402,
+      "step": "write against no revision, turn 8"
+    },
+    {
+      "body": {
+        "data": {
+          "changed": [
+            {
+              "kind": "settings",
+              "object": {
+                "ciphertext": "z7RMja4hQ4V6BTxrr1bwLdVHaIrj37jCQLCpgY09sVDEqrFUCBDSEibpwpgcuPHoX_B4w4lF4BdY3XXo7CucrlSYYvc_aP2am4CXbi0EdNl-9ENlCNx-uKoZFdHHPE98YQs51chGtup7KSxmxeDi-2kIFxRgJ5v6sOgt3RIOX-8B9eZMzO6y4Z-98KxtuD08hNB6WCaxa-t4MeW9lmBvaWvyYvMYp9nnfmvU-peETlEUEm1TmGHnsdwPfMSNxRRGf5dnLql_V8w8L0FrMm0_cs8ldXTXbVK4e-rcLll8GCSCPFLcHOlY4PWPhkYNwSywi3FzqdtZqRegxnp6ClSq3xwsiBceMgrI17TBnDp1XDKmFvUfJUVfH3AAUb_vAxF8cer9JSvLqhqEsInp_1mJ8GKi8nliIFh7xEQlEMks77kOnZ4Zffen39nbXMKUfznkfbHd2eLpLD3v10Ad4AeL2YWdAxZZK8oHK9LrWdR6Di-skTKLB6GN4DfJ_wkHmzikX-8kKozr_LLkvdtFc75RNoSTGlCb9GObxqCF2z_oUc1EVhwHMNZO8wvmXYEzvdG-x_-PMHP-u5j95s3WUhf1Dw7wwafp6bIFC48vAcJZSYFuaVnnwJDBFSV-UR_eH97TsugPY9yYuq1Xx42gIZjBFZkaJ2J1JLZkZmhmQAXjP60z_iCDXxcoVgk5ktxFxvSBj27tnxSFzQdWoGpdalVKV3uyQMFcswaMjgE5M0aDa7zkioguhMdTfZ0mwz6-jcNQg1ZBz4xDyn0Lc4f7LRT4ftDRSIS6_2CI9SuS3EXoXY4vO7NMGg0OysfmqJhs4gv5w2Kgbd4LSBwjadmv1OIhgwYFZh4BhazJM2CuOnq3gAL_BU1o4z_W-FLhyUfr_WHLv6RtudybQXTVzUVyt17T2aHaIjix8VYb53o30dZdwdKKBfGwq699kgBYLKL5SauEgWn7jn9luc0T3rfjwQZp8PMgJVXn7494kdiBV3MP5Zf04kwQH1lvp1np3qaoXa5d17Afgvjm9KOIYFVAD6NH8DT4F-n_qpNu71Qg-OvexpDNCLL_8cGPLhFHLpFhXU66GbFPncgdxMc7Be1ChjHuvmSXN4Bmxm_DJj2IR0PNEOVSIJesL-UsI7ju3RCueLSRscGaBSluukX9H2GFFMRwMMZQoGBDzBgVbMI-cBaVKYTsFXFHEKw8SoYfKHSVe5Vvx7uIvOmq8Px99AUc1ZNRH24Is38AmqBvibYZKnINB5CtN2oOZALFvdZeuxwSonA3Y5bGyJXrVtV9uCKNnju7arJlvp19HDwZaTboEfTjXlHgm4Mf7o3emXgZ1w6qbJEbOBKY2yuxtAk-SLi4NUE9NPGryqVLTmeIXtMtEKG49kA",
+                "nonce": "3jFwuCn5q5BnseRfvPptAk4Nd3vqldfA",
+                "size_bucket_bytes": "1024"
+              },
+              "object_id": "9424e185-c8b7-48c1-8221-f35ea4628f61",
+              "revision": "9d6a1772-d2a1-4050-be2b-48babd26df03",
+              "updated_at": "2026-10-17T16:00:00.956Z",
+              "write_sequence": "1"
+            }
+          ],
+          "conflicts": [
+            {
+              "conflict_id": "af02cd17-4ab1-4f41-b375-d46fb886b0aa",
+              "current_revision": "9d6a1772-d2a1-4050-be2b-48babd26df03",
+              "current_write_sequence": "1",
+              "expected_revision": null,
+              "kind": "settings",
+              "object": {
+                "ciphertext": "u0Tejbsl-3mQXPmnQEQFERTNnU1vAtt54cHKcaCLIhvakVR5iIG6yaGUgvNcl6T1H6nNA4FUpM9t7756MPK6YudY-PPgXZzH3FsZFkhXjTIPNnSPn-x8NFlSPHDTGCtzMZDsJ_ljw-kxNwRdEmrcPRCZPvVTMKTMD8kbcQvlp-lAIsvY50OaeMyQ5aOBaJNlxoJj1qMxbjravgQT2hJts_Wf_-gjugrWhAIbZVMechNi43lCcKQC2r900pNiENcuIsxh5Pv-XGHJmBxtXwVS26aEfhD_A6RbwGPWakvQzCPYyvgUjW3KuBLATyBztLMb4JZI2RxhPsAdZ2XEPmSx8fMMRBzstuqwN0T3rC30PPrQCEXzlp3RLN0CD7GnzWn4Dsi-Lt_DlrklIu58Ei6dBEL9rVbbkOhMKzmRflM1Zo7bgSsXVMvYMQYORplW9_lCk7dFBr5OgH5NuAzYFlPjBtigLCtIgXt_Zz-UQjXpWPKy-qpD0H_TMcDx73w3Al2yxySLCuiLyCkBjtbw2bHX46ETvdnOz7wy-PuGMjUUTeZGlsRWMEo_6aHNZPuWynI-30OE9cJbfK_wio6PRdwdgno1nXHZ3J-korpizcU6K7S3rZD4uTlh9JMwaR9yIflVWXY3AOLHTVJkn-bKY0QucSlGh2Cjq5Y5eGXrBXJSSHIdElh8GdVIj2BOfkRIsbEU-29KgrCcseIfmwZay9v6lgHFY9otIjdiqGxrBByAWvwnffn2RI-VDKp8d7diOE9EJZAN_nS6laBh5NlYh9N9Vp0unCD56FsJR5o1egBY1Fec2q-5TpCJm8nWdf3rC0iRf4QNMVjF-q7WJcc1oLob4y7tTgj8vBFBZYIye5cz3BpCZ6G58Vm7vRe-m7DHJTjbj7DcMlF4o73yoO9Jb2Mm-6heyzw9U435LsFuoAzfzQSb2iEYJgLG6KS7lA3RzQUtqpMBY2I-Ma9EFB2z_N6Zh9lI6MCo_gNr1Yx-e0ERylwKVjZx4oWM1LdFwJX_IviQWN4QBvzm7u6GlPBEtTPidHthKzkFkLVfxkGXdqctUPxjXVmrn2TjPV7lHFUlsdtLH1Wh6SEzk8x5gARf0knd1wVzCoj2fJCqLg-Y8UN5sXSvfgUoHx97W88tfazFMh92dAzf1Es2TbGusO8GJKrN_eEwFpfOmG91Lpu2CBxCrcFu5dqR7cqfG3ZnrUPs9yqO3IiOOS8iUgytMTmP9sidglMRoeBcos616rUnQzbNgl2nNsNqVwl75sYGQiC0IzuWItX1tw7yzaVGIGXbEguvpRvWQO3QH7LfvQvhpRcwC_-_lebt9zUTiMmNuod0gX9wu5L9X9ZymfqmREAnxRdknACOpk5-ZL50Eq1TxrHbdjo",
+                "nonce": "1QztLW3IsWilPnMchWBFIctMqOJaTSVC",
+                "size_bucket_bytes": "1024"
+              },
+              "object_id": "9424e185-c8b7-48c1-8221-f35ea4628f61",
+              "recorded_at": "2026-10-17T16:00:00.967Z",
+              "sequence": "1"
+            },
+            {
+              "conflict_id": "5f8692d3-b46e-4efa-873e-7f3cd29fe865",
+              "current_revision": "9d6a1772-d2a1-4050-be2b-48babd26df03",
+              "current_write_sequence": "1",
+              "expected_revision": null,
+              "kind": "settings",
+              "object": {
+                "ciphertext": "4fwQG6y2L3kzOdJQ08sy2kvqQ-rqkyyaRVwftTCQK0Z2TCPpDLSoA73-NqyA5xulDJtRk-m7nGSGaDcPHRyMVtKeJ8OfyXSzGquqSiPG-m3dmxT0sh36jsSYOXC0QDuAKqJIn96mEJ-uRipb5fW8Wz5VNSRwh1yN4LIahb8Z56LBu4TuRdx3jzj2XEA0QsFLxEe_6LiHiNGj4aXe3fswxIdqnsWlRsmYNxyopjEeMYsQFgXCblgX2qxe0XTcj2ZQL4hz3IZCtYK94zOz2A9G2ROAcB0Y8odLgs6dLJLYnfdLYK-hk1n5pbCmErSFg_qtrP-8m_XbapMb4zFs9kFtXUXjKUQ7BXFhsH2vAYR22arkuBW5BfV4uye9yP0Xv02KCZ6vA9kUifhyV55III9nWmS8-gqRWC8RY9Uc7hX-DHp1Dm92-ZHrReGlrmMfEzRq1jEyL6lML4RZTaVYqhMZBsx73T6mUk2stMgFvk24YmoRuzfkgZPLGDRJYiXXxu28_1B1ZHjAx0XP991FiGuIp-Vs-EcuMUsi-saeHqdA3aKXXnN7MitLr_kgbzs2xRJimLZ2E_Hp4ss7RH97XfLGoVbWzkGzohNvGFf19Ph3FEujb7G1gu5afoAHulJDwcxXo07E23KcFYeEnFuvX-t3JmnQCTfB1I2ZZTaDezhQqH-3iRp3ksLcn0x849sAQ6VQvXvgVxbpujCqw4E9uwwpZwnh8Vkv4GZdOq_xgVditkN88n-JC_5W6_75GFbK9azMzHIParEIUv0n2xoWQHLQgo2z9NgW2u-55mrPsbf9rZvfy99MNM0gi_q7D7Mj8FH2m70cHTXajBG6S5dnw8NGoMWigf8sP7zI52Y2wZqje4YO3xuYsXKu59j_o38IOgStYxk5MBeg-U8frXtB4KhnXbTiUiESF_6P0AiiDK5rAxUEvUsy5dUtC-OBQblM4HvHix1o88Z6US00UqwoXFgVzNtAed62jelwUFzYtoYf3EhX4L2enuiqnyh5AXumZxsgF5DDOW6d3q_g2_ZVGwnP6qEJqG-aeBC-zX6V_KxMosi_DtOgyJa-ncsHyb1X4FL0R7fY7M0_hNPp5ac-s7TNFdSk4BUL3A1oXAukwdLO7p7TeXYXHWq7onY9elHoYS_x6PFVBZjBa0PiBCwEDZ8UhAzl-hXoMTa34k4sUDL8YGCwJSoaD0Hk31PaRbAhcaPb0zR4FSWi6XVi0llAbqV4WYaYERUz0MpUJ3y3zbERc7mspHkR-ufnMqh4bqsjprE-ZkAp9vFsP_iuzWHuBK7iWcRqNgII-G4tDstQ_v4WpQfihKybmJgxDAwRfzso_UHW8XBFe3je8I-m_js1DZRQSzbNPUbWtXIX73jrcSLimQg",
+                "nonce": "lvcfRgeIIITCvdKAPn1RFecDFu42ZnkY",
+                "size_bucket_bytes": "1024"
+              },
+              "object_id": "9424e185-c8b7-48c1-8221-f35ea4628f61",
+              "recorded_at": "2026-10-17T16:00:00.977Z",
+              "sequence": "2"
+            },
+            {
+              "conflict_id": "5b3fdf69-e243-4ee3-88f2-a2a15edad92f",
+              "current_revision": "9d6a1772-d2a1-4050-be2b-48babd26df03",
+              "current_write_sequence": "1",
+              "expected_revision": null,
+              "kind": "settings",
+              "object": {
+                "ciphertext": "8-bzq5Zku4B89DLlyvdujZ5OqoTFRguxGdbxLmeSHWzFcB7DsY2ruRSOL6EstNZJ1RWaivPAU0dMPjWuz8gdFHhpR9iVpFa813gZCFTP4OM3HwL3xKCbgm6bxW99rJdDMzxHI6CIS0Fe8wRrxV0LVXu7ajoFpXXX25dH-nj6Z1fN9u8TTf97D0AIlCTFXonXALut8fr4JwIrVUKzhQTNtHlegAzqC7NQERGIeEN45g-6fOwRxljPKBohTT4KNLWAFi5J-KwoWOKacqIT43cmjpPiMRFdJuBdYvuC6Jehvdsju0684BoBw2ek8wmjfVhSTHFszRpKIZ6gQsYZucN4D8J5Un_s-bS-6wJ6MQNY2HfBtNuL1h4_3V8u4K_H97JWDjqLf4-M4evDP8qyJ9T2GGIF1DhREBKx7qBCiAozLB2znx3rXi5BAfzSznOCakG7Tf6FwnFAQ-Rp0owxCP9Ztg1sYjkpjsxOVYICV1i1NzCRX8LcYczQPP8PPQ8x9t8SkQb-zwHSagX6eLhjBXPVa1dvPZv8G9MCt3qlD0crzBankYxWYM8MkeBnCp-B4feECJWR4_RtyyJXILSi5SHgL9_stkbxJeOmsIzUFkY5Kr5ebVkTVWeV9eGMcBtGtRoua70IxEUOpy2tqQahSDqcLjtAgRBsuP4gjrGQWiTMGnJwlwoPyN-CMyqZ2eIJti-pDligHuALnEjZdDVEHbuDUFNc8ro6ifOCbA1wlcxcpjXZOxRdsnKIod3AeQcxmC8fpnw9SN-lfMVf5RUhzSk4OLACd5t9PWRtird7QU9exiOhjnA62NkuVibjzy3cNas3mrvU-ULQ75vxhJqbpYBp-mPK3SRbSfPwiJ-ydmzLUcDWl9yreRdgqPsZdF6e6Y7CFC9ywtYLPtU0Iy-v0UPznbjSquNqMDKs2v79gkIM1sOkK9fu--I9HmTEwbAKLXunUyXgJisS2LUno04g1A_mdnx3ZooOyfz4SM88l61DMSo7OOFofTAdPDcnM8Qy7szxlYrxYa-4XEEMZ18-hgPW3DEC6RE1ECeQ7dm_WMa7gGvwTn-0kk3qPf3ibcpL2mizyw9nW6HSP5Gp2ZtEVoGOqBUCDVLa8cp9c8UODijL1Yj-2JkhjFFXjL8VKMA_tIqG8nt2dJiE1u0U28M95NNnCY-G8Mk4fTbSI9L5ApxNV84RcX9gxPQaZdVhko1ozRHO1b6aQJzYdRsagU73raLcFCvUbOanXN6W6Og3BNp5YYM6HpqRfqYqVlUGUFHa1t-yQET3ssf-tRXKQC0BNk_EdCdAjsQRY2p7iqpDMGvlzK3adzEJg9aWAcoj-r_mUDFloEzhClAqr4BaLiHyL_eGhiSAnIpMd22VnSopvfL0iTE",
+                "nonce": "HzsdL6taBO9vYCshlRxzktQJNODTyo9G",
+                "size_bucket_bytes": "1024"
+              },
+              "object_id": "9424e185-c8b7-48c1-8221-f35ea4628f61",
+              "recorded_at": "2026-10-17T16:00:00.984Z",
+              "sequence": "3"
+            },
+            {
+              "conflict_id": "d607c126-cfd9-42c0-ade0-ee4ccf057213",
+              "current_revision": "9d6a1772-d2a1-4050-be2b-48babd26df03",
+              "current_write_sequence": "1",
+              "expected_revision": null,
+              "kind": "settings",
+              "object": {
+                "ciphertext": "Jiwa32m0drzIhD4RWzsZa1W94ESQHdlLMKRfQHfAWbwIKpEFSUx-MdZmJu7-9_4VejJehIlyhwESmi89gL7AWg_Qg7HZumwJRw8DerCPtQvpRUlJRTSOcsMX5eGtnGo0h9VY-hmk2eIBXtyMl1B_vUE5ikhIRkEHCrigTAwXFrIEZULsyuT0F6UlPqXob4xGBz_fE6oOe5Z62UXO_u8DD3nXc_oKuoGWXJQ7FQnXUe4I3rAj1MUuzwfOLjH5zTsRd0aQiuk0Mo9_9di-l5Di6ecFQ6YtRN2p9xQJbs2XStH2FpM17jCS8NUfHAK0jLKHzJhuQ8cFjYhh-duxLzKiceujtO2HmjcmMHXdoODRvHZdpy99xTuvC0rJSPtXA9DqsQfPwTqEcC83qNxxEnEdfxenzdoev-mYtTkMPWuVJ9uWt3KNOskzr_1p8WehpEZv_hOGCXoByRqR6bUd1rectzWO3xxYLs7QLL0ncEVQJbcavzSumISddZqSIKEXEx3YYbRX2FGk5hjgyKULYAIeex6qRJnKzxqFNjJ_8ELUIY02IeIAZ9OBydRZts-AWmMX74tmx0w5PvCjZl8Li73VW0vWWR_NF-bX6ZsCezoHOwgrxEfTHsp4HI2t8xqZWC7CZu-Ixbp7ymP3217yQVxHGhpLeMVD38F9LXreLWzBlJeQ00H10YQ7UuXj34PmuKXEVdaPxxSSk426imLiHzZWI5iA9VS2P6cK8ILq8QUOSu5NuMeC6yAZlCx5RWtQ0EyjIHavvvFghhtGTr-XrDKthsfKFrqgBLVoyup69wCGNxq-9edSPoZ4egW0jh_He44W-J1fXQq-ZXLYhRvf8bDGcFw09e48CtEpCA0ntzvSyinrr8cUt4CNkxnBsFNZxOSxgVdKeKxhVXk-vsQ59IqtY4UXgBIn1wPHc1Iee7tiTbsg-qOp04guCxff8GsyMSa9-0hGt-XAe0fQwD8qlC3flTS0nEWpsR-YbExlDpmVFFpqbqWzB6bD1e8cBbtwvIPKf1I4ohQMpeZ-r_PvcOpbgHsKrI-J3AJxPQX8t1LXrPjp73hJnDIeVpa7L117yjHvojfQQJg9OQe_LVfmcRZ67fc5bdPAaDva1DZ6YtS9Og45DCDmgVSHreGQfpqCMIOhieaTDyud7HscRq-GusQJFXTnJ1qYHno-krtB00pJI0nhY2xA-y-MOcZpH-qjte9lUuLbo7iEMBA1QgbuBT9nwSSsJXXwUDTEmek6tA2DvMMUMm2Q0WhhwFJIl2m1SLaRdyMejXI5hJDhyXLXffMkY36sJFMTihvYrKp6rNSc1kUqpIQmenq8iHMAGmOurqZDBR7b02Kz576JhmdSbUea_05lpJzN5saVHRAiXCcHuCs",
+                "nonce": "AZVfyoSNEkoVhBUtL1TKv9-1rgK5NH6B",
+                "size_bucket_bytes": "1024"
+              },
+              "object_id": "9424e185-c8b7-48c1-8221-f35ea4628f61",
+              "recorded_at": "2026-10-17T16:00:00.992Z",
+              "sequence": "4"
+            },
+            {
+              "conflict_id": "4ce2d115-61c2-420a-a92d-25369d179c9f",
+              "current_revision": "9d6a1772-d2a1-4050-be2b-48babd26df03",
+              "current_write_sequence": "1",
+              "expected_revision": null,
+              "kind": "settings",
+              "object": {
+                "ciphertext": "WdXqKKw7EhVKtmWkw9s_8zYmK6dq5w4OIy2wJ96NDjuU-Ec_NBcNJdwbvoj5ctEHv19jtlo5JyeOKf9L3Cs7irZYyiPUeBFSZfvH8RC_EXEIEeQMKFtz1w3DLacBotekoE8I8KJgQAlzmUHAyMzaFnqfxKoHQ5SG6-_NohQOV1kET9nNjo4_dn-wYwQVuUtFFuTD0vwneinIZJNGH5QGhx5BpjdgsywP4urDwIPvTvbWT_yCAR28ZW3FYY-kQNgtGObJF8i8AV_FZuT-m6727tYeR8ioISNI_8JlkPovAdu6qyAs6stNUXUDUDli9M85L6BwxzuaKa2I95xU9ZsQMHgAjhtAFbReE5-_B5_GF3ADMpn8_7K8Bxf43r2TuP3vkVtj4D6B2ALMYP9sZkhxrBFeqVM_0txDL2-eW62UIUrEdPlS4HHNl0j8yCwZHV9dJoHAWNlvznHtyilCSC55jp-jfTug1C6UrtvNYDQm3sdGPAQ_byOczhqXWz_KnCsfTYDRspxYxLauRkgtMlHLYWrByy5dpnASJmYwlyBQ-xMPr5kN_SZt434FyRgOGFPa4CMB4E81xrD72qCAmzPZ2SdjMA_TxjNNwPwDNfHIYuh5UWFL0YyBuk_A3uJzgXTxQwZ7df4xW0rMMTypNwHTzZaQaTddnNxK6yHx17r6UNDSEMUuWlnpflSZEOazAzZ9wUMeZbdJqOV5AI49YqvGLWatsQxk1U56-hDhLbjATr5Y9llxomfbZtMpK3o3AU-AL132BxrOmZf3IL4L1fmkc1KJXVdaqNOr_-qsvybvZCoyf_TdhCn3prNLEXzSYDg_Rf4cmN-5rV1OBPgerTT_Ru8JBp_diM95U8Du8NiHEAWTQmEEtaw1J8z3_C_KprMi_g3IX8hZXmGZoKHduiJysMskTUb0BUme-MAHb4lIczVDPOGcdcbvjSmGXRvB-y2CfoG0-Uqy6KFBKLPmqx1-GYGtWh2FzneraS-Aw2iBBCM570zUlPSfzVMWNYhtaMmTOu3iRZPxWuvRBVcbPoERxkGuTv65T6PJoEr8dfYjBnhAs7jcj1JwqpKZs0M7U2th7QUo_GqzTprqUQbrdp40fJq8j_wNVeF8K8afDj-fXeMq-GzST8lqvENdtBMpjw8mrmr2mZL_l0EY7E9Z1Go4xUNswMMYNw84iMzDdDe_PFFcHLFH7M7SWQTfWkaq99CHSvG9jufpGwmqWBS_pUp2wHCba5m_AYmG5w2nloInk2hIYMLYMofcZoEILUAvgQkxPBNB835rcWneiZWM2jx9cIOkt4a_ifylXylmk__LIQhelZDxC6fVz29EIoV3G1yekDsRMLCE3wswG0wLUrVyWOzlBlbnyYlRLZOj6m5drA8",
+                "nonce": "wUB9pjM_VssjlWIBKRpdqmeZacbS2soz",
+                "size_bucket_bytes": "1024"
+              },
+              "object_id": "9424e185-c8b7-48c1-8221-f35ea4628f61",
+              "recorded_at": "2026-10-17T16:00:00.999Z",
+              "sequence": "5"
+            },
+            {
+              "conflict_id": "f5bf5a80-f702-4a50-bad3-2cd995272963",
+              "current_revision": "9d6a1772-d2a1-4050-be2b-48babd26df03",
+              "current_write_sequence": "1",
+              "expected_revision": null,
+              "kind": "settings",
+              "object": {
+                "ciphertext": "Zqpl_XgDttUt8t98dZUPUFHjDdI4RhtaK6g9KLs2KsfowxI_APQ8URAzyUaMDXUzXk_TG0_sfDeCZJsyUINpG-LwQUhtR2N7HR9xnEe2lUtpEdlwBhXe8JzYWWBXkfbfZXeprRx0rqgMkkbr2AxEbRgLPCtYuJ3hKA7o4pca2ptnNGEyR4yns5sDVjDMXahhBz_iUInjYfy3n3XTYaxaT_tj9cJ6TtIz2iMxkW1fgFjmo32BKGrFiNBR_3bZO6aRy8625b5_ZbmfKK2ZdZqSFXcFqCAxUX13clKLIIy6xhRgVlR1Cq8RldM7GGZ5F0GHfSHTqeGMN_lgEozPFnI-Ep6QI0Oo4U3Z4yw8f2x6C60vQDVcjRNvnxwhN6c5q84IYD3ll4E3hXUucaag_hk4CIK6N28Uw5XRIWPOpmYgyn5Oc61iuGOs0ugA47rjr2JoIw3R6ekLG3A_-fFqtJKHBM1Fg0y-OnJkEQGTKXZbQdlLgpC2_yaJrISj3JwarDAHjgQu-cUSwYS-C8aROSBjAq9mY0B0izCvK_ZKmKihveIzn4Hvx9uV5qyaXpB2LM2W7M7KNhPeRMaK_lnr7p1XooIk6ALXQGUyBhGKMiKLEhRzVyT5-_DRjnfgaewEf5sOybDu8nX-LL83kojtreuYSrfs4zxiclk_4_sfW2JmAqwjod8hbCssIJwIC4zvuQ2wROXyoacjcgq9O706V-T0Zcz_xN_bPT2q9H5OjX3GtypZCMNLivtvulLxYD7GifOPnez-A4_YAdprQnU0IcgcMys-vy1uOggwCu5gREf7QNTieOnEfARgTN8VMG70GqCy8waQdu0yKRXwtdoKSBlp38h5zsgErOOQOvR_1zhI_l-T4NTevzMva_pPTqwsJfCeJGhjqEJkjsbFCDBGH8cRztSTNNKSIixEDQaugYf4578TmymoxHeWmYBp9JmIsU5OMxc1ZyCuK-t-SvWdLCSAlpu-Obs3__SUoFqSdBN9xevKuhSNOdyUsgyDPXu8t0n0NsyMqIZKJQAyPf9Yua125hXXwH6mh_KNSeHAlZ2YscowxX2mITLN_qcHrYMkgr6sVmV-DG3RWdAnyVxXa6TO3hy_C-jL7I1r_hn3PtCuFoqnQU2XH6WCtpsZo9IonQERcGYbjLji9rFCJfsH2E1DGs6CcKBZ1UgaX_AFznUkR3BXLLsFBNYKxiBObUNzMNReixTnL-0E4GQ_30NIeMtpia85yjAbMIg1n0ihl4TyqqM-u7VBxKJUcDMmwRSWEX4uJ1wGsfWM7HfFce42vRfgscVucXmMEzmwRTSykw1E5ax1Bq14P7gVBh2FI4tkREgVZVH6wkH3IBS6KgEzWS_22GB9mVMVehUXzrtIQDJiC0g",
+                "nonce": "2GBdHFNQkvv1kGP1jKGxc3XkbLqaRa3r",
+                "size_bucket_bytes": "1024"
+              },
+              "object_id": "9424e185-c8b7-48c1-8221-f35ea4628f61",
+              "recorded_at": "2026-10-17T16:00:01.006Z",
+              "sequence": "6"
+            },
+            {
+              "conflict_id": "d1de8343-3c42-4b17-9e09-23e5aea03d37",
+              "current_revision": "9d6a1772-d2a1-4050-be2b-48babd26df03",
+              "current_write_sequence": "1",
+              "expected_revision": null,
+              "kind": "settings",
+              "object": {
+                "ciphertext": "gx_faoOtzjxT_gt4TU6S5RG2jTFM4zlAUADyz57ebau95B4v4u__0HYGUWw6Eiv7k7eAYKJZCsGuJag0w2iFj2ayrL_O9ZIZQEdv7XQv0LzCEbsHE-gcCje5bTwv8H3flvuXg7ZEP-ORlvoF1mVPsgGCq1cBA-V1_eEyMmUtpMev99WyBZvIwKdnQ64pv0voiaEro4fT_wRMbyi7RKS1hCreQxMO_ETHTF0GfsEelEZFBeVVRNdn8nwzA61Aowb5xTM8swbkKQrC8mZKAd1F4qWwVgFV3aYCQ0aPKHib9xSYUaSUBNgpacILOtrsbPal4_zDCMUeTN254F1MXXpO--xNpVYAH1nSfoDz6PqHq1U-_J87DpWiN59e1KWao9XJu2fwSkpzwUR65VU1GVGCAa8Fb8_DFfTd8oYwKhlalmp_GhB5au1xm8OCPBhBGvLzdlRGDr3rsA1Xz-dU6ftOJnVtMEmSjO136TdMHQXPVSos6mYQPVfnQyNjDMSIjAtU1s4TKcFxENPmvuzorPUFMLQ45MYQDo4V7HOX8ryavsBPlcEfzobJKkZlqyz4SdkZmuQvfd4gKPcfPIoZ6RsJi5jG6L6egYmLIsHd9XBiPBQErpUm4v2cnGkrel735UUTrnijmMNWSLD3ustRC4Hg6daSPYsJ6aQackPrD6FvOyQhOifARCemLv7w8nZu-BOL1YpL1TdkX8Zz973ULGPkDoonrxsJlQZ-muZSzK04A3HYsZ0TSNSzEV81A3K1soZHgEUefbLsd8uYhIPZJv7HvZG-kntZN9L5mWBRQGmECUjKwewOCoWVWiC1BwM2o3i4fUP7-7K11zgI7i3LkdVnN7PPGi43Tb6kcNNzZ-czGNVX3yuLYYmg6WR1OE046wPq8mo78Oz9eBCZEl6ARDTAeTP3btpzbAuRNMzBug9U3ZEr7Iv8H1S6duGBDFNMX0lnpyAs0OvUvAhqiSJkHBbnyGCjHtkirFQRqOe5cbfKWzn4soDPvP4AYsev1LLYxITYOL5EBBNYLAA0BJCKggYMSrMj5sLhqdPsjX_35fgOIUbSmyj5v6kZvrTv7q7SkoVVlKj09wf-NMMuC453064sMWBBLZpQYy6dDO2jDSRFJ6v37wYF6cq463bVZkrX6Tzse8sKaRg8kGETk0JfDvDkIWs5xW4Jy9yP6HI9oloPfumCv_JC67fTBSpRE921K-IYP0TAJMH_qwggi5LoVUNZW5ESHiy_dd0E2YLecNj1Gg-Lp-y9P-nIkzzIAH8O76jpBI4FL6TwUft5-KNJJn10e0HRA3yyXD_Xq6hlltUwbX5Ib2LcWvzVBeOPjuW9v48tdPa3QDDU5C6luN6DelMyEhHUKcw788--KaNKOquYU1I",
+                "nonce": "GTlCAb79a_rIkMLEprMOekftlgMPChLW",
+                "size_bucket_bytes": "1024"
+              },
+              "object_id": "9424e185-c8b7-48c1-8221-f35ea4628f61",
+              "recorded_at": "2026-10-17T16:00:01.040Z",
+              "sequence": "7"
+            },
+            {
+              "conflict_id": "b2017539-4ae7-4c45-9283-7dd02e639c8a",
+              "current_revision": "9d6a1772-d2a1-4050-be2b-48babd26df03",
+              "current_write_sequence": "1",
+              "expected_revision": null,
+              "kind": "settings",
+              "object": {
+                "ciphertext": "T8gWYabcSP_V0dk8MoEgXAlUqCO4WLK0nxd9sHoJc_g-aESU8Y6VT74ebAACgN62dOAcg5DAriQPLpDHCVSe-fgyuoMqGZx1tSzpOudzl5NvR3HndsC1qbpaq-WKo881nZdD7gdD5n7GXlCYvo4IuLSDoF8Gs-ESEfyT3yzs9LlhxKyY8DXWU0Pbb6nxb5a5Ls0hFSz1B3dzUumagjlGDef5CaOBi1yiKm2x5N7ge7U5qpQ7D0SSQ69Nhnl6C0FY5Wg3oj1Lh1gV-gFwPbG9QzJtEBWG30TiDO4b0Zsu8XcicRjzhsT3JJ8X4wMA1k47zzNOn8bqysfRIPaJOmi05gaXRd5EUolTuvkLmriE8VI8s66Wvg16OmTiGVlo_zPDvkgFMUaHIzVuGPoDUcb1aaYluPyWOMTganRBNARnpp2BvfhboCRAbwMFV4JshBDzXUtb9nlWTRh8nZVHPa2XQ8JnRrS_ql7g4oIH0vDBNVH0bdLlkM9xenIjXZZBZ4y2B51eD6KMbP2A1DGfu4GjZzZhc9iORJlCQWh2rz_8nfbrJi0PZlS98xG7qlWQ8YB9gW4LZih1aX94iwKMoRjrXKIk3ek1ew9Wc68d5BQEK4frJEK-cj9K0W09kpdExIgp_JAzjf8hhP17aoC6VPslUUr_RJLAoqPQsBfFKjoRg13hBURkqzrqPnUs7Sis13n0Du7DRWNcJmqBfRtRJ03UYnLsGZObdFL9fGTJQM5nJ0uqAtilsXacKj9gf38fA__gFl0nUSbbBg9dN4XSwDXKSCa_mDZuE08DemF36h61f7gwaV3mTVOjioQnAWROsQ-K1yv88AEVyLqHMv8bEUiozMDZ8UpowjeLCRpQHE2CdgyFhaixB_uZ00cxF9O-x7lWoA6ebaNitbGwwQCtNE6R8lgIB6BS6ECzl9vGCIMJsyVNBC2qj6ebFb8uAMEefHAHr6-foP678FrGWvU3CaLXPRN2oljlCN1rnRjnHo6NaftqQIDRk0Vhnpo1fc3oQKUIxvOMKbBEDHLVQVIkGF45-YSzsDP_a9QVMKWazlHE1adh2JVuXbPaOQyrYIIxow7hJNXNEYa1ez41vQdpDkvOckBRD9hqwDSMhZ_uBQcOdZ5gcGVAlb9DtvNEdz9EKIAIQews0pzyjZt-gEPZDM1K4pQpiHegaYhWXvrQW_ntF4J1XMM2yCMjJWSrYL8IDtNdLC1aDQ14Hq8JWrNImRf0hhNehBgQOl7zDTdo4aSwngJy41-sWUF2w3sww0PgkRPyMePlEadA-h8B9mTWONrIVKZf6SScXEIEfiUBthJb5idJBBHMvFFrDDVyIK-SAYD33F3Rv1cAKZ74MdRgLqz88LIyuJLwq5BOur_IXjiGePI",
+                "nonce": "E9MWx2bnklL3dM0y4fF3uCVq7zIezR3b",
+                "size_bucket_bytes": "1024"
+              },
+              "object_id": "9424e185-c8b7-48c1-8221-f35ea4628f61",
+              "recorded_at": "2026-10-17T16:00:01.049Z",
+              "sequence": "8"
+            }
+          ],
+          "more_conflicts": false,
+          "next_conflicts_after_sequence": "8",
+          "recovery_id": null,
+          "removed": [],
+          "revisions": [
+            {
+              "object_id": "9424e185-c8b7-48c1-8221-f35ea4628f61",
+              "revision": "9d6a1772-d2a1-4050-be2b-48babd26df03",
+              "write_sequence": "1"
+            }
+          ],
+          "stored": {
+            "allowance_bytes": "33554432",
+            "bytes": "11880",
+            "conflicts": "8",
+            "object_limit": "256",
+            "objects": "1"
+          }
+        },
+        "ok": true
+      },
+      "path": "/api/sync/exchange",
+      "shape": {
+        "data": {
+          "changed": {
+            "array": {
+              "kind": "string",
+              "object": {
+                "ciphertext": "string",
+                "nonce": "string",
+                "size_bucket_bytes": "string"
+              },
+              "object_id": "string",
+              "revision": "string",
+              "updated_at": "string",
+              "write_sequence": "string"
+            }
+          },
+          "conflicts": {
+            "array": {
+              "conflict_id": "string",
+              "current_revision": "string",
+              "current_write_sequence": "string",
+              "expected_revision": "null",
+              "kind": "string",
+              "object": {
+                "ciphertext": "string",
+                "nonce": "string",
+                "size_bucket_bytes": "string"
+              },
+              "object_id": "string",
+              "recorded_at": "string",
+              "sequence": "string"
+            }
+          },
+          "more_conflicts": "boolean",
+          "next_conflicts_after_sequence": "string",
+          "recovery_id": "null",
+          "removed": {
+            "array": null
+          },
+          "revisions": {
+            "array": {
+              "object_id": "string",
+              "revision": "string",
+              "write_sequence": "string"
+            }
+          },
+          "stored": {
+            "allowance_bytes": "string",
+            "bytes": "string",
+            "conflicts": "string",
+            "object_limit": "string",
+            "objects": "string"
+          }
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "read the crowded collection with its copies"
+    },
+    {
+      "body": {
+        "data": {
+          "key_epoch": null,
+          "key_revision": "0",
+          "more": false,
+          "records": [],
+          "recovery_id": null
+        },
+        "ok": true
+      },
+      "path": "/api/sync/exchange",
+      "shape": {
+        "data": {
+          "key_epoch": "null",
+          "key_revision": "string",
+          "more": "boolean",
+          "records": {
+            "array": null
+          },
+          "recovery_id": "null"
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "read the records of a collection nothing has claimed"
+    },
+    {
+      "body": {
+        "data": {
+          "key_epoch": "0",
+          "key_revision": "1",
+          "recovery_id": null,
+          "state": "applied"
+        },
+        "ok": true
+      },
+      "path": "/api/sync/exchange",
+      "shape": {
+        "data": {
+          "key_epoch": "string",
+          "key_revision": "string",
+          "recovery_id": "null",
+          "state": "applied"
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "start a collection and send its claim"
+    },
+    {
+      "body": {
+        "data": {
+          "key_epoch": "0",
+          "key_revision": "1",
+          "more": false,
+          "records": [
+            {
+              "payload": {
+                "collection_id": "60bb9c01-e2f0-487a-b459-c68f0aadc27f",
+                "home": "c72ae34c-9fc1-07a5-807e-fa31234873e2",
+                "issued_at_ms": "1792252801098",
+                "issuer_key_id": "l_bTDIAe_NozP0fGWUqS8UD-EPtcjG-1B2T0CgcbG2s",
+                "key_epoch": "0",
+                "members": [
+                  {
+                    "authorisation": "KGuhSlsBZdiICEXpbFoPw2OSyhhFTJWZPaVK-JHPczE",
+                    "stored_envelope": "T9AioKH3vDOce_X-LUbwuxM1rH-cCMVuWCE88kC6JkQ",
+                    "wrap": {
+                      "ciphertext": "ToOf0k0r7XKJorZ_DD2KyZRVzXyaNg69dIZJKguyfbW4a6lmlymvtSqETz5umuYGURTUgpN0OEMdVUmuUmOfXLEyFqcmx0vHqqc2x-q2u101uZ_1t8iuVPRtpLTQ7_gSfNTQIxU3_Ldjb41pLU4IDFq7qE6oGRd3fZzL7zN9wa1IRSeyomTk02dOzqahIcIjdABdZKaBK0Q7SqKVwpcvXZrrrvxNB6NSThmacGz15yuDMt_kfhVC07Mr-VfhPmdBs6AbgvezxMfffkU5Kr7-ujqGSRT1rC01fiYQ1UxB4mc5aw",
+                      "context": {
+                        "collection_id": "60bb9c01-e2f0-487a-b459-c68f0aadc27f",
+                        "format": "kr-collection-key-wrap/1",
+                        "key_epoch": "0",
+                        "recipient_key_id": "DKUT6g5aOOOUyZVEihPoaFiiVQcprCF9ueaxvmpkpTY",
+                        "sender_key_id": "DKUT6g5aOOOUyZVEihPoaFiiVQcprCF9ueaxvmpkpTY"
+                      },
+                      "nonce": "23yUEd_rY7wLT14-Q4-mOHOfG7I3YM28"
+                    }
+                  }
+                ],
+                "previous": null,
+                "revision": "1"
+              },
+              "signature": "7yodsMEae1oWUnMeefVHLyL3fs2wBTfpCB6lH2iiJnpehGIW3P6-2S55s18Sxhj4yWgnnr26DO9ItsW7UL5FCw"
+            }
+          ],
+          "recovery_id": null
+        },
+        "ok": true
+      },
+      "path": "/api/sync/exchange",
+      "shape": {
+        "data": {
+          "key_epoch": "string",
+          "key_revision": "string",
+          "more": "boolean",
+          "records": {
+            "array": {
+              "payload": {
+                "collection_id": "string",
+                "home": "string",
+                "issued_at_ms": "string",
+                "issuer_key_id": "string",
+                "key_epoch": "string",
+                "members": {
+                  "array": {
+                    "authorisation": "string",
+                    "stored_envelope": "string",
+                    "wrap": {
+                      "ciphertext": "string",
+                      "context": {
+                        "collection_id": "string",
+                        "format": "string",
+                        "key_epoch": "string",
+                        "recipient_key_id": "string",
+                        "sender_key_id": "string"
+                      },
+                      "nonce": "string"
+                    }
+                  }
+                },
+                "previous": "null",
+                "revision": "string"
+              },
+              "signature": "string"
+            }
+          },
+          "recovery_id": "null"
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "read the key records"
+    },
+    {
+      "body": {
+        "data": {
+          "key_epoch": "0",
+          "key_revision": "1",
+          "more": false,
+          "records": [],
+          "recovery_id": null
+        },
+        "ok": true
+      },
+      "path": "/api/sync/exchange",
+      "shape": {
+        "data": {
+          "key_epoch": "string",
+          "key_revision": "string",
+          "more": "boolean",
+          "records": {
+            "array": null
+          },
+          "recovery_id": "null"
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "read the key records after the newest"
+    },
+    {
+      "body": {
+        "data": {
+          "memberships": [
+            {
+              "collection_id": "60bb9c01-e2f0-487a-b459-c68f0aadc27f",
+              "home": "c72ae34c-9fc1-07a5-807e-fa31234873e2",
+              "key_epoch": "0",
+              "key_revision": "1",
+              "recovery_id": null
+            }
+          ],
+          "more": false,
+          "next_after": "c72ae34c-9fc1-07a5-807e-fa31234873e2/60bb9c01-e2f0-487a-b459-c68f0aadc27f"
+        },
+        "ok": true
+      },
+      "path": "/api/sync/exchange",
+      "shape": {
+        "data": {
+          "memberships": {
+            "array": {
+              "collection_id": "string",
+              "home": "string",
+              "key_epoch": "string",
+              "key_revision": "string",
+              "recovery_id": "null"
+            }
+          },
+          "more": "boolean",
+          "next_after": "string"
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "list the collections the home is a member of"
+    },
+    {
+      "body": {
+        "data": {
+          "memberships": [],
+          "more": false,
+          "next_after": null
+        },
+        "ok": true
+      },
+      "path": "/api/sync/exchange",
+      "shape": {
+        "data": {
+          "memberships": {
+            "array": null
+          },
+          "more": "boolean",
+          "next_after": "null"
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "list the collections a stranger is a member of"
+    },
+    {
+      "body": {
+        "error": {
+          "code": "INVALID_ARGUMENT",
+          "message": "That key epoch is ahead of the epoch this collection is at."
+        },
+        "ok": false
+      },
+      "path": "/api/sync/exchange",
+      "shape": {
+        "error": {
+          "code": "INVALID_ARGUMENT",
+          "message": "string"
+        },
+        "ok": false
+      },
+      "status": 400,
+      "step": "write under an epoch the collection has never had"
+    },
+    {
+      "body": {
+        "data": {
+          "conflict": null,
+          "current_revision": "ab584060-b716-4e84-9eff-c45a7d9e54cf",
+          "current_write_sequence": "1",
+          "key_epoch": "0",
+          "key_revision": "1",
+          "record": {
+            "bytes": "1320",
+            "key_epoch": "0",
+            "kind": "settings",
+            "object_id": "f6639bca-f4ac-46ab-864d-ea371df5c8ca",
+            "revision": "ab584060-b716-4e84-9eff-c45a7d9e54cf",
+            "updated_at": "2026-10-17T16:00:01.185Z",
+            "write_sequence": "1"
+          },
+          "recovery_id": null,
+          "state": "written",
+          "stored": {
+            "allowance_bytes": null,
+            "bytes": "2128",
+            "conflicts": "0",
+            "object_limit": "256",
+            "objects": "1"
+          }
+        },
+        "ok": true
+      },
+      "path": "/api/sync/exchange",
+      "shape": {
+        "data": {
+          "conflict": "null",
+          "current_revision": "string",
+          "current_write_sequence": "string",
+          "key_epoch": "string",
+          "key_revision": "string",
+          "record": {
+            "bytes": "string",
+            "key_epoch": "string",
+            "kind": "string",
+            "object_id": "string",
+            "revision": "string",
+            "updated_at": "string",
+            "write_sequence": "string"
+          },
+          "recovery_id": "null",
+          "state": "written",
+          "stored": {
+            "allowance_bytes": "null",
+            "bytes": "string",
+            "conflicts": "string",
+            "object_limit": "string",
+            "objects": "string"
+          }
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "write under the collection's epoch"
+    },
+    {
+      "body": {
+        "data": {
+          "conflict": null,
+          "current_revision": "ab584060-b716-4e84-9eff-c45a7d9e54cf",
+          "current_write_sequence": "1",
+          "key_epoch": "0",
+          "key_revision": "1",
+          "record": {
+            "bytes": "1320",
+            "key_epoch": "0",
+            "kind": "settings",
+            "object_id": "f6639bca-f4ac-46ab-864d-ea371df5c8ca",
+            "revision": "ab584060-b716-4e84-9eff-c45a7d9e54cf",
+            "updated_at": "2026-10-17T16:00:01.185Z",
+            "write_sequence": "1"
+          },
+          "recovery_id": null,
+          "state": "written",
+          "stored": {
+            "allowance_bytes": null,
+            "bytes": "2128",
+            "conflicts": "0",
+            "object_limit": "256",
+            "objects": "1"
+          }
+        },
+        "ok": true
+      },
+      "path": "/api/sync/exchange",
+      "shape": {
+        "data": {
+          "conflict": "null",
+          "current_revision": "string",
+          "current_write_sequence": "string",
+          "key_epoch": "string",
+          "key_revision": "string",
+          "record": {
+            "bytes": "string",
+            "key_epoch": "string",
+            "kind": "string",
+            "object_id": "string",
+            "revision": "string",
+            "updated_at": "string",
+            "write_sequence": "string"
+          },
+          "recovery_id": "null",
+          "state": "written",
+          "stored": {
+            "allowance_bytes": "null",
+            "bytes": "string",
+            "conflicts": "string",
+            "object_limit": "string",
+            "objects": "string"
+          }
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "write the same request again"
+    },
+    {
+      "body": {
+        "data": {
+          "conflict_id": null,
+          "current_revision": "ab584060-b716-4e84-9eff-c45a7d9e54cf",
+          "current_write_sequence": "1",
+          "key_epoch": "0",
+          "key_revision": "1",
+          "never_ran": false,
+          "outcome": "written",
+          "record": {
+            "bytes": "1320",
+            "key_epoch": "0",
+            "kind": "settings",
+            "object_id": "f6639bca-f4ac-46ab-864d-ea371df5c8ca",
+            "revision": "ab584060-b716-4e84-9eff-c45a7d9e54cf",
+            "updated_at": "2026-10-17T16:00:01.185Z",
+            "write_sequence": "1"
+          },
+          "recorded_at": "2026-10-17T16:00:01.188Z",
+          "recovery_id": null,
+          "request_id": "4a2e81eb-1fa9-4f71-8332-7bb137be20f1",
+          "state": "applied"
+        },
+        "ok": true
+      },
+      "path": "/api/sync/exchange",
+      "shape": {
+        "data": {
+          "conflict_id": "null",
+          "current_revision": "string",
+          "current_write_sequence": "string",
+          "key_epoch": "string",
+          "key_revision": "string",
+          "never_ran": "boolean",
+          "outcome": "string",
+          "record": {
+            "bytes": "string",
+            "key_epoch": "string",
+            "kind": "string",
+            "object_id": "string",
+            "revision": "string",
+            "updated_at": "string",
+            "write_sequence": "string"
+          },
+          "recorded_at": "string",
+          "recovery_id": "null",
+          "request_id": "string",
+          "state": "applied"
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "ask what became of the write"
+    },
+    {
+      "body": {
+        "data": {
+          "changed": [
+            {
+              "key_epoch": "0",
+              "kind": "settings",
+              "object": {
+                "ciphertext": "9tKTt0SCu-UIyfxfj2QyJwRRaheLi5QHQi7mZ14Tlnf21O9Yk2aIIigbfgpDCQ9i-zJHk1A_yykdBvLwne6Yar_IgFeAtZiDy51XFHuA1niAYjxbJttPnqiLfzGcN1VyPRzRSuwudx9CHAQbo_GwPlsFXonCiV5uy21bcPwjGd-WWI7sMOm6dvxAMjkebs4BY22nNpRd7JbIQw7SoCa0X78eNp4Lz7dwFyKwI_Bw_6V-2ne_DRDgX3gQlYNhoyuErCdUVf-f75MpYXzb__Kx9H1E3_89W6zNDQn8-Prwn7hjQJWBowCD6xZkfopHWs1MbC9acsvUYTSG2B6sl42ZvzAbI38L_e3V_RbfkfBxmTYZ0uer4TN9QC57b4BnT0KA0rVCqiiCBVPBODRdYkt8bAshLXFrEhftSR7GeC-vGRWNVu_spBTUIN1Ywjl6tXyo6m3HQI8j5sPi2TucwZNRj6Wml3JJcfzEeUDZEIwuF1nPuYi9ugQeZg1czlnQdUPCvXl-FMM55qZqb7O_NFMecylHFBx60RB9vnOOZjUmXf9cx_MPq4dIei8r87YCmz8p0XkwAs78a2PdYMCSFBY8hKDWAd4U8gS5V1tPv5wnFV78h0r04FU7BbbmD5wiDuf8amFm7esD6U0rwNW_2I3JTKAR6fjn71qJ1BHSfiZ3KKcb4B2wtix-Cs5cJGZwswfWfTTJJ9Xz8o9Y45TRzunmbcU19n3yb_h902sPlEVm14Ilqh7v8ihsSF8Malz2i1f-tJbNIVK3kjvTHiNK7_PtXYQmFxmibIBo5RslkMAYts1N0niBU4RTKqvuu4YKMzF-stUFN_YCJQLNMLV0mSfipPY3OJlWNQvoXzJEDLWgv5jg4gh_-Q1AlwzYabcBam7TONg6pCsSMdobPhfFCzt5HU0M6fYdHsn04J1aJmRRUzGTe8PXwp4WEndLipHPcUtk8gmTuVB-gmTRGl075xFi8qZsZpZsfw3H50rLIH7NB8b82lLXmwA85FDNWWwlGjS7zkeU_mT4p8mCBbinIbfy9im4oOFwwsWXOSGi2luqW-DgttHvhBBO16d4xSq3UKTsDz4GTj0iCeUU5FGesZxPkx7gU6LeELRNhaNhaFz0_VXFcl3PMPqwyzKJ0gMgyUYBcfWHD-spryIcwlBVUGsZSKDD2ilfOVYDyKCbvvW5yJzQeCQwfKkXMFH88sN3W7YSq10waFjZk4QWBTi2mX0pUvigyBLYfmMsUyFpPFFF56cS-Uqmk9MPSwK-M-xTUcrLlOd_soJzDJdM2zjdqaxe9iknm35ooacgTN9RP1mohNvsYqAT9gGT4tXxnixBqgYMz13JifUY008jkkHpmoe75QRgMxnZf85tyyIMjJEVYUA",
+                "nonce": "mEQgSw1jHOBYMluqjYP_6W50BeG6pcqj",
+                "size_bucket_bytes": "1024"
+              },
+              "object_id": "f6639bca-f4ac-46ab-864d-ea371df5c8ca",
+              "revision": "ab584060-b716-4e84-9eff-c45a7d9e54cf",
+              "updated_at": "2026-10-17T16:00:01.185Z",
+              "write_sequence": "1"
+            }
+          ],
+          "conflicts": [],
+          "key_epoch": "0",
+          "key_revision": "1",
+          "more_conflicts": false,
+          "next_conflicts_after_sequence": "0",
+          "recovery_id": null,
+          "removed": [],
+          "revisions": [
+            {
+              "key_epoch": "0",
+              "object_id": "f6639bca-f4ac-46ab-864d-ea371df5c8ca",
+              "revision": "ab584060-b716-4e84-9eff-c45a7d9e54cf",
+              "write_sequence": "1"
+            }
+          ],
+          "stored": {
+            "allowance_bytes": "33554432",
+            "bytes": "2128",
+            "conflicts": "0",
+            "object_limit": "256",
+            "objects": "1"
+          }
+        },
+        "ok": true
+      },
+      "path": "/api/sync/exchange",
+      "shape": {
+        "data": {
+          "changed": {
+            "array": {
+              "key_epoch": "string",
+              "kind": "string",
+              "object": {
+                "ciphertext": "string",
+                "nonce": "string",
+                "size_bucket_bytes": "string"
+              },
+              "object_id": "string",
+              "revision": "string",
+              "updated_at": "string",
+              "write_sequence": "string"
+            }
+          },
+          "conflicts": {
+            "array": null
+          },
+          "key_epoch": "string",
+          "key_revision": "string",
+          "more_conflicts": "boolean",
+          "next_conflicts_after_sequence": "string",
+          "recovery_id": "null",
+          "removed": {
+            "array": null
+          },
+          "revisions": {
+            "array": {
+              "key_epoch": "string",
+              "object_id": "string",
+              "revision": "string",
+              "write_sequence": "string"
+            }
+          },
+          "stored": {
+            "allowance_bytes": "string",
+            "bytes": "string",
+            "conflicts": "string",
+            "object_limit": "string",
+            "objects": "string"
+          }
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "read the collection as a member"
+    },
+    {
+      "body": {
+        "error": {
+          "code": "COLLECTION_ABSENT",
+          "message": "That collection does not exist, or this installation is not one of its members."
+        },
+        "ok": false
+      },
+      "path": "/api/sync/exchange",
+      "shape": {
+        "error": {
+          "code": "COLLECTION_ABSENT",
+          "message": "string"
+        },
+        "ok": false
+      },
+      "status": 404,
+      "step": "read the collection as a stranger"
+    },
+    {
+      "body": {
+        "error": {
+          "code": "COLLECTION_ABSENT",
+          "message": "That collection does not exist, or this installation is not one of its members."
+        },
+        "ok": false
+      },
+      "path": "/api/sync/exchange",
+      "shape": {
+        "error": {
+          "code": "COLLECTION_ABSENT",
+          "message": "string"
+        },
+        "ok": false
+      },
+      "status": 404,
+      "step": "write as a stranger"
+    },
+    {
+      "body": {
+        "error": {
+          "code": "COLLECTION_ABSENT",
+          "message": "That collection does not exist, or this installation is not one of its members."
+        },
+        "ok": false
+      },
+      "path": "/api/sync/exchange",
+      "shape": {
+        "error": {
+          "code": "COLLECTION_ABSENT",
+          "message": "string"
+        },
+        "ok": false
+      },
+      "status": 404,
+      "step": "fence a request as a stranger"
+    },
+    {
+      "body": {
+        "error": {
+          "code": "COLLECTION_ABSENT",
+          "message": "That collection does not exist, or this installation is not one of its members."
+        },
+        "ok": false
+      },
+      "path": "/api/sync/exchange",
+      "shape": {
+        "error": {
+          "code": "COLLECTION_ABSENT",
+          "message": "string"
+        },
+        "ok": false
+      },
+      "status": 404,
+      "step": "read the key records as a stranger"
+    },
+    {
+      "body": {
+        "data": {
+          "key_epoch": "1",
+          "key_revision": "2",
+          "recovery_id": null,
+          "state": "applied"
+        },
+        "ok": true
+      },
+      "path": "/api/sync/exchange",
+      "shape": {
+        "data": {
+          "key_epoch": "string",
+          "key_revision": "string",
+          "recovery_id": "null",
+          "state": "applied"
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "offer the record that follows"
+    },
+    {
+      "body": {
+        "data": {
+          "key_epoch": "1",
+          "key_revision": "2",
+          "recovery_id": null,
+          "state": "applied"
+        },
+        "ok": true
+      },
+      "path": "/api/sync/exchange",
+      "shape": {
+        "data": {
+          "key_epoch": "string",
+          "key_revision": "string",
+          "recovery_id": "null",
+          "state": "applied"
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "offer the same record again"
+    },
+    {
+      "body": {
+        "data": {
+          "conflict_id": null,
+          "current_revision": null,
+          "current_write_sequence": null,
+          "key_epoch": "1",
+          "key_revision": "2",
+          "never_ran": false,
+          "outcome": "rekeyed",
+          "record": null,
+          "recorded_at": "2026-10-17T16:00:01.215Z",
+          "recovery_id": null,
+          "request_id": "c090cc37-d1d4-4b1f-bcb7-781939903c8f",
+          "state": "applied"
+        },
+        "ok": true
+      },
+      "path": "/api/sync/exchange",
+      "shape": {
+        "data": {
+          "conflict_id": "null",
+          "current_revision": "null",
+          "current_write_sequence": "null",
+          "key_epoch": "string",
+          "key_revision": "string",
+          "never_ran": "boolean",
+          "outcome": "string",
+          "record": "null",
+          "recorded_at": "string",
+          "recovery_id": "null",
+          "request_id": "string",
+          "state": "applied"
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "ask what became of the record"
+    },
+    {
+      "body": {
+        "error": {
+          "code": "ID_CONFLICT",
+          "message": "That request identity was used for a different settings-sync request."
+        },
+        "ok": false
+      },
+      "path": "/api/sync/exchange",
+      "shape": {
+        "error": {
+          "code": "ID_CONFLICT",
+          "message": "string"
+        },
+        "ok": false
+      },
+      "status": 409,
+      "step": "offer other content under the same request identity"
+    },
+    {
+      "body": {
+        "data": {
+          "key_epoch": "1",
+          "key_revision": "2",
+          "recovery_id": null,
+          "state": "refused"
+        },
+        "ok": true
+      },
+      "path": "/api/sync/exchange",
+      "shape": {
+        "data": {
+          "key_epoch": "string",
+          "key_revision": "string",
+          "recovery_id": "null",
+          "state": "refused"
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "offer a record that does not follow the newest"
+    },
+    {
+      "body": {
+        "error": {
+          "code": "KEY_EPOCH_RETIRED",
+          "key_epoch": "1",
+          "key_revision": "2",
+          "message": "That exchange names a key epoch this collection has retired; seal it again under the current one.",
+          "recovery_id": null
+        },
+        "ok": false
+      },
+      "path": "/api/sync/exchange",
+      "shape": {
+        "error": {
+          "code": "KEY_EPOCH_RETIRED",
+          "key_epoch": "string",
+          "key_revision": "string",
+          "message": "string",
+          "recovery_id": "null"
+        },
+        "ok": false
+      },
+      "status": 409,
+      "step": "write under the epoch the collection has moved past"
+    },
+    {
+      "body": {
+        "error": {
+          "code": "KEY_EPOCH_RETIRED",
+          "key_epoch": "1",
+          "key_revision": "2",
+          "message": "That exchange names a key epoch this collection has retired; seal it again under the current one.",
+          "recovery_id": null
+        },
+        "ok": false
+      },
+      "path": "/api/sync/exchange",
+      "shape": {
+        "error": {
+          "code": "KEY_EPOCH_RETIRED",
+          "key_epoch": "string",
+          "key_revision": "string",
+          "message": "string",
+          "recovery_id": "null"
+        },
+        "ok": false
+      },
+      "status": 409,
+      "step": "write the retired request again"
+    },
+    {
+      "body": {
+        "data": {
+          "conflict_id": null,
+          "current_revision": null,
+          "current_write_sequence": null,
+          "key_epoch": "1",
+          "key_revision": "2",
+          "never_ran": false,
+          "outcome": "retired",
+          "record": null,
+          "recorded_at": "2026-10-17T16:00:01.235Z",
+          "recovery_id": null,
+          "request_id": "cc0f1b09-8407-4cdc-b8c4-7d83a654681e",
+          "state": "retired"
+        },
+        "ok": true
+      },
+      "path": "/api/sync/exchange",
+      "shape": {
+        "data": {
+          "conflict_id": "null",
+          "current_revision": "null",
+          "current_write_sequence": "null",
+          "key_epoch": "string",
+          "key_revision": "string",
+          "never_ran": "boolean",
+          "outcome": "string",
+          "record": "null",
+          "recorded_at": "string",
+          "recovery_id": "null",
+          "request_id": "string",
+          "state": "retired"
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "ask what became of the retired request"
+    },
+    {
+      "body": {
+        "data": {
+          "conflict": null,
+          "current_revision": "8eb95c88-0d45-43ab-889f-6b6e11803d1e",
+          "current_write_sequence": "2",
+          "key_epoch": "1",
+          "key_revision": "2",
+          "record": {
+            "bytes": "1320",
+            "key_epoch": "1",
+            "kind": "settings",
+            "object_id": "f6639bca-f4ac-46ab-864d-ea371df5c8ca",
+            "revision": "8eb95c88-0d45-43ab-889f-6b6e11803d1e",
+            "updated_at": "2026-10-17T16:00:01.241Z",
+            "write_sequence": "2"
+          },
+          "recovery_id": null,
+          "state": "written",
+          "stored": {
+            "allowance_bytes": null,
+            "bytes": "2969",
+            "conflicts": "0",
+            "object_limit": "256",
+            "objects": "1"
+          }
+        },
+        "ok": true
+      },
+      "path": "/api/sync/exchange",
+      "shape": {
+        "data": {
+          "conflict": "null",
+          "current_revision": "string",
+          "current_write_sequence": "string",
+          "key_epoch": "string",
+          "key_revision": "string",
+          "record": {
+            "bytes": "string",
+            "key_epoch": "string",
+            "kind": "string",
+            "object_id": "string",
+            "revision": "string",
+            "updated_at": "string",
+            "write_sequence": "string"
+          },
+          "recovery_id": "null",
+          "state": "written",
+          "stored": {
+            "allowance_bytes": "null",
+            "bytes": "string",
+            "conflicts": "string",
+            "object_limit": "string",
+            "objects": "string"
+          }
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "write under the new epoch"
+    },
+    {
+      "body": {
+        "data": {
+          "key_epoch": "1",
+          "key_revision": "2",
+          "more": false,
+          "records": [
+            {
+              "payload": {
+                "collection_id": "60bb9c01-e2f0-487a-b459-c68f0aadc27f",
+                "home": "c72ae34c-9fc1-07a5-807e-fa31234873e2",
+                "issued_at_ms": "1792252801098",
+                "issuer_key_id": "l_bTDIAe_NozP0fGWUqS8UD-EPtcjG-1B2T0CgcbG2s",
+                "key_epoch": "0",
+                "members": [
+                  {
+                    "authorisation": "KGuhSlsBZdiICEXpbFoPw2OSyhhFTJWZPaVK-JHPczE",
+                    "stored_envelope": "T9AioKH3vDOce_X-LUbwuxM1rH-cCMVuWCE88kC6JkQ",
+                    "wrap": {
+                      "ciphertext": "ToOf0k0r7XKJorZ_DD2KyZRVzXyaNg69dIZJKguyfbW4a6lmlymvtSqETz5umuYGURTUgpN0OEMdVUmuUmOfXLEyFqcmx0vHqqc2x-q2u101uZ_1t8iuVPRtpLTQ7_gSfNTQIxU3_Ldjb41pLU4IDFq7qE6oGRd3fZzL7zN9wa1IRSeyomTk02dOzqahIcIjdABdZKaBK0Q7SqKVwpcvXZrrrvxNB6NSThmacGz15yuDMt_kfhVC07Mr-VfhPmdBs6AbgvezxMfffkU5Kr7-ujqGSRT1rC01fiYQ1UxB4mc5aw",
+                      "context": {
+                        "collection_id": "60bb9c01-e2f0-487a-b459-c68f0aadc27f",
+                        "format": "kr-collection-key-wrap/1",
+                        "key_epoch": "0",
+                        "recipient_key_id": "DKUT6g5aOOOUyZVEihPoaFiiVQcprCF9ueaxvmpkpTY",
+                        "sender_key_id": "DKUT6g5aOOOUyZVEihPoaFiiVQcprCF9ueaxvmpkpTY"
+                      },
+                      "nonce": "23yUEd_rY7wLT14-Q4-mOHOfG7I3YM28"
+                    }
+                  }
+                ],
+                "previous": null,
+                "revision": "1"
+              },
+              "signature": "7yodsMEae1oWUnMeefVHLyL3fs2wBTfpCB6lH2iiJnpehGIW3P6-2S55s18Sxhj4yWgnnr26DO9ItsW7UL5FCw"
+            },
+            {
+              "payload": {
+                "collection_id": "60bb9c01-e2f0-487a-b459-c68f0aadc27f",
+                "home": "c72ae34c-9fc1-07a5-807e-fa31234873e2",
+                "issued_at_ms": "1792252801210",
+                "issuer_key_id": "l_bTDIAe_NozP0fGWUqS8UD-EPtcjG-1B2T0CgcbG2s",
+                "key_epoch": "1",
+                "members": [
+                  {
+                    "authorisation": "KGuhSlsBZdiICEXpbFoPw2OSyhhFTJWZPaVK-JHPczE",
+                    "stored_envelope": "T9AioKH3vDOce_X-LUbwuxM1rH-cCMVuWCE88kC6JkQ",
+                    "wrap": {
+                      "ciphertext": "08PNE493AEqsDYkJzuMfWFxl4DVwD5aLZxX3YwVdvWW2CVC864aGFooPcSX0K53SgAFPYhJ8IgMLeUYJcm2kYVVtweTxOLya-XB5iGdc1vjraBCsT6ZOQJGah3n_uWvOX9dtHkcQoO4eNhMo81-Xm8uYAafiW1Mv9izsPd7JOMCq0Y2rtCdDlFZ5RCSr4O0p0V2XDSlHab68I1O7dl7rcPG-ZW4UWzQggoFzyUgsSaMnDYD0ovJdtNZ7KsINbQby5AsvkmXTu2_gUHUarx1NwSM7Ja5S_ObxtLq2kqUMuICbjA",
+                      "context": {
+                        "collection_id": "60bb9c01-e2f0-487a-b459-c68f0aadc27f",
+                        "format": "kr-collection-key-wrap/1",
+                        "key_epoch": "1",
+                        "recipient_key_id": "DKUT6g5aOOOUyZVEihPoaFiiVQcprCF9ueaxvmpkpTY",
+                        "sender_key_id": "DKUT6g5aOOOUyZVEihPoaFiiVQcprCF9ueaxvmpkpTY"
+                      },
+                      "nonce": "ZWwhpl8abchqgUU4ZezrmMr9Acsn7XB_"
+                    }
+                  }
+                ],
+                "previous": "7NzyGyf8l6AXgF5sLCc65BLSgEki4y6KV5fVlhI331k",
+                "revision": "2"
+              },
+              "signature": "cPdgg1ie-S1jA8BMOuwmMI7JYaKRegJcSnu27JAbJZICgoOTBAoqAhpRczHUM9iOVv_Ay_v_LrJLs1vRw9-3Dg"
+            }
+          ],
+          "recovery_id": null
+        },
+        "ok": true
+      },
+      "path": "/api/sync/exchange",
+      "shape": {
+        "data": {
+          "key_epoch": "string",
+          "key_revision": "string",
+          "more": "boolean",
+          "records": {
+            "array": {
+              "payload": {
+                "collection_id": "string",
+                "home": "string",
+                "issued_at_ms": "string",
+                "issuer_key_id": "string",
+                "key_epoch": "string",
+                "members": {
+                  "array": {
+                    "authorisation": "string",
+                    "stored_envelope": "string",
+                    "wrap": {
+                      "ciphertext": "string",
+                      "context": {
+                        "collection_id": "string",
+                        "format": "string",
+                        "key_epoch": "string",
+                        "recipient_key_id": "string",
+                        "sender_key_id": "string"
+                      },
+                      "nonce": "string"
+                    }
+                  }
+                },
+                "previous": "null",
+                "revision": "string"
+              },
+              "signature": "string"
+            }
+          },
+          "recovery_id": "null"
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "read the key records again"
+    },
+    {
+      "body": {
+        "data": {
+          "key_epoch": null,
+          "key_revision": "0",
+          "recovery_id": null,
+          "state": "refused"
+        },
+        "ok": true
+      },
+      "path": "/api/sync/exchange",
+      "shape": {
+        "data": {
+          "key_epoch": "null",
+          "key_revision": "string",
+          "recovery_id": "null",
+          "state": "refused"
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "claim a collection that holds an object"
+    },
+    {
+      "body": {
+        "data": {
+          "conflict_id": null,
+          "current_revision": null,
+          "current_write_sequence": null,
+          "never_ran": true,
+          "outcome": "fenced",
+          "record": null,
+          "recorded_at": "2026-10-17T16:00:01.256Z",
+          "recovery_id": null,
+          "request_id": "c6ad681c-7f61-4cf4-a0ae-5bdafd212f77",
+          "state": "fenced"
+        },
+        "ok": true
+      },
+      "path": "/api/sync/exchange",
+      "shape": {
+        "data": {
+          "conflict_id": "null",
+          "current_revision": "null",
+          "current_write_sequence": "null",
+          "never_ran": "boolean",
+          "outcome": "string",
+          "record": "null",
+          "recorded_at": "string",
+          "recovery_id": "null",
+          "request_id": "string",
+          "state": "fenced"
+        },
+        "ok": true
+      },
+      "status": 200,
+      "step": "fence a record offer nothing was recorded for"
+    }
+  ],
+  "names": [],
+  "recorded_from": "a Worker on this machine, started by infra/scripts/testing/local-restore.mjs",
+  "web_commit": "3b7168085d45e45c712a78630264d7121ea47cb2"
+}

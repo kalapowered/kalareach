@@ -557,7 +557,10 @@ impl ServiceWeb {
     /// The settings-sync allowance admits no write of an object or a key record from now on, or
     /// admits one again.
     pub fn refuse_settings_writes(&self, refused: bool) {
-        self.state.lock().expect("the state").settings_writes_refused = refused;
+        self.state
+            .lock()
+            .expect("the state")
+            .settings_writes_refused = refused;
     }
 
     /// The sealed bundle the service holds at `locator`, if it holds one.

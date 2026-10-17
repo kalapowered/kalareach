@@ -11,9 +11,7 @@
 //!
 //! A write names the revision it replaces. One that names another is refused and its content is
 //! kept as a copy for the person to choose between, up to eight copies of one object, past which
-//! the write is refused outright because dropping a copy would choose by the clock. A removal that
-//! loses its comparison carries nothing to keep. A removal is a write like any other: it takes a
-//! place in the object's order and leaves it behind, so a write that follows carries on from it.
+//! the write is refused outright because dropping a copy would choose by the clock.
 //!
 //! Every exchange and every key record offer may name a request identity, and the collection keeps
 //! a receipt for it under the installation that sent it: sent again it is answered what it was
@@ -24,11 +22,12 @@
 //! A write spends the principal's settings-sync allowance; a test arranges for it to be spent with
 //! [`crate::ServiceWeb::refuse_settings_writes`].
 //!
-//! What the Worker does that this does not: a receipt is never swept (a local run lasts far less
-//! than 30 days), so the collection keeps no replay cutoff and no sweep mark; the index of
-//! memberships is read from the collections at the moment it is asked, where the Worker delivers
-//! each change to it afterwards; and a collection is never put back from an export, so every
-//! recovery identity is null.
+//! What the Worker does that this does not: an object is never removed (no client of this crate
+//! sends a removal, which takes a place in the order and leaves a tombstone, so one is refused); a
+//! receipt is never swept (a local run lasts far less than 30 days), so the collection keeps no
+//! replay cutoff and no sweep mark; the index of memberships is read from the collections at the
+//! moment it is asked, where the Worker delivers each change to it afterwards; and a collection is
+//! never put back from an export, so every recovery identity is null.
 //!
 //! The source is the web repository's `workers/api/src/sync/{index,collection,memberships}.ts` and
 //! `packages/service-contracts/src/sync.ts`.
@@ -92,6 +91,9 @@ const FRESHNESS_MS: u64 = 300_000;
 const RECEIPT_RETENTION_MS: u64 = 30 * 24 * 60 * 60 * 1000;
 /// The last place in an object's order of writes.
 const MAX_WRITE_SEQUENCE: u64 = (1 << 53) - 1;
+/// The settings-sync allowance a comparison states for the one principal the service knows: the
+/// free tier a local deployment's catalogue gives, which the recording was made against.
+const ALLOWANCE_BYTES: &str = "33554432";
 
 /// Who sent a request: the installation its key derives and the key itself.
 struct Caller<'a> {
@@ -114,7 +116,6 @@ enum Standing {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Outcome {
     Written,
-    Removed,
     Conflict,
     Retired,
     Rekeyed,
@@ -126,7 +127,6 @@ impl Outcome {
     const fn as_str(self) -> &'static str {
         match self {
             Self::Written => "written",
-            Self::Removed => "removed",
             Self::Conflict => "conflict",
             Self::Retired => "retired",
             Self::Rekeyed => "rekeyed",
@@ -138,7 +138,7 @@ impl Outcome {
     /// The state a status query and a fence answer a recorded outcome with.
     const fn state(self) -> &'static str {
         match self {
-            Self::Written | Self::Removed | Self::Rekeyed => "applied",
+            Self::Written | Self::Rekeyed => "applied",
             Self::Conflict | Self::RekeyRefused => "refused",
             Self::Retired => "retired",
             Self::Fenced => "fenced",
@@ -271,8 +271,6 @@ struct Receipt {
 #[derive(Debug, Default)]
 struct Collection {
     objects: BTreeMap<String, Object>,
-    /// Where each removed object stood in its order of writes.
-    removed: BTreeMap<String, u64>,
     /// The copies, in the order they were recorded.
     copies: Vec<Copy>,
     next_sequence: u64,
@@ -372,7 +370,7 @@ struct Exchange {
     object_id: String,
     expected: Option<String>,
     /// The sealed object and the bytes it is stored as; nothing removes the object.
-    object: Option<(Value, u64)>,
+    object: (Value, u64),
 }
 
 impl Exchange {
@@ -384,7 +382,7 @@ impl Exchange {
             "kind": self.kind,
             "object_id": self.object_id,
             "expected_revision": self.expected,
-            "object": self.object.as_ref().map(|(object, _)| object),
+            "object": self.object.0,
         });
         if let Some(epoch) = self.key_epoch {
             digest["key_epoch"] = json!(epoch.to_string());
@@ -424,7 +422,11 @@ fn read_exchange(value: &Value) -> Result<Exchange, Unread> {
     };
     let request_id = request_id_of(fields, true)?;
     let object = match fields.get("object") {
-        None | Some(Value::Null) => None,
+        None | Some(Value::Null) => {
+            return Err(invalid_request(
+                "This stand-in keeps no removal of an object: nothing in this crate sends one.",
+            ));
+        }
         Some(declared) => {
             let sealed: SealedSyncObject =
                 serde_json::from_value(declared.clone()).map_err(|_| {
@@ -435,7 +437,7 @@ fn read_exchange(value: &Value) -> Result<Exchange, Unread> {
                     "A synchronised object is its declared bucket plus the seal, and nothing else.",
                 )
             })?;
-            Some((declared.clone(), sealed.stored_bytes()))
+            (declared.clone(), sealed.stored_bytes())
         }
     };
     Ok(Exchange {
@@ -788,7 +790,7 @@ impl Collections {
             "exchange" => {
                 read_exchange(value).map(|asked| self.exchange(&who, &asked, now_ms, funded))
             }
-            "compare" => read_compare(value).map(|asked| self.compare(&who, &asked)),
+            "compare" => read_compare(value).map(|asked| self.compare(&who, &asked, funded)),
             "resolve" => read_resolve(value).map(|asked| self.resolve(&who, &asked)),
             "status" => read_status(value).map(|asked| self.status(&who, &asked)),
             "fence" => read_fence(value).map(|asked| self.fence(&who, &asked, now_ms)),
@@ -824,12 +826,12 @@ impl Collections {
         collection.exchange(who, &home, asked, now_ms, funded)
     }
 
-    fn compare(&mut self, who: &Caller<'_>, asked: &Compare) -> ServiceHttpAnswer {
+    fn compare(&mut self, who: &Caller<'_>, asked: &Compare, funded: bool) -> ServiceHttpAnswer {
         let (home, collection) = self.collection(who, &asked.address);
         if collection.standing(&who.installation, &home) != Standing::Member {
             return absent();
         }
-        collection.compare(asked)
+        collection.compare(asked, funded)
     }
 
     fn resolve(&mut self, who: &Caller<'_>, asked: &Resolve) -> ServiceHttpAnswer {
@@ -1073,9 +1075,7 @@ impl Collection {
     fn write_sequence_of(&self, object_id: &str) -> u64 {
         self.objects
             .get(object_id)
-            .map(|object| object.write_sequence)
-            .or_else(|| self.removed.get(object_id).copied())
-            .unwrap_or(0)
+            .map_or(0, |object| object.write_sequence)
     }
 
     /// What the collection holds, and what the allowance leaves.
@@ -1225,7 +1225,7 @@ impl Collection {
                 }
             }
         }
-        if asked.object.is_some() && !funded {
+        if !funded {
             return quota_exhausted(
                 "This principal's settings-sync allowance has no room for that write.",
             );
@@ -1251,40 +1251,7 @@ impl Collection {
         if position >= MAX_WRITE_SEQUENCE {
             return quota_exhausted("This object has been written as many times as one may be.");
         }
-        let Some((object, stored_bytes)) = &asked.object else {
-            // A removal of an object that is not there removes nothing, so it moves nothing.
-            let Some(_) = existing else {
-                return self.answered(
-                    who,
-                    asked,
-                    digest,
-                    Reply {
-                        outcome: Outcome::Removed,
-                        record: None,
-                        current_revision: None,
-                        current_write_sequence: position,
-                        conflict: None,
-                    },
-                    now_ms,
-                );
-            };
-            let removed_at = position + 1;
-            self.objects.remove(&asked.object_id);
-            self.removed.insert(asked.object_id.clone(), removed_at);
-            return self.answered(
-                who,
-                asked,
-                digest,
-                Reply {
-                    outcome: Outcome::Removed,
-                    record: None,
-                    current_revision: None,
-                    current_write_sequence: removed_at,
-                    conflict: None,
-                },
-                now_ms,
-            );
-        };
+        let (object, stored_bytes) = &asked.object;
         if existing.is_none() && self.objects.len() as u64 >= MAX_SYNC_OBJECTS_PER_COLLECTION {
             return quota_exhausted(&format!(
                 "A collection holds {MAX_SYNC_OBJECTS_PER_COLLECTION} objects."
@@ -1302,7 +1269,6 @@ impl Collection {
         };
         let record = written.summary(&asked.object_id);
         self.objects.insert(asked.object_id.clone(), written);
-        self.removed.remove(&asked.object_id);
         self.answered(
             who,
             asked,
@@ -1330,22 +1296,7 @@ impl Collection {
     ) -> ServiceHttpAnswer {
         let record = existing.map(|object| object.summary(&asked.object_id));
         let current_revision = existing.map(|object| object.revision.clone());
-        let Some((object, stored_bytes)) = &asked.object else {
-            // A removal carries no content, so there is nothing to keep.
-            return self.answered(
-                who,
-                asked,
-                digest,
-                Reply {
-                    outcome: Outcome::Conflict,
-                    record,
-                    current_revision,
-                    current_write_sequence: position,
-                    conflict: None,
-                },
-                now_ms,
-            );
-        };
+        let (object, stored_bytes) = &asked.object;
         let held = self
             .copies
             .iter()
@@ -1431,7 +1382,7 @@ impl Collection {
         ))
     }
 
-    fn compare(&self, asked: &Compare) -> ServiceHttpAnswer {
+    fn compare(&self, asked: &Compare, funded: bool) -> ServiceHttpAnswer {
         let known: BTreeMap<&str, &str> = asked
             .known
             .iter()
@@ -1485,6 +1436,8 @@ impl Collection {
         let next = page
             .last()
             .map_or(asked.conflicts_after, |copy| copy.sequence);
+        let mut stored = self.usage();
+        stored["allowance_bytes"] = json!(if funded { ALLOWANCE_BYTES } else { "0" });
         let mut answer = json!({
             "changed": changed,
             "removed": removed,
@@ -1503,7 +1456,8 @@ impl Collection {
             "next_conflicts_after_sequence": next.to_string(),
             "more_conflicts": more_conflicts,
             "recovery_id": null,
-            "stored": self.usage(),
+            // The one answer that reads the ledger, so the one that states the allowance.
+            "stored": stored,
         });
         if let Some(answer) = answer.as_object_mut() {
             answer.extend(Head::members(self.head()));
