@@ -276,6 +276,57 @@ final class CallNewsQueue {
     }
 }
 
+/// The time a call's owner may leave without a sign before the call ends itself.
+///
+/// The call is ended by the Rust side that owns it. If that side is gone (the process was killed
+/// under a running call, a task was lost) nothing else would end it before the host's deadline,
+/// with the microphone open. So the owner gives a sign of life every few seconds, and a call that
+/// has had none for `afterPermit` seconds ends. A call that was opened and not yet permitted has
+/// the longer `beforePermit`, which covers the host's start and the provider's answer, but not for
+/// ever: it holds the device's one call. The clock is a monotonic one, and `expired` is true once.
+/// This is the same rule as the Android half's, with the same bounds.
+struct CallWatch {
+    /// How long an opened call waits for its permit and for signs before then.
+    static let beforePermit: TimeInterval = 180
+    /// How long a permitted call goes without a sign.
+    static let afterPermit: TimeInterval = 45
+
+    private let clock: () -> TimeInterval
+    private let before: TimeInterval
+    private let after: TimeInterval
+    private var lastSign: TimeInterval
+    private var permitted = false
+    private var spent = false
+
+    init(
+        clock: @escaping () -> TimeInterval,
+        beforePermit: TimeInterval = CallWatch.beforePermit,
+        afterPermit: TimeInterval = CallWatch.afterPermit
+    ) {
+        self.clock = clock
+        self.before = beforePermit
+        self.after = afterPermit
+        self.lastSign = clock()
+    }
+
+    /// The owner is there.
+    mutating func sign() { lastSign = clock() }
+
+    /// The call is permitted, and the shorter bound applies from now.
+    mutating func permit() {
+        permitted = true
+        lastSign = clock()
+    }
+
+    /// Whether the owner has given no sign for too long. True once, for the call to end on.
+    mutating func expired() -> Bool {
+        if spent { return false }
+        if clock() - lastSign < (permitted ? after : before) { return false }
+        spent = true
+        return true
+    }
+}
+
 /// The commands the plugin takes and the news it sends, as the JSON the Rust half speaks. The
 /// shapes are the fixtures under `native/platform/fixtures/call`, which the Rust and Kotlin halves
 /// are tested against as well.
@@ -383,10 +434,46 @@ public final class CallAdapter: NSObject {
     private var held: (id: String, engine: CallEngine, news: CallNewsQueue, capture: VoiceCaptureState)?
     /// The call the observer's reports are for, so a late report of an ended call is not news.
     private var ended: Set<String> = []
+    /// How long the held call's owner has been silent, kept for the call held.
+    private var watch: CallWatch?
+    /// The time the watch is measured on.
+    private let clock: () -> TimeInterval
+    /// Looks for an owner that has stopped giving signs, on the adapter's queue.
+    private var watching: DispatchSourceTimer?
 
-    init(maker: CallEngineMaker, device: CallDevice) {
+    /// How often a call's owner is looked for.
+    static let watchEvery: TimeInterval = 5
+
+    init(
+        maker: CallEngineMaker,
+        device: CallDevice,
+        clock: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
+        watches: Bool = true
+    ) {
         self.maker = maker
         self.device = device
+        self.clock = clock
+        if watches { startWatching() }
+    }
+
+    private func startWatching() {
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now() + CallAdapter.watchEvery, repeating: CallAdapter.watchEvery)
+        timer.setEventHandler { [weak self] in self?.endIfGone() }
+        timer.resume()
+        watching = timer
+    }
+
+    /// Looks for an owner that has given no sign for too long, and ends the call if so.
+    func endIfOwnerIsGone() { queue.sync { endIfGone() } }
+
+    /// Ends the held call when its owner has given no sign for too long: as it ends when the person
+    /// stops it, and the owner, if there is one, is told by the end. Runs on the adapter's queue.
+    private func endIfGone() {
+        guard let held = held, var watch = watch, watch.expired() else { return }
+        self.watch = watch
+        let engine = held.engine
+        engineQueue.async { engine.stop() }
     }
 
     /// Takes one request: see the file's description. The answer comes on a block, once.
@@ -429,6 +516,7 @@ public final class CallAdapter: NSObject {
                 engine.permit(
                     voiceSessionId: permit.voiceSessionId, closesAtEpochMs: permit.closesAtEpochMs)
             }
+            if permitted { queue.sync { watch?.permit() } }
             return CallWire.text(["permitted": permitted])
         case "callMute":
             let mute = try CallWire.decode(CallWire.Mute.self, arguments)
@@ -456,6 +544,7 @@ public final class CallAdapter: NSObject {
         case "callAlive":
             // The owner is there. The call is named, so a sign for a call that has ended says so.
             _ = try engine(CallWire.decode(CallWire.Call.self, arguments).call)
+            queue.sync { watch?.sign() }
             return await state()
         default:
             throw CallRefusal(code: CallRefusal.engine, message: "this build takes no such command")
@@ -515,6 +604,7 @@ public final class CallAdapter: NSObject {
                 guard held == nil else { throw VoiceAudioError.callAlreadyRunning }
                 let engine = try maker.make(reporting: Reporter(call: call, adapter: self))
                 held = (call, engine, queued, .idle)
+                watch = CallWatch(clock: clock)
                 return engine
             }
         } catch VoiceAudioError.callAlreadyRunning {
@@ -564,5 +654,6 @@ public final class CallAdapter: NSObject {
     private func finish(_ call: String) {
         ended.insert(call)
         held = nil
+        watch = nil
     }
 }
