@@ -2584,32 +2584,30 @@ fn release_after_a_while(
     (let_go, thread)
 }
 
-/// Types ordinary bytes until the session's output is waiting on the disk, and returns what lets
-/// the write go and how many bytes were typed.
+/// Types one ordinary byte, and returns what lets go of the write of its echo once that write is
+/// waiting on the disk.
 ///
-/// The write that opens the spool's segment again after a retention pass is made with the session
-/// held, and the host makes a pass as it starts, so how many bytes it takes for the output to wait
-/// is not for the case to say. Each byte the application echoes is output, and the first of them
-/// that the ingest hands to the disk is the write that is stopped.
+/// The application echoes the byte, the ingest records the echo, and the write of it to the spool
+/// is the next one made with the session let go: the segment the session's opening output went to
+/// holds bytes, and a write after a retention pass opens it again by itself.
 async fn until_the_output_waits_on_the_disk(
     wired: &Wired,
     client: &mut LocalClient,
     attachment: AttachmentId,
     epoch: kr_protocol::ids::InputLeaseEpoch,
-) -> (std::sync::mpsc::Sender<()>, u64) {
-    let (mut writing, resume) = wired.runtime.pause_in_next_spool_write();
-    for typed in 0..20 {
-        write_over(client, wired, attachment, epoch, typed, b".")
-            .await
-            .expect("the byte is accepted");
-        if tokio::time::timeout(Duration::from_millis(500), &mut writing)
-            .await
-            .is_ok()
-        {
-            return (resume, typed + 1);
-        }
-    }
-    panic!("the session's output never waited on the disk");
+) -> std::sync::mpsc::Sender<()> {
+    let (writing, resume) = wired.runtime.pause_in_next_spool_write();
+    write_over(client, wired, attachment, epoch, 0, b"x")
+        .await
+        .expect("the byte is accepted");
+    assert!(
+        matches!(
+            tokio::time::timeout(LIVENESS_DEADLINE, writing).await,
+            Ok(Ok(()))
+        ),
+        "the session's output waited on the disk"
+    );
+    resume
 }
 
 /// KR-PERF-002: a lone Escape reaches the application at its deadline while the session's output
@@ -2634,8 +2632,7 @@ async fn a_lone_escape_reaches_the_application_while_the_session_s_output_is_wai
     let wired = wired(&bracketed_recording(&received)).await;
     let (mut client, attachment, epoch) = typist(&wired).await;
 
-    let (resume, typed) =
-        until_the_output_waits_on_the_disk(&wired, &mut client, attachment, epoch).await;
+    let resume = until_the_output_waits_on_the_disk(&wired, &mut client, attachment, epoch).await;
 
     let accepted_or_not = Arc::new(AtomicBool::new(false));
     let (let_go, watchdog) = release_after_a_while(
@@ -2647,7 +2644,7 @@ async fn a_lone_escape_reaches_the_application_while_the_session_s_output_is_wai
         },
         &accepted_or_not,
     );
-    let accepted = write_over(&mut client, &wired, attachment, epoch, typed, b"\x1b")
+    let accepted = write_over(&mut client, &wired, attachment, epoch, 1, b"\x1b")
         .await
         .expect("the Escape is accepted");
     accepted_or_not.store(true, Ordering::Release);
@@ -2659,7 +2656,7 @@ async fn a_lone_escape_reaches_the_application_while_the_session_s_output_is_wai
 
     let arrived = tokio::time::timeout(LIVENESS_DEADLINE, async {
         loop {
-            if std::fs::read(&received).is_ok_and(|seen| contains(&seen, b".\x1b")) {
+            if std::fs::read(&received).is_ok_and(|seen| contains(&seen, b"x\x1b")) {
                 return;
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
@@ -2866,8 +2863,7 @@ async fn output_is_readable_from_the_session_while_it_is_waiting_on_the_disk() {
     let wired = wired(BRACKETED_ECHO).await;
     let (mut client, attachment, epoch) = typist(&wired).await;
 
-    let (resume, typed) =
-        until_the_output_waits_on_the_disk(&wired, &mut client, attachment, epoch).await;
+    let resume = until_the_output_waits_on_the_disk(&wired, &mut client, attachment, epoch).await;
 
     let read = Arc::new(AtomicBool::new(false));
     let (let_go, watchdog) = release_after_a_while(
@@ -2889,13 +2885,8 @@ async fn output_is_readable_from_the_session_while_it_is_waiting_on_the_disk() {
         "the read of the retained output was kept waiting by the output's write to the disk until \
          it was let go"
     );
-    let echoed = [
-        b"kr-ready.".as_slice(),
-        &vec![b'.'; usize::try_from(typed).unwrap_or(0)],
-    ]
-    .concat();
     assert!(
-        contains(&seen, &echoed),
+        contains(&seen, b"kr-ready.x"),
         "the echo was retained before the disk had taken it: {seen:?}"
     );
 
