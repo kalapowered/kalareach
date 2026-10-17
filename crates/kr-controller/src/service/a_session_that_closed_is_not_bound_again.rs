@@ -251,12 +251,7 @@ async fn an_adoption_after_a_closure_writes_no_row_and_publishes_nothing() {
 
     // The control.
     let answered = control;
-    world
-        .controller
-        .directory
-        .lock()
-        .await
-        .remove(world.session_id);
+    world.forget_the_worker().await;
     adopt(&world, answered)
         .await
         .expect("a worker that is not closed is adopted");
@@ -279,12 +274,7 @@ async fn an_adoption_after_a_closure_writes_no_row_and_publishes_nothing() {
         .await
         .record_closure(&closure_of(world.session_id))
         .expect("the closure is recorded");
-    world
-        .controller
-        .directory
-        .lock()
-        .await
-        .remove(world.session_id);
+    world.forget_the_worker().await;
     adopt(&world, answered)
         .await
         .expect("an adoption that finds the closure has nothing to do");
@@ -317,12 +307,7 @@ async fn an_adoption_after_a_closure_writes_no_row_and_publishes_nothing() {
 async fn a_row_beside_a_closure_does_not_keep_a_revocation_pending() {
     let world = Served::recorded().await;
     // The daemon has not reached the worker: nothing in its directory, the row in its registry.
-    world
-        .controller
-        .directory
-        .lock()
-        .await
-        .remove(world.session_id);
+    world.forget_the_worker().await;
     let control = world
         .controller
         .announce_authority_revision()
@@ -404,12 +389,7 @@ async fn an_adoption_held_before_its_publication(
     tokio::task::JoinHandle<crate::error::Result<()>>,
     tokio::sync::oneshot::Sender<()>,
 ) {
-    world
-        .controller
-        .directory
-        .lock()
-        .await
-        .remove(world.session_id);
+    world.forget_the_worker().await;
     let descriptor = world.worker.descriptor.clone();
     let (proof, described) = world
         .controller
@@ -542,12 +522,7 @@ async fn an_adoption_that_a_closure_overtakes_publishes_nothing() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_descriptor_is_written_without_the_registry_and_taken_away_when_a_closure_lands() {
     let world = Served::recorded().await;
-    world
-        .controller
-        .directory
-        .lock()
-        .await
-        .remove(world.session_id);
+    world.forget_the_worker().await;
     let mut registry = world.controller.registry.lock().await;
     let publishing = tokio::spawn({
         let controller = std::sync::Arc::clone(&world.controller);
@@ -588,12 +563,7 @@ async fn a_descriptor_is_written_without_the_registry_and_taken_away_when_a_clos
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_publication_that_is_cancelled_leaves_no_descriptor_of_a_closed_session() {
     let world = Served::recorded().await;
-    world
-        .controller
-        .directory
-        .lock()
-        .await
-        .remove(world.session_id);
+    world.forget_the_worker().await;
     world
         .controller
         .retire(&closure_of(world.session_id))
@@ -653,12 +623,7 @@ async fn a_publication_that_is_cancelled_leaves_no_descriptor_of_a_closed_sessio
 async fn a_publication_for_a_closed_session_removes_a_descriptor_whose_write_failed_after_its_rename()
  {
     let world = Served::recorded().await;
-    world
-        .controller
-        .directory
-        .lock()
-        .await
-        .remove(world.session_id);
+    world.forget_the_worker().await;
     let _refused = kr_flush::testing::refuse_flushes_of(world.controller.paths().descriptors_dir());
 
     // The control: the write fails after its rename, and the file has its name.
