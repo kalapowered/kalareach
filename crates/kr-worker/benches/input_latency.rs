@@ -27,12 +27,15 @@
 //! allowance for everything around it.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use kr_ipc::client::LocalClient;
 use kr_ipc::endpoint::Listener;
 use kr_ipc::verify::{ControllerIdentity, WorkerIdentity};
-use kr_protocol::attachment::{AttachMode, AttachmentCapability, SessionAttachParams};
+use kr_protocol::attachment::{
+    AttachMode, AttachmentCapability, SessionAttachParams, SessionDetachParams,
+};
 use kr_protocol::envelope::{ActionTarget, ControlFrame};
 use kr_protocol::hello::PROTOCOL_VERSION;
 use kr_protocol::identity::{DesktopBinding, WorkerProfile};
@@ -773,6 +776,7 @@ fn paste_prefix_recogniser_deadline() {
         .build()
         .expect("a runtime");
     let (report, closed) = runtime.block_on(measure_recogniser());
+    let beside_mutations = runtime.block_on(measure_recogniser_beside_mutations());
     // The figure is kept before the closure's outcome is, as above.
     let report = report.unwrap_or_else(|failure| panic!("the measurement: {failure}"));
 
@@ -867,6 +871,362 @@ fn paste_prefix_recogniser_deadline() {
         "and the framer recorded the paste the delimiter opened, rather than passing its bytes \
          through without recognising them"
     );
+    beside_mutations.assert_met(allowed);
+}
+
+/// The recogniser's holds taken while journalled mutations run beside them.
+///
+/// A journalled mutation commits three times to a store that makes each commit durable, and a
+/// keystroke that arrives during one is held no longer than the recogniser's deadline from its
+/// arrival all the same: aggregate figures cannot hide a wait for the next key. This is the
+/// measurement that shows it, and it is asserted to the same bound as the holds taken alone.
+struct BesideMutations {
+    /// One entry per prefix of each delimiter, as in [`Recogniser`].
+    holds: Vec<(String, Duration)>,
+    /// How long the split delimiter took to be recognised once its second half arrived.
+    split: Duration,
+    /// The host while the holds were taken, and how many mutations were completed beside them.
+    conditions: record::Conditions,
+    /// How many mutations were completed while the holds were taken.
+    mutations: u64,
+}
+
+impl BesideMutations {
+    /// Asserts the holds against the bound, after the figure has been kept.
+    fn assert_met(&self, allowed: Duration) {
+        assert!(
+            self.mutations >= self.holds.len() as u64,
+            "journalled mutations did not run beside the holds: {} completed for {} holds, so the \
+             figure says nothing about a keystroke behind a mutation",
+            self.mutations,
+            self.holds.len()
+        );
+        for (what, held) in &self.holds {
+            assert!(
+                *held <= allowed,
+                "{what} was held for {held:?} with journalled mutations running beside it, beyond \
+                 the {RECOGNISER_DEADLINE:?} deadline and the stated allowance around it"
+            );
+            assert!(
+                *held >= RECOGNISER_DEADLINE,
+                "{what} was forwarded in {held:?}, before its deadline"
+            );
+        }
+        assert!(
+            self.split <= allowed,
+            "the split delimiter took {:?} to be recognised with journalled mutations running \
+             beside it",
+            self.split
+        );
+    }
+}
+
+/// A client that attaches a terminal and detaches it again, over and over, until it is told to
+/// stop. Each is a journalled mutation: accepted, marked and settled in three commits.
+struct Mutating {
+    stop: Arc<AtomicBool>,
+    made: Arc<AtomicU64>,
+    task: tokio::task::JoinHandle<Result<(), String>>,
+}
+
+impl Mutating {
+    async fn begin(hosted: &Hosted) -> Self {
+        let mut client = LocalClient::connect(&hosted.endpoint, LocalClientKind::Cli, build())
+            .await
+            .expect("connects");
+        let (stop, made) = (
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicU64::new(0)),
+        );
+        let (target, session_id) = (hosted.target(), hosted.session_id);
+        let task = {
+            let (stop, made) = (Arc::clone(&stop), Arc::clone(&made));
+            tokio::spawn(async move {
+                let mut requested = CanonicalSet::new();
+                requested.insert(AttachmentCapability::ObserveTerminal);
+                while !stop.load(Ordering::Acquire) {
+                    let attached: kr_protocol::attachment::SessionAttachResult = client
+                        .mutate(
+                            Method::SessionAttach,
+                            ActionId::new(kr_ipc::new_uuid()),
+                            target.clone(),
+                            &SessionAttachParams {
+                                session_id,
+                                mode: AttachMode::Terminal,
+                                claim_geometry: false,
+                                dimensions: Nullable::some(Dimensions::new(80, 24)),
+                                terminal_profile_id: Nullable::some("xterm-256color".to_owned()),
+                                requested: requested.clone(),
+                            },
+                        )
+                        .await
+                        .map_err(|error| format!("the attach did not reach the worker: {error}"))?
+                        .map_err(|refusal| format!("the attach was refused: {refusal:?}"))?
+                        .to_typed()
+                        .map_err(|error| format!("the attach's answer did not decode: {error}"))?;
+                    made.fetch_add(1, Ordering::AcqRel);
+                    client
+                        .mutate(
+                            Method::SessionDetach,
+                            ActionId::new(kr_ipc::new_uuid()),
+                            target.clone(),
+                            &SessionDetachParams {
+                                attachment_id: Nullable::some(attached.attachment.attachment_id),
+                                line_token: Nullable::null(),
+                            },
+                        )
+                        .await
+                        .map_err(|error| format!("the detach did not reach the worker: {error}"))?
+                        .map_err(|refusal| format!("the detach was refused: {refusal:?}"))?;
+                    made.fetch_add(1, Ordering::AcqRel);
+                }
+                Ok(())
+            })
+        };
+        Self { stop, made, task }
+    }
+
+    /// Waits until a mutation has completed, so that the next is the one under way when the caller
+    /// writes: each mutation is accepted, marked and settled in turn, and the next begins as soon
+    /// as the last is answered.
+    async fn until_the_next_one_is_under_way(&self) -> Result<(), String> {
+        let seen = self.made.load(Ordering::Acquire);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while self.made.load(Ordering::Acquire) == seen {
+            if Instant::now() >= deadline || self.task.is_finished() {
+                return Err("the mutations beside the holds stopped".to_owned());
+            }
+            tokio::time::sleep(POLL).await;
+        }
+        Ok(())
+    }
+
+    /// Stops the mutations and returns how many were completed.
+    async fn end(self) -> Result<u64, String> {
+        self.stop.store(true, Ordering::Release);
+        self.task
+            .await
+            .map_err(|error| format!("the mutations ended abnormally: {error}"))??;
+        Ok(self.made.load(Ordering::Acquire))
+    }
+}
+
+/// A root program that passes what it reads to a named pipe, with bracketed paste enabled.
+///
+/// What reached the application is read from the pipe, which touches nothing of the worker's and
+/// no file system: an observation that polled the session would wait behind the mutations it is
+/// measuring beside, and a file the application wrote would wait behind their syncs.
+fn keeping(pipe: &std::path::Path) -> String {
+    format!(
+        "stty raw -echo; printf '\\033[?2004hkr-ready.'; exec cat > '{}'",
+        pipe.display()
+    )
+}
+
+/// What the pipe has delivered, each read with the instant it returned.
+struct Receipt {
+    reads: Arc<std::sync::Mutex<Vec<(Instant, Vec<u8>)>>>,
+}
+
+impl Receipt {
+    /// Starts reading the pipe on a thread of its own. The root program blocks opening it until
+    /// this has.
+    fn start(pipe: &std::path::Path) -> Self {
+        use std::io::Read as _;
+
+        let reads = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (path, kept) = (pipe.to_path_buf(), Arc::clone(&reads));
+        std::thread::spawn(move || {
+            let Ok(mut pipe) = std::fs::File::open(path) else {
+                return;
+            };
+            let mut buffer = [0_u8; 4096];
+            while let Ok(taken) = pipe.read(&mut buffer) {
+                if taken == 0 {
+                    return;
+                }
+                kept.lock()
+                    .expect("the receipt is not poisoned")
+                    .push((Instant::now(), buffer[..taken].to_vec()));
+            }
+        });
+        Self { reads }
+    }
+
+    /// Waits until the pipe has delivered exactly `expected`, and returns how long after `from` the
+    /// read that completed it returned.
+    async fn arrival(&self, expected: &[u8], from: Instant, within: Duration) -> Option<Duration> {
+        let deadline = from + within;
+        loop {
+            {
+                let reads = self.reads.lock().expect("the receipt is not poisoned");
+                let mut kept = Vec::new();
+                for (at, bytes) in reads.iter() {
+                    kept.extend_from_slice(bytes);
+                    if kept == expected {
+                        return Some(at.saturating_duration_since(from));
+                    }
+                }
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            tokio::time::sleep(POLL).await;
+        }
+    }
+}
+
+async fn measure_recogniser_beside_mutations() -> BesideMutations {
+    let kept = tempfile::tempdir().expect("a directory for what the application keeps");
+    let pipe = kept.path().join("received");
+    let made = std::process::Command::new("mkfifo")
+        .arg(&pipe)
+        .status()
+        .expect("mkfifo runs");
+    assert!(made.success(), "the pipe is made");
+    let receipt = Receipt::start(&pipe);
+    let hosted = hosted(&keeping(&pipe)).await;
+    let figures = recogniser_beside_mutations(&hosted, &receipt).await;
+    let closed = close(&hosted).await;
+    // The figure is kept before anything is asserted, as the holds taken alone are.
+    let beside =
+        figures.unwrap_or_else(|failure| panic!("the measurement beside mutations: {failure}"));
+    let mut lines = beside.conditions.lines();
+    lines.push(
+        "  measurement       the same holds as the section above, taken with an attach and a \
+         detach looping on a second connection for the whole window, each a journalled mutation \
+         that holds the session across three commits. A figure runs from the write to the byte \
+         reaching the application, which the root program passes to a pipe the test reads, so \
+         the observation waits behind nothing the mutations hold or sync."
+            .to_owned(),
+    );
+    for (what, held) in &beside.holds {
+        lines.push(format!(
+            "  held              {}: {what}",
+            milliseconds(*held)
+        ));
+    }
+    lines.push(format!(
+        "  split delimiter   recognised once, in {}",
+        milliseconds(beside.split)
+    ));
+    lines.push(format!(
+        "  mutations         {} completed beside the {} holds",
+        beside.mutations,
+        beside.holds.len()
+    ));
+    record::report(
+        RECORD,
+        "KR-PERF-002 recogniser deadline for a held prefix with journalled mutations running",
+        &lines,
+    );
+    closed.unwrap_or_else(|failure| panic!("the session this measurement created: {failure}"));
+    beside
+}
+
+async fn recogniser_beside_mutations(
+    hosted: &Hosted,
+    receipt: &Receipt,
+) -> Result<BesideMutations, String> {
+    if arrival(
+        &hosted.runtime,
+        b"kr-ready.",
+        Instant::now(),
+        Duration::from_secs(20),
+    )
+    .await
+    .is_none()
+    {
+        return Err("the root program never started reading".to_owned());
+    }
+    let (mut client, attachment_id, epoch) = controlling(hosted).await;
+    let mutating = Mutating::begin(hosted).await;
+    let window = record::Window::open().beside(
+        "journalled mutations (an attach or a detach each)",
+        Arc::clone(&mutating.made),
+    );
+    let mut sequence = 0_u64;
+    let mut holds = Vec::new();
+    let mut expected = Vec::new();
+    for (name, delimiter) in [("start", &b"\x1b[200~"[..]), ("end", &b"\x1b[201~"[..])] {
+        for length in 1..delimiter.len() {
+            let prefix = &delimiter[..length];
+            expected.extend_from_slice(prefix);
+            mutating.until_the_next_one_is_under_way().await?;
+            let started = Instant::now();
+            let accepted = write(
+                hosted,
+                &mut client,
+                attachment_id,
+                epoch,
+                &mut sequence,
+                prefix,
+            )
+            .await?;
+            if accepted.held_prefix_bytes.get() != length as u64 {
+                return Err(format!(
+                    "a prefix of {length} bytes of the {name} delimiter was not held: {} held, {} \
+                     forwarded",
+                    accepted.held_prefix_bytes.get(),
+                    accepted.forwarded_bytes.get()
+                ));
+            }
+            let held = receipt
+                .arrival(&expected, started, RECOGNISER_DEADLINE * 8)
+                .await
+                .ok_or_else(|| {
+                    format!(
+                        "a prefix of {length} bytes of the {name} delimiter never reached the \
+                         application on its own"
+                    )
+                })?;
+            let what = if length == 1 {
+                format!(
+                    "a lone Escape, with journalled mutations running (the {name} delimiter's pass)"
+                )
+            } else {
+                format!(
+                    "the {name} delimiter's prefix of {length} bytes, with journalled mutations running"
+                )
+            };
+            holds.push((what, held));
+        }
+    }
+    // A delimiter split across two frames, recognised once.
+    write(
+        hosted,
+        &mut client,
+        attachment_id,
+        epoch,
+        &mut sequence,
+        b"\x1b[20",
+    )
+    .await?;
+    expected.extend_from_slice(b"\x1b[20");
+    let started = Instant::now();
+    write(
+        hosted,
+        &mut client,
+        attachment_id,
+        epoch,
+        &mut sequence,
+        b"0~kr-payload",
+    )
+    .await?;
+    expected.extend_from_slice(b"0~kr-payload");
+    let split = receipt
+        .arrival(&expected, started, RECOGNISER_DEADLINE * 8)
+        .await
+        .ok_or_else(|| "the split delimiter never completed".to_owned())?;
+    let conditions = window.close();
+    let mutations = mutating.end().await?;
+    drop(client);
+    Ok(BesideMutations {
+        holds,
+        split,
+        conditions,
+        mutations,
+    })
 }
 
 struct Recogniser {
