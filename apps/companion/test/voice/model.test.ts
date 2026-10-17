@@ -331,10 +331,13 @@ describe('what a call that ended tells a person', () => {
     expect(words).not.toContain('may still be open')
   })
 
-  it('says what the host refused, and that the grant ends when the call was to close', () => {
+  // A refusal does not say the grant is gone, so the words say only that the host did not confirm
+  // it; whether it may still be open is said by what is owed.
+  it('says the host refused the stop and did not confirm that it withdrew the grant', () => {
     const words = endedWords(ended({ host: { kind: 'refused', words: 'No such voice session.' } }))
     expect(words).toContain('No such voice session.')
-    expect(words).toContain('ends when the call was to close')
+    expect(words).toContain("did not confirm that it withdrew the call's grant: it refused the stop")
+    expect(words).not.toContain('would not revoke')
   })
 
   it('says when the media may not have stopped', () => {

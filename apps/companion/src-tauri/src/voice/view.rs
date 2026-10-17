@@ -126,6 +126,19 @@ pub struct OwedView {
     pub host: Option<(DeviceId, EnvironmentId)>,
 }
 
+impl HostEnd {
+    /// What a revocation owed to the host is owed for, in words, when this end leaves one owed: the
+    /// host was not told, did not answer, or refused (which does not say the grant is gone).
+    #[must_use]
+    pub fn owed_reason(&self) -> Option<String> {
+        match self {
+            Self::NotTold { words } => Some(words.clone()),
+            Self::Refused { words } => Some(format!("The host refused the stop: {words}")),
+            Self::Revoked { .. } | Self::NotNeeded => None,
+        }
+    }
+}
+
 impl OwedView {
     /// A call's grant that `host` may still hold open until `until_ms`, for the reason `words`.
     #[must_use]

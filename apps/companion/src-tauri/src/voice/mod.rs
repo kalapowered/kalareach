@@ -278,14 +278,22 @@ impl Shared {
         }
     }
 
-    /// Takes a revocation out of what is owed, because its host has answered about it.
-    fn settled(&self, voice_session_id: &str) {
+    /// Takes a revocation out of what is owed, because the host it is owed to has revoked the grant.
+    /// Only an entry owed to that host and environment goes: another host's answer says nothing of
+    /// what a different host holds.
+    fn settled(
+        &self,
+        host: kr_protocol::ids::DeviceId,
+        environment: kr_protocol::ids::EnvironmentId,
+        voice_session_id: &str,
+    ) {
         let removed = {
             let mut view = self.view.lock().expect("the view lock is not poisoned");
             let before = view.owed.len();
             view.owed.retain(|owed| {
                 owed.kind != "revocation"
                     || owed.voice_session_id.as_deref() != Some(voice_session_id)
+                    || owed.host != Some((host, environment))
             });
             view.owed.len() != before
         };
@@ -555,20 +563,14 @@ impl Shared {
                     }
                 }
             }
-            if let (
-                HostEnd::NotTold { words } | HostEnd::Refused { words },
-                Some((_, until_ms)),
-                Some(id),
-                Some(host),
-                true,
-            ) = (
-                &host_end,
+            if let (Some(words), Some((_, until_ms)), Some(id), Some(host), true) = (
+                host_end.owed_reason(),
                 &kept.service_call,
                 kept.voice_session_id,
                 &kept.host,
                 toward_host_asked,
             ) {
-                owed.push(OwedView::revocation(words.clone(), id, *until_ms, host));
+                owed.push(OwedView::revocation(words, id, *until_ms, host));
             }
             if let (Some((action_id, until_ms)), Some(host)) = (kept.pending_start, &kept.host) {
                 owed.push(OwedView::start_unknown(action_id, until_ms, host));
@@ -668,7 +670,7 @@ impl Calls {
                 // Only a revocation done settles it: a refusal may come from a host that did not
                 // look at the session, and the grant is then still live.
                 if matches!(end, HostEnd::Revoked { .. }) {
-                    shared.settled(&voice_session_id.to_string());
+                    shared.settled(host, environment, &voice_session_id.to_string());
                 }
             }
         });
@@ -804,7 +806,11 @@ impl Calls {
         .await;
         // A host that revoked the grant settles what this device owed it for that call.
         if matches!(end, HostEnd::Revoked { .. }) {
-            shared.settled(&voice_session_id.to_string());
+            shared.settled(
+                host.paired.host_device_id,
+                host.environment_id,
+                &voice_session_id.to_string(),
+            );
         }
         Ok(Closed {
             local: false,

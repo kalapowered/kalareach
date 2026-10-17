@@ -514,7 +514,7 @@ export function endedWords(
     }
     case 'refused':
       parts.push(
-        `The host would not revoke the call's grant, and what it holds ends when the call was to close: ${ended.host.words}`
+        `The host did not confirm that it withdrew the call's grant: it refused the stop. ${ended.host.words}`
       )
       break
     case 'not_told':

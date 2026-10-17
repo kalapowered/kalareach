@@ -2228,6 +2228,22 @@ async fn a_revocation_owed_to_a_host_survives_a_launch() {
         voice_session_id
     );
     assert!(!state.owed[0].host_name.is_empty());
+    // The entry names the host it is owed to, as the owner wrote it, so a device launched again can
+    // ask that host.
+    let connection = scene
+        .phone
+        .companion
+        .app
+        .state::<companion_tauri::AppState>()
+        .connection()
+        .expect("the phone is connected");
+    let companion_tauri::connection::Standing::Paired { host, .. } = connection.standing() else {
+        panic!("the phone is a paired device");
+    };
+    assert_eq!(
+        state.owed[0].host,
+        Some((host.host_device_id, connection.environment_id()))
+    );
     scene.stop_host().await;
 }
 
@@ -2314,11 +2330,27 @@ async fn only_a_host_that_revokes_the_grant_settles_what_it_was_owed() {
     })
     .await;
     assert_eq!(file["owed"][0]["voice_session_id"], unknown.to_string());
-    // The call the host held ended with its revocation.
-    scene
+    // The call the host held ended with its revocation. The phone's own end then asks the host about
+    // a voice session it no longer holds and is refused, which does not say the grant is gone: the
+    // refusal is owed, with the host's own words behind a lead-in that says what happened.
+    let ended = scene
         .state_where("the call the host revoked, ended", |state| {
             state["running"] == false && state["ended"].is_object()
         })
         .await;
+    assert_eq!(ended["ended"]["host"]["kind"], "refused", "{ended}");
+    let owed_for_live = ended["owed"]
+        .as_array()
+        .and_then(|owed| {
+            owed.iter()
+                .find(|each| each["voice_session_id"] == live.to_string())
+        })
+        .unwrap_or_else(|| panic!("a refusal is owed: {ended}"));
+    assert!(
+        owed_for_live["words"]
+            .as_str()
+            .is_some_and(|words| words.starts_with("The host refused the stop: ")),
+        "{owed_for_live}"
+    );
     scene.stop_host().await;
 }

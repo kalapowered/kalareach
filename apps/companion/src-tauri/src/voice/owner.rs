@@ -1451,16 +1451,13 @@ impl Owner {
                 .to_owned(),
             });
         });
-        if let (
-            HostEnd::NotTold { words } | HostEnd::Refused { words },
-            Some(descriptor),
-            Some(host),
-        ) = (&host_end, &self.descriptor, &self.host)
+        if let (Some(words), Some(descriptor), Some(host)) =
+            (host_end.owed_reason(), &self.descriptor, &self.host)
         {
             // The grant may be live at the host until the moment the call was to close, by the
             // host's reading of the clock.
             let owed = OwedView::revocation(
-                words.clone(),
+                words,
                 descriptor.voice_session_id,
                 owed_until(descriptor.closes_at_ms.get()),
                 host,
