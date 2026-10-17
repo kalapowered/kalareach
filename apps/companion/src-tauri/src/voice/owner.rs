@@ -125,6 +125,9 @@ pub(super) async fn drive(shared: Arc<Shared>, launch: Launch) {
         reply,
     } = launch;
     let mut owner = Owner::new(id, shared, reach, tokens, inbox);
+    // The record of this call begins when the start is taken, so that whatever the start comes to,
+    // from the first step on, is this call's and not the one before it.
+    owner.view(|state| state.begin(id));
     match owner.start(request).await {
         Ok(Outcome::Live(started)) => {
             // A start whose asker is gone is a call nobody will hang up: it is ended.
@@ -139,9 +142,11 @@ pub(super) async fn drive(shared: Arc<Shared>, launch: Launch) {
             }
         }
         Ok(Outcome::Over(started)) => {
+            owner.note_not_started(declined_words(&started));
             let _ = reply.send(Ok(started));
         }
         Err(error) => {
+            owner.note_not_started(Some(error.message.clone()));
             let _ = reply.send(Err(error));
         }
     }
@@ -153,6 +158,29 @@ pub(super) async fn drive(shared: Arc<Shared>, launch: Launch) {
     });
     owner.shared.release(owner.id);
     owner.shared.forget_emergency(owner.id);
+}
+
+/// What a person is told of a start that ended with no call, when the answer was not one the owner
+/// wrote an end for: the service's or the host's own words.
+fn declined_words(started: &Started) -> Option<String> {
+    match started {
+        Started::Result(result) => match &result.outcome {
+            VoiceStartOutcome::Started { .. } => None,
+            VoiceStartOutcome::Unavailable { message, .. }
+            | VoiceStartOutcome::CreationUnknown { message, .. }
+            | VoiceStartOutcome::PreparationChanged { message } => Some(message.clone()),
+            VoiceStartOutcome::RateChanged { .. } => Some(
+                "The rate changed after it was shown, so nothing was started, held or charged."
+                    .to_owned(),
+            ),
+        },
+        Started::Receipt(_) => Some(
+            "The host answered with a receipt and not with a call, so no call was started."
+                .to_owned(),
+        ),
+        // The owner wrote what an unknown start left.
+        Started::Unknown { .. } => None,
+    }
 }
 
 /// What `start` came to.
@@ -288,6 +316,29 @@ impl Owner {
 
     fn platform(&self) -> Arc<dyn CallPlatform> {
         Arc::clone(&self.shared.platform)
+    }
+
+    /// Writes how a start that ended with no call ended, unless the owner already wrote an end for
+    /// it: a screen that was loaded again while the start ran finds that answer, in the words the
+    /// start's own asker was given, and not the end of the call before.
+    fn note_not_started(&self, words: Option<String>) {
+        let Some(words) = words else {
+            return;
+        };
+        let (id, local) = (self.id, self.media_stopped.unwrap_or(true));
+        self.view(|state| {
+            if state.owner != id || state.ended.as_ref().is_some_and(|ended| ended.owner == id) {
+                return;
+            }
+            state.ended = Some(EndedView {
+                owner: id,
+                cause: "not_started".to_owned(),
+                words,
+                closed_locally: local,
+                host: HostEnd::NotNeeded,
+                broker: "not_needed".to_owned(),
+            });
+        });
     }
 
     fn view(&self, change: impl FnOnce(&mut VoiceCallState)) {
@@ -440,8 +491,6 @@ impl Owner {
             Ok(opened) => opened,
             Err(failure) => return Err(self.open_failed(failure).await),
         };
-        let owner = self.id;
-        self.view(|state| state.begin(owner));
         let call = opened.call.clone();
         self.call = Some(call.clone());
         self.events = Some(opened.events);
@@ -521,7 +570,13 @@ impl Owner {
         // The send waits for the host for a bound of its own, after which its answer is taken as
         // lost and the host is asked what became of it. A stop that comes meanwhile waits in the
         // inbox and is read as soon as the answer is.
-        let until_ms = now_ms()
+        // A grant the host made for this start ends by itself, at the latest, a call's length after
+        // the last moment the host could still first admit the request: the end of the action
+        // window it carries, on the host's own clock. A repeat can only be answered from the
+        // host's record and is never an admission, so nothing later than that can create one.
+        let until_ms = composed
+            .window_issued_at_ms()
+            .saturating_add(composed.window_valid_for_ms())
             .saturating_add(u64::from(self.requested) * 1000)
             .saturating_add(MAX_CLOCK_SKEW_MS);
         self.shared.keep_start_pending(self.id, action_id, until_ms);
@@ -811,12 +866,18 @@ impl Owner {
         let mut local = true;
         if matches!(failure.kind, FailureKind::Unavailable | FailureKind::Engine) {
             // Native code may yet make the call it was asked for: whatever it holds is stopped.
-            if let Ok(held) = self.platform().held().await
-                && let Some(call) = held.call
-            {
-                local = self.stop_media(&call).await;
+            // What it holds that cannot be read is not known to be nothing.
+            match self.platform().held().await {
+                Ok(held) => {
+                    if let Some(call) = held.call {
+                        local = self.stop_media(&call).await;
+                    }
+                }
+                Err(_) => local = false,
             }
         }
+        self.media_stopped = Some(local);
+        self.view(|state| state.begin_ending(self.id));
         // A stop that waited meanwhile is told what became of the media, as the end of any other
         // call tells it.
         let closed = Closed {
@@ -847,6 +908,7 @@ impl Owner {
     /// a stop it does not return from, or refuses, is not a stop. A call native code has already
     /// ended is stopped.
     async fn stop_native(&mut self, host: HostEnd) -> bool {
+        self.view(|state| state.begin_ending(self.id));
         let local = match self.call.take() {
             Some(call) => self.stop_media(&call).await,
             None => self.media_stopped.unwrap_or(true),
@@ -1295,7 +1357,11 @@ impl Owner {
     /// Ends the call, whatever the cause.
     pub(super) async fn end(&mut self, cause: Cause) -> Closed {
         let timings = self.shared.timings;
-        self.view(|state| state.running = false);
+        let id = self.id;
+        self.view(|state| {
+            state.running = false;
+            state.begin_ending(id);
+        });
         // The control closes the call at the service while the media and the host are dealt with,
         // and its news is read meanwhile: a control that nobody reads stops reading its socket.
         let closing = match (&self.control, cause.service_closed()) {
@@ -1355,7 +1421,6 @@ impl Owner {
         };
 
         let needs_broker = self.descriptor.is_some();
-        let id = self.id;
         self.view(|state| {
             state.running = false;
             state.session = None;

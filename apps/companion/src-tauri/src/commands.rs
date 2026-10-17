@@ -2817,7 +2817,7 @@ mod tests {
     /// What the page is given for a stop answered with this result, as the command encodes it.
     fn the_closure_for(result: kr_cbor::CanonicalMap) -> serde_json::Value {
         let answered = kr_client::Settled::Result(kr_cbor::CanonicalValue::Map(result).into());
-        serde_json::to_value(VoiceClosure::of(false, fence_of(&answered))).expect("it encodes")
+        serde_json::to_value(VoiceClosure::of(true, fence_of(&answered))).expect("it encodes")
     }
 
     /// Section 9: a stop answered with a worker that has not held reaches the page as pending, with

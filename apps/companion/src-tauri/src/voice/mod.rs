@@ -391,9 +391,23 @@ impl Shared {
                 _ => None,
             }
         };
+        self.view
+            .lock()
+            .expect("the view lock is not poisoned")
+            .begin_ending(owner);
         let (closed_locally, host_end) = tokio::join!(local, toward_host);
         let toward_host_asked = host_end.is_some();
-        let host_end = host_end.unwrap_or(HostEnd::NotNeeded);
+        // A start the host was not heard to answer may have made a call, so it is not a host that
+        // was never asked: it has said nothing.
+        let host_end = host_end.unwrap_or_else(|| {
+            if kept.pending_start.is_some() {
+                HostEnd::NotTold {
+                    words: "The host never said whether it created the call.".to_owned(),
+                }
+            } else {
+                HostEnd::NotNeeded
+            }
+        });
         // What the owner wrote of the host's answer, when it got as far as writing it.
         let written = {
             let view = self.view.lock().expect("the view lock is not poisoned");
@@ -591,6 +605,7 @@ impl Calls {
             .expect("the slot lock is not poisoned")
             .as_ref()
             .map(|(_, commands)| commands.clone());
+        let holding = commands.is_some();
         if let Some(commands) = commands {
             let held = shared
                 .view
@@ -611,9 +626,11 @@ impl Calls {
             }
         }
         let Some(voice_session_id) = voice_session_id else {
-            return Err(CommandError::refused(
-                "this device is not holding a voice call",
-            ));
+            return Err(CommandError::refused(if holding {
+                "this device is already ending its call, and nothing more can be asked of it"
+            } else {
+                "this device is not holding a voice call"
+            }));
         };
         let host = reach.in_use()?;
         let end = host::revoke(
@@ -674,6 +691,7 @@ impl Calls {
             .expect("the slot lock is not poisoned")
             .is_some();
         state.setting_up = busy && !state.running;
+        state.ending = state.setting_up && state.ending;
         let now = now_ms();
         state.owed.retain(|owed| owed.until_ms > now);
         let remembered = shared

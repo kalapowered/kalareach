@@ -41,6 +41,8 @@ struct Inner {
     /// Whether an open fails after native code has made the call, as an engine that fails late
     /// does.
     open_fails_after_making_the_call: bool,
+    /// Whether what native code holds cannot be read.
+    held_cannot_be_read: bool,
     /// Whether a call that ends tells so.
     tells_the_end: bool,
     /// What a sign of life is answered with, when it is not what the call holds.
@@ -73,6 +75,7 @@ impl ScriptedCalls {
                 stop_never_returns: false,
                 stop_answers_ended: false,
                 open_fails_after_making_the_call: false,
+                held_cannot_be_read: false,
                 tells_the_end: true,
                 alive_refusal: None,
                 held_steps: Vec::new(),
@@ -137,6 +140,11 @@ impl ScriptedCalls {
     /// An open makes the call and then fails, so native code holds a call nobody was told of.
     pub fn fail_the_open_after_making_the_call(&self) {
         self.inner().open_fails_after_making_the_call = true;
+    }
+
+    /// What native code holds cannot be read: a read of it fails, as one does when the engine has.
+    pub fn fail_reads_of_what_is_held(&self) {
+        self.inner().held_cannot_be_read = true;
     }
 
     /// Holds `step` (`open`, `offer`, `accept`, `permit` or `stop`): the command is given and counted, and
@@ -380,6 +388,12 @@ impl CallPlatform for ScriptedCalls {
     fn held(&self) -> CallFuture<'_, Held> {
         Box::pin(async move {
             self.inner().commands.push("held".to_owned());
+            if self.inner().held_cannot_be_read {
+                return Err(CallFailure::new(
+                    FailureKind::Engine,
+                    "native code cannot say what it holds",
+                ));
+            }
             Ok(self.state_of())
         })
     }

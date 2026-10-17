@@ -18,9 +18,12 @@ pub struct VoiceCallState {
     /// Whether this device is holding a call that runs.
     pub running: bool,
     /// Whether this device holds a call that does not run: one being set up, before the host has
-    /// said whether it made it too, or one being given up. A screen that finds this finds a
-    /// device that is busy and a call it cannot yet name; it can end it without naming it.
+    /// said whether it made it too, or one being ended. A screen that finds this finds a device
+    /// that is busy and a call it cannot yet name; it can end a setup without naming it.
     pub setting_up: bool,
+    /// Whether what the device holds is being ended: the end has begun, and nothing more can be
+    /// asked of it. Only while `setting_up` is true.
+    pub ending: bool,
     /// What the microphone is doing, in the vocabulary the surface draws.
     pub capture: String,
     /// Whether the model's voice is coming out of this device.
@@ -55,6 +58,7 @@ impl VoiceCallState {
         Self {
             running: false,
             setting_up: false,
+            ending: false,
             capture: "idle".to_owned(),
             playing: false,
             control: "none".to_owned(),
@@ -77,6 +81,13 @@ impl VoiceCallState {
         *self = Self::no_call();
         self.owed = owed;
         self.owner = owner;
+    }
+
+    /// Says that the call the owner `owner` holds is being ended, unless a later owner has begun.
+    pub fn begin_ending(&mut self, owner: u64) {
+        if self.owner <= owner {
+            self.ending = true;
+        }
     }
 
     /// Notes something owed until its `until_ms`, and forgets what has lapsed by `now_ms`.
@@ -205,8 +216,9 @@ pub struct EndedView {
     /// What the host did.
     pub host: HostEnd,
     /// What the voice service did: `pending` while its closure is awaited, then `closed` (by the
-    /// control), `closed_by_service`, `closed_by_host`, `closed_over_http` or `not_confirmed`; or
-    /// `not_needed` when the host never created a call.
+    /// control), `closed_by_service`, `closed_by_host`, `closed_over_http` or `not_confirmed`;
+    /// `unknown` when the host never said whether it made a call, so the service may hold one this
+    /// device cannot name; or `not_needed` when the host never created a call.
     pub broker: String,
 }
 

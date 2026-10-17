@@ -150,6 +150,17 @@ fn quick() -> Timings {
     }
 }
 
+/// The time now, in milliseconds since the epoch.
+fn now_ms() -> u64 {
+    u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("the clock is after the epoch")
+            .as_millis(),
+    )
+    .expect("a moment that fits")
+}
+
 /// A moment in milliseconds as the page is given it, whether it arrives as a number or a string.
 fn milliseconds(value: &serde_json::Value) -> u64 {
     value
@@ -515,7 +526,11 @@ async fn a_device_with_no_voice_token_starts_nothing() {
         scene.platform.commands()
     );
     assert_eq!(scene.stand_in.count("/api/voice/sessions"), 0);
-    assert_eq!(scene.state()["running"], false);
+    let state = scene.state();
+    assert_eq!(state["running"], false);
+    // A screen loaded again finds how the start ended, in the words its asker was given.
+    assert_eq!(state["ended"]["cause"], "not_started", "{state}");
+    assert_eq!(state["ended"]["words"], refused["message"], "{state}");
     scene.stop_host().await;
 }
 
@@ -1226,6 +1241,10 @@ async fn a_screen_loaded_again_while_a_call_is_being_made_finds_it_and_ends_it()
     .expect("the host asked the service for the call");
     let waiting = scene.state();
     assert_eq!(waiting["setting_up"], true, "{waiting}");
+    assert_eq!(
+        waiting["ending"], false,
+        "nothing is being ended yet: {waiting}"
+    );
     assert!(
         waiting["session"].is_null(),
         "the host has not said whether it made a call: {waiting}"
@@ -1244,6 +1263,20 @@ async fn a_screen_loaded_again_while_a_call_is_being_made_finds_it_and_ends_it()
     .expect("the stop is answered");
     assert_eq!(closure["closed_locally"], true, "{closure}");
     assert!(scene.platform.count("stop") >= 1, "the media stopped");
+    // The device is still busy with the call the host may have made, and says it is ending it: a
+    // screen loaded now offers no start and no second end, and a second end is told why.
+    let ending = scene.state();
+    assert_eq!(ending["setting_up"], true, "{ending}");
+    assert_eq!(ending["ending"], true, "{ending}");
+    let again = scene
+        .call("voice_stop", json!({ "voiceSessionId": null }))
+        .expect_err("there is nothing more to ask of a call that is being ended");
+    assert!(
+        again["message"]
+            .as_str()
+            .is_some_and(|words| words.contains("already ending")),
+        "{again}"
+    );
 
     // The host finishes the call it was making, and the call is ended in full.
     scene.stand_in.release_creations();
@@ -1317,6 +1350,59 @@ async fn a_stop_waiting_during_a_failed_open_is_told_whether_the_media_stopped()
         .await
         .expect("the start ran")
         .expect_err("a call that could not be opened is not a call started");
+    // A screen loaded again finds how the start ended, and that the media is not known to be
+    // stopped.
+    let state = scene.state();
+    assert_eq!(state["ended"]["cause"], "not_started", "{state}");
+    assert_eq!(state["ended"]["closed_locally"], false, "{state}");
+    scene.stop_host().await;
+}
+
+/// The device's open fails after native code made the call, and what native code holds cannot be
+/// read, so the call it may hold cannot be stopped. A stop that waited is told the media is not
+/// known to be stopped, as it is when native code does not return from its own stop.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stop_waiting_during_a_failed_open_whose_state_cannot_be_read_is_told_it_is_unconfirmed()
+{
+    let mut scene = scene().await;
+    scene.platform.hold("open");
+    let _holding = scene.platform.release_when_done("open");
+    scene.platform.fail_the_open_after_making_the_call();
+    scene.platform.fail_reads_of_what_is_held();
+    let prepared = scene.prepared().await;
+    let starting = scene
+        .phone
+        .companion
+        .start_call("voice_start", scene.start_request(&prepared));
+    tokio::time::timeout(WATCHDOG, async {
+        while scene.platform.count("open") == 0 {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("native code was asked to open the call");
+    let stopping = scene
+        .phone
+        .companion
+        .start_call("voice_stop", json!({ "voiceSessionId": null }));
+    // The stop is queued behind the open the owner is waiting for.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    scene.platform.release("open");
+
+    let closure = tokio::time::timeout(WATCHDOG, stopping)
+        .await
+        .expect("the stop is answered")
+        .expect("the stop ran")
+        .expect("the stop is answered");
+
+    assert_eq!(
+        closure["closed_locally"], false,
+        "what native code holds could not be read: {closure}"
+    );
+    starting
+        .await
+        .expect("the start ran")
+        .expect_err("a call that could not be opened is not a call started");
     scene.stop_host().await;
 }
 
@@ -1366,6 +1452,7 @@ async fn a_start_the_host_never_answers_is_unknown_and_stays_owed() {
     let mut scene = scene_with(timings, Some(phone_grant(PHONE_TOKEN, 3600)), None).await;
     scene.stand_in.hold_creations();
 
+    let asked_at = now_ms();
     let started = scene.start().await;
 
     assert!(
@@ -1386,6 +1473,14 @@ async fn a_start_the_host_never_answers_is_unknown_and_stays_owed() {
     assert!(scene.platform.count("stop") >= 1, "the media is stopped");
     assert_eq!(state["owed"][0]["kind"], "start_unknown", "{state}");
     assert_eq!(state["owed"][0]["action_id"], action_id.as_str());
+    // The host could still admit the request until its action window ended, which is later than
+    // the time it was sent at, so a call it made ends later than a record counted from the send
+    // would say: the window's remaining validity (five minutes less the time since it was issued),
+    // the call's length and the clock allowance.
+    assert!(
+        milliseconds(&state["owed"][0]["until_ms"]) >= asked_at + 240_000 + 600_000 + 120_000,
+        "{state}"
+    );
 
     // The record outlives the next call's opening, whatever that call comes to.
     scene.stand_in.release_creations();
@@ -1903,6 +1998,10 @@ async fn an_owner_that_fails_while_asking_what_became_of_a_start_leaves_the_star
         })
         .await;
     assert!(scene.platform.count("stop") >= 1, "the media is stopped");
+    // The host was not heard to answer, so it is not a host that was never asked, and the service
+    // may hold a call this device cannot name.
+    assert_eq!(ended["ended"]["host"]["kind"], "not_told", "{ended}");
+    assert_eq!(ended["ended"]["broker"], "unknown", "{ended}");
     assert_eq!(ended["owed"][0]["kind"], "start_unknown", "{ended}");
     assert!(
         ended["owed"][0]["action_id"]
