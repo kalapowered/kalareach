@@ -330,7 +330,23 @@ impl Runtime {
     /// Returns [`RuntimeError::Engine`] when the engine will not build, or
     /// [`RuntimeError::CacheUnusable`] when the cache directory cannot be used.
     pub fn new(config: RuntimeConfig) -> RuntimeResult<Self> {
-        let engine = RuntimeEngine::new()?;
+        Self::over(config, RuntimeEngine::new()?)
+    }
+
+    /// Builds a runtime whose engine's epoch no time advances, for the tests of what a component
+    /// does with the calls it is given: a call is stopped by its deadline only when a test
+    /// advances the epoch, so a machine that stalls the call for as long as it likes cannot reach
+    /// one. See [`RuntimeEngine::with_epoch_held`].
+    ///
+    /// # Errors
+    ///
+    /// Returns what [`Self::new`] does.
+    #[cfg(feature = "testing")]
+    pub fn with_epoch_held(config: RuntimeConfig) -> RuntimeResult<Self> {
+        Self::over(config, RuntimeEngine::with_epoch_held()?)
+    }
+
+    fn over(config: RuntimeConfig, engine: RuntimeEngine) -> RuntimeResult<Self> {
         let cache = CompiledCache::open(config.cache_root.clone())?;
         let pool = CompilePool::with_threads(config.compile_threads, config.compile_queue);
         Ok(Self {

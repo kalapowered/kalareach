@@ -12,6 +12,12 @@ publish.workspace = true
 name = "kr-plugin-host"
 path = "src/bin/kr-plugin-host.rs"
 
+[features]
+# What this crate's own tests start the host with: an engine whose epoch no time advances, so a
+# component the test is watching is never stopped by a deadline a slow machine reached. It compiles
+# to nothing without this feature, and no shipped build enables it.
+testing = ["kr-plugin-runtime/testing"]
+
 [dependencies]
 clap.workspace = true
 kr-cbor.workspace = true
@@ -29,6 +35,8 @@ tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-th
 # shell in a real pseudo-terminal. The worker and the control daemon are test-only dependencies, so
 # the service binary does not link either of them.
 [dev-dependencies]
+# This crate's own tests, with the held epoch reachable.
+kr-plugin-host = { path = ".", features = ["testing"] }
 kr-controller.workspace = true
 kr-crypto.workspace = true
 kr-ipc = { workspace = true, features = ["testing"] }
