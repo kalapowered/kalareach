@@ -332,16 +332,18 @@ enum Kept {
     Refused,
 }
 
-/// Whether `error` is the host ending or refusing the connection, and nothing else.
+/// Whether `error` is the host ending the connection or refusing the device, and nothing else: the
+/// stream or the connection closed under the handshake, or a refusal of the device's authority.
 fn is_the_host_ending_the_connection(error: &kr_client::ClientError) -> bool {
-    matches!(
-        error,
+    match error {
         kr_client::ClientError::Transport(
-            kr_transport::TransportError::Stream(_)
-                | kr_transport::TransportError::Closed(_)
-                | kr_transport::TransportError::Refused(_)
-        )
-    )
+            kr_transport::TransportError::Stream(_) | kr_transport::TransportError::Closed(_),
+        ) => true,
+        kr_client::ClientError::Transport(kr_transport::TransportError::Refused(refusal)) => {
+            refusal.code == ErrorCode::PermissionDenied
+        }
+        _ => false,
+    }
 }
 
 impl Rig {
@@ -418,6 +420,9 @@ impl Rig {
 async fn a_device_the_feed_holds_a_revocation_for_is_kept_out_on_its_first_connection() {
     let rig = Rig::start().await;
     let (phone, record) = rig.pairs(&[ActionRight::SessionView]).await;
+    // The pairing woke the carrier, and its pass must end before the request is published: a pass
+    // that began after the request was stored would carry it out before the device dials.
+    rig.poll().await;
     let request = rig.owner_publishes(0xa1, devices(record.device_id)).await;
 
     // The carrier's wait has not ended: nothing but the connection can have taught the host.
