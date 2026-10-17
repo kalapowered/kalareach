@@ -37,13 +37,17 @@ interface Phone {
  * something of the test's own between the page and the host's port.
  */
 function start(options?: {
+  readonly host?: string
   readonly rights?: readonly string[]
   readonly before?: (c: FakeHostControls) => void
   readonly through?: (port: HostPort) => HostPort
 }): Phone {
   const { port: host, controls } = fakeHost()
   const port = options?.through === undefined ? host : options.through(host)
-  controls.reachAsPhone(options?.rights === undefined ? {} : { rights: options.rights as never })
+  controls.reachAsPhone({
+    ...(options?.rights === undefined ? {} : { rights: options.rights as never }),
+    ...(options?.host === undefined ? {} : { host: options.host })
+  })
   options?.before?.(controls)
   render(
     <AppProvider port={port}>
@@ -110,6 +114,15 @@ describe('an invitation at the head of the inbox (KR-REQ-18.13)', () => {
     expect(within(youCan).getByText('Not the terminal: the live view is not included')).toBeInTheDocument()
     expect(within(youCan).getByText('Send the agent prompts')).toBeInTheDocument()
     expect(within(card).queryByText('The terminal as it is when you open it.')).toBeNull()
+  })
+
+  it('starts the sentence with a capital when the host has no name of its own to give', async () => {
+    // Native says "your host" for a pairing that has no name.
+    start({ host: 'your host', before: (c) => c.sharing.offer({ role: 'controller', live: true }) })
+    await userEvent.click(await screen.findByRole('button', { name: /Your host shared session 3 with you\./ }))
+    const card = await screen.findByTestId('offer-card')
+    // Inside a sentence the name reads as it was given.
+    expect(within(card).getByText(/Terminal input runs as the owner’s account on your host\./)).toBeInTheDocument()
   })
 
   it('names no moment for a share that reaches back to the start of what the host kept', async () => {
