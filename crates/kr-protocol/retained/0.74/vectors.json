@@ -1,0 +1,21 @@
+{
+  "a caller token of the right length": true,
+  "a caller token one byte short": false,
+  "a number as an integer": true,
+  "a number as text": false,
+  "a reach of the host is the host's": true,
+  "a set in ascending order": true,
+  "a set of rights that holds voice.use travels to a worker": false,
+  "a set out of order": false,
+  "a set with a repeated item": false,
+  "a unique identifier of fifteen bytes": false,
+  "a unique identifier of sixteen bytes": true,
+  "a window of 80 by 24": true,
+  "a window of none": false,
+  "an empty identifier": false,
+  "an empty set of rights travels to a worker": true,
+  "an identifier of plain text": true,
+  "an identifier past every limit": false,
+  "an identifier with a control character": false,
+  "an identifier with a newline": false
+}

@@ -169,6 +169,10 @@ objc2-local-authentication = { version = "=0.3.2", default-features = false }
 # Opens the sign-in address in the default browser, on the machine the person types the command at.
 open = "=5.4.4"
 portable-pty = "=0.9.0"
+# The retained-surface check reads the source of the rules that decide what a frame's types accept, with
+# the pieces of a token stream it follows from one definition to the next. Both are already in the
+# tree through `syn`.
+proc-macro2 = "=1.0.107"
 # Draws an invitation's QR code in the terminal `kr pair invite` runs in. MIT licensed, with no
 # dependencies of its own.
 qrcodegen = "=1.8.0"
@@ -176,6 +180,7 @@ qrcodegen = "=1.8.0"
 # the conformance report keys to the requirement rows. Already in the tree through the property-list
 # reader that `netdev` uses, and it has one dependency.
 quick-xml = "=0.42.0"
+quote = "=1.0.47"
 # Certificates a test issues for a loopback server of its own, so the transport's certificate and
 # hostname checks are exercised against a real handshake rather than described.
 rcgen = "=0.14.10"

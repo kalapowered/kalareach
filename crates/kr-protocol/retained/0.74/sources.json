@@ -1,0 +1,1101 @@
+{
+  "roots": {
+    "ActionId": {
+      "digest": "9df2f512194940dc42a0ba2b69431be9bb43f39fa21e82e2422bd681f0d77562",
+      "followed": [
+        "kr_protocol crates/kr-protocol/src/ids.rs: uuid_id",
+        "kr_protocol crates/kr-protocol/src/ids.rs: uuid_id! invocation",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: FixedBytesVisitor",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: TextOrBytes",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: UUID_LEN",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: Uuid",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: UuidParseError",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: fixed",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: hex_nibble",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl FixedBytesVisitor",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl TextOrBytes",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl Uuid",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl UuidParseError"
+      ]
+    },
+    "ActionReadParams": {
+      "digest": "8a7aac9efa426fb46205197180309940178794d37fdfdd27399c2baf3bb25cf9",
+      "followed": [
+        "kr_protocol crates/kr-protocol/src/receipt.rs: ActionReadParams"
+      ]
+    },
+    "ActionTarget::validate": {
+      "digest": "071fc52592d2217610fceb42d0b099c685f075c3c54a4b21a258ae3419dc6a36",
+      "followed": [
+        "kr_protocol crates/kr-protocol/src/envelope.rs: ActionTarget::validate",
+        "kr_protocol crates/kr-protocol/src/envelope.rs: TargetError",
+        "kr_protocol crates/kr-protocol/src/envelope.rs: impl TargetError"
+      ]
+    },
+    "ActionWindowId": {
+      "digest": "fc4f024d65b493b2965a7120db0fd82a9768b98eb41cfb5397bbdcd9e3a88963",
+      "followed": [
+        "kr_protocol crates/kr-protocol/src/ids.rs: MAX_OPAQUE_ID_LEN",
+        "kr_protocol crates/kr-protocol/src/ids.rs: OpaqueIdError",
+        "kr_protocol crates/kr-protocol/src/ids.rs: impl OpaqueIdError",
+        "kr_protocol crates/kr-protocol/src/ids.rs: opaque_id",
+        "kr_protocol crates/kr-protocol/src/ids.rs: opaque_id! invocation",
+        "kr_protocol crates/kr-protocol/src/ids.rs: validate_opaque_id"
+      ]
+    },
+    "ActorId": {
+      "digest": "6e444a465aa1c762c2bcd390e63ceb9288be5e228bf85e514df122397e8d31e4",
+      "followed": [
+        "kr_protocol crates/kr-protocol/src/ids.rs: MAX_OPAQUE_ID_LEN",
+        "kr_protocol crates/kr-protocol/src/ids.rs: OpaqueIdError",
+        "kr_protocol crates/kr-protocol/src/ids.rs: impl OpaqueIdError",
+        "kr_protocol crates/kr-protocol/src/ids.rs: opaque_id",
+        "kr_protocol crates/kr-protocol/src/ids.rs: opaque_id! invocation",
+        "kr_protocol crates/kr-protocol/src/ids.rs: validate_opaque_id"
+      ]
+    },
+    "AgentBindingRevision": {
+      "digest": "a0172e177a112e31f518a27669dfeb1ed35531b976273f8ef6d0d6d82699cd62",
+      "followed": [
+        "kr_protocol crates/kr-protocol/src/ids.rs: counter_id",
+        "kr_protocol crates/kr-protocol/src/ids.rs: counter_id! invocation",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: U64",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: U64Visitor",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl U64",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl U64Visitor",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: u64_schema"
+      ]
+    },
+    "ApplicationInstanceId": {
+      "digest": "a04fae26ce4fb30788f7ef1797904d9979b6a0e89e7a880d57aa32828c202f76",
+      "followed": [
+        "kr_protocol crates/kr-protocol/src/ids.rs: uuid_id",
+        "kr_protocol crates/kr-protocol/src/ids.rs: uuid_id! invocation",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: FixedBytesVisitor",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: TextOrBytes",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: UUID_LEN",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: Uuid",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: UuidParseError",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: fixed",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: hex_nibble",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl FixedBytesVisitor",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl TextOrBytes",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl Uuid",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl UuidParseError"
+      ]
+    },
+    "AttachmentId": {
+      "digest": "853063214e0aa5da520210523c0420ac9bb07ca4d3dc3ea0e23a869de73f89cc",
+      "followed": [
+        "kr_protocol crates/kr-protocol/src/ids.rs: uuid_id",
+        "kr_protocol crates/kr-protocol/src/ids.rs: uuid_id! invocation",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: FixedBytesVisitor",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: TextOrBytes",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: UUID_LEN",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: Uuid",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: UuidParseError",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: fixed",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: hex_nibble",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl FixedBytesVisitor",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl TextOrBytes",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl Uuid",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl UuidParseError"
+      ]
+    },
+    "AttachmentOrdinal": {
+      "digest": "d26261b579aa627f379e50caf068ac8cabe2a7bc30bec2b028adb236dc175a4a",
+      "followed": [
+        "kr_protocol crates/kr-protocol/src/ids.rs: counter_id",
+        "kr_protocol crates/kr-protocol/src/ids.rs: counter_id! invocation",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: U64",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: U64Visitor",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl U64",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl U64Visitor",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: u64_schema"
+      ]
+    },
+    "AttachmentSummary": {
+      "digest": "76fee93222499260a46f72617d6f64449bd7f9913423cf4a368779766b84f591",
+      "followed": [
+        "kr_protocol crates/kr-protocol/src/attachment.rs: AttachmentSummary"
+      ]
+    },
+    "AttentionSource": {
+      "digest": "1c024cd18bb2ce791e8ab6b249fd38e0a15a4fc559ffdc8659288cad220d465f",
+      "followed": [
+        "kr_protocol crates/kr-protocol/src/attention.rs: wire_enum",
+        "kr_protocol crates/kr-protocol/src/attention.rs: wire_enum! invocation",
+        "kr_protocol crates/kr-protocol/src/automation.rs: wire_enum"
+      ]
+    },
+    "AuthorisationKey": {
+      "digest": "7402f7189dbaf63617175a7d82f1d3db9bcf93e2916c4d61dff2325a0cff5791",
+      "followed": [
+        "kr_protocol crates/kr-protocol/src/scalars.rs: Base64Alphabet",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: FixedBytesVisitor",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: TextOrBytes",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: base64url_schema",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: decode_fault",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: fixed",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: fixed_bytes",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: fixed_bytes! invocation",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: from_base64url",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl FixedBytesVisitor",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl TextOrBytes",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: to_base64url"
+      ]
+    },
+    "AuthorityRevision": {
+      "digest": "4a09942f293febb13860c8534a45b53dbb6b3b93b08a72b611fc12e3f67fbae5",
+      "followed": [
+        "kr_protocol crates/kr-protocol/src/hostinfo.rs: Generated",
+        "kr_protocol crates/kr-protocol/src/hostinfo.rs: HostIdentifier",
+        "kr_protocol crates/kr-protocol/src/hostinfo.rs: impl AuthorityRevision",
+        "kr_protocol crates/kr-protocol/src/hostinfo.rs: sealed",
+        "kr_protocol crates/kr-protocol/src/ids.rs: counter_id",
+        "kr_protocol crates/kr-protocol/src/ids.rs: counter_id! invocation",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: U64",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: U64Visitor",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl U64",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl U64Visitor",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: u64_schema"
+      ]
+    },
+    "AuthorityRevisionNotice": {
+      "digest": "000ac91119a26a433f129dae56e3a47671d73050f7489afec6e2bb5da70f5df7",
+      "followed": [
+        "kr_protocol crates/kr-protocol/src/worker.rs: AuthorityRevisionNotice",
+        "kr_protocol crates/kr-protocol/src/worker.rs: RevisionReach",
+        "kr_protocol crates/kr-protocol/src/worker.rs: impl RevisionReach",
+        "kr_protocol crates/kr-protocol/src/worker.rs: is_first_page"
+      ]
+    },
+    "BootEpoch": {
+      "digest": "26af48252e63f2d1ab9834f62cf9a3500d6924162858854cf2af8369f32c473d",
+      "followed": [
+        "kr_protocol crates/kr-protocol/src/ids.rs: counter_id",
+        "kr_protocol crates/kr-protocol/src/ids.rs: counter_id! invocation",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: U64",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: U64Visitor",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl U64",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl U64Visitor",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: u64_schema"
+      ]
+    },
+    "BrokerBindingId": {
+      "digest": "cc4cec80960dee60d5ce5f37737f7231b0c934e37940c99e04ccfbdaf4828945",
+      "followed": [
+        "kr_protocol crates/kr-protocol/src/ids.rs: uuid_id",
+        "kr_protocol crates/kr-protocol/src/ids.rs: uuid_id! invocation",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: FixedBytesVisitor",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: TextOrBytes",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: UUID_LEN",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: Uuid",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: UuidParseError",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: fixed",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: hex_nibble",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl FixedBytesVisitor",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl TextOrBytes",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl Uuid",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl UuidParseError"
+      ]
+    },
+    "BuildId": {
+      "digest": "6186857aecbba88cc0c839cc2319f82e61fb1175a351d3f3530c590556e0a27b",
+      "followed": [
+        "kr_protocol crates/kr-protocol/src/ids.rs: MAX_OPAQUE_ID_LEN",
+        "kr_protocol crates/kr-protocol/src/ids.rs: OpaqueIdError",
+        "kr_protocol crates/kr-protocol/src/ids.rs: impl OpaqueIdError",
+        "kr_protocol crates/kr-protocol/src/ids.rs: opaque_id",
+        "kr_protocol crates/kr-protocol/src/ids.rs: opaque_id! invocation",
+        "kr_protocol crates/kr-protocol/src/ids.rs: validate_opaque_id"
+      ]
+    },
+    "Bytes": {
+      "digest": "7fac57360eec6e02844f62f97448ef8ab7375dcccedb3089d13ef5ef12366f37",
+      "followed": [
+        "kr_protocol crates/kr-protocol/src/scalars.rs: Base64Alphabet",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: Bytes",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: TextOrBytes",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: VariableBytesVisitor",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: base64url_schema",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: decode_fault",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: from_base64url",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl Bytes",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl TextOrBytes",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl VariableBytesVisitor",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: to_base64url"
+      ]
+    },
+    "CallerToken::is_well_formed": {
+      "digest": "8d7d16e7468e028dce6452d7ac372b02b2fb920eaeb2f63eb7a928eea36866cc",
+      "followed": [
+        "kr_protocol crates/kr-protocol/src/question.rs: CALLER_TOKEN_BYTES",
+        "kr_protocol crates/kr-protocol/src/question.rs: CallerToken::is_well_formed"
+      ]
+    },
+    "CanonicalSet": {
+      "digest": "aca185928955229c743d7cb6c29ba00f4c1c85e54d89de83d847eca352bbdb49",
+      "followed": [
+        "kr_protocol crates/kr-protocol/src/scalars.rs: CanonicalSet",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: CanonicalSetVisitor",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl CanonicalSet",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl CanonicalSetVisitor"
+      ]
+    },
+    "CapabilityId": {
+      "digest": "f21baad4b1689922aa9e4bc7bb33b262015a086369407854e77a8cadb1db0cc9",
+      "followed": [
+        "kr_protocol crates/kr-protocol/src/ids.rs: MAX_OPAQUE_ID_LEN",
+        "kr_protocol crates/kr-protocol/src/ids.rs: OpaqueIdError",
+        "kr_protocol crates/kr-protocol/src/ids.rs: impl OpaqueIdError",
+        "kr_protocol crates/kr-protocol/src/ids.rs: opaque_id",
+        "kr_protocol crates/kr-protocol/src/ids.rs: opaque_id! invocation",
+        "kr_protocol crates/kr-protocol/src/ids.rs: validate_opaque_id"
+      ]
+    },
+    "ConnectionId": {
+      "digest": "a4dd466e465aae9d62102cb9cc9a3f666703b47f7a525daa48a63a2c10bbeff7",
+      "followed": [
+        "kr_protocol crates/kr-protocol/src/ids.rs: uuid_id",
+        "kr_protocol crates/kr-protocol/src/ids.rs: uuid_id! invocation",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: FixedBytesVisitor",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: TextOrBytes",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: UUID_LEN",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: Uuid",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: UuidParseError",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: fixed",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: hex_nibble",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl FixedBytesVisitor",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl TextOrBytes",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl Uuid",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl UuidParseError"
+      ]
+    },
+    "ControllerGeneration": {
+      "digest": "05b45074deb6d8185cfcee7fb983abcb927b829afdcc21b80a5a40d83089570f",
+      "followed": [
+        "kr_protocol crates/kr-protocol/src/hostinfo.rs: Generated",
+        "kr_protocol crates/kr-protocol/src/hostinfo.rs: HostIdentifier",
+        "kr_protocol crates/kr-protocol/src/hostinfo.rs: impl ControllerGeneration",
+        "kr_protocol crates/kr-protocol/src/hostinfo.rs: sealed",
+        "kr_protocol crates/kr-protocol/src/ids.rs: counter_id",
+        "kr_protocol crates/kr-protocol/src/ids.rs: counter_id! invocation",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: U64",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: U64Visitor",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl U64",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl U64Visitor",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: u64_schema"
+      ]
+    },
+    "CwdRevision": {
+      "digest": "429800d0ecb72ef17359e46de314653e7e89aa4d72238c060ccd1ee6eafd04e6",
+      "followed": [
+        "kr_protocol crates/kr-protocol/src/root.rs: CwdRevision",
+        "kr_protocol crates/kr-protocol/src/root.rs: counter",
+        "kr_protocol crates/kr-protocol/src/root.rs: counter! invocation",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: U64",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: U64Visitor",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl U64",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl U64Visitor",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: u64_schema"
+      ]
+    },
+    "DesktopSessionId": {
+      "digest": "3b9a08a388c8ddfa2743793a0dff0f6ec5a3288314e31d679c11ab830ff15f97",
+      "followed": [
+        "kr_protocol crates/kr-protocol/src/ids.rs: MAX_OPAQUE_ID_LEN",
+        "kr_protocol crates/kr-protocol/src/ids.rs: OpaqueIdError",
+        "kr_protocol crates/kr-protocol/src/ids.rs: impl OpaqueIdError",
+        "kr_protocol crates/kr-protocol/src/ids.rs: opaque_id",
+        "kr_protocol crates/kr-protocol/src/ids.rs: opaque_id! invocation",
+        "kr_protocol crates/kr-protocol/src/ids.rs: validate_opaque_id"
+      ]
+    },
+    "DeviceId": {
+      "digest": "a604dfdef1a7347ec3086d05ce1111638f89d787f033844843f42df037a57a58",
+      "followed": [
+        "kr_protocol crates/kr-protocol/src/hostinfo.rs: Generated",
+        "kr_protocol crates/kr-protocol/src/hostinfo.rs: HostIdentifier",
+        "kr_protocol crates/kr-protocol/src/hostinfo.rs: impl DeviceId",
+        "kr_protocol crates/kr-protocol/src/hostinfo.rs: sealed",
+        "kr_protocol crates/kr-protocol/src/ids.rs: uuid_id",
+        "kr_protocol crates/kr-protocol/src/ids.rs: uuid_id! invocation",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: FixedBytesVisitor",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: TextOrBytes",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: UUID_LEN",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: Uuid",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: UuidParseError",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: fixed",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: hex_nibble",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl FixedBytesVisitor",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl TextOrBytes",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl Uuid",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl UuidParseError"
+      ]
+    },
+    "DiagnosticId": {
+      "digest": "cce92fea21f0c528bcbc78d3d2b700841c324b26dedee26771a59917886d717e",
+      "followed": [
+        "kr_protocol crates/kr-protocol/src/ids.rs: MAX_OPAQUE_ID_LEN",
+        "kr_protocol crates/kr-protocol/src/ids.rs: OpaqueIdError",
+        "kr_protocol crates/kr-protocol/src/ids.rs: impl OpaqueIdError",
+        "kr_protocol crates/kr-protocol/src/ids.rs: opaque_id",
+        "kr_protocol crates/kr-protocol/src/ids.rs: opaque_id! invocation",
+        "kr_protocol crates/kr-protocol/src/ids.rs: validate_opaque_id"
+      ]
+    },
+    "Digest256": {
+      "digest": "c60c55fff074c96b5473bc94106d0616ff2d3ff7849126e1f8150a43afe4c6fc",
+      "followed": [
+        "kr_protocol crates/kr-protocol/src/scalars.rs: Base64Alphabet",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: FixedBytesVisitor",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: TextOrBytes",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: base64url_schema",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: decode_fault",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: fixed",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: fixed_bytes",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: fixed_bytes! invocation",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: from_base64url",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl FixedBytesVisitor",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl TextOrBytes",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: to_base64url"
+      ]
+    },
+    "Dimensions::validate": {
+      "digest": "e0ba477941990212495d724136ea1be6a0f1fe1a5bc8eb1abf5dc26fcba6f449",
+      "followed": [
+        "kr_protocol crates/kr-protocol/src/session.rs: Dimensions::validate",
+        "kr_protocol crates/kr-protocol/src/session.rs: DimensionsError",
+        "kr_protocol crates/kr-protocol/src/session.rs: MAX_CELLS",
+        "kr_protocol crates/kr-protocol/src/session.rs: MAX_COLUMNS",
+        "kr_protocol crates/kr-protocol/src/session.rs: MAX_ROWS",
+        "kr_protocol crates/kr-protocol/src/session.rs: impl DimensionsError"
+      ]
+    },
+    "DraftId": {
+      "digest": "a51cd5dc6ee72331719d4c99bc905bce1db382f0155bc648658833414818b211",
+      "followed": [
+        "kr_protocol crates/kr-protocol/src/ids.rs: uuid_id",
+        "kr_protocol crates/kr-protocol/src/ids.rs: uuid_id! invocation",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: FixedBytesVisitor",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: TextOrBytes",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: UUID_LEN",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: Uuid",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: UuidParseError",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: fixed",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: hex_nibble",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl FixedBytesVisitor",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl TextOrBytes",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl Uuid",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl UuidParseError"
+      ]
+    },
+    "DraftRevision": {
+      "digest": "0d51e232c64541840432fb92f94bcf559f47bc594ab085588ed0b1dcb398f7ac",
+      "followed": [
+        "kr_protocol crates/kr-protocol/src/ids.rs: counter_id",
+        "kr_protocol crates/kr-protocol/src/ids.rs: counter_id! invocation",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: U64",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: U64Visitor",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl U64",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl U64Visitor",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: u64_schema"
+      ]
+    },
+    "DurationMs": {
+      "digest": "4bfa2ae3af0eb27bcd0af2917bcba3beead605b0cdb6bdb45f360f99e63f6dc7",
+      "followed": [
+        "kr_protocol crates/kr-protocol/src/scalars.rs: DurationMs",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: U64",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: U64Visitor",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl DurationMs",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl U64",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl U64Visitor",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: u64_schema"
+      ]
+    },
+    "EnvironmentId": {
+      "digest": "7f53460c928fe0c978044ab9511293c5eb72f3ff4b2e4ecf48d624c062d2a676",
+      "followed": [
+        "kr_protocol crates/kr-protocol/src/hostinfo.rs: Generated",
+        "kr_protocol crates/kr-protocol/src/hostinfo.rs: HostIdentifier",
+        "kr_protocol crates/kr-protocol/src/hostinfo.rs: impl EnvironmentId",
+        "kr_protocol crates/kr-protocol/src/hostinfo.rs: sealed",
+        "kr_protocol crates/kr-protocol/src/ids.rs: uuid_id",
+        "kr_protocol crates/kr-protocol/src/ids.rs: uuid_id! invocation",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: FixedBytesVisitor",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: TextOrBytes",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: UUID_LEN",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: Uuid",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: UuidParseError",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: fixed",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: hex_nibble",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl FixedBytesVisitor",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl TextOrBytes",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl Uuid",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl UuidParseError"
+      ]
+    },
+    "EventSequence": {
+      "digest": "2aac3290fda1a5003a832011a0a2acd7e8da432cdecef48d0d99c722eb39062c",
+      "followed": [
+        "kr_protocol crates/kr-protocol/src/ids.rs: counter_id",
+        "kr_protocol crates/kr-protocol/src/ids.rs: counter_id! invocation",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: U64",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: U64Visitor",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl U64",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl U64Visitor",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: u64_schema"
+      ]
+    },
+    "EventType": {
+      "digest": "771f219a735896d19d609aeaf604f5a46f29b53aa59503ba97b22d7041cff84c",
+      "followed": [
+        "kr_protocol crates/kr-protocol/src/ids.rs: MAX_OPAQUE_ID_LEN",
+        "kr_protocol crates/kr-protocol/src/ids.rs: OpaqueIdError",
+        "kr_protocol crates/kr-protocol/src/ids.rs: impl OpaqueIdError",
+        "kr_protocol crates/kr-protocol/src/ids.rs: opaque_id",
+        "kr_protocol crates/kr-protocol/src/ids.rs: opaque_id! invocation",
+        "kr_protocol crates/kr-protocol/src/ids.rs: validate_opaque_id"
+      ]
+    },
+    "ForwardedMutation": {
+      "digest": "c0401e75f2a0ec7b12a5bf84575208ff3ffd8b8c5720fda47c10c362eec9754d",
+      "followed": [
+        "kr_protocol crates/kr-protocol/src/local.rs: ForwardedMutation",
+        "kr_protocol crates/kr-protocol/src/local.rs: REFUSED",
+        "kr_protocol crates/kr-protocol/src/local.rs: may_travel_to_a_worker",
+        "kr_protocol crates/kr-protocol/src/local.rs: worker_rights",
+        "kr_protocol crates/kr-protocol/src/rights.rs: UnknownActionRight",
+        "kr_protocol crates/kr-protocol/src/rights.rs: impl ActionRight",
+        "kr_protocol crates/kr-protocol/src/rights.rs: impl UnknownActionRight",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: CanonicalSet",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: CanonicalSetVisitor",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl CanonicalSet",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl CanonicalSetVisitor"
+      ]
+    },
+    "ForwardedRequest": {
+      "digest": "44c7585b0f555fabf9cc5a307bda83259d4b9cde76ac3582e5a59ed545bef38e",
+      "followed": [
+        "kr_protocol crates/kr-protocol/src/local.rs: ForwardedRequest"
+      ]
+    },
+    "GatewayConnectionId": {
+      "digest": "408d618b8c034d9219d16c0ef90ec988e26800e2298fce8dac074cbb439e7f20",
+      "followed": [
+        "kr_protocol crates/kr-protocol/src/ids.rs: counter_id",
+        "kr_protocol crates/kr-protocol/src/ids.rs: counter_id! invocation",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: U64",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: U64Visitor",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl U64",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl U64Visitor",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: u64_schema"
+      ]
+    },
+    "GeometryEpoch": {
+      "digest": "1953e53918cdbf225ac91b68c974a58b13b624fdcc5558b05db516e14005fd08",
+      "followed": [
+        "kr_protocol crates/kr-protocol/src/ids.rs: counter_id",
+        "kr_protocol crates/kr-protocol/src/ids.rs: counter_id! invocation",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: U64",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: U64Visitor",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl U64",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl U64Visitor",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: u64_schema"
+      ]
+    },
+    "GrantId": {
+      "digest": "9ce4881ab9c0f743b22ee3428675c4e25896f5256d956b03d0aaec794eff946d",
+      "followed": [
+        "kr_protocol crates/kr-protocol/src/ids.rs: uuid_id",
+        "kr_protocol crates/kr-protocol/src/ids.rs: uuid_id! invocation",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: FixedBytesVisitor",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: TextOrBytes",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: UUID_LEN",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: Uuid",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: UuidParseError",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: fixed",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: hex_nibble",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl FixedBytesVisitor",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl TextOrBytes",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl Uuid",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl UuidParseError"
+      ]
+    },
+    "InputLeaseEpoch": {
+      "digest": "cada59f40ec9e1394bd6d847b9f308f2feeac78ac8e5fa8ceeb241fefb50067f",
+      "followed": [
+        "kr_protocol crates/kr-protocol/src/ids.rs: counter_id",
+        "kr_protocol crates/kr-protocol/src/ids.rs: counter_id! invocation",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: U64",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: U64Visitor",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl U64",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl U64Visitor",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: u64_schema"
+      ]
+    },
+    "InputSequence": {
+      "digest": "38f3aff1af073cd1ec912a4d5196396341ca83f8a7f0e5cd0607a0327f4924fc",
+      "followed": [
+        "kr_protocol crates/kr-protocol/src/ids.rs: counter_id",
+        "kr_protocol crates/kr-protocol/src/ids.rs: counter_id! invocation",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: U64",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: U64Visitor",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl U64",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl U64Visitor",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: u64_schema"
+      ]
+    },
+    "LaunchProfileId": {
+      "digest": "316db3c82a6f8e60aa7f47c6dfbfd4141988bcfa858facd06dd34f6c228e324a",
+      "followed": [
+        "kr_protocol crates/kr-protocol/src/ids.rs: MAX_OPAQUE_ID_LEN",
+        "kr_protocol crates/kr-protocol/src/ids.rs: OpaqueIdError",
+        "kr_protocol crates/kr-protocol/src/ids.rs: impl OpaqueIdError",
+        "kr_protocol crates/kr-protocol/src/ids.rs: opaque_id",
+        "kr_protocol crates/kr-protocol/src/ids.rs: opaque_id! invocation",
+        "kr_protocol crates/kr-protocol/src/ids.rs: validate_opaque_id"
+      ]
+    },
+    "LocalHello": {
+      "digest": "5cdd465fb14dc9b86bdcca163edbf76a8809215e8939a1ed647f0ce461cde618",
+      "followed": [
+        "kr_protocol crates/kr-protocol/src/local.rs: LocalHello"
+      ]
+    },
+    "LocalHelloAck": {
+      "digest": "e00889835c0d6cbbfefc1ef3fa7d0f2038f4a7c87309a874451029c42bbb83e7",
+      "followed": [
+        "kr_protocol crates/kr-protocol/src/local.rs: LocalHelloAck"
+      ]
+    },
+    "MethodName": {
+      "digest": "d0b553f529896f1ce4f93bd05c96d6bfc427937766896122ed42b9e67de59f5e",
+      "followed": [
+        "kr_protocol crates/kr-protocol/src/method.rs: MAX_METHOD_NAME_LEN",
+        "kr_protocol crates/kr-protocol/src/method.rs: MethodName",
+        "kr_protocol crates/kr-protocol/src/method.rs: MethodNameError",
+        "kr_protocol crates/kr-protocol/src/method.rs: impl MethodName",
+        "kr_protocol crates/kr-protocol/src/method.rs: impl MethodNameError"
+      ]
+    },
+    "Nonce256": {
+      "digest": "cf32cc1f34ef698cf479e6fc7d06650ebeb55c45a168eba995d7a23829dee5d3",
+      "followed": [
+        "kr_protocol crates/kr-protocol/src/scalars.rs: Base64Alphabet",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: FixedBytesVisitor",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: TextOrBytes",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: base64url_schema",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: decode_fault",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: fixed",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: fixed_bytes",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: fixed_bytes! invocation",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: from_base64url",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl FixedBytesVisitor",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl TextOrBytes",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: to_base64url"
+      ]
+    },
+    "Nullable": {
+      "digest": "ef9c17810f27e000883c9be75e340d1eafb23d0aecdafff35e5b6248dd73584b",
+      "followed": [
+        "kr_protocol crates/kr-protocol/src/scalars.rs: Nullable",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: NullableVisitor",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl Nullable",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl NullableVisitor"
+      ]
+    },
+    "ParamsValue": {
+      "digest": "df4c0510b05145ecdfd3c6c7f37cb3009f8caafc730d217e8382df95ed336d6e",
+      "followed": [
+        "kr_cbor crates/kr-cbor/src/digest.rs: SHA256_LEN",
+        "kr_cbor crates/kr-cbor/src/digest.rs: sha256",
+        "kr_cbor crates/kr-cbor/src/encode.rs: encode",
+        "kr_cbor crates/kr-cbor/src/encode.rs: encode_into",
+        "kr_cbor crates/kr-cbor/src/lib.rs: encode",
+        "kr_cbor crates/kr-cbor/src/serde_bridge.rs: to_ciborium",
+        "kr_cbor crates/kr-cbor/src/value.rs: CanonicalMap",
+        "kr_cbor crates/kr-cbor/src/value.rs: CanonicalValue",
+        "kr_cbor crates/kr-cbor/src/value.rs: Integer",
+        "kr_cbor crates/kr-cbor/src/value.rs: impl CanonicalMap",
+        "kr_cbor crates/kr-cbor/src/value.rs: impl CanonicalValue",
+        "kr_cbor crates/kr-cbor/src/value.rs: impl Integer",
+        "kr_protocol crates/kr-protocol/src/envelope.rs: ParamsValue",
+        "kr_protocol crates/kr-protocol/src/envelope.rs: ParamsVisitor",
+        "kr_protocol crates/kr-protocol/src/envelope.rs: impl ParamsValue",
+        "kr_protocol crates/kr-protocol/src/envelope.rs: impl ParamsVisitor",
+        "kr_protocol crates/kr-protocol/src/envelope.rs: serialize_canonical",
+        "kr_protocol crates/kr-protocol/src/envelope.rs: serialize_integer",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: to_base64url"
+      ]
+    },
+    "PendingResourceId": {
+      "digest": "059a840019ba94683b5cc6baa4980c6dcc79bf314ab84983acff07dcd1723fec",
+      "followed": [
+        "kr_protocol crates/kr-protocol/src/ids.rs: uuid_id",
+        "kr_protocol crates/kr-protocol/src/ids.rs: uuid_id! invocation",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: FixedBytesVisitor",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: TextOrBytes",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: UUID_LEN",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: Uuid",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: UuidParseError",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: fixed",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: hex_nibble",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl FixedBytesVisitor",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl TextOrBytes",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl Uuid",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl UuidParseError"
+      ]
+    },
+    "PluginId": {
+      "digest": "0b2db6d1dd93ea628b17c67d5879725b3cd75f7e7b098d6406c8d4fadd64ec1c",
+      "followed": [
+        "kr_protocol crates/kr-protocol/src/ids.rs: MAX_OPAQUE_ID_LEN",
+        "kr_protocol crates/kr-protocol/src/ids.rs: OpaqueIdError",
+        "kr_protocol crates/kr-protocol/src/ids.rs: impl OpaqueIdError",
+        "kr_protocol crates/kr-protocol/src/ids.rs: opaque_id",
+        "kr_protocol crates/kr-protocol/src/ids.rs: opaque_id! invocation",
+        "kr_protocol crates/kr-protocol/src/ids.rs: validate_opaque_id"
+      ]
+    },
+    "PromptGeneration": {
+      "digest": "18cdd9fc503e2ebda759fde5feed91aa0bb43573a20b22e53d7c47570729abdf",
+      "followed": [
+        "kr_protocol crates/kr-protocol/src/root.rs: PromptGeneration",
+        "kr_protocol crates/kr-protocol/src/root.rs: counter",
+        "kr_protocol crates/kr-protocol/src/root.rs: counter! invocation",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: U64",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: U64Visitor",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl U64",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl U64Visitor",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: u64_schema"
+      ]
+    },
+    "ProtocolError": {
+      "digest": "6826d9765250d207df70b025f9c52aaa328b05a02f9350c1c1d1b7b30007eae9",
+      "followed": [
+        "kr_protocol crates/kr-protocol/src/error.rs: ProtocolError",
+        "kr_protocol crates/kr-protocol/src/error.rs: impl ProtocolError"
+      ]
+    },
+    "PublisherId": {
+      "digest": "4fe1cef9e1e96a72d9cafc1a94df0ea97d9a9acc6d835b70bef19efaa211e671",
+      "followed": [
+        "kr_protocol crates/kr-protocol/src/ids.rs: MAX_OPAQUE_ID_LEN",
+        "kr_protocol crates/kr-protocol/src/ids.rs: OpaqueIdError",
+        "kr_protocol crates/kr-protocol/src/ids.rs: impl OpaqueIdError",
+        "kr_protocol crates/kr-protocol/src/ids.rs: opaque_id",
+        "kr_protocol crates/kr-protocol/src/ids.rs: opaque_id! invocation",
+        "kr_protocol crates/kr-protocol/src/ids.rs: validate_opaque_id"
+      ]
+    },
+    "QuestionId": {
+      "digest": "e4b9f41174152f70d5104f670cfc9282c4457c0aa722b94e52bcd7f7f3c10fe9",
+      "followed": [
+        "kr_protocol crates/kr-protocol/src/ids.rs: uuid_id",
+        "kr_protocol crates/kr-protocol/src/ids.rs: uuid_id! invocation",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: FixedBytesVisitor",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: TextOrBytes",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: UUID_LEN",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: Uuid",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: UuidParseError",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: fixed",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: hex_nibble",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl FixedBytesVisitor",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl TextOrBytes",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl Uuid",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl UuidParseError"
+      ]
+    },
+    "QuestionRevision": {
+      "digest": "4bc6ffc43f5470f9e8ca0f3166536c506a48c35b701b9eed4db653c4e7ad3cea",
+      "followed": [
+        "kr_protocol crates/kr-protocol/src/ids.rs: counter_id",
+        "kr_protocol crates/kr-protocol/src/ids.rs: counter_id! invocation",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: U64",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: U64Visitor",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl U64",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl U64Visitor",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: u64_schema"
+      ]
+    },
+    "Receipt": {
+      "digest": "a35144c42d298270a4316c28f46d6528a15cf924e3e832e11f16894f2b967973",
+      "followed": [
+        "kr_protocol crates/kr-protocol/src/receipt.rs: Receipt",
+        "kr_protocol crates/kr-protocol/src/receipt.rs: impl Receipt"
+      ]
+    },
+    "RequestId": {
+      "digest": "02aa4228efc77bd978a88c2be8ba1021561b8170c72c3847843c7f81fd2a0bf5",
+      "followed": [
+        "kr_protocol crates/kr-protocol/src/ids.rs: counter_id",
+        "kr_protocol crates/kr-protocol/src/ids.rs: counter_id! invocation",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: U64",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: U64Visitor",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl U64",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl U64Visitor",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: u64_schema"
+      ]
+    },
+    "RevisionReach::is_host": {
+      "digest": "0a1db462c87e0e6a51b66918d4e983ba41ca7b85c3d6257f1027536f3c869866",
+      "followed": [
+        "kr_protocol crates/kr-protocol/src/worker.rs: RevisionReach::is_host"
+      ]
+    },
+    "SecretBytes32": {
+      "digest": "c2ceb548b5fb0de9fbbb7ace036df418a01750d04993c331e4605813814c0f6e",
+      "followed": [
+        "kr_protocol crates/kr-protocol/src/scalars.rs: Base64Alphabet",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: SecretBytes32",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: SecretBytesVisitor",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: SecretTextOrBytesVisitor",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: base64url_schema",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: decode_fault",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: from_base64url_into",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl SecretBytes32",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl SecretBytesVisitor",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl SecretTextOrBytesVisitor",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: to_base64url"
+      ]
+    },
+    "SessionCloseResult": {
+      "digest": "1f2d7d12c72a1fe9cdaa5850ba639daf96c0fc5317a47515284f2da6ae4dc68f",
+      "followed": [
+        "kr_protocol crates/kr-protocol/src/session.rs: SessionCloseResult"
+      ]
+    },
+    "SessionEpoch": {
+      "digest": "a6329a01da847d90c3a004ae491158bad98b4aa11efab78acb95cc26c9cd2a14",
+      "followed": [
+        "kr_protocol crates/kr-protocol/src/ids.rs: counter_id",
+        "kr_protocol crates/kr-protocol/src/ids.rs: counter_id! invocation",
+        "kr_protocol crates/kr-protocol/src/ids.rs: impl SessionEpoch",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: U64",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: U64Visitor",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl U64",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl U64Visitor",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: u64_schema"
+      ]
+    },
+    "SessionId": {
+      "digest": "5846b43d5c70a80beb1e00df6f17f7cf03f4064871a99e9ffff43c612b8104aa",
+      "followed": [
+        "kr_protocol crates/kr-protocol/src/hostinfo.rs: Generated",
+        "kr_protocol crates/kr-protocol/src/hostinfo.rs: HostIdentifier",
+        "kr_protocol crates/kr-protocol/src/hostinfo.rs: impl SessionId",
+        "kr_protocol crates/kr-protocol/src/hostinfo.rs: sealed",
+        "kr_protocol crates/kr-protocol/src/ids.rs: uuid_id",
+        "kr_protocol crates/kr-protocol/src/ids.rs: uuid_id! invocation",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: FixedBytesVisitor",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: TextOrBytes",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: UUID_LEN",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: Uuid",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: UuidParseError",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: fixed",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: hex_nibble",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl FixedBytesVisitor",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl TextOrBytes",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl Uuid",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl UuidParseError"
+      ]
+    },
+    "SessionSummary": {
+      "digest": "cdf061cf71bd576df6406553bcb45bf89d1402a6e789cbb0dcd4a75415f38c32",
+      "followed": [
+        "kr_protocol crates/kr-protocol/src/session.rs: SessionSummary"
+      ]
+    },
+    "Signature64": {
+      "digest": "05f8e9dba38322a259f96ae89f970c57741156881150901129f41fa2d0223094",
+      "followed": [
+        "kr_protocol crates/kr-protocol/src/scalars.rs: Base64Alphabet",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: FixedBytesVisitor",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: TextOrBytes",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: base64url_schema",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: decode_fault",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: fixed",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: fixed_bytes",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: fixed_bytes! invocation",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: from_base64url",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl FixedBytesVisitor",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl TextOrBytes",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: to_base64url"
+      ]
+    },
+    "SourceGeneration": {
+      "digest": "a7c6a336f924a07e0d14407ce7aeb78e2564b2ee9e840640f992787155ad17d9",
+      "followed": [
+        "kr_protocol crates/kr-protocol/src/ids.rs: counter_id",
+        "kr_protocol crates/kr-protocol/src/ids.rs: counter_id! invocation",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: U64",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: U64Visitor",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl U64",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl U64Visitor",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: u64_schema"
+      ]
+    },
+    "StreamId": {
+      "digest": "d43bc4e62a5d4f29e4720eca1c6fe41703c63659745f94bb92dc27e3f95a5052",
+      "followed": [
+        "kr_protocol crates/kr-protocol/src/ids.rs: MAX_OPAQUE_ID_LEN",
+        "kr_protocol crates/kr-protocol/src/ids.rs: OpaqueIdError",
+        "kr_protocol crates/kr-protocol/src/ids.rs: impl OpaqueIdError",
+        "kr_protocol crates/kr-protocol/src/ids.rs: opaque_id",
+        "kr_protocol crates/kr-protocol/src/ids.rs: opaque_id! invocation",
+        "kr_protocol crates/kr-protocol/src/ids.rs: validate_opaque_id"
+      ]
+    },
+    "TimestampMs": {
+      "digest": "533f1b166116aa775f8e6f521f45c707c8e1d6d74a4496bad71138caaf42c5a5",
+      "followed": [
+        "kr_protocol crates/kr-protocol/src/scalars.rs: TimestampMs",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: U64",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: U64Visitor",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl TimestampMs",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl U64",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl U64Visitor",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: u64_schema"
+      ]
+    },
+    "TransferId": {
+      "digest": "b9c2b12a3a79b3d6a2acecaa8793d2be3fbe6a3f17443a6c0f7e26af4040f86f",
+      "followed": [
+        "kr_protocol crates/kr-protocol/src/ids.rs: uuid_id",
+        "kr_protocol crates/kr-protocol/src/ids.rs: uuid_id! invocation",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: FixedBytesVisitor",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: TextOrBytes",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: UUID_LEN",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: Uuid",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: UuidParseError",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: fixed",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: hex_nibble",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl FixedBytesVisitor",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl TextOrBytes",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl Uuid",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl UuidParseError"
+      ]
+    },
+    "U64": {
+      "digest": "b5948ba65f1029a35a1f84c05cb5c4231becd0220631b4062f35dc92c009548a",
+      "followed": [
+        "kr_protocol crates/kr-protocol/src/scalars.rs: U64",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: U64Visitor",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl U64",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl U64Visitor",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: u64_schema"
+      ]
+    },
+    "UpstreamMethod": {
+      "digest": "c2fb19bd0a2c6019263e0585d018491413cee60f987e166cc91cca5cdc447523",
+      "followed": [
+        "kr_protocol crates/kr-protocol/src/ids.rs: MAX_OPAQUE_ID_LEN",
+        "kr_protocol crates/kr-protocol/src/ids.rs: OpaqueIdError",
+        "kr_protocol crates/kr-protocol/src/ids.rs: impl OpaqueIdError",
+        "kr_protocol crates/kr-protocol/src/ids.rs: opaque_id",
+        "kr_protocol crates/kr-protocol/src/ids.rs: opaque_id! invocation",
+        "kr_protocol crates/kr-protocol/src/ids.rs: validate_opaque_id"
+      ]
+    },
+    "UpstreamRequestId": {
+      "digest": "2ea630653372c5743ab7b8d354b5c0a6b0e4f24a66b7ba790e48f039c1db5646",
+      "followed": [
+        "kr_protocol crates/kr-protocol/src/ids.rs: MAX_OPAQUE_ID_LEN",
+        "kr_protocol crates/kr-protocol/src/ids.rs: MAX_UPSTREAM_REQUEST_ID_LEN",
+        "kr_protocol crates/kr-protocol/src/ids.rs: OpaqueIdError",
+        "kr_protocol crates/kr-protocol/src/ids.rs: impl OpaqueIdError",
+        "kr_protocol crates/kr-protocol/src/ids.rs: opaque_id",
+        "kr_protocol crates/kr-protocol/src/ids.rs: opaque_id! invocation",
+        "kr_protocol crates/kr-protocol/src/ids.rs: validate_opaque_id"
+      ]
+    },
+    "Uuid": {
+      "digest": "3f5f4960d3264d370e3cd8fab874a73417267f003a196d9e5fb44f9c5793ebe8",
+      "followed": [
+        "kr_protocol crates/kr-protocol/src/scalars.rs: FixedBytesVisitor",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: TextOrBytes",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: UUID_LEN",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: Uuid",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: UuidParseError",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: fixed",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: hex_nibble",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl FixedBytesVisitor",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl TextOrBytes",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl Uuid",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl UuidParseError"
+      ]
+    },
+    "WorkerLaunchSpec": {
+      "digest": "fab6729ff31883fdb497b2d1cce040036cfdcfe9ece66a700648a31ea30f166d",
+      "followed": [
+        "kr_protocol crates/kr-protocol/src/worker.rs: WorkerLaunchSpec"
+      ]
+    },
+    "macro action_rights": {
+      "digest": "d9e5be53ad95867184e555b8fa52ae77a6b78b2b6f7a0f78d8ef5ef4c2e3c187",
+      "followed": [
+        "kr_protocol crates/kr-protocol/src/rights.rs: action_rights"
+      ]
+    },
+    "macro counter": {
+      "digest": "2e6c7689da6480a94acfd83ce956eb53841bb96b2b7190aeddfe7675bd829c5e",
+      "followed": [
+        "kr_protocol crates/kr-protocol/src/root.rs: counter",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: U64",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: U64Visitor",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl U64",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl U64Visitor",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: u64_schema"
+      ]
+    },
+    "macro counter_id": {
+      "digest": "7ecd3380a842b81e2518f7683c2ab548cca47d99cb2cb750441af993557e1421",
+      "followed": [
+        "kr_protocol crates/kr-protocol/src/ids.rs: counter_id",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: U64",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: U64Visitor",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl U64",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl U64Visitor",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: u64_schema"
+      ]
+    },
+    "macro error_codes": {
+      "digest": "7fb9f13acef2f07430fac0f4186e7abd73eb57385757e6e1d6ff80b2d2825ca0",
+      "followed": [
+        "kr_protocol crates/kr-protocol/src/error.rs: RetryCategory",
+        "kr_protocol crates/kr-protocol/src/error.rs: error_codes",
+        "kr_protocol crates/kr-protocol/src/error.rs: impl RetryCategory"
+      ]
+    },
+    "macro fixed_bytes": {
+      "digest": "1b33ff58b9d3ab8bdc26ca5c0d9fa7c1f4a6daeb88760866b152bbdfcbe8ed73",
+      "followed": [
+        "kr_protocol crates/kr-protocol/src/scalars.rs: Base64Alphabet",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: FixedBytesVisitor",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: TextOrBytes",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: base64url_schema",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: decode_fault",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: fixed",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: fixed_bytes",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: from_base64url",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl FixedBytesVisitor",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl TextOrBytes",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: to_base64url"
+      ]
+    },
+    "macro methods": {
+      "digest": "6bff2aa44ca43347aa10e78f0be1ef0b06351ca223b2ff67ebeba4161f28febc",
+      "followed": [
+        "kr_protocol crates/kr-protocol/src/actor.rs: ActorIngress",
+        "kr_protocol crates/kr-protocol/src/actor.rs: impl ActorIngress",
+        "kr_protocol crates/kr-protocol/src/authority.rs: CapabilityRequirement",
+        "kr_protocol crates/kr-protocol/src/authority.rs: ConfirmationRequirement",
+        "kr_protocol crates/kr-protocol/src/authority.rs: EffectClass",
+        "kr_protocol crates/kr-protocol/src/authority.rs: FreshnessRequirement",
+        "kr_protocol crates/kr-protocol/src/authority.rs: HistoryFilter",
+        "kr_protocol crates/kr-protocol/src/authority.rs: IdempotencyBehaviour",
+        "kr_protocol crates/kr-protocol/src/authority.rs: MethodEntry",
+        "kr_protocol crates/kr-protocol/src/authority.rs: RequiredAuthority",
+        "kr_protocol crates/kr-protocol/src/authority.rs: RequiredRight",
+        "kr_protocol crates/kr-protocol/src/authority.rs: ResourceSelectorKind",
+        "kr_protocol crates/kr-protocol/src/authority.rs: RevisionBinding",
+        "kr_protocol crates/kr-protocol/src/authority.rs: RightCondition",
+        "kr_protocol crates/kr-protocol/src/authority.rs: impl MethodEntry",
+        "kr_protocol crates/kr-protocol/src/authority.rs: impl RequiredRight",
+        "kr_protocol crates/kr-protocol/src/method.rs: MethodGroup",
+        "kr_protocol crates/kr-protocol/src/method.rs: MethodVersion",
+        "kr_protocol crates/kr-protocol/src/method.rs: impl Method",
+        "kr_protocol crates/kr-protocol/src/method.rs: impl MethodVersion",
+        "kr_protocol crates/kr-protocol/src/method.rs: methods",
+        "kr_protocol crates/kr-protocol/src/rights.rs: UnknownActionRight",
+        "kr_protocol crates/kr-protocol/src/rights.rs: impl ActionRight",
+        "kr_protocol crates/kr-protocol/src/rights.rs: impl UnknownActionRight"
+      ]
+    },
+    "macro opaque_id": {
+      "digest": "e566bf4a82c6d23551af94b62e6bcc5a407d1572d47d82a9beaa9bf13c8dc02e",
+      "followed": [
+        "kr_protocol crates/kr-protocol/src/ids.rs: MAX_OPAQUE_ID_LEN",
+        "kr_protocol crates/kr-protocol/src/ids.rs: OpaqueIdError",
+        "kr_protocol crates/kr-protocol/src/ids.rs: impl OpaqueIdError",
+        "kr_protocol crates/kr-protocol/src/ids.rs: opaque_id",
+        "kr_protocol crates/kr-protocol/src/ids.rs: validate_opaque_id"
+      ]
+    },
+    "macro text_debug": {
+      "digest": "a54cee0b039b82bdc3ec752aca28461a012ba94623a68cead503e965ccca6361",
+      "followed": [
+        "kr_protocol crates/kr-protocol/src/pairing.rs: text_debug"
+      ]
+    },
+    "macro uuid_id": {
+      "digest": "dc20a9519b77ee198e6ae9f7fe0bbf01fd2ac1ea7a4696a46490682e0ba1429b",
+      "followed": [
+        "kr_protocol crates/kr-protocol/src/ids.rs: uuid_id",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: FixedBytesVisitor",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: TextOrBytes",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: UUID_LEN",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: Uuid",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: UuidParseError",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: fixed",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: hex_nibble",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl FixedBytesVisitor",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl TextOrBytes",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl Uuid",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl UuidParseError"
+      ]
+    },
+    "macro validated_text": {
+      "digest": "03feece8778bb2ec8fed984b10ec5e06236b0732df457de6df4784cd73f0b4a0",
+      "followed": [
+        "kr_protocol crates/kr-protocol/src/pairing.rs: PairingTextError",
+        "kr_protocol crates/kr-protocol/src/pairing.rs: impl PairingTextError",
+        "kr_protocol crates/kr-protocol/src/pairing.rs: validated_text"
+      ]
+    },
+    "macro wire_enum": {
+      "digest": "97617eaca2c4f4c15182fd91706f5864cb3214bed4f44c83d45848b852896fc3",
+      "followed": [
+        "kr_protocol crates/kr-protocol/src/attention.rs: wire_enum",
+        "kr_protocol crates/kr-protocol/src/automation.rs: wire_enum"
+      ]
+    },
+    "the attention text a worker serves": {
+      "digest": "408597cdeb5f040de3ceffb3a695b9c0495855e30ec320dbe3a70d392855389c",
+      "followed": [
+        "kr_worker crates/kr-worker/src/attention_source.rs: texts"
+      ]
+    },
+    "the envelope a worker checks": {
+      "digest": "32b8aa69d64d373de447cf520ea64764f42e4145f9d51ca2dedb9d81f6a76651",
+      "followed": [
+        "kr_worker crates/kr-worker/src/service.rs: WorkerService::check_envelope"
+      ]
+    },
+    "the limits of every frame": {
+      "digest": "69d8c66ac7adc7ebd6fde8b163236df5c7da89edd7ada87c6b8508a1905f2c6f",
+      "followed": [
+        "kr_cbor crates/kr-cbor/src/limits.rs: Limits",
+        "kr_cbor crates/kr-cbor/src/limits.rs: impl Limits"
+      ]
+    },
+    "the rights beside a forwarded mutation": {
+      "digest": "8bc496135f7e70c5c5025880fe9340b1e5b255a5001e659cc8fe9c1be8788b82",
+      "followed": [
+        "kr_protocol crates/kr-protocol/src/local.rs: REFUSED",
+        "kr_protocol crates/kr-protocol/src/local.rs: may_travel_to_a_worker",
+        "kr_protocol crates/kr-protocol/src/local.rs: worker_rights",
+        "kr_protocol crates/kr-protocol/src/rights.rs: UnknownActionRight",
+        "kr_protocol crates/kr-protocol/src/rights.rs: impl ActionRight",
+        "kr_protocol crates/kr-protocol/src/rights.rs: impl UnknownActionRight",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: CanonicalSet",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: CanonicalSetVisitor",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl CanonicalSet",
+        "kr_protocol crates/kr-protocol/src/scalars.rs: impl CanonicalSetVisitor"
+      ]
+    }
+  }
+}

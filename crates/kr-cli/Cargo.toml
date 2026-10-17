@@ -102,6 +102,9 @@ tempfile.workspace = true
 kr-service-stand-in = { path = "../../tests/support/service-stand-in" }
 # The stored-format checks read the types a store keeps from their definitions in the source.
 syn.workspace = true
+# The retained-surface check follows the helpers a validator calls through their source, token by token.
+proc-macro2.workspace = true
+quote.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
