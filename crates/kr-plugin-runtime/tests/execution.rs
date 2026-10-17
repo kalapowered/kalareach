@@ -654,13 +654,18 @@ fn kr_req_11_21_decode_and_encode_return_values_and_never_send() {
 
 // KR-REQ-11.01: every export works, so a vendor package with a component adds detection, events and
 // controls through the SDK alone.
+//
+// The engine's epoch is held: this case is about what each export does, and a call that a slow
+// machine kept from running for ten milliseconds would be stopped by its deadline and say nothing
+// about that. The deadlines are shown where a test advances the epoch itself.
 #[test]
 fn kr_req_11_01_a_vendor_component_adds_detection_events_and_controls() {
     let Some(wasm) = components::well_behaved() else {
         return;
     };
     let plugin = "well-behaved";
-    let (_directory, mut instance) = bound(&wasm, plugin);
+    let engine = held_engine();
+    let (_directory, mut instance) = bound_on(&engine, &wasm, plugin);
 
     // Events: an observation produces presentation.
     let observed = instance.observe(components::scrape("se-1", "building project"));
