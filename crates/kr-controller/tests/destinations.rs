@@ -2042,14 +2042,17 @@ fn a_mail_server_that_stops_reading_cannot_hold_the_attempt() {
     // begins. A write with no deadline would hold the attempt for ever, which is what this guard,
     // and nothing about the time the attempt took, is here to end.
     let outcome = runtime
-        .block_on(tokio::time::timeout(
-            std::time::Duration::from_secs(30 * 60),
-            submission.submit(
-                &account(&server, MailSecurity::ImplicitTls),
-                "person@example.com",
-                &message,
-            ),
-        ))
+        .block_on(async {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(30 * 60),
+                submission.submit(
+                    &account(&server, MailSecurity::ImplicitTls),
+                    "person@example.com",
+                    &message,
+                ),
+            )
+            .await
+        })
         .expect("the attempt ended; a write with no deadline would hold it for ever");
     assert!(
         matches!(
