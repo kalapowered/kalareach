@@ -5044,7 +5044,34 @@ impl WorkerService {
         // and whether it is inside is the kernel's answer, and the checks below read that answer
         // while the session is held; the walk that finds it is not a thing to hold the session for.
         state.binding = Self::binds_its_caller(method).then(|| self.bind_caller(state));
+        let answered = self.admit_and_dispatch(
+            state,
+            mutation,
+            method,
+            caller,
+            deadline,
+            work,
+            volatile_permitted,
+            &submission,
+        );
+        state.binding = None;
+        answered
+    }
 
+    /// Takes the session, admits the intent to the journal and dispatches the mutation, with the
+    /// session held from the first to the last.
+    #[allow(clippy::too_many_arguments)]
+    fn admit_and_dispatch(
+        &self,
+        state: &mut ConnectionState,
+        mutation: &MutationRequest,
+        method: Method,
+        caller: &Caller,
+        deadline: ContinuousInstant,
+        work: crate::persistence::fault::WorkClass,
+        volatile_permitted: bool,
+        submission: &crate::journal::Submission,
+    ) -> Result<Answered> {
         // From here the session is locked and stays locked. Admission, the final revalidation, the
         // dispatch marker, the effect and the recorded outcome are one serial boundary: nothing
         // the mutation was validated against — the geometry, the lease, the output cursor, the
@@ -5081,7 +5108,7 @@ impl WorkerService {
         // is exactly when a person most needs to be able to stop a session — so the exception
         // covers the write failing as well as the journal being missing.
         let admitted = match session.journal_mut() {
-            Some(journal) => match journal.accept(&submission) {
+            Some(journal) => match journal.accept(submission) {
                 Ok(_) => true,
                 Err(error) if volatile_permitted && is_storage_failure(&error) => {
                     session.note_journal_failure(error.to_string());
@@ -5099,7 +5126,7 @@ impl WorkerService {
             }
         };
 
-        let answered = self.dispatch_accepted(
+        self.dispatch_accepted(
             session,
             state,
             mutation,
@@ -5109,9 +5136,7 @@ impl WorkerService {
             admitted,
             volatile_permitted,
             None,
-        );
-        state.binding = None;
-        answered
+        )
     }
 
     /// Everything a mutation does once its intent is committed: the revalidation inside the
