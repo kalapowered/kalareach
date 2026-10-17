@@ -3779,47 +3779,91 @@ async fn a_lone_escape_reaches_the_application_while_a_host_event_commit_blocks_
     .await;
 }
 
-macro_rules! every_prefix_cases {
-    ($($(#[$meta:meta])* $name:ident: $stalled:expr, $disk:expr;)*) => {
-        $(
-            /// KR-PERF-002: every prefix length of the start delimiter, and the delimiter split
-            /// across two writes, reach the application while the stall is in force.
-            $(#[$meta])*
-            #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-            async fn $name() {
-                every_prefix_meets($stalled, $disk).await;
-            }
-        )*
-    };
+/// KR-PERF-002: every prefix length of the start delimiter, and the delimiter split across two
+/// writes, reach the application while the stall is in force.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn every_held_prefix_reaches_the_application_during_a_stalled_marker_commit() {
+    every_prefix_meets(Stalled::Marker, false).await;
 }
 
-every_prefix_cases! {
-    every_held_prefix_reaches_the_application_during_a_stalled_marker_commit:
-        Stalled::Marker, false;
-    every_held_prefix_reaches_the_application_during_a_stalled_maintenance_prune:
-        Stalled::Prune, false;
-    every_held_prefix_reaches_the_application_during_a_stalled_question_commit:
-        Stalled::Question, false;
-    #[cfg_attr(windows, ignore = "the application's input is read through a named pipe trigger")]
-    every_held_prefix_reaches_the_application_during_a_stalled_host_event_commit:
-        Stalled::HostEvent, false;
-    every_held_prefix_reaches_the_application_while_the_session_is_held:
-        Stalled::Session, false;
-    every_held_prefix_reaches_the_application_during_a_stalled_marker_commit_beside_a_disk_writer:
-        Stalled::Marker, true;
-    every_held_prefix_reaches_the_application_during_a_stalled_maintenance_prune_beside_a_disk_writer:
-        Stalled::Prune, true;
-    every_held_prefix_reaches_the_application_during_a_stalled_question_commit_beside_a_disk_writer:
-        Stalled::Question, true;
-    #[cfg_attr(windows, ignore = "the application's input is read through a named pipe trigger")]
-    every_held_prefix_reaches_the_application_during_a_stalled_host_event_commit_beside_a_disk_writer:
-        Stalled::HostEvent, true;
-    every_held_prefix_reaches_the_application_while_the_session_is_held_beside_a_disk_writer:
-        Stalled::Session, true;
+/// KR-PERF-002: every prefix length of the start delimiter, and the delimiter split across two
+/// writes, reach the application while the stall is in force.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn every_held_prefix_reaches_the_application_during_a_stalled_maintenance_prune() {
+    every_prefix_meets(Stalled::Prune, false).await;
+}
+
+/// KR-PERF-002: every prefix length of the start delimiter, and the delimiter split across two
+/// writes, reach the application while the stall is in force.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn every_held_prefix_reaches_the_application_during_a_stalled_question_commit() {
+    every_prefix_meets(Stalled::Question, false).await;
+}
+
+/// KR-PERF-002: every prefix length of the start delimiter, and the delimiter split across two
+/// writes, reach the application while the stall is in force.
+#[cfg_attr(
+    windows,
+    ignore = "the application's input is read through a named pipe trigger"
+)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn every_held_prefix_reaches_the_application_during_a_stalled_host_event_commit() {
+    every_prefix_meets(Stalled::HostEvent, false).await;
+}
+
+/// KR-PERF-002: every prefix length of the start delimiter, and the delimiter split across two
+/// writes, reach the application while the stall is in force.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn every_held_prefix_reaches_the_application_while_the_session_is_held() {
+    every_prefix_meets(Stalled::Session, false).await;
+}
+
+/// KR-PERF-002: every prefix length of the start delimiter, and the delimiter split across two
+/// writes, reach the application while the stall is in force.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn every_held_prefix_reaches_the_application_during_a_stalled_marker_commit_beside_a_disk_writer()
+ {
+    every_prefix_meets(Stalled::Marker, true).await;
+}
+
+/// KR-PERF-002: every prefix length of the start delimiter, and the delimiter split across two
+/// writes, reach the application while the stall is in force.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn every_held_prefix_reaches_the_application_during_a_stalled_maintenance_prune_beside_a_disk_writer()
+ {
+    every_prefix_meets(Stalled::Prune, true).await;
+}
+
+/// KR-PERF-002: every prefix length of the start delimiter, and the delimiter split across two
+/// writes, reach the application while the stall is in force.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn every_held_prefix_reaches_the_application_during_a_stalled_question_commit_beside_a_disk_writer()
+ {
+    every_prefix_meets(Stalled::Question, true).await;
+}
+
+/// KR-PERF-002: every prefix length of the start delimiter, and the delimiter split across two
+/// writes, reach the application while the stall is in force.
+#[cfg_attr(
+    windows,
+    ignore = "the application's input is read through a named pipe trigger"
+)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn every_held_prefix_reaches_the_application_during_a_stalled_host_event_commit_beside_a_disk_writer()
+ {
+    every_prefix_meets(Stalled::HostEvent, true).await;
+}
+
+/// KR-PERF-002: every prefix length of the start delimiter, and the delimiter split across two
+/// writes, reach the application while the stall is in force.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn every_held_prefix_reaches_the_application_while_the_session_is_held_beside_a_disk_writer()
+{
+    every_prefix_meets(Stalled::Session, true).await;
 }
 
 // ---------------------------------------------------------------------------------------------
-// KR-PERF-002, KR-REQ-08: what the input domain keeps exact while the session is busy.
+// KR-PERF-002: what the input domain keeps exact while the session is busy.
 // ---------------------------------------------------------------------------------------------
 
 /// As [`write_over`], for a connection moved into a task of its own.
