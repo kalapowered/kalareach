@@ -11,9 +11,12 @@
 //! kr-protocol-gen --out-dir P       write the schema to P instead of packages/protocol/schema
 //! kr-protocol-gen --fixtures-dir P  write the vectors to P instead of fixtures
 //! kr-protocol-gen --docs-dir P      write the index to, and read the documentation from, P
+//! kr-protocol-gen --retain L --commit C           cut retained level L from the release at C
+//! kr-protocol-gen --release-commit L C            move level L's record to release C, if its schema is the kept one
 //! ```
 
 mod method_index;
+mod retained;
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -55,6 +58,8 @@ fn main() -> ExitCode {
     let mut out_dir = default_out_dir();
     let mut fixtures_dir = default_fixtures_dir();
     let mut docs_dir = default_docs_dir();
+    let mut retain: Option<String> = None;
+    let mut commit: Option<String> = None;
     let mut arguments = std::env::args().skip(1);
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
@@ -80,10 +85,38 @@ fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             },
+            "--retain" => match arguments.next() {
+                Some(value) => retain = Some(value),
+                None => {
+                    eprintln!("--retain needs a level");
+                    return ExitCode::FAILURE;
+                }
+            },
+            "--commit" => match arguments.next() {
+                Some(value) => commit = Some(value),
+                None => {
+                    eprintln!("--commit needs a full commit");
+                    return ExitCode::FAILURE;
+                }
+            },
+            "--release-commit" => {
+                let (Some(level), Some(commit)) = (arguments.next(), arguments.next()) else {
+                    eprintln!("--release-commit needs a level and a full commit");
+                    return ExitCode::FAILURE;
+                };
+                return match retained::release_commit(&level, &commit) {
+                    Ok(()) => ExitCode::SUCCESS,
+                    Err(error) => {
+                        eprintln!("{error}");
+                        ExitCode::FAILURE
+                    }
+                };
+            }
             "--help" | "-h" => {
                 println!(
                     "kr-protocol-gen [--check] [--out-dir <path>] [--fixtures-dir <path>] \
-                     [--docs-dir <path>]"
+                     [--docs-dir <path>] | --retain <level> --commit <commit> | \
+                     --release-commit <level> <commit>"
                 );
                 return ExitCode::SUCCESS;
             }
@@ -92,6 +125,20 @@ fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
         }
+    }
+
+    if let Some(level) = retain {
+        let Some(commit) = commit else {
+            eprintln!("--retain needs --commit");
+            return ExitCode::FAILURE;
+        };
+        return match retained::retain(&level, &commit) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("{error}");
+                ExitCode::FAILURE
+            }
+        };
     }
 
     let files: Vec<(PathBuf, String)> = generated_files()
@@ -167,10 +214,29 @@ fn run_check(files: &[(PathBuf, String)], docs_dir: &Path) -> ExitCode {
             eprintln!("  {description}");
         }
     }
-    if differences > 0 || !undocumented.is_empty() || !broken.is_empty() {
+    let mut retained_problems = retained::problems(&retained::retained_dir());
+    if let Err(found) = kr_protocol::retained::check() {
+        retained_problems.extend(found);
+    }
+    if !retained_problems.is_empty() {
+        eprintln!(
+            "{} problems with the retained levels (crates/kr-protocol/retained):",
+            retained_problems.len()
+        );
+        for problem in &retained_problems {
+            eprintln!("  {problem}");
+        }
+    }
+    if differences > 0
+        || !undocumented.is_empty()
+        || !broken.is_empty()
+        || !retained_problems.is_empty()
+    {
         return ExitCode::FAILURE;
     }
-    println!("generated files are up to date and every method is documented");
+    println!(
+        "generated files are up to date, every method is documented and the retained levels hold"
+    );
     ExitCode::SUCCESS
 }
 

@@ -163,6 +163,7 @@ pub mod receipt;
 pub mod recovery;
 pub mod relay;
 pub mod rendezvous;
+pub mod retained;
 pub mod rights;
 pub mod root;
 pub mod scalars;
