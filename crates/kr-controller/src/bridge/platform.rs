@@ -314,7 +314,18 @@ fn run_bounded(
 /// Returns a resource failure when the program is not installed or could not be run. A program
 /// that runs and exits non-zero is not a failure here: its output is what says what it found.
 pub fn run(program: &str, arguments: &[String]) -> Result<CommandOutput> {
-    run_within(program, arguments, PLATFORM_LIMIT)
+    run_within(program, arguments, platform_limit())
+}
+
+/// The time a platform command is given: [`PLATFORM_LIMIT`], or what a suite gave its daemon in its
+/// place, for a suite whose subject is not that bound and whose runtime is slower than the bound
+/// allows.
+fn platform_limit() -> std::time::Duration {
+    #[cfg(any(test, feature = "testing"))]
+    if let Some(limit) = crate::testing::platform_commands_limit() {
+        return limit;
+    }
+    PLATFORM_LIMIT
 }
 
 /// [`run`], with the time it is given named.
