@@ -192,6 +192,13 @@ pub const NAMED_COMMANDS: &[(&str, Option<Method>)] = &[
     ("recovery_turn_on", None),
     ("recovery_settle", None),
     ("recovery_save_kit", None),
+    // The person's settings: the colour mode now, and keeping it in step with their other devices.
+    // None is a host method. The page names a mode from a closed set and is told where things
+    // stand; it holds no copy of its own and is given no key, identity or token.
+    ("settings_view", None),
+    ("settings_colour_mode_set", None),
+    ("settings_sync_turn_on", None),
+    ("settings_sync_now", None),
 ];
 
 /// The commands that reach a session's worker or name a session on a host this device is paired
@@ -469,6 +476,10 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'static
         recovery_turn_on,
         recovery_settle,
         recovery_save_kit,
+        settings_view,
+        settings_colour_mode_set,
+        settings_sync_turn_on,
+        settings_sync_now,
     ]
 }
 
@@ -3173,6 +3184,10 @@ mod tests {
         "recovery_turn_on",
         "recovery_settle",
         "recovery_save_kit",
+        "settings_view",
+        "settings_colour_mode_set",
+        "settings_sync_turn_on",
+        "settings_sync_now",
     ];
 
     #[test]
@@ -3304,6 +3319,13 @@ mod tests {
                 "recovery_settle",
                 "recovery_turn_on",
                 "recovery_view",
+                // The person's settings' four. The colour mode is kept in a file on this computer,
+                // and settings sync sends the settings sealed under a key only this person's
+                // devices hold; the page names a mode and nothing else.
+                "settings_view",
+                "settings_colour_mode_set",
+                "settings_sync_turn_on",
+                "settings_sync_now",
                 // The raw terminal view's five. The view attaches on the session's own worker,
                 // which the control daemon does not proxy for this computer, so the page names a
                 // session, a size, its moves and the person's input, and native code makes every
@@ -4099,4 +4121,40 @@ pub async fn recovery_save_kit(
     let destination = state.take_export_destination(std::path::Path::new(&path))?;
     state.recovery()?.save_kit(&destination).await?;
     Ok(crate::recovery::KitSaved { path })
+}
+
+/// The person's settings, and where keeping them in step with their other devices stands.
+#[tauri::command]
+pub fn settings_view(state: State<'_, AppState>) -> Result<crate::settings::SettingsView> {
+    Ok(state.settings()?.view())
+}
+
+/// Keeps the person's choice of colour mode, and sends it to their other devices when settings
+/// sync is on.
+///
+/// The page names one of three words. The choice is on this computer's disk before the answer
+/// comes back, whether or not the sync service can be reached.
+#[tauri::command]
+pub async fn settings_colour_mode_set(
+    state: State<'_, AppState>,
+    mode: crate::settings::ColourMode,
+) -> Result<crate::settings::SettingsView> {
+    state.settings()?.set_colour_mode(mode).await
+}
+
+/// Turns settings sync on: the settings are sealed under a key only this person's devices hold and
+/// kept at the sync service.
+#[tauri::command]
+pub async fn settings_sync_turn_on(
+    state: State<'_, AppState>,
+) -> Result<crate::settings::SettingsView> {
+    state.settings()?.sync_turn_on().await
+}
+
+/// Brings this computer and the sync service to the same settings now, when settings sync is on.
+#[tauri::command]
+pub async fn settings_sync_now(
+    state: State<'_, AppState>,
+) -> Result<crate::settings::SettingsView> {
+    state.settings()?.sync_now().await
 }

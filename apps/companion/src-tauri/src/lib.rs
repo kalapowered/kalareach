@@ -44,6 +44,7 @@ pub mod probe;
 pub mod questions;
 pub mod recovery;
 pub mod remote;
+pub mod settings;
 pub mod setup;
 pub mod sharing;
 pub mod standing;
@@ -166,6 +167,8 @@ pub mod mobile {
 /// The window's settings stay in `tauri.conf.json`, which marks it not to be created by itself, so
 /// it is built here with handlers that keep it on the bundled interface.
 fn open_main_window(app: &tauri::AppHandle) -> tauri::Result<()> {
+    use tauri::Manager as _;
+
     let configuration = app
         .config()
         .app
@@ -179,8 +182,16 @@ fn open_main_window(app: &tauri::AppHandle) -> tauri::Result<()> {
     } else {
         None
     };
+    // The person's settings are in the window's document before the page's first script runs, so
+    // the colour mode is applied before the first paint.
+    let settings = app
+        .state::<AppState>()
+        .settings()
+        .map(|settings| settings.local().initial_script())
+        .unwrap_or_default();
     account::navigation::guard(
-        tauri::WebviewWindowBuilder::from_config(app, &configuration)?,
+        tauri::WebviewWindowBuilder::from_config(app, &configuration)?
+            .initialization_script(settings),
         development,
     )
     .build()?;
@@ -334,13 +345,84 @@ fn open_recovery(app: &tauri::AppHandle) {
         return;
     };
     start_sync_service(app, &data);
-    let opened = app
-        .state::<AppState>()
-        .device()
+    let device = app.state::<AppState>().device();
+    let opened = device
+        .as_ref()
+        .map_err(Clone::clone)
         .and_then(|device| start_recovery(app, &data, device.identity()));
     if let Err(error) = opened {
         tracing::warn!(%error, "this computer's recovery records could not be opened");
     }
+    // Telling the page comes first, so a step that begins at once is heard.
+    watch_settings(app);
+    let taking_part = device.and_then(|device| start_settings_sync(app, &data, device.identity()));
+    match taking_part {
+        Ok(()) => keep_settings_in_step(app),
+        Err(error) => {
+            tracing::warn!(%error, "this computer cannot take part in settings sync");
+        }
+    }
+}
+
+/// Tells the page, on [`settings::SETTINGS_EVENT`], whenever what it shows of the settings changes.
+pub fn watch_settings<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
+    use tauri::{Emitter as _, Manager as _};
+
+    let Ok(settings) = app.state::<AppState>().settings() else {
+        return;
+    };
+    let handle = app.clone();
+    settings.told().by(move || {
+        if let Ok(settings) = handle.state::<AppState>().settings() {
+            let _ = handle.emit(settings::SETTINGS_EVENT, settings.view());
+        }
+    });
+}
+
+/// Lets this computer take part in settings sync, on `identity`'s keys and secure store and the
+/// sync service the setting names, with its records under `data`.
+///
+/// # Errors
+///
+/// Returns a local failure when the settings or the sync service setting were not opened first, or
+/// sync's directory cannot be made.
+pub fn start_settings_sync<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    data: &std::path::Path,
+    identity: &device::DeviceIdentity,
+) -> Result<()> {
+    use std::sync::Arc;
+
+    use tauri::Manager as _;
+
+    let state = app.state::<AppState>();
+    state.settings()?.take_part(
+        data,
+        settings::SyncParts {
+            keys: identity.keys.clone(),
+            secrets: Arc::clone(&identity.secrets),
+            service: state.sync_service()?,
+        },
+    )
+}
+
+/// How long settings sync waits between looking for what another device changed.
+const SETTINGS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+/// Starts the task that brings this computer and the sync service to the same settings now and
+/// every [`SETTINGS_INTERVAL`] after. Nothing is sent while settings sync is off.
+fn keep_settings_in_step(app: &tauri::AppHandle) {
+    use tauri::Manager as _;
+
+    let handle = app.clone();
+    tauri::async_runtime::spawn(async move {
+        loop {
+            if let Ok(settings) = handle.state::<AppState>().settings() {
+                let _ = settings.sync_now().await;
+            }
+            tokio::time::sleep(SETTINGS_INTERVAL).await;
+        }
+    });
 }
 
 /// Opens the sync service setting kept under `data`.

@@ -28,6 +28,7 @@ pub struct AppState {
     paste: OnceLock<Arc<dyn PastePlatform>>,
     sync_service: OnceLock<Arc<SyncService>>,
     recovery: OnceLock<Arc<Recovery>>,
+    settings: OnceLock<Arc<crate::settings::Settings>>,
     drafts: Arc<crate::drafts::DraftDesk>,
     questions: crate::questions::QuestionDesk,
     shares: Arc<crate::sharing::ShareDesk>,
@@ -63,6 +64,7 @@ impl AppState {
             paste: OnceLock::new(),
             sync_service: OnceLock::new(),
             recovery: OnceLock::new(),
+            settings: OnceLock::new(),
             drafts: Arc::new(crate::drafts::DraftDesk::default()),
             questions: crate::questions::QuestionDesk::default(),
             shares: Arc::new(crate::sharing::ShareDesk::default()),
@@ -397,6 +399,17 @@ impl AppState {
         })
     }
 
+    /// The person's settings.
+    ///
+    /// # Errors
+    ///
+    /// Returns a local failure when this computer's data directory could not be found.
+    pub fn settings(&self) -> Result<Arc<crate::settings::Settings>> {
+        self.settings.get().cloned().ok_or_else(|| {
+            CommandError::local_failure("this computer's settings could not be opened")
+        })
+    }
+
     /// Where this computer pastes invitations from.
     ///
     /// # Errors
@@ -494,9 +507,12 @@ impl AppState {
     }
 
     /// Gives what this application keeps on this device its place under the data directory: the
-    /// answers a host did not confirm and the drafts a person has not sent. The
-    /// application does this once, at start, before any command can run.
+    /// answers a host did not confirm, the drafts a person has not sent and the person's
+    /// settings. The application does this once, at start, before any command can run.
     pub fn keep_under(&self, data: &std::path::Path) {
+        let _ = self
+            .settings
+            .set(Arc::new(crate::settings::Settings::open(data)));
         self.questions.keep_at(crate::questions::kept_in(data));
         self.drafts.keep_at(data.to_path_buf());
         self.shares.keep_at(crate::sharing::kept_in(data));

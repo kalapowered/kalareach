@@ -1,0 +1,536 @@
+//! The person's settings, through the commands the page calls, against the sync service as a local
+//! Worker answered it.
+//!
+//! KR-REQ-20.13: settings sync uses per-object revisions and compare-and-swap writes, keeps the
+//! content a refused write lost for the person to choose from instead of choosing by the clock, and
+//! never overwrites a host's grants. KR-REQ-18.05: encrypted settings sync. KR-REQ-17.14: the sync
+//! service is a client the application fills with the service it is set to use.
+//!
+//! The companion runs on the mock runtime, its commands are called the way the page calls them,
+//! and its transport is the real one, talking over loopback to the stand-in `kr_service_stand_in`
+//! provides, which `crates/kr-client/tests/settings_answers.rs` holds to a recording of a local
+//! Worker. A second device is a second sync store of the same collection, opened with the keys the
+//! first one holds and writing as a client of the same library writes: the collection admits
+//! members, and how a device joins is not under test here.
+#![cfg(desktop)]
+
+use std::sync::{Arc, Mutex};
+
+use companion_tauri::AppState;
+use companion_tauri::device::DeviceIdentity;
+use companion_tauri::settings::SETTINGS_EVENT;
+use kr_client::services::{
+    HttpDeadlines, HttpService, ManagedSyncService, ServiceSigner, managed_response_limits,
+};
+use kr_client::sync::{
+    CollectionKeys, CollectionSealer, Published, Restored, SettingValue, SharedCollectionService,
+    StoredCollectionKeys, SyncBody, SyncClient, SyncObject, SyncStore, fresh_revision,
+};
+use kr_crypto::keys::AuthorisationKeyPair;
+use kr_crypto::sign::{SigningTranscript, sign};
+use kr_crypto::store::MemoryStore;
+use kr_protocol::ids::{DeviceId, SyncCollectionId, SyncObjectId};
+use kr_protocol::scalars::{AuthorisationKey, Signature64, TimestampMs, Uuid};
+use kr_protocol::service::{GatewayOrigin, ServiceRequestSigner, installation_id};
+use kr_protocol::sync::SyncObjectKind;
+use kr_service_stand_in::{Moment, Served, serve};
+use serde_json::{Value, json};
+use tauri::test::{INVOKE_KEY, MockRuntime, mock_builder, mock_context, noop_assets};
+use tauri::webview::InvokeRequest;
+use tauri::{Listener as _, Manager as _};
+
+const SYNC_PATH: &str = "/api/sync/exchange";
+
+/// Where the bundle's pages are served from, which is where the page's calls come from.
+#[cfg(windows)]
+const BUNDLE: &str = "http://tauri.localhost";
+#[cfg(not(windows))]
+const BUNDLE: &str = "tauri://localhost";
+
+/// A device's key, signing as an installation.
+#[derive(Debug)]
+struct Installation(AuthorisationKeyPair);
+
+impl ServiceSigner for Installation {
+    fn signer(&self) -> ServiceRequestSigner {
+        ServiceRequestSigner::Installation
+    }
+
+    fn public_key(&self) -> AuthorisationKey {
+        *self.0.public()
+    }
+
+    fn sign(&self, message: &[u8]) -> kr_client::Result<Signature64> {
+        let transcript = SigningTranscript::from_canonical_bytes(
+            ServiceRequestSigner::Installation.domain(),
+            message.to_vec(),
+        )
+        .expect("a transcript");
+        Ok(sign(&self.0, &transcript).expect("a signature"))
+    }
+}
+
+fn now_ms() -> u64 {
+    u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("a clock after 1970")
+            .as_millis(),
+    )
+    .expect("a time in range")
+}
+
+/* -------------------------------------------------------------------------- */
+/* This computer, and the application started on it                            */
+/* -------------------------------------------------------------------------- */
+
+/// What survives the application being closed: the service, the data directory and the secure
+/// store, which holds the device's keys and, once sync is on, the collection's.
+struct Computer {
+    served: Served,
+    data: tempfile::TempDir,
+    secrets: Arc<MemoryStore>,
+}
+
+impl Computer {
+    async fn new() -> Self {
+        Self {
+            served: serve().await,
+            data: tempfile::tempdir().expect("a directory"),
+            secrets: Arc::new(MemoryStore::new()),
+        }
+    }
+
+    fn identity(&self) -> DeviceIdentity {
+        DeviceIdentity::in_store(Arc::clone(&self.secrets) as _).expect("the device's keys")
+    }
+
+    fn origin(&self) -> GatewayOrigin {
+        GatewayOrigin::new(self.served.origin()).expect("an origin")
+    }
+
+    /// The application, started over this computer's records, with the sync service chosen to be
+    /// the one this computer can reach.
+    fn start(&self) -> Page {
+        let app = mock_builder()
+            .manage(AppState::new())
+            .invoke_handler(tauri::generate_handler![
+                companion_tauri::commands::sync_service_set,
+                companion_tauri::commands::settings_view,
+                companion_tauri::commands::settings_colour_mode_set,
+                companion_tauri::commands::settings_sync_turn_on,
+                companion_tauri::commands::settings_sync_now,
+            ])
+            .build(mock_context(noop_assets()))
+            .expect("an application on the mock runtime");
+        // What the application's start does, over this computer's records.
+        app.state::<AppState>().keep_under(self.data.path());
+        companion_tauri::start_sync_service(app.handle(), self.data.path());
+        companion_tauri::start_settings_sync(app.handle(), self.data.path(), &self.identity())
+            .expect("settings sync opens");
+        companion_tauri::watch_settings(app.handle());
+        let heard = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let listening = Arc::clone(&heard);
+        app.listen(SETTINGS_EVENT, move |event| {
+            listening
+                .lock()
+                .expect("the record")
+                .push(serde_json::from_str(event.payload()).expect("a view"));
+        });
+        let window = tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
+            .build()
+            .expect("a window");
+        let page = Page { app, window, heard };
+        page.call(
+            "sync_service_set",
+            json!({ "origin": self.served.origin() }),
+        )
+        .expect("the service is chosen");
+        page
+    }
+
+    /// Another device of the person's: a second store of the collection this computer started,
+    /// opened with the key this computer holds.
+    fn elsewhere(&self) -> Elsewhere {
+        let record: Value = serde_json::from_slice(
+            &std::fs::read(self.data.path().join("settings-sync").join("sync.json"))
+                .expect("the record sync keeps"),
+        )
+        .expect("a record");
+        let collection_id: SyncCollectionId =
+            serde_json::from_value(record["collection_id"].clone()).expect("a collection");
+        let object_id: SyncObjectId =
+            serde_json::from_value(record["object_id"].clone()).expect("an object");
+        let keys = self.identity().keys;
+        let origin = self.origin();
+        let http = HttpService::with(
+            origin.clone(),
+            HttpDeadlines::default(),
+            managed_response_limits(),
+        )
+        .expect("a transport");
+        let service = Arc::new(ManagedSyncService::new(
+            origin,
+            Arc::new(http),
+            Arc::new(Installation(keys.authorisation.clone())),
+        ));
+        let collection = kr_client::sync::membership::CollectionRef {
+            home: installation_id(keys.authorisation.public()),
+            collection_id,
+        };
+        let directory = tempfile::tempdir().expect("a directory");
+        let client = SyncClient::new(
+            Arc::new(SharedCollectionService::new(service, collection, 0)),
+            Arc::new(CollectionSealer::new(
+                Arc::new(StoredCollectionKeys::in_store(
+                    Arc::clone(&self.secrets) as _,
+                    companion_tauri::settings::sync::SCOPE,
+                )) as Arc<dyn CollectionKeys>,
+                &collection_id.to_string(),
+                0,
+            )),
+            SyncStore::open(directory.path()).expect("a store"),
+        );
+        Elsewhere {
+            client,
+            object_id,
+            device: DeviceId::new(Uuid::from_bytes([0xee; 16])),
+            _directory: directory,
+        }
+    }
+}
+
+/// The application's backend, called as the page calls it.
+struct Page {
+    app: tauri::App<MockRuntime>,
+    window: tauri::WebviewWindow<MockRuntime>,
+    /// Every view the page was told of by the backend itself.
+    heard: Arc<Mutex<Vec<Value>>>,
+}
+
+impl Page {
+    /// Calls `command` with `body` through the invoke path, and returns the answer the page gets,
+    /// or its refusal.
+    fn call(&self, command: &str, body: Value) -> Result<Value, Value> {
+        assert!(
+            companion_tauri::commands::NAMED_COMMANDS
+                .iter()
+                .any(|(name, _)| *name == command),
+            "{command} is a command the application registers"
+        );
+        let answered = tokio::task::block_in_place(|| {
+            tauri::test::get_ipc_response(
+                &self.window,
+                InvokeRequest {
+                    cmd: command.into(),
+                    callback: tauri::ipc::CallbackFn(0),
+                    error: tauri::ipc::CallbackFn(1),
+                    url: BUNDLE.parse().expect("the bundle's address"),
+                    body: tauri::ipc::InvokeBody::Json(body),
+                    headers: Default::default(),
+                    invoke_key: INVOKE_KEY.to_owned(),
+                },
+            )
+        });
+        match answered {
+            Ok(answer) => Ok(answer.deserialize().expect("an answer the page can read")),
+            Err(refusal) => Err(refusal),
+        }
+    }
+
+    fn view(&self) -> Value {
+        self.call("settings_view", json!({})).expect("the view")
+    }
+
+    fn choose(&self, mode: &str) -> Value {
+        self.call("settings_colour_mode_set", json!({ "mode": mode }))
+            .expect("the choice is kept")
+    }
+
+    fn turn_on(&self) -> Value {
+        self.call("settings_sync_turn_on", json!({}))
+            .expect("sync is turned on")
+    }
+
+    fn sync_now(&self) -> Value {
+        self.call("settings_sync_now", json!({}))
+            .expect("sync runs")
+    }
+}
+
+/// Another device's store of the collection.
+struct Elsewhere {
+    client: SyncClient,
+    object_id: SyncObjectId,
+    device: DeviceId,
+    _directory: tempfile::TempDir,
+}
+
+impl Elsewhere {
+    /// The colour mode the service holds, as this device reads it.
+    async fn colour(&self) -> String {
+        let Restored::Settings { object, .. } = self
+            .client
+            .fetch(
+                SyncObjectKind::Settings,
+                self.object_id,
+                TimestampMs::new(now_ms()),
+            )
+            .await
+            .expect("a fetch")
+        else {
+            panic!("settings");
+        };
+        colour_of(&object)
+    }
+
+    /// Writes `mode` as this device: it reads where the object stands, changes it, and publishes.
+    async fn write(&self, mode: &str) -> Published {
+        self.client
+            .fetch(
+                SyncObjectKind::Settings,
+                self.object_id,
+                TimestampMs::new(now_ms()),
+            )
+            .await
+            .expect("a fetch");
+        let mut settings = kr_client::sync::SyncSettings::default();
+        settings.values.insert(
+            "colour_mode".to_owned(),
+            SettingValue::Text(mode.to_owned()),
+        );
+        self.client
+            .store()
+            .put_object(&SyncObject {
+                object_id: self.object_id,
+                revision: fresh_revision().expect("a revision"),
+                device_id: self.device,
+                updated_at_ms: TimestampMs::new(now_ms()),
+                body: SyncBody::Settings(settings),
+            })
+            .expect("the object is kept");
+        self.client
+            .publish(self.object_id, TimestampMs::new(now_ms()))
+            .await
+            .expect("a publication")
+    }
+}
+
+fn colour_of(object: &SyncObject) -> String {
+    match &object.body {
+        SyncBody::Settings(settings) => match settings.values.get("colour_mode") {
+            Some(SettingValue::Text(word)) => word.clone(),
+            other => panic!("no colour mode: {other:?}"),
+        },
+        other => panic!("not settings: {other:?}"),
+    }
+}
+
+/// How many requests reached the sync route.
+fn sync_requests(computer: &Computer) -> usize {
+    computer.served.web().requests_to(SYNC_PATH)
+}
+
+/* -------------------------------------------------------------------------- */
+/* The colour mode, on this computer                                           */
+/* -------------------------------------------------------------------------- */
+
+/// The mode a person chose is on this computer's disk before the page is told, is the mode the
+/// window is opened in after a restart, and goes nowhere: settings sync is off until it is turned
+/// on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_colour_mode_is_kept_here_and_the_window_is_opened_in_it_and_nothing_is_sent() {
+    let computer = Computer::new().await;
+    let page = computer.start();
+
+    let view = page.view();
+    assert_eq!(view["colour_mode"], "system");
+    assert_eq!(view["sync"]["state"], "off");
+
+    assert_eq!(page.choose("dark")["colour_mode"], "dark");
+    // A word outside the three is not a mode, and the choice stands.
+    page.call("settings_colour_mode_set", json!({ "mode": "sepia" }))
+        .expect_err("that is not a colour mode");
+    assert_eq!(page.view()["colour_mode"], "dark");
+    assert_eq!(
+        sync_requests(&computer),
+        0,
+        "nothing is sent while settings sync is off"
+    );
+
+    // The file is the one source: a restart opens the window in the mode, as data in its document.
+    drop(page);
+    let again = computer.start();
+    assert_eq!(again.view()["colour_mode"], "dark");
+    let script = again
+        .app
+        .state::<AppState>()
+        .settings()
+        .expect("settings")
+        .local()
+        .initial_script();
+    assert!(script.contains(r#"{"colour_mode":"dark"}"#), "{script}");
+}
+
+/* -------------------------------------------------------------------------- */
+/* Turning it on                                                               */
+/* -------------------------------------------------------------------------- */
+
+/// Turning sync on starts a collection of this computer's own, claims it with its first key record,
+/// and puts the settings in it sealed: another device with the collection's key reads the mode, and
+/// no request carries an account.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn turning_sync_on_starts_a_collection_and_puts_the_settings_in_it_sealed() {
+    let computer = Computer::new().await;
+    let page = computer.start();
+    page.choose("dark");
+
+    let view = page.turn_on();
+    assert_eq!(view["sync"]["state"], "on");
+    assert_eq!(view["sync"]["outstanding"], 0);
+    assert_eq!(view["sync"]["conflicts"], 0);
+    assert!(view["sync"]["problem"].is_null(), "{view}");
+
+    assert_eq!(computer.elsewhere().colour().await, "dark");
+
+    // Every request is proven by this device's signature alone: no account, no token.
+    let arrived = computer.served.web().arrived();
+    assert!(!arrived.is_empty());
+    for request in &arrived {
+        assert_eq!(request.path, SYNC_PATH);
+        assert!(request.token.is_none(), "an account token was sent");
+        assert!(matches!(
+            request.signed_by,
+            Some((ServiceRequestSigner::Installation, _))
+        ));
+    }
+}
+
+/// A start the service could not take is not lost: the record names the collection, and turning
+/// sync on again goes on with it instead of starting a second one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_start_that_did_not_finish_goes_on_with_the_collection_it_began() {
+    let computer = Computer::new().await;
+    let page = computer.start();
+    page.choose("dark");
+
+    computer.served.web().fail(SYNC_PATH, 1, Moment::Before);
+    let started = page.turn_on();
+    assert_eq!(
+        started["sync"]["state"], "starting",
+        "the claim has not been answered, so the collection is not started"
+    );
+    let record = std::fs::read(computer.data.path().join("settings-sync").join("sync.json"))
+        .expect("the record");
+
+    let view = page.turn_on();
+    assert_eq!(view["sync"]["state"], "on");
+    assert_eq!(
+        std::fs::read(computer.data.path().join("settings-sync").join("sync.json"))
+            .map(|after| {
+                serde_json::from_slice::<Value>(&after).expect("a record")["collection_id"].clone()
+            })
+            .expect("the record"),
+        serde_json::from_slice::<Value>(&record).expect("a record")["collection_id"],
+        "the collection is the one the first start named"
+    );
+    assert_eq!(computer.elsewhere().colour().await, "dark");
+}
+
+/* -------------------------------------------------------------------------- */
+/* Keeping in step                                                             */
+/* -------------------------------------------------------------------------- */
+
+/// A change made here reaches the service, and a change another device made, while this computer
+/// had changed nothing since it last agreed, is followed: the settings file takes it and the page
+/// is told.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_change_here_is_sent_and_a_change_elsewhere_is_followed() {
+    let computer = Computer::new().await;
+    let page = computer.start();
+    page.choose("dark");
+    page.turn_on();
+    let elsewhere = computer.elsewhere();
+    assert_eq!(elsewhere.colour().await, "dark");
+
+    page.choose("light");
+    assert_eq!(elsewhere.colour().await, "light", "a change here is sent");
+
+    assert!(matches!(
+        elsewhere.write("dark").await,
+        Published::Accepted { .. }
+    ));
+    let before = page.heard.lock().expect("the record").len();
+    let view = page.sync_now();
+    assert_eq!(
+        view["colour_mode"], "dark",
+        "a change elsewhere is followed"
+    );
+    assert_eq!(view["sync"]["conflicts"], 0);
+    assert!(
+        page.heard.lock().expect("the record").len() > before,
+        "the page is told the settings changed"
+    );
+
+    // The file holds it: a restart opens in it.
+    drop(page);
+    assert_eq!(computer.start().view()["colour_mode"], "dark");
+}
+
+/// A change made here while another device changed the same setting is kept for the person: the
+/// mode this computer is in stays what the person chose, what the other device wrote is kept
+/// beside it, and neither this step nor any later one picks between them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_change_on_both_sides_is_kept_for_the_person_and_nothing_picks_between_them() {
+    let computer = Computer::new().await;
+    let page = computer.start();
+    page.choose("dark");
+    page.turn_on();
+    let elsewhere = computer.elsewhere();
+
+    assert!(matches!(
+        elsewhere.write("light").await,
+        Published::Accepted { .. }
+    ));
+    // This computer has not heard of it: its own change is a write against the old place.
+    let view = page.choose("system");
+    assert_eq!(
+        view["colour_mode"], "system",
+        "the person's own choice stands"
+    );
+    assert_eq!(view["sync"]["conflicts"], 1);
+
+    // Later steps leave both where they are.
+    for _ in 0..2 {
+        let view = page.sync_now();
+        assert_eq!(view["colour_mode"], "system");
+        assert_eq!(view["sync"]["conflicts"], 1);
+    }
+    assert_eq!(
+        elsewhere.colour().await,
+        "light",
+        "the service still holds what the other device wrote"
+    );
+}
+
+/// A service that cannot be reached does not undo the person's choice: it is kept, the page is told
+/// what the step could not do, and the next step that reaches the service sends it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_service_that_cannot_be_reached_does_not_undo_the_choice() {
+    let computer = Computer::new().await;
+    let page = computer.start();
+    page.choose("dark");
+    page.turn_on();
+    let elsewhere = computer.elsewhere();
+
+    computer.served.web().fail(SYNC_PATH, 1, Moment::Before);
+    let view = page.choose("light");
+    assert_eq!(view["colour_mode"], "light");
+    assert!(view["sync"]["problem"].is_string(), "{view}");
+    assert_eq!(elsewhere.colour().await, "dark");
+
+    let view = page.sync_now();
+    assert_eq!(view["colour_mode"], "light");
+    assert!(view["sync"]["problem"].is_null(), "{view}");
+    assert_eq!(elsewhere.colour().await, "light");
+}

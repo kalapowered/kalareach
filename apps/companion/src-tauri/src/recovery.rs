@@ -160,7 +160,14 @@ impl Record {
 }
 
 /// A device's key, signing a service request as an installation.
-struct DeviceSigner(AuthorisationKeyPair);
+pub(crate) struct DeviceSigner(AuthorisationKeyPair);
+
+impl DeviceSigner {
+    /// A signer for the service that signs with `key` as an installation.
+    pub(crate) const fn new(key: AuthorisationKeyPair) -> Self {
+        Self(key)
+    }
+}
 
 impl std::fmt::Debug for DeviceSigner {
     /// The public key, which is what names this device to a service. Never the private half.
@@ -672,7 +679,7 @@ fn write_private(path: &Path, body: &[u8]) -> std::io::Result<()> {
 }
 
 /// The time on this machine's clock, in UTC milliseconds.
-fn now() -> TimestampMs {
+pub(crate) fn now() -> TimestampMs {
     TimestampMs::new(
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
