@@ -119,6 +119,11 @@ for (const surface of ['ios', 'android'] as const) {
         expect(await overrunning(page, '[data-testid="offers"]')).toEqual([])
         expect(await unreachable(page, '[data-testid="offers"]')).toEqual([])
 
+        // The tab for this screen counts the two invitations, inside the bar and clear of its label.
+        await expect(page.locator('.m-tab-badge')).toHaveText('2')
+        await expect(page.getByRole('button', { name: /^Attention\s*, 2 waiting for you$/ })).toBeVisible()
+        expect(await overrunning(page, '.m-tabbar')).toEqual([])
+
         // The control: with the text kept from wrapping the same measure sees the rows run out.
         await page.screenshot({ path: shot(`offers-${surface}-${size.name}`) })
         await stopWrapping(page, ['[data-testid="offers"]'])
@@ -165,7 +170,7 @@ for (const surface of ['ios', 'android'] as const) {
           })
         })
         // Accept both, then the host stops listing one.
-        await page.getByRole('button', { name: 'Attention', exact: true }).click()
+        await page.getByRole('button', { name: /^Attention\b/ }).click()
         for (const session of ['3', '4']) {
           await page.getByRole('button', { name: new RegExp(`shared session ${session} with you`) }).click()
           await page.getByTestId('accept-offer').click()

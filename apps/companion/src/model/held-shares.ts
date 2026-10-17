@@ -116,6 +116,11 @@ function hostKeyOf(reach: Reach): string {
   return reach.paired && reach.environmentId !== null ? `host:${reach.environmentId}` : 'none'
 }
 
+/** The invitations that wait for the phone to answer: those offered and not put off. */
+export function waitingOffers(view: HeldView): readonly ShareOffer[] {
+  return view.offers.filter((offer) => !view.hidden.includes(offer.invitation_id))
+}
+
 /** Newest first, and the invitation's identity when two were issued in one moment. */
 function newestFirst(a: ShareOffer, b: ShareOffer): number {
   const by = Number(b.issued_at_ms) - Number(a.issued_at_ms)

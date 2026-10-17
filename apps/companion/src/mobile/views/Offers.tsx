@@ -26,6 +26,7 @@ import { Button, CommitButton, Sheet } from '../../components/ui'
 import { useApp } from '../../app/state'
 import { prefersReducedMotion } from '../../motion'
 import { type AttemptView } from '../../host/port'
+import { waitingOffers } from '../../model/held-shares'
 import { deskOf } from '../../model/sharing-desk'
 import {
   STALE_WORDS,
@@ -160,7 +161,7 @@ export function Offers({ surface }: { readonly surface: Surface }): ReactNode {
   }, [])
 
   const shown = view.status === 'ready'
-  const offers = view.offers.filter((offer) => !view.hidden.includes(offer.invitation_id))
+  const offers = waitingOffers(view)
   const attempts = view.attempts.filter((attempt) => !attempt.hidden && !isDone(attempt))
   const putOff = view.attempts.filter((attempt) => attempt.hidden && attempt.phase !== 'closed')
   const host = view.hostName
@@ -432,8 +433,8 @@ export function Offers({ surface }: { readonly surface: Surface }): ReactNode {
       <Sheet
         open={opened !== null}
         title={opened === null ? '' : offerTitle(host, opened)}
-        onClose={() => {
         closeLabel="Close invitation"
+        onClose={() => {
           setOpen(null)
         }}
         footer={

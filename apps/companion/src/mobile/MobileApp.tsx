@@ -37,7 +37,7 @@ import { VoiceRoute } from '../voice/VoiceRoute'
 import { useRebind } from '../app/drafts'
 import { KeptDrafts } from '../views/KeptDrafts'
 import type { Channel } from '../model/account'
-import { useReachedHost } from './model/held'
+import { useReachedHost, useWaitingInvitations } from './model/held'
 import { useKeyboardInset, useLifecycle } from './useLifecycle'
 import { detectSurface, type Surface } from './platform'
 import './mobile.css'
@@ -180,14 +180,18 @@ export function MobileApp({
     [port, rememberRights]
   )
 
+  // What waits for the person on Attention is what the host has raised and the invitations the
+  // phone is offered, which the inbox shows above it.
+  const invitations = useWaitingInvitations()
+  const waiting = actionable + invitations
   const destinations = useMemo<readonly Destination[]>(
     () => [
-      { id: 'attention', label: 'Attention', glyph: <AttentionGlyph />, badge: actionable },
+      { id: 'attention', label: 'Attention', glyph: <AttentionGlyph />, badge: waiting },
       { id: 'sessions', label: 'Sessions', glyph: <SessionsGlyph /> },
       { id: 'hosts', label: 'Hosts', glyph: <HostsGlyph /> },
       { id: 'account', label: 'Account', glyph: <AccountGlyph /> }
     ],
-    [actionable]
+    [waiting]
   )
 
   const openSession = useCallback((sessionId: string, grantId?: string | null) => {

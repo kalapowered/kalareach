@@ -720,3 +720,73 @@ describe('an invitation that arrives while the inbox is open (KR-REQ-18.13)', ()
     expect(screen.getByTestId('offers-said').textContent).toBe(said)
   })
 })
+
+describe('the Attention tab counts the invitations that wait for the phone (KR-REQ-18.13)', () => {
+  const attention = (): Promise<HTMLElement> => screen.findByRole('button', { name: /^Attention/ })
+
+  it('counts each invitation the phone is offered, and says so to a screen reader', async () => {
+    start({
+      before: (c) => {
+        c.sharing.offer()
+        c.sharing.offer({ session: '4' })
+      }
+    })
+    const tab = await attention()
+    await waitFor(() => {
+      expect(within(tab).getByText('2')).toBeInTheDocument()
+    })
+    expect(tab.textContent).toContain('2 waiting for you')
+  })
+
+  it('adds them to what the phone’s host asks of the person', async () => {
+    // Two decisions and one failure are what the host's inbox holds for someone who may see sessions.
+    start({ rights: ['session.view'], before: (c) => c.sharing.offer() })
+    const tab = await attention()
+    await waitFor(() => {
+      expect(tab.textContent).toContain('4 waiting for you')
+    })
+  })
+
+  it('does not count an invitation that was put off, and counts it again when it is shown', async () => {
+    start({ before: (c) => c.sharing.offer() })
+    const tab = await attention()
+    await waitFor(() => {
+      expect(tab.textContent).toContain('1 waiting for you')
+    })
+    await userEvent.click(await screen.findByRole('button', { name: new RegExp(INVITATION) }))
+    await userEvent.click(await screen.findByTestId('not-now'))
+    await screen.findByTestId('hidden-offers')
+    expect(tab.textContent).not.toContain('waiting for you')
+
+    await userEvent.click(screen.getByTestId('hidden-offers'))
+    await waitFor(() => {
+      expect(tab.textContent).toContain('1 waiting for you')
+    })
+  })
+
+  it('stops counting an invitation as soon as the host has accepted it', async () => {
+    start({ before: (c) => c.sharing.offer() })
+    const tab = await attention()
+    await waitFor(() => {
+      expect(tab.textContent).toContain('1 waiting for you')
+    })
+    await userEvent.click(await screen.findByRole('button', { name: new RegExp(INVITATION) }))
+    await userEvent.click(await screen.findByTestId('accept-offer'))
+    await screen.findByText(/^Accepted\./)
+    expect(tab.textContent).not.toContain('waiting for you')
+  })
+
+  it('follows an invitation that arrives while the person is on the sessions', async () => {
+    const { controls, port } = start()
+    const tab = await attention()
+    await openTab('Sessions')
+    await screen.findByText('Nothing is shared with this phone.')
+    expect(tab.textContent).not.toContain('waiting for you')
+
+    controls.sharing.offer({ session: '4' })
+    await readAgain(port)
+    await waitFor(() => {
+      expect(tab.textContent).toContain('1 waiting for you')
+    })
+  })
+})
