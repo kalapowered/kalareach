@@ -130,6 +130,37 @@ impl Feed {
         .expect("a signed revocation request")
     }
 
+    /// Publishes `request` through `client`, and returns the feed as the service answered.
+    ///
+    /// The service answers a change `OUTCOME_UNKNOWN` when the feed's own object did not answer
+    /// in time, which it does for an object nobody has asked yet, such as the feed each leg makes
+    /// for itself. That answer says it is not known whether the change took effect, and to read
+    /// the feed before sending it again, so that is what this does: a request the host's feed holds
+    /// was stored and is not sent again, and one it does not hold is sent once more, which the
+    /// service answers as a repeat if the first had landed in between. A second answer that
+    /// nothing settles is the deployment failing, and the leg fails with it.
+    async fn publish_settled(
+        &self,
+        client: &AuthorityFeedClient,
+        request: &RevocationRequest,
+        announce: Option<&FeedAnnouncement>,
+    ) -> kr_client::Result<kr_client::services::AuthorityFeedState> {
+        match client.publish(self.address(), request, announce).await {
+            Err(unknown) if unknown.code() == ErrorCode::OutcomeUnknown => {
+                eprintln!(
+                    "the publication was answered as unknown, so the feed is read: {unknown}"
+                );
+                let held = self.host_client.read(self.address(), None, false).await?;
+                if held.record(request.request_id).is_some() {
+                    Ok(held)
+                } else {
+                    client.publish(self.address(), request, announce).await
+                }
+            }
+            answered => answered,
+        }
+    }
+
     /// The host's next revision, applying `applied`.
     fn revision(
         &self,
@@ -317,8 +348,7 @@ async fn kr_req_10_46_a_published_request_is_retained_until_every_host_has_finis
         let published = feed.revocation();
 
         let state = feed
-            .owner_client
-            .publish(feed.address(), &published, None)
+            .publish_settled(&feed.owner_client, &published, None)
             .await
             .expect("the feed stored the owner's request");
         assert_eq!(state.summary.outstanding.get(), 1);
@@ -446,18 +476,19 @@ async fn kr_req_10_46_a_request_from_a_key_this_host_holds_no_owner_record_for_i
         // the key its request names. What it does not hold is owner authority on this host.
         let stranger = RunKey::installation();
         let published = feed.revocation_from(&stranger);
-        feed.deployment
-            .authority_feed(&stranger)
-            .publish(feed.address(), &published, None)
-            .await
-            .expect("the service stores what the key that signed it published");
+        feed.publish_settled(
+            &feed.deployment.authority_feed(&stranger),
+            &published,
+            None,
+        )
+        .await
+        .expect("the service stores what the key that signed it published");
 
         // And one from the owner this host does hold a record for, published to the same feed, so
         // that both go through the host's one path and the difference between them is the
         // validation and nothing else.
         let authorised = feed.revocation();
-        feed.owner_client
-            .publish(feed.address(), &authorised, None)
+        feed.publish_settled(&feed.owner_client, &authorised, None)
             .await
             .expect("the feed stored the owner's request");
 
@@ -551,8 +582,7 @@ async fn kr_req_10_46_a_request_from_a_key_this_host_holds_no_owner_record_for_i
 async fn kr_req_10_46_an_acknowledgement_outside_the_revision_that_applied_it_is_refused() {
     leg(|feed| async move {
         let published = feed.revocation();
-        feed.owner_client
-            .publish(feed.address(), &published, None)
+        feed.publish_settled(&feed.owner_client, &published, None)
             .await
             .expect("the feed stored the owner's request");
 
@@ -816,8 +846,7 @@ async fn kr_req_10_46_a_synchronisation_is_owed_from_the_connection_until_one_ha
 async fn kr_req_10_46_an_unreachable_feed_is_stale_and_still_shows_the_last_acknowledgement() {
     leg(|feed| async move {
         let published = feed.revocation();
-        feed.owner_client
-            .publish(feed.address(), &published, None)
+        feed.publish_settled(&feed.owner_client, &published, None)
             .await
             .expect("the feed stored the owner's request");
 
@@ -902,8 +931,7 @@ async fn kr_req_10_46_an_announcement_is_only_an_announcement() {
         let announcement = feed.announcement(SAID, now_ms());
 
         let state = feed
-            .owner_client
-            .publish(feed.address(), &published, Some(&announcement))
+            .publish_settled(&feed.owner_client, &published, Some(&announcement))
             .await
             .expect("the feed stored the owner's request");
         assert_eq!(
