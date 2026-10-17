@@ -14,9 +14,8 @@
  * What the host lists, and no refusal, decides whether the invitation was accepted.
  *
  * Reads happen while the inbox is shown. A new invitation arrives without moving what the person
- * is looking at: when they have scrolled, the part of the inbox above their place grows by exactly
- * the height of the new row and the scroll position moves by the same, and a pill says that
- * something arrived above.
+ * is looking at: the inbox keeps the first row in view where it is (`useKeepPlace`), and when the
+ * person has scrolled a pill says that something arrived above.
  */
 
 import { useEffect, useRef, useState, type ReactNode } from 'react'
@@ -55,45 +54,47 @@ const SCROLLED = 8
 const SHEET = '[data-testid="sheet"]'
 
 /**
- * Keeps what is below the head of the inbox where it is while the head changes height.
+ * Puts the focus somewhere that is still there once a sheet has left, when the sheet's own return
+ * of it found nothing: the row that opened it can be gone by then (an accepted invitation, one put
+ * off). Focus that is on something in the page is left where it is, and the person's own press or
+ * key takes the matter over, so this never moves focus the person has moved.
  *
- * The head is a box that is always there, empty or not. When its height changes and the person has
- * scrolled, the scroll position moves by the same amount, in the same frame as the layout, so the
- * rows under their finger do not move. At the top nothing moves: the head grows downward from
- * where the person is looking.
+ * The function this returns is called when the sheet is closed. Whatever it waits for is let go when
+ * the screen goes.
  */
-function useStillBelow(head: React.RefObject<HTMLElement | null>): void {
-  useEffect(() => {
-    const element = head.current
-    if (element === null || typeof ResizeObserver === 'undefined') return
-    const scroller = element.closest<HTMLElement>('.m-main')
-    if (scroller === null) return
-    let height = element.getBoundingClientRect().height
-    const watching = new ResizeObserver(() => {
-      const next = element.getBoundingClientRect().height
-      const by = next - height
-      height = next
-      if (by !== 0 && scroller.scrollTop > SCROLLED) scroller.scrollTop += by
-    })
-    watching.observe(element)
-    return () => {
-      watching.disconnect()
+function useFocusAfterSheet(find: () => HTMLElement | null): () => void {
+  const stop = useRef<() => void>(() => undefined)
+  useEffect(
+    () => () => {
+      stop.current()
+    },
+    []
+  )
+  return () => {
+    stop.current()
+    const settle = (): boolean => {
+      if (document.querySelector(SHEET) !== null) return false
+      const active = document.activeElement
+      if (active === null || active === document.body || !active.isConnected) find()?.focus()
+      return true
     }
-  }, [head])
-}
-
-/** Moves focus to what `find` returns once the sheet that was open has left, wherever it left from. */
-function focusWhenSheetIsGone(find: () => HTMLElement | null): void {
-  const attempt = (): boolean => {
-    if (document.querySelector(SHEET) !== null) return false
-    find()?.focus()
-    return true
+    if (settle()) return
+    const observer = new MutationObserver(() => {
+      if (settle()) stop.current()
+    })
+    observer.observe(document.body, { childList: true, subtree: true })
+    const taken = () => {
+      stop.current()
+    }
+    window.addEventListener('pointerdown', taken, true)
+    window.addEventListener('keydown', taken, true)
+    stop.current = () => {
+      observer.disconnect()
+      window.removeEventListener('pointerdown', taken, true)
+      window.removeEventListener('keydown', taken, true)
+      stop.current = () => undefined
+    }
   }
-  if (attempt()) return
-  const watching = new MutationObserver(() => {
-    if (attempt()) watching.disconnect()
-  })
-  watching.observe(document.body, { childList: true, subtree: true })
 }
 
 /** The invitations, and the acceptances not seen to the end. */
@@ -107,7 +108,6 @@ export function Offers({ surface }: { readonly surface: Surface }): ReactNode {
   const [accepting, setAccepting] = useState<string | null>(null)
   const [unseen, setUnseen] = useState(0)
   const [said, setSaid] = useState('')
-  useStillBelow(head)
 
   // A new invitation is told once, when it arrives: to a screen reader at once, and to the eye as a
   // pill when the person has scrolled past the head. The callback is the book telling this screen.
@@ -174,25 +174,35 @@ export function Offers({ surface }: { readonly surface: Surface }): ReactNode {
     }
   }, [view, desk, port, book, say])
 
+  const afterSheet = useFocusAfterSheet(
+    () =>
+      head.current?.querySelector<HTMLElement>('[data-offer]') ??
+      head.current?.querySelector<HTMLElement>('[data-attempt]') ??
+      document.getElementById('main')
+  )
+
   const accept = (offer: ShareOffer) => {
     setAccepting(offer.invitation_id)
     ask(() => port.grantRedeem({ invitation_id: offer.invitation_id }))
-      .then((done) => {
-        setOpen(null)
+      .then(async (done) => {
         if (done.attempt.phase === 'closed' && done.attempt.outcome === 'happened') {
           if (desk.firstTime(done.attempt.action_id)) say(acceptedWords(offer, Date.now()))
         } else {
           // The host's answer was lost or did not settle it. The row for the acceptance says where
           // it stands, in the host's words, and what the host lists decides how it ended.
+          book.keep(done.attempt)
           say(`Waiting to hear from the host about ${sessionWords(offer.display_number)}.`, 'pending')
         }
-        // The invitation leaves the list when the host's next answer says so, so focus does not wait
-        // on a row that is about to go: it goes to the screen's own region.
-        focusWhenSheetIsGone(() => document.getElementById('main'))
+        // The card stays until what the host lists is read, so the row it was opened from is gone,
+        // or is still there, when the card leaves, and focus is put back by what is true then.
+        await book.readNow()
+        setOpen(null)
+        afterSheet()
       })
       .catch((failure: unknown) => {
         setOpen(null)
         say(failureText(failure), 'danger')
+        afterSheet()
       })
       .finally(() => {
         setAccepting(null)
@@ -203,7 +213,7 @@ export function Offers({ surface }: { readonly surface: Surface }): ReactNode {
   const notNow = (offer: ShareOffer) => {
     setOpen(null)
     book.putOff(offer.invitation_id)
-    focusWhenSheetIsGone(() => head.current?.querySelector<HTMLElement>('[data-focus-after]') ?? null)
+    afterSheet()
   }
 
   const askHost = (attempt: AttemptView) => {
@@ -274,7 +284,7 @@ export function Offers({ surface }: { readonly surface: Surface }): ReactNode {
         {said}
       </div>
 
-      <div ref={head} className="sw-head" data-testid="offers-head">
+      <div ref={head} data-testid="offers-head">
         {shown && (offers.length > 0 || attempts.length > 0 || view.hidden.length > 0 || putOff.length > 0) ? (
           <section className="sw-group" aria-labelledby="offers-heading" data-testid="offers">
             <h2 className="sw-heading" id="offers-heading">
@@ -440,7 +450,7 @@ export function Offers({ surface }: { readonly surface: Surface }): ReactNode {
             <div>
               <h3>You can</h3>
               <ul>
-                {youCan(opened.actions).map((words) => (
+                {youCan(opened.actions, opened.includes_live_screen).map((words) => (
                   <li key={words}>{words}</li>
                 ))}
               </ul>

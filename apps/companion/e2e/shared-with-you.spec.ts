@@ -294,3 +294,57 @@ test.describe('a new invitation while the inbox is scrolled', () => {
     await expect(page.getByTestId('offers-said')).toHaveText('New invitation. Studio shared session 4 with you.')
   })
 })
+
+test.describe('a share that arrives while the sessions are scrolled', () => {
+  test.beforeEach(async ({ page }) => {
+    await withSystemTextScale(page, LARGEST)
+    await page.setViewportSize({ width: 320, height: 720 })
+  })
+
+  // KR-REQ-18.13: a share the host lists on a read is drawn above the phone's own sessions, and what
+  // the person has scrolled to stays where it is, in both engines.
+  test('keeps the session under the finger where it is when a share is drawn above it', async ({ page }) => {
+    await page.goto('/harness.html?surface=ios&tab=sessions&sessions=30')
+    await expect(page.locator('.m-shell')).toBeVisible()
+    await page.evaluate(() => {
+      window.krTestHost?.reachAsPhone({ rights: ['session.view'] })
+    })
+    const main = page.locator('.m-main')
+    await expect(main.locator('[data-session]').first()).toBeVisible()
+    await main.evaluate((element) => {
+      element.scrollTop = 900
+    })
+    await expect.poll(() => main.evaluate((element) => element.scrollTop)).toBeGreaterThan(800)
+
+    // The first session in view, by its identity, and where it is drawn.
+    const place = (id: string | null) =>
+      page.evaluate((wanted) => {
+        const scroller = document.querySelector('.m-main') as HTMLElement
+        const edge = scroller.getBoundingClientRect().top
+        const rows = Array.from(document.querySelectorAll<HTMLElement>('[data-session]'))
+        const row =
+          wanted === null
+            ? rows.find((each) => each.getBoundingClientRect().bottom > edge + 1)
+            : rows.find((each) => each.dataset.session === wanted)
+        return row === undefined
+          ? null
+          : { id: row.dataset.session ?? '', top: row.getBoundingClientRect().top, scrolled: scroller.scrollTop }
+      }, id)
+    const before = await place(null)
+    expect(before).not.toBeNull()
+
+    await page.evaluate(() => {
+      window.krTestHost?.sharing.hold({ session: '4' })
+    })
+    await readAgain(page)
+    await expect(page.getByTestId('shared-with-you')).toBeAttached()
+    await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))))
+    const after = await place(before?.id ?? null)
+    expect(after, 'the session is still drawn').not.toBeNull()
+    expect(
+      Math.abs((after?.top ?? Number.NaN) - (before?.top ?? Number.NaN)),
+      `the session under the finger kept its place (${JSON.stringify({ before, after })})`
+    ).toBeLessThanOrEqual(1)
+    expect(after?.scrolled ?? 0, 'the scroll position took up the new rows').toBeGreaterThan(before?.scrolled ?? 0)
+  })
+})

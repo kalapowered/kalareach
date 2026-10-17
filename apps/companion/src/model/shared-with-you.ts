@@ -33,22 +33,36 @@ export function sessionWords(displayNumber: string): string {
 
 /** What an invitation is called: the sentence the row and the card both start with. */
 export function offerTitle(host: string | null, offer: ShareOffer): string {
-  return `${hostWords(host)} shared ${sessionWords(offer.display_number)} with you.`
+  return `${sentenceCase(hostWords(host))} shared ${sessionWords(offer.display_number)} with you.`
 }
 
 /**
- * What each action lets the recipient do. Most of the issuer's words already read as an
- * instruction to whoever holds the share; the one about watching is the issuer's own account of
- * when the history begins, which the card states on its own line.
+ * What each action lets the recipient do. Most of the issuer's words already read as an instruction
+ * to whoever holds the share. Watching is not one of them: the issuer's own account is of when the
+ * history begins, which the card states on its own line, and what watching gives depends on whether
+ * the live view is included, since a share without it gives no terminal and no live stream.
  */
-const YOU_CAN: Partial<Readonly<Record<ActionRight, string>>> = {
-  ...ACTION_WORDS,
-  'session.view': 'See what the session shows and does'
+function youCanDo(action: ActionRight, live: boolean): string {
+  if (action === 'session.view') {
+    return live
+      ? 'See what the session shows and does'
+      : 'See what the session’s agent says and asks, but not its terminal'
+  }
+  return ACTION_WORDS[action] ?? action
 }
 
-/** The actions of an invitation, in the recipient's words, each as the card lists it. */
-export function youCan(actions: readonly ActionRight[]): readonly string[] {
-  return actions.map((action) => YOU_CAN[action] ?? action)
+/**
+ * The actions of an invitation, in the recipient's words, each as the card lists it.
+ *
+ * Without the live view the host gives a share no terminal: an action on the terminal is not one
+ * the share can use, so it is not listed as something the recipient can do, and the card says in
+ * one line that the terminal is not included.
+ */
+export function youCan(actions: readonly ActionRight[], live: boolean): readonly string[] {
+  const kept = live ? actions : actions.filter((action) => !action.startsWith('terminal.'))
+  const lines = kept.map((action) => youCanDo(action, live))
+  if (!live && kept.length < actions.length) lines.push('Not the terminal: the live view is not included')
+  return lines
 }
 
 /**
@@ -76,7 +90,13 @@ export function thisLetsYou(host: string | null, notices: readonly AuthorityNoti
  * and, when the host says the live view is included, what that is.
  */
 export function showsLines(offer: ShareOffer, nowMs: number): readonly string[] {
-  const lines = [`What the session does from ${momentWords(Number(offer.history_from_ms), nowMs)}.`]
+  // A share that reaches back to the start of what the host kept has no moment to name.
+  const from = Number(offer.history_from_ms)
+  const lines = [
+    from === 0
+      ? 'Everything the host has kept of the session.'
+      : `What the session does from ${momentWords(from, nowMs)}.`
+  ]
   if (offer.includes_live_screen) lines.push('The terminal as it is when you open it.')
   return lines
 }

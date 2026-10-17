@@ -37,6 +37,7 @@ import { VoiceRoute } from '../voice/VoiceRoute'
 import { useRebind } from '../app/drafts'
 import { KeptDrafts } from '../views/KeptDrafts'
 import type { Channel } from '../model/account'
+import { useReachedHost } from './model/held'
 import { useKeyboardInset, useLifecycle } from './useLifecycle'
 import { detectSurface, type Surface } from './platform'
 import './mobile.css'
@@ -263,13 +264,12 @@ export function MobileApp({
   }, [inVoice, inDrafts])
 
   const held = useMemo(
-    () => ({
-      rights: connection?.rights ?? null,
-      paired: connection?.paired ?? false,
-      environmentId: connection?.environmentId ?? null
-    }),
+    () => ({ rights: connection?.rights ?? null, paired: connection?.paired ?? false }),
     [connection]
   )
+  // The book of what is shared with this phone is told where the connection stands from here, where
+  // it is heard, and not from the screens that draw it, which come and go.
+  useReachedHost(connection)
 
   const shell = (
     <div className="m-shell" data-surface={resolved}>

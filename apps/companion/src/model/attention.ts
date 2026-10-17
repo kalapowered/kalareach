@@ -25,20 +25,6 @@ import { failureCode } from '../host/port'
  */
 export const ATTENTION_READ_CADENCE_MS = 5_000
 
-/**
- * The inbox of a device the host holds no view of any session for: nothing. A guest is refused the
- * read, and the page draws that refusal as an inbox with nothing in it.
- */
-export const NO_INBOX: AttentionReadResult = {
-  dropped: '0',
-  gaps: [],
-  items: [],
-  more: false,
-  quiet_hours: null,
-  quiet_hours_provable: true,
-  quiet_now: false
-}
-
 /** The most pages of the inbox one read follows. Sixteen pages hold every item a host retains. */
 export const MAX_INBOX_PAGES = 16
 

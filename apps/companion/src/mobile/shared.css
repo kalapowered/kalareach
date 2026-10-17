@@ -7,25 +7,6 @@
  * invitation that arrived above the part of the inbox a person has scrolled to.
  */
 
-/*
- * The inbox is one box so that a change at its head can be answered for. A browser that anchors the
- * scroll position to content moves it by itself when something above changes height; one that does
- * not (WebKit) leaves the content to jump. Neither is left to chance here: the head's height is
- * followed and the scroll position moved by exactly what it changed, so the anchoring is turned off
- * and the page does it the same in both.
- */
-.sw-inbox {
-  overflow-anchor: none;
-}
-
-/*
- * The head of the inbox is one box that holds everything the group's margin does, so the height
- * followed for the scroll position is the height that moves what is below it.
- */
-.sw-head {
-  display: flow-root;
-}
-
 .sw-group {
   display: grid;
   /* One column that is never wider than the group: a track sized to its widest unbroken word would run past the screen. */

@@ -17,8 +17,10 @@ import { HeldBook, type HeldView } from '../src/model/held-shares'
 /** A cadence so long that only a read the test asks for is made. */
 const ONLY_WHEN_ASKED = 1_000_000
 
-/** The host the phone is paired with, as the screens name the connection that reaches it. */
-const STUDIO = 'host:studio'
+/** The phone reaches the host it is paired with, as the shell hears of it. */
+const STUDIO = { connected: true, paired: true, environmentId: 'studio' } as const
+const ANOTHER = { connected: true, paired: true, environmentId: 'another' } as const
+const OUT_OF_CONTACT = { connected: false, paired: false, environmentId: null } as const
 
 const detaches: (() => void)[] = []
 afterEach(() => {
@@ -38,7 +40,7 @@ function phone(prepare?: (controls: FakeHostControls) => void): Phone {
   prepare?.(controls)
   const book = new HeldBook(port, ONLY_WHEN_ASKED)
   detaches.push(book.attach())
-  book.connect(STUDIO)
+  book.reach(STUDIO)
   return { book, port, controls }
 }
 
@@ -129,7 +131,7 @@ describe('what the host offers and what the phone holds (KR-REQ-18.13)', () => {
   })
 })
 
-describe('a share that is no longer listed has ended (KR-REQ-18.13, 18.14)', () => {
+describe('a share that is no longer listed has ended (KR-REQ-18.13)', () => {
   async function holding(): Promise<Phone & { grantId: string }> {
     const world = phone()
     const offer = world.controls.sharing.offer()
@@ -177,20 +179,49 @@ describe('a share that is no longer listed has ended (KR-REQ-18.13, 18.14)', () 
   })
 
   it('does not call a share ended that the host lists again', async () => {
-    const { book, port, controls, grantId } = await holding()
+    const { book, controls, grantId } = await holding()
     controls.sharing.endShare(grantId)
     book.refresh()
     await vi.waitFor(() => {
-      expect(book.snapshot().ended).toHaveLength(1)
+      expect(book.snapshot().ended.map((each) => each.grantId)).toEqual([grantId])
     })
-    // The host offers the same grant again and it is accepted: it is held, not ended.
-    const again = controls.sharing.offer({ session: '3' })
-    await port.grantRedeem({ invitation_id: again.invitation_id })
+    // The host lists the very same share again: it is held, and the row that said it ended is gone.
+    controls.sharing.restoreShare(grantId)
     book.refresh()
     await vi.waitFor(() => {
-      expect(book.snapshot().shares).toHaveLength(1)
+      expect(book.snapshot().shares.map((each) => each.grant.grant_id)).toEqual([grantId])
     })
-    expect(book.snapshot().ended.filter((each) => each.grantId === again.grant_id)).toEqual([])
+    expect(book.snapshot().ended).toEqual([])
+  })
+
+  it('keeps what it learned through a loss of contact, and finds a share that ended meanwhile', async () => {
+    const { book, controls, grantId } = await holding()
+    const offer = controls.sharing.offer({ session: '5' })
+    book.refresh()
+    await vi.waitFor(() => {
+      expect(book.snapshot().offers).toHaveLength(1)
+    })
+    book.putOff(offer.invitation_id)
+
+    // Contact is lost: nothing is forgotten, and the lists say they are not fresh.
+    book.reach(OUT_OF_CONTACT)
+    expect(book.snapshot()).toMatchObject({ status: 'ready', stale: true })
+    expect(book.snapshot().shares).toHaveLength(1)
+    expect(book.snapshot().hidden).toEqual([offer.invitation_id])
+    const reads = controls.sharing.heldReads()
+    book.refresh()
+    await settled()
+    expect(controls.sharing.heldReads(), 'nothing is asked of a host that is out of contact').toBe(reads)
+
+    // The share ends while the phone is out of contact, and contact comes back to the same host.
+    controls.sharing.endShare(grantId)
+    book.reach(STUDIO)
+    await vi.waitFor(() => {
+      expect(book.snapshot().ended.map((each) => each.grantId)).toEqual([grantId])
+    })
+    expect(book.snapshot().stale).toBe(false)
+    // What the person put off stays put off.
+    expect(book.snapshot().hidden).toEqual([offer.invitation_id])
   })
 
   it('leaves what was learned under one host out of the next', async () => {
@@ -207,7 +238,7 @@ describe('a share that is no longer listed has ended (KR-REQ-18.13, 18.14)', () 
     })
     book.putOff(offer.invitation_id)
 
-    book.connect('host:another')
+    book.reach(ANOTHER)
     expect(book.snapshot()).toMatchObject({ status: 'unread', ended: [], hidden: [], offers: [] })
     await vi.waitFor(() => {
       expect(book.snapshot().status).toBe('ready')
@@ -234,17 +265,85 @@ describe('a host that does not serve the read (KR-REQ-18.13)', () => {
     expect(book.snapshot()).toMatchObject({ offers: [], shares: [], ended: [] })
   })
 
-  it('is asked again under another connection', async () => {
+  it('is asked again under another connection, to the same host or to another', async () => {
     const { book, controls } = phone((prepared) => {
       prepared.sharing.doesNotServeHeld()
     })
     await vi.waitFor(() => {
       expect(book.snapshot().status).toBe('unsupported')
     })
-    book.connect('host:another')
+    expect(controls.sharing.heldReads()).toBe(1)
+
+    // The same host, reached again: it can have been updated since.
+    book.reach(OUT_OF_CONTACT)
+    book.reach(STUDIO)
     await vi.waitFor(() => {
       expect(controls.sharing.heldReads()).toBe(2)
     })
+
+    book.reach(ANOTHER)
+    await vi.waitFor(() => {
+      expect(controls.sharing.heldReads()).toBe(3)
+    })
+  })
+
+  it('is told of a connection while no screen is shown, so the next screen finds the host it is', async () => {
+    const { port, controls } = fakeHost()
+    controls.reachAsPhone()
+    const book = new HeldBook(port, ONLY_WHEN_ASKED)
+    book.reach(STUDIO)
+    controls.sharing.offer()
+    expect(controls.sharing.heldReads()).toBe(0)
+    detaches.push(book.attach())
+    await vi.waitFor(() => {
+      expect(ready(book).offers).toHaveLength(1)
+    })
+  })
+})
+
+describe('reads that overlap (KR-REQ-18.13)', () => {
+  it('takes in only the newest read: an older answer that comes after it changes nothing', async () => {
+    const { port, controls } = fakeHost()
+    controls.reachAsPhone()
+    const offer = controls.sharing.offer()
+    // Each read of the list waits for the test to let its answer go, and answers what the host held
+    // when it was asked.
+    const answers: (() => void)[] = []
+    const slow: HostPort = {
+      ...port,
+      grantHeld: async () => {
+        const held = await port.grantHeld()
+        await new Promise<void>((resolve) => {
+          answers.push(resolve)
+        })
+        return held
+      }
+    }
+    const book = new HeldBook(slow, ONLY_WHEN_ASKED)
+    book.reach(STUDIO)
+    // A screen reads and is left while the read is on its way: the host offered the invitation then
+    // and held no share.
+    const first = book.attach()
+    await vi.waitFor(() => {
+      expect(answers).toHaveLength(1)
+    })
+    first()
+    // The invitation is accepted, and another screen reads: the host lists the share.
+    await port.grantRedeem({ invitation_id: offer.invitation_id })
+    detaches.push(book.attach())
+    await vi.waitFor(() => {
+      expect(answers).toHaveLength(2)
+    })
+    answers[1]?.()
+    await vi.waitFor(() => {
+      expect(ready(book).shares.map((each) => each.grant.grant_id)).toEqual([offer.grant_id])
+    })
+    // The first read answers last, with the list from before the share: it is not taken in, so the
+    // share is neither dropped from what is held nor called ended.
+    answers[0]?.()
+    await settled()
+    expect(book.snapshot().shares.map((each) => each.grant.grant_id)).toEqual([offer.grant_id])
+    expect(book.snapshot().ended).toEqual([])
   })
 })
 
@@ -256,7 +355,7 @@ describe('when the list is read (KR-REQ-18.13)', () => {
       controls.reachAsPhone()
       const book = new HeldBook(port)
       const detach = book.attach()
-      book.connect(STUDIO)
+      book.reach(STUDIO)
       await vi.advanceTimersByTimeAsync(0)
       expect(controls.sharing.heldReads()).toBe(1)
 
@@ -288,7 +387,7 @@ describe('when the list is read (KR-REQ-18.13)', () => {
     })
 
     // Another host is the one reached.
-    book.connect('host:another')
+    book.reach(ANOTHER)
     await vi.waitFor(() => {
       expect(controls.sharing.heldReads()).toBe(3)
     })

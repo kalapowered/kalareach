@@ -24,6 +24,7 @@ import { MobileApp } from '../../src/mobile/MobileApp'
 
 afterEach(() => {
   cleanup()
+  window.history.replaceState({}, '', '/')
 })
 
 interface Phone {
@@ -91,6 +92,26 @@ describe('an invitation at the head of the inbox (KR-REQ-18.13)', () => {
     expect(within(ends).getByText(/\. Used once\.$/)).toBeInTheDocument()
   })
 
+  it('says a share without the live view gives no terminal, whatever the role could do with one', async () => {
+    start({ before: (c) => c.sharing.offer({ role: 'controller', live: false }) })
+    await userEvent.click(await screen.findByRole('button', { name: new RegExp(INVITATION) }))
+    const card = await screen.findByTestId('offer-card')
+    const youCan = within(card).getByRole('heading', { name: 'You can' }).parentElement as HTMLElement
+    expect(within(youCan).queryByText('Type into the terminal')).toBeNull()
+    expect(within(youCan).queryByText('Resize the terminal')).toBeNull()
+    expect(within(youCan).getByText('Not the terminal: the live view is not included')).toBeInTheDocument()
+    expect(within(youCan).getByText('Send the agent prompts')).toBeInTheDocument()
+    expect(within(card).queryByText('The terminal as it is when you open it.')).toBeNull()
+  })
+
+  it('names no moment for a share that reaches back to the start of what the host kept', async () => {
+    start({ before: (c) => c.sharing.offer({ allHistory: true }) })
+    await userEvent.click(await screen.findByRole('button', { name: new RegExp(INVITATION) }))
+    const card = await screen.findByTestId('offer-card')
+    expect(within(card).getByText('Everything the host has kept of the session.')).toBeInTheDocument()
+    expect(within(card).queryByText(/^What the session does from /)).toBeNull()
+  })
+
   it('shows no consequences and no live screen for a viewer share that includes neither', async () => {
     start({ before: (c) => c.sharing.offer() })
     await userEvent.click(await screen.findByRole('button', { name: new RegExp(INVITATION) }))
@@ -108,6 +129,36 @@ describe('an invitation at the head of the inbox (KR-REQ-18.13)', () => {
     expect(controls.sharing.sent().redeem).toBe(1)
     await waitFor(() => {
       expect(screen.queryByTestId('offers')).toBeNull()
+    })
+  })
+
+  it('puts focus on what is still there once the card has gone: the next invitation, or the screen', async () => {
+    start({
+      before: (c) => {
+        c.sharing.offer({ session: '3' })
+        c.sharing.offer({ session: '4' })
+      }
+    })
+    // The newest is first: session 4. Accepting it leaves session 3, and focus goes to that row.
+    await userEvent.click(await screen.findByRole('button', { name: /shared session 4 with you/ }))
+    await userEvent.click(await screen.findByTestId('accept-offer'))
+    await waitFor(() => {
+      expect(screen.queryByTestId('sheet')).toBeNull()
+    })
+    await waitFor(() => {
+      expect(document.activeElement).toBe(
+        screen.getByRole('button', { name: /shared session 3 with you/ })
+      )
+    })
+
+    // Putting the last one off leaves no row, and focus goes to the screen's own region.
+    await userEvent.click(screen.getByRole('button', { name: /shared session 3 with you/ }))
+    await userEvent.click(await screen.findByTestId('not-now'))
+    await waitFor(() => {
+      expect(screen.queryByTestId('sheet')).toBeNull()
+    })
+    await waitFor(() => {
+      expect(document.activeElement?.id).toBe('main')
     })
   })
 
@@ -204,6 +255,26 @@ describe('an invitation at the head of the inbox (KR-REQ-18.13)', () => {
 
     // The host never saw it, so it still offers the invitation, and the card says why it waits.
     await userEvent.click((await screen.findByText(INVITATION)).closest('button') as HTMLElement)
+    expect(await screen.findByTestId('accept-offer')).toBeDisabled()
+    expect(screen.getByTestId('offer-unsettled')).toBeInTheDocument()
+    expect(controls.sharing.sent().redeem).toBe(1)
+  })
+
+  it('holds a second acceptance back even when the read after the first could not be made', async () => {
+    const { controls } = start({ before: (c) => c.sharing.offer() })
+    const row = await screen.findByRole('button', { name: new RegExp(INVITATION) })
+    // From here the answer to the acceptance is lost, and so are the next reads of what is held.
+    controls.sharing.loseNextAnswer()
+    controls.sharing.failNextHeld('the connection to the host was lost', 3)
+    await userEvent.click(row)
+    await userEvent.click(await screen.findByTestId('accept-offer'))
+    await waitFor(() => {
+      expect(screen.queryByTestId('sheet')).toBeNull()
+    })
+
+    // The list could not be read after the acceptance, so the invitation is still listed as it was;
+    // what the page was told of the acceptance is what keeps a second one from being sent.
+    await userEvent.click(screen.getByRole('button', { name: new RegExp(INVITATION) }))
     expect(await screen.findByTestId('accept-offer')).toBeDisabled()
     expect(screen.getByTestId('offer-unsettled')).toBeInTheDocument()
     expect(controls.sharing.sent().redeem).toBe(1)
@@ -306,12 +377,73 @@ describe('a guest, whose pairing holds no view of any session (KR-REQ-25.28)', (
   })
 
   it('lists its own sessions and the shared ones apart when its pairing holds a view', async () => {
-    const { controls } = start({ rights: ['session.view'] })
-    controls.sharing.offer()
+    start({ rights: ['session.view'], before: (c) => c.sharing.offer({ session: '3' }) })
+    await userEvent.click(await screen.findByRole('button', { name: new RegExp(INVITATION) }))
+    await userEvent.click(await screen.findByTestId('accept-offer'))
+    await screen.findByText(/^Accepted\./)
     await openTab('Sessions')
-    expect(await screen.findByText('Session 1')).toBeInTheDocument()
-    expect(screen.queryByTestId('shared-with-you')).toBeNull()
+
+    const shared = await screen.findByTestId('shared-with-you')
+    expect(within(shared).getByText('Session 3 · Studio')).toBeInTheDocument()
+    expect(await screen.findByRole('heading', { name: 'On this host' })).toBeInTheDocument()
+    expect(screen.getByText('Session 1')).toBeInTheDocument()
     expect(screen.queryByText('Nothing is shared with this phone.')).toBeNull()
+  })
+
+  it('says that what is shared could not be read, when it never could, and not that it is being read', async () => {
+    // The phone opens on its sessions, so the first read of what is shared is the one that fails.
+    window.history.replaceState({}, '', '/?tab=sessions')
+    const { controls } = start({ before: (c) => c.sharing.failNextHeld('the host could not be reached') })
+    expect(
+      await screen.findByText('What is shared with this phone could not be read just now.')
+    ).toBeInTheDocument()
+    expect(screen.queryByText('Reading what is shared with this phone…')).toBeNull()
+    expect(controls.sharing.heldReads()).toBeGreaterThanOrEqual(1)
+  })
+
+  it('shows a failure that follows a refusal as the failure it is, not as nothing of its own', async () => {
+    const { controls } = start()
+    await openTab('Sessions')
+    expect(await screen.findByText('Nothing is shared with this phone.')).toBeInTheDocument()
+
+    // Contact comes back after a loss, and the host cannot list its sessions for another reason.
+    controls.failNextSessionList('the host could not list its sessions just now')
+    act(() => {
+      controls.setConnected(false)
+    })
+    act(() => {
+      controls.setConnected(true)
+    })
+    expect(await screen.findByText('The sessions could not be read')).toBeInTheDocument()
+    expect(screen.queryByText('Nothing is shared with this phone.')).toBeNull()
+  })
+})
+
+describe('contact with the host is lost and comes back (KR-REQ-18.13)', () => {
+  it('keeps the shares and the ended row drawn while out of contact, and finds one that ended meanwhile', async () => {
+    const { controls, port } = start({ rights: ['session.view'], before: (c) => c.sharing.offer() })
+    await userEvent.click(await screen.findByRole('button', { name: new RegExp(INVITATION) }))
+    await userEvent.click(await screen.findByTestId('accept-offer'))
+    await screen.findByText(/^Accepted\./)
+    await openTab('Sessions')
+    const shared = await screen.findByTestId('shared-with-you')
+    expect(within(shared).getByRole('button', { name: /Session 3 · Studio/ })).toBeInTheDocument()
+
+    act(() => {
+      controls.setConnected(false)
+    })
+    // Nothing the phone learned goes with the contact, and the list says it is not fresh.
+    expect(await within(shared).findByText(/Not refreshed just now/)).toBeInTheDocument()
+    expect(within(shared).getByRole('button', { name: /Session 3 · Studio/ })).toBeInTheDocument()
+
+    const grantId = controls.sharing.held()[0]?.grant.grant_id ?? ''
+    controls.sharing.endShare(grantId)
+    act(() => {
+      controls.setConnected(true)
+    })
+    await readAgain(port)
+    expect(await screen.findByTestId('ended-share')).toHaveTextContent('Session 3 · Studio')
+    expect(within(await screen.findByTestId('shared-with-you')).queryByText(/Not refreshed just now/)).toBeNull()
   })
 })
 

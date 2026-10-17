@@ -424,10 +424,12 @@ export interface FakeHostControls {
    * the two writes of description setup, which only its own socket may make.
    */
   reachAsPairedDevice(): void
+  /** The next read of the host's sessions fails for a reason that is not a refusal. */
+  failNextSessionList(message: string): void
   /**
    * Reaches the host as a phone paired with it under the name `host`, holding `rights` (none by
-   * default, as a guest does). The host tells what the phone is offered and holds, and refuses the
-   * lists of sessions that a pairing with no view of one is refused.
+   * default, as a guest does). The host tells what the phone is offered and holds, refuses the list
+   * of sessions to a pairing with no view of one, and answers it an inbox with nothing in it.
    */
   reachAsPhone(options?: { readonly rights?: readonly ActionRight[]; readonly host?: string }): void
   /**
@@ -965,7 +967,8 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
   let hostEnvironment: string = ENVIRONMENT
   let anotherHost = false
   let sessionListRefused = false
-  let attentionReadRefused = false
+  let attentionReadEmpty = false
+  let sessionListFailure: string | null = null
   let environmentListRefused = false
   /** Whether the host is one this device is paired with, not the one on its own computer. */
   let pairedDevice = false
@@ -1193,6 +1196,11 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
     sessionList: () =>
       reading('sessionList', () => {
         requireConnection()
+        if (sessionListFailure !== null) {
+          const words = sessionListFailure
+          sessionListFailure = null
+          refuse('UPSTREAM_UNAVAILABLE', words)
+        }
         if (sessionListRefused) {
           refuse('PERMISSION_DENIED', 'This device may not list the sessions of this host.')
         }
@@ -1525,8 +1533,17 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
     attentionRead: (params) =>
       reading('attentionRead', () => {
         requireConnection()
-        if (attentionReadRefused) {
-          refuse('PERMISSION_DENIED', 'This device holds no view of any session of this host.')
+        // A device whose pairing holds no view of a session is answered an inbox with nothing in it.
+        if (attentionReadEmpty) {
+          return {
+            dropped: '0',
+            gaps: [],
+            items: [],
+            more: false,
+            quiet_hours: null,
+            quiet_hours_provable: true,
+            quiet_now: false
+          }
         }
         return records.attentionRead(params)
       }),
@@ -2424,6 +2441,9 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
       pairedDevice = true
       for (const listener of connectionListeners) listener(connectionNow())
     },
+    failNextSessionList(message) {
+      sessionListFailure = message
+    },
     reachAsPhone(options) {
       pairedDevice = true
       rights = options?.rights ?? []
@@ -2443,7 +2463,7 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
       // A device whose pairing holds no view of a session is refused the lists of them outright.
       const mayView = rights.includes('session.view')
       sessionListRefused = !mayView
-      attentionReadRefused = !mayView
+      attentionReadEmpty = !mayView
       sharing.asPhone()
       for (const listener of connectionListeners) listener(connectionNow())
     },

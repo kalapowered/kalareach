@@ -3,14 +3,15 @@
  *
  * The inbox draws the invitations and the sessions list draws the shares, from one read of one
  * book, so the two halves never disagree about the host and a half that is not shown asks for
- * nothing. A screen that draws either one is attached to the book while it is shown.
+ * nothing. A screen that draws either one is attached to the book while it is shown. Which host is
+ * reached, and whether contact with it is up, is the shell's to say (`useReachedHost`), since it
+ * is a fact about the device and not about the screen that happens to be shown.
  */
 
 import { useEffect, useSyncExternalStore } from 'react'
 
-import { useHeldConnection } from '../../app/rights'
 import { useApp } from '../../app/state'
-import { bookOf, hostKeyOf, type HeldBook, type HeldView } from '../../model/held-shares'
+import { bookOf, type HeldBook, type HeldView, type Reach } from '../../model/held-shares'
 
 /** The book of the port the page talks to. */
 export function useHeldBook(): HeldBook {
@@ -20,11 +21,18 @@ export function useHeldBook(): HeldBook {
 /** What is held now, read for as long as the screen that calls this is shown. */
 export function useHeld(): HeldView {
   const book = useHeldBook()
-  const { paired, environmentId } = useHeldConnection()
-  const key = hostKeyOf(paired, environmentId ?? null)
   useEffect(() => book.attach(), [book])
-  useEffect(() => {
-    book.connect(key)
-  }, [book, key])
   return useSyncExternalStore(book.subscribe, book.snapshot)
+}
+
+/** Tells the book where the connection stands, each time the shell hears of a change. */
+export function useReachedHost(reach: Reach | null): void {
+  const book = useHeldBook()
+  const connected = reach?.connected
+  const paired = reach?.paired
+  const environmentId = reach?.environmentId
+  useEffect(() => {
+    if (connected === undefined || paired === undefined || environmentId === undefined) return
+    book.reach({ connected, paired, environmentId })
+  }, [book, connected, paired, environmentId])
 }

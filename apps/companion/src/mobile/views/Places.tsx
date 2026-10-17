@@ -5,7 +5,7 @@
  * so and says nothing more, because that is all this device knows about it.
  */
 
-import { useEffect, useState, type ReactNode } from 'react'
+import { useEffect, useRef, useState, type ReactNode } from 'react'
 
 import type { EnvironmentListResult, SessionListResult } from '@kalareach/protocol'
 
@@ -29,6 +29,7 @@ import {
 } from '../../model/describe'
 import { ask } from '../model/call'
 import { useHeld } from '../model/held'
+import { useKeepPlace } from '../model/keep-place'
 import { minimumTarget, type Surface } from '../platform'
 import { SharedWithYou, hasShares } from './SharedWithYou'
 
@@ -54,14 +55,14 @@ function connectionKey(connected: boolean | null | undefined, environmentId: str
 interface Held {
   readonly at: string
   readonly rows: readonly Row[]
-  /** True when the host refused the list outright: this device has no sessions of its own. */
-  readonly refused?: boolean
 }
 
 /** Why a list could not be read, and the connection it was read under. */
 interface Problem {
   readonly at: string
   readonly message: string
+  /** Whether the host refused the read outright, which a pairing with no view of a session is. */
+  readonly refused: boolean
 }
 
 /** The sessions on every host this device can see. */
@@ -88,23 +89,22 @@ export function MobileSessions({
   const keptEntryLine = keptEntry(useBook())
   const shared = useHeld()
   const { rights } = useHeldConnection()
-  // A pairing that holds no view of a session is refused the list outright, which makes the refusal
-  // the answer: this device has no sessions of its own.
+  // A pairing that holds no view of a session is refused the list of sessions outright, which for
+  // it is the answer: it has no sessions of its own, and what is shared with it is listed above.
   const lacksView = rights !== null && !rights.includes('session.view')
+  const content = useRef<HTMLDivElement | null>(null)
+  useKeepPlace(content)
   // What was read is kept with the connection it was read under, and shown only while that is the
   // connection there is: a list one host gave is never shown as another's.
   const [held, setHeld] = useState<Held | null>(null)
   const key = connectionKey(connected, environmentId)
   const rows = held !== null && held.at === key ? held.rows : null
-  // Where the host does not serve what is shared, a refusal stays the failure it always was.
-  const noneOfItsOwn =
-    held !== null &&
-    held.at === key &&
-    held.refused === true &&
-    lacksView &&
-    shared.status !== 'unsupported'
   const [problem, setProblem] = useState<Problem | null>(null)
-  const error = !noneOfItsOwn && problem !== null && problem.at === key ? problem.message : null
+  const current = problem !== null && problem.at === key ? problem : null
+  // The latest read decides, so a refusal that came earlier does not hide a failure that came since,
+  // and where the host does not serve what is shared a refusal stays the failure it always was.
+  const noneOfItsOwn = current?.refused === true && lacksView && shared.status !== 'unsupported'
+  const error = noneOfItsOwn ? null : (current?.message ?? null)
   const target = minimumTarget(surface)
   // The host is asked about the rows a person can see, and the few either side of them.
   const { onScreen, track } = useOnScreen()
@@ -147,10 +147,12 @@ export function MobileSessions({
         })
         .catch((failure: unknown) => {
           if (!current()) return
-          // Whether the refusal is the answer or a fault depends on what the pairing holds, which is
-          // known when it is drawn: the rows stand for no sessions, and the words are kept.
-          if (failureCode(failure) === 'PERMISSION_DENIED') setHeld({ at: key, rows: [], refused: true })
-          setProblem({ at: key, message: failureMessage(failure) })
+          if (failureCode(failure) === 'PERMISSION_DENIED') setHeld({ at: key, rows: [] })
+          setProblem({
+            at: key,
+            message: failureMessage(failure),
+            refused: failureCode(failure) === 'PERMISSION_DENIED'
+          })
         })
     })
     return reads.stop
@@ -159,7 +161,7 @@ export function MobileSessions({
   const sharedHere = hasShares(shared)
 
   return (
-    <>
+    <div ref={content}>
       {onOpenVoice === undefined ? null : (
         <button
           type="button"
@@ -187,19 +189,17 @@ export function MobileSessions({
       {error ? (
         <Banner tone="warning" title="The sessions could not be read" detail={error} />
       ) : null}
-      <SharedWithYou
-        view={shared}
-        surface={surface}
-        onOpen={(sessionId, grantId) => {
-          onOpen(sessionId, grantId)
-        }}
-      />
+      <SharedWithYou view={shared} surface={surface} onOpen={onOpen} />
       {noneOfItsOwn && !sharedHere ? (
         <p className="m-empty">
-          {shared.status === 'ready' ? 'Nothing is shared with this phone.' : 'Reading what is shared with this phone…'}
+          {shared.status === 'ready'
+            ? 'Nothing is shared with this phone.'
+            : shared.stale
+              ? 'What is shared with this phone could not be read just now.'
+              : 'Reading what is shared with this phone…'}
         </p>
       ) : null}
-      {rows && rows.length === 0 && !noneOfItsOwn && !error ? (
+      {rows && rows.length === 0 && !noneOfItsOwn ? (
         <p className="m-empty">No sessions on this host.</p>
       ) : null}
       {rows && rows.length > 0 && sharedHere ? (
@@ -262,7 +262,7 @@ export function MobileSessions({
       {!rows && !error && connected !== false ? (
         <p className="m-empty">Reading the sessions…</p>
       ) : null}
-    </>
+    </div>
   )
 }
 
@@ -319,7 +319,7 @@ export function MobileHosts({
         })
         .catch((failure: unknown) => {
           if (!current()) return
-          setProblem({ at: key, message: failureMessage(failure) })
+          setProblem({ at: key, message: failureMessage(failure), refused: false })
         })
     })
     return reads.stop

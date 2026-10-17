@@ -18,12 +18,10 @@ import type { AttentionReadResult } from '@kalareach/protocol'
 
 import { Banner, Button, Sheet } from '../../components/ui'
 import { readOnCadence } from '../../app/cadence'
-import { useHeldConnection } from '../../app/rights'
 import { useApp } from '../../app/state'
-import { failureCode, failureMessage, watch, type Watch } from '../../host/port'
+import { failureMessage, watch, type Watch } from '../../host/port'
 import {
   ATTENTION_READ_CADENCE_MS,
-  NO_INBOX,
   count,
   emptyMessage,
   filter,
@@ -36,6 +34,7 @@ import {
 import { ApprovalRequests } from '../../views/Approvals'
 import { KeptAnswers, QuestionRequests } from '../../views/Questions'
 import { ask } from '../model/call'
+import { useKeepPlace } from '../model/keep-place'
 import { minimumTarget, type Surface } from '../platform'
 import { Offers } from './Offers'
 
@@ -55,9 +54,6 @@ const FILTERS: readonly { readonly id: AttentionFilter; readonly label: string }
   { id: 'notice', label: 'Notices' }
 ]
 
-/** What a pairing that holds no view of a session is shown: an inbox with nothing in it. */
-const NO_INBOX_READ = { result: NO_INBOX, atMs: 0 }
-
 /** The largest page of the inbox one read asks for. */
 const PAGE_ITEMS = '200'
 
@@ -72,26 +68,24 @@ export function Inbox({
   readonly onCounts?: (actionable: number) => void
 }): ReactNode {
   const { port } = useApp()
-  const { rights } = useHeldConnection()
   const [inbox, setInbox] = useState<{ readonly result: AttentionReadResult; readonly atMs: number } | null>(
     null
   )
   const [error, setError] = useState<string | null>(null)
-  // Whether the host refused the read outright, which is the answer rather than a fault for a
-  // pairing that holds no view of a session.
-  const [denied, setDenied] = useState(false)
   const [chosen, setChosen] = useState<AttentionFilter>('all')
   const [open, setOpen] = useState<AttentionRow | null>(null)
   // Each session's display number, by its identifier, as the host listed them.
   const [numbers, setNumbers] = useState<ReadonlyMap<string, string>>(new Map())
   const target = minimumTarget(surface)
+  // What the person is reading stays where it is when something arrives above it.
+  const content = useRef<HTMLDivElement | null>(null)
+  useKeepPlace(content)
 
   // Every read of the inbox, on opening, on the cadence, when the connection changes and after an
   // answer, goes through one cadence under one watch: one read at a time, only the newest read's
   // answer shown, and none once the screen closes.
   const reads = useRef<Watch | null>(null)
   const again = useRef<() => void>(() => undefined)
-  const lacksView = rights !== null && !rights.includes('session.view')
 
   const load = useCallback((): Promise<void> => {
     const current = reads.current?.read() ?? null
@@ -110,13 +104,9 @@ export function Inbox({
         if (!current()) return
         setInbox({ result: answer, atMs: Date.now() })
         setError(null)
-        setDenied(false)
       })
       .catch((failure: unknown) => {
         if (!current()) return
-        // A pairing that holds no view of a session, a guest's, is refused the read outright and
-        // has no inbox of its own: the refusal is the answer, not a fault.
-        setDenied(failureCode(failure) === 'PERMISSION_DENIED')
         // A host that cannot be read is a host out of contact, which is a state the inbox has.
         // It is never a claim that anything on it failed.
         setError(failureMessage(failure))
@@ -147,17 +137,14 @@ export function Inbox({
     }
   }, [port, load])
 
-  // A pairing with no view of a session has no inbox of its own, and the refusal says so.
-  const noInboxOfItsOwn = denied && lacksView
-  const read = noInboxOfItsOwn ? NO_INBOX_READ : inbox
-  const rows = useMemo(() => (read ? order(read.result, read.atMs) : []), [read])
-  const counts = useMemo(() => (read ? count(read.result) : null), [read])
+  const rows = useMemo(() => (inbox ? order(inbox.result, inbox.atMs) : []), [inbox])
+  const counts = useMemo(() => (inbox ? count(inbox.result) : null), [inbox])
 
   useEffect(() => {
     if (counts && onCounts) onCounts(counts.actionable)
   }, [counts, onCounts])
 
-  const notes = useMemo(() => (read ? inboxNotes(read.result) : []), [read])
+  const notes = useMemo(() => (inbox ? inboxNotes(inbox.result) : []), [inbox])
   const shown = filter(rows, chosen)
   const whereOf = (row: AttentionRow): string => {
     const sessionId = row.item.session_id
@@ -167,10 +154,10 @@ export function Inbox({
   }
 
   return (
-    <div className="sw-inbox">
+    <div ref={content}>
       <Offers surface={surface} />
 
-      {error && !noInboxOfItsOwn ? (
+      {error ? (
         <Banner
           tone="warning"
           title="The inbox could not be read"
@@ -207,7 +194,7 @@ export function Inbox({
       ) : null}
 
       {shown.length === 0 ? (
-        <p className="m-empty">{read ? emptyMessage(chosen) : 'Reading the inbox…'}</p>
+        <p className="m-empty">{inbox ? emptyMessage(chosen) : 'Reading the inbox…'}</p>
       ) : (
         <ul className="m-list">
           {shown.map((row) => (

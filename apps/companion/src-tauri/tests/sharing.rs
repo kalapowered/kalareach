@@ -381,6 +381,7 @@ impl Page {
                 companion_tauri::commands::attempt_remove,
                 companion_tauri::commands::attention_read,
                 companion_tauri::commands::session_list,
+                companion_tauri::commands::session_read,
             ])
             .build(tauri::test::mock_context(tauri::test::noop_assets()))
             .expect("an application");
@@ -2038,6 +2039,18 @@ async fn accept_all(scene: &Scene, created: &[GrantCreateResult]) {
     connection.close();
 }
 
+/// A read of the whole inbox as the page makes it: nothing narrowed, the first page.
+fn well_formed_inbox_read() -> Value {
+    json!({
+        "params": {
+            "session_id": null,
+            "include_acknowledged": false,
+            "max_items": "200",
+            "after": null,
+        },
+    })
+}
+
 /// What `grant_held` answered, as the protocol's own result.
 fn held_of(answer: &Value) -> GrantHeldResult {
     typed(&json!({
@@ -2233,10 +2246,21 @@ async fn an_offer_to_a_guest_tells_what_it_carries_and_none_of_the_screen_the_is
         .await
         .expect_err("a guest lists no session");
     assert_eq!(code_of(&refused), "PERMISSION_DENIED", "{refused}");
-    phone
-        .call("attention_read", json!({ "params": {} }))
+    // The host answers a guest's inbox with nothing in it, never with what a session holds.
+    let inbox = phone
+        .call("attention_read", well_formed_inbox_read())
         .await
-        .expect_err("a guest has no inbox of its own");
+        .expect("a guest's inbox is read");
+    assert_eq!(inbox["items"], json!([]), "{inbox}");
+    // The session itself is not one the guest can read, shared or not, until one is shared with it.
+    let refused = phone
+        .call(
+            "session_read",
+            json!({ "params": { "session_id": session_id.to_string() } }),
+        )
+        .await
+        .expect_err("a guest reads no session of its host");
+    assert_eq!(code_of(&refused), "PERMISSION_DENIED", "{refused}");
     let nothing = held_of(&phone.call("grant_held", json!({})).await.expect("held"));
     assert!(nothing.offers.is_empty() && nothing.shares.is_empty());
 

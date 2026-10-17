@@ -79,6 +79,8 @@ export interface OfferSpec {
   readonly lastsMs?: number
   /** Where the session's history begins, in milliseconds before now. */
   readonly historyFromAgoMs?: number
+  /** The share reaches back to the start of what the host kept, which is the cursor zero. */
+  readonly allHistory?: boolean
 }
 
 /** What a test can do to the scripted host's sharing. */
@@ -91,14 +93,18 @@ export interface FakeSharing {
   asPhone(): void
   /** The host issues an invitation that names this device. */
   offer(spec?: OfferSpec): ShareOffer
+  /** The host lists a share the device holds, which it accepted before this phone was looking. */
+  hold(spec?: OfferSpec): HeldShare
   /** The host's invitation goes: withdrawn by its issuer, or run out. */
   withdrawOffer(invitationId: string): void
   /** The host stops listing a share the device holds: taken back, run out or its session gone. */
   endShare(grantId: string): void
+  /** The host lists a share again that it had stopped listing. */
+  restoreShare(grantId: string): void
   /** The shares the device holds, as the host would list them. */
   held(): readonly HeldShare[]
   /** The next read of what is held fails the way a lost connection does, for any reason but the host's refusal of the method. */
-  failNextHeld(message: string): void
+  failNextHeld(message: string, times?: number): void
   /** The host answers the read of what is held as one built before the method existed does. */
   doesNotServeHeld(): void
   /** How many times the page has asked what the device is offered and holds. */
@@ -220,7 +226,9 @@ export class ScriptedSharing implements FakeSharing {
   #phone = false
   #offers: ShareOffer[] = []
   #holds: HeldShare[] = []
+  #ended: HeldShare[] = []
   #heldFailure: string | null = null
+  #heldFailures = 0
   #heldServed = true
   #heldReads = 0
   #redeemRefusal: { message: string; committed: boolean } | null = null
@@ -271,8 +279,14 @@ export class ScriptedSharing implements FakeSharing {
   passTheBound(): void {
     for (const entry of this.#entries) {
       if (entry.view.phase === 'closed' || entry.view.phase === 'asking') continue
-      if (entry.written) this.#close(entry, 'happened', null)
-      else this.#close(entry, entry.view.kind === 'redeem' ? 'not_accepted' : 'not_done', null)
+      if (entry.view.kind === 'redeem') {
+        // What the host lists decides: a share it lists is an acceptance that happened, an
+        // invitation it still lists is one that was not accepted, and with neither it is unknown.
+        const share = this.#holds.some((held) => held.grant.grant_id === entry.view.grant_id)
+        const offered = this.#offers.some((offer) => offer.grant_id === entry.view.grant_id)
+        this.#close(entry, share ? 'happened' : offered ? 'not_accepted' : 'unknown', null)
+      } else if (entry.written) this.#close(entry, 'happened', null)
+      else this.#close(entry, 'not_done', null)
     }
   }
 
@@ -359,7 +373,8 @@ export class ScriptedSharing implements FakeSharing {
       display_number: spec.session ?? '3',
       ends_at_ms: String(this.#ids.nowMs + (spec.lastsMs ?? 3_600_000)),
       grant_id: idOf('e7e7e7e7', 2000 + this.#offered),
-      history_from_ms: String(this.#ids.nowMs - (spec.historyFromAgoMs ?? 600_000)),
+      history_from_ms:
+        spec.allHistory === true ? '0' : String(this.#ids.nowMs - (spec.historyFromAgoMs ?? 600_000)),
       includes_live_screen: spec.live ?? false,
       invitation_id: idOf('e9e9e9e9', 2000 + this.#offered),
       issued_at_ms: String(this.#ids.nowMs + this.#offered),
@@ -371,20 +386,38 @@ export class ScriptedSharing implements FakeSharing {
     return offer
   }
 
+  hold(spec: OfferSpec = {}): HeldShare {
+    const offer = this.offer(spec)
+    this.#take(offer)
+    const share = this.#holds.find((held) => held.grant.grant_id === offer.grant_id)
+    if (share === undefined) throw new Error('the share was not taken')
+    return share
+  }
+
   withdrawOffer(invitationId: string): void {
     this.#offers = this.#offers.filter((offer) => offer.invitation_id !== invitationId)
   }
 
   endShare(grantId: string): void {
+    const ended = this.#holds.find((share) => share.grant.grant_id === grantId)
+    if (ended !== undefined) this.#ended.push(ended)
     this.#holds = this.#holds.filter((share) => share.grant.grant_id !== grantId)
+  }
+
+  restoreShare(grantId: string): void {
+    const back = this.#ended.find((share) => share.grant.grant_id === grantId)
+    if (back === undefined || this.#holds.some((share) => share.grant.grant_id === grantId)) return
+    this.#ended = this.#ended.filter((share) => share !== back)
+    this.#holds.push(back)
   }
 
   held(): readonly HeldShare[] {
     return this.#holds
   }
 
-  failNextHeld(message: string): void {
+  failNextHeld(message: string, times = 1): void {
     this.#heldFailure = message
+    this.#heldFailures = times
   }
 
   doesNotServeHeld(): void {
@@ -525,7 +558,8 @@ export class ScriptedSharing implements FakeSharing {
       refuse('PERMISSION_DENIED', 'the effect is not listed for this actor')
     }
     const failure = this.#heldFailure
-    this.#heldFailure = null
+    this.#heldFailures -= 1
+    if (this.#heldFailures <= 0) this.#heldFailure = null
     if (failure !== null) refuse('UPSTREAM_UNAVAILABLE', failure)
     return { offers: [...this.#offers], shares: [...this.#holds] }
   }
