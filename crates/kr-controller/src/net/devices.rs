@@ -404,9 +404,9 @@ impl DeviceDirectory {
     /// Opens another handle on the directory `beside` is a handle on, raising the same signal as
     /// it does ([`Self::changed`]).
     ///
-    /// It is opened the way the first handle was. The first handle is open, so this process has the
-    /// store's index mapped already and nothing is letting go of it for this open to wait for: the
-    /// open takes no wait, and a handle never waits on the one it sits beside.
+    /// It is opened the way the first handle was. The first handle holds the store's index, so this
+    /// open does not reset it and the system has nothing to refuse: the open takes no wait, and a
+    /// handle never waits on the one it sits beside.
     ///
     /// # Errors
     ///

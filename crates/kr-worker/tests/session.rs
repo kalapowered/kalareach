@@ -1896,14 +1896,15 @@ async fn a_root_shell_that_exits_at_once_is_noticed_before_the_first_wait() {
     // gone by the time the supervision has opened the child signal it would have been reported on.
     // So the shell's status is asked for once before that supervision waits at all, and this case
     // has the shell gone before the supervision starts. The signal of its exit has been and gone,
-    // a descendant holds the terminal open, the sweep is an hour away, and the session's input
-    // and output no longer wake the supervision, so that first look is what finds the exit.
-    // What would find it without the look depends on the host: the poll every hundred
+    // the end of the terminal does not decide the exit, the sweep is an hour away, and the
+    // session's input and output no longer wake the supervision, so that first look is what finds
+    // the exit. What would find it without the look depends on the host: the poll every hundred
     // milliseconds where the supervision has one (Windows, and a host that cannot open the child
     // signal), and the end of another child of this process where it waits on the child signal
-    // (another case of this binary). On those hosts the case passes without the look and shows
-    // that the exit is noticed however long the start took; it fails without the look only where
-    // nothing else wakes the supervision.
+    // (a child of another case running in this binary, or a process the shell left behind that the
+    // worker adopted). On those hosts the case passes without the look and shows that the exit is
+    // noticed however long the start took; it fails without the look only where nothing else wakes
+    // the supervision.
     let host = kr_ipc::testing::TempHost::create();
     let config = configuration(&host, "sleep 600 & printf 'kr-leaving\\n'; exit 7");
     let mut session = Session::open(config).expect("opens");
