@@ -3214,9 +3214,9 @@ impl Session {
     pub fn ingest_output(&mut self, bytes: &[u8]) -> Vec<AttachmentId> {
         let (attachments, owed) = self.ingest_output_deferring_the_spool(bytes);
         if let Some(write) = owed
-            && let Err(failed) = write.perform(bytes)
+            && !write.perform(bytes)
         {
-            self.history.settle_failed_spool_write(failed);
+            self.history.settle_spool_write();
         }
         attachments
     }
@@ -3244,7 +3244,8 @@ impl Session {
     /// keep it waiting as long as it likes. The read loop makes it with the session let go, so
     /// that a keystroke's write, the recogniser's timer and every reader of the session do not
     /// wait for it. The bytes are in the resident window until it is made, and
-    /// [`Session::settle_failed_spool_write`] takes the result of one that fails.
+    /// [`Session::settle_spool_write`] takes the result of one that fails.
+    #[must_use = "the write to the spool that is owed has to be made"]
     pub fn ingest_output_deferring_the_spool(
         &mut self,
         bytes: &[u8],
@@ -3286,8 +3287,8 @@ impl Session {
 
     /// Settles a write to the spool that [`Session::ingest_output_deferring_the_spool`] owed and
     /// the disk did not take.
-    pub fn settle_failed_spool_write(&mut self, failed: crate::history::SpoolWriteFailed) {
-        self.history.settle_failed_spool_write(failed);
+    pub fn settle_spool_write(&mut self) {
+        self.history.settle_spool_write();
     }
 
     /// Takes the keys from a holder that can no longer supply what the application reads.
