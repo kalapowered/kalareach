@@ -1111,18 +1111,148 @@ async fn stop_daemon_of(tree: &teardown::Tree) -> bool {
 }
 
 /// Waits for `child` to end, and returns what it printed; a child that has not ended within `limit`
-/// is ended, and the test fails.
+/// is described, ended, and the test fails with the description: the program and its arguments,
+/// the programs it started, and what each of their threads waits for.
 fn finish_within(mut child: std::process::Child, limit: Duration) -> Output {
     let deadline = Instant::now() + limit;
     while matches!(child.try_wait(), Ok(None)) {
         if Instant::now() >= deadline {
+            let waiting = what_the_program_waits_on(child.id());
             let _ = child.kill();
             let _ = child.wait();
-            panic!("the program did not end within {} seconds", limit.as_secs());
+            panic!(
+                "the program did not end within {} seconds:\n{waiting}",
+                limit.as_secs()
+            );
         }
         std::thread::sleep(Duration::from_millis(50));
     }
     child.wait_with_output().expect("the program ends")
+}
+
+/// Describes the program `pid`, which has not ended: the program with its arguments and its state,
+/// the programs it started, and, where the host says, the kernel's name for what each thread
+/// waits for, the sockets the program holds, and the other programs of the same host (those with
+/// the same runtime directory), whose threads show whether the host answered at all.
+fn what_the_program_waits_on(pid: u32) -> String {
+    use std::fmt::Write as _;
+
+    let listing = Command::new("ps")
+        .args(["-axo", "pid=,ppid=,stat=,etime=,command="])
+        .output()
+        .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+        .unwrap_or_default();
+    // (process, parent, state, elapsed, command line)
+    let processes: Vec<(u32, u32, &str, &str, &str)> = listing
+        .lines()
+        .filter_map(|line| {
+            let mut rest = line.trim_start();
+            let mut word = || {
+                let (word, tail) = rest.split_at(rest.find(char::is_whitespace)?);
+                rest = tail.trim_start();
+                Some(word)
+            };
+            let process = word()?.parse().ok()?;
+            let parent = word()?.parse().ok()?;
+            let state = word()?;
+            let elapsed = word()?;
+            Some((process, parent, state, elapsed, rest))
+        })
+        .collect();
+    let mut related = vec![pid];
+    let mut next = 0;
+    while next < related.len() {
+        let parent = related[next];
+        next += 1;
+        let children: Vec<u32> = processes
+            .iter()
+            .filter(|(process, ppid, ..)| *ppid == parent && !related.contains(process))
+            .map(|(process, ..)| *process)
+            .collect();
+        related.extend(children);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let environment_of = |process: u32| {
+            std::fs::read(format!("/proc/{process}/environ"))
+                .unwrap_or_default()
+                .split(|byte| *byte == 0)
+                .find(|entry| entry.starts_with(b"KR_RUNTIME_DIR="))
+                .map(<[u8]>::to_vec)
+        };
+        if let Some(runtime) = environment_of(pid) {
+            for (process, ..) in &processes {
+                if !related.contains(process) && environment_of(*process) == Some(runtime.clone()) {
+                    related.push(*process);
+                }
+            }
+        }
+    }
+    let mut said = String::new();
+    for process in &related {
+        let Some((_, parent, state, elapsed, command)) = processes
+            .iter()
+            .find(|(candidate, ..)| candidate == process)
+        else {
+            continue;
+        };
+        let _ = writeln!(
+            said,
+            "  {process}{} (parent {parent}, state {state}, running {elapsed}): {command}",
+            if *process == pid {
+                " (the program)"
+            } else {
+                ""
+            }
+        );
+        #[cfg(target_os = "linux")]
+        {
+            let mut waits: std::collections::BTreeMap<String, usize> =
+                std::collections::BTreeMap::new();
+            for thread in std::fs::read_dir(format!("/proc/{process}/task"))
+                .into_iter()
+                .flatten()
+                .flatten()
+            {
+                let read = |name: &str| {
+                    std::fs::read_to_string(thread.path().join(name))
+                        .map(|text| text.trim().to_owned())
+                        .unwrap_or_default()
+                };
+                *waits
+                    .entry(format!("{} in {}", read("comm"), read("wchan")))
+                    .or_default() += 1;
+            }
+            let _ = writeln!(said, "    threads: {waits:?}");
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // The unix sockets the program holds open: what it can be waiting to hear from.
+        let sockets = std::fs::read_to_string("/proc/net/unix").unwrap_or_default();
+        for descriptor in std::fs::read_dir(format!("/proc/{pid}/fd"))
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
+            let Ok(target) = std::fs::read_link(descriptor.path()) else {
+                continue;
+            };
+            let target = target.display().to_string();
+            if let Some(inode) = target
+                .strip_prefix("socket:[")
+                .and_then(|rest| rest.strip_suffix(']'))
+            {
+                let path = sockets
+                    .lines()
+                    .find(|line| line.split_whitespace().nth(6) == Some(inode))
+                    .and_then(|line| line.split_whitespace().nth(7))
+                    .unwrap_or("with no name");
+                let _ = writeln!(said, "    holds the unix socket {path}");
+            }
+        }
+    }
+    said
 }
 
 /// Makes every directory under `root`, and `root`, read-only, as a release in the store is.
