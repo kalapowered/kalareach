@@ -4222,7 +4222,7 @@ impl WorkerService {
         }
         let restrictions = self.gate.restrictions();
         let allowed = match request.method.method() {
-            Some(method) => match self.check_local_hold(state, method) {
+            Some(method) => match off_the_executor(|| self.check_local_hold(state, method)) {
                 Ok(allowed) => allowed,
                 Err(error) => return failure(request.request_id, &error.to_protocol_error()),
             },
@@ -7605,10 +7605,6 @@ impl WorkerService {
                 kr_protocol::limits::MAX_INPUT_FRAME_LEN
             )));
         }
-        // Before the input domain is taken: the check reads the local gate and, for an owner whose
-        // membership is bound, the clock and the host's floor, none of which a lock that holds up
-        // a keystroke may wait for. Nothing the domain protects depends on its order.
-        self.check_local_dispatch(state, Method::InputWrite, caller)?;
         self.wait_before_the_input_session();
         let (accepted, pump) = {
             let mut acquisition = self.runtime.trace().acquisition(Site::InputAcceptance);
@@ -7621,6 +7617,12 @@ impl WorkerService {
             // revision or the grant behind it runs out, and what the domain decides is what
             // actually reaches the application.
             input.check_validated_revision(caller.validated_revision)?;
+        // Before the input domain is taken, and the last thing before it: the check reads the
+        // local gate and, for an owner whose membership is bound, the clock and the host's floor,
+        // none of which a lock that holds up a keystroke may wait for, and the wait is made on a
+        // thread the executor can do without. Nothing the domain protects depends on its order, and
+        // a restriction made since the request was admitted still refuses the batch.
+        off_the_executor(|| self.check_local_dispatch(state, Method::InputWrite, caller))?;
             self.check_authority_deadline(caller, params.attachment_id, params.epoch.get())?;
             Self::check_owned_session(input.session_id(), params.session_id)?;
             Self::check_granted(
