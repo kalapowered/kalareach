@@ -381,7 +381,7 @@ impl VoiceAuthority for GrantAuthority {
         // withdrawing a standing voice grant end the calls running under it.
         // The admission check inside the transaction is the caller's authority to revoke, which
         // the coordinator has already decided: it revokes only the grant of a voice session this
-        // device holds, and it has just taken that session out of its own registry.
+        // device holds, and it revokes before the session leaves its own registry.
         // The store's own admission hook, inside the transaction that performs the revocation and
         // after it has read the subtree: the admission this change arrived under is asked at the
         // moment the record changes rather than before the read that precedes it.
