@@ -342,6 +342,9 @@ describe('a host that does not know the read (KR-REQ-18.13)', () => {
     await openTab('Sessions')
     expect(screen.queryByTestId('shared-with-you')).toBeNull()
     expect(controls.sharing.heldReads()).toBe(1)
+    // With nothing shared to list, a guest's refusal stays the failure it was before shares existed.
+    expect(await screen.findByText('The sessions could not be read')).toBeInTheDocument()
+    expect(screen.queryByText('Nothing is shared with this phone.')).toBeNull()
   })
 })
 

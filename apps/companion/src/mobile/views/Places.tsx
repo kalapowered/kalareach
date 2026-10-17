@@ -96,7 +96,13 @@ export function MobileSessions({
   const [held, setHeld] = useState<Held | null>(null)
   const key = connectionKey(connected, environmentId)
   const rows = held !== null && held.at === key ? held.rows : null
-  const noneOfItsOwn = held !== null && held.at === key && held.refused === true && lacksView
+  // Where the host does not serve what is shared, a refusal stays the failure it always was.
+  const noneOfItsOwn =
+    held !== null &&
+    held.at === key &&
+    held.refused === true &&
+    lacksView &&
+    shared.status !== 'unsupported'
   const [problem, setProblem] = useState<Problem | null>(null)
   const error = !noneOfItsOwn && problem !== null && problem.at === key ? problem.message : null
   const target = minimumTarget(surface)
