@@ -2200,7 +2200,7 @@ async fn a_batch_whose_authority_ran_out_while_it_waited_is_never_written() {
         session
             .write_input(id, epoch, 0, b"kr-inside", Some(deadline), Instant::now())
             .expect("accepted");
-        runtime.flush_locked(&mut session);
+        runtime.flush_input();
     }
     let seen = retained_within(&runtime, b"kr-inside", Duration::from_secs(10)).await;
     assert!(
@@ -2215,7 +2215,7 @@ async fn a_batch_whose_authority_ran_out_while_it_waited_is_never_written() {
             .write_input(id, epoch, 1, b"kr-expired", Some(deadline), Instant::now())
             .expect("accepted");
         clock.advance(Duration::from_secs(5));
-        runtime.flush_locked(&mut session);
+        runtime.flush_input();
     }
     // A batch behind it under authority that has not run out. The writer is serial, so once this
     // one has arrived the one in front of it has either arrived or was never written.
@@ -2225,7 +2225,7 @@ async fn a_batch_whose_authority_ran_out_while_it_waited_is_never_written() {
         session
             .write_input(id, epoch, 2, b"kr-after", Some(later), Instant::now())
             .expect("accepted");
-        runtime.flush_locked(&mut session);
+        runtime.flush_input();
     }
     let seen = retained_within(&runtime, b"kr-after", Duration::from_secs(10)).await;
     assert!(
@@ -2243,13 +2243,15 @@ async fn a_batch_whose_authority_ran_out_while_it_waited_is_never_written() {
     let session = runtime.session();
     assert_eq!(
         session
+            .input()
+            .lock()
             .queued_input_bytes()
             .load(std::sync::atomic::Ordering::Acquire),
         0,
         "the budget the dropped batch held is given back"
     );
     assert_eq!(
-        session.queued_lease_bytes().load(),
+        session.input().lock().queued_lease_bytes().load(),
         0,
         "and so is the lease's share of it"
     );
@@ -2309,7 +2311,7 @@ async fn a_discarded_prefix_takes_its_authority_deadline_with_it() {
         session
             .write_input(second, next_epoch, 0, b"kr-next", None, Instant::now())
             .expect("accepted");
-        runtime.flush_locked(&mut session);
+        runtime.flush_input();
     }
     let seen = retained_within(&runtime, b"kr-next", Duration::from_secs(10)).await;
     assert!(
@@ -2378,7 +2380,7 @@ async fn a_prefix_made_only_of_the_newer_bytes_keeps_the_newer_deadline() {
         let released =
             session.expire_paste_prefix(Instant::now() + std::time::Duration::from_secs(1));
         assert_eq!(released, 1, "the held byte is released by its own deadline");
-        runtime.flush_locked(&mut session);
+        runtime.flush_input();
     }
     let seen = retained_within(&runtime, b"kr-ready.\x1b", Duration::from_secs(10)).await;
     assert!(

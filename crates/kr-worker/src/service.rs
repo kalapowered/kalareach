@@ -2368,7 +2368,7 @@ impl WorkerService {
             let mut session = self.runtime.session();
             let _ = session.detach(attachment_id);
             // The fence this detach moved, and any terminator it produced, reach the writer here.
-            self.runtime.flush_locked(&mut session);
+            self.runtime.flush_input();
         }
         // A window that outlived its connection could first-admit a request through a connection
         // that no longer exists, so the connection's windows go when it does, and so does its
@@ -3865,7 +3865,7 @@ impl WorkerService {
         let _ = session.release_input(holder, lease.epoch.get());
         // The fence moved, so what the writer holds has to be published with it rather than left
         // for the next caller to flush.
-        self.runtime.flush_locked(session);
+        self.runtime.flush_input();
     }
 
     /// Registers one admitted connection, and returns how it learns that it has been withdrawn.
@@ -3949,7 +3949,7 @@ impl WorkerService {
             let mut session = self.runtime.session();
             let _ = session.detach(attachment_id);
             // The fence this detach moved, and any terminator it produced, reach the writer here.
-            self.runtime.flush_locked(&mut session);
+            self.runtime.flush_input();
         }
         // Last, and never before the latch above. Nobody is left to read the recovery this
         // connection was paging, and a first page still being cut for it finds the latch set and
@@ -7589,7 +7589,7 @@ impl WorkerService {
             acquisition.deadline(session.paste_deadline());
             // Handed to the writer while the session is still held, so two writers cannot
             // interleave their batches after releasing the lock.
-            self.runtime.flush_locked(&mut session);
+            self.runtime.flush_input();
             accepted
         };
         state.input_sequence = params.sequence.get();
@@ -7711,7 +7711,7 @@ impl WorkerService {
                 // succession that follows it succeeded, and a fence that stayed in the session
                 // would let bytes already handed to the writer reach the application after the
                 // attachment that sent them had gone.
-                self.runtime.flush_locked(session);
+                self.runtime.flush_input();
                 // Whatever the result, the attachment is no longer the session's: the session either
                 // never had it or removed it before the geometry succession that can fail, and
                 // nothing puts a removed attachment back. So this connection stops holding it
@@ -7769,13 +7769,13 @@ impl WorkerService {
                     state.connection_id,
                     params.expected_epoch.as_ref().map(|epoch| epoch.get()),
                 )?;
-                self.runtime.flush_locked(session);
+                self.runtime.flush_input();
                 Ok((encode(&result)?, AfterEffect::None))
             }
             Method::InputRelease => {
                 let params: InputReleaseParams = parse(params)?;
                 let lease = session.release_input(params.attachment_id, params.epoch.get())?;
-                self.runtime.flush_locked(session);
+                self.runtime.flush_input();
                 Ok((encode(&InputLeaseResult { lease })?, AfterEffect::None))
             }
             Method::InputInterrupt => {
@@ -7792,7 +7792,7 @@ impl WorkerService {
                 // nothing else is due to run, and bytes the machine has let go of are the
                 // application's.
                 let interrupted = session.interrupt(params.attachment_id, params.epoch.get());
-                self.runtime.flush_locked(session);
+                self.runtime.flush_input();
                 interrupted?;
                 Ok((
                     encode(&InputLeaseResult {
@@ -7813,17 +7813,17 @@ impl WorkerService {
                 // goes on the session this call already holds: reaching for the lock again here
                 // would be this thread waiting for itself.
                 let receiver = session.register_launch(transaction);
-                let driver = session.fence_mut().ok_or_else(|| {
-                    WorkerError::ShellIntegrationUnsupported {
+                let outcome = session
+                    .stimulate_fence(|driver| {
+                        driver.launch_requested(params, attachment_id, transaction)
+                    })
+                    .ok_or_else(|| WorkerError::ShellIntegrationUnsupported {
                         detail: "this session has no managed root editor to install into"
                             .to_owned(),
-                    }
-                })?;
-                let effects = driver.launch_requested(params, attachment_id, transaction);
-                let outcome = session.apply_fence_effects(effects);
+                    })?;
                 // The same sweep, and the same reason: a launch request can expire a hold that
                 // arrived before it, and what the machine released belongs to the application now.
-                self.runtime.flush_locked(session);
+                self.runtime.flush_input();
                 // A refusal the machine could take on its own arrives here: nothing was sent to the
                 // reader, so there is nothing to wait for.
                 if let Some((_, answer)) = outcome.launch_answers.into_iter().next() {

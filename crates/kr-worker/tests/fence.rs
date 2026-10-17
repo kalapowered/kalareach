@@ -261,7 +261,7 @@ async fn unpumped() -> Unpumped {
     // Registered and qualified without a bridge: the phases are the driver's own, and what this
     // test needs from them is a session that accepts input and holds it for a reader.
     {
-        let driver = session.fence_mut().expect("a driver");
+        let mut driver = session.fence_mut().expect("a driver");
         assert!(driver.registered(ShellKind::Zsh, "zle-5.9"));
         let _ = driver.bridge_event(
             kr_protocol::ids::RequestId::new(1),
@@ -958,7 +958,7 @@ fn type_keys(wired: &Wired, holder: AttachmentId, sequence: u64, bytes: &[u8]) {
             std::time::Instant::now(),
         )
         .expect("the keys are accepted");
-    wired.runtime.flush_locked(&mut session);
+    wired.runtime.flush_input();
 }
 
 /// Returns whether the shell has already echoed `keys`.
@@ -1173,6 +1173,7 @@ async fn keys_behind_a_fence_never_written_go_once_the_loss_is_recorded() {
     echoed(&runtime, b"stranded-keys").await;
     {
         let session = runtime.session();
+        assert_eq!(session.waiting_for_fence(), 0);
         let driver = session.fence().expect("a driver");
         assert!(
             driver.fence().is_none(),
@@ -1184,7 +1185,6 @@ async fn keys_behind_a_fence_never_written_go_once_the_loss_is_recorded() {
             kr_shell_integration::contract::qualification::IntegrationPhase::Degraded,
             "the loss was recorded before the keys went"
         );
-        assert_eq!(session.waiting_for_fence(), 0);
     }
 
     runtime.close(ClosureReason::CloseRequested).1.release();
@@ -1213,6 +1213,7 @@ async fn a_fence_not_written_within_its_limit_ends_the_connection_and_lets_the_k
     echoed(&wired.runtime, b"waiting-keys").await;
     {
         let session = wired.runtime.session();
+        assert_eq!(session.waiting_for_fence(), 0);
         let driver = session.fence().expect("a driver");
         assert!(
             driver.fence().is_none(),
@@ -1223,7 +1224,6 @@ async fn a_fence_not_written_within_its_limit_ends_the_connection_and_lets_the_k
             kr_shell_integration::contract::qualification::IntegrationPhase::Degraded,
             "the loss was recorded before the keys went"
         );
-        assert_eq!(session.waiting_for_fence(), 0);
     }
     // The bridge finds its connection over.
     tokio::time::timeout(SOON, async { while wired.bridge.recv().await.is_ok() {} })
@@ -1268,6 +1268,7 @@ async fn a_takeover_that_times_out_lets_its_keys_go_while_an_earlier_fence_is_un
     echoed(&wired.runtime, b"second-keys").await;
     {
         let session = wired.runtime.session();
+        assert_eq!(session.waiting_for_fence(), 0);
         let driver = session.fence().expect("a driver");
         assert_eq!(
             driver.state(),
@@ -1279,7 +1280,6 @@ async fn a_takeover_that_times_out_lets_its_keys_go_while_an_earlier_fence_is_un
             kr_shell_integration::contract::qualification::IntegrationPhase::Qualified,
             "nothing ended the connection"
         );
-        assert_eq!(session.waiting_for_fence(), 0);
     }
     gate.open();
     wired.close().await;
@@ -1315,10 +1315,10 @@ async fn keys_waiting_for_a_fence_go_when_the_reader_leaves_the_prompt() {
     echoed(&wired.runtime, b"leaving-keys").await;
     {
         let session = wired.runtime.session();
+        assert_eq!(session.waiting_for_fence(), 0);
         let driver = session.fence().expect("a driver");
         assert_eq!(driver.state(), FenceState::Outside);
         assert!(driver.fence().is_none(), "the leave dropped the fence");
-        assert_eq!(session.waiting_for_fence(), 0);
     }
     gate.open();
     wired.close().await;
@@ -1392,6 +1392,7 @@ async fn a_launch_that_times_out_behind_an_unwritten_fence_gives_up_the_connecti
     echoed(&wired.runtime, b"launch-held-keys").await;
     {
         let session = wired.runtime.session();
+        assert_eq!(session.waiting_for_fence(), 0);
         let driver = session.fence().expect("a driver");
         assert!(
             driver.fence().is_none(),
@@ -1402,7 +1403,6 @@ async fn a_launch_that_times_out_behind_an_unwritten_fence_gives_up_the_connecti
             kr_shell_integration::contract::qualification::IntegrationPhase::Degraded,
             "the loss was recorded before the keys went"
         );
-        assert_eq!(session.waiting_for_fence(), 0);
     }
     let (_client, outcome) = tokio::time::timeout(SOON, calling)
         .await
@@ -1781,11 +1781,12 @@ fn held_input_reaches_the_writer_while_a_desktop_reading_is_outstanding() {
         // held for the machine's own deadline and no longer.
         {
             let mut session = wired.runtime.session();
-            let driver = session.fence_mut().expect("a driver");
+            let mut driver = session.fence_mut().expect("a driver");
             let _ = driver.bridge_event(
                 kr_protocol::ids::RequestId::new(9),
                 &enter(wired.session_id, 1, 1),
             );
+            drop(driver);
             session
                 .write_input(holder, epoch, 0, b"held\n", None, std::time::Instant::now())
                 .expect("accepted");
@@ -2468,7 +2469,8 @@ async fn a_startup_prompt_takes_its_answer_through_the_worker_and_the_session_is
         shell.produced(b"ASK>", 1).await;
         {
             let session = shell.runtime.session();
-            let phase = session.fence().expect("a driver").phase();
+            let driver = session.fence().expect("a driver");
+            let phase = driver.phase();
             assert!(
                 phase.accepts_external_input(),
                 "{kind:?}: the bridge is authenticated before the profile asks, so its answer is taken"
@@ -2488,7 +2490,8 @@ async fn a_startup_prompt_takes_its_answer_through_the_worker_and_the_session_is
             loop {
                 {
                     let session = shell.runtime.session();
-                    let phase = session.fence().expect("a driver").phase();
+                    let driver = session.fence().expect("a driver");
+                    let phase = driver.phase();
                     if phase.reports_ready() {
                         assert!(phase.permits_launch(), "{kind:?}");
                         return;
@@ -2525,7 +2528,8 @@ async fn a_startup_prompt_nobody_answers_leaves_the_session_not_ready_and_it_sti
         shell.produced(b"ASK>", 1).await;
         {
             let session = shell.runtime.session();
-            let phase = session.fence().expect("a driver").phase();
+            let driver = session.fence().expect("a driver");
+            let phase = driver.phase();
             assert!(phase.accepts_external_input(), "{kind:?}");
             assert!(
                 !phase.reports_ready(),
@@ -3384,7 +3388,7 @@ async fn a_reader_the_line_starts_keeps_the_lines_capability(
         let session = shell.runtime.session();
         session
             .fence()
-            .and_then(|driver| driver.fence())
+            .and_then(|driver| driver.fence().cloned())
             .map(|fence| fence.reader_revision)
             .expect("the prompt's fence is published")
     };
@@ -3422,7 +3426,7 @@ async fn a_reader_the_line_starts_keeps_the_lines_capability(
             .runtime
             .session()
             .fence()
-            .and_then(|driver| driver.fence())
+            .and_then(|driver| driver.fence().cloned())
             .is_some_and(|fence| fence.reader_revision > first_revision)
     })
     .await;
@@ -5283,11 +5287,12 @@ async fn a_request_that_expires_a_hold_delivers_what_it_released() {
     {
         // A reader enters, which starts an exchange nothing will answer: this session has no bridge.
         let mut session = wired.runtime.session();
-        let driver = session.fence_mut().expect("a driver");
+        let mut driver = session.fence_mut().expect("a driver");
         let _ = driver.bridge_event(
             kr_protocol::ids::RequestId::new(2),
             &enter(wired.session_id, 1, 1),
         );
+        drop(driver);
         session
             .write_input(holder, epoch, 0, b"held\n", None, std::time::Instant::now())
             .expect("accepted");
@@ -5383,11 +5388,12 @@ async fn an_interrupt_delivers_what_its_own_sweep_released() {
     let epoch = wired.runtime.session().lease().epoch.get();
     {
         let mut session = wired.runtime.session();
-        let driver = session.fence_mut().expect("a driver");
+        let mut driver = session.fence_mut().expect("a driver");
         let _ = driver.bridge_event(
             kr_protocol::ids::RequestId::new(2),
             &enter(wired.session_id, 1, 1),
         );
+        drop(driver);
         session
             .write_input(
                 holder,
@@ -6205,7 +6211,7 @@ async fn answers_that_outrun_one_drain_of_the_lane_reach_the_terminal_in_the_ord
 fn the_host_answers_the_application(wired: &Wired) {
     let mut session = wired.runtime.session();
     session.ingest_output(b"\x1b[c");
-    wired.runtime.flush_locked(&mut session);
+    wired.runtime.flush_input();
 }
 
 /// KR-REQ-08.49: an answer the host queues for the terminal after the reader proved its queues
@@ -6354,7 +6360,7 @@ async fn output_the_host_has_no_answer_for_leaves_the_fence_standing() {
     {
         let mut session = wired.runtime.session();
         session.ingest_output(b"plain output\r\n");
-        wired.runtime.flush_locked(&mut session);
+        wired.runtime.flush_input();
     }
     {
         let session = wired.runtime.session();
@@ -6474,6 +6480,85 @@ async fn a_launch_reserved_before_the_hosts_answer_is_revoked_and_refused() {
     wired.close().await;
 }
 
+/// KR-PERF-002, KR-REQ-08.49: the client whose keys a launch held is told the editor was busy once
+/// the host's answer to the application releases them, and the keys reach the terminal first.
+///
+/// The answer is queued under the session and the input domain, and what the machine says about it
+/// that needs the session, the event for the client's subscription, is carried out with the domain
+/// let go. The keys it released are in the terminal's queue by then, so the event never describes
+/// keys that are still held.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_client_is_told_the_editor_was_busy_after_the_hosts_answer_released_its_keys() {
+    let mut wired = wired().await;
+    let mut client = LocalClient::connect(&wired.endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects");
+    let holder = holder_over(&mut client, &wired).await;
+    let mut events = {
+        let mut session = wired.runtime.session();
+        session.subscribe(holder).expect("subscribes")
+    };
+    let fence = fenced(&mut wired, 1, 1).await;
+    let target = wired.target();
+    let session_id = wired.session_id;
+    let prompt = fence.prompt_generation;
+    let calling = tokio::spawn(async move {
+        client
+            .mutate(
+                Method::ShellLaunch,
+                ActionId::new(kr_ipc::new_uuid()),
+                target,
+                &ShellLaunchParams {
+                    session_id,
+                    command: LaunchCommand::Arguments(vec!["ls".to_owned()]),
+                    expected_prompt_generation: prompt,
+                    expected_buffer_revision: EditorBufferRevision::new(1),
+                },
+            )
+            .await
+    });
+    let request = loop {
+        match wired.next().await {
+            ToBridge::Request { request, .. } => match *request {
+                WorkerRequest::Launch(request) => break request,
+                _ => continue,
+            },
+            _ => continue,
+        }
+    };
+    type_keys(&wired, holder, 0, b"held-keys\n");
+    assert!(
+        !echoed_now(&wired.runtime, b"held-keys"),
+        "the launch holds what is typed while it is reserved"
+    );
+
+    the_host_answers_the_application(&wired);
+    echoed(&wired.runtime, b"held-keys").await;
+    let busy = tokio::time::timeout(SOON, async {
+        loop {
+            match events.recv().await {
+                Some(kr_worker::output::OutputDelivery::EditorBusy(event)) => return Some(*event),
+                Some(_) => {}
+                None => return None,
+            }
+        }
+    })
+    .await
+    .expect("an attachment event")
+    .expect("the stream stayed open");
+    assert_eq!(busy.attachment_id, holder);
+    assert_eq!(busy.reason, EditorBusyReason::QueuesNotDrained);
+    assert_eq!(
+        busy.released_input_bytes.get(),
+        b"held-keys\n".len() as u64,
+        "the event counts the keys the answer released"
+    );
+
+    let _ = request;
+    calling.abort();
+    wired.close().await;
+}
+
 /// KR-REQ-08.49: an answer queued while the exchange is in flight withholds the fence the reader's
 /// acknowledgement would have published, and the next exchange, from the reader's own snapshot,
 /// publishes one.
@@ -6556,7 +6641,7 @@ async fn an_answer_still_unwritten_when_a_later_exchange_begins_keeps_that_excha
     let first = asked_for_a_fence(&mut wired).await;
     // The boundary is held by a thread of its own until the case lets it go, so no guard is held
     // across an await here.
-    let boundary = wired.runtime.session().input_gate();
+    let boundary = wired.runtime.session().input().lock().input_gate();
     let (holding, held) = std::sync::mpsc::channel();
     let (release, released) = std::sync::mpsc::channel::<()>();
     let holder = std::thread::spawn(move || {
@@ -6627,7 +6712,7 @@ async fn until_the_reader_has_left(runtime: &SessionRuntime) {
 
 /// Waits until the writer has written every answer the host queued for the terminal.
 async fn until_replies_written(runtime: &SessionRuntime) {
-    let owed = runtime.session().unwritten_replies();
+    let owed = runtime.session().input().lock().unwritten_replies();
     tokio::time::timeout(std::time::Duration::from_secs(30), async {
         while owed.load(std::sync::atomic::Ordering::Acquire) != 0 {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -6691,7 +6776,7 @@ async fn a_real_readers_fence_is_invalidated_by_the_hosts_answer_and_proven_agai
         {
             let mut session = shell.runtime.session();
             session.ingest_output(b"\x1b[c");
-            shell.runtime.flush_locked(&mut session);
+            shell.runtime.flush_input();
             let driver = session.fence().expect("a driver");
             assert!(
                 driver.fence().is_none(),

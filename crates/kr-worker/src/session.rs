@@ -41,7 +41,7 @@ use kr_protocol::session::{
 use crate::attachments::AttachmentTable;
 use crate::error::{Result, WorkerError};
 use crate::history::{OutputHistory, SpoolLayout};
-use crate::input::{InputLease, LeaseRefusal, PasteFramer};
+use crate::input_domain::{Accepted, Applied, FenceGuard, InputDomain, InputShared};
 use crate::journal::{Journal, Kept};
 use crate::output::{EffectOutcome, OutputHub, OutputStream, OwedEffect};
 use crate::ownership::OwnedProcesses;
@@ -161,11 +161,11 @@ struct Unrecorded {
 /// Reading either one outside the boundary, or after the fence, reads an answer about a different
 /// moment.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct LeaseEnded {
+pub(crate) struct LeaseEnded {
     /// Bytes that lease had queued and the writer had not written.
-    left: u64,
+    pub(crate) left: u64,
     /// The lease whose delivered paste was open, as one more than its epoch; zero for none.
-    paste_open_for: u64,
+    pub(crate) paste_open_for: u64,
 }
 
 /// What a lease the host ended by itself left behind, waiting to be reported.
@@ -278,20 +278,15 @@ impl ScopedResources {
 /// One live session.
 pub struct Session {
     config: SessionConfig,
-    state: SessionState,
     pty: Pty,
     shell: Option<RootShell>,
     attachments: AttachmentTable,
-    lease: InputLease,
-    framer: PasteFramer,
-    /// What a lease that ended without anybody asking left behind, waiting to be reported.
+    /// What a keystroke, and the recogniser's timer, touch: the lease, the recogniser, the queue for
+    /// the terminal, the root editor's machine and the lifecycle's answer to whether input is accepted.
     ///
-    /// A takeover reports what the lease it displaced lost, in its own answer. A lease the host
-    /// ends by itself - because the application changed the keyboard negotiation to one that holder
-    /// cannot produce - has no such answer to be reported in, and dropping the count would make the
-    /// interruption unreportable. It is carried here until the next acquire, which reports it with
-    /// its own.
-    interrupted: Interrupted,
+    /// Behind a lock of its own, which is taken after this session and never before it, so that what
+    /// holds the session for as long as a disk call takes does not hold a keystroke.
+    input: Arc<InputShared>,
     history: OutputHistory,
     hub: OutputHub,
     journal: Option<Journal>,
@@ -335,11 +330,6 @@ pub struct Session {
     /// Where the variables the root shell is started with came from, which the worker that built
     /// them says before it starts the shell.
     environment_sources: Option<kr_protocol::session::SessionEnvironmentSources>,
-    /// What is queued for the pseudo-terminal and not yet handed to its writer, in order.
-    ///
-    /// Only [`Session::take_pending_input`] takes from it, and it stops at a published fence the
-    /// bridge's writer has not written yet.
-    pending_input: std::collections::VecDeque<Queued>,
     owned: Option<OwnedProcesses>,
     /// Writes what the session owns to the journal, off this session's lock, where the journal is
     /// a file.
@@ -353,30 +343,10 @@ pub struct Session {
     desktop: crate::desktop::Watch,
     /// The canonical grid. Every byte the terminal produces passes through it.
     engine: crate::projection::TerminalEngine,
-    /// The root editor's fence and detach machine, for a managed session.
-    ///
-    /// `None` is a session that claims none of that contract: a `native_compat` shell, where input
-    /// forwards like any application's, Ctrl-D is the shell's own and nothing is ever installed in
-    /// an editor.
-    fence: Option<crate::fence::FenceDriver>,
     /// The backends an integrated invocation is given before it runs, where the worker set them up.
     command_backends: Option<Arc<crate::broker::commands::CommandBackends>>,
     /// What the registered root integration is, recorded whole for diagnostics.
     root_integration: Option<kr_shell_integration::host::handshake::Registration>,
-    /// The last takeover receipt the machine completed.
-    takeover_receipt: Option<crate::fence::TakeoverReceipt>,
-    /// The callers waiting for a reader to say what it did with their launch.
-    ///
-    /// It lives beside the machine rather than beside the runtime, because every answer is produced
-    /// while this session is locked: an answer that arrives with a closure, a lost bridge or a
-    /// reader's decision is delivered on the same step that produced it, and none can be dropped on
-    /// the way out.
-    launches: BTreeMap<
-        kr_shell_integration::contract::requests::LaunchTransactionId,
-        tokio::sync::oneshot::Sender<crate::fence::driver::LaunchAnswer>,
-    >,
-    /// Commands a reader installed after their transaction had been revoked.
-    late_installations: Vec<kr_protocol::root::ShellLaunchResult>,
     /// The command blocks the private hooks have reported, oldest first.
     ///
     /// Bounded: a session that runs for a week must not grow a record of every command it ever
@@ -404,8 +374,6 @@ pub struct Session {
     agent_instances: AgentInstances,
     /// Why the last interrupt this session tried did not reach the foreground group.
     interrupt_failed: Option<String>,
-    /// Accepted bytes the root editor's machine is holding for a reader transition.
-    held_input_bytes: usize,
     /// The output cursor and the projection generation at which terminals kept on a projection by
     /// their screen were last asked whether a screen drawn now would carry everything.
     reconsidered_at: (u64, u64),
@@ -428,18 +396,6 @@ pub struct Session {
     /// snapshot of the same attachment keeps that moment, so replacing a subscription never moves
     /// what the view reaches. It goes with the attachment.
     live_views: BTreeMap<AttachmentId, u64>,
-    /// The attachments made under a grant: by every caller but the local owner, whichever socket
-    /// it came in on.
-    ///
-    /// An authority revision fences what those attachments were admitted to do, and an attachment
-    /// identifier is the only thing the input lease records about who holds it. The local owner's
-    /// attachments are not in here, because its authority is the operating-system identity the
-    /// socket authenticated and no revision replaces that. An attachment leaves it wherever it
-    /// leaves the session ([`Session::detach`]), the empty-prompt gesture included.
-    ///
-    /// Each is kept with the grant and the device its caller carried, which is what a revision's
-    /// reach is read against ([`kr_protocol::worker::RevisionReach`]).
-    granted_attachments: BTreeMap<AttachmentId, GrantedBy>,
     /// The attachments the host would serve directly and is holding in projected mode.
     ///
     /// Section 8: a transition into live byte forwarding must use a parser-ground boundary with no
@@ -456,64 +412,6 @@ pub struct Session {
     /// that possible: an update names the base it continues from, and the base is what the client
     /// was last actually sent.
     projections: crate::snapshot::Bases,
-    /// The host's own answers that have been queued for the application and not yet written.
-    ///
-    /// The response lane bounds what it holds; this bounds what has left the lane. Counting only
-    /// what is in `pending_input` would miss everything a flush has handed to the writer, so the
-    /// counter is shared with the writer and comes down as each batch is written.
-    /// Every byte queued for the pseudo-terminal, across every producer, released by the writer.
-    queued_input_bytes: Arc<std::sync::atomic::AtomicUsize>,
-    /// How many answers the writer has dropped because their lane deadline passed while they
-    /// waited for the terminal.
-    dropped_replies: Arc<std::sync::atomic::AtomicU64>,
-    /// How many bytes of the host's own answers have been queued for the terminal and are neither
-    /// written nor dropped yet. The writer takes them off as each piece reaches the terminal or the
-    /// rest of an answer is dropped, and the root editor's driver reads it when an exchange begins:
-    /// a reader that took its snapshot before those bytes reached the terminal cannot account for
-    /// them.
-    unwritten_replies: Arc<std::sync::atomic::AtomicUsize>,
-    /// The part of that which belongs to the **current** lease, and which a lease change discards.
-    ///
-    /// What is left is the response lane's share, so the two bounds section 8 and section 9 name
-    /// are read from one pair of counters rather than three. The lease's epoch travels with the
-    /// count in one word, because the two have to move together: a lease change takes the word and
-    /// leaves the next epoch with nothing, and a writer still finishing the previous lease's bytes
-    /// finds an epoch that is no longer its own and subtracts nothing. That is what makes the bytes
-    /// a takeover reports as discarded that lease's own, counted once.
-    queued_lease_bytes: Arc<crate::runtime::LeaseBytes>,
-    /// Whether the application is inside a bracketed paste, as the writer has actually delivered
-    /// it. The framer says what the accepted stream means; this says what arrived.
-    delivered_paste_open: Arc<std::sync::atomic::AtomicU64>,
-    /// The boundary the writer and a lease change share, described at [`Session::input_gate`].
-    input_gate: Arc<std::sync::Mutex<()>>,
-    /// Set by the writer on its way out, when the terminal will take nothing more.
-    ///
-    /// Input accepted after that would be acknowledged and never written, which is the one thing an
-    /// acknowledgement must not mean. The writer ends only for a terminal that has actually gone:
-    /// it waits out an application that has merely paused.
-    terminal_gone: Arc<std::sync::atomic::AtomicBool>,
-    /// When the authority behind the bytes the recogniser is still holding runs out.
-    ///
-    /// A held delimiter prefix is queued later than the write that produced it: by its own
-    /// deadline, by the paste mode being turned off, or by the next write completing it. It is
-    /// still that write's authority that admitted it. The tightest deadline of the writes whose
-    /// bytes are in the prefix is what it carries, so a prefix that outlived the grant behind it
-    /// is fenced with everything else that grant sent.
-    held_input_deadline: Option<u64>,
-    /// The same, in UTC milliseconds: the end of the membership lease a local owner's bytes were
-    /// accepted under, which a wall clock set forward passes while the continuous clock does not.
-    held_input_utc_deadline: Option<u64>,
-    /// The lease epoch the writer compares every queued batch against.
-    ///
-    /// The session publishes it the moment the lease changes, which is what lets the count of what
-    /// that lease left behind be taken *after* the writer can no longer add to it or write from it.
-    input_fence: Arc<std::sync::atomic::AtomicU64>,
-    /// Set while a lease change is queued for the writer and not yet taken.
-    ///
-    /// One is enough: the writer looks at the fence when it takes a batch, so a second would ask
-    /// the same question again. It is what keeps a caller that takes and releases the lease in a
-    /// loop from queueing without bound.
-    lease_change_queued: Arc<std::sync::atomic::AtomicBool>,
     /// Where the output ingest writes down the spans of its work, for the input measurement.
     trace: crate::trace::Shared,
 }
@@ -523,7 +421,7 @@ impl std::fmt::Debug for Session {
         formatter
             .debug_struct("Session")
             .field("session_id", &self.config.session_id)
-            .field("state", &self.state)
+            .field("state", &self.state())
             .field("attachments", &self.attachments.len())
             .field("cursor", &self.history.next_cursor())
             .finish_non_exhaustive()
@@ -689,12 +587,9 @@ impl Session {
         );
         Ok(Self {
             attachments: AttachmentTable::new(config.dimensions),
-            state: SessionState::Creating,
+            input: InputShared::new(InputDomain::new(config.session_id)),
             pty,
             shell: None,
-            lease: InputLease::new(),
-            framer: PasteFramer::new(),
-            interrupted: Interrupted::default(),
             history,
             hub: OutputHub::new(),
             journal,
@@ -717,26 +612,20 @@ impl Session {
             closing_reason: None,
             created_at_ms: kr_ipc::now_ms(),
             environment_sources: None,
-            pending_input: std::collections::VecDeque::new(),
             owned: None,
             owned_writer: None,
             root_exit: None,
             content_scopes: std::collections::BTreeMap::new(),
             resource_views: BTreeMap::new(),
             live_views: BTreeMap::new(),
-            granted_attachments: BTreeMap::new(),
             // Bound before the shell starts, from the desktop the create request recorded, or
             // from the login session this worker is in where the request recorded none. A desktop
             // that has already gone by now is a session that never had one, and the watch says so
             // from the first question rather than from a change it would never see.
             desktop: watch,
             engine,
-            fence: None,
             command_backends: None,
             root_integration: None,
-            takeover_receipt: None,
-            launches: BTreeMap::new(),
-            late_installations: Vec::new(),
             command_blocks: std::collections::VecDeque::new(),
             answered: Answered::default(),
             activity: crate::lifecycle::Activity::new(),
@@ -745,21 +634,9 @@ impl Session {
             foreground_reads: std::sync::Mutex::new(Vec::new()),
             agent_instances: AgentInstances::default(),
             interrupt_failed: None,
-            held_input_bytes: 0,
             reconsidered_at: (0, 0),
             forwarding_held: std::collections::BTreeMap::new(),
             projections: crate::snapshot::Bases::new(),
-            queued_input_bytes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            dropped_replies: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            unwritten_replies: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            queued_lease_bytes: Arc::new(crate::runtime::LeaseBytes::new()),
-            input_gate: Arc::new(std::sync::Mutex::new(())),
-            terminal_gone: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            held_input_deadline: None,
-            held_input_utc_deadline: None,
-            input_fence: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            delivered_paste_open: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            lease_change_queued: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             trace: crate::trace::LockTrace::shared(),
             config,
         })
@@ -796,7 +673,7 @@ impl Session {
     /// Returns an error when the shell cannot be started. The session is closed with
     /// `root_launch_failed` so a failed creation leaves a record rather than a stuck `creating`.
     pub fn launch(&mut self) -> Result<()> {
-        if self.state != SessionState::Creating {
+        if self.state() != SessionState::Creating {
             return Err(WorkerError::InvalidArgument(
                 "a root shell starts once, during creation".to_owned(),
             ));
@@ -814,7 +691,7 @@ impl Session {
                     shell.identity().clone(),
                 ));
                 self.shell = Some(shell);
-                self.state = SessionState::Live;
+                self.input.lock().set_state(SessionState::Live);
                 self.application_state = Some(ApplicationState::ShellReady);
                 // What the session is, written where a reader can find it after this worker is
                 // gone. Without it a closed session is only a closure record, and the shell it ran,
@@ -840,20 +717,19 @@ impl Session {
     /// It goes in before the reader can report anything, so the first boundary the shell reaches
     /// has somewhere to go. A `native_compat` session installs none, which is what makes its input
     /// forward like any application's.
-    pub fn install_fence(&mut self, mut driver: crate::fence::FenceDriver) {
-        driver.watch_unwritten_replies(Arc::clone(&self.unwritten_replies));
-        self.fence = Some(driver);
+    pub fn install_fence(&mut self, driver: crate::fence::FenceDriver) {
+        self.input.lock().install_fence(driver);
     }
 
     /// Returns the root-editor driver, for a managed session.
     #[must_use]
-    pub const fn fence(&self) -> Option<&crate::fence::FenceDriver> {
-        self.fence.as_ref()
+    pub fn fence(&self) -> Option<FenceGuard<'_>> {
+        FenceGuard::of(self.input.lock())
     }
 
     /// Returns the root-editor driver for a stimulus.
-    pub const fn fence_mut(&mut self) -> Option<&mut crate::fence::FenceDriver> {
-        self.fence.as_mut()
+    pub fn fence_mut(&mut self) -> Option<FenceGuard<'_>> {
+        FenceGuard::of(self.input.lock())
     }
 
     /// Records what registered as this session's root integration.
@@ -870,8 +746,8 @@ impl Session {
     /// hold ends without one. It says `unknown` in the second case rather than a zero nobody
     /// measured.
     #[must_use]
-    pub const fn last_takeover_receipt(&self) -> Option<crate::fence::TakeoverReceipt> {
-        self.takeover_receipt
+    pub fn last_takeover_receipt(&self) -> Option<crate::fence::TakeoverReceipt> {
+        self.input.lock().last_takeover_receipt()
     }
 
     /// Returns the registered root integration, for diagnostics and session status.
@@ -887,9 +763,7 @@ impl Session {
         &mut self,
         transaction: kr_shell_integration::contract::requests::LaunchTransactionId,
     ) -> tokio::sync::oneshot::Receiver<crate::fence::driver::LaunchAnswer> {
-        let (sender, receiver) = tokio::sync::oneshot::channel();
-        self.launches.insert(transaction, sender);
-        receiver
+        self.input.lock().register_launch(transaction)
     }
 
     /// Forgets a caller that is no longer waiting.
@@ -897,7 +771,7 @@ impl Session {
         &mut self,
         transaction: kr_shell_integration::contract::requests::LaunchTransactionId,
     ) {
-        self.launches.remove(&transaction);
+        self.input.lock().forget_launch(transaction);
     }
 
     /// Returns the commands a reader installed after their transaction had been revoked.
@@ -905,8 +779,8 @@ impl Session {
     /// The transaction was over, so no caller is told they were installed; what it means is that the
     /// editor holds a command this session had given up on, and the session records it.
     #[must_use]
-    pub fn late_installations(&self) -> &[kr_protocol::root::ShellLaunchResult] {
-        &self.late_installations
+    pub fn late_installations(&self) -> Vec<kr_protocol::root::ShellLaunchResult> {
+        self.input.lock().late_installations().to_vec()
     }
 
     /// Carries out what one fence stimulus left for the session to do.
@@ -918,39 +792,55 @@ impl Session {
     /// the input travel on two writers, so the queue also records where the fence was published,
     /// and nothing behind that point leaves it until the bridge's writer has written the fence.
     pub fn apply_fence_effects(&mut self, effects: crate::fence::Effects) -> FenceOutcome {
+        let Applied { mut outcome, owed } = self.input.lock().apply_effects(effects);
+        self.finish_fence(owed, &mut outcome);
+        outcome
+    }
+
+    /// Carries out what a stimulus to the root editor's machine left that needs this session, with
+    /// the input domain let go, and then lets out what the response lane owes.
+    pub(crate) fn finish_fence(
+        &mut self,
+        owed: Vec<crate::fence::Step>,
+        outcome: &mut FenceOutcome,
+    ) {
+        self.carry_out(owed, outcome);
+        self.pump_replies();
+    }
+
+    /// Puts one stimulus to the root editor's machine and carries out what came of it, as one
+    /// step of the input domain: nothing is accepted between the stimulus and its effects.
+    ///
+    /// Returns `None` for a session with no managed root editor.
+    pub fn stimulate_fence<F>(&mut self, stimulate: F) -> Option<FenceOutcome>
+    where
+        F: FnOnce(&mut crate::fence::FenceDriver) -> crate::fence::Effects,
+    {
+        let shared = Arc::clone(&self.input);
+        let mut input = shared.lock();
+        let effects = stimulate(input.fence_mut()?);
+        let Applied { mut outcome, owed } = input.apply_effects(effects);
+        drop(input);
+        self.finish_fence(owed, &mut outcome);
+        Some(outcome)
+    }
+
+    /// Returns the input domain this session shares with its keystroke path.
+    #[must_use]
+    pub fn input(&self) -> Arc<InputShared> {
+        Arc::clone(&self.input)
+    }
+
+    /// Carries out the steps the root editor's machine asked for that need this session, with the
+    /// input domain let go.
+    ///
+    /// They are in the machine's order, and so is whatever the machine ordered after one of them:
+    /// a detach is acknowledged only once its attachment is gone.
+    fn carry_out(&mut self, owed: Vec<crate::fence::Step>, outcome: &mut FenceOutcome) {
         use crate::fence::Step;
 
-        self.held_input_bytes = self
-            .held_input_bytes
-            .saturating_add(effects.held_added)
-            .saturating_sub(effects.held_removed);
-        if effects.discarded_bytes > 0 && effects.lease_acknowledged.is_none() {
-            // Input this session accepted and never delivered, with no answer to report it in. It
-            // is carried until an acquire has somewhere to put it. A lease change *does* have an
-            // answer, and its own acknowledgement carries the total, so it is not counted twice.
-            self.interrupted.bytes = self
-                .interrupted
-                .bytes
-                .saturating_add(effects.discarded_bytes);
-        }
-        let mut outcome = FenceOutcome {
-            acceptance: effects.acceptance,
-            lease_acknowledged: effects.lease_acknowledged,
-            close_session: effects.close_session,
-            ..FenceOutcome::default()
-        };
-        for step in effects.steps {
+        for step in owed {
             match step {
-                Step::Write(batch) => self.queue_input(batch),
-                Step::Publish(fence) => {
-                    if let Some(frame) = self
-                        .fence
-                        .as_mut()
-                        .and_then(|driver| driver.publish(*fence))
-                    {
-                        self.pending_input.push_back(Queued::Fence(frame));
-                    }
-                }
                 Step::EditorBusy(event) => self.hub.publish_event(
                     event.attachment_id,
                     crate::output::OutputDelivery::EditorBusy(event),
@@ -965,38 +855,24 @@ impl Session {
                         .err()
                         .map(|error| error.to_string());
                 }
-                Step::Receipt(receipt) => {
-                    self.takeover_receipt = Some(receipt);
-                    outcome.receipts.push(receipt);
-                }
-                Step::LateInstallation(result) => self.late_installations.push(*result),
-                Step::Launch(transaction, answer) => {
-                    // Every caller waiting for one of these is answered here, on the step that
-                    // produced the answer. A closure, a lost bridge and a reader's decision all
-                    // reach this line.
-                    if let Some(sender) = self.launches.remove(&transaction) {
-                        let _ = sender.send((*answer).clone());
-                    }
-                    outcome.launch_answers.push((transaction, *answer));
-                }
-                Step::Send(frame) => {
-                    if let Some(driver) = self.fence.as_ref() {
-                        driver.send(frame);
-                    }
-                }
                 Step::CommandHook(id, hook) => {
-                    let outcome = self.answer_command_hook(*hook);
-                    if let Some(driver) = self.fence.as_ref() {
-                        driver.send(crate::fence::Outbound::EventResult {
-                            id,
-                            result: Box::new(outcome),
-                        });
+                    let answer = self.answer_command_hook(*hook);
+                    self.input.lock().send(crate::fence::Outbound::EventResult {
+                        id,
+                        result: Box::new(answer),
+                    });
+                }
+                // What the machine ordered after a step that needed this session is the input
+                // domain's again, taken for the one step, and carried out in the machine's order.
+                step => {
+                    if let Err(step) = self.input.lock().carry_out_step(step, outcome) {
+                        unreachable!(
+                            "a step that needs the session is carried out above: {step:?}"
+                        );
                     }
                 }
             }
         }
-        self.pump_replies();
-        outcome
     }
 
     /// The most command blocks one session keeps in memory.
@@ -1060,7 +936,7 @@ impl Session {
         use kr_protocol::root::CommandBypassReason;
         use kr_shell_integration::host::command::{InvocationContext, Resolution, resolve};
 
-        if !self.state.accepts_input() {
+        if !self.state().accepts_input() {
             // Nothing new is started inside a session that is closing or closed. The machine's own
             // fence is gone by then and the phase it left behind says nothing about that, and a
             // session that is still being created has no accepted line to run a command from.
@@ -1076,8 +952,9 @@ impl Session {
             // that never claimed a managed editor never had one to ask through.
             managed_root_shell: self.config.shell_mode.claims_managed_editor()
                 && self
-                    .fence
-                    .as_ref()
+                    .input
+                    .lock()
+                    .fence()
                     .is_some_and(|driver| driver.phase().reports_ready()),
             interactive: params.interactive,
         };
@@ -1207,7 +1084,7 @@ impl Session {
     /// going, or the session closing, each of which delivers an answer to whoever was waiting.
     #[must_use]
     pub fn outstanding_launches(&self) -> Option<u64> {
-        self.fence.as_ref().map(|_| self.launches.len() as u64)
+        self.input.lock().outstanding_launches()
     }
 
     /// Sends the terminal's configured interrupt to the foreground process group.
@@ -1217,37 +1094,6 @@ impl Session {
         }
         let shell = self.shell.as_mut().ok_or(WorkerError::SessionClosed)?;
         shell.interrupt()
-    }
-
-    /// Tells the root editor's machine that the lease has moved.
-    ///
-    /// The change has already happened; what this decides is what becomes of the input the previous
-    /// holder had sent and whether a fence exchange starts. A session with no managed editor has
-    /// nothing to tell.
-    fn note_lease_change(&mut self, discarded_bytes: u64) -> u64 {
-        let lease = self.lease_view();
-        let Some(driver) = self.fence.as_mut() else {
-            return discarded_bytes;
-        };
-        let effects = driver.lease_changed(
-            lease,
-            discarded_bytes,
-            kr_protocol::root::FenceId::new(kr_ipc::new_uuid()),
-        );
-        let outcome = self.apply_fence_effects(effects);
-        outcome
-            .lease_acknowledged
-            .map_or(discarded_bytes, |acknowledgement| {
-                acknowledgement.discarded_bytes.get()
-            })
-    }
-
-    /// Returns the lease as the root-editor machine reads it.
-    fn lease_view(&self) -> kr_shell_integration::contract::fence::LeaseView {
-        kr_shell_integration::contract::fence::LeaseView {
-            epoch: kr_protocol::ids::InputLeaseEpoch::new(self.lease.epoch()),
-            holder: self.lease.holder(),
-        }
     }
 
     /// Returns the session's identity.
@@ -1264,8 +1110,8 @@ impl Session {
 
     /// Returns the lifecycle state.
     #[must_use]
-    pub const fn state(&self) -> SessionState {
-        self.state
+    pub fn state(&self) -> SessionState {
+        self.input.lock().state()
     }
 
     /// Returns the session epoch.
@@ -1301,7 +1147,7 @@ impl Session {
     pub fn begin_observation(&self) -> Option<crate::ownership::Observation> {
         // A closed session has written its record, and a reading made for it now would be thrown
         // away.
-        if self.state == SessionState::Closed {
+        if self.state() == SessionState::Closed {
             return None;
         }
         self.owned.as_ref().map(OwnedProcesses::begin_observation)
@@ -1383,7 +1229,7 @@ impl Session {
         // A session that is closing asks nothing more of the platform: what it is bound to stops
         // mattering the moment it begins to stop, and a reading in flight then has nothing left
         // to decide.
-        if !self.state.is_running() || self.state == SessionState::Closing {
+        if !self.state().is_running() || self.state() == SessionState::Closing {
             return None;
         }
         self.desktop.due(now)
@@ -1416,7 +1262,7 @@ impl Session {
         // A reading that came back after the session began to close decides nothing, and writing
         // the binding it adopted into the journal then would record a desktop for a session that
         // is already stopping.
-        if !self.state.is_running() || self.state == SessionState::Closing {
+        if !self.state().is_running() || self.state() == SessionState::Closing {
             return self.desktop.lost();
         }
         let lost = self.desktop.apply(now, probe, sample);
@@ -1482,60 +1328,21 @@ impl Session {
         self.pty.output_waiter()
     }
 
-    /// Discards the framing the lease that is ending left behind.
-    ///
-    /// The held delimiter prefix goes with it, so the deadline that prefix was carrying goes too.
-    /// Leaving it would put an ended actor's authority on the next actor's first keystrokes: the
-    /// bytes it belonged to have been discarded, and the deadline is a fact about those bytes.
-    fn close_framing_for_takeover(&mut self) -> crate::input::TakeoverFraming {
-        self.held_input_deadline = None;
-        self.held_input_utc_deadline = None;
-        self.framer.close_for_takeover()
-    }
-
     /// Ends the lease that was in force and returns what it left the writer holding.
     ///
     /// The fence and the count are one step, taken on the boundary the writer also takes: after
     /// this returns, no write of that lease's bytes can begin, and none was part way through while
     /// the count was taken. That is what makes the number a receipt can quote exact rather than an
     /// estimate of what a writer might still be doing.
-    fn end_lease(&mut self) -> LeaseEnded {
-        let gate = Arc::clone(&self.input_gate);
-        let boundary = gate.lock().expect("the input boundary is not poisoned");
-        // Read before the fence goes out. The writer clears this latch when it sees the fence
-        // change, so a read afterwards can find the zero the writer wrote for this very change and
-        // report that no paste was interrupted when one was. Before the fence, no writer can have
-        // seen it, and a latch an *earlier* change left set was reported by that change.
-        let paste_open_for = self
-            .delivered_paste_open
-            .load(std::sync::atomic::Ordering::Acquire);
-        self.note_lease_holder();
-        let left = self.queued_lease_bytes.take(self.lease.epoch()) as u64;
-        drop(boundary);
-        LeaseEnded {
-            left,
-            paste_open_for,
-        }
-    }
-
-    /// Returns the boundary the writer and a lease change share.
-    ///
-    /// Inside it are the fence, one write that refuses to wait, and the accounting for what that
-    /// write sent; outside it is the waiting for a terminal with no room. A lease change takes the
-    /// same boundary, which is what makes "this lease's bytes are no longer wanted" and "these
-    /// bytes have just been written" one order rather than two races.
-    #[must_use]
-    pub fn input_gate(&self) -> Arc<std::sync::Mutex<()>> {
-        Arc::clone(&self.input_gate)
-    }
-
-    /// Returns the latch the writer sets when the terminal will take nothing more.
-    ///
-    /// The writer holds it for the one moment it ends: a terminal that has gone. From then on this
-    /// session refuses input rather than acknowledging bytes nothing will write.
-    #[must_use]
-    pub fn terminal_gone_latch(&self) -> Arc<std::sync::atomic::AtomicBool> {
-        Arc::clone(&self.terminal_gone)
+    fn end_lease(&mut self, input: &mut InputDomain) -> LeaseEnded {
+        // The engine learns who holds the keys here. The fence itself is published by the domain,
+        // inside the writer's boundary and after it has read whether a paste is open, which is what
+        // makes the count it takes exact.
+        self.engine.set_lease_holder(
+            input.holder(),
+            kr_protocol::ids::InputLeaseEpoch::new(input.epoch()),
+        );
+        input.end_lease()
     }
 
     /// Renders the session for the wire.
@@ -1546,7 +1353,7 @@ impl Session {
             session_epoch: self.config.session_epoch,
             environment_id: self.config.environment_id,
             display_number: self.config.display_number,
-            state: self.state,
+            state: self.state(),
             shell_mode: self.config.shell_mode,
             shell_path: self.config.shell.program.clone(),
             cwd: self.config.shell.cwd.clone(),
@@ -1571,7 +1378,7 @@ impl Session {
     /// Returns the input lease.
     #[must_use]
     pub fn lease(&self) -> InputLeaseState {
-        self.lease.to_wire()
+        self.input.lock().lease()
     }
 
     /// Moves the session's canonical size, in the kernel and in the grid together.
@@ -1671,37 +1478,12 @@ impl Session {
     /// A bell, a clipboard write or a notification leaves the terminal, so it goes to exactly one
     /// place: the attachment holding the input lease. Every path that moves the lease passes
     /// through here, so the destination can never be an attachment that stopped holding it.
-    fn note_lease_holder(&mut self) {
-        let epoch = kr_protocol::ids::InputLeaseEpoch::new(self.lease.epoch());
-        self.engine.set_lease_holder(self.lease.holder(), epoch);
-        // The fence goes out here, with the change itself. Everything that reads what the lease
-        // that just ended left behind reads it afterwards, so the writer can no longer be adding to
-        // that count or writing from it while it is being counted.
-        self.input_fence
-            .store(self.lease.epoch(), std::sync::atomic::Ordering::Release);
-        // The writer is told the lease moved, so a paste the old lease left open at the
-        // application is closed even when nothing follows it. One outstanding notice answers every
-        // change that happens before the writer takes it, because what the writer then reads is
-        // the fence as it stands rather than the change that queued the notice.
-        if !self
-            .lease_change_queued
-            .swap(true, std::sync::atomic::Ordering::AcqRel)
-        {
-            self.pending_input
-                .push_back(Queued::Batch(InputBatch::LeaseChanged));
-        }
-    }
-
-    /// Returns the flag the writer clears when it has answered a lease change.
-    #[must_use]
-    pub fn lease_change_queued(&self) -> Arc<std::sync::atomic::AtomicBool> {
-        Arc::clone(&self.lease_change_queued)
-    }
-
-    /// Returns the writer's record of whether the application is inside a bracketed paste.
-    #[must_use]
-    pub fn delivered_paste_open(&self) -> Arc<std::sync::atomic::AtomicU64> {
-        Arc::clone(&self.delivered_paste_open)
+    fn note_lease_holder(&mut self, input: &mut InputDomain) {
+        self.engine.set_lease_holder(
+            input.holder(),
+            kr_protocol::ids::InputLeaseEpoch::new(input.epoch()),
+        );
+        input.publish_lease();
     }
 
     /// Returns the canonical grid this session's screen lives on.
@@ -1724,10 +1506,10 @@ impl Session {
     pub fn restoration(&mut self, attachment_id: AttachmentId) -> Result<(u64, Vec<u8>)> {
         let scope = self.content_scope(attachment_id);
         let dimensions = self.attachment_dimensions(attachment_id)?;
-        let gate = self.lane_gate();
         let keyboard = self.attachments.keyboard_control(attachment_id);
         let (cursor, restoration, settled) =
-            self.engine.restoration(dimensions, gate, keyboard, scope);
+            self.engine
+                .restoration(dimensions, InputDomain::shut_gate(), keyboard, scope);
         // Taking a snapshot settles the screen, and whatever that released belongs to the
         // attachments that were already watching. Delivering it here is what stops one client's
         // snapshot swallowing a character that was owed to another.
@@ -1771,13 +1553,13 @@ impl Session {
     /// Records that an attachment was made under a grant, so an authority revision or the grant's
     /// own expiry fences what it was admitted to do.
     pub fn note_granted_attachment(&mut self, attachment_id: AttachmentId, by: GrantedBy) {
-        self.granted_attachments.insert(attachment_id, by);
+        self.input.lock().note_granted_attachment(attachment_id, by);
     }
 
     /// Returns true while an attachment made under a grant is still this session's.
     #[must_use]
     pub fn holds_granted_attachment(&self, attachment_id: AttachmentId) -> bool {
-        self.granted_attachments.contains_key(&attachment_id)
+        self.input.lock().holds_granted_attachment(attachment_id)
     }
 
     /// Returns true while an attachment made under a grant is this session's and the reach of an
@@ -1788,14 +1570,9 @@ impl Session {
         attachment_id: AttachmentId,
         reach: &kr_protocol::worker::RevisionReach,
     ) -> bool {
-        self.granted_attachments
-            .get(&attachment_id)
-            .is_some_and(|by| reach.names(by.grant_id, by.device_id))
-    }
-
-    /// Forgets that an attachment was made under a grant, because it has left the session.
-    fn forget_granted_attachment(&mut self, attachment_id: AttachmentId) {
-        self.granted_attachments.remove(&attachment_id);
+        self.input
+            .lock()
+            .granted_attachment_within(attachment_id, reach)
     }
 
     /// Returns how much of the screen one attachment's caller may be shown.
@@ -2068,7 +1845,7 @@ impl Session {
         let previous = self.attachments.geometry();
         let (mut attachment, change) =
             self.attachments
-                .attach(params, granted, attachment_id, kr_ipc::now_ms())?;
+                .attach(params, granted.clone(), attachment_id, kr_ipc::now_ms())?;
 
         if change.resize_required
             && let Err(error) = self.resize_canonical(change.state.dimensions)
@@ -2100,6 +1877,9 @@ impl Session {
         {
             attachment = settled;
         }
+        // What the input path checks a keystroke against. Recorded last, once the attachment is
+        // certain to stay, and before anything can name it.
+        self.input.lock().grant(attachment_id, granted);
         Ok(SessionAttachResult {
             attachment,
             geometry: change.state,
@@ -2125,8 +1905,9 @@ impl Session {
     /// it belonged to has gone, or when the attachment it named has already left.
     pub fn detach_for_token(&self, presented: &str) -> Result<AttachmentId> {
         let named = self
-            .fence
-            .as_ref()
+            .input
+            .lock()
+            .fence()
             .and_then(|driver| driver.detach_for_token(presented));
         let Some(attachment_id) = named else {
             return Err(WorkerError::AmbiguousDetach {
@@ -2158,7 +1939,12 @@ impl Session {
         use kr_shell_integration::contract::fence::{AmbiguityReason, DetachTarget};
 
         let named = "name the one to detach with --attachment";
-        let Some(driver) = self.fence.as_ref() else {
+        let Some(target) = self
+            .input
+            .lock()
+            .fence()
+            .map(|driver| driver.detach_target())
+        else {
             return Err(WorkerError::AmbiguousDetach {
                 detail: format!(
                     "this session has no managed root editor, so it records no originating \
@@ -2166,7 +1952,7 @@ impl Session {
                 ),
             });
         };
-        match driver.detach_target() {
+        match target {
             DetachTarget::Attachment(attachment_id)
                 if self.attachments.get(attachment_id).is_some() =>
             {
@@ -2263,40 +2049,55 @@ impl Session {
         self.content_scopes.remove(&attachment_id);
         self.resource_views.remove(&attachment_id);
         self.live_views.remove(&attachment_id);
-        self.forget_granted_attachment(attachment_id);
+        let shared = Arc::clone(&self.input);
+        let mut input = shared.lock();
+        input.forget_attachment(attachment_id);
         // Undelivered input from the removed attachment goes with it; nothing is replayed. A paste
         // it had open is closed first, so the application is not left inside a bracketed paste
         // whose source has gone.
-        let held = self.lease.holder() == Some(attachment_id);
-        let ending_epoch = self.lease.epoch();
-        let discarded_queue = self.lease.release_attachment(attachment_id);
+        let held = input.holder() == Some(attachment_id);
+        let ending_epoch = input.epoch();
+        let discarded_queue = input.release_attachment(attachment_id);
         if held {
-            let framing = self.close_framing_for_takeover();
-            let ended = self.end_lease();
+            let framing = input.close_framing_for_takeover();
+            let ended = self.end_lease(&mut input);
             // The source of this input has gone, which is the loss section 8 asks to be reported.
             // The attachment that is leaving has no answer left to read it in, so it is carried to
             // whoever takes the keys next.
-            self.interrupted.bytes = self
-                .interrupted
-                .bytes
-                .saturating_add(discarded_queue)
-                .saturating_add(ended.left)
-                .saturating_add(framing.discarded_prefix.len() as u64);
-            self.interrupted.closed_open_paste |= framing.terminator.is_some()
-                || Self::delivered_paste_was_ours(&ended, ending_epoch);
+            input.carry_interrupted(
+                discarded_queue,
+                &ended,
+                &framing,
+                Self::delivered_paste_was_ours(&ended, ending_epoch),
+            );
         } else {
-            self.note_lease_holder();
+            self.note_lease_holder(&mut input);
         }
         // The machine discards whatever it was holding for this attachment, invalidates a fence
         // that named it, and ends the reader's wait for a key that can never arrive.
-        if let Some(driver) = self.fence.as_mut() {
+        let mut owed = Vec::new();
+        if let Some(driver) = input.fence_mut() {
             let effects = driver.attachment_removed(attachment_id);
-            let _ = self.apply_fence_effects(effects);
+            owed = input.apply_effects(effects).owed;
         }
+        let mut input = if owed.is_empty() {
+            input
+        } else {
+            // What the first stimulus left for the session is carried out before the second is
+            // put to the machine, as it was when one pass handled each in turn. The lease has
+            // already ended and its fence is out, so a keystroke in between finds no holder.
+            drop(input);
+            self.carry_out(owed, &mut FenceOutcome::default());
+            owed = Vec::new();
+            shared.lock()
+        };
         if held {
-            let carried = self.note_lease_change(0);
-            self.interrupted.bytes = self.interrupted.bytes.saturating_add(carried);
+            let (carried, more) = input.note_lease_change(0);
+            input.carry_bytes(carried);
+            owed.extend(more);
         }
+        drop(input);
+        self.carry_out(owed, &mut FenceOutcome::default());
         self.pump_replies();
         self.hub.detached(attachment_id);
         self.projections.forget(attachment_id);
@@ -2306,7 +2107,7 @@ impl Session {
         let previous = self.attachments.geometry();
         let change = self.attachments.detach(attachment_id)?;
         if change.resize_required
-            && self.state.is_running()
+            && self.state().is_running()
             && let Err(error) = self.resize_canonical(change.state.dimensions)
         {
             // The attachment is gone either way — it asked to leave — but the geometry it would
@@ -2314,7 +2115,7 @@ impl Session {
             self.attachments.restore_geometry(&previous);
             return Err(error);
         }
-        if change.resize_required && self.state.is_running() {
+        if change.resize_required && self.state().is_running() {
             // Succession moved the size, so every remaining client's screen is at the old one.
             // After the table, because the screen each is given is drawn for the window it has.
             self.reinstall_every_subscriber(ProjectionResetReason::Geometry);
@@ -2459,7 +2260,7 @@ impl Session {
         let previous = self.attachments.geometry();
         let change = self.attachments.configure(attachment_id, claim_geometry)?;
         if change.resize_required
-            && self.state.is_running()
+            && self.state().is_running()
             && let Err(error) = self.resize_canonical(change.state.dimensions)
         {
             // A withdrawn claim stays withdrawn, because the attachment asked for that, but the
@@ -2468,7 +2269,7 @@ impl Session {
             self.attachments.restore_geometry(&previous);
             return Err(error);
         }
-        if change.resize_required && self.state.is_running() {
+        if change.resize_required && self.state().is_running() {
             // The claim moved the size, so every client's screen is at the old one.
             self.reinstall_every_subscriber(ProjectionResetReason::Geometry);
         }
@@ -2547,14 +2348,18 @@ impl Session {
         connection_id: ConnectionId,
         expected_epoch: Option<u64>,
     ) -> Result<InputAcquireResult> {
-        self.require_running()?;
+        let shared = Arc::clone(&self.input);
+        let mut input = shared.lock();
+        if !input.state().is_running() {
+            return Err(WorkerError::SessionClosed);
+        }
         if self.attachments.get(attachment_id).is_none() {
             return Err(WorkerError::UnknownAttachment {
                 attachment: attachment_id.to_string(),
             });
         }
         if let Some(expected) = expected_epoch
-            && expected != self.lease.epoch()
+            && expected != input.epoch()
         {
             return Err(WorkerError::LeaseLost);
         }
@@ -2562,16 +2367,16 @@ impl Session {
 
         // An interrupted paste is closed before the new lease writes, so the application never
         // sees a paste finished under a different actor.
-        let framing = self.close_framing_for_takeover();
+        let framing = input.close_framing_for_takeover();
         // Read before the lease moves: it is the ending lease's answer, not the new one's.
-        let ending_epoch = self.lease.epoch();
-        let discarded_queue = self.lease.acquire(attachment_id, connection_id);
+        let ending_epoch = input.epoch();
+        let discarded_queue = input.acquire(attachment_id, connection_id);
         // The lease ends and what it left behind is counted in one step, on the boundary the writer
         // takes for every write: no byte of this lease's can be written after it, and none was
         // being written while it was counted. Taking the counter rather than reading it is what
         // makes the answer that lease's own: the next takeover starts from zero and cannot report
         // these bytes again.
-        let ended = self.end_lease();
+        let ended = self.end_lease(&mut input);
         let mut discarded = ended.left;
         discarded += discarded_queue;
         discarded += framing.discarded_prefix.len() as u64;
@@ -2582,19 +2387,22 @@ impl Session {
             framing.terminator.is_some() || Self::delivered_paste_was_ours(&ended, ending_epoch);
         // Plus whatever a lease the host ended by itself left behind. It had no answer of its own
         // to be reported in, so it is reported here, once, and then it is nobody's any more.
-        let carried = std::mem::take(&mut self.interrupted);
+        let carried = input.take_interrupted();
         discarded = discarded.saturating_add(carried.bytes);
         closed_open_paste |= carried.closed_open_paste;
         // The root editor's machine is told the lease has moved. It adds whatever it was holding
         // for the previous epoch to the count, cancels an incomplete reader operation and starts
         // the fence exchange; the takeover itself stands whatever the reader says about it.
-        discarded = self.note_lease_change(discarded);
+        let (discarded, owed) = input.note_lease_change(discarded);
+        let lease = input.lease();
+        drop(input);
+        self.carry_out(owed, &mut FenceOutcome::default());
         // Nothing is queued for the terminator here. The writer closes a paste the application is
         // actually inside, before anything from the new lease reaches it; queueing a correction
         // under the old lease is what let one be discarded with it.
         self.pump_replies();
         Ok(InputAcquireResult {
-            lease: self.lease.to_wire(),
+            lease,
             discarded_bytes: U64::new(discarded),
             closed_open_paste,
         })
@@ -2610,36 +2418,38 @@ impl Session {
         attachment_id: AttachmentId,
         epoch: u64,
     ) -> Result<InputLeaseState> {
-        let ending_epoch = self.lease.epoch();
-        let discarded_queue = self
-            .lease
+        let shared = Arc::clone(&self.input);
+        let mut input = shared.lock();
+        let ending_epoch = input.epoch();
+        let discarded_queue = input
             .release(attachment_id, epoch)
             .ok_or(WorkerError::LeaseLost)?;
         // A paste this lease opened is closed as it goes. Leaving it open would put the
         // application into a bracketed paste that nothing was ever going to end, so the next
         // keystroke would arrive inside somebody else's paste. The writer supplies the terminator,
         // because it is the only thing that knows whether the application ever saw the start.
-        let framing = self.close_framing_for_takeover();
+        let framing = input.close_framing_for_takeover();
         // What this lease handed over and the writer has not written goes with it, counted on the
         // same boundary that stopped the writer from touching it. The answer to a release is the
         // lease state, which has nowhere to say it, so it is carried to whoever takes the keys next
         // rather than dropped: an actor that let go of the keys still interrupted whatever it had
         // not delivered.
-        let ended = self.end_lease();
-        self.interrupted.bytes = self
-            .interrupted
-            .bytes
-            .saturating_add(discarded_queue)
-            .saturating_add(ended.left)
-            .saturating_add(framing.discarded_prefix.len() as u64);
-        self.interrupted.closed_open_paste |=
-            framing.terminator.is_some() || Self::delivered_paste_was_ours(&ended, ending_epoch);
+        let ended = self.end_lease(&mut input);
+        input.carry_interrupted(
+            discarded_queue,
+            &ended,
+            &framing,
+            Self::delivered_paste_was_ours(&ended, ending_epoch),
+        );
         // Nobody is being told about this one, so what the machine was holding is carried with the
         // rest until an acquire has an answer to report it in.
-        let held = self.note_lease_change(0);
-        self.interrupted.bytes = self.interrupted.bytes.saturating_add(held);
+        let (held, owed) = input.note_lease_change(0);
+        input.carry_bytes(held);
+        let lease = input.lease();
+        drop(input);
+        self.carry_out(owed, &mut FenceOutcome::default());
         self.pump_replies();
-        Ok(self.lease.to_wire())
+        Ok(lease)
     }
 
     /// Accepts ordered input for the pseudo-terminal.
@@ -2689,170 +2499,16 @@ impl Session {
         authority: InputAuthority,
         now: Instant,
     ) -> Result<InputAccepted> {
-        let authority_deadline_boot_ms = authority.boot_ms;
-        if !self.state.accepts_input() {
-            return Err(WorkerError::SessionClosed);
-        }
-        // A terminal that has gone takes nothing, and an acknowledgement here would say the
-        // opposite. The session itself is still open - what happened to the shell is the child
-        // monitor's question, not this one's - so this is the resource it is rather than a closure.
-        if self
-            .terminal_gone
-            .load(std::sync::atomic::Ordering::Acquire)
-        {
-            return Err(WorkerError::ResourceUnavailable {
-                detail: "this session's terminal has gone, so nothing can be written to it"
-                    .to_owned(),
-            });
-        }
-        match self.lease.accept_write(attachment_id, epoch, sequence) {
-            Ok(()) => {}
-            Err(LeaseRefusal::LeaseLost) => return Err(WorkerError::LeaseLost),
-            Err(LeaseRefusal::OutOfOrder { expected, received }) => {
-                return Err(WorkerError::InvalidArgument(format!(
-                    "input sequence {received} does not follow {expected}"
-                )));
-            }
-        }
-        // The budget is checked before the recogniser is fed, so a refused frame leaves the
-        // framing exactly as it was: what is refused is the whole frame, not part of it. A push
-        // can also release a prefix it was holding, which is at most one delimiter short of a
-        // whole one, so that is counted too.
-        let claimed = bytes.len().saturating_add(crate::input::PASTE_END.len());
-        let queued = self
-            .queued_input_bytes
-            .load(std::sync::atomic::Ordering::Acquire)
-            // What the root editor's machine is holding for a reader transition has been accepted
-            // and not delivered, so it is against the same bound. Leaving it out would let a client
-            // that keeps typing through a hold exceed the bound without limit.
-            .saturating_add(self.held_input_bytes);
-        if queued.saturating_add(claimed) > MAX_QUEUED_INPUT_BYTES {
-            return Err(WorkerError::ResourceUnavailable {
-                detail: format!(
-                    "the application is not reading its input and {MAX_QUEUED_INPUT_BYTES} bytes \
-                     are already waiting for it, so these bytes were not accepted"
-                ),
-            });
-        }
-        if !self.accepts_external_input() {
-            // Section 7 paragraph 4: in managed mode nothing external reaches the terminal until
-            // the private reader and pre-EOF bridge are authenticated and ABI-checked. The refusal
-            // is decided before the recogniser is fed, so a refused frame leaves no half-open paste
-            // behind it and no prefix waiting on a timer.
-            return Err(Self::unauthenticated());
-        }
-        let outcome = self.framer.push(bytes, now);
-        // The recogniser can hold bytes back, so what this push forwards may carry bytes an
-        // earlier write handed over. Whichever authority ends first is the one that decides: an
-        // earlier write's deadline never gets extended by a later write, and a later write's
-        // never gets extended by an earlier one.
-        let admitted = tightest(self.held_input_deadline, authority_deadline_boot_ms);
-        let admitted_utc = tightest(self.held_input_utc_deadline, authority.utc_ms);
-        if !outcome.forward.is_empty() {
-            // The framer's own state after the push is what these bytes leave the application in,
-            // because `forward` carries every delimiter the push completed and no part of one it
-            // did not. Whether a start is among them is the separate question the writer asks when
-            // it has delivered only part of the batch.
-            let paste = PasteTransition {
-                delimiters: outcome.delimiters.clone(),
-            };
-            let batch = InputBatch::Lease {
-                epoch,
-                bytes: outcome.forward.clone(),
-                paste,
-                authority_deadline_boot_ms: admitted,
-                authority_utc_deadline_ms: admitted_utc,
-            };
-            self.offer_input(attachment_id, epoch, batch)?;
-        }
-        // What is still held is a suffix of the prefix that was held and the bytes this write
-        // added. Longer than this write means it still carries bytes an earlier one handed over,
-        // and then the earlier authority is part of it; no longer than this write means every
-        // byte in it is this write's, and an earlier deadline has nothing to do with it. Nothing
-        // held means nothing to fence later.
-        self.held_input_deadline = if outcome.held == 0 {
-            None
-        } else if outcome.held > bytes.len() {
-            admitted
-        } else {
-            authority_deadline_boot_ms
-        };
-        self.held_input_utc_deadline = if outcome.held == 0 {
-            None
-        } else if outcome.held > bytes.len() {
-            admitted_utc
-        } else {
-            authority.utc_ms
-        };
+        let Accepted { accepted, owed, .. } =
+            self.input
+                .lock()
+                .accept(attachment_id, epoch, sequence, bytes, authority, now)?;
+        self.carry_out(owed, &mut FenceOutcome::default());
         // A paste that has just closed, or a frame that has just completed, opens the gate the
         // response lane was waiting on. An application that asked a question during one of those
         // and then sat still would otherwise wait for its answer until the next byte of output.
         self.pump_replies();
-        Ok(InputAccepted {
-            forwarded_bytes: outcome.forward.len() as u64,
-            held_prefix_bytes: outcome.held as u64,
-            deadline: outcome.deadline,
-        })
-    }
-
-    /// Returns whether the session's integration admits bytes from outside it.
-    ///
-    /// A session with no managed reader always does. A managed one does only once its private
-    /// reader and pre-EOF bridge have been authenticated and ABI-checked, and stops again if that
-    /// integration is lost.
-    fn accepts_external_input(&self) -> bool {
-        self.fence
-            .as_ref()
-            .is_none_or(|driver| driver.phase().accepts_external_input())
-    }
-
-    /// Returns the refusal an unauthenticated managed session owes a client's bytes.
-    fn unauthenticated() -> WorkerError {
-        WorkerError::PreconditionFailed {
-            detail: "this session's root integration has not been authenticated, so it accepts \
-                     no external input yet"
-                .to_owned(),
-        }
-    }
-
-    /// Offers one batch of a client's bytes to the terminal.
-    ///
-    /// Every client byte goes through here, whether it arrived in a frame or was released by the
-    /// paste recogniser's own timer. A managed session asks the root editor's machine what becomes
-    /// of it: written now, held for at most 250 ms while a reader transition resolves, or dropped
-    /// because its lease has moved. Queueing one of them anywhere else would let a later byte reach
-    /// the application in front of an earlier one the machine is still holding.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`WorkerError::SessionClosed`] when the machine refuses the batch outright.
-    fn offer_input(
-        &mut self,
-        attachment_id: AttachmentId,
-        epoch: u64,
-        batch: InputBatch,
-    ) -> Result<()> {
-        let Some(driver) = self.fence.as_mut() else {
-            self.queue_input(batch);
-            return Ok(());
-        };
-        if !driver.phase().accepts_external_input() {
-            // The same gate again, for the bytes that reach this path without passing through a
-            // frame: a prefix the recogniser's own timer released, or one a mode change let go of.
-            // Those were accepted while the integration was authenticated and may arrive after a
-            // loss took the phase back, and the terminal is owed no external byte after that.
-            return Err(Self::unauthenticated());
-        }
-        let effects = driver.input_arrived(
-            attachment_id,
-            kr_protocol::ids::InputLeaseEpoch::new(epoch),
-            batch,
-        );
-        if effects.input_refused.is_some() {
-            return Err(WorkerError::SessionClosed);
-        }
-        let _ = self.apply_fence_effects(effects);
-        Ok(())
+        Ok(accepted)
     }
 
     /// Forwards a held delimiter prefix whose deadline has passed.
@@ -2860,34 +2516,8 @@ impl Session {
     /// The timer runs whether or not more input arrives, so a lone Escape is never waiting for
     /// another keystroke.
     pub fn expire_paste_prefix(&mut self, now: Instant) -> usize {
-        let epoch = self.lease.epoch();
-        let expired = match self.framer.expire(now) {
-            Some(bytes) if !bytes.is_empty() => {
-                let len = bytes.len();
-                // The prefix was accepted when it arrived and counted against the budget then, so
-                // it goes through whatever the budget says now: forwarding it unchanged is what
-                // the recogniser promised, and it is at most one delimiter long. It still goes
-                // through the machine, because a reader transition that is holding what came before
-                // it must hold this too, and it still carries the authority it was accepted under.
-                if let Some(holder) = self.lease.holder() {
-                    let _ = self.offer_input(
-                        holder,
-                        epoch,
-                        InputBatch::Lease {
-                            epoch,
-                            bytes,
-                            paste: PasteTransition::default(),
-                            authority_deadline_boot_ms: self.held_input_deadline,
-                            authority_utc_deadline_ms: self.held_input_utc_deadline,
-                        },
-                    );
-                }
-                self.held_input_deadline = None;
-                self.held_input_utc_deadline = None;
-                len
-            }
-            _ => 0,
-        };
+        let (expired, owed) = self.input.lock().expire_paste_prefix(now);
+        self.carry_out(owed, &mut FenceOutcome::default());
         // The held prefix has gone, so a frame that was open is closed and the response lane's
         // gate is open again.
         self.pump_replies();
@@ -2897,7 +2527,7 @@ impl Session {
     /// Returns the deadline of a held delimiter prefix, if there is one.
     #[must_use]
     pub fn paste_deadline(&self) -> Option<Instant> {
-        self.framer.deadline()
+        self.input.lock().paste_deadline()
     }
 
     /// Records that the application has enabled or disabled bracketed-paste mode.
@@ -2907,47 +2537,19 @@ impl Session {
     /// would delay a keystroke for no reason. A prefix held inside an open paste keeps waiting,
     /// because that paste still has to be closed before another actor writes.
     pub fn set_bracketed_paste(&mut self, enabled: bool) {
-        let released = self.framer.set_bracketed_paste(enabled);
-        self.release_prefix(released);
-    }
-
-    /// Queues bytes the recogniser has stopped holding, under the lease that sent them.
-    fn release_prefix(&mut self, released: Vec<u8>) {
-        if released.is_empty() {
-            return;
+        let (owed, forwarded) = self.input.lock().set_bracketed_paste(enabled);
+        self.carry_out(owed, &mut FenceOutcome::default());
+        // The prefix has gone, so a frame that was open is closed and the response lane's gate is
+        // open again.
+        if forwarded {
+            self.pump_replies();
         }
-        if self.lease.holder().is_none() {
-            // Nothing holds the keys, so these bytes belong to a lease that has ended and went
-            // with it. Writing them now would put an ended actor's input in front of the next one.
-            self.held_input_deadline = None;
-            self.held_input_utc_deadline = None;
-            return;
-        }
-        let epoch = self.lease.epoch();
-        if let Some(holder) = self.lease.holder() {
-            let _ = self.offer_input(
-                holder,
-                epoch,
-                InputBatch::Lease {
-                    epoch,
-                    bytes: released,
-                    paste: PasteTransition::default(),
-                    authority_deadline_boot_ms: self.held_input_deadline,
-                    authority_utc_deadline_ms: self.held_input_utc_deadline,
-                },
-            );
-        }
-        self.held_input_deadline = None;
-        self.held_input_utc_deadline = None;
-        // The held prefix has gone, so a frame that was open is closed and the response lane's
-        // gate is open again.
-        self.pump_replies();
     }
 
     /// Returns whether a bracketed paste has been started and not yet ended.
     #[must_use]
-    pub const fn paste_open(&self) -> bool {
-        self.framer.paste_open()
+    pub fn paste_open(&self) -> bool {
+        self.input.lock().paste_open()
     }
 
     /// Sends the terminal's configured interrupt to the foreground process group.
@@ -2959,10 +2561,12 @@ impl Session {
     ///
     /// Returns [`WorkerError::LeaseLost`] when the caller does not hold the lease.
     pub fn interrupt(&mut self, attachment_id: AttachmentId, epoch: u64) -> Result<()> {
+        let shared = Arc::clone(&self.input);
+        let mut input = shared.lock();
         // In a managed session the machine decides it: the current epoch and holder, the configured
         // native action and nothing else, and it bypasses the reader-transition hold because a held
         // interrupt would be no interrupt at all.
-        if let Some(driver) = self.fence.as_mut() {
+        if let Some(driver) = input.fence_mut() {
             let effects = driver.interrupt_requested(
                 attachment_id,
                 kr_protocol::ids::InputLeaseEpoch::new(epoch),
@@ -2970,7 +2574,10 @@ impl Session {
             );
             let refused = effects.interrupt_refused;
             let interrupt = effects.interrupt();
-            let _ = self.apply_fence_effects(effects);
+            let owed = input.apply_effects(effects).owed;
+            drop(input);
+            self.carry_out(owed, &mut FenceOutcome::default());
+            self.pump_replies();
             if let Some(fault) = refused {
                 return Err(match fault {
                     kr_shell_integration::contract::fence::LeaseFault::SessionClosing => {
@@ -2993,9 +2600,10 @@ impl Session {
                 Some(detail) => Err(WorkerError::ResourceUnavailable { detail }),
             };
         }
-        if self.lease.holder() != Some(attachment_id) || self.lease.epoch() != epoch {
+        if input.holder() != Some(attachment_id) || input.epoch() != epoch {
             return Err(WorkerError::LeaseLost);
         }
+        drop(input);
         // The terminal's own foreground group first, because that is what the interrupt key
         // reaches. The root shell's group is the fallback for a terminal that will not say.
         self.interrupt_foreground()
@@ -3018,24 +2626,7 @@ impl Session {
     /// When the writer reports the fence written, its connection ends and the loss has been
     /// recorded, or the machine drops the fence, the next flush takes what was waiting.
     pub fn take_pending_input(&mut self) -> Vec<InputBatch> {
-        let mut taken = Vec::new();
-        while let Some(queued) = self.pending_input.pop_front() {
-            match queued {
-                Queued::Batch(batch) => taken.push(batch),
-                Queued::Fence(frame)
-                    if self
-                        .fence
-                        .as_ref()
-                        .is_some_and(|driver| driver.holds_back(frame)) =>
-                {
-                    self.pending_input.push_front(Queued::Fence(frame));
-                    break;
-                }
-                // Written, gone with the connection it was handed to, or no longer the machine's.
-                Queued::Fence(_) => {}
-            }
-        }
-        taken
+        self.input.lock().take_pending()
     }
 
     /// Returns how many batches wait in the queue for the terminal behind a published fence that
@@ -3046,17 +2637,7 @@ impl Session {
     #[cfg(feature = "testing")]
     #[must_use]
     pub fn waiting_for_fence(&self) -> usize {
-        self.pending_input
-            .iter()
-            .skip_while(|queued| match queued {
-                Queued::Batch(_) => true,
-                Queued::Fence(frame) => !self
-                    .fence
-                    .as_ref()
-                    .is_some_and(|driver| driver.holds_back(*frame)),
-            })
-            .filter(|queued| matches!(queued, Queued::Batch(_)))
-            .count()
+        self.input.lock().waiting_for_fence()
     }
 
     /// Returns the epoch a batch must carry to still be written.
@@ -3065,13 +2646,7 @@ impl Session {
     /// close moves this, and the writer drops whatever it is still holding from before.
     #[must_use]
     pub fn input_fence(&self) -> u64 {
-        self.lease.epoch()
-    }
-
-    /// Returns the published fence the writer compares every queued batch against.
-    #[must_use]
-    pub fn input_fence_handle(&self) -> Arc<std::sync::atomic::AtomicU64> {
-        Arc::clone(&self.input_fence)
+        self.input.lock().input_fence()
     }
 
     /// Subscribes an attachment to output.
@@ -3268,8 +2843,10 @@ impl Session {
         };
         let filtered = {
             let mut span = self.trace.acquisition(crate::trace::Site::IngestInterpret);
-            let gate = self.lane_gate();
-            let filtered = self.engine.feed(cursor, bytes, gate);
+            // With the gate shut. A reply is let out under the input domain, with the gate read
+            // there, so a keystroke that opens a paste while this batch is parsed cannot find
+            // an answer already written into the middle of it.
+            let filtered = self.engine.feed(cursor, bytes, InputDomain::shut_gate());
             span.held();
             filtered
         };
@@ -3278,10 +2855,7 @@ impl Session {
         // two reads, and one that appears inside a string and sets nothing, are both answered
         // correctly here and by nothing else. The recogniser is told after the batch is parsed,
         // which is the first moment the answer exists.
-        let released = self
-            .framer
-            .set_bracketed_paste(self.engine.bracketed_paste());
-        self.release_prefix(released);
+        self.set_bracketed_paste(self.engine.bracketed_paste());
         // The same batch may have changed the keyboard negotiation, and whoever holds the keys has
         // to be able to produce whatever it changed to.
         self.reevaluate_lease();
@@ -3314,29 +2888,31 @@ impl Session {
     ///
     /// Returns whether the keys were taken.
     fn reevaluate_lease(&mut self) -> bool {
-        let Some(holder) = self.lease.holder() else {
+        let shared = Arc::clone(&self.input);
+        let mut input = shared.lock();
+        let Some(holder) = input.holder() else {
             return false;
         };
         let required = self.engine.keyboard_negotiated();
         if self.attachments.supplies_encoding(holder, required) {
             return false;
         }
-        let ending_epoch = self.lease.epoch();
-        let discarded_queue = self.lease.release_attachment(holder);
-        let framing = self.close_framing_for_takeover();
-        let ended = self.end_lease();
+        let ending_epoch = input.epoch();
+        let discarded_queue = input.release_attachment(holder);
+        let framing = input.close_framing_for_takeover();
+        let ended = self.end_lease(&mut input);
         // What this lease lost is carried rather than dropped. Nobody asked for the release, so
         // there is no answer to put it in; the next acquire reports it with its own.
-        self.interrupted.bytes = self
-            .interrupted
-            .bytes
-            .saturating_add(discarded_queue)
-            .saturating_add(ended.left)
-            .saturating_add(framing.discarded_prefix.len() as u64);
-        self.interrupted.closed_open_paste |=
-            framing.terminator.is_some() || Self::delivered_paste_was_ours(&ended, ending_epoch);
-        let carried = self.note_lease_change(0);
-        self.interrupted.bytes = self.interrupted.bytes.saturating_add(carried);
+        input.carry_interrupted(
+            discarded_queue,
+            &ended,
+            &framing,
+            Self::delivered_paste_was_ours(&ended, ending_epoch),
+        );
+        let (carried, owed) = input.note_lease_change(0);
+        input.carry_bytes(carried);
+        drop(input);
+        self.carry_out(owed, &mut FenceOutcome::default());
         self.pump_replies();
         true
     }
@@ -3360,8 +2936,8 @@ impl Session {
     /// It is cleared by the next acquire, which reports it. A test reads it here because the wire
     /// answer belongs to that acquire rather than to the release.
     #[must_use]
-    pub const fn interrupted_input(&self) -> Interrupted {
-        self.interrupted
+    pub fn interrupted_input(&self) -> Interrupted {
+        self.input.lock().interrupted_input()
     }
 
     /// Settles the screen when the terminal's output goes quiet.
@@ -3370,7 +2946,7 @@ impl Session {
     /// screen that has stopped changing is only final once this has run. The read loop calls it
     /// when a read finds nothing waiting.
     pub fn quiesce_output(&mut self) -> Vec<AttachmentId> {
-        let filtered = self.engine.quiesce(self.lane_gate());
+        let filtered = self.engine.quiesce(InputDomain::shut_gate());
         self.reconsider_incomplete_restorations();
         self.deliver(filtered)
     }
@@ -3442,116 +3018,27 @@ impl Session {
     /// application that asked and then sat still would wait for ever. Every place that opens the
     /// gate calls this.
     pub fn pump_replies(&mut self) {
-        let gate = self.lane_gate();
-        let replies = self.engine.drain_replies(gate);
-        self.queue_replies(replies);
-    }
-
-    /// Queues the host's own answers for the application, up to what one may wait for.
-    ///
-    /// The response lane bounds what it holds; this bounds what has left the lane and is waiting
-    /// for an application that has stopped reading its input. One that asks questions and never
-    /// reads the answers stops being answered here rather than growing this queue without limit.
-    fn queue_replies(&mut self, replies: Vec<crate::projection::LaneReply>) {
-        let mut queued_bytes = 0_u64;
-        for reply in replies {
-            let queued = self
-                .queued_input_bytes
-                .load(std::sync::atomic::Ordering::Acquire);
-            let held = queued.saturating_sub(self.queued_lease_bytes.load());
-            // Two bounds, both of them this reply's: its own share, so an application that asks
-            // questions without reading the answers cannot fill the terminal by itself, and the
-            // whole budget, so its share cannot be spent on top of a full queue. What the root
-            // editor's machine is holding counts towards the second, because it is accepted input
-            // on its way to the same terminal.
-            let outstanding = queued.saturating_add(self.held_input_bytes);
-            if held.saturating_add(reply.bytes.len()) > MAX_PENDING_REPLY_BYTES
-                || outstanding.saturating_add(reply.bytes.len()) > MAX_QUEUED_INPUT_BYTES
-            {
-                break;
-            }
-            queued_bytes = queued_bytes.saturating_add(reply.bytes.len() as u64);
-            self.unwritten_replies
-                .fetch_add(reply.bytes.len(), std::sync::atomic::Ordering::AcqRel);
-            self.queue_input(InputBatch::Reply {
-                bytes: reply.bytes,
-                expires_at_ms: reply.expires_at_ms,
-            });
+        // The lane is drained and its answers queued in one hold of the input domain, with the
+        // gate read in that hold: a keystroke that opens a bracketed paste cannot come between the
+        // gate being read and the answers being queued behind it.
+        let shared = Arc::clone(&self.input);
+        let mut input = shared.lock();
+        let replies = self.engine.drain_replies(input.lane_gate());
+        let applied = input.queue_replies(replies);
+        drop(input);
+        // The machine's answer to them can let more out, and is looked at again, which must find
+        // this batch already queued.
+        if let Some(Applied { mut outcome, owed }) = applied {
+            self.carry_out(owed, &mut outcome);
+            self.pump_replies();
         }
-        // The root editor's machine hears of them once, after the whole batch is queued, in the
-        // order the terminal will get them: what the machine publishes because of them goes behind
-        // the bytes they are, and applying its answer drains the lane again, which must find this
-        // batch already in the queue rather than put the rest of the lane in front of it. Every
-        // byte the host puts into the terminal is accounted, not only a person's.
-        if queued_bytes > 0
-            && let Some(driver) = self.fence.as_mut()
-        {
-            let effects = driver.host_reply_queued(queued_bytes);
-            self.apply_fence_effects(effects);
-        }
-    }
-
-    /// Queues one batch for the pseudo-terminal, counted against the session's input budget.
-    ///
-    /// Every producer goes through here, because the writer releases every piece it writes against
-    /// the same counter: charging only some of them would make the count drift down until it
-    /// stopped bounding anything.
-    fn queue_input(&mut self, batch: InputBatch) {
-        self.queued_input_bytes
-            .fetch_add(batch.len(), std::sync::atomic::Ordering::AcqRel);
-        if let InputBatch::Lease { epoch, .. } = batch {
-            self.queued_lease_bytes.add(epoch, batch.len());
-        }
-        self.pending_input.push_back(Queued::Batch(batch));
-    }
-
-    /// Returns the counter the writer takes each answer's bytes off as they reach the terminal or
-    /// are dropped.
-    #[must_use]
-    pub fn unwritten_replies(&self) -> Arc<std::sync::atomic::AtomicUsize> {
-        Arc::clone(&self.unwritten_replies)
-    }
-
-    /// Returns the counter the writer adds to for each answer it drops.
-    #[must_use]
-    pub fn dropped_replies(&self) -> Arc<std::sync::atomic::AtomicU64> {
-        Arc::clone(&self.dropped_replies)
     }
 
     /// Returns how many answers the writer has dropped, because the response lane's deadline for
     /// each passed while it waited for a terminal that would not take it.
     #[must_use]
     pub fn replies_dropped(&self) -> u64 {
-        self.dropped_replies
-            .load(std::sync::atomic::Ordering::Acquire)
-    }
-
-    /// Returns the counter the writer releases as the application takes its input.
-    #[must_use]
-    pub fn queued_input_bytes(&self) -> Arc<std::sync::atomic::AtomicUsize> {
-        Arc::clone(&self.queued_input_bytes)
-    }
-
-    /// Returns the counter holding the current lease's share of the queue.
-    #[must_use]
-    pub fn queued_lease_bytes(&self) -> Arc<crate::runtime::LeaseBytes> {
-        Arc::clone(&self.queued_lease_bytes)
-    }
-
-    /// Returns what the response lane is allowed to write right now.
-    ///
-    /// A reply must not land in the middle of a bracketed paste or a recognised human input frame,
-    /// because the application would read it as part of what the person was typing.
-    fn lane_gate(&self) -> kr_term::lane::LaneGate {
-        kr_term::lane::LaneGate {
-            paste_open: self.framer.paste_open(),
-            // No backend this host drives is qualified to take a reply inside an open paste.
-            backend_handles_paste_interleave: false,
-            // A delimiter this framer is still holding is the first bytes of a frame the person is
-            // part way through sending. A reply written in the middle of it would arrive inside
-            // what the application reads as one key.
-            human_frame_open: self.framer.held_len() > 0,
-        }
+        self.input.lock().replies_dropped()
     }
 
     /// Sends one projected attachment what it is owed: a bounded update, or a fresh screen.
@@ -3591,7 +3078,6 @@ impl Session {
             crate::snapshot::Owed::Nothing => return false,
             crate::snapshot::Owed::Update(update) => update,
             crate::snapshot::Owed::Snapshot(reason) => {
-                let gate = self.lane_gate();
                 // The subscriber's own send queue is what a screen has to fit: this is the one
                 // message a client cannot use part of, so a screen too large for that queue is cut
                 // to it and marked degraded rather than refused for ever.
@@ -3600,16 +3086,19 @@ impl Session {
                 // live screen alone is paged the buffer that is showing and never the other one.
                 let scope = self.content_scope(attachment_id);
                 let window = self.window_of(attachment_id, dimensions);
-                match self
-                    .engine
-                    .projection_install(window, reason, gate, budget, scope)
-                {
-                    Ok((update, settled)) => {
+                match self.engine.projection_install(
+                    window,
+                    reason,
+                    InputDomain::shut_gate(),
+                    budget,
+                    scope,
+                ) {
+                    Ok((update, _settled)) => {
                         // Taking a snapshot settles the screen. It changes no display state here,
                         // because the screen was settled before this loop began, but it can still
                         // release replies the response lane held in the moment between, and those
                         // are the application's.
-                        self.queue_replies(settled.replies);
+                        self.pump_replies();
                         update
                     }
                     Err(_) => {
@@ -3711,7 +3200,11 @@ impl Session {
             unrecorded.undelivered.push(Arc::clone(&owed.effect));
             return;
         };
-        if self.lease.holder() != Some(id) || self.lease.epoch() != epoch.get() {
+        let holds_the_keys = {
+            let input = self.input.lock();
+            input.holder() == Some(id) && input.epoch() == epoch.get()
+        };
+        if !holds_the_keys {
             unrecorded.undelivered.push(Arc::clone(&owed.effect));
             return;
         }
@@ -3806,11 +3299,16 @@ impl Session {
             // back. Settling once here, before any snapshot, is what stops those bytes disappearing
             // inside the first projected subscriber's repaint when a direct attachment was owed
             // them.
-            let gate = self.lane_gate();
-            let settled = self.engine.quiesce(gate);
+            let settled = self.engine.quiesce(InputDomain::shut_gate());
             filtered.absorb(settled);
         }
-        self.queue_replies(filtered.replies);
+        // The lane is drained after the batch is parsed, with the gate as it stands then. A
+        // projected attachment's settling is a second look at the lane, as it was when the
+        // engine drained the lane inside each of the two calls.
+        self.pump_replies();
+        if !projected.is_empty() {
+            self.pump_replies();
+        }
         // Nothing holds the input lease for these, so there is no terminal they belong to. Section 8
         // makes each a durable host event rather than something shown to whoever is watching, and so
         // is every effect below that has nowhere to go: they are all kept at the end of the call,
@@ -3938,7 +3436,7 @@ impl Session {
             cursor: U64::new(self.history.next_cursor()),
             session: self.summary(),
             geometry: self.attachments.geometry(),
-            lease: self.lease.to_wire(),
+            lease: self.lease(),
             attachments: self.attachments.summaries(),
             oldest_retained_cursor: U64::new(self.history.oldest_retained_cursor()),
             taken_at_ms: kr_ipc::now_ms(),
@@ -4026,7 +3524,7 @@ impl Session {
     pub fn foreground_group(&self) -> Option<i32> {
         #[cfg(feature = "testing")]
         self.note_foreground_read();
-        if !self.state.accepts_input() || self.shell.is_none() {
+        if !self.state().accepts_input() || self.shell.is_none() {
             return None;
         }
         self.pty.foreground_group()
@@ -4042,7 +3540,7 @@ impl Session {
     pub fn foreground(&self) -> Option<crate::broker::adoption::Foreground> {
         #[cfg(feature = "testing")]
         self.note_foreground_read();
-        if !self.state.accepts_input() {
+        if !self.state().accepts_input() {
             return None;
         }
         let root_shell = self.root_identity()?;
@@ -4148,9 +3646,7 @@ impl Session {
         &self,
         attachment_id: AttachmentId,
     ) -> Option<CanonicalSet<AttachmentCapability>> {
-        self.attachments
-            .get(attachment_id)
-            .map(|attachment| attachment.granted.clone())
+        self.input.lock().capabilities(attachment_id).cloned()
     }
 
     /// Returns every attachment, for diagnostics and snapshots.
@@ -4164,7 +3660,7 @@ impl Session {
     /// # Errors
     ///
     /// Returns [`WorkerError::SessionClosed`] once the session has begun closing.
-    pub const fn require_live(&self) -> Result<()> {
+    pub fn require_live(&self) -> Result<()> {
         self.require_running()
     }
 
@@ -4809,29 +4305,59 @@ impl Session {
     /// The reply is built before any process is signalled, because the caller may be inside the
     /// group about to be stopped.
     pub fn begin_close(&mut self, reason: ClosureReason) -> CloseAcceptance {
-        match self.state {
-            SessionState::Closed => CloseAcceptance {
-                state: SessionState::Closed,
-                durability: self.durability(),
-                closure: self.closure.clone(),
-                initiated: false,
-            },
-            SessionState::Closing => CloseAcceptance {
-                state: SessionState::Closing,
-                durability: self.durability(),
-                closure: None,
-                initiated: false,
-            },
+        let shared = Arc::clone(&self.input);
+        let mut input = shared.lock();
+        match input.state() {
+            SessionState::Closed => {
+                drop(input);
+                CloseAcceptance {
+                    state: SessionState::Closed,
+                    durability: self.durability(),
+                    closure: self.closure.clone(),
+                    initiated: false,
+                }
+            }
+            SessionState::Closing => {
+                drop(input);
+                CloseAcceptance {
+                    state: SessionState::Closing,
+                    durability: self.durability(),
+                    closure: None,
+                    initiated: false,
+                }
+            }
             SessionState::Creating | SessionState::Live => {
                 // Atomic admission: the state changes before anything else, so input is rejected
                 // from here on and a second request joins this closure instead of starting a
                 // second one. Nothing is signalled yet. The caller may itself be inside the
                 // process group about to be stopped, and section 7 gives it its acceptance first.
-                self.state = SessionState::Closing;
+                input.set_state(SessionState::Closing);
                 self.closing_reason = Some(reason);
+                // Input is rejected from here, and that has to reach bytes already handed to the
+                // writer as well as the ones not yet accepted. Releasing the lease moves the fence,
+                // so a keystroke queued a moment before the close is dropped rather than typed into
+                // a shell that is being stopped. It is done in the same hold of the input domain as
+                // the state, so the recogniser's timer finds no prefix to forward and no lease to
+                // forward it under.
+                if let Some(holder) = input.holder() {
+                    input.release_attachment(holder);
+                }
+                input.close_framing_for_takeover();
+                let _ = self.end_lease(&mut input).left;
+                // The root editor's machine hears it too: a fence is invalidated, a launch the
+                // reader is still deciding is revoked and its caller answered, and whatever is held
+                // is discarded rather than typed into a shell that is being stopped.
+                let mut owed = Vec::new();
+                if let Some(driver) = input.fence_mut() {
+                    let effects = driver.session_closing();
+                    owed.extend(input.apply_effects(effects).owed);
+                }
+                drop(input);
                 // Nothing new is started inside a closing session, so no backend waits for one.
                 // The instances it is ending are announced as ended now, while every view is still
-                // attached, so no list this session keeps names a program it is ending.
+                // attached, so no list this session keeps names a program it is ending. Retiring a
+                // backend waits for a launch that is in step, which the input domain never waits
+                // for.
                 let ended = self
                     .command_backends
                     .as_ref()
@@ -4840,22 +4366,8 @@ impl Session {
                 for instance in ended {
                     self.announce_instance(instance);
                 }
-                // Input is rejected from here, and that has to reach bytes already handed to the
-                // writer as well as the ones not yet accepted. Releasing the lease moves the fence,
-                // so a keystroke queued a moment before the close is dropped rather than typed into
-                // a shell that is being stopped.
-                if let Some(holder) = self.lease.holder() {
-                    self.lease.release_attachment(holder);
-                }
-                self.close_framing_for_takeover();
-                let _ = self.end_lease().left;
-                // The root editor's machine hears it too: a fence is invalidated, a launch the
-                // reader is still deciding is revoked and its caller answered, and whatever is held
-                // is discarded rather than typed into a shell that is being stopped.
-                if let Some(driver) = self.fence.as_mut() {
-                    let effects = driver.session_closing();
-                    let _ = self.apply_fence_effects(effects);
-                }
+                self.carry_out(owed, &mut FenceOutcome::default());
+                self.pump_replies();
                 CloseAcceptance {
                     state: SessionState::Closing,
                     durability: self.durability(),
@@ -4949,7 +4461,7 @@ impl Session {
     /// open after the shell exits, and a read error on the terminal is not proof of death, so the
     /// two are observed separately.
     pub fn poll_root_exit(&mut self) -> bool {
-        if self.state == SessionState::Closed {
+        if self.state() == SessionState::Closed {
             return false;
         }
         let exit = match self.shell.as_mut().map(RootShell::try_wait) {
@@ -4957,7 +4469,7 @@ impl Session {
             _ => return false,
         };
         self.root_exit.get_or_insert(exit.clone());
-        if self.state == SessionState::Closing {
+        if self.state() == SessionState::Closing {
             // A closure already under way finishes through its own sequence, which stops the rest
             // of what the session owns and drains output before it writes the record.
             return false;
@@ -5000,8 +4512,8 @@ impl Session {
         } else {
             ClosureReason::RootExit
         };
-        if self.state == SessionState::Live || self.state == SessionState::Creating {
-            self.state = SessionState::Closing;
+        if self.state() == SessionState::Live || self.state() == SessionState::Creating {
+            self.input.lock().set_state(SessionState::Closing);
             self.closing_reason = Some(reason);
         }
         self.record_closure_with(self.closing_reason.unwrap_or(reason), Some(exit))
@@ -5057,7 +4569,7 @@ impl Session {
             closed_at_ms: kr_ipc::now_ms(),
         };
         record.durability = self.commit_closure(&record);
-        self.state = SessionState::Closed;
+        self.input.lock().set_state(SessionState::Closed);
         self.application_state = None;
         self.closure = Some(record.clone());
         // Every attachment is told, behind whatever output it was still owed, and one that has not
@@ -5128,8 +4640,8 @@ impl Session {
         }
     }
 
-    const fn require_running(&self) -> Result<()> {
-        if self.state.is_running() {
+    fn require_running(&self) -> Result<()> {
+        if self.state().is_running() {
             Ok(())
         } else {
             Err(WorkerError::SessionClosed)
@@ -5144,18 +4656,6 @@ pub struct InputAuthority {
     pub boot_ms: Option<u64>,
     /// The end in UTC milliseconds.
     pub utc_ms: Option<u64>,
-}
-
-/// Returns whichever of two authority deadlines ends first.
-///
-/// A null deadline is authority that does not expire, so it never shortens the other one and never
-/// replaces one that does expire.
-const fn tightest(left: Option<u64>, right: Option<u64>) -> Option<u64> {
-    match (left, right) {
-        (Some(left), Some(right)) => Some(if left < right { left } else { right }),
-        (Some(only), None) | (None, Some(only)) => Some(only),
-        (None, None) => None,
-    }
 }
 
 /// What the session could not carry out itself, handed back to the caller.
@@ -5178,18 +4678,6 @@ pub struct FenceOutcome {
     pub lease_acknowledged: Option<kr_shell_integration::contract::fence::LeaseAcknowledgement>,
     /// The loss that closes the creating session, when one does.
     pub close_session: Option<kr_shell_integration::contract::qualification::IntegrationLoss>,
-}
-
-/// One entry in a session's queue for the pseudo-terminal.
-#[derive(Debug)]
-enum Queued {
-    /// A batch for the writer.
-    Batch(InputBatch),
-    /// A fence published to the bridge at this point.
-    ///
-    /// What is queued behind it waits until the bridge's writer has written the fence, or until the
-    /// connection it was handed to has ended and the session has recorded the loss.
-    Fence(crate::fence::FenceFrame),
 }
 
 /// One ordered batch of input on its way to the pseudo-terminal.

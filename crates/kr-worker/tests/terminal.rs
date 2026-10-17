@@ -923,7 +923,7 @@ async fn losing_the_paste_holder_closes_the_paste_before_a_held_reply() {
     {
         let mut session = host.runtime.session();
         session.detach(keys.attachment()).expect("detaches");
-        host.runtime.flush_locked(&mut session);
+        host.runtime.flush_input();
     }
     std::fs::write(&read, b"").expect("opens the gate");
 
@@ -1082,7 +1082,7 @@ async fn a_query_flood_is_degraded_rather_than_forwarded_and_the_typed_line_is_t
     // the batch to the writer.
     let lease = host.runtime.session().lease();
     keys.type_bytes(&host.runtime, b"kr-typed\n");
-    let queued = host.runtime.session().queued_lease_bytes();
+    let queued = host.runtime.session().input().lock().queued_lease_bytes();
     let started = tokio::time::Instant::now();
     while queued.load() > 0 {
         assert!(

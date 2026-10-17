@@ -894,7 +894,7 @@ async fn bytes_queued_under_a_lease_whose_utc_end_passes_while_they_wait_are_nev
                 std::time::Instant::now(),
             )
             .expect("accepted");
-        world.runtime.flush_locked(&mut session);
+        world.runtime.flush_input();
     };
 
     queue(0, b"kr-inside", world.machine.utc_ms() + LEASE_MS);
@@ -920,7 +920,7 @@ async fn bytes_queued_under_a_lease_whose_utc_end_passes_while_they_wait_are_nev
             .machine
             .wall
             .advance(Duration::from_millis(LEASE_MS + 1));
-        world.runtime.flush_locked(&mut session);
+        world.runtime.flush_input();
     }
     // The writer is serial: once the batch behind it has arrived, the one in front of it has
     // either arrived or was never written.

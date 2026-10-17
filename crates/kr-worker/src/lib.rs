@@ -52,6 +52,7 @@ pub mod fence;
 pub mod history;
 pub mod history_filter;
 pub mod input;
+pub mod input_domain;
 pub mod journal;
 pub mod lifecycle;
 pub mod local_gate;
