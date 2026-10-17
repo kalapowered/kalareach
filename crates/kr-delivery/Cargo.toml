@@ -18,6 +18,8 @@ hmac.workspace = true
 kr-attention.workspace = true
 kr-cbor.workspace = true
 kr-crypto.workspace = true
+# The journal is opened the way every store is, waiting out a previous holder that is letting go.
+kr-flush = { workspace = true, features = ["sqlite"] }
 kr-protocol.workspace = true
 # The history filter and the privacy contract both live in the worker crate: this producer is a
 # consumer of both rather than the owner of either.
@@ -34,6 +36,8 @@ thiserror.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+# The test that stands the store in the interval its previous holder is letting go of its index.
+kr-flush = { workspace = true, features = ["testing"] }
 tempfile.workspace = true
 
 [lints]

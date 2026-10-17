@@ -26,7 +26,7 @@ futures.workspace = true
 jiff.workspace = true
 kr-crypto.workspace = true
 # The host's shared directory flush, through a handle the store already holds, on every platform.
-kr-flush.workspace = true
+kr-flush = { workspace = true, features = ["sqlite"] }
 kr-plugin-sdk.workspace = true
 kr-protocol.workspace = true
 # Reads a delegated role's name back out of the file the update client fetches its document from,
@@ -55,6 +55,8 @@ rustix = { workspace = true, features = ["fs"] }
 # The seed's test constructors, which a shipped build does not have.
 kr-plugin-catalogue = { workspace = true, features = ["testing"] }
 aws-lc-rs.workspace = true
+# The test that stands the store in the interval its previous holder is letting go of its index.
+kr-flush = { workspace = true, features = ["testing"] }
 # Identifiers a test makes for environments of its own.
 kr-ipc.workspace = true
 # The TLS provider a test's own repository client is built on; a host's comes with its trust.

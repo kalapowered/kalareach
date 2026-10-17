@@ -286,3 +286,21 @@ mod tests {
         let _ = Statement::checked("REPLACE INTO writers VALUES (?1, ?2, ?3, NULL)");
     }
 }
+
+/// A store whose previous holder is still letting go of its index is waited for, not reported as a
+/// disk that failed. On Windows a process that is ending releases its locks on a store's
+/// write-ahead index before the system removes its mapping of it, and the next process to open the
+/// store in that interval is told its disk failed, although the same open succeeds a moment later.
+#[cfg(all(test, windows))]
+mod a_previous_holder_that_is_letting_go {
+    use super::*;
+
+    #[test]
+    fn the_open_waits_for_it() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let path = directory.path().join("backup.sqlite");
+        kr_flush::release::assert_an_open_waits_for_the_previous_holder(&path, || {
+            Database::open(&path).map(drop)
+        });
+    }
+}
