@@ -42,6 +42,9 @@ being installed, or one inside a release but outside its `bin/`, which would run
 kr: ~/Library/Application Support/KalaReach/host/trash/0.1.0+aaaaaaaaaaaa-… is being removed from this host, so this program of it does not start
 ```
 
+A hook an application runs is the one exception: it answers neutrally with `{}` and exits
+successfully, and prints that line on standard error.
+
 What a program starts, it starts from its own release: a control daemon starts its own release's
 worker with its own release's shell packages, and opens a window with its own release's `kr`; `kr`
 starts its own release's restoration guard; a worker launches through its own release's forwarder.
