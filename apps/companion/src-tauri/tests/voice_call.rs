@@ -1660,6 +1660,70 @@ async fn a_device_the_host_revokes_loses_the_call_it_holds() {
     scene.stop_host().await;
 }
 
+/// The host revokes a phone whose call the voice service is slow to close. The revocation is
+/// answered while the service still holds the close, because the host ends what the device held on
+/// a task of its own after the fence: a service that answers slowly holds neither the fence nor
+/// the revocation's answer. The close that was still going on when the revocation was answered has
+/// not failed by then (a revocation that waited for it would have been answered after the close
+/// gave up and was reported as unclosed), and the call ends by the service's own closing, as it
+/// does when the service is quick.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_slow_service_does_not_hold_the_answer_to_the_host_revoking_a_device() {
+    let mut scene = scene().await;
+    scene.stand_in.end_the_control_when_a_call_is_closed();
+    scene.start().await;
+    scene
+        .state_where("an attached control", |state| {
+            state["control"] == "connected"
+        })
+        .await;
+    scene.stand_in.hold_closes();
+    let unclosed = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&unclosed);
+    scene
+        .host()
+        .controller()
+        .voice()
+        .coordinator()
+        .report_unclosed_calls_to(Arc::new(move |_| {
+            counted.fetch_add(1, Ordering::SeqCst);
+        }));
+
+    let mut client = scene.host().client().await;
+    let revoking = tokio::time::timeout(
+        WATCHDOG,
+        net_support::pairing::mutate::<_, kr_protocol::sharing::RevocationResult>(
+            scene.host().environment_id,
+            &mut client,
+            kr_protocol::method::Method::DeviceRevoke,
+            &kr_protocol::sharing::DeviceRevokeParams {
+                device_id: the_phone_of(scene.host()),
+            },
+        ),
+    )
+    .await;
+    // However it went, the service is let go of, so that nothing is left held.
+    scene.stand_in.release_closes();
+    revoking
+        .expect("the revocation is answered while the service still holds the close")
+        .expect("the host revokes the phone");
+    assert_eq!(
+        unclosed.load(Ordering::SeqCst),
+        0,
+        "the revocation was answered after the close gave up"
+    );
+
+    let ended = scene
+        .state_where("the end", |state| {
+            state["running"] == false && state["ended"].is_object()
+        })
+        .await;
+    assert_eq!(ended["ended"]["cause"], "service_closed", "{ended}");
+    assert_eq!(scene.stand_in.count("/api/voice/sessions/call-1/close"), 1);
+    assert_eq!(unclosed.load(Ordering::SeqCst), 0, "the close succeeded");
+    scene.stop_host().await;
+}
+
 /// Where a host reach that fails the way a bug does fails.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum FailsAt {
