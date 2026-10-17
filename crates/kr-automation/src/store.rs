@@ -2046,7 +2046,7 @@ impl WorkflowStore {
     /// version when it was written to a schema this build does not read.
     pub fn open(state_dir: impl AsRef<Path>) -> Result<Self> {
         let path = state_dir.as_ref().join(WORKFLOW_DB_NAME);
-        let conn = Connection::open(&path)?;
+        let conn = kr_flush::release::open_connection(&path, None)?;
         let store = Self::around(conn, path);
         store.init_schema()?;
         Ok(store)
