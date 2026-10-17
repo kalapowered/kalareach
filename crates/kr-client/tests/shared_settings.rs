@@ -13,6 +13,7 @@
 //! | KR-REQ-20.13, compare and swap in a shared collection, the other device's content kept beside this device's own | `a_refused_write_in_a_claimed_collection_keeps_the_other_devices_settings_for_the_person` |
 //! | KR-REQ-20.13, a write is sealed and the service holds no plaintext | `settings_written_into_a_claimed_collection_are_read_back_sealed_under_its_key` |
 //! | KR-REQ-20.11, sync-collection half, a write under a retired epoch is not stored | `a_write_under_a_retired_epoch_stores_nothing_and_the_work_is_settled_as_never_run` |
+//! | KR-REQ-20.11, sync-collection half, a client of one epoch does not read an object sealed under another as if it were its own | `an_object_sealed_under_another_epoch_is_refused_by_name_and_not_as_tampering` |
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -20,8 +21,8 @@ use std::sync::Arc;
 use kr_client::services::{ManagedSyncService, ServiceHttp, SyncBackupService, SyncFetched};
 use kr_client::sync::membership::{CollectionRef, KeyRecordService, RekeyAnswer};
 use kr_client::sync::{
-    CollectionKeys, CollectionSealer, MemoryCollectionKeys, Published, Restored, SettingValue,
-    SharedCollectionService, SyncBody, SyncClient, SyncObject, SyncSettings, SyncStore,
+    CollectionKeys, MemoryCollectionKeys, Published, Restored, SettingValue,
+    SharedCollectionService, SyncBody, SyncClient, SyncError, SyncObject, SyncSettings, SyncStore,
     fresh_object_id, fresh_revision, sync_collection,
 };
 use kr_crypto::envelope::{
@@ -147,17 +148,12 @@ impl Home {
     /// A settings client for one device's store, writing under the epoch the newest record has.
     fn client(&self, store: &std::path::Path) -> SyncClient {
         let epoch = self.epoch();
+        let shared =
+            SharedCollectionService::new(Arc::clone(&self.service), self.collection, epoch);
+        let sealer = shared.sealer(Arc::clone(&self.secrets) as Arc<dyn CollectionKeys>);
         SyncClient::new(
-            Arc::new(SharedCollectionService::new(
-                Arc::clone(&self.service),
-                self.collection,
-                epoch,
-            )),
-            Arc::new(CollectionSealer::new(
-                Arc::clone(&self.secrets) as Arc<dyn CollectionKeys>,
-                &self.collection.collection_id.to_string(),
-                epoch,
-            )),
+            Arc::new(shared),
+            Arc::new(sealer),
             SyncStore::open(store).expect("a store"),
         )
     }
@@ -365,5 +361,45 @@ async fn a_write_under_a_retired_epoch_stores_nothing_and_the_work_is_settled_as
             .await
             .expect("a publication"),
         Published::Accepted { .. }
+    ));
+}
+
+/// An object written under one epoch is not opened with the key of another: the client built for
+/// the newer epoch is told which epochs are in play, and the answer is not the one a ciphertext
+/// that fails to authenticate gets, which reads as tampering.
+#[tokio::test]
+async fn an_object_sealed_under_another_epoch_is_refused_by_name_and_not_as_tampering() {
+    let web = Arc::new(ServiceWeb::new());
+    let mut home = Home::claim(&web).await;
+    let (written, read) = (
+        tempfile::tempdir().expect("a directory"),
+        tempfile::tempdir().expect("a directory"),
+    );
+    let object_id = fresh_object_id().expect("an object");
+    let old = home.client(written.path());
+    old.store()
+        .put_object(&settings(object_id, "dark"))
+        .expect("the object is kept");
+    assert!(matches!(
+        old.publish(object_id, now()).await.expect("a publication"),
+        Published::Accepted { .. }
+    ));
+    home.issue().await;
+
+    let error = home
+        .client(read.path())
+        .fetch(SyncObjectKind::Settings, object_id, now())
+        .await
+        .expect_err("the object is sealed under the epoch before");
+    let SyncError::Client(error) = error else {
+        panic!("the service's own refusal, not a failure to open: {error:?}");
+    };
+    assert_eq!(error.code(), ErrorCode::ResyncRequired);
+    // The same epoch reads it.
+    assert!(matches!(
+        old.fetch(SyncObjectKind::Settings, object_id, now())
+            .await
+            .expect("a fetch"),
+        Restored::Settings { .. }
     ));
 }

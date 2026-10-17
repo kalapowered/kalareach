@@ -38,6 +38,7 @@ use kr_protocol::ids::{SyncConflictId, SyncObjectId};
 use kr_protocol::scalars::Uuid;
 
 use super::membership::CollectionRef;
+use super::{CollectionKeys, CollectionSealer};
 use crate::error::{ClientError, Result};
 use crate::services::{
     Keyed, ManagedSyncService, ServiceFuture, SyncBackupService, SyncExchanged, SyncFetched,
@@ -91,6 +92,13 @@ impl SharedCollectionService {
     pub const fn epoch(&self) -> u64 {
         self.epoch
     }
+
+    /// The sealer for this collection at this epoch, so that what a client seals and what it asks
+    /// the service to write are for one epoch by construction.
+    #[must_use]
+    pub fn sealer(&self, keys: Arc<dyn CollectionKeys>) -> CollectionSealer {
+        CollectionSealer::new(keys, &self.collection.collection_id.to_string(), self.epoch)
+    }
 }
 
 /// The error a write under a retired epoch is: the collection has a newer key to be read first.
@@ -102,6 +110,23 @@ fn retired() -> ClientError {
              key records and write again",
         ),
     )
+}
+
+/// The error an object sealed under another epoch than the one this reads is: the key it was
+/// sealed under is not the key this opens it with, so it is not opened and not taken for a forgery.
+fn sealed_under_another_epoch(sealed: Option<u64>, reads: u64) -> ClientError {
+    let text = match sealed {
+        Some(sealed) => crate::shown!(
+            "that object is sealed under key epoch {}, and this reads key epoch {}",
+            sealed,
+            reads
+        ),
+        None => crate::shown!(
+            "that object names no key epoch, and this reads key epoch {}",
+            reads
+        ),
+    };
+    ClientError::refusal(ErrorCode::ResyncRequired, text)
 }
 
 /// The error a collection that does not list this installation is.
@@ -214,19 +239,25 @@ impl SyncBackupService for SharedCollectionService {
             else {
                 return Err(absent());
             };
-            Ok(found
+            let Some(held) = found
                 .objects
                 .into_iter()
                 .find(|held| held.object_id == wanted)
-                .map_or(
-                    SyncFetched::Absent {
-                        recovery: found.recovery,
-                    },
-                    |held| SyncFetched::Held {
-                        position: held.position,
-                        ciphertext: held.ciphertext,
-                    },
-                ))
+            else {
+                return Ok(SyncFetched::Absent {
+                    recovery: found.recovery,
+                });
+            };
+            // The sealer this is read with has one epoch's key. An object sealed under another
+            // is refused here by name, where the sealer would say only that it did not
+            // authenticate.
+            if held.epoch != Some(self.epoch) {
+                return Err(sealed_under_another_epoch(held.epoch, self.epoch));
+            }
+            Ok(SyncFetched::Held {
+                position: held.position,
+                ciphertext: held.ciphertext,
+            })
         })
     }
 
