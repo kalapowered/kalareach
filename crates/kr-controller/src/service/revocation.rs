@@ -269,6 +269,14 @@ impl Controller {
         // ended.
         if lapsed.is_none() {
             self.retire_push_destination(device_id);
+            // A device the host no longer pairs holds no call: the voice sessions it started end,
+            // and the service is told to close the calls, instead of running to their deadlines.
+            if let Some(voice) = self.voice.get() {
+                voice
+                    .coordinator()
+                    .end_calls_of_revoked_device(device_id, now_ms)
+                    .await;
+            }
         }
         recorded?;
         match lapsed {
