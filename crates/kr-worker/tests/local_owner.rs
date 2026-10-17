@@ -2287,7 +2287,11 @@ const OBSERVE_AND_TYPE: [AttachmentCapability; 2] = [
 
 impl Typing {
     async fn start() -> Self {
-        let wired = wired("sleep 120").await;
+        Self::start_with("sleep 120").await
+    }
+
+    async fn start_with(script: &str) -> Self {
+        let wired = wired(script).await;
         let mut authority = wired.daemon(ControllerConnectionRole::Authority).await;
         let mut phone = wired.daemon(ControllerConnectionRole::Proxy).await;
         // The first revision this worker is told has no revision before it that it acknowledged,
@@ -2875,4 +2879,307 @@ async fn the_local_owner_cancels_another_actors_intent_and_a_device_does_not() {
 
     drop((phone, proxy, window));
     wired.close();
+}
+
+// ---------------------------------------------------------------------------------------------
+// KR-PERF-002, KR-REQ-10.45: the input path and the authority that fences it.
+// ---------------------------------------------------------------------------------------------
+
+/// An application that reads nothing until a named pipe is written to, and keeps all it reads in a
+/// file.
+///
+/// Until it reads, what the worker hands the terminal waits in the kernel's small buffer and in
+/// the worker's own queue, and the part in the queue is what a fence of the lease discards. Every
+/// byte typed is then either in the file or counted as discarded.
+struct LateReader {
+    _kept: tempfile::TempDir,
+    received: std::path::PathBuf,
+    trigger: std::path::PathBuf,
+    typing: Typing,
+}
+
+impl LateReader {
+    async fn start() -> Self {
+        let kept = tempfile::tempdir().expect("a directory for what the application keeps");
+        let received = kept.path().join("received");
+        let trigger = kept.path().join("trigger");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&trigger)
+            .status()
+            .expect("mkfifo runs");
+        assert!(made.success(), "the trigger is made");
+        let script = format!(
+            "stty raw -echo; cat '{}' >/dev/null; exec tee '{}'",
+            trigger.display(),
+            received.display()
+        );
+        let typing = Typing::start_with(&script).await;
+        Self {
+            _kept: kept,
+            received,
+            trigger,
+            typing,
+        }
+    }
+}
+
+/// The application starts reading.
+async fn starts_reading(trigger: std::path::PathBuf) {
+    tokio::task::spawn_blocking(move || std::fs::write(trigger, b"x"))
+        .await
+        .expect("the trigger task ends")
+        .expect("the trigger is pulled");
+}
+
+/// How many bytes the application has kept.
+fn kept(received: &std::path::Path) -> usize {
+    std::fs::read(received).map_or(0, |bytes| bytes.len())
+}
+
+impl Wired {
+    /// One `input.write` of `bytes`, forwarded by the daemon for the phone at `revision`, with the
+    /// authority deadline it travels with.
+    #[allow(clippy::too_many_arguments)]
+    async fn type_for(
+        &self,
+        daemon: &mut LocalClient,
+        revision: u64,
+        deadline_boot_ms: u64,
+        epoch: InputLeaseEpoch,
+        sequence: u64,
+        attachment_id: AttachmentId,
+        bytes: &[u8],
+    ) -> Result<kr_protocol::input::InputWriteResult, ProtocolError> {
+        let request_id = next_request();
+        let frame = ControlFrame::ForwardedRead(Box::new(ForwardedRequest {
+            request: Request {
+                request_id,
+                method: Method::InputWrite.into(),
+                method_version: MethodVersion::V1,
+                params: ParamsValue::from_typed(&kr_protocol::input::InputWriteParams {
+                    session_id: self.session_id,
+                    attachment_id,
+                    epoch,
+                    sequence: kr_protocol::ids::InputSequence::new(sequence),
+                    bytes: kr_protocol::scalars::Bytes::new(bytes.to_vec()),
+                })
+                .expect("encodes"),
+            },
+            authority_deadline_boot_ms: Nullable::some(U64::new(deadline_boot_ms)),
+            actor: device(revision),
+            history: None,
+        }));
+        answer(daemon, frame, request_id)
+            .await
+            .map(|value| value.to_typed().expect("decodes"))
+    }
+
+    /// The phone takes the lease again at `revision`, and the answer says what that discarded.
+    async fn acquire_result_for(
+        &self,
+        daemon: &mut LocalClient,
+        revision: u64,
+        attachment_id: AttachmentId,
+    ) -> kr_protocol::input::InputAcquireResult {
+        self.forward(
+            daemon,
+            &device(revision),
+            WATCH_AND_TYPE,
+            Method::InputAcquire,
+            &InputAcquireParams {
+                session_id: self.session_id,
+                attachment_id,
+                expected_epoch: Nullable::null(),
+            },
+        )
+        .await
+        .expect("the lease is granted")
+        .to_typed()
+        .expect("decodes")
+    }
+}
+
+/// KR-PERF-002, KR-REQ-10.45: a phone's keystrokes are accepted while the fence of a revision holds
+/// the session, and the install then takes the lease with everything of it that was not delivered,
+/// counted exactly.
+///
+/// The fence passes the journal with the session held and installs the revision afterwards. The
+/// keystrokes the phone types in between were validated under the revision still in force, so they
+/// are accepted, and they wait for nothing of the session: this case types them while the fence is
+/// stopped there. The install is one step of the input domain, so no keystroke is accepted between
+/// the lease going and the revision that took it. What the phone typed and the application has not
+/// read is discarded, and every byte it typed is in the application's file or in the count the
+/// lease change reports.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn keystrokes_typed_while_a_fence_holds_the_session_are_accepted_and_the_install_counts_what_it_discards()
+ {
+    const BLOCK: usize = 8 * 1024;
+    const BLOCKS: usize = 4;
+
+    let LateReader {
+        _kept,
+        received,
+        trigger,
+        typing:
+            Typing {
+                wired,
+                mut authority,
+                mut phone,
+                attachment,
+            },
+    } = LateReader::start().await;
+    let epoch = wired.runtime.session().lease().epoch;
+    let far = kr_ipc::clock::boot_elapsed_ms() + 600_000;
+
+    let (arrived, release) = wired.service.stall_next_fence();
+    // A regression leaves the fence holding what the keystrokes wait for. A thread of its own lets
+    // the fence go after a while, so that the case fails naming the wait instead of waiting with it.
+    let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let watchdog = {
+        let (release, done) = (release.clone(), Arc::clone(&done));
+        std::thread::spawn(move || {
+            for _ in 0..1_000 {
+                if done.load(Ordering::Acquire) {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            let _ = release.send(());
+        })
+    };
+    let revising = wired.revise_within(&mut authority, 3, grant_reach(2, devices_grant()));
+    let typing = async {
+        within("the fence to reach its stop", arrived)
+            .await
+            .expect("the fence stopped");
+        // The session is held by the fence and the revision is not installed. The phone's
+        // keystrokes are validated at revision 2, which is the one in force.
+        let mut accepted = 0_u64;
+        for sequence in 0..BLOCKS {
+            let written = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                wired.type_for(
+                    &mut phone,
+                    2,
+                    far,
+                    epoch,
+                    sequence as u64,
+                    attachment,
+                    &[b'k'; BLOCK],
+                ),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                panic!("a keystroke was kept waiting by a fence that holds the session")
+            })
+            .expect("the keystroke is accepted under the revision in force");
+            accepted += written.forwarded_bytes.get() + written.held_prefix_bytes.get();
+        }
+        done.store(true, Ordering::Release);
+        release.send(()).expect("lets the fence go on");
+        accepted
+    };
+    let (revised, accepted) = tokio::join!(revising, typing);
+    watchdog.join().expect("the watchdog ends");
+    let () = revised;
+    assert_eq!(
+        accepted,
+        (BLOCK * BLOCKS) as u64,
+        "every keystroke was accepted"
+    );
+
+    // The install took the lease, and with it a keystroke validated under the revision before it.
+    assert_eq!(
+        wired.lease_holder(),
+        None,
+        "the install took the phone's lease"
+    );
+    let refused = wired
+        .type_for(
+            &mut phone,
+            2,
+            far,
+            epoch,
+            BLOCKS as u64,
+            attachment,
+            b"late",
+        )
+        .await
+        .expect_err("a keystroke validated under a revision the worker has passed is refused");
+    assert_eq!(refused.code, ErrorCode::PermissionDenied, "{refused:?}");
+
+    // The phone takes the lease again under the new revision. What the last lease left in the
+    // worker's queue is reported as discarded, and the application reads the rest.
+    let discarded = wired
+        .acquire_result_for(&mut phone, 3, attachment)
+        .await
+        .discarded_bytes
+        .get();
+    starts_reading(trigger).await;
+    within("every byte to be kept or counted", async {
+        loop {
+            let delivered = kept(&received) as u64;
+            if delivered + discarded == accepted {
+                return;
+            }
+            assert!(
+                delivered + discarded < accepted,
+                "more bytes are accounted for ({delivered} kept and {discarded} discarded) than \
+                 were accepted ({accepted})"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(
+        discarded > 0,
+        "the case is about bytes the application had not read, and none was left"
+    );
+
+    drop((authority, phone));
+    wired.close();
+}
+
+/// KR-PERF-002: a keystroke whose authority has run out is refused at once and leaves the lease to
+/// a task that takes the dispatch barrier, so it never moves a lease that a mutation validated
+/// before its marker.
+///
+/// The barrier is held, as it is across a mutation's marker and effect, and the phone types with an
+/// authority deadline that has passed. The keystroke is refused, and the lease stays where it is
+/// until the barrier is let go; the task then releases it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_keystroke_whose_authority_ran_out_leaves_the_lease_to_a_task_under_the_dispatch_barrier()
+{
+    let mut typing = Typing::start().await;
+    let epoch = typing.wired.runtime.session().lease().epoch;
+    let lapsed = kr_ipc::clock::boot_elapsed_ms().saturating_sub(1);
+
+    let boundary = HeldBoundary::take(&typing.wired).await;
+    let refused = typing
+        .wired
+        .type_for(
+            &mut typing.phone,
+            2,
+            lapsed,
+            epoch,
+            0,
+            typing.attachment,
+            b"late",
+        )
+        .await
+        .expect_err("a keystroke whose authority ran out is refused");
+    assert_eq!(refused.code, ErrorCode::PermissionDenied, "{refused:?}");
+    assert!(
+        typing.holds_the_lease(),
+        "the lease stays where a mutation inside the dispatch barrier validated it"
+    );
+
+    boundary.release();
+    within("the lease to be released", async {
+        while typing.holds_the_lease() {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    typing.close();
 }

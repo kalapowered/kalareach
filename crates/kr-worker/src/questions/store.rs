@@ -89,6 +89,10 @@ pub struct Store {
     key: SymmetricKey,
     session_id: SessionId,
     session_epoch: SessionEpoch,
+    /// Where this host's own tests stop the commit of a question. Compiled away in every shipped
+    /// build.
+    #[cfg(feature = "testing")]
+    commit_stall: crate::testing::Stall,
 }
 
 impl Store {
@@ -115,6 +119,8 @@ impl Store {
             key,
             session_id,
             session_epoch,
+            #[cfg(feature = "testing")]
+            commit_stall: crate::testing::Stall::default(),
         };
         store.prepare()?;
         Ok(store)
@@ -474,12 +480,29 @@ impl Store {
                 recorded_at_ms: now.utc_ms,
             },
         )?;
+        #[cfg(feature = "testing")]
+        self.commit_stall.stand();
         transaction.commit().map_err(QuestionError::unavailable)?;
         Ok(Created {
             question,
             caller_token,
             deduplicated: false,
         })
+    }
+
+    /// Stops the commit of the next question, for this host's own tests.
+    ///
+    /// Returns the end that says the commit has arrived, and the end that lets it go. The stop
+    /// fires once.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn stall_next_commit(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        self.commit_stall.arm()
     }
 
     /// Refuses a creation whose request identifier already carries a different payload.

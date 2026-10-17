@@ -90,6 +90,28 @@ impl Questions {
         })
     }
 
+    /// Stops the commit of the next question, for this host's own tests.
+    ///
+    /// Returns the end that says the commit has arrived, and the end that lets it go. The stop
+    /// fires once.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the ledger's lock is poisoned.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn stall_next_commit(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        self.store
+            .lock()
+            .expect("the ledger is not poisoned")
+            .stall_next_commit()
+    }
+
     /// Takes what a qualified bridge says about the agents in this session.
     ///
     /// From then on a question from a source the bridge describes records the binding revision it

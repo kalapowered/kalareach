@@ -213,6 +213,18 @@ pub struct Journal {
     /// something to read, and this is what tells it there is. It is shared rather than owned, so
     /// the one waiting can hold it without holding the journal.
     attention_changes: std::sync::Arc<tokio::sync::Notify>,
+    /// Where this host's own tests stop the commit of a dispatch marker. Compiled away in every
+    /// shipped build.
+    #[cfg(feature = "testing")]
+    marker_stall: crate::testing::Stall,
+    /// Where this host's own tests stop the commit of a prune. Compiled away in every shipped
+    /// build.
+    #[cfg(feature = "testing")]
+    prune_stall: crate::testing::Stall,
+    /// Where this host's own tests stop the commit of a batch of host events. Compiled away in
+    /// every shipped build.
+    #[cfg(feature = "testing")]
+    host_event_stall: crate::testing::Stall,
 }
 
 /// The privacy record: the generation in force, whether privacy mode is on, and where each
@@ -344,6 +356,12 @@ impl Journal {
                 .ok()
                 .map(|boot| boot.value.as_slice().to_vec()),
             attention_changes: std::sync::Arc::new(tokio::sync::Notify::new()),
+            #[cfg(feature = "testing")]
+            marker_stall: crate::testing::Stall::default(),
+            #[cfg(feature = "testing")]
+            prune_stall: crate::testing::Stall::default(),
+            #[cfg(feature = "testing")]
+            host_event_stall: crate::testing::Stall::default(),
         };
         journal.migrate()?;
         // The mark describes the store rather than this process, so it starts at the highest
@@ -941,6 +959,8 @@ impl Journal {
                 )
                 .map_err(|error| faulted(&self.health, error))?;
         }
+        #[cfg(feature = "testing")]
+        self.host_event_stall.stand();
         transaction
             .commit()
             .map_err(|error| faulted(&self.health, error))?;
@@ -1759,6 +1779,10 @@ impl Journal {
             )?,
             None => false,
         };
+        #[cfg(feature = "testing")]
+        if state == ReceiptState::Dispatching {
+            self.marker_stall.stand();
+        }
         transaction
             .commit()
             .map_err(|error| faulted(&self.health, error))?;
@@ -2903,6 +2927,8 @@ impl Journal {
                 params![cutoff, boot, continuous_floor],
             )
             .map_err(|error| faulted(&self.health, error))?;
+        #[cfg(feature = "testing")]
+        self.prune_stall.stand();
         transaction
             .commit()
             .map_err(|error| faulted(&self.health, error))?;
@@ -2925,12 +2951,76 @@ impl Journal {
     ///
     /// Returns [`WorkerError::JournalUnavailable`] when the write fails.
     pub fn prune_if_due(&mut self, now_ms: TimestampMs, permitted: bool) -> Result<usize> {
+        // A prune this host's own tests have armed a stop in is made whatever the host's clock
+        // can prove, because what that case is about is a commit that waits on the disk.
+        #[cfg(feature = "testing")]
+        let permitted = permitted || self.prune_stall.is_armed();
         if !permitted || now_ms.get() < self.pruned_at_ms.saturating_add(PRUNE_INTERVAL_MS) {
             return Ok(0);
         }
         let removed = self.prune(now_ms)?;
         self.pruned_at_ms = now_ms.get();
         Ok(removed)
+    }
+
+    /// Stops the commit of the next dispatch marker, for this host's own tests.
+    ///
+    /// Returns the end that says the commit has arrived, and the end that lets it go. The stop
+    /// fires once.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn stall_next_marker(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        self.marker_stall.arm()
+    }
+
+    /// Stops the commit of the next dispatch marker as a call that blocks its thread, for this
+    /// host's own tests: the thread the commit runs on is not handed back to its runtime.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn stall_next_marker_blocking(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        self.marker_stall.arm_blocking()
+    }
+
+    /// Stops the commit of the next batch of host events, for this host's own tests.
+    ///
+    /// Returns the end that says the commit has arrived, and the end that lets it go. The stop
+    /// fires once.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn stall_next_host_events(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        self.host_event_stall.arm()
+    }
+
+    /// Makes the next maintenance pass prune, and stops the prune at its commit, for this host's
+    /// own tests.
+    ///
+    /// Returns the end that says the commit has arrived, and the end that lets it go. The stop
+    /// fires once.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn stall_next_prune(
+        &mut self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        self.pruned_at_ms = 0;
+        self.prune_stall.arm()
     }
 
     /// Reads the retained result of an action.
@@ -3015,6 +3105,12 @@ impl Journal {
             health: crate::persistence::fault::JournalHealth::shared(),
             boot: None,
             attention_changes: std::sync::Arc::new(tokio::sync::Notify::new()),
+            #[cfg(feature = "testing")]
+            marker_stall: crate::testing::Stall::default(),
+            #[cfg(feature = "testing")]
+            prune_stall: crate::testing::Stall::default(),
+            #[cfg(feature = "testing")]
+            host_event_stall: crate::testing::Stall::default(),
         };
         // The same mark the writable opener starts from. A reader that faulted would otherwise
         // report a gap reaching back to the beginning of the session.

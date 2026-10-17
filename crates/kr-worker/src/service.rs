@@ -316,6 +316,12 @@ pub struct WorkerService {
             std::sync::mpsc::Receiver<()>,
         )>,
     >,
+    /// A stop inside the fence of an authority revision, after the journal has been passed and
+    /// before the revision is installed, which this host's own tests arm to have a keystroke
+    /// arrive while the session is held and the revision is not yet in force. It is compiled away
+    /// in every shipped build.
+    #[cfg(feature = "testing")]
+    fence_stall: crate::testing::Stall,
     /// A pause in the binding of a question's or an alert's source to the session, which this
     /// host's own tests arm to stand a caller there while a keystroke arrives. It is compiled
     /// away in every shipped build.
@@ -596,6 +602,8 @@ impl WorkerService {
             input_pause: Mutex::new(None),
             #[cfg(feature = "testing")]
             binding_pause: Mutex::new(None),
+            #[cfg(feature = "testing")]
+            fence_stall: crate::testing::Stall::default(),
             #[cfg(feature = "testing")]
             refused_for_the_boundary: tokio::sync::watch::Sender::new(0),
             #[cfg(feature = "testing")]
@@ -1062,6 +1070,22 @@ impl WorkerService {
     )]
     const fn wait_inside_boundary(&self) {}
 
+    /// Stops the next fence of an authority revision after its journal pass, with the session held
+    /// and the revision not yet installed, for this host's own tests.
+    ///
+    /// Returns the end that says the fence has arrived, and the end that lets it go. The stop
+    /// fires once.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn stall_next_fence(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        self.fence_stall.arm()
+    }
+
     /// Makes every connection's loop take a finished preparation before it reads what its client
     /// has sent, for this host's own tests.
     ///
@@ -1419,51 +1443,66 @@ impl WorkerService {
         // clocks before it waits a minute to do either.
         tick.tick().await;
         loop {
-            let closed = {
-                // Maintenance passes through the same serial boundary a mutation does. Section 9
-                // puts the revalidation a discontinuity owes *before* the host serves a mutation,
-                // and this barrier is what "before" means here: a mutation either sees the
-                // revalidation completed or waits for it.
-                let _barrier = self
-                    .dispatch
-                    .lock()
-                    .expect("the dispatch barrier is not poisoned");
-                self.revalidate_time();
-                // A revocation this worker was told about while it was dispatching something. The
-                // announcement was refused rather than queued, and this is what makes the fence
-                // happen anyway: the daemon's next announcement finds it done.
-                self.fence_what_is_owed();
-                // One look at the session, and the lock released before anything else asks for
-                // it. Collection records its own failure, so nothing here needs the lock a second
-                // time to say that it failed.
-                let state = {
-                    let mut session = self.runtime.session();
-                    // A store that has started answering again is a store this host may call
-                    // durable, and the interval it could not is written down before it says so.
-                    // The broker's half follows, once this lock and the barrier are released.
-                    session.recover_journal();
-                    session.collect_expired();
-                    // Output retention is separate from receipt retention and runs on the same
-                    // tick: section 20 budgets the two stores apart, so history pressure never
-                    // reaches a dispatch barrier or a de-duplication record.
-                    session.collect_output();
-                    session.state()
-                };
-                state == kr_protocol::session::SessionState::Closed
-            };
-            // The broker's half of the same recovery, off the session's lock and the dispatch
-            // barrier. It writes its gap while native work goes on, and nothing that serves the
-            // terminal or a mutation waits on that write.
-            self.recover_broker();
-            // Questions whose time ran out, whose source went or whose agent binding moved on end
-            // here even when nobody is reading them, so the feed the daemon's attention store reads
-            // and every client that follows it hear of it on this tick rather than at the next read.
-            let _ = self.questions.sweep(self.question_clock());
-            if closed {
+            if self.maintain_once() {
                 break;
             }
             tick.tick().await;
         }
+    }
+
+    /// One pass of the host's maintenance. Returns whether the session has closed.
+    fn maintain_once(&self) -> bool {
+        let closed = {
+            // Maintenance passes through the same serial boundary a mutation does. Section 9
+            // puts the revalidation a discontinuity owes *before* the host serves a mutation,
+            // and this barrier is what "before" means here: a mutation either sees the
+            // revalidation completed or waits for it.
+            let _barrier = self
+                .dispatch
+                .lock()
+                .expect("the dispatch barrier is not poisoned");
+            self.revalidate_time();
+            // A revocation this worker was told about while it was dispatching something. The
+            // announcement was refused rather than queued, and this is what makes the fence
+            // happen anyway: the daemon's next announcement finds it done.
+            self.fence_what_is_owed();
+            // One look at the session, and the lock released before anything else asks for
+            // it. Collection records its own failure, so nothing here needs the lock a second
+            // time to say that it failed.
+            let state = {
+                let mut session = self.runtime.session();
+                // A store that has started answering again is a store this host may call
+                // durable, and the interval it could not is written down before it says so.
+                // The broker's half follows, once this lock and the barrier are released.
+                session.recover_journal();
+                session.collect_expired();
+                // Output retention is separate from receipt retention and runs on the same
+                // tick: section 20 budgets the two stores apart, so history pressure never
+                // reaches a dispatch barrier or a de-duplication record.
+                session.collect_output();
+                session.state()
+            };
+            state == kr_protocol::session::SessionState::Closed
+        };
+        // The broker's half of the same recovery, off the session's lock and the dispatch
+        // barrier. It writes its gap while native work goes on, and nothing that serves the
+        // terminal or a mutation waits on that write.
+        self.recover_broker();
+        // Questions whose time ran out, whose source went or whose agent binding moved on end
+        // here even when nobody is reading them, so the feed the daemon's attention store reads
+        // and every client that follows it hear of it on this tick rather than at the next read.
+        let _ = self.questions.sweep(self.question_clock());
+        closed
+    }
+
+    /// Runs one pass of the host's maintenance now, for this host's own tests.
+    ///
+    /// Maintenance does this on its own cadence, once a minute. This runs the same pass through the
+    /// same barrier, the same locks and the same order, on the caller's thread. It is compiled away
+    /// in every shipped build.
+    #[cfg(feature = "testing")]
+    pub fn maintain_now(&self) {
+        self.maintain_once();
     }
 
     /// Runs the storage half of one maintenance pass now: the journal first, then the broker.
@@ -3615,6 +3654,8 @@ impl WorkerService {
             None => Ok(0),
         };
         outcome?;
+        #[cfg(feature = "testing")]
+        self.fence_stall.stand();
         self.fence_granted_input(&mut session, Fenced::Within(reach));
         let mut authority = self
             .authority
