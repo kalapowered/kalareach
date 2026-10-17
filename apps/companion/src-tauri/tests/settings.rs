@@ -120,6 +120,8 @@ impl Computer {
                 companion_tauri::commands::settings_colour_mode_set,
                 companion_tauri::commands::settings_sync_turn_on,
                 companion_tauri::commands::settings_sync_now,
+                companion_tauri::commands::settings_conflicts,
+                companion_tauri::commands::settings_conflict_resolve,
             ])
             .build(mock_context(noop_assets()))
             .expect("an application on the mock runtime");
@@ -174,6 +176,7 @@ impl Computer {
             Arc::new(http),
             Arc::new(Installation(keys.authorisation.clone())),
         ));
+        let held_service = Arc::clone(&service);
         let collection = kr_client::sync::membership::CollectionRef {
             home: installation_id(keys.authorisation.public()),
             collection_id,
@@ -193,6 +196,8 @@ impl Computer {
         );
         Elsewhere {
             client,
+            service: held_service,
+            collection,
             object_id,
             device: DeviceId::new(Uuid::from_bytes([0xee; 16])),
             _directory: directory,
@@ -261,12 +266,25 @@ impl Page {
 /// Another device's store of the collection.
 struct Elsewhere {
     client: SyncClient,
+    service: Arc<ManagedSyncService>,
+    collection: kr_client::sync::membership::CollectionRef,
     object_id: SyncObjectId,
     device: DeviceId,
     _directory: tempfile::TempDir,
 }
 
 impl Elsewhere {
+    /// How many copies of refused writes the service is keeping for the person to choose between.
+    async fn copies_kept(&self) -> usize {
+        self.service
+            .compare_shared(&self.collection, &[], true, None)
+            .await
+            .expect("a comparison")
+            .expect("a member")
+            .copies
+            .len()
+    }
+
     /// The colour mode the service holds, as this device reads it.
     async fn colour(&self) -> String {
         let Restored::Settings { object, .. } = self
@@ -533,4 +551,185 @@ async fn a_service_that_cannot_be_reached_does_not_undo_the_choice() {
     assert_eq!(view["colour_mode"], "light");
     assert!(view["sync"]["problem"].is_null(), "{view}");
     assert_eq!(elsewhere.colour().await, "light");
+}
+
+/* -------------------------------------------------------------------------- */
+/* Choosing between two versions                                               */
+/* -------------------------------------------------------------------------- */
+
+/// A computer that chose `system` while another device wrote `light`, with sync on and the
+/// collection's copies waiting for a choice.
+async fn waiting_for_a_choice(computer: &Computer) -> (Page, Elsewhere) {
+    let page = computer.start();
+    page.choose("dark");
+    page.turn_on();
+    let elsewhere = computer.elsewhere();
+    assert!(matches!(
+        elsewhere.write("light").await,
+        Published::Accepted { .. }
+    ));
+    let view = page.choose("system");
+    assert_eq!(view["sync"]["conflicts"], 1);
+    (page, elsewhere)
+}
+
+/// The versions are shown as they are, this computer's own and each the other devices wrote, and the
+/// times that are shown decide nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_versions_are_listed_and_none_is_picked_for_the_person() {
+    let computer = Computer::new().await;
+    let (page, _elsewhere) = waiting_for_a_choice(&computer).await;
+
+    let listed = page
+        .call("settings_conflicts", json!({}))
+        .expect("the versions");
+    assert_eq!(listed["mine"]["colour_mode"], "system");
+    let others = listed["others"].as_array().expect("the other versions");
+    assert_eq!(others.len(), 1);
+    assert_eq!(others[0]["colour_mode"], "light");
+    assert!(others[0]["conflict_id"].is_string());
+
+    // Nothing was chosen by being listed or by being synced.
+    assert_eq!(page.sync_now()["colour_mode"], "system");
+    assert_eq!(page.sync_now()["sync"]["conflicts"], 1);
+}
+
+/// Keeping this computer's settings lets every copy go, on this computer and at the service, and
+/// sends them as the settings every device now holds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn keeping_this_computers_settings_lets_the_other_content_go_and_sends_them() {
+    let computer = Computer::new().await;
+    let (page, elsewhere) = waiting_for_a_choice(&computer).await;
+    assert_eq!(elsewhere.copies_kept().await, 1);
+
+    let view = page
+        .call(
+            "settings_conflict_resolve",
+            json!({ "keep": { "choice": "mine" } }),
+        )
+        .expect("the choice is recorded");
+    assert_eq!(view["colour_mode"], "system");
+    assert_eq!(view["sync"]["conflicts"], 0);
+    assert_eq!(elsewhere.colour().await, "system");
+    assert_eq!(
+        elsewhere.copies_kept().await,
+        0,
+        "the service kept nothing of the choice"
+    );
+    assert!(
+        page.call("settings_conflicts", json!({}))
+            .expect("a read")
+            .is_null(),
+        "nothing waits"
+    );
+}
+
+/// Keeping what another device wrote takes it as this computer's own: the settings file holds it,
+/// the service holds it as this computer's write, and the page is told.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn keeping_what_another_device_wrote_takes_it_as_this_computers_own() {
+    let computer = Computer::new().await;
+    let (page, elsewhere) = waiting_for_a_choice(&computer).await;
+    let listed = page
+        .call("settings_conflicts", json!({}))
+        .expect("the versions");
+    let copy = listed["others"][0]["conflict_id"].clone();
+
+    let view = page
+        .call(
+            "settings_conflict_resolve",
+            json!({ "keep": { "choice": "copy", "conflict_id": copy } }),
+        )
+        .expect("the choice is recorded");
+    assert_eq!(view["colour_mode"], "light");
+    assert_eq!(view["sync"]["conflicts"], 0);
+    assert_eq!(elsewhere.copies_kept().await, 0);
+    drop(page);
+    assert_eq!(
+        computer.start().view()["colour_mode"],
+        "light",
+        "the file holds it"
+    );
+}
+
+/// A choice whose telling the service failed is made all the same: it is on this computer's disk
+/// and the copy is gone from it, and the next step that reaches the service tells it, so the
+/// service's copy goes too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_choice_the_service_was_not_told_of_is_told_later() {
+    let computer = Computer::new().await;
+    let (page, elsewhere) = waiting_for_a_choice(&computer).await;
+
+    // The service cannot be reached for as long as the choice is being recorded and sent.
+    for nth in 1..=8 {
+        computer.served.web().fail(SYNC_PATH, nth, Moment::Before);
+    }
+    let view = page
+        .call(
+            "settings_conflict_resolve",
+            json!({ "keep": { "choice": "mine" } }),
+        )
+        .expect("the choice is recorded");
+    assert_eq!(view["colour_mode"], "system");
+    assert_eq!(
+        view["sync"]["conflicts"], 0,
+        "the copy is gone from this computer"
+    );
+    assert!(view["sync"]["problem"].is_string(), "{view}");
+    computer.served.web().mend();
+    assert_eq!(
+        elsewhere.copies_kept().await,
+        1,
+        "the service has not been told it can let its copy go"
+    );
+
+    let view = page.sync_now();
+    assert!(view["sync"]["problem"].is_null(), "{view}");
+    assert_eq!(elsewhere.copies_kept().await, 0);
+    assert_eq!(elsewhere.colour().await, "system");
+}
+
+/// Content that says what this computer's settings say asks nothing of the person: it is let go,
+/// and nothing is shown.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn content_that_says_what_this_computer_says_asks_nothing() {
+    let computer = Computer::new().await;
+    let page = computer.start();
+    page.choose("dark");
+    page.turn_on();
+    let elsewhere = computer.elsewhere();
+    assert!(matches!(
+        elsewhere.write("light").await,
+        Published::Accepted { .. }
+    ));
+    // This computer chooses the same mode the other device wrote, without having heard of it.
+    let view = page.choose("light");
+    assert_eq!(view["sync"]["conflicts"], 1);
+
+    let view = page.sync_now();
+    assert_eq!(view["sync"]["conflicts"], 0);
+    assert_eq!(view["colour_mode"], "light");
+    assert_eq!(elsewhere.copies_kept().await, 0);
+}
+
+/// A choice that names nothing waiting is refused, and nothing changes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_choice_that_names_nothing_waiting_is_refused() {
+    let computer = Computer::new().await;
+    let (page, _elsewhere) = waiting_for_a_choice(&computer).await;
+    let stranger = json!("00000000-0000-4000-8000-0000000000aa");
+    page.call(
+        "settings_conflict_resolve",
+        json!({ "keep": { "choice": "copy", "conflict_id": stranger } }),
+    )
+    .expect_err("that content is not waiting");
+    assert_eq!(page.view()["sync"]["conflicts"], 1);
+
+    let quiet = Computer::new().await;
+    let page = quiet.start();
+    page.call(
+        "settings_conflict_resolve",
+        json!({ "keep": { "choice": "mine" } }),
+    )
+    .expect_err("settings sync is not on");
 }

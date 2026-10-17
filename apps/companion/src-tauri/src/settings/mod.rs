@@ -29,7 +29,9 @@ use crate::error::{CommandError, Result};
 
 pub mod sync;
 
-pub use sync::{SettingsSync, SyncParts, SyncState, SyncView};
+pub use sync::{
+    Candidate, ConflictView, Keep, Other, SettingsSync, SyncParts, SyncState, SyncView,
+};
 
 /// The event the backend publishes the settings on, as a [`SettingsView`].
 pub const SETTINGS_EVENT: &str = "kr://settings";
@@ -318,6 +320,28 @@ impl Settings {
             ));
         };
         sync.turn_on().await?;
+        Ok(self.view())
+    }
+
+    /// The versions of the settings the person is asked to choose between, when there are any.
+    ///
+    /// # Errors
+    ///
+    /// Returns a local failure when the records cannot be read.
+    pub fn conflicts(&self) -> Result<Option<ConflictView>> {
+        self.sync.get().map_or(Ok(None), SettingsSync::conflicts)
+    }
+
+    /// Records the person's choice between the versions, and sends it.
+    ///
+    /// # Errors
+    ///
+    /// Returns a refusal when no content waits or the choice names none that does.
+    pub async fn resolve_conflict(&self, keep: Keep) -> Result<SettingsView> {
+        let Some(sync) = self.sync.get() else {
+            return Err(CommandError::refused("settings sync is not on"));
+        };
+        sync.resolve(keep).await?;
         Ok(self.view())
     }
 
