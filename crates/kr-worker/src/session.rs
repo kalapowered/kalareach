@@ -1860,9 +1860,12 @@ impl Session {
     ) -> Result<SessionAttachResult> {
         self.require_running()?;
         let previous = self.attachments.geometry();
-        let (mut attachment, change) =
-            self.attachments
-                .attach(params, granted.clone(), attachment_id, kr_ipc::now_ms())?;
+        let change = self.attachments.attach(
+            params,
+            granted.contains(&AttachmentCapability::Geometry),
+            attachment_id,
+            kr_ipc::now_ms(),
+        )?;
 
         if change.resize_required
             && let Err(error) = self.resize_canonical(change.state.dimensions)
@@ -1886,17 +1889,14 @@ impl Session {
         // between the attach and the subscription. This attachment has nothing to continue from,
         // so it is the one installing.
         self.settle_forwarding(Some(attachment_id));
-        if let Some(settled) = self
+        // What the input path checks a keystroke against, and what the summary below says. It has
+        // one owner, the input domain. Recorded once the attachment is certain to stay, and before
+        // anything can name it.
+        self.input.lock().grant(attachment_id, granted.clone());
+        let attachment = self
             .attachments
-            .summaries()
-            .into_iter()
-            .find(|summary| summary.attachment_id == attachment_id)
-        {
-            attachment = settled;
-        }
-        // What the input path checks a keystroke against. Recorded last, once the attachment is
-        // certain to stay, and before anything can name it.
-        self.input.lock().grant(attachment_id, granted);
+            .summary(attachment_id, granted)
+            .expect("the attachment was just added");
         Ok(SessionAttachResult {
             attachment,
             geometry: change.state,
@@ -2257,11 +2257,7 @@ impl Session {
     ) -> Option<TerminalPresentationMode> {
         self.attachments
             .set_carryable(self.engine.direct_is_carryable());
-        self.attachments
-            .summaries()
-            .into_iter()
-            .find(|summary| summary.attachment_id == attachment_id)
-            .and_then(|summary| summary.presentation.0)
+        self.attachments.presentation_mode(attachment_id)
     }
 
     /// Adds or withdraws a geometry claim.
@@ -2824,8 +2820,7 @@ impl Session {
             .map(|(id, _)| id)
             .collect();
         let boundary = self.engine.ground_boundary();
-        for summary in self.attachments.summaries() {
-            let id = summary.attachment_id;
+        for id in self.attachments.ids() {
             if projected.contains(&id) && !self.forwarding_held.contains_key(&id) {
                 // The host is not serving this one directly at all, for a reason of its own: its
                 // size, its profile, its stream or the screen it was given. There is no handoff.
@@ -3535,7 +3530,7 @@ impl Session {
             session: self.summary(),
             geometry: self.attachments.geometry(),
             lease: self.lease(),
-            attachments: self.attachments.summaries(),
+            attachments: self.attachments(),
             oldest_retained_cursor: U64::new(self.history.oldest_retained_cursor()),
             taken_at_ms: kr_ipc::now_ms(),
             agent_resources,
@@ -3750,7 +3745,13 @@ impl Session {
     /// Returns every attachment, for diagnostics and snapshots.
     #[must_use]
     pub fn attachments(&self) -> Vec<AttachmentSummary> {
-        self.attachments.summaries()
+        let input = self.input.lock();
+        self.attachments.summaries(|id| {
+            input
+                .capabilities(id)
+                .cloned()
+                .unwrap_or_else(CanonicalSet::new)
+        })
     }
 
     /// Refuses an operation that needs a session which is still running.

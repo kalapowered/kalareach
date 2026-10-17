@@ -37,8 +37,9 @@ pub struct Attachment {
     pub dimensions: Option<Dimensions>,
     /// The terminal profile it presents.
     pub terminal_profile_id: Option<String>,
-    /// The capabilities the host granted it.
-    pub granted: CanonicalSet<AttachmentCapability>,
+    /// Whether the host granted it the geometry right, which the size-ownership order needs. The
+    /// capabilities themselves are the input domain's, and a summary is written with them.
+    pub holds_geometry_right: bool,
     /// When it joined.
     pub attached_at_ms: TimestampMs,
     /// Whether the screen this attachment was last given carried everything a terminal continuing
@@ -98,11 +99,16 @@ impl Attachment {
     pub fn is_eligible(&self) -> bool {
         self.mode.may_claim_geometry()
             && self.claim_geometry
-            && self.granted.contains(&AttachmentCapability::Geometry)
+            && self.holds_geometry_right
             && self.dimensions.is_some()
     }
 
-    fn to_wire(&self, geometry: Dimensions, carryable: bool) -> AttachmentSummary {
+    fn to_wire(
+        &self,
+        geometry: Dimensions,
+        carryable: bool,
+        granted: CanonicalSet<AttachmentCapability>,
+    ) -> AttachmentSummary {
         let presented = self.presentation(geometry, carryable);
         AttachmentSummary {
             attachment_id: self.id,
@@ -113,7 +119,7 @@ impl Attachment {
             presentation: Nullable(presented.map(|(mode, _)| mode)),
             presentation_reason: presented.and_then(|(_, reason)| reason),
             terminal_profile_id: Nullable(self.terminal_profile_id.clone()),
-            granted: self.granted.clone(),
+            granted,
             attached_at_ms: self.attached_at_ms,
         }
     }
@@ -354,12 +360,45 @@ impl AttachmentTable {
             .and_then(|ordinal| self.attachments.get(ordinal))
     }
 
-    /// Renders every attachment for the wire.
+    /// Renders every attachment for the wire, with what each was granted as `granted` says.
     #[must_use]
-    pub fn summaries(&self) -> Vec<AttachmentSummary> {
+    pub fn summaries(
+        &self,
+        granted: impl Fn(AttachmentId) -> CanonicalSet<AttachmentCapability>,
+    ) -> Vec<AttachmentSummary> {
         self.attachments
             .values()
-            .map(|attachment| attachment.to_wire(self.dimensions, self.carryable))
+            .map(|attachment| {
+                attachment.to_wire(self.dimensions, self.carryable, granted(attachment.id))
+            })
+            .collect()
+    }
+
+    /// Renders one attachment for the wire, with what it was granted.
+    #[must_use]
+    pub fn summary(
+        &self,
+        id: AttachmentId,
+        granted: CanonicalSet<AttachmentCapability>,
+    ) -> Option<AttachmentSummary> {
+        self.get(id)
+            .map(|attachment| attachment.to_wire(self.dimensions, self.carryable, granted))
+    }
+
+    /// Returns how one attachment is presented the session, when it is a terminal.
+    #[must_use]
+    pub fn presentation_mode(&self, id: AttachmentId) -> Option<TerminalPresentationMode> {
+        self.get(id)?
+            .presentation(self.dimensions, self.carryable)
+            .map(|(mode, _)| mode)
+    }
+
+    /// Returns every attachment's identifier, in join order.
+    #[must_use]
+    pub fn ids(&self) -> Vec<AttachmentId> {
+        self.attachments
+            .values()
+            .map(|attachment| attachment.id)
             .collect()
     }
 
@@ -432,10 +471,10 @@ impl AttachmentTable {
     pub fn attach(
         &mut self,
         params: &SessionAttachParams,
-        granted: CanonicalSet<AttachmentCapability>,
+        holds_geometry_right: bool,
         id: AttachmentId,
         now: TimestampMs,
-    ) -> Result<(AttachmentSummary, GeometryChange)> {
+    ) -> Result<GeometryChange> {
         let dimensions = self.admissible(params)?;
         // Join order is what decides succession, so an ordinal that wrapped would put a new
         // attachment in front of older claims - or land on an occupied entry. The counter is
@@ -456,7 +495,7 @@ impl AttachmentTable {
             claim_geometry: params.claim_geometry,
             dimensions,
             terminal_profile_id: params.terminal_profile_id.as_ref().cloned(),
-            granted,
+            holds_geometry_right,
             attached_at_ms: now,
             restoration_continues: true,
             forwarding_held: false,
@@ -478,11 +517,7 @@ impl AttachmentTable {
                 resize_required: false,
             }
         };
-        let summary = self
-            .get(id)
-            .expect("the attachment was just inserted")
-            .to_wire(self.dimensions, self.carryable);
-        Ok((summary, change))
+        Ok(change)
     }
 
     /// Removes an attachment and runs succession.
@@ -808,7 +843,7 @@ impl AttachmentTable {
                 "a semantic attachment cannot claim geometry".to_owned(),
             ));
         }
-        if claim_geometry && !attachment.granted.contains(&AttachmentCapability::Geometry) {
+        if claim_geometry && !attachment.holds_geometry_right {
             return Err(WorkerError::InvalidArgument(
                 "this attachment does not hold the geometry right".to_owned(),
             ));
@@ -1005,15 +1040,11 @@ mod tests {
         table
             .attach(
                 params,
-                capabilities(&[
-                    AttachmentCapability::ObserveTerminal,
-                    AttachmentCapability::Geometry,
-                ]),
+                true,
                 identifier(id),
                 TimestampMs::new(u64::from(id)),
             )
             .expect("attaches")
-            .1
     }
 
     #[test]
@@ -1080,20 +1111,20 @@ mod tests {
             table
                 .attach(
                     &terminal(80, 24, true),
-                    capabilities(&[
-                        AttachmentCapability::ObserveTerminal,
-                        AttachmentCapability::Geometry,
-                    ]),
+                    true,
                     identifier(id),
                     TimestampMs::new(u64::from(id)),
                 )
-                .expect("attaches")
-                .0
+                .expect("attaches");
+            table
+                .get(identifier(id))
+                .expect("the attachment joined")
+                .clone()
         };
         // The identifiers run the other way from the order of joining.
         let ordinals: Vec<u64> = [9u8, 5, 1]
             .into_iter()
-            .map(|id| join(&mut table, id).ordinal.get())
+            .map(|id| join(&mut table, id).ordinal)
             .collect();
         assert!(
             ordinals.windows(2).all(|pair| pair[0] < pair[1]),
@@ -1107,7 +1138,7 @@ mod tests {
 
         // Joining again is joining last.
         let rejoined = join(&mut table, 9);
-        assert!(rejoined.ordinal.get() > ordinals[2]);
+        assert!(rejoined.ordinal > ordinals[2]);
         let change = table.detach(identifier(5)).expect("detaches");
         assert_eq!(
             change.state.owner.as_ref(),
@@ -1185,14 +1216,8 @@ mod tests {
         let mut table = AttachmentTable::new(Dimensions::new(120, 40));
         let params = terminal(100, 30, true);
         let change = table
-            .attach(
-                &params,
-                capabilities(&[AttachmentCapability::ObserveTerminal]),
-                identifier(9),
-                TimestampMs::new(1),
-            )
-            .expect("attaches")
-            .1;
+            .attach(&params, false, identifier(9), TimestampMs::new(1))
+            .expect("attaches");
         assert!(!change.state.owner.is_present());
         assert_eq!(change.state.dimensions, Dimensions::new(120, 40));
     }
@@ -1207,12 +1232,7 @@ mod tests {
             ..terminal(1, 1, true)
         };
         assert!(matches!(
-            table.attach(
-                &params,
-                capabilities(&[AttachmentCapability::Geometry]),
-                identifier(4),
-                TimestampMs::new(1)
-            ),
+            table.attach(&params, true, identifier(4), TimestampMs::new(1)),
             Err(WorkerError::InvalidArgument(_))
         ));
     }
@@ -1314,9 +1334,7 @@ mod tests {
         id: u8,
     ) -> (Option<TerminalPresentationMode>, Option<PresentationReason>) {
         let summary = table
-            .summaries()
-            .into_iter()
-            .find(|summary| summary.attachment_id == identifier(id))
+            .summary(identifier(id), CanonicalSet::new())
             .expect("the attachment is summarised");
         (
             summary.presentation.as_ref().copied(),
@@ -1405,12 +1423,7 @@ mod tests {
             ..terminal(120, 40, false)
         };
         table
-            .attach(
-                &semantic,
-                capabilities(&[AttachmentCapability::ObserveSemantic]),
-                identifier(8),
-                TimestampMs::new(8),
-            )
+            .attach(&semantic, false, identifier(8), TimestampMs::new(8))
             .expect("a semantic attachment joins");
         assert_eq!(presented(&table, 8), (None, None));
     }
