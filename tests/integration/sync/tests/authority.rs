@@ -164,53 +164,52 @@ impl Feed {
     /// request had to be sent again.
     ///
     /// The announcement is what the answer reports, and the service places it with what is left
-    /// of the one deadline it gives the whole request, after the change has answered. So the
-    /// request is sent again when the answer is unknown (the service gave up on the change before
-    /// placing anything, or the answer was lost on the way back), and when the announcement was
-    /// declined (the mailbox is a new one and may not have answered in time); the service answers
-    /// the resend from the record it holds, or stores the request, and places the announcement
-    /// again. A first request that placed its announcement after all leaves the same item
-    /// waiting, and the resend then reports it as a duplicate: the caller accepts a duplicate only
-    /// when this says it sent again. A decline that comes back is the deployment failing, and the
-    /// leg fails with it.
+    /// of the one deadline it gives the whole request, after the change has answered. Two answers
+    /// leave the announcement unplaced for a reason that says nothing about the deployment: the
+    /// answer is unknown (the service gave up on the change before it placed anything, or the
+    /// answer was lost on the way back), and the announcement is declined (the leg's mailbox is a
+    /// new one and may not have answered in time). The request is sent again once for each of the
+    /// two, whichever order they come in, and the same one coming back is the deployment failing,
+    /// so the leg fails with it. The service answers a resend from the record it holds, or stores
+    /// the request, and places the announcement; a first request whose announcement arrived after
+    /// all leaves the same item waiting, and the resend then reports it as a duplicate. The
+    /// caller accepts a duplicate only when this says it sent again.
     async fn publish_announcing(
         &self,
         client: &AuthorityFeedClient,
         request: &RevocationRequest,
         announcement: &FeedAnnouncement,
     ) -> kr_client::Result<(kr_client::services::AuthorityFeedState, bool)> {
-        let resend = |why: String| async move {
-            eprintln!("{why}, so the feed is read and the request sent again");
-            // The service asks for the feed to be read before a change is sent again.
-            self.host_client.read(self.address(), None, false).await?;
-            client
+        let declined = |state: &kr_client::services::AuthorityFeedState| {
+            state.announced.as_ref().is_some_and(|announced| {
+                announced.mailbox == kr_client::services::AnnouncementPlacement::Declined
+            })
+        };
+        let (mut after_unknown, mut after_decline) = (false, false);
+        loop {
+            match client
                 .publish(self.address(), request, Some(announcement))
                 .await
-                .map(|state| (state, true))
-        };
-        match client
-            .publish(self.address(), request, Some(announcement))
-            .await
-        {
-            Err(unknown) if unknown.code() == ErrorCode::OutcomeUnknown => {
-                resend(format!(
-                    "the publication was answered as unknown: {unknown}"
-                ))
-                .await
-            }
-            Ok(state)
-                if state.announced.as_ref().is_some_and(|announced| {
-                    announced.mailbox == kr_client::services::AnnouncementPlacement::Declined
-                }) =>
             {
-                let why = state
-                    .announced
-                    .as_ref()
-                    .and_then(|announced| announced.declined_reason.clone())
-                    .unwrap_or_default();
-                resend(format!("the announcement was declined: {why}")).await
+                Err(unknown) if unknown.code() == ErrorCode::OutcomeUnknown && !after_unknown => {
+                    after_unknown = true;
+                    eprintln!("the publication was answered as unknown: {unknown}");
+                }
+                Ok(state) if declined(&state) && !after_decline => {
+                    after_decline = true;
+                    let why = state
+                        .announced
+                        .as_ref()
+                        .and_then(|announced| announced.declined_reason.as_deref())
+                        .unwrap_or_default();
+                    eprintln!("the announcement was declined: {why}");
+                }
+                answered => {
+                    return answered.map(|state| (state, after_unknown || after_decline));
+                }
             }
-            answered => answered.map(|state| (state, false)),
+            // The service asks for the feed to be read before a change is sent again.
+            self.host_client.read(self.address(), None, false).await?;
         }
     }
 
@@ -983,16 +982,17 @@ async fn kr_req_10_46_an_announcement_is_only_an_announcement() {
             .publish_announcing(&feed.owner_client, &published, &announcement)
             .await
             .expect("the feed stored the owner's request");
-        let placement = state
+        let announced = state
             .announced
             .as_ref()
-            .expect("the feed says what became of the announcement")
-            .mailbox;
+            .expect("the feed says what became of the announcement");
+        let placement = announced.mailbox;
         assert!(
             placement == kr_client::services::AnnouncementPlacement::Stored
                 || (sent_again
                     && placement == kr_client::services::AnnouncementPlacement::Duplicate),
-            "the announcement was placed: {placement:?}, after sending again: {sent_again}"
+            "the announcement was placed: {placement:?} ({:?}), after sending again: {sent_again}",
+            announced.declined_reason
         );
 
         // The host never reads that mailbox. It learns the revocation from the feed, which is where
