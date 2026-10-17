@@ -151,19 +151,16 @@ impl Rig {
         self.runtime().synchronised_before_serving().await;
     }
 
-    /// Waits until a pass that began after this call has finished, and fails if the wait ran out
-    /// without one: the wait for a synchronisation is bounded, and a bound that ends the wait
-    /// silently would let a pass that is still running read what is published after it.
-    async fn until_a_pass_ends(&self) {
-        let passes = self.runtime().passes();
-        let before = *passes.borrow();
+    /// Waits until the carrier is between passes: a pass that began after this call has finished,
+    /// and the carrier has asked for the wait that follows it. The wait for a synchronisation is
+    /// bounded, and a bound that ended it silently would leave a pass running that reads what is
+    /// published after it, so the second condition is the one that holds: it is met only by a
+    /// carrier that has finished and is waiting.
+    async fn until_the_carrier_is_idle(&self) {
         self.runtime()
             .wait_for_a_synchronisation_at_most(Duration::from_secs(170));
         self.poll().await;
-        assert!(
-            *passes.borrow() > before,
-            "no pass ended while the setup waited"
-        );
+        self.until_a_pass_waits().await;
     }
 
     /// A request the owner signs and publishes, naming `target`, under a fixed identity.
@@ -437,7 +434,7 @@ async fn a_device_the_feed_holds_a_revocation_for_is_kept_out_on_its_first_conne
     let (phone, record) = rig.pairs(&[ActionRight::SessionView]).await;
     // The pairing woke the carrier, and its pass must end before the request is published: a pass
     // that began after the request was stored would carry it out before the device dials.
-    rig.until_a_pass_ends().await;
+    rig.until_the_carrier_is_idle().await;
     let request = rig.owner_publishes(0xa1, devices(record.device_id)).await;
 
     // The carrier's wait has not ended: nothing but the connection can have taught the host.
