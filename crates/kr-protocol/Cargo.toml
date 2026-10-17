@@ -24,6 +24,10 @@ zeroize.workspace = true
 [target.'cfg(unix)'.dependencies]
 rustix = { workspace = true, features = ["fs", "process"] }
 
+[features]
+# A level of the tests' own, for the host crates' tests of what a retained level changes.
+testing = []
+
 [dev-dependencies]
 hex.workspace = true
 

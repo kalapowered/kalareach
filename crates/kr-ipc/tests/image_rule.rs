@@ -34,6 +34,13 @@
 //!
 //! The reading is by tokens: comments and string and character literals are not code and are
 //! passed over, so a sentence that mentions `current_exe` is not a use of it.
+//!
+//! The same reading holds the control daemon's links to workers to one place. A worker's frames
+//! are read and written in the shape of the level the worker states, so the daemon reaches a worker
+//! only through a link bound to that level ([`kr_ipc::client::BoundLink`]). Production code in
+//! `crates/kr-controller/src` names the raw client (`LocalClient`), dials a connection
+//! (`Connection::connect`) or splits one into frame halves (`framed::split`) only in
+//! [`LINK_FILES`].
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -44,6 +51,17 @@ const ALLOWED: &str = "crates/kr-ipc/src/install.rs";
 /// The names nothing else may use: the standard library's path of the running program, and macOS's
 /// own call for it. The kernel's record of the image is `kr_ipc::install`'s to read.
 const NAMES: [&str; 2] = ["current_exe", "_NSGetExecutablePath"];
+
+/// The files of the control daemon that may serve or dial a connection themselves: the one that
+/// serves the daemon's own clients, and the one that answers a worker's rendezvous on a connection
+/// of its own. Every other way from the daemon to a worker goes through a bound link.
+const LINK_FILES: [&str; 2] = [
+    "crates/kr-controller/src/service/local.rs",
+    "crates/kr-controller/src/service/rendezvous.rs",
+];
+
+/// The names of the raw ways to a connection that [`LINK_FILES`] alone may use.
+const RAW_LINKS: [&str; 3] = ["LocalClient", "Connection::connect", "framed::split"];
 
 /// The features that exist for tests, in whichever crate they are: each compiles seams into its
 /// crate that only a test acts through, so a program built with one carries a way in that nothing
@@ -271,6 +289,8 @@ struct Declaration {
 struct Reading {
     /// The lines production code names one of [`NAMES`] on.
     uses: Vec<usize>,
+    /// The lines production code names one of [`RAW_LINKS`] on, with the name.
+    links: Vec<(usize, &'static str)>,
     /// What production code does that this reading cannot follow, by line.
     unfollowed: Vec<(usize, &'static str)>,
     /// The modules the file declares out of line.
@@ -453,6 +473,9 @@ fn block(
                 {
                     reading.uses.push(tokens[at].line);
                 }
+                if let Some(name) = raw_link(tokens, at, end) {
+                    reading.links.push((tokens[at].line, name));
+                }
                 if tokens[at].token == Token::Ident("include".to_owned()) {
                     let next = tokens.get(at + 1).map(|next| &next.token);
                     if next == Some(&Token::Punct('!')) {
@@ -475,6 +498,35 @@ fn block(
             at += 1;
         }
     }
+}
+
+/// The name in [`RAW_LINKS`] the tokens at `at` start, when one: the raw client, a dial of a
+/// connection, or the split of one, whether written out or imported (`framed::{.., split}`).
+fn raw_link(tokens: &[Located], at: usize, end: usize) -> Option<&'static str> {
+    let ident = |index: usize, word: &str| {
+        index < end && matches!(&tokens[index].token, Token::Ident(found) if found == word)
+    };
+    let punct =
+        |index: usize, wanted: char| index < end && tokens[index].token == Token::Punct(wanted);
+    let path_sep = |index: usize| punct(index, ':') && punct(index + 1, ':');
+    if ident(at, "LocalClient") {
+        return Some("LocalClient");
+    }
+    if ident(at, "Connection") && path_sep(at + 1) && ident(at + 3, "connect") {
+        return Some("Connection::connect");
+    }
+    if ident(at, "framed") && path_sep(at + 1) {
+        if ident(at + 3, "split") {
+            return Some("framed::split");
+        }
+        if punct(at + 3, '{') {
+            let close = closing_brace(tokens, at + 3, end);
+            if (at + 4..close).any(|index| ident(index, "split")) {
+                return Some("framed::split");
+            }
+        }
+    }
+    None
 }
 
 /// When the tokens at `at` are `mod name`, after any visibility, the name and the index just past
@@ -926,6 +978,8 @@ fn normalise(path: &Path) -> PathBuf {
 struct Found {
     /// Every production use of [`NAMES`], as `(file, line)`.
     uses: Vec<(PathBuf, usize)>,
+    /// Every production use of [`RAW_LINKS`], as `(file, line, name)`.
+    links: Vec<(PathBuf, usize, &'static str)>,
     /// What this reading cannot follow in production code, as `(file, what)`.
     unfollowed: Vec<(PathBuf, String)>,
 }
@@ -1003,17 +1057,34 @@ fn read_sources(sources: &[(PathBuf, String)], roots: &BTreeSet<PathBuf>) -> Fou
             .iter()
             .flat_map(|file| readings[file].uses.iter().map(|line| (file.clone(), *line)))
             .collect(),
+        links: production
+            .iter()
+            .flat_map(|file| {
+                readings[file]
+                    .links
+                    .iter()
+                    .map(|(line, name)| (file.clone(), *line, *name))
+            })
+            .collect(),
         unfollowed,
     }
 }
 
-/// Every production use of [`NAMES`] under `crates/*/src`, as `(file, line)` relative to the
-/// workspace, what the reading could not follow, as `file: what`, and the number of files read,
-/// given the crates' `roots`.
-fn uses_in(
-    workspace: &Path,
-    roots: &BTreeSet<PathBuf>,
-) -> (Vec<(String, usize)>, Vec<String>, usize) {
+/// What reading every source under `crates/*/src` found, with the files named relative to the
+/// workspace.
+struct Reads {
+    /// Every production use of [`NAMES`], as `(file, line)`.
+    uses: Vec<(String, usize)>,
+    /// Every production use of [`RAW_LINKS`], as `(file, line, name)`.
+    links: Vec<(String, usize, &'static str)>,
+    /// What the reading could not follow, as `file: what`.
+    unfollowed: Vec<String>,
+    /// The number of files read.
+    files: usize,
+}
+
+/// Reads every source under `crates/*/src`, given the crates' `roots`.
+fn reads_in(workspace: &Path, roots: &BTreeSet<PathBuf>) -> Reads {
     let mut files = Vec::new();
     let crates = workspace.join("crates");
     let mut members: Vec<PathBuf> = std::fs::read_dir(&crates)
@@ -1042,17 +1113,24 @@ fn uses_in(
             .replace('\\', "/")
     };
     let found = read_sources(&sources, roots);
-    let uses = found
-        .uses
-        .iter()
-        .map(|(file, line)| (relative(file), *line))
-        .collect();
-    let unfollowed = found
-        .unfollowed
-        .iter()
-        .map(|(file, what)| format!("{}: {what}", relative(file)))
-        .collect();
-    (uses, unfollowed, files.len())
+    Reads {
+        uses: found
+            .uses
+            .iter()
+            .map(|(file, line)| (relative(file), *line))
+            .collect(),
+        links: found
+            .links
+            .iter()
+            .map(|(file, line, name)| (relative(file), *line, *name))
+            .collect(),
+        unfollowed: found
+            .unfollowed
+            .iter()
+            .map(|(file, what)| format!("{}: {what}", relative(file)))
+            .collect(),
+        files: files.len(),
+    }
 }
 
 /// No production code in the host's crates asks where its program is, but the install module.
@@ -1061,7 +1139,12 @@ fn only_the_install_module_asks_where_its_program_is() {
     let workspace = workspace();
     let metadata = cargo_metadata(&workspace);
     let roots = crate_roots(&metadata);
-    let (uses, unfollowed, files) = uses_in(&workspace, &roots);
+    let Reads {
+        uses,
+        unfollowed,
+        files,
+        ..
+    } = reads_in(&workspace, &roots);
     assert!(
         files > 500,
         "the whole of crates/*/src was read, and it was: {files} files"
@@ -1110,6 +1193,81 @@ fn only_the_install_module_asks_where_its_program_is() {
         uses.iter().any(|(file, _)| file == ALLOWED),
         "the reading found the install module's own use"
     );
+}
+
+/// The control daemon reaches a worker only through a link bound to the worker's level: no
+/// production file of the daemon but [`LINK_FILES`] names the raw client, dials a connection or
+/// splits one.
+#[test]
+fn the_control_daemon_reaches_a_worker_only_through_a_bound_link() {
+    let workspace = workspace();
+    let roots = crate_roots(&cargo_metadata(&workspace));
+    let reads = reads_in(&workspace, &roots);
+    let daemon: Vec<&(String, usize, &str)> = reads
+        .links
+        .iter()
+        .filter(|(file, ..)| file.starts_with("crates/kr-controller/src/"))
+        .collect();
+    let outside: Vec<String> = daemon
+        .iter()
+        .filter(|(file, ..)| !LINK_FILES.contains(&file.as_str()))
+        .map(|(file, line, name)| format!("{file}:{line} {name}"))
+        .collect();
+    assert!(
+        outside.is_empty(),
+        "these name {RAW_LINKS:?} outside {LINK_FILES:?}; reach a worker through \
+         `kr_ipc::client::BoundLink`, which reads and writes its frames in the worker's level:\n{}",
+        outside.join("\n")
+    );
+    // The control on the real tree: the reading does see the daemon's production code, because
+    // each file that may serve a connection is found serving one.
+    for file in LINK_FILES {
+        assert!(
+            daemon.iter().any(|(found, ..)| found == file),
+            "the reading found the use in {file}"
+        );
+    }
+}
+
+/// A raw way to a connection is found however it is written, and a word, a test module and the
+/// bound link are not one.
+#[test]
+fn the_reading_finds_a_raw_way_to_a_connection_however_it_is_written() {
+    let names = |source: &str| -> Vec<&'static str> {
+        read(source)
+            .links
+            .into_iter()
+            .map(|(_, name)| name)
+            .collect()
+    };
+    for (source, name) in [
+        ("use kr_ipc::client::LocalClient;", "LocalClient"),
+        ("fn f() { let _ = LocalClient::connect(); }", "LocalClient"),
+        (
+            "async fn f() { let _ = kr_ipc::endpoint::Connection::connect(&e).await; }",
+            "Connection::connect",
+        ),
+        ("use kr_ipc::framed::split;", "framed::split"),
+        (
+            "use kr_ipc::framed::{FrameReader, FrameWriter, split};",
+            "framed::split",
+        ),
+        (
+            "fn f() { let _ = kr_ipc::framed::split(c, k); }",
+            "framed::split",
+        ),
+    ] {
+        assert_eq!(names(source), vec![name], "{source}");
+    }
+    for source in [
+        "use kr_ipc::framed::{FrameReader, FrameWriter};",
+        "// LocalClient\nfn f() {}",
+        "fn f() { let _ = \"Connection::connect\"; }",
+        "#[cfg(test)]\nmod tests { use kr_ipc::framed::split; }",
+        "fn f() { let _ = BoundLink::connect(); let _ = \"a,b\".split(','); }",
+    ] {
+        assert!(names(source).is_empty(), "{source}");
+    }
 }
 
 /// No feature that exists for tests is on in a program built from the host's crates, and every

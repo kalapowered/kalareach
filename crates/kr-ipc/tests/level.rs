@@ -143,18 +143,44 @@ fn another_level() -> PackageVersion {
     }
 }
 
-/// KR-REQ-26.08: a daemon's connection to a worker of another level, or to one that states no
-/// build, is refused before anything but the hello is sent; a worker at this build's level is met,
-/// a patch number apart included.
+/// The version of a build at the level this release retains besides its own.
+fn retained_version() -> PackageVersion {
+    let retained = kr_protocol::retained::RETAINED_WORKER_LEVELS[0];
+    PackageVersion::new(retained.major(), retained.minor().unwrap_or(0), 0)
+}
+
+/// A version one level below the retained one, which this release does not speak at.
+fn level_below_the_retained_one() -> PackageVersion {
+    let retained = retained_version();
+    PackageVersion::new(retained.major, retained.minor - 1, 0)
+}
+
+/// KR-REQ-26.08: a daemon's connection to a worker of a level its release does not retain, or to
+/// one that states no build, is refused before anything but the hello is sent; a worker at this
+/// build's level or at the level it retains is met, a patch number apart included, and the link is
+/// bound to the level the worker stated.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_daemon_meets_only_a_worker_at_a_level_its_release_retains() {
-    // The controls: this build's own version, and one a patch number apart, are met.
-    for version in [
-        PACKAGE_VERSION,
-        PackageVersion::new(
-            PACKAGE_VERSION.major,
-            PACKAGE_VERSION.minor,
-            PACKAGE_VERSION.patch + 1,
+    // The controls: this build's own version and the retained level's, and each a patch number
+    // apart, are met, at the level they state.
+    for (version, this_level) in [
+        (PACKAGE_VERSION, true),
+        (
+            PackageVersion::new(
+                PACKAGE_VERSION.major,
+                PACKAGE_VERSION.minor,
+                PACKAGE_VERSION.patch + 1,
+            ),
+            true,
+        ),
+        (retained_version(), false),
+        (
+            PackageVersion::new(
+                retained_version().major,
+                retained_version().minor,
+                retained_version().patch + 1,
+            ),
+            false,
         ),
     ] {
         let worker = Worker::start(stating(version));
@@ -162,10 +188,16 @@ async fn a_daemon_meets_only_a_worker_at_a_level_its_release_retains() {
             .connect_as_daemon()
             .await
             .unwrap_or_else(|error| panic!("a worker at {version} is met: {error}"));
+        assert_eq!(client.level().is_this(), this_level, "{version}");
+        assert!(client.level().level().admits(version), "{version}");
         drop(client);
         assert!(worker.sent_after_hello().await.is_empty());
     }
-    for stated in [stating(another_level()), None] {
+    for stated in [
+        stating(another_level()),
+        stating(level_below_the_retained_one()),
+        None,
+    ] {
         let worker = Worker::start(stated.clone());
         let refused = worker
             .connect_as_daemon()

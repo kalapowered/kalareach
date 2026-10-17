@@ -55,11 +55,18 @@ pub fn publish_for(
 
 /// Reads the bytes of a descriptor file in the shape of this release or of a level it retains.
 fn decode(bytes: &[u8]) -> Result<WorkerDescriptor> {
+    decode_under(
+        std::iter::once(Level::this())
+            .chain(kr_protocol::retained::RETAINED.iter().map(Level::retained)),
+        bytes,
+    )
+}
+
+/// Reads the bytes of a descriptor file in the shape of the first of `levels` that reads them.
+fn decode_under(levels: impl IntoIterator<Item = Level>, bytes: &[u8]) -> Result<WorkerDescriptor> {
     let value = kr_cbor::decode(bytes, &kr_cbor::Limits::DEFAULT)
         .map_err(|error| IpcError::Frame(kr_protocol::frame::FrameError::Cbor(error)))?;
     let value = kr_protocol::envelope::ParamsValue::new(value);
-    let levels = std::iter::once(Level::this())
-        .chain(kr_protocol::retained::RETAINED.iter().map(Level::retained));
     let mut first = None;
     for level in levels {
         match level.decode_value::<WorkerDescriptor>(&value) {
@@ -635,6 +642,121 @@ mod tests {
                 & 0o777;
             assert_eq!(mode, crate::paths::OWNER_ONLY_FILE_MODE);
         }
+    }
+
+    /// A level of the tests' own, whose workers wrote no publication time in a descriptor: the
+    /// time is left out going out and read as nought coming in.
+    fn a_level_without_the_publication_time() -> Level {
+        use kr_cbor::{CanonicalMap, CanonicalValue};
+
+        fn leave_out(value: &mut CanonicalValue) -> std::result::Result<(), String> {
+            kr_protocol::retained::remove_member(value, "published_at_ms");
+            Ok(())
+        }
+        fn read_as_nought(value: &mut CanonicalValue) -> std::result::Result<(), String> {
+            let CanonicalValue::Map(map) = value else {
+                return Err("not a map".to_owned());
+            };
+            let mut entries = std::mem::take(map).into_entries();
+            entries.push((
+                "published_at_ms".to_owned(),
+                CanonicalValue::integer(0).map_err(|error| error.to_string())?,
+            ));
+            *map = CanonicalMap::from_entries(entries).map_err(|error| error.to_string())?;
+            Ok(())
+        }
+        static ENTRY: [kr_protocol::retained::Declared; 1] = [kr_protocol::retained::Declared {
+            at: "WorkerDescriptor.published_at_ms",
+            write: leave_out,
+            read: read_as_nought,
+            golden: &[],
+        }];
+        kr_protocol::retained::a_level_of_the_tests_own(
+            |definitions| {
+                let descriptor = &mut definitions["WorkerDescriptor"];
+                descriptor["properties"]
+                    .as_object_mut()
+                    .expect("members")
+                    .remove("published_at_ms");
+                descriptor["required"]
+                    .as_array_mut()
+                    .expect("required")
+                    .retain(|name| name != "published_at_ms");
+            },
+            &ENTRY,
+        )
+    }
+
+    /// A descriptor is published in the shape of the level its worker is at, and read in the shape of
+    /// whichever level reads it: this release's own file is read as it is, and one of a level that
+    /// differs is read through that level.
+    #[test]
+    fn a_descriptor_is_written_and_read_in_the_shape_of_the_level_its_worker_is_at() {
+        let host = TempHost::create();
+        let paths = host.environment();
+        let level = a_level_without_the_publication_time();
+        let published = descriptor(&host, 10);
+
+        publish_for(level, &paths, &published).expect("written for the level");
+        let bytes = std::fs::read(paths.descriptor_file(published.session_id)).expect("the file");
+        let value = kr_cbor::decode(&bytes, &kr_cbor::Limits::DEFAULT).expect("canonical");
+        let kr_cbor::CanonicalValue::Map(members) = &value else {
+            panic!("a descriptor is a map");
+        };
+        assert!(
+            members.get("published_at_ms").is_none(),
+            "the file has the shape of the level"
+        );
+        assert!(
+            decode_under([Level::this()], &bytes).is_err(),
+            "this release's shape does not read it"
+        );
+        let read_back = decode_under([Level::this(), level], &bytes).expect("read under the level");
+        assert_eq!(
+            read_back,
+            WorkerDescriptor {
+                published_at_ms: TimestampMs::new(0),
+                ..published.clone()
+            }
+        );
+
+        // This release's own file is read in its own shape, whatever else is tried after it.
+        publish(&paths, &published).expect("published");
+        assert_eq!(
+            read(&paths, published.session_id)
+                .expect("reads")
+                .expect("present"),
+            published
+        );
+    }
+
+    /// A descriptor the level cannot hold is not published for it: the level lacks a member this
+    /// release's descriptor has and no entry says what to do with it.
+    #[test]
+    fn a_descriptor_a_level_cannot_hold_is_not_published_for_it() {
+        let host = TempHost::create();
+        let paths = host.environment();
+        let level = kr_protocol::retained::a_level_of_the_tests_own(
+            |definitions| {
+                let descriptor = &mut definitions["WorkerDescriptor"];
+                descriptor["properties"]
+                    .as_object_mut()
+                    .expect("members")
+                    .remove("worker_profile");
+                descriptor["required"]
+                    .as_array_mut()
+                    .expect("required")
+                    .retain(|name| name != "worker_profile");
+            },
+            &[],
+        );
+        let published = descriptor(&host, 11);
+        let refused = publish_for(level, &paths, &published).expect_err("refused");
+        assert!(matches!(refused, IpcError::NotInLevel(_)), "{refused}");
+        assert!(
+            read(&paths, published.session_id).expect("reads").is_none(),
+            "nothing was written"
+        );
     }
 
     #[test]

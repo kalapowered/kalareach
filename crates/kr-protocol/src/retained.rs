@@ -247,6 +247,103 @@ pub static RETAINED: [RetainedLevel; 1] = [RetainedLevel::new(
     &[],
 )];
 
+/// A level of a test's own: the surface this release retains besides its own, with its definitions
+/// changed by `edit`, and `declared` as the entries that cover what it differs by.
+///
+/// The surface a release keeps equals the one it has until the release changes it, so a test that
+/// needs a level whose frames differ makes one. The level lives for the rest of the process.
+///
+/// # Panics
+///
+/// When the edited document is not a surface.
+#[cfg(feature = "testing")]
+pub fn a_level_of_the_tests_own(
+    edit: impl FnOnce(&mut serde_json::Map<String, serde_json::Value>),
+    declared: &'static [Declared],
+) -> Level {
+    let kept = &RETAINED[0];
+    let mut document: serde_json::Value =
+        serde_json::from_str(&kept.surface().render()).expect("a surface renders as a document");
+    edit(
+        document
+            .get_mut("$defs")
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("a surface has definitions"),
+    );
+    drop_what_no_root_reaches(&mut document);
+    let text = serde_json::to_string(&document).expect("a document is text");
+    Surface::parse(&text).expect("an edited surface is a surface");
+    Level::retained(Box::leak(Box::new(RetainedLevel::new(
+        kept.level,
+        Box::leak(text.into_boxed_str()),
+        kept.release,
+        kept.plugin_host,
+        declared,
+        &[],
+    ))))
+}
+
+/// Removes the definitions of a surface document that no root reaches any more, as an edit that
+/// removes a variant leaves the definition it carried.
+#[cfg(feature = "testing")]
+fn drop_what_no_root_reaches(document: &mut serde_json::Value) {
+    use std::collections::BTreeSet;
+
+    fn references(value: &serde_json::Value, found: &mut Vec<String>) {
+        match value {
+            serde_json::Value::Object(members) => {
+                for (key, member) in members {
+                    if key == "$ref" {
+                        if let Some(name) = member
+                            .as_str()
+                            .and_then(|text| text.strip_prefix("#/$defs/"))
+                        {
+                            found.push(name.to_owned());
+                        }
+                    } else {
+                        references(member, found);
+                    }
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    references(item, found);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut reached: BTreeSet<String> = document
+        .get("roots")
+        .and_then(serde_json::Value::as_array)
+        .map(|roots| {
+            roots
+                .iter()
+                .filter_map(|root| root.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut pending: Vec<String> = reached.iter().cloned().collect();
+    while let Some(name) = pending.pop() {
+        let mut found = Vec::new();
+        if let Some(definition) = document.get("$defs").and_then(|defs| defs.get(&name)) {
+            references(definition, &mut found);
+        }
+        for next in found {
+            if reached.insert(next.clone()) {
+                pending.push(next);
+            }
+        }
+    }
+    if let Some(definitions) = document
+        .get_mut("$defs")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        definitions.retain(|name, _| reached.contains(name));
+    }
+}
+
 /// The value of `name` in a record of `name=value` lines.
 #[must_use]
 pub fn record<'a>(record: &'a str, name: &str) -> Option<&'a str> {

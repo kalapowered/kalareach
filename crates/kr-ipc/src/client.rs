@@ -287,7 +287,18 @@ impl BoundLink {
     /// Returns [`IpcError::UnretainedLevel`] naming what the worker stated, an error when nothing
     /// is listening or the peer is refused, and the worker's refusal of the controller connection.
     pub async fn connect(endpoint: &Endpoint, build_id: BuildId) -> Result<Self> {
-        Self::connecting(endpoint, build_id, ReceiveLimits::default()).await
+        Self::connecting(endpoint, build_id, ReceiveLimits::default(), None).await
+    }
+
+    /// Connects as [`BoundLink::connect`] does and binds the link to `level`, whatever the worker
+    /// states, so that a test can drive a link at a level of its own.
+    ///
+    /// # Errors
+    ///
+    /// Returns what [`BoundLink::connect`] returns, bar the refusal of the worker's level.
+    #[cfg(feature = "testing")]
+    pub async fn connect_at(endpoint: &Endpoint, build_id: BuildId, level: Level) -> Result<Self> {
+        Self::connecting(endpoint, build_id, ReceiveLimits::default(), Some(level)).await
     }
 
     /// Connects and says the link can receive `max_receive`, rather than the usual limits.
@@ -305,13 +316,14 @@ impl BoundLink {
         build_id: BuildId,
         max_receive: ReceiveLimits,
     ) -> Result<Self> {
-        Self::connecting(endpoint, build_id, max_receive).await
+        Self::connecting(endpoint, build_id, max_receive, None).await
     }
 
     async fn connecting(
         endpoint: &Endpoint,
         build_id: BuildId,
         max_receive: ReceiveLimits,
+        bound_to: Option<Level>,
     ) -> Result<Self> {
         let (reader, writer, acknowledgement) = hello(
             endpoint,
@@ -321,7 +333,10 @@ impl BoundLink {
             None,
         )
         .await?;
-        let level = retained_level(acknowledgement.build.as_ref())?;
+        let level = match bound_to {
+            Some(level) => level,
+            None => retained_level(acknowledgement.build.as_ref())?,
+        };
         let mut link = Self {
             codec: Bound(level),
             reader,

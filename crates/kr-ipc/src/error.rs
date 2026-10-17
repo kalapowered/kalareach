@@ -243,6 +243,19 @@ fn carries_account_refusal(source: &std::io::Error) -> bool {
 /// The result of a local IPC operation.
 pub type Result<T> = std::result::Result<T, IpcError>;
 
+impl From<kr_protocol::retained::CodecError> for IpcError {
+    fn from(error: kr_protocol::retained::CodecError) -> Self {
+        use kr_protocol::retained::CodecError;
+        match error {
+            CodecError::Cbor(error) => Self::Frame(kr_protocol::frame::FrameError::Cbor(error)),
+            CodecError::NotInLevel { .. } => Self::NotInLevel(error.to_string()),
+            CodecError::OutsideLevel { .. } | CodecError::NotInSurface(_) => {
+                Self::OutsideLevel(error.to_string())
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -272,18 +285,5 @@ mod tests {
             std::io::Error::from(std::io::ErrorKind::PermissionDenied),
         );
         assert_eq!(denied.code(), ErrorCode::ResourceUnavailable);
-    }
-}
-
-impl From<kr_protocol::retained::CodecError> for IpcError {
-    fn from(error: kr_protocol::retained::CodecError) -> Self {
-        use kr_protocol::retained::CodecError;
-        match error {
-            CodecError::Cbor(error) => Self::Frame(kr_protocol::frame::FrameError::Cbor(error)),
-            CodecError::NotInLevel { .. } => Self::NotInLevel(error.to_string()),
-            CodecError::OutsideLevel { .. } | CodecError::NotInSurface(_) => {
-                Self::OutsideLevel(error.to_string())
-            }
-        }
     }
 }
