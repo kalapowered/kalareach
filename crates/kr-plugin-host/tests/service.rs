@@ -136,12 +136,27 @@ impl Host {
 
     /// Starts a plugin host through the platform's own service manager.
     async fn start_plugin_host(&self) -> Started {
+        self.start_plugin_host_with(&[]).await
+    }
+
+    /// Starts a plugin host whose engine's epoch no time advances, so no call into a component is
+    /// ever stopped by its deadline: for a test of what a terminal does beside a component that is
+    /// working, which a machine slow to schedule the host must not be able to stop.
+    async fn start_plugin_host_holding_the_epoch(&self) -> Started {
+        self.start_plugin_host_with(&["--hold-epoch"]).await
+    }
+
+    async fn start_plugin_host_with(&self, extra_arguments: &[&str]) -> Started {
         let recorded: Arc<std::sync::Mutex<Option<ServiceLaunch>>> =
             Arc::new(std::sync::Mutex::new(None));
         let seen: Arc<std::sync::Mutex<Option<u32>>> = Arc::new(std::sync::Mutex::new(None));
         let supervisor: Arc<dyn HostSupervisor> = Arc::new(Recorded {
             recorded: Arc::clone(&recorded),
             seen: Arc::clone(&seen),
+            extra_arguments: extra_arguments
+                .iter()
+                .map(|argument| (*argument).to_owned())
+                .collect(),
         });
         let outcome = launcher::start(
             &self.environment(),
@@ -236,14 +251,18 @@ impl Host {
 struct Recorded {
     recorded: Arc<std::sync::Mutex<Option<ServiceLaunch>>>,
     seen: Arc<std::sync::Mutex<Option<u32>>>,
+    /// Arguments a test adds to the ones the launcher chose.
+    extra_arguments: Vec<String>,
 }
 
 impl HostSupervisor for Recorded {
     fn start(&self, plan: &HostLaunchPlan) -> HostStartOutcome {
+        let mut arguments = plan.arguments.clone();
+        arguments.extend(self.extra_arguments.iter().cloned());
         let launch = ServiceLaunch {
             label: plan.label.clone(),
             program: plan.program.clone(),
-            arguments: plan.arguments.clone(),
+            arguments,
             jobs_directory: plan.jobs_directory.clone(),
             working_directory: plan.working_directory.clone(),
         };
@@ -801,13 +820,16 @@ async fn a_component_that_never_returns_costs_its_own_binding_and_not_the_termin
 // test, not an amount of work sized for some machine. The binding is given observations at a
 // steady pace until the test opens a gate, so the component goes on finishing calls through the
 // whole window and after it, however fast or slow the machine is. That is continued activity, a
-// short call after a short call, not one call that lasts the window. Each call is one short
-// observation that ends far inside its deadline, so a slow machine does not overrun it. A machine
-// that stalls outright can still hold a call past its deadline now and then, which the runtime
-// records as a fault and the binding survives until three come within a minute; nothing here
-// measures how long a call takes, so such a fault is not a failure. A disabled binding would leave
-// a window with nothing running in it, so that fails the test, and whether it happened is read
-// from the binding itself after the window, since disabling is final.
+// short call after a short call, not one call that lasts the window.
+//
+// The host's epoch is held, so no call is ever stopped by its deadline: a machine that stalls the
+// host for ten milliseconds in the middle of a call would otherwise fault the component, and three
+// faults within a minute disable the binding, which leaves the window with nothing running in it.
+// That is how the runtime treats a component on a machine that cannot run it, and it says nothing
+// about whether a terminal drains beside a component that is working. What stops a component at
+// its deadline is shown where a test advances the epoch itself. A disabled binding would still
+// fail this test, and whether it happened is read from the binding itself after the window, since
+// disabling is final.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_11_39_a_terminal_drains_and_is_answered_while_a_component_runs() {
     let Some(well_behaved) = component("well-behaved") else {
@@ -820,7 +842,7 @@ async fn kr_req_11_39_a_terminal_drains_and_is_answered_while_a_component_runs()
     let session = WorkerSession::running(&host, ASKING_SHELL);
     let mut terminal = session.attach().await;
 
-    let started = host.start_plugin_host().await;
+    let started = host.start_plugin_host_holding_the_epoch().await;
     let plugin = host.plugin_client().await;
     let installed = host.install("well-behaved", &well_behaved);
     let binding = new_binding_id();
@@ -952,9 +974,7 @@ async fn kr_req_11_39_a_terminal_drains_and_is_answered_while_a_component_runs()
     // notices it sent, which go on arriving for as long as it runs: disabling is final, and a
     // disabled binding answers every call it is asked for by saying so before it runs anything, so
     // any other answer now comes from a binding that was not disabled at any point before, the
-    // window included. How the call itself ends does not matter: one a stalled machine holds past
-    // its deadline is a fault the binding survives, and a fault that does not disable it leaves a
-    // component at work, which is all the window needs.
+    // window included.
     let asking = std::time::Instant::now() + Duration::from_secs(10);
     loop {
         match plugin.snapshot(binding, Duration::from_secs(2)).await {

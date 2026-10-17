@@ -51,14 +51,19 @@ pub async fn run(options: Options) -> LaunchResult<()> {
     // published would name the process that lost.
     let listener = Listener::bind(&endpoint)?;
 
-    let host = Arc::new(PluginHost::new(
-        identity,
-        HostConfig {
-            endpoint: endpoint.clone(),
-            packages_root: options.packages_dir.clone(),
-            cache_root: environment.state_dir().join(Options::CACHE_DIRECTORY),
-        },
-    )?);
+    let config = HostConfig {
+        endpoint: endpoint.clone(),
+        packages_root: options.packages_dir.clone(),
+        cache_root: environment.state_dir().join(Options::CACHE_DIRECTORY),
+    };
+    #[cfg(feature = "testing")]
+    let host = Arc::new(if options.hold_epoch {
+        PluginHost::new_with_epoch_held(identity, config)?
+    } else {
+        PluginHost::new(identity, config)?
+    });
+    #[cfg(not(feature = "testing"))]
+    let host = Arc::new(PluginHost::new(identity, config)?);
 
     report_in(&host, &options, &endpoint.as_text()).await?;
 
@@ -162,6 +167,8 @@ mod tests {
             runtime_dir: environment.runtime_root().to_path_buf(),
             state_dir: environment.state_root().to_path_buf(),
             packages_dir: packages,
+            #[cfg(feature = "testing")]
+            hold_epoch: false,
         };
         let error = run(options)
             .await

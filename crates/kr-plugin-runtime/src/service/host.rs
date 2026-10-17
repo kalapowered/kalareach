@@ -137,6 +137,13 @@ impl core::fmt::Debug for PluginHost {
     }
 }
 
+/// The refusal a host gives when its runtime cannot be built.
+fn runtime_refused(error: crate::RuntimeError) -> LaunchError {
+    LaunchError::Refused {
+        detail: format!("the component runtime could not be built: {error}"),
+    }
+}
+
 impl PluginHost {
     /// Builds the service.
     ///
@@ -145,11 +152,26 @@ impl PluginHost {
     /// Returns [`LaunchError::Refused`] when the engine or the cache cannot be prepared.
     pub fn new(identity: HostIdentity, config: HostConfig) -> LaunchResult<Self> {
         let runtime =
-            Runtime::new(RuntimeConfig::new(config.cache_root.clone())).map_err(|error| {
-                LaunchError::Refused {
-                    detail: format!("the component runtime could not be built: {error}"),
-                }
-            })?;
+            Runtime::new(RuntimeConfig::new(config.cache_root.clone())).map_err(runtime_refused)?;
+        Self::around(identity, config, runtime)
+    }
+
+    /// Builds the service over a runtime whose epoch no time advances, for the tests of what a
+    /// terminal does beside a component that is working: a call into a component is then stopped
+    /// by its deadline only when a test advances the epoch, so a machine that is slow to schedule
+    /// the host cannot make a component fault. See [`Runtime::with_epoch_held`].
+    ///
+    /// # Errors
+    ///
+    /// Returns what [`Self::new`] does.
+    #[cfg(feature = "testing")]
+    pub fn new_with_epoch_held(identity: HostIdentity, config: HostConfig) -> LaunchResult<Self> {
+        let runtime = Runtime::with_epoch_held(RuntimeConfig::new(config.cache_root.clone()))
+            .map_err(runtime_refused)?;
+        Self::around(identity, config, runtime)
+    }
+
+    fn around(identity: HostIdentity, config: HostConfig, runtime: Runtime) -> LaunchResult<Self> {
         // The directory belongs to whoever filed the components in it, which is the catalogue: it
         // holds every repository's store, made with the catalogue's own permissions. This host
         // opens it and nothing more. It does not create it, because a host started where no

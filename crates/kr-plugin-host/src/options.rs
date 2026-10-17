@@ -35,6 +35,13 @@ pub struct Options {
     /// The only directory a component payload may be read from.
     #[arg(long = "packages-dir")]
     pub packages_dir: PathBuf,
+    /// Holds the engine's epoch still, so that no call into a component reaches its deadline.
+    /// For this crate's own tests, which start a host to see what a terminal does beside a
+    /// component that is working: a slow machine would otherwise stop that component. It is not
+    /// an argument any shipped build has.
+    #[cfg(feature = "testing")]
+    #[arg(long = "hold-epoch", hide = true)]
+    pub hold_epoch: bool,
 }
 
 impl Options {
