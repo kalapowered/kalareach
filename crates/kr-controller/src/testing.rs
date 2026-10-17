@@ -54,9 +54,16 @@ pub async fn with_git_read_bound<F: Future>(bound: Duration, start: F) -> F::Out
 /// daemons through [`with_git_read_bound`]: a read that finishes is answered whenever it does.
 pub const HUNG_GIT_READ: Duration = Duration::from_secs(600);
 
+/// The environment variable, in milliseconds, that gives a daemon a suite runs as a program of its
+/// own the bound of [`with_git_read_bound`], which no task of the suite starts.
+pub const GIT_READ_BOUND_VARIABLE: &str = "KR_TEST_GIT_READ_BOUND_MS";
+
 /// The bound a suite gave the Git reads of the daemon being started, when it did.
 pub(crate) fn git_read_bound() -> Option<Duration> {
-    GIT_READ_BOUND.try_with(|bound| *bound).ok()
+    GIT_READ_BOUND.try_with(|bound| *bound).ok().or_else(|| {
+        let milliseconds = std::env::var(GIT_READ_BOUND_VARIABLE).ok()?.parse().ok()?;
+        Some(Duration::from_millis(milliseconds))
+    })
 }
 
 /// The environment variable that stands the account service at an origin for a daemon a suite
