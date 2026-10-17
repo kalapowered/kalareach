@@ -631,6 +631,49 @@ async fn a_choice_made_while_the_first_read_is_out_does_not_replace_what_the_oth
     );
 }
 
+/// A step that stops after it read what another device wrote, and before it took it, leaves a note
+/// of where that write stands and nothing that holds it. The person's choice made after that is
+/// not published against the note: the other device's write is kept beside it for them to choose.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_step_that_stopped_before_taking_what_was_read_does_not_let_the_next_choice_replace_it() {
+    use companion_tauri::settings::ColourMode;
+    let computer = Computer::new().await;
+    let page = computer.start();
+    // Nothing is chosen on this computer, and sync is on.
+    page.turn_on();
+    let elsewhere = computer.elsewhere();
+    assert!(matches!(
+        elsewhere.write("light").await,
+        Published::Accepted { .. }
+    ));
+
+    // The step reads the other device's write and cannot take it: a directory stands where the
+    // lock on the settings file is made, so the settings file cannot be written.
+    let lock = computer.data.path().join("settings.lock");
+    std::fs::create_dir(&lock).expect("a directory where the lock goes");
+    page.call("settings_sync_now", json!({}))
+        .expect_err("the step could not take what it read");
+    std::fs::remove_dir(&lock).expect("the directory goes");
+
+    // The person chooses; the next steps do not publish it over what the other device wrote.
+    let settings = page.app.state::<AppState>().settings().expect("settings");
+    settings
+        .local()
+        .set_colour_mode(ColourMode::Dark)
+        .expect("the person's choice");
+    let view = page.sync_now();
+    assert_eq!(view["colour_mode"], "dark", "the person's choice stands");
+    assert_eq!(
+        view["sync"]["conflicts"], 1,
+        "what the other device wrote waits"
+    );
+    assert_eq!(
+        elsewhere.colour().await,
+        "light",
+        "and is still at the service"
+    );
+}
+
 /// A file this build cannot read is no choice to compare with, and a mode read from elsewhere does
 /// not replace it.
 #[test]
