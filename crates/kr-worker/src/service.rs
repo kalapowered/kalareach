@@ -1483,11 +1483,17 @@ impl WorkerService {
         loop {
             // The pass commits to the journal under the dispatch barrier and the session, on a
             // thread the executor can do without.
-            if off_the_executor(|| self.maintain_once()) {
+            if self.maintain_pass() {
                 break;
             }
             tick.tick().await;
         }
+    }
+
+    /// One pass of the host's maintenance, made on a thread the executor can do without. Returns
+    /// whether the session has closed.
+    fn maintain_pass(&self) -> bool {
+        off_the_executor(|| self.maintain_once())
     }
 
     /// One pass of the host's maintenance. Returns whether the session has closed.
@@ -1538,11 +1544,11 @@ impl WorkerService {
     /// Runs one pass of the host's maintenance now, for this host's own tests.
     ///
     /// Maintenance does this on its own cadence, once a minute. This runs the same pass through the
-    /// same barrier, the same locks and the same order, on the caller's thread. It is compiled away
-    /// in every shipped build.
+    /// same barrier, the same locks, the same order and the same hand-off from the executor, on
+    /// the caller's task. It is compiled away in every shipped build.
     #[cfg(feature = "testing")]
     pub fn maintain_now(&self) {
-        self.maintain_once();
+        self.maintain_pass();
     }
 
     /// Runs the storage half of one maintenance pass now: the journal first, then the broker.

@@ -3116,10 +3116,14 @@ enum Stalled {
     BlockedMarker,
     /// The commit of the maintenance pass that prunes the receipt journal.
     Prune,
+    /// The same commit, made by a thread that blocks and hands nothing off.
+    BlockedPrune,
     /// The commit of a question to the ledger, made with the session held as a mutation makes it.
     Question,
     /// The commit of a host event the output ingest records with the session held.
     HostEvent,
+    /// The same commit, made by a thread that blocks and hands nothing off.
+    BlockedHostEvent,
     /// The session itself, held by something that takes as long as it likes.
     Session,
 }
@@ -3306,15 +3310,19 @@ async fn stall(rig: &mut Rig, stalled: Stalled) -> Standing {
             });
             (reached, release, Some(attaching))
         }
-        Stalled::Prune => {
-            let (reached, release) = wired
-                .runtime
-                .session()
-                .journal_mut()
-                .expect("this session keeps a journal")
-                .stall_next_prune();
+        Stalled::Prune | Stalled::BlockedPrune => {
+            let (reached, release) = {
+                let mut session = wired.runtime.session();
+                let journal = session.journal_mut().expect("this session keeps a journal");
+                if matches!(stalled, Stalled::Prune) {
+                    journal.stall_next_prune()
+                } else {
+                    journal.stall_next_prune_blocking()
+                }
+            };
+            // As maintenance runs: a task of the worker's own runtime.
             let service = Arc::clone(&wired.service);
-            let pass = tokio::task::spawn_blocking(move || service.maintain_now());
+            let pass = tokio::spawn(async move { service.maintain_now() });
             let pass = tokio::spawn(async move {
                 let _ = pass.await;
             });
@@ -3364,16 +3372,18 @@ async fn stall(rig: &mut Rig, stalled: Stalled) -> Standing {
             });
             (reached, release, Some(asking))
         }
-        Stalled::HostEvent => {
+        Stalled::HostEvent | Stalled::BlockedHostEvent => {
             // The attachment's terminal takes no clipboard writes, so one the application asks for
             // is a host event, and the ingest records it with the session held.
             let (reached, release) = {
                 let mut session = wired.runtime.session();
                 session.decline_clipboard_writes(rig.attachment);
-                session
-                    .journal_mut()
-                    .expect("this session keeps a journal")
-                    .stall_next_host_events()
+                let journal = session.journal_mut().expect("this session keeps a journal");
+                if matches!(stalled, Stalled::HostEvent) {
+                    journal.stall_next_host_events()
+                } else {
+                    journal.stall_next_host_events_blocking()
+                }
             };
             rig.pull_the_trigger().await;
             (reached, release, None)
@@ -3703,6 +3713,43 @@ forced_cases! {
 async fn a_lone_escape_reaches_the_application_while_a_commit_blocks_the_only_thread_of_the_runtime()
  {
     a_lone_escape_meets(Stalled::BlockedMarker, Timing::Arrives, LIVENESS_DEADLINE).await;
+}
+
+/// KR-PERF-002: a lone Escape reaches the application while the maintenance pass's commit blocks
+/// the one thread the worker's runtime has.
+///
+/// Maintenance runs as a task of the worker's runtime, and its prune commits with the session
+/// held. On one thread, a pass that kept the thread for that commit would stop the connection and
+/// the timer whatever the input path takes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[cfg_attr(
+    windows,
+    ignore = "a Windows pseudo-console holds back a lone Escape, which it cannot tell from the start of a sequence, so the Escape this case waits for does not come back"
+)]
+async fn a_lone_escape_reaches_the_application_while_a_prune_blocks_the_only_thread_of_the_runtime()
+{
+    a_lone_escape_meets(Stalled::BlockedPrune, Timing::Arrives, LIVENESS_DEADLINE).await;
+}
+
+/// KR-PERF-002: a lone Escape reaches the application while the ingest's host-event commit blocks
+/// the one thread the worker's runtime has.
+///
+/// The ingest records a host event with the session held, on a task of the worker's runtime. On
+/// one thread, an ingest that kept the thread for that commit would stop the connection and the
+/// timer whatever the input path takes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+#[cfg_attr(
+    windows,
+    ignore = "a Windows pseudo-console holds back a lone Escape, which it cannot tell from the start of a sequence, so the Escape this case waits for does not come back"
+)]
+async fn a_lone_escape_reaches_the_application_while_a_host_event_commit_blocks_the_only_thread_of_the_runtime()
+ {
+    a_lone_escape_meets(
+        Stalled::BlockedHostEvent,
+        Timing::Arrives,
+        LIVENESS_DEADLINE,
+    )
+    .await;
 }
 
 macro_rules! every_prefix_cases {

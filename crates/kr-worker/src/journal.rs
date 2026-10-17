@@ -3013,6 +3013,19 @@ impl Journal {
         self.host_event_stall.arm()
     }
 
+    /// Stops the commit of the next batch of host events as a call that blocks its thread, for
+    /// this host's own tests: the thread the commit runs on is not handed back to its runtime.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn stall_next_host_events_blocking(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        self.host_event_stall.arm_blocking()
+    }
+
     /// Makes the next maintenance pass prune, and stops the prune at its commit, for this host's
     /// own tests.
     ///
@@ -3028,6 +3041,21 @@ impl Journal {
     ) {
         self.pruned_at_ms = 0;
         self.prune_stall.arm()
+    }
+
+    /// Makes the next maintenance pass prune, and stops the prune at its commit as a call that
+    /// blocks its thread, for this host's own tests: the thread the commit runs on is not handed
+    /// back to its runtime.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn stall_next_prune_blocking(
+        &mut self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        self.pruned_at_ms = 0;
+        self.prune_stall.arm_blocking()
     }
 
     /// Reads the retained result of an action.
