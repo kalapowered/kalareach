@@ -16,8 +16,8 @@ use crate::error::{ControllerError, Result};
 use super::{Controller, encode, error_reply, net, parse, respond};
 
 /// The local write methods this daemon performs itself that take no admission into a service:
-/// the environment record, the update handover and the setting up of backups change nothing the
-/// revision or the deadline decides.
+/// the environment record, the update handover, the setting up of backups and the host's own
+/// sign-in and sign-out change nothing the revision or the deadline decides.
 ///
 /// The fence check and the registration check run for each of them before it does anything. A
 /// method that takes an admission asks both inside the service that performs it, so this list is
@@ -25,12 +25,14 @@ use super::{Controller, encode, error_reply, net, parse, respond};
 /// missing runs while the fence is owed. `every_local_write_method_the_daemon_performs_is_placed`
 /// walks the registry and fails for a method that is on neither this list nor the list of those
 /// that take an admission.
-pub(super) const NO_ADMISSION: [Method; 5] = [
+pub(super) const NO_ADMISSION: [Method; 7] = [
     Method::EnvironmentEnrol,
     Method::EnvironmentForget,
     Method::EnvironmentRefresh,
     Method::HostUpdateHandover,
     Method::BackupEnable,
+    Method::AccountSignIn,
+    Method::AccountSignOut,
 ];
 
 impl Controller {
