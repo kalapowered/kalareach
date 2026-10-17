@@ -134,6 +134,15 @@ impl ScriptedCalls {
         self.freed.notify_waiters();
     }
 
+    /// Lets `step` go on when the guard is dropped, so a test that fails while it holds a step does
+    /// not leave a command waiting for ever.
+    pub fn release_when_done(self: &Arc<Self>, step: &'static str) -> ReleaseWhenDropped {
+        ReleaseWhenDropped {
+            calls: Arc::clone(self),
+            step,
+        }
+    }
+
     async fn gate(&self, step: &'static str) {
         loop {
             let freed = self.freed.notified();
@@ -355,5 +364,17 @@ impl CallPlatform for ScriptedCalls {
             self.named(call)?;
             Ok(self.state_of())
         })
+    }
+}
+
+/// Releases a held step of the scripted native code when it is dropped.
+pub struct ReleaseWhenDropped {
+    calls: Arc<ScriptedCalls>,
+    step: &'static str,
+}
+
+impl Drop for ReleaseWhenDropped {
+    fn drop(&mut self) {
+        self.calls.release(self.step);
     }
 }

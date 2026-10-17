@@ -893,6 +893,7 @@ async fn the_hosts_revocation_does_not_wait_for_native_code_to_stop_the_media() 
         .state_where("a running call", |state| state["running"] == true)
         .await;
     scene.platform.hold("stop");
+    let _holding = scene.platform.release_when_done("stop");
 
     let stopping = scene
         .phone
@@ -1087,6 +1088,7 @@ async fn a_stop_that_names_the_call_during_its_setup_ends_that_call() {
     let mut scene = scene().await;
     let prepared = scene.prepared().await;
     scene.platform.hold("permit");
+    let _holding = scene.platform.release_when_done("permit");
     let starting = scene
         .phone
         .companion
@@ -1346,6 +1348,7 @@ async fn a_call_the_host_cannot_be_told_about_is_closed_at_the_service_over_its_
     };
     let mut scene = scene_with(timings, Some(phone_grant(PHONE_TOKEN, 3600)), None).await;
     scene.platform.hold("permit");
+    let _holding = scene.platform.release_when_done("permit");
     scene.platform.refuse_the_permit();
     let prepared = scene.prepared().await;
     let starting = scene
