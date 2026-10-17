@@ -169,8 +169,9 @@ impl Record {
     /// Returns an error when the file cannot be opened, or holds a schema this build does not read.
     pub fn open(state_dir: &Path, kept: Kept<'_>) -> Result<Self> {
         std::fs::create_dir_all(state_dir).map_err(ControllerError::registry)?;
-        let connection = Connection::open(state_dir.join(RELAY_LEASE_RECORD))
-            .map_err(ControllerError::registry)?;
+        let connection =
+            kr_flush::release::open_connection(&state_dir.join(RELAY_LEASE_RECORD), None)
+                .map_err(|error| ControllerError::registry(kr_flush::release::describe(&error)))?;
         connection
             .busy_timeout(std::time::Duration::from_secs(5))
             .map_err(ControllerError::registry)?;

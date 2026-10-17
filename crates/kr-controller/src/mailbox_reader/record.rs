@@ -50,8 +50,9 @@ impl Record {
     /// Returns an error when the file cannot be opened, or holds a schema this build does not read.
     pub fn open(state_dir: &Path) -> Result<Self> {
         std::fs::create_dir_all(state_dir).map_err(ControllerError::registry)?;
-        let connection = Connection::open(state_dir.join(MAILBOX_REPLAY_RECORD))
-            .map_err(ControllerError::registry)?;
+        let connection =
+            kr_flush::release::open_connection(&state_dir.join(MAILBOX_REPLAY_RECORD), None)
+                .map_err(|error| ControllerError::registry(kr_flush::release::describe(&error)))?;
         connection
             .busy_timeout(std::time::Duration::from_secs(5))
             .map_err(ControllerError::registry)?;
@@ -185,5 +186,23 @@ impl Record {
     /// Returns an error when the record cannot be read.
     pub fn is_empty(&self) -> Result<bool> {
         self.len().map(|count| count == 0)
+    }
+}
+
+/// A store whose previous holder is still letting go of its index is waited for, not reported as a
+/// disk that failed. On Windows a process that is ending releases its locks on a store's
+/// write-ahead index before the system removes its mapping of it, and the next process to open the
+/// store in that interval is told its disk failed, although the same open succeeds a moment later.
+#[cfg(all(test, windows))]
+mod a_previous_holder_that_is_letting_go {
+    use super::*;
+
+    #[test]
+    fn the_open_waits_for_it() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let database = directory.path().join(MAILBOX_REPLAY_RECORD);
+        kr_flush::release::assert_an_open_waits_for_the_previous_holder(&database, || {
+            Record::open(directory.path()).map(drop)
+        });
     }
 }
