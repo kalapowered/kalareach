@@ -52,8 +52,13 @@ async function openTheChoice(page: Page, surface: 'desktop' | 'ios', theme: 'lig
     window.kalareachSettings = { colour_mode: mode }
   }, theme)
   await page.goto(surface === 'ios' ? '/harness.html?surface=ios' : '/harness.html')
-  await page.waitForSelector('.app-shell')
-  await page.getByRole('button', { name: /^Account/ }).click()
+  await page.waitForSelector(surface === 'ios' ? '.m-shell' : '.app-shell')
+  // The phone reaches the account from its tab bar, the desktop from its sidebar.
+  const account =
+    surface === 'ios'
+      ? page.getByRole('navigation', { name: 'Sections' }).getByRole('button', { name: /^Account/ })
+      : page.getByRole('button', { name: /^Account/ })
+  await account.click()
   await page.evaluate((waiting) => {
     window.krTestHost?.settings.waitingForAChoice(waiting)
     window.krTestHost?.settings.change({
@@ -108,16 +113,30 @@ for (const theme of ['light', 'dark'] as const) {
       await page.evaluate(() =>
         Promise.all(document.getAnimations().map((each) => each.finished.catch(() => undefined)))
       )
-      await page.screenshot({ path: shot(`${surface}-${size.toFixed(1)}x-${theme}`) })
+      // The photograph is of the whole choice: the window is made as tall as the choice is, so the
+      // phone's tab bar does not lie across it.
+      const view = page.viewportSize()
+      const height = await choice.evaluate((each) => each.getBoundingClientRect().height)
+      if (view !== null) {
+        await page.setViewportSize({ width: view.width, height: Math.ceil(height) + view.height })
+      }
+      await choice.screenshot({ path: shot(`${surface}-${size.toFixed(1)}x-${theme}`) })
     })
   }
 }
 
-test('is reached and decided from the keyboard alone', async ({ page }) => {
+test('is reached and decided from the keyboard alone', async ({ page, browserName }) => {
   const choice = await openTheChoice(page, 'desktop', 'light')
   await expect(choice.getByRole('heading', { name: /Which appearance/ })).toBeFocused()
 
-  await page.keyboard.press('Tab')
+  // Tab reaches the first version. WebKit on macOS passes over radio buttons unless the system's
+  // keyboard setting asks for them, so there the version is focused directly and the arrow keys and
+  // Enter are what the case holds to.
+  if (browserName === 'chromium') {
+    await page.keyboard.press('Tab')
+  } else {
+    await choice.getByRole('radio').first().focus()
+  }
   await expect(choice.getByRole('radio').first()).toBeFocused()
   await page.keyboard.press('ArrowRight')
   await expect(choice.getByRole('radio').nth(1)).toBeChecked()

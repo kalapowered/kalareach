@@ -248,16 +248,14 @@ html[data-input='keyboard'] *::after {
   .icon-btn,
   .nav-item,
   .session-row,
-  .switch-thumb,
-  .choice-option .theme-preview {
+  .switch-thumb {
     transition: none;
   }
 
   .btn:active,
   .icon-btn:active,
   .nav-item:active,
-  .session-row:active,
-  .choice-option[data-readable='true']:active .theme-preview {
+  .session-row:active {
     transform: none;
   }
 }

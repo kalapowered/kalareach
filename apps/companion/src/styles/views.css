@@ -1276,6 +1276,8 @@
 
 .choice {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  overflow-wrap: anywhere;
   gap: 12px;
   margin-top: 16px;
   padding-top: 16px;
@@ -1287,13 +1289,17 @@
   font-size: 1rem;
 }
 
+.choice-actions {
+  flex-wrap: wrap;
+}
+
 .choice-title:focus {
   outline: none;
 }
 
 .choice-options {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(9.5rem, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(min(9.5rem, 100%), 1fr));
   gap: 13px;
   margin: 0;
   padding: 0;
@@ -1332,11 +1338,26 @@
 .choice-option .theme-preview {
   transition:
     border-color var(--state) ease,
-    transform 120ms ease-out;
+    transform var(--press) var(--ease-out);
 }
 
 .choice-option[data-readable='true']:active .theme-preview {
   transform: scale(0.97);
+}
+
+/*
+ * Reduced motion keeps the border's answer to the pointer and takes out the press's travel. It is
+ * stated here, after the rules it overrides: base.css loads first, so a rule of equal weight there
+ * would lose to these.
+ */
+@media (prefers-reduced-motion: reduce) {
+  .choice-option .theme-preview {
+    transition: none;
+  }
+
+  .choice-option[data-readable='true']:active .theme-preview {
+    transform: none;
+  }
 }
 
 /* ---- Narrow windows -------------------------------------------------------------------------- */

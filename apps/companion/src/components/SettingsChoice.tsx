@@ -63,10 +63,11 @@ export function SettingsChoiceForm({
           />
         ))}
       </fieldset>
-      <div className="row">
+      <div className="row choice-actions">
         <Button
           tone="primary"
           data-testid="settings-choice-keep"
+          data-wraps
           disabled={busy || kept === null || kept.mode === null}
           style={{ minBlockSize: target }}
           onClick={() => {
@@ -77,6 +78,7 @@ export function SettingsChoiceForm({
         </Button>
         <Button
           data-testid="settings-choice-cancel"
+          data-wraps
           disabled={busy}
           style={{ minBlockSize: target }}
           onClick={onCancel}

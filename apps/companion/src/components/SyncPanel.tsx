@@ -353,6 +353,7 @@ export function SyncPanel({
               <div className="account-actions">
                 {settingsProblem !== null ? (
                   <Button
+                    data-wraps
                     disabled={busy}
                     style={{ minBlockSize: target }}
                     onClick={() => {
@@ -366,6 +367,7 @@ export function SyncPanel({
                   <Button
                     tone="primary"
                     data-testid="settings-sync-turn-on"
+                    data-wraps
                     disabled={busy}
                     style={{ minBlockSize: target }}
                     onClick={() => {
@@ -379,6 +381,7 @@ export function SyncPanel({
                   <Button
                     tone="primary"
                     data-testid="settings-sync-choose"
+                    data-wraps
                     aria-expanded={choice !== null}
                     disabled={busy}
                     style={{ minBlockSize: target }}
@@ -404,6 +407,7 @@ export function SyncPanel({
                 {settings?.sync.state === 'on' ? (
                   <Button
                     data-testid="settings-sync-now"
+                    data-wraps
                     disabled={busy}
                     style={{ minBlockSize: target }}
                     onClick={() => {
