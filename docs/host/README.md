@@ -5773,16 +5773,16 @@ feed is reported stale rather than current.
 
 When the configuration document names an `authority.origin`, the daemon runs a carrier for the feed
 for as long as it lives. When it names none, no remote owner's revocation can reach the host, and
-only the owner at the machine revokes a device. The origin is read only once, at start. The carrier signs
-as the host, with the authorisation key its pairings recorded, which is what the feed is addressed
-by. It reads the feed at five moments: when the daemon starts, when a connection is established,
-every 30 seconds after that, when an owner is paired or revoked, and when the host finds an
-announcement in its own mailbox, which it reads every ten seconds (see "The host's own mailbox"). A
-connection waits for a read that began after it was admitted, for at most five seconds, before
-anything it asks is answered. So a device the feed holds a revocation for is kept out before its first request is
-answered, by a refusal of the request or by the connection ending before anything is served, and not
-at the next poll. A feed that does not answer in that time leaves the connection
-served, and the status goes stale when the pass that was held ends without an answer.
+only the owner at the machine revokes a device. The origin is read only once, at start. The carrier
+signs as the host, with the authorisation key its pairings recorded, which is what the feed is
+addressed by. It reads the feed at five moments: when the daemon starts, when a connection is
+established, every 30 seconds after that, when an owner is paired or revoked, and when the host
+finds an announcement in its own mailbox, which it reads every ten seconds (see "The host's own
+mailbox"). A connection waits for a read that began after it was admitted, for at most five seconds,
+before anything it asks is answered. So a device the feed holds a revocation for is kept out before
+its first request is answered, by a refusal of the request or by the connection ending before
+anything is served, and not at the next poll. A feed that does not answer in that time leaves the
+connection served, and the status goes stale when the pass that was held ends without an answer.
 
 The host judges each request from its own records. A request addressed to another host, or that
 names nothing this host knows, is refused to the feed as an unknown target. A request signed by a

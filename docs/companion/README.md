@@ -472,13 +472,13 @@ open.
 
 A sync step performs the following steps to bring the settings on the device and the settings sync
 service into a consistent state: If there is a pending response from a previous write, query the
-settings sync service for the response. If another device wrote a version that differs from this
-computer's settings, nothing else happens until the person chooses. If the settings on the device
-differ from the last known consistent state, perform a write to the settings sync service to publish
-the changes. The service refuses the write when something was written to it in between, and keeps
-what the other device wrote beside this device's own for the person to choose between. Otherwise
-perform a read from the settings sync service to sync the settings on the device to any changes made
-by another device. A clock never decides between two devices.
+settings sync service for the response. If a version another device wrote is waiting for a choice
+and differs from this computer's settings, nothing else happens until the person chooses. If the
+settings on the device differ from the last known consistent state, perform a write to the settings
+sync service to publish the changes. The service refuses the write when something was written to it
+in between, and keeps what the other device wrote beside this device's own for the person to choose
+between. Otherwise perform a read from the settings sync service to sync the settings on the device
+to any changes made by another device. A clock never decides between two devices.
 
 When there is a conflict between the settings on two devices, the user is prompted to resolve the
 conflict in the settings card of the Account sheet. The conflict is resolved inline, with each
