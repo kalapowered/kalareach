@@ -180,6 +180,18 @@ test.describe('at the largest text size on a screen 320 points wide', () => {
       }
     ],
     [
+      'the voice screen while the device is setting a call up',
+      '&tab=sessions',
+      async (page) => {
+        await page.evaluate(() => {
+          window.krTestHost?.settingUpAVoiceCall()
+        })
+        await page.getByTestId('voice-entry').click()
+        await expect(page.getByRole('button', { name: 'End the call' })).toBeVisible()
+        await expect(page.getByRole('button', { name: 'Start voice session' })).toHaveCount(0)
+      }
+    ],
+    [
       'the question that allows voice',
       '&tab=sessions',
       async (page) => {
@@ -345,6 +357,35 @@ test.describe('at the largest text size on a screen 320 points wide', () => {
         })
         expect(await overrunning(page, '.kr-voice__delegation'), 'lines of a request row that run past their box').toEqual([])
         expect(await overrunning(page, '.kr-voice__refusal'), 'lines of a notice that run past their box').toEqual([])
+      })
+    }
+
+    // The screen while the device makes a call that has no name yet, at the default size and at the
+    // largest: the line that says so and the one control stay inside their boxes, the control is
+    // reachable, and ending it hands the screen back to the choice.
+    for (const [size, ratio] of [['default', 1], ['largest', LARGEST]] as const) {
+      test(`keeps the voice screen whole while a call is being set up at the ${size} size on ${surface}`, async ({
+        page
+      }) => {
+        await withSystemTextScale(page, ratio)
+        await page.setViewportSize({ width: size === 'default' ? 390 : 320, height: 720 })
+        await page.goto(`/harness.html?surface=${surface}&tab=sessions`)
+        await page.evaluate(() => {
+          window.krTestHost?.settingUpAVoiceCall()
+        })
+        await page.getByTestId('voice-entry').click()
+        const end = page.getByRole('button', { name: 'End the call' })
+        await expect(end).toBeVisible()
+        await page.screenshot({
+          path: `/tmp/kr-voice-setup-${size}-${surface}-${test.info().project.name}.png`,
+          fullPage: true
+        })
+        expect(await overrunning(page, '.kr-voice__note'), 'lines of the setup note that run past their box').toEqual([])
+        expect(await overrunning(page, '.kr-voice__control'), 'a control label that runs past its box').toEqual([])
+
+        await end.click()
+        await expect(page.getByRole('button', { name: 'Start voice session' })).toBeVisible()
+        await expect(page.getByRole('heading', { name: 'Start a voice session' })).toBeFocused()
       })
     }
 

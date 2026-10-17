@@ -170,8 +170,8 @@ function SettingUpScreen({
         Starting a voice session
       </h1>
       <p className="kr-voice__note" role="status">
-        This device is making a call, or ending one. Nothing is listening yet, and the call goes on
-        to the screen below when it runs.
+        This device is making a call, or ending one. Nothing is listening yet. The call's controls
+        appear here when it runs.
       </p>
       {notice && (
         <p className="kr-voice__refusal" role="status">
