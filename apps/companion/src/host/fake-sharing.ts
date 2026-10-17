@@ -23,9 +23,11 @@ import type {
   GrantSummary,
   GrantTransferParams,
   GrantTransferResult,
+  HeldShare,
   RevocationResult,
   RoleSelection,
-  SessionScreenPreviewResult
+  SessionScreenPreviewResult,
+  ShareOffer
 } from '@kalareach/protocol'
 
 import { FakeHostError } from './fake'
@@ -59,13 +61,53 @@ function refuse(code: string, message: string): never {
 /** The identities and the clock the sharing is written against. */
 export interface SharingIds {
   readonly environment: string
+  /** The session an invitation to the phone is about, until a test says another. */
+  readonly session: string
   readonly nowMs: number
   /** The device the host issues from: itself. */
   readonly issuer: string
 }
 
+/** What an invitation to the phone is, where a test does not say. */
+export interface OfferSpec {
+  /** The session's number on the host. */
+  readonly session?: string
+  readonly role?: RoleSelection['role']
+  /** Whether the live view of the screen is included. */
+  readonly live?: boolean
+  /** How long the invitation lasts from now, in milliseconds. */
+  readonly lastsMs?: number
+  /** Where the session's history begins, in milliseconds before now. */
+  readonly historyFromAgoMs?: number
+}
+
 /** What a test can do to the scripted host's sharing. */
 export interface FakeSharing {
+  /**
+   * The host is one the phone is paired with: it tells the device what it is offered and holds, and
+   * the device accepts an invitation rather than issuing one. Before this the host is the one on
+   * the computer, which holds no share of itself and refuses both reads.
+   */
+  asPhone(): void
+  /** The host issues an invitation that names this device. */
+  offer(spec?: OfferSpec): ShareOffer
+  /** The host's invitation goes: withdrawn by its issuer, or run out. */
+  withdrawOffer(invitationId: string): void
+  /** The host stops listing a share the device holds: taken back, run out or its session gone. */
+  endShare(grantId: string): void
+  /** The shares the device holds, as the host would list them. */
+  held(): readonly HeldShare[]
+  /** The next read of what is held fails the way a lost connection does, for any reason but the host's refusal of the method. */
+  failNextHeld(message: string): void
+  /** The host answers the read of what is held as one built before the method existed does. */
+  doesNotServeHeld(): void
+  /** How many times the page has asked what the device is offered and holds. */
+  heldReads(): number
+  /**
+   * The host refuses the next acceptance in its words. `committed` says whether it had written the
+   * share before it refused, as the paired door can when the bounds of its decision end first.
+   */
+  refuseNextRedeem(message: string, committed: boolean): void
   /** The grants the host holds, resolved ones included. */
   grants(): readonly GrantSummary[]
   /** The attempts native code keeps, as the list of them would show. */
@@ -175,6 +217,14 @@ export class ScriptedSharing implements FakeSharing {
   #barrierHeld = false
   #finishHold: { release: () => void; fail: (failure: unknown) => void; held: Promise<void> } | null = null
   #unreadable = 0
+  #phone = false
+  #offers: ShareOffer[] = []
+  #holds: HeldShare[] = []
+  #heldFailure: string | null = null
+  #heldServed = true
+  #heldReads = 0
+  #redeemRefusal: { message: string; committed: boolean } | null = null
+  #offered = 0
   #actions = 0
   #references = 0
   #sent: Record<AttemptKind, number> = { invite: 0, redeem: 0, revoke: 0, transfer: 0 }
@@ -222,7 +272,7 @@ export class ScriptedSharing implements FakeSharing {
     for (const entry of this.#entries) {
       if (entry.view.phase === 'closed' || entry.view.phase === 'asking') continue
       if (entry.written) this.#close(entry, 'happened', null)
-      else this.#close(entry, 'not_done', null)
+      else this.#close(entry, entry.view.kind === 'redeem' ? 'not_accepted' : 'not_done', null)
     }
   }
 
@@ -289,6 +339,64 @@ export class ScriptedSharing implements FakeSharing {
 
   sent(): Readonly<Record<AttemptKind, number>> {
     return this.#sent
+  }
+
+  asPhone(): void {
+    this.#phone = true
+  }
+
+  offer(spec: OfferSpec = {}): ShareOffer {
+    this.#offered += 1
+    const selection = {
+      role: spec.role ?? 'viewer',
+      include_live_screen: spec.live ?? false,
+      include_question_respond: false,
+      history_from_cursor_ms: null
+    } as unknown as RoleSelection
+    const actions = actionsOf(selection)
+    const offer: ShareOffer = {
+      actions,
+      display_number: spec.session ?? '3',
+      ends_at_ms: String(this.#ids.nowMs + (spec.lastsMs ?? 3_600_000)),
+      grant_id: idOf('e7e7e7e7', 2000 + this.#offered),
+      history_from_ms: String(this.#ids.nowMs - (spec.historyFromAgoMs ?? 600_000)),
+      includes_live_screen: spec.live ?? false,
+      invitation_id: idOf('e9e9e9e9', 2000 + this.#offered),
+      issued_at_ms: String(this.#ids.nowMs + this.#offered),
+      notices: noticesFor(actions),
+      role: selection.role,
+      session_id: this.#ids.session
+    }
+    this.#offers.push(offer)
+    return offer
+  }
+
+  withdrawOffer(invitationId: string): void {
+    this.#offers = this.#offers.filter((offer) => offer.invitation_id !== invitationId)
+  }
+
+  endShare(grantId: string): void {
+    this.#holds = this.#holds.filter((share) => share.grant.grant_id !== grantId)
+  }
+
+  held(): readonly HeldShare[] {
+    return this.#holds
+  }
+
+  failNextHeld(message: string): void {
+    this.#heldFailure = message
+  }
+
+  doesNotServeHeld(): void {
+    this.#heldServed = false
+  }
+
+  heldReads(): number {
+    return this.#heldReads
+  }
+
+  refuseNextRedeem(message: string, committed: boolean): void {
+    this.#redeemRefusal = { message, committed }
   }
 
   /* ---- The commands --------------------------------------------------------------------------- */
@@ -376,18 +484,50 @@ export class ScriptedSharing implements FakeSharing {
   }
 
   grantRedeem(params: unknown): Attempted<GrantRedeemResult> {
-    decodeParams<GrantRedeemParams>(params, GRANT_REDEEM_PARAMS)
-    return refuse(
-      'PERMISSION_DENIED',
-      'this application is the owner of the host it is connected to; it holds no share of it'
+    const read = decodeParams<GrantRedeemParams>(params, GRANT_REDEEM_PARAMS)
+    if (!this.#phone) return this.#owner()
+    const offer = this.#offers.find((each) => each.invitation_id === read.invitation_id)
+    if (offer === undefined) {
+      refuse('RESOURCE_UNAVAILABLE', 'that invitation is no longer offered to this device')
+    }
+    const entry = this.#begin(
+      'redeem',
+      `Accepting session ${offer.display_number}`,
+      offer.session_id,
+      null,
+      offer.grant_id
     )
+    const refusal = this.#redeemRefusal
+    this.#redeemRefusal = null
+    if (refusal !== null) {
+      // The paired door can answer a committed redemption with a refusal, so a refusal to the first
+      // send is a reason to read what the host shows and not the end of the attempt.
+      entry.written = refusal.committed
+      if (refusal.committed) this.#take(offer)
+      entry.result = this.#redeemed(offer)
+      entry.view = { ...entry.view, refusal: refusal.message }
+      this.#set(entry, 'checking')
+      return { attempt: entry.view, value: null }
+    }
+    if (this.#lost(entry)) {
+      if (entry.written) this.#take(offer)
+      entry.result = this.#redeemed(offer)
+      return this.#unfinished(entry)
+    }
+    this.#take(offer)
+    return this.#answer(entry, this.#redeemed(offer))
   }
 
   grantHeld(): Held {
-    return refuse(
-      'PERMISSION_DENIED',
-      'this application is the owner of the host it is connected to; it holds no share of it'
-    )
+    if (!this.#phone) return this.#owner()
+    this.#heldReads += 1
+    if (!this.#heldServed) {
+      refuse('PERMISSION_DENIED', 'the effect is not listed for this actor')
+    }
+    const failure = this.#heldFailure
+    this.#heldFailure = null
+    if (failure !== null) refuse('UPSTREAM_UNAVAILABLE', failure)
+    return { offers: [...this.#offers], shares: [...this.#holds] }
   }
 
   transferAsk(params: unknown, session: { sessionId?: string }): HandoverAsked {
@@ -569,6 +709,51 @@ export class ScriptedSharing implements FakeSharing {
       refuse('INVALID_ARGUMENT', 'that hand-over is not one this application is asking about')
     }
     return handover
+  }
+
+  #owner(): never {
+    return refuse(
+      'PERMISSION_DENIED',
+      'this application is the owner of the host it is connected to; it holds no share of it'
+    )
+  }
+
+  /** The offer becomes a share the device holds. */
+  #take(offer: ShareOffer): void {
+    this.#offers = this.#offers.filter((each) => each.invitation_id !== offer.invitation_id)
+    if (this.#holds.some((share) => share.grant.grant_id === offer.grant_id)) return
+    const grant = this.#grantOf(offer)
+    this.#holds.push({
+      display_number: offer.display_number,
+      ends_at_ms: offer.ends_at_ms,
+      grant,
+      issued_at_ms: offer.issued_at_ms
+    })
+  }
+
+  #grantOf(offer: ShareOffer): GrantRedeemResult['grant'] {
+    return {
+      grant_id: offer.grant_id,
+      parent_grant_id: null,
+      issuer_device_id: this.#ids.issuer,
+      recipient_device_id: idOf('d4d4d4d4', 1),
+      authority_revision: '5',
+      environment_selector: { these: { environment_ids: [this.#ids.environment] } },
+      session_selector: { these: { session_ids: [offer.session_id] } },
+      actions: offer.actions,
+      history: {
+        lower_bound_ms: offer.history_from_ms,
+        include_live_screen: offer.includes_live_screen,
+        named_questions: [],
+        named_approvals: []
+      },
+      expiry: { at: { expires_at_ms: offer.ends_at_ms } },
+      organisation: null
+    }
+  }
+
+  #redeemed(offer: ShareOffer): GrantRedeemResult {
+    return { grant: this.#grantOf(offer), invitation_id: offer.invitation_id }
   }
 
   #nameOf(deviceId: string): string {

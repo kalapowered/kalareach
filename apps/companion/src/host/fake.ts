@@ -425,6 +425,12 @@ export interface FakeHostControls {
    */
   reachAsPairedDevice(): void
   /**
+   * Reaches the host as a phone paired with it under the name `host`, holding `rights` (none by
+   * default, as a guest does). The host tells what the phone is offered and holds, and refuses the
+   * lists of sessions that a pairing with no view of one is refused.
+   */
+  reachAsPhone(options?: { readonly rights?: readonly ActionRight[]; readonly host?: string }): void
+  /**
    * Changes what description setup says, as the host would after something outside this device
    * changed it: its offer, its settings or how a fetch is going.
    */
@@ -790,7 +796,12 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
     nowMs: Date.now()
   })
   const sharing = new ScriptedSharing(
-    { environment: ENVIRONMENT, nowMs: Date.now(), issuer: 'e8e8e8e8-0000-4000-8000-000000000001' },
+    {
+      environment: ENVIRONMENT,
+      session: SESSION_MAIN,
+      nowMs: Date.now(),
+      issuer: 'e8e8e8e8-0000-4000-8000-000000000001'
+    },
     () => records.deviceList({ include_revoked: true }).devices,
     (sessionId) => {
       // A session the host does not have is refused as the host refuses it.
@@ -954,6 +965,7 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
   let hostEnvironment: string = ENVIRONMENT
   let anotherHost = false
   let sessionListRefused = false
+  let attentionReadRefused = false
   let environmentListRefused = false
   /** Whether the host is one this device is paired with, not the one on its own computer. */
   let pairedDevice = false
@@ -1513,6 +1525,9 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
     attentionRead: (params) =>
       reading('attentionRead', () => {
         requireConnection()
+        if (attentionReadRefused) {
+          refuse('PERMISSION_DENIED', 'This device holds no view of any session of this host.')
+        }
         return records.attentionRead(params)
       }),
     attentionAcknowledge: (params) => {
@@ -2407,6 +2422,29 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
     },
     reachAsPairedDevice() {
       pairedDevice = true
+      for (const listener of connectionListeners) listener(connectionNow())
+    },
+    reachAsPhone(options) {
+      pairedDevice = true
+      rights = options?.rights ?? []
+      publishPairing({
+        hosts: [
+          {
+            reference: 'studio-reference',
+            in_use: true,
+            name: options?.host ?? 'Studio',
+            owner: false,
+            authority: 'shared sessions only',
+            grant_expires_at_ms: null,
+            in_contact: true
+          }
+        ]
+      })
+      // A device whose pairing holds no view of a session is refused the lists of them outright.
+      const mayView = rights.includes('session.view')
+      sessionListRefused = !mayView
+      attentionReadRefused = !mayView
+      sharing.asPhone()
       for (const listener of connectionListeners) listener(connectionNow())
     },
     changeDescriptionSetup(change) {
