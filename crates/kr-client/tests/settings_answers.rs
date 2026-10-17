@@ -191,7 +191,8 @@ fn shown_fence(fence: &SyncRequestFence) -> String {
 
 fn shown_comparison(found: &SyncComparison) -> String {
     format!(
-        "{} objects at {:?}, {} copies (more {}), stored {} objects, {} copies, {} bytes, collection {}",
+        "{} objects at {:?}, {} copies (more {}), stored {} objects, {} copies, {} bytes, \
+         collection {}",
         found.objects.len(),
         found
             .objects
@@ -717,7 +718,8 @@ async fn the_stand_in_answers_as_the_worker_did() {
 /// It is ignored unless it is asked for, and then it needs the Worker to ask, so an ordinary run
 /// of this workspace asks nothing of any service.
 #[tokio::test]
-#[ignore = "runs only against a Worker on this machine named by KR_DEPLOYED_ORIGIN and KR_RECORD_SETTINGS_ANSWERS"]
+#[ignore = "runs only against a Worker on this machine named by KR_DEPLOYED_ORIGIN and \
+            KR_RECORD_SETTINGS_ANSWERS"]
 async fn record_a_local_workers_answers() {
     let (Some(path), Some(origin)) = (
         std::env::var_os("KR_RECORD_SETTINGS_ANSWERS"),

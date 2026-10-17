@@ -243,7 +243,9 @@ pub(crate) fn route(
         return refusal(
             400,
             "INVALID_REQUEST",
-            "A settings-sync request exchanges, compares, resolves, queries status, fences a request identity, reads or offers key records, or lists memberships, and asks for one of those.",
+            "A settings-sync request exchanges, compares, resolves, queries status, fences a \
+             request identity, reads or offers key records, or lists memberships, and asks for one \
+             of those.",
         );
     };
     let Some(fields) = arrival.body[*member].as_object() else {

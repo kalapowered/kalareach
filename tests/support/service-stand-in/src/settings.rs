@@ -416,7 +416,8 @@ fn read_exchange(value: &Value) -> Result<Exchange, Unread> {
         None | Some(Value::Null) => None,
         Some(epoch) => Some(counter(epoch).ok_or_else(|| {
             invalid_argument(
-                "A key epoch is a whole number no larger than 9007199254740991, written as a decimal string.",
+                "A key epoch is a whole number no larger than 9007199254740991, written as a \
+                 decimal string.",
             )
         })?),
     };
@@ -755,7 +756,8 @@ fn retired(head: Head) -> ServiceHttpAnswer {
     refusal_with(
         409,
         "KEY_EPOCH_RETIRED",
-        "That exchange names a key epoch this collection has retired; seal it again under the current one.",
+        "That exchange names a key epoch this collection has retired; seal it again under the \
+         current one.",
         Value::Object(Head::members(Some(head)))
             .as_object()
             .map_or_else(
@@ -1187,12 +1189,14 @@ impl Collection {
             (None, None) => {}
             (None, Some(_)) => {
                 return refused_argument(
-                    "A collection no key record has claimed has no key epoch, so an exchange into it declares none.",
+                    "A collection no key record has claimed has no key epoch, so an exchange into \
+                     it declares none.",
                 );
             }
             (Some(_), None) => {
                 return refused_argument(
-                    "An exchange into a collection a key record has claimed declares the key epoch its object is sealed under.",
+                    "An exchange into a collection a key record has claimed declares the key epoch \
+                     its object is sealed under.",
                 );
             }
             (Some(head), Some(epoch)) => {
