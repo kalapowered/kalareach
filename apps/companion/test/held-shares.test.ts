@@ -247,3 +247,50 @@ describe('a host that does not serve the read (KR-REQ-18.13)', () => {
     })
   })
 })
+
+describe('when the list is read (KR-REQ-18.13)', () => {
+  it('is read on a cadence of five seconds while a screen is shown, and not once the last has gone', async () => {
+    vi.useFakeTimers()
+    try {
+      const { port, controls } = fakeHost()
+      controls.reachAsPhone()
+      const book = new HeldBook(port)
+      const detach = book.attach()
+      book.connect(STUDIO)
+      await vi.advanceTimersByTimeAsync(0)
+      expect(controls.sharing.heldReads()).toBe(1)
+
+      await vi.advanceTimersByTimeAsync(4_999)
+      expect(controls.sharing.heldReads()).toBe(1)
+      await vi.advanceTimersByTimeAsync(1)
+      expect(controls.sharing.heldReads()).toBe(2)
+      await vi.advanceTimersByTimeAsync(5_000)
+      expect(controls.sharing.heldReads()).toBe(3)
+
+      detach()
+      await vi.advanceTimersByTimeAsync(30_000)
+      expect(controls.sharing.heldReads()).toBe(3)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('is read at once when a screen comes, when the page is shown again and when the connection changes', async () => {
+    const { book, controls } = phone()
+    await vi.waitFor(() => {
+      expect(controls.sharing.heldReads()).toBe(1)
+    })
+
+    // The page is shown again after being hidden.
+    document.dispatchEvent(new Event('visibilitychange'))
+    await vi.waitFor(() => {
+      expect(controls.sharing.heldReads()).toBe(2)
+    })
+
+    // Another host is the one reached.
+    book.connect('host:another')
+    await vi.waitFor(() => {
+      expect(controls.sharing.heldReads()).toBe(3)
+    })
+  })
+})
