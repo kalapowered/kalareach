@@ -265,7 +265,7 @@ impl Recovery {
                     options.mode(0o600);
                 }
                 let file = options.open(path)?;
-                file.lock()?;
+                kr_flush::lock::exclusive(&file)?;
                 Ok(file)
             })
             .await
