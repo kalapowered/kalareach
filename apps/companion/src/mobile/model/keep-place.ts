@@ -11,9 +11,10 @@
  * is not corrected: the row moved because the list did, and a correction would take the scroll
  * back. A change below the row moves nothing.
  *
- * A row that is in view and goes (an invitation that was accepted, an attempt that was removed) is
+ * The first row in view going (an invitation that was accepted, an attempt that was removed) is
  * not made up for: what is after it stays where it was and what is above it comes into view. The
- * person was looking at what is after it, and it is what stays.
+ * person was looking at what is after it, and it is what stays. A row below the first one going
+ * moves nothing that is above it.
  *
  * At the top of the list nothing is anchored: a row that arrives there is simply the first, which is
  * where a person who has not scrolled expects it.

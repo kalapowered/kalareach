@@ -63,7 +63,10 @@ const SHEET = '[data-testid="sheet"]'
  * element that last had focus in it has gone, it waits for the card to leave if one is open, and then
  * puts focus on what `find` returns, but only if focus is on nothing. Every observer it makes is its
  * own and ends with the area, and nothing it does depends on a press or a key, so a person who
- * moves focus themselves, or a screen reader's cursor, is never taken from where they put it.
+ * moves focus themselves is never taken from where they put it. A screen reader's cursor follows
+ * focus when focus is moved and the page cannot see it when it is not, so a person whose focus was
+ * on the row that went is taken to the first invitation or the screen: the other choice leaves
+ * focus on nothing.
  */
 function useKeepFocus(area: React.RefObject<HTMLElement | null>, find: () => HTMLElement | null): void {
   const where = useRef(find)
