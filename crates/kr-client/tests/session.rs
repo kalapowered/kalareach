@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use iroh::endpoint::{ConnectingError, ConnectionError};
 use iroh::{Endpoint, EndpointAddr};
 use kr_client::cursors::{Restoration, RestorationStep};
 use kr_client::drafts::{
@@ -390,17 +391,60 @@ struct SessionList {
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
 struct Empty {}
 
-async fn connect(client: &Side, host: &Side) -> Session {
-    let transport = NetworkTransport::connect(
-        &client.endpoint,
-        direct_addr(host),
-        &client.identity,
-        &host.record,
-        SendLimits::default(),
+/// How long a case lets a client try to reach its host before it takes the host for hung.
+///
+/// It ends a case that never connects and decides nothing else: a dial that is answered ends the
+/// wait at once.
+const REACH_DEADLINE: Duration = Duration::from_secs(300);
+
+/// Whether the transport ended a dial because nothing answered it inside its inactivity threshold.
+/// A failure of any other kind is the host's answer or something else.
+fn gave_up_unanswered(error: &ClientError) -> bool {
+    matches!(
+        error,
+        ClientError::Transport(kr_transport::TransportError::Connect(message))
+            if *message == ConnectingError::from(ConnectionError::TimedOut).to_string()
     )
-    .await
-    .expect("an authorised connection");
-    Session::start(Arc::new(transport)).expect("a session")
+}
+
+/// Connects `client` to `host` and returns the transport.
+///
+/// A dial the transport gave up on, because nothing answered it inside its 30-second inactivity
+/// threshold, is made again on a new connection, as a client reconnects once the transport is
+/// declared unavailable. The host has not read a frame of such a dial, so nothing it keeps depends
+/// on it. Any other failure is the case's failure.
+async fn dial(client: &Side, host: &Side) -> NetworkTransport {
+    let mut attempts = 0_u32;
+    let answered = tokio::time::timeout(REACH_DEADLINE, async {
+        loop {
+            attempts += 1;
+            match NetworkTransport::connect(
+                &client.endpoint,
+                direct_addr(host),
+                &client.identity,
+                &host.record,
+                SendLimits::default(),
+            )
+            .await
+            {
+                Err(error) if gave_up_unanswered(&error) => {}
+                outcome => return outcome,
+            }
+        }
+    })
+    .await;
+    answered
+        .unwrap_or_else(|_| {
+            panic!(
+                "no dial of the host was answered in {REACH_DEADLINE:?}: {attempts} attempts, each \
+                 ended by the transport's inactivity threshold"
+            )
+        })
+        .expect("an authorised connection")
+}
+
+async fn connect(client: &Side, host: &Side) -> Session {
+    Session::start(Arc::new(dial(client, host).await)).expect("a session")
 }
 
 /// KR-REQ-10.01: the native client library connects to a host over iroh in Rust.
@@ -410,17 +454,8 @@ async fn one_connection_carries_one_session() {
     let client = side(2, false).await;
     let serving = spawn_host(&host, client.record, Arc::new(HostScript::default()), None);
 
-    let transport: Arc<dyn kr_client::transport::ControlTransport> = Arc::new(
-        NetworkTransport::connect(
-            &client.endpoint,
-            direct_addr(&host),
-            &client.identity,
-            &host.record,
-            SendLimits::default(),
-        )
-        .await
-        .expect("an authorised connection"),
-    );
+    let transport: Arc<dyn kr_client::transport::ControlTransport> =
+        Arc::new(dial(&client, &host).await);
     let session = Session::start(Arc::clone(&transport)).expect("a session");
     // Two sessions on one control stream would divide its frames between them.
     assert!(
@@ -2228,17 +2263,8 @@ async fn the_local_path_is_a_socket_and_the_remote_path_is_iroh_behind_one_seam(
     let client = side(2, false).await;
     let network_script = Arc::new(HostScript::default());
     let serving_remotely = spawn_host(&host, client.record, Arc::clone(&network_script), None);
-    let remote: Arc<dyn kr_client::transport::ControlTransport> = Arc::new(
-        NetworkTransport::connect(
-            &client.endpoint,
-            direct_addr(&host),
-            &client.identity,
-            &host.record,
-            SendLimits::default(),
-        )
-        .await
-        .expect("an authorised connection"),
-    );
+    let remote: Arc<dyn kr_client::transport::ControlTransport> =
+        Arc::new(dial(&client, &host).await);
 
     // One seam. The session is written against `ControlTransport` and nothing else, so the same
     // calls produce the same answers whichever way the client connected.

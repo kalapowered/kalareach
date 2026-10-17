@@ -20,6 +20,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use iroh::endpoint::{ConnectingError, ConnectionError};
 use iroh::{Endpoint, EndpointAddr};
 use kr_client::cursors::StreamCursors;
 use kr_client::error::ClientError;
@@ -74,6 +75,22 @@ pub const CHALLENGE_WAIT: Duration = Duration::from_secs(60);
 ///
 /// A host that keeps a connection open and never answers must not hold a leg for ever.
 pub const REQUEST: Duration = Duration::from_secs(60);
+
+/// How long a device lets its dials of the host go unanswered before it takes the host for hung.
+///
+/// It ends a leg whose host never answers and decides nothing else: a dial that is answered ends
+/// the wait at once.
+const REACH: Duration = Duration::from_secs(300);
+
+/// Whether the transport ended a dial because nothing answered it inside its inactivity threshold.
+/// A failure of any other kind is the host's answer or something else.
+fn gave_up_unanswered(error: &ClientError) -> bool {
+    matches!(
+        error,
+        ClientError::Transport(kr_transport::TransportError::Connect(message))
+            if *message == ConnectingError::from(ConnectionError::TimedOut).to_string()
+    )
+}
 
 /// Waits for `exchange` within [`REQUEST`], and says which exchange did not finish when it does
 /// not.
@@ -558,6 +575,10 @@ impl Device {
     /// A new connection has its own identity and its own input stream; what it carries is how far
     /// each stream's content had been applied, which is what its subscriptions resume from.
     ///
+    /// A dial the transport gave up on, because nothing answered it inside its inactivity
+    /// threshold, is made again on a new connection: the host has not read a frame of it, so
+    /// nothing it keeps depends on it. What the host decides is what this returns.
+    ///
     /// # Errors
     ///
     /// As [`Self::connect`].
@@ -573,18 +594,29 @@ impl Device {
             self.keys.authorisation.clone(),
             build(),
         );
-        let transport = bounded(
-            "the paired connection",
-            NetworkTransport::connect(
-                &self.endpoint,
-                paired.address.clone(),
-                &identity,
-                &paired.record,
-                SendLimits::default(),
-            ),
-        )
-        .await?
-        .map_err(|error| format!("the paired connection: {error}"))?;
+        let dial = async {
+            loop {
+                let attempt = bounded(
+                    "the paired connection",
+                    NetworkTransport::connect(
+                        &self.endpoint,
+                        paired.address.clone(),
+                        &identity,
+                        &paired.record,
+                        SendLimits::default(),
+                    ),
+                )
+                .await?;
+                match attempt {
+                    Err(error) if gave_up_unanswered(&error) => {}
+                    outcome => return Ok::<_, String>(outcome),
+                }
+            }
+        };
+        let transport = tokio::time::timeout(REACH, dial)
+            .await
+            .map_err(|_| format!("the paired connection was not answered within {REACH:?}"))??
+            .map_err(|error| format!("the paired connection: {error}"))?;
         let connection_id = kr_client::transport::ControlTransport::connection_id(&transport);
         let session = Session::resume(Arc::new(transport), cursors)
             .map_err(|error| format!("a session on the connection: {error}"))?;
