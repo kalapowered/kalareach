@@ -84,25 +84,28 @@ impl Host {
         let environment = temp.environment();
         let environment_id = temp.environment_id();
         let secrets = environment.secrets_dir();
-        let controller = Controller::start(ControllerSetup {
-            paths: environment.clone(),
-            environment_id,
-            identity: Box::new(move || {
-                let store = open_store_in(&secrets).expect("a secret store in the test tree");
-                Ok(
-                    ControllerIdentity::open(store.store.as_ref(), environment_id, false)
-                        .expect("an identity"),
-                )
+        let controller = kr_controller::testing::with_git_read_bound(
+            kr_controller::testing::HUNG_GIT_READ,
+            Controller::start(ControllerSetup {
+                paths: environment.clone(),
+                environment_id,
+                identity: Box::new(move || {
+                    let store = open_store_in(&secrets).expect("a secret store in the test tree");
+                    Ok(
+                        ControllerIdentity::open(store.store.as_ref(), environment_id, false)
+                            .expect("an identity"),
+                    )
+                }),
+                secret_store: StoreSelection::File,
+                boot_identity: kr_ipc::identity::boot_identity().expect("a boot identity"),
+                supervisor: Box::new(NoWorkers),
+                worker_program: PathBuf::from("/nonexistent/kr-worker"),
+                build_id: build(),
+                release: "0".to_owned(),
+                shell_packages: None,
+                terminal: Box::new(kr_controller::supervision::NoTerminal),
             }),
-            secret_store: StoreSelection::File,
-            boot_identity: kr_ipc::identity::boot_identity().expect("a boot identity"),
-            supervisor: Box::new(NoWorkers),
-            worker_program: PathBuf::from("/nonexistent/kr-worker"),
-            build_id: build(),
-            release: "0".to_owned(),
-            shell_packages: None,
-            terminal: Box::new(kr_controller::supervision::NoTerminal),
-        })
+        )
         .await
         .expect("the daemon starts");
         let endpoint = environment.controller_endpoint().expect("an endpoint");
