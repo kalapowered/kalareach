@@ -546,7 +546,7 @@ pub struct DiffApplyArguments {
 /// One `kr device` operation.
 #[derive(Subcommand)]
 pub enum DeviceCommand {
-    /// List the paired devices, and the last authority revision each one acknowledged.
+    /// List the paired devices, and how the revocation feed stands.
     List(DeviceListArguments),
     /// Revoke a device and every grant it holds.
     Revoke(DeviceRevokeArguments),
