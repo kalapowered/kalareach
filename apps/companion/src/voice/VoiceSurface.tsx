@@ -165,11 +165,13 @@ function ProviderChoiceScreen({
       </h1>
 
       {aftermath.length > 0 && (
-        <ul className="kr-voice__list kr-voice__aftermath" role="status" aria-label="The last call">
-          {aftermath.map((line) => (
-            <li key={line}>{line}</li>
-          ))}
-        </ul>
+        <div className="kr-voice__aftermath" role="status" aria-label="The last call">
+          <ul className="kr-voice__list">
+            {aftermath.map((line, index) => (
+              <li key={`${String(index)}-${line}`}>{line}</li>
+            ))}
+          </ul>
+        </div>
       )}
 
       {terms ? (

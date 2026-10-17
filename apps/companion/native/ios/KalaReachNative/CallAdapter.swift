@@ -453,6 +453,7 @@ public final class CallAdapter: NSObject {
         self.maker = maker
         self.device = device
         self.clock = clock
+        super.init()
         if watches { startWatching() }
     }
 

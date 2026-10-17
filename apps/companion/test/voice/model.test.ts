@@ -17,6 +17,7 @@ import {
   controlAvailable,
   endedWords,
   needsHost,
+  owedWords,
   rateWords,
   requestedSeconds,
   runningCallFrom,
@@ -329,6 +330,32 @@ describe('what a call that ended tells a person', () => {
       ended({ host: { kind: 'revoked', fence: { kind: 'unreadable' }, broker_notified: false } })
     )
     expect(pending).toContain('cannot confirm that nothing the call sent can still run')
+  })
+})
+
+describe('what is owed', () => {
+  // The record's own words are the reason; what is owed, and until when, is said with them.
+  it('says until when a grant the host may hold open stays so', () => {
+    const words = owedWords({
+      kind: 'revocation',
+      words: 'The host could not be reached in time.',
+      action_id: null,
+      voice_session_id: 'vs-1',
+      until_ms: Date.UTC(2026, 9, 17, 12, 30)
+    })
+    expect(words).toContain('may still hold open ends by itself at')
+    expect(words).toContain('The host could not be reached in time.')
+  })
+
+  it('leaves the words of a start that was never answered as they are', () => {
+    const words = owedWords({
+      kind: 'start_unknown',
+      words: 'The host never said whether it created the call.',
+      action_id: 'a-1',
+      voice_session_id: null,
+      until_ms: 1
+    })
+    expect(words).toBe('The host never said whether it created the call.')
   })
 })
 
