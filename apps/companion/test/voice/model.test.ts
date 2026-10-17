@@ -117,6 +117,7 @@ function callState(over: Partial<VoiceCallState> = {}): VoiceCallState {
   return {
     running: true,
     setting_up: false,
+    ending: false,
     capture: 'capturing',
     playing: true,
     control: 'connected',
