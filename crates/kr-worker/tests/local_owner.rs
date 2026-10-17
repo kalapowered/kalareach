@@ -3183,3 +3183,154 @@ async fn a_keystroke_whose_authority_ran_out_leaves_the_lease_to_a_task_under_th
     .await;
     typing.close();
 }
+
+/// Waits until the application's output, as the session retained it, holds `text`.
+async fn the_application_printed(runtime: &kr_worker::runtime::SessionRuntime, text: &[u8]) {
+    within("the application's output", async {
+        loop {
+            let seen = {
+                let session = runtime.session();
+                let mut seen = Vec::new();
+                let mut cursor = 0_u64;
+                loop {
+                    let page = session
+                        .history_page(cursor, 1024 * 1024)
+                        .expect("reads the retained output");
+                    if page.bytes.as_slice().is_empty() {
+                        break;
+                    }
+                    seen.extend_from_slice(page.bytes.as_slice());
+                    cursor = page.next_cursor.get();
+                }
+                seen
+            };
+            if seen.windows(text.len()).any(|window| window == text) {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+}
+
+/// KR-PERF-002, KR-REQ-08.64: a revision that takes a lease while a paste is open has the paste
+/// closed at the application at once, with nothing else typed or printed.
+///
+/// The install releases the lease in one step of the input domain, and what that queued for the
+/// terminal's writer, the notice that the lease moved, goes to the writer with the install and not
+/// with whatever writes next. The application here prints nothing after the paste opened, so there
+/// is no later write to carry it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    windows,
+    ignore = "a Windows pseudo-console begins its output with mode sequences of its own, which this case reads as the application's bytes"
+)]
+async fn a_revision_that_takes_a_lease_with_a_paste_open_has_the_paste_closed_at_once() {
+    let kept = tempfile::tempdir().expect("a directory for what the application keeps");
+    let received = kept.path().join("received");
+    let script = format!(
+        "stty raw -echo; printf '\\033[?2004hkr-ready.'; exec tee '{}'",
+        received.display()
+    );
+    let mut typing = Typing::start_with(&script).await;
+    the_application_printed(&typing.wired.runtime, b"kr-ready.").await;
+    let epoch = typing.wired.runtime.session().lease().epoch;
+    let far = kr_ipc::clock::boot_elapsed_ms() + 600_000;
+
+    let opening = b"\x1b[200~pasted";
+    typing
+        .wired
+        .type_for(
+            &mut typing.phone,
+            2,
+            far,
+            epoch,
+            0,
+            typing.attachment,
+            opening,
+        )
+        .await
+        .expect("the phone opens a paste");
+    within("the paste to reach the application", async {
+        while std::fs::read(&received).unwrap_or_default() != opening {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+
+    typing
+        .wired
+        .revise_within(&mut typing.authority, 3, grant_reach(2, devices_grant()))
+        .await;
+    assert_eq!(
+        typing.wired.lease_holder(),
+        None,
+        "the install took the lease"
+    );
+
+    // Nothing is typed and nothing is printed from here: the end of the paste is the install's.
+    let closed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while !std::fs::read(&received)
+            .unwrap_or_default()
+            .ends_with(b"\x1b[201~")
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    assert!(
+        closed.is_ok(),
+        "the paste the lease left open was not closed: the application has {:?}",
+        String::from_utf8_lossy(&std::fs::read(&received).unwrap_or_default())
+    );
+    typing.close();
+}
+
+/// KR-PERF-002: the release a refused keystroke leaves to a task is for the lease it named.
+///
+/// The attachment can hold a newer lease by the time the task has the dispatch barrier, taken under
+/// authority that has not run out, and that one is not the keystroke's to end.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_release_a_refused_keystroke_asks_for_leaves_a_newer_lease_alone() {
+    use kr_worker::session::GrantedInput;
+
+    let typing = Typing::start().await;
+    let named = typing.wired.runtime.session().lease().epoch.get();
+    typing
+        .wired
+        .runtime
+        .session()
+        .acquire_input(
+            typing.attachment,
+            ConnectionId::new(kr_ipc::new_uuid()),
+            None,
+        )
+        .expect("the phone takes the lease again");
+    let current = typing.wired.runtime.session().lease().epoch.get();
+    assert_ne!(named, current, "taking the lease again moved its epoch");
+
+    typing.wired.runtime.session().fence_granted_input(
+        GrantedInput::Lease {
+            attachment_id: typing.attachment,
+            epoch: named,
+        },
+        None,
+    );
+    assert!(
+        typing.holds_the_lease(),
+        "a release for the lease that ended does not end the one that followed it"
+    );
+
+    typing.wired.runtime.session().fence_granted_input(
+        GrantedInput::Lease {
+            attachment_id: typing.attachment,
+            epoch: current,
+        },
+        None,
+    );
+    assert!(
+        !typing.holds_the_lease(),
+        "and the release for the lease that stands ends it"
+    );
+    typing.close();
+}

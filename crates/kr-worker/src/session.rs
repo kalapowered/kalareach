@@ -210,8 +210,15 @@ pub struct GrantedBy {
 /// Whose input lease the worker's fence of granted input takes.
 #[derive(Clone, Copy, Debug)]
 pub enum GrantedInput<'a> {
-    /// The one attachment whose authority ended, a grant that ran out.
-    Attachment(AttachmentId),
+    /// The one lease whose authority ended, a grant that ran out: the attachment, and the epoch of
+    /// the lease its refused keystroke named. The attachment may hold a newer lease by the time
+    /// this is carried out, under authority that has not run out, and that one is not this one's.
+    Lease {
+        /// The attachment whose authority ran out.
+        attachment_id: AttachmentId,
+        /// The lease epoch the refused keystroke carried.
+        epoch: u64,
+    },
     /// The callers a revision's reach names, or every caller under a grant for the reach that
     /// names the whole host.
     Within(&'a kr_protocol::worker::RevisionReach),
@@ -2505,8 +2512,13 @@ impl Session {
         let mut owed = Vec::new();
         if let Some(holder) = input.holder() {
             let to_fence = match only {
-                GrantedInput::Attachment(named) => {
-                    named == holder && input.holds_granted_attachment(holder)
+                GrantedInput::Lease {
+                    attachment_id,
+                    epoch,
+                } => {
+                    attachment_id == holder
+                        && epoch == input.epoch()
+                        && input.holds_granted_attachment(holder)
                 }
                 GrantedInput::Within(reach) => input.granted_attachment_within(holder, reach),
             };

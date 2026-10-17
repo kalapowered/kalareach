@@ -195,9 +195,9 @@ pub struct WorkerService {
     dispatch: Mutex<()>,
     /// The attachments whose caller's authority ran out on a keystroke. The lease of each is
     /// released by a task under the dispatch barrier, not by the keystroke.
-    expired: tokio::sync::mpsc::UnboundedSender<AttachmentId>,
+    expired: tokio::sync::mpsc::UnboundedSender<(AttachmentId, u64)>,
     /// The receiving end of that, taken by the task that serves it when the service starts serving.
-    expired_receiver: Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<AttachmentId>>>,
+    expired_receiver: Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<(AttachmentId, u64)>>>,
     /// How many connections this session is serving.
     connections: Arc<std::sync::atomic::AtomicUsize>,
     /// Every connection this worker has admitted, and how to withdraw it.
@@ -1430,10 +1430,11 @@ impl WorkerService {
     /// The wait for the barrier and the session is made on a thread for blocking work.
     async fn release_expired_grants(
         self: Arc<Self>,
-        mut expired: tokio::sync::mpsc::UnboundedReceiver<AttachmentId>,
+        mut expired: tokio::sync::mpsc::UnboundedReceiver<(AttachmentId, u64)>,
     ) {
         while let Some(first) = expired.recv().await {
-            // Every attachment that ran out while this task was waiting is released in one pass.
+            // Every lease that ran out while this task was waiting is released in one pass, once
+            // however many keystrokes found it gone.
             let mut ended = std::collections::BTreeSet::from([first]);
             while let Ok(more) = expired.try_recv() {
                 ended.insert(more);
@@ -1444,11 +1445,14 @@ impl WorkerService {
                     .dispatch
                     .lock()
                     .expect("the dispatch barrier is not poisoned");
-                for attachment_id in ended {
-                    service
-                        .runtime
-                        .session()
-                        .fence_granted_input(GrantedInput::Attachment(attachment_id), None);
+                for (attachment_id, epoch) in ended {
+                    service.runtime.session().fence_granted_input(
+                        GrantedInput::Lease {
+                            attachment_id,
+                            epoch,
+                        },
+                        None,
+                    );
                 }
                 service.runtime.flush_input();
             })
@@ -3702,6 +3706,10 @@ impl WorkerService {
         // the input domain: no keystroke is accepted between the lease going and the revision that
         // took it, and none validated under an earlier revision is accepted after.
         session.fence_granted_input(GrantedInput::Within(reach), Some(revision));
+        // What the release queued for the terminal's writer, the notice that closes a paste the
+        // lease left open and the replies its end lets out, goes now and not with whatever writes
+        // next.
+        self.runtime.flush_input();
         drop(session);
         let mut authority = self
             .authority
@@ -4179,6 +4187,8 @@ impl WorkerService {
         method: Method,
         caller: &Caller,
     ) -> Result<()> {
+        // It takes the local gate's lock and may read the host's floor from the disk.
+        crate::input_domain::assert_not_held("a check of the local owner's access");
         self.check_local_hold(state, method)?;
         if let Some(admitted) = caller.gate_restrictions
             && self.gate.restrictions() != admitted
@@ -5709,7 +5719,12 @@ impl WorkerService {
     /// terminal has not taken is held to the same deadline by the writer, which checks it before
     /// every piece it offers the terminal, and the lease goes with the release that is asked for
     /// here.
-    fn check_authority_deadline(&self, caller: &Caller, attachment_id: AttachmentId) -> Result<()> {
+    fn check_authority_deadline(
+        &self,
+        caller: &Caller,
+        attachment_id: AttachmentId,
+        epoch: u64,
+    ) -> Result<()> {
         let Some(deadline) = caller.authority_deadline_boot_ms else {
             return Ok(());
         };
@@ -5718,10 +5733,10 @@ impl WorkerService {
         }
         // Refused at once, which is all a keystroke does about it. Its lease is released by a task
         // that takes the dispatch barrier, so a keystroke never moves a lease that a mutation
-        // validated before its marker. Only this request's own attachment is named: another caller
-        // may hold the lease by now, and its authority has nothing to do with this one's having
-        // ended.
-        let _ = self.expired.send(attachment_id);
+        // validated before its marker. Only the lease this request named is released: the
+        // attachment may hold a newer one by the time the task runs, and another caller may hold
+        // the lease by then, and neither has anything to do with this authority's having ended.
+        let _ = self.expired.send((attachment_id, epoch));
         Err(WorkerError::PermissionDenied {
             detail: "the authority this request was admitted under has run out".to_owned(),
         })
@@ -7588,6 +7603,10 @@ impl WorkerService {
                 kr_protocol::limits::MAX_INPUT_FRAME_LEN
             )));
         }
+        // Before the input domain is taken: the check reads the local gate and, for an owner whose
+        // membership is bound, the clock and the host's floor, none of which a lock that holds up
+        // a keystroke may wait for. Nothing the domain protects depends on its order.
+        self.check_local_dispatch(state, Method::InputWrite, caller)?;
         self.wait_before_the_input_session();
         let (accepted, pump) = {
             let mut acquisition = self.runtime.trace().acquisition(Site::InputAcceptance);
@@ -7600,8 +7619,7 @@ impl WorkerService {
             // revision or the grant behind it runs out, and what the domain decides is what
             // actually reaches the application.
             input.check_validated_revision(caller.validated_revision)?;
-            self.check_local_dispatch(state, Method::InputWrite, caller)?;
-            self.check_authority_deadline(caller, params.attachment_id)?;
+            self.check_authority_deadline(caller, params.attachment_id, params.epoch.get())?;
             Self::check_owned_session(input.session_id(), params.session_id)?;
             Self::check_granted(
                 input.capabilities(params.attachment_id),
