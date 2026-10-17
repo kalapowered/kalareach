@@ -11,6 +11,8 @@ publish.workspace = true
 [dependencies]
 kr-attention.workspace = true
 kr-changeset.workspace = true
+# The journal is opened the way every store is, waiting out a previous holder that is letting go.
+kr-flush = { workspace = true, features = ["sqlite"] }
 kr-ipc.workspace = true
 kr-project.workspace = true
 kr-protocol.workspace = true
@@ -25,6 +27,8 @@ tracing.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+# The test that stands the journal in the interval its previous holder is letting go of its index.
+kr-flush = { workspace = true, features = ["testing"] }
 kr-ipc = { workspace = true, features = ["testing"] }
 tempfile.workspace = true
 
