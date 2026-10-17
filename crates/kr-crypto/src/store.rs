@@ -1431,7 +1431,7 @@ pub fn store_recovery_seed(
     store.set(&SecretName::recovery_seed(scope)?, seed.expose())
 }
 
-/// Reads the recovery seed back, or `None` when the host has none.
+/// Reads the recovery seed back, or `None` when the store holds none for `scope`.
 ///
 /// # Errors
 ///

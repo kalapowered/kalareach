@@ -273,8 +273,8 @@ impl Controller {
     /// mailbox in the hands of `mailbox_timer` and not of `timer`.
     ///
     /// A suite that holds the carriers' waits and reads the order they were asked for in has no
-    /// use for the ten-second wait of a task it is not about, and gives that task a timer of its
-    /// own, which it never releases.
+    /// use for the waits of a task it is not about, and gives that task a timer of its own, which
+    /// it never releases.
     ///
     /// # Errors
     ///
@@ -307,7 +307,8 @@ impl Controller {
         .await
     }
 
-    /// The one start, with the schedule its debt pass keeps and the timer its carriers wait by.
+    /// The one start, with the schedule its debt pass keeps, the timer its carriers wait by and
+    /// the timer the reader of the host's own mailbox waits by, when it is another.
     pub(super) async fn start_passing(
         setup: ControllerSetup,
         clocks: Clocks,

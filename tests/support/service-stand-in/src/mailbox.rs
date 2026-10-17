@@ -940,6 +940,12 @@ pub(crate) mod tests {
             read_envelope(&beside).unwrap_err().as_deref(),
             Some("a sealed envelope has no field \"note\"")
         );
+        let mut control = good.clone();
+        control["\u{1}"] = json!("x");
+        assert_eq!(
+            read_envelope(&control).unwrap_err().as_deref(),
+            Some("a sealed envelope has no field \"\\u0001\"")
+        );
         let mut without = good.clone();
         without.as_object_mut().expect("an object").remove("nonce");
         assert_eq!(
