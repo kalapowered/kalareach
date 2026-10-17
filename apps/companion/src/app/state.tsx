@@ -153,12 +153,16 @@ export function AppProvider({
       .onSettings((view) => {
         applyMode(view.colour_mode)
       })
-      .then((unlisten) => {
-        if (ended) {
-          unlisten()
-          return
-        }
-        stop = unlisten
+      .then(
+        (unlisten) => {
+          if (ended) unlisten()
+          else stop = unlisten
+        },
+        // A listener that could not be had leaves the read, which is still worth making.
+        () => undefined
+      )
+      .then(() => {
+        if (ended) return
         const asked = modeApplications()
         port
           .settingsView()

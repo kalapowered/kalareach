@@ -899,22 +899,30 @@ export function ThemeChooser({ port }: { readonly port: HostPort }): ReactNode {
   useEffect(() => {
     let stop: (() => void) | null = null
     let ended = false
+    let heard = false
     void port
       .onSettings((view) => {
+        heard = true
         setMode(view.colour_mode)
         setWaiting(view.sync.conflicts > 0)
       })
-      .then((unlisten) => {
-        if (ended) {
-          unlisten()
-          return
-        }
-        stop = unlisten
-        // Read once the listener is live, so a change cannot fall between the two.
+      .then(
+        (unlisten) => {
+          if (ended) unlisten()
+          else stop = unlisten
+        },
+        () => undefined
+      )
+      .then(() => {
+        if (ended) return
+        // Read once the listener is live, so a change cannot fall between the two, and dropped
+        // when one was heard since: a change is newer than the answer.
         port
           .settingsView()
           .then((view) => {
-            if (!ended) setWaiting(view.sync.conflicts > 0)
+            if (ended || heard) return
+            setMode(view.colour_mode)
+            setWaiting(view.sync.conflicts > 0)
           })
           .catch(() => undefined)
       })
@@ -978,8 +986,8 @@ export function ThemeChooser({ port }: { readonly port: HostPort }): ReactNode {
     )}
     {waiting ? (
       <p className="form-hint" data-testid="theme-waiting">
-        Another device changed this too. Your settings do not sync until you choose between the
-        versions in your account.
+        Another device changed this too, so your settings do not sync while the two differ. Choose
+        between the versions in your account.
       </p>
     ) : null}
     </>

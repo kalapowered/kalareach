@@ -37,10 +37,10 @@ export function shownMode(): ColourMode {
   return isColourMode(mode) ? mode : openedMode()
 }
 
-/** How many times a mode has been applied, so that an answer can tell whether one came after it. */
+/** How many preferences have been applied, so that an answer can tell whether one came after it. */
 let applications = 0
 
-/** The number of modes applied so far in this window. */
+/** The number of preferences applied so far in this window. */
 export function modeApplications(): number {
   return applications
 }
@@ -48,6 +48,11 @@ export function modeApplications(): number {
 /** Applies a preference to the document and the browser chrome. */
 export function applyMode(mode: ColourMode): void {
   applications += 1
+  paint(mode)
+}
+
+/** Puts a preference in the document and the browser chrome. */
+function paint(mode: ColourMode): void {
   const root = document.documentElement
   const resolved =
     mode === 'system'
@@ -65,5 +70,6 @@ applyMode(openedMode())
 
 // System mode follows the device while the window is open.
 matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => {
-  if (document.documentElement.dataset.preference === 'system') applyMode('system')
+  // The device changed, and the person's preference did not: the preference count stands.
+  if (document.documentElement.dataset.preference === 'system') paint('system')
 })

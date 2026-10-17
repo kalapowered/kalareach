@@ -94,9 +94,12 @@ describe('the window\'s own mode', () => {
       answer = resolve
     })
     const slow = { ...port, settingsView: () => late }
+    // The press is kept and no event comes of it, so only what was applied tells the first read
+    // that it is old.
+    const silent = { ...port, settingsSetColourMode: () => new Promise<SettingsView>(() => undefined) }
     render(
       <AppProvider port={slow}>
-        <ThemeChooser port={port} />
+        <ThemeChooser port={silent} />
       </AppProvider>
     )
     await person.click(screen.getByRole('radio', { name: /Dark/ }))
@@ -109,6 +112,28 @@ describe('the window\'s own mode', () => {
       await Promise.resolve()
     })
     expect(document.documentElement.dataset.preference).toBe('dark')
+  })
+
+  it('reads after its listener is live, so a change made while it registered is not lost', async () => {
+    const { port, controls } = fakeHost()
+    const complete = controls.holdRegistrations()
+    render(
+      <AppProvider port={port}>
+        <p>Nothing here draws the appearance.</p>
+      </AppProvider>
+    )
+    await act(async () => {
+      await Promise.resolve()
+    })
+    // Nothing published now reaches a listener; the read has not been made either.
+    controls.settings.change({ colour_mode: 'dark' })
+    await act(async () => {
+      complete()
+      await Promise.resolve()
+    })
+    await waitFor(() => {
+      expect(document.documentElement.dataset.preference).toBe('dark')
+    })
   })
 
   it('is the mode native code keeps when the window starts, as a reload finds it', async () => {
@@ -252,6 +277,26 @@ describe('the choice between two versions of the settings', () => {
     await act(async () => {
       await Promise.resolve()
       controls.settings.change({ sync: { state: 'on', kept_at: 'reach.kala.to', conflicts: 1 } })
+    })
+    expect(screen.getByTestId('theme-waiting')).toBeInTheDocument()
+  })
+
+  it('keeps the note a newer event raised when an older read answers after it', async () => {
+    const { port, controls } = fakeHost()
+    let answer: (view: SettingsView) => void = () => undefined
+    const late = new Promise<SettingsView>((resolve) => {
+      answer = resolve
+    })
+    const found = await port.settingsView()
+    render(<ThemeChooser port={{ ...port, settingsView: () => late }} />)
+    await act(async () => {
+      await Promise.resolve()
+      controls.settings.change({ sync: { state: 'on', kept_at: 'reach.kala.to', conflicts: 1 } })
+    })
+    expect(screen.getByTestId('theme-waiting')).toBeInTheDocument()
+    await act(async () => {
+      answer(found)
+      await Promise.resolve()
     })
     expect(screen.getByTestId('theme-waiting')).toBeInTheDocument()
   })

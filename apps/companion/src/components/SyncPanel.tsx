@@ -97,6 +97,9 @@ export function SyncPanel({
   const recoveryStatus = useRef<HTMLDivElement | null>(null)
   const serviceInput = useRef<HTMLInputElement | null>(null)
   const finished = useRef<Finished | null>(null)
+  // How many settings the backend has told this card of, so that a read that was asked for before
+  // one of them and answers after it does not put older settings over it.
+  const settingsHeard = useRef(0)
   // A sign-in that changes what the account may do changes what stops recovery, so it is read again.
   const standing = account?.state === 'signed_in' ? account.generation : (account?.state ?? null)
 
@@ -116,9 +119,11 @@ export function SyncPanel({
         setService(null)
         setServiceProblem(failureMessage(error))
       })
+    const asked = settingsHeard.current
     const settings = port
       .settingsView()
       .then((view) => {
+        if (settingsHeard.current !== asked) return
         setSettings(view)
         setSettingsProblem(null)
       })
@@ -150,10 +155,15 @@ export function SyncPanel({
   useEffect(() => {
     let stop: (() => void) | null = null
     let ended = false
-    void port.onSettings(setSettings).then((unlisten) => {
-      if (ended) unlisten()
-      else stop = unlisten
-    })
+    void port
+      .onSettings((view) => {
+        settingsHeard.current += 1
+        setSettings(view)
+      })
+      .then((unlisten) => {
+        if (ended) unlisten()
+        else stop = unlisten
+      })
     return () => {
       ended = true
       stop?.()
