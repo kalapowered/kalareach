@@ -2362,6 +2362,30 @@ mod tests {
         }
     }
 
+    /// Walks the tree again for as long as the walk reports that it could not read it.
+    ///
+    /// The walk reads this process's own children, and the kernel's list of them cannot be read
+    /// while the process's threads keep leaving: the walk then reports none, which its caller takes
+    /// as the reason to read the terminal instead. The threads of this test binary are those of
+    /// every case running beside this one, so any number of walks in a row can meet that. What the
+    /// case is about is a walk that read the tree, so it asks again; the bound only ends a walk that
+    /// never reads.
+    #[cfg(target_os = "linux")]
+    fn tree_once_read(owned: &mut OwnedProcesses) -> Vec<ProcessStartIdentity> {
+        const HUNG: std::time::Duration = std::time::Duration::from_secs(120);
+        let started = std::time::Instant::now();
+        loop {
+            if let Some(walked) = owned.tree() {
+                return walked;
+            }
+            assert!(
+                started.elapsed() < HUNG,
+                "the walk reported no tree of a running session in {HUNG:?}"
+            );
+            std::thread::yield_now();
+        }
+    }
+
     /// KR-REQ-07.13: the walk of the worker's tree reads nothing below a process already read as
     /// having left, whatever its scope reads now, and goes on with the rest of the tree: what the
     /// process started is its own, and the session would otherwise record it and stop it.
@@ -2418,7 +2442,7 @@ mod tests {
                 top.clone(),
             );
             owned.note_left(left);
-            let walked = owned.tree().expect("the tree of a running session is read");
+            let walked = tree_once_read(&mut owned);
             for read in [&top, left, &other.0, &other.1] {
                 assert!(
                     walked.contains(read),
