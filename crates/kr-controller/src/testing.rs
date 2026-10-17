@@ -93,16 +93,31 @@ pub const ENVIRONMENT_HANDOVER_DEADLINE: Duration = Duration::from_secs(120);
 static PLATFORM_COMMANDS_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Gives the platform commands this process's daemons run (`podman`, `wsl.exe`) `limit` in place of
-/// the bound the product holds them to.
+/// the bound the product holds them to, until the returned guard is dropped.
 ///
 /// That bound is what ends a runtime that has stopped answering. A suite whose subject is something
 /// else, and whose runtime is only slow because the machine it runs on is busy, waits for the
-/// runtime's answer and lets this limit end only a runtime that has hung.
-pub fn hold_platform_commands_to(limit: Duration) {
-    PLATFORM_COMMANDS_MS.store(
-        u64::try_from(limit.as_millis()).unwrap_or(u64::MAX).max(1),
-        Ordering::Relaxed,
-    );
+/// runtime's answer and lets this limit end only a runtime that has hung. The limit is the
+/// process's, so a case that holds it keeps the guard for as long as it runs and the cases beside
+/// it in the same process see the product's bound again once it has ended.
+#[must_use = "the limit is lifted when the guard is dropped"]
+pub fn hold_platform_commands_to(limit: Duration) -> PlatformCommandsHeld {
+    let held = u64::try_from(limit.as_millis()).unwrap_or(u64::MAX).max(1);
+    PlatformCommandsHeld {
+        before: PLATFORM_COMMANDS_MS.swap(held, Ordering::Relaxed),
+    }
+}
+
+/// What [`hold_platform_commands_to`] holds; the limit before it is back when this is dropped.
+#[derive(Debug)]
+pub struct PlatformCommandsHeld {
+    before: u64,
+}
+
+impl Drop for PlatformCommandsHeld {
+    fn drop(&mut self) {
+        PLATFORM_COMMANDS_MS.store(self.before, Ordering::Relaxed);
+    }
 }
 
 /// The limit a suite chose for the platform commands, if it did.

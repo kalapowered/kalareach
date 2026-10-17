@@ -325,7 +325,8 @@ async fn a_refresh_that_reached_a_running_environment_without_a_helper_scopes_no
     // A busy machine makes the runtime slow to answer the daemon, which says nothing about what the
     // refresh leaves behind. The daemon waits for the runtime as long as the runtime needs and ends
     // it only if it has hung.
-    kr_controller::testing::hold_platform_commands_to(std::time::Duration::from_secs(600));
+    let _platform_commands =
+        kr_controller::testing::hold_platform_commands_to(std::time::Duration::from_secs(600));
     let owner = kr_crypto::keys::DeviceKeys::generate().expect("owner keys");
     let host = net_support::Host::start(&owner).await;
     let mut client = host.client().await;
