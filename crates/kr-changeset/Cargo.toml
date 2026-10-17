@@ -11,7 +11,7 @@ publish.workspace = true
 [dependencies]
 cap-std.workspace = true
 kr-cbor.workspace = true
-kr-flush.workspace = true
+kr-flush = { workspace = true, features = ["sqlite"] }
 kr-ipc.workspace = true
 kr-project = { workspace = true }
 kr-protocol.workspace = true
@@ -22,6 +22,8 @@ sha2.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+# The test that stands the store in the interval its previous holder is letting go of its index.
+kr-flush = { workspace = true, features = ["testing"] }
 kr-ipc = { workspace = true, features = ["testing"] }
 # The tests stop an apply where a crash would stop it and act while a capture reads a file. They get
 # the seams from here, so that a plain `cargo test` has them, and so that no build that is not a test

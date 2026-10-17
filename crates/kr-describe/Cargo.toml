@@ -23,6 +23,8 @@ required-features = ["testing"]
 # transcript is built the same way every other signature in this product is built.
 kr-cbor.workspace = true
 kr-crypto.workspace = true
+# The names store is opened the way every store is, waiting out a previous holder that is letting go.
+kr-flush = { workspace = true, features = ["sqlite"] }
 # The description process reports its own start identity when it says it is ready, so the daemon
 # can end that process and no other.
 kr-ipc.workspace = true
@@ -55,6 +57,8 @@ rustix = { workspace = true, features = ["fs"] }
 
 [dev-dependencies]
 kr-describe = { path = ".", features = ["testing"] }
+# The test that stands the store in the interval its previous holder is letting go of its index.
+kr-flush = { workspace = true, features = ["testing"] }
 # Places the stub executable on the internal disk before a test starts it.
 kr-ipc = { workspace = true, features = ["testing"] }
 tempfile.workspace = true

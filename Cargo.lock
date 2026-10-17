@@ -4163,6 +4163,7 @@ name = "kr-attention"
 version = "0.1.0"
 dependencies = [
  "hmac 0.13.0",
+ "kr-flush",
  "kr-protocol",
  "rusqlite",
  "sha2 0.11.0",
@@ -4437,6 +4438,7 @@ dependencies = [
  "kr-attention",
  "kr-cbor",
  "kr-crypto",
+ "kr-flush",
  "kr-protocol",
  "kr-worker",
  "rusqlite",
@@ -4455,6 +4457,7 @@ dependencies = [
  "kr-cbor",
  "kr-crypto",
  "kr-describe",
+ "kr-flush",
  "kr-ipc",
  "kr-protocol",
  "kr-worker",
