@@ -18,13 +18,20 @@
 //! | KR-REQ-23.49 | `an_application_restarted_after_the_host_committed_asks_the_host_and_is_answered` |
 //! | KR-REQ-23.49 | `a_second_invitation_is_not_started_while_the_first_can_still_happen` |
 //! | KR-REQ-23.49 | `an_action_the_host_never_saw_is_not_done_only_after_the_bound` |
+//! | KR-REQ-25.10 | `the_screen_preview_is_read_from_a_real_worker_through_the_command` |
+//! | KR-REQ-18.13 | `a_list_of_offers_and_shares_longer_than_a_page_is_read_whole` |
+//! | KR-REQ-18.13 | `a_read_that_fails_between_pages_answers_nothing_and_the_next_answers_all` |
+//! | KR-REQ-18.13 | `an_offer_to_a_guest_tells_what_it_carries_and_none_of_the_screen_the_issuer_was_shown` |
+//! | KR-REQ-25.28 | `an_offer_to_a_guest_tells_what_it_carries_and_none_of_the_screen_the_issuer_was_shown` |
+//! | KR-REQ-18.14 | `a_share_taken_back_ends_nothing_on_the_main_connection` |
+//! | KR-REQ-18.13 | `a_refusal_of_the_first_send_of_an_acceptance_is_the_hosts_sentence_and_the_rows_decide` |
 
 #![cfg(unix)]
 
 #[path = "../../../../crates/kr-controller/tests/net_support/mod.rs"]
 mod net_support;
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -42,17 +49,21 @@ use kr_protocol::envelope::ControlFrame;
 use kr_protocol::grant::{EnvironmentSelector, GrantExpiry, HistoryScope, SessionSelector};
 use kr_protocol::hello::{ActionWindow, ReceiveLimits};
 use kr_protocol::ids::{
-    ConnectionId, DeviceId, DeviceKeyRevision, GrantId, InvitationId, RequestId, SessionId,
+    ActionId, ConnectionId, DeviceId, DeviceKeyRevision, GrantId, InvitationId, RequestId,
+    SessionId,
 };
+use kr_protocol::method::Method;
 use kr_protocol::pairing::{NetworkConfig, ProposedGrant};
+use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::{CanonicalSet, Nullable};
 use kr_protocol::sharing::{
     AuthorityNotice, GrantCreateParams, GrantCreateResult, GrantHeldResult, GrantListParams,
     GrantListResult, GrantRedeemParams, GrantRedeemResult, GrantRevokeParams, GrantState,
     GrantTransferParams, GrantTransferResult, RevocationResult, RoleSelection, SessionRole,
-    local_actor, share_identities,
+    SessionScreenPreviewResult, local_actor, share_identities,
 };
-use net_support::{Device, Host, an_open_session, owned_by, recipient};
+use net_support::worker::{Adopted, type_into};
+use net_support::{Device, Host, RawDevice, an_open_session, on_the_host, owned_by, recipient};
 use serde_json::{Value, json};
 use tauri::Manager as _;
 use tauri::test::MockRuntime;
@@ -72,6 +83,12 @@ struct Faults {
     answer: AtomicBool,
     /// Lose the next mutation before it leaves: the host never sees it.
     request: AtomicBool,
+    /// Lose the connection as the read numbered so is about to leave, counting from one for the next
+    /// read sent: the host never sees it. Zero is off.
+    cut_at_read: AtomicUsize,
+    /// Hold the next mutation before it leaves: it says it is held through the first, and leaves
+    /// when the second is told. The host sees nothing until then.
+    hold_next: Mutex<Option<(Arc<Notify>, Arc<Notify>)>>,
     watching: Mutex<Option<RequestId>>,
 }
 
@@ -101,6 +118,31 @@ impl ControlTransport for Lossy {
 
     fn send<'a>(&'a self, frame: &'a ControlFrame) -> TransportFuture<'a, ()> {
         Box::pin(async move {
+            if let ControlFrame::Request(_) = frame {
+                let counting = self.faults.cut_at_read.load(Ordering::SeqCst);
+                if counting == 1 {
+                    self.faults.cut_at_read.store(0, Ordering::SeqCst);
+                    self.inner.close();
+                    return Err(ClientError::ConnectionEnded);
+                }
+                if counting > 1 {
+                    self.faults
+                        .cut_at_read
+                        .store(counting - 1, Ordering::SeqCst);
+                }
+            }
+            if let ControlFrame::Mutation(_) = frame {
+                let held = self
+                    .faults
+                    .hold_next
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .take();
+                if let Some((parked, release)) = held {
+                    parked.notify_one();
+                    release.notified().await;
+                }
+            }
             if let ControlFrame::Mutation(request) = frame {
                 if self.faults.request.swap(false, Ordering::SeqCst) {
                     self.inner.close();
@@ -338,6 +380,7 @@ impl Page {
                 companion_tauri::commands::attempt_set_hidden,
                 companion_tauri::commands::attempt_remove,
                 companion_tauri::commands::attention_read,
+                companion_tauri::commands::session_list,
             ])
             .build(tauri::test::mock_context(tauri::test::noop_assets()))
             .expect("an application");
@@ -1935,3 +1978,516 @@ async fn a_refusal_to_a_repeat_of_the_confirmation_request_is_not_the_hosts_answ
 const _: fn(&GrantId, &InvitationId, &GrantCreateParams) = |_, _, _| {};
 #[allow(dead_code, reason = "the actor a local caller is")]
 const _: fn(u64) -> kr_protocol::ids::ActorId = local_actor;
+
+/// Writes `count` invitations of `session_id` to the device `to`, all at one moment and below the
+/// host's own checks, so that a list longer than a page exists without a session for each.
+fn invitations(
+    host: &Host,
+    session_id: SessionId,
+    to: DeviceId,
+    count: usize,
+) -> Vec<GrantCreateResult> {
+    let now_ms = kr_ipc::now_ms().get();
+    (0..count)
+        .map(|_| {
+            let selection = RoleSelection::plain(SessionRole::Viewer);
+            host.controller()
+                .sharing()
+                .share(
+                    &kr_controller::sharing::ShareRequest {
+                        invitation_id: InvitationId::new(kr_ipc::new_uuid()),
+                        grant_id: GrantId::new(kr_ipc::new_uuid()),
+                        environment_id: host.environment_id,
+                        session_id,
+                        issuer_device_id: host.controller().sharing().host_device_id(),
+                        recipient_device_id: to,
+                        parent_grant_id: None,
+                        accepted_notices: AuthorityNotice::for_actions(&selection.actions()),
+                        selection,
+                        lifetime_ms: Some(3_600_000),
+                        live_screen: None,
+                        named_questions: Vec::new(),
+                        named_approvals: Vec::new(),
+                        authority_revision: host.controller().policy().authority_revision(),
+                        owner_confirmed: false,
+                        now_ms,
+                    },
+                    || Ok(()),
+                )
+                .expect("the invitation is written")
+        })
+        .collect()
+}
+
+/// Every invitation of `created` accepted over a connection of the device's own.
+async fn accept_all(scene: &Scene, created: &[GrantCreateResult]) {
+    let connection = RawDevice::connect(&scene.host, &scene.device, &scene.record).await;
+    for each in created {
+        connection
+            .mutate(
+                Method::GrantRedeem,
+                ActionId::new(kr_ipc::new_uuid()),
+                on_the_host(&scene.host),
+                &GrantRedeemParams {
+                    invitation_id: each.preview.invitation_id,
+                },
+            )
+            .await
+            .expect("the invitation is accepted");
+    }
+    connection.close();
+}
+
+/// What `grant_held` answered, as the protocol's own result.
+fn held_of(answer: &Value) -> GrantHeldResult {
+    typed(&json!({
+        "offers": answer["offers"], "offers_more": false,
+        "shares": answer["shares"], "shares_more": false,
+    }))
+}
+
+/// KR-REQ-18.13: a device with more invitations, and then more shares, than one page holds is told
+/// every one of them by one command, each once, however many pages the host answered it in.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_list_of_offers_and_shares_longer_than_a_page_is_read_whole() {
+    let scene = Scene::start().await;
+    let created = invitations(&scene.host, scene.session_id, scene.record.device_id, 70);
+
+    let answered = scene
+        .phone
+        .call("grant_held", json!({}))
+        .await
+        .expect("held");
+    let held = held_of(&answered);
+    assert_eq!(held.offers.len(), 70, "both pages of offers");
+    assert!(held.shares.is_empty());
+    let mut offered: Vec<_> = held
+        .offers
+        .iter()
+        .map(|offer| offer.invitation_id)
+        .collect();
+    offered.sort();
+    offered.dedup();
+    assert_eq!(offered.len(), 70, "no offer is listed twice");
+
+    accept_all(&scene, &created).await;
+    let answered = scene
+        .phone
+        .call("grant_held", json!({}))
+        .await
+        .expect("held");
+    let held = held_of(&answered);
+    assert!(held.offers.is_empty());
+    assert_eq!(held.shares.len(), 70, "both pages of shares");
+    let mut grants: Vec<_> = held
+        .shares
+        .iter()
+        .map(|share| share.grant.grant_id)
+        .collect();
+    grants.sort();
+    grants.dedup();
+    assert_eq!(grants.len(), 70, "no share is listed twice");
+    scene.stop().await;
+}
+
+/// KR-REQ-18.13: a read that loses its connection between two pages answers with nothing at all,
+/// not with the first page, so that what is missing from a list can never be taken for ended; the
+/// next read, on a connection taken up again, answers with every one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_read_that_fails_between_pages_answers_nothing_and_the_next_answers_all() {
+    let mut scene = Scene::start().await;
+    invitations(&scene.host, scene.session_id, scene.record.device_id, 70);
+
+    scene.phone_faults.cut_at_read.store(2, Ordering::SeqCst);
+    let refused = scene
+        .phone
+        .call("grant_held", json!({}))
+        .await
+        .expect_err("a list with a page missing is not an answer");
+    assert!(
+        refused.get("offers").is_none(),
+        "no part of the list: {refused}"
+    );
+
+    scene.reconnect_phone().await;
+    let answered = scene
+        .phone
+        .call("grant_held", json!({}))
+        .await
+        .expect("held");
+    assert_eq!(held_of(&answered).offers.len(), 70);
+    scene.stop().await;
+}
+
+/// The marker the session's terminal is made to show.
+const MARKER: &str = "kalareach-on-the-screen";
+
+/// KR-REQ-25.10: the screen the person is shown before an invitation exists is the session's own,
+/// read by the session's worker for the command. The command is sent a well-formed request, as the
+/// Sharing tab sends it, against the real daemon and a real worker whose terminal shows a line.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn the_screen_preview_is_read_from_a_real_worker_through_the_command() {
+    let adopted = Adopted::start(1).await;
+    let session_id = adopted.workers[0].session_id;
+    let _typing = type_into(
+        &adopted.host,
+        &adopted.owner,
+        session_id,
+        &format!("{MARKER}\n"),
+    )
+    .await;
+    let issuer = Page::start(
+        local_connection(&adopted.host, None).await,
+        Arc::new(tempfile::tempdir().expect("a data directory")),
+        WorkerLinks::at(adopted.host.tree().environment()),
+    );
+    let asking = |include_live_screen: bool| {
+        json!({
+            "params": {
+                "session_id": session_id.to_string(),
+                "selection": serde_json::to_value(&RoleSelection {
+                    include_live_screen,
+                    ..RoleSelection::plain(SessionRole::Viewer)
+                }).expect("encodes"),
+            },
+        })
+    };
+
+    // The terminal draws what was typed when the worker has got to it, so the command is asked
+    // until it shows it.
+    let shown = tokio::time::timeout(WATCHDOG, async {
+        loop {
+            let answered = issuer
+                .call("session_screen_preview", asking(true))
+                .await
+                .expect("the preview is read");
+            let preview: SessionScreenPreviewResult = typed(&answered);
+            if let Some(screen) = preview.screen.0
+                && screen.lines.iter().any(|line| line.contains(MARKER))
+            {
+                return screen;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the screen shows what was typed");
+    assert!(!shown.truncated, "a screen of a few lines is shown whole");
+
+    // Asked for an invitation without the live view, the worker is not asked for a screen.
+    let answered = issuer
+        .call("session_screen_preview", asking(false))
+        .await
+        .expect("the preview is read");
+    let preview: SessionScreenPreviewResult = typed(&answered);
+    assert!(preview.screen.0.is_none(), "{answered}");
+
+    issuer
+        .state()
+        .connection()
+        .expect("connected")
+        .session()
+        .close();
+    adopted.stop().await;
+}
+
+/// KR-REQ-18.13, KR-REQ-25.28: a device paired as a guest reaches no session and no screen of its
+/// host, and is told what an invitation to it carries before it accepts: the actions, that the
+/// live view is included, where its history begins, and none of the text on the screen its issuer
+/// was shown. The screen is a real worker's, and the issuer is shown its line.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn an_offer_to_a_guest_tells_what_it_carries_and_none_of_the_screen_the_issuer_was_shown() {
+    let adopted = Adopted::start_reserved(1).await;
+    let host = &adopted.host;
+    let session_id = adopted.workers[0].session_id;
+    let _typing = type_into(host, &adopted.owner, session_id, &format!("{MARKER}\n")).await;
+    let environment = host.tree().environment();
+    let issuer = Page::start(
+        local_connection(host, None).await,
+        Arc::new(tempfile::tempdir().expect("a data directory")),
+        WorkerLinks::at(environment.clone()),
+    );
+    let guest = Device::create().await;
+    let record = net_support::pair_with(
+        host,
+        &guest,
+        &adopted.owner,
+        kr_pairing::grants::guest_grant(
+            kr_ipc::now_ms().get(),
+            24 * 60 * 60 * 1000,
+            host.environment_id,
+        )
+        .expect("a guest grant"),
+    )
+    .await;
+    let phone = Page::start(
+        paired_connection(host, &guest, &record, None).await,
+        Arc::new(tempfile::tempdir().expect("a data directory")),
+        WorkerLinks::at(environment),
+    );
+
+    // A guest reaches no session of the host, and none is listed for it, until one is shared.
+    let own = || json!({ "params": { "environment_id": null, "include_closed": false } });
+    let refused = phone
+        .call("session_list", own())
+        .await
+        .expect_err("a guest lists no session");
+    assert_eq!(code_of(&refused), "PERMISSION_DENIED", "{refused}");
+    phone
+        .call("attention_read", json!({ "params": {} }))
+        .await
+        .expect_err("a guest has no inbox of its own");
+    let nothing = held_of(&phone.call("grant_held", json!({})).await.expect("held"));
+    assert!(nothing.offers.is_empty() && nothing.shares.is_empty());
+
+    // The line is on the session's screen, as the issuer's preview shows.
+    let selection = RoleSelection {
+        include_live_screen: true,
+        ..RoleSelection::plain(SessionRole::Viewer)
+    };
+    let preview = json!({
+        "params": {
+            "session_id": session_id.to_string(),
+            "selection": serde_json::to_value(&selection).expect("encodes"),
+        },
+    });
+    tokio::time::timeout(WATCHDOG, async {
+        loop {
+            let answered = issuer
+                .call("session_screen_preview", preview.clone())
+                .await
+                .expect("read");
+            let shown: SessionScreenPreviewResult = typed(&answered);
+            if shown
+                .screen
+                .0
+                .is_some_and(|screen| screen.lines.iter().any(|line| line.contains(MARKER)))
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the screen shows the line");
+
+    let invited = issuer
+        .call(
+            "grant_create",
+            json!({
+                "params": serde_json::to_value(&GrantCreateParams {
+                    session_id,
+                    recipient_device_id: record.device_id,
+                    parent_grant_id: Nullable::null(),
+                    accepted_notices: AuthorityNotice::for_actions(&selection.actions()),
+                    selection,
+                    lifetime_ms: Nullable::null(),
+                    owner_confirmation: Nullable::null(),
+                }).expect("encodes"),
+                "subject": { "sessionId": session_id.to_string(), "sessionEpoch": "1" },
+            }),
+        )
+        .await
+        .expect("the invitation is issued");
+    let created: GrantCreateResult = typed(&invited["value"]);
+    // The control for the search below: it finds the line where the issuer was shown it.
+    assert!(invited.to_string().contains(MARKER), "{invited}");
+    let shown = created
+        .preview
+        .live_screen
+        .0
+        .expect("the issuer is shown the screen");
+    assert!(
+        shown.lines.iter().any(|line| line.contains(MARKER)),
+        "the issuer's preview carries the line: {shown:?}"
+    );
+
+    // The guest is told what it is offered, that the live view is included, and not one character of
+    // the screen the issuer saw.
+    let answered = phone.call("grant_held", json!({})).await.expect("held");
+    let offers = held_of(&answered).offers;
+    assert_eq!(offers.len(), 1);
+    assert_eq!(offers[0].invitation_id, created.preview.invitation_id);
+    assert!(offers[0].includes_live_screen);
+    assert!(
+        offers[0]
+            .actions
+            .iter()
+            .any(|action| *action == ActionRight::SessionView)
+    );
+    assert!(
+        !answered.to_string().contains(MARKER),
+        "the offer carries no text of the screen: {answered}"
+    );
+    // Offered, it reaches nothing yet.
+    phone
+        .call("session_list", own())
+        .await
+        .expect_err("an offer lists no session");
+
+    phone
+        .state()
+        .connection()
+        .expect("connected")
+        .session()
+        .close();
+    issuer
+        .state()
+        .connection()
+        .expect("connected")
+        .session()
+        .close();
+    adopted.stop().await;
+}
+
+/// KR-REQ-18.14: a share taken back by the person at the host leaves the device's main connection as
+/// it was. What the device is told it holds is read on that connection under its pairing and never
+/// under the share, so the host has nothing of the share to withdraw the connection with: the same
+/// connection reads the list again, without the share, and no connection was taken up in between.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_share_taken_back_ends_nothing_on_the_main_connection() {
+    let scene = Scene::start().await;
+    let made = scene
+        .issuer
+        .call("grant_create", scene.invitation(SessionRole::Viewer))
+        .await
+        .expect("the invitation is issued");
+    let created: GrantCreateResult = typed(&made["value"]);
+    scene
+        .phone
+        .call(
+            "grant_redeem",
+            json!({ "params": serde_json::to_value(&GrantRedeemParams {
+                invitation_id: created.preview.invitation_id,
+            }).expect("encodes") }),
+        )
+        .await
+        .expect("accepted");
+    let main_connection = scene
+        .phone
+        .state()
+        .connection()
+        .expect("connected")
+        .session();
+    let held = held_of(
+        &scene
+            .phone
+            .call("grant_held", json!({}))
+            .await
+            .expect("held"),
+    );
+    assert_eq!(held.shares.len(), 1);
+
+    scene
+        .issuer
+        .call(
+            "grant_revoke",
+            json!({ "params": serde_json::to_value(&GrantRevokeParams {
+                grant_id: created.grant.grant_id,
+            }).expect("encodes") }),
+        )
+        .await
+        .expect("the share is taken back");
+
+    // The share has left the list, read on the connection the device had before.
+    for _ in 0..2 {
+        let held = held_of(
+            &scene
+                .phone
+                .call("grant_held", json!({}))
+                .await
+                .expect("held"),
+        );
+        assert!(held.offers.is_empty() && held.shares.is_empty());
+    }
+    assert!(
+        Arc::ptr_eq(
+            &main_connection,
+            &scene
+                .phone
+                .state()
+                .connection()
+                .expect("connected")
+                .session()
+        ),
+        "the device kept its connection"
+    );
+    scene.stop().await;
+}
+
+/// KR-REQ-18.13: the host refuses the first send of an acceptance, because the invitation was
+/// withdrawn after the device read its list. The device is answered with an acceptance that is not
+/// settled and carries the host's sentence, not with a claim that nothing was accepted: the paired
+/// door can replace the result of an acceptance it committed with a refusal, so only what the host
+/// lists decides. With neither the invitation nor a share listed once the bound has passed, the
+/// outcome stays unknown.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refusal_of_the_first_send_of_an_acceptance_is_the_hosts_sentence_and_the_rows_decide() {
+    let scene = Scene::start().await;
+    let made = scene
+        .issuer
+        .call("grant_create", scene.invitation(SessionRole::Viewer))
+        .await
+        .expect("the invitation is issued");
+    let created: GrantCreateResult = typed(&made["value"]);
+
+    let parked = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    *scene
+        .phone_faults
+        .hold_next
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner) =
+        Some((Arc::clone(&parked), Arc::clone(&release)));
+    let accepting = scene.phone.call(
+        "grant_redeem",
+        json!({ "params": serde_json::to_value(&GrantRedeemParams {
+            invitation_id: created.preview.invitation_id,
+        }).expect("encodes") }),
+    );
+    let withdrawing = async {
+        parked.notified().await;
+        scene
+            .issuer
+            .call(
+                "grant_revoke",
+                json!({ "params": serde_json::to_value(&GrantRevokeParams {
+                    grant_id: created.grant.grant_id,
+                }).expect("encodes") }),
+            )
+            .await
+            .expect("the invitation is withdrawn");
+        release.notify_one();
+    };
+    let (answered, ()) = tokio::join!(accepting, withdrawing);
+
+    let answered = answered.expect("the device is answered with the attempt, not refused");
+    assert_eq!(answered["value"], Value::Null, "{answered}");
+    assert_ne!(answered["attempt"]["phase"], "closed", "{answered}");
+    assert!(
+        answered["attempt"]["refusal"].is_string(),
+        "the host's own sentence rides on the attempt: {answered}"
+    );
+
+    // Neither the invitation nor a share is listed, so once the bound has passed it is unknown and
+    // never "not accepted".
+    scene
+        .phone
+        .state()
+        .shares()
+        .advance(Duration::from_secs(3600));
+    let closed = scene
+        .phone
+        .attempt_where(|attempt| attempt["phase"] == "closed")
+        .await;
+    assert_eq!(closed["outcome"], "unknown", "{closed}");
+    let held = held_of(
+        &scene
+            .phone
+            .call("grant_held", json!({}))
+            .await
+            .expect("held"),
+    );
+    assert!(held.offers.is_empty() && held.shares.is_empty());
+    scene.stop().await;
+}
