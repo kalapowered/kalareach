@@ -91,6 +91,7 @@ import type {
 } from './port'
 import { MAX_HANDED_BYTES, receivedConnection, viewMoveArguments, viewSizeArguments } from './port'
 import { codeComplete } from '../pairing/words'
+import { openedMode } from '../theme-init'
 import { scriptedHostDrafts, type BindParams, type FakeHostDrafts } from './fake-host-drafts'
 import {
   AGENT_DRAFT_ADD_ATTACHMENT_PARAMS,
@@ -900,7 +901,7 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
   const recoveryView = (): RecoveryView => ({ sync_service: syncService, ...recovery })
 
   let settings: SettingsView = {
-    colour_mode: 'system',
+    colour_mode: openedMode(),
     sync: {
       state: 'off',
       service: null,
@@ -2113,7 +2114,8 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
     settingsSetColourMode: (mode) => {
       if (settingsKeepFails !== null) return refused('RESOURCE_UNAVAILABLE', settingsKeepFails)
       colourModesSet.push(mode)
-      settings = { ...settings, colour_mode: mode }
+      // Native code tells the page of every change it keeps, this one included.
+      setSettings({ ...settings, colour_mode: mode })
       return Promise.resolve(settingsOf())
     },
     settingsSyncTurnOn: () => {

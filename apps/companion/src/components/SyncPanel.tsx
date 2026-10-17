@@ -160,6 +160,19 @@ export function SyncPanel({
     }
   }, [port])
 
+  // The choice closes where it opened, and focus goes back to the control that opened it: the
+  // button that was pressed to close it is gone, and a keyboard or a screen reader would be left
+  // on nothing.
+  const returnFocus = useRef(false)
+  useEffect(() => {
+    if (choice !== null || !returnFocus.current) return
+    returnFocus.current = false
+    settingsStatus.current
+      ?.closest('[data-card]')
+      ?.querySelector<HTMLElement>('[data-testid="settings-sync-choose"]')
+      ?.focus()
+  }, [choice])
+
   // When a step ends, focus goes to its card's status line: the pressed control may be disabled,
   // or gone, and a person using a keyboard or a screen reader would otherwise be left on nothing.
   // It is not taken from something the person went on to use elsewhere, and a service the backend
@@ -432,6 +445,7 @@ export function SyncPanel({
                     )
                   }}
                   onCancel={() => {
+                    returnFocus.current = true
                     setChoice(null)
                   }}
                 />

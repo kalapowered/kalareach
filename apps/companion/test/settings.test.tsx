@@ -47,7 +47,11 @@ describe('the colour mode', () => {
 
   it('follows a change another device made, as the backend reports it', async () => {
     const { port, controls } = fakeHost()
-    render(<ThemeChooser port={port} />)
+    render(
+      <AppProvider port={port}>
+        <ThemeChooser port={port} />
+      </AppProvider>
+    )
     await waitFor(() => {
       expect(screen.getByRole('radio', { name: /System/ })).toBeChecked()
     })
@@ -59,6 +63,40 @@ describe('the colour mode', () => {
     })
     expect(screen.getByRole('radio', { name: /Light/ })).toBeChecked()
     expect(document.documentElement.dataset.preference).toBe('light')
+  })
+})
+
+describe('the window\'s own mode', () => {
+  beforeEach(() => {
+    applyMode('system')
+  })
+
+  it('follows what native code keeps while no control for it is on screen', async () => {
+    const { port, controls } = fakeHost()
+    render(
+      <AppProvider port={port}>
+        <p>Nothing here draws the appearance.</p>
+      </AppProvider>
+    )
+    await act(async () => {
+      await Promise.resolve()
+      controls.settings.change({ colour_mode: 'dark' })
+    })
+    expect(document.documentElement.dataset.preference).toBe('dark')
+  })
+
+  it('is the mode native code keeps when the window starts, as a reload finds it', async () => {
+    const { port, controls } = fakeHost()
+    controls.settings.change({ colour_mode: 'dark' })
+    expect(document.documentElement.dataset.preference).toBe('system')
+    render(
+      <AppProvider port={port}>
+        <p>Nothing here draws the appearance.</p>
+      </AppProvider>
+    )
+    await waitFor(() => {
+      expect(document.documentElement.dataset.preference).toBe('dark')
+    })
   })
 })
 
@@ -158,13 +196,38 @@ describe('the choice between two versions of the settings', () => {
     expect(within(card).queryByTestId('settings-sync-conflicts')).toBeNull()
   })
 
+  it('takes the window to the version that was kept, with no appearance control on screen', async () => {
+    const { person, controls, form } = await waiting()
+    await person.click(within(form).getByRole('radio', { name: /Light/ }))
+    await person.click(within(form).getByTestId('settings-choice-keep'))
+    await waitFor(() => {
+      expect(controls.settings.kept).toEqual([{ choice: 'copy', conflict_id: 'copy-1' }])
+    })
+    await waitFor(() => {
+      expect(document.documentElement.dataset.preference).toBe('light')
+    })
+  })
+
   it('closes without recording anything when the person is not ready', async () => {
     const { person, controls, card, form } = await waiting()
     await person.click(within(form).getByTestId('settings-choice-cancel'))
     expect(within(card).queryByTestId('settings-choice')).toBeNull()
+    // Focus goes back to the control that opened the choice, which is where the person was.
+    expect(within(card).getByTestId('settings-sync-choose')).toHaveFocus()
     expect(controls.settings.kept).toEqual([])
     // The conflict is still there to come back to.
     expect(within(card).getByTestId('settings-sync-conflicts')).toBeInTheDocument()
+  })
+
+  it('says in the appearance control that a choice stays on this device while versions wait', async () => {
+    const { port, controls } = fakeHost()
+    render(<ThemeChooser port={port} />)
+    expect(screen.queryByTestId('theme-waiting')).toBeNull()
+    await act(async () => {
+      await Promise.resolve()
+      controls.settings.change({ sync: { state: 'on', kept_at: 'reach.kala.to', conflicts: 1 } })
+    })
+    expect(screen.getByTestId('theme-waiting')).toBeInTheDocument()
   })
 
   it('shows a version it cannot read and does not let the person keep it', async () => {

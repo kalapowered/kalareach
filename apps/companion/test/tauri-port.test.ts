@@ -742,6 +742,20 @@ describe('the desktop port and the person\'s settings', () => {
     ])
   })
 
+  it('asks for the versions waiting for a choice, and sends the choice by the word the backend reads', async () => {
+    await tauriPort().settingsConflicts()
+    await tauriPort().settingsConflictResolve({ choice: 'mine' })
+    await tauriPort().settingsConflictResolve({ choice: 'copy', conflict_id: 'copy-1' })
+    expect(shell.invoked).toEqual([
+      { command: 'settings_conflicts', args: {} },
+      { command: 'settings_conflict_resolve', args: { keep: { choice: 'mine' } } },
+      {
+        command: 'settings_conflict_resolve',
+        args: { keep: { choice: 'copy', conflict_id: 'copy-1' } }
+      }
+    ])
+  })
+
   it('hands on the settings native code publishes', async () => {
     const heard: unknown[] = []
     await tauriPort().onSettings((view) => {

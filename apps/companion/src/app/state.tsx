@@ -28,6 +28,7 @@ import { QuestionForms } from '../model/question-forms'
 import { Openings } from '../model/openings'
 import { SessionStates, type SessionState } from '../model/sessions'
 import { ConfirmationStore } from '../pairing/confirmationStore'
+import { applyMode } from '../theme-init'
 
 /** The screens the navigation model has. */
 export type Place =
@@ -138,6 +139,35 @@ export function AppProvider({
     },
     []
   )
+
+  // The window is in the colour mode native code keeps, whoever changed it and whatever is on
+  // screen: one made on another device and followed, a choice kept in the account sheet, and the
+  // mode as it stands when the window starts, which a reload would otherwise leave as the window
+  // was first opened. A change heard before the first read answers is newer than the read.
+  useEffect(() => {
+    let stop: (() => void) | null = null
+    let ended = false
+    let heard = false
+    void port
+      .onSettings((view) => {
+        heard = true
+        applyMode(view.colour_mode)
+      })
+      .then((unlisten) => {
+        if (ended) unlisten()
+        else stop = unlisten
+      })
+    port
+      .settingsView()
+      .then((view) => {
+        if (!ended && !heard) applyMode(view.colour_mode)
+      })
+      .catch(() => undefined)
+    return () => {
+      ended = true
+      stop?.()
+    }
+  }, [port])
 
   // The drafts kept on this device are read once, and written as the window is hidden or closed.
   // A write is also made at every change, so these two are a second chance, not the only one.

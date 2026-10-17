@@ -35,6 +35,7 @@ export function SettingsChoiceForm({
   readonly onCancel: () => void
 }): ReactNode {
   const headingId = useId()
+  const group = useId()
   const heading = useRef<HTMLHeadingElement | null>(null)
   // The control opens where the person pressed to open it, and focus goes to what it says first.
   useEffect(() => {
@@ -56,6 +57,7 @@ export function SettingsChoiceForm({
           <Version
             key={version.id}
             version={version}
+            group={group}
             checked={picked === version.id}
             onPick={() => {
               setPicked(version.id)
@@ -92,10 +94,12 @@ export function SettingsChoiceForm({
 
 function Version({
   version,
+  group,
   checked,
   onPick
 }: {
   readonly version: Keepable
+  readonly group: string
   readonly checked: boolean
   readonly onPick: () => void
 }): ReactNode {
@@ -104,7 +108,7 @@ function Version({
     <label className="theme-option choice-option" data-readable={readable ? 'true' : 'false'}>
       <input
         type="radio"
-        name="keep"
+        name={group}
         value={version.id}
         checked={checked}
         disabled={!readable}

@@ -884,11 +884,16 @@ export function Sheet({
  * The mode is native code's to keep: a choice is applied at once, so the window answers the press,
  * and asked for from the backend, which keeps it before it says so. A choice the backend could not
  * keep is taken back and said. A change another device made, which the backend followed, arrives
- * on the same listener and is shown as it is.
+ * on the same listener and is shown as it is; the window's own mode follows it at the application's
+ * root, whether or not this control is on screen.
+ *
+ * While versions of the settings wait for a choice, a press here is kept on this device and goes
+ * no further, and the control says so.
  */
 export function ThemeChooser({ port }: { readonly port: HostPort }): ReactNode {
   const [mode, setMode] = useState<ColourMode>(() => shownMode())
   const [problem, setProblem] = useState<string | null>(null)
+  const [waiting, setWaiting] = useState(false)
   const problemId = useId()
 
   useEffect(() => {
@@ -896,11 +901,17 @@ export function ThemeChooser({ port }: { readonly port: HostPort }): ReactNode {
     let ended = false
     void port.onSettings((view) => {
       setMode(view.colour_mode)
-      applyMode(view.colour_mode)
+      setWaiting(view.sync.conflicts > 0)
     }).then((unlisten) => {
       if (ended) unlisten()
       else stop = unlisten
     })
+    port
+      .settingsView()
+      .then((view) => {
+        if (!ended) setWaiting(view.sync.conflicts > 0)
+      })
+      .catch(() => undefined)
     return () => {
       ended = true
       stop?.()
@@ -959,6 +970,12 @@ export function ThemeChooser({ port }: { readonly port: HostPort }): ReactNode {
         {problem}
       </p>
     )}
+    {waiting ? (
+      <p className="form-hint" data-testid="theme-waiting">
+        Another device changed this too. Your choice stays on this device until you choose between
+        the two in your account.
+      </p>
+    ) : null}
     </>
   )
 }

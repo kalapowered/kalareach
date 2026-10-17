@@ -1324,6 +1324,16 @@
   font-size: 0.75rem;
 }
 
+/*
+ * Nothing is selected to begin with, so the ring that says which version has the keyboard is the
+ * first and for a while the only one. It is the text's own colour and heavier than the ring that
+ * says which version is kept, so the two are never taken for each other.
+ */
+.choice-option input:focus-visible ~ .theme-preview {
+  outline: 3px solid var(--text);
+  outline-offset: 4px;
+}
+
 .choice-option[data-readable='false'] {
   cursor: not-allowed;
   opacity: 0.6;
