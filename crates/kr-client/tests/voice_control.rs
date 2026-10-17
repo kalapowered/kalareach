@@ -30,7 +30,7 @@ mod control_route;
 #[path = "support/room_tls.rs"]
 mod room_tls;
 
-use control_route::{ControlRoute, PATH, TOKEN, WATCHDOG, session};
+use control_route::{CALL, ControlRoute, PATH, TOKEN, WATCHDOG};
 
 const fn ms(count: u64) -> Duration {
     Duration::from_millis(count)
@@ -336,10 +336,62 @@ async fn the_same_control_attaches_over_tls_the_platform_would_verify() {
 
 #[tokio::test]
 async fn an_address_that_is_neither_https_nor_loopback_is_not_opened() {
-    let target = ControlTarget::new("http://192.0.2.7:9", &session()).expect("a target");
+    let target = ControlTarget::at("http://192.0.2.7:9", "http://192.0.2.7:9", PATH, CALL)
+        .expect("a target");
     let (_control, mut news) = VoiceControl::open(&connector(), target, Tokens::new());
 
     assert_eq!(ended(&mut news).await, ControlEnd::Misconfigured);
+}
+
+/// The account's token goes only to the service the account is signed in at: a host cannot name
+/// another origin, nor another path on this one, for the control to be opened at.
+#[test]
+fn a_host_cannot_name_where_the_account_token_goes() {
+    let service = "https://reach.example";
+    assert!(ControlTarget::at(service, service, PATH, CALL).is_ok());
+    // The same origin spelled another way is the same origin.
+    assert!(ControlTarget::at(service, "HTTPS://Reach.Example:443", PATH, CALL).is_ok());
+
+    for other in [
+        "https://elsewhere.example",
+        "http://reach.example",
+        "https://reach.example:8443",
+        "https://reach.example.evil.example",
+        "https://reach.example@evil.example",
+        "https://reach.example/",
+        "",
+    ] {
+        assert!(
+            ControlTarget::at(service, other, PATH, CALL).is_err(),
+            "{other:?} is not the service"
+        );
+    }
+    // An origin neither side can spell is no origin, and two of them are not the same one.
+    assert!(
+        ControlTarget::at(
+            "https://%72each.example",
+            "https://%72each.example",
+            PATH,
+            CALL
+        )
+        .is_err()
+    );
+    assert!(ControlTarget::at("", "", PATH, CALL).is_err());
+
+    for path in [
+        "/api/voice/sessions/call-2/control",
+        "/api/voice/sessions/call-1/control?x=1",
+        "/api/voice/sessions/call-1/close",
+        "/elsewhere",
+        "//elsewhere.example/api/voice/sessions/call-1/control",
+        "",
+    ] {
+        assert!(
+            ControlTarget::at(service, service, path, CALL).is_err(),
+            "{path:?} is not the call's control path"
+        );
+    }
+    assert!(ControlTarget::at(service, service, PATH, "").is_err());
 }
 
 #[tokio::test]

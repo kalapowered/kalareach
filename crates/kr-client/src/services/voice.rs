@@ -113,6 +113,21 @@ pub fn voice_close_path(call_id: &str) -> String {
     format!("{VOICE_SESSIONS_PATH}/{}/close", encode_segment(call_id))
 }
 
+/// Returns the path of one call's control socket, as the service's contract writes it.
+#[must_use]
+pub fn voice_control_path(call_id: &str) -> String {
+    format!("{VOICE_SESSIONS_PATH}/{}/control", encode_segment(call_id))
+}
+
+/// Whether two origins are one origin, in the one spelling this crate compares them in.
+///
+/// An origin this crate does not accept is no origin, and two of them are not the same one.
+#[must_use]
+pub fn same_origin(first: &str, second: &str) -> bool {
+    let first = normalised_origin(first);
+    !first.is_empty() && first == normalised_origin(second)
+}
+
 /// Percent-encodes one path segment.
 ///
 /// A call identifier comes from the service and is a UUID today. It is encoded anyway, because a
