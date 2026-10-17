@@ -557,7 +557,8 @@ export interface FakeHostControls {
   holdAVoiceCall(): void
   /**
    * Makes the device busy setting a call up with no call to name yet, as it is while the
-   * microphone question is asked or the host has not said whether it made the call.
+   * microphone question is asked or the host has not said whether it made the call. A stop that
+   * names nothing begins the end, and the setup stays until `endVoiceCall` finishes it.
    */
   settingUpAVoiceCall(): void
   /** Sets what the voice service did about the call that last ended, once it has said. */
@@ -883,6 +884,7 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
     delegations: [],
     host: 'reachable',
     settingUp: false,
+    ending: false,
     ended: null,
     warning: null,
     owed: [],
@@ -2062,12 +2064,10 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
 
     voiceStop: () => {
       if (voice.settingUp) {
-        // A stop that names nothing ends what the device is making.
-        voice.settingUp = false
-        voice.ended = {
-          ...endedBy('requested', 'You ended the call.', { kind: 'not_needed' }),
-          broker: 'not_needed'
-        }
+        // A stop that names nothing begins the end of what the device is making, which is over
+        // when the device says so, and not before.
+        if (voice.ending) refuse('PERMISSION_DENIED', 'This device is already ending its call.')
+        voice.ending = true
         return Promise.resolve({ closed_locally: true, fence: null, host_failure: null })
       }
       const running = voice.call
@@ -2648,6 +2648,7 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
     endVoiceCall(ended) {
       voice.call = null
       voice.settingUp = false
+      voice.ending = false
       voice.host = 'none'
       voice.ended = {
         ...endedBy('native_ended', 'The call ended on this device: from its notification, by the system, or at its time limit.', {
@@ -2664,12 +2665,14 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
     settingUpAVoiceCall() {
       voice.call = null
       voice.settingUp = true
+      voice.ending = false
       voice.ended = null
       voice.delegations = []
       voice.host = 'none'
     },
     holdAVoiceCall() {
       voice.settingUp = false
+      voice.ending = false
       const session = fakeVoiceSession([SESSION_MAIN], VOICE_NOW_MS + 1_800_000)
       voice.call = { session, capture: voice.startCapture, playing: true }
       voice.ended = null
@@ -2796,6 +2799,8 @@ interface VoiceState {
   host: string
   /** Whether the device is setting up a call that has no descriptor yet. */
   settingUp: boolean
+  /** Whether what the device holds is being ended. */
+  ending: boolean
   /** How the last call ended. */
   ended: VoiceEnded | null
   /** What a person is told before starting. */
@@ -2861,6 +2866,7 @@ function voiceCallState(voice: VoiceState): VoiceCallState {
     return {
       running: false,
       setting_up: voice.settingUp,
+      ending: voice.settingUp && voice.ending,
       capture: 'idle',
       playing: false,
       control: 'none',
@@ -2873,6 +2879,7 @@ function voiceCallState(voice: VoiceState): VoiceCallState {
   return {
     running: true,
     setting_up: false,
+    ending: false,
     capture: running.capture,
     playing: running.playing,
     control: voice.brokerReachable ? 'connected' : 'unreachable',

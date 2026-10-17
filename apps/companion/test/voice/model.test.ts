@@ -319,12 +319,15 @@ describe('what a call that ended tells a person', () => {
   })
 
   // The grant may be live until the call was to close, so the host's silence is said as owed.
-  it('says the grant may still be open when the host did not confirm that it withdrew it', () => {
+  // What happened is said in the past tense, and whether the grant may still be open is said by what
+  // is owed, which lapses with the grant: the words of the end do not outlive it.
+  it('says the host did not confirm that it withdrew the grant, and not that it may still be open', () => {
     const words = endedWords(ended({ host: { kind: 'not_told', words: 'The host could not be reached.' } }))
     expect(words).toContain(
-      "The host did not confirm that it withdrew the call's grant, so it may still be open: The host could not be reached."
+      "The host did not confirm that it withdrew the call's grant: The host could not be reached."
     )
     expect(words).not.toContain('The host withdrew')
+    expect(words).not.toContain('may still be open')
   })
 
   it('says what the host refused, and that the grant ends when the call was to close', () => {
@@ -360,7 +363,7 @@ describe('what is owed', () => {
       host_reference: 'ref-1',
       host_name: "Ric's Mac"
     })
-    expect(words).toContain("Ric's Mac may still hold open ends by itself at")
+    expect(words).toContain("Ric's Mac may still hold a grant for this call open. It ends by itself by")
     expect(words).toContain('The host could not be reached in time.')
   })
 
@@ -416,6 +419,18 @@ describe('what the screen says when it ends a call', () => {
     expect(words).not.toContain('is closed')
   })
 
+  // A reader must not take "and its grant withdrawn" to be what could not be confirmed.
+  it('keeps the unconfirmed microphone apart from a grant that was withdrawn', () => {
+    const words = closureWords(
+      none({
+        closed_locally: false,
+        fence: { kind: 'unreadable' }
+      })
+    )
+    expect(words).toContain("could not confirm that the call's microphone stopped.")
+    expect(words).not.toContain('and its grant withdrawn')
+  })
+
   it('says the host did not confirm when it could not be told or did not answer', () => {
     const words = closureWords(
       none({
@@ -424,7 +439,7 @@ describe('what the screen says when it ends a call', () => {
       })
     )
     expect(words).toContain("This device's call is closed.")
-    expect(words).toContain('The host did not confirm that it withdrew the grant, so it may still be open: No answer.')
+    expect(words).toContain('The host did not confirm that it withdrew the grant: No answer.')
     expect(words).not.toContain('RESOURCE_UNAVAILABLE')
   })
 })

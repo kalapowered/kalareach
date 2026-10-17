@@ -141,7 +141,7 @@ describe('before a call exists', () => {
     const left = await screen.findByRole('status', { name: 'The last call' })
     expect(within(left).getByText(/from its notification/)).toBeInTheDocument()
     expect(
-      within(left).getByText(/The host did not confirm that it withdrew the call's grant, so it may still be open/)
+      within(left).getByText(/The host did not confirm that it withdrew the call's grant/)
     ).toBeInTheDocument()
   })
 
@@ -398,13 +398,13 @@ describe('while a call is running', () => {
     await person.click(screen.getByRole('button', { name: 'End session' }))
 
     await waitFor(() => {
-      expect(screen.getByText(/may still be open/)).toBeInTheDocument()
+      expect(screen.getByText(/did not confirm that it withdrew the grant/)).toBeInTheDocument()
     })
     expect(screen.queryByRole('heading', { name: 'Voice session' })).not.toBeInTheDocument()
     // The host's words and never the protocol code the client library puts before them. The call is
     // closed and there is nothing here to try again, so no action is said after them.
-    const said = screen.getByText(/may still be open/).textContent ?? ''
-    expect(said.endsWith('so it may still be open: This host cannot be contacted right now.')).toBe(true)
+    const said = screen.getByText(/did not confirm that it withdrew the grant/).textContent ?? ''
+    expect(said.endsWith('withdrew the grant: This host cannot be contacted right now.')).toBe(true)
     expect(said).not.toContain('RESOURCE_UNAVAILABLE')
   })
 
@@ -511,24 +511,41 @@ describe('while a call is running', () => {
       expect(screen.queryByRole('heading', { name: 'Voice session' })).not.toBeInTheDocument()
     })
     expect(screen.getByText(/from its notification/)).toBeInTheDocument()
-    expect(screen.getByText(/so it may still be open: The host could not be reached\./)).toBeInTheDocument()
+    expect(screen.getByText(/did not confirm that it withdrew the call's grant: The host could not be reached\./)).toBeInTheDocument()
   })
 
   // The device is busy making a call that has no descriptor yet: a screen loaded again finds that,
   // offers no second start, and can end what the device is making without naming it.
   it('finds a device that is setting a call up and ends it without naming it', async () => {
     const person = userEvent.setup()
-    const { port } = start((controls) => {
+    const { controls, port } = start((controls) => {
       controls.settingUpAVoiceCall()
     })
     const stopped = vi.spyOn(port, 'voiceStop')
 
     const end = await screen.findByRole('button', { name: 'End the call' })
     expect(screen.queryByRole('button', { name: 'Start voice session' })).not.toBeInTheDocument()
+    // Before a call runs the device cannot say what its microphone is doing, so the screen does
+    // not say that nothing is listening.
+    expect(screen.queryByText(/Nothing is listening/)).not.toBeInTheDocument()
     await person.click(end)
 
-    await waitForChoice()
+    // The stop is answered at once, and the device is still busy with what the host may have
+    // made: the screen says it is ending, offers neither a start nor a second end, and goes on
+    // reading until the device says it is done.
     expect(stopped).toHaveBeenCalledWith(null, {})
+    await screen.findByRole('heading', { name: 'Ending a voice session' })
+    expect(screen.queryByRole('button', { name: 'End the call' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Start voice session' })).not.toBeInTheDocument()
+
+    controls.endVoiceCall({
+      cause: 'requested',
+      words: 'You ended the call.',
+      host: { kind: 'not_told', words: 'The host never said whether it created the call.' }
+    })
+
+    await waitForChoice()
+    expect(screen.getByText(/did not confirm that it withdrew the call's grant/)).toBeInTheDocument()
     // The control that was pressed is gone, and focus goes to what replaced it.
     expect(screen.getByRole('heading', { name: 'Start a voice session' })).toHaveFocus()
   })
@@ -560,6 +577,98 @@ describe('while a call is running', () => {
 
     await screen.findByRole('heading', { name: 'Voice session' })
     expect(screen.getByRole('button', { name: 'End session' })).toBeEnabled()
+  })
+
+  // The device reads as busy while it finishes the end of a call this screen holds. The screen's
+  // own hang-up says its own words, and the read in between does not turn the call into a setup.
+  it('does not show the setup screen for the end of the call it holds', async () => {
+    const person = userEvent.setup()
+    const { port } = start((controls) => {
+      controls.holdAVoiceCall()
+    })
+    const real = port.voiceCallState.bind(port)
+    let finish: (closure: VoiceClosure) => void = () => undefined
+    vi.spyOn(port, 'voiceStop').mockImplementation(
+      () =>
+        new Promise<VoiceClosure>((resolve) => {
+          finish = resolve
+        })
+    )
+    const reading = vi.spyOn(port, 'voiceCallState').mockImplementation(async () => ({
+      ...(await real()),
+      running: false,
+      setting_up: true,
+      ending: true
+    }))
+    await person.click(await screen.findByRole('button', { name: 'End session' }))
+    const before = reading.mock.calls.length
+
+    await waitFor(() => {
+      expect(reading.mock.calls.length).toBeGreaterThan(before)
+    })
+
+    expect(screen.queryByRole('heading', { name: 'Ending a voice session' })).not.toBeInTheDocument()
+    expect(screen.getByRole('heading', { name: 'Voice session' })).toBeInTheDocument()
+    reading.mockRestore()
+    await act(async () => {
+      finish({ closed_locally: true, fence: { kind: 'not_owed' }, host_failure: null })
+      await Promise.resolve()
+    })
+    await waitForChoice()
+    expect(screen.queryByRole('heading', { name: 'Ending a voice session' })).not.toBeInTheDocument()
+  })
+
+  // The screen's own start tells its own answer. A read of the device while that start waits, which
+  // sees the device busy with that very start, does not put the setup screen in the start's place.
+  it('does not replace its own start with the setup screen', async () => {
+    const person = userEvent.setup()
+    // A call that ended still has the voice service to answer, so the screen reads the device.
+    const { port } = start((controls) => {
+      controls.holdAVoiceCall()
+      controls.endVoiceCall({ broker: 'pending' })
+    })
+    await waitForChoice()
+    const real = port.voiceCallState.bind(port)
+    const reading = vi.spyOn(port, 'voiceCallState').mockImplementation(async () => ({
+      ...(await real()),
+      setting_up: true
+    }))
+    vi.spyOn(port, 'voiceStart').mockImplementation(() => new Promise(() => undefined))
+    const before = reading.mock.calls.length
+
+    await person.click(screen.getByRole('button', { name: 'Start voice session' }))
+    await waitFor(() => {
+      expect(reading.mock.calls.length).toBeGreaterThan(before + 1)
+    })
+
+    expect(screen.queryByRole('heading', { name: 'Starting a voice session' })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Starting…' })).toBeInTheDocument()
+  })
+
+  // A read that fails when what is owed lapses is asked again, so the warning does not outlive it.
+  it('asks again when the read at the lapse of what is owed fails', async () => {
+    const { port } = start((controls) => {
+      controls.oweVoice({ until_ms: Date.now() + 400 })
+    })
+    await waitForChoice()
+    expect(await screen.findByRole('status', { name: 'The last call' })).toBeInTheDocument()
+    const real = port.voiceCallState.bind(port)
+    let failed = false
+    vi.spyOn(port, 'voiceCallState').mockImplementation(() => {
+      if (!failed) {
+        failed = true
+        return Promise.reject(new Error('the device did not answer'))
+      }
+      return real()
+    })
+
+    await waitFor(
+      () => {
+        expect(screen.queryByRole('status', { name: 'The last call' })).not.toBeInTheDocument()
+      },
+      { timeout: 6000 }
+    )
+    expect(failed).toBe(true)
   })
 
   // What the device owes stops being said when it lapses, with no other change on the screen.

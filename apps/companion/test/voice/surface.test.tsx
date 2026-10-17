@@ -542,7 +542,7 @@ describe('while a call is running', () => {
         actions={actions()}
       />
     )
-    expect(screen.getByText('Asked before this device was listening')).toBeInTheDocument()
+    expect(screen.getByText('Asked earlier, at a time this device was not told')).toBeInTheDocument()
     expect(screen.getByText('Asked 1.2 seconds in')).toBeInTheDocument()
     expect(screen.queryByText('Asked 0.0 seconds in')).not.toBeInTheDocument()
   })
@@ -569,6 +569,26 @@ describe('while a call is running', () => {
 
     expect(acted.endSetup).toHaveBeenCalledTimes(1)
     expect(acted.hangUp).not.toHaveBeenCalled()
+  })
+
+  // Once the end has begun there is nothing more to ask of the device: the screen says it is ending
+  // and offers nothing to press, and says nothing of the microphone, which it cannot know.
+  it('offers nothing to press while the device is ending its call', () => {
+    render(
+      <VoiceSurface
+        choice={choice()}
+        call={null}
+        currentTurn={null}
+        busy={false}
+        notice={null}
+        settingUp
+        ending
+        actions={actions()}
+      />
+    )
+    expect(screen.getByRole('heading', { name: 'Ending a voice session' })).toBeInTheDocument()
+    expect(screen.queryByRole('button')).not.toBeInTheDocument()
+    expect(screen.queryByText(/Nothing is listening/)).not.toBeInTheDocument()
   })
 
   // Section 13 line 879: every control this screen adds meets the platform's target minimum and

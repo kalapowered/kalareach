@@ -688,6 +688,8 @@ export interface VoiceCallState {
    * ended without naming it.
    */
   readonly setting_up: boolean
+  /** Whether what the device holds is being ended, so that nothing more can be asked of it. */
+  readonly ending: boolean
   /** What the microphone is doing, in the native layer's own vocabulary. */
   readonly capture: string
   /** Whether the model's voice is coming out of this device. */

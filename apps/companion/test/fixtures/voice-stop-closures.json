@@ -2,7 +2,7 @@
   {
     "name": "the host owed no fence",
     "closure": {
-      "closed_locally": false,
+      "closed_locally": true,
       "fence": { "kind": "not_owed" },
       "host_failure": null
     },
@@ -11,7 +11,7 @@
   {
     "name": "every worker holds",
     "closure": {
-      "closed_locally": false,
+      "closed_locally": true,
       "fence": {
         "kind": "barrier",
         "barrier": {
@@ -40,7 +40,7 @@
   {
     "name": "a worker has not held",
     "closure": {
-      "closed_locally": false,
+      "closed_locally": true,
       "fence": {
         "kind": "barrier",
         "barrier": {
@@ -69,7 +69,7 @@
   {
     "name": "the host's status could not be read",
     "closure": {
-      "closed_locally": false,
+      "closed_locally": true,
       "fence": { "kind": "unreadable" },
       "host_failure": null
     },

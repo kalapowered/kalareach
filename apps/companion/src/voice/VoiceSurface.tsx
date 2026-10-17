@@ -97,10 +97,12 @@ export interface VoiceSurfaceProps {
    */
   readonly aftermath?: readonly string[]
   /**
-   * Whether the device is busy making a call that does not run yet, which this screen is asked to
-   * say instead of offering a second start. There may be no call to name.
+   * Whether the device is busy with a call that does not run: making one, which this screen is
+   * asked to say instead of offering a second start, or ending one. There may be no call to name.
    */
   readonly settingUp?: boolean
+  /** Whether what the device holds is being ended, so that nothing more can be asked of it. */
+  readonly ending?: boolean
   /**
    * Counts the calls that have left this screen. A screen that appears after one takes focus, so
    * that the control that was pressed going away does not leave focus on nothing.
@@ -118,6 +120,7 @@ export function VoiceSurface({
   notice,
   aftermath = [],
   settingUp = false,
+  ending = false,
   focusToken = 0,
   actions
 }: VoiceSurfaceProps): React.ReactElement {
@@ -125,7 +128,7 @@ export function VoiceSurface({
     return <CallScreen call={call} currentTurn={currentTurn} busy={busy} notice={notice} actions={actions} />
   }
   if (settingUp) {
-    return <SettingUpScreen notice={notice} onEnd={actions.endSetup} />
+    return <SettingUpScreen ending={ending} notice={notice} onEnd={actions.endSetup} />
   }
   if (choice) {
     return (
@@ -150,16 +153,21 @@ export function VoiceSurface({
 }
 
 /**
- * The screen while the device is making a call that does not run yet.
+ * The screen while the device holds a call that does not run: one it is making, or one it is
+ * ending.
  *
  * It offers no second start: the device holds one call at a time, and a start made now would be
- * turned away. It says what is true, that a call is being made or given up and that the person's
- * only act is to end it, which needs no call to be named.
+ * turned away. It says what is true, and no more: this device cannot tell the screen what its
+ * microphone is doing before a call runs, so it says nothing of it. While a call is being made the
+ * one thing a person can do is end it, which needs no call to be named; once the end has begun
+ * there is nothing more to ask, and the screen only says so.
  */
 function SettingUpScreen({
+  ending,
   notice,
   onEnd
 }: {
+  readonly ending: boolean
   readonly notice: string | null
   readonly onEnd: () => void
 }): React.ReactElement {
@@ -167,22 +175,25 @@ function SettingUpScreen({
   return (
     <section className="kr-voice" aria-labelledby={`${id}-heading`}>
       <h1 id={`${id}-heading`} className="kr-voice__title">
-        Starting a voice session
+        {ending ? 'Ending a voice session' : 'Starting a voice session'}
       </h1>
       <p className="kr-voice__note" role="status">
-        This device is making a call, or ending one. Nothing is listening yet. The call's controls
-        appear here when it runs.
+        {ending
+          ? 'This device is ending its call. This screen changes when that is done.'
+          : "This device is making a call. The call's controls appear here when it runs."}
       </p>
       {notice && (
         <p className="kr-voice__refusal" role="status">
           {notice}
         </p>
       )}
-      <div className="kr-voice__controls">
-        <button type="button" className="kr-voice__control kr-voice__control--end" onClick={onEnd}>
-          End the call
-        </button>
-      </div>
+      {!ending && (
+        <div className="kr-voice__controls">
+          <button type="button" className="kr-voice__control kr-voice__control--end" onClick={onEnd}>
+            End the call
+          </button>
+        </div>
+      )}
     </section>
   )
 }
@@ -650,7 +661,7 @@ function DelegationRow({ delegation }: { readonly delegation: Delegation }): Rea
     <li className="kr-voice__delegation">
       <span className="kr-voice__kind">
         {delegation.offsetMs === null
-          ? 'Asked before this device was listening'
+          ? 'Asked earlier, at a time this device was not told'
           : `Asked ${(delegation.offsetMs / 1000).toFixed(1)} seconds in`}
       </span>
       <span className="kr-voice__summary">

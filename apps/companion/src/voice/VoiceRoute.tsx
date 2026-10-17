@@ -111,8 +111,15 @@ export function VoiceRoute({
    * or one it asked for and was loaded again before the host answered. There may be no call to name.
    */
   const [setUp, setSetUp] = useState(false)
+  /** Whether what the device is busy with is being ended, so that nothing more can be asked of it. */
+  const [endingSetUp, setEndingSetUp] = useState(false)
   /** Whether the last reading found the device setting a call up, to say how that ended. */
   const settingUpBefore = useRef(false)
+  /**
+   * True while this screen's own start waits for the host. The start tells its own answer, so what
+   * the device is read to say meanwhile does not describe the start again, in other words.
+   */
+  const starting = useRef(false)
   /** True while this screen's own hang-up is waiting for the host, which says its own words. */
   const hangingUp = useRef(false)
   /**
@@ -258,20 +265,31 @@ export function VoiceRoute({
     if (state.running && described !== null) {
       settingUpBefore.current = false
       setSetUp(false)
+      setEndingSetUp(false)
       setCall((running) =>
         running ? callAsReported(running, state) : runningCallFrom(described, state, '')
       )
       return
     }
-    // A call being set up, or given up, is read again until it runs or is over. It may have no
+    setLeft(state)
+    // A call being set up, or ended, is read again until it runs or is over. It may have no
     // descriptor yet, so the device's own word that it is busy decides.
     const busy = state.setting_up || described !== null
-    const watchedSettingUp = settingUpBefore.current
-    settingUpBefore.current = busy
-    setSetUp(busy)
-    setLeft(state)
-    if (busy) return
-    if (held.current !== null || watchedSettingUp) {
+    // This screen's own start tells its own answer, and a call it holds is ended by its own
+    // hang-up or by the device's own news: reading the device meanwhile describes neither again.
+    if (starting.current) return
+    if (busy) {
+      if (held.current !== null) return
+      settingUpBefore.current = true
+      setSetUp(true)
+      setEndingSetUp(state.ending)
+      return
+    }
+    const watched = settingUpBefore.current
+    settingUpBefore.current = false
+    setSetUp(false)
+    setEndingSetUp(false)
+    if (held.current !== null || watched) {
       setCall(null)
       setLeftCount((count) => count + 1)
       if (!hangingUp.current) {
@@ -333,16 +351,21 @@ export function VoiceRoute({
     const ends = (left?.owed ?? []).map((owed) => owed.until_ms)
     return ends.length === 0 ? null : Math.min(...ends)
   }, [left])
+  const [lapseTries, setLapseTries] = useState(0)
   useEffect(() => {
     if (nextLapse === null) return
     let current = true
+    let retry: number | undefined
     const timer = window.setTimeout(
       () => {
         void ask(() => port.voiceCallState())
           .then((state) => {
             if (current) settle(state)
           })
-          .catch(() => undefined)
+          .catch(() => {
+            // A read that failed leaves the warning standing, and is asked again.
+            if (current) retry = window.setTimeout(() => setLapseTries((n) => n + 1), 2_000)
+          })
       },
       // A little after the lapse, and never longer than a timer can hold.
       Math.min(Math.max(nextLapse - Date.now(), 0) + 50, 2_000_000_000)
@@ -350,8 +373,9 @@ export function VoiceRoute({
     return () => {
       current = false
       window.clearTimeout(timer)
+      if (retry !== undefined) window.clearTimeout(retry)
     }
-  }, [nextLapse, port, settle])
+  }, [lapseTries, nextLapse, port, settle])
 
   /** What the last call left, as lines a person reads before starting another. */
   const aftermath = useMemo(() => {
@@ -426,6 +450,7 @@ export function VoiceRoute({
         }
         setBusy(true)
         setNotice(null)
+        starting.current = true
         const shown = choice
         void ask(() =>
           port.voiceStart(
@@ -487,6 +512,7 @@ export function VoiceRoute({
               (): VoiceCallState => ({
                 running: true,
                 setting_up: false,
+                ending: false,
                 capture: 'unavailable',
                 playing: false,
                 control: 'none',
@@ -507,6 +533,7 @@ export function VoiceRoute({
             void ask(() => port.voiceCallState()).then(settle, () => undefined)
           })
           .finally(() => {
+            starting.current = false
             setBusy(false)
           })
       },
@@ -541,11 +568,9 @@ export function VoiceRoute({
       // Ends what the device is making when there is no call to name yet, and a call being made
       // that this screen was loaded again to find.
       endSetup: () => {
-        endTheCall(null, () => {
-          settingUpBefore.current = false
-          setSetUp(false)
-          setLeftCount((count) => count + 1)
-        })
+        // The device is still busy until it says so: the stop is answered at once, and the call the
+        // host may yet turn out to have made is ended after it. The screen goes on reading.
+        endTheCall(null, () => undefined)
       },
 
       cancelTask: (turn) => {
@@ -657,6 +682,7 @@ export function VoiceRoute({
         notice={notice}
         aftermath={aftermath}
         settingUp={setUp && !call}
+        ending={endingSetUp}
         focusToken={leftCount}
         actions={actions}
       />

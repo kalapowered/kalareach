@@ -518,10 +518,10 @@ export function endedWords(
       )
       break
     case 'not_told':
-      // Not told, or told and silent: either way the host has not said it withdrew the grant.
-      parts.push(
-        `The host did not confirm that it withdrew the call's grant, so it may still be open: ${ended.host.words}`
-      )
+      // Not told, or told and silent: either way the host has not said it withdrew the grant. That
+      // is what happened. Whether the grant may still be open now is said by what is owed, which
+      // lasts as long as the grant can.
+      parts.push(`The host did not confirm that it withdrew the call's grant: ${ended.host.words}`)
       break
     default:
       break
@@ -555,25 +555,30 @@ export function closureWords(
   closure: VoiceClosure,
   names: Readonly<Record<string, string>> = {}
 ): string | null {
+  // The microphone is the first thing to say, and a call is not said to be closed when this device
+  // could not confirm that its media stopped.
   const here = closure.closed_locally
     ? "This device's call is closed"
     : "This device could not confirm that the call's microphone stopped"
   if (closure.host_failure) {
-    return `${here}. The host did not confirm that it withdrew the grant, so it may still be open: ${failureWords(closure.host_failure)}`
+    return `${here}. The host did not confirm that it withdrew the grant: ${failureWords(closure.host_failure)}`
   }
   const unconfirmed = closure.fence === null ? null : fenceWords(closure.fence, names)
-  if (unconfirmed === null) return closure.closed_locally ? null : `${here}.`
-  return `${here} and its grant withdrawn. ${unconfirmed}`
+  if (!closure.closed_locally) {
+    return unconfirmed === null ? `${here}.` : `${here}. ${unconfirmed}`
+  }
+  return unconfirmed === null ? null : `${here} and its grant withdrawn. ${unconfirmed}`
 }
 
 /**
  * The words for something this device could not finish, which the host may still hold open. It
- * stands until the moment the host's grant ends by itself.
+ * stands until the moment the host's grant is certain to have ended by itself, with room for a
+ * clock that is not this device's own.
  */
 export function owedWords(owed: VoiceOwed): string {
   if (owed.kind !== 'revocation') return `${owed.words} It was asked of ${owed.host_name}.`
   const until = new Date(owed.until_ms).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-  return `A grant ${owed.host_name} may still hold open ends by itself at ${until}. ${owed.words}`
+  return `${owed.host_name} may still hold a grant for this call open. It ends by itself by ${until}. ${owed.words}`
 }
 
 /** Every capture state the surface can draw, by its wire name. */

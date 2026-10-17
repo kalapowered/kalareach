@@ -383,7 +383,19 @@ test.describe('at the largest text size on a screen 320 points wide', () => {
         expect(await overrunning(page, '.kr-voice__note'), 'lines of the setup note that run past their box').toEqual([])
         expect(await overrunning(page, '.kr-voice__control'), 'a control label that runs past its box').toEqual([])
 
+        // The end is answered at once and the device is still busy: the screen says so, offers
+        // nothing to press, and gives way to the choice when the device is done.
         await end.click()
+        await expect(page.getByRole('heading', { name: 'Ending a voice session' })).toBeVisible()
+        await expect(page.getByRole('button', { name: 'End the call' })).toHaveCount(0)
+        await page.screenshot({
+          path: `/tmp/kr-voice-ending-${size}-${surface}-${test.info().project.name}.png`,
+          fullPage: true
+        })
+        expect(await overrunning(page, '.kr-voice__note'), 'lines of the ending note that run past their box').toEqual([])
+        await page.evaluate(() => {
+          window.krTestHost?.endVoiceCall({ cause: 'requested', words: 'You ended the call.' })
+        })
         await expect(page.getByRole('button', { name: 'Start voice session' })).toBeVisible()
         await expect(page.getByRole('heading', { name: 'Start a voice session' })).toBeFocused()
       })
