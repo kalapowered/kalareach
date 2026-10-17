@@ -379,7 +379,8 @@ impl DeviceDirectory {
     ///
     /// Returns an error when the database cannot be opened or migrated.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let connection = Connection::open(path.as_ref()).map_err(ControllerError::registry)?;
+        let connection = kr_flush::release::open_connection(path.as_ref(), None)
+            .map_err(|error| ControllerError::registry(kr_flush::release::describe(&error)))?;
         Self::prepare(connection)
     }
 

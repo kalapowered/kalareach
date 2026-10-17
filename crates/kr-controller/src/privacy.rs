@@ -1831,8 +1831,8 @@ struct Record {
 impl Record {
     fn open(state_dir: &Path) -> Result<Self> {
         std::fs::create_dir_all(state_dir).map_err(ControllerError::registry)?;
-        let connection =
-            Connection::open(state_dir.join(PRIVACY_RECORD)).map_err(ControllerError::registry)?;
+        let connection = kr_flush::release::open_connection(&state_dir.join(PRIVACY_RECORD), None)
+            .map_err(|error| ControllerError::registry(kr_flush::release::describe(&error)))?;
         // A write that finds the record held by another connection waits for it, up to five
         // seconds, rather than refusing the change at once.
         connection
