@@ -1301,7 +1301,8 @@ struct MailScript {
     rcpt_reply: &'static str,
     /// Answers the message with this, or ends the connection without answering when `None`.
     final_reply: Option<&'static str>,
-    /// Agrees to take the message and then stops reading.
+    /// Agrees to take the message and then stops reading, and holds the connection open for as long
+    /// as the test runs: only the sender's own deadline can end the attempt.
     stalls_after_data: bool,
 }
 
@@ -1509,8 +1510,7 @@ async fn serve_secure<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
         } else if command == "DATA" {
             write_line(stream.get_mut(), "354 End data with <CR><LF>.<CR><LF>").await;
             if script.stalls_after_data {
-                tokio::time::sleep(std::time::Duration::from_secs(300)).await;
-                return;
+                std::future::pending::<()>().await;
             }
             loop {
                 let mut raw = Vec::new();
@@ -2039,8 +2039,9 @@ fn a_mail_server_that_stops_reading_cannot_hold_the_attempt() {
         });
     // The attempt ends, and with the message unsent. How long that takes is the machine's: the
     // message is tens of megabytes to compose and to dot-stuff before the write that has a deadline
-    // begins. A write with no deadline would hold the attempt for ever, which is what this guard,
-    // and nothing about the time the attempt took, is here to end.
+    // begins. The server holds its connection open and reads nothing, so nothing but the sender's
+    // own write deadline can end the attempt; a write with no deadline would hold it for ever,
+    // which is what this guard, and nothing about the time the attempt took, is here to end.
     let outcome = runtime
         .block_on(async {
             tokio::time::timeout(
