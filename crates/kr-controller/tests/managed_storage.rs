@@ -2166,8 +2166,15 @@ async fn the_daemon_a_person_runs_reaches_the_storage_service_it_selects() {
             }
         }
     });
+    // The daemon's own words, for a failure that would otherwise say only that something is missing.
+    let daemon_says = || std::fs::read_to_string(&log_path).unwrap_or_default();
     within("the daemon binds its endpoints", async {
-        let _ = ready.await;
+        ready.await.unwrap_or_else(|_| {
+            panic!(
+                "the daemon ended before it said what it serves; its log says: {}",
+                daemon_says()
+            )
+        });
     })
     .await;
     let endpoint = host
@@ -2176,7 +2183,12 @@ async fn the_daemon_a_person_runs_reaches_the_storage_service_it_selects() {
         .expect("an endpoint");
     let mut client = LocalClient::connect(&endpoint, LocalClientKind::Cli, build())
         .await
-        .expect("connects");
+        .unwrap_or_else(|error| {
+            panic!(
+                "connects: {error}; the daemon's log says: {}",
+                daemon_says()
+            )
+        });
     within(
         "the daemon's first question about backup storage",
         served.web().requests_reach(STATUS, 1),
