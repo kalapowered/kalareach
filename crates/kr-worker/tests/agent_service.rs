@@ -321,19 +321,28 @@ async fn host() -> Host {
 
 /// Waits until the host's journal is healthy, asking its maintenance to recover it where it is not.
 ///
-/// A store can refuse a write the first thing the host does, on a machine whose disk is slow or
-/// busy, and the journal is then faulted until the host's own maintenance writes the gap that
-/// explains it, which it does once a minute. Binding a component is refused meanwhile, for a reason
-/// that has nothing to do with the connector: so the tests that act on one start from a journal
-/// that works, and ask for the recovery the host would make rather than wait for its cadence. A
-/// store that stays faulted is the one thing that ends the wait, and says why.
+/// A store can refuse a write the first thing the host does, and the journal is then faulted until
+/// the host's own maintenance writes the gap that explains it, which it does once a minute.
+/// Binding a component is refused meanwhile, for a reason that has nothing to do with the
+/// connector: so the tests that act on one start from a journal that works, and ask for the
+/// recovery the host would make rather than wait for its cadence. A fault that is found is
+/// printed with the store's own answer and result code, so a run that passes still says it was
+/// there; a store that stays faulted is the one thing that ends the wait.
 fn until_the_journal_is_healthy(host: &Host) {
     let started = std::time::Instant::now();
+    let mut said = false;
     loop {
         host.service.recover_storage_now();
         let session = host.service.runtime().session();
         if session.health().is_healthy() {
             return;
+        }
+        if !said {
+            said = true;
+            eprintln!(
+                "the journal was faulted when the test began: {:?}",
+                session.journal_failure()
+            );
         }
         assert!(
             started.elapsed() < common::LIVENESS_DEADLINE,
