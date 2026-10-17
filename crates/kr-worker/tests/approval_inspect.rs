@@ -1692,7 +1692,11 @@ async fn a_worker_states_that_it_reads_a_forwarded_scope() {
     .await
     .expect("connects");
     assert!(
-        kr_protocol::local::reads_history_scopes(&client.acknowledgement().capabilities),
+        client
+            .acknowledgement()
+            .capabilities
+            .iter()
+            .any(|stated| stated.as_str() == kr_protocol::local::FORWARDED_HISTORY_SCOPE),
         "stated: {:?}",
         client.acknowledgement().capabilities
     );

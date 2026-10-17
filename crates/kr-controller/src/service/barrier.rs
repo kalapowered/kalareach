@@ -644,12 +644,7 @@ impl Controller {
         held: AuthorityRevision,
         bound: Option<std::time::Duration>,
     ) -> Option<kr_protocol::worker::AuthorityRevisionAck> {
-        let mut notices = self.revision_notices(
-            revision,
-            held,
-            0,
-            &link.client().acknowledgement().capabilities,
-        );
+        let mut notices = self.revision_notices(revision, held, 0);
         let told: Vec<AuthorityRevision> = notices.iter().map(|notice| notice.revision).collect();
         self.leases.announced(session_id, &told);
         let last = notices.pop().expect("an announcement is made");
@@ -1110,19 +1105,17 @@ impl Controller {
         groups
     }
 
-    /// The announcements of `revision` to a worker that said `capabilities` in its hello and last
-    /// acknowledged `held`, as this daemon recorded it, oldest first: the last is the one the
-    /// barrier waits on.
+    /// The announcements of `revision` to a worker that last acknowledged `held`, as this daemon
+    /// recorded it, oldest first: the last is the one the barrier waits on.
     ///
-    /// They name whose authority the revisions withdrew ([`Self::reach_groups`]) only to a worker
-    /// that reads that, and only for the first page of the revision's evidence: a continuation asks
-    /// for names of a revision the worker has already fenced.
+    /// They name whose authority the revisions withdrew ([`Self::reach_groups`]) only for the
+    /// first page of the revision's evidence: a continuation asks for names of a revision the
+    /// worker has already fenced.
     pub(crate) fn revision_notices(
         &self,
         revision: AuthorityRevision,
         held: AuthorityRevision,
         evidence_from: u64,
-        capabilities: &kr_protocol::scalars::CanonicalSet<kr_protocol::ids::CapabilityId>,
     ) -> Vec<kr_protocol::worker::AuthorityRevisionNotice> {
         let notice =
             |revision, reach, evidence_from| kr_protocol::worker::AuthorityRevisionNotice {
@@ -1131,7 +1124,7 @@ impl Controller {
                 reach,
                 evidence_from,
             };
-        if evidence_from != 0 || !kr_protocol::local::reads_revision_reach(capabilities) {
+        if evidence_from != 0 {
             return vec![notice(
                 revision,
                 kr_protocol::worker::RevisionReach::Host,
@@ -1151,9 +1144,8 @@ impl Controller {
         revision: AuthorityRevision,
         held: AuthorityRevision,
         evidence_from: u64,
-        capabilities: &kr_protocol::scalars::CanonicalSet<kr_protocol::ids::CapabilityId>,
     ) -> kr_protocol::worker::AuthorityRevisionNotice {
-        self.revision_notices(revision, held, evidence_from, capabilities)
+        self.revision_notices(revision, held, evidence_from)
             .pop()
             .expect("an announcement is made")
     }

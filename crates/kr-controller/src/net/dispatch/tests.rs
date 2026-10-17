@@ -1452,89 +1452,6 @@ async fn a_device_reads_an_agents_history_and_an_approval_record_under_its_grant
     world.serving.abort();
 }
 
-/// A worker of an earlier build does not say that it reads a forwarded read's history scope,
-/// and a frame with a member it does not know would end the link. So it is sent none: a
-/// device's snapshot reaches it without a scope, which it refuses by itself, and the same link
-/// serves the device's next read.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_worker_that_does_not_read_scopes_is_sent_none_and_serves_the_next_read() {
-    use std::sync::Arc;
-
-    use kr_protocol::agent::{
-        AgentBindingState, AgentCapabilitiesParams, AgentCapabilitiesResult, AgentSnapshotParams,
-        AgentSubject,
-    };
-
-    use crate::service::a_close_a_worker_never_answers as fake;
-
-    let capabilities = AgentCapabilitiesResult {
-        binding: AgentBindingState {
-            binding_revision: kr_protocol::ids::AgentBindingRevision::new(3),
-            thread_id: Nullable::null(),
-            turn_id: Nullable::null(),
-            profile_id: Nullable::null(),
-            mode: kr_protocol::broker::IntegrationMode::Gateway,
-            rich_mutations_suspended: false,
-            suspension_reason: Nullable::null(),
-        },
-        capabilities: kr_protocol::broker::CapabilityMap {
-            records: Vec::new(),
-        },
-    };
-    let recorded: fake::Recorded = Arc::default();
-    let world = answering_worker(
-        {
-            let capabilities = capabilities.clone();
-            Arc::new(move |request: &kr_protocol::envelope::Request| {
-                match request.method.method()? {
-                    Method::AgentCapabilities => ParamsValue::from_typed(&capabilities).ok(),
-                    _ => None,
-                }
-            })
-        },
-        Arc::clone(&recorded),
-        CanonicalSet::new(),
-    )
-    .await;
-    let controller = &world.controller;
-    fake::acknowledged(controller, world.session_id);
-    let subject = AgentSubject {
-        session_id: world.session_id,
-        application_instance_id: kr_protocol::ids::ApplicationInstanceId::new(Uuid::from_bytes(
-            [5; 16],
-        )),
-    };
-    let viewer = paired(controller, 18, |_| {});
-    let connection = super::RemoteConnection::for_test(controller, viewer);
-
-    let snapshot = device_request(
-        1,
-        Method::AgentSnapshot,
-        &AgentSnapshotParams {
-            subject,
-            from_node: Nullable::null(),
-        },
-    );
-    refusal(connection.read(&snapshot).await);
-    let next = device_request(
-        2,
-        Method::AgentCapabilities,
-        &AgentCapabilitiesParams { subject },
-    );
-    assert_eq!(
-        answered::<AgentCapabilitiesResult>(connection.read(&next).await),
-        capabilities,
-        "the link serves the next read"
-    );
-    let forwarded = forwarded_reads(&recorded);
-    assert_eq!(forwarded.len(), 2);
-    assert!(
-        forwarded.iter().all(|read| read.history.is_none()),
-        "a worker that does not read scopes is sent none"
-    );
-    world.serving.abort();
-}
-
 /// A device whose grant lets it close and read every session.
 fn closing_and_viewing(
     controller: &crate::service::Controller,
@@ -1819,7 +1736,7 @@ async fn a_replacement_daemon_settles_a_close_the_worker_answers_again_from_what
     assert!(
         matches!(
             closed.retained,
-            crate::service::net::Retained::Worker { .. }
+            crate::service::net::Retained::Worker
         ),
         "the worker answered from what it kept"
     );
@@ -1937,54 +1854,41 @@ pub(super) fn error_of(
     error
 }
 
-/// KR-REQ-10.49: a mutation carries the history scope of the grant a device acts under to a worker
-/// that holds what it retains to one, and carries none to a worker of an earlier build, which ends
-/// the link a frame with a member it does not know arrived on: a device's close is made either way.
+/// KR-REQ-10.49: a mutation carries the history scope of the grant a device acts under to the
+/// worker, on the wire as well as in the frame the worker reads.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn kr_req_10_49_a_mutation_carries_the_devices_scope_only_to_a_worker_that_holds_results_to_one()
- {
+async fn kr_req_10_49_a_mutation_carries_the_devices_scope_to_the_worker() {
     use kr_protocol::rights::ActionRight;
 
     use crate::service::a_close_a_worker_never_answers as fake;
     use crate::service::a_read_that_meets_a_worker_on_its_way_out::{self as scripted, Scripted};
 
-    for holds in [true, false] {
-        let script = Scripted::new();
-        if !holds {
-            script.built_before_results_were_held_to_scopes();
-        }
-        let world = scripted::scripted(&script).await;
-        let controller = &world.controller;
-        let connection =
-            super::RemoteConnection::for_test(controller, closing_and_viewing(controller, 31));
-        let closed = close_for_a_device(
-            &world,
-            &connection,
-            &fake::close_request(world.environment_id, world.session_id),
-            &[ActionRight::SessionView, ActionRight::SessionClose],
-        )
-        .await;
-        assert_eq!(
-            closed.retained,
-            crate::service::net::Retained::Not,
-            "{holds}"
-        );
-        let forwarded = script.forwarded();
-        assert_eq!(forwarded.len(), 1, "{holds}");
-        assert_eq!(
-            forwarded[0].history,
-            holds.then(|| connection.device.grant.history.clone()),
-            "a worker that holds results to a scope is sent it, and no other is: {holds}"
-        );
-        // On the wire the member is absent for a worker that does not state the capability, not
-        // null: a null member is one an earlier worker's closed frame refuses all the same.
-        assert_eq!(
-            script.forwarded_with_history(),
-            vec![holds],
-            "the bytes the proxy wrote carry a history member only for a capable worker: {holds}"
-        );
-        world.serving.abort();
-    }
+    let script = Scripted::new();
+    let world = scripted::scripted(&script).await;
+    let controller = &world.controller;
+    let connection =
+        super::RemoteConnection::for_test(controller, closing_and_viewing(controller, 31));
+    let closed = close_for_a_device(
+        &world,
+        &connection,
+        &fake::close_request(world.environment_id, world.session_id),
+        &[ActionRight::SessionView, ActionRight::SessionClose],
+    )
+    .await;
+    assert_eq!(closed.retained, crate::service::net::Retained::Not);
+    let forwarded = script.forwarded();
+    assert_eq!(forwarded.len(), 1);
+    assert_eq!(
+        forwarded[0].history,
+        Some(connection.device.grant.history.clone()),
+        "the worker is sent the scope of the grant the device acts under"
+    );
+    assert_eq!(
+        script.forwarded_with_history(),
+        vec![true],
+        "and the bytes the proxy wrote carry it"
+    );
+    world.serving.abort();
 }
 
 /// Publishes one small attachment for `actor`.
@@ -3661,8 +3565,8 @@ async fn a_sweep_leaves_a_draft_sent_to_a_session_that_began_after_it_asked() {
 }
 
 /// KR-REQ-10.49: the daemon's own link to a worker, the one a close made at the local door and a
-/// supervised action go through, carries no history scope on the wire whatever the worker states:
-/// it acts as the owner, whom no scope bounds.
+/// supervised action go through, carries no history scope on the wire: it acts as the owner, whom
+/// no scope bounds.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_10_49_the_daemons_own_link_forwards_no_history_member() {
     use kr_protocol::rights::ActionRight;
@@ -3670,219 +3574,172 @@ async fn kr_req_10_49_the_daemons_own_link_forwards_no_history_member() {
     use crate::service::a_close_a_worker_never_answers as fake;
     use crate::service::a_read_that_meets_a_worker_on_its_way_out::{self as scripted, Scripted};
 
-    for holds in [true, false] {
-        let script = Scripted::new();
-        if !holds {
-            script.built_before_results_were_held_to_scopes();
-        }
-        let world = scripted::scripted(&script).await;
-        let mut client = world
-            .controller
-            .worker_client(&world.worker)
-            .await
-            .expect("the daemon's own link");
-        let rights: CanonicalSet<ActionRight> = [ActionRight::SessionClose].into_iter().collect();
-        let answered = client
-            .client()
-            .forward(
-                &fake::close_request(world.environment_id, world.session_id),
-                &world.actor,
-                &rights,
-                kr_protocol::scalars::U64::new(u64::MAX),
-            )
-            .await
-            .expect("the worker answers the daemon's own close");
-        assert!(answered.is_ok(), "the close is accepted: {answered:?}");
-        drop(client);
-        assert_eq!(script.forwarded().len(), 1, "{holds}");
-        assert_eq!(
-            script.forwarded_with_history(),
-            vec![false],
-            "no history member reaches the worker, stated capability or not: {holds}"
-        );
-        world.serving.abort();
-    }
+    let script = Scripted::new();
+    let world = scripted::scripted(&script).await;
+    let mut client = world
+        .controller
+        .worker_client(&world.worker)
+        .await
+        .expect("the daemon's own link");
+    let rights: CanonicalSet<ActionRight> = [ActionRight::SessionClose].into_iter().collect();
+    let answered = client
+        .client()
+        .forward(
+            &fake::close_request(world.environment_id, world.session_id),
+            &world.actor,
+            &rights,
+            kr_protocol::scalars::U64::new(u64::MAX),
+        )
+        .await
+        .expect("the worker answers the daemon's own close");
+    assert!(answered.is_ok(), "the close is accepted: {answered:?}");
+    drop(client);
+    assert_eq!(script.forwarded().len(), 1);
+    assert_eq!(
+        script.forwarded_with_history(),
+        vec![false],
+        "no history member reaches the worker"
+    );
+    world.serving.abort();
 }
 
-/// KR-REQ-10.49: an answer to a question, for a device that has a history scope, is not sent to a
-/// worker that does not hold what it retains to one: it would answer with the whole question. The
-/// refusal is `UNSUPPORTED_CAPABILITY`, before anything is sent. A worker that does is sent it.
+/// KR-REQ-10.49: a device's retry of a close whose answer the worker kept is answered, and the
+/// daemon settles the kept answer first, as it settles one given now: the worker keeps the answer
+/// whole, which the daemon uses for its own record, and shows the device what its grant reaches.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn kr_req_10_49_a_question_is_not_resolved_for_a_device_at_a_worker_that_cannot_hold_the_answer_to_its_scope()
- {
-    use kr_protocol::rights::ActionRight;
-
-    use crate::service::a_read_that_meets_a_worker_on_its_way_out::{self as scripted, Scripted};
-
-    for holds in [false, true] {
-        let script = Scripted::new();
-        if !holds {
-            script.built_before_results_were_held_to_scopes();
-        }
-        let world = scripted::scripted(&script).await;
-        let controller = &world.controller;
-        let connection = super::RemoteConnection::for_test(
-            controller,
-            paired(controller, 32, |grant| {
-                grant.actions = [ActionRight::SessionView, ActionRight::QuestionRespond]
-                    .into_iter()
-                    .collect();
-                grant.history.lower_bound_ms =
-                    Nullable::some(kr_protocol::scalars::TimestampMs::new(0));
-            }),
-        );
-        let params = kr_protocol::question::QuestionAnswerParams {
-            session_id: world.session_id,
-            question_id: kr_protocol::ids::QuestionId::new(kr_ipc::new_uuid()),
-            expected_revision: kr_protocol::ids::QuestionRevision::new(1),
-            answer: kr_protocol::question::QuestionAnswer::Decision { decided: true },
-        };
-        for (index, method) in [Method::QuestionAnswer, Method::QuestionCancel]
-            .into_iter()
-            .enumerate()
-        {
-            let params = if method == Method::QuestionAnswer {
-                ParamsValue::from_typed(&params).expect("encodes")
-            } else {
-                ParamsValue::from_typed(&kr_protocol::question::QuestionCancelParams {
-                    session_id: params.session_id,
-                    question_id: params.question_id,
-                    expected_revision: params.expected_revision,
-                })
-                .expect("encodes")
-            };
-            let mutation = device_mutation(&world, &connection, method, 41, params);
-            let answer = connection.mutate(&mutation).await;
-            if holds {
-                // It reached the worker, which refuses what it does not perform.
-                assert_eq!(script.forwarded().len(), index + 1, "{method:?}");
-                assert_eq!(
-                    error_of(&answer).code,
-                    kr_protocol::error::ErrorCode::ResourceUnavailable,
-                    "{answer:?}"
-                );
-            } else {
-                assert_eq!(
-                    script.forwarded().len(),
-                    0,
-                    "nothing was sent for {method:?}"
-                );
-                assert_eq!(
-                    error_of(&answer).code,
-                    kr_protocol::error::ErrorCode::UnsupportedCapability,
-                    "{answer:?}"
-                );
-            }
-        }
-        world.serving.abort();
-    }
-}
-
-/// KR-REQ-10.49: a device's retry of a close whose answer a worker of an earlier build kept is
-/// refused by name, and the daemon settles the kept answer first, as it settles one given now: the
-/// worker keeps the answer whole, which the daemon uses for its own record and does not show. The
-/// refusal says the host holds the answer and that a close under a new action identifier stops the
-/// session, and never that the first close did not happen. The control, a worker that holds
-/// results to a scope, answers the retry.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn kr_req_10_49_a_retried_close_at_an_earlier_worker_is_settled_and_refused_by_name() {
+async fn kr_req_10_49_a_retried_close_is_answered_and_the_kept_answer_is_settled() {
     use kr_protocol::envelope::{ControlFrame, Outcome, Response};
     use kr_protocol::session::SessionState;
 
     use crate::service::a_close_a_worker_never_answers as fake;
     use crate::service::a_read_that_meets_a_worker_on_its_way_out::{self as scripted, Scripted};
 
-    for holds in [false, true] {
-        let script = Scripted::new();
-        if !holds {
-            script.built_before_results_were_held_to_scopes();
-        }
-        let world = scripted::scripted(&script).await;
-        script.refuse_reads(true);
-        let world = scripted::restarted(world).await;
-        let controller = &world.controller;
-        let connection =
-            super::RemoteConnection::for_test(controller, closing_and_viewing(controller, 33));
-        let close = fake::close_request(world.environment_id, world.session_id);
-        assert!(
-            connection
-                .claim_route(&close, Some(world.session_id))
-                .is_ok(),
-            "the route of the close is on record"
-        );
-        let accepted = script.acceptance(world.session_id);
-        script.kept(
-            close.action_id,
-            ParamsValue::from_typed(&accepted).expect("encodes"),
-        );
+    let script = Scripted::new();
+    let world = scripted::scripted(&script).await;
+    script.refuse_reads(true);
+    let world = scripted::restarted(world).await;
+    let controller = &world.controller;
+    let connection =
+        super::RemoteConnection::for_test(controller, closing_and_viewing(controller, 33));
+    let close = fake::close_request(world.environment_id, world.session_id);
+    assert!(
+        connection
+            .claim_route(&close, Some(world.session_id))
+            .is_ok(),
+        "the route of the close is on record"
+    );
+    let accepted = script.acceptance(world.session_id);
+    script.kept(
+        close.action_id,
+        ParamsValue::from_typed(&accepted).expect("encodes"),
+    );
 
-        let answered = connection
-            .answer(ControlFrame::Mutation(Box::new(close)))
-            .await
-            .expect("the retry is answered");
-        if holds {
-            let ControlFrame::Response(Response {
-                outcome: Outcome::Ok(_),
-                ..
-            }) = answered.frame()
-            else {
-                panic!(
-                    "a worker that holds results to a scope answers: {:?}",
-                    answered.frame()
-                );
-            };
-        } else {
-            let error = error_of(answered.frame());
-            assert_eq!(
-                error.code,
-                kr_protocol::error::ErrorCode::UnsupportedCapability,
-                "{error}"
-            );
-            assert!(
-                error.message.contains("holds what this action produced"),
-                "{error}"
-            );
-            assert!(error.message.contains("new action identifier"), "{error}");
-            assert!(!error.message.contains("not done"), "{error}");
-        }
+    let answered = connection
+        .answer(ControlFrame::Mutation(Box::new(close)))
+        .await
+        .expect("the retry is answered");
+    let ControlFrame::Response(Response {
+        outcome: Outcome::Ok(_),
+        ..
+    }) = answered.frame()
+    else {
+        panic!("the retry is answered: {:?}", answered.frame());
+    };
 
-        // Either way the daemon kept what the worker said of the session, so a read answers
-        // closing once the worker has stopped answering.
-        let (_arrived, go) = script.end_at_next_read();
-        drop(go);
-        let read = scripted::read(&world)
-            .await
-            .expect("a closing session is answered from the acceptance the worker kept");
-        assert_eq!(Some(read.session), accepted.session, "{holds}");
-        assert_eq!(
-            scripted::list(&world, false).await,
-            vec![(world.session_id, SessionState::Closing)]
-        );
-        world.serving.abort();
-    }
+    // The daemon kept what the worker said of the session, so a read answers closing once the
+    // worker has stopped answering.
+    let (_arrived, go) = script.end_at_next_read();
+    drop(go);
+    let read = scripted::read(&world)
+        .await
+        .expect("a closing session is answered from the acceptance the worker kept");
+    assert_eq!(Some(read.session), accepted.session);
+    assert_eq!(
+        scripted::list(&world, false).await,
+        vec![(world.session_id, SessionState::Closing)]
+    );
+    world.serving.abort();
 }
 
-/// KR-REQ-10.49: the receipt a worker of an earlier build keeps for a refused action holds no
-/// result and an error whose text it did not hold to anything, and a device is not shown it: the
-/// retry is refused by name, with none of the worker's words in it. A worker that holds results to
-/// a scope is the control: it answers with the receipt.
+/// KR-REQ-10.49: the receipt a worker keeps for a refused action holds no result and an error whose
+/// text the device is not shown: the retry is answered with the receipt as the worker held it to
+/// the device's grant, and nothing the device receives carries the worker's words.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn kr_req_10_49_a_receipt_an_earlier_worker_kept_is_not_shown_to_a_device() {
+async fn kr_req_10_49_a_kept_result_is_not_shown_to_a_device() {
     use kr_protocol::envelope::ControlFrame;
     use kr_protocol::rights::ActionRight;
 
     use crate::service::a_read_that_meets_a_worker_on_its_way_out::{self as scripted, Scripted};
 
-    for holds in [false, true] {
+    let script = Scripted::new();
+    let world = scripted::scripted(&script).await;
+    let controller = &world.controller;
+    let connection = super::RemoteConnection::for_test(
+        controller,
+        paired(controller, 34, |grant| {
+            grant.actions = [ActionRight::SessionView, ActionRight::AgentPrompt]
+                .into_iter()
+                .collect();
+        }),
+    );
+    let prompt = device_mutation(
+        &world,
+        &connection,
+        Method::AgentPromptSubmit,
+        51,
+        ParamsValue::empty(),
+    );
+    assert!(
+        connection
+            .claim_route(&prompt, Some(world.session_id))
+            .is_ok(),
+        "the route of the prompt is on record"
+    );
+    script.kept_without_a_result(
+        prompt.action_id,
+        Method::AgentPromptSubmit,
+        kr_protocol::error::ProtocolError::new(
+            kr_protocol::error::ErrorCode::InvalidArgument,
+            "the agent said the prompt quoted /home/person/secret-notes",
+        ),
+    );
+    let answered = connection
+        .answer(ControlFrame::Mutation(Box::new(prompt)))
+        .await
+        .expect("the retry is answered");
+    assert!(
+        matches!(answered.frame(), ControlFrame::Receipt(_)),
+        "{:?}",
+        answered.frame()
+    );
+    let shown = format!("{:?}", answered.frame());
+    assert!(!shown.contains("secret-notes"), "{shown}");
+    assert!(!shown.contains("the agent said"), "{shown}");
+    world.serving.abort();
+}
+
+/// KR-REQ-10.49: what a worker kept is passed to a device only as the daemon reads it in the shape
+/// of the worker's level. An answer that does not read there is refused by name and is not passed
+/// on as it came, and the action is not dispatched again to get another. The control is the same
+/// retry answered by a worker whose answer reads: it is answered, with the worker's words withheld.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_10_49_a_kept_answer_that_does_not_read_in_the_workers_level_is_refused_not_passed_on()
+ {
+    use kr_protocol::envelope::ControlFrame;
+    use kr_protocol::rights::ActionRight;
+
+    use crate::service::a_read_that_meets_a_worker_on_its_way_out::{self as scripted, Scripted};
+
+    for readable in [true, false] {
         let script = Scripted::new();
-        if !holds {
-            script.built_before_results_were_held_to_scopes();
+        if !readable {
+            script.answers_receipts_in_no_known_form();
         }
         let world = scripted::scripted(&script).await;
         let controller = &world.controller;
         let connection = super::RemoteConnection::for_test(
             controller,
-            paired(controller, 34, |grant| {
+            paired(controller, 36, |grant| {
                 grant.actions = [ActionRight::SessionView, ActionRight::AgentPrompt]
                     .into_iter()
                     .collect();
@@ -3892,7 +3749,7 @@ async fn kr_req_10_49_a_receipt_an_earlier_worker_kept_is_not_shown_to_a_device(
             &world,
             &connection,
             Method::AgentPromptSubmit,
-            51,
+            52,
             ParamsValue::empty(),
         );
         assert!(
@@ -3913,7 +3770,7 @@ async fn kr_req_10_49_a_receipt_an_earlier_worker_kept_is_not_shown_to_a_device(
             .answer(ControlFrame::Mutation(Box::new(prompt)))
             .await
             .expect("the retry is answered");
-        if holds {
+        if readable {
             assert!(
                 matches!(answered.frame(), ControlFrame::Receipt(_)),
                 "{:?}",
@@ -3923,11 +3780,15 @@ async fn kr_req_10_49_a_receipt_an_earlier_worker_kept_is_not_shown_to_a_device(
             let error = error_of(answered.frame());
             assert_eq!(
                 error.code,
-                kr_protocol::error::ErrorCode::UnsupportedCapability,
+                kr_protocol::error::ErrorCode::UnsupportedSchema,
                 "{error}"
             );
             assert!(!error.message.contains("secret-notes"), "{error}");
-            assert!(!error.message.contains("the agent said"), "{error}");
+            assert_eq!(
+                script.forwarded().len(),
+                0,
+                "the action was not dispatched again"
+            );
         }
         world.serving.abort();
     }
@@ -3938,8 +3799,7 @@ async fn kr_req_10_49_a_receipt_an_earlier_worker_kept_is_not_shown_to_a_device(
 /// ahead, and what a worker answers a retried close with is checked on its way back. The route is
 /// recorded before the close is sent, and a link that fails after that leaves a route and no
 /// receipt, which is not a reason to refuse a close the caller may make. A close the worker
-/// already kept is made again and not shown, and the daemon settles what the worker kept. Both
-/// contracts of worker are tried.
+/// already kept is made again and not shown, and the daemon settles what the worker kept.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_23_34_a_close_is_made_for_a_caller_that_may_not_read_its_receipt() {
     use kr_protocol::envelope::{ControlFrame, Outcome, Response};
@@ -3948,90 +3808,81 @@ async fn kr_req_23_34_a_close_is_made_for_a_caller_that_may_not_read_its_receipt
 
     use crate::service::a_read_that_meets_a_worker_on_its_way_out::{self as scripted, Scripted};
 
-    for holds in [true, false] {
-        for kept in [false, true] {
-            let script = Scripted::new();
-            if !holds {
-                script.built_before_results_were_held_to_scopes();
-            }
-            let world = scripted::scripted(&script).await;
-            script.refuse_reads(true);
-            let world = scripted::restarted(world).await;
-            let controller = &world.controller;
-            let connection = super::RemoteConnection::for_test(
-                controller,
-                paired(controller, 35, |grant| {
-                    grant.actions = [ActionRight::SessionClose].into_iter().collect();
-                }),
+    for kept in [false, true] {
+        let script = Scripted::new();
+        let world = scripted::scripted(&script).await;
+        script.refuse_reads(true);
+        let world = scripted::restarted(world).await;
+        let controller = &world.controller;
+        let connection = super::RemoteConnection::for_test(
+            controller,
+            paired(controller, 35, |grant| {
+                grant.actions = [ActionRight::SessionClose].into_iter().collect();
+            }),
+        );
+        let close = device_mutation(
+            &world,
+            &connection,
+            Method::SessionClose,
+            1,
+            ParamsValue::from_typed(&kr_protocol::session::SessionCloseParams {
+                session_id: world.session_id,
+            })
+            .expect("encodes"),
+        );
+        assert!(
+            connection
+                .claim_route(&close, Some(world.session_id))
+                .is_ok(),
+            "the route of the close is on record"
+        );
+        let accepted = script.acceptance(world.session_id);
+        if kept {
+            script.kept(
+                close.action_id,
+                ParamsValue::from_typed(&accepted).expect("encodes"),
             );
-            let close = device_mutation(
-                &world,
-                &connection,
-                Method::SessionClose,
-                1,
-                ParamsValue::from_typed(&kr_protocol::session::SessionCloseParams {
-                    session_id: world.session_id,
-                })
-                .expect("encodes"),
-            );
-            assert!(
-                connection
-                    .claim_route(&close, Some(world.session_id))
-                    .is_ok(),
-                "the route of the close is on record"
-            );
-            let accepted = script.acceptance(world.session_id);
-            if kept {
-                script.kept(
-                    close.action_id,
-                    ParamsValue::from_typed(&accepted).expect("encodes"),
-                );
-            }
-            let answered = connection
-                .answer(ControlFrame::Mutation(Box::new(close)))
-                .await
-                .expect("the close is answered");
-            assert_eq!(
-                script.forwarded().len(),
-                1,
-                "the close reaches the worker once, whatever it kept and whatever it holds: \
-                 holds {holds}, kept {kept}: {:?}",
-                answered.frame()
-            );
-            if kept {
-                let error = error_of(answered.frame());
-                assert!(
-                    matches!(
-                        error.code,
-                        kr_protocol::error::ErrorCode::PermissionDenied
-                            | kr_protocol::error::ErrorCode::UnsupportedCapability
-                    ),
-                    "{error}"
-                );
-                // What it kept is settled all the same.
-                let (_arrived, go) = script.end_at_next_read();
-                drop(go);
-                let read = scripted::read(&world)
-                    .await
-                    .expect("a closing session is answered from the acceptance the worker kept");
-                assert_eq!(Some(read.session), accepted.session);
-                assert_eq!(
-                    scripted::list(&world, false).await,
-                    vec![(world.session_id, SessionState::Closing)]
-                );
-            } else {
-                let ControlFrame::Response(Response {
-                    outcome: Outcome::Ok(value),
-                    ..
-                }) = answered.frame()
-                else {
-                    panic!("the close is made: {:?}", answered.frame());
-                };
-                let made: SessionCloseResult = value.to_typed().expect("a close answer");
-                assert_eq!(made.state, SessionState::Closing);
-            }
-            world.serving.abort();
         }
+        let answered = connection
+            .answer(ControlFrame::Mutation(Box::new(close)))
+            .await
+            .expect("the close is answered");
+        assert_eq!(
+            script.forwarded().len(),
+            1,
+            "the close reaches the worker once, whatever it kept, kept {kept}: {:?}",
+            answered.frame()
+        );
+        if kept {
+            let error = error_of(answered.frame());
+            assert_eq!(
+                error.code,
+                kr_protocol::error::ErrorCode::PermissionDenied,
+                "{error}"
+            );
+            // What it kept is settled all the same.
+            let (_arrived, go) = script.end_at_next_read();
+            drop(go);
+            let read = scripted::read(&world)
+                .await
+                .expect("a closing session is answered from the acceptance the worker kept");
+            assert_eq!(Some(read.session), accepted.session);
+            assert_eq!(
+                scripted::list(&world, false).await,
+                vec![(world.session_id, SessionState::Closing)]
+            );
+        } else {
+            let ControlFrame::Response(Response {
+                outcome: Outcome::Ok(value),
+                ..
+            }) = answered.frame()
+            else {
+                panic!("the close is made: {:?}", answered.frame());
+            };
+            let made: SessionCloseResult = value.to_typed().expect("a close answer");
+            assert_eq!(made.state, SessionState::Closing);
+        }
+        world.serving.abort();
     }
 }
 
@@ -4348,8 +4199,8 @@ async fn kr_req_23_34_a_retry_of_an_action_other_than_a_close_is_refused_to_a_ca
 
 /// KR-REQ-23.34: a retried close of a session this daemon recorded the closure of is answered from
 /// that record, which no worker gave and which therefore is not a worker's whole answer: it is the
-/// daemon's own, and a device that may read it is shown it, whichever contract the session's worker
-/// kept. It carries no description, because no worker is left to describe the session.
+/// daemon's own, and a device that may read it is shown it. It carries no description, because no
+/// worker is left to describe the session.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_23_34_a_close_answered_from_the_closure_record_is_the_daemons_own() {
     use kr_protocol::rights::ActionRight;
@@ -4359,7 +4210,6 @@ async fn kr_req_23_34_a_close_answered_from_the_closure_record_is_the_daemons_ow
     use crate::service::a_read_that_meets_a_worker_on_its_way_out::{self as scripted, Scripted};
 
     let script = Scripted::new();
-    script.built_before_results_were_held_to_scopes();
     let world = scripted::scripted(&script).await;
     let controller = &world.controller;
     controller

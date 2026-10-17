@@ -268,8 +268,8 @@ impl Controller {
     }
 
     /// Tells the worker behind `client` what the local owner may do, and settles: it is told again
-    /// until the sequence it acknowledged is the one in force. Nothing is sent to a worker that
-    /// does not state `local.access/1`, which would end its connection.
+    /// until the sequence it acknowledged is the one in force. A worker whose level cannot read the
+    /// statement is sent nothing, and its link goes on.
     ///
     /// Returns the sequence the worker acknowledged, or nothing for a worker that cannot be told.
     pub(crate) async fn tell_link(
@@ -277,19 +277,18 @@ impl Controller {
         session_id: SessionId,
         client: &mut BoundLink,
     ) -> Result<Option<u64>> {
-        let states = kr_protocol::local::holds_local_access(&client.acknowledgement().capabilities);
-        self.local_access.note_worker(session_id, states, None);
-        if !states {
-            return Ok(None);
-        }
         let mut frame = self.local_access_now();
         #[cfg(test)]
         self.after_the_local_access_is_drawn.wait().await;
         loop {
-            let ack = client
-                .announce_local_access(frame)
-                .await
-                .map_err(ControllerError::from)?;
+            let ack = match client.announce_local_access(frame).await {
+                Ok(ack) => ack,
+                Err(kr_ipc::IpcError::NotInLevel(_)) => {
+                    self.local_access.note_worker(session_id, false, None);
+                    return Ok(None);
+                }
+                Err(error) => return Err(ControllerError::from(error)),
+            };
             let held = ack.sequence.get();
             if held < frame.sequence.get() {
                 return Err(ControllerError::supervision(
@@ -343,9 +342,9 @@ impl Controller {
     }
 
     /// The sessions whose workers cannot be told what the local owner may do, as the registry
-    /// stands: every recorded worker that has not stated `local.access/1` (one never reached
-    /// counts as lacking it), and every claimed or fenced reservation that this run of the daemon
-    /// did not make, whose worker may still be alive.
+    /// stands: every recorded worker that has not been told (one never reached counts as lacking
+    /// it), and every claimed or fenced reservation that this run of the daemon did not make,
+    /// whose worker may still be alive.
     ///
     /// # Errors
     ///

@@ -2636,13 +2636,14 @@ fn as_the_worker_gave_it(error: ProtocolError) -> PreviewFailure {
     })
 }
 
-/// Reads an answer of the worker as `T`, or refuses the share as unreachable: a worker that answers
-/// a read with something else has said nothing about it.
+/// Reads an answer of the worker as `T` in the shape of its level, or refuses the share as
+/// unreachable: a worker that answers a read with something else has said nothing about it.
 fn answered_as<T: kr_protocol::wire::WireMessage>(
+    level: kr_protocol::retained::Level,
     value: &ParamsValue,
 ) -> std::result::Result<T, PreviewFailure> {
-    value
-        .to_typed()
+    level
+        .decode_value(value)
         .map_err(|error| PreviewFailure::Refused(unreachable_worker(error)))
 }
 
@@ -2651,8 +2652,7 @@ fn answered_as<T: kr_protocol::wire::WireMessage>(
 /// The worker cuts them to the scope the share would carry and says when it had to cut them;
 /// [`crate::sharing::SharingService::preview`] then refuses a screen that was cut, because a
 /// preview that says less than the recipient will see is the thing the preview is there to
-/// prevent. A worker of an earlier build does not know the read, and the screen is not shared
-/// through it.
+/// prevent.
 async fn read_screen(
     client: &mut BoundLink,
     session_id: SessionId,
@@ -2669,21 +2669,7 @@ async fn read_screen(
         .await
         .map_err(PreviewFailure::Link)?;
     let result: kr_protocol::sharing::SessionScreenPreviewResult = match answered {
-        Ok(value) => answered_as(&value)?,
-        // A worker of an earlier build lists no such read, and answers it as it answers any method
-        // it does not list.
-        Err(error)
-            if error.code == ErrorCode::UnsupportedCapability
-                || (error.code == ErrorCode::PermissionDenied
-                    && error.message == kr_protocol::local::METHOD_NOT_REACHABLE) =>
-        {
-            return Err(PreviewFailure::Refused(ControllerError::Refused {
-                code: ErrorCode::UnsupportedCapability,
-                detail: "this session's worker is of a build that cannot show its screen to the \
-                         issuer of a share, so the screen is not shared"
-                    .to_owned(),
-            }));
-        }
+        Ok(value) => answered_as(client.level(), &value)?,
         Err(error) => return Err(as_the_worker_gave_it(error)),
     };
     let Some(screen) = result.screen.0 else {
@@ -2723,7 +2709,7 @@ async fn read_previews(
             .await
             .map_err(PreviewFailure::Link)?;
         let read: QuestionReadResult = match answered {
-            Ok(value) => answered_as(&value)?,
+            Ok(value) => answered_as(client.level(), &value)?,
             // The worker refuses a question it does not hold without saying whether it exists.
             Err(error) if error.code == ErrorCode::PermissionDenied => {
                 return Err(no_open_question());
@@ -2768,7 +2754,7 @@ async fn read_previews(
             .await
             .map_err(PreviewFailure::Link)?;
         let record: AgentApprovalInspectResult = match answered {
-            Ok(value) => answered_as(&value)?,
+            Ok(value) => answered_as(client.level(), &value)?,
             // The worker answers a record it does not hold, or no longer holds under that
             // instance, as an unknown subject, with one text for every such case.
             Err(error) if error.code == ErrorCode::StaleSession => {
@@ -2815,7 +2801,7 @@ async fn holding(
                 .await
                 .map_err(PreviewFailure::Link)?;
             let page: EventsSnapshotResult = match answered {
-                Ok(value) => answered_as(&value)?,
+                Ok(value) => answered_as(client.level(), &value)?,
                 Err(error) if error.code == ErrorCode::ResyncRequired => continue 'snapshot,
                 Err(error) => return Err(as_the_worker_gave_it(error)),
             };

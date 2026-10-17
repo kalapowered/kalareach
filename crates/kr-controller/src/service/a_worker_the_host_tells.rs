@@ -1,8 +1,7 @@
 //! What this daemon sends a session worker about its host's local owner, and when.
 //!
 //! The worker here is a recording one that stands for each worker a daemon can meet: one that
-//! states it can be told what the local owner may do and acknowledges the statement, one that
-//! states nothing, as a worker of an earlier release does, and one whose first exchange fails. A
+//! acknowledges the statement of what the local owner may do and one whose first exchange fails. A
 //! test reads what the worker was sent, in the order it arrived.
 
 use std::sync::Arc;
@@ -33,8 +32,6 @@ type Heard = Arc<std::sync::Mutex<Vec<(u64, ControlFrame)>>>;
 /// How a recording worker behaves.
 #[derive(Clone, Copy)]
 struct Behaviour {
-    /// Whether it states that it can be told what the local owner may do.
-    states: bool,
     /// Whether it ends the link that carries the first such statement without answering it.
     fails_the_first_statement: bool,
 }
@@ -47,13 +44,10 @@ fn recording(
     move |listener, identity, endpoint_text| {
         let failing = Arc::new(AtomicBool::new(behaviour.fails_the_first_statement));
         let links = Arc::new(AtomicU64::new(0));
-        let stated: CanonicalSet<CapabilityId> = if behaviour.states {
+        let stated: CanonicalSet<CapabilityId> =
             [CapabilityId::new(kr_protocol::local::LOCAL_ACCESS).expect("a capability")]
                 .into_iter()
-                .collect()
-        } else {
-            CanonicalSet::new()
-        };
+                .collect();
         tokio::spawn(async move {
             loop {
                 let Ok((connection, peer)) = listener.accept().await else {
@@ -69,14 +63,21 @@ fn recording(
                     let (mut reader, mut writer) = split(connection, StreamKind::Control);
                     let connection_id = ConnectionId::new(kr_ipc::new_uuid());
                     while let Ok(frame) = reader.read_message::<ControlFrame>().await {
-                        if let Some(answers) = world::handshake(
-                            &frame,
-                            &identity,
-                            &endpoint_text,
-                            connection_id,
-                            &peer,
-                            &stated,
-                        ) {
+                        // The statements are what this worker is here to record, so they are
+                        // not answered with the rest of the handshake.
+                        let handshaking = if matches!(frame, ControlFrame::LocalAccess(_)) {
+                            None
+                        } else {
+                            world::handshake(
+                                &frame,
+                                &identity,
+                                &endpoint_text,
+                                connection_id,
+                                &peer,
+                                &stated,
+                            )
+                        };
+                        if let Some(answers) = handshaking {
                             for answer in answers {
                                 if writer.write_message(&answer).await.is_err() {
                                     return;
@@ -90,9 +91,7 @@ fn recording(
                             .push((link, frame.clone()));
                         let answer = match frame {
                             ControlFrame::LocalAccess(access) => {
-                                // A worker that does not state the capability ends the link that
-                                // carries one, as a worker of an earlier release does.
-                                if !behaviour.states || failing.swap(false, Ordering::SeqCst) {
+                                if failing.swap(false, Ordering::SeqCst) {
                                     return;
                                 }
                                 ControlFrame::LocalAccessAck(LocalAccessAck {
@@ -189,7 +188,6 @@ async fn a_barrier_tells_a_worker_what_its_local_owner_may_do_before_it_announce
     use kr_protocol::worker::LocalBound;
 
     let (silent, recorded) = with(Behaviour {
-        states: true,
         fails_the_first_statement: false,
     })
     .await;
@@ -239,14 +237,12 @@ async fn a_barrier_tells_a_worker_what_its_local_owner_may_do_before_it_announce
     silent.serving.abort();
 }
 
-/// KR-REQ-17.54: a worker that states no capability is sent no statement: it would end the link
-/// that carried one, as a worker of an earlier release does. Such a worker is counted as one that
-/// cannot be told, which is what the enablement of exclusive management refuses to pass over.
+/// KR-REQ-17.54: a worker whose level cannot read the statement is sent none, and the link it was
+/// told on goes on. Such a worker is counted as one that cannot be told, which is what the
+/// enablement of exclusive management refuses to pass over.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_worker_that_states_no_capability_is_sent_no_statement_and_counts_as_one_that_cannot_be_told()
- {
+async fn a_worker_whose_level_cannot_read_the_statement_is_sent_none_and_its_link_goes_on() {
     let (silent, recorded) = with(Behaviour {
-        states: false,
         fails_the_first_statement: false,
     })
     .await;
@@ -261,24 +257,43 @@ async fn a_worker_that_states_no_capability_is_sent_no_statement_and_counts_as_o
             Some(&kr_protocol::identity::DesktopBinding::none()),
         )
         .expect("the registry records the worker");
-
-    controller.tell_workers().await;
-    let debt = controller
-        .owe_debt("a change that restricts", Reach::Host)
-        .expect("written");
-    let own = controller.publish_debts(&[(debt, Reach::Host)]);
-    controller.barrier(own).await.expect("a barrier");
-
-    assert_eq!(
-        lacking(&silent).await,
-        vec![silent.session_id],
-        "the worker's hello said it cannot be told, and the host counts it as one that cannot be"
+    // A level whose frames have no statement of what the local owner may do.
+    let level = kr_protocol::retained::a_level_of_the_tests_own(
+        |definitions| {
+            definitions["ControlFrame"]["oneOf"]
+                .as_array_mut()
+                .expect("variants")
+                .retain(|variant| variant["properties"].get("local_access").is_none());
+        },
+        &[],
     );
+    let mut link = kr_ipc::client::BoundLink::connect_at(
+        &silent.worker.endpoint,
+        controller.build_id.clone(),
+        level,
+    )
+    .await
+    .expect("the link is made");
+
+    for _ in 0..2 {
+        assert_eq!(
+            controller
+                .tell_link(silent.session_id, &mut link)
+                .await
+                .expect("a worker that cannot be told is not an error, and its link goes on"),
+            None
+        );
+    }
     assert!(
         !heard(&recorded)
             .iter()
             .any(|frame| matches!(frame, ControlFrame::LocalAccess(_))),
-        "no statement reached a worker that cannot take one"
+        "no statement reached a worker that cannot read one"
+    );
+    assert_eq!(
+        lacking(&silent).await,
+        vec![silent.session_id],
+        "and the host counts it as one that cannot be told"
     );
     silent.serving.abort();
 }
@@ -288,7 +303,6 @@ async fn a_worker_that_states_no_capability_is_sent_no_statement_and_counts_as_o
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_statement_a_worker_did_not_acknowledge_is_sent_again_by_the_publisher_alone() {
     let (silent, recorded) = with(Behaviour {
-        states: true,
         fails_the_first_statement: true,
     })
     .await;
@@ -308,14 +322,13 @@ async fn a_statement_a_worker_did_not_acknowledge_is_sent_again_by_the_publisher
 }
 
 /// KR-REQ-17.54: the host counts as unable to be told every recorded worker it has not reached or
-/// that states no capability, and every claimed launch that this run of the daemon did not make,
-/// because its worker may be alive and serving its local caller without the hold. A worker it has
-/// told is not counted. Making the host exclusively organisation-managed is refused while the
-/// count is not empty.
+/// whose level cannot read the statement, and every claimed launch that this run of the daemon did
+/// not make, because its worker may be alive and serving its local caller without the hold. A
+/// worker it has told is not counted. Making the host exclusively organisation-managed is refused
+/// while the count is not empty.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_host_counts_the_workers_it_cannot_tell_and_not_those_it_has_told() {
     let (silent, _recorded) = with(Behaviour {
-        states: true,
         fails_the_first_statement: false,
     })
     .await;
@@ -333,7 +346,7 @@ async fn the_host_counts_the_workers_it_cannot_tell_and_not_those_it_has_told() 
     // A recorded worker that has not been reached counts as one that cannot be told.
     assert_eq!(lacking(&silent).await, vec![silent.session_id]);
 
-    // Once it has been reached and states the capability, it does not.
+    // Once it has been reached and told, it does not.
     controller.tell_workers().await;
     assert!(lacking(&silent).await.is_empty());
 

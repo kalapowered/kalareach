@@ -1159,11 +1159,7 @@ pub(crate) enum Retained {
     /// answered, so there is no worker to hold the answer to a scope: it is the daemon's own.
     Record,
     /// The worker answered from an action it had already performed.
-    Worker {
-        /// Whether that worker holds what it retains to the history scope a forwarded frame
-        /// carries. One that does not gave the answer whole.
-        holds_results_to_scopes: bool,
-    },
+    Worker,
 }
 
 /// How long a close's link is held for the acceptance to reach the device that asked for it.
@@ -1614,9 +1610,7 @@ impl Controller {
         // The connection that asked decides whether it may be told a retained result; the close
         // itself happened either way, which is what section 7 asks of a stop.
         if answered.retained {
-            *retained = Retained::Worker {
-                holds_results_to_scopes: answered.holds_results_to_scopes,
-            };
+            *retained = Retained::Worker;
         }
         let value = match answered.response.outcome {
             kr_protocol::envelope::Outcome::Ok(value) => value,
@@ -1629,18 +1623,20 @@ impl Controller {
         };
         if answered.retained {
             // The close this answers happened, and what comes back now is that action's retained
-            // answer, which may be its result or its receipt. It is passed through as it is rather
-            // than read as a close result it need not be. A close result is settled on the way, as
-            // one given now is: the daemon that passed the close on first may not be this one, and
-            // what the answer says is then this daemon's only word of the end. The answer is the
-            // worker's receipt either way, so it goes whatever the settling found.
-            if let Ok(reply) = value.to_typed::<kr_protocol::session::SessionCloseResult>() {
+            // answer, which may be its result or its receipt. It is not read as a close result it
+            // need not be. A close result is settled on the way, as one given now is: the daemon
+            // that passed the close on first may not be this one, and what the answer says is then
+            // this daemon's only word of the end. The answer is the worker's receipt either way,
+            // so it goes whatever the settling found.
+            let (answer, closed) = crate::service::close::read_close_answer(proxy.level(), &value)?;
+            if let Some(reply) = closed {
                 let _ = self.settle_close_answer(session_id, &reply).await;
             }
-            return Ok(value);
+            return Ok(answer);
         }
-        let reply: kr_protocol::session::SessionCloseResult = value
-            .to_typed()
+        let reply: kr_protocol::session::SessionCloseResult = proxy
+            .level()
+            .decode_value(&value)
             .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
         // The worker's description of the session goes on in the answer as it came: what a device
         // is shown of it is decided where its answer is written.

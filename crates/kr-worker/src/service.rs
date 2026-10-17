@@ -2781,15 +2781,12 @@ impl WorkerService {
     ///
     /// The clock floor it maps, by the floor's identity, so a control daemon can tell whether this
     /// worker decides UTC deadlines from the same floor as it does; a worker that maps none states
-    /// none. That it reads the history scope a forwarded read carries, which a daemon sends only to
-    /// a worker that says so, that it holds a question read to that scope, without which a daemon
-    /// sends it no question read with one, and that it holds what it retains to the scope a
-    /// forwarded mutation carries, without which a daemon shows a paired device none of a retained
-    /// answer it gives, and that it reads which grant a forwarded `session.attach` was decided
-    /// under and draws a share's attachment only the screen its issuer was shown, without which a
-    /// daemon attaches no share to it, and that it reads which grants and devices an authority
-    /// revision withdrew and fences the input of those callers alone, without which a daemon
-    /// announces a revision with no reach and every caller under a grant is fenced.
+    /// none. And what it does with the frames a control daemon sends it: it reads the history
+    /// scope of a forwarded read, holds a question read and what it retains to that scope, reads
+    /// which grant a `session.attach` was decided under, reads which grants and devices an
+    /// authority revision withdrew, holds a local caller to the local owner's statement and serves
+    /// `agent.instances`. A control daemon of an earlier release reads these before it sends the
+    /// frames, so they are stated for as long as such a daemon can be brought back by a rollback.
     fn stated_capabilities(&self) -> CanonicalSet<kr_protocol::ids::CapabilityId> {
         self.time
             .floor_identity()

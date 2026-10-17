@@ -1698,18 +1698,16 @@ async fn a_worker_states_that_it_holds_a_question_read_to_its_scope() {
     .await
     .expect("connects as the daemon");
     let stated = &daemon.acknowledgement().capabilities;
-    assert!(
-        kr_protocol::local::reads_history_scopes(stated),
-        "stated: {stated:?}"
-    );
-    assert!(
-        kr_protocol::local::holds_question_reads_to_scopes(stated),
-        "stated: {stated:?}"
-    );
-    assert!(
-        kr_protocol::local::reads_the_screen_basis(stated),
-        "stated: {stated:?}"
-    );
+    for capability in [
+        kr_protocol::local::FORWARDED_HISTORY_SCOPE,
+        kr_protocol::local::FORWARDED_QUESTION_SCOPE,
+        kr_protocol::local::FORWARDED_SCREEN_BASIS,
+    ] {
+        assert!(
+            stated.iter().any(|stated| stated.as_str() == capability),
+            "{capability} is not stated: {stated:?}"
+        );
+    }
     drop(daemon);
     wired.close();
 }

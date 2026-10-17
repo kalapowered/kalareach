@@ -73,9 +73,6 @@ pub(super) struct Scripted {
     generations: std::sync::Mutex<Vec<kr_protocol::ids::ControllerGeneration>>,
     /// How many connections it has accepted.
     connections: AtomicUsize,
-    /// Whether it states that it holds what it retains to the history scope a forwarded frame
-    /// carries, as a worker of this build does.
-    holds_results_to_scopes: AtomicBool,
     /// Every mutation a daemon forwarded to it, in the order they came.
     forwarded: std::sync::Mutex<Vec<kr_protocol::local::ForwardedMutation>>,
     /// Whether each of those frames carried a `history` member on the wire, read from the bytes
@@ -103,6 +100,8 @@ pub(super) struct Scripted {
     prompt_receipts: std::sync::Mutex<BTreeMap<PromptKey, PromptReceipt>>,
     /// Whether it cannot read its receipts, as a worker whose journal is failing.
     receipts_unreadable: AtomicBool,
+    /// Whether its answer to `action.read` carries a member no level's surface admits.
+    answers_in_no_known_form: AtomicBool,
 }
 
 /// The actor and the action a scripted worker keeps a prompt's receipt under.
@@ -138,7 +137,6 @@ impl Scripted {
             answered: std::sync::Mutex::new(BTreeMap::new()),
             generations: std::sync::Mutex::new(Vec::new()),
             connections: AtomicUsize::new(0),
-            holds_results_to_scopes: AtomicBool::new(true),
             forwarded: std::sync::Mutex::new(Vec::new()),
             forwarded_with_history: std::sync::Mutex::new(Vec::new()),
             receipts_only: std::sync::Mutex::new(BTreeMap::new()),
@@ -149,6 +147,7 @@ impl Scripted {
             installed: std::sync::Mutex::new(None),
             prompt_receipts: std::sync::Mutex::new(BTreeMap::new()),
             receipts_unreadable: AtomicBool::new(false),
+            answers_in_no_known_form: AtomicBool::new(false),
         })
     }
 
@@ -214,28 +213,18 @@ impl Scripted {
         self.accepts_prompts.store(accepting, Ordering::Release);
     }
 
-    /// Has this worker state what a worker built before results were held to a scope states: that
-    /// it reads a scope and holds a question read to it, and nothing more. It keeps an answer
-    /// whole, and ends the link a mutation that carries a scope arrived on.
-    pub(super) fn built_before_results_were_held_to_scopes(&self) {
-        self.holds_results_to_scopes.store(false, Ordering::Release);
-    }
-
     /// What this worker states about itself in its answer to a hello.
     fn stated(&self) -> kr_protocol::scalars::CanonicalSet<kr_protocol::ids::CapabilityId> {
-        let mut stated = vec![
+        [
             kr_protocol::local::FORWARDED_HISTORY_SCOPE,
             kr_protocol::local::FORWARDED_QUESTION_SCOPE,
-        ];
-        if self.holds_results_to_scopes.load(Ordering::Acquire) {
-            stated.push(kr_protocol::local::FORWARDED_RESULT_SCOPE);
-        }
-        stated
-            .into_iter()
-            .map(|capability| {
-                kr_protocol::ids::CapabilityId::new(capability).expect("a capability identifier")
-            })
-            .collect()
+            kr_protocol::local::FORWARDED_RESULT_SCOPE,
+        ]
+        .into_iter()
+        .map(|capability| {
+            kr_protocol::ids::CapabilityId::new(capability).expect("a capability identifier")
+        })
+        .collect()
     }
 
     /// Every mutation a daemon forwarded to this worker, in the order they came.
@@ -364,6 +353,12 @@ impl Scripted {
             .insert(action_id, (method, failure));
     }
 
+    /// Has this worker answer `action.read` with a member that no level's surface admits, so that
+    /// the answer does not read in the shape of the level it is at.
+    pub(super) fn answers_receipts_in_no_known_form(&self) {
+        self.answers_in_no_known_form.store(true, Ordering::Release);
+    }
+
     /// How many connections this worker has accepted, from any daemon.
     pub(super) fn connections(&self) -> usize {
         self.connections.load(Ordering::Acquire)
@@ -444,8 +439,9 @@ impl Scripted {
     }
 
     /// How this worker answers `action.read`: the receipt of a close it kept an answer to, with
-    /// that answer, and otherwise a refusal.
-    fn receipt(&self, request: &Request) -> ControlFrame {
+    /// that answer, and otherwise a refusal. Where the read carries a history scope, the text of a
+    /// failure a receipt records is withheld, as a worker holds a retained answer to the scope.
+    fn receipt(&self, request: &Request, scoped: bool) -> ControlFrame {
         if let Some(params) = request
             .params
             .to_typed::<kr_protocol::receipt::ActionReadParams>()
@@ -457,13 +453,33 @@ impl Scripted {
                 .get(&params.action_id)
                 .cloned()
         {
-            return respond(
-                request.request_id,
-                &kr_protocol::receipt::ActionReadResult {
-                    receipt: self.receipt_of(params.action_id, method, Some(failure)),
-                    result: Nullable::null(),
+            let read = kr_protocol::receipt::ActionReadResult {
+                receipt: {
+                    let receipt = self.receipt_of(params.action_id, method, Some(failure));
+                    if scoped {
+                        receipt.with_error_withheld()
+                    } else {
+                        receipt
+                    }
                 },
-            );
+                result: Nullable::null(),
+            };
+            if self.answers_in_no_known_form.load(Ordering::Acquire) {
+                #[derive(serde::Serialize)]
+                struct WithAMemberNoLevelHas {
+                    #[serde(flatten)]
+                    read: kr_protocol::receipt::ActionReadResult,
+                    held_back_by_the_worker: bool,
+                }
+                return respond(
+                    request.request_id,
+                    &WithAMemberNoLevelHas {
+                        read,
+                        held_back_by_the_worker: true,
+                    },
+                );
+            }
+            return respond(request.request_id, &read);
         }
         let kept = request
             .params
@@ -780,11 +796,18 @@ fn serve_scripted(
                                                 ParamsValue::from_typed(
                                                     &kr_protocol::receipt::ReceiptResponse {
                                                         request_id,
-                                                        receipt: script.receipt_of(
-                                                            forwarded.mutation.action_id,
-                                                            method,
-                                                            Some(failure),
-                                                        ),
+                                                        receipt: {
+                                                            let receipt = script.receipt_of(
+                                                                forwarded.mutation.action_id,
+                                                                method,
+                                                                Some(failure),
+                                                            );
+                                                            if forwarded.history.is_some() {
+                                                                receipt.with_error_withheld()
+                                                            } else {
+                                                                receipt
+                                                            }
+                                                        },
                                                     },
                                                 )
                                                 .expect("encodes"),
@@ -855,7 +878,7 @@ fn serve_scripted(
                         (None, ControlFrame::ForwardedRead(forwarded))
                             if forwarded.request.method == Method::ActionRead.into() =>
                         {
-                            vec![script.receipt(&forwarded.request)]
+                            vec![script.receipt(&forwarded.request, forwarded.history.is_some())]
                         }
                         // It installs a revision it is told of, with nothing to fence, as a
                         // device's link to it asks it to.

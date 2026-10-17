@@ -341,14 +341,6 @@ pub(super) fn holds_question_reads() -> CanonicalSet<CapabilityId> {
     .collect()
 }
 
-/// What a worker of an earlier build states: that it reads a scope, and nothing of its question
-/// reads.
-fn reads_scopes_only() -> CanonicalSet<CapabilityId> {
-    [CapabilityId::new(kr_protocol::local::FORWARDED_HISTORY_SCOPE).expect("a capability")]
-        .into_iter()
-        .collect()
-}
-
 /// A daemon whose one worker is the played worker, holding `holding` and stating `stated`.
 pub(super) async fn world(
     holding: Holding,
@@ -669,9 +661,8 @@ fn invitation_written(world: &fake::Silent, action: u8) -> bool {
 // ---------------------------------------------------------------------------------------------
 
 /// KR-REQ-10.50: a share that includes the live screen is written only for a screen its issuer was
-/// shown whole. A screen the worker had to cut, and a worker of an earlier build that cannot show
-/// a screen at all, write no grant and no invitation; a screen shown whole is written, with the
-/// lines the issuer was shown.
+/// shown whole. A screen the worker had to cut, and a worker that refuses the read, write no grant
+/// and no invitation; a screen shown whole is written, with the lines the issuer was shown.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_10_50_a_share_is_written_only_for_a_screen_its_issuer_was_shown_whole() {
     use kr_protocol::sharing::{LiveScreenPreview, SessionScreenPreviewResult};
@@ -684,14 +675,15 @@ async fn kr_req_10_50_a_share_is_written_only_for_a_screen_its_issuer_was_shown_
             }),
         })
     };
-    // What a worker that does not list the read answers, as it answers any method it does not list.
-    let earlier_build = Err(ProtocolError::new(
+    // A worker that answers the screen read with a refusal says nothing of the screen, whatever its
+    // reason: the share is refused with the worker's own code.
+    let refused_read = Err(ProtocolError::new(
         ErrorCode::PermissionDenied,
         kr_protocol::local::METHOD_NOT_REACHABLE,
     ));
     for (action, answer, refused) in [
         (0x72, screen(true), Some(ErrorCode::InvalidArgument)),
-        (0x73, earlier_build, Some(ErrorCode::UnsupportedCapability)),
+        (0x73, refused_read, Some(ErrorCode::PermissionDenied)),
         (0x74, screen(false), None),
     ] {
         let (world, holding) = world(
@@ -2106,123 +2098,39 @@ pub(super) fn refused(answer: ControlFrame) -> ProtocolError {
     }
 }
 
-/// KR-REQ-10.51: a device's question read carries its grant's scope, and only the worker holds the
-/// answer to it, so it goes only to a worker that says it does. A worker of an earlier build reads
-/// a scope and answers a question read with every question it holds; a device's question read is
-/// refused before anything reaches it, while its other reads still go to it with their scope.
+/// KR-REQ-19.08: a device's read of a session's agent instances reaches the session's worker, with
+/// the device's scope.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn kr_req_10_51_a_question_read_goes_only_to_a_worker_that_holds_it_to_its_scope() {
-    let (world, holding) = world(Holding::default(), reads_scopes_only()).await;
-    holding.lock().expect("held").questions.insert(
-        question_id(0x75),
-        question(
-            world.session_id,
-            0x75,
-            QuestionState::Answered,
-            1_000,
-            "Before the bound",
-        ),
-    );
+async fn kr_req_19_08_an_agent_instances_read_reaches_the_worker_with_the_devices_scope() {
+    let (world, holding) = world(Holding::default(), holds_question_reads()).await;
     let device = scoped_device(&world.controller, 21, 5_000, &[]);
     let connection = super::RemoteConnection::for_test(&world.controller, device.clone());
-
-    let refusal = refused(
-        connection
-            .read(&device_read(
-                1,
-                Method::QuestionRead,
-                &QuestionReadParams {
-                    session_id: world.session_id,
-                    question_id: Nullable::null(),
-                    include_resolved: true,
-                },
-            ))
-            .await,
-    );
-    assert_eq!(
-        refusal.code,
-        ErrorCode::UnsupportedCapability,
-        "{refusal:?}"
-    );
-    // Another read goes to that worker as it always did, with the grant's scope.
     let _ = connection
         .read(&device_read(
-            2,
-            Method::AgentCapabilities,
-            &kr_protocol::agent::AgentCapabilitiesParams {
-                subject: kr_protocol::agent::AgentSubject {
-                    session_id: world.session_id,
-                    application_instance_id: instance(0x41),
-                },
+            1,
+            Method::AgentInstances,
+            &kr_protocol::recovery::AgentInstancesParams {
+                session_id: world.session_id,
+                agent_resources_from: Nullable::null(),
             },
         ))
         .await;
-    let held = holding.lock().expect("held");
+    let reached: Vec<_> = holding
+        .lock()
+        .expect("held")
+        .forwarded
+        .iter()
+        .map(|forwarded| (forwarded.request.method.method(), forwarded.history.clone()))
+        .collect();
     assert_eq!(
-        held.forwarded
-            .iter()
-            .map(|forwarded| (forwarded.request.method.method(), forwarded.history.clone()))
-            .collect::<Vec<_>>(),
+        reached,
         vec![(
-            Some(Method::AgentCapabilities),
+            Some(Method::AgentInstances),
             Some(device.grant.history.clone())
         )],
-        "the question read reached no worker"
+        "the read reached the worker with the grant's scope"
     );
-    drop(held);
     world.serving.abort();
-}
-
-/// KR-REQ-19.08: a device's read of a session's agent instances goes only to a worker that says it
-/// serves one. A worker of an earlier build answers a method it does not list as it answers a
-/// caller it does not allow, so the daemon cannot tell the two apart from the answer: the read is
-/// refused as an unsupported capability before anything reaches the worker, and reaches a worker
-/// that states the capability, with the device's scope.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn kr_req_19_08_an_agent_instances_read_goes_only_to_a_worker_that_serves_it() {
-    let asked = |world: &fake::Silent| kr_protocol::recovery::AgentInstancesParams {
-        session_id: world.session_id,
-        agent_resources_from: Nullable::null(),
-    };
-    let mut serving = holds_question_reads();
-    serving
-        .insert(CapabilityId::new(kr_protocol::local::AGENT_INSTANCES_READ).expect("a capability"));
-    for (stated, refused_as) in [
-        (reads_scopes_only(), Some(ErrorCode::UnsupportedCapability)),
-        (serving, None),
-    ] {
-        let (world, holding) = world(Holding::default(), stated).await;
-        let device = scoped_device(&world.controller, 21, 5_000, &[]);
-        let connection = super::RemoteConnection::for_test(&world.controller, device.clone());
-        let answer = connection
-            .read(&device_read(1, Method::AgentInstances, &asked(&world)))
-            .await;
-        let reached: Vec<_> = holding
-            .lock()
-            .expect("held")
-            .forwarded
-            .iter()
-            .map(|forwarded| (forwarded.request.method.method(), forwarded.history.clone()))
-            .collect();
-        match refused_as {
-            Some(code) => {
-                assert_eq!(refused(answer).code, code);
-                assert!(reached.is_empty(), "the read reached no worker");
-            }
-            None => {
-                let _ = answer;
-                assert_eq!(
-                    reached,
-                    vec![(
-                        Some(Method::AgentInstances),
-                        Some(device.grant.history.clone())
-                    )],
-                    "the read reached the worker with the grant's scope"
-                );
-            }
-        }
-        world.serving.abort();
-    }
 }
 
 // ---------------------------------------------------------------------------------------------

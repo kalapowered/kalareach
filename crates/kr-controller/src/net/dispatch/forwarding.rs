@@ -42,23 +42,18 @@ impl RouteRefusal {
     }
 }
 
-/// The refusal for a retained answer a worker of an earlier build gave whole.
+/// The refusal for a retained answer that does not read in the shape of the level its worker is
+/// at.
 ///
-/// Such a worker keeps an answer as it was produced and does not hold it to the grant a caller acts
-/// under, so a device is not shown it. The refusal says what the host holds and does not do, never
-/// that the action did not happen: it did, and the caller may well have caused it. For a close it
-/// says how to stop the session, because the answer that would have told the caller whether it was
-/// stopped is the one that is not shown.
-pub(super) fn held_by_an_earlier_worker(method: Method) -> ProtocolError {
-    let detail = if method == Method::SessionClose {
+/// What the worker kept is not shown to a device as it came, because the host cannot tell what the
+/// worker held it to. The refusal says what the host holds and does not do, never that the action
+/// did not happen: it did, and the caller may well have caused it.
+fn unreadable_retained_answer() -> ProtocolError {
+    ProtocolError::new(
+        ErrorCode::UnsupportedSchema,
         "this host holds what this action produced and does not show it to this device, because \
-         the session's worker is of an earlier build that cannot hold it to this device's grant; \
-         a close under a new action identifier stops the session while this host still holds it"
-    } else {
-        "this host holds what this action produced and does not show it to this device, because \
-         the session's worker is of an earlier build that cannot hold it to this device's grant"
-    };
-    ProtocolError::new(ErrorCode::UnsupportedCapability, detail)
+         the session's worker answered in a form this host cannot read",
+    )
 }
 
 impl RemoteConnection {
@@ -324,13 +319,9 @@ impl RemoteConnection {
         match effect.await {
             Ok(Ok(answered)) => {
                 if answered.retained {
-                    // A retained answer is a read of somebody's receipt. A worker that holds
-                    // nothing to a scope gave it whole, so it is not shown; one that does gave
-                    // what this device's grant reached, and it is written under present view
+                    // A retained answer is a read of somebody's receipt: the worker gave what
+                    // this device's grant reached, and it is written under present view
                     // authority over the session.
-                    if !answered.holds_results_to_scopes {
-                        return failure(request_id, held_by_an_earlier_worker(answering));
-                    }
                     match self.may_read_receipts(Some(session_id), answering, acting) {
                         Ok(read) => *asked = Some(read),
                         Err(error) => return failure(request_id, error),
@@ -548,10 +539,9 @@ impl RemoteConnection {
     ///
     /// The answer is returned with the decision it is to be written under: a read of the receipt
     /// over the session it belongs to ([`Self::may_read_receipts`]). A worker holds what it keeps to
-    /// the history scope of this device's grant, which goes with the read. A worker of an earlier
-    /// build holds nothing to a scope, so it is asked for the daemon's own use, which is to settle
-    /// a close it kept the answer of, and the device is then refused by name rather than shown what
-    /// was kept: the host holds it and does not show it.
+    /// the history scope of this device's grant, which goes with the read, and its answer is read
+    /// in the shape of its level: one that does not read there is refused by name, after the daemon
+    /// has used it to settle a close it kept the answer of.
     ///
     /// A caller that may not read this session's receipts is not told what its action produced,
     /// and for a close that is all it is not told: a close it may make is still made, because
@@ -633,10 +623,13 @@ impl RemoteConnection {
         let authority = self
             .authority_deadline(asked)
             .map_err(RouteRefusal::Conflict)?;
-        let holds = proxy.holds_results_to_scopes();
-        let scope = holds.then_some(&asked.acting.grant.history);
         let Ok(response) = proxy
-            .forward_read(&request, &envelope, authority, scope)
+            .forward_read(
+                &request,
+                &envelope,
+                authority,
+                Some(&asked.acting.grant.history),
+            )
             .await
         else {
             // The link failed, not the lookup. The ordinary path decides what happens next.
@@ -647,23 +640,27 @@ impl RemoteConnection {
             // answer, and the request goes on to be admitted or refused on its own terms.
             return Ok(None);
         };
-        let Ok(read_back) = value.to_typed::<kr_protocol::receipt::ActionReadResult>() else {
-            return Ok(None);
+        // The answer is read in the shape of the worker's level. One that does not read there is
+        // never passed on as it came: the worker held it to a scope in a way this host cannot see.
+        let Ok(read_back) = proxy
+            .level()
+            .decode_value::<kr_protocol::receipt::ActionReadResult>(&value)
+        else {
+            return Err(RouteRefusal::Conflict(unreadable_retained_answer()));
         };
         // A close's result is settled as one given now is, and goes as it came: the daemon keeps
         // the worker's whole description for its own use, and what a device is shown of it is
         // decided where the answer is written.
         if mutation.method == Method::SessionClose.into()
             && let Some(result) = read_back.result.as_ref()
-            && let Ok(answer) = result.to_typed::<kr_protocol::session::SessionCloseResult>()
+            && let Ok(answer) = proxy
+                .level()
+                .decode_value::<kr_protocol::session::SessionCloseResult>(result)
         {
             let _ = self
                 .controller
                 .settle_close_answer(session_id, &answer)
                 .await;
-        }
-        if !holds {
-            return Err(RouteRefusal::Conflict(held_by_an_earlier_worker(answering)));
         }
         // The result when the action produced one, and the receipt when it has not: a caller that
         // resubmitted is told what became of its action, and nothing is dispatched again.

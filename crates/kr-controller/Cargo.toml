@@ -104,6 +104,8 @@ iroh-relay = { workspace = true, features = ["server", "test-utils"] }
 jiff.workspace = true
 kr-cbor.workspace = true
 kr-client = { workspace = true, features = ["terminal"] }
+# A level of the tests' own, for the cases that show what a worker of a level that differs is sent.
+kr-protocol = { workspace = true, features = ["testing"] }
 # The change-set tests stop an apply where a crash would stop it, which the service compiles only
 # for them.
 kr-changeset = { workspace = true, features = ["fault-injection"] }

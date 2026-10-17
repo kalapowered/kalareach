@@ -9,9 +9,7 @@
 //! has not yet been told. Nothing here decides anything about privacy mode: the host applies a page
 //! under its admission or drops it.
 //!
-//! A connection that fails is made again after a pause that doubles to five minutes, which is also
-//! what a worker of an older build, one that does not know the role, gets: it refuses the
-//! connection and is asked again later, quietly, until it is replaced.
+//! A connection that fails is made again after a pause that doubles to five minutes.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, PoisonError, Weak};

@@ -49,19 +49,11 @@ pub struct Vouched<'a> {
     /// The history scope of that grant, for a caller that acts under one.
     ///
     /// The worker holds what it retains to it: the first answer to a question and the retained
-    /// answer to a duplicate are shown as far as it reaches. It goes only to a worker that states
-    /// it holds results to a scope ([`kr_protocol::local::FORWARDED_RESULT_SCOPE`]), because an
-    /// earlier worker ends the link a frame with a member it does not know arrived on.
+    /// answer to a duplicate are shown as far as it reaches.
     pub history: Option<&'a HistoryScope>,
     /// The kind of grant the host decided this request under, for a `session.attach`: a share,
     /// whose issuer was shown the session's screen as text and is drawn that and no more, or the
     /// device's pairing grant.
-    ///
-    /// It goes only to a worker that states
-    /// [`kr_protocol::local::FORWARDED_SCREEN_BASIS`], whichever grant the attach was decided
-    /// under. An attach under a share is refused for a worker that does not, since the worker
-    /// would draw it more than was shown, and an attach under a pairing grant is sent without it,
-    /// as it always was.
     pub screen_basis: Option<ScreenBasis>,
 }
 use crate::service::Controller;
@@ -177,12 +169,6 @@ pub struct Forwarded {
     /// present view authority over the subject before it returns either half of a retained
     /// result. Keeping the two apart here is what lets the dispatcher make that check.
     pub retained: bool,
-    /// Whether the worker holds what it retains to the history scope a forwarded frame carries.
-    ///
-    /// A worker that does not keeps a retained answer whole, so passing one on to a paired device
-    /// would show it more than its grant reaches. The dispatcher refuses it by name, after this
-    /// daemon has used it for its own purposes.
-    pub holds_results_to_scopes: bool,
 }
 
 /// What a link to a worker is opened for, which decides whether its session's closure ends it.
@@ -218,33 +204,8 @@ pub struct WorkerProxy {
     waiters: Arc<std::sync::Mutex<Waiters>>,
     reader: tokio::task::JoinHandle<()>,
     next_request: AtomicU64,
-    /// Whether the worker said, in its answer to this link's hello, that it reads the history
-    /// scope a forwarded read carries.
-    ///
-    /// A worker survives an upgrade of this daemon, a forwarded frame is a closed schema, and a
-    /// worker ends the link a frame it cannot read arrived on. So a worker that did not say so is
-    /// sent no scope, and it refuses the reads a scope narrows by itself.
-    reads_history_scopes: bool,
-    /// Whether the worker said, in the same answer, that it holds a question read to the scope the
-    /// read carries.
-    ///
-    /// A worker of an earlier build reads a scope and still answers a question read with every
-    /// question it holds, so a question read with a scope goes only to a worker that says this.
-    holds_question_reads: bool,
-    /// Whether the worker said, in the same answer, that it holds what it retains to the history
-    /// scope a forwarded mutation carries.
-    ///
-    /// A worker of an earlier build keeps a retained answer whole and ends the link a mutation with
-    /// a scope arrived on, so such a worker is sent none.
-    holds_results_to_scopes: bool,
-    /// Whether the worker said, in the same answer, that it reads the screen basis of an attach
-    /// and draws the attachment the screen that grant allows.
-    reads_the_screen_basis: bool,
-    /// Whether the worker said, in the same answer, that it serves `agent.instances`.
-    ///
-    /// A worker of an earlier build answers a method it does not list as it answers a caller it
-    /// does not allow, so the read goes only to a worker that says this.
-    serves_agent_instances: bool,
+    /// The level the worker stated, which every frame on this link is read and written under.
+    level: kr_protocol::retained::Level,
 }
 
 /// Whom this link owes an answer, and whether it can still give one.
@@ -319,17 +280,8 @@ impl WorkerProxy {
             })
             .await?;
 
-        let (reader, writer, acknowledgement) = client.into_halves();
-        let reads_history_scopes =
-            kr_protocol::local::reads_history_scopes(&acknowledgement.capabilities);
-        let holds_question_reads =
-            kr_protocol::local::holds_question_reads_to_scopes(&acknowledgement.capabilities);
-        let holds_results_to_scopes =
-            kr_protocol::local::holds_results_to_scopes(&acknowledgement.capabilities);
-        let reads_the_screen_basis =
-            kr_protocol::local::reads_the_screen_basis(&acknowledgement.capabilities);
-        let serves_agent_instances =
-            kr_protocol::local::serves_agent_instances(&acknowledgement.capabilities);
+        let level = client.level();
+        let (reader, writer, _) = client.into_halves();
         let waiters: Arc<std::sync::Mutex<Waiters>> =
             Arc::new(std::sync::Mutex::new(Waiters::default()));
         let reader = tokio::spawn(read_loop(
@@ -346,11 +298,7 @@ impl WorkerProxy {
             waiters,
             reader,
             next_request: AtomicU64::new(1),
-            reads_history_scopes,
-            holds_question_reads,
-            holds_results_to_scopes,
-            reads_the_screen_basis,
-            serves_agent_instances,
+            level,
         }))
     }
 
@@ -378,9 +326,7 @@ impl WorkerProxy {
     /// # Errors
     ///
     /// Returns an error when the rights hold a voice right, when the link fails, or when the
-    /// worker does not answer in time, and `UNSUPPORTED_CAPABILITY` for an answer or a
-    /// cancellation of a question for a caller that has a history scope, to a worker that does not
-    /// hold results to one, before anything is sent.
+    /// worker does not answer in time.
     pub async fn forward_mutation(
         &self,
         mutation: &MutationRequest,
@@ -392,31 +338,11 @@ impl WorkerProxy {
                 detail: "voice.use never travels to a worker".to_owned(),
             });
         }
-        // What a worker shows of the answer to a question is held to the caller's grant there, so a
-        // worker that does not hold results to a scope is not asked to resolve one for a caller
-        // that has one: it would answer with the whole question.
-        if vouched.history.is_some()
-            && !self.holds_results_to_scopes
-            && matches!(
-                mutation.method.method(),
-                Some(Method::QuestionAnswer | Method::QuestionCancel)
-            )
-        {
-            return Err(self.cannot_hold_results_to_a_scope());
-        }
-        // An attachment under a share is drawn the screen its issuer was shown, which a worker that
-        // does not state it narrows to would draw more of; it is not asked.
+        // The kind of grant travels only with an attach: under a share it is drawn the screen the
+        // share's issuer was shown, and under a pairing grant the live one.
         let screen_basis = vouched
             .screen_basis
             .filter(|_| mutation.method.method() == Some(Method::SessionAttach));
-        if screen_basis == Some(ScreenBasis::Share) && !self.reads_the_screen_basis {
-            return Err(ControllerError::Refused {
-                code: kr_protocol::error::ErrorCode::UnsupportedCapability,
-                detail: "this session's worker is of a build that cannot draw a shared session's \
-                         screen as its issuer was shown it, so it is not asked"
-                    .to_owned(),
-            });
-        }
         let request_id = self.next_request_id();
         let mut forwarded = mutation.clone();
         // The request identity is this link's; the durable identity is the action's, and that
@@ -427,50 +353,26 @@ impl WorkerProxy {
             actor: vouched.actor.clone(),
             grant_rights: vouched.grant_rights.clone(),
             accepted_deadline_boot_ms,
-            history: vouched
-                .history
-                .filter(|_| self.holds_results_to_scopes)
-                .cloned(),
-            screen_basis: screen_basis.filter(|_| self.reads_the_screen_basis),
+            history: vouched.history.cloned(),
+            screen_basis,
         }));
-        let mut answered = self.call(request_id, &frame).await?;
-        answered.holds_results_to_scopes = self.holds_results_to_scopes;
-        Ok(answered)
+        self.call(request_id, &frame).await
     }
 
-    /// Returns whether the worker holds what it retains to the history scope a forwarded frame
-    /// carries.
+    /// The level of the worker this link is to, which the answers it carries are read under.
     #[must_use]
-    pub const fn holds_results_to_scopes(&self) -> bool {
-        self.holds_results_to_scopes
-    }
-
-    /// The refusal for an action whose answer a worker of an earlier build would give whole.
-    fn cannot_hold_results_to_a_scope(&self) -> ControllerError {
-        ControllerError::Refused {
-            code: kr_protocol::error::ErrorCode::UnsupportedCapability,
-            detail:
-                "this session's worker is of a build that does not hold what it retains to the \
-                     grant a caller acts under, so it is not asked; the session's own owner can \
-                     still resolve a question at the session"
-                    .to_owned(),
-        }
+    pub const fn level(&self) -> kr_protocol::retained::Level {
+        self.level
     }
 
     /// Forwards one admitted read and returns what the worker answered.
     ///
     /// `history` is the history scope of the grant the read was decided under, which the worker
-    /// holds what it retains to. It goes only to a worker that said, in its answer to this link's
-    /// hello, that it reads one. A question read with one goes only to a worker that also said it
-    /// holds a question read to it, and a read of a retained receipt only to one that said it holds
-    /// what it retains to a scope: the worker is the one place its answer is narrowed, and a worker
-    /// that does not would answer with every question it holds, or with a retained answer whole.
+    /// holds what it retains to: the worker is the one place its answer is narrowed.
     ///
     /// # Errors
     ///
-    /// As [`Self::forward_mutation`], and `UNSUPPORTED_CAPABILITY` for a question read or a read of
-    /// a receipt with a scope to a worker that does not hold one to it, and for an agent instances
-    /// read to a worker that does not serve it, before anything is sent.
+    /// As [`Self::forward_mutation`].
     pub async fn forward_read(
         &self,
         request: &Request,
@@ -478,31 +380,6 @@ impl WorkerProxy {
         authority_deadline_boot_ms: Nullable<U64>,
         history: Option<&HistoryScope>,
     ) -> Result<Response> {
-        if history.is_some()
-            && request.method == Method::ActionRead.into()
-            && !self.holds_results_to_scopes
-        {
-            return Err(self.cannot_hold_results_to_a_scope());
-        }
-        if history.is_some()
-            && request.method == Method::QuestionRead.into()
-            && !self.holds_question_reads
-        {
-            return Err(ControllerError::Refused {
-                code: kr_protocol::error::ErrorCode::UnsupportedCapability,
-                detail: "this session's worker is of a build that does not hold a question read \
-                         to the grant it is made under, so it is not asked"
-                    .to_owned(),
-            });
-        }
-        if request.method == Method::AgentInstances.into() && !self.serves_agent_instances {
-            return Err(ControllerError::Refused {
-                code: kr_protocol::error::ErrorCode::UnsupportedCapability,
-                detail: "this session's worker is of a build that does not serve the agent \
-                         instances read, so it is not asked"
-                    .to_owned(),
-            });
-        }
         let request_id = self.next_request_id();
         let mut forwarded = request.clone();
         forwarded.request_id = request_id;
@@ -510,7 +387,7 @@ impl WorkerProxy {
             request: forwarded,
             actor: actor.clone(),
             authority_deadline_boot_ms,
-            history: history.filter(|_| self.reads_history_scopes).cloned(),
+            history: history.cloned(),
         }));
         // A read is a read whichever way the worker answered it, so the marker means nothing here.
         Ok(self.call(request_id, &frame).await?.response)
@@ -699,7 +576,6 @@ async fn read_loop(
                     Forwarded {
                         response,
                         retained: false,
-                        holds_results_to_scopes: false,
                     },
                     spent,
                 );
@@ -715,7 +591,6 @@ async fn read_loop(
                 Forwarded {
                     response: *response,
                     retained: true,
-                    holds_results_to_scopes: false,
                 },
                 false,
             ),

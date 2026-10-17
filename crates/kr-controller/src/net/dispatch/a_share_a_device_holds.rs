@@ -102,29 +102,13 @@ fn unplaced() -> kr_protocol::ids::SessionId {
     kr_protocol::ids::SessionId::new(kr_protocol::scalars::Uuid::from_bytes([0; 16]))
 }
 
-/// What a worker states that holds results to a scope but does not read the grant an attach was
-/// decided under: it reads a scope, holds a question read and the result of a mutation to it.
+/// What a worker states of a forwarded frame's scope: it reads one, and holds a question read and
+/// the result of a mutation to it.
 fn holds_results() -> CanonicalSet<kr_protocol::ids::CapabilityId> {
     [
         kr_protocol::local::FORWARDED_HISTORY_SCOPE,
         kr_protocol::local::FORWARDED_QUESTION_SCOPE,
         kr_protocol::local::FORWARDED_RESULT_SCOPE,
-    ]
-    .into_iter()
-    .map(|capability| {
-        kr_protocol::ids::CapabilityId::new(capability).expect("a capability identifier")
-    })
-    .collect()
-}
-
-/// What a worker of this build states when it also draws an attachment under a share the screen
-/// its issuer was shown.
-fn a_worker_that_reads_the_screen_basis() -> CanonicalSet<kr_protocol::ids::CapabilityId> {
-    [
-        kr_protocol::local::FORWARDED_HISTORY_SCOPE,
-        kr_protocol::local::FORWARDED_QUESTION_SCOPE,
-        kr_protocol::local::FORWARDED_RESULT_SCOPE,
-        kr_protocol::local::FORWARDED_SCREEN_BASIS,
     ]
     .into_iter()
     .map(|capability| {
@@ -1027,102 +1011,75 @@ async fn kr_req_25_10_a_connection_is_ended_with_a_share_it_only_read_under() {
 }
 
 /// KR-REQ-10.50: an attach says which grant it was decided under, and a share's asks the worker to
-/// draw the screen the share's issuer was shown. A worker that does not state it reads that is not
-/// asked to attach a share, since it would draw more than was shown, and is still asked to attach
-/// the device under its pairing grant, with no member it would end the link on.
+/// draw the screen the share's issuer was shown, while one under a pairing grant says it is one and
+/// is drawn the live screen.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_10_50_an_attach_under_a_share_asks_for_the_previewed_screen_and_one_under_a_pairing_grant_does_not()
  {
-    for worker_narrows in [true, false] {
-        let (world, holding) = world(
-            Holding::default(),
-            if worker_narrows {
-                a_worker_that_reads_the_screen_basis()
-            } else {
-                holds_results()
-            },
-        )
-        .await;
-        // A pairing grant that admits the session and its screen, and a share of the same.
-        let (mut grant, _) = crate::service::net::tests::granted(
-            GrantExpiry::Never,
-            world.controller.policy().authority_revision(),
-        );
-        grant.history.include_live_screen = true;
-        let device = holding_grant(&world.controller, 41, grant);
-        let viewing = share_with(
-            &world,
-            &device,
-            &[ActionRight::SessionView],
-            &[],
-            true,
-            GrantExpiry::Never,
-            true,
-        );
+    let (world, holding) = world(Holding::default(), holds_results()).await;
+    // A pairing grant that admits the session and its screen, and a share of the same.
+    let (mut grant, _) = crate::service::net::tests::granted(
+        GrantExpiry::Never,
+        world.controller.policy().authority_revision(),
+    );
+    grant.history.include_live_screen = true;
+    let device = holding_grant(&world.controller, 41, grant);
+    let viewing = share_with(
+        &world,
+        &device,
+        &[ActionRight::SessionView],
+        &[],
+        true,
+        GrantExpiry::Never,
+        true,
+    );
 
-        let under_the_pairing_grant =
-            super::RemoteConnection::for_test(&world.controller, device.clone());
-        drop(
-            under_the_pairing_grant
-                .mutate(&attaching(&world, &under_the_pairing_grant, 51, None))
-                .await,
-        );
-        let under_the_share = super::RemoteConnection::for_test(&world.controller, device);
-        let answer = under_the_share
+    let under_the_pairing_grant =
+        super::RemoteConnection::for_test(&world.controller, device.clone());
+    drop(
+        under_the_pairing_grant
+            .mutate(&attaching(&world, &under_the_pairing_grant, 51, None))
+            .await,
+    );
+    let under_the_share = super::RemoteConnection::for_test(&world.controller, device);
+    drop(
+        under_the_share
             .mutate(&attaching(
                 &world,
                 &under_the_share,
                 52,
                 Some(viewing.grant_id),
             ))
-            .await;
+            .await,
+    );
 
-        let held = holding.lock().expect("held");
-        let attached: Vec<(Nullable<GrantId>, Option<kr_protocol::local::ScreenBasis>)> = held
-            .mutations
-            .iter()
-            .filter(|forwarded| forwarded.mutation.method == Method::SessionAttach.into())
-            .map(|forwarded| (forwarded.actor.grant_id, forwarded.screen_basis))
-            .collect();
-        if worker_narrows {
-            assert_eq!(
-                attached.len(),
-                2,
-                "both attaches reached the worker: {attached:?}"
-            );
-            assert_eq!(
-                attached[0].1,
-                Some(kr_protocol::local::ScreenBasis::Pairing),
-                "a device under its pairing grant says it is one, and is drawn the live screen"
-            );
-            assert_eq!(
-                attached[1],
-                (
-                    Nullable::some(viewing.grant_id),
-                    Some(kr_protocol::local::ScreenBasis::Share)
-                ),
-                "and the recipient of a share says it is one, to be drawn the screen its issuer \
-                 was shown"
-            );
-        } else {
-            assert_eq!(
-                attached.len(),
-                1,
-                "only the attach under the pairing grant reached an earlier worker: {attached:?}"
-            );
-            assert_eq!(
-                attached[0].1, None,
-                "and it carries no member the earlier worker would end the link on"
-            );
-            let refused = refusal_of(&answer);
-            assert_eq!(
-                refused.code,
-                ErrorCode::UnsupportedCapability,
-                "{refused:?}"
-            );
-        }
-        world.serving.abort();
-    }
+    let held = holding.lock().expect("held");
+    let attached: Vec<(Nullable<GrantId>, Option<kr_protocol::local::ScreenBasis>)> = held
+        .mutations
+        .iter()
+        .filter(|forwarded| forwarded.mutation.method == Method::SessionAttach.into())
+        .map(|forwarded| (forwarded.actor.grant_id, forwarded.screen_basis))
+        .collect();
+    assert_eq!(
+        attached.len(),
+        2,
+        "both attaches reached the worker: {attached:?}"
+    );
+    assert_eq!(
+        attached[0].1,
+        Some(kr_protocol::local::ScreenBasis::Pairing),
+        "a device under its pairing grant says it is one, and is drawn the live screen"
+    );
+    assert_eq!(
+        attached[1],
+        (
+            Nullable::some(viewing.grant_id),
+            Some(kr_protocol::local::ScreenBasis::Share)
+        ),
+        "and the recipient of a share says it is one, to be drawn the screen its issuer was shown"
+    );
+    drop(held);
+    world.serving.abort();
 }
 
 /// KR-REQ-19.01: a view-only recipient binds no attachment through `agent.draft.add_attachment`. The

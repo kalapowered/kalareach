@@ -800,21 +800,10 @@ impl RemoteConnection {
                         // and this is the check section 23 wants before either half of a retained
                         // result goes back, under the decision the answer is then written under.
                         // The close itself happened: section 7's stop does not wait on this, and
-                        // only the answer does. A worker that holds nothing to a scope gave it
-                        // whole, and it has been settled; it is not shown.
+                        // only the answer does.
                         match closed.retained {
                             Retained::Not => {}
-                            Retained::Worker {
-                                holds_results_to_scopes: false,
-                            } => {
-                                return failure(
-                                    request_id,
-                                    super::forwarding::held_by_an_earlier_worker(
-                                        Method::SessionClose,
-                                    ),
-                                );
-                            }
-                            Retained::Record | Retained::Worker { .. } => {
+                            Retained::Record | Retained::Worker => {
                                 match self.may_read_receipts(
                                     Some(session_id),
                                     Method::SessionClose,

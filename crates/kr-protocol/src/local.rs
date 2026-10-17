@@ -208,147 +208,58 @@ impl LocalBuild {
     }
 }
 
-/// The capability a worker states when it reads the UTC deadline beside each forwarded copy's
-/// continuous one, and a control daemon offers when it writes it.
-///
-/// A worker survives an upgrade of the daemon, and the forwarded frames are closed schemas, so a
-/// worker of an earlier build refuses a frame with a field it does not know. The daemon reads this
-/// in the worker's answer to its hello before it sends such a frame.
-pub const FORWARDED_UTC_DEADLINE: &str = "forwarded.utc-deadline/1";
-
 /// The capability a worker states when it reads the history scope a forwarded read carries
-/// ([`ForwardedRequest::history`]), and a control daemon reads before it sends one.
+/// ([`ForwardedRequest::history`]).
 ///
-/// A worker survives an upgrade of the daemon, the forwarded frames are closed schemas, and a
-/// worker ends the connection a frame it cannot read arrived on, so a worker of an earlier build is
-/// sent no scope at all. It refuses the agent reads a scope narrows by itself, as it always did.
-/// The version is the second: a scope names approvals by the broker's resource identity, and a
-/// worker that states only the first read them as an upstream's text, so it is sent none either. A
-/// question read is decided by [`FORWARDED_QUESTION_SCOPE`] as well.
+/// A control daemon of an earlier release reads it before it sends a scope, and a worker keeps
+/// stating it so that such a daemon, which a rollback brings back, goes on sending one. The version
+/// is the second: a scope names approvals by the broker's resource identity.
 pub const FORWARDED_HISTORY_SCOPE: &str = "forwarded.history-scope/2";
 
-/// Returns true when a worker's statement says it reads a forwarded read's history scope
-/// ([`FORWARDED_HISTORY_SCOPE`]).
-#[must_use]
-pub fn reads_history_scopes(capabilities: &CanonicalSet<CapabilityId>) -> bool {
-    capabilities
-        .iter()
-        .any(|capability| capability.as_str() == FORWARDED_HISTORY_SCOPE)
-}
-
 /// The capability a worker states when it holds a local caller to what the control daemon tells it
-/// the host's local owner may do ([`crate::worker::LocalAccess`]), and a control daemon reads
-/// before it sends one.
+/// the host's local owner may do ([`crate::worker::LocalAccess`]).
 ///
-/// A worker of an earlier build ends the connection that carries a frame it cannot read, so a
-/// daemon sends the statement only to a worker that states this. An exclusive host refuses to be
-/// made so while a worker it knows of does not.
+/// A control daemon of an earlier release sends the statement only to a worker that states this.
 pub const LOCAL_ACCESS: &str = "local.access/1";
 
-/// Returns true when a worker's statement says it holds a local caller to the host's statement of
-/// what its local owner may do ([`LOCAL_ACCESS`]).
-#[must_use]
-pub fn holds_local_access(capabilities: &CanonicalSet<CapabilityId>) -> bool {
-    capabilities
-        .iter()
-        .any(|capability| capability.as_str() == LOCAL_ACCESS)
-}
-
 /// The capability a worker states when it holds a forwarded `question.read` to the history scope
-/// the read carries, and a control daemon reads before it sends a question read with a scope.
+/// the read carries.
 ///
-/// A worker of an earlier build reads a scope ([`FORWARDED_HISTORY_SCOPE`]) and still answers a
-/// question read with every question it holds, because the daemon of its build narrowed a paired
-/// device's answer itself. The narrowing is the worker's now, so a daemon sends a question read
-/// that carries a scope only to a worker that states this, and refuses it for any other rather
-/// than pass on what nothing narrowed. It stands beside [`FORWARDED_HISTORY_SCOPE`], which keeps
-/// its meaning: a worker that states only that is still sent its scope with every other read.
+/// A control daemon of an earlier release sends a question read that carries a scope only to a
+/// worker that states this.
 pub const FORWARDED_QUESTION_SCOPE: &str = "forwarded.question-scope/1";
 
 /// What a worker answers a method it does not list, whoever asks.
-///
-/// A worker of a build that predates a local read answers it this way, which is how the daemon
-/// tells an earlier build from a worker that refused for another reason.
 pub const METHOD_NOT_REACHABLE: &str = "the method is not reachable from a local caller";
-
-/// Returns true when a worker's statement says it holds a forwarded question read to the read's
-/// history scope ([`FORWARDED_QUESTION_SCOPE`]).
-#[must_use]
-pub fn holds_question_reads_to_scopes(capabilities: &CanonicalSet<CapabilityId>) -> bool {
-    capabilities
-        .iter()
-        .any(|capability| capability.as_str() == FORWARDED_QUESTION_SCOPE)
-}
 
 /// The capability a worker states when it holds what it retains to the history scope a forwarded
 /// frame carries: the first answer to a `question.answer` or `question.cancel`, the answer to a
-/// duplicate of any mutation, and the answer to an `action.read`. A control daemon reads it before
-/// it sends a mutation's scope ([`ForwardedMutation::history`]) or a `question.answer`,
-/// `question.cancel` or `action.read` that carries one.
+/// duplicate of any mutation, and the answer to an `action.read`.
 ///
-/// A worker of an earlier build keeps a retained answer whole, so a daemon never passes one of its
-/// retained answers to a paired device. It also ends the link a frame with a member it does not
-/// know arrived on, which is why the member is sent only to a worker that states this.
+/// A control daemon of an earlier release sends a mutation's scope ([`ForwardedMutation::history`])
+/// only to a worker that states this.
 pub const FORWARDED_RESULT_SCOPE: &str = "forwarded.result-scope/1";
-
-/// Returns true when a worker's statement says it holds what it retains to a forwarded frame's
-/// history scope ([`FORWARDED_RESULT_SCOPE`]).
-#[must_use]
-pub fn holds_results_to_scopes(capabilities: &CanonicalSet<CapabilityId>) -> bool {
-    capabilities
-        .iter()
-        .any(|capability| capability.as_str() == FORWARDED_RESULT_SCOPE)
-}
 
 /// The capability a worker states when it reads the grant a forwarded `session.attach` was decided
 /// under ([`ForwardedMutation::screen_basis`]) and draws the attachment the screen that grant
 /// allows.
 ///
-/// A worker of an earlier build ends the link a frame with a member it does not know arrived on,
-/// and would draw a share's attachment more than the preview showed, so a daemon refuses a share's
-/// attach to a worker that does not state this, and sends a pairing grant's attach without the
-/// member.
+/// A control daemon of an earlier release refuses a share's attach to a worker that does not state
+/// this.
 pub const FORWARDED_SCREEN_BASIS: &str = "forwarded.screen-basis/1";
 
 /// The capability a worker states when it reads which grants and devices an authority revision
 /// withdrew ([`crate::worker::AuthorityRevisionNotice::reach`]) and fences the input of those
 /// callers alone.
 ///
-/// A worker of an earlier build ends the link a frame with a member it does not know arrived on,
-/// so a daemon names a revision's reach only to a worker that states this, and announces the
-/// revision to any other as it always did, which fences every caller acting under a grant.
-///
-/// A worker of an earlier build can outlive the daemon that started it, so the statement is kept
-/// until no such worker can be reached by a daemon of this build.
+/// A control daemon of an earlier release names a revision's reach only to a worker that states
+/// this.
 pub const AUTHORITY_REVISION_REACH: &str = "authority.revision-reach/1";
 
-/// Returns true when a worker's statement says it fences the input of the callers a revision's
-/// reach names ([`AUTHORITY_REVISION_REACH`]).
-#[must_use]
-pub fn reads_revision_reach(capabilities: &CanonicalSet<CapabilityId>) -> bool {
-    capabilities
-        .iter()
-        .any(|capability| capability.as_str() == AUTHORITY_REVISION_REACH)
-}
-
-/// The capability a worker states when it serves `agent.instances`, and a control daemon reads
-/// before it sends one.
+/// The capability a worker states when it serves `agent.instances`.
 ///
-/// A worker of an earlier build answers a method it does not list as it answers a caller it does
-/// not allow, so a daemon cannot tell the two apart from the answer. A daemon sends the read only
-/// to a worker that states this, and refuses it for any other. A worker can outlive the daemon
-/// that started it, so the statement is kept until no such worker can be reached by a daemon of
-/// this build.
+/// A control daemon of an earlier release sends the read only to a worker that states this.
 pub const AGENT_INSTANCES_READ: &str = "agent.instances/1";
-
-/// Returns true when a worker's statement says it serves `agent.instances`
-/// ([`AGENT_INSTANCES_READ`]).
-#[must_use]
-pub fn serves_agent_instances(capabilities: &CanonicalSet<CapabilityId>) -> bool {
-    capabilities
-        .iter()
-        .any(|capability| capability.as_str() == AGENT_INSTANCES_READ)
-}
 
 /// The kind of grant a forwarded `session.attach` was decided under, which decides how much of the
 /// session's screen the attachment is drawn.
@@ -366,15 +277,6 @@ pub enum ScreenBasis {
     /// A share, whose issuer was shown the screen as text before it existed: its attachment is
     /// drawn that and no more, with no title and no link target.
     Share,
-}
-
-/// Returns true when a worker's statement says it reads the screen basis of a forwarded
-/// `session.attach` ([`FORWARDED_SCREEN_BASIS`]).
-#[must_use]
-pub fn reads_the_screen_basis(capabilities: &CanonicalSet<CapabilityId>) -> bool {
-    capabilities
-        .iter()
-        .any(|capability| capability.as_str() == FORWARDED_SCREEN_BASIS)
 }
 
 /// What a worker's statement of the clock floor it maps starts with. The rest is the floor's
@@ -418,15 +320,6 @@ pub fn stated_utc_floor(capabilities: &CanonicalSet<CapabilityId>) -> Option<[u8
         identity[index] = (value(pair[0])? << 4) | value(pair[1])?;
     }
     Some(identity)
-}
-
-/// Whether a set of capabilities states the forwarded frames' UTC deadlines
-/// ([`FORWARDED_UTC_DEADLINE`]).
-#[must_use]
-pub fn states_utc_deadlines(capabilities: &CanonicalSet<CapabilityId>) -> bool {
-    capabilities
-        .iter()
-        .any(|capability| capability.as_str() == FORWARDED_UTC_DEADLINE)
 }
 
 /// Whether a set of rights may travel to a worker beside a [`ForwardedMutation`]: never with
@@ -710,17 +603,12 @@ mod tests {
             stated.as_str(),
             "utc-floor/a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5"
         );
-        let frame_shape =
-            CapabilityId::new(super::FORWARDED_UTC_DEADLINE).expect("a capability identifier");
-        let capabilities: CanonicalSet<CapabilityId> =
-            [stated.clone(), frame_shape].into_iter().collect();
+        let capabilities: CanonicalSet<CapabilityId> = [stated.clone()].into_iter().collect();
         assert_eq!(super::stated_utc_floor(&capabilities), Some(identity));
-        assert!(super::states_utc_deadlines(&capabilities));
 
         // A worker of an earlier build states nothing, and a statement this build cannot read
         // states no floor.
         assert_eq!(super::stated_utc_floor(&CanonicalSet::new()), None);
-        assert!(!super::states_utc_deadlines(&CanonicalSet::new()));
         let upper: CanonicalSet<CapabilityId> =
             [CapabilityId::new("utc-floor/A5A5A5A5A5A5A5A5A5A5A5A5A5A5A5A5").expect("text")]
                 .into_iter()
@@ -994,108 +882,6 @@ mod tests {
             kr_cbor::from_canonical_slice::<Earlier>(&bytes, &limits).is_err(),
             "an earlier worker cannot read a scope"
         );
-    }
-
-    #[test]
-    fn a_worker_states_that_it_holds_results_to_a_scope() {
-        use crate::ids::CapabilityId;
-        use crate::scalars::CanonicalSet;
-
-        let statement = |capabilities: &[&str]| -> CanonicalSet<CapabilityId> {
-            capabilities
-                .iter()
-                .map(|capability| CapabilityId::new(*capability).expect("a capability identifier"))
-                .collect()
-        };
-        assert_eq!(super::FORWARDED_SCREEN_BASIS, "forwarded.screen-basis/1");
-        assert!(super::reads_the_screen_basis(&statement(&[
-            super::FORWARDED_SCREEN_BASIS
-        ])));
-        assert!(!super::reads_the_screen_basis(&statement(&[
-            super::FORWARDED_RESULT_SCOPE
-        ])));
-        assert_eq!(super::FORWARDED_RESULT_SCOPE, "forwarded.result-scope/1");
-        assert!(super::holds_results_to_scopes(&statement(&[
-            super::FORWARDED_RESULT_SCOPE
-        ])));
-        // A worker that reads a scope and holds its question reads to it still keeps a retained
-        // answer whole, and a worker that states nothing at all is the same.
-        assert!(!super::holds_results_to_scopes(&statement(&[
-            super::FORWARDED_HISTORY_SCOPE,
-            super::FORWARDED_QUESTION_SCOPE,
-        ])));
-        assert!(!super::holds_results_to_scopes(&CanonicalSet::new()));
-        // The statements are read apart.
-        assert!(!super::reads_history_scopes(&statement(&[
-            super::FORWARDED_RESULT_SCOPE
-        ])));
-        assert!(!super::holds_question_reads_to_scopes(&statement(&[
-            super::FORWARDED_RESULT_SCOPE
-        ])));
-    }
-
-    #[test]
-    fn a_worker_states_that_it_reads_a_forwarded_scope() {
-        use crate::ids::CapabilityId;
-        use crate::scalars::CanonicalSet;
-
-        let stated: CanonicalSet<CapabilityId> =
-            [CapabilityId::new(super::FORWARDED_HISTORY_SCOPE).expect("a capability identifier")]
-                .into_iter()
-                .collect();
-        assert!(super::reads_history_scopes(&stated));
-        assert!(!super::reads_history_scopes(&CanonicalSet::new()));
-        let other: CanonicalSet<CapabilityId> =
-            [CapabilityId::new(super::FORWARDED_UTC_DEADLINE).expect("a capability identifier")]
-                .into_iter()
-                .collect();
-        assert!(!super::reads_history_scopes(&other));
-
-        // A worker that read scopes naming approvals by an upstream's text says so with the first
-        // version alone, and is sent no scope; the version that names them by resource is read.
-        let statement = |capability: &str| -> CanonicalSet<CapabilityId> {
-            [CapabilityId::new(capability).expect("a capability identifier")]
-                .into_iter()
-                .collect()
-        };
-        assert!(!super::reads_history_scopes(&statement(
-            "forwarded.history-scope/1"
-        )));
-        assert!(super::reads_history_scopes(&statement(
-            "forwarded.history-scope/2"
-        )));
-    }
-
-    #[test]
-    fn a_worker_states_that_it_holds_a_question_read_to_its_scope() {
-        use crate::ids::CapabilityId;
-        use crate::scalars::CanonicalSet;
-
-        let statement = |capabilities: &[&str]| -> CanonicalSet<CapabilityId> {
-            capabilities
-                .iter()
-                .map(|capability| CapabilityId::new(*capability).expect("a capability identifier"))
-                .collect()
-        };
-        assert_eq!(
-            super::FORWARDED_QUESTION_SCOPE,
-            "forwarded.question-scope/1"
-        );
-        assert!(super::holds_question_reads_to_scopes(&statement(&[
-            super::FORWARDED_HISTORY_SCOPE,
-            super::FORWARDED_QUESTION_SCOPE,
-        ])));
-        // A worker that reads a scope and says nothing of its question reads answers them with
-        // every question it holds, and a worker that states nothing at all is the same.
-        assert!(!super::holds_question_reads_to_scopes(&statement(&[
-            super::FORWARDED_HISTORY_SCOPE
-        ])));
-        assert!(!super::holds_question_reads_to_scopes(&CanonicalSet::new()));
-        // The two statements are read apart: the new one alone says nothing about the scope's
-        // other reads.
-        assert!(!super::reads_history_scopes(&statement(&[
-            super::FORWARDED_QUESTION_SCOPE
-        ])));
     }
 
     #[test]

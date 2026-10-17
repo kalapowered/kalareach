@@ -37,6 +37,26 @@ pub const CLOSE_EXCHANGE: std::time::Duration = std::time::Duration::from_millis
         + kr_worker::session::DRAIN_PERIOD.as_millis() as u64,
 );
 
+/// A worker's answer to a close, read in the shape of the worker's level and put in this build's:
+/// a close result, which is returned with the answer, or the receipt a retried close is answered
+/// with.
+///
+/// # Errors
+///
+/// Returns an error when the answer is neither under the level, which is then not passed on.
+pub(crate) fn read_close_answer(
+    level: kr_protocol::retained::Level,
+    value: &ParamsValue,
+) -> Result<(ParamsValue, Option<SessionCloseResult>)> {
+    if let Ok(reply) = level.decode_value::<SessionCloseResult>(value) {
+        return Ok((encode(&reply)?, Some(reply)));
+    }
+    let receipt = level
+        .decode_value::<kr_protocol::receipt::ReceiptResponse>(value)
+        .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
+    Ok((encode(&receipt)?, None))
+}
+
 impl Controller {
     /// Tells every worker holding a close for this action that the caller has its acceptance.
     ///
@@ -211,13 +231,13 @@ impl Controller {
             Ok(value) => {
                 // A retry of an action this worker settled without closing anything answers with
                 // its receipt rather than a close result. That is the right answer to the caller's
-                // retry, so it is passed through as it stands: reading it as a close result would
-                // turn the receipt the caller asked for into a decoding failure.
-                let Ok(reply) = value.to_typed::<SessionCloseResult>() else {
-                    return Ok(value);
-                };
-                self.settle_close_answer(params.session_id, &reply).await?;
-                encode(&reply)
+                // retry, so it is passed on: reading it as a close result would turn the receipt
+                // the caller asked for into a decoding failure.
+                let (answer, closed) = read_close_answer(worker.level, &value)?;
+                if let Some(reply) = closed {
+                    self.settle_close_answer(params.session_id, &reply).await?;
+                }
+                Ok(answer)
             }
             Err(error) => Err(ControllerError::InvalidArgument(error.to_string())),
         }

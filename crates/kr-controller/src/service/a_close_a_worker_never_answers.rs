@@ -115,8 +115,9 @@ fn serve_fake_worker(
 
 /// What a fake worker answers the handshake with that the daemon makes before it will speak
 /// to a worker at all: the version exchange, stating `stated` about itself, the challenge over
-/// the descriptor's key, the controller generation and the role a link says it is for. Any
-/// other frame is `None`, and the fake worker answers it in its own way.
+/// the descriptor's key, the controller generation, the role a link says it is for and the
+/// statement of what the host's local owner may do. Any other frame is `None`, and the fake
+/// worker answers it in its own way.
 pub(super) fn handshake(
     frame: &ControlFrame,
     identity: &WorkerIdentity,
@@ -166,6 +167,13 @@ pub(super) fn handshake(
         }
         // A proxy link says what it is for, and the worker agrees.
         ControlFrame::ControllerRole(role) => Some(vec![ControlFrame::ControllerRole(*role)]),
+        // The first thing a daemon tells a worker on a link it has opened: what its local owner may
+        // do, which a worker of every level the daemon speaks to acknowledges.
+        ControlFrame::LocalAccess(access) => Some(vec![ControlFrame::LocalAccessAck(
+            kr_protocol::worker::LocalAccessAck {
+                sequence: access.sequence,
+            },
+        )]),
         _ => None,
     }
 }

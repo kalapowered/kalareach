@@ -650,3 +650,143 @@ async fn write_under(
     writer.write_frame(&framed).await?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use kr_cbor::{CanonicalMap, CanonicalValue};
+    use kr_protocol::admission::PluginRuntimeState;
+    use kr_protocol::error::{ErrorCode, RetryCategory};
+
+    use super::*;
+    use crate::directory::KnownWorker;
+    use crate::service::a_close_a_worker_never_answers as world;
+
+    /// The payload of a running worker's first frame: the variant that asks, naming `session_id`,
+    /// and a member that only a worker of another level writes.
+    fn asking(question: &str, session_id: SessionId) -> Vec<u8> {
+        let request = CanonicalMap::from_entries([
+            (
+                "session_id".to_owned(),
+                kr_cbor::to_canonical_value(&session_id).expect("encodes"),
+            ),
+            (
+                "a_member_of_another_level".to_owned(),
+                CanonicalValue::integer(1).expect("an integer"),
+            ),
+        ])
+        .expect("a map");
+        let frame =
+            CanonicalMap::from_entries([(question.to_owned(), CanonicalValue::Map(request))])
+                .expect("a map");
+        kr_cbor::encode(&CanonicalValue::Map(frame))
+    }
+
+    /// A level whose workers write a member this release does not know in the question for the
+    /// plugin runtime, which the read leaves out.
+    fn a_level_with_a_member_more() -> Level {
+        fn leave_out(value: &mut CanonicalValue) -> std::result::Result<(), String> {
+            kr_protocol::retained::remove_member(value, "a_member_of_another_level");
+            Ok(())
+        }
+        fn keep(_: &mut CanonicalValue) -> std::result::Result<(), String> {
+            Ok(())
+        }
+        static ENTRY: [kr_protocol::retained::Declared; 1] = [kr_protocol::retained::Declared {
+            at: "PluginRuntimeWanted.a_member_of_another_level",
+            write: keep,
+            read: leave_out,
+            golden: &[],
+        }];
+        kr_protocol::retained::a_level_of_the_tests_own(
+            |definitions| {
+                let wanted = &mut definitions["PluginRuntimeWanted"];
+                wanted["properties"]
+                    .as_object_mut()
+                    .expect("members")
+                    .insert(
+                        "a_member_of_another_level".to_owned(),
+                        serde_json::json!({ "type": "integer" }),
+                    );
+                wanted["required"]
+                    .as_array_mut()
+                    .expect("required")
+                    .push("a_member_of_another_level".into());
+            },
+            &ENTRY,
+        )
+    }
+
+    /// A worker the daemon has not recorded is told to ask again, in the shape every release
+    /// reads, whatever shape its question has: the daemon cannot know what level it is at yet.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_worker_the_daemon_has_not_recorded_is_told_to_ask_again_whatever_its_question_looks_like()
+     {
+        let silent = world::fake_worker(None).await;
+        let unrecorded = SessionId::new(kr_ipc::new_uuid());
+        let controller = &silent.controller;
+
+        let Ok(Claimed::NotYet(answer)) = controller
+            .rendezvous_claim(&asking("plugin_runtime_wanted", unrecorded))
+            .await
+        else {
+            panic!("a worker the daemon has not recorded is told to ask again");
+        };
+        let ControlFrame::PluginRuntimeState(PluginRuntimeState::Unavailable(told)) = answer else {
+            panic!("the answer is that the runtime is unavailable: {answer:?}");
+        };
+        assert!(told.retry_after_ms.get() > 0);
+
+        let Ok(Claimed::NotYet(answer)) = controller
+            .rendezvous_claim(&asking("draft_wanted", unrecorded))
+            .await
+        else {
+            panic!("a worker the daemon has not recorded is told to ask again");
+        };
+        let ControlFrame::DraftAnswer(answer) = answer else {
+            panic!("the answer is about a draft");
+        };
+        let DraftAnswer::Refused(refusal) = *answer else {
+            panic!("the draft question is refused");
+        };
+        assert_eq!(refusal.code, ErrorCode::ResourceUnavailable);
+        assert_eq!(refusal.retry, RetryCategory::Transient);
+        silent.serving.abort();
+    }
+
+    /// A running worker's first frame is read under the level the daemon recorded for the session it
+    /// names: a frame with a member this release does not know is read when that worker's level has
+    /// it, and is not when the worker is at this release's level.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_running_workers_first_frame_is_read_under_the_level_recorded_for_its_session() {
+        let silent = world::fake_worker(None).await;
+        let controller = &silent.controller;
+        let payload = asking("plugin_runtime_wanted", silent.session_id);
+
+        // Recorded at this release's level, the member is one it does not know.
+        assert!(
+            controller.rendezvous_claim(&payload).await.is_err(),
+            "this release does not read a member only another level has"
+        );
+
+        let level = a_level_with_a_member_more();
+        controller.directory.lock().await.insert(
+            KnownWorker {
+                level,
+                ..silent.worker.clone()
+            },
+            None,
+        );
+        let Ok(Claimed::Frame(frame, read_under)) = controller.rendezvous_claim(&payload).await
+        else {
+            panic!("a frame of the level the daemon recorded is read");
+        };
+        assert!(!read_under.is_this());
+        assert_eq!(
+            frame,
+            ControlFrame::PluginRuntimeWanted(kr_protocol::admission::PluginRuntimeWanted {
+                session_id: silent.session_id,
+            })
+        );
+        silent.serving.abort();
+    }
+}
