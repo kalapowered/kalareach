@@ -125,6 +125,11 @@ describe('an invitation at the head of the inbox (KR-REQ-18.13)', () => {
     expect(within(card).getByText(/Terminal input runs as the owner’s account on your host\./)).toBeInTheDocument()
   })
 
+  it('starts the sentence with a name that is the owner’s own text just as it is written', async () => {
+    start({ host: 'iMac in the study', before: (c) => c.sharing.offer() })
+    expect(await screen.findByText('iMac in the study shared session 3 with you.')).toBeInTheDocument()
+  })
+
   it('names no moment for a share that reaches back to the start of what the host kept', async () => {
     start({ before: (c) => c.sharing.offer({ allHistory: true }) })
     await userEvent.click(await screen.findByRole('button', { name: new RegExp(INVITATION) }))
