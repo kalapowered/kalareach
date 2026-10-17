@@ -5352,12 +5352,10 @@ async fn a_request_that_expires_a_hold_delivers_what_it_released() {
 /// session, and the next keystroke sweeps it: the machine releases what it held, says the editor
 /// was busy, and forwards the keystroke. The session is not there to carry out the event, and the
 /// bytes behind it must not wait for it, or the keystroke after it would reach the application
-/// first. The application keeps what it reads in a file, which is read without the session.
+/// first. What the application was handed is read without the session: from the file it keeps, or
+/// where a Windows pseudo-console would hold a lone Escape back, from what the terminal's writer
+/// wrote.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[cfg_attr(
-    windows,
-    ignore = "a Windows pseudo-console begins its output with sequences of its own and holds back a lone Escape, and this case reads what the application received from a file a shell script keeps"
-)]
 async fn a_keystroke_that_expires_a_hold_reaches_the_terminal_in_order_while_the_session_is_held() {
     let kept = tempfile::tempdir().expect("a directory for what the application keeps");
     let received = kept.path().join("received");
@@ -5453,13 +5451,30 @@ async fn a_keystroke_that_expires_a_hold_reaches_the_terminal_in_order_while_the
     }
 
     // Everything the application was typed reaches it, in order, with the session still held.
+    let handed = || -> Vec<u8> {
+        #[cfg(windows)]
+        {
+            wired
+                .runtime
+                .input()
+                .terminal_writes()
+                .into_iter()
+                .filter(|write| write.of_a_lease)
+                .flat_map(|write| write.bytes)
+                .collect()
+        }
+        #[cfg(not(windows))]
+        {
+            std::fs::read(&received).unwrap_or_default()
+        }
+    };
     let reached = tokio::time::timeout(SOON, async {
-        while std::fs::read(&received).unwrap_or_default() != b"held\nab" {
+        while handed() != b"held\nab" {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
     })
     .await;
-    let seen = std::fs::read(&received).unwrap_or_default();
+    let seen = handed();
     release.send(()).expect("lets the session go");
     assert!(
         reached.is_ok(),

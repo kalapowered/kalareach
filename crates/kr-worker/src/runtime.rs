@@ -590,6 +590,26 @@ impl RuntimePauses {
     }
 }
 
+/// The terminal's writer with a record of what it wrote, for this host's own tests.
+#[cfg(feature = "testing")]
+struct RecordingWriter {
+    inner: Box<dyn std::io::Write + Send>,
+    log: Arc<crate::testing::TerminalWrites>,
+}
+
+#[cfg(feature = "testing")]
+impl std::io::Write for RecordingWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let written = self.inner.write(bytes)?;
+        self.log.record(&bytes[..written]);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
 /// Runs work that waits on a lock or on the disk on a thread the executor can do without.
 ///
 /// A task that blocks its worker thread in a commit, or in the wait for a lock a commit holds,
@@ -709,7 +729,7 @@ impl SessionRuntime {
         shared_clock: Arc<dyn kr_ipc::clock::SharedClock>,
     ) -> Result<Self> {
         let reader = session.output_reader()?;
-        let mut writer = session.input_writer()?;
+        let writer = session.input_writer()?;
         // The session's time contract, which the writer reads UTC through when a batch carries a
         // UTC end.
         let writer_time = Arc::clone(session.time());
@@ -756,6 +776,14 @@ impl SessionRuntime {
                 Arc::clone(&writer.terminal_gone),
             )
         };
+        #[cfg(feature = "testing")]
+        let terminal_writes = Arc::clone(&domain.lock().writer().terminal_writes);
+        #[cfg(feature = "testing")]
+        let writer: Box<dyn std::io::Write + Send> = Box::new(RecordingWriter {
+            inner: writer,
+            log: Arc::clone(&terminal_writes),
+        });
+        let mut writer = writer;
         // Input this session accepted and output it produced are what ask the supervision to look
         // at the boundary, and the adoption watch at the terminal's foreground; neither is proof
         // that a process started, and [`crate::lifecycle`] says what a session whose application
@@ -878,6 +906,8 @@ impl SessionRuntime {
         let writer_lease_change = Arc::clone(&lease_change_queued);
         let writer_gone = Arc::clone(&terminal_gone);
         let writer_clock = Arc::clone(&shared_clock);
+        #[cfg(feature = "testing")]
+        let writer_log = Arc::clone(&terminal_writes);
         std::thread::spawn(move || {
             use std::sync::atomic::Ordering;
 
@@ -891,6 +921,8 @@ impl SessionRuntime {
             // a batch this writer never wrote never happened to the application.
             let mut last_fence = writer_fence.load(Ordering::Acquire);
             while let Some(batch) = input_receiver.blocking_recv() {
+                #[cfg(feature = "testing")]
+                writer_log.of_a_lease(false);
                 if matches!(batch, InputBatch::LeaseChanged) {
                     writer_lease_change.store(false, Ordering::Release);
                 }
@@ -940,6 +972,8 @@ impl SessionRuntime {
                         ),
                         InputBatch::LeaseChanged => continue,
                     };
+                #[cfg(feature = "testing")]
+                writer_log.of_a_lease(epoch.is_some());
                 // Stale keystrokes are dropped here rather than written. A takeover that only
                 // stopped *new* input would still let the previous holder's last keystrokes land in
                 // the new holder's command line. The host's own answer to a query the application

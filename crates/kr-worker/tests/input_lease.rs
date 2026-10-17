@@ -3158,6 +3158,8 @@ fn triggered_recording(
 /// A worker with a session whose application keeps what it is typed, and the attachment typing.
 struct Rig {
     _kept: tempfile::TempDir,
+    /// The file the application keeps what it reads in, which a Windows host does not read.
+    #[cfg_attr(windows, allow(dead_code))]
     received: std::path::PathBuf,
     trigger: std::path::PathBuf,
     wired: Wired,
@@ -3196,11 +3198,16 @@ impl Rig {
         let kept = tempfile::tempdir().expect("a directory for what the application keeps");
         let received = kept.path().join("received");
         let trigger = kept.path().join("trigger");
-        let made = std::process::Command::new("mkfifo")
-            .arg(&trigger)
-            .status()
-            .expect("mkfifo runs");
-        assert!(made.success(), "the trigger is made");
+        // A Windows host has no named pipe to make this way; the cases that pull the trigger are
+        // not run there.
+        #[cfg(unix)]
+        {
+            let made = std::process::Command::new("mkfifo")
+                .arg(&trigger)
+                .status()
+                .expect("mkfifo runs");
+            assert!(made.success(), "the trigger is made");
+        }
         let wired = wired(&script(&received, &trigger)).await;
         let (client, attachment, epoch) = typist(&wired).await;
         Self {
@@ -3236,8 +3243,28 @@ impl Rig {
     }
 
     /// What the application has received, read from the file it keeps.
+    #[cfg(not(windows))]
     fn received(&self) -> Vec<u8> {
         std::fs::read(&self.received).unwrap_or_default()
+    }
+
+    /// What the application has been handed, read from what the terminal's writer wrote.
+    ///
+    /// A Windows pseudo-console holds back a lone Escape, which it cannot tell from the start of a
+    /// sequence, so the application does not see one for a while whatever the host did, and a file
+    /// the application keeps says nothing of the host's wait. What the writer wrote to the
+    /// pseudo-console is the host's last step, and it is the same observation on every platform
+    /// that touches nothing of the session's.
+    #[cfg(windows)]
+    fn received(&self) -> Vec<u8> {
+        self.wired
+            .runtime
+            .input()
+            .terminal_writes()
+            .into_iter()
+            .filter(|write| write.of_a_lease)
+            .flat_map(|write| write.bytes)
+            .collect()
     }
 
     /// Waits until the application has received everything typed so far, and says when that was.
@@ -3651,10 +3678,6 @@ macro_rules! forced_cases {
         $(
             $(#[$meta])*
             #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-            #[cfg_attr(
-                windows,
-                ignore = "a Windows pseudo-console holds back a lone Escape, which it cannot tell from the start of a sequence, so the Escape this case waits for does not come back"
-            )]
             async fn $name() {
                 a_lone_escape_meets($stalled, $timing, Duration::from_millis($millis)).await;
             }
@@ -3689,9 +3712,11 @@ forced_cases! {
     a_held_escape_whose_deadline_falls_in_a_stalled_question_commit_reaches_the_application:
         Stalled::Question, Timing::DeadlineFalls, 300;
     /// KR-PERF-002: a lone Escape that arrives while the ingest's host-event commit is stalled.
+    #[cfg_attr(windows, ignore = "the application's input is read through a named pipe trigger")]
     a_lone_escape_arriving_during_a_stalled_host_event_commit_reaches_the_application:
         Stalled::HostEvent, Timing::Arrives, 300;
     /// KR-PERF-002: a held Escape whose deadline passes inside a stalled host-event commit.
+    #[cfg_attr(windows, ignore = "the application's input is read through a named pipe trigger")]
     a_held_escape_whose_deadline_falls_in_a_stalled_host_event_commit_reaches_the_application:
         Stalled::HostEvent, Timing::DeadlineFalls, 300;
     /// KR-PERF-002: a lone Escape that arrives while the session is held for 100 ms.
@@ -3716,10 +3741,6 @@ forced_cases! {
 /// that thread would stop the connection reading the Escape and the timer forwarding it, whatever
 /// the input path takes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-#[cfg_attr(
-    windows,
-    ignore = "a Windows pseudo-console holds back a lone Escape, which it cannot tell from the start of a sequence, so the Escape this case waits for does not come back"
-)]
 async fn a_lone_escape_reaches_the_application_while_a_commit_blocks_the_only_thread_of_the_runtime()
  {
     a_lone_escape_meets(Stalled::BlockedMarker, Timing::Arrives, LIVENESS_DEADLINE).await;
@@ -3732,10 +3753,6 @@ async fn a_lone_escape_reaches_the_application_while_a_commit_blocks_the_only_th
 /// held. On one thread, a pass that kept the thread for that commit would stop the connection and
 /// the timer whatever the input path takes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-#[cfg_attr(
-    windows,
-    ignore = "a Windows pseudo-console holds back a lone Escape, which it cannot tell from the start of a sequence, so the Escape this case waits for does not come back"
-)]
 async fn a_lone_escape_reaches_the_application_while_a_prune_blocks_the_only_thread_of_the_runtime()
 {
     a_lone_escape_meets(Stalled::BlockedPrune, Timing::Arrives, LIVENESS_DEADLINE).await;
@@ -3750,7 +3767,7 @@ async fn a_lone_escape_reaches_the_application_while_a_prune_blocks_the_only_thr
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 #[cfg_attr(
     windows,
-    ignore = "a Windows pseudo-console holds back a lone Escape, which it cannot tell from the start of a sequence, so the Escape this case waits for does not come back"
+    ignore = "the application's input is read through a named pipe trigger"
 )]
 async fn a_lone_escape_reaches_the_application_while_a_host_event_commit_blocks_the_only_thread_of_the_runtime()
  {
@@ -3763,15 +3780,12 @@ async fn a_lone_escape_reaches_the_application_while_a_host_event_commit_blocks_
 }
 
 macro_rules! every_prefix_cases {
-    ($($name:ident: $stalled:expr, $disk:expr;)*) => {
+    ($($(#[$meta:meta])* $name:ident: $stalled:expr, $disk:expr;)*) => {
         $(
             /// KR-PERF-002: every prefix length of the start delimiter, and the delimiter split
             /// across two writes, reach the application while the stall is in force.
+            $(#[$meta])*
             #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-            #[cfg_attr(
-                windows,
-                ignore = "a Windows pseudo-console holds back a lone Escape, which it cannot tell from the start of a sequence, so the Escape this case waits for does not come back"
-            )]
             async fn $name() {
                 every_prefix_meets($stalled, $disk).await;
             }
@@ -3786,6 +3800,7 @@ every_prefix_cases! {
         Stalled::Prune, false;
     every_held_prefix_reaches_the_application_during_a_stalled_question_commit:
         Stalled::Question, false;
+    #[cfg_attr(windows, ignore = "the application's input is read through a named pipe trigger")]
     every_held_prefix_reaches_the_application_during_a_stalled_host_event_commit:
         Stalled::HostEvent, false;
     every_held_prefix_reaches_the_application_while_the_session_is_held:
@@ -3796,6 +3811,7 @@ every_prefix_cases! {
         Stalled::Prune, true;
     every_held_prefix_reaches_the_application_during_a_stalled_question_commit_beside_a_disk_writer:
         Stalled::Question, true;
+    #[cfg_attr(windows, ignore = "the application's input is read through a named pipe trigger")]
     every_held_prefix_reaches_the_application_during_a_stalled_host_event_commit_beside_a_disk_writer:
         Stalled::HostEvent, true;
     every_held_prefix_reaches_the_application_while_the_session_is_held_beside_a_disk_writer:
@@ -3983,7 +3999,7 @@ async fn a_takeover_waiting_for_a_held_session_counts_exactly_what_it_discards()
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[cfg_attr(
     windows,
-    ignore = "a Windows pseudo-console holds back a lone Escape, which it cannot tell from the start of a sequence, so the Escape this case waits for does not come back"
+    ignore = "the application's input is read through a named pipe trigger"
 )]
 async fn output_that_turns_paste_mode_off_releases_a_held_prefix_once() {
     let mut rig = Rig::start("\\033[?2004l").await;
@@ -4169,10 +4185,6 @@ async fn replies_one_drain_of_the_lane_did_not_take_follow_the_keystrokes_that_c
 /// domain. A write that arrives while the session is busy with the closure's own work is refused
 /// from that domain, and what the recogniser held is never forwarded.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[cfg_attr(
-    windows,
-    ignore = "a Windows pseudo-console holds back a lone Escape, which it cannot tell from the start of a sequence, so the Escape this case waits for does not come back"
-)]
 async fn a_keystroke_after_a_close_is_refused_without_waiting_for_the_session() {
     let mut rig = Rig::start(HOST_EVENT_OUTPUT).await;
     let (reached, go) = rig.wired.runtime.pause_the_timer_at_its_deadline();

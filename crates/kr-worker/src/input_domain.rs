@@ -109,6 +109,15 @@ impl InputShared {
         self.domain.try_lock().ok().map(|domain| domain.state())
     }
 
+    /// Returns what the terminal's writer has written to the pseudo-terminal, for this host's own
+    /// tests.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn terminal_writes(&self) -> Vec<crate::testing::TerminalWrite> {
+        let writes = Arc::clone(&self.lock().writer().terminal_writes);
+        writes.all()
+    }
+
     /// Asks the pump to take the session and do what is owed.
     pub fn wake_pump(&self) {
         self.pump.notify_one();
@@ -282,6 +291,9 @@ pub(crate) struct WriterHandles {
     pub(crate) input_fence: Arc<AtomicU64>,
     /// Set while a lease change is queued for the writer and not yet taken.
     pub(crate) lease_change_queued: Arc<AtomicBool>,
+    /// What the writer wrote to the pseudo-terminal, for this host's own tests.
+    #[cfg(feature = "testing")]
+    pub(crate) terminal_writes: Arc<crate::testing::TerminalWrites>,
 }
 
 impl WriterHandles {
@@ -296,6 +308,8 @@ impl WriterHandles {
             delivered_paste_open: Arc::new(AtomicU64::new(0)),
             input_fence: Arc::new(AtomicU64::new(0)),
             lease_change_queued: Arc::new(AtomicBool::new(false)),
+            #[cfg(feature = "testing")]
+            terminal_writes: Arc::default(),
         }
     }
 }

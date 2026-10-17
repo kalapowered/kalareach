@@ -3011,6 +3011,10 @@ impl Wired {
 /// read is discarded, and every byte it typed is in the application's file or in the count the
 /// lease change reports.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    windows,
+    ignore = "the application's input is read through a named pipe trigger"
+)]
 async fn keystrokes_typed_while_a_fence_holds_the_session_are_accepted_and_the_install_counts_what_it_discards()
  {
     const BLOCK: usize = 8 * 1024;
@@ -3221,10 +3225,6 @@ async fn the_application_printed(runtime: &kr_worker::runtime::SessionRuntime, t
 /// with whatever writes next. The application here prints nothing after the paste opened, so there
 /// is no later write to carry it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[cfg_attr(
-    windows,
-    ignore = "a Windows pseudo-console begins its output with mode sequences of its own, which this case reads as the application's bytes"
-)]
 async fn a_revision_that_takes_a_lease_with_a_paste_open_has_the_paste_closed_at_once() {
     let kept = tempfile::tempdir().expect("a directory for what the application keeps");
     let received = kept.path().join("received");
@@ -3236,6 +3236,29 @@ async fn a_revision_that_takes_a_lease_with_a_paste_open_has_the_paste_closed_at
     the_application_printed(&typing.wired.runtime, b"kr-ready.").await;
     let epoch = typing.wired.runtime.session().lease().epoch;
     let far = kr_ipc::clock::boot_elapsed_ms() + 600_000;
+    // What the application was handed, read without the session: from the file it keeps, or where
+    // a Windows pseudo-console would hold back what the host wrote, from what the terminal's writer
+    // wrote. The second counts the terminator the writer adds when a lease ends inside a paste, and
+    // not only a lease's own bytes.
+    let handed = |only_a_lease: bool| -> Vec<u8> {
+        #[cfg(windows)]
+        {
+            typing
+                .wired
+                .runtime
+                .input()
+                .terminal_writes()
+                .into_iter()
+                .filter(|write| write.of_a_lease || !only_a_lease)
+                .flat_map(|write| write.bytes)
+                .collect()
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = only_a_lease;
+            std::fs::read(&received).unwrap_or_default()
+        }
+    };
 
     let opening = b"\x1b[200~pasted";
     typing
@@ -3252,7 +3275,7 @@ async fn a_revision_that_takes_a_lease_with_a_paste_open_has_the_paste_closed_at
         .await
         .expect("the phone opens a paste");
     within("the paste to reach the application", async {
-        while std::fs::read(&received).unwrap_or_default() != opening {
+        while handed(true) != opening {
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
     })
@@ -3270,10 +3293,7 @@ async fn a_revision_that_takes_a_lease_with_a_paste_open_has_the_paste_closed_at
 
     // Nothing is typed and nothing is printed from here: the end of the paste is the install's.
     let closed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        while !std::fs::read(&received)
-            .unwrap_or_default()
-            .ends_with(b"\x1b[201~")
-        {
+        while !handed(false).ends_with(b"\x1b[201~") {
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
     })
@@ -3281,7 +3301,7 @@ async fn a_revision_that_takes_a_lease_with_a_paste_open_has_the_paste_closed_at
     assert!(
         closed.is_ok(),
         "the paste the lease left open was not closed: the application has {:?}",
-        String::from_utf8_lossy(&std::fs::read(&received).unwrap_or_default())
+        String::from_utf8_lossy(&handed(false))
     );
     typing.close();
 }

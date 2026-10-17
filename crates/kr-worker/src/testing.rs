@@ -487,3 +487,60 @@ impl Stall {
         }
     }
 }
+
+/// One write the terminal's writer made to the pseudo-terminal.
+#[cfg(feature = "testing")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TerminalWrite {
+    /// When the write returned.
+    pub at: std::time::Instant,
+    /// What the terminal took.
+    pub bytes: Vec<u8>,
+    /// Whether the bytes belong to a lease's input. The terminator the writer adds when a lease
+    /// ended inside a paste, and the host's own answers, do not.
+    pub of_a_lease: bool,
+}
+
+/// What the terminal's writer wrote, as the writer saw it.
+///
+/// It is the one observation of a keystroke reaching the application that does not depend on
+/// what the pseudo-terminal does with it afterwards: a Windows pseudo-console holds a lone Escape
+/// back, because it cannot tell it from the start of a sequence, so the application does not see
+/// one for a while whatever the host did.
+#[cfg(feature = "testing")]
+#[derive(Debug, Default)]
+pub struct TerminalWrites {
+    log: std::sync::Mutex<Vec<TerminalWrite>>,
+    of_a_lease: std::sync::atomic::AtomicBool,
+}
+
+#[cfg(feature = "testing")]
+impl TerminalWrites {
+    /// Says whether the batch the writer is on belongs to a lease.
+    pub(crate) fn of_a_lease(&self, yes: bool) {
+        self.of_a_lease
+            .store(yes, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Keeps one write.
+    pub(crate) fn record(&self, bytes: &[u8]) {
+        let entry = TerminalWrite {
+            at: std::time::Instant::now(),
+            bytes: bytes.to_vec(),
+            of_a_lease: self.of_a_lease.load(std::sync::atomic::Ordering::Acquire),
+        };
+        self.log
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(entry);
+    }
+
+    /// Returns every write so far, in the order they were made.
+    #[must_use]
+    pub fn all(&self) -> Vec<TerminalWrite> {
+        self.log
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
