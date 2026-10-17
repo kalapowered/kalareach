@@ -20,17 +20,19 @@
 //!
 //! The source is the web repository's `workers/api/src/sync/{index,collection}.ts` and
 //! `packages/service-contracts/src/sync.ts`. Settings-sync collections, drafts and key records use
-//! the same route and are not modelled: a request for one is answered `400 INVALID_REQUEST` and
-//! says so.
+//! the same route and are [`crate::settings`]'s: [`route`] hands a request that names no `locator`
+//! to it.
 
 use std::collections::BTreeMap;
 
 use kr_client::services::ServiceHttpAnswer;
+use kr_protocol::service::ServiceRequestSignature;
 use kr_protocol::sync::{
     MAX_SEALED_RECOVERY_BUNDLE_BYTES, MIN_SEALED_RECOVERY_BUNDLE_BYTES, SYNC_RECORD_BYTES,
 };
 use serde_json::{Value, json};
 
+use crate::settings::Collections;
 use crate::web::{BACKUP_RESTORE_SCOPE, BACKUP_WRITE_SCOPE, Token, answered, refusal};
 
 /// Where the route is addressed.
@@ -110,8 +112,8 @@ pub(crate) struct Bundles {
     collections: BTreeMap<String, Collection>,
 }
 
-/// Why a request about the bundle is not one the contract reads.
-struct Unread(ServiceHttpAnswer);
+/// Why a request is not one the contract reads.
+pub(crate) struct Unread(pub(crate) ServiceHttpAnswer);
 
 impl Bundles {
     /// The write sequence and the sealed stream the bundle at `locator` stands at.
@@ -154,48 +156,22 @@ impl Bundles {
     ///
     /// `now_ms` is the service's own clock, and `funded` whether the account's backup storage
     /// admits a write. The kind of key that signed the request is read before the route is reached.
-    pub(crate) fn handle(
+    fn handle(
         &mut self,
         tokens: &BTreeMap<String, Token>,
+        member: &str,
         body: &Value,
         token: Option<&str>,
-        now_ms: u64,
-        funded: bool,
+        (now_ms, funded): (u64, bool),
     ) -> ServiceHttpAnswer {
-        let named: Vec<&str> = MEMBERS
-            .into_iter()
-            .filter(|member| body.get(*member).is_some())
-            .collect();
-        let [member] = named.as_slice() else {
-            return refusal(
-                400,
-                "INVALID_REQUEST",
-                "A settings-sync request exchanges, compares, resolves, queries status, fences a request identity, reads or offers key records, or lists memberships, and asks for one of those.",
-            );
-        };
-        let Some(fields) = body[*member].as_object() else {
-            return refusal(
-                400,
-                "INVALID_REQUEST",
-                "A settings-sync request carries the fields of what it asks for.",
-            );
-        };
-        if !fields.contains_key("locator") {
-            return refusal(
-                400,
-                "INVALID_REQUEST",
-                "This service answers the recovery bundle at its locator and no other \
-                 settings-sync request.",
-            );
-        }
-        let asked = match read(member, &body[*member]) {
+        let asked = match read(member, &body[member]) {
             Ok(asked) => asked,
             Err(Unread(answer)) => return answer,
         };
 
         // The second proof: a live token that carries a scope this member is answered for. A
         // missing one, an unknown one, an expired one and one without the scope are one answer.
-        let needs: &[&str] = if *member == "compare" {
+        let needs: &[&str] = if member == "compare" {
             &[BACKUP_WRITE_SCOPE, BACKUP_RESTORE_SCOPE]
         } else {
             &[BACKUP_WRITE_SCOPE]
@@ -226,6 +202,67 @@ impl Bundles {
             Asked::Status { request_id, .. } => held.status(&request_id),
             Asked::Fence { request_id, .. } => held.fence(&request_id, now_ms),
         }
+    }
+}
+
+/// What a request to the sync route arrived as: the document, who signed it, the account token
+/// beside it and the service's clock.
+pub(crate) struct Arrival<'a> {
+    /// The signed request's body.
+    pub(crate) body: &'a Value,
+    /// The credential that signed it.
+    pub(crate) signature: &'a ServiceRequestSignature,
+    /// The bearer token beside it, when there was one.
+    pub(crate) token: Option<&'a str>,
+    /// The service's own clock, in UTC milliseconds.
+    pub(crate) now_ms: u64,
+}
+
+/// Which writes the service admits, as a test arranged.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Allowances {
+    /// Whether the account's backup storage admits the write of a bundle.
+    pub(crate) bundles: bool,
+    /// Whether the settings-sync allowance admits the write of an object or a key record.
+    pub(crate) settings: bool,
+}
+
+/// What the service answers one request to the sync route: a request that names a locator is about
+/// the recovery bundle, and any other is about a settings collection.
+pub(crate) fn route(
+    (bundles, settings): (&mut Bundles, &mut Collections),
+    tokens: &BTreeMap<String, Token>,
+    arrival: &Arrival<'_>,
+    allowances: Allowances,
+) -> ServiceHttpAnswer {
+    let named: Vec<&'static str> = MEMBERS
+        .into_iter()
+        .filter(|member| arrival.body.get(*member).is_some())
+        .collect();
+    let [member] = named.as_slice() else {
+        return refusal(
+            400,
+            "INVALID_REQUEST",
+            "A settings-sync request exchanges, compares, resolves, queries status, fences a request identity, reads or offers key records, or lists memberships, and asks for one of those.",
+        );
+    };
+    let Some(fields) = arrival.body[*member].as_object() else {
+        return refusal(
+            400,
+            "INVALID_REQUEST",
+            "A settings-sync request carries the fields of what it asks for.",
+        );
+    };
+    if fields.contains_key("locator") {
+        bundles.handle(
+            tokens,
+            member,
+            arrival.body,
+            arrival.token,
+            (arrival.now_ms, allowances.bundles),
+        )
+    } else {
+        settings.handle(arrival, member, allowances.settings)
     }
 }
 
@@ -264,16 +301,16 @@ fn absent() -> ServiceHttpAnswer {
     )
 }
 
-fn invalid_request(message: &str) -> Unread {
+pub(crate) fn invalid_request(message: &str) -> Unread {
     Unread(refusal(400, "INVALID_REQUEST", message))
 }
 
-fn invalid_argument(message: &str) -> Unread {
+pub(crate) fn invalid_argument(message: &str) -> Unread {
     Unread(refusal(400, "INVALID_ARGUMENT", message))
 }
 
 /// A canonical lowercase hyphenated UUID, as the contract reads one.
-fn is_uuid(value: &Value) -> bool {
+pub(crate) fn is_uuid(value: &Value) -> bool {
     value.as_str().is_some_and(|text| {
         text.len() == 36
             && text.char_indices().all(|(at, character)| match at {
@@ -289,7 +326,7 @@ const MAX_SYNC_COUNTER: u64 = (1 << 53) - 1;
 
 /// A counter the contract reads: decimal text with no leading zero, no larger than
 /// [`MAX_SYNC_COUNTER`].
-fn counter(value: &Value) -> Option<u64> {
+pub(crate) fn counter(value: &Value) -> Option<u64> {
     let text = value.as_str()?;
     if text.is_empty()
         || !text.bytes().all(|byte| byte.is_ascii_digit())
@@ -460,7 +497,7 @@ fn decode(text: &str) -> Option<Vec<u8>> {
 }
 
 /// A moment as the service writes one: ISO 8601 in UTC, to the millisecond.
-fn instant(ms: u64) -> String {
+pub(crate) fn instant(ms: u64) -> String {
     let days = i64::try_from(ms / 86_400_000).unwrap_or(i64::MAX);
     let in_day = ms % 86_400_000;
     // Civil date from a day count: Howard Hinnant's algorithm, for the proleptic Gregorian
