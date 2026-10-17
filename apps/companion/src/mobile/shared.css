@@ -1,0 +1,259 @@
+/*
+ * What the phone is offered and holds: the invitations at the head of the inbox, the shares at the
+ * head of the sessions, and the card an invitation opens.
+ *
+ * The rows are the phone's own rows (`.m-row`); what is here is what they do not already say: the
+ * heading over a group, the card's lists, the actions under a row and the pill that tells of an
+ * invitation that arrived above the part of the inbox a person has scrolled to.
+ */
+
+/*
+ * The inbox is one box so that a change at its head can be answered for. A browser that anchors the
+ * scroll position to content moves it by itself when something above changes height; one that does
+ * not (WebKit) leaves the content to jump. Neither is left to chance here: the head's height is
+ * followed and the scroll position moved by exactly what it changed, so the anchoring is turned off
+ * and the page does it the same in both.
+ */
+.sw-inbox {
+  overflow-anchor: none;
+}
+
+/*
+ * The head of the inbox is one box that holds everything the group's margin does, so the height
+ * followed for the scroll position is the height that moves what is below it.
+ */
+.sw-head {
+  display: flow-root;
+}
+
+.sw-group {
+  display: grid;
+  /* One column that is never wider than the group: a track sized to its widest unbroken word would run past the screen. */
+  grid-template-columns: minmax(0, 1fr);
+  gap: var(--gap-3);
+  margin-block-end: var(--gap-5);
+}
+
+/*
+ * A row's own grid has one column as wide as its widest unbroken word, so the label over a row, one
+ * long word in capitals, would draw every line of the row past its edge at the largest text size on
+ * the narrowest screen. The column is the row's and the label breaks where the row ends.
+ */
+.sw-group .m-row {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.sw-group .m-row-kind {
+  overflow-wrap: anywhere;
+}
+
+/* Under whatever the screen starts with, a group stands apart from it. */
+* + .sw-group {
+  margin-block-start: var(--gap-3);
+}
+
+.sw-heading + .m-list {
+  margin-block-start: var(--gap-3);
+}
+
+.sw-heading {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.8125rem;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  line-height: 1.3;
+}
+
+.sw-stale {
+  margin: 0;
+  color: var(--faint);
+  font-size: 0.8125rem;
+  line-height: 1.45;
+}
+
+/* A row that is not a control: a share that ended, which leads nowhere. */
+.sw-ended {
+  cursor: default;
+  background: transparent;
+  border-style: dashed;
+}
+
+.sw-ended:active {
+  transform: none;
+  background: transparent;
+}
+
+/* What a row says beside its title when there is more than one thing to say. */
+.sw-row-lines {
+  display: grid;
+  gap: var(--gap-1);
+}
+
+/* The row that stands for what the person put off, and the row that stands for attempts they hid. */
+.sw-quiet {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--gap-1) var(--gap-3);
+  color: var(--muted);
+}
+
+.sw-quiet-action {
+  color: var(--accent);
+  font-weight: 600;
+}
+
+/* An acceptance that is not settled: the words, what the host said, and what can be done. */
+.sw-attempt {
+  display: grid;
+  gap: var(--gap-2);
+  padding: var(--gap-3) var(--gap-4);
+  border: 1px solid var(--line);
+  border-inline-start: 3px solid var(--warning);
+  border-radius: 12px;
+  background: var(--raised);
+}
+
+.sw-attempt[data-phase='closed'] {
+  border-inline-start-color: var(--control-line);
+}
+
+.sw-attempt p {
+  margin: 0;
+  overflow-wrap: anywhere;
+  font-size: 0.875rem;
+  line-height: 1.45;
+}
+
+.sw-attempt:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.sw-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--gap-2);
+}
+
+/* ---- The card an invitation opens ------------------------------------------------------------ */
+
+.sw-card {
+  display: grid;
+  gap: var(--gap-4);
+}
+
+.sw-card h3 {
+  margin: 0 0 var(--gap-1);
+  color: var(--muted);
+  font-size: 0.8125rem;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  line-height: 1.3;
+}
+
+.sw-card ul {
+  display: grid;
+  gap: var(--gap-1);
+  margin: 0;
+  padding-inline-start: 1.1rem;
+}
+
+.sw-card li {
+  overflow-wrap: anywhere;
+  font-size: 0.9375rem;
+  line-height: 1.4;
+}
+
+.sw-card p {
+  margin: 0;
+  overflow-wrap: anywhere;
+  font-size: 0.875rem;
+  line-height: 1.45;
+  color: var(--muted);
+}
+
+.sw-footer {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--gap-2);
+}
+
+/* ---- The pill for an invitation that arrived above the part of the inbox that is in view ----- */
+
+/*
+ * It sits in the flow with no height of its own and sticks to the top of the scrolling area, so it
+ * stays over the content however far the person has scrolled and takes no room when it is not
+ * shown.
+ */
+.sw-new {
+  position: sticky;
+  inset-block-start: 0;
+  z-index: 3;
+  display: flex;
+  justify-content: center;
+  block-size: 0;
+  overflow: visible;
+  pointer-events: none;
+}
+
+.sw-new-button {
+  pointer-events: auto;
+  margin-block-start: var(--gap-2);
+  padding: var(--gap-2) var(--gap-4);
+  border: 1px solid var(--accent-line);
+  border-radius: 999px;
+  background: var(--accent-soft);
+  color: var(--accent);
+  box-shadow: var(--shadow);
+  font: inherit;
+  font-size: 0.875rem;
+  font-weight: 600;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+  transition:
+    transform var(--state) var(--ease-out),
+    opacity var(--state) var(--ease-out);
+}
+
+.sw-new-button:active {
+  transform: scale(0.97);
+}
+
+/* It arrives from just above where it rests, quickly: it is news, not a place the person went. */
+@starting-style {
+  .sw-new-button {
+    opacity: 0;
+    transform: translateY(-6px);
+  }
+}
+
+.sw-new-button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .sw-new-button {
+    transition: opacity var(--state) var(--ease-out);
+  }
+
+  .sw-new-button:active {
+    transform: none;
+  }
+
+  @starting-style {
+    .sw-new-button {
+      transform: none;
+    }
+  }
+}
+
+@media (prefers-reduced-transparency: reduce), (prefers-contrast: more) {
+  .sw-new-button {
+    background: var(--raised);
+    border-color: var(--control-line);
+  }
+}

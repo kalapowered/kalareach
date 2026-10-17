@@ -24,9 +24,14 @@ export interface HeldConnection {
   readonly rights: readonly ActionRight[] | null
   /** True while the host is one this device is paired with, not the one on this computer. */
   readonly paired: boolean
+  /**
+   * The environment the connection belongs to, which says which host is reached. Only the phone's
+   * shell states it, because only the phone draws what depends on which host that is.
+   */
+  readonly environmentId?: string | null
 }
 
-const NOTHING_KNOWN: HeldConnection = { rights: null, paired: false }
+const NOTHING_KNOWN: HeldConnection = { rights: null, paired: false, environmentId: null }
 
 /**
  * What the shell heard, for the views under it: nothing known while the connection has not
@@ -47,7 +52,9 @@ export function useHeldConnection(): HeldConnection {
       (state) => {
         if (state.connected && state.rights !== null) rememberRights(state.rights)
         setOwn(
-          state.connected ? { rights: state.rights, paired: state.paired } : NOTHING_KNOWN
+          state.connected
+            ? { rights: state.rights, paired: state.paired, environmentId: state.environment_id }
+            : NOTHING_KNOWN
         )
       },
       () => {

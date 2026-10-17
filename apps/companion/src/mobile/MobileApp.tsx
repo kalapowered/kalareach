@@ -51,6 +51,8 @@ type Tab = 'attention' | 'sessions' | 'hosts' | 'account'
 interface Place {
   readonly tab: Tab
   readonly sessionId?: string
+  /** The share the session is opened under, for a session that is shared with this phone. */
+  readonly grantId?: string
   readonly settings?: boolean
   /** The voice screen, over the sessions list: opened from it, and left the way a session is. */
   readonly voice?: boolean
@@ -187,8 +189,12 @@ export function MobileApp({
     [actionable]
   )
 
-  const openSession = useCallback((sessionId: string) => {
-    setPlace({ tab: 'sessions', sessionId })
+  const openSession = useCallback((sessionId: string, grantId?: string | null) => {
+    setPlace(
+      grantId === undefined || grantId === null
+        ? { tab: 'sessions', sessionId }
+        : { tab: 'sessions', sessionId, grantId }
+    )
   }, [])
 
   const inSession = place.tab === 'sessions' && place.sessionId !== undefined
@@ -257,7 +263,11 @@ export function MobileApp({
   }, [inVoice, inDrafts])
 
   const held = useMemo(
-    () => ({ rights: connection?.rights ?? null, paired: connection?.paired ?? false }),
+    () => ({
+      rights: connection?.rights ?? null,
+      paired: connection?.paired ?? false,
+      environmentId: connection?.environmentId ?? null
+    }),
     [connection]
   )
 
@@ -306,6 +316,7 @@ export function MobileApp({
         {inSession && place.sessionId ? (
           <MobileSession
             sessionId={place.sessionId}
+            grantId={place.grantId ?? null}
             surface={resolved}
             lifecycle={lifecycle}
             connected={connection?.connected ?? null}

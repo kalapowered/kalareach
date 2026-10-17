@@ -11,8 +11,9 @@ import type { EnvironmentListResult, SessionListResult } from '@kalareach/protoc
 
 import { useApp } from '../../app/state'
 import { useBook } from '../../app/drafts'
+import { useHeldConnection } from '../../app/rights'
 import { keptEntry } from '../../model/draft-book'
-import { failureMessage, watch, type Watch } from '../../host/port'
+import { failureCode, failureMessage, watch, type Watch } from '../../host/port'
 import { Banner } from '../../components/ui'
 import { PairingFlow } from '../../pairing/PairingFlow'
 import { accountName } from '../../views/account-name'
@@ -27,7 +28,9 @@ import {
   useOnScreen
 } from '../../model/describe'
 import { ask } from '../model/call'
+import { useHeld } from '../model/held'
 import { minimumTarget, type Surface } from '../platform'
+import { SharedWithYou, hasShares } from './SharedWithYou'
 
 interface Row {
   readonly id: string
@@ -51,6 +54,8 @@ function connectionKey(connected: boolean | null | undefined, environmentId: str
 interface Held {
   readonly at: string
   readonly rows: readonly Row[]
+  /** True when the host refused the list outright: this device has no sessions of its own. */
+  readonly refused?: boolean
 }
 
 /** Why a list could not be read, and the connection it was read under. */
@@ -69,7 +74,7 @@ export function MobileSessions({
   environmentId
 }: {
   readonly surface: Surface
-  readonly onOpen: (sessionId: string) => void
+  readonly onOpen: (sessionId: string, grantId?: string | null) => void
   /** Opens the voice screen. Absent while no host is reached, when there is no one to talk to. */
   readonly onOpenVoice?: () => void
   /** Opens the list of kept drafts, which is shown only while there are some. */
@@ -81,13 +86,19 @@ export function MobileSessions({
 }): ReactNode {
   const { port } = useApp()
   const keptEntryLine = keptEntry(useBook())
+  const shared = useHeld()
+  const { rights } = useHeldConnection()
+  // A pairing that holds no view of a session is refused the list outright, which makes the refusal
+  // the answer: this device has no sessions of its own.
+  const lacksView = rights !== null && !rights.includes('session.view')
   // What was read is kept with the connection it was read under, and shown only while that is the
   // connection there is: a list one host gave is never shown as another's.
   const [held, setHeld] = useState<Held | null>(null)
   const key = connectionKey(connected, environmentId)
   const rows = held !== null && held.at === key ? held.rows : null
+  const noneOfItsOwn = held !== null && held.at === key && held.refused === true && lacksView
   const [problem, setProblem] = useState<Problem | null>(null)
-  const error = problem !== null && problem.at === key ? problem.message : null
+  const error = !noneOfItsOwn && problem !== null && problem.at === key ? problem.message : null
   const target = minimumTarget(surface)
   // The host is asked about the rows a person can see, and the few either side of them.
   const { onScreen, track } = useOnScreen()
@@ -130,11 +141,16 @@ export function MobileSessions({
         })
         .catch((failure: unknown) => {
           if (!current()) return
+          // Whether the refusal is the answer or a fault depends on what the pairing holds, which is
+          // known when it is drawn: the rows stand for no sessions, and the words are kept.
+          if (failureCode(failure) === 'PERMISSION_DENIED') setHeld({ at: key, rows: [], refused: true })
           setProblem({ at: key, message: failureMessage(failure) })
         })
     })
     return reads.stop
   }, [port, connected, key])
+
+  const sharedHere = hasShares(shared)
 
   return (
     <>
@@ -165,9 +181,28 @@ export function MobileSessions({
       {error ? (
         <Banner tone="warning" title="The sessions could not be read" detail={error} />
       ) : null}
-      {rows && rows.length === 0 ? <p className="m-empty">No sessions on this host.</p> : null}
+      <SharedWithYou
+        view={shared}
+        surface={surface}
+        onOpen={(sessionId, grantId) => {
+          onOpen(sessionId, grantId)
+        }}
+      />
+      {noneOfItsOwn && !sharedHere ? (
+        <p className="m-empty">
+          {shared.status === 'ready' ? 'Nothing is shared with this phone.' : 'Reading what is shared with this phone…'}
+        </p>
+      ) : null}
+      {rows && rows.length === 0 && !noneOfItsOwn && !error ? (
+        <p className="m-empty">No sessions on this host.</p>
+      ) : null}
+      {rows && rows.length > 0 && sharedHere ? (
+        <h2 className="sw-heading" id="own-sessions-heading">
+          On this host
+        </h2>
+      ) : null}
       {rows && rows.length > 0 ? (
-        <ul className="m-list">
+        <ul className="m-list" aria-labelledby={sharedHere ? 'own-sessions-heading' : undefined}>
           {rows.map((row) => {
             const described = descriptions.get(row.id)
             const label = sourceLabel(described)
