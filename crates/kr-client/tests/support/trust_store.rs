@@ -184,6 +184,7 @@ pub async fn run_child(
         .env_remove("SSL_CERT_FILE")
         .env_remove("SSL_CERT_DIR")
         .current_dir(std::env::temp_dir())
+        .stdin(std::process::Stdio::null())
         // A child that outlasts the wait is ended with it, not left running.
         .kill_on_drop(true);
     if let Some(file) = cert_file {
