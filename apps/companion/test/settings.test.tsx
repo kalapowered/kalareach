@@ -161,6 +161,47 @@ describe('the window\'s own mode', () => {
     expect(screen.getByRole('radio', { name: /Dark/ })).toBeChecked()
   })
 
+  it('selects the mode the root applied when the chooser\'s own read answers after it', async () => {
+    const { port, controls } = fakeHost()
+    controls.settings.change({ colour_mode: 'dark' })
+    const found = await port.settingsView()
+    // Both first reads are held, the root's and the chooser's, each by a port of its own.
+    let answerRoot: (view: SettingsView) => void = () => undefined
+    let answerChooser: (view: SettingsView) => void = () => undefined
+    const root = {
+      ...port,
+      settingsView: () =>
+        new Promise<SettingsView>((resolve) => {
+          answerRoot = resolve
+        })
+    }
+    const chooser = {
+      ...port,
+      settingsView: () =>
+        new Promise<SettingsView>((resolve) => {
+          answerChooser = resolve
+        })
+    }
+    render(
+      <AppProvider port={root}>
+        <ThemeChooser port={chooser} />
+      </AppProvider>
+    )
+    await act(async () => {
+      await Promise.resolve()
+    })
+    await act(async () => {
+      answerRoot(found)
+      await Promise.resolve()
+    })
+    expect(document.documentElement.dataset.preference).toBe('dark')
+    await act(async () => {
+      answerChooser(found)
+      await Promise.resolve()
+    })
+    expect(screen.getByRole('radio', { name: /Dark/ })).toBeChecked()
+  })
+
   it('is the mode native code keeps when the window starts, as a reload finds it', async () => {
     const { port, controls } = fakeHost()
     controls.settings.change({ colour_mode: 'dark' })
@@ -189,6 +230,33 @@ describe('settings sync in the account sheet', () => {
     const sheet = await screen.findByRole('dialog', { name: 'Account' })
     return { person, controls, card: await within(sheet).findByTestId('settings-sync') }
   }
+
+  it('does not show a failed read next to a change that came after it was asked for', async () => {
+    const person = userEvent.setup()
+    const { port, controls } = fakeHost()
+    let fail: (reason: unknown) => void = () => undefined
+    const doomed = new Promise<never>((_, reject) => {
+      fail = reject
+    })
+    const slow = { ...port, settingsView: () => doomed }
+    render(
+      <AppProvider port={slow} initialPlace={{ view: 'attention' }}>
+        <App />
+      </AppProvider>
+    )
+    await person.click(screen.getByRole('button', { name: /^Account/ }))
+    const sheet = await screen.findByRole('dialog', { name: 'Account' })
+    act(() => {
+      controls.settings.change({ sync: { state: 'on', kept_at: 'reach.kala.to', conflicts: 0 } })
+    })
+    await act(async () => {
+      fail(new Error('the settings could not be read'))
+      await Promise.resolve()
+    })
+    const card = await within(sheet).findByTestId('settings-sync')
+    expect(card).toHaveAttribute('data-state', 'on')
+    expect(within(sheet).queryByTestId('settings-problem')).toBeNull()
+  })
 
   it('is off until it is turned on, and then says where it keeps the settings', async () => {
     const { person, controls, card } = await openSheet()

@@ -161,6 +161,7 @@ export function SyncPanel({
       .onSettings((view) => {
         settingsHeard.current += 1
         setSettings(view)
+        setSettingsProblem(null)
       })
       .then(
         (unlisten) => {

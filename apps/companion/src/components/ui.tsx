@@ -887,8 +887,8 @@ export function Sheet({
  * on the same listener and is shown as it is; the window's own mode follows it at the application's
  * root, whether or not this control is on screen.
  *
- * While versions of the settings wait for a choice, settings are not synced while the two differ,
- * and the control says so.
+ * While a version from another device differs from this one and waits for a choice, settings are
+ * not synced, and the control says so.
  */
 export function ThemeChooser({ port }: { readonly port: HostPort }): ReactNode {
   const [mode, setMode] = useState<ColourMode>(() => shownMode())
@@ -916,13 +916,15 @@ export function ThemeChooser({ port }: { readonly port: HostPort }): ReactNode {
       .then(() => {
         if (ended) return
         // Read once the listener is live, so a change cannot fall between the two, and dropped
-        // when one was heard since, or the person pressed since: both are newer than the answer.
+        // when one was heard since: a change is newer than the answer. A preference applied since
+        // the read was asked for (a press, or the root's own read) is newer than its mode, and
+        // the document holds the last one applied, so the radio is set from the document then.
         const asked = modeApplications()
         port
           .settingsView()
           .then((view) => {
             if (ended || heard) return
-            if (modeApplications() === asked) setMode(view.colour_mode)
+            setMode(modeApplications() === asked ? view.colour_mode : shownMode())
             setWaiting(view.sync.conflicts > 0)
           })
           .catch(() => undefined)
