@@ -20,6 +20,7 @@ import { AppProvider } from '../../src/app/state'
 import { fakeHost, type FakeHostControls } from '../../src/host/fake'
 import type { HostPort } from '../../src/host/port'
 import { bookOf } from '../../src/model/held-shares'
+import { STALE_WORDS } from '../../src/model/shared-with-you'
 import { MobileApp } from '../../src/mobile/MobileApp'
 
 afterEach(() => {
@@ -220,22 +221,39 @@ describe('an invitation at the head of the inbox (KR-REQ-18.13)', () => {
 
   it('puts focus on the screen when an invitation is gone by the time the host refuses to accept it', async () => {
     const offered = { id: '' }
+    // The list that says the invitation is gone is held until the card has left, so the row goes
+    // with nothing open over the screen.
+    let held = false
+    let release: () => void = () => undefined
+    const gate = new Promise<void>((resolve) => {
+      release = resolve
+    })
     const { controls } = start({
       before: (c) => {
         offered.id = c.sharing.offer().invitation_id
-      }
+      },
+      through: (host) => ({
+        ...host,
+        grantHeld: async () => {
+          const list = await host.grantHeld()
+          if (held) await gate
+          return list
+        }
+      })
     })
     const row = await screen.findByRole('button', { name: new RegExp(INVITATION) })
     await userEvent.click(row)
     const accept = await screen.findByTestId('accept-offer')
-    // The issuer withdraws it after the phone read its list: the host refuses the acceptance, and
-    // the list that says it is gone is read after the card has closed.
+    // The issuer withdraws it after the phone read its list: the host refuses the acceptance.
     controls.sharing.withdrawOffer(offered.id)
+    held = true
     await userEvent.click(accept)
     expect(await screen.findByText(/no longer offered to this device/)).toBeInTheDocument()
     await waitFor(() => {
       expect(screen.queryByTestId('sheet')).toBeNull()
     })
+    expect(screen.getByRole('button', { name: new RegExp(INVITATION) })).toBeInTheDocument()
+    release()
     await waitFor(() => {
       expect(screen.queryByTestId('offers')).toBeNull()
     })
@@ -280,9 +298,11 @@ describe('an invitation at the head of the inbox (KR-REQ-18.13)', () => {
       expect(screen.queryByTestId('sheet')).toBeNull()
     })
 
-    // The held read answers now, with the acceptances as they were before this one.
+    // The held read answers now, with the acceptances as they were before this one. The read that
+    // follows it fails, and the page says its list is not fresh: the held one has been taken in or
+    // let go of by then.
     waiting[0]?.()
-    await settled()
+    expect(await screen.findByText(STALE_WORDS)).toBeInTheDocument()
     expect(screen.getByTestId('accept-attempt')).toBeInTheDocument()
     await userEvent.click(screen.getByRole('button', { name: new RegExp(INVITATION) }))
     expect(await screen.findByTestId('accept-offer')).toBeDisabled()
