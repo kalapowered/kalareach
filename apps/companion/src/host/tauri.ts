@@ -36,6 +36,7 @@ import type {
   SessionSubject,
   Settled,
   SettingsPane,
+  SettingsView,
   SessionStanding,
   SetupIdentity,
   StandingEvent,
@@ -60,6 +61,9 @@ export const DROPPED_EVENT = 'kr://dropped'
 
 /** The event the backend publishes the account's view on when it changes by itself. */
 export const ACCOUNT_EVENT = 'kr://account'
+
+/** The event the backend publishes the person's settings on when they change by themselves. */
+export const SETTINGS_EVENT = 'kr://settings'
 
 /** The event the backend publishes a change of an opened session's standing on. */
 export const STANDING_EVENT = 'kr://standing'
@@ -406,6 +410,11 @@ export function tauriPort(): HostPort {
 
     syncServiceView: () => call<SyncServiceView>('sync_service_view', {}),
     syncServiceSet: (origin) => call<SyncServiceView>('sync_service_set', { origin }),
+    settingsView: () => call<SettingsView>('settings_view', {}),
+    settingsSetColourMode: (mode) => call<SettingsView>('settings_colour_mode_set', { mode }),
+    settingsSyncTurnOn: () => call<SettingsView>('settings_sync_turn_on', {}),
+    settingsSyncNow: () => call<SettingsView>('settings_sync_now', {}),
+    onSettings: (listener) => listening<SettingsView>(SETTINGS_EVENT, listener),
     recoveryView: () => call<RecoveryView>('recovery_view', {}),
     recoveryTurnOn: () => call<RecoveryView>('recovery_turn_on', {}),
     recoverySettle: () => call<RecoveryView>('recovery_settle', {}),

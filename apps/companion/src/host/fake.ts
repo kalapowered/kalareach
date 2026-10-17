@@ -61,6 +61,8 @@ import type {
   PairingView,
   PasteView,
   RecoveryView,
+  SettingsSyncView,
+  SettingsView,
   ReviewOutcome,
   Settled,
   SessionStanding,
@@ -311,6 +313,26 @@ export interface FakeRecovery {
   holdNextRead(): () => void
 }
 
+/**
+ * The person's settings, as the backend reports them: the colour mode it keeps, where settings sync
+ * stands, and what the page asked for.
+ */
+export interface FakeSettings {
+  /** The colour modes the page asked to keep, in order. */
+  readonly colourModesSet: readonly string[]
+  /** How many times the page asked to turn settings sync on. */
+  readonly syncTurnedOn: number
+  /** How many times the page asked sync to run now. */
+  readonly syncRuns: number
+  /**
+   * Sets the settings as the backend would report them, and tells every listener, as it does when
+   * another device's change was followed.
+   */
+  change(view: Partial<Omit<SettingsView, 'sync'>> & { readonly sync?: Partial<SettingsSyncView> }): void
+  /** Makes every change of the colour mode fail as one does that could not be kept on disk. */
+  failKeeping(message: string | null): void
+}
+
 /** The sync service setting, as the backend reports it. */
 export interface FakeSyncService {
   /**
@@ -328,6 +350,8 @@ export interface FakeHostControls {
   readonly account: FakeAccount
   /** Recovery. */
   readonly recovery: FakeRecovery
+  /** The person's settings. */
+  readonly settings: FakeSettings
   /** The sync service setting. */
   readonly syncService: FakeSyncService
   /** Pushes one event to every subscriber. */
@@ -868,6 +892,33 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
   let syncServiceKeepFails: string | null = null
   const kitsSaved: string[] = []
   const recoveryView = (): RecoveryView => ({ sync_service: syncService, ...recovery })
+
+  let settings: SettingsView = {
+    colour_mode: 'system',
+    sync: {
+      state: 'off',
+      service: null,
+      kept_at: null,
+      outstanding: 0,
+      conflicts: 0,
+      paused: false,
+      problem: null
+    }
+  }
+  const colourModesSet: string[] = []
+  let settingsSyncTurnOns = 0
+  let settingsSyncRuns = 0
+  let settingsKeepFails: string | null = null
+  const settingsListeners = new Set<(view: SettingsView) => void>()
+  const setSettings = (view: SettingsView) => {
+    settings = view
+    for (const listener of settingsListeners) listener(view)
+  }
+  /** The view with the service the settings would be kept at filled in. */
+  const settingsOf = (): SettingsView => ({
+    ...settings,
+    sync: { ...settings.sync, service: settings.sync.service ?? syncService }
+  })
 
   const requireConnection = () => {
     if (!connected) {
@@ -2050,6 +2101,26 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
       syncService = { origin: trimmed, host, is_default: trimmed === 'https://reach.kala.to' }
       return Promise.resolve(syncService)
     },
+    settingsView: () => Promise.resolve(settingsOf()),
+    settingsSetColourMode: (mode) => {
+      if (settingsKeepFails !== null) return refused('RESOURCE_UNAVAILABLE', settingsKeepFails)
+      colourModesSet.push(mode)
+      settings = { ...settings, colour_mode: mode }
+      return Promise.resolve(settingsOf())
+    },
+    settingsSyncTurnOn: () => {
+      settingsSyncTurnOns += 1
+      setSettings({
+        ...settings,
+        sync: { ...settings.sync, state: 'on', kept_at: syncService.host, problem: null }
+      })
+      return Promise.resolve(settingsOf())
+    },
+    settingsSyncNow: () => {
+      settingsSyncRuns += 1
+      return Promise.resolve(settingsOf())
+    },
+    onSettings: (listener) => register(settingsListeners, listener),
     recoveryView: () => {
       const answer = (): Promise<RecoveryView> =>
         recoveryReadFails === null
@@ -2124,6 +2195,25 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
           release = resolve
         })
         return release
+      }
+    },
+    settings: {
+      colourModesSet,
+      get syncTurnedOn() {
+        return settingsSyncTurnOns
+      },
+      get syncRuns() {
+        return settingsSyncRuns
+      },
+      change(view) {
+        setSettings({
+          ...settings,
+          ...view,
+          sync: { ...settings.sync, ...view.sync }
+        })
+      },
+      failKeeping(message) {
+        settingsKeepFails = message
       }
     },
     syncService: {

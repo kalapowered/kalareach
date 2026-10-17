@@ -26,7 +26,14 @@
 
 import { useCallback, useEffect, useId, useRef, useState, type ReactNode } from 'react'
 
-import { failureCode, failureMessage, type HostPort, type RecoveryView, type SyncServiceView } from '../host/port'
+import {
+  failureCode,
+  failureMessage,
+  type HostPort,
+  type RecoveryView,
+  type SettingsView,
+  type SyncServiceView
+} from '../host/port'
 import { minimumTarget, type Surface } from '../mobile/platform'
 import type { AccountView } from '../model/account'
 import {
@@ -38,10 +45,11 @@ import {
   describeRecovery,
   describeStaysAt
 } from '../model/recovery'
+import { SETTINGS_SYNC_HELP, describeSettingsSync, describeWaiting } from '../model/settings'
 import { Button, Card } from './ui'
 
 /** Which card a step belongs to, so the status it ends with is said in that card. */
-type Place = 'service' | 'recovery'
+type Place = 'service' | 'settings' | 'recovery'
 
 /** What the last step said. */
 interface Said {
@@ -73,6 +81,8 @@ export function SyncPanel({
   const serviceStatusId = useId()
   const [service, setService] = useState<SyncServiceView | null>(null)
   const [serviceProblem, setServiceProblem] = useState<string | null>(null)
+  const [settings, setSettings] = useState<SettingsView | null>(null)
+  const [settingsProblem, setSettingsProblem] = useState<string | null>(null)
   const [recovery, setRecovery] = useState<RecoveryView | null>(null)
   const [recoveryProblem, setRecoveryProblem] = useState<string | null>(null)
   const [changing, setChanging] = useState(false)
@@ -80,6 +90,7 @@ export function SyncPanel({
   const [said, setSaid] = useState<Said | null>(null)
   const [busy, setBusy] = useState(false)
   const serviceStatus = useRef<HTMLDivElement | null>(null)
+  const settingsStatus = useRef<HTMLDivElement | null>(null)
   const recoveryStatus = useRef<HTMLDivElement | null>(null)
   const serviceInput = useRef<HTMLInputElement | null>(null)
   const finished = useRef<Finished | null>(null)
@@ -102,6 +113,16 @@ export function SyncPanel({
         setService(null)
         setServiceProblem(failureMessage(error))
       })
+    const settings = port
+      .settingsView()
+      .then((view) => {
+        setSettings(view)
+        setSettingsProblem(null)
+      })
+      .catch((error: unknown) => {
+        setSettings(null)
+        setSettingsProblem(failureMessage(error))
+      })
     const recovery = desktop
       ? port
           .recoveryView()
@@ -114,12 +135,27 @@ export function SyncPanel({
             setRecoveryProblem(failureMessage(error))
           })
       : Promise.resolve()
-    return { service, recovery }
+    return { service, settings, recovery }
   }, [port, desktop])
 
   useEffect(() => {
     refresh()
   }, [refresh, standing])
+
+  // Another device's change, a step that ended by itself and content waiting for a choice arrive
+  // here as they happen.
+  useEffect(() => {
+    let stop: (() => void) | null = null
+    let ended = false
+    void port.onSettings(setSettings).then((unlisten) => {
+      if (ended) unlisten()
+      else stop = unlisten
+    })
+    return () => {
+      ended = true
+      stop?.()
+    }
+  }, [port])
 
   // When a step ends, focus goes to its card's status line: the pressed control may be disabled,
   // or gone, and a person using a keyboard or a screen reader would otherwise be left on nothing.
@@ -129,7 +165,8 @@ export function SyncPanel({
     if (busy || finished.current === null) return
     const { place, invalid } = finished.current
     finished.current = null
-    const status = place === 'service' ? serviceStatus : recoveryStatus
+    const status =
+      place === 'service' ? serviceStatus : place === 'settings' ? settingsStatus : recoveryStatus
     const card = status.current?.closest('[data-card]') ?? null
     const active = document.activeElement
     const free = active === null || active === document.body || (card?.contains(active) ?? false)
@@ -269,6 +306,89 @@ export function SyncPanel({
           ) : null}
         </div>
       </Card>
+
+      {settings !== null || settingsProblem !== null ? (
+        <>
+          <p className="account-section-title">Your settings</p>
+          <Card data-card="settings" data-testid="settings-sync" data-state={settings?.sync.state ?? 'unread'}>
+            <div className="account-state">
+              <div
+                className="account-status"
+                aria-live="polite"
+                tabIndex={-1}
+                ref={settingsStatus}
+                data-testid="settings-sync-status"
+              >
+                {settings !== null ? (
+                  <p className="account-lead">{describeSettingsSync(settings.sync)}</p>
+                ) : null}
+                {settings?.sync.state === 'off' ? (
+                  <p className="account-note">{SETTINGS_SYNC_HELP}</p>
+                ) : null}
+                {settings !== null && describeWaiting(settings.sync) !== null ? (
+                  <p className="account-note" data-testid="settings-sync-waiting">
+                    {describeWaiting(settings.sync)}
+                  </p>
+                ) : null}
+                {settings !== null && settings.sync.conflicts > 0 ? (
+                  <p className="account-note" data-testid="settings-sync-conflicts">
+                    Another device changed a setting you changed too. Nothing has been replaced.
+                  </p>
+                ) : null}
+                {settings?.sync.problem != null ? (
+                  <p className="account-note" data-testid="settings-sync-problem">
+                    {settings.sync.problem}
+                  </p>
+                ) : null}
+                {settingsProblem !== null ? (
+                  <p className="account-note" data-testid="settings-problem">
+                    {settingsProblem}
+                  </p>
+                ) : null}
+                {said?.place === 'settings' ? <p className="account-note">{said.text}</p> : null}
+              </div>
+              <div className="account-actions">
+                {settingsProblem !== null ? (
+                  <Button
+                    disabled={busy}
+                    style={{ minBlockSize: target }}
+                    onClick={() => {
+                      step('settings', () => Promise.resolve(null))
+                    }}
+                  >
+                    Try again
+                  </Button>
+                ) : null}
+                {settings !== null && settings.sync.state !== 'on' && settings.sync.service !== null ? (
+                  <Button
+                    tone="primary"
+                    data-testid="settings-sync-turn-on"
+                    disabled={busy}
+                    style={{ minBlockSize: target }}
+                    onClick={() => {
+                      step('settings', () => port.settingsSyncTurnOn().then(() => null))
+                    }}
+                  >
+                    {settings.sync.state === 'off' ? 'Keep settings in step' : 'Try again'}
+                  </Button>
+                ) : null}
+                {settings?.sync.state === 'on' ? (
+                  <Button
+                    data-testid="settings-sync-now"
+                    disabled={busy}
+                    style={{ minBlockSize: target }}
+                    onClick={() => {
+                      step('settings', () => port.settingsSyncNow().then(() => null))
+                    }}
+                  >
+                    Check now
+                  </Button>
+                ) : null}
+              </div>
+            </div>
+          </Card>
+        </>
+      ) : null}
 
       {desktop && (recovery !== null || recoveryProblem !== null) ? (
         <>

@@ -331,6 +331,44 @@ export interface KitSaved {
   readonly path: string
 }
 
+/* ---- The person's settings -----------------------------------------------------------------------
+ *
+ * Native code keeps the settings in a file on this computer and is their one source: the page holds
+ * no copy of its own, asks for a change and is told what stands. Settings sync keeps the same
+ * settings, sealed, at the sync service so the person's other devices find them. It is off until the
+ * person turns it on. The key, the identities and the content other devices wrote stay in native
+ * code; the page is told how many copies wait for a choice.
+ */
+
+/** How the window is coloured: light, dark, or whatever the device is set to. */
+export type ColourMode = 'light' | 'dark' | 'system'
+
+/** Where settings sync stands on this computer. */
+export type SettingsSyncState = 'off' | 'starting' | 'on'
+
+/** What the page is shown of settings sync. */
+export interface SettingsSyncView {
+  readonly state: SettingsSyncState
+  /** The sync service a collection started now would be kept at, when this computer can sync. */
+  readonly service: SyncServiceView | null
+  /** The host of the service the collection is kept at, once it was started. */
+  readonly kept_at: string | null
+  /** How many writes left this computer and have no answer yet. */
+  readonly outstanding: number
+  /** How many copies of other devices' settings wait for the person to choose. */
+  readonly conflicts: number
+  /** Whether privacy mode has stopped sync from sending. */
+  readonly paused: boolean
+  /** What the last step could not do, in words, until a step succeeds. */
+  readonly problem: string | null
+}
+
+/** The person's settings, and where keeping them in step with their other devices stands. */
+export interface SettingsView {
+  readonly colour_mode: ColourMode
+  readonly sync: SettingsSyncView
+}
+
 /** Which of the outcomes a person is told apart an attempt ended with. */
 export type FailureKind =
   | 'malformed'
@@ -1452,6 +1490,25 @@ export interface HostPort {
   syncServiceView(): Promise<SyncServiceView>
   /** Chooses another sync service. The page names an origin, and nothing else. */
   syncServiceSet(origin: string): Promise<SyncServiceView>
+
+  /** The person's settings, and where settings sync stands. Nothing is sent to any service. */
+  settingsView(): Promise<SettingsView>
+  /**
+   * Keeps the person's choice of colour mode on this computer and, when settings sync is on, sends
+   * it. The choice is kept whether or not the sync service can be reached; `sync.problem` says
+   * when it could not.
+   */
+  settingsSetColourMode(mode: ColourMode): Promise<SettingsView>
+  /** Turns settings sync on. Native code starts the collection and seals the settings in it. */
+  settingsSyncTurnOn(): Promise<SettingsView>
+  /** Brings this computer and the sync service to the same settings now, when sync is on. */
+  settingsSyncNow(): Promise<SettingsView>
+  /**
+   * Tells `listener` the settings each time they change by themselves: another device's change
+   * was followed, a step ended, or content waits for a choice. Resolves, with the function that
+   * stops it, once the listener is registered.
+   */
+  onSettings(listener: (view: SettingsView) => void): Promise<() => void>
 
   /** Where recovery stands, and what stops the next step. Nothing is sent to any service. */
   recoveryView(): Promise<RecoveryView>

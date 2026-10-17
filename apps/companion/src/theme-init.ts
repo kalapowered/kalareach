@@ -1,22 +1,37 @@
 // The colour mode is applied before the first paint, so a dark-mode window never flashes white.
 // This runs as its own module in the document head rather than inside the application, because the
 // application's first render is already one frame too late.
+//
+// The mode is the person's setting, and native code keeps it: the window is opened with the mode
+// already in its document, as data, before any script runs. This page keeps no copy of its own.
+// Opened without the native shell (the browser harness), there is no setting and the device's own
+// mode is followed.
 
 const MODES = ['light', 'dark', 'system'] as const
 export type ColourMode = (typeof MODES)[number]
 
-/** The key the chosen mode is remembered under. */
-export const THEME_KEY = 'kalareach-theme'
-
-/** Reads the stored preference, treating an unreadable store as "follow the system". */
-export function storedMode(): ColourMode {
-  try {
-    const stored = localStorage.getItem(THEME_KEY)
-    if (stored && (MODES as readonly string[]).includes(stored)) return stored as ColourMode
-  } catch {
-    // A private window or blocked site data is not an error: the controls still work for this page.
+declare global {
+  interface Window {
+    /** The person's settings as native code opened this window with them. Absent in the harness. */
+    kalareachSettings?: { readonly colour_mode?: unknown }
   }
-  return 'system'
+}
+
+/** Whether a value is one of the three modes. */
+export function isColourMode(value: unknown): value is ColourMode {
+  return typeof value === 'string' && (MODES as readonly string[]).includes(value)
+}
+
+/** The mode native code opened this window in, or the device's own when it opened it in none. */
+export function openedMode(): ColourMode {
+  const mode = window.kalareachSettings?.colour_mode
+  return isColourMode(mode) ? mode : 'system'
+}
+
+/** The mode the document is in now, which is what the person sees. */
+export function shownMode(): ColourMode {
+  const mode = document.documentElement.dataset.preference
+  return isColourMode(mode) ? mode : openedMode()
 }
 
 /** Applies a preference to the document and the browser chrome. */
@@ -34,7 +49,7 @@ export function applyMode(mode: ColourMode): void {
   if (meta) meta.content = (resolved === 'dark' ? meta.dataset.dark : meta.dataset.light) ?? ''
 }
 
-applyMode(storedMode())
+applyMode(openedMode())
 
 // System mode follows the device while the window is open.
 matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => {

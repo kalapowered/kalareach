@@ -9,6 +9,7 @@
 
 import type { ReactNode } from 'react'
 
+import { useApp } from '../../app/state'
 import { Sheet, ThemeChooser } from '../../components/ui'
 
 /** The settings sheet: shown while `open`, and asks to be closed by any of the ways a sheet closes. */
@@ -19,12 +20,13 @@ export function MobileSettings({
   readonly open: boolean
   readonly onClose: () => void
 }): ReactNode {
+  const { port } = useApp()
   return (
     <Sheet open={open} title="Settings" description="The session behind this keeps running." onClose={onClose}>
       <div className="settings-content">
         <h2>Appearance</h2>
         <p className="muted">Light, dark, or whatever this device is set to.</p>
-        <ThemeChooser />
+        <ThemeChooser port={port} />
       </div>
     </Sheet>
   )

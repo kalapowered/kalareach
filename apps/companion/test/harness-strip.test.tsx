@@ -133,15 +133,12 @@ describe('the harness control strip', () => {
     const storage = window.localStorage
     storage.setItem(FAKE_DRAFTS_KEY, '[]')
     storage.setItem('kr.mobile.submissions', '[]')
-    storage.setItem('kalareach-theme', 'dark')
     open(storage, reload)
     await person.click(screen.getByRole('button', { name: 'Controls' }))
     await person.click(screen.getByRole('button', { name: 'Reset' }))
     expect(storage.getItem(FAKE_DRAFTS_KEY)).toBeNull()
     expect(storage.getItem('kr.mobile.submissions')).toBeNull()
-    expect(storage.getItem('kalareach-theme')).toBe('dark')
     expect(reload).toHaveBeenCalledTimes(1)
-    storage.removeItem('kalareach-theme')
   })
 
   it('leaves nothing of the drafts behind when the page it reloads writes them on its way out', async () => {
