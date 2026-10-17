@@ -229,7 +229,9 @@ pub fn image_path() -> std::io::Result<PathBuf> {
 ///
 /// Each host executable calls this first thing, before it does anything a release could matter to,
 /// and refuses to run on an error: a program whose release is being removed must not start work
-/// the removal would take away from under it. Every later call answers the same.
+/// the removal would take away from under it. A hook of an application is the one exception: its
+/// contract is a neutral answer whatever happens, so it answers `{}` and exits successfully, and
+/// says why on standard error. Every later call answers the same.
 ///
 /// # Errors
 ///
