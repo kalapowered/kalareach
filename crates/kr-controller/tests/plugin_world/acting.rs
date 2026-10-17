@@ -689,17 +689,21 @@ pub async fn ask_for_receipt(client: &mut LocalClient, action_id: ActionId) {
         .expect("writes the request");
 }
 
+/// Reads the answer to a request that [`ask_for_receipt`] made: the receipt, or what the worker
+/// said instead of one.
+pub async fn receipt_or_refusal(client: &mut LocalClient) -> Result<Receipt, String> {
+    match answer(client, Some(900)).await {
+        Outcome::Ok(value) => Ok(value
+            .to_typed::<ActionReadResult>()
+            .expect("decodes")
+            .receipt),
+        Outcome::Error(error) => Err(format!("{error:?}")),
+    }
+}
+
 /// Reads the answer to a request that [`ask_for_receipt`] made.
 pub async fn receipt_answered(client: &mut LocalClient) -> Option<Receipt> {
-    match answer(client, Some(900)).await {
-        Outcome::Ok(value) => Some(
-            value
-                .to_typed::<ActionReadResult>()
-                .expect("decodes")
-                .receipt,
-        ),
-        Outcome::Error(_) => None,
-    }
+    receipt_or_refusal(client).await.ok()
 }
 
 /// Asks for an action's receipt on `client`.
@@ -712,14 +716,15 @@ pub async fn read_receipt(client: &mut LocalClient, action_id: ActionId) -> Opti
 pub async fn until_settled(client: &mut LocalClient, action_id: ActionId) -> Receipt {
     let deadline = tokio::time::Instant::now() + PATIENCE;
     loop {
-        if let Some(receipt) = read_receipt(client, action_id).await
-            && receipt.state != ReceiptState::Accepted
-        {
-            return receipt;
-        }
+        ask_for_receipt(client, action_id).await;
+        let last = match receipt_or_refusal(client).await {
+            Ok(receipt) if receipt.state != ReceiptState::Accepted => return receipt,
+            Ok(receipt) => format!("the receipt was {:?}", receipt.state),
+            Err(refusal) => format!("the worker answered {refusal}"),
+        };
         assert!(
             tokio::time::Instant::now() < deadline,
-            "waited for the receipt to leave accepted"
+            "waited for the receipt to leave accepted: {last}"
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -733,14 +738,15 @@ pub async fn until_receipt(
 ) -> Receipt {
     let deadline = tokio::time::Instant::now() + PATIENCE;
     loop {
-        if let Some(receipt) = read_receipt(client, action_id).await
-            && receipt.state == state
-        {
-            return receipt;
-        }
+        ask_for_receipt(client, action_id).await;
+        let last = match receipt_or_refusal(client).await {
+            Ok(receipt) if receipt.state == state => return receipt,
+            Ok(receipt) => format!("the receipt was {:?}", receipt.state),
+            Err(refusal) => format!("the worker answered {refusal}"),
+        };
         assert!(
             tokio::time::Instant::now() < deadline,
-            "waited for the receipt to be {state:?}"
+            "waited for the receipt to be {state:?}: {last}"
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
