@@ -136,6 +136,31 @@ describe('the window\'s own mode', () => {
     })
   })
 
+  it('keeps the radio the person pressed when the chooser\'s first read answers after it', async () => {
+    const person = userEvent.setup()
+    const { port } = fakeHost()
+    let answer: (view: SettingsView) => void = () => undefined
+    const late = new Promise<SettingsView>((resolve) => {
+      answer = resolve
+    })
+    const found = await port.settingsView()
+    render(
+      <ThemeChooser
+        port={{
+          ...port,
+          settingsView: () => late,
+          settingsSetColourMode: () => new Promise<SettingsView>(() => undefined)
+        }}
+      />
+    )
+    await person.click(screen.getByRole('radio', { name: /Dark/ }))
+    await act(async () => {
+      answer({ ...found, colour_mode: 'system' })
+      await Promise.resolve()
+    })
+    expect(screen.getByRole('radio', { name: /Dark/ })).toBeChecked()
+  })
+
   it('is the mode native code keeps when the window starts, as a reload finds it', async () => {
     const { port, controls } = fakeHost()
     controls.settings.change({ colour_mode: 'dark' })

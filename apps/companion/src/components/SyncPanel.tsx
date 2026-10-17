@@ -100,6 +100,9 @@ export function SyncPanel({
   // How many settings the backend has told this card of, so that a read that was asked for before
   // one of them and answers after it does not put older settings over it.
   const settingsHeard = useRef(0)
+  // Settles once the listener for settings is live (or could not be had), which the first read of
+  // the settings waits for, so that no change falls between the two.
+  const listening = useRef<Promise<void>>(Promise.resolve())
   // A sign-in that changes what the account may do changes what stops recovery, so it is read again.
   const standing = account?.state === 'signed_in' ? account.generation : (account?.state ?? null)
 
@@ -119,18 +122,21 @@ export function SyncPanel({
         setService(null)
         setServiceProblem(failureMessage(error))
       })
-    const asked = settingsHeard.current
-    const settings = port
-      .settingsView()
-      .then((view) => {
-        if (settingsHeard.current !== asked) return
-        setSettings(view)
-        setSettingsProblem(null)
-      })
-      .catch((error: unknown) => {
-        setSettings(null)
-        setSettingsProblem(failureMessage(error))
-      })
+    const settings = listening.current.then(() => {
+      const asked = settingsHeard.current
+      return port
+        .settingsView()
+        .then((view) => {
+          if (settingsHeard.current !== asked) return
+          setSettings(view)
+          setSettingsProblem(null)
+        })
+        .catch((error: unknown) => {
+          if (settingsHeard.current !== asked) return
+          setSettings(null)
+          setSettingsProblem(failureMessage(error))
+        })
+    })
     const recovery = desktop
       ? port
           .recoveryView()
@@ -146,29 +152,32 @@ export function SyncPanel({
     return { service, settings, recovery }
   }, [port, desktop])
 
-  useEffect(() => {
-    refresh()
-  }, [refresh, standing])
-
   // Another device's change, a step that ended by itself and content waiting for a choice arrive
-  // here as they happen.
+  // here as they happen. It is registered before the first read is made.
   useEffect(() => {
     let stop: (() => void) | null = null
     let ended = false
-    void port
+    listening.current = port
       .onSettings((view) => {
         settingsHeard.current += 1
         setSettings(view)
       })
-      .then((unlisten) => {
-        if (ended) unlisten()
-        else stop = unlisten
-      })
+      .then(
+        (unlisten) => {
+          if (ended) unlisten()
+          else stop = unlisten
+        },
+        () => undefined
+      )
     return () => {
       ended = true
       stop?.()
     }
   }, [port])
+
+  useEffect(() => {
+    refresh()
+  }, [refresh, standing])
 
   // The choice closes where it opened, and focus goes back to the control that opened it: the
   // button that was pressed to close it is gone, and a keyboard or a screen reader would be left

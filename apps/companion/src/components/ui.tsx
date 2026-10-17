@@ -23,7 +23,7 @@ import {
 import markLight from '../assets/kala-mark.svg'
 import markDark from '../assets/kala-mark-dark.svg'
 import { failureMessage, type HostPort } from '../host/port'
-import { applyMode, shownMode, type ColourMode } from '../theme-init'
+import { applyMode, modeApplications, shownMode, type ColourMode } from '../theme-init'
 import {
   animateSpring,
   DRAG_THRESHOLD,
@@ -887,8 +887,8 @@ export function Sheet({
  * on the same listener and is shown as it is; the window's own mode follows it at the application's
  * root, whether or not this control is on screen.
  *
- * While versions of the settings wait for a choice, settings are not synced, and the control says
- * so.
+ * While versions of the settings wait for a choice, settings are not synced while the two differ,
+ * and the control says so.
  */
 export function ThemeChooser({ port }: { readonly port: HostPort }): ReactNode {
   const [mode, setMode] = useState<ColourMode>(() => shownMode())
@@ -916,12 +916,13 @@ export function ThemeChooser({ port }: { readonly port: HostPort }): ReactNode {
       .then(() => {
         if (ended) return
         // Read once the listener is live, so a change cannot fall between the two, and dropped
-        // when one was heard since: a change is newer than the answer.
+        // when one was heard since, or the person pressed since: both are newer than the answer.
+        const asked = modeApplications()
         port
           .settingsView()
           .then((view) => {
             if (ended || heard) return
-            setMode(view.colour_mode)
+            if (modeApplications() === asked) setMode(view.colour_mode)
             setWaiting(view.sync.conflicts > 0)
           })
           .catch(() => undefined)
