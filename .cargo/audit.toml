@@ -43,6 +43,18 @@ ignore = [
     "RUSTSEC-2025-0081", # unic-char-property
     "RUSTSEC-2025-0098", # unic-ucd-version
     "RUSTSEC-2025-0100", # unic-ucd-ident
+    # zip 8.6.0 has three advisories about extracting an archive whose entries an attacker chose.
+    # Its one user here is the build script of libsodium-sys-stable, which for a Windows (MSVC)
+    # target unpacks libsodium's prebuilt libraries from an archive on libsodium's download host.
+    # The crate does not ship that archive: the build reads it from SODIUM_DIST_DIR, where
+    # continuous integration places it, or else downloads it over plain HTTP. Either way the
+    # script unpacks it only after checking its minisign signature against libsodium's public key,
+    # which the script holds, so no archive it unpacks is an attacker's. The fix is in zip 9.0.0,
+    # which libsodium-sys-stable 1.24.3, its newest release, does not yet allow. Remove these once
+    # the lock carries no zip older than 9.0.0.
+    "RUSTSEC-2026-0367", # set-user-ID and set-group-ID bits kept
+    "RUSTSEC-2026-0368", # symbolic links whose targets leave the destination
+    "RUSTSEC-2026-0369", # permissions applied through a symbolic link
 ]
 
 [output]
