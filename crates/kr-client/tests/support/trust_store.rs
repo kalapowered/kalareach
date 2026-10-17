@@ -27,8 +27,13 @@ use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs
 /// Where a child finds the server its parent started.
 pub const SERVER_PORT: &str = "TRUST_STORE_TEST_PORT";
 
-/// How long one child may take.
-const PATIENCE: Duration = Duration::from_secs(60);
+/// How long one child may take before it is taken to have hung.
+///
+/// A child is this test binary started again, and on an idle machine it is done in seconds: it
+/// makes two connections that the server refuses at the handshake. What a case decides on is that
+/// the child finishes, and a child that is only slow, because the machine it runs on is busy with
+/// other work, is waited for. This ends a child that has hung.
+const PATIENCE: Duration = Duration::from_secs(300);
 
 /// A certificate authority no platform trusts.
 pub struct TestAuthority {
