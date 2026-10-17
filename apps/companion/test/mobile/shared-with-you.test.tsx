@@ -32,9 +32,17 @@ interface Phone {
   readonly port: HostPort
 }
 
-/** A phone paired with the scripted host as a guest, whose pairing holds no view of a session. */
-function start(options?: { readonly rights?: readonly string[]; readonly before?: (c: FakeHostControls) => void }): Phone {
-  const { port, controls } = fakeHost()
+/**
+ * A phone paired with the scripted host, a guest unless `rights` say otherwise. `through` puts
+ * something of the test's own between the page and the host's port.
+ */
+function start(options?: {
+  readonly rights?: readonly string[]
+  readonly before?: (c: FakeHostControls) => void
+  readonly through?: (port: HostPort) => HostPort
+}): Phone {
+  const { port: host, controls } = fakeHost()
+  const port = options?.through === undefined ? host : options.through(host)
   controls.reachAsPhone(options?.rights === undefined ? {} : { rights: options.rights as never })
   options?.before?.(controls)
   render(
@@ -130,6 +138,42 @@ describe('an invitation at the head of the inbox (KR-REQ-18.13)', () => {
     await waitFor(() => {
       expect(screen.queryByTestId('offers')).toBeNull()
     })
+  })
+
+  it('keeps the card open until the list the host gives has been read, so the invitation is gone when it closes', async () => {
+    // The read of what the host lists after the acceptance is held until the test lets it go.
+    let gate: Promise<void> | null = null
+    let release: () => void = () => undefined
+    const { controls } = start({
+      before: (c) => c.sharing.offer(),
+      through: (port) => ({
+        ...port,
+        grantHeld: async () => {
+          const held = await port.grantHeld()
+          if (gate !== null) await gate
+          return held
+        }
+      })
+    })
+    const row = await screen.findByRole('button', { name: new RegExp(INVITATION) })
+    await userEvent.click(row)
+    const accept = await screen.findByTestId('accept-offer')
+    gate = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    await userEvent.click(accept)
+    // Accepted, and the toast says so, but the list that says the invitation is gone is not in yet.
+    expect(await screen.findByText(/^Accepted\. Session 3 is shared with you until /)).toBeInTheDocument()
+    expect(controls.sharing.sent().redeem).toBe(1)
+    expect(screen.getByTestId('sheet')).toBeInTheDocument()
+    expect(screen.getByTestId('accept-offer')).toBeDisabled()
+
+    release()
+    await waitFor(() => {
+      expect(screen.queryByTestId('sheet')).toBeNull()
+    })
+    // The card has gone and so has the row it was opened from: nothing is left of the invitation.
+    expect(screen.queryByRole('button', { name: new RegExp(INVITATION) })).toBeNull()
   })
 
   it('puts focus on what is still there once the card has gone: the next invitation, or the screen', async () => {
