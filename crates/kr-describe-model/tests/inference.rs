@@ -692,6 +692,7 @@ fn a_case_that_needs_weights_this_host_lacks_says_so_on_a_line_of_its_own() {
     let ran = Command::new(std::env::current_exe().expect("this test program"))
         .args(["--exact", CASE, "--show-output", "--test-threads=1"])
         .env("KR_DESCRIBE_MODEL_CACHE", empty_cache.path())
+        .env_remove("RUST_TEST_NOCAPTURE")
         .output()
         .expect("this test program runs again");
     let shown = String::from_utf8_lossy(&ran.stdout);
