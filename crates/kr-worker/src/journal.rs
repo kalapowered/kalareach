@@ -254,8 +254,8 @@ impl Journal {
     ///
     /// Returns [`WorkerError::JournalUnavailable`] when the database cannot be opened or migrated.
     pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self> {
-        let connection = kr_flush::release::open_connection(path.as_ref(), None)
-            .map_err(unavailable)?;
+        let connection =
+            kr_flush::release::open_connection(path.as_ref(), None).map_err(unavailable)?;
         Self::prepare(connection)
     }
 
