@@ -7,7 +7,7 @@
 //!
 //! The same crate holds the other thing every local SQLite store needs from the file system and
 //! nothing else of the host provides: opening a store whose previous holder is still letting go of
-//! it ([`release`], with the `sqlite` feature).
+//! it (the `release` module, with the `sqlite` feature).
 //!
 //! This crate depends on no other crate of this host, so every one of them can reach it, the
 //! cryptography crate's directory store included.
