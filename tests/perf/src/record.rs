@@ -88,7 +88,7 @@ fn steps(count: u64) -> u64 {
 #[derive(Debug)]
 pub struct Window {
     entering: Option<String>,
-    speed: Speed,
+    speed: Option<Speed>,
     stolen: StolenTime,
 }
 
@@ -97,13 +97,29 @@ impl Window {
     ///
     /// Its speed is read after the load average and before the span the hypervisor's share is
     /// read over begins, so that the work that reads it is neither in the load nor in that span.
+    /// A measurement that takes a processor reading of its own starts that reading after this
+    /// returns and ends it before [`Window::close`], so the work is in neither.
     #[must_use]
     pub fn open() -> Self {
         let entering = load_average();
-        let speed = Speed::read();
+        let speed = Some(Speed::read());
         Self {
             entering,
             speed,
+            stolen: StolenTime::start(),
+        }
+    }
+
+    /// Reads the host as a measurement begins, without reading its speed.
+    ///
+    /// For a window opened inside another measurement's interval, where the work that reads the
+    /// speed would be processor time in the figure that measurement is taking. The record says the
+    /// speed was not read.
+    #[must_use]
+    pub fn open_without_speed() -> Self {
+        Self {
+            entering: load_average(),
+            speed: None,
             stolen: StolenTime::start(),
         }
     }
@@ -117,7 +133,7 @@ impl Window {
             host: Host::read(),
             entering: self.entering,
             leaving,
-            speed: Some((self.speed, Speed::read())),
+            speed: self.speed.map(|entering| (entering, Speed::read())),
             stolen,
         }
     }

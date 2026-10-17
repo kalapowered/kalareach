@@ -65,6 +65,16 @@ fn a_run_that_keeps_no_evidence_writes_nothing() {
 }
 
 #[test]
+fn a_window_opened_inside_another_measurement_reads_no_speed() {
+    let lines = Window::open_without_speed().close().lines();
+    assert!(
+        lines[6].ends_with("not read"),
+        "the record says the speed was not read: {}",
+        lines[6]
+    );
+}
+
+#[test]
 fn the_conditions_name_the_host_and_the_reference_host_it_is_held_to() {
     let lines = Window::open().close().lines();
     let labels: Vec<&str> = lines
