@@ -276,6 +276,33 @@ describe('an invitation at the head of the inbox (KR-REQ-18.13)', () => {
     expect(controls.sharing.sent().redeem).toBe(1)
   })
 
+  it('leaves focus where the person put it when the row it was on goes later', async () => {
+    const offered = { id: '' }
+    const { controls, port } = start({
+      before: (c) => {
+        offered.id = c.sharing.offer().invitation_id
+      }
+    })
+    const row = await screen.findByRole('button', { name: new RegExp(INVITATION) })
+    await userEvent.click(row)
+    await userEvent.keyboard('{Escape}')
+    await waitFor(() => {
+      expect(screen.queryByTestId('sheet')).toBeNull()
+    })
+    // The person moves on to another control of the screen.
+    const elsewhere = screen.getByRole('button', { name: 'Failed' })
+    elsewhere.focus()
+    expect(document.activeElement).toBe(elsewhere)
+
+    // The invitation is withdrawn and the next read says so: the row goes, and focus stays put.
+    controls.sharing.withdrawOffer(offered.id)
+    await readAgain(port)
+    await waitFor(() => {
+      expect(screen.queryByTestId('offers')).toBeNull()
+    })
+    expect(document.activeElement).toBe(elsewhere)
+  })
+
   it('arms nothing when the host answers an acceptance after the screen has gone', async () => {
     let release: () => void = () => undefined
     const gate = new Promise<void>((resolve) => {
