@@ -24,17 +24,18 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use companion_platform::call::{CallId, CallPlatform, Mute};
-use kr_client::services::ServiceHttp;
 use kr_client::services::account::SignedInAccount;
+use kr_client::services::voice::{ManagedVoiceBroker, ManagedVoiceService as _};
 use kr_client::services::voice_control::ControlConnector;
+use kr_client::services::{AccountTokenSource, ServiceHttp};
 use kr_protocol::ids::{ActionId, SessionId, VoiceSessionId};
 use kr_protocol::scalars::Digest256;
 use kr_protocol::voice::VoiceStartResult;
 use tokio::sync::{mpsc, oneshot};
 
 pub use cause::Cause;
-pub use host::{AppReach, CallHost, HostReach, Reaching};
-pub use view::{DelegationRow, EndedView, HostEnd, VoiceCallState};
+pub use host::{AppReach, CallHost, HostReach, Pairing, Reaching};
+pub use view::{DelegationRow, EndedView, HostEnd, OwedView, VoiceCallState};
 
 use crate::error::{CommandError, Result};
 use crate::target::Subject;
@@ -180,7 +181,19 @@ struct Emergency {
     call: Option<CallId>,
     host: Option<CallHost>,
     voice_session_id: Option<VoiceSessionId>,
+    /// The call at the voice service, and the moment the host's grant for it ends by itself.
+    service_call: Option<(String, u64)>,
     reach: Arc<dyn HostReach>,
+    tokens: Arc<SignedInAccount>,
+}
+
+/// The time now, in milliseconds since the epoch.
+pub(crate) fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+        })
 }
 
 /// What the owner and the commands share.
@@ -221,6 +234,7 @@ impl Shared {
         host: Option<&CallHost>,
         descriptor: Option<&kr_protocol::voice::VoiceSessionDescriptor>,
         reach: &Arc<dyn HostReach>,
+        tokens: &Arc<SignedInAccount>,
     ) {
         *self
             .emergency
@@ -231,9 +245,50 @@ impl Shared {
                 call,
                 host: host.cloned(),
                 voice_session_id: descriptor.map(|descriptor| descriptor.voice_session_id),
+                service_call: descriptor
+                    .map(|descriptor| (descriptor.call_id.clone(), descriptor.closes_at_ms.get())),
                 reach: Arc::clone(reach),
+                tokens: Arc::clone(tokens),
             },
         ));
+    }
+
+    /// Says that the owner has told the host to revoke the call's grant, so a supervisor that
+    /// finishes the call after a failure does not ask the host again.
+    pub(crate) fn host_was_told(&self, owner: u64) {
+        let mut kept = self
+            .emergency
+            .lock()
+            .expect("the emergency lock is not poisoned");
+        if let Some((held, kept)) = kept.as_mut()
+            && *held == owner
+        {
+            kept.host = None;
+            kept.voice_session_id = None;
+        }
+    }
+
+    /// Closes a call at the voice service over its own route, with the account's token, and says
+    /// whether the service confirmed. The close runs on a task of its own: it takes the account's
+    /// token, and a refresh that a wait gave up on half way could lose the token it rotated.
+    pub(crate) async fn close_over_http(
+        &self,
+        tokens: &Arc<SignedInAccount>,
+        call_id: &str,
+    ) -> bool {
+        let Ok(broker) = ManagedVoiceBroker::new(
+            self.service.origin.clone(),
+            Arc::clone(&self.service.http),
+            Arc::clone(tokens) as Arc<dyn AccountTokenSource>,
+        ) else {
+            return false;
+        };
+        let call_id = call_id.to_owned();
+        let closing = tokio::spawn(async move { broker.close(&call_id).await });
+        matches!(
+            tokio::time::timeout(self.timings.close_within, closing).await,
+            Ok(Ok(Ok(_)))
+        )
     }
 
     pub(crate) fn forget_emergency(&self, owner: u64) {
@@ -264,9 +319,12 @@ impl Shared {
             return;
         };
         let local = async {
-            if let Some(call) = &kept.call {
-                let _ =
-                    tokio::time::timeout(self.timings.local_within, self.platform.stop(call)).await;
+            match &kept.call {
+                Some(call) => matches!(
+                    tokio::time::timeout(self.timings.local_within, self.platform.stop(call)).await,
+                    Ok(Ok(()))
+                ),
+                None => false,
             }
         };
         let toward_host = async {
@@ -277,19 +335,59 @@ impl Shared {
                 _ => None,
             }
         };
-        let (_, host_end) = tokio::join!(local, toward_host);
-        let mut view = self.view.lock().expect("the view lock is not poisoned");
-        view.running = false;
-        view.session = None;
-        view.ended = Some(EndedView {
-            owner,
-            cause: "owner_failed".to_owned(),
-            words: "This device's call stopped working, so the call was ended.".to_owned(),
-            closed_locally: kept.call.is_some(),
-            host: host_end.unwrap_or(HostEnd::NotNeeded),
-            broker: "not_confirmed".to_owned(),
-        });
-        drop(view);
+        let (closed_locally, host_end) = tokio::join!(local, toward_host);
+        let toward_host_asked = host_end.is_some();
+        let host_end = host_end.unwrap_or(HostEnd::NotNeeded);
+        // The service is asked over its own route unless the host told it.
+        let broker = match (&kept.service_call, &host_end) {
+            (
+                _,
+                HostEnd::Revoked {
+                    broker_notified: true,
+                    ..
+                },
+            ) => "closed_by_host",
+            (Some((call_id, _)), _) => {
+                if self.close_over_http(&kept.tokens, call_id).await {
+                    "closed_over_http"
+                } else {
+                    "not_confirmed"
+                }
+            }
+            (None, _) => "not_needed",
+        };
+        {
+            let mut view = self.view.lock().expect("the view lock is not poisoned");
+            // A call that began after this one has its own record, which this does not touch.
+            if view.owner <= owner {
+                view.running = false;
+                view.session = None;
+                view.control = "none".to_owned();
+                view.host = "none".to_owned();
+                view.ended = Some(EndedView {
+                    owner,
+                    cause: "owner_failed".to_owned(),
+                    words: "This device's call stopped working, so the call was ended.".to_owned(),
+                    closed_locally,
+                    host: host_end.clone(),
+                    broker: broker.to_owned(),
+                });
+            }
+            if let (HostEnd::NotTold { words }, Some((_, until_ms)), true) =
+                (&host_end, &kept.service_call, toward_host_asked)
+            {
+                view.owe(
+                    now_ms(),
+                    OwedView {
+                        kind: "revocation".to_owned(),
+                        words: words.clone(),
+                        action_id: None,
+                        voice_session_id: kept.voice_session_id.map(|id| id.to_string()),
+                        until_ms: *until_ms,
+                    },
+                );
+            }
+        }
         self.release(owner);
     }
 }
@@ -490,6 +588,8 @@ impl Calls {
             .lock()
             .expect("the view lock is not poisoned")
             .clone();
+        let now = now_ms();
+        state.owed.retain(|owed| owed.until_ms > now);
         let remembered = shared
             .note
             .lock()

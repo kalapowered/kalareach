@@ -32,6 +32,13 @@ pub struct VoiceCallState {
     pub delegations: Vec<DelegationRow>,
     /// What a person is told before starting, from what the last call showed.
     pub warning: Option<String>,
+    /// What this device could not finish and the host may still hold open, until the moment the
+    /// call would have closed. It outlives the call that left it and the calls that follow.
+    pub owed: Vec<OwedView>,
+    /// Which call's owner last wrote this record, so that an owner that failed late does not
+    /// overwrite the record of the call after it.
+    #[serde(skip)]
+    pub owner: u64,
 }
 
 impl VoiceCallState {
@@ -48,8 +55,49 @@ impl VoiceCallState {
             ended: None,
             delegations: Vec::new(),
             warning: None,
+            owed: Vec::new(),
+            owner: 0,
         }
     }
+}
+
+/// The most things a device keeps as owed at once.
+const MOST_OWED: usize = 8;
+
+impl VoiceCallState {
+    /// Starts the record of a call the owner `owner` holds, keeping what is still owed from the
+    /// calls before it.
+    pub fn begin(&mut self, owner: u64) {
+        let owed = std::mem::take(&mut self.owed);
+        *self = Self::no_call();
+        self.owed = owed;
+        self.owner = owner;
+    }
+
+    /// Notes something owed until `until_ms`, and forgets what has lapsed by `now_ms`.
+    pub fn owe(&mut self, now_ms: u64, owed: OwedView) {
+        self.owed.retain(|each| each.until_ms > now_ms);
+        self.owed.push(owed);
+        if self.owed.len() > MOST_OWED {
+            self.owed.remove(0);
+        }
+    }
+}
+
+/// Something this device could not finish, which the host may still hold open.
+#[derive(Clone, Debug, Serialize)]
+pub struct OwedView {
+    /// `revocation` when a call's grant may still be live at the host, `start_unknown` when the
+    /// host never said whether it made a call.
+    pub kind: String,
+    /// What a person is told.
+    pub words: String,
+    /// The action a start was sent under, for `start_unknown`.
+    pub action_id: Option<String>,
+    /// The call whose grant may be live, for `revocation`.
+    pub voice_session_id: Option<String>,
+    /// The moment the grant ends by itself, in milliseconds since the epoch.
+    pub until_ms: u64,
 }
 
 /// What the host did about the end of a call, kept apart from what happened on this device.
@@ -92,8 +140,9 @@ pub struct EndedView {
     pub closed_locally: bool,
     /// What the host did.
     pub host: HostEnd,
-    /// What the voice service did: `pending` while its closure is awaited, then `closed`,
-    /// `closed_by_service` or `not_confirmed`.
+    /// What the voice service did: `pending` while its closure is awaited, then `closed` (by the
+    /// control), `closed_by_service`, `closed_by_host`, `closed_over_http` or `not_confirmed`; or
+    /// `not_needed` when the host never created a call.
     pub broker: String,
 }
 

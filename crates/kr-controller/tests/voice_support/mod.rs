@@ -55,7 +55,44 @@ enum Disposition {
 /// How the service answers a start's offer.
 type Answering = Box<dyn Fn(&str) -> String + Send + Sync>;
 
+/// A step of the service that a test can hold: the request is read and counted, and answered once
+/// the step is released.
+#[derive(Default)]
+struct Gate {
+    held: std::sync::atomic::AtomicBool,
+    freed: tokio::sync::Notify,
+}
+
+impl Gate {
+    fn hold(&self) {
+        self.held.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn release(&self) {
+        self.held.store(false, std::sync::atomic::Ordering::SeqCst);
+        self.freed.notify_waiters();
+    }
+
+    async fn pass(&self) {
+        loop {
+            let freed = self.freed.notified();
+            tokio::pin!(freed);
+            freed.as_mut().enable();
+            if !self.held.load(std::sync::atomic::Ordering::SeqCst) {
+                return;
+            }
+            freed.await;
+        }
+    }
+}
+
 struct State {
+    /// The creation of a call, which a test can hold.
+    creation: Arc<Gate>,
+    /// The closing of a call, which a test can hold.
+    closing: Arc<Gate>,
+    /// Whether closing a call over HTTP also ends the call's control, as the service does.
+    control_follows_close: bool,
     seen: Vec<Seen>,
     /// What the control makes of each bearer token it was told of; any other is not accepted.
     tokens: Vec<(String, Disposition)>,
@@ -135,6 +172,9 @@ impl StandIn {
         let origin = format!("http://{}", listener.local_addr().expect("an address"));
         let route = Arc::new(ControlRoute::detached(origin.clone(), None));
         let state = Arc::new(Mutex::new(State {
+            creation: Arc::default(),
+            closing: Arc::default(),
+            control_follows_close: false,
             seen: Vec::new(),
             tokens: Vec::new(),
             answer: Box::new(|_offer| "v=0\r\na=answered-by-the-stand-in\r\n".to_owned()),
@@ -199,6 +239,40 @@ impl StandIn {
         if let Some(disposition) = disposition {
             state.tokens.push((token.to_owned(), disposition));
         }
+    }
+
+    /// Holds the creation of a call: the request is read and counted, and answered when
+    /// [`Self::release_creations`] lets it.
+    pub fn hold_creations(&self) {
+        let gate = Arc::clone(&self.state.lock().expect("the stand-in's state").creation);
+        gate.hold();
+    }
+
+    /// Lets the held creations be answered.
+    pub fn release_creations(&self) {
+        let gate = Arc::clone(&self.state.lock().expect("the stand-in's state").creation);
+        gate.release();
+    }
+
+    /// Has a call closed over HTTP end the call's control with a closure, as the service does when
+    /// a host closes a call a device is still controlling.
+    pub fn end_the_control_when_a_call_is_closed(&self) {
+        self.state
+            .lock()
+            .expect("the stand-in's state")
+            .control_follows_close = true;
+    }
+
+    /// Holds the closing of a call as [`Self::hold_creations`] holds its creation.
+    pub fn hold_closes(&self) {
+        let gate = Arc::clone(&self.state.lock().expect("the stand-in's state").closing);
+        gate.hold();
+    }
+
+    /// Lets the held closes be answered.
+    pub fn release_closes(&self) {
+        let gate = Arc::clone(&self.state.lock().expect("the stand-in's state").closing);
+        gate.release();
     }
 
     /// Has the service answer a start's offer with what `answer` builds from it.
@@ -365,6 +439,25 @@ async fn serve(mut stream: TcpStream, route: &ControlRoute, state: &Arc<Mutex<St
         let _ = stream.write_all(&response(401, refusal)).await;
         return;
     };
+    let gate = {
+        let state = state.lock().expect("the stand-in's state");
+        match path.as_str() {
+            "/api/voice/sessions" => Some(Arc::clone(&state.creation)),
+            other if other.ends_with("/close") => Some(Arc::clone(&state.closing)),
+            _ => None,
+        }
+    };
+    if let Some(gate) = gate {
+        gate.pass().await;
+    }
+    if path.ends_with("/close")
+        && state
+            .lock()
+            .expect("the stand-in's state")
+            .control_follows_close
+    {
+        route.close_call("client_closed", 0);
+    }
     let data = match path.as_str() {
         "/api/voice/metadata" => serde_json::json!({
             "enabled": true,

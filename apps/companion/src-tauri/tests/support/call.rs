@@ -40,11 +40,14 @@ struct Inner {
     tells_the_end: bool,
     /// What a sign of life is answered with, when it is not what the call holds.
     alive_refusal: Option<FailureKind>,
+    /// The steps a test holds: a held step has been given and does not return until released.
+    held_steps: Vec<&'static str>,
 }
 
 /// Native code, as a test describes it.
 pub struct ScriptedCalls {
     inner: Mutex<Inner>,
+    freed: tokio::sync::Notify,
 }
 
 impl ScriptedCalls {
@@ -65,7 +68,9 @@ impl ScriptedCalls {
                 stop_never_returns: false,
                 tells_the_end: true,
                 alive_refusal: None,
+                held_steps: Vec::new(),
             }),
+            freed: tokio::sync::Notify::new(),
         })
     }
 
@@ -117,6 +122,30 @@ impl ScriptedCalls {
         self.inner().stop_never_returns = true;
     }
 
+    /// Holds `step` (`open`, `offer`, `accept`, `permit` or `stop`): the command is given and counted, and
+    /// does not return until [`Self::release`] lets it.
+    pub fn hold(&self, step: &'static str) {
+        self.inner().held_steps.push(step);
+    }
+
+    /// Lets the held `step` go on.
+    pub fn release(&self, step: &'static str) {
+        self.inner().held_steps.retain(|held| *held != step);
+        self.freed.notify_waiters();
+    }
+
+    async fn gate(&self, step: &'static str) {
+        loop {
+            let freed = self.freed.notified();
+            tokio::pin!(freed);
+            freed.as_mut().enable();
+            if !self.inner().held_steps.contains(&step) {
+                return;
+            }
+            freed.await;
+        }
+    }
+
     /// The call ends and says nothing of it, as news that was lost would leave it.
     pub fn end_without_saying_so(&self) {
         let mut inner = self.inner();
@@ -155,11 +184,26 @@ impl ScriptedCalls {
         }
     }
 
-    /// The connection fails.
+    /// The connection fails, and native code ends the call, as it does for a connection that has
+    /// failed for good: the end is told after the failure.
     pub fn fail_the_connection(&self) {
-        self.tell(CallEvent::Connection {
-            state: ConnectionState::Failed,
-        });
+        let mut inner = self.inner();
+        if let Some((call, sink, mut seq)) = inner.held.take() {
+            for event in [
+                CallEvent::Connection {
+                    state: ConnectionState::Failed,
+                },
+                CallEvent::Ended,
+            ] {
+                seq += 1;
+                sink.deliver(EventFrame {
+                    call: call.clone(),
+                    seq,
+                    event,
+                });
+            }
+        }
+        inner.capture = CaptureState::Idle;
     }
 
     fn named(&self, call: &CallId) -> Result<(), CallFailure> {
@@ -183,8 +227,9 @@ impl ScriptedCalls {
 impl CallPlatform for ScriptedCalls {
     fn open(&self) -> CallFuture<'_, OpenedCall> {
         Box::pin(async move {
+            self.inner().commands.push("open".to_owned());
+            self.gate("open").await;
             let mut inner = self.inner();
-            inner.commands.push("open".to_owned());
             if inner.microphone_refused {
                 return Err(CallFailure::new(
                     FailureKind::MicrophoneRefused,
@@ -212,6 +257,8 @@ impl CallPlatform for ScriptedCalls {
         Box::pin(async move {
             self.named(call)?;
             self.inner().commands.push("offer".to_owned());
+            self.gate("offer").await;
+            self.named(call)?;
             Ok(OFFER.to_owned())
         })
     }
@@ -219,9 +266,10 @@ impl CallPlatform for ScriptedCalls {
     fn accept<'a>(&'a self, call: &'a CallId, answer: &'a str) -> CallFuture<'a, Answered> {
         Box::pin(async move {
             self.named(call)?;
-            let mut inner = self.inner();
-            inner.commands.push("accept".to_owned());
-            inner.answer = Some(answer.to_owned());
+            self.inner().commands.push("accept".to_owned());
+            self.gate("accept").await;
+            self.named(call)?;
+            self.inner().answer = Some(answer.to_owned());
             Ok(Answered { uses_dtx: false })
         })
     }
@@ -234,9 +282,11 @@ impl CallPlatform for ScriptedCalls {
     ) -> CallFuture<'a, bool> {
         Box::pin(async move {
             self.named(call)?;
+            self.inner().commands.push("permit".to_owned());
+            self.gate("permit").await;
+            self.named(call)?;
             {
                 let mut inner = self.inner();
-                inner.commands.push("permit".to_owned());
                 if inner.permit_refused {
                     return Ok(false);
                 }
@@ -273,6 +323,7 @@ impl CallPlatform for ScriptedCalls {
     fn stop<'a>(&'a self, call: &'a CallId) -> CallFuture<'a, ()> {
         Box::pin(async move {
             self.inner().commands.push("stop".to_owned());
+            self.gate("stop").await;
             if self.inner().stop_never_returns {
                 std::future::pending::<()>().await;
             }

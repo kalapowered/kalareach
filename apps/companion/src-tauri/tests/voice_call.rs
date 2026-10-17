@@ -22,6 +22,14 @@
 //! | A mute silences the microphone here and is told to the service | `muting_the_microphone_silences_it_here_and_tells_the_service` |
 //! | A host that names another voice service gets no token | `a_host_that_names_another_voice_service_gets_no_token` |
 //! | A stop that never returns does not hold the host's revocation | `a_stop_native_code_never_returns_does_not_hold_the_revocation` |
+//! | The host's revocation does not wait for native code's stop | `the_hosts_revocation_does_not_wait_for_native_code_to_stop_the_media` |
+//! | A stop that names the call during its setup reaches its owner | `a_stop_that_names_the_call_during_its_setup_ends_that_call` |
+//! | A stop that names another call ends nothing that is held | `a_stop_that_names_another_call_ends_nothing_that_is_held` |
+//! | A start whose answer was lost continues under the answer a repeat brings | `a_start_whose_answer_is_lost_continues_under_the_answer_a_repeat_brings` |
+//! | A start the host never answers is unknown, stays owed, and a stop during the repeats revokes what they find | `a_start_the_host_never_answers_is_unknown_and_stays_owed`, `a_stop_during_the_repeats_stops_the_media_and_revokes_what_the_repeats_find` |
+//! | A host that is forgotten, a host that is changed and a device the host revokes each end the call | `forgetting_the_host_ends_the_call_and_owes_the_revocation`, `choosing_another_host_ends_the_call`, `a_device_the_host_revokes_loses_the_call_it_holds` |
+//! | A call the host cannot be told about is closed at the service over its own route | `a_call_the_host_cannot_be_told_about_is_closed_at_the_service_over_its_own_route` |
+//! | An owner that fails ends the call it held, in full | `an_owner_that_fails_ends_the_call_it_held_in_full` |
 //! | A page that is loaded again finds the call and can end it | `a_page_that_is_loaded_again_finds_the_call_and_ends_it` |
 //! | Native code that stops answering the signs of life ends the call | `native_code_that_stops_answering_ends_the_call` |
 //! | A sign-out during the call ends it | `signing_out_during_a_call_ends_it` |
@@ -152,7 +160,8 @@ fn document_naming(origin: &str) -> ConfigurationDocument {
 
 /// Everything one test holds.
 struct Scene {
-    host: Host,
+    /// The daemon, until a test stops it.
+    host: Option<Host>,
     stand_in: StandIn,
     platform: Arc<ScriptedCalls>,
     phone: Phone,
@@ -162,6 +171,17 @@ struct Scene {
 }
 
 impl Scene {
+    fn host(&self) -> &Host {
+        self.host.as_ref().expect("the host is running")
+    }
+
+    /// Stops the daemon, once.
+    async fn stop_host(&mut self) {
+        if let Some(host) = self.host.take() {
+            host.stop().await;
+        }
+    }
+
     fn call(
         &self,
         command: &str,
@@ -308,7 +328,7 @@ async fn scene_with(
     .await;
     let session = kr_protocol::ids::SessionId::new(kr_ipc::new_uuid()).to_string();
     let scene = Scene {
-        host,
+        host: Some(host),
         stand_in,
         platform,
         phone,
@@ -370,7 +390,7 @@ fn commands_sent(scene: &Scene) -> Vec<String> {
 /// wait for the service.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_call_runs_from_the_pages_start_to_its_hang_up() {
-    let scene = scene().await;
+    let mut scene = scene().await;
 
     let started = scene.start().await;
     let session = &started["value"]["outcome"]["started"]["session"];
@@ -465,7 +485,7 @@ async fn a_call_runs_from_the_pages_start_to_its_hang_up() {
     assert_eq!(ended["ended"]["cause"], "requested");
     assert_eq!(ended["ended"]["host"]["kind"], "revoked");
     assert!(commands_sent(&scene).contains(&"close".to_owned()));
-    scene.host.stop().await;
+    scene.stop_host().await;
 }
 
 /// A device with no account token for the voice scope could not control a call, and the service
@@ -473,7 +493,7 @@ async fn a_call_runs_from_the_pages_start_to_its_hang_up() {
 /// and the host is not asked to start one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_device_with_no_voice_token_starts_nothing() {
-    let scene = scene_with(quick(), None, None).await;
+    let mut scene = scene_with(quick(), None, None).await;
     let prepared = scene.prepared().await;
 
     let refused = scene
@@ -488,14 +508,14 @@ async fn a_device_with_no_voice_token_starts_nothing() {
     );
     assert_eq!(scene.stand_in.count("/api/voice/sessions"), 0);
     assert_eq!(scene.state()["running"], false);
-    scene.host.stop().await;
+    scene.stop_host().await;
 }
 
 /// A token that has run out is replaced before the start, so a start never finds out at the
 /// control that its token is old, and the control presents the one the refresh issued.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_expired_token_is_refreshed_before_the_start_and_the_control_presents_the_new_one() {
-    let scene = scene_with(quick(), Some(phone_grant(PHONE_TOKEN, 1)), None).await;
+    let mut scene = scene_with(quick(), Some(phone_grant(PHONE_TOKEN, 1)), None).await;
     assert_eq!(scene.service.refreshes.load(Ordering::SeqCst), 0);
 
     let started = scene.start().await;
@@ -514,7 +534,7 @@ async fn an_expired_token_is_refreshed_before_the_start_and_the_control_presents
         Some(format!("Bearer {PHONE_TOKEN_REFRESHED}").as_str())
     );
     let _ = scene.call("voice_stop", json!({ "voiceSessionId": null }));
-    scene.host.stop().await;
+    scene.stop_host().await;
 }
 
 /// A device whose account is not the one the call was started under finds the service has no such
@@ -522,7 +542,7 @@ async fn an_expired_token_is_refreshed_before_the_start_and_the_control_presents
 /// is told why in words, and a warning stands before the next start without blocking it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_token_of_another_account_ends_the_call_and_a_warning_stands_before_the_next() {
-    let scene = scene().await;
+    let mut scene = scene().await;
     scene.stand_in.treat_as_another_account(PHONE_TOKEN);
     assert_eq!(scene.state()["warning"], serde_json::Value::Null);
 
@@ -567,14 +587,14 @@ async fn a_token_of_another_account_ends_the_call_and_a_warning_stands_before_th
                 && state["warning"].is_null()
         })
         .await;
-    scene.host.stop().await;
+    scene.stop_host().await;
 }
 
 /// A control whose token the service does not accept, after the host created the call, closes the
 /// call: the media stops, the host revokes the grant and closes the call at the service.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_control_that_is_not_authorised_closes_the_call_the_host_started() {
-    let scene = scene().await;
+    let mut scene = scene().await;
     // The service has never been told of the token the phone holds.
     scene.stand_in.forget_control_token(PHONE_TOKEN);
 
@@ -589,14 +609,14 @@ async fn a_control_that_is_not_authorised_closes_the_call_the_host_started() {
     assert_eq!(ended["ended"]["host"]["kind"], "revoked");
     assert!(scene.platform.count("stop") >= 1);
     assert_eq!(scene.stand_in.count("/api/voice/sessions/call-1/close"), 1);
-    scene.host.stop().await;
+    scene.stop_host().await;
 }
 
 /// The notification's stop is native code's own end of the call. No page is looking, and the call
 /// is ended in full all the same.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_notifications_stop_ends_the_call_with_no_page() {
-    let scene = scene().await;
+    let mut scene = scene().await;
     scene.start().await;
     scene
         .state_where("a running call", |state| state["running"] == true)
@@ -614,13 +634,13 @@ async fn the_notifications_stop_ends_the_call_with_no_page() {
             state["ended"]["broker"] == "closed"
         })
         .await;
-    scene.host.stop().await;
+    scene.stop_host().await;
 }
 
 /// A connection that fails ends the call the same way.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_failed_connection_ends_the_call_with_no_page() {
-    let scene = scene().await;
+    let mut scene = scene().await;
     scene.start().await;
     scene
         .state_where("a running call", |state| state["running"] == true)
@@ -635,7 +655,11 @@ async fn a_failed_connection_ends_the_call_with_no_page() {
         .await;
     assert_eq!(ended["ended"]["host"]["kind"], "revoked");
     assert!(scene.platform.count("stop") >= 1);
-    scene.host.stop().await;
+    assert_eq!(
+        ended["ended"]["closed_locally"], true,
+        "native code ended the call itself, so its media is stopped: {ended}"
+    );
+    scene.stop_host().await;
 }
 
 /// News that was lost can be the end of the call. The device asks native code what it holds, and
@@ -647,7 +671,7 @@ async fn news_that_was_lost_is_checked_against_what_native_code_holds() {
         tick: Duration::from_secs(3600),
         ..quick()
     };
-    let scene = scene_with(timings, Some(phone_grant(PHONE_TOKEN, 3600)), None).await;
+    let mut scene = scene_with(timings, Some(phone_grant(PHONE_TOKEN, 3600)), None).await;
     scene.start().await;
     scene
         .state_where("a running call", |state| state["running"] == true)
@@ -671,14 +695,14 @@ async fn news_that_was_lost_is_checked_against_what_native_code_holds() {
         signs_before,
         "no sign of life ended it"
     );
-    scene.host.stop().await;
+    scene.stop_host().await;
 }
 
 /// A sign of life that native code answers as a call that has ended ends the call, whether or not
 /// its news said so.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_sign_of_life_native_code_refuses_as_ended_ends_the_call() {
-    let scene = scene().await;
+    let mut scene = scene().await;
     scene.start().await;
     scene
         .state_where("a running call", |state| state["running"] == true)
@@ -691,7 +715,7 @@ async fn a_sign_of_life_native_code_refuses_as_ended_ends_the_call() {
         .await;
     assert!(scene.platform.count("alive") >= 1);
     assert_eq!(ended["ended"]["host"]["kind"], "revoked");
-    scene.host.stop().await;
+    scene.stop_host().await;
 }
 
 /// The provider announces a delegation, and this version acts on nothing a person says: the model
@@ -699,7 +723,7 @@ async fn a_sign_of_life_native_code_refuses_as_ended_ends_the_call() {
 /// row that says so.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_delegation_is_answered_to_the_model_that_nothing_was_done_once() {
-    let scene = scene().await;
+    let mut scene = scene().await;
     scene.start().await;
     scene
         .state_where("an attached control", |state| {
@@ -729,28 +753,39 @@ async fn a_delegation_is_answered_to_the_model_that_nothing_was_done_once() {
         .control()
         .until("the socket attached again", |report| report.open >= 1)
         .await;
-    let answered = scene
-        .stand_in
-        .control()
-        .report()
-        .sent
-        .iter()
-        .filter(|sent| sent.delegation.as_deref() == Some("d-1"))
-        .count();
-    assert_eq!(answered, 1, "the model was told once");
+    // The news of the second socket is read in order, so once a delegation announced on it is
+    // answered the device has read what the socket listed at its attachment, d-1 among it.
+    scene.stand_in.control().announce("d-2", 2400);
+    scene
+        .state_where("the second delegation answered", |state| {
+            state["delegations"][1]["told"] == true
+        })
+        .await;
+    let answered = |delegation: &str| {
+        scene
+            .stand_in
+            .control()
+            .report()
+            .sent
+            .iter()
+            .filter(|sent| sent.delegation.as_deref() == Some(delegation))
+            .count()
+    };
+    assert_eq!(answered("d-1"), 1, "the model was told once");
+    assert_eq!(answered("d-2"), 1);
     assert_eq!(
         scene.state()["delegations"].as_array().map(Vec::len),
-        Some(1)
+        Some(2)
     );
     let _ = scene.call("voice_stop", json!({ "voiceSessionId": null }));
-    scene.host.stop().await;
+    scene.stop_host().await;
 }
 
 /// Muting the microphone is native code's, and the service is told as advice to the provider.
 /// Silencing the model's voice is native code's alone.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn muting_the_microphone_silences_it_here_and_tells_the_service() {
-    let scene = scene().await;
+    let mut scene = scene().await;
     scene.start().await;
     scene
         .state_where("an attached control", |state| {
@@ -799,7 +834,7 @@ async fn muting_the_microphone_silences_it_here_and_tells_the_service() {
         "only the microphone's mute is advice to the provider: {tellings:?}"
     );
     let _ = scene.call("voice_stop", json!({ "voiceSessionId": null }));
-    scene.host.stop().await;
+    scene.stop_host().await;
 }
 
 /// The host decides where a call's control is, and the account's token goes only where the
@@ -808,7 +843,7 @@ async fn muting_the_microphone_silences_it_here_and_tells_the_service() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_host_that_names_another_voice_service_gets_no_token() {
     // The phone's account is signed in at a service that is not the one the host names.
-    let scene = scene_with(
+    let mut scene = scene_with(
         quick(),
         Some(phone_grant(PHONE_TOKEN, 3600)),
         Some("http://127.0.0.1:9"),
@@ -843,7 +878,46 @@ async fn a_host_that_names_another_voice_service_gets_no_token() {
         1,
         "the host closed the call it created"
     );
-    scene.host.stop().await;
+    scene.stop_host().await;
+}
+
+/// The host is asked to revoke while native code is still stopping the media: its revocation is not
+/// held behind the stop, and the stop is not held behind the host. The service has been told the
+/// call is over while native code has not returned, and the person's answer comes when both are
+/// done.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_hosts_revocation_does_not_wait_for_native_code_to_stop_the_media() {
+    let mut scene = scene().await;
+    scene.start().await;
+    scene
+        .state_where("a running call", |state| state["running"] == true)
+        .await;
+    scene.platform.hold("stop");
+
+    let stopping = scene
+        .phone
+        .companion
+        .start_call("voice_stop", json!({ "voiceSessionId": null }));
+    tokio::time::timeout(WATCHDOG, async {
+        while scene.stand_in.count("/api/voice/sessions/call-1/close") == 0 {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("the host revoked and told the service while native code was still stopping");
+    assert!(
+        !stopping.is_finished(),
+        "native code has not returned from its stop"
+    );
+
+    scene.platform.release("stop");
+    let closure = stopping
+        .await
+        .expect("the stop ran")
+        .expect("the call ends");
+    assert_eq!(closure["closed_locally"], true);
+    assert_eq!(closure["fence"]["kind"], "not_owed");
+    scene.stop_host().await;
 }
 
 /// Native code that does not return from a stop never holds the host's revocation: the host is
@@ -854,7 +928,7 @@ async fn a_stop_native_code_never_returns_does_not_hold_the_revocation() {
         local_within: Duration::from_millis(300),
         ..quick()
     };
-    let scene = scene_with(timings, Some(phone_grant(PHONE_TOKEN, 3600)), None).await;
+    let mut scene = scene_with(timings, Some(phone_grant(PHONE_TOKEN, 3600)), None).await;
     scene.start().await;
     scene
         .state_where("a running call", |state| state["running"] == true)
@@ -874,14 +948,14 @@ async fn a_stop_native_code_never_returns_does_not_hold_the_revocation() {
         "the host revoked the grant"
     );
     assert_eq!(scene.stand_in.count("/api/voice/sessions/call-1/close"), 1);
-    scene.host.stop().await;
+    scene.stop_host().await;
 }
 
 /// A page that is loaded again holds nothing of the call it left, and finds it where it is kept:
 /// the state names the call, and a stop that names none ends the call this device holds.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_page_that_is_loaded_again_finds_the_call_and_ends_it() {
-    let scene = scene().await;
+    let mut scene = scene().await;
     let started = scene.start().await;
     let voice_session_id =
         started["value"]["outcome"]["started"]["session"]["voice_session_id"].clone();
@@ -897,14 +971,14 @@ async fn a_page_that_is_loaded_again_finds_the_call_and_ends_it() {
         .expect("the call ends");
     assert_eq!(closure["closed_locally"], true);
     assert_eq!(scene.state()["running"], false);
-    scene.host.stop().await;
+    scene.stop_host().await;
 }
 
 /// Native code that stops answering the owner's signs of life is not holding a call the owner can
 /// still end: after a few signs unanswered the call is ended, with the host asked to revoke.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn native_code_that_stops_answering_ends_the_call() {
-    let scene = scene().await;
+    let mut scene = scene().await;
     scene.start().await;
     scene
         .state_where("a running call", |state| state["running"] == true)
@@ -919,14 +993,14 @@ async fn native_code_that_stops_answering_ends_the_call() {
         .await;
     assert!(scene.platform.count("alive") >= 3);
     assert_eq!(ended["ended"]["host"]["kind"], "revoked");
-    scene.host.stop().await;
+    scene.stop_host().await;
 }
 
 /// The account is signed out during the call: the call is not carried on under no account, and is
 /// ended in full.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn signing_out_during_a_call_ends_it() {
-    let scene = scene().await;
+    let mut scene = scene().await;
     scene.start().await;
     scene
         .state_where("a running call", |state| state["running"] == true)
@@ -941,7 +1015,7 @@ async fn signing_out_during_a_call_ends_it() {
         .await;
     assert_eq!(ended["ended"]["host"]["kind"], "revoked");
     assert!(scene.platform.count("stop") >= 1);
-    scene.host.stop().await;
+    scene.stop_host().await;
 }
 
 /// The host connection is lost during the call. The call goes on, and the model is told by a fixed
@@ -950,7 +1024,7 @@ async fn signing_out_during_a_call_ends_it() {
 /// the screen is told so in words, still says the host is lost, and the model is told nothing more.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_host_that_is_lost_is_told_to_the_model_and_a_refusal_is_not_its_return() {
-    let scene = scene().await;
+    let mut scene = scene().await;
     scene.start().await;
     scene
         .state_where("an attached control", |state| {
@@ -1003,5 +1077,490 @@ async fn a_host_that_is_lost_is_told_to_the_model_and_a_refusal_is_not_its_retur
         "the model was told once of the loss"
     );
     let _ = scene.call("voice_stop", json!({ "voiceSessionId": null }));
-    scene.host.stop().await;
+    scene.stop_host().await;
+}
+
+/// A page that names the call while it is still being set up reaches the call's owner: the call is
+/// given up before native code is permitted, and the media never carries the person's voice.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stop_that_names_the_call_during_its_setup_ends_that_call() {
+    let mut scene = scene().await;
+    let prepared = scene.prepared().await;
+    scene.platform.hold("permit");
+    let starting = scene
+        .phone
+        .companion
+        .start_call("voice_start", scene.start_request(&prepared));
+    tokio::time::timeout(WATCHDOG, async {
+        while scene.platform.count("permit") == 0 {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("native code was asked to permit the call");
+
+    // The host has created the call, and the screen can read which call it is.
+    let setting_up = scene.state();
+    let voice_session_id = setting_up["session"]["voice_session_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the state names the call being set up: {setting_up}"))
+        .to_owned();
+    assert_eq!(setting_up["running"], false, "{setting_up}");
+
+    let closure = scene
+        .call("voice_stop", json!({ "voiceSessionId": voice_session_id }))
+        .expect("the call is given up");
+
+    assert_eq!(closure["closed_locally"], true);
+    assert_eq!(
+        closure["fence"]["kind"], "not_owed",
+        "the host revoked: {closure}"
+    );
+    assert!(scene.platform.permitted_for().is_none(), "never permitted");
+    assert_eq!(scene.stand_in.count("/api/voice/sessions/call-1/close"), 1);
+    let refused = starting
+        .await
+        .expect("the start ran")
+        .expect_err("a call given up is not a call started");
+    assert_eq!(refused["code"], "RESOURCE_UNAVAILABLE", "{refused}");
+    assert_eq!(scene.state()["running"], false);
+    scene.platform.release("permit");
+    scene.stop_host().await;
+}
+
+/// A stop that names a call this device does not hold is the host's to answer: it ends nothing of
+/// the call that is held.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stop_that_names_another_call_ends_nothing_that_is_held() {
+    let mut scene = scene().await;
+    scene.start().await;
+    scene
+        .state_where("a running call", |state| state["running"] == true)
+        .await;
+
+    let other = kr_protocol::ids::VoiceSessionId::new(kr_ipc::new_uuid()).to_string();
+    let closure = scene
+        .call("voice_stop", json!({ "voiceSessionId": other }))
+        .expect("the host is asked about the call it was named");
+
+    assert_eq!(closure["closed_locally"], false);
+    assert_eq!(scene.state()["running"], true, "the held call goes on");
+    assert_eq!(scene.platform.count("stop"), 0);
+    let _ = scene.call("voice_stop", json!({ "voiceSessionId": null }));
+    scene.stop_host().await;
+}
+
+/// Timings for a start whose answer is cut at once, so the device asks again.
+fn asking_again() -> Timings {
+    Timings {
+        start_within: Duration::ZERO,
+        repeat_delays: [Duration::from_millis(20); 3],
+        host_within: Duration::from_secs(3),
+        ..quick()
+    }
+}
+
+/// The host's answer to a start never arrives, as a connection that ends between the host's
+/// reading and its answer would leave it. The device asks again under the same action, the host
+/// answers from what it kept, and the call goes on as the one that was started: one creation at
+/// the service, one opening of the call here.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_start_whose_answer_is_lost_continues_under_the_answer_a_repeat_brings() {
+    let mut scene = scene_with(asking_again(), Some(phone_grant(PHONE_TOKEN, 3600)), None).await;
+
+    let started = scene.start().await;
+
+    assert!(
+        started["value"]["outcome"]["started"].is_object(),
+        "the call the host made is the call that runs: {started}"
+    );
+    scene
+        .state_where("a running call", |state| {
+            state["running"] == true && state["control"] == "connected"
+        })
+        .await;
+    assert_eq!(scene.stand_in.count("/api/voice/sessions"), 1);
+    assert_eq!(scene.platform.count("open"), 1);
+    let _ = scene.call("voice_stop", json!({ "voiceSessionId": null }));
+    scene.stop_host().await;
+}
+
+/// The host never says whether it made the call. The person is told so, with the action the start
+/// was sent under, the media is stopped, and the revocation the host may be owed stays on the
+/// screen after the next call opens, until the moment the call would have closed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_start_the_host_never_answers_is_unknown_and_stays_owed() {
+    let timings = Timings {
+        host_within: Duration::from_millis(300),
+        ..asking_again()
+    };
+    let mut scene = scene_with(timings, Some(phone_grant(PHONE_TOKEN, 3600)), None).await;
+    scene.stand_in.hold_creations();
+
+    let started = scene.start().await;
+
+    assert!(
+        started["value"].is_null(),
+        "no call was reported: {started}"
+    );
+    let action_id = started["action_id"]
+        .as_str()
+        .expect("the start names its action")
+        .to_owned();
+    let state = scene.state();
+    assert_eq!(state["running"], false);
+    assert_eq!(state["ended"]["cause"], "start_unknown", "{state}");
+    assert_eq!(state["ended"]["closed_locally"], true);
+    assert_eq!(state["ended"]["host"]["kind"], "not_told");
+    assert!(scene.platform.count("stop") >= 1, "the media is stopped");
+    assert_eq!(state["owed"][0]["kind"], "start_unknown", "{state}");
+    assert_eq!(state["owed"][0]["action_id"], action_id.as_str());
+
+    // The record outlives the next call's opening, whatever that call comes to.
+    scene.stand_in.release_creations();
+    let prepared = scene.prepared().await;
+    let _ = scene.call("voice_start", scene.start_request(&prepared));
+    let later = scene.state();
+    assert_eq!(later["owed"][0]["action_id"], action_id.as_str(), "{later}");
+    let _ = scene.call("voice_stop", json!({ "voiceSessionId": null }));
+    scene.stop_host().await;
+}
+
+/// The person presses stop while the device is still asking the host what became of its start. The
+/// media stops at once and the stop is answered, and the device goes on asking: when the host turns
+/// out to have made the call, the call is ended in full and the host's grant is revoked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stop_during_the_repeats_stops_the_media_and_revokes_what_the_repeats_find() {
+    let timings = Timings {
+        start_within: Duration::ZERO,
+        repeat_delays: [
+            Duration::from_millis(50),
+            Duration::from_millis(50),
+            Duration::from_secs(4),
+        ],
+        host_within: Duration::from_millis(300),
+        ..quick()
+    };
+    let mut scene = scene_with(timings, Some(phone_grant(PHONE_TOKEN, 3600)), None).await;
+    scene.stand_in.hold_creations();
+    let prepared = scene.prepared().await;
+    let starting = scene
+        .phone
+        .companion
+        .start_call("voice_start", scene.start_request(&prepared));
+    tokio::time::timeout(WATCHDOG, async {
+        while scene.stand_in.count("/api/voice/sessions") == 0 {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("the host asked the service for the call");
+
+    let closure = scene
+        .call("voice_stop", json!({ "voiceSessionId": null }))
+        .expect("the stop is answered at once");
+    assert_eq!(closure["closed_locally"], true);
+    assert!(
+        closure["host_failure"].is_object(),
+        "the host has not said whether it made the call: {closure}"
+    );
+    assert!(scene.platform.count("stop") >= 1, "the media stopped");
+
+    // The host finishes the call it was making, and a repeat finds it.
+    scene.stand_in.release_creations();
+    starting
+        .await
+        .expect("the start ran")
+        .expect_err("a call given up is not a call started");
+    let ended = scene
+        .state_where("the call the repeats found, ended", |state| {
+            state["ended"]["host"]["kind"] == "revoked"
+        })
+        .await;
+    assert_eq!(ended["ended"]["cause"], "requested", "{ended}");
+    assert_eq!(ended["ended"]["closed_locally"], true);
+    assert_eq!(scene.stand_in.count("/api/voice/sessions/call-1/close"), 1);
+    assert!(scene.platform.permitted_for().is_none(), "never permitted");
+    scene.stop_host().await;
+}
+
+/// The person forgets the host the call belongs to, while the call runs and the host cannot be
+/// reached. This device no longer holds the pairing, so the call is ended, and what it could not
+/// tell the host is owed: the grant may be live until the moment the call was to close.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn forgetting_the_host_ends_the_call_and_owes_the_revocation() {
+    let timings = Timings {
+        host_within: Duration::from_secs(3),
+        ..quick()
+    };
+    let mut scene = scene_with(timings, Some(phone_grant(PHONE_TOKEN, 3600)), None).await;
+    let started = scene.start().await;
+    let voice_session_id =
+        started["value"]["outcome"]["started"]["session"]["voice_session_id"].clone();
+    scene
+        .state_where("an attached control", |state| {
+            state["control"] == "connected"
+        })
+        .await;
+    let reference = scene
+        .call("pairing_view", json!({}))
+        .expect("the pairing screen")["hosts"][0]["reference"]
+        .clone();
+    // The host goes away, and the person forgets it before it is back.
+    scene.stop_host().await;
+    scene
+        .state_where("a host that is lost", |state| state["host"] == "lost")
+        .await;
+
+    scene
+        .call("hosts_forget", json!({ "reference": reference }))
+        .expect("the host is forgotten");
+
+    let ended = scene
+        .state_where("the end", |state| {
+            state["ended"]["cause"] == "host_forgotten"
+        })
+        .await;
+    assert_eq!(ended["running"], false);
+    assert!(scene.platform.count("stop") >= 1);
+    assert_eq!(ended["ended"]["host"]["kind"], "not_told", "{ended}");
+    assert_eq!(ended["owed"][0]["kind"], "revocation", "{ended}");
+    assert_eq!(
+        ended["owed"][0]["voice_session_id"], voice_session_id,
+        "{ended}"
+    );
+    // The host cannot tell the voice service, so the device does, by the call's own control.
+    assert_eq!(ended["ended"]["broker"], "closed", "{ended}");
+    assert!(commands_sent(&scene).contains(&"close".to_owned()));
+}
+
+/// The host created the call, and cannot be told it is over: it is gone before the device finishes
+/// setting the call up. The call is ended all the same, the revocation is owed, and the voice
+/// service is told over its own route, with the account's token, because nothing else can: no
+/// control was opened for the call and the host cannot tell it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_call_the_host_cannot_be_told_about_is_closed_at_the_service_over_its_own_route() {
+    let timings = Timings {
+        host_within: Duration::from_secs(3),
+        ..quick()
+    };
+    let mut scene = scene_with(timings, Some(phone_grant(PHONE_TOKEN, 3600)), None).await;
+    scene.platform.hold("permit");
+    scene.platform.refuse_the_permit();
+    let prepared = scene.prepared().await;
+    let starting = scene
+        .phone
+        .companion
+        .start_call("voice_start", scene.start_request(&prepared));
+    tokio::time::timeout(WATCHDOG, async {
+        while scene.platform.count("permit") == 0 {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("native code was asked to permit the call");
+    scene.stop_host().await;
+
+    scene.platform.release("permit");
+
+    starting
+        .await
+        .expect("the start ran")
+        .expect_err("a call that could not be permitted is not a call started");
+    let ended = scene
+        .state_where("the end", |state| {
+            state["ended"]["broker"] == "closed_over_http"
+        })
+        .await;
+    assert_eq!(ended["ended"]["host"]["kind"], "not_told", "{ended}");
+    assert_eq!(ended["owed"][0]["kind"], "revocation", "{ended}");
+    assert_eq!(
+        scene.stand_in.count("/api/voice/sessions/call-1/close"),
+        1,
+        "the service was told over its own route"
+    );
+}
+
+/// The person chooses another host to browse while a call runs. The call belongs to the host that
+/// made it, and a device does not carry a call for one host while it acts on another: the call is
+/// ended, and the host it belongs to is asked to revoke.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn choosing_another_host_ends_the_call() {
+    let mut scene = scene().await;
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let other = Host::start(&owner).await;
+    pair(&scene.phone, &other, &owner, &[ActionRight::SessionView]).await;
+    scene.start().await;
+    scene
+        .state_where("an attached control", |state| {
+            state["control"] == "connected"
+        })
+        .await;
+    let view = scene
+        .call("pairing_view", json!({}))
+        .expect("the pairing screen");
+    let another = view["hosts"]
+        .as_array()
+        .expect("hosts")
+        .iter()
+        .find(|row| row["in_use"] == false)
+        .and_then(|row| row["reference"].as_str())
+        .expect("the host not in use")
+        .to_owned();
+
+    scene
+        .call("hosts_use", json!({ "reference": another }))
+        .expect("the other host is chosen");
+
+    let ended = scene
+        .state_where("the end", |state| state["ended"]["cause"] == "host_changed")
+        .await;
+    assert_eq!(ended["running"], false);
+    assert_eq!(ended["ended"]["host"]["kind"], "revoked", "{ended}");
+    assert_eq!(scene.stand_in.count("/api/voice/sessions/call-1/close"), 1);
+    other.stop().await;
+    scene.stop_host().await;
+}
+
+/// The identity `host` gave the one phone paired with it.
+fn the_phone_of(host: &Host) -> kr_protocol::ids::DeviceId {
+    let owner = host.owner.as_ref().map(|owner| owner.device_id);
+    host.controller()
+        .devices()
+        .devices()
+        .expect("the device directory answers")
+        .into_iter()
+        .find(|record| record.is_paired() && owner != Some(record.device_id))
+        .expect("the paired phone")
+        .device_id
+}
+
+/// The host revokes the phone while its call runs. Revocation is the host's act, so the host ends
+/// what the device holds: its grant is withdrawn and the call is closed at the service, which
+/// closes the control, and the phone ends the call by its ordinary path, with the media stopped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_device_the_host_revokes_loses_the_call_it_holds() {
+    let mut scene = scene().await;
+    scene.stand_in.end_the_control_when_a_call_is_closed();
+    scene.start().await;
+    scene
+        .state_where("an attached control", |state| {
+            state["control"] == "connected"
+        })
+        .await;
+
+    let mut client = scene.host().client().await;
+    let _: kr_protocol::sharing::RevocationResult = net_support::pairing::mutate(
+        scene.host().environment_id,
+        &mut client,
+        kr_protocol::method::Method::DeviceRevoke,
+        &kr_protocol::sharing::DeviceRevokeParams {
+            device_id: the_phone_of(scene.host()),
+        },
+    )
+    .await
+    .expect("the host revokes the phone");
+
+    let ended = scene
+        .state_where("the end", |state| {
+            state["running"] == false && state["ended"].is_object()
+        })
+        .await;
+    assert_eq!(ended["ended"]["cause"], "service_closed", "{ended}");
+    assert_eq!(scene.stand_in.count("/api/voice/sessions/call-1/close"), 1);
+    assert!(scene.platform.count("stop") >= 1, "the media stopped");
+    scene.stop_host().await;
+}
+
+/// A host reach that fails the way a bug does: the first look at the pairing after it is told to
+/// panics, in the task that owns the call.
+struct FailsWhenTold {
+    inner: companion_tauri::voice::AppReach<tauri::test::MockRuntime>,
+    told: AtomicUsize,
+}
+
+impl companion_tauri::voice::HostReach for FailsWhenTold {
+    fn in_use(
+        &self,
+    ) -> Result<companion_tauri::voice::CallHost, companion_tauri::error::CommandError> {
+        self.inner.in_use()
+    }
+
+    fn session_to<'a>(
+        &'a self,
+        host: &'a kr_client::pairing::paired::PairedHost,
+        avoiding: Option<&'a Arc<kr_client::Session>>,
+    ) -> companion_tauri::voice::Reaching<'a, Arc<kr_client::Session>> {
+        self.inner.session_to(host, avoiding)
+    }
+
+    fn pairing(
+        &self,
+        host: &kr_client::pairing::paired::PairedHost,
+    ) -> companion_tauri::voice::Pairing {
+        assert!(self.told.load(Ordering::SeqCst) == 0, "the owner fails");
+        self.inner.pairing(host)
+    }
+
+    fn another_host_in_use(&self, host: &kr_client::pairing::paired::PairedHost) -> bool {
+        self.inner.another_host_in_use(host)
+    }
+}
+
+/// The task that owns a call fails. The call is not left running with nobody to end it: the
+/// supervisor stops the media, asks the host to revoke the grant, closes the call at the service,
+/// and says in the record that the owner failed. The next call starts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_owner_that_fails_ends_the_call_it_held_in_full() {
+    let mut scene = scene().await;
+    let prepared = scene.prepared().await;
+    let app = scene.phone.companion.app.handle().clone();
+    let calls = scene.phone.companion.app.state::<Calls>();
+    let reach = Arc::new(FailsWhenTold {
+        inner: companion_tauri::voice::AppReach::new(app),
+        told: AtomicUsize::new(0),
+    });
+    let request = companion_tauri::voice::StartRequest {
+        session_ids: vec![scene.session.parse().expect("a session")],
+        duration_seconds: 600,
+        reasoning_budget_minor: None,
+        prepared: serde_json::from_value(prepared["prepared"].clone()).expect("a digest"),
+        expected_rate_version: prepared["managed"]["rate"]["version"]
+            .as_str()
+            .map(str::to_owned),
+        subject: companion_tauri::target::Subject::default(),
+    };
+    let started = calls
+        .start(
+            request,
+            Arc::clone(&reach) as Arc<dyn companion_tauri::voice::HostReach>,
+            Arc::clone(&scene.tokens),
+        )
+        .await
+        .expect("a call starts");
+    assert!(matches!(
+        started,
+        companion_tauri::voice::Started::Result(_)
+    ));
+    scene
+        .state_where("a running call", |state| state["running"] == true)
+        .await;
+
+    reach.told.store(1, Ordering::SeqCst);
+
+    let ended = scene
+        .state_where("the owner's failure", |state| {
+            state["ended"]["cause"] == "owner_failed"
+        })
+        .await;
+    assert_eq!(ended["running"], false);
+    assert!(scene.platform.count("stop") >= 1, "the media is stopped");
+    assert_eq!(ended["ended"]["host"]["kind"], "revoked", "{ended}");
+    assert_eq!(ended["ended"]["closed_locally"], true);
+    assert_eq!(scene.stand_in.count("/api/voice/sessions/call-1/close"), 1);
+    // The slot is free: the next call starts.
+    let again = scene.start().await;
+    assert!(again["value"]["outcome"]["started"].is_object(), "{again}");
+    let _ = scene.call("voice_stop", json!({ "voiceSessionId": null }));
+    scene.stop_host().await;
 }
