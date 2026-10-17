@@ -37,7 +37,7 @@ use kr_protocol::scalars::{AuthorisationKey, CanonicalSet, KeyId, Nullable, Sign
 use kr_protocol::service::{GatewayOrigin, ServiceRequestSigner};
 use kr_protocol::sharing::{DeviceListParams, DeviceListResult, OfflineValidityPolicy};
 use kr_service_stand_in::{Moment, Served, serve};
-use net_support::{Device, Host, MovedWall, connect, pair_with, proposal};
+use net_support::{Device, Host, MovedWall, connect, pair_with, paired_dial, proposal};
 
 const AUTHORITY: &str = "/api/authority/sync";
 
@@ -321,20 +321,109 @@ fn devices(id: DeviceId) -> RevocationTarget {
     }
 }
 
-/// KR-REQ-10.46: a device the feed holds a revocation for is refused on its first request after
-/// it connects, with polling off. Section 10 asks for the synchronisation before affected remote
-/// access, so a poll that has not come yet is no window for the device.
+/// How a device that connects while the feed holds a revocation for it is kept from the host.
+#[derive(Debug, PartialEq, Eq)]
+enum Kept {
+    /// The host ended the connection before the handshake was over: the revocation was carried
+    /// out, and the connection withdrawn, before the device had read that it was accepted, or the
+    /// device's record was already withdrawn.
+    Out,
+    /// The handshake finished, and the first request was refused.
+    Refused,
+}
+
+/// Whether `error` is the host ending or refusing the connection, and nothing else.
+fn is_the_host_ending_the_connection(error: &kr_client::ClientError) -> bool {
+    matches!(
+        error,
+        kr_client::ClientError::Transport(
+            kr_transport::TransportError::Stream(_)
+                | kr_transport::TransportError::Closed(_)
+                | kr_transport::TransportError::Refused(_)
+        )
+    )
+}
+
+impl Rig {
+    /// Connects a device the feed holds a revocation for, and says how the host kept it out.
+    ///
+    /// Section 10 asks the host to synchronise at reconnect before affected remote access. The host
+    /// does that by finding the revocation as the connection is admitted and carrying it out, which
+    /// withdraws the connection it came on. Whether the device has read that it was accepted by
+    /// then is the order two tasks ran in: a device that has is refused on its first request, and
+    /// one that has not finds the connection ended. Both are the host keeping the device from
+    /// every request; what neither may be is a request answered.
+    async fn connects_while_a_revocation_is_held(
+        &self,
+        device: &Device,
+        record: &kr_controller::service::net::devices::DeviceRecord,
+    ) -> Kept {
+        match paired_dial(&self.host, device, record).try_dial().await {
+            Ok(transport) => {
+                let session =
+                    kr_client::session::Session::start(Arc::new(transport)).expect("a session");
+                self.doctor_as(&session)
+                    .await
+                    .expect_err("the revocation reached the host before the first request");
+                Kept::Refused
+            }
+            Err(error) => {
+                assert!(
+                    is_the_host_ending_the_connection(&error),
+                    "the connection ended for another reason: {error:?}"
+                );
+                Kept::Out
+            }
+        }
+    }
+
+    /// Waits until the host has carried the revocation out and acknowledged it, which a connection
+    /// that ended first does not wait for: the pass that withdrew it may still be writing.
+    async fn until_the_revocation_is_acknowledged(&self, request: &RevocationRequest) {
+        let mut passes = self.runtime().passes();
+        within(
+            "the host carries the revocation out and acknowledges it",
+            async {
+                loop {
+                    let _ = *passes.borrow_and_update();
+                    let taken = self
+                        .host
+                        .controller()
+                        .authority_revision()
+                        .await
+                        .expect("a revision")
+                        .get()
+                        > 0;
+                    let acknowledged = self
+                        .feed_as_the_owner_sees_it()
+                        .await
+                        .record(request.request_id)
+                        .is_some_and(|held| held.acknowledgement.0.is_some());
+                    if taken && acknowledged {
+                        return;
+                    }
+                    passes.changed().await.expect("the carrier runs");
+                }
+            },
+        )
+        .await;
+    }
+}
+
+/// KR-REQ-10.46: a device the feed holds a revocation for is kept from the host on its first
+/// connection, with polling off: refused on its first request, or out before the handshake is over.
+/// Section 10 asks for the synchronisation before affected remote access, so a poll that has not
+/// come yet is no window for the device.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_device_the_feed_holds_a_revocation_for_is_refused_on_its_first_request() {
+async fn a_device_the_feed_holds_a_revocation_for_is_kept_out_on_its_first_connection() {
     let rig = Rig::start().await;
     let (phone, record) = rig.pairs(&[ActionRight::SessionView]).await;
     let request = rig.owner_publishes(0xa1, devices(record.device_id)).await;
 
     // The carrier's wait has not ended: nothing but the connection can have taught the host.
-    let session = connect(&rig.host, &phone, &record).await;
-    rig.doctor_as(&session)
-        .await
-        .expect_err("the revocation reached the host before the first request");
+    rig.connects_while_a_revocation_is_held(&phone, &record)
+        .await;
+    rig.until_the_revocation_is_acknowledged(&request).await;
     assert!(
         rig.host
             .controller()
@@ -368,6 +457,26 @@ async fn a_device_the_feed_holds_a_revocation_for_is_refused_on_its_first_reques
         .filter(|arrived| arrived.path == AUTHORITY && arrived.body.get("revise").is_some())
         .count();
     assert_eq!(revisions, 1, "one revision for one request");
+}
+
+/// A host that has already carried the revocation out, in a pass the connection did not start, ends
+/// the device's connection before the handshake is over. This is the order the first case may meet
+/// on a slow machine, made the only one: the device connects after the host's pass, so the host
+/// ends the connection and nothing is served.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_revocation_carried_out_before_a_device_connects_ends_its_connection() {
+    let rig = Rig::start().await;
+    let (phone, record) = rig.pairs(&[ActionRight::SessionView]).await;
+    let request = rig.owner_publishes(0xa1, devices(record.device_id)).await;
+    rig.poll().await;
+    rig.until_the_revocation_is_acknowledged(&request).await;
+
+    assert_eq!(
+        rig.connects_while_a_revocation_is_held(&phone, &record)
+            .await,
+        Kept::Out,
+        "the connection ended before the handshake was over"
+    );
 }
 
 /// The poll the feed states carries out a revocation published while the device stays connected.
