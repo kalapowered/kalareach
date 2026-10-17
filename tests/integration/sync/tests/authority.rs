@@ -163,33 +163,52 @@ impl Feed {
     /// [`Self::publish_settled`] for a publication that carries an announcement, and whether the
     /// request had to be sent again.
     ///
-    /// The announcement is what the answer reports, so the request is sent again whether or not
-    /// the feed holds it, which the service answers from the record it holds. When the service
-    /// itself gave up on the change, it had placed no announcement. When the answer was lost on
-    /// the way back (the client's own deadline, a connection that ended), the first request may
-    /// have placed it, and the resend then finds the same item already there: the caller accepts
-    /// a duplicate when this says it sent again, and nothing else.
+    /// The announcement is what the answer reports, and the service places it with what is left
+    /// of the one deadline it gives the whole request, after the change has answered. So the
+    /// request is sent again when the answer is unknown (the service gave up on the change before
+    /// placing anything, or the answer was lost on the way back), and when the announcement was
+    /// declined (the mailbox is a new one and may not have answered in time); the service answers
+    /// the resend from the record it holds, or stores the request, and places the announcement
+    /// again. A first request that placed its announcement after all leaves the same item
+    /// waiting, and the resend then reports it as a duplicate: the caller accepts a duplicate only
+    /// when this says it sent again. A decline that comes back is the deployment failing, and the
+    /// leg fails with it.
     async fn publish_announcing(
         &self,
         client: &AuthorityFeedClient,
         request: &RevocationRequest,
         announcement: &FeedAnnouncement,
     ) -> kr_client::Result<(kr_client::services::AuthorityFeedState, bool)> {
+        let resend = |why: String| async move {
+            eprintln!("{why}, so the feed is read and the request sent again");
+            // The service asks for the feed to be read before a change is sent again.
+            self.host_client.read(self.address(), None, false).await?;
+            client
+                .publish(self.address(), request, Some(announcement))
+                .await
+                .map(|state| (state, true))
+        };
         match client
             .publish(self.address(), request, Some(announcement))
             .await
         {
             Err(unknown) if unknown.code() == ErrorCode::OutcomeUnknown => {
-                eprintln!(
-                    "the publication was answered as unknown, so the feed is read and the \
-                     request sent again: {unknown}"
-                );
-                // The service asks for the feed to be read before a change is sent again.
-                self.host_client.read(self.address(), None, false).await?;
-                client
-                    .publish(self.address(), request, Some(announcement))
-                    .await
-                    .map(|state| (state, true))
+                resend(format!(
+                    "the publication was answered as unknown: {unknown}"
+                ))
+                .await
+            }
+            Ok(state)
+                if state.announced.as_ref().is_some_and(|announced| {
+                    announced.mailbox == kr_client::services::AnnouncementPlacement::Declined
+                }) =>
+            {
+                let why = state
+                    .announced
+                    .as_ref()
+                    .and_then(|announced| announced.declined_reason.clone())
+                    .unwrap_or_default();
+                resend(format!("the announcement was declined: {why}")).await
             }
             answered => answered.map(|state| (state, false)),
         }
@@ -520,8 +539,8 @@ async fn kr_req_10_46_a_request_from_a_key_this_host_holds_no_owner_record_for_i
         let stranger = RunKey::installation();
         let published = feed.revocation_from(&stranger);
         feed.publish_settled(&feed.deployment.authority_feed(&stranger), &published)
-        .await
-        .expect("the service stores what the key that signed it published");
+            .await
+            .expect("the service stores what the key that signed it published");
 
         // And one from the owner this host does hold a record for, published to the same feed, so
         // that both go through the host's one path and the difference between them is the
