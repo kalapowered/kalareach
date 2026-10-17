@@ -34,36 +34,49 @@ private enum Fixtures {
 
 /// A call that does what the test tells it and remembers what it was asked.
 private final class FakeEngine: CallEngine {
-    var asked: [String] = []
+    /// What the call was asked, in order. A stop is asked from the adapter's engine queue while a
+    /// test reads this, so it is kept under a lock.
+    private let lock = NSLock()
+    private var log: [String] = []
+    var asked: [String] {
+        get { lock.lock(); defer { lock.unlock() }; return log }
+        set { lock.lock(); defer { lock.unlock() }; log = newValue }
+    }
     var offered = "v=0\r\ns=-\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n"
     var usesDtx: Bool? = true
     var permitted = true
     var isPlaybackMuted = false
     var isMutedByPerson = false
 
+    func record(_ what: String) {
+        lock.lock()
+        log.append(what)
+        lock.unlock()
+    }
+
     func offer() async throws -> String {
-        asked.append("offer")
+        record("offer")
         return offered
     }
 
-    func accept(answerSdp: String) async throws { asked.append("accept \(answerSdp.count)") }
+    func accept(answerSdp: String) async throws { record("accept \(answerSdp.count)") }
     var answerUsesDtx: Bool? { usesDtx }
 
     func permit(voiceSessionId: String, closesAtEpochMs: UInt64) -> Bool {
-        asked.append("permit \(voiceSessionId) \(closesAtEpochMs)")
+        record("permit \(voiceSessionId) \(closesAtEpochMs)")
         return permitted
     }
 
     func setMutedByPerson(_ muted: Bool) {
-        asked.append("microphone \(muted)")
+        record("microphone \(muted)")
         isMutedByPerson = muted
     }
     func setPlaybackMuted(_ muted: Bool) {
-        asked.append("playback \(muted)")
+        record("playback \(muted)")
         isPlaybackMuted = muted
     }
 
-    func stop() { asked.append("stop") }
+    func stop() { record("stop") }
 }
 
 /// Makes the fake call, keeping the reporter the adapter gave it.
@@ -202,6 +215,110 @@ final class CallAdapterTests: XCTestCase {
         let idle = try Fixtures.command("callState", 1)
         let after = await ask(adapter, "callState", idle.request)
         XCTAssertEqual(after.result, idle.response, "a call that has ended is not held")
+    }
+
+    func testASignOfLifeNamesACallAndIsAnsweredWithWhatTheCallIsDoing() async throws {
+        let maker = FakeMaker()
+        let adapter = CallAdapter(maker: maker, device: FakeDevice(), watches: false)
+        _ = await ask(adapter, "callOpen", #"{"call":"c1","events":"__CHANNEL__:7"}"#, told: Told())
+        maker.reporting?.capture(.capturing)
+        let alive = try Fixtures.command("callAlive")
+
+        let answered = await ask(adapter, "callAlive", alive.request)
+
+        XCTAssertEqual(answered.result, alive.response)
+
+        let other = await ask(adapter, "callAlive", #"{"call":"c9"}"#)
+        XCTAssertEqual(other.code, "no_such_call")
+        _ = await ask(adapter, "callStop", #"{"call":"c1"}"#)
+        let ended = await ask(adapter, "callAlive", alive.request)
+        XCTAssertEqual(ended.code, "ended", "a sign for a call that has ended says so")
+    }
+
+    func testACallWhoseOwnerGivesNoSignEndsAtTheBoundAndASignStartsTheWaitAgain() async throws {
+        var now: TimeInterval = 0
+        let maker = FakeMaker()
+        let adapter = CallAdapter(maker: maker, device: FakeDevice(), clock: { now }, watches: false)
+        _ = await ask(adapter, "callOpen", #"{"call":"c1","events":"__CHANNEL__:7"}"#, told: Told())
+
+        now = CallWatch.beforePermit - 1
+        adapter.endIfOwnerIsGone()
+        _ = await ask(adapter, "callAlive", #"{"call":"c1"}"#)
+        now += CallWatch.beforePermit - 1
+        adapter.endIfOwnerIsGone()
+        XCTAssertFalse(maker.engine.asked.contains("stop"), "a sign started the wait again")
+
+        now += 1
+        adapter.endIfOwnerIsGone()
+
+        try await waitUntil { maker.engine.asked.contains("stop") }
+        XCTAssertEqual(maker.engine.asked.filter { $0 == "stop" }.count, 1)
+        adapter.endIfOwnerIsGone()
+        try await Task.sleep(nanoseconds: 100_000_000)
+        XCTAssertEqual(maker.engine.asked.filter { $0 == "stop" }.count, 1, "it ends once")
+    }
+
+    func testAPermittedCallWaitsTheShorterBound() async throws {
+        var now: TimeInterval = 0
+        let maker = FakeMaker()
+        let adapter = CallAdapter(maker: maker, device: FakeDevice(), clock: { now }, watches: false)
+        _ = await ask(adapter, "callOpen", #"{"call":"c1","events":"__CHANNEL__:7"}"#, told: Told())
+        let permit = try Fixtures.command("callPermit")
+        _ = await ask(adapter, "callPermit", permit.request)
+
+        now = CallWatch.afterPermit - 1
+        adapter.endIfOwnerIsGone()
+        XCTAssertFalse(maker.engine.asked.contains("stop"))
+        now = CallWatch.afterPermit
+
+        adapter.endIfOwnerIsGone()
+
+        try await waitUntil { maker.engine.asked.contains("stop") }
+    }
+
+    func testAConnectionThatHasFailedForGoodEndsTheCall() async throws {
+        let maker = FakeMaker()
+        let adapter = CallAdapter(maker: maker, device: FakeDevice(), watches: false)
+        _ = await ask(adapter, "callOpen", #"{"call":"c1","events":"__CHANNEL__:7"}"#, told: Told())
+
+        maker.reporting?.connection("disconnected")
+        try await Task.sleep(nanoseconds: 100_000_000)
+        XCTAssertFalse(maker.engine.asked.contains("stop"), "a connection that may come back is left")
+        maker.reporting?.connection("failed")
+
+        try await waitUntil { maker.engine.asked.contains("stop") }
+    }
+
+    func testTheWatchWaitsTheLongerBoundBeforeThePermitAndTheShorterAfterIt() {
+        var now: TimeInterval = 0
+        var opened = CallWatch(clock: { now }, beforePermit: 100, afterPermit: 10)
+        now = 99
+        XCTAssertFalse(opened.expired())
+        now = 100
+        XCTAssertTrue(opened.expired())
+        now = 500
+        XCTAssertFalse(opened.expired(), "a call is found gone once")
+
+        now = 0
+        var permitted = CallWatch(clock: { now }, beforePermit: 100, afterPermit: 10)
+        now = 50
+        permitted.permit()
+        now = 59
+        XCTAssertFalse(permitted.expired())
+        permitted.sign()
+        now = 68
+        XCTAssertFalse(permitted.expired(), "a sign starts the wait again")
+        now = 69
+        XCTAssertTrue(permitted.expired())
+    }
+
+    /// Waits for `condition` to hold, which something on another queue makes so, for up to ten seconds.
+    private func waitUntil(_ condition: @escaping () -> Bool) async throws {
+        let end = Date().addingTimeInterval(10)
+        while !condition() {
+            if Date() > end { return XCTFail("it did not come about") }
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
     }
 
     func testNotificationsRefusedIsReportedAndDoesNotRefuseTheCall() async throws {

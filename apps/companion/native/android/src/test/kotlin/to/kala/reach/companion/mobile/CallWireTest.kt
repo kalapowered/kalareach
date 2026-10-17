@@ -88,6 +88,16 @@ class CallWireTest {
     }
 
     @Test
+    fun `a sign of life names a call and is answered with what the call is doing`() {
+        val alive = cases("callAlive")[0]
+        assertEquals("c1", CallWire.call(alive.getJSONObject("request").toString()))
+        same(
+            alive.getJSONObject("response"),
+            CallWire.held(HeldCall("c1", VoiceCaptureState.CAPTURING, microphoneMuted = false, playing = true)),
+        )
+    }
+
+    @Test
     fun `each item of news is the fixture's frame`() {
         val news = fixture("events.json")
         val frames = (0 until news.length()).map { news.getJSONObject(it).getJSONObject("frame") }
@@ -128,7 +138,7 @@ class CallWireTest {
                     "callMute" -> CallWire.mute(request)
                     "callPermit" -> CallWire.permit(request)
                     "callAccept" -> CallWire.answer(request)
-                    "callOffer", "callStop" -> CallWire.call(request)
+                    "callOffer", "callStop", "callAlive" -> CallWire.call(request)
                     else -> error("the fixture names a command ${case.getString("command")}")
                 }
                 false
