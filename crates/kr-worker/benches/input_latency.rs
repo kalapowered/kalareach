@@ -882,13 +882,30 @@ fn paste_prefix_recogniser_deadline() {
 /// measurement that shows it, and it is asserted to the same bound as the holds taken alone.
 struct BesideMutations {
     /// One entry per prefix of each delimiter, as in [`Recogniser`].
-    holds: Vec<(String, Duration)>,
+    holds: Vec<MutatedHold>,
     /// How long the split delimiter took to be recognised once its second half arrived.
     split: Duration,
     /// The host while the holds were taken, and how many mutations were completed beside them.
     conditions: record::Conditions,
     /// How many mutations were completed while the holds were taken.
     mutations: u64,
+}
+
+/// One hold taken with journalled mutations running, and what the mutations were doing during it.
+struct MutatedHold {
+    what: String,
+    held: Duration,
+    /// How many mutations completed between the write and the byte reaching the application.
+    completed_during: u64,
+    /// Whether a mutation was under way, accepted and not yet answered, when the write was made.
+    under_way_at_the_write: bool,
+}
+
+impl MutatedHold {
+    /// Whether a journalled mutation was running at some point of the hold.
+    const fn ran_during(&self) -> bool {
+        self.under_way_at_the_write || self.completed_during > 0
+    }
 }
 
 impl BesideMutations {
@@ -901,7 +918,13 @@ impl BesideMutations {
             self.mutations,
             self.holds.len()
         );
-        for (what, held) in &self.holds {
+        for hold in &self.holds {
+            let (what, held) = (&hold.what, &hold.held);
+            assert!(
+                hold.ran_during(),
+                "{what}: no journalled mutation was under way or completed during the hold, so \
+                 the figure says nothing about a keystroke behind a mutation"
+            );
             assert!(
                 *held <= allowed,
                 "{what} was held for {held:?} with journalled mutations running beside it, beyond \
@@ -925,6 +948,8 @@ impl BesideMutations {
 /// stop. Each is a journalled mutation: accepted, marked and settled in three commits.
 struct Mutating {
     stop: Arc<AtomicBool>,
+    /// How many mutations have been sent to the worker, answered or not.
+    sent: Arc<AtomicU64>,
     made: Arc<AtomicU64>,
     task: tokio::task::JoinHandle<Result<(), String>>,
 }
@@ -934,17 +959,19 @@ impl Mutating {
         let mut client = LocalClient::connect(&hosted.endpoint, LocalClientKind::Cli, build())
             .await
             .expect("connects");
-        let (stop, made) = (
+        let (stop, sent, made) = (
             Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),
         );
         let (target, session_id) = (hosted.target(), hosted.session_id);
         let task = {
-            let (stop, made) = (Arc::clone(&stop), Arc::clone(&made));
+            let (stop, sent, made) = (Arc::clone(&stop), Arc::clone(&sent), Arc::clone(&made));
             tokio::spawn(async move {
                 let mut requested = CanonicalSet::new();
                 requested.insert(AttachmentCapability::ObserveTerminal);
                 while !stop.load(Ordering::Acquire) {
+                    sent.fetch_add(1, Ordering::AcqRel);
                     let attached: kr_protocol::attachment::SessionAttachResult = client
                         .mutate(
                             Method::SessionAttach,
@@ -965,6 +992,7 @@ impl Mutating {
                         .to_typed()
                         .map_err(|error| format!("the attach's answer did not decode: {error}"))?;
                     made.fetch_add(1, Ordering::AcqRel);
+                    sent.fetch_add(1, Ordering::AcqRel);
                     client
                         .mutate(
                             Method::SessionDetach,
@@ -983,7 +1011,22 @@ impl Mutating {
                 Ok(())
             })
         };
-        Self { stop, made, task }
+        Self {
+            stop,
+            sent,
+            made,
+            task,
+        }
+    }
+
+    /// How many mutations have been answered.
+    fn completed(&self) -> u64 {
+        self.made.load(Ordering::Acquire)
+    }
+
+    /// Whether a mutation has been sent and not yet answered.
+    fn under_way(&self) -> bool {
+        self.sent.load(Ordering::Acquire) > self.made.load(Ordering::Acquire)
     }
 
     /// Waits until a mutation has completed, so that the next is the one under way when the caller
@@ -1100,10 +1143,13 @@ async fn measure_recogniser_beside_mutations() -> BesideMutations {
          the observation waits behind nothing the mutations hold or sync."
             .to_owned(),
     );
-    for (what, held) in &beside.holds {
+    for hold in &beside.holds {
         lines.push(format!(
-            "  held              {}: {what}",
-            milliseconds(*held)
+            "  held              {}: {}; {} journalled mutations completed during it, and one {} under way at the write",
+            milliseconds(hold.held),
+            hold.what,
+            hold.completed_during,
+            if hold.under_way_at_the_write { "was" } else { "was not" }
         ));
     }
     lines.push(format!(
@@ -1153,6 +1199,8 @@ async fn recogniser_beside_mutations(
             let prefix = &delimiter[..length];
             expected.extend_from_slice(prefix);
             mutating.until_the_next_one_is_under_way().await?;
+            let (under_way_at_the_write, made_before) =
+                (mutating.under_way(), mutating.completed());
             let started = Instant::now();
             let accepted = write(
                 hosted,
@@ -1180,6 +1228,7 @@ async fn recogniser_beside_mutations(
                          application on its own"
                     )
                 })?;
+            let completed_during = mutating.completed() - made_before;
             let what = if length == 1 {
                 format!(
                     "a lone Escape, with journalled mutations running (the {name} delimiter's pass)"
@@ -1189,7 +1238,12 @@ async fn recogniser_beside_mutations(
                     "the {name} delimiter's prefix of {length} bytes, with journalled mutations running"
                 )
             };
-            holds.push((what, held));
+            holds.push(MutatedHold {
+                what,
+                held,
+                completed_during,
+                under_way_at_the_write,
+            });
         }
     }
     // A delimiter split across two frames, recognised once.
