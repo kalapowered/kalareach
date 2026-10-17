@@ -1216,6 +1216,9 @@ async fn a_token_source_that_panics_ends_the_control_and_is_not_asked_again() {
 #[tokio::test]
 async fn a_closure_goes_ahead_of_the_requests_that_wait_for_the_pacer() {
     let route = ControlRoute::start_with(None, Some((ms(300), ms(1800)))).await;
+    // The service confirms a closure after the control has stopped waiting for it, so the case
+    // decides by the order in which the service read the frames, not by how soon it answered.
+    route.confirm_closures_after(ms(3000));
     let (control, mut news) = open(&route, &Tokens::new());
     attached(&mut news).await;
     tokio::spawn(async move { while news.next().await.is_some() {} });
@@ -1238,16 +1241,33 @@ async fn a_closure_goes_ahead_of_the_requests_that_wait_for_the_pacer() {
         .until("the first ten", |report| report.sent.len() >= 10)
         .await;
 
-    let closure = control.close().await.expect("confirmed");
+    let closing = {
+        let control = control.clone();
+        tokio::spawn(async move { control.close().await })
+    };
+    let is_closure = |frame: &String| frame.contains(r#""command":"close""#);
+    route
+        .until("the closure read", |report| {
+            report.frames.iter().any(is_closure)
+        })
+        .await;
 
-    // It took a free slot ahead of the requests still waiting: it was not the last to be written
-    // (the bound shows that it overtook the last burst, not which slot it took).
-    assert_eq!(closure.seconds, 42);
+    // It took a free slot ahead of the requests still waiting: the service read it before the
+    // last of them.
+    let frames = route.report().frames;
+    let at = frames
+        .iter()
+        .position(is_closure)
+        .expect("the closure was read");
+    let requests_before = frames[..at]
+        .iter()
+        .filter(|frame| frame.contains(r#""type":"context""#))
+        .count();
     assert!(
-        route.report().sent.len() < 25,
-        "{:?}",
-        route.report().sent.len()
+        requests_before < 25,
+        "the closure was read after {requests_before} of 25 requests"
     );
+    let _ = closing.await.expect("the task");
     for waited in waiting {
         let _ = waited.await.expect("the task");
     }
