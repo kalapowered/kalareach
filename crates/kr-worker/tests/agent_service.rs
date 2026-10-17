@@ -319,8 +319,36 @@ async fn host() -> Host {
     }
 }
 
+/// Waits until the host's journal is healthy, asking its maintenance to recover it where it is not.
+///
+/// A store can refuse a write the first thing the host does, on a machine whose disk is slow or
+/// busy, and the journal is then faulted until the host's own maintenance writes the gap that
+/// explains it, which it does once a minute. Binding a component is refused meanwhile, for a reason
+/// that has nothing to do with the connector: so the tests that act on one start from a journal
+/// that works, and ask for the recovery the host would make rather than wait for its cadence. A
+/// store that stays faulted is the one thing that ends the wait, and says why.
+fn until_the_journal_is_healthy(host: &Host) {
+    let started = std::time::Instant::now();
+    loop {
+        host.service.recover_storage_now();
+        let session = host.service.runtime().session();
+        if session.health().is_healthy() {
+            return;
+        }
+        assert!(
+            started.elapsed() < common::LIVENESS_DEADLINE,
+            "the journal stayed faulted for {:?}: {:?}",
+            started.elapsed(),
+            session.journal_failure()
+        );
+        drop(session);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
 /// Registers the instance every test here acts on, with the capability a prompt needs.
 fn register(host: &Host, dispatch: Option<Arc<dyn UpstreamDispatch>>) {
+    until_the_journal_is_healthy(host);
     let broker = host.service.broker();
     let process = ProcessStartIdentity::new(41, ProcessStartSource::MacosProcBsdInfo, 900);
     broker
