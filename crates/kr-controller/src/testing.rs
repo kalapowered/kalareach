@@ -88,6 +88,31 @@ pub(crate) fn account_origin() -> Option<String> {
 /// the environment over, not how soon the holder lets go.
 pub const ENVIRONMENT_HANDOVER_DEADLINE: Duration = Duration::from_secs(120);
 
+/// The time a platform command is given in this process, in milliseconds, when a suite chose it;
+/// zero while none has.
+static PLATFORM_COMMANDS_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Gives the platform commands this process's daemons run (`podman`, `wsl.exe`) `limit` in place of
+/// the bound the product holds them to.
+///
+/// That bound is what ends a runtime that has stopped answering. A suite whose subject is something
+/// else, and whose runtime is only slow because the machine it runs on is busy, waits for the
+/// runtime's answer and lets this limit end only a runtime that has hung.
+pub fn hold_platform_commands_to(limit: Duration) {
+    PLATFORM_COMMANDS_MS.store(
+        u64::try_from(limit.as_millis()).unwrap_or(u64::MAX).max(1),
+        Ordering::Relaxed,
+    );
+}
+
+/// The limit a suite chose for the platform commands, if it did.
+pub(crate) fn platform_commands_limit() -> Option<Duration> {
+    match PLATFORM_COMMANDS_MS.load(Ordering::Relaxed) {
+        0 => None,
+        milliseconds => Some(Duration::from_millis(milliseconds)),
+    }
+}
+
 /// What a test runs once, right after the first stop it supplied an answer to.
 type AfterRefusal = Box<dyn FnOnce() + Send>;
 
