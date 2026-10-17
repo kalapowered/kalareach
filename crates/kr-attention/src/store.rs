@@ -1615,7 +1615,7 @@ impl Store {
         // `file:` as a URI and `:memory:` as a database of its own, and neither is the file this
         // store is meant to be. Who owns the store is a row inside it, not anything about a name.
         let resolved = resolve(path.as_ref())?;
-        let connection = Connection::open_with_flags(&resolved, FILE_ONLY)?;
+        let connection = kr_flush::release::open_connection(&resolved, Some(FILE_ONLY))?;
         Self::prepare(connection, Some(resolved.as_path()))
     }
 

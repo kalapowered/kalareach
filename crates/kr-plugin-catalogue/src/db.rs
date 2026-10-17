@@ -197,12 +197,14 @@ impl Db {
             name.push(suffix);
             check_own_file(Path::new(&name))?;
         }
-        let connection = Connection::open_with_flags(
+        let connection = kr_flush::release::open_connection(
             &path,
-            OpenFlags::SQLITE_OPEN_READ_WRITE
-                | OpenFlags::SQLITE_OPEN_CREATE
-                | OpenFlags::SQLITE_OPEN_NO_MUTEX
-                | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+            Some(
+                OpenFlags::SQLITE_OPEN_READ_WRITE
+                    | OpenFlags::SQLITE_OPEN_CREATE
+                    | OpenFlags::SQLITE_OPEN_NO_MUTEX
+                    | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+            ),
         )
         .map_err(|source| failed(&path, &source))?;
         let db = Self { connection, path };
@@ -1788,7 +1790,11 @@ impl ReceiptRow {
 
 fn failed(path: &Path, source: &rusqlite::Error) -> CatalogueError {
     CatalogueError::StorageUnavailable {
-        detail: format!("{}: {source}", path.display()),
+        detail: format!(
+            "{}: {}",
+            path.display(),
+            kr_flush::release::describe(source)
+        ),
     }
 }
 

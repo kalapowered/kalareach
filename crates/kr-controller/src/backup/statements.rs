@@ -128,7 +128,7 @@ pub(super) struct Database {
 impl Database {
     /// Opens the database one host keeps its backup accounting in.
     pub(super) fn open(path: &Path) -> rusqlite::Result<Self> {
-        Self::configured(Connection::open(path)?)
+        Self::configured(kr_flush::release::open_connection(path, None)?)
     }
 
     /// Opens one that exists only for the life of this process.

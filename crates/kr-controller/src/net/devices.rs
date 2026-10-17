@@ -381,6 +381,13 @@ pub struct DeviceDirectory {
     changed: std::sync::Arc<tokio::sync::Notify>,
 }
 
+/// Opens the registry database the way every store is opened: waiting out a previous holder that
+/// is letting go of its index, not reporting the refusal the store makes meanwhile.
+fn open_connection(path: &Path) -> Result<Connection> {
+    kr_flush::release::open_connection(path, None)
+        .map_err(|error| ControllerError::registry(kr_flush::release::describe(&error)))
+}
+
 impl DeviceDirectory {
     /// Opens the directory in the daemon's registry database, creating its tables.
     ///
@@ -391,8 +398,7 @@ impl DeviceDirectory {
     ///
     /// Returns an error when the database cannot be opened or migrated.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let connection = Connection::open(path.as_ref()).map_err(ControllerError::registry)?;
-        Self::prepare(connection, std::sync::Arc::default())
+        Self::prepare(open_connection(path.as_ref())?, std::sync::Arc::default())
     }
 
     /// Opens another handle on the directory `beside` is a handle on, raising the same signal as
@@ -402,8 +408,10 @@ impl DeviceDirectory {
     ///
     /// Returns an error when the database cannot be opened or migrated.
     pub(crate) fn open_beside(path: impl AsRef<Path>, beside: &Self) -> Result<Self> {
-        let connection = Connection::open(path.as_ref()).map_err(ControllerError::registry)?;
-        Self::prepare(connection, std::sync::Arc::clone(&beside.changed))
+        Self::prepare(
+            open_connection(path.as_ref())?,
+            std::sync::Arc::clone(&beside.changed),
+        )
     }
 
     /// Opens an in-memory directory, which is what a test uses.
