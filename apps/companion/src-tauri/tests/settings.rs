@@ -651,8 +651,15 @@ async fn a_step_that_stopped_before_taking_what_was_read_does_not_let_the_next_c
     // lock on the settings file is made, so the settings file cannot be written.
     let lock = computer.data.path().join("settings.lock");
     std::fs::create_dir(&lock).expect("a directory where the lock goes");
-    page.call("settings_sync_now", json!({}))
+    let refusal = page
+        .call("settings_sync_now", json!({}))
         .expect_err("the step could not take what it read");
+    // It stopped where the settings file is taken, which comes after the read: the read left its
+    // note, and nothing else is the reason the next choice is kept beside what was read.
+    assert!(
+        refusal.to_string().contains("could not be locked"),
+        "the step stopped at the lock on the settings file: {refusal}"
+    );
     std::fs::remove_dir(&lock).expect("the directory goes");
 
     // The person chooses; the next steps do not publish it over what the other device wrote.

@@ -151,24 +151,15 @@ impl Rig {
         self.runtime().synchronised_before_serving().await;
     }
 
-    /// Waits until the carrier is between passes: a pass that began after this call has finished,
-    /// and the carrier has asked for a wait that it had not asked for before the call. A carrier
-    /// asks for a wait only when a pass has ended and nothing more is asked of it, so the second
-    /// condition is met only by a carrier that has finished and is waiting. The wait for a
-    /// synchronisation is bounded and ends silently at its bound, which is why the first condition
-    /// alone would not do. The waits asked for before the call are taken past without being
-    /// counted, as `until_a_pass_waits` would take them.
+    /// Waits until a pass that began after this call has finished, which leaves no pass running
+    /// that began before it: what a connection waits for is exactly that, and the pass it started
+    /// is the only one that began after the pairing's. The wait for a synchronisation ends
+    /// silently at its bound, so the bound is made longer than `within` allows, and the wait can
+    /// then end only with its pass or fail the case.
     async fn until_the_carrier_is_idle(&self) {
-        let asked_before = self.timer.asked_for().len();
         self.runtime()
-            .wait_for_a_synchronisation_at_most(Duration::from_secs(170));
-        self.poll().await;
-        within("the carrier waits between passes", async {
-            while self.timer.asked_for().len() <= asked_before {
-                let _ = self.timer.next_wait().await;
-            }
-        })
-        .await;
+            .wait_for_a_synchronisation_at_most(Duration::from_secs(3600));
+        within("the pass the setup asked for ends", self.poll()).await;
     }
 
     /// A request the owner signs and publishes, naming `target`, under a fixed identity.
