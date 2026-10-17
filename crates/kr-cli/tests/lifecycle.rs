@@ -100,11 +100,12 @@ const ANSWER: &str = "call it Kalareach one";
 
 /// How long a wait for something that has to happen is given.
 ///
-/// A liveness bound, not a measurement: it is there to fail when something never happens. These
-/// suites run beside others on shared machines, and a host that needs half a minute to publish a
-/// closure record is slow rather than broken, which is why the bound is the one the attach suite
-/// uses.
-const LIVENESS_DEADLINE: Duration = Duration::from_secs(120);
+/// A liveness bound, not a measurement: it is there to fail when something never happens, and a
+/// host that is only slow is waited for. These suites run beside others on shared machines, and one
+/// that runs at background priority beside builds of its own has taken more than two minutes to
+/// close a session whose shell wrote two megabytes, so the bound is long enough that only a wait
+/// on something that is not coming ends by it.
+const LIVENESS_DEADLINE: Duration = Duration::from_secs(600);
 
 /// How long a command a failing test runs while it cleans up is given.
 ///
