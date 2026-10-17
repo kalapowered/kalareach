@@ -258,6 +258,28 @@ describe('settings sync in the account sheet', () => {
     expect(within(sheet).queryByTestId('settings-problem')).toBeNull()
   })
 
+  it('does not keep a failed read beside a change that arrives after it', async () => {
+    const person = userEvent.setup()
+    const { port, controls } = fakeHost()
+    const failing = {
+      ...port,
+      settingsView: () => Promise.reject(new Error('the settings could not be read'))
+    }
+    render(
+      <AppProvider port={failing} initialPlace={{ view: 'attention' }}>
+        <App />
+      </AppProvider>
+    )
+    await person.click(screen.getByRole('button', { name: /^Account/ }))
+    const sheet = await screen.findByRole('dialog', { name: 'Account' })
+    await within(sheet).findByTestId('settings-problem')
+    act(() => {
+      controls.settings.change({ sync: { state: 'on', kept_at: 'reach.kala.to', conflicts: 0 } })
+    })
+    expect(within(sheet).getByTestId('settings-sync')).toHaveAttribute('data-state', 'on')
+    expect(within(sheet).queryByTestId('settings-problem')).toBeNull()
+  })
+
   it('is off until it is turned on, and then says where it keeps the settings', async () => {
     const { person, controls, card } = await openSheet()
     expect(card).toHaveAttribute('data-state', 'off')
