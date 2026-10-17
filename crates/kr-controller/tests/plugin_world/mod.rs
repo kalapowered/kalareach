@@ -116,6 +116,8 @@ pub struct Supervisor {
     pub launched: Mutex<Option<std::sync::mpsc::Sender<WorkerLaunch>>>,
     pub services: Services,
     pub service: Box<dyn WorkerSupervisor>,
+    /// What a test adds to the arguments the daemon chose for the plugin host it starts.
+    pub host_arguments: Vec<String>,
 }
 
 /// The supervisor a daemon is given, which a daemon started again on the same tree is given again.
@@ -152,7 +154,15 @@ impl WorkerSupervisor for Supervisor {
     }
 
     fn start_service(&self, launch: &ServiceLaunch) -> LaunchOutcome {
-        let outcome = self.service.start_service(launch);
+        let mut launch = launch.clone();
+        if launch
+            .program
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().starts_with("kr-plugin-host"))
+        {
+            launch.arguments.extend(self.host_arguments.iter().cloned());
+        }
+        let outcome = self.service.start_service(&launch);
         let process = match &outcome {
             LaunchOutcome::Started(identity) => Some(identity.clone()),
             _ => None,
@@ -536,9 +546,28 @@ pub async fn start_daemon(
     (controller, serving)
 }
 
+/// Whether the plugin host a world starts has an engine whose epoch time advances.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Epoch {
+    /// As a shipped host has it: a call into a component is stopped when its deadline passes, on
+    /// whatever time that takes the machine.
+    Running,
+    /// Held still, so that no call into a component is stopped by its deadline. For the suites
+    /// whose subject is what a daemon does with a component's answers: a machine that stalls the
+    /// host for ten milliseconds in the middle of a call would otherwise make the component fault,
+    /// and the action it was asked to prepare fail, which says nothing about those answers. The
+    /// host must have been built with the `testing` feature of `kr-plugin-host`.
+    Held,
+}
+
 /// A daemon, a session whose worker is this process with a shell of its own, and the plugin host
-/// placed where the daemon looks for it.
+/// placed where the daemon looks for it, with the epoch running as a shipped host has it.
 pub async fn hosted() -> Hosted {
+    hosted_with(Epoch::Running).await
+}
+
+/// [`hosted`], with the plugin host's epoch as `epoch` says.
+pub async fn hosted_with(epoch: Epoch) -> Hosted {
     let tree = kr_ipc::testing::TempHost::create();
     let environment = tree.environment();
     let environment_id = tree.environment_id();
@@ -548,12 +577,29 @@ pub async fn hosted() -> Hosted {
         .root()
         .join(format!("kr-worker{}", std::env::consts::EXE_SUFFIX));
     std::fs::write(&worker, b"").expect("a stand-in for the worker program");
-    kr_ipc::testing::place_and_start_once(
-        &beside_this_test("kr-plugin-host"),
-        &tree
-            .root()
-            .join(format!("kr-plugin-host{}", std::env::consts::EXE_SUFFIX)),
-        &["--version"],
+    let host_arguments = match epoch {
+        Epoch::Running => Vec::new(),
+        Epoch::Held => vec!["--hold-epoch".to_owned()],
+    };
+    let host_program = tree
+        .root()
+        .join(format!("kr-plugin-host{}", std::env::consts::EXE_SUFFIX));
+    let host_source = beside_this_test("kr-plugin-host");
+    let first_start: Vec<&str> = host_arguments
+        .iter()
+        .map(String::as_str)
+        .chain(["--version"])
+        .collect();
+    let placed = std::panic::catch_unwind(|| {
+        kr_ipc::testing::place_and_start_once(&host_source, &host_program, &first_start);
+    });
+    assert!(
+        placed.is_ok(),
+        "this world starts the plugin host with {host_arguments:?}, and the one at {} would not \
+         start that way: a host with its epoch held is built with \
+         `cargo build -p kr-plugin-host --features testing`, which a workspace test run does \
+         itself",
+        host_source.display()
     );
 
     let (launched, launches) = std::sync::mpsc::channel::<WorkerLaunch>();
@@ -563,6 +609,7 @@ pub async fn hosted() -> Hosted {
         launched: Mutex::new(Some(launched)),
         services: Arc::clone(&services),
         service,
+        host_arguments,
     });
     let (controller, serving) =
         start_daemon(&environment, environment_id, &worker, &supervisor).await;
