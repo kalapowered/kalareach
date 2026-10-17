@@ -1906,6 +1906,20 @@ fn no_program_of_a_release_being_removed_starts() {
             );
         }
     }
+    // A hook an application runs is the one program that answers instead: its contract is a
+    // neutral answer whatever prevents its work, and an application reads a failing exit as an
+    // error. It does no work, and says why on standard error.
+    let hook = host.run(
+        &removing.join("bin").join(Program::Hook.file_name()),
+        &["claude-code", "hook"],
+    );
+    let said = String::from_utf8_lossy(&hook.stderr);
+    assert_eq!(hook.status.code(), Some(0), "a hook answers: {said}");
+    assert_eq!(hook.stdout, b"{}\n", "a hook answers neutrally");
+    assert!(
+        said.contains("is being removed from this host"),
+        "a hook says why: {said}"
+    );
 }
 
 /// KR-REQ-26.06: a daemon of a release states it, records the roots it serves, holds its release,
