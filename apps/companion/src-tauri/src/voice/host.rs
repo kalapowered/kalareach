@@ -55,8 +55,24 @@ pub trait HostReach: Send + Sync + 'static {
         avoiding: Option<&'a Arc<Session>>,
     ) -> Reaching<'a, Arc<Session>>;
 
-    /// Whether this device still holds its pairing with `host`.
-    fn still_paired(&self, host: &PairedHost) -> bool;
+    /// Whether this device still holds its pairing with `host`. A record that cannot be read is
+    /// not a pairing that is gone.
+    fn pairing(&self, host: &PairedHost) -> Pairing;
+
+    /// Whether the commands of this application now go to a host other than `host`: another
+    /// paired host, or this computer's own.
+    fn another_host_in_use(&self, host: &PairedHost) -> bool;
+}
+
+/// What this device's records say of a pairing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Pairing {
+    /// The pairing is held.
+    Held,
+    /// The pairing is not in the records.
+    Gone,
+    /// The records could not be read.
+    Unreadable,
 }
 
 /// How an application reaches the host its commands go to.
@@ -117,12 +133,28 @@ impl<R: Runtime> HostReach for AppReach<R> {
         })
     }
 
-    fn still_paired(&self, host: &PairedHost) -> bool {
-        self.app
+    fn pairing(&self, host: &PairedHost) -> Pairing {
+        match self
+            .app
             .state::<AppState>()
             .device()
             .and_then(|device| device.is_paired_with(host.host_device_id))
-            .unwrap_or(false)
+        {
+            Ok(true) => Pairing::Held,
+            Ok(false) => Pairing::Gone,
+            Err(_) => Pairing::Unreadable,
+        }
+    }
+
+    fn another_host_in_use(&self, host: &PairedHost) -> bool {
+        let state = self.app.state::<AppState>();
+        if let Some(chosen) = state.device().ok().and_then(|device| device.host_in_use()) {
+            return chosen.host_device_id != host.host_device_id;
+        }
+        // None is chosen: only this computer's own host is another one.
+        state
+            .connection()
+            .is_ok_and(|connection| matches!(connection.standing(), Standing::Owner))
     }
 }
 

@@ -24,6 +24,8 @@ pub enum Cause {
     AccountChanged,
     /// This device no longer holds the pairing with the host the call belongs to.
     HostForgotten,
+    /// The person chose another host while the call ran.
+    HostChanged,
     /// A step of the setup after the host created the call did not work.
     Step(String),
     /// The host named a voice service other than the one this device's account is signed in at.
@@ -51,6 +53,7 @@ impl Cause {
             Self::Deadline => "deadline",
             Self::AccountChanged => "account_changed",
             Self::HostForgotten => "host_forgotten",
+            Self::HostChanged => "host_changed",
             Self::Step(_) => "step_failed",
             Self::ForeignService => "foreign_service",
         }
@@ -107,6 +110,11 @@ impl Cause {
             Self::HostForgotten => {
                 "This device no longer holds the pairing with the host the call belongs to, so \
                  the call was ended."
+                    .to_owned()
+            }
+            Self::HostChanged => {
+                "You chose another host while the call was running, so the call was ended. A call \
+                 belongs to the host that made it."
                     .to_owned()
             }
             Self::Step(why) => format!("The call could not be set up on this device: {why}"),
