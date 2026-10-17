@@ -55,7 +55,7 @@ pub enum Site {
     SupervisionWake,
     /// An observation of the session's processes read them, with the session let go.
     Observation,
-    /// A mutation held the session, from its admission to the return of its dispatch. A span:
+    /// A mutation held the session, from its admission to the release of the session. A span:
     /// `held` and `released` are its start and its end.
     Mutation,
 }

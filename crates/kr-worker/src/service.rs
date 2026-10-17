@@ -4148,8 +4148,10 @@ impl WorkerService {
         {
             return Ok(None);
         }
-        self.gate
-            .check()
+        // The gate's lock and, for an owner whose membership is bound, the time contract's lock
+        // and the host's floor, which is read from the disk. A wait for any of those is made on a
+        // thread the executor can do without, so it takes nothing from the recogniser's timer.
+        off_the_executor(|| self.gate.check())
             .map(Some)
             .map_err(|refused| WorkerError::PermissionDenied {
                 detail: refused.detail().to_owned(),
@@ -4208,6 +4210,10 @@ impl WorkerService {
         request: &Request,
         caller: &Caller,
     ) -> ControlFrame {
+        // When the request reached this handler. A held prefix's deadline runs from here, so
+        // nothing a request waits for on its way to the input domain, the checks of a local owner's
+        // access among them, is outside the deadline.
+        let arrived = std::time::Instant::now();
         // Every request of a local connection is recorded as waiting for its answer, before
         // anything can answer it: the writer tells a held request's answer from the answer of
         // another request of the same identifier by what was recorded here.
@@ -4221,12 +4227,8 @@ impl WorkerService {
             return failure(request.request_id, &error.to_protocol_error());
         }
         let restrictions = self.gate.restrictions();
-        // The check takes the local gate's lock and, for an owner whose membership is bound, the
-        // time contract's and the host's floor, which is read from the disk. A wait for any of
-        // those is made on a thread the executor can do without, so it takes nothing from the
-        // recogniser's timer.
         let allowed = match request.method.method() {
-            Some(method) => match off_the_executor(|| self.check_local_hold(state, method)) {
+            Some(method) => match self.check_local_hold(state, method) {
                 Ok(allowed) => allowed,
                 Err(error) => return failure(request.request_id, &error.to_protocol_error()),
             },
@@ -4257,7 +4259,7 @@ impl WorkerService {
         // read can wait for the session or for the disk behind it, and that wait is made on a
         // thread the executor can do without.
         let outcome = if method == Method::InputWrite {
-            self.input_write(state, &request.params, caller)
+            self.input_write(state, &request.params, caller, arrived)
         } else {
             off_the_executor(|| match method {
                 Method::SessionRead => self.session_read(&request.params, caller),
@@ -4598,8 +4600,8 @@ impl WorkerService {
         let session = self.runtime.session();
         holding.held();
         self.dispatch_accepted(
-            session,
             holding,
+            session,
             state,
             mutation,
             method,
@@ -5215,8 +5217,8 @@ impl WorkerService {
         };
 
         self.dispatch_accepted(
-            session,
             holding,
+            session,
             state,
             mutation,
             method,
@@ -5238,8 +5240,8 @@ impl WorkerService {
     #[allow(clippy::too_many_arguments)]
     fn dispatch_accepted(
         &self,
-        mut session: std::sync::MutexGuard<'_, Session>,
         holding: crate::trace::Acquisition<'_>,
+        mut session: std::sync::MutexGuard<'_, Session>,
         state: &mut ConnectionState,
         mutation: &MutationRequest,
         method: Method,
@@ -7600,12 +7602,12 @@ impl WorkerService {
         state: &mut ConnectionState,
         params: &ParamsValue,
         caller: &Caller,
+        arrived: std::time::Instant,
     ) -> Result<ParamsValue> {
-        // When the batch reached this handler. A held prefix's deadline runs from here and not from
-        // the moment the input domain comes free for it: something may hold it for a moment when a
-        // lone Escape arrives, and the application's wait for it, which section 27 puts at no more
-        // than the recogniser's deadline, began with the write.
-        let arrived = std::time::Instant::now();
+        // `arrived` is when the request reached the handler. A held prefix's deadline runs from
+        // there and not from the moment the input domain comes free for it: something may hold it
+        // for a moment when a lone Escape arrives, and the application's wait for it, which
+        // section 27 puts at no more than the recogniser's deadline, began with the write.
         let params: InputWriteParams = parse(params)?;
         Self::check_attachment(state, params.attachment_id)?;
         // Raw input is its own stream with its own bound. Travelling inside a control frame does
@@ -7619,10 +7621,10 @@ impl WorkerService {
         self.wait_before_the_input_session();
         // Before the input domain is taken, and the last thing before it: the check reads the
         // local gate and, for an owner whose membership is bound, the clock and the host's floor,
-        // none of which a lock that holds up a keystroke may wait for, and the wait is made on a
-        // thread the executor can do without. Nothing the domain protects depends on its order, and
-        // a restriction made since the request was admitted still refuses the batch.
-        off_the_executor(|| self.check_local_dispatch(state, Method::InputWrite, caller))?;
+        // none of which a lock that holds up a keystroke may wait for. Nothing the domain protects
+        // depends on its order, and a restriction made since the request was admitted still
+        // refuses the batch.
+        self.check_local_dispatch(state, Method::InputWrite, caller)?;
         let (accepted, pump) = {
             let mut acquisition = self.runtime.trace().acquisition(Site::InputAcceptance);
             // The input domain and nothing else: whatever the session is busy with, this write
