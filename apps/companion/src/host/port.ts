@@ -93,9 +93,9 @@ import type {
   ShellLaunchResult,
   VoiceContextResult,
   VoiceAction,
-  VoiceDelegateResult,
   VoiceGrantResult,
   VoicePrepareResult,
+  VoiceSessionDescriptor,
   VoiceStartResult,
   VoiceStopResult
 } from '@kalareach/protocol'
@@ -643,20 +643,21 @@ export interface VoiceScope {
 }
 
 /**
- * What allowing voice came to: the sentences the grant states, what it could not carry, and the
- * barrier of the fence that replacing the grant owed. The device the grant is for is not in it;
- * native code holds that identity.
+ * What allowing voice came to: the sentences the grant states, what it could not carry, and what
+ * the answer showed of the fence that replacing the grant owed. The device the grant is for is not
+ * in it; native code holds that identity.
  */
 export interface VoiceAllowed {
   readonly statement: VoiceGrantResult['statement']
   /** The actions asked for that this device's own access to the host does not include. */
   readonly not_held_by_device: readonly VoiceAction[]
   /**
-   * The workers' status for the calls the replacement ended: null when it owed no fence, and
-   * otherwise the barrier as the host's wait for it left it, without the names of the actions the
-   * fence named. A worker still `pending` may yet take up what one of those calls sent.
+   * The workers' status for the calls the replacement ended, read as a stop's is: that it owed no
+   * fence, the barrier as the host's wait for it left it (without the names of the actions the
+   * fence named; a worker still `pending` may yet take up what one of those calls sent), or that
+   * the answer gave no status this build could read.
    */
-  readonly barrier: VoiceGrantResult['barrier']
+  readonly fence: VoiceFence
 }
 
 /** What the page asks when the person allows voice for some of a host's sessions. */
@@ -679,7 +680,7 @@ export type VoiceMute = 'microphone' | 'playback'
  * matters.
  */
 export interface VoiceCallState {
-  /** Whether this device is holding a call at all. */
+  /** Whether this device is holding a call that is permitted. */
   readonly running: boolean
   /** What the microphone is doing, in the native layer's own vocabulary. */
   readonly capture: string
@@ -690,6 +691,79 @@ export interface VoiceCallState {
    * or `unreachable`. Whether the voice service is answering is read from here and nowhere else.
    */
   readonly control: string
+  /**
+   * Whether the host the call belongs to is being reached: `none` with no call, `reachable`, or
+   * `lost`. A different fact from this application's own connection, which follows the host the
+   * person chose to browse.
+   */
+  readonly host: string
+  /**
+   * The call, as the host described it without the provider's answer. Present while the call runs
+   * and while it is being set up, which is what a screen that was loaded again finds a call by.
+   */
+  readonly session: VoiceSessionDescriptor | null
+  /** How the last call ended, until another starts. */
+  readonly ended: VoiceEnded | null
+  /** The delegations the provider announced, and what this version did with each. */
+  readonly delegations: readonly VoiceDelegationRow[]
+  /** What a person is told before starting, from what the last call showed. */
+  readonly warning: string | null
+  /**
+   * What this device could not finish and the host may still hold open, until the moment the call
+   * would have closed. It outlives the call that left it.
+   */
+  readonly owed: readonly VoiceOwed[]
+}
+
+/** What the host did about the end of a call, kept apart from what happened on this device. */
+export type VoiceHostEnd =
+  | { readonly kind: 'revoked'; readonly fence: VoiceFence; readonly broker_notified: boolean }
+  | { readonly kind: 'refused'; readonly words: string }
+  | { readonly kind: 'not_told'; readonly words: string }
+  | { readonly kind: 'not_needed' }
+
+/** How a call ended. */
+export interface VoiceEnded {
+  /** Why, as a word the screen branches on. */
+  readonly cause: string
+  /** Why, in words for a person. */
+  readonly words: string
+  /** Whether the call's media was stopped on this device. */
+  readonly closed_locally: boolean
+  /** What the host did. */
+  readonly host: VoiceHostEnd
+  /**
+   * What the voice service did: `pending` while its closure is awaited, then `closed`,
+   * `closed_by_service`, `closed_by_host`, `closed_over_http` or `not_confirmed`; `not_needed`
+   * when the host never created a call.
+   */
+  readonly broker: string
+}
+
+/** A delegation the provider announced, and the answer this version gives it. */
+export interface VoiceDelegationRow {
+  /** The provider's identifier. Correlation data, never authority. */
+  readonly delegation_id: string
+  /** Where in the call it happened, in milliseconds from its start. */
+  readonly offset_ms: number
+  /** What became of it: always `not_done` in this version, which acts on no spoken request. */
+  readonly state: string
+  /** Whether the model was told so. */
+  readonly told: boolean
+}
+
+/** Something this device could not finish, which the host may still hold open. */
+export interface VoiceOwed {
+  /** `revocation` when a call's grant may still be live; `start_unknown` for a start never answered. */
+  readonly kind: string
+  /** What a person is told. */
+  readonly words: string
+  /** The action a start was sent under, for `start_unknown`. */
+  readonly action_id: string | null
+  /** The call whose grant may be live, for `revocation`. */
+  readonly voice_session_id: string | null
+  /** The moment the grant ends by itself, in milliseconds since the epoch. */
+  readonly until_ms: number
 }
 
 /**
@@ -1429,9 +1503,6 @@ export interface HostPort {
    * revocation that may not have happened.
    */
   voiceStop(voiceSessionId: string, subject: SessionSubject): Promise<VoiceClosure>
-
-  /** Submits one delegation the provider announced, with its confirmation when one was asked for. */
-  voiceDelegate(params: unknown, subject: SessionSubject): Promise<Settled<VoiceDelegateResult>>
 
   /** Reads the context the host selected for this call, to be sent on as a bounded request. */
   voiceContext(params: unknown): Promise<VoiceContextResult>

@@ -2,15 +2,20 @@ import { describe, expect, it } from 'vitest'
 
 import type { VoiceManagedTerms, VoicePrepareResult } from '@kalareach/protocol'
 
+import type { VoiceCallState, VoiceEnded } from '../../src/host/port'
+
 import {
   CAPTURE_DISPLAY,
   LOCAL_ONLY_CONTROLS,
+  NOT_ACTED_ON_WORDS,
   STOP_MEANS,
   asCaptureState,
+  callAsReported,
   callLength,
   choiceFromPreparation,
   choiceWithRate,
   controlAvailable,
+  endedWords,
   needsHost,
   rateWords,
   requestedSeconds,
@@ -85,9 +90,27 @@ function call(over: Partial<RunningCall> = {}): RunningCall {
     playing: true,
     brokerReachable: true,
     hostReachable: true,
+    callHost: 'reachable',
     delegations: [],
     requests: [],
     admissionMeans: ADMISSION_MEANS,
+    ...over
+  }
+}
+
+/** The state of a call the device holds, as it reports it. */
+function callState(over: Partial<VoiceCallState> = {}): VoiceCallState {
+  return {
+    running: true,
+    capture: 'capturing',
+    playing: true,
+    control: 'connected',
+    host: 'reachable',
+    session: null,
+    ended: null,
+    delegations: [],
+    warning: null,
+    owed: [],
     ...over
   }
 }
@@ -220,12 +243,7 @@ describe('what the native layer reports about capture', () => {
         closes_at_ms: '1763000000000',
         disclosure: []
       },
-      {
-        running: true,
-        capture: 'muted_by_person',
-        playing: false,
-        control: 'unreachable'
-      },
+      callState({ capture: 'muted_by_person', playing: false, control: 'unreachable' }),
       ADMISSION_MEANS
     )
     expect(built.voiceSessionId).toBe('vs-9')
@@ -237,6 +255,80 @@ describe('what the native layer reports about capture', () => {
     // Whether the voice service answers is the call's own report about its control channel.
     expect(built.brokerReachable).toBe(false)
     expect(built.sessions).toEqual(['s-1'])
+  })
+})
+
+describe('what the device reports of its call', () => {
+  // The call is the application's, so the screen takes its microphone, its speaker, the voice
+  // service, the host the call belongs to and the delegations from the device's report, whoever
+  // started the call.
+  it('takes every fact of a held call from the device\'s report', () => {
+    const reported = callAsReported(
+      call(),
+      callState({
+        capture: 'interrupted',
+        playing: false,
+        control: 'unreachable',
+        host: 'lost',
+        delegations: [{ delegation_id: 'd-1', offset_ms: 1200, state: 'not_done', told: true }]
+      })
+    )
+    expect(reported.capture).toBe('interrupted')
+    expect(reported.playing).toBe(false)
+    expect(reported.brokerReachable).toBe(false)
+    expect(reported.callHost).toBe('lost')
+    expect(reported.delegations).toEqual([{ delegationId: 'd-1', offsetMs: 1200, told: true }])
+    expect(reported.voiceSessionId).toBe('vs-1')
+  })
+
+  it('says that this version acts on no spoken request', () => {
+    expect(NOT_ACTED_ON_WORDS).toMatch(/^Not done: this version does not act on spoken requests/)
+  })
+})
+
+describe('what a call that ended tells a person', () => {
+  const ended = (over: Partial<VoiceEnded> = {}): VoiceEnded => ({
+    cause: 'native_ended',
+    words: 'The call ended on this device.',
+    closed_locally: true,
+    host: { kind: 'revoked', fence: { kind: 'not_owed' }, broker_notified: true },
+    broker: 'closed_by_host',
+    ...over
+  })
+
+  it('says the host withdrew the grant when it answered', () => {
+    const words = endedWords(ended())
+    expect(words).toContain('The call ended on this device.')
+    expect(words).toContain("The host withdrew the call's grant.")
+    expect(words).not.toContain('may still be open')
+  })
+
+  // The grant may be live until the call was to close, so the host's silence is said as owed.
+  it('says the grant may still be open when the host was not told', () => {
+    const words = endedWords(ended({ host: { kind: 'not_told', words: 'The host could not be reached.' } }))
+    expect(words).toContain('The host was not told, so its grant may still be open: The host could not be reached.')
+    expect(words).not.toContain('withdrew')
+  })
+
+  it('says what the host refused, and that the grant ends when the call was to close', () => {
+    const words = endedWords(ended({ host: { kind: 'refused', words: 'No such voice session.' } }))
+    expect(words).toContain('No such voice session.')
+    expect(words).toContain('ends when the call was to close')
+  })
+
+  it('says when the media may not have stopped, and when the voice service has not confirmed', () => {
+    const words = endedWords(ended({ closed_locally: false, broker: 'not_confirmed' }))
+    expect(words).toContain("could not confirm that the call's microphone stopped")
+    expect(words).toContain('has not confirmed that it closed the call')
+    expect(endedWords(ended())).not.toContain('microphone stopped')
+  })
+
+  it('says nothing of a host that was never asked, and keeps the fence it has still to confirm', () => {
+    expect(endedWords(ended({ host: { kind: 'not_needed' } }))).toBe('The call ended on this device.')
+    const pending = endedWords(
+      ended({ host: { kind: 'revoked', fence: { kind: 'unreadable' }, broker_notified: false } })
+    )
+    expect(pending).toContain('cannot confirm that nothing the call sent can still run')
   })
 })
 

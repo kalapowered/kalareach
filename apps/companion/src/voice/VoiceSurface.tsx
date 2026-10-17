@@ -15,6 +15,7 @@ import { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react'
 
 import {
   CAPTURE_DISPLAY,
+  NOT_ACTED_ON_WORDS,
   STOP_MEANS,
   callLength,
   controlAvailable,
@@ -84,6 +85,12 @@ export interface VoiceSurfaceProps {
    * each one is shown in the host's own words rather than turned into a state the screen invented.
    */
   readonly notice: string | null
+  /**
+   * What the last call left, in words: how it ended when no screen was looking, what this device
+   * could not finish and the host may still hold open, and the warning a person is given before the
+   * next start. Shown before a call and never in place of what the person is deciding.
+   */
+  readonly aftermath?: readonly string[]
   readonly actions: VoiceSurfaceActions
 }
 
@@ -94,13 +101,22 @@ export function VoiceSurface({
   currentTurn,
   busy,
   notice,
+  aftermath = [],
   actions
 }: VoiceSurfaceProps): React.ReactElement {
   if (call) {
     return <CallScreen call={call} currentTurn={currentTurn} busy={busy} notice={notice} actions={actions} />
   }
   if (choice) {
-    return <ProviderChoiceScreen choice={choice} busy={busy} notice={notice} onStart={actions.start} />
+    return (
+      <ProviderChoiceScreen
+        choice={choice}
+        busy={busy}
+        notice={notice}
+        aftermath={aftermath}
+        onStart={actions.start}
+      />
+    )
   }
   return (
     <section className="kr-voice" aria-busy={busy}>
@@ -125,6 +141,7 @@ function ProviderChoiceScreen({
   choice,
   busy,
   notice,
+  aftermath,
   onStart
 }: {
   readonly choice: ProviderChoice
@@ -132,6 +149,8 @@ function ProviderChoiceScreen({
   readonly busy: boolean
   /** What the last answer said, when it was not a call. */
   readonly notice: string | null
+  /** What the last call left. */
+  readonly aftermath: readonly string[]
   readonly onStart: () => void
 }): React.ReactElement {
   const id = useId()
@@ -145,12 +164,24 @@ function ProviderChoiceScreen({
         Start a voice session
       </h1>
 
+      {aftermath.length > 0 && (
+        <ul className="kr-voice__list kr-voice__aftermath" role="status" aria-label="The last call">
+          {aftermath.map((line) => (
+            <li key={line}>{line}</li>
+          ))}
+        </ul>
+      )}
+
       {terms ? (
         <dl className="kr-voice__provider">
-          <dt>Voice model</dt>
-          <dd>{terms.model}</dd>
-          <dt>Brokered by</dt>
-          <dd>{choice.brokerOrigin}</dd>
+          <div>
+            <dt>Voice model</dt>
+            <dd>{terms.model}</dd>
+          </div>
+          <div>
+            <dt>Brokered by</dt>
+            <dd>{choice.brokerOrigin}</dd>
+          </div>
         </dl>
       ) : (
         <p className="kr-voice__refusal" role="status">
@@ -218,6 +249,9 @@ function ProviderChoiceScreen({
           {choice.needsUnlockedScreen &&
             ' Some of these ask for your confirmation on the unlocked screen of this device each time.'}
         </p>
+        {/* What the grant permits and what this version carries out are different things, and the
+            person reads the first list before they decide: so the second is said beside it. */}
+        <p className="kr-voice__note">{NOT_ACTED_ON_WORDS}</p>
       </section>
 
       {terms && !terms.enabled && (
@@ -514,6 +548,7 @@ function CallScreen({
 
       <section className="kr-voice__panel" aria-label="Delegations">
         <h2>What the voice has asked for</h2>
+        <p className="kr-voice__note">{NOT_ACTED_ON_WORDS}</p>
         {call.delegations.length === 0 ? (
           <p className="kr-voice__note">Nothing yet.</p>
         ) : (
@@ -523,7 +558,9 @@ function CallScreen({
             ))}
           </ul>
         )}
-        {admitted > 0 && <p className="kr-voice__note">{call.admissionMeans}</p>}
+        {admitted > 0 && call.admissionMeans !== '' && (
+          <p className="kr-voice__note">{call.admissionMeans}</p>
+        )}
       </section>
     </section>
   )
@@ -538,20 +575,16 @@ const REQUEST_WORDS: Readonly<Record<ContextRequest['outcome'], string>> = {
   refused: 'Refused'
 }
 
-/** One delegation, with what the host actually said about it. */
+/** One delegation the voice announced: this version did nothing about it, and the row says so. */
 function DelegationRow({ delegation }: { readonly delegation: Delegation }): React.ReactElement {
-  const words: Record<Delegation['state'], string> = {
-    announced: 'Heard',
-    not_sent: 'Not sent to the host',
-    submitted: 'Sent to the host',
-    needs_confirmation: 'Needs your confirmation on this device’s unlocked screen',
-    refused: 'Refused by the host',
-    receipted: 'Done, with the host’s receipt'
-  }
   return (
     <li className="kr-voice__delegation">
-      <span className="kr-voice__kind">{words[delegation.state]}</span>
-      {delegation.detail && <span className="kr-voice__summary">{delegation.detail}</span>}
+      <span className="kr-voice__kind">Asked {(delegation.offsetMs / 1000).toFixed(1)} seconds in</span>
+      <span className="kr-voice__summary">
+        {delegation.told
+          ? 'Not done. The voice was told so.'
+          : 'Not done. The voice has not been told yet.'}
+      </span>
     </li>
   )
 }

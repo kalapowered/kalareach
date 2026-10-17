@@ -333,9 +333,9 @@ export function tauriPort(): HostPort {
       }
     },
 
-    // Voice. The reads, the stop and the delegation each reach one method. Native code refuses the
-    // start, because it opens no call. The last two reach no service at all: this process holds no
-    // call, so the silence is refused and the state is a device holding none.
+    // Voice. The reads and the stop each reach one method. A start is the application's own call:
+    // it opens the call on the device and asks the host for it. The silence and the state are read
+    // from the call the application holds, and reach no service.
     voicePrepare: (params) => read('voice_prepare', params),
     voiceStart: (request, subject) =>
       call('voice_start', {
@@ -355,7 +355,6 @@ export function tauriPort(): HostPort {
       ),
     voiceStop: (voiceSessionId, subject) =>
       call<VoiceClosure>('voice_stop', { voiceSessionId, subject }),
-    voiceDelegate: (params, subject) => mutate('voice_delegate', params, subject),
     voiceContext: (params) => read('voice_context', params),
     voiceSetMuted: (what, muted) => call<VoiceCallState>('voice_set_muted', { what, muted }),
     voiceCallState: () => call<VoiceCallState>('voice_call_state', {}),

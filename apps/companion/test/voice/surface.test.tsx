@@ -74,6 +74,7 @@ function call(over: Partial<RunningCall> = {}): RunningCall {
     playing: true,
     brokerReachable: true,
     hostReachable: true,
+    callHost: 'reachable',
     delegations: [],
     requests: [],
     admissionMeans: ADMISSION_MEANS,
@@ -505,9 +506,7 @@ describe('while a call is running', () => {
           choice={choice()}
           call={call({
             requests: [{ id: 'r-1', command: 'commentary', outcome }],
-            delegations: [
-              { delegationId: 'd-1', offsetMs: 1200, state: 'submitted', detail: 'Read session 1' }
-            ]
+            delegations: [{ delegationId: 'd-1', offsetMs: 1200, told: true }]
           })}
           currentTurn={null}
           busy={false}
