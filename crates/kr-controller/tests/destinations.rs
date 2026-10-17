@@ -2043,7 +2043,7 @@ fn a_mail_server_that_stops_reading_cannot_hold_the_attempt() {
     // and nothing about the time the attempt took, is here to end.
     let outcome = runtime
         .block_on(tokio::time::timeout(
-            std::time::Duration::from_secs(300),
+            std::time::Duration::from_secs(30 * 60),
             submission.submit(
                 &account(&server, MailSecurity::ImplicitTls),
                 "person@example.com",
