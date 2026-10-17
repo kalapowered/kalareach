@@ -223,16 +223,20 @@ impl Unpumped {
 }
 
 async fn unpumped() -> Unpumped {
+    // A shell that echoes what it is sent and ignores an interrupt, because one of these tests
+    // sends the configured native interrupt and still expects the application to be there to
+    // receive what the machine released on the same boundary.
+    unpumped_running("trap '' INT; while IFS= read -r line; do printf '%s\\n' \"$line\"; done")
+        .await
+}
+
+/// The same, with the shell the script names.
+async fn unpumped_running(script: &str) -> Unpumped {
     let temp = kr_ipc::testing::TempHost::create();
     let environment = temp.environment();
     let environment_id = temp.environment_id();
     let mut config = configuration(&temp, ShellMode::Managed);
-    // A shell that echoes what it is sent and ignores an interrupt, because one of these tests
-    // sends the configured native interrupt and still expects the application to be there to
-    // receive what the machine released on the same boundary.
-    config.shell = kr_worker::testing::posix_script(
-        "trap '' INT; while IFS= read -r line; do printf '%s\\n' \"$line\"; done",
-    );
+    config.shell = kr_worker::testing::posix_script(script);
     let session_id = config.session_id;
     let boot = kr_ipc::identity::boot_identity().expect("a boot identity");
     let process = kr_ipc::identity::current_process_start_identity().expect("a process identity");
@@ -5339,6 +5343,146 @@ async fn a_request_that_expires_a_hold_delivers_what_it_released() {
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+    wired.close().await;
+}
+
+/// KR-PERF-002: a keystroke that expires a hold queues its own bytes on its own boundary.
+///
+/// The exchange a reader transition started is past its deadline while something else holds the
+/// session, and the next keystroke sweeps it: the machine releases what it held, says the editor
+/// was busy, and forwards the keystroke. The session is not there to carry out the event, and the
+/// bytes behind it must not wait for it, or the keystroke after it would reach the application
+/// first. The application keeps what it reads in a file, which is read without the session.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    windows,
+    ignore = "a Windows pseudo-console begins its output with sequences of its own and holds back a lone Escape, and this case reads what the application received from a file a shell script keeps"
+)]
+async fn a_keystroke_that_expires_a_hold_reaches_the_terminal_in_order_while_the_session_is_held() {
+    let kept = tempfile::tempdir().expect("a directory for what the application keeps");
+    let received = kept.path().join("received");
+    let wired = unpumped_running(&format!(
+        "stty raw -echo; exec tee '{}'",
+        received.display()
+    ))
+    .await;
+    let mut client = LocalClient::connect(&wired.endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects");
+    let attached: kr_protocol::attachment::SessionAttachResult = client
+        .mutate(
+            Method::SessionAttach,
+            ActionId::new(kr_ipc::new_uuid()),
+            wired.target(),
+            &terminal(wired.session_id),
+        )
+        .await
+        .expect("reaches the worker")
+        .expect("attaches")
+        .to_typed()
+        .expect("decodes");
+    let holder = attached.attachment.attachment_id;
+    let acquired = client
+        .mutate(
+            Method::InputAcquire,
+            ActionId::new(kr_ipc::new_uuid()),
+            wired.target(),
+            &kr_protocol::input::InputAcquireParams {
+                session_id: wired.session_id,
+                attachment_id: holder,
+                expected_epoch: Nullable::null(),
+            },
+        )
+        .await
+        .expect("reaches the worker")
+        .expect("takes the keys");
+    let epoch = acquired
+        .to_typed::<kr_protocol::input::InputAcquireResult>()
+        .expect("decodes")
+        .lease
+        .epoch;
+    let mut events = wired
+        .runtime
+        .session()
+        .subscribe(holder)
+        .expect("subscribes");
+    {
+        // A reader enters, which starts an exchange nothing will answer: this session has no
+        // bridge. What is typed meanwhile waits for it.
+        let mut session = wired.runtime.session();
+        let mut driver = session.fence_mut().expect("a driver");
+        let _ = driver.bridge_event(
+            kr_protocol::ids::RequestId::new(2),
+            &enter(wired.session_id, 1, 1),
+        );
+        drop(driver);
+        session
+            .write_input(
+                holder,
+                epoch.get(),
+                0,
+                b"held\n",
+                None,
+                std::time::Instant::now(),
+            )
+            .expect("accepted");
+        assert_eq!(session.fence().expect("a driver").held().len(), 1);
+    }
+
+    // Something takes the session and keeps it, as a mutation committing to a busy disk does.
+    let (held, release) = wired.runtime.hold_the_session();
+    held.await.expect("the session is held");
+    wired.clock.advance(Duration::from_millis(400));
+
+    for (sequence, bytes) in [(1_u64, &b"a"[..]), (2, &b"b"[..])] {
+        let accepted: Result<kr_protocol::input::InputWriteResult, _> = client
+            .request(
+                Method::InputWrite,
+                &kr_protocol::input::InputWriteParams {
+                    session_id: wired.session_id,
+                    attachment_id: holder,
+                    epoch,
+                    sequence: kr_protocol::ids::InputSequence::new(sequence),
+                    bytes: kr_protocol::scalars::Bytes::new(bytes.to_vec()),
+                },
+            )
+            .await
+            .expect("reaches the worker")
+            .map(|value| value.to_typed().expect("decodes"));
+        accepted.expect("the keystroke is accepted while the session is held");
+    }
+
+    // Everything the application was typed reaches it, in order, with the session still held.
+    let reached = tokio::time::timeout(SOON, async {
+        while std::fs::read(&received).unwrap_or_default() != b"held\nab" {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    let seen = std::fs::read(&received).unwrap_or_default();
+    release.send(()).expect("lets the session go");
+    assert!(
+        reached.is_ok(),
+        "the keystrokes were left behind the session, or passed one another: the application \
+         has {:?}",
+        String::from_utf8_lossy(&seen)
+    );
+
+    // And the client is still told the editor was busy, once the session is free.
+    let busy = tokio::time::timeout(SOON, async {
+        loop {
+            match events.recv().await {
+                Some(kr_worker::output::OutputDelivery::EditorBusy(event)) => return Some(*event),
+                Some(_) => {}
+                None => return None,
+            }
+        }
+    })
+    .await
+    .expect("an attachment event")
+    .expect("the stream stayed open");
+    assert_eq!(busy.attachment_id, holder);
+    assert_eq!(busy.released_input_bytes.get(), b"held\n".len() as u64);
     wired.close().await;
 }
 

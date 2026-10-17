@@ -1290,9 +1290,14 @@ impl InputDomain {
     /// fence was published, and nothing behind that point leaves it until the bridge's writer has
     /// written the fence.
     ///
-    /// The steps that need the session are handed back, and so is every step the machine ordered
-    /// after the first of them, so that the session carries them out in the machine's order: a
-    /// detach is acknowledged only once its attachment is gone.
+    /// The steps that need the session are handed back. An `editor_busy` event is handed back
+    /// alone: it only tells a subscriber what happened, and no step behind it waits for it, so the
+    /// bytes the machine ordered after it are queued now. A keystroke that expires a hold would
+    /// otherwise leave its own bytes behind the session, and the next keystroke would pass them.
+    /// The removal of an attachment, the interrupt and the answer to a command hook are handed back
+    /// with every step the machine ordered after them, so that the session carries them out in the
+    /// machine's order: a detach is acknowledged only once its attachment is gone. The stimuli a
+    /// keystroke and the recogniser's timer make never order one of those.
     pub(crate) fn apply_effects(&mut self, effects: Effects) -> Applied {
         self.held_input_bytes = self
             .held_input_bytes
@@ -1316,10 +1321,18 @@ impl InputDomain {
             },
             owed: Vec::new(),
         };
+        // Set by the first step that later steps must wait for.
+        let mut behind_a_session_step = false;
         for step in effects.steps {
-            if !applied.owed.is_empty() {
+            if behind_a_session_step {
                 applied.owed.push(step);
             } else if let Err(step) = self.carry_out_step(step, &mut applied.outcome) {
+                behind_a_session_step = !matches!(step, Step::EditorBusy(_));
+                // An attachment that is going is not typed at from this moment, whoever else takes
+                // the domain before the session removes it.
+                if let Step::RemoveAttachment(attachment_id) = &step {
+                    self.capabilities.remove(attachment_id);
+                }
                 applied.owed.push(step);
             }
         }
@@ -1422,6 +1435,102 @@ mod tests {
             order,
             ["remove", "write", "interrupt"],
             "the session carries out the rest in the machine's order"
+        );
+    }
+
+    fn editor_busy(attachment_id: AttachmentId) -> Step {
+        Step::EditorBusy(Box::new(kr_protocol::root::EditorBusyEvent {
+            session_id: SessionId::new(kr_ipc::new_uuid()),
+            attachment_id,
+            input_epoch: InputLeaseEpoch::new(1),
+            reason: kr_protocol::root::EditorBusyReason::QueuesNotDrained,
+            released_input_bytes: kr_protocol::scalars::U64::new(0),
+            state: kr_protocol::root::FenceState::Unfenced,
+        }))
+    }
+
+    /// An `editor_busy` event only tells a subscriber what happened. The bytes the machine ordered
+    /// after it are queued at once, because a keystroke that expires a hold has no session to wait
+    /// for them with, and the keystroke after it must not pass them.
+    #[test]
+    fn an_editor_busy_event_does_not_hold_back_the_bytes_ordered_after_it() {
+        let mut input = domain();
+        let holder = AttachmentId::new(kr_ipc::new_uuid());
+        let effects = Effects {
+            steps: vec![
+                Step::Write(batch(b"released")),
+                editor_busy(holder),
+                Step::Write(batch(b"typed")),
+            ],
+            ..Effects::default()
+        };
+
+        let applied = input.apply_effects(effects);
+
+        assert_eq!(
+            input.take_pending(),
+            vec![batch(b"released"), batch(b"typed")],
+            "every byte is queued in the machine's order"
+        );
+        assert!(
+            matches!(applied.owed.as_slice(), [Step::EditorBusy(_)]),
+            "the event is the only thing left for the session"
+        );
+    }
+
+    /// A step that must wait for a session step still does when an event came before it.
+    #[test]
+    fn a_session_step_behind_an_event_still_holds_back_what_follows_it() {
+        let mut input = domain();
+        let removed = AttachmentId::new(kr_ipc::new_uuid());
+        let effects = Effects {
+            steps: vec![
+                editor_busy(removed),
+                Step::RemoveAttachment(removed),
+                Step::Write(batch(b"after")),
+            ],
+            ..Effects::default()
+        };
+
+        let applied = input.apply_effects(effects);
+
+        assert!(
+            input.take_pending().is_empty(),
+            "nothing runs ahead of the removal"
+        );
+        assert!(
+            matches!(
+                applied.owed.as_slice(),
+                [
+                    Step::EditorBusy(_),
+                    Step::RemoveAttachment(_),
+                    Step::Write(_)
+                ]
+            ),
+            "the event, the removal and the write are the session's, in the machine's order"
+        );
+    }
+
+    /// An attachment whose removal is owed is not typed at from the moment the machine orders it,
+    /// whoever takes the domain before the session carries the removal out.
+    #[test]
+    fn an_attachment_whose_removal_is_owed_holds_no_capability_in_the_meantime() {
+        let mut input = domain();
+        let removed = AttachmentId::new(kr_ipc::new_uuid());
+        let mut granted = CanonicalSet::new();
+        granted.insert(AttachmentCapability::Input);
+        input.grant(removed, granted);
+        assert!(input.capabilities(removed).is_some());
+
+        let applied = input.apply_effects(Effects {
+            steps: vec![Step::RemoveAttachment(removed)],
+            ..Effects::default()
+        });
+
+        assert_eq!(applied.owed.len(), 1, "the removal itself is the session's");
+        assert!(
+            input.capabilities(removed).is_none(),
+            "and a keystroke from it is refused before the session removes it"
         );
     }
 }
