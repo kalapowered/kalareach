@@ -31,9 +31,10 @@ pub const SERVER_PORT: &str = "TRUST_STORE_TEST_PORT";
 ///
 /// A child is this test binary started again, and on an idle machine it is done in seconds: it
 /// makes two connections that the server refuses at the handshake. What a case decides on is that
-/// the child finishes, and a child that is only slow, because the machine it runs on is busy with
-/// other work, is waited for. This ends a child that has hung.
-const PATIENCE: Duration = Duration::from_secs(300);
+/// the child finishes, and a child that is only slow is waited for. A machine that runs the suite
+/// at background priority beside builds of its own can keep a process from starting for minutes,
+/// so this is long enough that only a child that has hung is ended by it.
+const PATIENCE: Duration = Duration::from_secs(30 * 60);
 
 /// A certificate authority no platform trusts.
 pub struct TestAuthority {
