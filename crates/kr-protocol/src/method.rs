@@ -650,7 +650,8 @@ methods! {
     effect: Read, ingress: [LocalIpc, PairedDevice], rights: [req(HostManage)], selectors: [Device],
     history: NotApplicable, capability: NO_CAPABILITY, freshness: CurrentAuthority,
     confirmation: None, idempotency: READ,
-    doc: "Paired devices, their key purposes, when each pairing ends, and how the authority feed stands.";
+    doc: "Paired devices, their key purposes, when each pairing ends, and how the authority feed \
+          stands.";
 
     DeviceRevoke = "device.revoke", Devices,
     effect: Write, ingress: [LocalIpc], rights: [req(HostManage)],
