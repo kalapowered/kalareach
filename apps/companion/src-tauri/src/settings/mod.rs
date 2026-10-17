@@ -20,6 +20,7 @@
 //! nothing else. No setting here is a host's grant or a revocation, and no code here can reach one.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use kr_ipc::paths::{read_owner_only_file, write_owner_only_file};
@@ -123,6 +124,9 @@ pub struct LocalSettings {
     file: PathBuf,
     lock: PathBuf,
     kept: Mutex<Kept>,
+    /// Whether the log has said the file cannot be read, so that it says so once and not at every
+    /// read, and says so again if it comes back and goes.
+    unreadable: AtomicBool,
     /// Held from the moment a change is begun to the moment it is written, so that two changes
     /// made together in this run are made one after the other.
     keeping: Mutex<()>,
@@ -142,37 +146,56 @@ impl LocalSettings {
             file: data.join(FILE),
             lock: data.join(LOCK),
             kept: Mutex::new(Kept::default()),
+            unreadable: AtomicBool::new(false),
             keeping: Mutex::new(()),
         };
         settings.read();
         settings
     }
 
-    /// What the file holds now, or what was last read or written when it cannot be read.
-    fn read(&self) -> Kept {
+    /// What the file holds now, and whether it could be read; when it cannot, what was last read
+    /// or written.
+    fn read(&self) -> (Kept, bool) {
         let read = match read_owner_only_file(&self.file, LIMIT) {
             Ok(None) => Some(Kept::default()),
             Ok(Some(bytes)) => match serde_json::from_slice::<Kept>(&bytes) {
                 Ok(kept) if kept.version == Kept::VERSION => Some(kept),
                 Ok(_) => {
-                    tracing::warn!("the settings file is of a version this build does not read");
+                    self.say_unreadable(|| {
+                        tracing::warn!(
+                            "the settings file is of a version this build does not read"
+                        );
+                    });
                     None
                 }
                 Err(error) => {
-                    tracing::warn!(%error, "the settings file is not one this build reads");
+                    self.say_unreadable(|| {
+                        tracing::warn!(%error, "the settings file is not one this build reads");
+                    });
                     None
                 }
             },
             Err(error) => {
-                tracing::warn!(%error, "the settings file could not be read");
+                self.say_unreadable(|| {
+                    tracing::warn!(%error, "the settings file could not be read");
+                });
                 None
             }
         };
         let mut kept = self.kept.lock().unwrap_or_else(PoisonError::into_inner);
+        let readable = read.is_some();
         if let Some(read) = read {
+            self.unreadable.store(false, Ordering::SeqCst);
             *kept = read;
         }
-        kept.clone()
+        (kept.clone(), readable)
+    }
+
+    /// Runs `say` the first time the file is found unreadable since it was last read.
+    fn say_unreadable(&self, say: impl FnOnce()) {
+        if !self.unreadable.swap(true, Ordering::SeqCst) {
+            say();
+        }
     }
 
     /// The colour mode the window is shown in: the one the person chose, or the device's.
@@ -184,7 +207,7 @@ impl LocalSettings {
     /// The colour mode the person chose, when they have.
     #[must_use]
     pub fn chosen_colour_mode(&self) -> Option<ColourMode> {
-        self.read().colour_mode
+        self.read().0.colour_mode
     }
 
     /// Keeps the person's choice of colour mode.
@@ -204,7 +227,8 @@ impl LocalSettings {
     ///
     /// This is how a mode that was read from elsewhere takes the place of the choice it was read
     /// against without taking the place of a choice made since: the comparison and the write are
-    /// one act, across every companion on this computer.
+    /// one act, across every companion on this computer. A file this build cannot read is no
+    /// choice to compare with and is not replaced, so it is left for a newer build to find.
     ///
     /// # Errors
     ///
@@ -224,9 +248,9 @@ impl LocalSettings {
                 "the settings could not be locked on this computer: {error}"
             ))
         })?;
-        let mut next = self.read();
+        let (mut next, readable) = self.read();
         if let Some(expected) = expected
-            && next.colour_mode != expected
+            && (!readable || next.colour_mode != expected)
         {
             return Ok(false);
         }

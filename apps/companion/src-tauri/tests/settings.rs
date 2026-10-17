@@ -23,7 +23,7 @@ use kr_client::services::{
     HttpDeadlines, HttpService, ManagedSyncService, ServiceSigner, managed_response_limits,
 };
 use kr_client::sync::{
-    CollectionKeys, CollectionSealer, Published, Restored, SettingValue, SharedCollectionService,
+    CollectionKeys, Published, Restored, SettingValue, SharedCollectionService,
     StoredCollectionKeys, SyncBody, SyncClient, SyncObject, SyncStore, fresh_revision,
 };
 use kr_crypto::keys::AuthorisationKeyPair;
@@ -182,16 +182,14 @@ impl Computer {
             collection_id,
         };
         let directory = tempfile::tempdir().expect("a directory");
+        let shared = SharedCollectionService::new(service, collection, 0);
+        let sealer = shared.sealer(Arc::new(StoredCollectionKeys::in_store(
+            Arc::clone(&self.secrets) as _,
+            companion_tauri::settings::sync::SCOPE,
+        )) as Arc<dyn CollectionKeys>);
         let client = SyncClient::new(
-            Arc::new(SharedCollectionService::new(service, collection, 0)),
-            Arc::new(CollectionSealer::new(
-                Arc::new(StoredCollectionKeys::in_store(
-                    Arc::clone(&self.secrets) as _,
-                    companion_tauri::settings::sync::SCOPE,
-                )) as Arc<dyn CollectionKeys>,
-                &collection_id.to_string(),
-                0,
-            )),
+            Arc::new(shared),
+            Arc::new(sealer),
             SyncStore::open(directory.path()).expect("a store"),
         );
         Elsewhere {
@@ -304,14 +302,21 @@ impl Elsewhere {
 
     /// Writes `mode` as this device: it reads where the object stands, changes it, and publishes.
     async fn write(&self, mode: &str) -> Published {
-        self.client
+        match self
+            .client
             .fetch(
                 SyncObjectKind::Settings,
                 self.object_id,
                 TimestampMs::new(now_ms()),
             )
             .await
-            .expect("a fetch");
+        {
+            Ok(_) => {}
+            // The collection holds no settings yet, and this device writes the first.
+            Err(kr_client::sync::SyncError::Client(error))
+                if error.code() == kr_protocol::error::ErrorCode::UnknownSession => {}
+            Err(error) => panic!("a fetch: {error:?}"),
+        }
         let mut settings = kr_client::sync::SyncSettings::default();
         settings.values.insert(
             "colour_mode".to_owned(),
@@ -506,11 +511,26 @@ async fn a_check_that_finds_nothing_new_writes_nothing_and_a_later_change_is_sti
     page.turn_on();
     let elsewhere = computer.elsewhere();
 
+    let writes = || {
+        computer
+            .served
+            .web()
+            .arrived()
+            .iter()
+            .filter(|arrived| arrived.path == SYNC_PATH && arrived.body.get("exchange").is_some())
+            .count()
+    };
+    let before = writes();
     for _ in 0..3 {
         let view = page.sync_now();
         assert_eq!(view["colour_mode"], "dark");
         assert_eq!(view["sync"]["conflicts"], 0);
     }
+    assert_eq!(
+        writes(),
+        before,
+        "a check that finds nothing new writes nothing"
+    );
     assert_eq!(elsewhere.copies_kept().await, 0);
 
     assert!(matches!(
@@ -555,6 +575,93 @@ async fn a_second_companion_on_this_computer_does_not_write_over_the_first_ones_
         "nothing was written over it"
     );
     assert_eq!(elsewhere.copies_kept().await, 0);
+}
+
+/// A choice made while the first read of the service is out is not replaced by what that read
+/// brings: this computer held nothing when the read left, so there is no version kept beside, and
+/// the next publication is refused and keeps what the other device wrote for the person to choose.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_choice_made_while_the_first_read_is_out_does_not_replace_what_the_other_device_wrote() {
+    use companion_tauri::settings::ColourMode;
+    let computer = Computer::new().await;
+    let page = computer.start();
+    // Nothing is chosen on this computer, and sync is on.
+    page.turn_on();
+    let elsewhere = computer.elsewhere();
+    let before = sync_requests(&computer);
+    page.sync_now();
+    let per_step = sync_requests(&computer) - before;
+    assert!(per_step >= 1, "a step asks the service something");
+    assert!(matches!(
+        elsewhere.write("light").await,
+        Published::Accepted { .. }
+    ));
+
+    // The step's last request is the read; it is made, and the answer is given when it is let go.
+    let web = computer.served.web();
+    let asked = sync_requests(&computer);
+    web.fail(
+        SYNC_PATH,
+        u32::try_from(per_step).expect("a small count"),
+        Moment::Slow,
+    );
+    let settings = page.app.state::<AppState>().settings().expect("settings");
+    let step = tokio::spawn({
+        let settings = Arc::clone(&settings);
+        async move { settings.sync_now().await }
+    });
+    web.requests_reach(SYNC_PATH, asked + per_step).await;
+    settings
+        .local()
+        .set_colour_mode(ColourMode::Dark)
+        .expect("the person's choice");
+    web.release_held();
+    step.await.expect("the step ran").expect("the step ended");
+
+    let view = page.sync_now();
+    assert_eq!(view["colour_mode"], "dark", "the person's choice stands");
+    assert_eq!(
+        view["sync"]["conflicts"], 1,
+        "what the other device wrote waits"
+    );
+    assert_eq!(
+        elsewhere.colour().await,
+        "light",
+        "and is still at the service"
+    );
+}
+
+/// A file this build cannot read is no choice to compare with, and a mode read from elsewhere does
+/// not replace it.
+#[test]
+fn a_file_this_build_cannot_read_is_not_replaced_by_a_mode_read_elsewhere() {
+    use companion_tauri::settings::{ColourMode, LocalSettings};
+    let directory = tempfile::tempdir().expect("a directory");
+    let file = directory.path().join("settings.json");
+    let newer = br#"{"version":99,"colour_mode":"sepia"}"#;
+    std::fs::write(&file, newer).expect("a newer build's file");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600))
+            .expect("owner only");
+    }
+    let settings = LocalSettings::open(directory.path());
+    assert!(
+        !settings
+            .replace_colour_mode(None, ColourMode::Light)
+            .expect("a refusal that is no failure")
+    );
+    assert_eq!(
+        std::fs::read(&file).expect("the file"),
+        newer,
+        "it was not touched"
+    );
+    // The person's own choice still replaces it.
+    settings
+        .set_colour_mode(ColourMode::Dark)
+        .expect("a choice");
+    assert_eq!(settings.chosen_colour_mode(), Some(ColourMode::Dark));
 }
 
 /// A replacement that names the choice it expects does not replace a choice made since: the

@@ -620,6 +620,8 @@ impl SettingsSync {
         // The choice first, on this computer; the service is told after, and may be told later.
         if let Some(mode) = chosen {
             self.local.set_colour_mode(mode)?;
+            // The window is in the mode the file holds, whatever becomes of the rest of this step.
+            self.told.tell();
             let held = store.object(record.object_id).map_err(sync_failure)?;
             let object = self.object_of(record.object_id, held.as_ref(), mode, now())?;
             store.put_object(&object).map_err(sync_failure)?;
@@ -758,19 +760,23 @@ impl SettingsSync {
         chosen: Option<ColourMode>,
         copy: Option<SyncConflictId>,
     ) -> Result<()> {
-        match colour_mode_of(object) {
-            Some(mode) => {
-                if !self.local.replace_colour_mode(chosen, mode)? {
-                    return Ok(());
-                }
-            }
-            None => {
-                if self.local.chosen_colour_mode() != chosen {
-                    return Ok(());
-                }
-            }
-        }
         let store = client.store();
+        let taken = match colour_mode_of(object) {
+            Some(mode) => self.local.replace_colour_mode(chosen, mode)?,
+            None => self.local.chosen_colour_mode() == chosen,
+        };
+        if !taken {
+            // The person chose while the service was being read. Where the fetch kept a copy of
+            // what the other device wrote, the copy waits for them. Where this computer held
+            // nothing, there is no copy, and the note the fetch wrote names the other device's
+            // write: the next publication would be made against it and replace what the other
+            // device wrote without a choice. The note is forgotten, so that publication is refused
+            // and keeps that content beside this computer's own.
+            if copy.is_none() {
+                store.forget_checkpoint(object_id).map_err(sync_failure)?;
+            }
+            return Ok(());
+        }
         store.put_object(object).map_err(sync_failure)?;
         Self::agreed(store, object_id, object.revision)?;
         if let Some(copy) = copy {
