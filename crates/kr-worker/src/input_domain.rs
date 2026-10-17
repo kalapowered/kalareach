@@ -27,7 +27,7 @@
 //!
 //! Some steps the root editor's machine asks for need the session: an `editor_busy` event for an
 //! attachment's subscription, the removal of an attachment, the interrupt of the foreground
-//! process group, and the answer to a command hook. [`InputDomain::apply_effects`] carries out
+//! process group, and the answer to a command hook. `InputDomain::apply_effects` carries out
 //! every other step in the machine's order and hands these back, with whatever the machine ordered
 //! after one of them (an `editor_busy` event holds nothing back, because it only tells a
 //! subscriber what happened), for the session to carry out with this lock let go.
