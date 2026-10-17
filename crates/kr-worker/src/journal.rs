@@ -961,6 +961,7 @@ impl Journal {
         }
         #[cfg(feature = "testing")]
         self.host_event_stall.stand();
+        crate::input_domain::assert_not_held("a journal commit");
         transaction
             .commit()
             .map_err(|error| faulted(&self.health, error))?;
@@ -1384,6 +1385,7 @@ impl Journal {
             )
             .map_err(|error| faulted(&self.health, error))?;
         let sequence = append_event(&self.health, &transaction, &receipt)?;
+        crate::input_domain::assert_not_held("a journal commit");
         transaction
             .commit()
             .map_err(|error| faulted(&self.health, error))?;
@@ -1513,6 +1515,7 @@ impl Journal {
             )
             .map_err(|error| faulted(&self.health, error))?;
         let sequence = append_event_at(&self.health, &transaction, &receipt, now_ms)?;
+        crate::input_domain::assert_not_held("a journal commit");
         transaction
             .commit()
             .map_err(|error| faulted(&self.health, error))?;
@@ -1783,6 +1786,7 @@ impl Journal {
         if state == ReceiptState::Dispatching {
             self.marker_stall.stand();
         }
+        crate::input_domain::assert_not_held("a journal commit");
         transaction
             .commit()
             .map_err(|error| faulted(&self.health, error))?;
@@ -2625,6 +2629,7 @@ impl Journal {
             write_state(&self.health, &transaction, &receipt)?;
             advanced = Some(append_event(&self.health, &transaction, &receipt)?);
         }
+        crate::input_domain::assert_not_held("a journal commit");
         transaction
             .commit()
             .map_err(|error| faulted(&self.health, error))?;
@@ -2817,6 +2822,7 @@ impl Journal {
             };
             sequence = append_event_at(&self.health, &transaction, &receipt, now_ms)?;
         }
+        crate::input_domain::assert_not_held("a journal commit");
         transaction
             .commit()
             .map_err(|error| faulted(&self.health, error))?;
@@ -2929,6 +2935,7 @@ impl Journal {
             .map_err(|error| faulted(&self.health, error))?;
         #[cfg(feature = "testing")]
         self.prune_stall.stand();
+        crate::input_domain::assert_not_held("a journal commit");
         transaction
             .commit()
             .map_err(|error| faulted(&self.health, error))?;
@@ -3235,6 +3242,7 @@ impl Journal {
                 ],
             )
             .map_err(|error| faulted(&self.health, error))?;
+        crate::input_domain::assert_not_held("a journal commit");
         transaction
             .commit()
             .map_err(|error| faulted(&self.health, error))?;
@@ -3310,6 +3318,7 @@ impl Journal {
                 [],
             )
             .map_err(|error| faulted(&self.health, error))?;
+        crate::input_domain::assert_not_held("a journal commit");
         transaction
             .commit()
             .map_err(|error| faulted(&self.health, error))?;
@@ -3344,6 +3353,7 @@ impl Journal {
                 params![actor_id.as_str(), action_id.get().as_bytes().as_slice()],
             )
             .map_err(|error| faulted(&self.health, error))?;
+        crate::input_domain::assert_not_held("a journal commit");
         transaction
             .commit()
             .map_err(|error| faulted(&self.health, error))?;

@@ -2394,6 +2394,7 @@ fn cut_back(path: &Path, len: u64) -> bool {
 fn append_open(file: &std::fs::File, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write as _;
 
+    crate::input_domain::assert_not_held("a write to the spool");
     let mut file = file;
     file.write_all(bytes)
 }

@@ -37,7 +37,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 
 use kr_protocol::attachment::AttachmentCapability;
-use kr_protocol::ids::{AttachmentId, ConnectionId, InputLeaseEpoch, SessionId};
+use kr_protocol::ids::{AttachmentId, AuthorityRevision, ConnectionId, InputLeaseEpoch, SessionId};
 use kr_protocol::input::InputLeaseState;
 use kr_protocol::scalars::CanonicalSet;
 use kr_protocol::session::SessionState;
@@ -88,6 +88,13 @@ impl InputShared {
     ///
     /// Panics when an earlier holder panicked, which means the state can no longer be trusted.
     pub fn lock(&self) -> InputGuard<'_> {
+        // The lock is not re-entrant: a thread that takes it again while it holds it waits for
+        // itself for ever. In a build that checks, that is a panic that names the mistake.
+        #[cfg(debug_assertions)]
+        assert!(
+            HELD.with(std::cell::Cell::get) == 0,
+            "the input domain was taken by a thread that already holds it"
+        );
         InputGuard::new(
             self.domain
                 .lock()
@@ -95,11 +102,47 @@ impl InputShared {
         )
     }
 
+    /// Returns the lifecycle state when the domain is free to be looked at, for a `Debug` that
+    /// must not wait for it.
+    #[must_use]
+    pub fn try_state(&self) -> Option<SessionState> {
+        self.domain.try_lock().ok().map(|domain| domain.state())
+    }
+
     /// Asks the pump to take the session and do what is owed.
     pub fn wake_pump(&self) {
         self.pump.notify_one();
     }
+
+    /// Waits until the pump is asked for.
+    pub(crate) async fn pump_asked(&self) {
+        self.pump.notified().await;
+    }
 }
+
+#[cfg(debug_assertions)]
+thread_local! {
+    /// How many times this thread holds an input domain.
+    static HELD: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Fails in a debug build when this thread holds an input domain.
+///
+/// The domain is never held across a disk call, a journal, spool, question or ledger commit, a
+/// process call or a wait, and the session is never taken while it is held. The places that begin
+/// one of those call this first, so a change that breaks the rule fails where it is made and not
+/// as a keystroke that is late on a machine with a busy disk.
+#[cfg(debug_assertions)]
+pub fn assert_not_held(what: &str) {
+    assert!(
+        HELD.with(std::cell::Cell::get) == 0,
+        "{what} was begun with the input domain held, which a keystroke would wait behind"
+    );
+}
+
+/// The same, in a build that does not check.
+#[cfg(not(debug_assertions))]
+pub const fn assert_not_held(_what: &str) {}
 
 /// The input domain, taken.
 #[derive(Debug)]
@@ -109,7 +152,16 @@ pub struct InputGuard<'a> {
 
 impl<'a> InputGuard<'a> {
     fn new(guard: MutexGuard<'a, InputDomain>) -> Self {
+        #[cfg(debug_assertions)]
+        HELD.with(|held| held.set(held.get() + 1));
         Self { guard }
+    }
+}
+
+#[cfg(debug_assertions)]
+impl Drop for InputGuard<'_> {
+    fn drop(&mut self) {
+        HELD.with(|held| held.set(held.get() - 1));
     }
 }
 
@@ -279,6 +331,16 @@ pub struct InputDomain {
     /// forwards like any application's, Ctrl-D is the shell's own and nothing is ever installed in
     /// an editor.
     fence: Option<FenceDriver>,
+    /// The authority revision this worker last installed and acknowledged.
+    ///
+    /// It is here, with the lease and the input fence, because installing a revision and fencing
+    /// the input granted under what it removed are one step: a keystroke that was validated under
+    /// an earlier revision is refused from the moment this moves, and the lease of a caller the
+    /// revision reaches is gone in the same hold.
+    revision: Option<AuthorityRevision>,
+    /// Steps of the root editor's machine that need the session, left here by a keystroke or the
+    /// timer, which cannot take it. The pump carries them out.
+    owed: Vec<Step>,
     /// The last takeover receipt the machine completed.
     takeover_receipt: Option<TakeoverReceipt>,
     /// The callers waiting for a reader to say what it did with their launch.
@@ -332,6 +394,8 @@ impl InputDomain {
             held_input_bytes: 0,
             writer: WriterHandles::new(),
             fence: None,
+            revision: None,
+            owed: Vec::new(),
             takeover_receipt: None,
             launches: BTreeMap::new(),
             late_installations: Vec::new(),
@@ -576,6 +640,60 @@ impl InputDomain {
     #[must_use]
     pub const fn interrupted_input(&self) -> Interrupted {
         self.interrupted
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // The authority revision.
+    // -----------------------------------------------------------------------------------------
+
+    /// Returns the authority revision this worker last installed and acknowledged.
+    #[must_use]
+    pub const fn revision(&self) -> Option<AuthorityRevision> {
+        self.revision
+    }
+
+    /// Installs the revision the controller now holds.
+    pub(crate) const fn install_revision(&mut self, revision: AuthorityRevision) {
+        self.revision = Some(revision);
+    }
+
+    /// Refuses an action validated under a revision this worker has installed past.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError::PermissionDenied`] when a later revision is installed.
+    pub fn check_validated_revision(&self, validated: Option<AuthorityRevision>) -> Result<()> {
+        let Some(validated) = validated else {
+            return Ok(());
+        };
+        if self
+            .revision
+            .is_some_and(|held| held.get() > validated.get())
+        {
+            return Err(WorkerError::PermissionDenied {
+                detail: format!(
+                    "this action was admitted under authority revision {validated}, and this \
+                     worker holds a later one"
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    /// Leaves steps for the pump, which takes the session to carry them out.
+    pub(crate) fn owe(&mut self, steps: Vec<Step>) {
+        self.owed.extend(steps);
+    }
+
+    /// Takes the steps left for the pump.
+    pub(crate) fn take_owed(&mut self) -> Vec<Step> {
+        std::mem::take(&mut self.owed)
+    }
+
+    /// Returns whether steps are left for the pump.
+    #[must_use]
+    pub fn is_owed(&self) -> bool {
+        !self.owed.is_empty()
     }
 
     // -----------------------------------------------------------------------------------------

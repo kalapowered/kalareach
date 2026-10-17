@@ -207,6 +207,16 @@ pub struct GrantedBy {
     pub device_id: Option<DeviceId>,
 }
 
+/// Whose input lease the worker's fence of granted input takes.
+#[derive(Clone, Copy, Debug)]
+pub enum GrantedInput<'a> {
+    /// The one attachment whose authority ended, a grant that ran out.
+    Attachment(AttachmentId),
+    /// The callers a revision's reach names, or every caller under a grant for the reach that
+    /// names the whole host.
+    Within(&'a kr_protocol::worker::RevisionReach),
+}
+
 /// What a view whose subscription came with a grant's history scope keeps about the broker's
 /// resources, so every transition after its snapshot is decided the way the snapshot was.
 #[derive(Debug)]
@@ -421,7 +431,7 @@ impl std::fmt::Debug for Session {
         formatter
             .debug_struct("Session")
             .field("session_id", &self.config.session_id)
-            .field("state", &self.state())
+            .field("state", &self.input.try_state())
             .field("attachments", &self.attachments.len())
             .field("cursor", &self.history.next_cursor())
             .finish_non_exhaustive()
@@ -2420,6 +2430,22 @@ impl Session {
     ) -> Result<InputLeaseState> {
         let shared = Arc::clone(&self.input);
         let mut input = shared.lock();
+        let owed = self.release_input_locked(&mut input, attachment_id, epoch)?;
+        let lease = input.lease();
+        drop(input);
+        self.carry_out(owed, &mut FenceOutcome::default());
+        self.pump_replies();
+        Ok(lease)
+    }
+
+    /// Releases the lease under the input domain the caller already holds, and returns the steps
+    /// the root editor's machine asked for that need this session once the domain is let go.
+    fn release_input_locked(
+        &mut self,
+        input: &mut InputDomain,
+        attachment_id: AttachmentId,
+        epoch: u64,
+    ) -> Result<Vec<crate::fence::Step>> {
         let ending_epoch = input.epoch();
         let discarded_queue = input
             .release(attachment_id, epoch)
@@ -2434,7 +2460,7 @@ impl Session {
         // lease state, which has nowhere to say it, so it is carried to whoever takes the keys next
         // rather than dropped: an actor that let go of the keys still interrupted whatever it had
         // not delivered.
-        let ended = self.end_lease(&mut input);
+        let ended = self.end_lease(input);
         input.carry_interrupted(
             discarded_queue,
             &ended,
@@ -2445,11 +2471,67 @@ impl Session {
         // rest until an acquire has an answer to report it in.
         let (held, owed) = input.note_lease_change(0);
         input.carry_bytes(held);
-        let lease = input.lease();
+        Ok(owed)
+    }
+
+    /// Takes the input lease away from a caller acting under a grant, with whatever it had not
+    /// delivered, and installs the authority revision that did it, as one step.
+    ///
+    /// Section 10's input fence is what a revocation needs here. Input the worker accepted can sit
+    /// in the lease's queue while the application is not taking bytes, so an acknowledgement that
+    /// only fenced *admitted intents* would let keystrokes admitted under the replaced authority
+    /// reach the application afterwards. Releasing the lease discards them on the same boundary
+    /// the writer takes, which is the step a takeover already uses. The revision is installed in
+    /// the same hold of the input domain, so no keystroke is accepted between the lease going and
+    /// the revision that took it.
+    ///
+    /// `only` says whose authority ended. A revision acknowledgement names the grants and devices
+    /// the revision withdrew, when the daemon can say and this worker has missed no revision
+    /// before it: the lease of a caller acting under none of them is left alone, because its
+    /// authority is its own. Otherwise every lease held under a grant is fenced. A grant that ran
+    /// out knows exactly which attachment it belonged to, and fences nothing else: another caller
+    /// may hold the lease by then.
+    ///
+    /// Either way the caller acquires the lease again on its next request, under the authority now
+    /// in force; the local owner's lease is untouched, because no revision and no grant replaces
+    /// the operating-system identity behind it.
+    pub fn fence_granted_input(
+        &mut self,
+        only: GrantedInput<'_>,
+        install: Option<kr_protocol::ids::AuthorityRevision>,
+    ) {
+        let shared = Arc::clone(&self.input);
+        let mut input = shared.lock();
+        let mut owed = Vec::new();
+        if let Some(holder) = input.holder() {
+            let to_fence = match only {
+                GrantedInput::Attachment(named) => {
+                    named == holder && input.holds_granted_attachment(holder)
+                }
+                GrantedInput::Within(reach) => input.granted_attachment_within(holder, reach),
+            };
+            if to_fence {
+                let epoch = input.epoch();
+                if let Ok(steps) = self.release_input_locked(&mut input, holder, epoch) {
+                    owed = steps;
+                }
+            }
+        }
+        if let Some(revision) = install {
+            input.install_revision(revision);
+        }
         drop(input);
         self.carry_out(owed, &mut FenceOutcome::default());
         self.pump_replies();
-        Ok(lease)
+    }
+
+    /// Does what a keystroke or the recogniser's timer could not do for itself, because it cannot
+    /// take this session: carries out the steps the root editor's machine asked for, and lets out
+    /// the replies the response lane owes now that the gate allows them.
+    pub fn serve_the_pump(&mut self) {
+        let owed = self.input.lock().take_owed();
+        self.carry_out(owed, &mut FenceOutcome::default());
+        self.pump_replies();
     }
 
     /// Accepts ordered input for the pseudo-terminal.

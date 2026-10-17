@@ -590,6 +590,82 @@ impl RuntimePauses {
     }
 }
 
+/// Runs work that waits on a lock or on the disk on a thread the executor can do without.
+///
+/// A task that blocks its worker thread in a commit, or in the wait for a lock a commit holds,
+/// takes a thread from everything else on that runtime, the recogniser's timer among it. On a
+/// multi-threaded runtime the worker hands what it was running to another thread before it blocks;
+/// on any other the work runs where it is.
+pub(crate) fn off_the_executor<R>(work: impl FnOnce() -> R) -> R {
+    let several = tokio::runtime::Handle::try_current().is_ok_and(|runtime| {
+        runtime.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread
+    });
+    if several {
+        tokio::task::block_in_place(work)
+    } else {
+        work()
+    }
+}
+
+/// Takes the session. When something else holds it, the wait is made off the executor.
+pub(crate) fn lock_session(
+    session: &Mutex<Session>,
+) -> std::sync::LockResult<MutexGuard<'_, Session>> {
+    #[cfg(debug_assertions)]
+    crate::input_domain::assert_not_held("a wait for the session");
+    match session.try_lock() {
+        Ok(guard) => Ok(guard),
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => Err(poisoned),
+        Err(std::sync::TryLockError::WouldBlock) => off_the_executor(|| session.lock()),
+    }
+}
+
+/// Where batches for the terminal's writer are handed over, and who is told they were.
+///
+/// Whoever holds the input domain takes what it has queued and sends it here before letting the
+/// domain go, so the order bytes reach the terminal in is the order they were accepted in.
+#[derive(Clone, Debug)]
+struct Sink {
+    input: mpsc::UnboundedSender<InputBatch>,
+    /// Woken when something new is held and the recogniser's timer has to look again.
+    wake: Arc<Notify>,
+    /// What tells the supervision that a process this session owns can have appeared.
+    activity: Arc<crate::lifecycle::Activity>,
+}
+
+impl Sink {
+    /// Hands batches the input domain's queue let go of to the terminal's writer.
+    ///
+    /// Only the flushes call it, with what [`InputDomain::take_pending`] returned, so every batch
+    /// the writer is handed has come through the domain's queue. That queue is where a published
+    /// fence holds back the input behind it, and a batch handed over any other way could reach the
+    /// terminal ahead of its fence.
+    fn send(&self, batches: Vec<InputBatch>) {
+        let sent = !batches.is_empty();
+        for batch in batches {
+            let _ = self.input.send(batch);
+        }
+        // A new held prefix needs the timer to look again, and the permit has to survive the
+        // moment between the timer reading "no deadline" and beginning to wait. Waking whoever is
+        // already waiting is not enough: the timer that has just read an empty deadline is not
+        // waiting yet, and a notice it missed would leave a lone Escape waiting for the next
+        // keystroke, which is the one thing section 8 says it must never do. There is exactly one
+        // consumer of this signal, so storing a permit for it is what this needs.
+        self.wake.notify_one();
+        if sent {
+            // Input the session accepted is how a process it owns usually starts, so the
+            // supervision looks at the boundary shortly after this rather than on a clock.
+            self.activity.note();
+        }
+    }
+
+    /// Takes what the domain has queued and sends it, in one hold of the domain.
+    fn flush(&self, domain: &crate::input_domain::InputShared) {
+        let mut input = domain.lock();
+        self.send(input.take_pending());
+    }
+}
+
 /// A running session and the tasks around it.
 #[derive(Debug)]
 pub struct SessionRuntime {
@@ -600,12 +676,9 @@ pub struct SessionRuntime {
     /// process decides whether a forwarded deadline has passed. One reading of one clock answers
     /// the same question at both boundaries.
     shared_clock: Arc<dyn kr_ipc::clock::SharedClock>,
-    input: mpsc::UnboundedSender<InputBatch>,
-    wake: Arc<Notify>,
+    sink: Sink,
     closed: Arc<Notify>,
     fence: Arc<std::sync::atomic::AtomicU64>,
-    /// What tells the supervision that a process this session owns can have appeared.
-    activity: Arc<crate::lifecycle::Activity>,
     /// How far ingestion is behind the terminal, which the closure waits out.
     progress: ReadProgress,
     /// The instants of the session's acquisitions along a keystroke's path, which the input
@@ -712,6 +785,11 @@ impl SessionRuntime {
         let observing = Arc::new(tokio::sync::Mutex::new(()));
         let wake = Arc::new(Notify::new());
         let closed = Arc::new(Notify::new());
+        let sink = Sink {
+            input: input_sender,
+            wake,
+            activity: Arc::clone(&activity),
+        };
 
         // The read loop runs on its own thread. The terminal answers a read with nothing to read
         // rather than waiting inside it, so this waits on the descriptor and then reads what is
@@ -1000,11 +1078,9 @@ impl SessionRuntime {
             session: Arc::clone(&session),
             domain: Arc::clone(&domain),
             shared_clock: Arc::clone(&shared_clock),
-            input: input_sender.clone(),
-            wake: Arc::clone(&wake),
+            sink: sink.clone(),
             closed: Arc::clone(&closed),
             fence: Arc::clone(&fence),
-            activity: Arc::clone(&activity),
             progress: progress.clone(),
             trace: trace.clone(),
             observing: Arc::clone(&observing),
@@ -1012,7 +1088,8 @@ impl SessionRuntime {
 
         let ingest_session = Arc::clone(&session);
         let ingest_closed = Arc::clone(&closed);
-        let ingest_input = input_sender.clone();
+        let ingest_sink = sink.clone();
+        let ingest_domain = Arc::clone(&domain);
         let ingest_activity = Arc::clone(&activity);
         let ingest_trace = trace.clone();
         tokio::spawn(async move {
@@ -1023,7 +1100,11 @@ impl SessionRuntime {
                         // that was not there at the last observation.
                         ingest_activity.note();
                         let length = bytes.len() as u64;
-                        let owed = {
+                        // The batch is recorded with the session held, and what is recorded can
+                        // include a host event committed to the journal. That wait is made on a
+                        // thread the executor can do without, so it takes nothing from the
+                        // recogniser's timer.
+                        let owed = off_the_executor(|| {
                             let mut acquisition = ingest_trace.acquisition(Site::Ingest);
                             if let Ok(mut session) = ingest_session.lock() {
                                 acquisition.held();
@@ -1038,14 +1119,12 @@ impl SessionRuntime {
                                 // What the host owes the application goes back into its terminal
                                 // input. An application that asked the terminal a question is
                                 // waiting for the answer, and nothing else can supply it.
-                                for batch in session.take_pending_input() {
-                                    let _ = ingest_input.send(batch);
-                                }
+                                ingest_sink.flush(&ingest_domain);
                                 owed
                             } else {
                                 None
                             }
-                        };
+                        });
                         // The disk is waited for with the session let go, and on a thread for
                         // blocking work: a write to a disk that is busy with other work can take
                         // as long as the disk likes, and everything that needs the session, or
@@ -1064,7 +1143,7 @@ impl SessionRuntime {
                             // A write that failed, or was lost with the thread that made it, left
                             // its settlement in the spool, and the session settles it.
                             if !matches!(made, Ok(true))
-                                && let Ok(mut session) = ingest_session.lock()
+                                && let Ok(mut session) = lock_session(&ingest_session)
                             {
                                 session.settle_spool_write();
                             }
@@ -1082,8 +1161,9 @@ impl SessionRuntime {
                         // the engine held back for a mark that could have followed it goes to every
                         // attachment. The end is often queued straight behind the final output, and
                         // then the settling above, which waits for a quiet queue, never runs.
-                        if let Ok(mut session) = ingest_session.lock() {
+                        if let Ok(mut session) = lock_session(&ingest_session) {
                             session.quiesce_output();
+                            ingest_sink.flush(&ingest_domain);
                         }
                         ingest_closed.notify_waiters();
                         break;
@@ -1098,8 +1178,7 @@ impl SessionRuntime {
         let monitor_session = Arc::clone(&session);
         let monitor_domain = Arc::clone(&domain);
         let monitor_closed = Arc::clone(&closed);
-        let monitor_input = input_sender.clone();
-        let monitor_wake = Arc::clone(&wake);
+        let monitor_sink = sink.clone();
         let monitor_fence = Arc::clone(&fence);
         let monitor_activity = Arc::clone(&activity);
         let monitor_clock = Arc::clone(&shared_clock);
@@ -1118,11 +1197,9 @@ impl SessionRuntime {
                 session: Arc::clone(&monitor_session),
                 domain: Arc::clone(&monitor_domain),
                 shared_clock: monitor_clock,
-                input: monitor_input.clone(),
-                wake: Arc::clone(&monitor_wake),
+                sink: monitor_sink.clone(),
                 closed: Arc::clone(&monitor_closed),
                 fence: Arc::clone(&monitor_fence),
-                activity: Arc::clone(&monitor_activity),
                 progress: monitor_progress,
                 trace: monitor_trace.clone(),
                 observing: Arc::clone(&monitor_observing),
@@ -1150,7 +1227,7 @@ impl SessionRuntime {
                 // The look this wake begins, which a test that must know the root shell has been
                 // asked about waits to see end.
                 #[cfg(feature = "testing")]
-                let look = runtime.activity.begin_look();
+                let look = runtime.sink.activity.begin_look();
                 // The set of processes the session owns is built up while it runs, on the cadence
                 // [`crate::lifecycle`] describes: a process that starts and ends between two
                 // observations is never recorded, and enumerating the boundary every time the
@@ -1169,7 +1246,7 @@ impl SessionRuntime {
                     let copied = {
                         let mut acquisition = monitor_trace.acquisition(Site::SupervisionWake);
                         acquisition.note(SUPERVISION_COPIED_OUT);
-                        monitor_session.lock().ok().and_then(|session| {
+                        lock_session(&monitor_session).ok().and_then(|session| {
                             acquisition.held();
                             session.begin_observation()
                         })
@@ -1201,7 +1278,7 @@ impl SessionRuntime {
                 let mut wanted = None;
                 let initiated = {
                     let mut acquisition = monitor_trace.acquisition(Site::SupervisionWake);
-                    let Ok(mut session) = monitor_session.lock() else {
+                    let Ok(mut session) = lock_session(&monitor_session) else {
                         break;
                     };
                     acquisition.held();
@@ -1267,7 +1344,7 @@ impl SessionRuntime {
                             taken = &mut *running => {
                                 probing = None;
                                 if let Ok((at, probe, sample)) = taken
-                                    && let Ok(mut session) = monitor_session.lock()
+                                    && let Ok(mut session) = lock_session(&monitor_session)
                                 {
                                     session.apply_desktop_reading(at, &probe, &sample);
                                 }
@@ -1281,19 +1358,19 @@ impl SessionRuntime {
             }
         });
 
-        // The paste recogniser's deadline runs on the clock, not on the arrival of more input.
-        let timer_session = Arc::clone(&session);
-        let timer_input = input_sender;
-        let timer_wake = Arc::clone(&wake);
+        // The paste recogniser's deadline runs on the clock, not on the arrival of more input. The
+        // timer takes the input domain and nothing else: whatever the session is busy with, a
+        // held prefix is forwarded at its deadline.
+        let timer_domain = Arc::clone(&domain);
+        let timer_sink = sink.clone();
         let timer_trace = trace.clone();
         tokio::spawn(async move {
             loop {
                 let deadline = {
                     let mut acquisition = timer_trace.acquisition(Site::TimerLook);
-                    timer_session.lock().ok().and_then(|session| {
-                        acquisition.held();
-                        session.paste_deadline()
-                    })
+                    let input = timer_domain.lock();
+                    acquisition.held();
+                    input.paste_deadline()
                 };
                 match deadline {
                     Some(deadline) => {
@@ -1301,22 +1378,48 @@ impl SessionRuntime {
                         let wait = deadline.saturating_duration_since(now);
                         tokio::select! {
                             () = tokio::time::sleep(wait) => {}
-                            () = timer_wake.notified() => continue,
+                            () = timer_sink.wake.notified() => continue,
                         }
                         timer_trace.timer_woke(deadline);
                         #[cfg(feature = "testing")]
                         timer_pauses.at_timer_deadline().await;
                         let mut acquisition = timer_trace.acquisition(Site::TimerForward);
-                        if let Ok(mut session) = timer_session.lock() {
-                            acquisition.held();
-                            session.expire_paste_prefix(Instant::now());
-                            for batch in session.take_pending_input() {
-                                let _ = timer_input.send(batch);
-                            }
+                        let mut input = timer_domain.lock();
+                        acquisition.held();
+                        let (expired, owed) = input.expire_paste_prefix(Instant::now());
+                        let steps_owed = !owed.is_empty();
+                        input.owe(owed);
+                        timer_sink.send(input.take_pending());
+                        drop(input);
+                        // The held prefix has gone, so a frame that was open is closed and the
+                        // response lane's gate is open again. Letting out what the lane held back
+                        // needs the session, which the pump takes.
+                        if expired > 0 || steps_owed {
+                            timer_domain.wake_pump();
                         }
                     }
-                    None => timer_wake.notified().await,
+                    None => timer_sink.wake.notified().await,
                 }
+            }
+        });
+
+        // The pump does what a keystroke and the timer cannot do for themselves, because they do
+        // not take the session: letting out the replies the response lane held back while a paste
+        // or a frame was open, and carrying out the steps the root editor's machine asked for that
+        // need the session.
+        let pump_session = Arc::clone(&session);
+        let pump_domain = Arc::clone(&domain);
+        let pump_sink = sink.clone();
+        tokio::spawn(async move {
+            loop {
+                pump_domain.pump_asked().await;
+                // Waited for off the executor: the session may be held by a commit.
+                off_the_executor(|| {
+                    if let Ok(mut session) = pump_session.lock() {
+                        session.serve_the_pump();
+                        pump_sink.flush(&pump_domain);
+                    }
+                });
             }
         });
 
@@ -1351,47 +1454,34 @@ impl SessionRuntime {
     /// Panics when the lock is poisoned, which means an earlier operation panicked while holding
     /// session state and the state can no longer be trusted.
     pub fn session(&self) -> MutexGuard<'_, Session> {
-        self.session
-            .lock()
-            .expect("the session lock is not poisoned")
+        lock_session(&self.session).expect("the session lock is not poisoned")
+    }
+
+    /// Returns what a keystroke and the recogniser's timer touch.
+    ///
+    /// It is taken after the session when both are, and never before it.
+    #[must_use]
+    pub const fn input(&self) -> &Arc<crate::input_domain::InputShared> {
+        &self.domain
+    }
+
+    /// Writes what the input domain has queued, under the hold of it the caller already has.
+    ///
+    /// The batches are sent before the domain is let go, so the order bytes reach the terminal in
+    /// is the order they were accepted in.
+    pub fn flush_locked(&self, input: &mut crate::input_domain::InputDomain) {
+        self.sink.send(input.take_pending());
     }
 
     /// Writes whatever the session has queued for the pseudo-terminal.
     ///
     /// Call this after any operation that can produce input bytes.
     pub fn flush_input(&self) {
-        let mut input = self.domain.lock();
-        let pending = input.take_pending();
         // Sent while the input domain is still held, so two callers cannot interleave their
         // batches: the order bytes reach the terminal in is the order they were accepted in. The
         // fence is already published: the domain moves it as it changes the lease, which is
         // earlier than here and earlier than anything that counts what the lease left behind.
-        self.send_input(pending);
-    }
-
-    /// Hands batches the session's queue let go of to the terminal's writer.
-    ///
-    /// Only the two flushes above call it, with what [`Session::take_pending_input`] returned, so
-    /// every batch the writer is handed has come through the session's queue. That queue is where a
-    /// published fence holds back the input behind it, and a batch handed over any other way could
-    /// reach the terminal ahead of its fence.
-    fn send_input(&self, batches: Vec<InputBatch>) {
-        let sent = !batches.is_empty();
-        for batch in batches {
-            let _ = self.input.send(batch);
-        }
-        // A new held prefix needs the timer to look again, and the permit has to survive the
-        // moment between the timer reading "no deadline" and beginning to wait. Waking whoever is
-        // already waiting is not enough: the timer that has just read an empty deadline is not
-        // waiting yet, and a notice it missed would leave a lone Escape waiting for the next
-        // keystroke, which is the one thing section 8 says it must never do. There is exactly one
-        // consumer of this signal, so storing a permit for it is what this needs.
-        self.wake.notify_one();
-        if sent {
-            // Input the session accepted is how a process it owns usually starts, so the
-            // supervision looks at the boundary shortly after this rather than on a clock.
-            self.activity.note();
-        }
+        self.sink.flush(&self.domain);
     }
 
     /// Admits a close and returns the acceptance, before anything is signalled.
@@ -1432,7 +1522,7 @@ impl SessionRuntime {
     #[cfg(feature = "testing")]
     #[must_use]
     pub fn supervision_is_looking(&self) -> bool {
-        self.activity.supervision_is_looking()
+        self.sink.activity.supervision_is_looking()
     }
 
     /// Waits until the session has finished closing and returns its record.
@@ -1464,7 +1554,7 @@ impl SessionRuntime {
     /// Makes the supervision observe the session's processes now, for this host's own tests.
     #[cfg(feature = "testing")]
     pub fn observe_now(&self) {
-        self.activity.force_observation();
+        self.sink.activity.force_observation();
     }
 
     /// Stops the next observation of the session's processes while it is reading them, for this
@@ -2492,6 +2582,7 @@ mod tests {
         // holds.
         let now = runtime.shared_clock.boot_elapsed_ms();
         runtime
+            .sink
             .input
             .send(InputBatch::Reply {
                 bytes: b"kr-late\n".to_vec(),
@@ -2499,6 +2590,7 @@ mod tests {
             })
             .expect("the writer is taking input");
         runtime
+            .sink
             .input
             .send(InputBatch::Reply {
                 bytes: b"kr-early\n".to_vec(),

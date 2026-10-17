@@ -70,7 +70,9 @@ use kr_protocol::projection::ProjectionEvent;
 
 use crate::output::OutputDelivery;
 use crate::runtime::SessionRuntime;
+use crate::runtime::off_the_executor;
 use crate::session::DETACH_HINT;
+use crate::session::GrantedInput;
 use crate::session::Session;
 use crate::trace::Site;
 
@@ -112,16 +114,6 @@ pub const MAX_CONNECTIONS: usize = kr_protocol::limits::MAX_CONCURRENT_ATTACHMEN
 /// that rather than filling it exactly.
 pub const MAX_REPLAY_PAGE_BYTES: u64 = 512 * 1024;
 
-/// Whose input lease the worker's fence of granted input takes.
-#[derive(Clone, Copy, Debug)]
-enum Fenced<'a> {
-    /// The one attachment whose authority ended, a grant that ran out.
-    Attachment(AttachmentId),
-    /// The callers a revision's reach names, or every caller under a grant for the reach that
-    /// names the whole host.
-    Within(&'a kr_protocol::worker::RevisionReach),
-}
-
 /// What the worker currently accepts as controller authority.
 ///
 /// The generation and the connection that speaks for it are one value under one lock, so a token
@@ -153,8 +145,6 @@ struct Authority {
     /// There is one, bound as the attention connection is: a newer one replaces it, and a
     /// replacement generation fences it with the rest.
     descriptions_connection: Option<ConnectionId>,
-    /// The authority revision the controller last announced and this worker acknowledged.
-    acknowledged_revision: Option<kr_protocol::ids::AuthorityRevision>,
     /// A revision this worker was told about while it was inside a dispatch transition.
     ///
     /// The announcement was refused, because a fence cannot interleave with a dispatch and waiting
@@ -203,6 +193,11 @@ pub struct WorkerService {
     /// what makes the check mean something by the time the effect happens. Authority changes take
     /// it too, so one cannot slip between the two halves of the other.
     dispatch: Mutex<()>,
+    /// The attachments whose caller's authority ran out on a keystroke. The lease of each is
+    /// released by a task under the dispatch barrier, not by the keystroke.
+    expired: tokio::sync::mpsc::UnboundedSender<AttachmentId>,
+    /// The receiving end of that, taken by the task that serves it when the service starts serving.
+    expired_receiver: Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<AttachmentId>>>,
     /// How many connections this session is serving.
     connections: Arc<std::sync::atomic::AtomicUsize>,
     /// Every connection this worker has admitted, and how to withdraw it.
@@ -539,6 +534,7 @@ impl WorkerService {
         let attention_fence = Arc::new(crate::attention_fence::AttentionFence::new(Arc::clone(
             &shared_clock,
         )));
+        let expired = tokio::sync::mpsc::unbounded_channel();
         Ok(Self {
             runtime,
             identity,
@@ -558,10 +554,11 @@ impl WorkerService {
                 proxy_connections: std::collections::BTreeSet::new(),
                 attention_connection: None,
                 descriptions_connection: None,
-                acknowledged_revision: None,
                 owed: None,
             }),
             dispatch: Mutex::new(()),
+            expired: expired.0,
+            expired_receiver: Mutex::new(Some(expired.1)),
             connections: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             admitted: Mutex::new(std::collections::BTreeMap::new()),
             questions,
@@ -1362,10 +1359,7 @@ impl WorkerService {
     /// this arrives with the transport; this is the worker half of that interface.
     #[must_use]
     pub fn acknowledged_revision(&self) -> Option<kr_protocol::ids::AuthorityRevision> {
-        self.authority
-            .lock()
-            .expect("the authority lock is not poisoned")
-            .acknowledged_revision
+        self.runtime.input().lock().revision()
     }
 
     /// Serves the endpoint until the session has closed.
@@ -1391,6 +1385,16 @@ impl WorkerService {
             Arc::downgrade(&self),
             Arc::clone(&self.broker),
         ));
+        // The leases of callers whose authority ran out while they typed are released from here,
+        // under the dispatch barrier, and not by the keystroke that found the authority gone.
+        if let Some(expired) = self
+            .expired_receiver
+            .lock()
+            .expect("the expiry channel is not poisoned")
+            .take()
+        {
+            tokio::spawn(Arc::clone(&self).release_expired_grants(expired));
+        }
         // The components of this session's bindings are registered with the plugin runtime from
         // here. Nothing is asked of anybody until a binding wants one.
         if let Some(request) = self.plugin_runtime.clone() {
@@ -1415,6 +1419,40 @@ impl WorkerService {
                 let _ = service.run_connection(connection, peer).await;
                 held.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
             });
+        }
+    }
+
+    /// Releases the input lease of each attachment whose caller's authority ran out.
+    ///
+    /// A keystroke finds the authority gone and is refused at once; the release is left to this
+    /// task, which takes the dispatch barrier first. A mutation that validated the lease before
+    /// its marker therefore finishes under the lease it validated, and a keystroke never moves it.
+    /// The wait for the barrier and the session is made on a thread for blocking work.
+    async fn release_expired_grants(
+        self: Arc<Self>,
+        mut expired: tokio::sync::mpsc::UnboundedReceiver<AttachmentId>,
+    ) {
+        while let Some(first) = expired.recv().await {
+            // Every attachment that ran out while this task was waiting is released in one pass.
+            let mut ended = std::collections::BTreeSet::from([first]);
+            while let Ok(more) = expired.try_recv() {
+                ended.insert(more);
+            }
+            let service = Arc::clone(&self);
+            let _ = tokio::task::spawn_blocking(move || {
+                let _barrier = service
+                    .dispatch
+                    .lock()
+                    .expect("the dispatch barrier is not poisoned");
+                for attachment_id in ended {
+                    service
+                        .runtime
+                        .session()
+                        .fence_granted_input(GrantedInput::Attachment(attachment_id), None);
+                }
+                service.runtime.flush_input();
+            })
+            .await;
         }
     }
 
@@ -1443,7 +1481,9 @@ impl WorkerService {
         // clocks before it waits a minute to do either.
         tick.tick().await;
         loop {
-            if self.maintain_once() {
+            // The pass commits to the journal under the dispatch barrier and the session, on a
+            // thread the executor can do without.
+            if off_the_executor(|| self.maintain_once()) {
                 break;
             }
             tick.tick().await;
@@ -2457,7 +2497,9 @@ impl WorkerService {
                 }
             }
             ControlFrame::ControllerRole(role) => Some(Self::declare_role(state, role)),
-            ControlFrame::GenerationToken(token) => Some(self.accept_generation(state, &token)),
+            ControlFrame::GenerationToken(token) => {
+                Some(off_the_executor(|| self.accept_generation(state, &token)))
+            }
             ControlFrame::AcceptanceDelivered(action_id) => {
                 // The proxy has passed the acceptance on. Whatever it names, only the close this
                 // connection is holding can be released by it.
@@ -2470,9 +2512,9 @@ impl WorkerService {
                 }
                 None
             }
-            ControlFrame::AuthorityRevision(notice) => {
-                Some(self.acknowledge_revision(state, &notice))
-            }
+            ControlFrame::AuthorityRevision(notice) => Some(off_the_executor(|| {
+                self.acknowledge_revision(state, &notice)
+            })),
             ControlFrame::LocalAccess(access) => Some(self.accept_local_access(state, access)),
             ControlFrame::PrivacyGeneration(notice) => {
                 Some(self.take_privacy(state, &notice).await)
@@ -3542,13 +3584,7 @@ impl WorkerService {
         // How many names of this revision's evidence the daemon already has. A first announcement
         // asks for the first page; a later one asks for what the previous answer said remained.
         let page_from = usize::try_from(notice.evidence_from).unwrap_or(usize::MAX);
-        let held = {
-            let authority = self
-                .authority
-                .lock()
-                .expect("the authority lock is not poisoned");
-            authority.acknowledged_revision
-        };
+        let held = self.runtime.input().lock().revision();
         // Revisions are ordered and only the host issues them, so an older one never replaces a
         // newer one that has already been acknowledged.
         if held.is_some_and(|held| held.get() >= notice.revision.get()) {
@@ -3656,12 +3692,15 @@ impl WorkerService {
         outcome?;
         #[cfg(feature = "testing")]
         self.fence_stall.stand();
-        self.fence_granted_input(&mut session, Fenced::Within(reach));
+        // The lease of every caller the revision reaches, and the revision itself, in one hold of
+        // the input domain: no keystroke is accepted between the lease going and the revision that
+        // took it, and none validated under an earlier revision is accepted after.
+        session.fence_granted_input(GrantedInput::Within(reach), Some(revision));
+        drop(session);
         let mut authority = self
             .authority
             .lock()
             .expect("the authority lock is not poisoned");
-        authority.acknowledged_revision = Some(revision);
         // Only work this fence covered. A newer announcement can have arrived while this pass ran,
         // and clearing that would leave the maintenance with nothing to do and the newer
         // revocation waiting on a caller.
@@ -3681,11 +3720,11 @@ impl WorkerService {
     /// revision stays owed, and the next tick tries again.
     fn fence_what_is_owed(&self) {
         let owed = {
+            let held = self.runtime.input().lock().revision();
             let authority = self
                 .authority
                 .lock()
                 .expect("the authority lock is not poisoned");
-            let held = authority.acknowledged_revision;
             authority
                 .owed
                 .clone()
@@ -3793,23 +3832,28 @@ impl WorkerService {
         let held = self.runtime.session().privacy();
         let mut attention = self.attention_privacy();
         let applied = if !notice.enabled {
-            self.runtime
-                .session()
-                .disable_privacy(generation)
-                .map(|_| ())
+            off_the_executor(|| {
+                self.runtime
+                    .session()
+                    .disable_privacy(generation)
+                    .map(|_| ())
+            })
         } else if held.generation() == generation && held.is_enabled() {
             // Committed already, so there is no transition to raise: the cleanup is taken again.
-            self.runtime
-                .session()
-                .enable_privacy(generation, &mut [&mut attention])
-                .map(|_| ())
+            off_the_executor(|| {
+                self.runtime
+                    .session()
+                    .enable_privacy(generation, &mut [&mut attention])
+                    .map(|_| ())
+            })
         } else {
             let transition = self.raise_privacy_transition().await;
-            let enabled = self
-                .runtime
-                .session()
-                .enable_privacy(generation, &mut [&mut attention])
-                .map(|_| ());
+            let enabled = off_the_executor(|| {
+                self.runtime
+                    .session()
+                    .enable_privacy(generation, &mut [&mut attention])
+                    .map(|_| ())
+            });
             transition.settle().await;
             enabled
         };
@@ -3827,45 +3871,6 @@ impl WorkerService {
             enabled: privacy.is_enabled(),
             completion: (&completion).into(),
         }))
-    }
-
-    /// Takes the input lease away from a caller acting under a grant, with whatever it had not
-    /// delivered.
-    ///
-    /// Section 10's input fence is what a revocation needs here. Input the worker accepted can sit
-    /// in the lease's queue while the application is not taking bytes, so an acknowledgement that
-    /// only fenced *admitted intents* would let keystrokes admitted under the replaced authority
-    /// reach the application afterwards. Releasing the lease discards them on the same boundary
-    /// the writer takes, which is the step a takeover already uses.
-    ///
-    /// `only` says whose authority ended ([`Fenced`]). A revision acknowledgement names the grants
-    /// and devices the revision withdrew, when the daemon can say and this worker has missed no
-    /// revision before it: the lease of a caller acting under none of them is left alone, because
-    /// its authority is its own. Otherwise every lease held under a grant is fenced. A grant that
-    /// ran out knows exactly which attachment it belonged to, and fences nothing else: another
-    /// caller may hold the lease by then.
-    ///
-    /// Either way the caller acquires the lease again on its next request, under the authority
-    /// now in force; the local owner's lease is untouched, because no revision and no grant
-    /// replaces the operating-system identity behind it.
-    fn fence_granted_input(&self, session: &mut Session, only: Fenced<'_>) {
-        let lease = session.lease();
-        let Some(holder) = lease.holder.0 else {
-            return;
-        };
-        let to_fence = match only {
-            Fenced::Attachment(named) => {
-                named == holder && session.holds_granted_attachment(holder)
-            }
-            Fenced::Within(reach) => session.granted_attachment_within(holder, reach),
-        };
-        if !to_fence {
-            return;
-        }
-        let _ = session.release_input(holder, lease.epoch.get());
-        // The fence moved, so what the writer holds has to be published with it rather than left
-        // for the next caller to flush.
-        self.runtime.flush_input();
     }
 
     /// Registers one admitted connection, and returns how it learns that it has been withdrawn.
@@ -4042,8 +4047,11 @@ impl WorkerService {
         // An announcement of a revision this worker has already fenced owes nothing, and recording
         // it would join its reach, which is the whole host's for a repeat or a continuation page,
         // with the reach of the next revision it is refused for.
-        if authority
-            .acknowledged_revision
+        if self
+            .runtime
+            .input()
+            .lock()
+            .revision()
             .is_some_and(|held| held.get() >= notice.revision.get())
         {
             return Ok(());
@@ -4225,27 +4233,35 @@ impl WorkerService {
         if Self::entry(method, request.method_version, caller.ingress).is_none() {
             return failure(request.request_id, &unlisted());
         }
-        let outcome = match method {
-            Method::SessionRead => self.session_read(&request.params, caller),
-            Method::SessionScreenPreview => self.session_screen_preview(&request.params, caller),
-            Method::EventsSnapshot => self.events_snapshot(state, &request.params, caller),
-            Method::AgentInstances => self.agent_instances(state, &request.params, caller),
-            Method::HistoryPage => self.history_page(state, &request.params, caller),
-            Method::EventsSubscribe => self.events_subscribe(state, &request.params, caller),
-            Method::ActionRead => self.action_read(state, caller, &request.params),
-            Method::InputWrite => self.input_write(state, &request.params, caller),
-            Method::QuestionReadOwn => self.question_read_own(state, &request.params),
-            Method::QuestionRead => self.question_read(&request.params, caller),
-            Method::AgentCapabilities => self.agent_capabilities(&request.params),
-            Method::AgentSnapshot => self.agent_snapshot(state, &request.params, caller),
-            Method::AgentCommands => self.agent_commands(&request.params),
-            Method::AgentApprovalInspect => {
-                self.agent_approval_inspect(state, &request.params, caller)
-            }
-            _ => Err(WorkerError::InvalidArgument(format!(
-                "{} is not a read this worker serves",
-                method.as_str()
-            ))),
+        // A keystroke takes the input domain and nothing else, on whatever thread it arrived on. A
+        // read can wait for the session or for the disk behind it, and that wait is made on a
+        // thread the executor can do without.
+        let outcome = if method == Method::InputWrite {
+            self.input_write(state, &request.params, caller)
+        } else {
+            off_the_executor(|| match method {
+                Method::SessionRead => self.session_read(&request.params, caller),
+                Method::SessionScreenPreview => {
+                    self.session_screen_preview(&request.params, caller)
+                }
+                Method::EventsSnapshot => self.events_snapshot(state, &request.params, caller),
+                Method::AgentInstances => self.agent_instances(state, &request.params, caller),
+                Method::HistoryPage => self.history_page(state, &request.params, caller),
+                Method::EventsSubscribe => self.events_subscribe(state, &request.params, caller),
+                Method::ActionRead => self.action_read(state, caller, &request.params),
+                Method::QuestionReadOwn => self.question_read_own(state, &request.params),
+                Method::QuestionRead => self.question_read(&request.params, caller),
+                Method::AgentCapabilities => self.agent_capabilities(&request.params),
+                Method::AgentSnapshot => self.agent_snapshot(state, &request.params, caller),
+                Method::AgentCommands => self.agent_commands(&request.params),
+                Method::AgentApprovalInspect => {
+                    self.agent_approval_inspect(state, &request.params, caller)
+                }
+                _ => Err(WorkerError::InvalidArgument(format!(
+                    "{} is not a read this worker serves",
+                    method.as_str()
+                ))),
+            })
         };
         // Checked again, now that the read has finished. A read that passed its check and then
         // waited for the session lock can complete after the authority behind it was withdrawn,
@@ -4317,7 +4333,11 @@ impl WorkerService {
         {
             local.hold_request(mutation.request_id);
         }
-        let dispatched = self.receipted(state, mutation, method, entry, caller, freshness);
+        // The marker, the effect and the outcome are commits, and the wait for the dispatch
+        // barrier and the session is for whatever else holds them. A thread that is in either is
+        // not one the recogniser's timer, or any other task, can be run on.
+        let dispatched =
+            off_the_executor(|| self.receipted(state, mutation, method, entry, caller, freshness));
         self.answered(state, mutation, caller, forwarded, dispatched)
     }
 
@@ -4456,7 +4476,7 @@ impl WorkerService {
             pending,
             preparation,
         } = ready;
-        let dispatched = self.continue_prepared(state, &pending, preparation);
+        let dispatched = off_the_executor(|| self.continue_prepared(state, &pending, preparation));
         self.answered(
             state,
             &pending.mutation,
@@ -4636,7 +4656,7 @@ impl WorkerService {
                 })
             }
         };
-        self.settle(&pending.actor_id, pending.action_id, outcome.as_ref());
+        off_the_executor(|| self.settle(&pending.actor_id, pending.action_id, outcome.as_ref()));
         respond(pending.request_id, outcome)
     }
 
@@ -4655,7 +4675,9 @@ impl WorkerService {
         let mut handoff = pending.handoff;
         let claim = handoff.claim.take();
         let outcome = handoff.carry(deadline).await;
-        self.settle_upstream(&pending.actor_id, pending.action_id, outcome.as_ref());
+        off_the_executor(|| {
+            self.settle_upstream(&pending.actor_id, pending.action_id, outcome.as_ref());
+        });
         // The offer is reported from what the receipt now says: applied is accepted, a refusal the
         // upstream proved is a failure, and anything else is unknown.
         if let Some(claim) = claim {
@@ -5663,50 +5685,37 @@ impl WorkerService {
     /// forwarded caller's authority is a grant the daemon checked at a revision, and this worker
     /// installing a later one is exactly the event that withdraws it.
     fn check_validated_revision(&self, caller: &Caller) -> Result<()> {
-        let Some(validated) = caller.validated_revision else {
-            return Ok(());
-        };
-        let acknowledged = self
-            .authority
+        self.runtime
+            .input()
             .lock()
-            .expect("the authority lock is not poisoned")
-            .acknowledged_revision;
-        if acknowledged.is_some_and(|held| held.get() > validated.get()) {
-            return Err(WorkerError::PermissionDenied {
-                detail: format!(
-                    "this action was admitted under authority revision {validated}, and this \
-                     worker holds a later one"
-                ),
-            });
-        }
-        Ok(())
+            .check_validated_revision(caller.validated_revision)
     }
 
-    /// Refuses a request whose authority has run out, and fences what it was allowed to do.
+    /// Refuses a request whose authority has run out, and asks for the fence of what it was allowed
+    /// to do.
     ///
     /// Read on the machine's own continuous clock, which is the clock the daemon expressed the
-    /// deadline on. Called inside the boundary that decides what reaches the application, because
-    /// that is the only place the answer cannot go stale: a batch that passed the daemon's check
-    /// can wait here while the grant behind it ends.
+    /// deadline on. Called inside the input domain, where the lease is decided, because that is the
+    /// only place the answer cannot go stale: a batch that passed the daemon's check can wait here
+    /// while the grant behind it ends.
     ///
     /// The refusal alone is not the fence. Input this caller has already handed over and the
-    /// terminal has not taken goes with it, on the writer's own boundary, the same way a takeover
-    /// discards the previous holder's bytes.
-    fn check_authority_deadline(
-        &self,
-        caller: &Caller,
-        session: &mut Session,
-        attachment_id: AttachmentId,
-    ) -> Result<()> {
+    /// terminal has not taken is held to the same deadline by the writer, which checks it before
+    /// every piece it offers the terminal, and the lease goes with the release that is asked for
+    /// here.
+    fn check_authority_deadline(&self, caller: &Caller, attachment_id: AttachmentId) -> Result<()> {
         let Some(deadline) = caller.authority_deadline_boot_ms else {
             return Ok(());
         };
         if self.shared_clock.boot_elapsed_ms() < deadline {
             return Ok(());
         }
-        // Only this request's own attachment. Another caller may hold the lease by now, and its
-        // authority has nothing to do with this one's having ended.
-        self.fence_granted_input(session, Fenced::Attachment(attachment_id));
+        // Refused at once, which is all a keystroke does about it. Its lease is released by a task
+        // that takes the dispatch barrier, so a keystroke never moves a lease that a mutation
+        // validated before its marker. Only this request's own attachment is named: another caller
+        // may hold the lease by now, and its authority has nothing to do with this one's having
+        // ended.
+        let _ = self.expired.send(attachment_id);
         Err(WorkerError::PermissionDenied {
             detail: "the authority this request was admitted under has run out".to_owned(),
         })
@@ -6495,7 +6504,11 @@ impl WorkerService {
     /// session is not a request for this session with a typo in it; acting on it would let a
     /// caller close one session by addressing another.
     fn check_session(session: &Session, named: SessionId) -> Result<()> {
-        let owned = session.id();
+        Self::check_owned_session(session.id(), named)
+    }
+
+    /// The same, against the identity of the session the input domain belongs to.
+    fn check_owned_session(owned: SessionId, named: SessionId) -> Result<()> {
         if named == owned {
             Ok(())
         } else {
@@ -6544,11 +6557,22 @@ impl WorkerService {
         attachment_id: AttachmentId,
         capability: AttachmentCapability,
     ) -> Result<()> {
-        let granted = session
-            .attachment_capabilities(attachment_id)
-            .ok_or_else(|| WorkerError::UnknownAttachment {
-                attachment: attachment_id.to_string(),
-            })?;
+        Self::check_granted(
+            session.attachment_capabilities(attachment_id).as_ref(),
+            attachment_id,
+            capability,
+        )
+    }
+
+    /// The same, against what the input domain recorded the attachment was granted.
+    fn check_granted(
+        granted: Option<&CanonicalSet<AttachmentCapability>>,
+        attachment_id: AttachmentId,
+        capability: AttachmentCapability,
+    ) -> Result<()> {
+        let granted = granted.ok_or_else(|| WorkerError::UnknownAttachment {
+            attachment: attachment_id.to_string(),
+        })?;
         if granted.contains(&capability) {
             Ok(())
         } else {
@@ -7544,9 +7568,9 @@ impl WorkerService {
         caller: &Caller,
     ) -> Result<ParamsValue> {
         // When the batch reached this handler. A held prefix's deadline runs from here and not from
-        // the moment the session comes free for it: the session may be busy with something else
-        // when a lone Escape arrives, and the application's wait for it, which section 27 puts at
-        // no more than the recogniser's deadline, began with the write.
+        // the moment the input domain comes free for it: something may hold it for a moment when a
+        // lone Escape arrives, and the application's wait for it, which section 27 puts at no more
+        // than the recogniser's deadline, began with the write.
         let arrived = std::time::Instant::now();
         let params: InputWriteParams = parse(params)?;
         Self::check_attachment(state, params.attachment_id)?;
@@ -7559,20 +7583,30 @@ impl WorkerService {
             )));
         }
         self.wait_before_the_input_session();
-        let accepted = {
+        let (accepted, pump) = {
             let mut acquisition = self.runtime.trace().acquisition(Site::InputAcceptance);
-            let mut session = self.runtime.session();
+            // The input domain and nothing else: whatever the session is busy with, this write
+            // does not wait for it.
+            let mut input = self.runtime.input().lock();
             acquisition.held();
-            // Inside the session's own boundary, where the lease and the fence are: a forwarded
-            // batch can wait here while the controller installs a newer authority revision or the
-            // grant behind it runs out, and what the boundary decides is what actually reaches the
-            // application.
-            self.check_validated_revision(caller)?;
+            // Inside the domain, where the lease, the fence and the validated revision are: a
+            // forwarded batch can wait here while the controller installs a newer authority
+            // revision or the grant behind it runs out, and what the domain decides is what
+            // actually reaches the application.
+            input.check_validated_revision(caller.validated_revision)?;
             self.check_local_dispatch(state, Method::InputWrite, caller)?;
-            self.check_authority_deadline(caller, &mut session, params.attachment_id)?;
-            Self::check_session(&session, params.session_id)?;
-            Self::check_capability(&session, params.attachment_id, AttachmentCapability::Input)?;
-            let accepted = session.write_input_until(
+            self.check_authority_deadline(caller, params.attachment_id)?;
+            Self::check_owned_session(input.session_id(), params.session_id)?;
+            Self::check_granted(
+                input.capabilities(params.attachment_id),
+                params.attachment_id,
+                AttachmentCapability::Input,
+            )?;
+            let crate::input_domain::Accepted {
+                accepted,
+                owed,
+                opened_the_gate,
+            } = input.accept(
                 params.attachment_id,
                 params.epoch.get(),
                 params.sequence.get(),
@@ -7586,12 +7620,21 @@ impl WorkerService {
                 },
                 arrived,
             )?;
-            acquisition.deadline(session.paste_deadline());
-            // Handed to the writer while the session is still held, so two writers cannot
+            acquisition.deadline(input.paste_deadline());
+            // Handed to the writer while the domain is still held, so two writers cannot
             // interleave their batches after releasing the lock.
-            self.runtime.flush_input();
-            accepted
+            let owes = !owed.is_empty();
+            input.owe(owed);
+            self.runtime.flush_locked(&mut input);
+            // A paste that has just closed, or a frame that has just completed, opens the gate the
+            // response lane was waiting on, and an application that asked a question during one of
+            // those would otherwise wait for its answer until the next byte of output. Letting the
+            // reply out needs the session, which the pump takes.
+            (accepted, opened_the_gate || owes)
         };
+        if pump {
+            self.runtime.input().wake_pump();
+        }
         state.input_sequence = params.sequence.get();
         encode(&InputWriteResult {
             sequence: params.sequence,

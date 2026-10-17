@@ -87,12 +87,12 @@ impl BridgeServer {
             let Ok(FromBridge::Hello(hello)) = reader.recv().await else {
                 continue;
             };
-            let already = {
-                let session = self.runtime.session();
-                session
-                    .fence()
-                    .is_some_and(|driver| driver.phase().shell().is_some())
-            };
+            let already = self
+                .runtime
+                .input()
+                .lock()
+                .fence()
+                .is_some_and(|driver| driver.phase().shell().is_some());
             let expectation = WorkerExpectation {
                 already_registered: already,
                 ..self.expectation.clone()
@@ -183,8 +183,8 @@ impl BridgeServer {
     async fn pump(&self, reader: &mut BridgeReader, writing: &mut tokio::task::JoinHandle<()>) {
         loop {
             let (wake, machine, fence_write) = {
-                let session = self.runtime.session();
-                let Some(driver) = session.fence() else {
+                let input = self.runtime.input().lock();
+                let Some(driver) = input.fence() else {
                     return;
                 };
                 (
