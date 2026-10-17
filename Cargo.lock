@@ -4707,6 +4707,7 @@ dependencies = [
  "kr-controller",
  "kr-crypto",
  "kr-ipc",
+ "kr-plugin-host",
  "kr-plugin-runtime",
  "kr-plugin-sdk",
  "kr-plugin-service",
