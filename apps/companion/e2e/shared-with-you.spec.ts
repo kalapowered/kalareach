@@ -406,4 +406,55 @@ test.describe('a share that arrives while the sessions are scrolled', () => {
       `the share beside it kept its place (${JSON.stringify({ before, after })})`
     ).toBeLessThanOrEqual(1)
   })
+
+  // KR-REQ-18.13: a bar above the list that changes height moves the scrolling area and not the
+  // list, so what the list does after it is still judged by where its rows are in the area.
+  test('keeps the place when the bar above the list changed height before the list did', async ({ page }) => {
+    await page.goto('/harness.html?surface=ios&tab=sessions&sessions=30')
+    await expect(page.locator('.m-shell')).toBeVisible()
+    await page.evaluate(() => {
+      window.krTestHost?.reachAsPhone({ rights: ['session.view'] })
+    })
+    const main = page.locator('.m-main')
+    await expect(main.locator('[data-session]').first()).toBeVisible()
+    await main.evaluate((element) => {
+      element.scrollTop = 900
+    })
+    await expect.poll(() => main.evaluate((element) => element.scrollTop)).toBeGreaterThan(800)
+    await drawn(page)
+
+    // The first session in view, by its identity, and where it is in the scrolling area.
+    const inTheArea = (id: string | null) =>
+      page.evaluate((wanted) => {
+        const scroller = document.querySelector('.m-main') as HTMLElement
+        const edge = scroller.getBoundingClientRect().top
+        const rows = Array.from(document.querySelectorAll<HTMLElement>('[data-session]'))
+        const row =
+          wanted === null
+            ? rows.find((each) => each.getBoundingClientRect().bottom > edge + 1)
+            : rows.find((each) => each.dataset.session === wanted)
+        return row === undefined ? null : { id: row.dataset.session ?? '', top: row.getBoundingClientRect().top - edge }
+      }, id)
+    const before = await inTheArea(null)
+    expect(before).not.toBeNull()
+
+    // The bar grows: the area moves down and gets shorter, and the list in it is as it was.
+    await page.evaluate(() => {
+      const bar = document.querySelector<HTMLElement>('.m-topbar')
+      if (bar === null) throw new Error('no bar')
+      bar.style.paddingBlockEnd = '60px'
+    })
+    await drawn(page)
+    await page.evaluate(() => {
+      window.krTestHost?.sharing.hold({ session: '4' })
+    })
+    await readAgain(page)
+    await expect(page.getByTestId('shared-with-you')).toBeAttached()
+    await drawn(page)
+    const after = await inTheArea(before?.id ?? null)
+    expect(
+      Math.abs((after?.top ?? Number.NaN) - (before?.top ?? Number.NaN)),
+      `the session kept its place in the area (${JSON.stringify({ before, after })})`
+    ).toBeLessThanOrEqual(1)
+  })
 })
