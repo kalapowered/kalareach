@@ -366,10 +366,16 @@ export function VoiceRoute({
           .then(async (settled) => {
             const outcome = settled.value?.outcome
             if (!outcome) {
-              setNotice(
-                'The host never said whether it created that call. Nothing is running on this device.'
+              setNotice('The host never said whether it created that call.')
+              // What the device then says of the end is its own words: whether the media stopped
+              // and what is owed are not for this screen to guess.
+              void ask(() => port.voiceCallState()).then(
+                (state) => {
+                  settle(state)
+                  if (state.ended) setNotice(endedWords(state.ended))
+                },
+                () => undefined
               )
-              void ask(() => port.voiceCallState()).then(settle, () => undefined)
               return
             }
             if ('preparation_changed' in outcome) {

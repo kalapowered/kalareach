@@ -532,7 +532,9 @@ export function endedWords(
  * stands until the moment the host's grant ends by itself.
  */
 export function owedWords(owed: VoiceOwed): string {
-  return owed.words
+  if (owed.kind !== 'revocation') return owed.words
+  const until = new Date(owed.until_ms).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+  return `A grant the host may still hold open ends by itself at ${until}. ${owed.words}`
 }
 
 /** Every capture state the surface can draw, by its wire name. */
