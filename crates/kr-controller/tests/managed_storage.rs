@@ -2182,23 +2182,40 @@ async fn the_daemon_a_person_runs_reaches_the_storage_service_it_selects() {
         served.web().requests_reach(STATUS, 1),
     )
     .await;
-    let result: HostDoctorResult = client
-        .request(Method::HostDoctor, &())
-        .await
-        .expect("the call reaches the daemon")
-        .expect("host.doctor is served on the local socket")
-        .to_typed()
-        .expect("a result of the declared shape");
-    let check = result
-        .checks
-        .iter()
-        .find(|check| check.id() == "managed-storage")
-        .unwrap_or_else(|| {
-            panic!(
-                "the storage check is reported; the daemon's log says: {}",
-                std::fs::read_to_string(&log_path).unwrap_or_default()
-            )
-        });
+    // The doctor asks the service itself, and gives it a few seconds to answer. A service that a
+    // busy machine is slow to answer is a question the doctor says it could not settle, and what it
+    // says the next time it asks is the service's answer to that one. So the check is asked for
+    // until the doctor has heard the service within its patience; a refusal or anything else the
+    // check says ends the test at once, and a service that never answers in time is the guard's.
+    let check = within("the doctor to hear the storage service answer", async {
+        loop {
+            let result: HostDoctorResult = client
+                .request(Method::HostDoctor, &())
+                .await
+                .expect("the call reaches the daemon")
+                .expect("host.doctor is served on the local socket")
+                .to_typed()
+                .expect("a result of the declared shape");
+            let check = result
+                .checks
+                .into_iter()
+                .find(|check| check.id() == "managed-storage")
+                .unwrap_or_else(|| {
+                    panic!(
+                        "the storage check is reported; the daemon's log says: {}",
+                        std::fs::read_to_string(&log_path).unwrap_or_default()
+                    )
+                });
+            if check.status == DoctorStatus::Ok
+                || !check
+                    .detail()
+                    .contains("did not answer the last question in time")
+            {
+                return check;
+            }
+        }
+    })
+    .await;
     assert_eq!(check.status, DoctorStatus::Ok, "{}", check.detail());
     assert!(
         check.detail().contains("backup storage is on"),
