@@ -1113,9 +1113,30 @@ async fn stop_daemon_of(tree: &teardown::Tree) -> bool {
 /// Waits for `child` to end, and returns what it printed; a child that has not ended within `limit`
 /// is described, ended, and the test fails with the description: the program and its arguments,
 /// the programs it started, and what each of their threads waits for.
+///
+/// What the child prints is read while it runs. A program that writes more than a pipe holds waits
+/// for its reader, so a reader that waited for the program to end first would wait for ever, and
+/// whether the program wrote that much depends on what it was asked.
 fn finish_within(mut child: std::process::Child, limit: Duration) -> Output {
+    fn drain(
+        pipe: Option<impl std::io::Read + Send + 'static>,
+    ) -> std::thread::JoinHandle<Vec<u8>> {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            if let Some(mut pipe) = pipe {
+                let _ = pipe.read_to_end(&mut bytes);
+            }
+            bytes
+        })
+    }
+
+    let stdout = drain(child.stdout.take());
+    let stderr = drain(child.stderr.take());
     let deadline = Instant::now() + limit;
-    while matches!(child.try_wait(), Ok(None)) {
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("the program's status") {
+            break status;
+        }
         if Instant::now() >= deadline {
             let waiting = what_the_program_waits_on(child.id());
             let _ = child.kill();
@@ -1126,8 +1147,14 @@ fn finish_within(mut child: std::process::Child, limit: Duration) -> Output {
             );
         }
         std::thread::sleep(Duration::from_millis(50));
+    };
+    Output {
+        status,
+        stdout: stdout.join().expect("what the program printed"),
+        stderr: stderr
+            .join()
+            .expect("what the program printed to standard error"),
     }
-    child.wait_with_output().expect("the program ends")
 }
 
 /// Describes the program `pid`, which has not ended: the program with its arguments and its state,
