@@ -880,10 +880,10 @@ async fn a_step_holds_the_lock_another_companion_waits_on_while_it_runs() {
         .open(computer.data.path().join("recovery").join("recovery.lock"))
         .expect("the lock file");
     assert!(
-        lock.try_lock().is_ok(),
+        kr_flush::lock::try_exclusive(&lock).is_ok(),
         "nothing holds the lock between steps"
     );
-    lock.unlock().expect("released");
+    kr_flush::lock::release(&lock).expect("released");
 
     // The service holds the first write, so the step is in flight.
     let web = Arc::clone(computer.served.web());
@@ -893,7 +893,10 @@ async fn a_step_holds_the_lock_another_companion_waits_on_while_it_runs() {
     let step = tokio::spawn(async move { recovery.turn_on(&account).await });
     web.requests_reach(SYNC_PATH, 1).await;
     assert!(
-        matches!(lock.try_lock(), Err(std::fs::TryLockError::WouldBlock)),
+        matches!(
+            kr_flush::lock::try_exclusive(&lock),
+            Err(std::fs::TryLockError::WouldBlock)
+        ),
         "a step in flight holds the lock"
     );
 
@@ -902,7 +905,7 @@ async fn a_step_holds_the_lock_another_companion_waits_on_while_it_runs() {
         .expect("the step ends")
         .expect_err("the held write was never answered");
     assert!(
-        lock.try_lock().is_ok(),
+        kr_flush::lock::try_exclusive(&lock).is_ok(),
         "the lock is let go when the step ends"
     );
 }
