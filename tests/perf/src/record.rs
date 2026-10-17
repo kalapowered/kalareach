@@ -49,7 +49,7 @@ pub struct Speed {
 }
 
 impl Speed {
-    /// Runs the work [`SPEED_READINGS`] times and keeps the quickest, because a run that was
+    /// Runs the work `SPEED_READINGS` times and keeps the quickest, because a run that was
     /// preempted says how busy the host was, and the time it takes to do the work at its best is
     /// what its speed is.
     #[must_use]
