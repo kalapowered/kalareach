@@ -212,6 +212,7 @@ fn voice_calls(app: &tauri::AppHandle) -> voice::Calls {
     use std::sync::Arc;
 
     use companion_platform::call::{NativeCalls, PluginCommands};
+    use tauri::Manager as _;
 
     match voice::Service::managed() {
         Ok(service) => voice::Calls::on_phone(

@@ -51,6 +51,9 @@ function failureMessage(value: unknown): string {
  */
 const CAPTURE_POLL_MS = 500
 
+/** How often the screen re-reads what is owed to a host while a revocation is, in milliseconds. */
+const OWED_POLL_MS = 5_000
+
 /**
  * Runs one request and answers with what it did.
  *
@@ -344,6 +347,26 @@ export function VoiceRoute({
       window.clearInterval(timer)
     }
   }, [port, reading, settle])
+
+  // What is owed to a host may be settled while no call runs: the host is reached again, and the
+  // device asks it once more. The screen reads again every few seconds while a revocation is owed,
+  // so it does not go on saying that a grant may be open once the host has said it is not.
+  const revocationOwed = (left?.owed ?? []).some((owed) => owed.kind === 'revocation')
+  useEffect(() => {
+    if (!revocationOwed) return
+    let current = true
+    const timer = window.setInterval(() => {
+      void ask(() => port.voiceCallState())
+        .then((state) => {
+          if (current) settle(state)
+        })
+        .catch(() => undefined)
+    }, OWED_POLL_MS)
+    return () => {
+      current = false
+      window.clearInterval(timer)
+    }
+  }, [port, revocationOwed, settle])
 
   // What this device owes lapses by itself, and the device stops saying it then: the screen reads
   // again at the first lapse it is waiting for, so a warning does not outlive what it warns of.

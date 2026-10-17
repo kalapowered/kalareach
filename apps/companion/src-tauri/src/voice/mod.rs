@@ -213,6 +213,9 @@ pub(crate) struct Shared {
     emergency: Mutex<Option<(u64, Emergency)>>,
     /// Where what outlives a launch is kept.
     kept: Kept,
+    /// Held from the moment what is kept is copied until it is written, so that what is written
+    /// last is what was copied last: a copy taken earlier never replaces a later one.
+    keeping: Mutex<()>,
 }
 
 impl Shared {
@@ -255,6 +258,10 @@ impl Shared {
     /// leaves the record in memory, which is what the screen reads: ending a call is never stopped
     /// by a file.
     pub(crate) fn keep(&self) {
+        let _ordered = self
+            .keeping
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let owed = self
             .view
             .lock()
@@ -603,15 +610,17 @@ impl Calls {
                 note: Mutex::new(before.note),
                 emergency: Mutex::new(None),
                 kept,
+                keeping: Mutex::new(()),
             })),
         }
     }
 
-    /// Tells the host a call left a grant at that it is reached, over `session`, so that what this
-    /// device owes it is asked once more: each revocation owed to `host` in `environment` goes to
-    /// the host again, and an answer of any kind, that it revoked the grant or that it knows no such
-    /// call, settles it. A host that does not answer leaves it owed until the grant lapses. It runs
-    /// on a task of its own and the screen does not wait for it.
+    /// Says that the host a call left a grant at is reached, over `session`, so that what this
+    /// device owes it is asked once more: each revocation owed to `host` in `environment` that has
+    /// not lapsed goes to the host again. That the host revoked the grant, or says it holds no such
+    /// voice session, settles it; a host that could not do it now, or does not answer, leaves it
+    /// owed until the grant lapses. It runs on a task of its own and the screen does not wait for
+    /// it.
     pub fn host_reached(
         &self,
         host: kr_protocol::ids::DeviceId,
@@ -621,20 +630,29 @@ impl Calls {
         let Some(shared) = self.shared.clone() else {
             return;
         };
-        let owed: Vec<VoiceSessionId> = shared
+        let owed: Vec<(VoiceSessionId, u64)> = shared
             .view
             .lock()
             .expect("the view lock is not poisoned")
             .owed
             .iter()
             .filter(|owed| owed.kind == "revocation" && owed.host == Some((host, environment)))
-            .filter_map(|owed| owed.voice_session_id.as_deref()?.parse().ok())
+            .filter_map(|owed| {
+                Some((
+                    owed.voice_session_id.as_deref()?.parse().ok()?,
+                    owed.until_ms,
+                ))
+            })
             .collect();
         if owed.is_empty() {
             return;
         }
         tokio::spawn(async move {
-            for voice_session_id in owed {
+            for (voice_session_id, until_ms) in owed {
+                // What has lapsed is not asked: the grant has ended by itself.
+                if until_ms <= now_ms() {
+                    continue;
+                }
                 let end = host::revoke(
                     &session,
                     environment,
@@ -814,19 +832,20 @@ impl Calls {
         let Some(shared) = &self.shared else {
             return VoiceCallState::no_call();
         };
-        let mut state = shared
-            .view
-            .lock()
-            .expect("the view lock is not poisoned")
-            .clone();
         // The slot is the one record of whether this device is busy with a call: a call that is
         // being made or given up holds it from the moment the start is taken until it is over,
-        // before any descriptor exists to name it.
+        // before any descriptor exists to name it. It is read first: a call writes its end and
+        // then frees the slot, so a read that finds the slot free finds the end too.
         let busy = shared
             .slot
             .lock()
             .expect("the slot lock is not poisoned")
             .is_some();
+        let mut state = shared
+            .view
+            .lock()
+            .expect("the view lock is not poisoned")
+            .clone();
         state.setting_up = busy && !state.running;
         state.ending = state.setting_up && state.ending;
         let now = now_ms();

@@ -711,6 +711,25 @@ describe('while a call is running', () => {
     expect(failed).toBe(true)
   })
 
+  // A host that is reached again settles what it was owed, while no call runs and nothing on the
+  // screen has changed: the screen reads again while a revocation is owed, and stops saying it.
+  it('stops saying what is owed once the device has settled it with the host', async () => {
+    const { controls } = start((controls) => {
+      controls.oweVoice({})
+    })
+    await waitForChoice()
+    expect(await screen.findByRole('status', { name: 'The last call' })).toBeInTheDocument()
+
+    controls.settleOwedVoice()
+
+    await waitFor(
+      () => {
+        expect(screen.queryByRole('status', { name: 'The last call' })).not.toBeInTheDocument()
+      },
+      { timeout: 8000 }
+    )
+  })
+
   // What the device owes stops being said when it lapses, with no other change on the screen.
   it('stops saying what is owed when it has lapsed', async () => {
     start((controls) => {

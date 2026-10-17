@@ -2,11 +2,12 @@
 //!
 //! Two things outlive the process. What a call left owed (a grant the host may still hold open, a
 //! start it never answered) lasts until the moment the grant ends by itself, and a person who
-//! closes and opens the application inside that time must still be told. And the host's answer
-//! that its voice service had no such call for this account is remembered until the account, the
-//! host or the service changes. Both are in one small file in the application's data directory,
-//! replaced as a whole: written to a name of its own, flushed, renamed over the old one, and the
-//! directory flushed, so a crash leaves the old file or the new one and nothing between.
+//! closes and opens the application inside that time must still be told. And the voice service's
+//! answer on a call's control that it had no such call for this account is remembered until a
+//! call's control attaches again, and counts only for the same host, account and service. Both are
+//! in one small file in the application's data directory, replaced as a whole: written to a name of
+//! its own, flushed, renamed over the old one, and the directory flushed, so a crash leaves the old
+//! file or the new one and nothing between.
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -30,7 +31,8 @@ const VERSION: u8 = 1;
 pub struct KeptVoice {
     /// What the calls left owed.
     pub owed: Vec<OwedView>,
-    /// The host's answer that its voice service had no such call, and what it was about.
+    /// The voice service's answer that it had no such call, and the host, account and service it
+    /// was about.
     pub note: Option<NoteKey>,
 }
 
@@ -92,6 +94,19 @@ impl Kept {
         let Some(directory) = &self.directory else {
             return KeptVoice::default();
         };
+        // A file staged by a process that ended before it was put in place is one nothing will
+        // finish: this process is the file's only writer, and it has not written yet.
+        if let Ok(entries) = std::fs::read_dir(directory) {
+            for entry in entries.flatten() {
+                if entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("voice-kept.staged-")
+                {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
         let bytes = match std::fs::read(directory.join(FILE)) {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -135,7 +150,9 @@ impl Kept {
     ///
     /// # Errors
     ///
-    /// Returns why the file could not be put in place; what was kept before is then as it was.
+    /// Returns why the file could not be put in place. A failure before the rename leaves what was
+    /// kept before as it was; a failure to flush the directory after it leaves the new file in
+    /// place, whose survival of a crash is then not known.
     pub fn write(&self, kept: &KeptVoice) -> std::io::Result<()> {
         static STAGED: AtomicU64 = AtomicU64::new(0);
         let Some(directory) = &self.directory else {

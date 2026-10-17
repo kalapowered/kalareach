@@ -196,9 +196,7 @@ pub async fn revoke(
                 words: error.message,
             },
         },
-        Ok(Err(kr_client::ClientError::Host(error))) => HostEnd::Refused {
-            words: error.message,
-        },
+        Ok(Err(kr_client::ClientError::Host(error))) => end_of_refusal(&error),
         Ok(Err(error)) => HostEnd::NotTold {
             words: error.to_string(),
         },
@@ -215,4 +213,46 @@ fn told_the_service(answer: &kr_client::Settled) -> bool {
         kr_cbor::CanonicalValue::Map(result)
             if matches!(result.get("broker_notified"), Some(kr_cbor::CanonicalValue::Bool(true)))
     )
+}
+
+/// What a host's refusal of a stop came to.
+///
+/// A refusal that says the host holds no such voice session, or does not let this device stop it
+/// (`PermissionDenied`), is the host's last word: the grant it holds ends when the call was to
+/// close. Any other refusal is a host that could not do it now, such as a store that would not
+/// write the revocation, and the host then keeps the session and its live grant for a stop asked
+/// again: nothing was revoked, and the revocation is still owed.
+pub(super) fn end_of_refusal(error: &kr_protocol::error::ProtocolError) -> HostEnd {
+    if error.code == kr_protocol::error::ErrorCode::PermissionDenied {
+        HostEnd::Refused {
+            words: error.message.clone(),
+        }
+    } else {
+        HostEnd::NotTold {
+            words: format!("The host could not revoke the grant now: {}", error.message),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn refusal(code: kr_protocol::error::ErrorCode) -> kr_protocol::error::ProtocolError {
+        kr_protocol::error::ProtocolError::new(code, "the host's words".to_owned())
+    }
+
+    /// Only a host that holds no such voice session is done with a revocation. A host whose store
+    /// refused to write it holds the grant live, and a revocation owed to it stays owed.
+    #[test]
+    fn only_a_refusal_that_says_no_such_voice_session_is_final() {
+        assert!(matches!(
+            end_of_refusal(&refusal(kr_protocol::error::ErrorCode::PermissionDenied)),
+            HostEnd::Refused { .. }
+        ));
+        assert!(matches!(
+            end_of_refusal(&refusal(kr_protocol::error::ErrorCode::StorageUnavailable)),
+            HostEnd::NotTold { .. }
+        ));
+    }
 }

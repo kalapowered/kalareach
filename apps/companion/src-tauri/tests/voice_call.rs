@@ -1829,7 +1829,7 @@ enum FailsAt {
     /// became of a start.
     Reaching,
     /// The first look at the host a call belongs to, which the owner takes before it asks
-    /// native code for anything.
+    /// native code for anything; it fails whatever `told` says.
     InUse,
 }
 
@@ -2208,7 +2208,8 @@ async fn a_revocation_owed_to_a_host_survives_a_launch_and_is_asked_again_when_t
     assert!(!state.owed[0].host_name.is_empty());
 
     // The host did revoke the grant: only its answer was late. The phone reaches the host, and the
-    // host is asked again, answers that it knows no such voice session, and the entry is settled.
+    // host is asked again by the device that was launched again, from what the file kept of the
+    // host's identity, answers that it knows no such voice session, and the entry is settled.
     let connection = scene
         .phone
         .companion
@@ -2219,16 +2220,18 @@ async fn a_revocation_owed_to_a_host_survives_a_launch_and_is_asked_again_when_t
     let companion_tauri::connection::Standing::Paired { host, .. } = connection.standing() else {
         panic!("the phone is a paired device");
     };
-    scene.phone.companion.app.state::<Calls>().host_reached(
+    relaunched.host_reached(
         host.host_device_id,
         connection.environment_id(),
         connection.session(),
     );
-    scene
-        .state_where("the host asked again and the entry settled", |state| {
-            state["owed"].as_array().is_some_and(Vec::is_empty)
-        })
-        .await;
+    tokio::time::timeout(WATCHDOG, async {
+        while !relaunched.state(None).owed.is_empty() {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("the host asked again and the entry settled");
     // What was settled is not owed after the next launch either.
     let again = Calls::on_phone(
         ScriptedCalls::new() as Arc<dyn companion_platform::call::CallPlatform>,
