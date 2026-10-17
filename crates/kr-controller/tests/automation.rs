@@ -2855,6 +2855,12 @@ impl DaemonProcess {
             .arg(temp.root().join("no-such-worker"))
             .arg("--secret-store")
             .arg("file")
+            .env(
+                kr_controller::testing::GIT_READ_BOUND_VARIABLE,
+                kr_controller::testing::HUNG_GIT_READ
+                    .as_millis()
+                    .to_string(),
+            )
             .stdin(std::process::Stdio::null())
             .stdout(log.try_clone().expect("duplicates the log"))
             .stderr(log)
