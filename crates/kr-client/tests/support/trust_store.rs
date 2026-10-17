@@ -177,24 +177,25 @@ pub async fn run_child(
     cert_dir: Option<&Path>,
 ) -> std::process::Output {
     let binary = std::env::current_exe().expect("this test binary");
-    let mut command = std::process::Command::new(binary);
+    let mut command = tokio::process::Command::new(binary);
     command
         .args(["--exact", "--ignored", "--nocapture", test])
         .env(SERVER_PORT, port.to_string())
         .env_remove("SSL_CERT_FILE")
         .env_remove("SSL_CERT_DIR")
-        .current_dir(std::env::temp_dir());
+        .current_dir(std::env::temp_dir())
+        // A child that outlasts the wait is ended with it, not left running.
+        .kill_on_drop(true);
     if let Some(file) = cert_file {
         command.env("SSL_CERT_FILE", file);
     }
     if let Some(directory) = cert_dir {
         command.env("SSL_CERT_DIR", directory);
     }
-    let child = tokio::task::spawn_blocking(move || command.output().expect("the child"));
-    tokio::time::timeout(PATIENCE, child)
+    tokio::time::timeout(PATIENCE, command.output())
         .await
         .expect("the child finishes")
-        .expect("the child's thread")
+        .expect("the child ran")
 }
 
 /// Runs `test` once under each of `store`'s settings against `server`, and returns the settings
