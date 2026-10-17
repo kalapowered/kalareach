@@ -78,6 +78,10 @@ import type {
   VoiceAllowed,
   VoiceAllowRequest,
   VoiceCallState,
+  VoiceDelegationRow,
+  VoiceEnded,
+  VoiceFence,
+  VoiceOwed,
   VoiceScope,
   VoiceStartRequest,
   Written
@@ -439,11 +443,23 @@ export interface FakeHostControls {
   /** Puts the running call's microphone into one of the states a platform reports. */
   setVoiceCapture(state: string): void
   /**
-   * Announces one delegation to the running call, as the device's own record of the provider's
-   * channel would: its identifier, where in the call it happened, and the words the person said
-   * to it, or none when `words` is null.
+   * Records one delegation the provider announced to the running call, as the call's owner does:
+   * this version acts on none, so the row says so, and says whether the model was told.
    */
-  announceVoiceDelegation(delegationId: string, words?: string | null): void
+  announceVoiceDelegation(delegationId: string, told?: boolean): void
+  /**
+   * Ends the running call without the page asking, as the notification's stop, a failed connection
+   * or the voice service would: the call is gone, and `ended` is what it left.
+   */
+  endVoiceCall(ended?: Partial<VoiceEnded>): void
+  /** Starts a call that no screen asked for, as a screen that is loaded again finds one. */
+  holdAVoiceCall(): void
+  /** Sets whether the host the call belongs to is reached: `reachable` or `lost`. */
+  setVoiceHost(host: 'reachable' | 'lost'): void
+  /** Sets the warning a person is told before starting, or none. */
+  setVoiceWarning(words: string | null): void
+  /** Leaves something owed at the host, until the moment the call would have closed. */
+  oweVoice(owed: Partial<VoiceOwed>): void
   /** Changes what the pairing screen shows, as native code would publish it. */
   setPairing(change: Partial<PairingView>): void
   /** The references the page asked to use as the host its commands go to, in order. */
@@ -479,6 +495,11 @@ export interface FakeHostControls {
    * cannot read, as a host that has changed the barrier's shape does.
    */
   leaveNextVoiceStopFenceUnreadable(): void
+  /**
+   * Has the next allowance of voice be answered with no status for its fence that the page's build
+   * can read, as a host older than the one that added it does.
+   */
+  leaveNextVoiceAllowFenceUnreadable(): void
   /** What the next paste from the clipboard finds. */
   setPasteboard(result: PasteView): void
   /** The codes the page started pairing with, in order. */
@@ -743,6 +764,10 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
   const voice: VoiceState = {
     call: null,
     delegations: [],
+    host: 'reachable',
+    ended: null,
+    warning: null,
+    owed: [],
     brokerReachable: seed.brokerReachable,
     startRefusal: null,
     rate: { ...VOICE_TERMS.rate },
@@ -761,6 +786,7 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
   let voiceAllowUnconfirmed = false
   /** Whether the next end of a call is answered with a barrier this build cannot read. */
   let voiceStopFenceUnreadable = false
+  let allowFenceUnreadable = false
   /** The sessions whose workers the next voice change leaves pending, and how many it cuts. */
   let voiceFencePendingAt: { sessionIds: readonly string[]; cut: number } | null = null
   /** The barrier the next voice change carries: none, or workers that have not held. */
@@ -1745,6 +1771,8 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
       const actions = asked.filter((action) => !voiceHeldBack.includes(action))
       const notHeld = asked.filter((action) => voiceHeldBack.includes(action))
       voiceHeldBack = []
+      const unreadableFence = allowFenceUnreadable
+      allowFenceUnreadable = false
       return reading('voiceAllow', () => ({
         receipt: null,
         action_id: null,
@@ -1758,7 +1786,7 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
             unlocked_screen_actions: []
           },
           not_held_by_device: notHeld,
-          barrier: voiceBarrier()
+          fence: unreadableFence ? ({ kind: 'unreadable' } as const) : voiceFence(voiceBarrier())
         } satisfies VoiceAllowed
       }))
     },
@@ -1834,6 +1862,9 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
       }
       const started = fakeVoiceSession(request.sessionIds, VOICE_NOW_MS + 1_800_000)
       voice.call = { session: started, capture: voice.startCapture, playing: true }
+      voice.ended = null
+      voice.delegations = []
+      voice.host = 'reachable'
       return Promise.resolve({
         receipt: null,
         action_id: null,
@@ -1844,8 +1875,14 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
     voiceStop: () => {
       const running = voice.call
       voice.call = null
-      voice.delegations = []
+      voice.host = 'none'
       if (!connected) {
+        if (running) {
+          voice.ended = endedBy('requested', 'You ended the call.', {
+            kind: 'not_told',
+            words: 'This host cannot be contacted right now.'
+          })
+        }
         return Promise.resolve({
           closed_locally: running !== null,
           fence: null,
@@ -1860,6 +1897,17 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
       const unreadable = voiceStopFenceUnreadable
       voiceStopFenceUnreadable = false
       const barrier = unreadable ? null : voiceBarrier()
+      if (running) {
+        voice.ended = endedBy('requested', 'You ended the call.', {
+          kind: 'revoked',
+          fence: unreadable
+            ? { kind: 'unreadable' }
+            : barrier === null
+              ? { kind: 'not_owed' }
+              : { kind: 'barrier', barrier },
+          broker_notified: true
+        })
+      }
       return Promise.resolve({
         closed_locally: running !== null,
         fence: unreadable
@@ -1868,36 +1916,6 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
             ? { kind: 'not_owed' }
             : { kind: 'barrier', barrier },
         host_failure: null
-      })
-    },
-
-    voiceDelegate: (params) => {
-      requireConnection()
-      const asked = requireFields(params, [
-        'voice_session_id',
-        'delegation_id',
-        'offset_ms',
-        'fragments',
-        'confirmation'
-      ])
-      const delegationId = typeof asked.delegation_id === 'string' ? asked.delegation_id : ''
-      if (!voice.delegations.includes(delegationId)) {
-        refuse('INVALID_ARGUMENT', 'This call was never told about that delegation.')
-      }
-      return Promise.resolve({
-        receipt: null,
-        action_id: null,
-        value: {
-          delegation_id: delegationId,
-          action: 'status',
-          session_id: SESSION_MAIN,
-          outcome: {
-            admitted: {
-              action_id: nextActionId(),
-              note: HOST_ADMISSION_NOTE
-            }
-          }
-        }
       })
     },
 
@@ -2067,6 +2085,9 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
     leaveNextVoiceChangePendingAt(sessionIds, cut = 0) {
       voiceFencePendingAt = { sessionIds, cut }
     },
+    leaveNextVoiceAllowFenceUnreadable() {
+      allowFenceUnreadable = true
+    },
     leaveNextVoiceStopFenceUnreadable() {
       voiceStopFenceUnreadable = true
     },
@@ -2205,21 +2226,48 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
     setVoiceCapture(state) {
       if (voice.call) voice.call.capture = state
     },
-    announceVoiceDelegation(delegationId, words = 'status') {
-      voice.delegations.push(delegationId)
-      const offset = 1_000 * voice.delegations.length
-      emit({
-        stream_id: `voice:${VOICE_SESSION}`,
-        sequence: String(voice.delegations.length),
-        body: {
-          kind: 'voice_delegation',
-          delegation_id: delegationId,
-          offset_ms: String(offset),
-          fragments:
-            words === null
-              ? []
-              : [{ start_ms: String(offset - 200), end_ms: String(offset), text: words }]
-        }
+    announceVoiceDelegation(delegationId, told = true) {
+      if (!voice.call) return
+      voice.delegations.push({
+        delegation_id: delegationId,
+        offset_ms: 1_000 * (voice.delegations.length + 1),
+        state: 'not_done',
+        told
+      })
+    },
+    endVoiceCall(ended) {
+      voice.call = null
+      voice.host = 'none'
+      voice.ended = {
+        ...endedBy('native_ended', 'The call ended on this device: from its notification, by the system, or at its time limit.', {
+          kind: 'revoked',
+          fence: { kind: 'not_owed' },
+          broker_notified: true
+        }),
+        ...ended
+      }
+    },
+    holdAVoiceCall() {
+      const session = fakeVoiceSession([SESSION_MAIN], VOICE_NOW_MS + 1_800_000)
+      voice.call = { session, capture: voice.startCapture, playing: true }
+      voice.ended = null
+      voice.delegations = []
+      voice.host = 'reachable'
+    },
+    setVoiceHost(host) {
+      voice.host = host
+    },
+    setVoiceWarning(words) {
+      voice.warning = words
+    },
+    oweVoice(owed) {
+      voice.owed.push({
+        kind: 'revocation',
+        words: 'The host was not told, so its grant may still be open.',
+        action_id: null,
+        voice_session_id: VOICE_SESSION,
+        until_ms: VOICE_NOW_MS + 1_800_000,
+        ...owed
       })
     },
     setPairing(change) {
@@ -2318,8 +2366,16 @@ interface VoiceState {
     capture: string
     playing: boolean
   } | null
-  /** The delegations the provider has announced to this call. */
-  delegations: string[]
+  /** The delegations the provider has announced to this call, as the call's owner records them. */
+  delegations: VoiceDelegationRow[]
+  /** Whether the host the call belongs to is reached. */
+  host: string
+  /** How the last call ended. */
+  ended: VoiceEnded | null
+  /** What a person is told before starting. */
+  warning: string | null
+  /** What this device could not finish, which the host may still hold open. */
+  owed: VoiceOwed[]
   /** Whether the control socket to the voice service is carrying requests. */
   brokerReachable: boolean
   /** The reason a start answers `unavailable` with, when one is set. */
@@ -2369,15 +2425,40 @@ export type VoiceTermsState = 'published' | 'closed' | 'unread'
 /** What the call this device is holding is doing. */
 function voiceCallState(voice: VoiceState): VoiceCallState {
   const running = voice.call
+  const left = { ended: voice.ended, warning: voice.warning, owed: voice.owed }
   if (!running) {
-    return { running: false, capture: 'idle', playing: false, control: 'none' }
+    return {
+      running: false,
+      capture: 'idle',
+      playing: false,
+      control: 'none',
+      host: 'none',
+      session: null,
+      delegations: voice.delegations,
+      ...left
+    }
   }
   return {
     running: true,
     capture: running.capture,
     playing: running.playing,
-    control: voice.brokerReachable ? 'connected' : 'unreachable'
+    control: voice.brokerReachable ? 'connected' : 'unreachable',
+    host: voice.host,
+    // The provider's answer holds the call's ICE credentials, and is native code's alone.
+    session: { ...running.session, answer_sdp: '' },
+    delegations: voice.delegations,
+    ...left
   }
+}
+
+/** What a barrier, or the lack of one, shows of a fence, as the page is given it. */
+function voiceFence(barrier: VoiceStopResult['barrier']): VoiceFence {
+  return barrier === null ? { kind: 'not_owed' } : { kind: 'barrier', barrier }
+}
+
+/** How a call ended, as the call's owner records it. */
+function endedBy(cause: string, words: string, host: VoiceEnded['host']): VoiceEnded {
+  return { cause, words, closed_locally: true, host, broker: 'closed_by_host' }
 }
 
 /** The content classes section 15 ¶12 leaves out of the default context. */
@@ -2469,10 +2550,6 @@ const VOICE_TERMS: VoiceManagedTerms = {
   heartbeat_seconds: 20,
   context_bytes: 500
 }
-
-/** What this host says when it admits a delegation it has not performed. */
-const HOST_ADMISSION_NOTE =
-  'The model received this context. It is not evidence that a host action ran or that audio was played; host action receipts are the authority for that.'
 
 /** The running voice session this host answers a start with. */
 function fakeVoiceSession(

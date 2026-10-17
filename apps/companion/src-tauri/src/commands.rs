@@ -1659,14 +1659,39 @@ pub(crate) fn fence_of(answer: &kr_client::Settled) -> Result<VoiceFence> {
     })
 }
 
-/// A replacement's result as the page reads it: what the grant permits and could not carry, and the
-/// barrier of its fence without the names of the actions the fence named.
-fn allowed_for_the_page(granted: kr_protocol::voice::VoiceGrantResult) -> VoiceAllowed {
-    VoiceAllowed {
-        statement: granted.statement,
-        not_held_by_device: granted.not_held_by_device,
-        barrier: kr_protocol::scalars::Nullable(granted.barrier.0.map(without_the_names)),
-    }
+/// A replacement's result as the page reads it: what the grant permits and could not carry, each
+/// read strictly, and what the answer showed of the fence its replacement owed, read the way a
+/// stop's is ([`fence_of`]).
+///
+/// The host has replaced the grant by the time it answers. So an answer this build cannot read
+/// (a host older than the build that added the fence's status, say) is not a failure to ask: the
+/// grant may have changed, and the person is told that, not that the request failed here.
+fn allowed_from(answer: &kr_client::Settled) -> Result<VoiceAllowed> {
+    let unreadable = || {
+        CommandError::unavailable(
+            "The host answered, but this application could not read what it granted, so the \
+             grant may have changed. Allow voice again to read it.",
+        )
+    };
+    let kr_client::Settled::Result(value) = answer else {
+        return Err(unreadable());
+    };
+    let kr_cbor::CanonicalValue::Map(result) = value.as_value() else {
+        return Err(unreadable());
+    };
+    let member = |name: &str| result.get(name).cloned().ok_or_else(unreadable);
+    let statement = kr_protocol::envelope::ParamsValue::from(member("statement")?)
+        .to_typed::<kr_protocol::voice::VoiceGrantStatement>()
+        .map_err(|_| unreadable())?;
+    let not_held_by_device =
+        kr_protocol::envelope::ParamsValue::from(member("not_held_by_device")?)
+            .to_typed::<kr_protocol::scalars::CanonicalSet<kr_protocol::voice::VoiceAction>>()
+            .map_err(|_| unreadable())?;
+    Ok(VoiceAllowed {
+        statement,
+        not_held_by_device,
+        fence: fence_of(answer)?,
+    })
 }
 
 /// What the host's answer to a stop showed of the fence its withdrawal owed (read by `fence_of`).
@@ -1689,7 +1714,9 @@ pub enum VoiceFence {
 /// What ending a call did, locally and on the host.
 #[derive(Debug, Serialize)]
 pub struct VoiceClosure {
-    /// Whether a call of this process's own was closed. It holds none, so this is false.
+    /// Whether this device's own call is stopped: native code returned from the stop, or had ended
+    /// the call already. False when this device held no call (the page named one it does not hold,
+    /// and only the host was asked) and when native code did not return from the stop in time.
     pub closed_locally: bool,
     /// What the host's answer showed of its fence; none when there was no answer to read: the host
     /// could not be told, or what it answered was not a stop's result.
@@ -1834,14 +1861,16 @@ struct VoiceAllow {
     actions: Option<Vec<kr_protocol::voice::VoiceAction>>,
 }
 
-/// What allowing voice came to: the sentences the grant states, what it could not carry, and the
-/// barrier of the fence that replacing the grant owed. The device the grant is for is not in it.
+/// What allowing voice came to: the sentences the grant states, what it could not carry, and what
+/// the answer showed of the fence that replacing the grant owed. The device the grant is for is
+/// not in it.
 ///
 /// Replacing the standing grant ends the calls under it, and when a close sent under one of them
 /// can still reach a worker the host's answer names the workers that have not acknowledged the
-/// fence. That is passed on as the host gave it, less the names of the actions the fence named
-/// (see `without_the_names`), and null when the replacement owed none, so the screen can say
-/// that those workers are still to confirm.
+/// fence. That is passed on as a stop's is (see [`fence_of`]): the barrier less the names of the
+/// actions the fence named, `not_owed` when the replacement owed none, and `unreadable` when the
+/// answer gave no status this build can read, so the screen can say that those workers are still
+/// to confirm, or that it cannot tell.
 #[derive(Debug, Serialize)]
 pub struct VoiceAllowed {
     /// What the grant permits, each action in the sentence that states it.
@@ -1849,8 +1878,8 @@ pub struct VoiceAllowed {
     /// The actions the person asked for that this device's own grant does not carry, so the grant
     /// does not either.
     pub not_held_by_device: kr_protocol::scalars::CanonicalSet<kr_protocol::voice::VoiceAction>,
-    /// The per-worker status of the fence the replacement owed, or null when it owed none.
-    pub barrier: kr_protocol::scalars::Nullable<kr_protocol::action::RevocationBarrier>,
+    /// What the answer showed of the fence the replacement owed.
+    pub fence: VoiceFence,
 }
 
 /// A fence's barrier as the page reads it: which workers have held and which have not, with every
@@ -1921,16 +1950,11 @@ pub async fn voice_allow(
         )
         .await;
     match settled {
-        Ok(kr_client::Settled::Result(value)) => {
-            let granted: kr_protocol::voice::VoiceGrantResult = value
-                .to_typed()
-                .map_err(|error| CommandError::local_failure(error.to_string()))?;
-            Ok(Settled {
-                receipt: None,
-                action_id: None,
-                value: Some(encode(&allowed_for_the_page(granted))?),
-            })
-        }
+        Ok(answer @ kr_client::Settled::Result(_)) => Ok(Settled {
+            receipt: None,
+            action_id: None,
+            value: Some(encode(&allowed_from(&answer)?)?),
+        }),
         other => submitted(other),
     }
 }
@@ -2625,10 +2649,9 @@ mod tests {
         )
     }
 
-    /// A replacement's result reaches the page without the names of the actions the fence named,
-    /// and as the page reads a session: its identifier as text, not as the wire's bytes.
-    #[test]
-    fn a_replacements_result_reaches_the_page_without_names() {
+    /// A replacement's answer as the client gives it: the result the host sends as a map, with the
+    /// member `without` left out when a test names one.
+    fn a_replacement_answered_without(without: Option<&str>) -> kr_client::Settled {
         use kr_protocol::ids::GrantId;
         use kr_protocol::scalars::{CanonicalSet, Nullable, Uuid};
 
@@ -2639,18 +2662,67 @@ mod tests {
             not_held_by_device: CanonicalSet::new(),
             barrier: Nullable::some(a_barrier_with_a_pending_worker()),
         };
+        let kr_cbor::CanonicalValue::Map(typed) =
+            kr_cbor::to_canonical_value(&granted).expect("it encodes")
+        else {
+            panic!("a result is a map");
+        };
+        let mut result = kr_cbor::CanonicalMap::new();
+        for (key, held) in typed.entries() {
+            if Some(key.as_str()) != without {
+                result.insert(key.clone(), held.clone()).expect("a key");
+            }
+        }
+        kr_client::Settled::Result(kr_cbor::CanonicalValue::Map(result).into())
+    }
 
-        let read = encode(&allowed_for_the_page(granted)).expect("it encodes");
+    /// A replacement's result reaches the page without the names of the actions the fence named,
+    /// and as the page reads a session: its identifier as text, not as the wire's bytes.
+    #[test]
+    fn a_replacements_result_reaches_the_page_without_names() {
+        use kr_protocol::scalars::Uuid;
+
+        let read = encode(&allowed_from(&a_replacement_answered_without(None)).expect("it reads"))
+            .expect("it encodes");
 
         let said = read.to_string();
         assert!(!said.contains("device:phone"), "{said}");
+        assert!(read.get("device_id").is_none(), "{said}");
+        assert_eq!(read["fence"]["kind"], "barrier");
         assert_eq!(
-            read["barrier"]["workers"][0]["session_id"],
+            read["fence"]["barrier"]["workers"][0]["session_id"],
             kr_protocol::ids::SessionId::new(Uuid::from_bytes([9; 16])).to_string(),
             "the page reads a session as text"
         );
-        assert_eq!(read["barrier"]["workers"][0]["state"], "pending");
-        assert_eq!(read["barrier"]["workers_total"], "1");
+        assert_eq!(read["fence"]["barrier"]["workers"][0]["state"], "pending");
+        assert_eq!(read["fence"]["barrier"]["workers_total"], "1");
+    }
+
+    /// The host has replaced the grant by the time it answers, so an answer this build cannot read
+    /// is not a failure of the request: the page is told the grant may have changed, and what the
+    /// answer showed of its fence is not taken for "none owed" when it showed none.
+    #[test]
+    fn a_replacement_this_build_cannot_read_is_told_as_unreadable_and_not_as_a_local_failure() {
+        for without in ["statement", "not_held_by_device"] {
+            let error = allowed_from(&a_replacement_answered_without(Some(without)))
+                .expect_err("an answer without its sentences is not read");
+            assert_eq!(
+                error.code,
+                kr_protocol::error::ErrorCode::ResourceUnavailable,
+                "{without}: {error:?}"
+            );
+            assert!(
+                error.message.contains("may have changed"),
+                "{without}: {error:?}"
+            );
+        }
+
+        let read =
+            allowed_from(&a_replacement_answered_without(Some("barrier"))).expect("it reads");
+        assert!(
+            matches!(read.fence, VoiceFence::Unreadable),
+            "no status for the workers is not none owed: {read:?}"
+        );
     }
 
     /// A stop's answer as the client gives it: the result the host sends, as a map the test may add

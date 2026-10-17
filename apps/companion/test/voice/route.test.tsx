@@ -23,7 +23,7 @@ const SESSION_MAIN = '8a7b6c50-22bb-4c3d-8e4f-000000000101'
 
 /** The voice calls this screen made, watched from before it was rendered. */
 type Watched = Record<
-  'voicePrepare' | 'voiceStart' | 'voiceContext' | 'voiceDelegate' | 'voiceSetMuted',
+  'voicePrepare' | 'voiceStart' | 'voiceContext' | 'voiceSetMuted',
   ReturnType<typeof vi.fn>
 >
 
@@ -40,7 +40,6 @@ function start(setup?: (controls: FakeHostControls) => void): {
     voicePrepare: port.voicePrepare.bind(port),
     voiceStart: port.voiceStart.bind(port),
     voiceContext: port.voiceContext.bind(port),
-    voiceDelegate: port.voiceDelegate.bind(port),
     voiceSetMuted: port.voiceSetMuted.bind(port)
   }
   const watched = {
@@ -50,9 +49,6 @@ function start(setup?: (controls: FakeHostControls) => void): {
     voiceStart: vi.fn((...args: Parameters<HostPort['voiceStart']>) => answers.voiceStart(...args)),
     voiceContext: vi.fn((...args: Parameters<HostPort['voiceContext']>) =>
       answers.voiceContext(...args)
-    ),
-    voiceDelegate: vi.fn((...args: Parameters<HostPort['voiceDelegate']>) =>
-      answers.voiceDelegate(...args)
     ),
     voiceSetMuted: vi.fn((...args: Parameters<HostPort['voiceSetMuted']>) =>
       answers.voiceSetMuted(...args)
@@ -99,9 +95,52 @@ describe('before a call exists', () => {
     // or send any context, so nothing beyond the preparation has been called.
     expect(watched.voiceStart).not.toHaveBeenCalled()
     expect(watched.voiceContext).not.toHaveBeenCalled()
-    expect(watched.voiceDelegate).not.toHaveBeenCalled()
     expect(watched.voiceSetMuted).not.toHaveBeenCalled()
     expect(watched.voicePrepare).toHaveBeenCalledTimes(1)
+  })
+
+  // What a grant permits is not what this version carries out, and the person is told so before
+  // they start, beside the list of what speaking is allowed to do.
+  it('says before a start that this version acts on no spoken request', async () => {
+    start()
+    await waitForChoice()
+
+    const permits = screen.getByRole('region', { name: 'What speaking will be allowed to do' })
+    expect(
+      within(permits).getByText('Not done: this version does not act on spoken requests.')
+    ).toBeInTheDocument()
+  })
+
+  // The device keeps what the last call left, and the screen shows it before another start: the
+  // warning from a service that had no such call, and a grant the host may still hold open.
+  it('shows the warning and what is owed before a start', async () => {
+    start((controls) => {
+      controls.setVoiceWarning('The last call found that this voice service has no such call.')
+      controls.oweVoice({ words: 'The host was not told, so its grant may still be open.' })
+    })
+    await waitForChoice()
+
+    const left = await screen.findByRole('status', { name: 'The last call' })
+    expect(within(left).getByText(/no such call/)).toBeInTheDocument()
+    expect(within(left).getByText(/its grant may still be open/)).toBeInTheDocument()
+  })
+
+  // A call that ended while no screen looked is said to have ended, in the device's words, when a
+  // screen is shown.
+  it('says how a call that ended with no screen looking ended', async () => {
+    start((controls) => {
+      controls.holdAVoiceCall()
+      controls.endVoiceCall({
+        cause: 'native_ended',
+        words: 'The call ended on this device: from its notification.',
+        host: { kind: 'not_told', words: 'The host could not be reached.' }
+      })
+    })
+    await waitForChoice()
+
+    const left = await screen.findByRole('status', { name: 'The last call' })
+    expect(within(left).getByText(/from its notification/)).toBeInTheDocument()
+    expect(within(left).getByText(/The host was not told, so its grant may still be open/)).toBeInTheDocument()
   })
 
   // A host that will not answer the preparation leaves the person with its refusal, not with a
@@ -426,58 +465,95 @@ describe('while a call is running', () => {
     expect(screen.getByRole('button', { name: 'End session' })).toBeEnabled()
   })
 
-  // Section 15 ¶7: a delegation the provider announced is submitted to the host over this device's
-  // own connection, and the row says what the host answered rather than what was asked for.
-  it('submits an announced delegation to the host and shows what it answered', async () => {
+  // The call is the application's own: a screen that is loaded again finds it where it is kept.
+  it('takes up a call that is running when the screen is shown', async () => {
+    start((controls) => {
+      controls.holdAVoiceCall()
+    })
+
+    await screen.findByRole('heading', { name: 'Voice session' })
+    expect(screen.getByText('Microphone on')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'End session' })).toBeEnabled()
+    expect(screen.queryByRole('button', { name: 'Start voice session' })).not.toBeInTheDocument()
+  })
+
+  // The same call ends with the person's hang-up, on the voice session it names.
+  it('ends a call it took up', async () => {
     const person = userEvent.setup()
-    const { controls, port } = start()
+    const { port } = start((controls) => {
+      controls.holdAVoiceCall()
+    })
+    const stopped = vi.spyOn(port, 'voiceStop')
+    await person.click(await screen.findByRole('button', { name: 'End session' }))
+
+    await waitFor(() => {
+      expect(screen.queryByRole('heading', { name: 'Voice session' })).not.toBeInTheDocument()
+    })
+    expect(stopped).toHaveBeenCalledTimes(1)
+  })
+
+  // A call that ends while the screen is open (the notification's stop, a failed connection, the
+  // voice service closing it) is over on the screen, and the device's words say how it ended.
+  it('says how a call that ended while the screen was open ended', async () => {
+    const { controls } = start()
     await waitForChoice()
-    await person.click(screen.getByRole('button', { name: 'Start voice session' }))
+    await userEvent.setup().click(screen.getByRole('button', { name: 'Start voice session' }))
+    await screen.findByRole('button', { name: 'End session' })
+
+    controls.endVoiceCall({
+      words: 'The call ended on this device: from its notification.',
+      host: { kind: 'not_told', words: 'The host could not be reached.' }
+    })
+
+    await waitFor(() => {
+      expect(screen.queryByRole('heading', { name: 'Voice session' })).not.toBeInTheDocument()
+    })
+    expect(screen.getByText(/from its notification/)).toBeInTheDocument()
+    expect(screen.getByText(/its grant may still be open: The host could not be reached\./)).toBeInTheDocument()
+  })
+
+  // The delegations the voice announced are rows the device keeps, and this version did nothing
+  // about any of them: the row says so, and whether the voice was told.
+  it('shows each delegation as not done', async () => {
+    const { controls } = start()
+    await waitForChoice()
+    await userEvent.setup().click(screen.getByRole('button', { name: 'Start voice session' }))
     await waitFor(() => {
       expect(screen.getByText('Nothing yet.')).toBeInTheDocument()
     })
 
-    const delegated = vi.spyOn(port, 'voiceDelegate')
     controls.announceVoiceDelegation('item_a1')
 
     await waitFor(() => {
-      expect(screen.getByText('Sent to the host')).toBeInTheDocument()
+      expect(screen.getByText('Not done. The voice was told so.')).toBeInTheDocument()
     })
-    expect(delegated).toHaveBeenCalledTimes(1)
-    // KR-REQ-15.17: admission is not execution, and the words beside it say so.
-    expect(screen.getByText(/It is not evidence that a host action ran/)).toBeInTheDocument()
-    // The request is the protocol's own shape: the words the device vouched for and nothing that
-    // names an action, a session or a destination, which the host reads for itself. The scripted
-    // host refuses a field the real one does not read, as the real one does.
-    const [params] = delegated.mock.calls[0]
-    expect(params).toEqual({
-      voice_session_id: (params as { voice_session_id: string }).voice_session_id,
-      delegation_id: 'item_a1',
-      offset_ms: '1000',
-      fragments: [{ start_ms: '800', end_ms: '1000', text: 'status' }],
-      confirmation: null
-    })
+    expect(screen.getByText('Asked 1.0 seconds in')).toBeInTheDocument()
+    expect(screen.queryByText('Nothing yet.')).not.toBeInTheDocument()
+    const panel = screen.getByRole('region', { name: 'Delegations' })
+    expect(
+      within(panel).getByText('Not done: this version does not act on spoken requests.')
+    ).toBeInTheDocument()
+    // Nothing was sent to the host: this screen has no way to submit a delegation.
+    expect('voiceDelegate' in controls).toBe(false)
   })
 
-  // Section 15 ¶7: what a delegation asks for is the host's to read from the words. One that
-  // carried no words is shown and never turned into a guess.
-  it('does not submit a delegation that carried no words', async () => {
-    const person = userEvent.setup()
-    const { controls, port } = start()
+  // The host the call belongs to can be lost while the application's own connection is fine, and
+  // the call says so: the host requests go, and the local controls stay.
+  it('takes the host requests away when the call itself has lost its host', async () => {
+    const { controls } = start()
     await waitForChoice()
-    await person.click(screen.getByRole('button', { name: 'Start voice session' }))
+    await userEvent.setup().click(screen.getByRole('button', { name: 'Start voice session' }))
     await waitFor(() => {
-      expect(screen.getByText('Nothing yet.')).toBeInTheDocument()
+      expect(screen.getByRole('button', { name: 'Show what the host selected' })).toBeEnabled()
     })
 
-    const delegated = vi.spyOn(port, 'voiceDelegate')
-    controls.announceVoiceDelegation('item_b2', null)
+    controls.setVoiceHost('lost')
 
     await waitFor(() => {
-      expect(screen.getByText('Not sent to the host')).toBeInTheDocument()
+      expect(screen.getByRole('button', { name: 'Show what the host selected' })).toBeDisabled()
     })
-    expect(screen.getByText(/said nothing the host could read/)).toBeInTheDocument()
-    expect(delegated).not.toHaveBeenCalled()
+    expect(screen.getByRole('button', { name: 'Mute microphone' })).toBeEnabled()
+    expect(screen.getByRole('button', { name: 'End session' })).toBeEnabled()
   })
 })
 

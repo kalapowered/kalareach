@@ -147,6 +147,38 @@ test.describe('at the largest text size on a screen 320 points wide', () => {
       }
     ],
     [
+      'the voice screen with what the last call left',
+      '&tab=sessions',
+      async (page) => {
+        await page.evaluate(() => {
+          window.krTestHost?.setVoiceWarning(
+            'The last call found that this voice service has no such call for this account. You can start another, and it may end the same way.'
+          )
+          window.krTestHost?.oweVoice({
+            words:
+              'The host was not told, so its grant may still be open: the host could not be reached in time.'
+          })
+        })
+        await page.getByTestId('voice-entry').click()
+        await expect(page.getByRole('status', { name: 'The last call' })).toBeVisible()
+        await expect(page.getByRole('button', { name: 'Start voice session' })).toBeVisible()
+      }
+    ],
+    [
+      'a voice call that is running, with a request it did not act on',
+      '&tab=sessions',
+      async (page) => {
+        await page.evaluate(() => {
+          window.krTestHost?.holdAVoiceCall()
+          window.krTestHost?.announceVoiceDelegation('item_a1')
+          window.krTestHost?.setVoiceHost('lost')
+        })
+        await page.getByTestId('voice-entry').click()
+        await expect(page.getByRole('button', { name: 'End session' })).toBeVisible()
+        await expect(page.getByText('Not done. The voice was told so.')).toBeVisible()
+      }
+    ],
+    [
       'the question that allows voice',
       '&tab=sessions',
       async (page) => {
@@ -265,6 +297,55 @@ test.describe('at the largest text size on a screen 320 points wide', () => {
         expect(await overrunning(page, root), `the measure sees ${root} text that cannot wrap`).not.toEqual([])
       }
     })
+
+    // What the last call left, and a call that runs with a request this version did not act on,
+    // at the default size and at the largest: every line stays inside its box, and the screenshot
+    // is kept for a person to look at.
+    for (const [size, ratio] of [['default', 1], ['largest', LARGEST]] as const) {
+      test(`keeps the voice screen with what the last call left, and a running voice call, whole at the ${size} size on ${surface}`, async ({
+        page
+      }) => {
+        await withSystemTextScale(page, ratio)
+        await page.setViewportSize({ width: size === 'default' ? 390 : 320, height: 720 })
+        await page.goto(`/harness.html?surface=${surface}&tab=sessions`)
+        await page.evaluate(() => {
+          window.krTestHost?.setVoiceWarning(
+            'The last call found that this voice service has no such call for this account. You can start another, and it may end the same way.'
+          )
+          window.krTestHost?.oweVoice({
+            words:
+              'The host was not told, so its grant may still be open: the host could not be reached in time.'
+          })
+        })
+        await page.getByTestId('voice-entry').click()
+        const left = page.getByRole('status', { name: 'The last call' })
+        await expect(left).toBeVisible()
+        await page.screenshot({
+          path: `/tmp/kr-voice-aftermath-${size}-${surface}-${test.info().project.name}.png`,
+          fullPage: true
+        })
+        expect(await overrunning(page, '.kr-voice__aftermath'), 'lines of what the last call left that run past their box').toEqual([])
+        expect(await overrunning(page, '.kr-voice__note'), 'notes that run past their box').toEqual([])
+
+        // A call is held by the device, so a screen shown now finds it running.
+        await page.goto(`/harness.html?surface=${surface}&tab=sessions`)
+        await page.evaluate(() => {
+          window.krTestHost?.holdAVoiceCall()
+          window.krTestHost?.announceVoiceDelegation('item_a1')
+          window.krTestHost?.setVoiceHost('lost')
+        })
+        await page.getByTestId('voice-entry').click()
+        const told = page.getByText('Not done. The voice was told so.')
+        await expect(told).toBeVisible()
+        await told.scrollIntoViewIfNeeded()
+        await page.screenshot({
+          path: `/tmp/kr-voice-call-${size}-${surface}-${test.info().project.name}.png`,
+          fullPage: true
+        })
+        expect(await overrunning(page, '.kr-voice__delegation'), 'lines of a request row that run past their box').toEqual([])
+        expect(await overrunning(page, '.kr-voice__refusal'), 'lines of a notice that run past their box').toEqual([])
+      })
+    }
 
     test(`lists the action nobody knows the end of beside the next one, whole, on ${surface}`, async ({ page }) => {
       await withSystemTextScale(page, LARGEST)

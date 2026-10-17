@@ -16,7 +16,12 @@ import { useEffect, useId, useRef, useState, type ReactNode } from 'react'
 
 import type { HostPort, VoiceAllowed, VoiceScope } from '../host/port'
 import { failureMessage } from '../host/port'
-import { toConfirm, toConfirmWords } from './model'
+import {
+  FENCE_UNREADABLE_WORDS,
+  NOT_ACTED_ON_WORDS,
+  toConfirmOfFence,
+  toConfirmWords
+} from './model'
 
 /** A session the person can choose, as the host lists it. */
 interface Choice {
@@ -111,7 +116,8 @@ export function VoiceGrantStep({
         // have seen it.
         if (
           settled.value.not_held_by_device.length === 0 &&
-          toConfirm(settled.value.barrier).sessions.length === 0
+          settled.value.fence.kind !== 'unreadable' &&
+          toConfirmOfFence(settled.value.fence).sessions.length === 0
         ) {
           onAllowed(sessionIds)
           return
@@ -162,6 +168,11 @@ export function VoiceGrantStep({
           </ul>
         )}
         <p className="kr-voice__note">The host refuses anything not listed here.</p>
+        {/* What a grant permits is not what this version carries out, and the person reads the
+            first before they allow it: so the second is said beside it. */}
+        <p className="kr-voice__note" data-testid="voice-not-acted-on">
+          {NOT_ACTED_ON_WORDS}
+        </p>
       </section>
 
       <section className="kr-voice__panel" aria-labelledby={`${id}-sessions`}>
@@ -209,13 +220,15 @@ export function VoiceGrantStep({
                     .join(', ')}: this phone’s own access to the host does not include ${
                     granted.not_held_by_device.length === 1 ? 'it' : 'them'
                   }.`,
-              toConfirm(granted.barrier).sessions.length === 0
-                ? null
-                : `The calls that were running under the earlier allowance have ended. ${toConfirmWords(
-                    toConfirm(granted.barrier),
-                    Object.fromEntries((choices ?? []).map((each) => [each.id, each.name])),
-                    'calls'
-                  )}`
+              granted.fence.kind === 'unreadable'
+                ? `Any calls that were running under the earlier allowance have ended. ${FENCE_UNREADABLE_WORDS}`
+                : toConfirmOfFence(granted.fence).sessions.length === 0
+                  ? null
+                  : `The calls that were running under the earlier allowance have ended. ${toConfirmWords(
+                      toConfirmOfFence(granted.fence),
+                      Object.fromEntries((choices ?? []).map((each) => [each.id, each.name])),
+                      'calls'
+                    )}`
             ]
               .filter((words) => words !== null)
               .join(' ')}

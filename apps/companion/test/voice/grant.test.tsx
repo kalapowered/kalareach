@@ -157,6 +157,32 @@ describe('allowing voice for the first time', () => {
     expect(await screen.findByRole('button', { name: 'Start voice session' })).toBeInTheDocument()
   })
 
+  // The host has replaced the grant by the time it answers. An answer with no fence status this
+  // build can read is not "none owed": the person is told the app cannot confirm the host's workers
+  // before they go on.
+  it('says it cannot confirm the host\'s workers when the answer gave no readable status', async () => {
+    start((fake) => {
+      fake.leaveNextVoiceAllowFenceUnreadable()
+    })
+    await screen.findAllByRole('checkbox')
+    await userEvent.click(screen.getByTestId('voice-allow'))
+    const result = await screen.findByTestId('voice-grant-result')
+    expect(result).toHaveTextContent('cannot confirm that nothing the call sent can still run')
+    expect(screen.queryByRole('button', { name: 'Start voice session' })).toBeNull()
+    await userEvent.click(screen.getByTestId('voice-grant-continue'))
+    expect(await screen.findByRole('button', { name: 'Start voice session' })).toBeInTheDocument()
+  })
+
+  // What a grant permits is not what this version carries out, and the first question says so
+  // beside the list of actions.
+  it('says beside the actions that spoken requests are not acted on', async () => {
+    start()
+    await screen.findAllByRole('checkbox')
+    expect(screen.getByTestId('voice-not-acted-on')).toHaveTextContent(
+      'Not done: this version does not act on spoken requests.'
+    )
+  })
+
   // Section 9: the host keeps the workers that have not confirmed before any that have, but an answer
   // that left workers out may be missing some that have not, and the screen says so.
   it('says when the answer left workers out of the sessions to confirm', async () => {

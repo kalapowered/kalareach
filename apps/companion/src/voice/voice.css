@@ -12,16 +12,31 @@
 .kr-voice {
   display: flex;
   flex-direction: column;
-  gap: var(--gap-4);
-  padding: var(--gap-4);
+  /* The screen's own spacing is measured in the chrome's unit, which stops growing with the text at
+     one and a half times: at the largest text sizes a gap that grew with the text would take the
+     column the text needs. */
+  gap: var(--chrome-unit);
+  padding: var(--chrome-unit);
   max-width: 44rem;
   margin: 0 auto;
   color: var(--text);
+  /* A long word, a path or an origin breaks rather than running past the screen's edge. */
+  overflow-wrap: anywhere;
+}
+
+/* Inside the phone's shell the main region already pads the screen, and with the text: padding it
+   twice leaves a narrow column at large text sizes. The screen takes no padding of its own there,
+   and keeps its margins to the chrome's unit, as the bars above and below it do, so the text has
+   the width the screen can give it. */
+.m-main .kr-voice {
+  padding: 0;
+  margin-inline: calc(var(--chrome-unit) - var(--gap-4));
 }
 
 .kr-voice__title {
-  /* Tracking tightens as the type grows: letters read too far apart at display sizes. */
-  font-size: 1.5rem;
+  /* Tracking tightens as the type grows: letters read too far apart at display sizes. The title
+     grows with the text, to a size that still fits a word of it across the narrowest screen. */
+  font-size: min(1.5rem, calc(var(--chrome-unit) * 1.75));
   line-height: 1.15;
   letter-spacing: -0.02em;
   margin: 0;
@@ -41,14 +56,22 @@
 .kr-voice__panel {
   border: 1px solid var(--line);
   border-radius: 0.5rem;
-  padding: var(--gap-3);
+  padding: calc(var(--chrome-unit) * 0.75);
 }
 
 .kr-voice__provider {
-  display: grid;
-  grid-template-columns: auto 1fr;
-  gap: var(--gap-1) var(--gap-3);
+  display: flex;
+  flex-direction: column;
+  gap: var(--gap-1);
   margin: 0;
+}
+
+/* A label and its value sit side by side while there is room, and the value goes under the label
+   when there is not. */
+.kr-voice__provider > div {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0 var(--gap-3);
 }
 
 .kr-voice__provider dt {
@@ -57,6 +80,7 @@
 
 .kr-voice__provider dd {
   margin: 0;
+  min-inline-size: 0;
   font-family: var(--font-mono);
 }
 
@@ -97,6 +121,11 @@
   color: var(--muted);
 }
 
+/* A list that follows a note stands apart from it. */
+.kr-voice__note + .kr-voice__list {
+  margin-top: var(--gap-3);
+}
+
 /* The rate is what a start accepts, so it reads first in its panel: a step up in size and weight,
    with figures that keep their width when the rate changes under them. */
 .kr-voice__rate {
@@ -120,10 +149,17 @@
 
 .kr-voice__refusal {
   margin: 0;
-  padding: var(--gap-2) var(--gap-3);
+  padding: calc(var(--chrome-unit) * 0.5) calc(var(--chrome-unit) * 0.75);
   border-left: 3px solid var(--danger);
   background: var(--danger-soft);
   color: var(--text);
+}
+
+/* What the last call left: read before starting again, so it is set apart the way a refusal is. */
+.kr-voice__aftermath {
+  padding: calc(var(--chrome-unit) * 0.5) calc(var(--chrome-unit) * 0.75);
+  border-left: 3px solid var(--danger);
+  background: var(--danger-soft);
 }
 
 .kr-voice__controls {

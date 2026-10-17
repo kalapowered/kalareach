@@ -26,7 +26,13 @@ import type {
   VoiceStopResult
 } from '@kalareach/protocol'
 
-import type { VoiceCallState, VoiceFence } from '../host/port'
+import type {
+  VoiceCallState,
+  VoiceDelegationRow,
+  VoiceEnded,
+  VoiceFence,
+  VoiceOwed
+} from '../host/port'
 
 /** What the screen says when the host's answer gave no status for its workers that could be read. */
 export const FENCE_UNREADABLE_WORDS =
@@ -72,6 +78,14 @@ export function toConfirmWords(
   const named = pending.sessions.map((session) => names[session] ?? `session ${session.slice(0, 8)}`)
   const where = named.join(', ') + (pending.more ? ', and possibly others' : '')
   return `The host has not yet confirmed that nothing the ${ended} sent can still run in ${where}.`
+}
+
+/**
+ * The sessions a fence status names as not yet confirmed. A status this build could not read names
+ * none, which is not the same as none being owed: the caller says so ([`FENCE_UNREADABLE_WORDS`]).
+ */
+export function toConfirmOfFence(fence: VoiceFence): ToConfirm {
+  return fence.kind === 'barrier' ? toConfirm(fence.barrier) : { sessions: [], more: false }
 }
 
 /**
@@ -364,25 +378,31 @@ export interface ContextRequest {
   readonly reason?: string
 }
 
-/** One delegation the provider announced during the call. */
+/**
+ * What this version says of what a person asks for by voice: it acts on none of it.
+ *
+ * Shown before a call, beside the actions a grant permits, and against every request the voice
+ * announces, so a person never reads a permitted action as one this version carries out.
+ */
+export const NOT_ACTED_ON_WORDS = 'Not done: this version does not act on spoken requests.'
+
+/** One delegation the provider announced during the call, and what this version did with it. */
 export interface Delegation {
   /** The provider's opaque identifier. Correlation data, never authority. */
   readonly delegationId: string
   /** Where in the call it happened, in milliseconds from the start. */
   readonly offsetMs: number
-  /**
-   * What became of it. `not_sent` is this device declining to submit one it could not describe to
-   * the host; every other state after `announced` is what the host answered.
-   */
-  readonly state:
-    | 'announced'
-    | 'not_sent'
-    | 'submitted'
-    | 'needs_confirmation'
-    | 'refused'
-    | 'receipted'
-  /** The host's own words, when it refused or receipted. */
-  readonly detail?: string
+  /** Whether the model was told that nothing was done. */
+  readonly told: boolean
+}
+
+/** The rows the call's owner keeps of the delegations announced, as the screen shows them. */
+export function delegationsFrom(rows: readonly VoiceDelegationRow[]): readonly Delegation[] {
+  return rows.map((row) => ({
+    delegationId: row.delegation_id,
+    offsetMs: row.offset_ms,
+    told: row.told
+  }))
 }
 
 /** A call that is running, as the screen sees it. */
@@ -409,13 +429,20 @@ export interface RunningCall {
    * fails when the host is the thing that is gone.
    */
   readonly hostReachable: boolean
+  /**
+   * Whether the host this call belongs to is being reached, as the call itself reports it: a
+   * different fact from `hostReachable`, which is this application's connection to the host the
+   * person is browsing.
+   */
+  readonly callHost: 'reachable' | 'lost'
   readonly delegations: readonly Delegation[]
   readonly requests: readonly ContextRequest[]
   /**
    * What an append acknowledgement does not establish, in the host's own words.
    *
    * Shown with every admitted request, because a person reading "acknowledged" next to a
-   * delegation would otherwise reasonably conclude the work was done.
+   * delegation would otherwise reasonably conclude the work was done. Empty until the host's
+   * terms have been read, which a call adopted by a screen that was loaded again waits for.
    */
   readonly admissionMeans: string
 }
@@ -442,10 +469,70 @@ export function runningCallFrom(
     playing: state.playing,
     brokerReachable: state.control !== 'unreachable',
     hostReachable: true,
-    delegations: [],
+    callHost: state.host === 'lost' ? 'lost' : 'reachable',
+    delegations: delegationsFrom(state.delegations),
     requests: [],
     admissionMeans
   }
+}
+
+/**
+ * The same call, as the device reports it now: the microphone, the speaker, the voice service,
+ * the host the call belongs to and the delegations the voice has announced.
+ */
+export function callAsReported(call: RunningCall, state: VoiceCallState): RunningCall {
+  return {
+    ...call,
+    capture: asCaptureState(state.capture),
+    playing: state.playing,
+    brokerReachable: state.control !== 'unreachable',
+    callHost: state.host === 'lost' ? 'lost' : 'reachable',
+    delegations: delegationsFrom(state.delegations)
+  }
+}
+
+/** What the screen says of what a call's end left undone, one line for each thing. */
+export function endedWords(
+  ended: VoiceEnded,
+  names: Readonly<Record<string, string>> = {}
+): string {
+  const parts = [ended.words]
+  if (!ended.closed_locally) {
+    parts.push("This device could not confirm that the call's microphone stopped.")
+  }
+  switch (ended.host.kind) {
+    case 'revoked': {
+      const unconfirmed = fenceWords(ended.host.fence, names)
+      parts.push(
+        unconfirmed === null
+          ? "The host withdrew the call's grant."
+          : `The host withdrew the call's grant. ${unconfirmed}`
+      )
+      break
+    }
+    case 'refused':
+      parts.push(
+        `The host would not revoke the call's grant, and what it holds ends when the call was to close: ${ended.host.words}`
+      )
+      break
+    case 'not_told':
+      parts.push(`The host was not told, so its grant may still be open: ${ended.host.words}`)
+      break
+    default:
+      break
+  }
+  if (ended.broker === 'not_confirmed') {
+    parts.push('The voice service has not confirmed that it closed the call; it closes it at its own deadline.')
+  }
+  return parts.join(' ')
+}
+
+/**
+ * The words for something this device could not finish, which the host may still hold open. It
+ * stands until the moment the host's grant ends by itself.
+ */
+export function owedWords(owed: VoiceOwed): string {
+  return owed.words
 }
 
 /** Every capture state the surface can draw, by its wire name. */

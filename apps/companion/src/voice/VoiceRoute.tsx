@@ -14,14 +14,15 @@ import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } fro
 import { VoiceGrantStep } from './VoiceGrantStep'
 import { VoiceSurface, type VoiceSurfaceActions } from './VoiceSurface'
 import {
-  asCaptureState,
+  callAsReported,
   choiceFromPreparation,
   choiceWithRate,
+  endedWords,
   fenceWords,
+  owedWords,
   requestedSeconds,
   runningCallFrom,
   type ContextRequest,
-  type Delegation,
   type ProviderChoice,
   type RunningCall
 } from './model'
@@ -30,11 +31,9 @@ import {
   failureCode,
   failureMessage as portFailureMessage,
   failureWords,
-  follow,
-  watch
+  follow
 } from '../host/port'
-import type { HostPort, VoiceCallState } from '../host/port'
-import type { TranscriptFragment, VoiceDelegateParams } from '@kalareach/protocol'
+import type { VoiceCallState } from '../host/port'
 import type { Surface } from '../mobile/platform'
 
 /** The message to show for a failure, whatever shape it arrived in. */
@@ -100,6 +99,17 @@ export function VoiceRoute({
   const [call, setCall] = useState<RunningCall | null>(null)
   const [busy, setBusy] = useState(false)
   const [notice, setNotice] = useState<string | null>(null)
+  /**
+   * What this device last said while it held no call: the warning before a start, what an earlier
+   * call left the host to hold open, and, for a call that ended while no screen was looking, how.
+   */
+  const [left, setLeft] = useState<VoiceCallState | null>(null)
+  /** How the call that ended before this screen was shown ended, said once, when it is shown. */
+  const [endedBefore, setEndedBefore] = useState<string | null>(null)
+  /** Whether the device is setting up a call that this screen did not ask for. */
+  const [setUp, setSetUp] = useState(false)
+  /** True while this screen's own hang-up is waiting for the host, which says its own words. */
+  const hangingUp = useRef(false)
 
   /**
    * Whether this device's connection to the host is carrying requests.
@@ -218,29 +228,74 @@ export function VoiceRoute({
   useEffect(() => {
     held.current = call
   }, [call])
+  const shown = useRef<ProviderChoice | null>(null)
+  useEffect(() => {
+    shown.current = choice
+  }, [choice])
 
-  const applyLocalState = useCallback((state: VoiceCallState) => {
-    setCall((running) => {
-      if (!running) return running
-      if (!state.running) return null
-      return {
-        ...running,
-        capture: asCaptureState(state.capture),
-        playing: state.playing,
-        brokerReachable: state.control !== 'unreachable'
+  /**
+   * Takes what the device says of its call.
+   *
+   * The call is the application's, not this screen's: it runs, and it ends, with no screen
+   * looking. So a call the device holds is taken up whoever asked for it (a screen that is loaded
+   * again finds the call it left), a call the screen held that the device no longer holds is
+   * over, and said to be over in the device's words, and what an ended call left is kept for the
+   * person to read before they start another.
+   */
+  const settle = useCallback((state: VoiceCallState) => {
+    const described = state.session
+    if (state.running && described !== null) {
+      setSetUp(false)
+      setCall((running) =>
+        running ? callAsReported(running, state) : runningCallFrom(described, state, '')
+      )
+      return
+    }
+    // A call being set up has its descriptor and does not run yet: it is read again until it does
+    // or is given up.
+    setSetUp(described !== null)
+    setLeft(state)
+    if (held.current !== null && described === null) {
+      setCall(null)
+      if (!hangingUp.current) {
+        setNotice(
+          state.ended
+            ? endedWords(state.ended, shown.current?.sessionNames ?? {})
+            : 'The call ended.'
+        )
       }
-    })
+    }
   }, [])
 
-  // The call's own state, re-read while one is running. The native layer owns the microphone, and
-  // the interruptions that matter most are the ones nothing asked for.
+  // What the device holds, read when the screen is shown: a call that is running is taken up, and
+  // what the last one left is shown before a start.
   useEffect(() => {
-    if (!call) return
+    let current = true
+    void ask(() => port.voiceCallState())
+      .then((state) => {
+        if (!current) return
+        if (!state.running && state.session === null && state.ended) {
+          setEndedBefore(endedWords(state.ended))
+        }
+        settle(state)
+      })
+      .catch(() => {
+        // A local read that failed says nothing of the call; the screen starts as it would have.
+      })
+    return () => {
+      current = false
+    }
+  }, [port, settle])
+
+  // The call's own state, re-read while one runs or is being set up. The native layer owns the
+  // microphone, and the interruptions that matter most are the ones nothing asked for.
+  useEffect(() => {
+    if (!call && !setUp) return
     let current = true
     const read = () => {
       void ask(() => port.voiceCallState())
         .then((state) => {
-          if (current) applyLocalState(state)
+          if (current) settle(state)
         })
         .catch(() => {
           // A local read that failed says nothing new about the call; the next one answers.
@@ -251,7 +306,16 @@ export function VoiceRoute({
       current = false
       window.clearInterval(timer)
     }
-  }, [applyLocalState, call, port])
+  }, [call, port, setUp, settle])
+
+  /** What the last call left, as lines a person reads before starting another. */
+  const aftermath = useMemo(() => {
+    const lines: string[] = []
+    if (endedBefore !== null) lines.push(endedBefore)
+    for (const owed of left?.owed ?? []) lines.push(owedWords(owed))
+    if (left?.warning) lines.push(left.warning)
+    return lines
+  }, [endedBefore, left])
 
   // Whether this device is reaching the host. The backend publishes the connection's state, and
   // cancelling a turn is the one control that depends on it, so the screen follows the answer
@@ -271,50 +335,6 @@ export function VoiceRoute({
       ),
     [port]
   )
-
-  // A delegation the provider announced to this call. It is submitted to the host over this
-  // device's own connection, never to the service, and what the row says is what the host answered.
-  useEffect(() => {
-    if (!call) return undefined
-    return watch([port.subscribe((event) => {
-      const body = event.body as {
-        kind?: string
-        delegation_id?: string
-        offset_ms?: string
-        fragments?: TranscriptFragment[]
-      } | null
-      if (body?.kind !== 'voice_delegation' || !body.delegation_id) return
-      const delegationId = body.delegation_id
-      setCall((running) => (running ? withDelegation(running, delegationId, 'announced') : running))
-      // What the delegation asks for is the host's to read: this screen hands it the words the
-      // device vouched for and names no action. A delegation that carried no words is not turned
-      // into a guess: it is shown and not submitted.
-      if (!body.fragments || body.fragments.length === 0) {
-        setCall((running) =>
-          running
-            ? withDelegation(
-                running,
-                delegationId,
-                'not_sent',
-                'The voice said nothing the host could read, so nothing was sent to the host.'
-              )
-            : running
-        )
-        return
-      }
-      void submitDelegation(
-        port,
-        held,
-        {
-          delegationId,
-          fragments: body.fragments,
-          offsetMs: body.offset_ms ?? '0'
-        },
-        setCall,
-        setNotice
-      )
-    })]).stop
-  }, [call, port])
 
   const actions = useMemo<VoiceSurfaceActions>(
     () => ({
@@ -347,8 +367,9 @@ export function VoiceRoute({
             const outcome = settled.value?.outcome
             if (!outcome) {
               setNotice(
-                'This host has not said whether that call was created. Nothing is running here.'
+                'The host never said whether it created that call. Nothing is running on this device.'
               )
+              void ask(() => port.voiceCallState()).then(settle, () => undefined)
               return
             }
             if ('preparation_changed' in outcome) {
@@ -385,13 +406,22 @@ export function VoiceRoute({
                 running: true,
                 capture: 'unavailable',
                 playing: false,
-                control: 'none'
+                control: 'none',
+                host: 'reachable',
+                session: null,
+                ended: null,
+                delegations: [],
+                warning: null,
+                owed: []
               })
             )
+            setLeft(null)
+            setEndedBefore(null)
             setCall(runningCallFrom(session, state, terms.admission_note))
           })
           .catch((error: unknown) => {
             setNotice(failureMessage(error))
+            void ask(() => port.voiceCallState()).then(settle, () => undefined)
           })
           .finally(() => {
             setBusy(false)
@@ -400,7 +430,7 @@ export function VoiceRoute({
 
       setMicrophoneMuted: (muted: boolean) => {
         void ask(() => port.voiceSetMuted('microphone', muted))
-          .then(applyLocalState)
+          .then(settle)
           .catch((error: unknown) => {
             setNotice(failureMessage(error))
           })
@@ -408,7 +438,7 @@ export function VoiceRoute({
 
       stopPlayback: () => {
         void ask(() => port.voiceSetMuted('playback', true))
-          .then(applyLocalState)
+          .then(settle)
           .catch((error: unknown) => {
             setNotice(failureMessage(error))
           })
@@ -417,6 +447,7 @@ export function VoiceRoute({
       hangUp: () => {
         const running = held.current
         if (!running) return
+        hangingUp.current = true
         void ask(() => port.voiceStop(running.voiceSessionId, {}))
           .then((closure) => {
             if (closure.closed_locally) setCall(null)
@@ -432,6 +463,16 @@ export function VoiceRoute({
           })
           .catch((error: unknown) => {
             setNotice(failureMessage(error))
+          })
+          .finally(() => {
+            hangingUp.current = false
+            // What the call left is read once the hang-up has said its own words, and adds none.
+            void ask(() => port.voiceCallState()).then(
+              (state) => {
+                if (state.session === null) setLeft(state)
+              },
+              () => undefined
+            )
           })
       },
 
@@ -507,7 +548,7 @@ export function VoiceRoute({
           })
       }
     }),
-    [applyLocalState, busy, choice, port, prepare, sessionIds]
+    [busy, choice, port, prepare, sessionIds, settle]
   )
 
   if (needsGrant !== null && !call) {
@@ -530,10 +571,19 @@ export function VoiceRoute({
     <Region embedded={embedded} surface={surface}>
       <VoiceSurface
         choice={choice}
-        call={call && { ...call, hostReachable }}
+        call={
+          call && {
+            ...call,
+            // The host the call belongs to is reached when this application is reaching a host and
+            // the call itself has not lost the one it was made with.
+            hostReachable: hostReachable && call.callHost !== 'lost',
+            admissionMeans: call.admissionMeans || (choice?.managed?.admission_note ?? '')
+          }
+        }
         currentTurn={currentTurn}
         busy={busy}
         notice={notice}
+        aftermath={aftermath}
         actions={actions}
       />
     </Region>
@@ -558,27 +608,6 @@ function Region({
   )
 }
 
-/** Records one delegation at the state the host put it in. */
-function withDelegation(
-  call: RunningCall,
-  delegationId: string,
-  state: Delegation['state'],
-  detail?: string
-): RunningCall {
-  const existing = call.delegations.findIndex((each) => each.delegationId === delegationId)
-  const row: Delegation = {
-    delegationId,
-    offsetMs: existing >= 0 ? call.delegations[existing].offsetMs : 0,
-    state,
-    detail
-  }
-  const delegations =
-    existing >= 0
-      ? call.delegations.map((each, index) => (index === existing ? row : each))
-      : [...call.delegations, row]
-  return { ...call, delegations }
-}
-
 /** Records one context request at the outcome the service gave it. */
 function withRequest(
   call: RunningCall,
@@ -594,79 +623,4 @@ function withRequest(
       ? call.requests.map((each, index) => (index === existing ? row : each))
       : [...call.requests, row]
   return { ...call, requests }
-}
-
-/**
- * Submits one announced delegation to the host and records what it answered.
- *
- * Section 15 ¶7 puts this on the paired device's own connection to the host, not on the service's
- * channel. The provider's identifier travels as correlation data: it names which announcement this
- * answers and carries nothing the host acts on.
- */
-async function submitDelegation(
-  port: HostPort,
-  held: { readonly current: RunningCall | null },
-  announced: {
-    readonly delegationId: string
-    readonly fragments: readonly TranscriptFragment[]
-    readonly offsetMs: string
-  },
-  setCall: (update: (call: RunningCall | null) => RunningCall | null) => void,
-  setNotice: (text: string | null) => void
-): Promise<void> {
-  const running = held.current
-  if (!running) return
-  const { delegationId } = announced
-  // The protocol's own shape, so a field the host does not read cannot be sent by mistake.
-  const params: VoiceDelegateParams = {
-    voice_session_id: running.voiceSessionId,
-    delegation_id: delegationId,
-    offset_ms: announced.offsetMs,
-    fragments: [...announced.fragments],
-    confirmation: null
-  }
-  try {
-    const settled = await ask(() => port.voiceDelegate(params, {}))
-    const outcome = settled.value?.outcome
-    if (!outcome) {
-      setCall((call) => (call ? withDelegation(call, delegationId, 'submitted') : call))
-      return
-    }
-    if ('performed' in outcome) {
-      setCall((call) =>
-        call ? withDelegation(call, delegationId, 'receipted', outcome.performed.summary) : call
-      )
-      return
-    }
-    if ('admitted' in outcome) {
-      setCall((call) =>
-        call ? withDelegation(call, delegationId, 'submitted', outcome.admitted.note) : call
-      )
-      return
-    }
-    if ('confirmation_required' in outcome) {
-      // The host's challenge is signed on this device's unlocked screen with the key the host
-      // knows this device by, and this screen has no way to reach that ceremony. Saying so is
-      // what keeps the row from reading as something the person could still do here.
-      setCall((call) =>
-        call
-          ? withDelegation(
-              call,
-              delegationId,
-              'needs_confirmation',
-              `${outcome.confirmation_required.message} This screen has no way to sign a confirmation, so the host has not acted on it.`
-            )
-          : call
-      )
-      return
-    }
-    setCall((call) =>
-      call ? withDelegation(call, delegationId, 'refused', outcome.refused.message) : call
-    )
-  } catch (error: unknown) {
-    setCall((call) =>
-      call ? withDelegation(call, delegationId, 'refused', failureMessage(error)) : call
-    )
-    setNotice(failureMessage(error))
-  }
 }
