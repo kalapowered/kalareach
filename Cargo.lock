@@ -4179,6 +4179,7 @@ version = "0.1.0"
 dependencies = [
  "kr-attention",
  "kr-changeset",
+ "kr-flush",
  "kr-ipc",
  "kr-project",
  "kr-protocol",
