@@ -37,9 +37,11 @@ pub struct Attachment {
     pub dimensions: Option<Dimensions>,
     /// The terminal profile it presents.
     pub terminal_profile_id: Option<String>,
-    /// Whether the host granted it the geometry right, which the size-ownership order needs. The
-    /// capabilities themselves are the input domain's, and a summary is written with them.
-    pub holds_geometry_right: bool,
+    /// Whether the host granted it the geometry right, which the size-ownership order needs. It is
+    /// fixed when the attachment is made, from the capabilities the input domain keeps for it, and
+    /// nothing changes it. The capabilities themselves are the input domain's, and a summary is
+    /// written with them.
+    holds_geometry_right: bool,
     /// When it joined.
     pub attached_at_ms: TimestampMs,
     /// Whether the screen this attachment was last given carried everything a terminal continuing

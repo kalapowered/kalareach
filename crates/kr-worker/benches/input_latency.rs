@@ -777,9 +777,6 @@ fn paste_prefix_recogniser_deadline() {
         .build()
         .expect("a runtime");
     let (report, closed) = runtime.block_on(measure_recogniser());
-    // Each keeps its own figure when it succeeds and fails after the idle figure is kept below.
-    let beside_mutations = runtime.block_on(measure_recogniser_beside_mutations(false));
-    let beside_a_disk_writer = runtime.block_on(measure_recogniser_beside_mutations(true));
     // The figure is kept before the closure's outcome is, as above.
     let report = report.unwrap_or_else(|failure| panic!("the measurement: {failure}"));
 
@@ -844,6 +841,11 @@ fn paste_prefix_recogniser_deadline() {
         &lines,
     );
     closed.unwrap_or_else(|failure| panic!("the session this measurement created: {failure}"));
+    // After the idle figure is kept, so that a failure to set up either measurement beside
+    // journalled mutations cannot lose it. Each keeps its own figure when it succeeds, and fails
+    // below.
+    let beside_mutations = runtime.block_on(measure_recogniser_beside_mutations(false));
+    let beside_a_disk_writer = runtime.block_on(measure_recogniser_beside_mutations(true));
     // The requirement's own bound, on the deadline this host is built with. It is asserted here
     // rather than inferred from a figure, because a measurement with an allowance around it cannot
     // tell a twenty-five millisecond deadline from a thirty-five millisecond one.
