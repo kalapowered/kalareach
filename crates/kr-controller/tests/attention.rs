@@ -3089,8 +3089,10 @@ fn newest_record(journal: &kr_automation::WorkflowStore) -> u64 {
 }
 
 /// Pauses a revision for a breach of one of its own limits, which records the attention record the
-/// pause owes. Returns that record's sequence.
-fn pause(journal: &kr_automation::WorkflowStore, definition: &WorkflowDefinition) -> u64 {
+/// pause owes, and does not read the journal back. A test with a daemon reading the journal uses
+/// this one: the daemon takes each record as it is committed and the journal keeps no record every
+/// reader has passed, so there may be no record left to ask for.
+fn pause_unread(journal: &kr_automation::WorkflowStore, definition: &WorkflowDefinition) {
     journal
         .pause_workflow_on_breach(
             definition.workflow_id,
@@ -3099,6 +3101,12 @@ fn pause(journal: &kr_automation::WorkflowStore, definition: &WorkflowDefinition
             kr_ipc::now_ms().get(),
         )
         .expect("the pause is recorded");
+}
+
+/// As [`pause_unread`], and returns the sequence of the record the pause owes. For a test with no
+/// daemon reading the journal.
+fn pause(journal: &kr_automation::WorkflowStore, definition: &WorkflowDefinition) -> u64 {
+    pause_unread(journal, definition);
     newest_record(journal)
 }
 
@@ -3132,12 +3140,19 @@ fn run(journal: &kr_automation::WorkflowStore, definition: &WorkflowDefinition) 
 }
 
 /// Asks a chain's budget for an action after the chain's lifetime has run out, which exhausts it and
-/// records the chain's one attention record. Returns that record's sequence.
-fn exhaust(journal: &kr_automation::WorkflowStore, root: CausalRootId) -> u64 {
+/// records the chain's one attention record, and does not read the journal back (see
+/// [`pause_unread`]).
+fn exhaust_unread(journal: &kr_automation::WorkflowStore, root: CausalRootId) {
     let later = kr_ipc::now_ms().get() + kr_protocol::automation::DEFAULT_CAUSAL_LIFETIME_MS + 1;
     journal
         .reserve_budget_action(root, 0, 0, later)
         .expect_err("the chain has outlived its budget");
+}
+
+/// As [`exhaust_unread`], and returns the sequence of the chain's record. For a test with no daemon
+/// reading the journal.
+fn exhaust(journal: &kr_automation::WorkflowStore, root: CausalRootId) -> u64 {
+    exhaust_unread(journal, root);
     newest_record(journal)
 }
 
@@ -3733,15 +3748,15 @@ async fn a_device_sees_an_automation_item_only_under_its_grant() {
     let journal = Arc::clone(host.controller().automation().journal());
     let mine = workflow(&journal, first_grant);
     let theirs = workflow(&journal, second_grant);
-    pause(&journal, &mine);
-    pause(&journal, &theirs);
+    pause_unread(&journal, &mine);
+    pause_unread(&journal, &theirs);
     let chain = run(&journal, &mine);
-    exhaust(&journal, chain);
+    exhaust_unread(&journal, chain);
     let nobodys = CausalRootId::new(kr_ipc::new_uuid());
     journal
         .get_or_create_budget(nobodys, kr_ipc::now_ms().get())
         .expect("a chain with no run of its own");
-    exhaust(&journal, nobodys);
+    exhaust_unread(&journal, nobodys);
 
     let mut control = host.client().await;
     let everything =
