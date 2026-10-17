@@ -685,6 +685,49 @@ describe('while a call is running', () => {
     expect(screen.getByRole('button', { name: 'Starting…' })).toBeInTheDocument()
   })
 
+  // The screen's own start waits for the host for as long as the host takes. The person can give it
+  // up from the same screen: the stop names nothing, is answered at once, and the control says it is
+  // ending until the start is over. The choice is theirs again when the host has answered.
+  it('ends its own start while the host has not answered', async () => {
+    const person = userEvent.setup()
+    const { controls, port } = start()
+    await waitForChoice()
+    const answer = controls.holdVoiceStart()
+    const stopped = vi.spyOn(port, 'voiceStop')
+
+    await person.click(screen.getByRole('button', { name: 'Start voice session' }))
+    const end = await screen.findByRole('button', { name: 'End the call' })
+    expect(screen.getByRole('button', { name: 'Starting…' })).toBeDisabled()
+    await person.click(end)
+
+    expect(stopped).toHaveBeenCalledWith(null, {})
+    expect(await screen.findByRole('button', { name: 'Ending…' })).toBeDisabled()
+    expect(screen.queryByRole('button', { name: 'End the call' })).not.toBeInTheDocument()
+
+    answer()
+
+    expect(await screen.findByRole('button', { name: 'Start voice session' })).toBeEnabled()
+    expect(screen.queryByRole('button', { name: 'Ending…' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'End the call' })).not.toBeInTheDocument()
+    expect(screen.getByText(/given up before it began/)).toBeInTheDocument()
+  })
+
+  // A start that was not given up is the same start it always was: the end control goes with the
+  // start control when the call runs.
+  it('takes the end away when the start it belongs to runs a call', async () => {
+    const person = userEvent.setup()
+    const { controls } = start()
+    await waitForChoice()
+    const answer = controls.holdVoiceStart()
+
+    await person.click(screen.getByRole('button', { name: 'Start voice session' }))
+    await screen.findByRole('button', { name: 'End the call' })
+    answer()
+
+    await screen.findByRole('button', { name: 'End session' })
+    expect(screen.queryByRole('button', { name: 'End the call' })).not.toBeInTheDocument()
+  })
+
   // A read that fails when what is owed lapses is asked again, so the warning does not outlive it.
   it('asks again when the read at the lapse of what is owed fails', async () => {
     const { port } = start((controls) => {

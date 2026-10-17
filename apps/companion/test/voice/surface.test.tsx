@@ -162,6 +162,34 @@ describe('before voice starts', () => {
     expect(screen.getByRole('button', { name: 'Starting…' })).toBeDisabled()
   })
 
+  // A start waits for the host for as long as the host takes, up to a minute and a half. The person
+  // who pressed it can end it from the same place, and the control to end it is not there before
+  // there is anything to end.
+  it('offers an end beside the start control while a start is in flight, and not before', async () => {
+    const person = userEvent.setup()
+    const acted = actions()
+    const { rerender } = render(
+      <VoiceSurface choice={choice()} call={null} currentTurn={null} busy={false} notice={null} actions={acted} />
+    )
+    expect(screen.queryByRole('button', { name: 'End the call' })).not.toBeInTheDocument()
+
+    rerender(<VoiceSurface choice={choice()} call={null} currentTurn={null} busy notice={null} actions={acted} />)
+    await person.click(screen.getByRole('button', { name: 'End the call' }))
+
+    expect(acted.endSetup).toHaveBeenCalledTimes(1)
+    expect(acted.start).not.toHaveBeenCalled()
+  })
+
+  // Once the end has begun there is nothing more to ask: the control says so and cannot be pressed
+  // a second time.
+  it('says the end has begun and takes the control away once it has', () => {
+    render(
+      <VoiceSurface choice={choice()} call={null} currentTurn={null} busy ending notice={null} actions={actions()} />
+    )
+    expect(screen.getByRole('button', { name: 'Ending…' })).toBeDisabled()
+    expect(screen.queryByRole('button', { name: 'End the call' })).not.toBeInTheDocument()
+  })
+
   it('says a model statement is not a confirmation once, in the service’s words', () => {
     render(<VoiceSurface choice={choice()} call={null} currentTurn={null} busy={false}
         notice={null}

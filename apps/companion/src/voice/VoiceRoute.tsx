@@ -465,7 +465,11 @@ export function VoiceRoute({
    * when it is done. What the end left is read once those words are said, and adds none.
    */
   const endTheCall = useCallback(
-    (voiceSessionId: string | null, closed: (closure: VoiceClosure) => void) => {
+    (
+      voiceSessionId: string | null,
+      closed: (closure: VoiceClosure) => void,
+      refused: () => void = () => undefined
+    ) => {
       hangingUp.current = true
       void ask(() => port.voiceStop(voiceSessionId, {}))
         .then((closure) => {
@@ -475,6 +479,7 @@ export function VoiceRoute({
           )
         })
         .catch((error: unknown) => {
+          refused()
           setNotice(failureMessage(error))
         })
         .finally(() => {
@@ -584,6 +589,7 @@ export function VoiceRoute({
           .finally(() => {
             starting.current = false
             setBusy(false)
+            setEndingSetUp(false)
           })
       },
 
@@ -618,8 +624,18 @@ export function VoiceRoute({
       // that this screen was loaded again to find.
       endSetup: () => {
         // The device is still busy until it says so: the stop is answered at once, and the call the
-        // host may yet turn out to have made is ended after it. The screen goes on reading.
-        endTheCall(null, () => undefined)
+        // host may yet turn out to have made is ended after it. The screen goes on reading. When
+        // this screen's own start is the one waiting for the host, the start is still waiting
+        // when the stop is answered, and the control says the end has begun until the start is over.
+        const own = starting.current
+        if (own) setEndingSetUp(true)
+        endTheCall(
+          null,
+          () => undefined,
+          () => {
+            if (own) setEndingSetUp(false)
+          }
+        )
       },
 
       cancelTask: (turn) => {

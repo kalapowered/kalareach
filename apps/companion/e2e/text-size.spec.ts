@@ -16,6 +16,13 @@ import { expect, test, type Page } from '@playwright/test'
 
 import { overrunning, stopWrapping } from './layout'
 
+declare global {
+  interface Window {
+    /** Lets the start the harness holds be answered. */
+    krReleaseStart?: () => void
+  }
+}
+
 const SESSION = '8a7b6c50-22bb-4c3d-8e4f-000000000101'
 
 /** The largest accessibility size's body text, 53 points, against 17 at the default setting. */
@@ -398,6 +405,51 @@ test.describe('at the largest text size on a screen 320 points wide', () => {
         })
         await expect(page.getByRole('button', { name: 'Start voice session' })).toBeVisible()
         await expect(page.getByRole('heading', { name: 'Start a voice session' })).toBeFocused()
+      })
+    }
+
+    // The screen's own start while the host has not answered, at the default size and at the
+    // largest: the control that gives it up is on screen without scrolling, inside its box, and
+    // says the end has begun once it is pressed. The choice is the person's again when the start
+    // is over.
+    for (const [size, ratio] of [['default', 1], ['largest', LARGEST]] as const) {
+      test(`offers the end of its own start while the host has not answered at the ${size} size on ${surface}`, async ({
+        page
+      }) => {
+        await withSystemTextScale(page, ratio)
+        await page.setViewportSize({ width: size === 'default' ? 390 : 320, height: 720 })
+        await page.goto(`/harness.html?surface=${surface}&tab=sessions`)
+        await page.evaluate(() => {
+          window.krReleaseStart = window.krTestHost?.holdVoiceStart()
+        })
+        await page.getByTestId('voice-entry').click()
+        const start = page.getByRole('button', { name: 'Start voice session' })
+        await start.scrollIntoViewIfNeeded()
+        await start.click()
+
+        const end = page.getByRole('button', { name: 'End the call' })
+        await expect(end).toBeInViewport()
+        await expect(page.getByRole('button', { name: 'Starting…' })).toBeDisabled()
+        await page.screenshot({
+          path: `/tmp/kr-voice-own-start-${size}-${surface}-${test.info().project.name}.png`
+        })
+        expect(await overrunning(page, '.kr-voice__control'), 'a control label that runs past its box').toEqual([])
+        expect(await overrunning(page, '.kr-voice__start'), 'the start label that runs past its box').toEqual([])
+
+        await end.click()
+        const ending = page.getByRole('button', { name: 'Ending…' })
+        await expect(ending).toBeDisabled()
+        await expect(ending).toBeInViewport()
+        await page.screenshot({
+          path: `/tmp/kr-voice-own-start-ending-${size}-${surface}-${test.info().project.name}.png`
+        })
+        expect(await overrunning(page, '.kr-voice__control'), 'the ending label that runs past its box').toEqual([])
+
+        await page.evaluate(() => {
+          window.krReleaseStart?.()
+        })
+        await expect(page.getByRole('button', { name: 'Start voice session' })).toBeEnabled()
+        await expect(page.getByRole('button', { name: 'Ending…' })).toHaveCount(0)
       })
     }
 

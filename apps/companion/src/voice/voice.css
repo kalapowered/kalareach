@@ -228,6 +228,19 @@
   margin-top: var(--gap-2);
 }
 
+/* The start control, and beside it the control that gives the start up while it waits for the
+   host: the start fills the row when it is alone, and the two wrap when the text is too large for
+   one row. */
+.kr-voice__begin {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--gap-2);
+}
+
+.kr-voice__begin > .kr-voice__start {
+  flex: 1 1 auto;
+}
+
 .kr-voice__start {
   min-height: var(--target, 2.75rem);
   padding: 0 var(--gap-4);

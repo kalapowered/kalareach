@@ -63,8 +63,9 @@ export interface VoiceSurfaceActions {
   /** Ends the call and revokes its grant. Local, and the host is told after. */
   readonly hangUp: () => void
   /**
-   * Ends what the device is making when there is no call to name yet. Local, and the host is
-   * asked after, as a hang-up is.
+   * Ends what the device is making when there is no call to name yet, whether the device found
+   * it or this screen's own start is still waiting for the host. Local, and the host is asked
+   * after, as a hang-up is.
    */
   readonly endSetup: () => void
   /** Cancels the current turn on a host. Typed, and it names the turn. */
@@ -101,7 +102,10 @@ export interface VoiceSurfaceProps {
    * asked to say instead of offering a second start, or ending one. There may be no call to name.
    */
   readonly settingUp?: boolean
-  /** Whether what the device holds is being ended, so that nothing more can be asked of it. */
+  /**
+   * Whether what the device holds is being ended, so that nothing more can be asked of it: the
+   * setup screen says so, and so does the control that gives up this screen's own start.
+   */
   readonly ending?: boolean
   /**
    * Counts the calls that have left this screen. A screen that appears after one takes focus, so
@@ -135,10 +139,12 @@ export function VoiceSurface({
       <ProviderChoiceScreen
         choice={choice}
         busy={busy}
+        ending={ending}
         notice={notice}
         aftermath={aftermath}
         focusOnShow={focusToken > 0}
         onStart={actions.start}
+        onEnd={actions.endSetup}
       />
     )
   }
@@ -218,14 +224,18 @@ function SettingUpScreen({
 function ProviderChoiceScreen({
   choice,
   busy,
+  ending,
   notice,
   aftermath,
   focusOnShow,
-  onStart
+  onStart,
+  onEnd
 }: {
   readonly choice: ProviderChoice
   /** True while a start is in flight, so one press cannot become two calls. */
   readonly busy: boolean
+  /** Whether the start in flight has been given up and is being ended. */
+  readonly ending: boolean
   /** What the last answer said, when it was not a call. */
   readonly notice: string | null
   /** What the last call left. */
@@ -233,6 +243,8 @@ function ProviderChoiceScreen({
   /** Whether a call has just left this screen, so that focus goes to its heading. */
   readonly focusOnShow: boolean
   readonly onStart: () => void
+  /** Gives up the start in flight, without naming a call: there may be none to name yet. */
+  readonly onEnd: () => void
 }): React.ReactElement {
   const id = useId()
   const heading = useRef<HTMLHeadingElement | null>(null)
@@ -240,6 +252,13 @@ function ProviderChoiceScreen({
   useEffect(() => {
     if (takeFocus.current) heading.current?.focus()
   }, [])
+  const end = useRef<HTMLButtonElement | null>(null)
+  // A start waits for the host as long as the host takes. The control that gives it up appears
+  // beside the one that was pressed, which at the largest text sizes is a row lower, so it is
+  // brought into view. Focus does not move to it: a key pressed twice would end the call it began.
+  useEffect(() => {
+    if (busy) end.current?.scrollIntoView({ block: 'nearest' })
+  }, [busy])
   const terms = choice.managed
   const seconds = terms ? requestedSeconds(terms) : null
   const startable = terms !== null && terms.enabled && seconds !== null
@@ -372,15 +391,28 @@ function ProviderChoiceScreen({
       )}
 
       {startable && (
-        <button
-          type="button"
-          className="kr-voice__start"
-          onClick={onStart}
-          disabled={busy}
-          aria-describedby={`${id}-cost-rate ${id}-cost-limits`}
-        >
-          {busy ? 'Starting…' : choice.previousRate ? 'Start at the new rate' : 'Start voice session'}
-        </button>
+        <div className="kr-voice__begin">
+          <button
+            type="button"
+            className="kr-voice__start"
+            onClick={onStart}
+            disabled={busy}
+            aria-describedby={`${id}-cost-rate ${id}-cost-limits`}
+          >
+            {busy ? 'Starting…' : choice.previousRate ? 'Start at the new rate' : 'Start voice session'}
+          </button>
+          {busy && (
+            <button
+              type="button"
+              ref={end}
+              className="kr-voice__control kr-voice__control--end"
+              onClick={onEnd}
+              disabled={ending}
+            >
+              {ending ? 'Ending…' : 'End the call'}
+            </button>
+          )}
+        </div>
       )}
     </section>
   )

@@ -561,6 +561,13 @@ export interface FakeHostControls {
    * names nothing begins the end, and the setup stays until `endVoiceCall` finishes it.
    */
   settingUpAVoiceCall(): void
+  /**
+   * Holds the answer to the next start, with the device busy making the call, until the returned
+   * function is called: a host that is slow to say whether it made the call. A stop that names
+   * nothing meanwhile begins the end. When the answer comes a start that was given up is refused
+   * as a call given up before it began, and one that was not goes on as it would have.
+   */
+  holdVoiceStart(): () => void
   /** Sets what the voice service did about the call that last ended, once it has said. */
   settleVoiceBroker(broker: string): void
   /** Sets whether the host the call belongs to is reached: `reachable` or `lost`. */
@@ -921,6 +928,8 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
   let voiceAllowUnconfirmed = false
   /** Whether the next end of a call is answered with a barrier this build cannot read. */
   let voiceStopFenceUnreadable = false
+  /** The answer the next start waits for, until a test lets it go. */
+  let heldStart: Promise<void> | null = null
   let allowFenceUnreadable = false
   /** The sessions whose workers the next voice change leaves pending, and how many it cuts. */
   let voiceFencePendingAt: { sessionIds: readonly string[]; cut: number } | null = null
@@ -1189,6 +1198,83 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
         `Session descriptions are set up at the host itself: ${change} is not changed from a paired device.`
       )
     }
+  }
+
+  /** What the host answers a start that is not held. */
+  const answerStart = (request: VoiceStartRequest): ReturnType<HostPort['voiceStart']> => {
+    // The host compares the preparation the start names with what the call would be bound to
+    // now, before it asks the service for anything.
+    if (request.prepared !== preparedFor(voice)) {
+      return Promise.resolve({
+        receipt: null,
+        action_id: null,
+        value: {
+          outcome: {
+            preparation_changed: {
+              message:
+                'What this call would reach, what it could do or the service that would carry it changed after it was shown, so nothing was started. Read it again before starting.'
+            }
+          }
+        }
+      })
+    }
+    // The service compares the version the start names with the rate it would charge now, and
+    // refuses before anything is held when they differ.
+    if (request.expectedRateVersion !== voice.rate.version) {
+      return Promise.resolve({
+        receipt: null,
+        action_id: null,
+        value: {
+          outcome: {
+            rate_changed: {
+              rate: { ...voice.rate },
+              message:
+                'The rate a call would run under now is not the one this request named, so nothing was started, held or charged. Show the rate this answer carries and ask again with its version to start under it.'
+            }
+          }
+        }
+      })
+    }
+    if (voice.terms === 'closed') {
+      return Promise.resolve({
+        receipt: null,
+        action_id: null,
+        value: {
+          outcome: {
+            unavailable: {
+              reason: 'service_capacity',
+              message: 'Managed voice is closed at the moment.',
+              alternatives: [...VOICE_TERMS.alternatives]
+            }
+          }
+        }
+      })
+    }
+    if (voice.startRefusal) {
+      return Promise.resolve({
+        receipt: null,
+        action_id: null,
+        value: {
+          outcome: {
+            unavailable: {
+              reason: voice.startRefusal,
+              message: 'Managed voice cannot be started right now.',
+              alternatives: ['Type to the session instead.']
+            }
+          }
+        }
+      })
+    }
+    const started = fakeVoiceSession(request.sessionIds, VOICE_NOW_MS + 1_800_000)
+    voice.call = { session: started, capture: voice.startCapture, playing: true }
+    voice.ended = null
+    voice.delegations = []
+    voice.host = 'reachable'
+    return Promise.resolve({
+      receipt: null,
+      action_id: null,
+      value: { outcome: { started: { session: started } } }
+    })
   }
 
   const port: HostPort = {
@@ -2002,78 +2088,20 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
       if (voice.call) {
         refuse('PERMISSION_DENIED', 'This device is already holding a voice call.')
       }
-      // The host compares the preparation the start names with what the call would be bound to
-      // now, before it asks the service for anything.
-      if (request.prepared !== preparedFor(voice)) {
-        return Promise.resolve({
-          receipt: null,
-          action_id: null,
-          value: {
-            outcome: {
-              preparation_changed: {
-                message:
-                  'What this call would reach, what it could do or the service that would carry it changed after it was shown, so nothing was started. Read it again before starting.'
-              }
-            }
-          }
-        })
-      }
-      // The service compares the version the start names with the rate it would charge now, and
-      // refuses before anything is held when they differ.
-      if (request.expectedRateVersion !== voice.rate.version) {
-        return Promise.resolve({
-          receipt: null,
-          action_id: null,
-          value: {
-            outcome: {
-              rate_changed: {
-                rate: { ...voice.rate },
-                message:
-                  'The rate a call would run under now is not the one this request named, so nothing was started, held or charged. Show the rate this answer carries and ask again with its version to start under it.'
-              }
-            }
-          }
-        })
-      }
-      if (voice.terms === 'closed') {
-        return Promise.resolve({
-          receipt: null,
-          action_id: null,
-          value: {
-            outcome: {
-              unavailable: {
-                reason: 'service_capacity',
-                message: 'Managed voice is closed at the moment.',
-                alternatives: [...VOICE_TERMS.alternatives]
-              }
-            }
-          }
-        })
-      }
-      if (voice.startRefusal) {
-        return Promise.resolve({
-          receipt: null,
-          action_id: null,
-          value: {
-            outcome: {
-              unavailable: {
-                reason: voice.startRefusal,
-                message: 'Managed voice cannot be started right now.',
-                alternatives: ['Type to the session instead.']
-              }
-            }
-          }
-        })
-      }
-      const started = fakeVoiceSession(request.sessionIds, VOICE_NOW_MS + 1_800_000)
-      voice.call = { session: started, capture: voice.startCapture, playing: true }
+      const waiting = heldStart
+      if (waiting === null) return answerStart(request)
+      heldStart = null
+      // The device is busy making the call until the host answers.
+      voice.settingUp = true
+      voice.ending = false
       voice.ended = null
-      voice.delegations = []
-      voice.host = 'reachable'
-      return Promise.resolve({
-        receipt: null,
-        action_id: null,
-        value: { outcome: { started: { session: started } } }
+      return waiting.then(() => {
+        const givenUp = voice.ending
+        voice.settingUp = false
+        voice.ending = false
+        if (!givenUp) return answerStart(request)
+        voice.ended = endedBy('requested', 'You ended the call.', { kind: 'not_needed' })
+        return refused('RESOURCE_UNAVAILABLE', 'The call was given up before it began.')
       })
     },
 
@@ -2685,6 +2713,13 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
         }),
         ...ended
       }
+    },
+    holdVoiceStart() {
+      let release = () => {}
+      heldStart = new Promise<void>((resolve) => {
+        release = resolve
+      })
+      return release
     },
     settleVoiceBroker(broker) {
       if (voice.ended) voice.ended = { ...voice.ended, broker }

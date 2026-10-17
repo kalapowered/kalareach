@@ -117,3 +117,7 @@ if (typeof globalThis.IntersectionObserver !== 'function') {
     value: EverythingIsOnScreen
   })
 }
+
+// jsdom has no layout and does not scroll. A screen that brings a control into view asks the
+// element to, and there is nothing to move.
+Element.prototype.scrollIntoView = function scrollIntoView() {}
