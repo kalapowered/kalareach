@@ -111,6 +111,19 @@ describe('an invitation at the head of the inbox (KR-REQ-18.13)', () => {
     expect(within(ends).getByText(/\. Used once\.$/)).toBeInTheDocument()
   })
 
+  it('names the control that closes the card by the card, and closing it leaves the invitation offered', async () => {
+    start({ before: (c) => c.sharing.offer() })
+    await userEvent.click(await screen.findByRole('button', { name: new RegExp(INVITATION) }))
+    const card = await screen.findByRole('dialog')
+    // A screen reader says what the control closes, here the invitation and not the settings.
+    expect(within(card).queryByRole('button', { name: 'Close settings' })).toBeNull()
+    await userEvent.click(within(card).getByRole('button', { name: 'Close invitation' }))
+    await waitFor(() => {
+      expect(screen.queryByRole('dialog')).toBeNull()
+    })
+    expect(screen.getByRole('button', { name: new RegExp(INVITATION) })).toBeInTheDocument()
+  })
+
   it('says a share without the live view gives no terminal, whatever the role could do with one', async () => {
     start({ before: (c) => c.sharing.offer({ role: 'controller', live: false }) })
     await userEvent.click(await screen.findByRole('button', { name: new RegExp(INVITATION) }))

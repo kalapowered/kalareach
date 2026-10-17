@@ -22,7 +22,13 @@ export function MobileSettings({
 }): ReactNode {
   const { port } = useApp()
   return (
-    <Sheet open={open} title="Settings" description="The session behind this keeps running." onClose={onClose}>
+    <Sheet
+      open={open}
+      title="Settings"
+      description="The session behind this keeps running."
+      closeLabel="Close settings"
+      onClose={onClose}
+    >
       <div className="settings-content">
         <h2>Appearance</h2>
         <p className="muted">Light, dark, or whatever this device is set to.</p>

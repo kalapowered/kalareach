@@ -228,6 +228,7 @@ export function Inbox({
         open={open !== null}
         title={open?.title ?? ''}
         description={open ? whereOf(open) : undefined}
+        closeLabel="Close item"
         onClose={() => {
           setOpen(null)
         }}

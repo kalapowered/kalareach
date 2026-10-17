@@ -531,6 +531,7 @@ export function Sheet({
   open,
   title,
   description,
+  closeLabel,
   onClose,
   children,
   footer
@@ -538,6 +539,8 @@ export function Sheet({
   readonly open: boolean
   readonly title: string
   readonly description?: string
+  /** What the control that closes the surface is called: it names the surface, as "Close settings". */
+  readonly closeLabel: string
   readonly onClose: () => void
   readonly children: ReactNode
   readonly footer?: ReactNode
@@ -865,7 +868,7 @@ export function Sheet({
             <h2 id={titleId}>{title}</h2>
             {description ? <p className="muted">{description}</p> : null}
           </div>
-          <IconButton label="Close settings" onClick={close}>
+          <IconButton label={closeLabel} onClick={close}>
             ×
           </IconButton>
         </header>

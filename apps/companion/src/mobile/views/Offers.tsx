@@ -433,6 +433,7 @@ export function Offers({ surface }: { readonly surface: Surface }): ReactNode {
         open={opened !== null}
         title={opened === null ? '' : offerTitle(host, opened)}
         onClose={() => {
+        closeLabel="Close invitation"
           setOpen(null)
         }}
         footer={

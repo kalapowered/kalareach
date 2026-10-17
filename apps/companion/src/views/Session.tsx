@@ -409,6 +409,7 @@ function CloseConsequence({
       open={open}
       title="Close this session?"
       description="This is what closing does."
+      closeLabel="Cancel closing this session"
       onClose={onCancel}
       footer={
         <>
@@ -467,7 +468,13 @@ function SessionSettings({
   const [followOutput, setFollowOutput] = useState(true)
 
   return (
-    <Sheet open={open} title="Settings" description="The session behind this keeps running." onClose={onClose}>
+    <Sheet
+      open={open}
+      title="Settings"
+      description="The session behind this keeps running."
+      closeLabel="Close settings"
+      onClose={onClose}
+    >
       <div className="settings-layout">
         <nav className="settings-nav" aria-label="Settings sections">
           {(

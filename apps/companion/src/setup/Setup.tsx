@@ -399,6 +399,7 @@ export function Setup(): ReactNode {
       <Sheet
         open={effectsOpen}
         title="What each check does"
+        closeLabel="Close the list of checks"
         description="Every one of these is run in the same place an agent runs, and each says what it does before it does it."
         onClose={() => {
           setEffectsOpen(false)

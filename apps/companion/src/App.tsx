@@ -229,6 +229,7 @@ export function App(): ReactNode {
         open={accountOpen}
         title="Account"
         description="Sessions keep running while this is open."
+        closeLabel="Close account"
         onClose={() => {
           setAccountOpen(false)
         }}
