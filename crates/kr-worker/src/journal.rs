@@ -254,7 +254,7 @@ impl Journal {
     ///
     /// Returns [`WorkerError::JournalUnavailable`] when the database cannot be opened or migrated.
     pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self> {
-        let connection = crate::persistence::release::open_connection(path.as_ref(), None)
+        let connection = kr_flush::release::open_connection(path.as_ref(), None)
             .map_err(unavailable)?;
         Self::prepare(connection)
     }
@@ -271,7 +271,7 @@ impl Journal {
     /// Returns [`WorkerError::JournalUnavailable`] when there is no journal there, or when the
     /// one that is there cannot be opened or migrated.
     pub fn open_existing(path: impl AsRef<std::path::Path>) -> Result<Self> {
-        let connection = crate::persistence::release::open_connection(
+        let connection = kr_flush::release::open_connection(
             path.as_ref(),
             Some(
                 rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
@@ -2960,7 +2960,7 @@ impl Journal {
     /// Returns [`WorkerError::JournalUnavailable`] when the file cannot be opened or records no
     /// version.
     pub fn recorded_schema_version(path: impl AsRef<std::path::Path>) -> Result<i64> {
-        let connection = crate::persistence::release::open_connection(
+        let connection = kr_flush::release::open_connection(
             path.as_ref(),
             Some(
                 rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
@@ -2984,7 +2984,7 @@ impl Journal {
     /// Returns [`WorkerError::JournalUnavailable`] when the file cannot be opened or is not a
     /// journal this build reads.
     pub fn open_read_only(path: impl AsRef<std::path::Path>) -> Result<Self> {
-        let connection = crate::persistence::release::open_connection(
+        let connection = kr_flush::release::open_connection(
             path.as_ref(),
             Some(
                 rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
@@ -4346,7 +4346,7 @@ fn faulted(
 ) -> WorkerError {
     health.observe(&error, kr_ipc::now_ms().get());
     WorkerError::JournalUnavailable {
-        detail: crate::persistence::fault::describe(&error),
+        detail: kr_flush::release::describe(&error),
     }
 }
 
@@ -4377,7 +4377,7 @@ fn parse_content_class(value: &str) -> Option<crate::persistence::stores::Conten
 
 fn unavailable(error: rusqlite::Error) -> WorkerError {
     WorkerError::JournalUnavailable {
-        detail: crate::persistence::fault::describe(&error),
+        detail: kr_flush::release::describe(&error),
     }
 }
 

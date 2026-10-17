@@ -1028,7 +1028,7 @@ fn a_recovery_gap_survives_reopening_the_journal() {
 // ---------------------------------------------------------------------------------------------
 
 #[cfg(windows)]
-use kr_worker::persistence::release::held_index;
+use kr_flush::release::held_index;
 
 /// A journal with one receipt in it, closed again, and the path of its index file.
 #[cfg(windows)]
@@ -1090,7 +1090,7 @@ fn every_way_of_opening_a_journal_waits_for_a_holder_that_has_not_let_go_of_its_
 
         let waited = Arc::new(AtomicBool::new(false));
         let signal = Arc::clone(&waited);
-        kr_worker::persistence::release::on_the_next_wait(move || {
+        kr_flush::release::on_the_next_wait(move || {
             signal.store(true, Ordering::SeqCst);
             drop(held);
         });
