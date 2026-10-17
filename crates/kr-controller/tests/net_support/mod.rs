@@ -380,7 +380,8 @@ impl Host {
     }
 
     /// Starts a daemon whose configuration document selects the authority feed at `origin`, whose
-    /// carriers wait by `timer`, with `owner` as its first owner.
+    /// carriers wait by `timer`, the reader of its own mailbox waiting by `timer` too, with `owner`
+    /// as its first owner.
     ///
     /// The host's own keys are `host_keys`, put where the daemon finds them when it starts, so a
     /// suite can seal an item to the host's mailbox before the daemon reads it.
