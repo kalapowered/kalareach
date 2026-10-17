@@ -1,0 +1,363 @@
+/**
+ * What is shared with a phone, as the person sees it: the invitations at the head of the inbox, the
+ * shares at the head of the sessions, and what each says when the host or the connection does not
+ * do what was hoped.
+ *
+ * The scripted host stands in for native code and answers the two commands as they do. What these
+ * hold the page to is what the person reads and can do: the card says what accepting lets the phone
+ * do in the host's own terms, accepting commits once on a completed press, a refusal of the first
+ * send is the host's sentence and never a claim that nothing was accepted, the list the host gives
+ * decides what is held and what has ended, and a guest, whose pairing holds no view of any session,
+ * has an inbox and a sessions list that say so rather than fail. The same flows run against a real
+ * host in the backend's suite.
+ */
+
+import { act, cleanup, render, screen, waitFor, within } from '@testing-library/react'
+import userEvent from '@testing-library/user-event'
+import { afterEach, describe, expect, it } from 'vitest'
+
+import { AppProvider } from '../../src/app/state'
+import { fakeHost, type FakeHostControls } from '../../src/host/fake'
+import type { HostPort } from '../../src/host/port'
+import { bookOf } from '../../src/model/held-shares'
+import { MobileApp } from '../../src/mobile/MobileApp'
+
+afterEach(() => {
+  cleanup()
+})
+
+interface Phone {
+  readonly controls: FakeHostControls
+  readonly port: HostPort
+}
+
+/** A phone paired with the scripted host as a guest, whose pairing holds no view of a session. */
+function start(options?: { readonly rights?: readonly string[]; readonly before?: (c: FakeHostControls) => void }): Phone {
+  const { port, controls } = fakeHost()
+  controls.reachAsPhone(options?.rights === undefined ? {} : { rights: options.rights as never })
+  options?.before?.(controls)
+  render(
+    <AppProvider port={port}>
+      <MobileApp surface="ios" storage={null} />
+    </AppProvider>
+  )
+  return { controls, port }
+}
+
+async function openTab(name: string): Promise<void> {
+  await userEvent.click(await screen.findByRole('button', { name }))
+}
+
+/** Reads the host's list again now, as the five-second cadence does. */
+async function readAgain(port: HostPort): Promise<void> {
+  await act(async () => {
+    bookOf(port).refresh()
+    await Promise.resolve()
+  })
+}
+
+const INVITATION = 'Studio shared session 3 with you.'
+
+describe('an invitation at the head of the inbox (KR-REQ-18.13)', () => {
+  it('is the first thing the inbox shows, in the words of who shared which session', async () => {
+    start({ before: (c) => c.sharing.offer({ role: 'controller', live: true }) })
+    const offers = await screen.findByTestId('offers')
+    expect(within(offers).getByRole('heading', { name: 'Invitations' })).toBeInTheDocument()
+    expect(within(offers).getByText(INVITATION)).toBeInTheDocument()
+    // It is above the filters the inbox starts with.
+    const filters = screen.getByRole('group', { name: 'Filter the inbox' })
+    expect(offers.compareDocumentPosition(filters) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+  })
+
+  it('is opened as a card that says what accepting lets the phone do, show and until when', async () => {
+    start({ before: (c) => c.sharing.offer({ role: 'controller', live: true }) })
+    await userEvent.click(await screen.findByRole('button', { name: new RegExp(INVITATION) }))
+    const card = await screen.findByTestId('offer-card')
+
+    const youCan = within(card).getByRole('heading', { name: 'You can' }).parentElement as HTMLElement
+    expect(within(youCan).getByText('Type into the terminal')).toBeInTheDocument()
+    expect(within(youCan).getByText('Resize the terminal')).toBeInTheDocument()
+
+    // The host's consequences, said to the person they are about, with the host named.
+    const lets = within(card).getByRole('heading', { name: 'This lets you' }).parentElement as HTMLElement
+    expect(within(lets).getByText(/Terminal input runs as the owner’s account on Studio\./)).toBeInTheDocument()
+    expect(within(lets).getByText(/may act on under its own permissions on Studio\./)).toBeInTheDocument()
+
+    const shows = within(card).getByRole('heading', { name: 'Shows' }).parentElement as HTMLElement
+    expect(within(shows).getByText(/^What the session does from /)).toBeInTheDocument()
+    expect(within(shows).getByText('The terminal as it is when you open it.')).toBeInTheDocument()
+
+    const ends = within(card).getByRole('heading', { name: 'Ends' }).parentElement as HTMLElement
+    expect(within(ends).getByText(/\. Used once\.$/)).toBeInTheDocument()
+  })
+
+  it('shows no consequences and no live screen for a viewer share that includes neither', async () => {
+    start({ before: (c) => c.sharing.offer() })
+    await userEvent.click(await screen.findByRole('button', { name: new RegExp(INVITATION) }))
+    const card = await screen.findByTestId('offer-card')
+    expect(within(card).queryByRole('heading', { name: 'This lets you' })).toBeNull()
+    expect(within(card).queryByText('The terminal as it is when you open it.')).toBeNull()
+  })
+
+  it('is accepted by a completed press, once, with the host named in what is said', async () => {
+    const { controls } = start({ before: (c) => c.sharing.offer() })
+    await userEvent.click(await screen.findByRole('button', { name: new RegExp(INVITATION) }))
+    await userEvent.click(await screen.findByTestId('accept-offer'))
+
+    expect(await screen.findByText(/^Accepted\. Session 3 is shared with you until /)).toBeInTheDocument()
+    expect(controls.sharing.sent().redeem).toBe(1)
+    await waitFor(() => {
+      expect(screen.queryByTestId('offers')).toBeNull()
+    })
+  })
+
+  it('is put off with Not now, and shown again from the row that says one is hidden', async () => {
+    const { controls } = start({ before: (c) => c.sharing.offer() })
+    await userEvent.click(await screen.findByRole('button', { name: new RegExp(INVITATION) }))
+    await userEvent.click(await screen.findByTestId('not-now'))
+
+    const hidden = await screen.findByTestId('hidden-offers')
+    expect(hidden).toHaveTextContent('1 hidden invitation')
+    expect(screen.queryByText(INVITATION)).toBeNull()
+    // Putting it off decides nothing for the host: it never sent a redemption.
+    expect(controls.sharing.sent().redeem).toBe(0)
+
+    await userEvent.click(hidden)
+    expect(await screen.findByText(INVITATION)).toBeInTheDocument()
+    expect(screen.queryByTestId('hidden-offers')).toBeNull()
+  })
+
+  it('says the host’s sentence when the host refuses the first send, never that nothing was accepted', async () => {
+    const { controls, port } = start({ before: (c) => c.sharing.offer() })
+    controls.sharing.refuseNextRedeem('The host could not finish accepting that just now.', true)
+    await userEvent.click(await screen.findByRole('button', { name: new RegExp(INVITATION) }))
+    await userEvent.click(await screen.findByTestId('accept-offer'))
+
+    // The row for the acceptance is unfinished, in the host's words.
+    const attempt = await screen.findByTestId('accept-attempt')
+    expect(attempt).toHaveTextContent('Unfinished: Accepting session 3.')
+    expect(attempt).toHaveTextContent('The host said: The host could not finish accepting that just now.')
+    expect(attempt).not.toHaveTextContent(/nothing was accepted|was not accepted/)
+
+    // The host had written the share before it refused: the rows decide, and the share is held.
+    await openTab('Sessions')
+    const shared = await screen.findByTestId('shared-with-you')
+    expect(within(shared).getByText('Session 3 · Studio')).toBeInTheDocument()
+
+    // Once the host's bound has passed it says that it was accepted, and the record goes.
+    act(() => {
+      controls.sharing.passTheBound()
+    })
+    await openTab('Attention')
+    await readAgain(port)
+    expect(await screen.findByText(/^Accepted\. Session 3 is shared with you until /)).toBeInTheDocument()
+    await waitFor(() => {
+      expect(screen.queryByTestId('accept-attempt')).toBeNull()
+    })
+  })
+
+  it('closes an acceptance the host never wrote as not accepted, once the bound has passed', async () => {
+    const { controls, port } = start({ before: (c) => c.sharing.offer() })
+    controls.sharing.refuseNextRedeem('That invitation cannot be used right now.', false)
+    await userEvent.click(await screen.findByRole('button', { name: new RegExp(INVITATION) }))
+    await userEvent.click(await screen.findByTestId('accept-offer'))
+    expect(await screen.findByTestId('accept-attempt')).toHaveTextContent('Unfinished')
+
+    act(() => {
+      controls.sharing.passTheBound()
+    })
+    await readAgain(port)
+    await waitFor(() => {
+      expect(screen.getByTestId('accept-attempt')).toHaveTextContent('it was not accepted, as far as the host shows')
+    })
+    // The invitation is still the host's to offer, and the person can try again.
+    expect(screen.getByText(INVITATION)).toBeInTheDocument()
+    await userEvent.click(screen.getByTestId('attempt-remove'))
+    await waitFor(() => {
+      expect(screen.queryByTestId('accept-attempt')).toBeNull()
+    })
+  })
+
+  it('lists an acceptance whose answer was lost as unfinished, and the host’s record answers Ask the host', async () => {
+    const { controls } = start({ before: (c) => c.sharing.offer() })
+    controls.sharing.loseNextAnswer()
+    await userEvent.click(await screen.findByRole('button', { name: new RegExp(INVITATION) }))
+    await userEvent.click(await screen.findByTestId('accept-offer'))
+
+    const attempt = await screen.findByTestId('accept-attempt')
+    expect(attempt).toHaveTextContent('Unfinished: Accepting session 3.')
+    expect(attempt).toHaveTextContent('The host has not said whether it happened.')
+
+    await userEvent.click(within(attempt).getByTestId('attempt-ask'))
+    expect(await screen.findByText('Accepted.')).toBeInTheDocument()
+    await waitFor(() => {
+      expect(screen.queryByTestId('accept-attempt')).toBeNull()
+    })
+  })
+
+  it('holds a second acceptance of an invitation back while an earlier one is not settled', async () => {
+    const { controls } = start({ before: (c) => c.sharing.offer() })
+    controls.sharing.loseNextRequest()
+    await userEvent.click(await screen.findByRole('button', { name: new RegExp(INVITATION) }))
+    await userEvent.click(await screen.findByTestId('accept-offer'))
+    await screen.findByTestId('accept-attempt')
+
+    // The host never saw it, so it still offers the invitation, and the card says why it waits.
+    await userEvent.click((await screen.findByText(INVITATION)).closest('button') as HTMLElement)
+    expect(await screen.findByTestId('accept-offer')).toBeDisabled()
+    expect(screen.getByTestId('offer-unsettled')).toBeInTheDocument()
+    expect(controls.sharing.sent().redeem).toBe(1)
+  })
+
+  it('can hide an unfinished acceptance and show it again, which releases nothing', async () => {
+    const { controls } = start({ before: (c) => c.sharing.offer() })
+    controls.sharing.loseNextAnswer()
+    await userEvent.click(await screen.findByRole('button', { name: new RegExp(INVITATION) }))
+    await userEvent.click(await screen.findByTestId('accept-offer'))
+    await userEvent.click(await screen.findByTestId('attempt-hide'))
+
+    const hidden = await screen.findByTestId('hidden-attempts')
+    expect(hidden).toHaveTextContent('1 hidden attempt can still happen')
+    await userEvent.click(within(hidden).getByTestId('attempt-show'))
+    expect(await screen.findByTestId('accept-attempt')).toBeInTheDocument()
+  })
+})
+
+describe('the shares held, at the head of the sessions (KR-REQ-18.13)', () => {
+  async function accepted(): Promise<Phone> {
+    const phone = start({ before: (c) => c.sharing.offer({ role: 'controller' }) })
+    await userEvent.click(await screen.findByRole('button', { name: new RegExp(INVITATION) }))
+    await userEvent.click(await screen.findByTestId('accept-offer'))
+    await screen.findByText(/^Accepted\./)
+    await openTab('Sessions')
+    return phone
+  }
+
+  it('lists a share by its session, the host and its role, until the time the host gives', async () => {
+    await accepted()
+    const shared = await screen.findByTestId('shared-with-you')
+    expect(within(shared).getByRole('heading', { name: 'Shared with you' })).toBeInTheDocument()
+    expect(within(shared).getByText('Session 3 · Studio')).toBeInTheDocument()
+    expect(within(shared).getByText('Controller')).toBeInTheDocument()
+    expect(within(shared).getByText(/^Until /)).toBeInTheDocument()
+  })
+
+  it('opens the session under the share when the row is pressed', async () => {
+    const { controls } = await accepted()
+    const shared = await screen.findByTestId('shared-with-you')
+    await userEvent.click(within(shared).getByRole('button', { name: /Session 3 · Studio/ }))
+    await waitFor(() => {
+      expect(controls.standings.opens.at(-1)).toMatchObject({
+        sessionId: '8a7b6c50-22bb-4c3d-8e4f-000000000101',
+        grantId: controls.sharing.held()[0]?.grant.grant_id
+      })
+    })
+  })
+
+  it('keeps a share the host stopped listing as a row that says it ended and leads nowhere', async () => {
+    const { controls, port } = await accepted()
+    const shared = await screen.findByTestId('shared-with-you')
+    expect(within(shared).queryByTestId('ended-share')).toBeNull()
+
+    const grantId = controls.sharing.held()[0]?.grant.grant_id ?? ''
+    controls.sharing.endShare(grantId)
+    await readAgain(port)
+    const ended = await screen.findByTestId('ended-share')
+    expect(ended).toHaveTextContent('Ended')
+    expect(ended).toHaveTextContent('Session 3 · Studio')
+    expect(within(shared).queryByRole('button', { name: /Session 3 · Studio/ })).toBeNull()
+  })
+
+  it('marks nothing as ended when the read that would have said so failed', async () => {
+    const { controls, port } = await accepted()
+    await screen.findByTestId('shared-with-you')
+    const grantId = controls.sharing.held()[0]?.grant.grant_id ?? ''
+    controls.sharing.endShare(grantId)
+    controls.sharing.failNextHeld('the connection to the host was lost')
+    await readAgain(port)
+
+    const shared = await screen.findByTestId('shared-with-you')
+    expect(await within(shared).findByText(/Not refreshed just now/)).toBeInTheDocument()
+    expect(screen.queryByTestId('ended-share')).toBeNull()
+    expect(within(shared).getByRole('button', { name: /Session 3 · Studio/ })).toBeInTheDocument()
+
+    await readAgain(port)
+    expect(await screen.findByTestId('ended-share')).toBeInTheDocument()
+    expect(within(shared).queryByText(/Not refreshed just now/)).toBeNull()
+  })
+})
+
+describe('a guest, whose pairing holds no view of any session (KR-REQ-25.28)', () => {
+  it('has an inbox with nothing of its own and not one that failed, and an invitation above it', async () => {
+    start({ before: (c) => c.sharing.offer() })
+    expect(await screen.findByText(INVITATION)).toBeInTheDocument()
+    await waitFor(() => {
+      expect(screen.getByText('Nothing needs you right now.')).toBeInTheDocument()
+    })
+    expect(screen.queryByText('The inbox could not be read')).toBeNull()
+  })
+
+  it('lists only what is shared with it, and says so when nothing is', async () => {
+    start()
+    await openTab('Sessions')
+    expect(await screen.findByText('Nothing is shared with this phone.')).toBeInTheDocument()
+    expect(screen.queryByText('The sessions could not be read')).toBeNull()
+    expect(screen.queryByText('Session 1')).toBeNull()
+  })
+
+  it('lists its own sessions and the shared ones apart when its pairing holds a view', async () => {
+    const { controls } = start({ rights: ['session.view'] })
+    controls.sharing.offer()
+    await openTab('Sessions')
+    expect(await screen.findByText('Session 1')).toBeInTheDocument()
+    expect(screen.queryByTestId('shared-with-you')).toBeNull()
+    expect(screen.queryByText('Nothing is shared with this phone.')).toBeNull()
+  })
+})
+
+describe('the host on this computer (KR-REQ-18.13)', () => {
+  it('holds no share of itself, so neither half is drawn and nothing is asked', async () => {
+    const { port, controls } = fakeHost()
+    render(
+      <AppProvider port={port}>
+        <MobileApp surface="ios" storage={null} />
+      </AppProvider>
+    )
+    await screen.findByRole('group', { name: 'Filter the inbox' })
+    expect(screen.queryByTestId('offers')).toBeNull()
+    await openTab('Sessions')
+    await screen.findByText('Session 1')
+    expect(screen.queryByTestId('shared-with-you')).toBeNull()
+    expect(controls.sharing.heldReads()).toBe(0)
+  })
+})
+
+describe('a host that does not know the read (KR-REQ-18.13)', () => {
+  it('shows neither half, no failure, and asks once', async () => {
+    const { controls } = start({ before: (c) => c.sharing.doesNotServeHeld() })
+    await waitFor(() => {
+      expect(controls.sharing.heldReads()).toBe(1)
+    })
+    expect(screen.queryByTestId('offers')).toBeNull()
+    await openTab('Sessions')
+    expect(screen.queryByTestId('shared-with-you')).toBeNull()
+    expect(controls.sharing.heldReads()).toBe(1)
+  })
+})
+
+describe('an invitation that arrives while the inbox is open (KR-REQ-18.13)', () => {
+  it('is told once to a screen reader and takes its place at the head', async () => {
+    const { controls, port } = start()
+    await screen.findByText('Nothing needs you right now.')
+    controls.sharing.offer({ session: '4' })
+    await readAgain(port)
+
+    expect(await screen.findByText('Studio shared session 4 with you.')).toBeInTheDocument()
+    expect(screen.getByTestId('offers-said')).toHaveTextContent('New invitation. Studio shared session 4 with you.')
+
+    // A read that finds nothing new says nothing more.
+    const said = screen.getByTestId('offers-said').textContent
+    await readAgain(port)
+    expect(screen.getByTestId('offers-said').textContent).toBe(said)
+  })
+})
