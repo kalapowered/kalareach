@@ -20,6 +20,8 @@
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 #[path = "../../../crates/kr-transport/tests/support/conditions.rs"]
@@ -90,6 +92,14 @@ pub struct Window {
     entering: Option<String>,
     speed: Option<Speed>,
     stolen: StolenTime,
+    beside: Option<Beside>,
+}
+
+/// Work that runs beside a measurement for its whole window, and the count of what it completed.
+#[derive(Debug)]
+struct Beside {
+    what: &'static str,
+    done: Arc<AtomicU64>,
 }
 
 impl Window {
@@ -107,7 +117,19 @@ impl Window {
             entering,
             speed,
             stolen: StolenTime::start(),
+            beside: None,
         }
+    }
+
+    /// Says that work runs beside this measurement, and counts what it completes.
+    ///
+    /// A figure taken while journalled mutations run is a different figure from one taken on a
+    /// worker with nothing else to do, and the record has to say which it is. `done` is read as the
+    /// window closes, and the section names what was completed and how many.
+    #[must_use]
+    pub fn beside(mut self, what: &'static str, done: Arc<AtomicU64>) -> Self {
+        self.beside = Some(Beside { what, done });
+        self
     }
 
     /// Reads the host as a measurement begins, without reading its speed.
@@ -121,6 +143,7 @@ impl Window {
             entering: load_average(),
             speed: None,
             stolen: StolenTime::start(),
+            beside: None,
         }
     }
 
@@ -135,6 +158,9 @@ impl Window {
             leaving,
             speed: self.speed.map(|entering| (entering, Speed::read())),
             stolen,
+            beside: self
+                .beside
+                .map(|beside| (beside.what, beside.done.load(Ordering::Acquire))),
         }
     }
 }
@@ -148,6 +174,8 @@ pub struct Conditions {
     /// The host's speed at the two edges, where it was read.
     speed: Option<(Speed, Speed)>,
     stolen: Option<f64>,
+    /// What ran beside the measurement, and how many of it were completed.
+    beside: Option<(&'static str, u64)>,
 }
 
 impl Conditions {
@@ -167,7 +195,7 @@ impl Conditions {
         let host = &self.host;
         let unread = || "unread".to_owned();
         let shortfalls = self.shortfalls();
-        vec![
+        let mut lines = vec![
             format!(
                 "  build             {}",
                 if host.optimised { "release" } else { "debug" }
@@ -228,7 +256,13 @@ impl Conditions {
             } else {
                 format!("  reference host    short: {}", shortfalls.join("; "))
             },
-        ]
+        ];
+        if let Some((what, done)) = self.beside {
+            lines.push(format!(
+                "  work beside       {done} {what} completed while the measurement ran"
+            ));
+        }
+        lines
     }
 }
 
@@ -255,6 +289,7 @@ impl Conditions {
             leaving: None,
             speed: None,
             stolen,
+            beside: None,
         }
     }
 }
