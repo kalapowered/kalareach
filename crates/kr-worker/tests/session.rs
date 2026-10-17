@@ -1890,20 +1890,16 @@ fn marked_number(output: &[u8], marker: &[u8]) -> Option<u64> {
 async fn a_root_shell_that_exits_at_once_is_noticed_before_the_first_wait() {
     // The exit can happen before anything is watching for it: the shell is launched, and it is
     // gone by the time the supervision has opened the child signal it would have been reported on.
-    // So the shell's status is asked for once before that supervision waits at all, and this is the
-    // case that sets that order up. Run alone on a host with the child signal, nothing but that
-    // look can find the exit; in a binary whose other cases also start children, or on a host that
-    // polls, something else may find it first, and the case then shows that the exit is noticed.
-    //
-    // The shell is gone before the supervision starts, so the signal of its exit has been and
-    // gone; a descendant holds the terminal open, so the terminal hanging up is not the evidence
-    // either; the sweep is an hour away; and the session's input and output no longer wake the
-    // supervision. What is left to find the exit depends on the host. Where the supervision asks
-    // for the shell's status every hundred milliseconds (Windows, and a host that cannot open the
-    // child signal), the first look or that poll found it. Where it waits on the child signal, the
-    // first look or the end of another child of this process, which wakes it the way the shell's
-    // own would have, found it. Either way the shell was gone when the supervision looked,
-    // however long the start took; the case does not say which look it was.
+    // So the shell's status is asked for once before that supervision waits at all, and this case
+    // has the shell gone before the supervision starts. The signal of its exit has been and gone,
+    // a descendant holds the terminal open, the sweep is an hour away, and the session's input
+    // and output no longer wake the supervision, so that first look is what finds the exit.
+    // What would find it without the look depends on the host: the poll every hundred
+    // milliseconds where the supervision has one (Windows, and a host that cannot open the child
+    // signal), and the end of another child of this process where it waits on the child signal
+    // (another case of this binary). On those hosts the case passes without the look and shows
+    // that the exit is noticed however long the start took; it fails without the look only where
+    // nothing else wakes the supervision.
     let host = kr_ipc::testing::TempHost::create();
     let config = configuration(&host, "sleep 600 & printf 'kr-leaving\\n'; exit 7");
     let mut session = Session::open(config).expect("opens");
