@@ -9,7 +9,7 @@
 
 use std::sync::Arc;
 
-use kr_controller::registry::{Registry, WorkerRecord};
+use kr_controller::registry::{LaunchPhase, Registry, WorkerRecord};
 use kr_controller::service::Clocks;
 use kr_crypto::keys::DeviceKeys;
 use kr_crypto::store::open_store_in;
@@ -65,6 +65,17 @@ impl Worker {
     /// registry row and a published descriptor. A daemon started afterwards reaches it at its
     /// start. No daemon may be running on the tree while this runs.
     pub async fn start(tree: &kr_ipc::testing::TempHost, display: u64) -> Self {
+        Self::start_as(tree, display, false).await
+    }
+
+    /// As [`Self::start`], for a session the registry also holds an open reservation of, as it does
+    /// for every session a daemon creates. What a share or an offer of a session tells a device
+    /// depends on that: a session with no reservation is not one the host can tell a device about.
+    pub async fn start_reserved(tree: &kr_ipc::testing::TempHost, display: u64) -> Self {
+        Self::start_as(tree, display, true).await
+    }
+
+    async fn start_as(tree: &kr_ipc::testing::TempHost, display: u64, reserved: bool) -> Self {
         let environment = tree.environment();
         let environment_id = tree.environment_id();
         let boot = kr_ipc::identity::boot_identity().expect("a boot identity");
@@ -74,8 +85,36 @@ impl Worker {
                 .expect("the daemon's identity")
                 .public_key()
         };
-        let session_id = SessionId::new(kr_ipc::new_uuid());
-        let display_number = DisplayNumber::new(display);
+        let (session_id, display_number) = if reserved {
+            let mut registry = Registry::open(environment.registry_database(), environment_id)
+                .expect("the registry");
+            let admitted = registry
+                .reserve(
+                    &kr_protocol::ids::ActorId::new("local:501").expect("an actor"),
+                    kr_ipc::new_uuid(),
+                    Digest256::from_bytes([0x5e; 32]),
+                    &[0xa0],
+                    now(),
+                )
+                .expect("the session is reserved");
+            registry
+                .set_phase(admitted.reservation.reservation_id, LaunchPhase::Live)
+                .expect("the session is live");
+            assert_eq!(
+                admitted.reservation.display_number,
+                DisplayNumber::new(display),
+                "sessions are reserved in the order their workers start"
+            );
+            (
+                admitted.reservation.session_id,
+                admitted.reservation.display_number,
+            )
+        } else {
+            (
+                SessionId::new(kr_ipc::new_uuid()),
+                DisplayNumber::new(display),
+            )
+        };
         let process =
             kr_ipc::identity::current_process_start_identity().expect("a process identity");
         let identity = Arc::new(
@@ -533,7 +572,12 @@ impl Adopted {
     /// Starts a daemon on a fresh environment, bootstraps its owner, stops it, starts `sessions`
     /// workers on the tree and starts the daemon again, which adopts them.
     pub async fn start(sessions: u64) -> Self {
-        Self::start_on(sessions, None, Clocks::system()).await
+        Self::start_on(sessions, None, Clocks::system(), false).await
+    }
+
+    /// As [`Self::start`], with each session also reserved and open in the daemon's registry.
+    pub async fn start_reserved(sessions: u64) -> Self {
+        Self::start_on(sessions, None, Clocks::system(), true).await
     }
 
     /// As [`Self::start`], for a host whose configuration is `document`.
@@ -541,18 +585,19 @@ impl Adopted {
         sessions: u64,
         document: &kr_protocol::hostinfo::configuration::ConfigurationDocument,
     ) -> Self {
-        Self::start_on(sessions, Some(document), Clocks::system()).await
+        Self::start_on(sessions, Some(document), Clocks::system(), false).await
     }
 
     /// As [`Self::start`], on the clocks a suite moves by hand.
     pub async fn start_on_clocks(sessions: u64, clocks: Clocks) -> Self {
-        Self::start_on(sessions, None, clocks).await
+        Self::start_on(sessions, None, clocks, false).await
     }
 
     async fn start_on(
         sessions: u64,
         document: Option<&kr_protocol::hostinfo::configuration::ConfigurationDocument>,
         clocks: Clocks,
+        reserved: bool,
     ) -> Self {
         let owner = DeviceKeys::generate().expect("owner keys");
         let host = match document {
@@ -562,7 +607,11 @@ impl Adopted {
         let stopped = host.shut_down().await;
         let mut workers = Vec::new();
         for display in 1..=sessions {
-            workers.push(Worker::start(stopped.tree(), display).await);
+            workers.push(if reserved {
+                Worker::start_reserved(stopped.tree(), display).await
+            } else {
+                Worker::start(stopped.tree(), display).await
+            });
         }
         let settings = stopped.settings().clone();
         let host = stopped.start(settings).await;
@@ -685,6 +734,97 @@ pub async fn revoke(host: &Host, grant_id: kr_protocol::ids::GrantId) {
         .await
         .expect("the call reaches the daemon")
         .expect("the grant is revoked");
+}
+
+/// Types `text` into the terminal of `session_id` as a device that is paired with the host and may
+/// type does. The connection that typed is returned with the device: the attachment lives as long as
+/// the connection does, and the screen keeps what was typed after it is gone.
+pub async fn type_into(
+    host: &Host,
+    owner: &DeviceKeys,
+    session_id: SessionId,
+    text: &str,
+) -> (kr_client::session::Session, super::Device) {
+    use kr_protocol::attachment::{
+        AttachMode, AttachmentCapability, SessionAttachParams, SessionAttachResult,
+    };
+    use kr_protocol::envelope::ParamsValue;
+    use kr_protocol::input::{InputAcquireParams, InputAcquireResult, InputWriteParams};
+    use kr_protocol::scalars::DurationMs;
+
+    let typist = super::Device::create().await;
+    let record = super::pair_with(
+        host,
+        &typist,
+        owner,
+        super::proposal(&[
+            kr_protocol::rights::ActionRight::SessionView,
+            kr_protocol::rights::ActionRight::TerminalInput,
+        ]),
+    )
+    .await;
+    let session = super::connect(host, &typist, &record).await;
+    let on_the_session = || ActionTarget {
+        environment_id: host.environment_id,
+        session_id: Nullable::some(session_id),
+        session_epoch: Nullable::some(kr_protocol::ids::SessionEpoch::V1),
+        application_instance_id: Nullable::null(),
+        agent_binding_revision: Nullable::null(),
+    };
+    let attached: SessionAttachResult = session
+        .mutate(
+            Method::SessionAttach,
+            on_the_session(),
+            None,
+            &ParamsValue::empty(),
+            &SessionAttachParams {
+                session_id,
+                mode: AttachMode::Semantic,
+                claim_geometry: false,
+                dimensions: Nullable::null(),
+                terminal_profile_id: Nullable::null(),
+                requested: [
+                    AttachmentCapability::ObserveTerminal,
+                    AttachmentCapability::Input,
+                ]
+                .into_iter()
+                .collect(),
+            },
+            DurationMs::new(120_000),
+        )
+        .await
+        .expect("the attach is settled")
+        .to_typed()
+        .expect("an attachment");
+    let attachment_id = attached.attachment.attachment_id;
+    let acquired: InputAcquireResult = session
+        .mutate(
+            Method::InputAcquire,
+            on_the_session(),
+            None,
+            &ParamsValue::empty(),
+            &InputAcquireParams {
+                session_id,
+                attachment_id,
+                expected_epoch: Nullable::null(),
+            },
+            DurationMs::new(120_000),
+        )
+        .await
+        .expect("the lease is settled")
+        .to_typed()
+        .expect("a lease");
+    session
+        .write_input(&InputWriteParams {
+            session_id,
+            attachment_id,
+            epoch: acquired.lease.epoch,
+            sequence: kr_protocol::ids::InputSequence::new(0),
+            bytes: kr_protocol::scalars::Bytes::new(text.as_bytes().to_vec()),
+        })
+        .await
+        .expect("the input is accepted");
+    (session, typist)
 }
 
 /// An upstream that takes every prompt and answers it only once it is released, so a prompt stays
