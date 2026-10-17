@@ -572,6 +572,27 @@ impl Served {
         )
     }
 
+    /// Leaves the daemon holding nothing of the worker, as a daemon that has not found it yet holds
+    /// it: no entry in the directory and no slot in the connection table.
+    ///
+    /// The daemon's own tasks open the slot of a worker the directory lists as soon as they have a
+    /// reason to, and this fixture lists its worker from the start. A fixture that took only the
+    /// directory entry could be left with a slot one of them opened in between, which nothing but a
+    /// closure's own tidying removes. A slot is made only while the directory lists the worker, and
+    /// the directory is taken first, so none can be made once it is out.
+    pub(super) async fn forget_the_worker(&self) {
+        self.controller
+            .directory
+            .lock()
+            .await
+            .remove(self.session_id);
+        self.controller
+            .connections
+            .lock()
+            .await
+            .remove(&self.session_id);
+    }
+
     /// A hold on a reservation of no session, for a test that makes the daemon publish this worker
     /// with neither a report nor a recovery to have taken one.
     pub(super) async fn held(&self) -> super::recovery::ReservationHold {
