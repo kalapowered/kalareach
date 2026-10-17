@@ -7,7 +7,7 @@
  * choice; the key, the identities and the content stay in native code.
  */
 
-import type { SettingsSyncView } from '../host/port'
+import type { ColourMode, SettingsChoice, SettingsKeep, SettingsSyncView } from '../host/port'
 
 /** What settings sync is, and what it is not. */
 export const SETTINGS_SYNC_HELP =
@@ -31,4 +31,66 @@ export function describeWaiting(sync: SettingsSyncView): string | null {
   if (sync.paused) return 'Privacy mode has stopped settings from being sent.'
   if (sync.outstanding > 0) return 'A change was sent and has not been answered yet.'
   return null
+}
+
+/** What the colour mode is called. */
+export function colourModeName(mode: ColourMode): string {
+  switch (mode) {
+    case 'light':
+      return 'Light'
+    case 'dark':
+      return 'Dark'
+    case 'system':
+      return 'System'
+  }
+}
+
+/** What two devices changed, and what the person is asked to do about it. */
+export const SETTINGS_CHOICE_HELP =
+  'You changed how KalaReach looks on this device, and another device changed it too. Nothing has ' +
+  'been replaced. Keep one; the other is let go.'
+
+/** One version the person can keep, in the words the choice shows it in. */
+export interface Keepable {
+  /** What chooses it: this device's own, or a copy another device wrote. */
+  readonly keep: SettingsKeep
+  /** A stable key. */
+  readonly id: string
+  /** The colour mode it holds, or null when this version cannot show it. */
+  readonly mode: ColourMode | null
+  /** Whose it is, in words. */
+  readonly whose: string
+  /** When the device that wrote it recorded it, formatted for a person, never used to order. */
+  readonly recorded: string
+}
+
+/** The time a version was recorded, as a person reads it. */
+export function recordedAt(ms: number): string {
+  if (ms <= 0) return ''
+  return new Intl.DateTimeFormat(undefined, { dateStyle: 'medium', timeStyle: 'short' }).format(
+    new Date(ms)
+  )
+}
+
+/**
+ * The versions to choose between: this device's own first, then each other device's in the order
+ * this device received them. None is placed or marked for being later than another.
+ */
+export function keepables(choice: SettingsChoice): readonly Keepable[] {
+  return [
+    {
+      keep: { choice: 'mine' },
+      id: 'mine',
+      mode: choice.mine.colour_mode,
+      whose: 'This device',
+      recorded: recordedAt(choice.mine.updated_at_ms)
+    },
+    ...choice.others.map((other) => ({
+      keep: { choice: 'copy', conflict_id: other.conflict_id } as const,
+      id: other.conflict_id,
+      mode: other.colour_mode,
+      whose: 'Another device',
+      recorded: recordedAt(other.updated_at_ms)
+    }))
+  ]
 }

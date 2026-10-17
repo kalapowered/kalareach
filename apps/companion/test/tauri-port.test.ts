@@ -14,7 +14,13 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { GrantCreateParams, RoleSelection, SessionCreateParams } from '@kalareach/protocol'
 
 import type { ConnectionState } from '../src/host/port'
-import { CONNECTION_EVENT, HOST_EVENT, STANDING_EVENT, tauriPort } from '../src/host/tauri'
+import {
+  CONNECTION_EVENT,
+  HOST_EVENT,
+  SETTINGS_EVENT,
+  STANDING_EVENT,
+  tauriPort
+} from '../src/host/tauri'
 
 const shell = vi.hoisted(() => ({
   invoked: [] as { command: string; args: unknown; options?: unknown }[],
@@ -718,5 +724,31 @@ describe('the desktop port and recovery', () => {
       { command: 'recovery_save_kit', args: { path: '/tmp/kit.txt' } },
       { command: 'account_sign_in_for_recovery', args: {} }
     ])
+  })
+})
+
+describe('the desktop port and the person\'s settings', () => {
+  it('sends each settings step to its own command, naming a mode and nothing else', async () => {
+    const port = tauriPort()
+    await port.settingsView()
+    await port.settingsSetColourMode('dark')
+    await port.settingsSyncTurnOn()
+    await port.settingsSyncNow()
+    expect(shell.invoked).toEqual([
+      { command: 'settings_view', args: {} },
+      { command: 'settings_colour_mode_set', args: { mode: 'dark' } },
+      { command: 'settings_sync_turn_on', args: {} },
+      { command: 'settings_sync_now', args: {} }
+    ])
+  })
+
+  it('hands on the settings native code publishes', async () => {
+    const heard: unknown[] = []
+    await tauriPort().onSettings((view) => {
+      heard.push(view)
+    })
+    const published = { colour_mode: 'light' }
+    shell.handlers.get(SETTINGS_EVENT)?.({ payload: published })
+    expect(heard).toEqual([published])
   })
 })

@@ -1268,6 +1268,77 @@
   outline-offset: 4px;
 }
 
+/*
+ * The choice between two versions of the settings. The versions are drawn as the chooser draws an
+ * appearance, in a grid that holds as many columns as fit and one at the largest text size, so a
+ * version is never cut: its caption wraps, and nothing is measured in pixels.
+ */
+
+.choice {
+  display: grid;
+  gap: 12px;
+  margin-top: 16px;
+  padding-top: 16px;
+  border-top: 1px solid var(--line);
+}
+
+.choice-title {
+  margin: 0;
+  font-size: 1rem;
+}
+
+.choice-title:focus {
+  outline: none;
+}
+
+.choice-options {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(9.5rem, 1fr));
+  gap: 13px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+.choice-option .theme-caption {
+  align-items: flex-start;
+  font-size: 0.8125rem;
+}
+
+.choice-words {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.choice-words small {
+  color: var(--muted);
+  font-size: 0.75rem;
+}
+
+.choice-option[data-readable='false'] {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .choice-option[data-readable='true']:hover .theme-preview {
+    border-color: var(--accent);
+  }
+}
+
+.choice-option .theme-preview {
+  transition:
+    border-color var(--state) ease,
+    transform 120ms ease-out;
+}
+
+.choice-option[data-readable='true']:active .theme-preview {
+  transform: scale(0.97);
+}
+
 /* ---- Narrow windows -------------------------------------------------------------------------- */
 
 @media (max-width: 1000px) {

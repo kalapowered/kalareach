@@ -35,6 +35,7 @@ import type {
   SessionAgents,
   SessionSubject,
   Settled,
+  SettingsChoice,
   SettingsPane,
   SettingsView,
   SessionStanding,
@@ -414,6 +415,9 @@ export function tauriPort(): HostPort {
     settingsSetColourMode: (mode) => call<SettingsView>('settings_colour_mode_set', { mode }),
     settingsSyncTurnOn: () => call<SettingsView>('settings_sync_turn_on', {}),
     settingsSyncNow: () => call<SettingsView>('settings_sync_now', {}),
+    settingsConflicts: () => call<SettingsChoice | null>('settings_conflicts', {}),
+    settingsConflictResolve: (keep) =>
+      call<SettingsView>('settings_conflict_resolve', { keep }),
     onSettings: (listener) => listening<SettingsView>(SETTINGS_EVENT, listener),
     recoveryView: () => call<RecoveryView>('recovery_view', {}),
     recoveryTurnOn: () => call<RecoveryView>('recovery_turn_on', {}),

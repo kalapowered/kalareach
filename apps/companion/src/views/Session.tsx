@@ -462,6 +462,7 @@ function SessionSettings({
   readonly subject: SessionSubject
   readonly onClose: () => void
 }): ReactNode {
+  const { port } = useApp()
   const [tab, setTab] = useState<'appearance' | 'session' | 'sharing' | 'export'>('appearance')
   const [followOutput, setFollowOutput] = useState(true)
 

@@ -363,6 +363,35 @@ export interface SettingsSyncView {
   readonly problem: string | null
 }
 
+/** One version of the settings the person is asked to choose between. */
+export interface SettingsVersion {
+  /** The colour mode it holds, or null when it holds one this version cannot show. */
+  readonly colour_mode: ColourMode | null
+  /**
+   * When the device that wrote it recorded it, in UTC milliseconds. It is shown and decides
+   * nothing: no version is kept, or offered first, for being later.
+   */
+  readonly updated_at_ms: number
+}
+
+/** A version another device wrote, named so a choice can name it. */
+export interface SettingsOtherVersion extends SettingsVersion {
+  readonly conflict_id: string
+}
+
+/** What the person chooses between when two devices changed the same setting. */
+export interface SettingsChoice {
+  /** This device's own settings. */
+  readonly mine: SettingsVersion
+  /** Each version another device wrote, in the order this device received them. */
+  readonly others: readonly SettingsOtherVersion[]
+}
+
+/** The version the person keeps: this device's own, or one another device wrote. */
+export type SettingsKeep =
+  | { readonly choice: 'mine' }
+  | { readonly choice: 'copy'; readonly conflict_id: string }
+
 /** The person's settings, and where keeping them in step with their other devices stands. */
 export interface SettingsView {
   readonly colour_mode: ColourMode
@@ -1503,6 +1532,13 @@ export interface HostPort {
   settingsSyncTurnOn(): Promise<SettingsView>
   /** Brings this computer and the sync service to the same settings now, when sync is on. */
   settingsSyncNow(): Promise<SettingsView>
+  /** The versions of the settings to choose between, or null when two devices changed none. */
+  settingsConflicts(): Promise<SettingsChoice | null>
+  /**
+   * Records which version the person keeps and sends it. Every other version is let go, here and
+   * at the sync service. Refused when nothing waits for a choice.
+   */
+  settingsConflictResolve(keep: SettingsKeep): Promise<SettingsView>
   /**
    * Tells `listener` the settings each time they change by themselves: another device's change
    * was followed, a step ended, or content waits for a choice. Resolves, with the function that
