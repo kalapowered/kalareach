@@ -1451,12 +1451,20 @@ impl SessionRuntime {
         (watch, release)
     }
 
+    /// Waits until the write of the session's output to its spool that is in flight has been
+    /// made, for this host's own tests. The write needs nothing of the session, so the session is
+    /// held while this waits.
+    #[cfg(feature = "testing")]
+    pub fn wait_for_the_spool_write(&self) {
+        self.session().wait_for_the_spool_write();
+    }
+
     /// Stops the next write of the session's output to its spool that the ingest makes with the
     /// session let go, while the write is being made, for this host's own tests.
     ///
     /// Returns the end that says the write has arrived, and the end that lets it go. The pause
-    /// fires once. The write that opens a segment again after a retention pass is made with the
-    /// session held and is not the one this stops.
+    /// fires once. The segment's first write and one that opens a new segment are made with the
+    /// session held and are not the ones this stops.
     #[cfg(feature = "testing")]
     #[must_use]
     pub fn pause_in_next_spool_write(

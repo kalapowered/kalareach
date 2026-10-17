@@ -426,6 +426,13 @@ impl OutputHistory {
         (start, owed)
     }
 
+    /// Waits until the write [`Self::append_deferred`] owed has been made, if one is in flight, for
+    /// this host's own tests.
+    #[cfg(feature = "testing")]
+    pub(crate) fn wait_for_the_spool_write(&self) {
+        self.wait_for_owed_write();
+    }
+
     /// Waits until the write [`Self::append_deferred`] owed has been made, if one is in flight.
     ///
     /// The write needs nothing of the session, so this may be waited for with the session held.
@@ -1113,6 +1120,9 @@ struct Spool {
     /// Whether a test has arranged that a file cannot be cut back after a failed write.
     #[cfg(test)]
     refuse_cut: bool,
+    /// Whether a test has arranged that a segment cannot be removed.
+    #[cfg(test)]
+    refuse_remove: bool,
 }
 
 /// Where a spool stopped taking output, and why.
@@ -1222,9 +1232,10 @@ impl Segment {
 /// the write.
 ///
 /// The spool counts the bytes of a write as held when the write is owed, and the file has them
-/// only when it is made. Until then nothing else may write to the segment or take it away, so an
-/// appender waits for the write that is in flight, and a failure the write left is settled by the
-/// next thing that enters the history.
+/// only when it is made. Until then nothing else may write to the segment, so an appender waits for
+/// the write that is in flight, and a failure the write left is settled by the next thing that
+/// enters the history. Each write has a number, so that a write that was made and is dropped later
+/// cannot end the one that came after it.
 #[derive(Debug, Default)]
 struct OwedWrite {
     state: std::sync::Mutex<OwedState>,
@@ -1233,7 +1244,10 @@ struct OwedWrite {
 
 #[derive(Debug, Default)]
 struct OwedState {
-    in_flight: bool,
+    /// The number of the write in flight, or none.
+    in_flight: Option<u64>,
+    /// The number the next write is given.
+    next: u64,
     failed: Option<SpoolWriteFailed>,
     /// The segment's file and the handle a write opened it with, for the spool to keep writing
     /// through.
@@ -1247,21 +1261,24 @@ impl OwedWrite {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Notes that a write is owed. There is at most one.
-    fn begin(&self) {
+    /// Notes that a write is owed, and gives it its number. There is at most one.
+    fn begin(&self) -> u64 {
         let mut state = self.lock();
         debug_assert!(
-            !state.in_flight,
+            state.in_flight.is_none(),
             "an appender waits for the write in flight before it plans another"
         );
-        state.in_flight = true;
+        state.next += 1;
+        let ticket = state.next;
+        state.in_flight = Some(ticket);
+        ticket
     }
 
     /// Waits until no write is in flight. The write needs nothing of the session to finish, so
     /// this may be waited for with the session held.
     fn wait_idle(&self) {
         let mut state = self.lock();
-        while state.in_flight {
+        while state.in_flight.is_some() {
             state = self
                 .done
                 .wait(state)
@@ -1269,15 +1286,19 @@ impl OwedWrite {
         }
     }
 
-    /// Ends the write in flight, leaving its failure when it failed and the handle it opened when
-    /// it opened one.
+    /// Ends write number `ticket`, leaving its failure when it failed and the handle it opened
+    /// when it opened one. A write that is no longer the one in flight has nothing to end.
     fn finish(
         &self,
+        ticket: u64,
         failed: Option<SpoolWriteFailed>,
         reopened: Option<(PathBuf, Arc<std::fs::File>)>,
     ) {
         let mut state = self.lock();
-        state.in_flight = false;
+        if state.in_flight != Some(ticket) {
+            return;
+        }
+        state.in_flight = None;
         if failed.is_some() {
             state.failed = failed;
         }
@@ -1287,12 +1308,13 @@ impl OwedWrite {
         self.done.notify_all();
     }
 
-    /// Ends the write in flight as a failure if it is still in flight, which is a write that was
-    /// dropped without being made.
-    fn abandon(&self, failed: impl FnOnce() -> SpoolWriteFailed) {
+    /// Ends write number `ticket` as a failure if it is still the one in flight, which is a write
+    /// that was dropped without being made. A write that was made, or that a later write has
+    /// replaced, is left alone.
+    fn abandon(&self, ticket: u64, failed: impl FnOnce() -> SpoolWriteFailed) {
         let mut state = self.lock();
-        if state.in_flight {
-            state.in_flight = false;
+        if state.in_flight == Some(ticket) {
+            state.in_flight = None;
             state.failed = Some(failed());
             self.done.notify_all();
         }
@@ -1331,6 +1353,8 @@ pub struct SpoolWrite {
     /// How many bytes this write lays down.
     len: u64,
     owed: Arc<OwedWrite>,
+    /// This write's number among the writes the spool has owed.
+    ticket: u64,
     #[cfg(feature = "testing")]
     pause: SpoolPause,
     #[cfg(test)]
@@ -1377,7 +1401,7 @@ impl SpoolWrite {
                             segment_name(&self.path)
                         ),
                     );
-                    self.owed.finish(Some(failed), None);
+                    self.owed.finish(self.ticket, Some(failed), None);
                     return false;
                 }
             },
@@ -1400,7 +1424,7 @@ impl SpoolWrite {
             )
         });
         let made = failed.is_none();
-        self.owed.finish(failed, reopened);
+        self.owed.finish(self.ticket, failed, reopened);
         made
     }
 
@@ -1418,7 +1442,7 @@ impl SpoolWrite {
 
 impl Drop for SpoolWrite {
     fn drop(&mut self) {
-        self.owed.abandon(|| {
+        self.owed.abandon(self.ticket, || {
             self.failed(
                 self.file.clone(),
                 "the write to the spool was dropped before it was made".to_owned(),
@@ -1517,6 +1541,8 @@ impl Spool {
             short_write: None,
             #[cfg(test)]
             refuse_cut: false,
+            #[cfg(test)]
+            refuse_remove: false,
         })
     }
 
@@ -1675,8 +1701,13 @@ impl Spool {
                 "segment {} could not be written: {error}",
                 segment_name(&path)
             );
-            let open = self.open_segment.clone();
-            return Err(self.settle_failed_write(open, counted, bytes.len() as u64, reason));
+            return Err(self.settle_failed_write(
+                &path,
+                &handle,
+                counted,
+                bytes.len() as u64,
+                reason,
+            ));
         }
         self.count_written(bytes.len() as u64);
         Ok(())
@@ -1698,7 +1729,7 @@ impl Spool {
     /// the caller.
     ///
     /// That is nearly every append: the bytes continue the newest segment, fit in it, and fit
-    /// within the capacity, so no segment has to be opened and none given up. The caller makes the
+    /// within the capacity, so no segment has to be created and none given up. The caller makes the
     /// write when it has let go of whatever it was holding, because a write to a disk that is busy
     /// with other work can take as long as the disk likes. The bytes are counted as held now, as
     /// they will be once the write is made, and [`Spool::settle_failed_write_of`] takes them back
@@ -1734,12 +1765,12 @@ impl Spool {
             counted: segment.len,
             len,
             owed: Arc::clone(&self.owed),
+            ticket: self.owed.begin(),
             #[cfg(feature = "testing")]
             pause: self.pause.clone(),
             #[cfg(test)]
             short: self.short_write.take(),
         };
-        self.owed.begin();
         self.count_written(len);
         Some(write)
     }
@@ -1788,7 +1819,8 @@ impl Spool {
             return;
         };
         let outcome = self.settle_failed_write(
-            Some((path, file)),
+            &path,
+            &file,
             failed.counted,
             failed.attempted,
             failed.reason,
@@ -1810,11 +1842,12 @@ impl Spool {
     /// there and the spool writes nothing more. Either way the segment takes no further bytes, and
     /// one that holds none leaves the index.
     ///
-    /// `file` is the segment's path and the handle the write was made through, which the caller
-    /// names because the spool's own handle is not always the one.
+    /// `path` and `file` are the segment's path and the handle the write was made through, which
+    /// the caller names because the spool's own handle is not always the one.
     fn settle_failed_write(
         &mut self,
-        file: Option<(PathBuf, Arc<std::fs::File>)>,
+        path: &Path,
+        file: &std::fs::File,
         counted: u64,
         attempted: u64,
         reason: String,
@@ -1823,13 +1856,13 @@ impl Spool {
         let may_cut = !self.refuse_cut;
         #[cfg(not(test))]
         let may_cut = true;
-        let (kept, uncertain) = match file.as_ref() {
-            Some((path, _)) if may_cut && cut_back(path, counted) => (0, 0),
-            Some((_, file)) => match file.metadata() {
+        let (kept, uncertain) = if may_cut && cut_back(path, counted) {
+            (0, 0)
+        } else {
+            match file.metadata() {
                 Ok(metadata) => (metadata.len().saturating_sub(counted).min(attempted), 0),
                 Err(_) => (0, attempted),
-            },
-            None => (0, attempted),
+            }
         };
         self.open_segment = None;
         let segment = self.segments.back_mut().expect("the segment being written");
@@ -2012,6 +2045,13 @@ impl Spool {
             .is_some_and(|(path, _)| *path == segment.path)
         {
             self.open_segment = None;
+        }
+        #[cfg(test)]
+        if self.refuse_remove {
+            return Err(format!(
+                "segment {} could not be removed: a test refuses it",
+                segment_name(&segment.path)
+            ));
         }
         match std::fs::remove_file(&segment.path) {
             Ok(()) => {}
@@ -2892,6 +2932,7 @@ mod tests {
         std::fs::remove_dir_all(&directory).ok();
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_write_owed_to_a_segment_that_has_gone_is_settled_without_it() {
         // The segment's file is removed from under the spool, and a retention pass forgets the
@@ -3041,9 +3082,10 @@ mod tests {
     }
 
     #[test]
-    fn discarding_waits_for_the_write_in_flight_and_loses_none_of_it_to_a_failed_removal() {
-        // A discard that cannot finish leaves the index where it was, so the bytes it counts have
-        // to be in the file by then: the discard makes the owed write land first.
+    fn discarding_waits_for_the_write_in_flight_so_a_removal_that_fails_leaves_it_readable() {
+        // A discard whose removal fails leaves the index where it was, and the output it counts is
+        // read from the file. The discard makes the owed write land first, so that what the index
+        // counts is in the file when it stops.
         let directory = spool_directory("owed-write-discard");
         let mut history =
             OutputHistory::with_spool(64, directory.clone(), SpoolLayout::new(64, 1 << 20))
@@ -3051,14 +3093,49 @@ mod tests {
         history.append(b"ab");
         let (_, owed) = history.append_deferred(b"cd");
         let write = owed.expect("the write is owed");
+        history.spool.as_mut().expect("a spool").refuse_remove = true;
         let making = std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(100));
             assert!(write.perform(b"cd"));
         });
         let discarded = history.discard_retained();
+        assert!(
+            discarded.left_behind.is_some(),
+            "the removal was refused: {discarded:?}"
+        );
+        let page = history.page(2, 64).expect("a page");
+        assert!(page.gap.0.is_none(), "{:?}", page.gap.0);
+        assert_eq!(
+            page.bytes.as_slice(),
+            b"cd",
+            "the output the index counts is there"
+        );
         making.join().expect("the write is made");
-        assert_eq!(discarded.bytes, 4 + 4, "the window and the file, once each");
-        assert!(discarded.left_behind.is_none());
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    #[test]
+    fn a_write_that_was_made_and_is_dropped_later_leaves_the_next_write_alone() {
+        // The first write is made and kept; the second is planned; the first is dropped. Dropping
+        // it must not end the second as a failure.
+        let directory = spool_directory("owed-write-ticket");
+        let mut history =
+            OutputHistory::with_spool(64, directory.clone(), SpoolLayout::new(64, 1 << 20))
+                .expect("a spool");
+        history.append(b"ab");
+        let (_, owed) = history.append_deferred(b"cd");
+        let first = owed.expect("the first write is owed");
+        assert!(first.perform(b"cd"));
+        let (_, owed) = history.append_deferred(b"ef");
+        let second = owed.expect("the second write is owed");
+        drop(first);
+        history.settle_spool_write();
+        assert!(history.suspended().is_none(), "nothing failed");
+        assert!(second.perform(b"ef"));
+        history.append(b"gh");
+        let (gap, bytes) = read_back(&directory, 0);
+        assert!(gap.is_none(), "{gap:?}");
+        assert_eq!(bytes, b"abcdefgh", "every byte once, and in its place");
         std::fs::remove_dir_all(&directory).ok();
     }
 

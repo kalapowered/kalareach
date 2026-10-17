@@ -2589,13 +2589,18 @@ fn release_after_a_while(
 ///
 /// The application echoes the byte, the ingest records the echo, and the write of it to the spool
 /// is the next one made with the session let go: the segment the session's opening output went to
-/// holds bytes, and a write after a retention pass opens it again by itself.
+/// holds bytes, and a write after a retention pass opens it again by itself. The write of the
+/// opening output is waited for first, so that it is not the one the pause stops.
 async fn until_the_output_waits_on_the_disk(
     wired: &Wired,
     client: &mut LocalClient,
     attachment: AttachmentId,
     epoch: kr_protocol::ids::InputLeaseEpoch,
 ) -> std::sync::mpsc::Sender<()> {
+    let runtime = Arc::clone(&wired.runtime);
+    tokio::task::spawn_blocking(move || runtime.wait_for_the_spool_write())
+        .await
+        .expect("the wait ends");
     let (writing, resume) = wired.runtime.pause_in_next_spool_write();
     write_over(client, wired, attachment, epoch, 0, b"x")
         .await

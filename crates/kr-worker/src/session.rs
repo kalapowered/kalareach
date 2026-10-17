@@ -776,6 +776,13 @@ impl Session {
         self.history.pause_next_spool_write()
     }
 
+    /// Waits until the write of the session's output to its spool that is in flight has been made,
+    /// for this host's own tests.
+    #[cfg(feature = "testing")]
+    pub(crate) fn wait_for_the_spool_write(&self) {
+        self.history.wait_for_the_spool_write();
+    }
+
     /// Gives the session the recorder its runtime's tasks share, so the ingest's spans fall beside
     /// theirs.
     pub(crate) fn record_into(&mut self, trace: crate::trace::Shared) {
