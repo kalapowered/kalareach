@@ -52,6 +52,7 @@ use kr_worker::pty::ShellCommand;
 use kr_worker::runtime::SessionRuntime;
 use kr_worker::service::{ServiceBinding, WorkerService};
 use kr_worker::session::{Session, SessionConfig};
+use kr_worker::trace::Site;
 
 #[path = "../../../tests/perf/src/record.rs"]
 mod record;
@@ -776,7 +777,9 @@ fn paste_prefix_recogniser_deadline() {
         .build()
         .expect("a runtime");
     let (report, closed) = runtime.block_on(measure_recogniser());
-    let beside_mutations = runtime.block_on(measure_recogniser_beside_mutations());
+    // Each keeps its own figure when it succeeds and fails after the idle figure is kept below.
+    let beside_mutations = runtime.block_on(measure_recogniser_beside_mutations(false));
+    let beside_a_disk_writer = runtime.block_on(measure_recogniser_beside_mutations(true));
     // The figure is kept before the closure's outcome is, as above.
     let report = report.unwrap_or_else(|failure| panic!("the measurement: {failure}"));
 
@@ -871,7 +874,14 @@ fn paste_prefix_recogniser_deadline() {
         "and the framer recorded the paste the delimiter opened, rather than passing its bytes \
          through without recognising them"
     );
-    beside_mutations.assert_met(allowed);
+    beside_mutations
+        .unwrap_or_else(|failure| panic!("the measurement beside mutations: {failure}"))
+        .assert_met(allowed);
+    beside_a_disk_writer
+        .unwrap_or_else(|failure| {
+            panic!("the measurement beside mutations and a disk writer: {failure}")
+        })
+        .assert_met(allowed);
 }
 
 /// The recogniser's holds taken while journalled mutations run beside them.
@@ -891,20 +901,43 @@ struct BesideMutations {
     mutations: u64,
 }
 
-/// One hold taken with journalled mutations running, and what the mutations were doing during it.
+/// Where an instant on a keystroke's path fell in a mutation's hold of the session, as the worker
+/// recorded the hold: how far into it, and how long the hold was.
+#[derive(Clone, Copy)]
+struct Within {
+    into: Duration,
+    of: Duration,
+}
+
+impl Within {
+    fn describe(place: Option<Self>, what: &str) -> String {
+        match place {
+            Some(Self { into, of }) => format!(
+                "{what} {} into a mutation's {} hold of the session",
+                milliseconds(into),
+                milliseconds(of)
+            ),
+            None => format!("{what} between the mutations' holds of the session"),
+        }
+    }
+}
+
+/// One hold taken with journalled mutations running, and where the worker's own record puts the
+/// keystroke in relation to the session a mutation was holding.
 struct MutatedHold {
     what: String,
     held: Duration,
-    /// How many mutations completed between the write and the byte reaching the application.
-    completed_during: u64,
-    /// Whether a mutation was under way, accepted and not yet answered, when the write was made.
-    under_way_at_the_write: bool,
+    /// Where the worker took the write into its input domain.
+    accepted: Option<Within>,
+    /// Where the recogniser's timer took the prefix to forward it.
+    forwarded: Option<Within>,
 }
 
 impl MutatedHold {
-    /// Whether a journalled mutation was running at some point of the hold.
-    const fn ran_during(&self) -> bool {
-        self.under_way_at_the_write || self.completed_during > 0
+    /// Whether the keystroke met a journalled mutation holding the session, on its way in or when
+    /// the timer forwarded it.
+    const fn met_a_mutation(&self) -> bool {
+        self.accepted.is_some() || self.forwarded.is_some()
     }
 }
 
@@ -918,13 +951,13 @@ impl BesideMutations {
             self.mutations,
             self.holds.len()
         );
+        assert!(
+            self.holds.iter().any(MutatedHold::met_a_mutation),
+            "no keystroke met a mutation holding the session, on its way in or at its forward, so \
+             the figure says nothing about a keystroke behind a mutation"
+        );
         for hold in &self.holds {
             let (what, held) = (&hold.what, &hold.held);
-            assert!(
-                hold.ran_during(),
-                "{what}: no journalled mutation was under way or completed during the hold, so \
-                 the figure says nothing about a keystroke behind a mutation"
-            );
             assert!(
                 *held <= allowed,
                 "{what} was held for {held:?} with journalled mutations running beside it, beyond \
@@ -944,12 +977,45 @@ impl BesideMutations {
     }
 }
 
+/// Something that writes to the disk the measurement runs on for as long as it lives, the way a
+/// process beside the worker does.
+struct DiskWriter {
+    stop: Arc<AtomicBool>,
+    thread: std::thread::JoinHandle<()>,
+}
+
+impl DiskWriter {
+    fn beside(directory: &std::path::Path) -> Self {
+        use std::io::Write as _;
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let path = directory.join("disk-writer");
+        let thread = {
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                let block = vec![0x5a_u8; 4 * 1024 * 1024];
+                while !stop.load(Ordering::Acquire) {
+                    if let Ok(mut file) = std::fs::File::create(&path) {
+                        let _ = file.write_all(&block);
+                        let _ = file.sync_all();
+                    }
+                }
+                let _ = std::fs::remove_file(&path);
+            })
+        };
+        Self { stop, thread }
+    }
+
+    fn stop(self) {
+        self.stop.store(true, Ordering::Release);
+        self.thread.join().expect("the disk writer ends");
+    }
+}
+
 /// A client that attaches a terminal and detaches it again, over and over, until it is told to
 /// stop. Each is a journalled mutation: accepted, marked and settled in three commits.
 struct Mutating {
     stop: Arc<AtomicBool>,
-    /// How many mutations have been sent to the worker, answered or not.
-    sent: Arc<AtomicU64>,
     made: Arc<AtomicU64>,
     task: tokio::task::JoinHandle<Result<(), String>>,
 }
@@ -959,19 +1025,17 @@ impl Mutating {
         let mut client = LocalClient::connect(&hosted.endpoint, LocalClientKind::Cli, build())
             .await
             .expect("connects");
-        let (stop, sent, made) = (
+        let (stop, made) = (
             Arc::new(AtomicBool::new(false)),
-            Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),
         );
         let (target, session_id) = (hosted.target(), hosted.session_id);
         let task = {
-            let (stop, sent, made) = (Arc::clone(&stop), Arc::clone(&sent), Arc::clone(&made));
+            let (stop, made) = (Arc::clone(&stop), Arc::clone(&made));
             tokio::spawn(async move {
                 let mut requested = CanonicalSet::new();
                 requested.insert(AttachmentCapability::ObserveTerminal);
                 while !stop.load(Ordering::Acquire) {
-                    sent.fetch_add(1, Ordering::AcqRel);
                     let attached: kr_protocol::attachment::SessionAttachResult = client
                         .mutate(
                             Method::SessionAttach,
@@ -992,7 +1056,6 @@ impl Mutating {
                         .to_typed()
                         .map_err(|error| format!("the attach's answer did not decode: {error}"))?;
                     made.fetch_add(1, Ordering::AcqRel);
-                    sent.fetch_add(1, Ordering::AcqRel);
                     client
                         .mutate(
                             Method::SessionDetach,
@@ -1011,22 +1074,7 @@ impl Mutating {
                 Ok(())
             })
         };
-        Self {
-            stop,
-            sent,
-            made,
-            task,
-        }
-    }
-
-    /// How many mutations have been answered.
-    fn completed(&self) -> u64 {
-        self.made.load(Ordering::Acquire)
-    }
-
-    /// Whether a mutation has been sent and not yet answered.
-    fn under_way(&self) -> bool {
-        self.sent.load(Ordering::Acquire) > self.made.load(Ordering::Acquire)
+        Self { stop, made, task }
     }
 
     /// Waits until a mutation has completed, so that the next is the one under way when the caller
@@ -1119,7 +1167,9 @@ impl Receipt {
     }
 }
 
-async fn measure_recogniser_beside_mutations() -> BesideMutations {
+async fn measure_recogniser_beside_mutations(
+    beside_a_disk_writer: bool,
+) -> Result<BesideMutations, String> {
     let kept = tempfile::tempdir().expect("a directory for what the application keeps");
     let pipe = kept.path().join("received");
     let made = std::process::Command::new("mkfifo")
@@ -1128,46 +1178,78 @@ async fn measure_recogniser_beside_mutations() -> BesideMutations {
         .expect("mkfifo runs");
     assert!(made.success(), "the pipe is made");
     let receipt = Receipt::start(&pipe);
+    let writer = beside_a_disk_writer.then(|| DiskWriter::beside(kept.path()));
     let hosted = hosted(&keeping(&pipe)).await;
     let figures = recogniser_beside_mutations(&hosted, &receipt).await;
     let closed = close(&hosted).await;
-    // The figure is kept before anything is asserted, as the holds taken alone are.
-    let beside =
-        figures.unwrap_or_else(|failure| panic!("the measurement beside mutations: {failure}"));
+    if let Some(writer) = writer {
+        writer.stop();
+    }
+    // The figure is kept before anything is asserted, as the holds taken alone are, and a failure
+    // is the caller's to raise once the figures of the measurements before it are kept too.
+    let beside = figures?;
     let mut lines = beside.conditions.lines();
-    lines.push(
+    lines.push(format!(
         "  measurement       the same holds as the section above, taken with an attach and a \
          detach looping on a second connection for the whole window, each a journalled mutation \
-         that holds the session across three commits. A figure runs from the write to the byte \
+         that holds the session across three commits{}. A figure runs from the write to the byte \
          reaching the application, which the root program passes to a pipe the test reads, so \
-         the observation waits behind nothing the mutations hold or sync."
-            .to_owned(),
-    );
+         the observation waits behind nothing the mutations hold or sync. Where the write was \
+         taken and where the timer forwarded it are the worker's own instants, set against the \
+         spans in which a mutation held the session.",
+        if beside_a_disk_writer {
+            ", and a writer that writes four megabytes to the same disk and syncs them, over and over"
+        } else {
+            ""
+        }
+    ));
     for hold in &beside.holds {
         lines.push(format!(
-            "  held              {}: {}; {} journalled mutations completed during it, and one {} under way at the write",
+            "  held              {}: {}; {}; {}",
             milliseconds(hold.held),
             hold.what,
-            hold.completed_during,
-            if hold.under_way_at_the_write { "was" } else { "was not" }
+            Within::describe(hold.accepted, "the write was taken"),
+            Within::describe(hold.forwarded, "the timer forwarded it")
         ));
     }
     lines.push(format!(
-        "  split delimiter   recognised once, in {}",
+        "  split delimiter   recognised once, in {}, and the framer recorded the paste it opened",
         milliseconds(beside.split)
     ));
     lines.push(format!(
-        "  mutations         {} completed beside the {} holds",
+        "  mutations         {} completed beside the {} holds; {} of them met a mutation holding \
+         the session",
         beside.mutations,
-        beside.holds.len()
+        beside.holds.len(),
+        beside
+            .holds
+            .iter()
+            .filter(|hold| hold.met_a_mutation())
+            .count()
     ));
     record::report(
         RECORD,
-        "KR-PERF-002 recogniser deadline for a held prefix with journalled mutations running",
+        if beside_a_disk_writer {
+            "KR-PERF-002 recogniser deadline for a held prefix with journalled mutations and a disk writer running"
+        } else {
+            "KR-PERF-002 recogniser deadline for a held prefix with journalled mutations running"
+        },
         &lines,
     );
-    closed.unwrap_or_else(|failure| panic!("the session this measurement created: {failure}"));
-    beside
+    closed.map_err(|failure| format!("the session this measurement created: {failure}"))?;
+    Ok(beside)
+}
+
+/// The place of an instant, in nanoseconds on the recorder's clock, among the spans in which a
+/// mutation held the session.
+fn place(spans: &[(u64, u64)], at: u64) -> Option<Within> {
+    spans
+        .iter()
+        .find(|(from, to)| *from <= at && at <= *to)
+        .map(|(from, to)| Within {
+            into: Duration::from_nanos(at - from),
+            of: Duration::from_nanos(to - from),
+        })
 }
 
 async fn recogniser_beside_mutations(
@@ -1186,21 +1268,22 @@ async fn recogniser_beside_mutations(
         return Err("the root program never started reading".to_owned());
     }
     let (mut client, attachment_id, epoch) = controlling(hosted).await;
+    let trace = hosted.runtime.trace();
+    trace.arm();
     let mutating = Mutating::begin(hosted).await;
     let window = record::Window::open().beside(
         "journalled mutations (an attach or a detach each)",
         Arc::clone(&mutating.made),
     );
     let mut sequence = 0_u64;
-    let mut holds = Vec::new();
+    // What was measured, and when each write began on the recorder's clock.
+    let mut measured = Vec::new();
     let mut expected = Vec::new();
     for (name, delimiter) in [("start", &b"\x1b[200~"[..]), ("end", &b"\x1b[201~"[..])] {
         for length in 1..delimiter.len() {
             let prefix = &delimiter[..length];
             expected.extend_from_slice(prefix);
             mutating.until_the_next_one_is_under_way().await?;
-            let (under_way_at_the_write, made_before) =
-                (mutating.under_way(), mutating.completed());
             let started = Instant::now();
             let accepted = write(
                 hosted,
@@ -1228,7 +1311,6 @@ async fn recogniser_beside_mutations(
                          application on its own"
                     )
                 })?;
-            let completed_during = mutating.completed() - made_before;
             let what = if length == 1 {
                 format!(
                     "a lone Escape, with journalled mutations running (the {name} delimiter's pass)"
@@ -1238,12 +1320,7 @@ async fn recogniser_beside_mutations(
                     "the {name} delimiter's prefix of {length} bytes, with journalled mutations running"
                 )
             };
-            holds.push(MutatedHold {
-                what,
-                held,
-                completed_during,
-                under_way_at_the_write,
-            });
+            measured.push((what, held, trace.offset(started)));
         }
     }
     // A delimiter split across two frames, recognised once.
@@ -1272,9 +1349,52 @@ async fn recogniser_beside_mutations(
         .arrival(&expected, started, RECOGNISER_DEADLINE * 8)
         .await
         .ok_or_else(|| "the split delimiter never completed".to_owned())?;
+    // A prefix that had expired and was forwarded with the bytes behind it would also arrive whole,
+    // and opens no paste: the framer says whether the delimiter was recognised.
+    if !hosted.runtime.input().lock().paste_open() {
+        return Err("the split delimiter reached the application but opened no paste".to_owned());
+    }
     let conditions = window.close();
     let mutations = mutating.end().await?;
     drop(client);
+    trace.disarm();
+    let recording = trace.recording();
+    if recording.overflowed {
+        return Err("the worker's recorder filled before the measurement ended".to_owned());
+    }
+    // The spans in which a mutation held the session, and the instants the keystrokes were taken
+    // and forwarded at, are the worker's own.
+    let spans: Vec<(u64, u64)> = recording
+        .events
+        .iter()
+        .filter(|event| event.site == Site::Mutation)
+        .map(|event| (event.held, event.released))
+        .collect();
+    let holds = measured
+        .into_iter()
+        .map(|(what, held, began)| {
+            let taken = recording
+                .events
+                .iter()
+                .filter(|event| event.site == Site::InputAcceptance && event.held >= began)
+                .map(|event| event.held)
+                .min();
+            let forwarded = taken.and_then(|taken| {
+                recording
+                    .events
+                    .iter()
+                    .filter(|event| event.site == Site::TimerForward && event.held >= taken)
+                    .map(|event| event.held)
+                    .min()
+            });
+            MutatedHold {
+                what,
+                held,
+                accepted: taken.and_then(|at| place(&spans, at)),
+                forwarded: forwarded.and_then(|at| place(&spans, at)),
+            }
+        })
+        .collect();
     Ok(BesideMutations {
         holds,
         split,

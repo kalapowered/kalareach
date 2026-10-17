@@ -503,13 +503,18 @@ fn describe(event: &Event, base: u64) -> String {
             after(event.begun, base),
             after(event.held, base)
         ),
-        Site::IngestRetain | Site::IngestInterpret | Site::IngestDeliver | Site::SpoolWrite => {
+        Site::IngestRetain
+        | Site::IngestInterpret
+        | Site::IngestDeliver
+        | Site::SpoolWrite
+        | Site::Mutation => {
             format!(
                 "{}[{} to {}]",
                 match event.site {
                     Site::IngestRetain => "ingest-retain",
                     Site::IngestInterpret => "ingest-interpret",
                     Site::IngestDeliver => "ingest-deliver",
+                    Site::Mutation => "mutation-holds-the-session",
                     _ => "spool-write",
                 },
                 after(event.begun, base),
@@ -528,7 +533,8 @@ fn describe(event: &Event, base: u64) -> String {
                 | Site::IngestRetain
                 | Site::IngestInterpret
                 | Site::IngestDeliver
-                | Site::SpoolWrite => unreachable!("described above"),
+                | Site::SpoolWrite
+                | Site::Mutation => unreachable!("described above"),
             };
             let mut text = format!(
                 "{name}[wait {} held {} let go {}",

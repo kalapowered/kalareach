@@ -5155,7 +5155,9 @@ impl WorkerService {
         // dispatch marker, the effect and the recorded outcome are one serial boundary: nothing
         // the mutation was validated against — the geometry, the lease, the output cursor, the
         // lifecycle state — can move between the check and the effect.
+        let mut holding = self.runtime.trace().acquisition(Site::Mutation);
         let mut session = self.runtime.session();
+        holding.held();
 
         // The condition the journal publishes, asked inside the boundary and before anything is
         // admitted. A write that fails is refused where it fails, which is what the arms below

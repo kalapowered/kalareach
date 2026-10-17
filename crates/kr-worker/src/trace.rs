@@ -55,6 +55,9 @@ pub enum Site {
     SupervisionWake,
     /// An observation of the session's processes read them, with the session let go.
     Observation,
+    /// A mutation held the session, from its admission to the return of its dispatch. A span:
+    /// `held` and `released` are its start and its end.
+    Mutation,
 }
 
 #[cfg(feature = "testing")]
@@ -73,6 +76,7 @@ impl Site {
             Self::IngestInterpret => 9,
             Self::IngestDeliver => 10,
             Self::SpoolWrite => 11,
+            Self::Mutation => 12,
         }
     }
 
@@ -90,6 +94,7 @@ impl Site {
             9 => Self::IngestInterpret,
             10 => Self::IngestDeliver,
             11 => Self::SpoolWrite,
+            12 => Self::Mutation,
             _ => return None,
         })
     }
