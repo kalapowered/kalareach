@@ -233,6 +233,7 @@ pub const fn result_content(method: Method) -> ResultContent {
         | Method::AuthoritySync
         | Method::SyncCompareExchange
         | Method::BackupManifest
+        | Method::BackupEnable
         | Method::StorageRetentionSet
         | Method::StorageUploadCreate
         | Method::StorageUploadPart
@@ -452,11 +453,12 @@ mod tests {
     use super::*;
     use crate::history_filter::ViewerScope;
     use kr_protocol::authority::{EffectClass, HistoryFilter as RegistryHistory};
+    use kr_protocol::backup_setup::{BackupEnableCause, BackupEnableResult};
     use kr_protocol::describe::{DescriptionDownload, DescriptionSetup, DescriptionState};
     use kr_protocol::grant::HistoryScope;
     use kr_protocol::ids::{
-        ActorId, ApplicationInstanceId, ConnectionId, QuestionId, QuestionRevision, SessionEpoch,
-        SessionId,
+        ActorId, ApplicationInstanceId, ArchiveId, ConnectionId, QuestionId, QuestionRevision,
+        SessionEpoch, SessionId,
     };
     use kr_protocol::question::{
         AnswerRecord, QuestionAnswer, QuestionChoice, QuestionKind, QuestionSource,
@@ -810,6 +812,53 @@ mod tests {
                         .expect("shown"),
                     kept,
                     "{method:?}"
+                );
+            }
+        }
+    }
+
+    /// KR-REQ-10.49: `backup.enable` is a record of an operation on the environment, held by the
+    /// right the method names as its read twin is. What it answers is the archive, the public
+    /// fingerprint of the kit that opens it, the instant of the setup, or the reason nothing was
+    /// recorded: no session's text, and nothing of the sealed bundle, its locator or the recovery
+    /// seed, which are the call's parameters and are in no answer. Every reader is shown the answer
+    /// whole, as it is shown any other record of an operation on the environment.
+    #[test]
+    fn backup_enable_is_a_record_of_an_operation_on_the_environment() {
+        assert_eq!(
+            result_content(Method::BackupEnable),
+            ResultContent::Environment
+        );
+        let answers = [
+            BackupEnableResult::Enabled {
+                archive_id: ArchiveId::new(Uuid::from_bytes([4; 16])),
+                kit_fingerprint: "KMNP-2345".to_owned(),
+                enabled_at_ms: TimestampMs::new(1_700_000_000_000),
+            },
+            BackupEnableResult::Declined {
+                cause: BackupEnableCause::AlreadySetUp {},
+            },
+            BackupEnableResult::Unknown {
+                retry_after_seconds: Nullable::some(U64::new(30)),
+            },
+        ];
+        for answer in answers {
+            let kept = ParamsValue::from_typed(&answer).expect("encodes");
+            for disclosure in [
+                Disclosure::Whole,
+                Disclosure::StateOnly,
+                scoped(Some(0), &[], false),
+            ] {
+                assert_eq!(
+                    shown_result(
+                        &disclosure,
+                        Method::BackupEnable,
+                        kept.clone(),
+                        Occasion::Replay
+                    )
+                    .expect("shown"),
+                    kept,
+                    "{answer:?}"
                 );
             }
         }
