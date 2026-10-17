@@ -4372,3 +4372,25 @@ mod tests {
         assert_eq!(tables(&connection), before);
     }
 }
+
+/// A journal whose previous holder is still letting go of its index is waited for, not reported as a
+/// disk that failed. A journal is written in the rollback mode, so it has an index only when an
+/// earlier build left it in write-ahead mode, which is the one a store keeps until it is told
+/// otherwise; this stands one in that mode.
+#[cfg(all(test, windows))]
+mod a_previous_holder_that_is_letting_go {
+    use super::*;
+
+    #[test]
+    fn the_open_waits_for_it() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let database = directory.path().join(WORKFLOW_DB_NAME);
+        kr_flush::release::assert_an_open_waits_for_the_previous_holder(&database, || {
+            let opened = WorkflowStore::open(directory.path()).map(drop);
+            Connection::open(&database)
+                .and_then(|connection| connection.pragma_update(None, "journal_mode", "WAL"))
+                .expect("an earlier build's mode");
+            opened
+        });
+    }
+}
