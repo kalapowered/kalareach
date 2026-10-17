@@ -813,6 +813,9 @@ struct ManagedFake {
     /// round trip rather than an invention of the test.
     holding: tokio::sync::Semaphore,
     held: Mutex<bool>,
+    /// Whether a close waits to be let through, as one does when the service is slow to answer.
+    close_held: Mutex<bool>,
+    closing: tokio::sync::Semaphore,
 }
 
 impl ManagedFake {
@@ -828,7 +831,21 @@ impl ManagedFake {
             asked: Mutex::new(Vec::new()),
             holding: tokio::sync::Semaphore::new(0),
             held: Mutex::new(false),
+            close_held: Mutex::new(false),
+            closing: tokio::sync::Semaphore::new(0),
         }
+    }
+
+    /// Makes every close wait until [`ManagedFake::release_closes`], as a service that is slow to
+    /// answer does.
+    fn hold_closes(&self) {
+        *self.close_held.lock().expect("the hold") = true;
+    }
+
+    /// Lets the closes that wait answer, and every close after them.
+    fn release_closes(&self) {
+        *self.close_held.lock().expect("the hold") = false;
+        self.closing.add_permits(1 << 16);
     }
 
     /// Makes every close fail, as one does when the service cannot be reached.
@@ -1027,7 +1044,11 @@ impl ManagedVoiceService for ManagedFake {
             .push(call_id.to_owned());
         let call_id = call_id.to_owned();
         let unreachable = *self.close_unreachable.lock().expect("the switch");
+        let held = *self.close_held.lock().expect("the hold");
         Box::pin(async move {
+            if held {
+                drop(self.closing.acquire().await);
+            }
             if unreachable {
                 return Err(kr_client::error::ClientError::Host(
                     kr_protocol::error::ProtocolError::new(
@@ -2293,6 +2314,102 @@ async fn revoking_a_device_ends_the_calls_it_holds() {
     assert_eq!(fixture.coordinator.live_sessions(), 0);
     assert_eq!(fixture.broker.closed(), vec!["call-managed".to_owned()]);
     assert_eq!(fixture.authority.revocations(), vec![12_500]);
+}
+
+/// KR-REQ-15.14: a revocation the host could not make leaves the call known, whoever ends it. The
+/// host finding a call over at its deadline revokes the grant first, as a stop does: a grant that
+/// cannot be revoked keeps its voice session known and its call open until the next look, which
+/// revokes it and tells the service.
+#[tokio::test]
+async fn a_call_that_is_over_keeps_its_session_while_its_grant_cannot_be_revoked() {
+    let fixture = fixture();
+    let _ = started(&fixture, None).await;
+    // Started at 10 000 for 600 seconds.
+    let deadline = 610_000;
+
+    fixture.authority.fail_the_next_revocation();
+    assert_eq!(
+        fixture.coordinator.end_calls_that_are_over(deadline).await,
+        0
+    );
+    assert_eq!(fixture.coordinator.live_sessions(), 1, "still known");
+    assert!(fixture.broker.closed().is_empty(), "the call is still open");
+    assert!(fixture.coordinator.calls_open());
+
+    assert_eq!(
+        fixture
+            .coordinator
+            .end_calls_that_are_over(deadline + 500)
+            .await,
+        1
+    );
+    assert_eq!(fixture.coordinator.live_sessions(), 0);
+    assert_eq!(fixture.broker.closed(), vec!["call-managed".to_owned()]);
+    assert_eq!(fixture.authority.revocations(), vec![deadline + 500]);
+}
+
+/// KR-REQ-15.14: a grant the host cannot read is not a grant that has ended. Ending the calls of a
+/// revoked device revokes it, and does not take the call's session out on the guess that the
+/// grant is gone.
+#[tokio::test]
+async fn a_grant_that_cannot_be_read_is_revoked_not_assumed_gone() {
+    let fixture = fixture();
+    let _ = started(&fixture, None).await;
+    fixture
+        .authority
+        .refuse(Some((Seam::Grant, host_refusal())));
+
+    assert_eq!(
+        fixture
+            .coordinator
+            .end_calls_of_revoked_device(device(PHONE), 12_000)
+            .await,
+        1
+    );
+    assert_eq!(
+        fixture.authority.revocations(),
+        vec![12_000],
+        "the grant was revoked, not presumed ended"
+    );
+    assert_eq!(fixture.broker.closed(), vec!["call-managed".to_owned()]);
+}
+
+/// Section 15 paragraph 8: a stop is answered inside the time a phone gives it. A service that is
+/// slow to confirm the close is waited for a bound below that time and no longer, the answer then
+/// says the service was not told, and the close goes on in the background, counted as open until
+/// it ends.
+#[tokio::test(start_paused = true)]
+async fn a_stop_does_not_wait_for_a_slow_broker_past_the_time_a_phone_gives_it() {
+    let fixture = fixture();
+    let voice_session_id = started(&fixture, None).await;
+    fixture.broker.hold_closes();
+
+    let stopped = tokio::time::timeout(
+        std::time::Duration::from_secs(19),
+        fixture
+            .coordinator
+            .stop(device(PHONE), &VoiceStopParams { voice_session_id }, 12_000),
+    )
+    .await
+    .expect("the stop is answered before the phone gives up on it")
+    .expect("the call stops");
+
+    assert!(fixture.authority.is_revoked(stopped.revoked_grant_id));
+    assert!(!stopped.broker_notified, "the service has not confirmed");
+    assert_eq!(fixture.broker.closed(), vec!["call-managed".to_owned()]);
+    assert!(
+        fixture.coordinator.calls_open(),
+        "the close is still going on"
+    );
+
+    fixture.broker.release_closes();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while fixture.coordinator.calls_open() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the close finishes once the service answers");
 }
 
 /// KR-REQ-15.02 and 15.17: a call whose device went silent is over at its own deadline, whatever

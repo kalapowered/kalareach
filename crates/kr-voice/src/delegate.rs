@@ -241,7 +241,7 @@ pub struct Coordinator {
     environment_id: EnvironmentId,
     broker_origin: String,
     patterns: SecretPatterns,
-    state: Mutex<State>,
+    state: Arc<Mutex<State>>,
 }
 
 impl std::fmt::Debug for Coordinator {
@@ -278,12 +278,15 @@ struct State {
 
 /// A call's close at the broker, held for as long as it runs, and counted from the moment the call's
 /// record was removed.
-struct Closing<'a> {
-    state: &'a Mutex<State>,
+///
+/// Owned, so that a close the caller stopped waiting for can go on in a task of its own and still be
+/// counted until it ends.
+struct Closing {
+    state: Arc<Mutex<State>>,
     count: usize,
 }
 
-impl Drop for Closing<'_> {
+impl Drop for Closing {
     fn drop(&mut self) {
         if let Ok(mut state) = self.state.lock() {
             state.closing = state.closing.saturating_sub(self.count);
@@ -306,6 +309,31 @@ impl Drop for StartGate<'_> {
             state.starting.remove(&self.device_id);
         }
     }
+}
+
+/// How long a stop waits for the voice service to confirm that it closed the call.
+///
+/// A phone gives a stop twenty seconds, and the service's own client waits as long for a close, so
+/// a slow service would make a revocation that was made read as one that was not told. The wait is
+/// bounded below that, with room left for the fence the withdrawal owes.
+const BROKER_CLOSE_WAIT: std::time::Duration = std::time::Duration::from_secs(8);
+
+/// Closes `call_id` at `provider` on a task of its own and waits for it up to
+/// [`BROKER_CLOSE_WAIT`]. Says whether the service confirmed the close in that time. The task keeps
+/// `closing`, so a close that outlasts the wait still counts as open until it ends.
+async fn close_within_bound(
+    provider: Arc<dyn ManagedVoiceService>,
+    call_id: String,
+    closing: Closing,
+) -> bool {
+    let closed = tokio::spawn(async move {
+        let _closing = closing;
+        provider.close(&call_id).await.is_ok()
+    });
+    matches!(
+        tokio::time::timeout(BROKER_CLOSE_WAIT, closed).await,
+        Ok(Ok(true))
+    )
 }
 
 impl Coordinator {
@@ -341,7 +369,7 @@ impl Coordinator {
             environment_id,
             broker_origin: broker_origin.into(),
             patterns: SecretPatterns::default(),
-            state: Mutex::new(State::default()),
+            state: Arc::new(Mutex::new(State::default())),
         }
     }
 
@@ -464,8 +492,9 @@ impl Coordinator {
     /// A call is over when its own deadline has passed, and when the managed service says it no
     /// longer holds the call open. A device that went silent never stops its call, and a host that
     /// waited for it would hold the call, and the account it was made under, for good. Each call
-    /// is ended as a stop would end it: the record leaves, the call's grant is revoked, and the
-    /// service is told so it can finalise the call.
+    /// is ended as a stop would end it: the call's grant is revoked first, then the record leaves, and
+    /// the service is told so it can finalise the call. A grant that stands and cannot be revoked
+    /// leaves the voice session known, and the next look ends it.
     ///
     /// A service that cannot be asked leaves the call as it is: the deadline then ends it. A call
     /// the device stops while this asks is the device's to end, and is not counted.
@@ -492,30 +521,53 @@ impl Coordinator {
                 }
             };
             if is_over {
-                over.push((record.voice_session_id, record.device_id));
+                over.push((record.voice_session_id, record.device_id, record.grant_id));
             }
         }
         let mut ended = 0;
-        for (voice_session_id, device_id) in over {
-            let Ok((record, _closing)) = self.take_session(voice_session_id, device_id) else {
-                continue;
-            };
-            ended += 1;
-            match self.revoke_taken(&record, now_ms).await {
-                Ok(_) => {
-                    if let (Some(provider), Some(call_id)) =
-                        (record.provider.as_ref(), record.call_id.as_ref())
-                    {
-                        self.close_unbound(provider, call_id).await;
-                    }
-                }
-                // The call is already finalised, and the record is gone either way.
-                Err(error) => eprintln!(
-                    "kr-voice: the grant of a call that is over could not be revoked: {error}"
-                ),
+        for (voice_session_id, device_id, grant_id) in over {
+            if self
+                .end_held(voice_session_id, device_id, grant_id, now_ms)
+                .await
+            {
+                ended += 1;
             }
         }
         ended
+    }
+
+    /// Ends one voice session for a reason of the host's own: the grant is revoked first, then the
+    /// record leaves, then the service is told so it can finalise the call. Says whether the session
+    /// was ended here.
+    ///
+    /// The order is a stop's. A grant that has ended needs no revocation. One that stands, or that
+    /// cannot be read (which is not the same as one that has ended), is revoked, and a revocation
+    /// that fails leaves the voice session known with its live grant, so that a stop or the next
+    /// look can end it, and a read under the grant is still answered. A session that left the
+    /// registry meanwhile is its device's to end.
+    async fn end_held(
+        &self,
+        voice_session_id: VoiceSessionId,
+        device_id: DeviceId,
+        grant_id: kr_protocol::ids::GrantId,
+        now_ms: u64,
+    ) -> bool {
+        if !matches!(self.authority.grant(grant_id), Ok(None))
+            && self
+                .authority
+                .revoke(grant_id, now_ms, &crate::seams::Unbounded)
+                .is_err()
+        {
+            return false;
+        }
+        let Ok((record, _closing)) = self.take_session(voice_session_id, device_id) else {
+            return false;
+        };
+        if let (Some(provider), Some(call_id)) = (record.provider.as_ref(), record.call_id.as_ref())
+        {
+            self.close_unbound(provider, call_id).await;
+        }
+        true
     }
 
     /// Ends the voice sessions of a device the host has revoked, and returns how many it ended.
@@ -543,22 +595,11 @@ impl Coordinator {
         };
         let mut ended = 0;
         for (voice_session_id, grant_id) in held {
-            if matches!(self.authority.grant(grant_id), Ok(Some(_)))
-                && self
-                    .authority
-                    .revoke(grant_id, now_ms, &crate::seams::Unbounded)
-                    .is_err()
+            if self
+                .end_held(voice_session_id, device_id, grant_id, now_ms)
+                .await
             {
-                continue;
-            }
-            let Ok((record, _closing)) = self.take_session(voice_session_id, device_id) else {
-                continue;
-            };
-            ended += 1;
-            if let (Some(provider), Some(call_id)) =
-                (record.provider.as_ref(), record.call_id.as_ref())
-            {
-                self.close_unbound(provider, call_id).await;
+                ended += 1;
             }
         }
         ended
@@ -664,7 +705,7 @@ impl Coordinator {
             (written, ending, ended_sessions)
         };
         let _closing = Closing {
-            state: &self.state,
+            state: Arc::clone(&self.state),
             count: ending.len(),
         };
         // Outside the lock, and after the authority is already gone: a call whose grant this
@@ -1247,7 +1288,7 @@ impl Coordinator {
             }
         };
         let _closing = Closing {
-            state: &self.state,
+            state: Arc::clone(&self.state),
             count: closing.len(),
         };
         for ending in &closing {
@@ -1315,8 +1356,10 @@ impl Coordinator {
     /// goes first, while the voice session is still known, and the broker is told afterwards, so a
     /// broker that cannot be reached does not hold a revocation open. A revocation the store
     /// refuses leaves the voice session and its live grant known, so the stop can be asked again
-    /// and a read under the grant is still answered. The answer waits for the broker's own reply,
-    /// up to the broker client's deadline, and says whether the broker was told. Section 15 ¶1: the
+    /// and a read under the grant is still answered. The answer waits for the broker's reply for
+    /// [`BROKER_CLOSE_WAIT`] at most, which is less than the time a phone gives a stop, and says
+    /// whether the broker confirmed the close. A close that is still going on after that is
+    /// finished in the background, and counts as open until it ends. Section 15 ¶1: the
     /// terminal sessions it reached keep running, and they are named in the answer so nobody has to
     /// take that on trust.
     ///
@@ -1346,7 +1389,7 @@ impl Coordinator {
         let Revoked { at_ms, fence } =
             self.authority
                 .revoke(grant_id, now_ms, &crate::seams::Unbounded)?;
-        let (record, _closing) = self.take_session(params.voice_session_id, device_id)?;
+        let (record, closing) = self.take_session(params.voice_session_id, device_id)?;
 
         let mut broker_notified = false;
         // Through the provider that created it, not through whatever this coordinator brokers
@@ -1356,7 +1399,8 @@ impl Coordinator {
             // The grant is already gone, so the broker's answer decides nothing but whether the
             // phone has to close the call at the service itself. What the service does about the
             // money is settled on its own schedule and `session.closed` is what finalises it.
-            broker_notified = provider.close(call_id).await.is_ok();
+            broker_notified =
+                close_within_bound(Arc::clone(provider), call_id.clone(), closing).await;
         }
         // Answered once the workers hold the revision that refuses whatever was sent under the
         // grant, when anything could have been: a stop that said the call was over while a close
@@ -1394,7 +1438,7 @@ impl Coordinator {
         &self,
         voice_session_id: VoiceSessionId,
         device_id: DeviceId,
-    ) -> Result<(VoiceSessionRecord, Closing<'_>)> {
+    ) -> Result<(VoiceSessionRecord, Closing)> {
         let mut state = self.state.lock().expect("the coordinator's state");
         let record = state.sessions.stop(voice_session_id, device_id)?;
         state.ledger.forget_session(voice_session_id);
@@ -1402,33 +1446,10 @@ impl Coordinator {
         Ok((
             record,
             Closing {
-                state: &self.state,
+                state: Arc::clone(&self.state),
                 count: 1,
             },
         ))
-    }
-
-    /// Revokes the grant of a voice session that has left the registry.
-    ///
-    /// The voice session is already out of the registry, so nothing can use it, and its record is
-    /// the only thing that still knows which call it held. When the revocation fails the call is
-    /// finalised before the failure is returned, or nothing would be able to finalise it
-    /// afterwards.
-    async fn revoke_taken(&self, record: &VoiceSessionRecord, now_ms: u64) -> Result<Revoked> {
-        match self
-            .authority
-            .revoke(record.grant_id, now_ms, &crate::seams::Unbounded)
-        {
-            Ok(revoked_at_ms) => Ok(revoked_at_ms),
-            Err(error) => {
-                if let (Some(provider), Some(call_id)) =
-                    (record.provider.as_ref(), record.call_id.as_ref())
-                {
-                    self.close_unbound(provider, call_id).await;
-                }
-                Err(error)
-            }
-        }
     }
 
     /* ---------------------------------------------------------------- */
