@@ -2763,13 +2763,7 @@ async fn a_process_that_outlasts_the_cleanup_is_named_and_cannot_act_as_the_sess
     })
     .await;
     let _members = Members(vec![plain.clone(), survivor.clone()]);
-    until("the worker to record the survivor", || {
-        recorded_by(&host, session_id)?
-            .processes
-            .contains(&survivor)
-            .then_some(())
-    })
-    .await;
+    until_recorded(&host, session_id, &[("the survivor", survivor.clone())]).await;
     let descriptor = kr_ipc::descriptor::read(&host.paths(), session_id)
         .expect("reads the runtime directory")
         .expect("the session's descriptor is published");
