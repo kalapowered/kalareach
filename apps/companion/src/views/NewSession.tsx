@@ -165,7 +165,7 @@ export function NewSession({
     <Sheet
       open={open}
       title="New session"
-      closeLabel="Close new session"
+      closeLabel="Close the new session form"
       description="It starts on this host, in the directory you name, and keeps running when this window closes."
       onClose={onClose}
       footer={
