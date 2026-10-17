@@ -8,5 +8,5 @@
     "news": "news",
     "reply": "reply"
   },
-  "commands": ["callOpen", "callOffer", "callAccept", "callPermit", "callMute", "callStop", "callState"]
+  "commands": ["callOpen", "callOffer", "callAccept", "callPermit", "callMute", "callStop", "callState", "callAlive"]
 }

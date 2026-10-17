@@ -48,5 +48,10 @@
     "command": "callState",
     "request": {},
     "response": { "call": null, "capture": "idle", "microphoneMuted": false, "playing": false }
+  },
+  {
+    "command": "callAlive",
+    "request": { "call": "c1" },
+    "response": { "call": "c1", "capture": "capturing", "microphoneMuted": false, "playing": true }
   }
 ]
