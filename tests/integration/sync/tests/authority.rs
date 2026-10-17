@@ -135,10 +135,13 @@ impl Feed {
     /// The service answers a change `OUTCOME_UNKNOWN` when the feed's own object did not answer
     /// in time, which it does for an object nobody has asked yet, such as the feed each leg makes
     /// for itself. That answer says it is not known whether the change took effect, and to read
-    /// the feed before sending it again, so that is what this does: a request the host's feed holds
-    /// was stored and is not sent again, and one it does not hold is sent once more, which the
-    /// service answers as a repeat if the first had landed in between. A second answer that
-    /// nothing settles is the deployment failing, and the leg fails with it.
+    /// the feed before sending it again, so that is what this does. A request the host's feed
+    /// holds was stored, and is not sent again unless it carried an announcement: the service
+    /// places the announcement only after the change has answered, so an unknown answer means none
+    /// was placed, and the announcement, with the feed as it then stands, is only had by sending
+    /// the request once more, which the service answers from the record it holds. A request the
+    /// feed does not hold is sent once more in either case. A second answer that nothing settles
+    /// is the deployment failing, and the leg fails with it.
     async fn publish_settled(
         &self,
         client: &AuthorityFeedClient,
@@ -151,7 +154,7 @@ impl Feed {
                     "the publication was answered as unknown, so the feed is read: {unknown}"
                 );
                 let held = self.host_client.read(self.address(), None, false).await?;
-                if held.record(request.request_id).is_some() {
+                if announce.is_none() && held.record(request.request_id).is_some() {
                     Ok(held)
                 } else {
                     client.publish(self.address(), request, announce).await
