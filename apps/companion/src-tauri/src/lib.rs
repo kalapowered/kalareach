@@ -108,6 +108,15 @@ pub fn run() {
                 }
             }
             open_main_window(app.handle())?;
+            // A debug build on a phone reads the request a probe left. A run of a whole call
+            // names the voice service and the account it uses, and they are managed here, before
+            // the application's own: a state is managed once, and the first one stays.
+            #[cfg(all(debug_assertions, mobile))]
+            let probe = probe::take(app.handle());
+            #[cfg(all(debug_assertions, mobile))]
+            if let Some(harness) = probe.as_ref().and_then(probe::Request::harness) {
+                manage_harness(app.handle(), harness)?;
+            }
             app.manage(account::AccountSlot::new(account_builder(
                 app.handle().clone(),
             )));
@@ -136,7 +145,9 @@ pub fn run() {
             #[cfg(mobile)]
             hosts::resume(app.handle());
             #[cfg(all(debug_assertions, mobile))]
-            probe::start(app.handle());
+            if let Some(request) = probe {
+                probe::start(app.handle(), request);
+            }
             #[cfg(all(debug_assertions, mobile))]
             device_probe::start(app.handle());
             open_recovery(app.handle());
@@ -238,6 +249,32 @@ fn voice_calls(app: &tauri::AppHandle) -> voice::Calls {
 #[cfg(desktop)]
 fn voice_calls(_app: &tauri::AppHandle) -> voice::Calls {
     voice::Calls::absent()
+}
+
+/// Gives a run of a whole call on a phone the voice service and the account it names, and calls
+/// made through native code at that service.
+#[cfg(all(debug_assertions, mobile))]
+fn manage_harness(
+    app: &tauri::AppHandle,
+    harness: &probe::harness::Harness,
+) -> std::result::Result<(), String> {
+    use std::sync::Arc;
+
+    use companion_platform::call::{NativeCalls, PluginCommands};
+    use tauri::Manager as _;
+
+    let kept = match app.path().app_data_dir() {
+        Ok(directory) => voice::Kept::at(directory),
+        Err(_) => voice::Kept::nowhere(),
+    };
+    app.manage(harness.account());
+    app.manage(voice::Calls::on_phone(
+        Arc::new(NativeCalls::new(PluginCommands::new(app.clone()))),
+        harness.service()?,
+        voice::Timings::default(),
+        kept,
+    ));
+    Ok(())
 }
 
 /// Builds the account: the managed service on its fixed origin, the device's secure store, and
