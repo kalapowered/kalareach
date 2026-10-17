@@ -199,6 +199,8 @@ pub const NAMED_COMMANDS: &[(&str, Option<Method>)] = &[
     ("settings_colour_mode_set", None),
     ("settings_sync_turn_on", None),
     ("settings_sync_now", None),
+    ("settings_conflicts", None),
+    ("settings_conflict_resolve", None),
 ];
 
 /// The commands that reach a session's worker or name a session on a host this device is paired
@@ -480,6 +482,8 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'static
         settings_colour_mode_set,
         settings_sync_turn_on,
         settings_sync_now,
+        settings_conflicts,
+        settings_conflict_resolve,
     ]
 }
 
@@ -3188,6 +3192,8 @@ mod tests {
         "settings_colour_mode_set",
         "settings_sync_turn_on",
         "settings_sync_now",
+        "settings_conflicts",
+        "settings_conflict_resolve",
     ];
 
     #[test]
@@ -3326,6 +3332,11 @@ mod tests {
                 "settings_colour_mode_set",
                 "settings_sync_turn_on",
                 "settings_sync_now",
+                // The versions of a setting two devices changed, and the person's choice between
+                // them. The page names a copy this computer showed it, or this computer's own, and
+                // is shown neither key nor identity.
+                "settings_conflicts",
+                "settings_conflict_resolve",
                 // The raw terminal view's five. The view attaches on the session's own worker,
                 // which the control daemon does not proxy for this computer, so the page names a
                 // session, a size, its moves and the person's input, and native code makes every
@@ -4157,4 +4168,23 @@ pub async fn settings_sync_now(
     state: State<'_, AppState>,
 ) -> Result<crate::settings::SettingsView> {
     state.settings()?.sync_now().await
+}
+
+/// The versions of the settings the person is asked to choose between, when two devices changed the
+/// same setting. Nothing is sent.
+#[tauri::command]
+pub fn settings_conflicts(
+    state: State<'_, AppState>,
+) -> Result<Option<crate::settings::ConflictView>> {
+    state.settings()?.conflicts()
+}
+
+/// Records which version the person keeps. The page names this computer's own or a copy this
+/// computer showed it; whichever is kept, every copy that waited is let go.
+#[tauri::command]
+pub async fn settings_conflict_resolve(
+    state: State<'_, AppState>,
+    keep: crate::settings::Keep,
+) -> Result<crate::settings::SettingsView> {
+    state.settings()?.resolve_conflict(keep).await
 }

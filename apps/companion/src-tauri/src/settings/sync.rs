@@ -67,7 +67,7 @@ use kr_ipc::paths::{
     create_private_directory, flush_path_names, read_owner_only_file, write_owner_only_file,
 };
 use kr_protocol::error::ErrorCode;
-use kr_protocol::ids::{DeviceId, SyncCollectionId, SyncObjectId};
+use kr_protocol::ids::{DeviceId, SyncCollectionId, SyncConflictId, SyncObjectId};
 use kr_protocol::scalars::{Nullable, TimestampMs};
 use kr_protocol::service::{GatewayOrigin, installation_id};
 use kr_protocol::sync::SyncObjectKind;
@@ -147,6 +147,51 @@ impl SyncView {
             problem: None,
         }
     }
+}
+
+/// One version of the settings, as the person is shown it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct Candidate {
+    /// The colour mode it holds, when it holds one this build reads.
+    pub colour_mode: Option<ColourMode>,
+    /// When the device that wrote it recorded it, in UTC milliseconds. It is shown and decides
+    /// nothing.
+    pub updated_at_ms: u64,
+}
+
+/// A version of the settings another device wrote, as the person is shown it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct Other {
+    /// The content, which a choice names.
+    pub conflict_id: SyncConflictId,
+    /// The colour mode it holds, when it holds one this build reads.
+    pub colour_mode: Option<ColourMode>,
+    /// When the device that wrote it recorded it, in UTC milliseconds. It is shown and decides
+    /// nothing.
+    pub updated_at_ms: u64,
+}
+
+/// What the person is asked to choose between: this computer's settings, and each version another
+/// device wrote that this computer's settings disagree with.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ConflictView {
+    /// This computer's settings.
+    pub mine: Candidate,
+    /// The versions other devices wrote, in the order this computer received them.
+    pub others: Vec<Other>,
+}
+
+/// The version the person keeps.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(tag = "choice", rename_all = "snake_case")]
+pub enum Keep {
+    /// This computer's settings.
+    Mine,
+    /// The content another device wrote.
+    Copy {
+        /// Which.
+        conflict_id: SyncConflictId,
+    },
 }
 
 /// What a computer needs to take part in a collection.
@@ -482,6 +527,127 @@ impl SettingsSync {
         Ok(Progress::Agreed)
     }
 
+    /// What the person is asked to choose between, or nothing when no content waits.
+    ///
+    /// Nothing is sent. The settings object this computer holds is shown as the file says it: a
+    /// choice written to the file and not yet to the object is this computer's choice all the same.
+    ///
+    /// # Errors
+    ///
+    /// Returns a local failure when the records cannot be read.
+    pub fn conflicts(&self) -> Result<Option<ConflictView>> {
+        let Some(record) = self.record()? else {
+            return Ok(None);
+        };
+        let store = self.store()?;
+        let copies = store
+            .conflicts(record.object_id)
+            .map_err(sync_failure)?
+            .items;
+        if copies.is_empty() {
+            return Ok(None);
+        }
+        let held = store.object(record.object_id).map_err(sync_failure)?;
+        Ok(Some(ConflictView {
+            mine: Candidate {
+                colour_mode: self
+                    .local
+                    .chosen_colour_mode()
+                    .or_else(|| held.as_ref().and_then(colour_mode_of)),
+                updated_at_ms: held.as_ref().map_or(0, |object| object.updated_at_ms.get()),
+            },
+            others: copies
+                .iter()
+                .map(|copy| Other {
+                    conflict_id: copy.conflict_id,
+                    colour_mode: colour_mode_of(&copy.other),
+                    updated_at_ms: copy.other.updated_at_ms.get(),
+                })
+                .collect(),
+        }))
+    }
+
+    /// Records the person's choice between this computer's settings and the content other devices
+    /// wrote, and sends it.
+    ///
+    /// Whatever is chosen, every copy that waited is let go: they were versions of the one object,
+    /// and the choice is the one that stands. A choice for a copy takes its content as this
+    /// computer's own, as a new write. The choice is on this computer's disk before anything is
+    /// sent, so a service that cannot be reached leaves it made and the next step sends it.
+    ///
+    /// # Errors
+    ///
+    /// Returns a refusal when no such content waits or what was chosen is not content this build
+    /// reads, and a local failure when a record cannot be kept. Nothing is changed then.
+    pub async fn resolve(&self, keep: Keep) -> Result<()> {
+        self.resolve_in_a_step(keep).await
+    }
+
+    async fn resolve_in_a_step(&self, keep: Keep) -> Result<()> {
+        let _step = self.step().await?;
+        let Some(mut record) = self.record()? else {
+            return Err(CommandError::refused("settings sync is not on"));
+        };
+        let store = self.store()?;
+        let copies = store
+            .conflicts(record.object_id)
+            .map_err(sync_failure)?
+            .items;
+        if copies.is_empty() {
+            return Err(CommandError::refused(
+                "no content from another device is waiting for a choice",
+            ));
+        }
+        let chosen = match keep {
+            Keep::Mine => None,
+            Keep::Copy { conflict_id } => {
+                let copy = copies
+                    .iter()
+                    .find(|copy| copy.conflict_id == conflict_id)
+                    .ok_or_else(|| {
+                        CommandError::refused("that content is not waiting for a choice")
+                    })?;
+                let mode = colour_mode_of(&copy.other).ok_or_else(|| {
+                    CommandError::refused("that content has no setting this version reads")
+                })?;
+                Some(mode)
+            }
+        };
+        let service = self.managed(&record.origin()?)?;
+        let status = self
+            .membership(&service)?
+            .members()
+            .map_err(member_failure)?
+            .ok_or_else(|| {
+                CommandError::local_failure("this computer holds no settings collection")
+            })?;
+        let (collection, epoch) = (
+            status.collection,
+            status.installed.map(|(epoch, _)| epoch).ok_or_else(|| {
+                CommandError::local_failure("the collection has no key installed")
+            })?,
+        );
+        let client = self.client(&service, collection, epoch)?;
+        // The choice first, on this computer; the service is told after, and may be told later.
+        if let Some(mode) = chosen {
+            self.local.set_colour_mode(mode)?;
+            let held = store.object(record.object_id).map_err(sync_failure)?;
+            let object = self.object_of(record.object_id, held.as_ref(), mode, now())?;
+            store.put_object(&object).map_err(sync_failure)?;
+        }
+        for copy in copies {
+            client
+                .resolve(copy.conflict_id)
+                .await
+                .map_err(sync_failure)?;
+        }
+        // Sending the choice may fail and the choice stands: the step that next reaches the service
+        // sends it, and the page is told what this one could not do.
+        let sent = self.settle(&mut record, &service).await.map(|_| ());
+        self.finished(&sent);
+        Ok(())
+    }
+
     /// The agreement itself: see the module's list.
     async fn agree(
         &self,
@@ -494,9 +660,27 @@ impl SettingsSync {
             .reconcile_unsettled(now_ms)
             .await
             .map_err(sync_failure)?;
-        if !store.conflicts(object_id).map_err(sync_failure)?.is_empty() {
-            return Ok(());
+        // Content another device wrote that this computer's own settings disagree with waits for
+        // the person. Content that says what this computer's settings say asks nothing of them,
+        // and is let go.
+        let waiting = store.conflicts(object_id).map_err(sync_failure)?.items;
+        if !waiting.is_empty() {
+            let mine = self.local.chosen_colour_mode();
+            if mine.is_none()
+                || waiting
+                    .iter()
+                    .any(|copy| colour_mode_of(&copy.other) != mine)
+            {
+                return Ok(());
+            }
+            for copy in waiting {
+                client
+                    .resolve(copy.conflict_id)
+                    .await
+                    .map_err(sync_failure)?;
+            }
         }
+        client.finish_resolutions().await.map_err(sync_failure)?;
         // The file is the one source: the object this computer holds is made again whenever it
         // does not carry what the file says, which is also how a change that was written to the
         // file and not yet to the object (a stop between the two) is carried on.

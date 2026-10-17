@@ -619,6 +619,11 @@ impl ServiceWeb {
         });
     }
 
+    /// The service is reachable again: every fault not yet met is forgotten.
+    pub fn mend(&self) {
+        self.faults.lock().expect("the faults").clear();
+    }
+
     /// As [`Self::fail`], counting only the requests to `path` whose body carries every member of
     /// `matching`, so a fault meets one pair's request however many others the daemon sends.
     pub fn fail_matching(
