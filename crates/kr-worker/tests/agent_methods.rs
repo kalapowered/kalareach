@@ -2628,13 +2628,13 @@ impl SilentHost {
     ) {
         use kr_plugin_service::launcher::{HostIdentity, host_endpoint};
         use kr_plugin_service::protocol::{
-            Frame, HostDescriptor, PROTOCOL, Request, RequestBody, ResponseBody,
+            Frame, HostDescriptor, Request, RequestBody, ResponseBody,
         };
         let temp = kr_ipc::testing::TempHost::create();
         let identity = HostIdentity::generate(temp.environment_id()).expect("an identity");
         let endpoint = host_endpoint(&temp.environment()).expect("an endpoint");
         let descriptor = HostDescriptor {
-            protocol: PROTOCOL.to_owned(),
+            protocol: kr_protocol::retained::PLUGIN_HOST_PROTOCOL.to_owned(),
             environment_id: temp.environment_id(),
             reservation_id: kr_protocol::worker::ReservationId::new(kr_ipc::new_uuid()),
             endpoint: endpoint.as_text(),
@@ -2654,7 +2654,7 @@ impl SilentHost {
                 while let Ok(request) = reader.read_message_without_schema::<Request>().await {
                     let body = match request.body {
                         RequestBody::Hello { .. } => ResponseBody::Hello {
-                            protocol: PROTOCOL.to_owned(),
+                            protocol: kr_protocol::retained::PLUGIN_HOST_PROTOCOL.to_owned(),
                             descriptor: Box::new(descriptor.clone()),
                         },
                         RequestBody::Verify { nonce } => ResponseBody::Verified(Box::new(

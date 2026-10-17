@@ -17,7 +17,7 @@ use kr_plugin_service::client::{PluginClient, new_binding_id};
 use kr_plugin_service::error::ServiceError;
 use kr_plugin_service::launcher::{HostIdentity, host_endpoint};
 use kr_plugin_service::protocol::{
-    ComponentSource, Frame, HostDescriptor, Notice, PROTOCOL, RequestBody, ResponseBody,
+    ComponentSource, Frame, HostDescriptor, Notice, RequestBody, ResponseBody,
 };
 use kr_plugin_service::vocabulary::Admission;
 
@@ -41,7 +41,7 @@ impl Served {
         let identity = HostIdentity::generate(temp.environment_id()).expect("an identity");
         let endpoint = host_endpoint(&environment).expect("an endpoint");
         let descriptor = HostDescriptor {
-            protocol: PROTOCOL.to_owned(),
+            protocol: kr_protocol::retained::PLUGIN_HOST_PROTOCOL.to_owned(),
             environment_id: temp.environment_id(),
             reservation_id: kr_protocol::worker::ReservationId::new(kr_ipc::new_uuid()),
             endpoint: endpoint.as_text(),
@@ -163,7 +163,10 @@ async fn the_host_answers_a_challenge_before_it_is_trusted() {
     // Connecting runs the handshake and the challenge; a host that could not answer would make
     // this fail rather than serve.
     let client = served.client().await;
-    assert_eq!(client.descriptor().protocol, PROTOCOL);
+    assert_eq!(
+        client.descriptor().protocol,
+        kr_protocol::retained::PLUGIN_HOST_PROTOCOL
+    );
 
     let health = client.health().await.expect("the host reports itself");
     assert_eq!(health.live_bindings, 0);
@@ -797,7 +800,7 @@ async fn a_client_whose_connection_failed_is_told_without_waiting() {
     let identity = HostIdentity::generate(temp.environment_id()).expect("an identity");
     let endpoint = host_endpoint(&environment).expect("an endpoint");
     let descriptor = HostDescriptor {
-        protocol: PROTOCOL.to_owned(),
+        protocol: kr_protocol::retained::PLUGIN_HOST_PROTOCOL.to_owned(),
         environment_id: temp.environment_id(),
         reservation_id: kr_protocol::worker::ReservationId::new(kr_ipc::new_uuid()),
         endpoint: endpoint.as_text(),
@@ -822,7 +825,7 @@ async fn a_client_whose_connection_failed_is_told_without_waiting() {
                     .expect("a request");
                 let body = match request.body {
                     RequestBody::Hello { .. } => ResponseBody::Hello {
-                        protocol: PROTOCOL.to_owned(),
+                        protocol: kr_protocol::retained::PLUGIN_HOST_PROTOCOL.to_owned(),
                         descriptor: Box::new(descriptor.clone()),
                     },
                     RequestBody::Verify { nonce } => ResponseBody::Verified(Box::new(
@@ -1053,7 +1056,7 @@ async fn a_plugin_runtime_of_an_earlier_protocol_is_refused_at_the_handshake() {
     let identity = HostIdentity::generate(temp.environment_id()).expect("an identity");
     let endpoint = host_endpoint(&environment).expect("an endpoint");
     let mut descriptor = HostDescriptor {
-        protocol: PROTOCOL.to_owned(),
+        protocol: kr_protocol::retained::PLUGIN_HOST_PROTOCOL.to_owned(),
         environment_id: temp.environment_id(),
         reservation_id: kr_protocol::worker::ReservationId::new(kr_ipc::new_uuid()),
         endpoint: endpoint.as_text(),

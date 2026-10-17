@@ -749,12 +749,12 @@ pub fn read_descriptor(environment: &EnvironmentPaths) -> LaunchResult<Option<Ho
                 path.display()
             ),
         })?;
-    if descriptor.protocol != protocol::PROTOCOL {
+    if descriptor.protocol != kr_protocol::retained::PLUGIN_HOST_PROTOCOL {
         return Err(LaunchError::Refused {
             detail: format!(
                 "the descriptor names protocol {}, and this host speaks {}",
                 descriptor.protocol,
-                protocol::PROTOCOL
+                kr_protocol::retained::PLUGIN_HOST_PROTOCOL
             ),
         });
     }
@@ -1161,7 +1161,7 @@ impl HostReservation {
         }
         Ok((
             HostDescriptor {
-                protocol: protocol::PROTOCOL.to_owned(),
+                protocol: kr_protocol::retained::PLUGIN_HOST_PROTOCOL.to_owned(),
                 environment_id: claim.environment_id,
                 reservation_id: claim.reservation_id,
                 endpoint: claim.endpoint,
@@ -1236,7 +1236,7 @@ mod tests {
 
     fn descriptor_of(identity: &HostIdentity, endpoint: &str) -> HostDescriptor {
         HostDescriptor {
-            protocol: protocol::PROTOCOL.to_owned(),
+            protocol: kr_protocol::retained::PLUGIN_HOST_PROTOCOL.to_owned(),
             environment_id: identity.environment_id(),
             reservation_id: ReservationId::new(kr_protocol::scalars::Uuid::from_bytes([2; 16])),
             endpoint: endpoint.to_owned(),
@@ -1323,7 +1323,7 @@ mod tests {
         let identity = HostIdentity::generate(host.environment_id()).expect("an identity");
         let endpoint = host_endpoint(&environment).expect("an endpoint");
         let descriptor = HostDescriptor {
-            protocol: protocol::PROTOCOL.to_owned(),
+            protocol: kr_protocol::retained::PLUGIN_HOST_PROTOCOL.to_owned(),
             environment_id: host.environment_id(),
             reservation_id: ReservationId::new(kr_protocol::scalars::Uuid::from_bytes([2; 16])),
             endpoint: endpoint.as_text(),

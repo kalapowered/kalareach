@@ -379,13 +379,13 @@ impl PluginClient {
 
         let hello = client
             .request(RequestBody::Hello {
-                protocol: crate::protocol::PROTOCOL.to_owned(),
+                protocol: kr_protocol::retained::PLUGIN_HOST_PROTOCOL.to_owned(),
             })
             .await?;
         let ResponseBody::Hello { protocol, .. } = hello else {
             return Err(protocol_error(&hello));
         };
-        if protocol != crate::protocol::PROTOCOL {
+        if protocol != kr_protocol::retained::PLUGIN_HOST_PROTOCOL {
             return Err(ServiceError::Protocol {
                 detail: format!("the host speaks {protocol}"),
             });

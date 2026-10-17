@@ -456,17 +456,17 @@ impl PluginHost {
     ) -> Result<ResponseBody, (String, bool)> {
         match body {
             RequestBody::Hello { protocol } => {
-                if protocol != kr_plugin_service::protocol::PROTOCOL {
+                if protocol != kr_protocol::retained::PLUGIN_HOST_PROTOCOL {
                     return Err((
                         format!(
                             "this host speaks {} and the caller offered {protocol}",
-                            kr_plugin_service::protocol::PROTOCOL
+                            kr_protocol::retained::PLUGIN_HOST_PROTOCOL
                         ),
                         false,
                     ));
                 }
                 Ok(ResponseBody::Hello {
-                    protocol: kr_plugin_service::protocol::PROTOCOL.to_owned(),
+                    protocol: kr_protocol::retained::PLUGIN_HOST_PROTOCOL.to_owned(),
                     descriptor: Box::new(self.descriptor()),
                 })
             }
@@ -736,7 +736,7 @@ impl PluginHost {
 
     fn descriptor(&self) -> kr_plugin_service::protocol::HostDescriptor {
         kr_plugin_service::protocol::HostDescriptor {
-            protocol: kr_plugin_service::protocol::PROTOCOL.to_owned(),
+            protocol: kr_protocol::retained::PLUGIN_HOST_PROTOCOL.to_owned(),
             environment_id: self.identity.environment_id(),
             reservation_id: kr_protocol::worker::ReservationId::new(
                 kr_protocol::scalars::Uuid::from_bytes([0; 16]),

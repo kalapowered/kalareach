@@ -122,6 +122,9 @@ pub const FROZEN_VARIANTS: &[&str] = &[
 /// A worker connects to its environment's one plugin host directly, so a daemon of one release can
 /// meet a host of another and a worker of one release a host of another. The name is part of what
 /// a retained level records (`PLUGIN_HOST`), and a bump needs the retained levels to speak both.
+/// A host and a worker of another protocol refuse each other at the handshake, and a descriptor
+/// that names another protocol is not one a worker uses: the control daemon takes it away and
+/// starts a runtime of its own. The second protocol adds the request that prepares an action.
 pub const PLUGIN_HOST_PROTOCOL: &str = "kr-plugin-host/2";
 
 /// The definition that names the parameters of a read the control daemon makes of a worker itself,

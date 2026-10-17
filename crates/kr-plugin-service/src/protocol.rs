@@ -28,13 +28,6 @@ use serde::{Deserialize, Serialize};
 use kr_plugin_sdk::digest::PayloadDigest;
 use kr_plugin_sdk::identity::PluginIdentity;
 
-/// The protocol a worker and the plugin host speak.
-///
-/// A host and a worker of another protocol refuse each other at the handshake, and a descriptor
-/// that names another protocol is not one a worker uses: the control daemon takes it away and
-/// starts a runtime of its own. The second protocol adds the request that prepares an action.
-pub const PROTOCOL: &str = "kr-plugin-host/2";
-
 /// The domain separating the plugin host's startup claim.
 pub const RENDEZVOUS_DOMAIN: &str = "kr-plugin-host/1/rendezvous";
 
@@ -735,7 +728,7 @@ mod tests {
         let binding_id = kr_protocol::scalars::Uuid::from_bytes([3; 16]);
         for body in [
             RequestBody::Hello {
-                protocol: PROTOCOL.to_owned(),
+                protocol: kr_protocol::retained::PLUGIN_HOST_PROTOCOL.to_owned(),
             },
             RequestBody::Verify {
                 nonce: Nonce256::from_bytes([4; 32]),
@@ -952,7 +945,6 @@ mod tests {
 
     #[test]
     fn the_domains_and_names_are_the_ones_this_protocol_publishes() {
-        assert_eq!(PROTOCOL, "kr-plugin-host/2");
         assert_eq!(RENDEZVOUS_DOMAIN, "kr-plugin-host/1/rendezvous");
         assert_eq!(VERIFY_DOMAIN, "kr-plugin-host/1/verify");
         assert_ne!(RENDEZVOUS_DOMAIN, VERIFY_DOMAIN);

@@ -743,7 +743,7 @@ mod tests {
         launcher::publish_descriptor(
             &environment,
             &kr_plugin_service::protocol::HostDescriptor {
-                protocol: kr_plugin_service::protocol::PROTOCOL.to_owned(),
+                protocol: kr_protocol::retained::PLUGIN_HOST_PROTOCOL.to_owned(),
                 environment_id: host.environment_id(),
                 reservation_id: kr_protocol::worker::ReservationId::new(kr_ipc::new_uuid()),
                 endpoint: launcher::host_endpoint(&environment)
