@@ -79,6 +79,10 @@ pub enum Moment {
     /// The service holds the request open and answers nothing, until [`ServiceWeb::release_held`]
     /// lets the connection go. It acts on nothing.
     Hold,
+    /// The service acts on the request and answers `504 OUTCOME_UNKNOWN`, as a service does whose
+    /// feed stored the change and did not answer in time. The caller is told it is not known
+    /// whether the change took effect, and it did.
+    ActedAndUnknown,
     /// The service acts on the request and is slow to answer: the answer is given when
     /// [`ServiceWeb::release_held`] is called, and is the one the service would have given at once.
     Slow,
@@ -854,6 +858,13 @@ impl ServiceWeb {
         );
         if moment == Some(Moment::After) {
             return Handled::Lost;
+        }
+        if moment == Some(Moment::ActedAndUnknown) {
+            return Handled::Answer(refusal(
+                504,
+                "OUTCOME_UNKNOWN",
+                "The service did not answer in time, so it is not known whether the change took effect.",
+            ));
         }
         if moment == Some(Moment::Slow) {
             return Handled::Slow(released, answer);

@@ -78,10 +78,14 @@ struct Feed {
 impl Feed {
     /// The feed this leg runs against, or nothing when this run was given no deployment.
     fn open() -> Option<Self> {
-        let deployment = Deployment::from_environment()?;
+        Some(Self::on(Deployment::from_environment()?))
+    }
+
+    /// A feed on `deployment`, made for one leg.
+    fn on(deployment: Deployment) -> Self {
         let owner = RunKey::installation();
         let host = RunKey::host();
-        Some(Self {
+        Self {
             owner_client: deployment.authority_feed(&owner),
             host_client: deployment.authority_feed(&host),
             deployment,
@@ -90,7 +94,7 @@ impl Feed {
             host_mailbox: StoredEnvelopeKeyPair::generate().expect("the host's mailbox key"),
             owner_envelopes: StoredEnvelopeKeyPair::generate().expect("the owner's envelope key"),
             announced: Mutex::new(false),
-        })
+        }
     }
 
     /// The feed's address: the identifier of the host's own authorisation key.
@@ -154,6 +158,31 @@ impl Feed {
                     Ok(held)
                 } else {
                     client.publish(self.address(), request, None).await
+                }
+            }
+            answered => answered,
+        }
+    }
+
+    /// Sends the host's `revision`, and returns the feed as the service answered.
+    ///
+    /// As [`Self::publish_settled`], for the host's own change: an answer of unknown is followed by
+    /// a read of the feed before anything is sent again. The feed holds the revision when its
+    /// summary names it, since a revision follows the one the feed holds and this sends one at a
+    /// time, and then it is not sent again. Otherwise it is sent once more, which the service
+    /// answers as a repeat if the first had landed in between.
+    async fn revise_settled(
+        &self,
+        revision: &AuthorityRevisionRecord,
+    ) -> kr_client::Result<kr_client::services::AuthorityFeedState> {
+        match self.host_client.revise(revision, None).await {
+            Err(unknown) if unknown.code() == ErrorCode::OutcomeUnknown => {
+                eprintln!("the revision was answered as unknown, so the feed is read: {unknown}");
+                let held = self.host_client.read(self.address(), None, true).await?;
+                if held.summary.authority_revision == Nullable(Some(revision.authority_revision)) {
+                    Ok(held)
+                } else {
+                    self.host_client.revise(revision, None).await
                 }
             }
             answered => answered,
@@ -786,8 +815,7 @@ async fn kr_req_10_46_a_revision_that_does_not_follow_the_accepted_one_is_reject
         // The feed holds the same order. A revision that does not follow the one it holds is
         // refused.
         let first = feed.revision(AuthorityRevision::new(0), &[]);
-        feed.host_client
-            .revise(&first, None)
+        feed.revise_settled(&first)
             .await
             .expect("the first revision follows nothing");
         let gap = feed.revision(AuthorityRevision::new(4), &[]);
@@ -1081,4 +1109,48 @@ async fn kr_req_10_46_an_announcement_is_only_an_announcement() {
         "an announcement is placed in a mailbox and carries nothing of the record, and a host that never reads it still learns the revocation from the feed and applies it".to_owned()
     })
     .await;
+}
+
+/// The first change a leg makes to its feed is the first request the feed's own object has been
+/// asked, and the service answers it `OUTCOME_UNKNOWN` when that object does not answer in time,
+/// whether or not the change was stored. The revision is read back before it is sent again: a
+/// revision the feed holds is not sent a second time, and one it does not hold is.
+#[tokio::test]
+async fn a_first_revision_answered_as_unknown_is_read_back_before_it_is_sent_again() {
+    use kr_service_stand_in::Moment;
+
+    for (stored, fault, reaching) in [
+        (
+            false,
+            Moment::Refuse {
+                status: 504,
+                code: "OUTCOME_UNKNOWN",
+                retry_after_seconds: None,
+            },
+            3,
+        ),
+        (true, Moment::ActedAndUnknown, 2),
+    ] {
+        let served = kr_service_stand_in::serve().await;
+        let origin = kr_protocol::service::GatewayOrigin::new(served.origin().to_owned())
+            .expect("a loopback origin");
+        let feed = Feed::on(Deployment::at(origin));
+        served.web().fail(AUTHORITY_SYNC_PATH, 1, fault);
+
+        let first = feed.revision(AuthorityRevision::new(0), &[]);
+        let state = feed
+            .revise_settled(&first)
+            .await
+            .unwrap_or_else(|error| panic!("stored {stored}: the revision is settled: {error}"));
+        assert_eq!(
+            state.summary.authority_revision,
+            Nullable(Some(first.authority_revision)),
+            "stored {stored}: the feed holds the revision"
+        );
+        assert_eq!(
+            served.web().requests_to(AUTHORITY_SYNC_PATH),
+            reaching,
+            "stored {stored}: the revision was sent again only when the feed did not hold it"
+        );
+    }
 }

@@ -5021,6 +5021,7 @@ dependencies = [
  "kr-crypto",
  "kr-pairing",
  "kr-protocol",
+ "kr-service-stand-in",
  "serde_json",
  "tempfile",
  "tokio",

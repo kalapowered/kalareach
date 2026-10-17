@@ -26,5 +26,9 @@ serde_json.workspace = true
 tempfile.workspace = true
 tokio.workspace = true
 
+[dev-dependencies]
+# The service the revision case is answered by, with the answers it is made to give.
+kr-service-stand-in = { path = "../../support/service-stand-in" }
+
 [lints]
 workspace = true
