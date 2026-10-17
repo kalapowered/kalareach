@@ -61,6 +61,8 @@ import type {
   PairingView,
   PasteView,
   RecoveryView,
+  SettingsChoice,
+  SettingsKeep,
   SettingsSyncView,
   SettingsView,
   ReviewOutcome,
@@ -331,6 +333,10 @@ export interface FakeSettings {
   change(view: Partial<Omit<SettingsView, 'sync'>> & { readonly sync?: Partial<SettingsSyncView> }): void
   /** Makes every change of the colour mode fail as one does that could not be kept on disk. */
   failKeeping(message: string | null): void
+  /** Sets the versions the person is asked to choose between, or none. */
+  waitingForAChoice(choice: SettingsChoice | null): void
+  /** The choices the page recorded, in order. */
+  readonly kept: readonly SettingsKeep[]
 }
 
 /** The sync service setting, as the backend reports it. */
@@ -906,6 +912,8 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
     }
   }
   const colourModesSet: string[] = []
+  let choice: SettingsChoice | null = null
+  const settingsKept: SettingsKeep[] = []
   let settingsSyncTurnOns = 0
   let settingsSyncRuns = 0
   let settingsKeepFails: string | null = null
@@ -2120,6 +2128,25 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
       settingsSyncRuns += 1
       return Promise.resolve(settingsOf())
     },
+    settingsConflicts: () => Promise.resolve(choice),
+    settingsConflictResolve: (keep) => {
+      if (choice === null) refuse('PERMISSION_DENIED', 'No content from another device is waiting.')
+      if (keep.choice === 'copy' && !choice.others.some((one) => one.conflict_id === keep.conflict_id)) {
+        refuse('PERMISSION_DENIED', 'That content is not waiting for a choice.')
+      }
+      settingsKept.push(keep)
+      const kept =
+        keep.choice === 'mine'
+          ? choice.mine
+          : choice.others.find((one) => one.conflict_id === keep.conflict_id)
+      choice = null
+      setSettings({
+        ...settings,
+        colour_mode: kept?.colour_mode ?? settings.colour_mode,
+        sync: { ...settings.sync, conflicts: 0 }
+      })
+      return Promise.resolve(settingsOf())
+    },
     onSettings: (listener) => register(settingsListeners, listener),
     recoveryView: () => {
       const answer = (): Promise<RecoveryView> =>
@@ -2214,7 +2241,11 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
       },
       failKeeping(message) {
         settingsKeepFails = message
-      }
+      },
+      waitingForAChoice(next) {
+        choice = next
+      },
+      kept: settingsKept
     },
     syncService: {
       failKeeping(message) {

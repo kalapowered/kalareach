@@ -7,8 +7,11 @@
 // Opened without the native shell (the browser harness), there is no setting and the device's own
 // mode is followed.
 
-const MODES = ['light', 'dark', 'system'] as const
-export type ColourMode = (typeof MODES)[number]
+import type { ColourMode } from './host/port'
+
+export type { ColourMode }
+
+const MODES: readonly ColourMode[] = ['light', 'dark', 'system']
 
 declare global {
   interface Window {

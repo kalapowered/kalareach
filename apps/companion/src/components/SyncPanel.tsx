@@ -31,6 +31,7 @@ import {
   failureMessage,
   type HostPort,
   type RecoveryView,
+  type SettingsChoice,
   type SettingsView,
   type SyncServiceView
 } from '../host/port'
@@ -46,6 +47,7 @@ import {
   describeStaysAt
 } from '../model/recovery'
 import { SETTINGS_SYNC_HELP, describeSettingsSync, describeWaiting } from '../model/settings'
+import { SettingsChoiceForm } from './SettingsChoice'
 import { Button, Card } from './ui'
 
 /** Which card a step belongs to, so the status it ends with is said in that card. */
@@ -83,6 +85,7 @@ export function SyncPanel({
   const [serviceProblem, setServiceProblem] = useState<string | null>(null)
   const [settings, setSettings] = useState<SettingsView | null>(null)
   const [settingsProblem, setSettingsProblem] = useState<string | null>(null)
+  const [choice, setChoice] = useState<SettingsChoice | null>(null)
   const [recovery, setRecovery] = useState<RecoveryView | null>(null)
   const [recoveryProblem, setRecoveryProblem] = useState<string | null>(null)
   const [changing, setChanging] = useState(false)
@@ -372,6 +375,32 @@ export function SyncPanel({
                     {settings.sync.state === 'off' ? 'Keep settings in step' : 'Try again'}
                   </Button>
                 ) : null}
+                {settings !== null && settings.sync.conflicts > 0 ? (
+                  <Button
+                    tone="primary"
+                    data-testid="settings-sync-choose"
+                    aria-expanded={choice !== null}
+                    disabled={busy}
+                    style={{ minBlockSize: target }}
+                    onClick={() => {
+                      if (choice !== null) {
+                        setChoice(null)
+                        return
+                      }
+                      step(
+                        'settings',
+                        async () => {
+                          const next = await port.settingsConflicts()
+                          setChoice(next)
+                          return next === null ? 'Nothing is waiting for a choice any more.' : null
+                        },
+                        false
+                      )
+                    }}
+                  >
+                    Choose which to keep
+                  </Button>
+                ) : null}
                 {settings?.sync.state === 'on' ? (
                   <Button
                     data-testid="settings-sync-now"
@@ -385,6 +414,24 @@ export function SyncPanel({
                   </Button>
                 ) : null}
               </div>
+              {choice !== null && (settings?.sync.conflicts ?? 0) > 0 ? (
+                <SettingsChoiceForm
+                  choice={choice}
+                  busy={busy}
+                  target={target}
+                  onKeep={(keep) => {
+                    step('settings', () =>
+                      port.settingsConflictResolve(keep).then(() => {
+                        setChoice(null)
+                        return 'Kept. Your other devices take it from here.'
+                      })
+                    )
+                  }}
+                  onCancel={() => {
+                    setChoice(null)
+                  }}
+                />
+              ) : null}
             </div>
           </Card>
         </>
