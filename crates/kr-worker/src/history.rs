@@ -1725,15 +1725,15 @@ impl Spool {
         self.peak_bytes = self.peak_bytes.max(self.total_bytes);
     }
 
-    /// Takes an append that needs nothing but a write to the open segment, and leaves the write to
-    /// the caller.
+    /// Takes an append that needs nothing but a write to the newest segment, and leaves the write
+    /// to the caller.
     ///
     /// That is nearly every append: the bytes continue the newest segment, fit in it, and fit
     /// within the capacity, so no segment has to be created and none given up. The caller makes the
     /// write when it has let go of whatever it was holding, because a write to a disk that is busy
     /// with other work can take as long as the disk likes. The bytes are counted as held now, as
     /// they will be once the write is made, and [`Spool::settle_failed_write_of`] takes them back
-    /// if it fails. Anything else - a segment to open, room to make, a spool that has stopped -
+    /// if it fails. Anything else - a segment to create, room to make, a spool that has stopped -
     /// returns `None` and is made by [`Spool::append`] as before.
     fn take_plain_append(&mut self, start: u64, bytes: &[u8], now_ms: u64) -> Option<SpoolWrite> {
         if self.suspended.is_some() {
