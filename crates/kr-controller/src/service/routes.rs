@@ -15,6 +15,24 @@ use crate::error::{ControllerError, Result};
 
 use super::{Controller, encode, error_reply, net, parse, respond};
 
+/// The local write methods this daemon performs itself that take no admission into a service:
+/// the environment record, the update handover and the setting up of backups change nothing the
+/// revision or the deadline decides.
+///
+/// The fence check and the registration check run for each of them before it does anything. A
+/// method that takes an admission asks both inside the service that performs it, so this list is
+/// the only place a method is held to the fence by name, and a method that belongs here and is
+/// missing runs while the fence is owed. `every_local_write_method_the_daemon_performs_is_placed`
+/// walks the registry and fails for a method that is on neither this list nor the list of those
+/// that take an admission.
+pub(super) const NO_ADMISSION: [Method; 5] = [
+    Method::EnvironmentEnrol,
+    Method::EnvironmentForget,
+    Method::EnvironmentRefresh,
+    Method::HostUpdateHandover,
+    Method::BackupEnable,
+];
+
 impl Controller {
     /// Performs one project or workspace mutation under the admission its ingress recorded.
     ///
@@ -659,21 +677,14 @@ impl Controller {
             admitted_revision,
             deadline: accepted.map(|accepted| accepted.deadline),
         };
-        // Five methods take no admission into a service: the environment record, the update
-        // handover and the setting up of backups change nothing the revision or the deadline
-        // decides. They still do not run for a connection whose registration was withdrawn while
-        // the call waited, and they do not run while this host owes a fence it could not raise:
-        // whichever service performs an effect, an owed fence stops it.
-        if matches!(
-            method,
-            Method::EnvironmentEnrol
-                | Method::EnvironmentForget
-                | Method::EnvironmentRefresh
-                | Method::HostUpdateHandover
-                | Method::BackupEnable
-        ) && let Err(error) = self
-            .authorised(connection_id)
-            .and_then(|_| self.check_fence())
+        // The methods in [`NO_ADMISSION`] take no admission into a service. They still do not run
+        // for a connection whose registration was withdrawn while the call waited, and they do not
+        // run while this host owes a fence it could not raise: whichever service performs an
+        // effect, an owed fence stops it.
+        if NO_ADMISSION.contains(&method)
+            && let Err(error) = self
+                .authorised(connection_id)
+                .and_then(|_| self.check_fence())
         {
             return error_reply(mutation.request_id, error.code(), error.to_string());
         }

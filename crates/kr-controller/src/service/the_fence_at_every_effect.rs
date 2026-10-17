@@ -552,6 +552,8 @@ async fn a_method_that_takes_no_admission_is_refused_on_a_withdrawn_registration
         Method::EnvironmentRefresh,
         Method::HostUpdateHandover,
         Method::BackupEnable,
+        Method::AccountSignIn,
+        Method::AccountSignOut,
     ];
 
     // The control first: nothing here is refused for authority while the registration stands.
@@ -1214,7 +1216,7 @@ async fn a_privacy_change_that_was_applied_is_not_answered_as_failed_when_its_re
     assert!(enabled(), "the retry was not performed again");
 }
 
-/// KR-REQ-09.09, 09.12 and 26.16: the five methods that take no admission into a service are
+/// KR-REQ-09.09, 09.12 and 26.16: the seven methods that take no admission into a service are
 /// refused while this host owes a fence it could not raise. The control: with nothing owed, none is
 /// refused for a fence.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1230,6 +1232,8 @@ async fn the_methods_that_take_no_admission_are_refused_while_a_fence_is_owed() 
         Method::EnvironmentRefresh,
         Method::HostUpdateHandover,
         Method::BackupEnable,
+        Method::AccountSignIn,
+        Method::AccountSignOut,
     ];
     let answer = |method: Method| {
         let controller = Arc::clone(&controller);
@@ -1262,6 +1266,110 @@ async fn the_methods_that_take_no_admission_are_refused_while_a_fence_is_owed() 
         refused_for_a_fence(
             refusal(&answered)
                 .unwrap_or_else(|| panic!("{method:?} while a fence is owed: {answered:?}")),
+        );
+    }
+}
+
+/// The local write methods this daemon performs itself that pass their admission on to the service
+/// that acts: every one of them asks the fence and the registration again inside that service.
+const TAKES_AN_ADMISSION: [Method; 24] = [
+    Method::SessionCreate,
+    Method::SessionClose,
+    Method::AgentPromptSubmit,
+    Method::AgentPromptQueue,
+    Method::AgentToolsInstall,
+    Method::AgentToolsRemove,
+    Method::GrantCreate,
+    Method::GrantRevoke,
+    Method::GrantTransfer,
+    Method::DeviceRevoke,
+    Method::DeliveryDestinationConfigure,
+    Method::DeliveryDestinationRemove,
+    Method::DeliveryDestinationSecretSet,
+    Method::OrganisationEnrol,
+    Method::OrganisationExclusiveSet,
+    Method::OrganisationWithdraw,
+    Method::MembershipPresent,
+    Method::PrivacySet,
+    Method::SessionRename,
+    Method::DescriptionConfigure,
+    Method::DescriptionDownload,
+    Method::MachineJoin,
+    Method::MachineMerge,
+    Method::MachineSplit,
+];
+
+/// Whether one of the services that take the admission of a local write performs `method`.
+fn performed_by_a_service(method: Method) -> bool {
+    super::net::methods::serves(method)
+        || crate::transfer::TransferModule::serves(method)
+        || crate::voice::VoiceModule::serves(method)
+        || crate::catalogue::CatalogueModule::serves(method)
+        || crate::project::ProjectModule::serves(method)
+        || crate::automation::AutomationModule::serves(method)
+        || crate::attention::AttentionModule::serves(method)
+        || crate::changeset::ChangeSetModule::serves(method)
+}
+
+/// Whether the registry holds `method` as a write a local caller makes.
+fn is_a_local_write(method: Method) -> bool {
+    let entry = method.entry();
+    entry.effect == kr_protocol::authority::EffectClass::Write
+        && entry
+            .ingress
+            .contains(&kr_protocol::actor::ActorIngress::LocalIpc)
+}
+
+/// KR-REQ-09.09, 09.12 and 26.16: every local write method the daemon performs itself is placed,
+/// as one that takes no admission into a service and is held to the fence by name, or as one that
+/// passes its admission on. A method that is neither is not one the daemon performs; the control
+/// is that the daemon says so when it is asked. So a method added to the daemon without being
+/// placed fails here, instead of running while the host owes a fence.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn every_local_write_method_the_daemon_performs_is_placed() {
+    use super::routes::NO_ADMISSION;
+
+    let (temp, controller, _clock) = daemon().await;
+    let (connection_id, actor_id) = admitted(&controller).await;
+    let captured = controller
+        .admitted_revision(connection_id)
+        .expect("the connection is registered");
+    for listed in NO_ADMISSION.iter().chain(&TAKES_AN_ADMISSION) {
+        assert!(
+            is_a_local_write(*listed) && !performed_by_a_service(*listed),
+            "{listed:?} is listed and is not a local write the daemon performs itself"
+        );
+    }
+    for listed in &TAKES_AN_ADMISSION {
+        assert!(
+            !NO_ADMISSION.contains(listed),
+            "{listed:?} is on both lists"
+        );
+    }
+    for method in Method::ALL.iter().copied() {
+        if !is_a_local_write(method)
+            || performed_by_a_service(method)
+            || NO_ADMISSION.contains(&method)
+            || TAKES_AN_ADMISSION.contains(&method)
+        {
+            continue;
+        }
+        let answered = controller
+            .write_method(
+                &actor_id,
+                &mutation_of(&temp, method, ParamsValue::empty()),
+                method,
+                connection_id,
+                None,
+                Some(accepted(&controller)),
+                Some(captured),
+            )
+            .await;
+        let error = refusal(&answered)
+            .unwrap_or_else(|| panic!("{method:?} is performed and is placed on no list"));
+        assert!(
+            error.message.contains("is not a mutation this daemon serves"),
+            "{method:?} is performed and is placed on no list: {error:?}"
         );
     }
 }
