@@ -52,7 +52,11 @@ const TEST_FEATURES: [&str; 3] = ["testing", "fault-injection", "git-fixtures"];
 
 /// The features of the host's crates that are not for tests, as `(crate, feature)`: each adds code
 /// or a dependency to the crate and none is a seam a test acts through.
-const PRODUCT_FEATURES: [(&str, &str); 2] = [("kr-client", "terminal"), ("kr-term", "conformance")];
+const PRODUCT_FEATURES: [(&str, &str); 3] = [
+    ("kr-client", "terminal"),
+    ("kr-flush", "sqlite"),
+    ("kr-term", "conformance"),
+];
 
 /// One token of a source, as far as this reading needs to tell them apart.
 #[derive(Clone, Debug, PartialEq, Eq)]
