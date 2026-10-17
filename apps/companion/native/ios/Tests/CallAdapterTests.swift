@@ -47,6 +47,8 @@ private final class FakeEngine: CallEngine {
     var permitted = true
     var isPlaybackMuted = false
     var isMutedByPerson = false
+    /// Where a real call reports its end, which a stop is followed by.
+    var reporting: CallReporting?
 
     func record(_ what: String) {
         lock.lock()
@@ -76,7 +78,12 @@ private final class FakeEngine: CallEngine {
         isPlaybackMuted = muted
     }
 
-    func stop() { record("stop") }
+    /// A stop ends the call, and the call says so, as a real one does. The end is reported before
+    /// the stop is recorded, so a test that has seen the stop has the end already queued.
+    func stop() {
+        reporting?.ended()
+        record("stop")
+    }
 }
 
 /// Makes the fake call, keeping the reporter the adapter gave it.
@@ -88,6 +95,7 @@ private final class FakeMaker: CallEngineMaker {
     func make(reporting: CallReporting) throws -> CallEngine {
         made += 1
         self.reporting = reporting
+        engine.reporting = reporting
         return engine
     }
 }
@@ -256,6 +264,25 @@ final class CallAdapterTests: XCTestCase {
         adapter.endIfOwnerIsGone()
         try await Task.sleep(nanoseconds: 100_000_000)
         XCTAssertEqual(maker.engine.asked.filter { $0 == "stop" }.count, 1, "it ends once")
+    }
+
+    // A call the watch ended reports its end like any other, and is let go of: the next open is not
+    // met by a call that is gone.
+    func testACallTheWatchEndedIsLetGoOfSoTheNextOpenIsNotRefused() async throws {
+        var now: TimeInterval = 0
+        let maker = FakeMaker()
+        let adapter = CallAdapter(maker: maker, device: FakeDevice(), clock: { now }, watches: false)
+        _ = await ask(adapter, "callOpen", #"{"call":"c1","events":"__CHANNEL__:7"}"#, told: Told())
+        now = CallWatch.beforePermit
+        adapter.endIfOwnerIsGone()
+        try await waitUntil { maker.engine.asked.contains("stop") }
+
+        let again = await ask(adapter, "callOpen", #"{"call":"c2","events":"__CHANNEL__:8"}"#, told: Told())
+
+        XCTAssertNil(again.code, "the call the watch ended is not held")
+        XCTAssertEqual(maker.made, 2)
+        let old = await ask(adapter, "callAlive", #"{"call":"c1"}"#)
+        XCTAssertEqual(old.code, "ended", "a sign for the call that ended says so")
     }
 
     func testAPermittedCallWaitsTheShorterBound() async throws {
