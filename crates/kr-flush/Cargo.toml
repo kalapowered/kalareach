@@ -1,6 +1,6 @@
 [package]
 name = "kr-flush"
-description = "KalaReach's directory flush and file lock: how every local store makes a name it changed survive a crash and keeps two processes from writing one store"
+description = "KalaReach's local store durability: the directory flush and file lock that make a store's names survive a crash and keep two processes from writing one store, and the open of a store whose previous holder is still letting go"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,10 +9,16 @@ repository.workspace = true
 publish.workspace = true
 
 [features]
-# What a store's own tests use to act exactly when one of its renames was refused as held, and to
-# make the flush of one directory fail after the name it follows was given: never enabled in a
-# build a store ships.
+# What a store's own tests use to act exactly when one of its renames was refused as held, to make
+# the flush of one directory fail after the name it follows was given, and to stand a store in the
+# interval its previous holder is letting go of its index: never enabled in a build a store ships.
 testing = []
+# The open of a SQLite store whose previous holder is still letting go of it ([`release`]). A store
+# that uses SQLite asks for it; a crate that does not links no SQLite for it.
+sqlite = ["dep:rusqlite"]
+
+[dependencies]
+rusqlite = { workspace = true, optional = true }
 
 [target.'cfg(unix)'.dependencies]
 # A held directory is opened again relative to its own descriptor, a store's lock is taken on its
@@ -21,7 +27,9 @@ rustix = { workspace = true, features = ["fs", "process"] }
 
 [target.'cfg(windows)'.dependencies]
 # A held directory is opened again relative to its own handle, which only the native open offers.
-windows-sys.workspace = true
+# `Win32_System_Memory` is for the test seam that holds a store's index mapped the way a process
+# that is ending does (`release::held_index`), which no shipped build compiles.
+windows-sys = { workspace = true, features = ["Win32_System_Memory"] }
 
 # The workspace forbids unsafe code, which a crate that asks the kernel directly cannot honour. This
 # crate denies it instead and allows it in exactly one module, `windows`, which opens a held
