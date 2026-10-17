@@ -680,6 +680,14 @@ impl SettingsSync {
         if let Some(mode) = chosen
             && held.as_ref().and_then(colour_mode_of) != Some(mode)
         {
+            if held.is_none() {
+                // The first object this computer makes is published against nothing. A note kept
+                // without an object names a write this computer read and did not take (the person
+                // chose while it was being read, or the step stopped before it was taken), and a
+                // publication against it would replace that write without a choice: forgotten, the
+                // publication is refused and keeps that content beside this computer's own.
+                store.forget_checkpoint(object_id).map_err(sync_failure)?;
+            }
             let object = self.object_of(object_id, held.as_ref(), mode, now_ms)?;
             store.put_object(&object).map_err(sync_failure)?;
             held = Some(object);
@@ -768,13 +776,8 @@ impl SettingsSync {
         if !taken {
             // The person chose while the service was being read. Where the fetch kept a copy of
             // what the other device wrote, the copy waits for them. Where this computer held
-            // nothing, there is no copy, and the note the fetch wrote names the other device's
-            // write: the next publication would be made against it and replace what the other
-            // device wrote without a choice. The note is forgotten, so that publication is refused
-            // and keeps that content beside this computer's own.
-            if copy.is_none() {
-                store.forget_checkpoint(object_id).map_err(sync_failure)?;
-            }
+            // nothing there is no copy, and the step that makes this computer's first object
+            // forgets the note this fetch wrote, so that object is not published against it.
             return Ok(());
         }
         store.put_object(object).map_err(sync_failure)?;
