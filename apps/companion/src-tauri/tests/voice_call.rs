@@ -309,6 +309,7 @@ async fn scene_with(
     let account = Arc::new(Account::new(
         Arc::clone(&tokens),
         Arc::clone(&service) as Arc<dyn AccountService>,
+        kr_protocol::service::GatewayOrigin::new(stand_in.origin()).expect("an origin"),
         Arc::new(NoCarrier),
         Arc::new(|_| {}),
     ));
