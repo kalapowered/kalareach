@@ -3164,7 +3164,10 @@ fn kr_close_is_closing_at_once_then_grace_force_drain_and_a_final_status() {
     let host = Host::start();
     let mut closed = Vec::new();
     let mut missed = Vec::new();
-    for attempt in 1..=CLOSE_ATTEMPTS {
+    let started = Instant::now();
+    // Another close is watched for as long as the last one showed nothing either way: what ends
+    // this is a close the watch saw in full, or the liveness bound on a watch that never does.
+    loop {
         let (session_id, observed) = close_explicitly(&host);
         closed.push(session_id);
         match observed {
@@ -3175,17 +3178,22 @@ fn kr_close_is_closing_at_once_then_grace_force_drain_and_a_final_status() {
             }
             Err(reason) => {
                 eprintln!(
-                    "close {attempt} shows nothing either way, because the watch missed a moment \
-                     it depends on: {reason}"
+                    "close {} shows nothing either way, because the watch missed a moment it \
+                     depends on: {reason}",
+                    closed.len()
                 );
                 missed.push(reason);
             }
         }
+        assert!(
+            started.elapsed() < LIVENESS_DEADLINE,
+            "the watch missed a moment the checks depend on in each of {} closes in {:?}; the \
+             last three: {:?}",
+            closed.len(),
+            started.elapsed(),
+            &missed[missed.len().saturating_sub(3)..]
+        );
     }
-    panic!(
-        "the watch missed a moment the checks depend on in each of {CLOSE_ATTEMPTS} closes: \
-         {missed:?}"
-    );
 }
 
 /* ------------------------------------------------------------------------------------------ */
