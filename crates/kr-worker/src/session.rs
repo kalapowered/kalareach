@@ -41,7 +41,7 @@ use kr_protocol::session::{
 use crate::attachments::AttachmentTable;
 use crate::error::{Result, WorkerError};
 use crate::history::{OutputHistory, SpoolLayout};
-use crate::input_domain::{Accepted, Applied, FenceGuard, InputDomain, InputShared};
+use crate::input_domain::{Accepted, Applied, FenceGuard, FenceView, InputDomain, InputShared};
 use crate::journal::{Journal, Kept};
 use crate::output::{EffectOutcome, OutputHub, OutputStream, OwedEffect};
 use crate::ownership::OwnedProcesses;
@@ -740,8 +740,8 @@ impl Session {
 
     /// Returns the root-editor driver, for a managed session.
     #[must_use]
-    pub fn fence(&self) -> Option<FenceGuard<'_>> {
-        FenceGuard::of(self.input.lock())
+    pub fn fence(&self) -> Option<FenceView<'_>> {
+        FenceView::of(self.input.lock())
     }
 
     /// Returns the root-editor driver for a stimulus.

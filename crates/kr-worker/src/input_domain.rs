@@ -179,7 +179,33 @@ impl std::ops::DerefMut for InputGuard<'_> {
     }
 }
 
-/// The root editor's driver, with the input domain held for as long as it is looked at.
+/// The root editor's driver to look at, with the input domain held for as long as it is looked at.
+///
+/// Only a session held mutably steps the machine, through [`FenceGuard`].
+#[derive(Debug)]
+pub struct FenceView<'a> {
+    guard: InputGuard<'a>,
+}
+
+impl<'a> FenceView<'a> {
+    /// Looks at the driver of a managed session; `None` for one that has none.
+    pub(crate) fn of(guard: InputGuard<'a>) -> Option<Self> {
+        guard.fence.is_some().then_some(Self { guard })
+    }
+}
+
+impl std::ops::Deref for FenceView<'_> {
+    type Target = FenceDriver;
+
+    fn deref(&self) -> &FenceDriver {
+        self.guard
+            .fence
+            .as_ref()
+            .expect("a view is made only for a session that has a driver")
+    }
+}
+
+/// The root editor's driver to step, with the input domain held for as long as it is.
 #[derive(Debug)]
 pub struct FenceGuard<'a> {
     guard: InputGuard<'a>,
