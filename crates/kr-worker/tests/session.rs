@@ -870,7 +870,7 @@ async fn detaching_mid_paste_publishes_the_fence_and_closes_the_paste() {
     {
         let mut session = runtime.session();
         session.detach(attachment_id).expect("detaches");
-        runtime.flush_locked(&mut session);
+        runtime.flush_input();
     }
     let session = runtime.session();
     assert!(!session.paste_open(), "the detach closed the open paste");
@@ -905,7 +905,7 @@ async fn a_root_shell_that_exits_mid_paste_publishes_the_fence_and_closes_the_pa
                 std::time::Instant::now(),
             )
             .expect("writes end of transmission");
-        runtime.flush_locked(&mut session);
+        runtime.flush_input();
     }
     let record = closure_record(&runtime, "the session closes when its root shell exits").await;
     assert!(matches!(
@@ -1053,7 +1053,7 @@ async fn input_beyond_the_session_budget_is_refused_rather_than_acknowledged() {
                 std::time::Instant::now(),
             );
             if outcome.is_ok() {
-                runtime.flush_locked(&mut session);
+                runtime.flush_input();
             }
             outcome
         };
@@ -1089,6 +1089,8 @@ async fn input_beyond_the_session_budget_is_refused_rather_than_acknowledged() {
     assert!(
         runtime
             .session()
+            .input()
+            .lock()
             .queued_input_bytes()
             .load(std::sync::atomic::Ordering::Acquire)
             <= kr_worker::session::MAX_QUEUED_INPUT_BYTES,
@@ -1201,7 +1203,7 @@ async fn takeover_mid_paste(one_frame: bool) {
                 )
                 .expect("writes the terminator");
         }
-        runtime.flush_locked(&mut session);
+        runtime.flush_input();
     }
 
     // The takeover has to happen while the writer is *inside* that batch: the terminal has taken
@@ -1210,7 +1212,7 @@ async fn takeover_mid_paste(one_frame: bool) {
     // the writer has begun; the notice the lease change left for it can. The writer clears that
     // notice when it takes it, and it is queued ahead of the paste, so a cleared notice means the
     // writer has moved on to the batch that opens the paste.
-    let notice = runtime.session().lease_change_queued();
+    let notice = runtime.session().input().lock().lease_change_queued();
     let started = tokio::time::Instant::now();
     let deadline = started + LIVENESS_DEADLINE;
     while notice.load(std::sync::atomic::Ordering::Acquire) {
@@ -1222,7 +1224,7 @@ async fn takeover_mid_paste(one_frame: bool) {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     tokio::time::sleep(Duration::from_millis(200)).await;
-    let queued = runtime.session().queued_lease_bytes();
+    let queued = runtime.session().input().lock().queued_lease_bytes();
     assert!(
         queued.load() > 0,
         "and is waiting inside it, because the application is not reading"
@@ -1232,7 +1234,7 @@ async fn takeover_mid_paste(one_frame: bool) {
         let taken = session
             .acquire_input(second, ConnectionId::new(kr_ipc::new_uuid()), None)
             .expect("takes the lease over");
-        runtime.flush_locked(&mut session);
+        runtime.flush_input();
         taken
     };
     assert!(
@@ -1252,7 +1254,7 @@ async fn takeover_mid_paste(one_frame: bool) {
                 std::time::Instant::now(),
             )
             .expect("the new lease writes");
-        runtime.flush_locked(&mut session);
+        runtime.flush_input();
     }
 
     let seen = retained_within(&runtime, b"kr-new-lease", LIVENESS_DEADLINE).await;
@@ -1352,12 +1354,12 @@ async fn a_takeover_publishes_the_fence_before_it_counts_what_the_old_lease_left
         session
             .write_input(first, epoch, 0, &batch, None, std::time::Instant::now())
             .expect("writes");
-        runtime.flush_locked(&mut session);
+        runtime.flush_input();
     }
     // The lease changes while the writer is part way through: some of the batch is with the
     // application and the rest is waiting for a terminal that has no room.
     let total = batch.len();
-    let queued = runtime.session().queued_lease_bytes();
+    let queued = runtime.session().input().lock().queued_lease_bytes();
     let started = tokio::time::Instant::now();
     let deadline = started + LIVENESS_DEADLINE;
     loop {
@@ -1387,11 +1389,11 @@ async fn a_takeover_publishes_the_fence_before_it_counts_what_the_old_lease_left
             "the writer was told the lease changed before the bytes it was holding were counted"
         );
         assert_eq!(
-            session.queued_lease_bytes().load(),
+            session.input().lock().queued_lease_bytes().load(),
             0,
             "and the count the receipt took belongs to the lease that ended"
         );
-        runtime.flush_locked(&mut session);
+        runtime.flush_input();
         taken
     };
     assert!(
@@ -1508,12 +1510,12 @@ async fn a_takeover_reports_exactly_the_bytes_the_application_never_received() {
         session
             .write_input(first, epoch, 0, &batch, None, std::time::Instant::now())
             .expect("writes");
-        runtime.flush_locked(&mut session);
+        runtime.flush_input();
     }
     // The lease changes while the writer is part way through: some of the batch is with the
     // application and the rest is waiting for a terminal that has no room.
     let total = batch.len();
-    let queued = runtime.session().queued_lease_bytes();
+    let queued = runtime.session().input().lock().queued_lease_bytes();
     let started = tokio::time::Instant::now();
     let deadline = started + LIVENESS_DEADLINE;
     loop {
@@ -1535,7 +1537,7 @@ async fn a_takeover_reports_exactly_the_bytes_the_application_never_received() {
         let taken = session
             .acquire_input(second, ConnectionId::new(kr_ipc::new_uuid()), None)
             .expect("takes the lease over");
-        runtime.flush_locked(&mut session);
+        runtime.flush_input();
         taken
     };
     let discarded = usize::try_from(taken.discarded_bytes.get()).expect("fits");
@@ -1559,7 +1561,7 @@ async fn a_takeover_reports_exactly_the_bytes_the_application_never_received() {
                 std::time::Instant::now(),
             )
             .expect("the new lease writes");
-        runtime.flush_locked(&mut session);
+        runtime.flush_input();
     }
     let _ = retained_within(&runtime, b"kr-next", LIVENESS_DEADLINE).await;
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -1758,6 +1760,8 @@ async fn input_for_a_terminal_that_has_gone_is_refused_rather_than_acknowledged(
         .expect("an ordinary write while the terminal is there");
 
     session
+        .input()
+        .lock()
         .terminal_gone_latch()
         .store(true, std::sync::atomic::Ordering::Release);
 
@@ -2212,7 +2216,7 @@ async fn a_shell_the_host_described_keeps_the_identity_the_kernel_gave_it() {
                 std::time::Instant::now(),
             )
             .expect("writes the line the shell is waiting for");
-        runtime.flush_locked(&mut session);
+        runtime.flush_input();
     }
 
     let record = closure_record(&runtime, "the session closes on the root shell's exit").await;

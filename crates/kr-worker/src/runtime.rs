@@ -594,6 +594,8 @@ impl RuntimePauses {
 #[derive(Debug)]
 pub struct SessionRuntime {
     session: Arc<Mutex<Session>>,
+    /// What a keystroke touches, which is taken after the session and never before it.
+    domain: Arc<crate::input_domain::InputShared>,
     /// The machine's own continuous clock, shared with the writer and with whatever else in this
     /// process decides whether a forwarded deadline has passed. One reading of one clock answers
     /// the same question at both boundaries.
@@ -647,22 +649,40 @@ impl SessionRuntime {
         // terminal is outside it. A lease change takes the same boundary, so a write cannot begin
         // after the lease it belongs to has ended, and the count of what that lease left behind
         // cannot be taken while a write of its own is part way through.
-        let gate = session.input_gate();
-        let queued_input = session.queued_input_bytes();
-        let dropped_replies = session.dropped_replies();
-        let unwritten_replies = session.unwritten_replies();
-        let queued_lease = session.queued_lease_bytes();
-        let delivered_paste_open = session.delivered_paste_open();
-        let lease_change_queued = session.lease_change_queued();
-        // What the writer compares every batch against. A takeover, a release, a detach or a close
-        // moves the session's lease epoch, and this is how that reaches bytes already handed over.
-        // The session owns it, because it publishes the change in the same breath as making it,
-        // which is what lets the bytes that lease left behind be counted once it can no longer be
-        // writing them.
-        let fence = session.input_fence_handle();
-        // Set when the writer ends. A terminal that will take nothing more is one this session
-        // cannot accept input for, and saying so is better than acknowledging bytes nothing writes.
-        let terminal_gone = session.terminal_gone_latch();
+        let domain = session.input();
+        let (
+            gate,
+            queued_input,
+            dropped_replies,
+            unwritten_replies,
+            queued_lease,
+            delivered_paste_open,
+            lease_change_queued,
+            fence,
+            terminal_gone,
+        ) = {
+            let input = domain.lock();
+            let writer = input.writer();
+            (
+                Arc::clone(&writer.gate),
+                Arc::clone(&writer.queued_input_bytes),
+                Arc::clone(&writer.dropped_replies),
+                Arc::clone(&writer.unwritten_replies),
+                Arc::clone(&writer.queued_lease_bytes),
+                Arc::clone(&writer.delivered_paste_open),
+                Arc::clone(&writer.lease_change_queued),
+                // What the writer compares every batch against. A takeover, a release, a detach or
+                // a close moves the lease epoch, and this is how that reaches bytes already handed
+                // over. The input domain owns it, because it publishes the change in the same
+                // breath as making it, which is what lets the bytes that lease left behind be
+                // counted once it can no longer be writing them.
+                Arc::clone(&writer.input_fence),
+                // Set when the writer ends. A terminal that will take nothing more is one this
+                // session cannot accept input for, and saying so is better than acknowledging
+                // bytes nothing writes.
+                Arc::clone(&writer.terminal_gone),
+            )
+        };
         // Input this session accepted and output it produced are what ask the supervision to look
         // at the boundary, and the adoption watch at the terminal's foreground; neither is proof
         // that a process started, and [`crate::lifecycle`] says what a session whose application
@@ -978,6 +998,7 @@ impl SessionRuntime {
 
         let runtime = Self {
             session: Arc::clone(&session),
+            domain: Arc::clone(&domain),
             shared_clock: Arc::clone(&shared_clock),
             input: input_sender.clone(),
             wake: Arc::clone(&wake),
@@ -1075,6 +1096,7 @@ impl SessionRuntime {
         // end of file at the root prompt and a crash all close the session, and KalaReach never
         // restarts the shell.
         let monitor_session = Arc::clone(&session);
+        let monitor_domain = Arc::clone(&domain);
         let monitor_closed = Arc::clone(&closed);
         let monitor_input = input_sender.clone();
         let monitor_wake = Arc::clone(&wake);
@@ -1094,6 +1116,7 @@ impl SessionRuntime {
             // nothing else is going to.
             let runtime = Arc::new(SessionRuntime {
                 session: Arc::clone(&monitor_session),
+                domain: Arc::clone(&monitor_domain),
                 shared_clock: monitor_clock,
                 input: monitor_input.clone(),
                 wake: Arc::clone(&monitor_wake),
@@ -1209,7 +1232,7 @@ impl SessionRuntime {
                     if initiated {
                         // Admission released the lease and may have produced a paste terminator.
                         // Both reach the writer here, under the lock that admitted the closure.
-                        runtime.flush_locked(&mut session);
+                        runtime.flush_input();
                     }
                     initiated
                 };
@@ -1337,21 +1360,12 @@ impl SessionRuntime {
     ///
     /// Call this after any operation that can produce input bytes.
     pub fn flush_input(&self) {
-        let mut session = self.session();
-        let pending = session.take_pending_input();
-        // Sent while the session is still held, so two callers cannot interleave their batches:
-        // the order bytes reach the terminal in is the order they were accepted in. The fence is
-        // already published: the session moves it as it changes the lease, which is earlier than
-        // here and earlier than anything that counts what the lease left behind.
-        self.send_input(pending);
-    }
-
-    /// Writes the batches a caller produced while it was holding the session.
-    ///
-    /// The session published the fence as it changed the lease, so a batch the caller's own
-    /// operation invalidated is already one the writer drops rather than writes.
-    pub fn flush_locked(&self, session: &mut Session) {
-        let pending = session.take_pending_input();
+        let mut input = self.domain.lock();
+        let pending = input.take_pending();
+        // Sent while the input domain is still held, so two callers cannot interleave their
+        // batches: the order bytes reach the terminal in is the order they were accepted in. The
+        // fence is already published: the domain moves it as it changes the lease, which is
+        // earlier than here and earlier than anything that counts what the lease left behind.
         self.send_input(pending);
     }
 
@@ -1405,7 +1419,7 @@ impl SessionRuntime {
         // Admission moved the input fence and may have produced a paste terminator. Publishing both
         // here is what makes "input is rejected from this moment" true of bytes that were already
         // handed to the writer, rather than only of bytes not yet accepted.
-        self.flush_locked(session);
+        self.flush_input();
         let gate = CloseGate {
             runtime: Arc::clone(self),
             initiated: acceptance.initiated,
@@ -1596,23 +1610,24 @@ impl SessionRuntime {
 
     /// Returns the session's current lifecycle state.
     #[must_use]
-    /// Applies one fence stimulus and everything that came of it, under one session lock.
+    /// Applies one fence stimulus and everything that came of it, as one step.
     ///
-    /// The transition and its effects are one step. Releasing the lock between them would let
-    /// another writer put a batch in front of one the machine had just released, and would leave a
-    /// takeover counting neither.
+    /// The session is taken first and the input domain inside it, as every other change to the
+    /// lease or to what the root editor's machine holds is made: a mutation that validated the
+    /// machine's state under the session is not overtaken by a stimulus from the bridge between
+    /// its marker and its effect. The transition and its effects are one step of the domain, so
+    /// another writer cannot put a batch in front of one the machine had just released, and a
+    /// takeover cannot count neither.
     pub fn drive_fence<F>(self: &Arc<Self>, stimulate: F) -> crate::session::FenceOutcome
     where
         F: FnOnce(&mut crate::fence::FenceDriver) -> crate::fence::Effects,
     {
         let outcome = {
             let mut session = self.session();
-            let Some(driver) = session.fence_mut() else {
+            let Some(outcome) = session.stimulate_fence(stimulate) else {
                 return crate::session::FenceOutcome::default();
             };
-            let effects = stimulate(driver);
-            let outcome = session.apply_fence_effects(effects);
-            self.flush_locked(&mut session);
+            self.flush_input();
             outcome
         };
         self.settle_fence(&outcome);
@@ -1672,7 +1687,7 @@ impl SessionRuntime {
                 // then whether the integration is ready.
                 if let Some(refusal) = session
                     .fence()
-                    .and_then(|driver| driver.qualification_refusal())
+                    .and_then(|driver| driver.qualification_refusal().cloned())
                 {
                     eprintln!(
                         "kr-worker: session {}: the root integration was refused ({}): {}; {}",

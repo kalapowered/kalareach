@@ -132,7 +132,7 @@ impl BridgeServer {
             let (outbound, receiving) = tokio::sync::mpsc::unbounded_channel();
             {
                 let mut session = self.runtime.session();
-                if let Some(driver) = session.fence_mut() {
+                if let Some(mut driver) = session.fence_mut() {
                     let _ = driver.registered(hello.shell.kind, &accepted.editor_abi);
                     driver.send_through(outbound);
                 }
@@ -639,7 +639,7 @@ mod tests {
                     None,
                 )
                 .expect("takes the keys");
-            let driver = session.fence_mut().expect("a driver");
+            let mut driver = session.fence_mut().expect("a driver");
             let _ = driver.bridge_event(
                 kr_protocol::ids::RequestId::new(1),
                 &BridgeEvent::HooksActivated(HooksActivated {
@@ -763,7 +763,7 @@ mod tests {
                     None,
                 )
                 .expect("takes the keys");
-            let driver = session.fence_mut().expect("a driver");
+            let mut driver = session.fence_mut().expect("a driver");
             driver.send_through(outbound);
             let _ = driver.bridge_event(
                 kr_protocol::ids::RequestId::new(1),
@@ -827,6 +827,7 @@ mod tests {
                     ),
                 ),
             );
+            drop(driver);
             // Carried out as the session carries out every step, which hands the fence to a writer
             // that never writes it.
             let _ = session.apply_fence_effects(acknowledged);
