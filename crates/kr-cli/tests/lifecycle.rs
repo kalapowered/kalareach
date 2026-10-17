@@ -1905,20 +1905,8 @@ fn shows_number(haystack: &[u8], prefix: &[u8], number: u64) -> bool {
 /// gone. [`Watch::start`] returns only once a sample has found every process running, so a watch
 /// that is held up afterwards can only leave the interval between the two wider; it cannot narrow
 /// it or move it.
-///
-/// The watch has no time limit of its own while the test is still working towards the moment it is
-/// waiting for: how long the session takes to close is the machine's, and the steps that lead to
-/// the closure each have a limit of theirs. [`Watch::finish`] starts the clock for the processes
-/// that are left: from then on each has [`LIVENESS_DEADLINE`] to end, which is what fails a worker
-/// that never does. A watch that is dropped unfinished ends its thread.
 struct Watch {
-    thread: Option<std::thread::JoinHandle<Vec<Seen>>>,
-    /// How many milliseconds after the watch began it gives up on a process that is still running.
-    /// Nothing, until the test is finished with the steps before the end.
-    give_up_at_ms: Arc<std::sync::atomic::AtomicU64>,
-    /// Set when the test no longer has a watch to finish.
-    abandoned: Arc<std::sync::atomic::AtomicBool>,
-    began: Instant,
+    thread: std::thread::JoinHandle<Vec<Seen>>,
 }
 
 /// Between which moments the watch saw one process end, on both clocks.
@@ -1942,22 +1930,13 @@ impl Watch {
     /// Panics when a process is not running when the watch begins, which everything the watch is
     /// for depends on.
     fn start(processes: Vec<ProcessStartIdentity>) -> Self {
-        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-
-        let (ready, first_round) = std::sync::mpsc::channel();
-        let begun = Instant::now();
-        let give_up_at_ms = Arc::new(AtomicU64::new(u64::MAX));
-        let abandoned = Arc::new(AtomicBool::new(false));
-        let (give_up, quit) = (Arc::clone(&give_up_at_ms), Arc::clone(&abandoned));
+        let (ready, began) = std::sync::mpsc::channel();
         let thread = std::thread::spawn(move || {
+            let started = Instant::now();
             let mut running: Vec<Option<(Instant, SystemTime)>> = vec![None; processes.len()];
             let mut gone: Vec<Option<(Instant, SystemTime)>> = vec![None; processes.len()];
             let mut ready = Some(ready);
-            while gone.iter().any(Option::is_none)
-                && !quit.load(Ordering::Acquire)
-                && u64::try_from(begun.elapsed().as_millis()).unwrap_or(u64::MAX)
-                    < give_up.load(Ordering::Acquire)
-            {
+            while gone.iter().any(Option::is_none) && started.elapsed() < LIVENESS_DEADLINE {
                 for (index, identity) in processes.iter().enumerate() {
                     if gone[index].is_some() {
                         continue;
@@ -1977,9 +1956,6 @@ impl Watch {
                 }
                 std::thread::sleep(Duration::from_millis(2));
             }
-            if quit.load(Ordering::Acquire) {
-                return Vec::new();
-            }
             running
                 .into_iter()
                 .zip(gone)
@@ -1998,31 +1974,19 @@ impl Watch {
                 })
                 .collect()
         });
-        let all_running = first_round
+        let all_running = began
             .recv_timeout(LIVENESS_DEADLINE)
             .unwrap_or_else(|_| panic!("the watch took no sample within {LIVENESS_DEADLINE:?}"));
         assert!(
             all_running,
             "every watched process was running when the watch began"
         );
-        Self {
-            thread: Some(thread),
-            give_up_at_ms,
-            abandoned,
-            began: begun,
-        }
+        Self { thread }
     }
 
-    /// Waits until every watched process has ended, and says when each was seen to. A process
-    /// still running [`LIVENESS_DEADLINE`] after this is called fails the test.
-    fn finish(mut self) -> Vec<Seen> {
-        let give_up_at = self.began.elapsed() + LIVENESS_DEADLINE;
-        self.give_up_at_ms.store(
-            u64::try_from(give_up_at.as_millis()).unwrap_or(u64::MAX),
-            std::sync::atomic::Ordering::Release,
-        );
-        let thread = self.thread.take().expect("the watch is finished once");
-        thread.join().unwrap_or_else(|panic| {
+    /// Waits until every watched process has ended, and says when each was seen to.
+    fn finish(self) -> Vec<Seen> {
+        self.thread.join().unwrap_or_else(|panic| {
             let detail = panic
                 .downcast_ref::<String>()
                 .cloned()
@@ -2030,13 +1994,6 @@ impl Watch {
                 .unwrap_or_else(|| "the watch failed".to_owned());
             panic!("{detail}")
         })
-    }
-}
-
-impl Drop for Watch {
-    fn drop(&mut self) {
-        self.abandoned
-            .store(true, std::sync::atomic::Ordering::Release);
     }
 }
 
