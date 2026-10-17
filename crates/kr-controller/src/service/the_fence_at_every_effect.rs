@@ -551,6 +551,7 @@ async fn a_method_that_takes_no_admission_is_refused_on_a_withdrawn_registration
         Method::EnvironmentForget,
         Method::EnvironmentRefresh,
         Method::HostUpdateHandover,
+        Method::BackupEnable,
     ];
 
     // The control first: nothing here is refused for authority while the registration stands.
@@ -1213,7 +1214,7 @@ async fn a_privacy_change_that_was_applied_is_not_answered_as_failed_when_its_re
     assert!(enabled(), "the retry was not performed again");
 }
 
-/// KR-REQ-09.09, 09.12 and 26.16: the four methods that take no admission into a service are
+/// KR-REQ-09.09, 09.12 and 26.16: the five methods that take no admission into a service are
 /// refused while this host owes a fence it could not raise. The control: with nothing owed, none is
 /// refused for a fence.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1228,6 +1229,7 @@ async fn the_methods_that_take_no_admission_are_refused_while_a_fence_is_owed() 
         Method::EnvironmentForget,
         Method::EnvironmentRefresh,
         Method::HostUpdateHandover,
+        Method::BackupEnable,
     ];
     let answer = |method: Method| {
         let controller = Arc::clone(&controller);

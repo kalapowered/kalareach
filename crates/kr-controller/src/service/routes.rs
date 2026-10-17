@@ -659,17 +659,18 @@ impl Controller {
             admitted_revision,
             deadline: accepted.map(|accepted| accepted.deadline),
         };
-        // Four methods take no admission into a service: the environment record and the update
-        // handover change nothing the revision or the deadline decides. They still do not run for a
-        // connection whose registration was withdrawn while the call waited, and they do not run
-        // while this host owes a fence it could not raise: whichever service performs an effect,
-        // an owed fence stops it.
+        // Five methods take no admission into a service: the environment record, the update
+        // handover and the setting up of backups change nothing the revision or the deadline
+        // decides. They still do not run for a connection whose registration was withdrawn while
+        // the call waited, and they do not run while this host owes a fence it could not raise:
+        // whichever service performs an effect, an owed fence stops it.
         if matches!(
             method,
             Method::EnvironmentEnrol
                 | Method::EnvironmentForget
                 | Method::EnvironmentRefresh
                 | Method::HostUpdateHandover
+                | Method::BackupEnable
         ) && let Err(error) = self
             .authorised(connection_id)
             .and_then(|_| self.check_fence())
