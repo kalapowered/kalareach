@@ -521,11 +521,17 @@ impl Owner {
         // The send waits for the host for a bound of its own, after which its answer is taken as
         // lost and the host is asked what became of it. A stop that comes meanwhile waits in the
         // inbox and is read as soon as the answer is.
-        let sent = match tokio::time::timeout(
-            self.shared.timings.start_within,
-            host.session.send(&composed),
-        )
-        .await
+        let until_ms = now_ms()
+            .saturating_add(u64::from(self.requested) * 1000)
+            .saturating_add(MAX_CLOCK_SKEW_MS);
+        self.shared.keep_start_pending(self.id, action_id, until_ms);
+        let start_within = self.shared.timings.start_within;
+        let sent = match self
+            .wait_through(tokio::time::timeout(
+                start_within,
+                host.session.send(&composed),
+            ))
+            .await
         {
             Ok(sent) => sent,
             Err(_) => Err(ClientError::SubmissionUncertain { action_id }),
@@ -553,25 +559,27 @@ impl Owner {
             }
         };
 
-        let result = match created {
-            Reached::Receipt(receipt) => {
-                self.stop_native(HostEnd::NotNeeded).await;
-                self.release();
-                return Ok(Outcome::Over(Started::Receipt(receipt)));
-            }
-            Reached::Unknown => {
-                let local = self
-                    .stop_native(HostEnd::NotTold {
-                        words: "The host never said whether it created the call, so a grant it \
+        if !matches!(created, Reached::Unknown) {
+            self.shared.start_was_answered(self.id);
+        }
+        let result =
+            match created {
+                Reached::Receipt(receipt) => {
+                    self.stop_native(HostEnd::NotNeeded).await;
+                    self.release();
+                    return Ok(Outcome::Over(Started::Receipt(receipt)));
+                }
+                Reached::Unknown => {
+                    let local = self
+                        .stop_native(HostEnd::NotTold {
+                            words:
+                                "The host never said whether it created the call, so a grant it \
                                 made may still be open until the moment the call was to close."
-                            .to_owned(),
-                    })
-                    .await;
-                let owner = self.id;
-                let until_ms = now_ms()
-                    .saturating_add(u64::from(self.requested) * 1000)
-                    .saturating_add(MAX_CLOCK_SKEW_MS);
-                self.view(|state| {
+                                    .to_owned(),
+                        })
+                        .await;
+                    let owner = self.id;
+                    self.view(|state| {
                     state.running = false;
                     state.ended = Some(EndedView {
                         owner,
@@ -589,26 +597,17 @@ impl Owner {
                         host: HostEnd::NotTold {
                             words: "The host never said whether it created the call.".to_owned(),
                         },
-                        broker: "not_needed".to_owned(),
+                        // The service may hold a call this device cannot name.
+                        broker: "unknown".to_owned(),
                     });
-                    state.owe(
-                        now_ms(),
-                        OwedView {
-                            kind: "start_unknown".to_owned(),
-                            words: "The host never said whether it created the call. If it did, \
-                                    its grant ends by itself when the call was to close."
-                                .to_owned(),
-                            action_id: Some(action_id.to_string()),
-                            voice_session_id: None,
-                            until_ms,
-                        },
-                    );
+                    state.owe(now_ms(), OwedView::start_unknown(action_id, until_ms, &host));
                 });
-                self.release();
-                return Ok(Outcome::Over(Started::Unknown { action_id }));
-            }
-            Reached::Result(result) => result,
-        };
+                    self.shared.start_was_answered(self.id);
+                    self.release();
+                    return Ok(Outcome::Over(Started::Unknown { action_id }));
+                }
+                Reached::Result(result) => result,
+            };
         let VoiceStartOutcome::Started { session } = &result.outcome else {
             self.stop_native(HostEnd::NotNeeded).await;
             self.release();
@@ -809,14 +808,22 @@ impl Owner {
                 "The call could not be opened on this device ({failure})"
             )),
         };
+        let mut local = true;
         if matches!(failure.kind, FailureKind::Unavailable | FailureKind::Engine) {
             // Native code may yet make the call it was asked for: whatever it holds is stopped.
             if let Ok(held) = self.platform().held().await
                 && let Some(call) = held.call
             {
-                self.stop_media(&call).await;
+                local = self.stop_media(&call).await;
             }
         }
+        // A stop that waited meanwhile is told what became of the media, as the end of any other
+        // call tells it.
+        let closed = Closed {
+            local,
+            host: HostEnd::NotNeeded,
+        };
+        self.close_inbox(&closed);
         self.release();
         error
     }
@@ -1105,7 +1112,7 @@ impl Owner {
         self.view(|state| {
             state.delegations.push(DelegationRow {
                 delegation_id: delegation_id.clone(),
-                offset_ms: offset_ms.unwrap_or(0),
+                offset_ms,
                 state: "not_done".to_owned(),
                 told: false,
             });
@@ -1277,14 +1284,7 @@ impl Owner {
     /// stop in time, or answered that the call has ended already, as it does for a call it ended
     /// itself.
     async fn stop_media(&self, call: &CallId) -> bool {
-        let platform = self.platform();
-        match tokio::time::timeout(self.shared.timings.local_within, platform.stop(call)).await {
-            Ok(Ok(())) => true,
-            Ok(Err(failure)) => {
-                matches!(failure.kind, FailureKind::Ended | FailureKind::NoSuchCall)
-            }
-            Err(_) => false,
-        }
+        self.shared.stop_media(call).await
     }
 
     /// Frees the slot, so another call can be started.
@@ -1375,15 +1375,17 @@ impl Owner {
                 .to_owned(),
             });
         });
-        if let (HostEnd::NotTold { words }, Some(descriptor)) = (&host_end, &self.descriptor) {
-            // The grant may be live at the host until the moment the call was to close.
-            let owed = OwedView {
-                kind: "revocation".to_owned(),
-                words: words.clone(),
-                action_id: None,
-                voice_session_id: Some(descriptor.voice_session_id.to_string()),
-                until_ms: descriptor.closes_at_ms.get(),
-            };
+        if let (HostEnd::NotTold { words }, Some(descriptor), Some(host)) =
+            (&host_end, &self.descriptor, &self.host)
+        {
+            // The grant may be live at the host until the moment the call was to close, by the
+            // host's reading of the clock.
+            let owed = OwedView::revocation(
+                words.clone(),
+                descriptor.voice_session_id,
+                owed_until(descriptor.closes_at_ms.get()),
+                host,
+            );
             self.view(|state| state.owe(now_ms(), owed));
         }
         if matches!(cause, Cause::Control(ControlEnd::NoSuchCall)) {
@@ -1524,6 +1526,13 @@ enum Reached {
 
 /// How far from the clock this device's idea of the moment a call closes may be, in milliseconds.
 const MAX_CLOCK_SKEW_MS: u64 = 120_000;
+
+/// The moment a grant the host made for a call that closes at `closes_at_ms` is certain to have
+/// ended by itself: the host's closing time is the host's reading of its own clock, so it is held
+/// back by what the two clocks may differ by.
+pub(super) fn owed_until(closes_at_ms: u64) -> u64 {
+    closes_at_ms.saturating_add(MAX_CLOCK_SKEW_MS)
+}
 
 /// Asks `host` to revoke the call's grant, over a connection to that host.
 pub(super) async fn stop_at_host(

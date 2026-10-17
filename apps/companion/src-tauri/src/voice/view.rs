@@ -1,9 +1,12 @@
 //! What the screen is told of the call this application holds.
 
+use kr_protocol::ids::{ActionId, VoiceSessionId};
 use kr_protocol::voice::VoiceSessionDescriptor;
 use serde::Serialize;
 
+use super::host::CallHost;
 use crate::commands::VoiceFence;
+use crate::device::hosts::{UNNAMED_HOST, reference_of};
 
 /// What the screen reads of the call, from this application's own record of it.
 ///
@@ -12,8 +15,12 @@ use crate::commands::VoiceFence;
 /// and so that a screen that was loaded again finds the call it left.
 #[derive(Clone, Debug, Serialize)]
 pub struct VoiceCallState {
-    /// Whether this device is holding a call at all.
+    /// Whether this device is holding a call that runs.
     pub running: bool,
+    /// Whether this device holds a call that does not run: one being set up, before the host has
+    /// said whether it made it too, or one being given up. A screen that finds this finds a
+    /// device that is busy and a call it cannot yet name; it can end it without naming it.
+    pub setting_up: bool,
     /// What the microphone is doing, in the vocabulary the surface draws.
     pub capture: String,
     /// Whether the model's voice is coming out of this device.
@@ -47,6 +54,7 @@ impl VoiceCallState {
     pub fn no_call() -> Self {
         Self {
             running: false,
+            setting_up: false,
             capture: "idle".to_owned(),
             playing: false,
             control: "none".to_owned(),
@@ -61,9 +69,6 @@ impl VoiceCallState {
     }
 }
 
-/// The most things a device keeps as owed at once.
-const MOST_OWED: usize = 8;
-
 impl VoiceCallState {
     /// Starts the record of a call the owner `owner` holds, keeping what is still owed from the
     /// calls before it.
@@ -74,13 +79,14 @@ impl VoiceCallState {
         self.owner = owner;
     }
 
-    /// Notes something owed until `until_ms`, and forgets what has lapsed by `now_ms`.
+    /// Notes something owed until its `until_ms`, and forgets what has lapsed by `now_ms`.
+    ///
+    /// Nothing that has not lapsed is dropped to make room: a grant the host may still hold open is
+    /// told to the person until it ends, however many there are. The list is bounded by time, as
+    /// each entry ends by itself, and by the calls a device can make in that time.
     pub fn owe(&mut self, now_ms: u64, owed: OwedView) {
         self.owed.retain(|each| each.until_ms > now_ms);
         self.owed.push(owed);
-        if self.owed.len() > MOST_OWED {
-            self.owed.remove(0);
-        }
     }
 }
 
@@ -96,8 +102,66 @@ pub struct OwedView {
     pub action_id: Option<String>,
     /// The call whose grant may be live, for `revocation`.
     pub voice_session_id: Option<String>,
-    /// The moment the grant ends by itself, in milliseconds since the epoch.
+    /// The moment the grant ends by itself, in milliseconds since the epoch, with room for a clock
+    /// that is not this device's own.
     pub until_ms: u64,
+    /// What the page names the host this is owed to by: the reference its list of hosts uses.
+    pub host_reference: String,
+    /// The name the host gives people.
+    pub host_name: String,
+}
+
+impl OwedView {
+    /// A call's grant that `host` may still hold open until `until_ms`, for the reason `words`.
+    #[must_use]
+    pub fn revocation(
+        words: String,
+        voice_session_id: VoiceSessionId,
+        until_ms: u64,
+        host: &CallHost,
+    ) -> Self {
+        Self {
+            kind: "revocation".to_owned(),
+            words,
+            action_id: None,
+            voice_session_id: Some(voice_session_id.to_string()),
+            until_ms,
+            ..Self::of(host)
+        }
+    }
+
+    /// A start `host` never said it answered, which may have made a call whose grant stands until
+    /// `until_ms`.
+    #[must_use]
+    pub fn start_unknown(action_id: ActionId, until_ms: u64, host: &CallHost) -> Self {
+        Self {
+            kind: "start_unknown".to_owned(),
+            words: "The host never said whether it created the call. If it did, its grant ends by \
+                    itself when the call was to close."
+                .to_owned(),
+            action_id: Some(action_id.to_string()),
+            voice_session_id: None,
+            until_ms,
+            ..Self::of(host)
+        }
+    }
+
+    /// The part of an entry that says which host it is owed to.
+    fn of(host: &CallHost) -> Self {
+        Self {
+            kind: String::new(),
+            words: String::new(),
+            action_id: None,
+            voice_session_id: None,
+            until_ms: 0,
+            host_reference: reference_of(&host.paired),
+            host_name: host
+                .paired
+                .name
+                .clone()
+                .unwrap_or_else(|| UNNAMED_HOST.to_owned()),
+        }
+    }
 }
 
 /// What the host did about the end of a call, kept apart from what happened on this device.
@@ -151,10 +215,48 @@ pub struct EndedView {
 pub struct DelegationRow {
     /// The provider's identifier. Correlation data, never authority.
     pub delegation_id: String,
-    /// Where in the call it happened, in milliseconds from its start.
-    pub offset_ms: u64,
+    /// Where in the call it happened, in milliseconds from its start, when the voice service said:
+    /// a delegation listed when the control attached carries no offset.
+    pub offset_ms: Option<u64>,
     /// What became of it: always `not_done` in this version, which acts on no spoken request.
     pub state: String,
     /// Whether the model was told so.
     pub told: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn owed(until_ms: u64) -> OwedView {
+        OwedView {
+            kind: "revocation".to_owned(),
+            words: String::new(),
+            action_id: None,
+            voice_session_id: None,
+            until_ms,
+            host_reference: "a-host".to_owned(),
+            host_name: "A host".to_owned(),
+        }
+    }
+
+    /// A grant the host may still hold open is told to the person until it ends by itself, however
+    /// many calls left one; only what has lapsed is forgotten.
+    #[test]
+    fn what_is_owed_is_forgotten_when_it_lapses_and_never_to_make_room() {
+        let mut state = VoiceCallState::no_call();
+        for index in 0..20 {
+            state.owe(0, owed(1_000 + index));
+        }
+        assert_eq!(state.owed.len(), 20, "none was dropped for room");
+
+        state.owe(1_010, owed(5_000));
+
+        assert!(state.owed.iter().all(|each| each.until_ms > 1_010));
+        assert_eq!(
+            state.owed.len(),
+            10,
+            "nine that had not lapsed, and the new one"
+        );
+    }
 }

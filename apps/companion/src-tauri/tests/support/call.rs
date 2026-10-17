@@ -36,6 +36,11 @@ struct Inner {
     microphone_refused: bool,
     permit_refused: bool,
     stop_never_returns: bool,
+    /// Whether a stop is answered as native code answers one for a call it has already ended.
+    stop_answers_ended: bool,
+    /// Whether an open fails after native code has made the call, as an engine that fails late
+    /// does.
+    open_fails_after_making_the_call: bool,
     /// Whether a call that ends tells so.
     tells_the_end: bool,
     /// What a sign of life is answered with, when it is not what the call holds.
@@ -66,6 +71,8 @@ impl ScriptedCalls {
                 microphone_refused: false,
                 permit_refused: false,
                 stop_never_returns: false,
+                stop_answers_ended: false,
+                open_fails_after_making_the_call: false,
                 tells_the_end: true,
                 alive_refusal: None,
                 held_steps: Vec::new(),
@@ -120,6 +127,16 @@ impl ScriptedCalls {
     /// A stop that never returns, as an engine that blocks does.
     pub fn never_return_from_a_stop(&self) {
         self.inner().stop_never_returns = true;
+    }
+
+    /// A stop is answered as a call that has already ended is: native code refuses it as ended.
+    pub fn answer_a_stop_as_ended(&self) {
+        self.inner().stop_answers_ended = true;
+    }
+
+    /// An open makes the call and then fails, so native code holds a call nobody was told of.
+    pub fn fail_the_open_after_making_the_call(&self) {
+        self.inner().open_fails_after_making_the_call = true;
     }
 
     /// Holds `step` (`open`, `offer`, `accept`, `permit` or `stop`): the command is given and counted, and
@@ -254,6 +271,12 @@ impl CallPlatform for ScriptedCalls {
             let call = CallId::next();
             let (sink, events) = event_queue(call.clone());
             inner.held = Some((call.clone(), sink, 0));
+            if inner.open_fails_after_making_the_call {
+                return Err(CallFailure::new(
+                    FailureKind::Engine,
+                    "the engine failed after it made the call",
+                ));
+            }
             Ok(OpenedCall {
                 call,
                 notifications: Permission::Granted,
@@ -335,6 +358,12 @@ impl CallPlatform for ScriptedCalls {
             self.gate("stop").await;
             if self.inner().stop_never_returns {
                 std::future::pending::<()>().await;
+            }
+            if self.inner().stop_answers_ended {
+                let mut inner = self.inner();
+                inner.held = None;
+                inner.capture = CaptureState::Idle;
+                return Err(CallFailure::new(FailureKind::Ended, "that call has ended"));
             }
             self.named(call)?;
             let tells = self.inner().tells_the_end;

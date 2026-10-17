@@ -183,6 +183,9 @@ struct Emergency {
     voice_session_id: Option<VoiceSessionId>,
     /// The call at the voice service, and the moment the host's grant for it ends by itself.
     service_call: Option<(String, u64)>,
+    /// A start the host has not been heard to answer: the action it was sent under, and the
+    /// moment a call it made would end by itself.
+    pending_start: Option<(ActionId, u64)>,
     reach: Arc<dyn HostReach>,
     tokens: Arc<SignedInAccount>,
 }
@@ -236,21 +239,59 @@ impl Shared {
         reach: &Arc<dyn HostReach>,
         tokens: &Arc<SignedInAccount>,
     ) {
-        *self
+        let mut kept = self
             .emergency
             .lock()
-            .expect("the emergency lock is not poisoned") = Some((
+            .expect("the emergency lock is not poisoned");
+        // A start that was not heard to be answered stays pending until the host names the call.
+        let pending_start = match (&*kept, descriptor) {
+            (Some((held, before)), None) if *held == owner => before.pending_start,
+            _ => None,
+        };
+        *kept = Some((
             owner,
             Emergency {
                 call,
                 host: host.cloned(),
                 voice_session_id: descriptor.map(|descriptor| descriptor.voice_session_id),
-                service_call: descriptor
-                    .map(|descriptor| (descriptor.call_id.clone(), descriptor.closes_at_ms.get())),
+                service_call: descriptor.map(|descriptor| {
+                    (
+                        descriptor.call_id.clone(),
+                        owner::owed_until(descriptor.closes_at_ms.get()),
+                    )
+                }),
+                pending_start,
                 reach: Arc::clone(reach),
                 tokens: Arc::clone(tokens),
             },
         ));
+    }
+
+    /// Says that the host has been sent a start under `action_id` and not been heard to answer
+    /// it, so a supervisor that finishes the call after a failure keeps the start as owed.
+    pub(crate) fn keep_start_pending(&self, owner: u64, action_id: ActionId, until_ms: u64) {
+        let mut kept = self
+            .emergency
+            .lock()
+            .expect("the emergency lock is not poisoned");
+        if let Some((held, kept)) = kept.as_mut()
+            && *held == owner
+        {
+            kept.pending_start = Some((action_id, until_ms));
+        }
+    }
+
+    /// Says that the host has answered the start, so it is no longer pending.
+    pub(crate) fn start_was_answered(&self, owner: u64) {
+        let mut kept = self
+            .emergency
+            .lock()
+            .expect("the emergency lock is not poisoned");
+        if let Some((held, kept)) = kept.as_mut()
+            && *held == owner
+        {
+            kept.pending_start = None;
+        }
     }
 
     /// Says that the owner has told the host to revoke the call's grant, so a supervisor that
@@ -301,7 +342,25 @@ impl Shared {
         }
     }
 
+    /// Stops a call's media, and says whether the media is stopped: native code returned from the
+    /// stop in time, or answered that the call has ended already, as it does for a call it ended
+    /// itself.
+    pub(crate) async fn stop_media(&self, call: &CallId) -> bool {
+        match tokio::time::timeout(self.timings.local_within, self.platform.stop(call)).await {
+            Ok(Ok(())) => true,
+            Ok(Err(failure)) => matches!(
+                failure.kind,
+                companion_platform::call::FailureKind::Ended
+                    | companion_platform::call::FailureKind::NoSuchCall
+            ),
+            Err(_) => false,
+        }
+    }
+
     /// Ends a call whose owner failed: the media, then the host's grant.
+    ///
+    /// What the owner had already written of the end stands. It is the owner's account of what the
+    /// host answered, and only what it left pending is settled here.
     async fn finish_failed_owner(&self, owner: u64) {
         let kept = {
             let mut kept = self
@@ -320,10 +379,7 @@ impl Shared {
         };
         let local = async {
             match &kept.call {
-                Some(call) => matches!(
-                    tokio::time::timeout(self.timings.local_within, self.platform.stop(call)).await,
-                    Ok(Ok(()))
-                ),
+                Some(call) => self.stop_media(call).await,
                 None => false,
             }
         };
@@ -338,8 +394,16 @@ impl Shared {
         let (closed_locally, host_end) = tokio::join!(local, toward_host);
         let toward_host_asked = host_end.is_some();
         let host_end = host_end.unwrap_or(HostEnd::NotNeeded);
+        // What the owner wrote of the host's answer, when it got as far as writing it.
+        let written = {
+            let view = self.view.lock().expect("the view lock is not poisoned");
+            view.ended
+                .as_ref()
+                .filter(|ended| ended.owner == owner)
+                .map(|ended| ended.host.clone())
+        };
         // The service is asked over its own route unless the host told it.
-        let broker = match (&kept.service_call, &host_end) {
+        let broker = match (&kept.service_call, written.as_ref().unwrap_or(&host_end)) {
             (
                 _,
                 HostEnd::Revoked {
@@ -354,6 +418,8 @@ impl Shared {
                     "not_confirmed"
                 }
             }
+            // A start the host may have answered made a call this device cannot name.
+            (None, _) if kept.pending_start.is_some() => "unknown",
             (None, _) => "not_needed",
         };
         {
@@ -364,28 +430,39 @@ impl Shared {
                 view.session = None;
                 view.control = "none".to_owned();
                 view.host = "none".to_owned();
-                view.ended = Some(EndedView {
-                    owner,
-                    cause: "owner_failed".to_owned(),
-                    words: "This device's call stopped working, so the call was ended.".to_owned(),
-                    closed_locally,
-                    host: host_end.clone(),
-                    broker: broker.to_owned(),
-                });
+                match view.ended.as_mut().filter(|ended| ended.owner == owner) {
+                    Some(ended) => {
+                        if ended.broker == "pending" {
+                            ended.broker = broker.to_owned();
+                        }
+                    }
+                    None => {
+                        view.ended = Some(EndedView {
+                            owner,
+                            cause: "owner_failed".to_owned(),
+                            words: "This device's call stopped working, so the call was ended."
+                                .to_owned(),
+                            closed_locally,
+                            host: host_end.clone(),
+                            broker: broker.to_owned(),
+                        });
+                    }
+                }
             }
-            if let (HostEnd::NotTold { words }, Some((_, until_ms)), true) =
-                (&host_end, &kept.service_call, toward_host_asked)
-            {
+            if let (HostEnd::NotTold { words }, Some((_, until_ms)), Some(id), Some(host), true) = (
+                &host_end,
+                &kept.service_call,
+                kept.voice_session_id,
+                &kept.host,
+                toward_host_asked,
+            ) {
                 view.owe(
                     now_ms(),
-                    OwedView {
-                        kind: "revocation".to_owned(),
-                        words: words.clone(),
-                        action_id: None,
-                        voice_session_id: kept.voice_session_id.map(|id| id.to_string()),
-                        until_ms: *until_ms,
-                    },
+                    OwedView::revocation(words.clone(), id, *until_ms, host),
                 );
+            }
+            if let (Some((action_id, until_ms)), Some(host)) = (kept.pending_start, &kept.host) {
+                view.owe(now_ms(), OwedView::start_unknown(action_id, until_ms, host));
             }
         }
         self.release(owner);
@@ -588,6 +665,15 @@ impl Calls {
             .lock()
             .expect("the view lock is not poisoned")
             .clone();
+        // The slot is the one record of whether this device is busy with a call: a call that is
+        // being made or given up holds it from the moment the start is taken until it is over,
+        // before any descriptor exists to name it.
+        let busy = shared
+            .slot
+            .lock()
+            .expect("the slot lock is not poisoned")
+            .is_some();
+        state.setting_up = busy && !state.running;
         let now = now_ms();
         state.owed.retain(|owed| owed.until_ms > now);
         let remembered = shared

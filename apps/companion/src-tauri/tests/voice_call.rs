@@ -150,6 +150,14 @@ fn quick() -> Timings {
     }
 }
 
+/// A moment in milliseconds as the page is given it, whether it arrives as a number or a string.
+fn milliseconds(value: &serde_json::Value) -> u64 {
+    value
+        .as_u64()
+        .or_else(|| value.as_str().and_then(|text| text.parse().ok()))
+        .unwrap_or_else(|| panic!("not a moment: {value}"))
+}
+
 /// The document an operator writes to name the voice service.
 fn document_naming(origin: &str) -> ConfigurationDocument {
     let mut document = ConfigurationDocument::empty();
@@ -781,6 +789,27 @@ async fn a_delegation_is_answered_to_the_model_that_nothing_was_done_once() {
     scene.stop_host().await;
 }
 
+/// A delegation the voice service lists when the control attaches was announced before this device
+/// was listening, and the service gives no offset for it: the row has none, rather than saying it
+/// was asked at the start of the call.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_delegation_listed_when_the_control_attaches_has_no_offset() {
+    let mut scene = scene().await;
+    scene.stand_in.control().list(vec!["d-0".to_owned()]);
+    scene.start().await;
+
+    let row = scene
+        .state_where("the listed delegation answered", |state| {
+            state["delegations"][0]["told"] == true
+        })
+        .await;
+
+    assert_eq!(row["delegations"][0]["delegation_id"], "d-0");
+    assert!(row["delegations"][0]["offset_ms"].is_null(), "{row}");
+    let _ = scene.call("voice_stop", json!({ "voiceSessionId": null }));
+    scene.stop_host().await;
+}
+
 /// Muting the microphone is native code's, and the service is told as advice to the provider.
 /// Silencing the model's voice is native code's alone.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1153,6 +1182,144 @@ async fn a_stop_that_names_another_call_ends_nothing_that_is_held() {
 }
 
 /// Timings for a start whose answer is cut at once, so the device asks again.
+/// A screen that is loaded again while the device is making a call, before the host has said
+/// whether it made one, finds a device that is setting a call up, with no call to name. The screen
+/// ends what the device is making without naming it: the media stops and the stop is answered at
+/// once, while the host is still answering the start, and the call the host then turns out to have
+/// made is ended in full.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_screen_loaded_again_while_a_call_is_being_made_finds_it_and_ends_it() {
+    let timings = Timings {
+        host_within: Duration::from_secs(3),
+        ..quick()
+    };
+    let mut scene = scene_with(timings, Some(phone_grant(PHONE_TOKEN, 3600)), None).await;
+    scene.platform.hold("open");
+    let _holding = scene.platform.release_when_done("open");
+    scene.stand_in.hold_creations();
+    let prepared = scene.prepared().await;
+    let starting = scene
+        .phone
+        .companion
+        .start_call("voice_start", scene.start_request(&prepared));
+    tokio::time::timeout(WATCHDOG, async {
+        while scene.platform.count("open") == 0 {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("native code was asked to open the call");
+
+    // The microphone question is still being asked: nothing runs, and there is no call to name.
+    let asking = scene.state();
+    assert_eq!(asking["setting_up"], true, "{asking}");
+    assert_eq!(asking["running"], false, "{asking}");
+    assert!(asking["session"].is_null(), "{asking}");
+
+    scene.platform.release("open");
+    tokio::time::timeout(WATCHDOG, async {
+        while scene.stand_in.count("/api/voice/sessions") == 0 {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("the host asked the service for the call");
+    let waiting = scene.state();
+    assert_eq!(waiting["setting_up"], true, "{waiting}");
+    assert!(
+        waiting["session"].is_null(),
+        "the host has not said whether it made a call: {waiting}"
+    );
+
+    let closure = tokio::time::timeout(
+        WATCHDOG,
+        scene
+            .phone
+            .companion
+            .start_call("voice_stop", json!({ "voiceSessionId": null })),
+    )
+    .await
+    .expect("the stop is answered while the host is still answering the start")
+    .expect("the stop ran")
+    .expect("the stop is answered");
+    assert_eq!(closure["closed_locally"], true, "{closure}");
+    assert!(scene.platform.count("stop") >= 1, "the media stopped");
+
+    // The host finishes the call it was making, and the call is ended in full.
+    scene.stand_in.release_creations();
+    starting
+        .await
+        .expect("the start ran")
+        .expect_err("a call given up is not a call started");
+    let ended = scene
+        .state_where("the call the host made, ended", |state| {
+            state["setting_up"] == false && state["ended"]["host"]["kind"] == "revoked"
+        })
+        .await;
+    assert_eq!(ended["ended"]["cause"], "requested", "{ended}");
+    assert_eq!(scene.stand_in.count("/api/voice/sessions/call-1/close"), 1);
+    scene.stop_host().await;
+}
+
+/// The device's open fails after native code made the call, and the person's stop was already
+/// waiting. The stop is told what became of the media: native code did not return from its stop, so
+/// the media is not known to be stopped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stop_waiting_during_a_failed_open_is_told_whether_the_media_stopped() {
+    let timings = Timings {
+        local_within: Duration::from_millis(1500),
+        ..quick()
+    };
+    let mut scene = scene_with(timings, Some(phone_grant(PHONE_TOKEN, 3600)), None).await;
+    scene.platform.hold("open");
+    let _holding = scene.platform.release_when_done("open");
+    scene.platform.fail_the_open_after_making_the_call();
+    scene.platform.never_return_from_a_stop();
+    let prepared = scene.prepared().await;
+    let starting = scene
+        .phone
+        .companion
+        .start_call("voice_start", scene.start_request(&prepared));
+    tokio::time::timeout(WATCHDOG, async {
+        while scene.platform.count("open") == 0 {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("native code was asked to open the call");
+
+    // The open fails; the owner stops what native code made, and that stop does not return.
+    scene.platform.release("open");
+    tokio::time::timeout(WATCHDOG, async {
+        while scene.platform.count("stop") == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the owner stopped the call native code made");
+    let closure = tokio::time::timeout(
+        WATCHDOG,
+        scene
+            .phone
+            .companion
+            .start_call("voice_stop", json!({ "voiceSessionId": null })),
+    )
+    .await
+    .expect("the stop is answered")
+    .expect("the stop ran")
+    .expect("the stop is answered");
+
+    assert_eq!(
+        closure["closed_locally"], false,
+        "native code did not return from its stop: {closure}"
+    );
+    starting
+        .await
+        .expect("the start ran")
+        .expect_err("a call that could not be opened is not a call started");
+    scene.stop_host().await;
+}
+
 fn asking_again() -> Timings {
     Timings {
         start_within: Duration::ZERO,
@@ -1214,6 +1381,8 @@ async fn a_start_the_host_never_answers_is_unknown_and_stays_owed() {
     assert_eq!(state["ended"]["cause"], "start_unknown", "{state}");
     assert_eq!(state["ended"]["closed_locally"], true);
     assert_eq!(state["ended"]["host"]["kind"], "not_told");
+    // The service may hold a call this device cannot name, so it is not "not needed".
+    assert_eq!(state["ended"]["broker"], "unknown", "{state}");
     assert!(scene.platform.count("stop") >= 1, "the media is stopped");
     assert_eq!(state["owed"][0]["kind"], "start_unknown", "{state}");
     assert_eq!(state["owed"][0]["action_id"], action_id.as_str());
@@ -1329,6 +1498,22 @@ async fn forgetting_the_host_ends_the_call_and_owes_the_revocation() {
     assert_eq!(ended["owed"][0]["kind"], "revocation", "{ended}");
     assert_eq!(
         ended["owed"][0]["voice_session_id"], voice_session_id,
+        "{ended}"
+    );
+    // The entry says which host it is owed to, by the reference the page lists that host by.
+    assert_eq!(ended["owed"][0]["host_reference"], reference, "{ended}");
+    assert!(
+        ended["owed"][0]["host_name"]
+            .as_str()
+            .is_some_and(|name| !name.is_empty()),
+        "{ended}"
+    );
+    // It stands until the moment the host's grant ends by itself, with room for a clock that is not
+    // this device's own: the host's closing time is the host's reading.
+    let closes = milliseconds(&started["value"]["outcome"]["started"]["session"]["closes_at_ms"]);
+    assert_eq!(
+        milliseconds(&ended["owed"][0]["until_ms"]),
+        closes + 120_000,
         "{ended}"
     );
     // The host cannot tell the voice service, so the device does, by the call's own control.
@@ -1475,11 +1660,22 @@ async fn a_device_the_host_revokes_loses_the_call_it_holds() {
     scene.stop_host().await;
 }
 
-/// A host reach that fails the way a bug does: the first look at the pairing after it is told to
-/// panics, in the task that owns the call.
+/// Where a host reach that fails the way a bug does fails.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FailsAt {
+    /// The first look at the pairing, which the owner takes at each tick of a running call.
+    Pairing,
+    /// The first reach for a connection to the host, which the owner takes when it asks what
+    /// became of a start.
+    Reaching,
+}
+
+/// A host reach that fails the way a bug does: the first time it is asked for what `at` names after
+/// it is told to, it panics, in the task that owns the call.
 struct FailsWhenTold {
     inner: companion_tauri::voice::AppReach<tauri::test::MockRuntime>,
     told: AtomicUsize,
+    at: FailsAt,
 }
 
 impl companion_tauri::voice::HostReach for FailsWhenTold {
@@ -1494,6 +1690,10 @@ impl companion_tauri::voice::HostReach for FailsWhenTold {
         host: &'a kr_client::pairing::paired::PairedHost,
         avoiding: Option<&'a Arc<kr_client::Session>>,
     ) -> companion_tauri::voice::Reaching<'a, Arc<kr_client::Session>> {
+        assert!(
+            self.at != FailsAt::Reaching || self.told.load(Ordering::SeqCst) == 0,
+            "the owner fails"
+        );
         self.inner.session_to(host, avoiding)
     }
 
@@ -1501,13 +1701,39 @@ impl companion_tauri::voice::HostReach for FailsWhenTold {
         &self,
         host: &kr_client::pairing::paired::PairedHost,
     ) -> companion_tauri::voice::Pairing {
-        assert!(self.told.load(Ordering::SeqCst) == 0, "the owner fails");
+        assert!(
+            self.at != FailsAt::Pairing || self.told.load(Ordering::SeqCst) == 0,
+            "the owner fails"
+        );
         self.inner.pairing(host)
     }
 
     fn another_host_in_use(&self, host: &kr_client::pairing::paired::PairedHost) -> bool {
         self.inner.another_host_in_use(host)
     }
+}
+
+/// What a start asks for, as the page asks for it.
+fn request_of(scene: &Scene, prepared: &serde_json::Value) -> companion_tauri::voice::StartRequest {
+    companion_tauri::voice::StartRequest {
+        session_ids: vec![scene.session.parse().expect("a session")],
+        duration_seconds: 600,
+        reasoning_budget_minor: None,
+        prepared: serde_json::from_value(prepared["prepared"].clone()).expect("a digest"),
+        expected_rate_version: prepared["managed"]["rate"]["version"]
+            .as_str()
+            .map(str::to_owned),
+        subject: companion_tauri::target::Subject::default(),
+    }
+}
+
+/// A reach to the scene's host that fails where `at` says once `told` is set.
+fn failing_reach(scene: &Scene, at: FailsAt, told: usize) -> Arc<FailsWhenTold> {
+    Arc::new(FailsWhenTold {
+        inner: companion_tauri::voice::AppReach::new(scene.phone.companion.app.handle().clone()),
+        told: AtomicUsize::new(told),
+        at,
+    })
 }
 
 /// The task that owns a call fails. The call is not left running with nobody to end it: the
@@ -1517,25 +1743,11 @@ impl companion_tauri::voice::HostReach for FailsWhenTold {
 async fn an_owner_that_fails_ends_the_call_it_held_in_full() {
     let mut scene = scene().await;
     let prepared = scene.prepared().await;
-    let app = scene.phone.companion.app.handle().clone();
+    let reach = failing_reach(&scene, FailsAt::Pairing, 0);
     let calls = scene.phone.companion.app.state::<Calls>();
-    let reach = Arc::new(FailsWhenTold {
-        inner: companion_tauri::voice::AppReach::new(app),
-        told: AtomicUsize::new(0),
-    });
-    let request = companion_tauri::voice::StartRequest {
-        session_ids: vec![scene.session.parse().expect("a session")],
-        duration_seconds: 600,
-        reasoning_budget_minor: None,
-        prepared: serde_json::from_value(prepared["prepared"].clone()).expect("a digest"),
-        expected_rate_version: prepared["managed"]["rate"]["version"]
-            .as_str()
-            .map(str::to_owned),
-        subject: companion_tauri::target::Subject::default(),
-    };
     let started = calls
         .start(
-            request,
+            request_of(&scene, &prepared),
             Arc::clone(&reach) as Arc<dyn companion_tauri::voice::HostReach>,
             Arc::clone(&scene.tokens),
         )
@@ -1565,5 +1777,75 @@ async fn an_owner_that_fails_ends_the_call_it_held_in_full() {
     let again = scene.start().await;
     assert!(again["value"]["outcome"]["started"].is_object(), "{again}");
     let _ = scene.call("voice_stop", json!({ "voiceSessionId": null }));
+    scene.stop_host().await;
+}
+
+/// The owner fails after native code ended the call by itself: native code answers the stop that
+/// ends the call as a call that has ended already, and that is a call whose media is stopped, as
+/// the owner's own end reads it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_owner_that_fails_counts_a_call_native_code_already_ended_as_stopped() {
+    let mut scene = scene().await;
+    let prepared = scene.prepared().await;
+    let reach = failing_reach(&scene, FailsAt::Pairing, 0);
+    let calls = scene.phone.companion.app.state::<Calls>();
+    calls
+        .start(
+            request_of(&scene, &prepared),
+            Arc::clone(&reach) as Arc<dyn companion_tauri::voice::HostReach>,
+            Arc::clone(&scene.tokens),
+        )
+        .await
+        .expect("a call starts");
+    scene
+        .state_where("a running call", |state| state["running"] == true)
+        .await;
+    scene.platform.answer_a_stop_as_ended();
+
+    reach.told.store(1, Ordering::SeqCst);
+
+    let ended = scene
+        .state_where("the owner's failure", |state| {
+            state["ended"]["cause"] == "owner_failed"
+        })
+        .await;
+    assert_eq!(ended["ended"]["closed_locally"], true, "{ended}");
+    scene.stop_host().await;
+}
+
+/// The owner fails while it asks the host what became of a start whose answer was lost. The host
+/// may have made a call, so the supervisor stops the media and keeps the start as owed, under the
+/// action it was sent under, as the owner would have.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_owner_that_fails_while_asking_what_became_of_a_start_leaves_the_start_owed() {
+    let mut scene = scene_with(asking_again(), Some(phone_grant(PHONE_TOKEN, 3600)), None).await;
+    scene.stand_in.hold_creations();
+    let prepared = scene.prepared().await;
+    let reach = failing_reach(&scene, FailsAt::Reaching, 1);
+    let calls = scene.phone.companion.app.state::<Calls>();
+
+    let refused = calls
+        .start(
+            request_of(&scene, &prepared),
+            Arc::clone(&reach) as Arc<dyn companion_tauri::voice::HostReach>,
+            Arc::clone(&scene.tokens),
+        )
+        .await;
+
+    assert!(refused.is_err(), "the owner failed before it could answer");
+    let ended = scene
+        .state_where("the owner's failure", |state| {
+            state["ended"]["cause"] == "owner_failed"
+        })
+        .await;
+    assert!(scene.platform.count("stop") >= 1, "the media is stopped");
+    assert_eq!(ended["owed"][0]["kind"], "start_unknown", "{ended}");
+    assert!(
+        ended["owed"][0]["action_id"]
+            .as_str()
+            .is_some_and(|action| !action.is_empty()),
+        "{ended}"
+    );
+    scene.stand_in.release_creations();
     scene.stop_host().await;
 }
