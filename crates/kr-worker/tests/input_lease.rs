@@ -3574,11 +3574,14 @@ async fn a_lone_escape_meets(stalled: Stalled, timing: Timing, stalled_for: Dura
 /// What the application prints when its trigger is pulled: a clipboard write.
 const HOST_EVENT_OUTPUT: &str = "\\033]52;c;aGk=\\007";
 
-/// Every prefix of the bracketed-paste start delimiter that the recogniser holds, shortest first.
+/// Every prefix of the bracketed-paste start delimiter that the recogniser holds, shortest first,
+/// and the longest prefix of the end delimiter, which the start's do not include.
 fn the_held_prefixes() -> Vec<&'static [u8]> {
-    (1..PASTE_START.len())
+    let mut prefixes: Vec<&'static [u8]> = (1..PASTE_START.len())
         .map(|length| &PASTE_START[..length])
-        .collect()
+        .collect();
+    prefixes.push(&PASTE_END[..PASTE_END.len() - 1]);
+    prefixes
 }
 
 /// KR-PERF-002: every prefix length of the start delimiter, and the delimiter split across two
@@ -3604,12 +3607,19 @@ async fn every_prefix_meets(stalled: Stalled, beside_a_disk_writer: bool) {
         4,
         "{stalled:?}: the first part is held"
     );
-    let (second, _) = rig.write(&PASTE_START[4..]).await;
+    // The rest of the delimiter, and a payload behind it, in one write.
+    let rest = [&PASTE_START[4..], &b"kr-payload"[..]].concat();
+    let (second, _) = rig.write(&rest).await;
     assert_eq!(
         second.forwarded_bytes.get(),
-        PASTE_START.len() as u64,
+        (PASTE_START.len() + b"kr-payload".len()) as u64,
         "{stalled:?}: the second part reached the worker inside the recogniser's deadline and \
-         completes the delimiter, which is forwarded whole"
+         completes the delimiter, which is forwarded whole with the payload behind it"
+    );
+    assert!(
+        rig.wired.runtime.input().lock().paste_open(),
+        "{stalled:?}: the delimiter was recognised, which is what opens a paste: a prefix that \
+         had expired and was forwarded with the bytes behind it opens none"
     );
     let arrived = rig.until_everything_typed_arrived().await;
     assert!(
