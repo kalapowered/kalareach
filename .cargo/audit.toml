@@ -55,6 +55,18 @@ ignore = [
     "RUSTSEC-2026-0367", # set-user-ID and set-group-ID bits kept
     "RUSTSEC-2026-0368", # symbolic links whose targets leave the destination
     "RUSTSEC-2026-0369", # permissions applied through a symbolic link
+    # zvariant 5.15.0, zbus_names 4.3.4 and zvariant_derive 5.15.0 are unmaintained: each was merged
+    # into zbus 6.0.0, as its wire module, its names module and its derive macros. They come with
+    # zbus 5.19.0, on Linux only, by two routes. The keyring store under kr-crypto,
+    # zbus-secret-service-keyring-store 1.0.1, reaches the Linux secret service with it, directly
+    # and through secret-service 5.2.0. The companion application's opener plugin,
+    # tauri-plugin-opener 2.5.5, uses it only to show a file in the file manager, which the
+    # companion never asks for. No release of the store, of secret-service or of the plugin yet
+    # allows zbus 6. The advisories report no defect. Remove these once the lock carries no
+    # zvariant, zbus_names or zvariant_derive.
+    "RUSTSEC-2026-0370", # zvariant
+    "RUSTSEC-2026-0371", # zbus_names
+    "RUSTSEC-2026-0372", # zvariant_derive
 ]
 
 [output]
