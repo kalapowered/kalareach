@@ -325,6 +325,21 @@ impl Started {
         self.launch.as_ref().expect("a recorded launch plan")
     }
 
+    /// Stops the host, by the process identifier this test recorded and no other, until the
+    /// returned guard is dropped: it is not running, and nothing it was sent is read.
+    fn stop(&self) -> Stopped {
+        let pid = self.pid();
+        let stopped = std::process::Command::new("/bin/kill")
+            .arg("-STOP")
+            .arg(pid.to_string())
+            .status();
+        assert!(
+            stopped.is_ok_and(|status| status.success()),
+            "process {pid} could not be stopped"
+        );
+        Stopped(pid)
+    }
+
     /// Kills the host, by the process identifier this test recorded and no other.
     fn kill(&self) {
         let pid = self.pid();
@@ -336,6 +351,18 @@ impl Started {
             killed.is_ok_and(|status| status.success()),
             "process {pid} could not be ended"
         );
+    }
+}
+
+/// A host that is stopped, let go on again when this is dropped.
+struct Stopped(u32);
+
+impl Drop for Stopped {
+    fn drop(&mut self) {
+        let _ = std::process::Command::new("/bin/kill")
+            .arg("-CONT")
+            .arg(self.0.to_string())
+            .status();
     }
 }
 
@@ -892,42 +919,32 @@ async fn kr_req_11_39_a_terminal_drains_and_is_answered_while_a_component_runs()
     // throughout it rather than for part of it. The call count is what turns that from an
     // expectation into evidence: it counts calls the component finished, so a count that grew
     // across the window is a component that was executing inside it.
-    let window = std::time::Instant::now();
+    //
+    // The window lasts until all of it has happened: the component has finished a call, the shell
+    // has produced a line above the last one drained, and the host has answered one of its
+    // questions. How long that takes is the machine's; a terminal that waited on the component
+    // would not get there while the component was held up, and the guard ends a window in which
+    // it never does.
     let before_calls = finished_calls(&plugin).await;
-    let during = collect(&mut terminal, Duration::from_millis(800)).await;
-    let after_calls = finished_calls(&plugin).await;
-    // Measured from before the first sample to after the second, so the bound below covers the
-    // whole stretch the two samples bracket rather than the collection alone.
-    let bracketed = window.elapsed();
-    assert!(
-        after_calls > before_calls,
-        "the component finished no calls during the window: {before_calls} before, {after_calls} \
-         after, so the terminal's progress was measured around nothing"
-    );
-    // The two samples bracket the collection and little else: a component that finished calls
-    // between them finished them while the terminal was being collected from, not before or after
-    // some much longer stretch.
-    assert!(
-        bracketed < Duration::from_millis(1_600),
-        "the samples bracket {bracketed:?}, which is more than the collection they are for"
-    );
-    let during = String::from_utf8_lossy(&during).into_owned();
-    let after = highest_line(&during).unwrap_or(0);
-    assert!(
-        after > high_water,
-        "the terminal produced nothing new while a component was running: it was at \
-         {high_water} before and {after} after"
-    );
-    let answers = during.matches("answered-").count();
-    assert!(
-        answers > 0 && during.contains("[?6"),
-        "the host answered no device query while a component was running ({answers} answers)"
-    );
-
-    assert!(
-        bracketed >= Duration::from_millis(800),
-        "the window was shorter than it was asked to be"
-    );
+    let hung = std::time::Instant::now() + WINDOW_HUNG;
+    let mut during = Vec::new();
+    let (after_calls, during) = loop {
+        during.extend(collect(&mut terminal, Duration::from_millis(50)).await);
+        let text = String::from_utf8_lossy(&during).into_owned();
+        let after_calls = finished_calls(&plugin).await;
+        let produced = highest_line(&text).unwrap_or(0) > high_water;
+        let answered = text.contains("answered-") && text.contains("[?6");
+        if after_calls > before_calls && produced && answered {
+            break (after_calls, text);
+        }
+        assert!(
+            std::time::Instant::now() < hung,
+            "the window never held a component at work, a new line and an answered question \
+             together: calls {before_calls} before and {after_calls} after, the shell at \
+             {high_water} before and {:?} after, answered {answered}",
+            highest_line(&text)
+        );
+    };
 
     // And the component was still at work when that window closed, rather than having stopped
     // partway through and left the rest of the window measuring nothing: with the gate still shut,
@@ -945,18 +962,7 @@ async fn kr_req_11_39_a_terminal_drains_and_is_answered_while_a_component_runs()
 
     // The gate opens only now, and the component is given nothing more.
     let _ = open.send(());
-    let taken = supplying.await.expect("the observations were supplied");
-    // Handing an observation over waits for nothing, so it is quick every time but when the machine
-    // stalls the whole test, which holds up only the one it happens to catch. A path that waited on
-    // the runtime would be slow far more often than one time in a hundred.
-    let bound = Duration::from_millis(50);
-    let slow = taken.iter().filter(|took| **took >= bound).count();
-    assert!(
-        slow <= taken.len().div_ceil(100),
-        "{slow} of {} observations took {bound:?} or more to hand over, more than one in a \
-         hundred, so the terminal path waited on the runtime",
-        taken.len()
-    );
+    supplying.await.expect("the observations were supplied");
 
     // And what the terminal produced goes to the runtime by the same handoff, which is what a
     // worker's observation path does with its output.
@@ -988,9 +994,49 @@ async fn kr_req_11_39_a_terminal_drains_and_is_answered_while_a_component_runs()
         }
     }
 
+    // Handing an observation over waits for nothing. That is shown with the host stopped, so that no
+    // call can finish and nothing reads what the runtime sends it: a hand-off that waited on the
+    // runtime would wait for ever, and the guard ends it. Each one is accepted or refused at once,
+    // however long that takes the machine. It comes last because a stopped host is not one a
+    // binding is expected to outlast.
+    let stopped = started.stop();
+    let handing = tokio::task::spawn_blocking({
+        let plugin = Arc::clone(&plugin);
+        move || {
+            (0..STOPPED_HOST_HANDOFFS)
+                .map(|index| plugin.offer(binding, &scrape(&format!("stopped-{index}"), "output")))
+                .collect::<Vec<_>>()
+        }
+    });
+    let handed = tokio::time::timeout(WINDOW_HUNG, handing)
+        .await
+        .unwrap_or_else(|_| panic!("handing observations over waited on a host that was stopped"))
+        .expect("the observations were handed over");
+    drop(stopped);
+    assert!(
+        handed.iter().all(|handed| matches!(
+            handed,
+            kr_plugin_service::client::Handoff::Accepted
+                | kr_plugin_service::client::Handoff::Refused { .. }
+        )),
+        "an observation was handed over as something else while the host was stopped: {handed:?}"
+    );
+
     started.kill();
     let _ = launcher::retire_descriptor(&environment);
 }
+
+/// How many observations are handed over while the host is stopped.
+///
+/// More than the runtime holds for a host that reads nothing, so that the hand-offs that follow
+/// the held ones are refused rather than waited for.
+const STOPPED_HOST_HANDOFFS: u64 = 5_000;
+
+/// How long a window of a case in which a component works may go on before it is taken for hung.
+///
+/// It ends a window in which what the case waits for never happens and decides nothing else: a
+/// window that holds what it needs ends at once, however slow the machine.
+const WINDOW_HUNG: Duration = Duration::from_secs(120);
 
 /// How often a binding is given an observation while a test holds its work open.
 ///
@@ -999,8 +1045,7 @@ async fn kr_req_11_39_a_terminal_drains_and_is_answered_while_a_component_runs()
 /// can hold one past its deadline.
 const OBSERVATION_PACE: Duration = Duration::from_millis(10);
 
-/// Gives a binding one observation each [`OBSERVATION_PACE`] until the gate opens, and returns how
-/// long each took to hand over.
+/// Gives a binding one observation each [`OBSERVATION_PACE`] until the gate opens.
 ///
 /// This is what holds a component's work open. Observations handed over in advance last as long as
 /// the machine takes to work through them, which is a guess about the machine: on a fast one the
@@ -1015,19 +1060,16 @@ async fn supply(
     plugin: Arc<PluginClient>,
     binding: BindingId,
     mut gate: tokio::sync::oneshot::Receiver<()>,
-) -> Vec<Duration> {
+) {
     let mut pace = tokio::time::interval(OBSERVATION_PACE);
     pace.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut taken = Vec::new();
     for index in 0_u64.. {
         tokio::select! {
             biased;
             _ = &mut gate => break,
             _ = pace.tick() => {}
         }
-        let offered = std::time::Instant::now();
         let handed = plugin.offer(binding, &scrape(&format!("se-{index}"), "output"));
-        taken.push(offered.elapsed());
         assert!(
             matches!(
                 handed,
@@ -1037,7 +1079,6 @@ async fn supply(
             "an observation was handed over as {handed:?}"
         );
     }
-    taken
 }
 
 /// Returns how many calls into a component this connection's bindings have finished.
