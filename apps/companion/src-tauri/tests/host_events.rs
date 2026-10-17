@@ -48,7 +48,20 @@ mod macos {
     /// The window the interface's own capability names.
     const INTERFACE_WINDOW: &str = "main";
 
+    /// Panics heard on any thread of the check, the application's own tasks included.
+    static PANICS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
     pub fn run() -> i32 {
+        // A task of the application that panics ends alone and says nothing to the check, so the
+        // check listens for panics itself and fails on any.
+        let default = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            PANICS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(info.to_string());
+            default(info);
+        }));
         // The scripted worker answers on a runtime of the check's own: the application's own
         // runtime is where the publisher runs.
         let runtime = Arc::new(tokio::runtime::Runtime::new().expect("a runtime for the worker"));
@@ -58,6 +71,8 @@ mod macos {
         // copy is a duplicate symbol. With no capability of its own, the context takes the
         // application's, so the page is allowed what the interface is and nothing more.
         let app = tauri::Builder::default()
+            // The application's own state, as the publisher finds it when its connection ends.
+            .manage(companion_tauri::AppState::new())
             .build(tauri::generate_context!(
                 "tests/host_events/tauri.conf.json",
                 test = true
@@ -98,6 +113,14 @@ mod macos {
                 handle.exit(code);
             });
         });
+        let panics = PANICS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if !panics.is_empty() {
+            eprintln!("host_events: a task panicked: {panics:?}");
+            return 1;
+        }
         returned.max(verdict.load(Ordering::SeqCst))
     }
 
@@ -187,7 +210,7 @@ mod macos {
         // publisher only listens on it.
         let session = Arc::new(session);
         let host = kr_protocol::ids::EnvironmentId::new(kr_ipc::new_uuid());
-        tauri::async_runtime::spawn(companion_tauri::connection::forward_events(
+        let publisher = tauri::async_runtime::spawn(companion_tauri::connection::forward_events(
             app.clone(),
             Arc::clone(&session),
             host,
@@ -236,6 +259,14 @@ mod macos {
         ];
         let received = heard(&window);
         session.close();
+        // The publisher ends when its connection does. It is waited for here, so that whatever it
+        // does at its end (and a panic there) is seen by this check and not by nobody.
+        tauri::async_runtime::block_on(async {
+            tokio::time::timeout(LIVENESS, publisher)
+                .await
+                .map_err(|_| "the publisher did not end with its connection".to_owned())?
+                .map_err(|error| format!("the publisher ended badly: {error}"))
+        })?;
         if received != expected {
             return Err(format!(
                 "the page heard {received:?}, not the events as they were published"
