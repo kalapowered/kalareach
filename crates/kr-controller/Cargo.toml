@@ -39,7 +39,7 @@ kr-delivery.workspace = true
 # store and its deterministic titles. That crate holds no model runtime (kr-describe-model does),
 # and this daemon maps none: it names every session from metadata.
 kr-describe.workspace = true
-kr-flush.workspace = true
+kr-flush = { workspace = true, features = ["sqlite"] }
 kr-ipc.workspace = true
 kr-loopback.workspace = true
 kr-pairing.workspace = true

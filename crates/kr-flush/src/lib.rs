@@ -5,10 +5,17 @@
 //! store on this host flushes its directories here, on every platform, so what a flush opens and
 //! what it asks for is decided in one place.
 //!
+//! The same crate holds the other thing every local SQLite store needs from the file system and
+//! nothing else of the host provides: opening a store whose previous holder is still letting go of
+//! it ([`release`], with the `sqlite` feature).
+//!
 //! This crate depends on no other crate of this host, so every one of them can reach it, the
 //! cryptography crate's directory store included.
 
 use std::path::Path;
+
+#[cfg(feature = "sqlite")]
+pub mod release;
 
 /// What kind of name a directory flush makes durable.
 ///

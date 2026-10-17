@@ -446,14 +446,14 @@ fn desktop_columns(desktop: &DesktopBinding) -> (Option<String>, Option<i64>) {
 /// The first read is what maps the store's write-ahead index, so it is where a store whose
 /// previous holder is still letting go of that index refuses: a daemon that ended by a kill, and
 /// whose successor takes the environment the moment the lock is free. The open is asked again for
-/// as long as the store says so ([`kr_worker::persistence::release`]), and a refusal that lasts
-/// is reported with the store's result code, which tells it from a disk that failed.
+/// as long as the store says so ([`kr_flush::release`]), and a refusal that lasts is reported with
+/// the store's result code, which tells it from a disk that failed.
 fn open_connection(
     path: &std::path::Path,
     flags: Option<rusqlite::OpenFlags>,
 ) -> Result<Connection> {
-    kr_worker::persistence::release::open_connection(path, flags)
-        .map_err(|error| ControllerError::registry(kr_worker::persistence::fault::describe(&error)))
+    kr_flush::release::open_connection(path, flags)
+        .map_err(|error| ControllerError::registry(kr_flush::release::describe(&error)))
 }
 
 impl Registry {
@@ -4032,7 +4032,7 @@ mod tests {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, Ordering};
 
-        use kr_worker::persistence::release::{held_index::HeldIndex, on_the_next_wait};
+        use kr_flush::release::{held_index::HeldIndex, on_the_next_wait};
 
         let directory = tempfile::tempdir().expect("a directory");
         let path = directory.path().join("registry.sqlite3");
@@ -4078,7 +4078,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn an_open_that_a_previous_daemon_never_lets_go_of_reports_the_stores_result_code() {
-        use kr_worker::persistence::release::held_index::HeldIndex;
+        use kr_flush::release::held_index::HeldIndex;
 
         let directory = tempfile::tempdir().expect("a directory");
         let path = directory.path().join("registry.sqlite3");
