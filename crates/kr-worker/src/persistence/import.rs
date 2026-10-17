@@ -168,9 +168,13 @@ pub enum ImportRefusal {
 /// Returns an [`ImportRefusal`] naming what the importer could not read. The journal is then
 /// exactly as it was.
 pub fn import_journal(path: impl AsRef<Path>) -> Result<Imported, ImportRefusal> {
-    let mut connection = Connection::open_with_flags(
+    // Opened as the journal's own openers are, so that a previous holder still letting go of the
+    // journal's index is waited for and not reported as a journal that cannot be read.
+    let mut connection = kr_flush::release::open_connection(
         path.as_ref(),
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        Some(
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        ),
     )
     .map_err(unreadable)?;
     connection.busy_timeout(BUSY_TIMEOUT).map_err(unreadable)?;
@@ -688,5 +692,22 @@ fn difference(expected: &Shape, produced: &Shape) -> String {
 fn unreadable(error: rusqlite::Error) -> ImportRefusal {
     ImportRefusal::Unreadable {
         detail: error.to_string(),
+    }
+}
+
+/// A journal whose previous holder is still letting go of its index is waited for by the importer,
+/// not reported as one that cannot be read.
+#[cfg(all(test, windows))]
+mod a_previous_holder_that_is_letting_go {
+    use super::*;
+
+    #[test]
+    fn the_open_waits_for_it() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let database = directory.path().join("journal.sqlite");
+        drop(crate::journal::Journal::open(&database).expect("a journal of the current schema"));
+        kr_flush::release::assert_an_open_waits_for_the_previous_holder(&database, || {
+            import_journal(&database).map(drop)
+        });
     }
 }
