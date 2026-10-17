@@ -1891,7 +1891,9 @@ async fn a_root_shell_that_exits_at_once_is_noticed_before_the_first_wait() {
     // The exit can happen before anything is watching for it: the shell is launched, and it is
     // gone by the time the supervision has opened the child signal it would have been reported on.
     // So the shell's status is asked for once before that supervision waits at all, and this is the
-    // case that proves it.
+    // case that sets that order up. Run alone on a host with the child signal, nothing but that
+    // look can find the exit; in a binary whose other cases also start children, or on a host that
+    // polls, something else may find it first, and the case then shows that the exit is noticed.
     //
     // The shell is gone before the supervision starts, so the signal of its exit has been and
     // gone; a descendant holds the terminal open, so the terminal hanging up is not the evidence
