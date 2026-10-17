@@ -1,8 +1,12 @@
 package to.kala.reach.companion.voice
 
 import android.content.Context
+import android.os.SystemClock
 import java.util.concurrent.Executors
+import java.util.concurrent.ScheduledExecutorService
+import java.util.concurrent.TimeUnit
 import to.kala.reach.companion.mobile.CallBridge
+import to.kala.reach.companion.mobile.CallWatch
 import to.kala.reach.companion.mobile.CallEvent
 import to.kala.reach.companion.mobile.CallMute
 import to.kala.reach.companion.mobile.CallNames
@@ -24,7 +28,12 @@ import to.kala.reach.companion.mobile.VoiceCaptureState
 class VoiceCallBridge(context: Context) : CallBridge {
     private val context = context.applicationContext
 
-    private class Held(val name: String, val call: VoiceCall, val reporter: Reporter)
+    private class Held(
+        val name: String,
+        val call: VoiceCall,
+        val reporter: Reporter,
+        val watch: CallWatch,
+    )
 
     private val lock = Any()
     private var held: Held? = null
@@ -49,9 +58,30 @@ class VoiceCallBridge(context: Context) : CallBridge {
         }
         synchronized(lock) {
             // A call that ended while it was being made has said so already, and is not held.
-            if (names.held() == call) held = Held(call, made, reporter)
+            if (names.held() == call) {
+                held = Held(call, made, reporter, CallWatch({ SystemClock.elapsedRealtime() }))
+            }
         }
     }
+
+    /**
+     * Ends a call whose owner has stopped giving signs of life. Checked each few seconds by a
+     * thread of its own; the call ends as it does when the person stops it.
+     */
+    private val watching: ScheduledExecutorService =
+        Executors.newSingleThreadScheduledExecutor { task ->
+            Thread(task, "kr-call-watch").apply { isDaemon = true }
+        }.also { scheduler ->
+            scheduler.scheduleWithFixedDelay(
+                {
+                    val one = synchronized(lock) { held }
+                    if (one != null && one.watch.expired()) one.call.stop()
+                },
+                WATCH_EVERY_SECONDS,
+                WATCH_EVERY_SECONDS,
+                TimeUnit.SECONDS,
+            )
+        }
 
     /** The call by that name, or why there is none: it ended, or it never was held. */
     private fun named(call: String): Held {
@@ -67,8 +97,12 @@ class VoiceCallBridge(context: Context) : CallBridge {
         return one.answerUsesDtx ?: false
     }
 
-    override fun permit(call: String, voiceSessionId: String, closesAtEpochMs: Long): Boolean =
-        named(call).call.permit(voiceSessionId, closesAtEpochMs)
+    override fun permit(call: String, voiceSessionId: String, closesAtEpochMs: Long): Boolean {
+        val one = named(call)
+        val permitted = one.call.permit(voiceSessionId, closesAtEpochMs)
+        if (permitted) one.watch.permitted()
+        return permitted
+    }
 
     override fun setMuted(call: String, what: CallMute, muted: Boolean) {
         val one = named(call).call
@@ -80,6 +114,11 @@ class VoiceCallBridge(context: Context) : CallBridge {
 
     override fun stop(call: String) {
         named(call).call.stop()
+    }
+
+    override fun alive(call: String): HeldCall {
+        named(call).watch.sign()
+        return held()
     }
 
     override fun held(): HeldCall =
@@ -106,7 +145,14 @@ class VoiceCallBridge(context: Context) : CallBridge {
 
         override fun onFirstAudio() = tell(CallEvent.FirstAudio)
 
-        override fun onConnectionState(state: String) = tell(CallEvent.Connection(state))
+        override fun onConnectionState(state: String) {
+            tell(CallEvent.Connection(state))
+            // A connection that has failed for good carries no call: it ends here, and Rust
+            // is told by the end, whether or not it is there to hear the failure.
+            if (state == "failed") {
+                synchronized(lock) { held }?.takeIf { it.name == name }?.call?.stop()
+            }
+        }
 
         override fun onEnded() {
             // The call is no longer held before the end is told, so a command that follows the
@@ -117,5 +163,10 @@ class VoiceCallBridge(context: Context) : CallBridge {
             }
             tell(CallEvent.Ended)
         }
+    }
+
+    private companion object {
+        /** How often a call's owner is looked for. */
+        const val WATCH_EVERY_SECONDS = 5L
     }
 }

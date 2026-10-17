@@ -189,6 +189,17 @@ class VoiceCallService : android.app.Service() {
         return START_NOT_STICKY
     }
 
+    /**
+     * The person swiped the application away from the recent tasks. A call that goes on with no
+     * screen of its own is one whose only control is its notification, and its owner is not at
+     * hand: it ends, as it does when the person stops it from the notification.
+     */
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        VoiceCallHolder.current(call)?.stop()
+        stopCall()
+        super.onTaskRemoved(rootIntent)
+    }
+
     override fun onDestroy() {
         running = false
         // The service going away takes the microphone with it, so the call goes too. A call whose

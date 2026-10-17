@@ -75,6 +75,65 @@ interface CallBridge {
 
     /** What the call this device holds is doing, if it holds one. */
     fun held(): HeldCall
+
+    /**
+     * Records a sign that the call's owner is still there, and answers what the call is doing.
+     *
+     * @throws CallRefused when the call named has ended or is not held.
+     */
+    fun alive(call: String): HeldCall
+}
+
+/**
+ * The time a call's owner may leave without a sign before the call ends itself.
+ *
+ * A call is ended by the Rust side that owns it. If that side is gone (the process was killed
+ * under a running service, a task was lost) nothing else would end it before the host's deadline,
+ * with the microphone open. So the owner gives a sign of life each few seconds, and a call that
+ * has had none for [afterPermit] milliseconds ends. A call that was opened and not yet permitted
+ * has the longer [beforePermit], which covers the host's start and the provider's answer, but not
+ * for ever: it holds the device's one call. The clock is a monotonic one, and the check is made by
+ * whoever owns the schedule: [expired] is true once.
+ */
+class CallWatch(
+    private val clock: () -> Long,
+    private val beforePermit: Long = BEFORE_PERMIT_MS,
+    private val afterPermit: Long = AFTER_PERMIT_MS,
+) {
+    private var lastSign = clock()
+    private var permitted = false
+    private var spent = false
+
+    /** The owner is there. */
+    @Synchronized
+    fun sign() {
+        lastSign = clock()
+    }
+
+    /** The call is permitted, and the shorter bound applies from now. */
+    @Synchronized
+    fun permitted() {
+        permitted = true
+        lastSign = clock()
+    }
+
+    /** Whether the owner has given no sign for too long. True once, for the call to end on. */
+    @Synchronized
+    fun expired(): Boolean {
+        if (spent) return false
+        val allowed = if (permitted) afterPermit else beforePermit
+        if (clock() - lastSign < allowed) return false
+        spent = true
+        return true
+    }
+
+    companion object {
+        /** How long an opened call waits for its permit and for signs before then. */
+        const val BEFORE_PERMIT_MS = 180_000L
+
+        /** How long a permitted call goes without a sign. */
+        const val AFTER_PERMIT_MS = 45_000L
+    }
 }
 
 /**
