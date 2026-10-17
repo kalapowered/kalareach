@@ -1897,9 +1897,12 @@ async fn a_root_shell_that_exits_at_once_is_noticed_before_the_first_wait() {
     // gone; a descendant holds the terminal open, so the terminal hanging up is not the evidence
     // either; the sweep is an hour away; and the session's input and output no longer wake the
     // supervision. What is left to find the exit is the supervision's first look at the shell,
-    // and any other child of this process that ends, which wakes it the way a signal does on a
-    // platform that has them. Either way the shell was gone when the supervision looked, however
-    // long the start took, and no wait of the supervision's own is what the closure came from.
+    // any other child of this process that ends, which wakes it the way a signal does on a
+    // platform that has them, and, where the supervision asks for the shell's status every
+    // hundred milliseconds (Windows, and a host that cannot open the child signal), that poll.
+    // On those hosts the case shows that the exit is noticed however long the start took, and
+    // not which of the three noticed it; where the first look is the only way left, it shows that
+    // one.
     let host = kr_ipc::testing::TempHost::create();
     let config = configuration(&host, "sleep 600 & printf 'kr-leaving\\n'; exit 7");
     let mut session = Session::open(config).expect("opens");
