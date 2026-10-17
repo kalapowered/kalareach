@@ -1,6 +1,6 @@
 //! What the tests that need the real weights share: where the weights are, the check that they are
-//! the selected profile's, and saying so where a person can see it when this host does not have
-//! them.
+//! the selected profile's, and saying so in the test's output (which `--show-output` prints under
+//! the test's name) when this host does not have them.
 
 // Each test file takes the parts it needs.
 #![allow(dead_code)]

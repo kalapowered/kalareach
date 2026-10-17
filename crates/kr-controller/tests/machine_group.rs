@@ -1413,7 +1413,8 @@ fn paired_with(host: &Host, record: &kr_controller::service::net::devices::Devic
 /// Whether `host` lets `device`, which presents the identity `record` gave it, in and answer it.
 ///
 /// A host that does not let a device in refuses it, and an attempt nothing answered is made again,
-/// so `false` is always the host's decision.
+/// so the transport's give-up never reads as `false`: that is the host's refusal, or a connection
+/// that ended some other way.
 async fn lets_in(
     host: &Host,
     device: &Device,
