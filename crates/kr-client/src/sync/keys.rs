@@ -199,8 +199,8 @@ fn poisoned() -> ClientError {
 ///
 /// [`StoreKind`]: kr_crypto::store::StoreKind
 pub struct StoredCollectionKeys {
-    store: Box<dyn SecretStore>,
-    kind: kr_crypto::store::StoreKind,
+    store: Arc<dyn SecretStore>,
+    kind: Option<kr_crypto::store::StoreKind>,
     scope: String,
 }
 
@@ -241,15 +241,29 @@ impl StoredCollectionKeys {
     #[must_use]
     pub fn of(opened: OpenedStore, scope: &str) -> Self {
         Self {
-            kind: opened.kind,
-            store: opened.store,
+            kind: Some(opened.kind),
+            store: Arc::from(opened.store),
             scope: scope.to_owned(),
         }
     }
 
-    /// Which store the keys are in.
+    /// Keeps this device's collection keys in the store the rest of the device's secrets are in.
+    ///
+    /// The store is shared, so a sealer and a membership each hold their own handle on the one
+    /// store. Which kind of store it is, is not something a handle can say: [`Self::kind`] says
+    /// nothing for one built here.
     #[must_use]
-    pub const fn kind(&self) -> kr_crypto::store::StoreKind {
+    pub fn in_store(store: Arc<dyn SecretStore>, scope: &str) -> Self {
+        Self {
+            kind: None,
+            store,
+            scope: scope.to_owned(),
+        }
+    }
+
+    /// Which store the keys are in, when it was opened here and so known.
+    #[must_use]
+    pub const fn kind(&self) -> Option<kr_crypto::store::StoreKind> {
         self.kind
     }
 
@@ -543,7 +557,7 @@ mod tests {
             SCOPE,
         )
         .expect("a store");
-        assert_eq!(keys.kind(), StoreKind::FileFallback);
+        assert_eq!(keys.kind(), Some(StoreKind::FileFallback));
 
         let key: SymmetricKey = Secret::random().expect("a key");
         keys.put(COLLECTION, 3, &key).expect("written");
@@ -724,7 +738,7 @@ mod tests {
         let guard = Removes { keys, epoch };
         assert_eq!(
             guard.keys.kind(),
-            StoreKind::Platform,
+            Some(StoreKind::Platform),
             "this run promised a platform store"
         );
 
@@ -873,7 +887,10 @@ mod tests {
         keys.put(COLLECTION, 1, &key).expect("written");
         // The store by its kind alone: never a key, and never the scope, which is the caller's.
         let rendered = format!("{keys:?}");
-        assert_eq!(rendered, "StoredCollectionKeys { kind: FileFallback, .. }");
+        assert_eq!(
+            rendered,
+            "StoredCollectionKeys { kind: Some(FileFallback), .. }"
+        );
         assert_eq!(
             format!("{sealer:?}"),
             format!("CollectionSealer {{ collection: Some(Uuid({COLLECTION})), epoch: 1, .. }}")

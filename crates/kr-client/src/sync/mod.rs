@@ -51,10 +51,12 @@
 //! | [`client`] | The compare-and-swap client, and the privacy operations the host drives it through |
 //! | [`keys`] | The key a collection is sealed under, where a device keeps it, and the sealing itself |
 //! | [`membership`] | Who holds a shared collection's key, and what this device does when that changes |
+//! | [`shared`] | A shared collection as the single-object service the clients write through, at one epoch |
 
 pub mod client;
 pub mod keys;
 pub mod membership;
+pub mod shared;
 pub mod store;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -69,6 +71,7 @@ pub use client::{
     Resolved, Restored, Resumed, SyncClient, fresh_object_id, fresh_revision,
 };
 pub use keys::{CollectionKeys, CollectionSealer, MemoryCollectionKeys, StoredCollectionKeys};
+pub use shared::SharedCollectionService;
 pub use store::{
     Across, Attempt, Basis, Claimed, ConflictCopy, Crossing, Dispatch, End, Fetched, InGeneration,
     Listing, Outcome, PinnedLabel, PrivacyRecord, Publication, RequestRecord, RequestRevision,
