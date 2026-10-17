@@ -404,6 +404,10 @@ impl DeviceDirectory {
     /// Opens another handle on the directory `beside` is a handle on, raising the same signal as
     /// it does ([`Self::changed`]).
     ///
+    /// It is opened the way the first handle was. The first handle is open, so this process has the
+    /// store's index mapped already and nothing is letting go of it for this open to wait for: the
+    /// open takes no wait, and a handle never waits on the one it sits beside.
+    ///
     /// # Errors
     ///
     /// Returns an error when the database cannot be opened or migrated.
@@ -2551,5 +2555,29 @@ mod a_previous_holder_that_is_letting_go {
         kr_flush::release::assert_an_open_waits_for_the_previous_holder(&path, || {
             DeviceDirectory::open(&path).map(drop)
         });
+    }
+
+    /// A second handle on a directory this process holds does not wait for the first, and raises
+    /// the first one's signal.
+    #[test]
+    fn a_second_handle_does_not_wait_on_the_first() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let directory = tempfile::tempdir().expect("a directory");
+        let path = directory.path().join("registry.sqlite3");
+        let first = DeviceDirectory::open(&path).expect("a first handle");
+        let waited = Arc::new(AtomicBool::new(false));
+        let signal = Arc::clone(&waited);
+        kr_flush::release::on_the_next_wait(move || signal.store(true, Ordering::SeqCst));
+        let second = DeviceDirectory::open_beside(&path, &first).expect("a handle beside it");
+        assert!(
+            !waited.load(Ordering::SeqCst),
+            "the second handle waited for a holder while the first was open"
+        );
+        assert!(
+            Arc::ptr_eq(&first.changed, &second.changed),
+            "the second handle raises the first one's signal"
+        );
     }
 }
