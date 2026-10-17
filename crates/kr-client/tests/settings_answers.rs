@@ -19,7 +19,8 @@
 //! node infra/scripts/testing/local-restore.mjs start --state <dir> --name first --port <port>
 //! KR_DEPLOYED_ORIGIN=http://127.0.0.1:<port> \
 //!   KR_RECORD_SETTINGS_ANSWERS=fixtures/service/settings-answers.json \
-//!   KR_WEB_COMMIT=<the web commit> cargo test -p kr-client --test settings_answers record -- --ignored
+//!   KR_WEB_COMMIT=<the web commit> \
+//!   cargo test -p kr-client --test settings_answers record -- --ignored
 //! ```
 //!
 //! Settings need no account: an installation's signature is the whole of the proof. What a local

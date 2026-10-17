@@ -573,8 +573,8 @@ async fn waiting_for_a_choice(computer: &Computer) -> (Page, Elsewhere) {
     (page, elsewhere)
 }
 
-/// The versions are shown as they are, this computer's own and each the other devices wrote, and the
-/// times that are shown decide nothing.
+/// The versions are shown as they are, this computer's own and each the other devices wrote, and
+/// the times that are shown decide nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_versions_are_listed_and_none_is_picked_for_the_person() {
     let computer = Computer::new().await;

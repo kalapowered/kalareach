@@ -247,7 +247,7 @@ async fn a_request_identity_is_answered_from_its_receipt_and_a_fence_ends_it() {
     let collection = settings_collection(identity());
     let name = identity();
     let signed = now_ms();
-    // A sealer draws a fresh nonce for each object, so a retry sends the bytes of the first attempt.
+    // A sealer draws a fresh nonce for each object, so a retry sends the first attempt's bytes.
     let write_a = sealed(b"a");
 
     let first = applied(

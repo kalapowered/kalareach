@@ -1,12 +1,13 @@
 //! A settings collection two or more devices share, reached as the service the settings and the
 //! draft clients write through.
 //!
-//! [`SyncClient`](super::SyncClient) and [`DraftSync`](crate::drafts::DraftSync) are written against
-//! [`SyncBackupService`]: one object, named by its kind and identity, in a collection nobody has
-//! claimed. Once a key record has claimed a collection, every request about it names the home it
-//! lives in and every write names the epoch its object is sealed under, so the plain service no
-//! longer reaches it. [`SharedCollectionService`] is the one that does: it holds the collection and
-//! the epoch, and asks the `_shared` calls of [`ManagedSyncService`] for what the clients ask.
+//! [`SyncClient`](super::SyncClient) and [`DraftSync`](crate::drafts::DraftSync) are written
+//! against [`SyncBackupService`]: one object, named by its kind and identity, in a collection
+//! nobody has claimed. Once a key record has claimed a collection, every request about it names
+//! the home it lives in and every write names the epoch its object is sealed under, so the plain
+//! service no longer reaches it. [`SharedCollectionService`] is the one that does: it holds the
+//! collection and the epoch, and asks the `_shared` calls of [`ManagedSyncService`] for what the
+//! clients ask.
 //!
 //! # One epoch per value
 //!
