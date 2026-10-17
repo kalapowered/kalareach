@@ -495,7 +495,7 @@ function SessionSettings({
             <>
               <h2>Appearance</h2>
               <p className="muted">Light, dark, or whatever this device is set to.</p>
-              <ThemeChooser />
+              <ThemeChooser port={port} />
             </>
           ) : null}
 

@@ -22,7 +22,8 @@ import {
 
 import markLight from '../assets/kala-mark.svg'
 import markDark from '../assets/kala-mark-dark.svg'
-import { applyMode, storedMode, THEME_KEY, type ColourMode } from '../theme-init'
+import { failureMessage, type HostPort } from '../host/port'
+import { applyMode, shownMode, type ColourMode } from '../theme-init'
 import {
   animateSpring,
   DRAG_THRESHOLD,
@@ -877,22 +878,53 @@ export function Sheet({
 
 /* ---- Appearance ------------------------------------------------------------------------------ */
 
-/** Light, dark or the device's own setting. */
-export function ThemeChooser(): ReactNode {
-  const [mode, setMode] = useState<ColourMode>(() => storedMode())
+/**
+ * Light, dark or the device's own setting.
+ *
+ * The mode is native code's to keep: a choice is applied at once, so the window answers the press,
+ * and asked for from the backend, which keeps it before it says so. A choice the backend could not
+ * keep is taken back and said. A change another device made, which the backend followed, arrives
+ * on the same listener and is shown as it is.
+ */
+export function ThemeChooser({ port }: { readonly port: HostPort }): ReactNode {
+  const [mode, setMode] = useState<ColourMode>(() => shownMode())
+  const [problem, setProblem] = useState<string | null>(null)
+  const problemId = useId()
+
+  useEffect(() => {
+    let stop: (() => void) | null = null
+    let ended = false
+    void port.onSettings((view) => {
+      setMode(view.colour_mode)
+      applyMode(view.colour_mode)
+    }).then((unlisten) => {
+      if (ended) unlisten()
+      else stop = unlisten
+    })
+    return () => {
+      ended = true
+      stop?.()
+    }
+  }, [port])
 
   const choose = (next: ColourMode) => {
+    const before = mode
+    setProblem(null)
     setMode(next)
     applyMode(next)
-    try {
-      localStorage.setItem(THEME_KEY, next)
-    } catch {
-      // A private window keeps the choice for this page and no longer. The controls still work.
-    }
+    port.settingsSetColourMode(next).catch((error: unknown) => {
+      setMode(before)
+      applyMode(before)
+      setProblem(failureMessage(error))
+    })
   }
 
   return (
-    <fieldset className="theme-options">
+    <>
+    <fieldset
+      className="theme-options"
+      aria-describedby={problem === null ? undefined : problemId}
+    >
       <legend className="visually-hidden">Appearance</legend>
       {(['light', 'dark', 'system'] as const).map((option) => (
         <label key={option} className="theme-option">
@@ -922,5 +954,11 @@ export function ThemeChooser(): ReactNode {
         </label>
       ))}
     </fieldset>
+    {problem === null ? null : (
+      <p className="form-hint" id={problemId} role="status" data-testid="theme-problem">
+        {problem}
+      </p>
+    )}
+    </>
   )
 }

@@ -1460,7 +1460,7 @@ test.describe('how the host presents a raw view', () => {
   /** Opens the harness in one colour mode, whatever the system's. */
   async function inTheme(page: Page, theme: 'light' | 'dark'): Promise<void> {
     await page.addInitScript((mode) => {
-      localStorage.setItem('kalareach-theme', mode)
+      window.kalareachSettings = { colour_mode: mode }
     }, theme)
   }
 
@@ -1606,7 +1606,7 @@ test.describe("a raw view's selection", () => {
   /** Opens the harness in one colour mode, whatever the system's. */
   async function inTheme(page: Page, theme: 'light' | 'dark'): Promise<void> {
     await page.addInitScript((mode) => {
-      localStorage.setItem('kalareach-theme', mode)
+      window.kalareachSettings = { colour_mode: mode }
     }, theme)
   }
 
@@ -1685,7 +1685,7 @@ test.describe("the phone's room for its terminal", () => {
   /** Opens the harness in one colour mode, whatever the system's. */
   async function inTheme(page: Page, theme: 'light' | 'dark'): Promise<void> {
     await page.addInitScript((mode) => {
-      localStorage.setItem('kalareach-theme', mode)
+      window.kalareachSettings = { colour_mode: mode }
     }, theme)
   }
 
@@ -2417,7 +2417,7 @@ test.describe("moving a raw view's window", () => {
   /** Opens the harness in one colour mode, whatever the system's. */
   async function inTheme(page: Page, theme: 'light' | 'dark'): Promise<void> {
     await page.addInitScript((mode) => {
-      localStorage.setItem('kalareach-theme', mode)
+      window.kalareachSettings = { colour_mode: mode }
     }, theme)
   }
 
@@ -2975,7 +2975,7 @@ test.describe('a session in a window 320 px wide', () => {
   for (const theme of ['light', 'dark'] as const) {
     test(`the session in a wide window and at 320 px, ${theme}`, async ({ page }) => {
       await page.addInitScript((mode) => {
-        localStorage.setItem('kalareach-theme', mode)
+        window.kalareachSettings = { colour_mode: mode }
       }, theme)
       await openSession(page)
       await expect(page.locator('html')).toHaveAttribute('data-theme', theme)
