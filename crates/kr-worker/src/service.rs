@@ -4221,6 +4221,10 @@ impl WorkerService {
             return failure(request.request_id, &error.to_protocol_error());
         }
         let restrictions = self.gate.restrictions();
+        // The check takes the local gate's lock and, for an owner whose membership is bound, the
+        // time contract's and the host's floor, which is read from the disk. A wait for any of
+        // those is made on a thread the executor can do without, so it takes nothing from the
+        // recogniser's timer.
         let allowed = match request.method.method() {
             Some(method) => match off_the_executor(|| self.check_local_hold(state, method)) {
                 Ok(allowed) => allowed,
@@ -4590,9 +4594,12 @@ impl WorkerService {
                 error,
             ));
         }
+        let mut holding = self.runtime.trace().acquisition(Site::Mutation);
         let session = self.runtime.session();
+        holding.held();
         self.dispatch_accepted(
             session,
+            holding,
             state,
             mutation,
             method,
@@ -5209,6 +5216,7 @@ impl WorkerService {
 
         self.dispatch_accepted(
             session,
+            holding,
             state,
             mutation,
             method,
@@ -5231,6 +5239,7 @@ impl WorkerService {
     fn dispatch_accepted(
         &self,
         mut session: std::sync::MutexGuard<'_, Session>,
+        holding: crate::trace::Acquisition<'_>,
         state: &mut ConnectionState,
         mutation: &MutationRequest,
         method: Method,
@@ -5427,6 +5436,8 @@ impl WorkerService {
             session.redact_settled_action(&caller.actor_id, mutation.action_id);
         }
         drop(session);
+        // The record of the hold ends where the hold does, and not with the result's processing.
+        holding.end();
 
         // The boundary is over. What the mutation left behind happens now: input reaches the
         // terminal, and a close that was admitted waits for its acceptance to be written before
@@ -7606,6 +7617,12 @@ impl WorkerService {
             )));
         }
         self.wait_before_the_input_session();
+        // Before the input domain is taken, and the last thing before it: the check reads the
+        // local gate and, for an owner whose membership is bound, the clock and the host's floor,
+        // none of which a lock that holds up a keystroke may wait for, and the wait is made on a
+        // thread the executor can do without. Nothing the domain protects depends on its order, and
+        // a restriction made since the request was admitted still refuses the batch.
+        off_the_executor(|| self.check_local_dispatch(state, Method::InputWrite, caller))?;
         let (accepted, pump) = {
             let mut acquisition = self.runtime.trace().acquisition(Site::InputAcceptance);
             // The input domain and nothing else: whatever the session is busy with, this write
@@ -7617,12 +7634,6 @@ impl WorkerService {
             // revision or the grant behind it runs out, and what the domain decides is what
             // actually reaches the application.
             input.check_validated_revision(caller.validated_revision)?;
-        // Before the input domain is taken, and the last thing before it: the check reads the
-        // local gate and, for an owner whose membership is bound, the clock and the host's floor,
-        // none of which a lock that holds up a keystroke may wait for, and the wait is made on a
-        // thread the executor can do without. Nothing the domain protects depends on its order, and
-        // a restriction made since the request was admitted still refuses the batch.
-        off_the_executor(|| self.check_local_dispatch(state, Method::InputWrite, caller))?;
             self.check_authority_deadline(caller, params.attachment_id, params.epoch.get())?;
             Self::check_owned_session(input.session_id(), params.session_id)?;
             Self::check_granted(

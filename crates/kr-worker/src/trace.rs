@@ -24,7 +24,7 @@
 pub use recording::{Acquisition, Event, LockTrace, Recording, Shared};
 
 #[cfg(not(feature = "testing"))]
-pub use shipped::{LockTrace, Shared};
+pub use shipped::{Acquisition, LockTrace, Shared};
 
 /// Where on a keystroke's path an event happened.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -336,6 +336,12 @@ mod recording {
     }
 
     impl Acquisition<'_> {
+        /// Ends the span here, where the lock was let go, and not where the value goes out of
+        /// scope.
+        pub fn end(self) {
+            drop(self);
+        }
+
         /// Says that the session is held now, or that the span's work has ended.
         pub fn held(&mut self) {
             if let Some(recorder) = self.recorder {
@@ -389,8 +395,8 @@ mod shipped {
         }
 
         /// Begins an acquisition, which is not recorded.
-        pub const fn acquisition(&self, _site: Site) -> Acquisition {
-            Acquisition
+        pub const fn acquisition(&self, _site: Site) -> Acquisition<'_> {
+            Acquisition(std::marker::PhantomData)
         }
 
         /// Does nothing.
@@ -399,9 +405,12 @@ mod shipped {
 
     /// An acquisition that is not recorded.
     #[derive(Debug)]
-    pub struct Acquisition;
+    pub struct Acquisition<'a>(std::marker::PhantomData<&'a ()>);
 
-    impl Acquisition {
+    impl Acquisition<'_> {
+        /// Ends the span here, where the lock was let go.
+        pub const fn end(self) {}
+
         /// Does nothing.
         pub const fn held(&mut self) {}
 
