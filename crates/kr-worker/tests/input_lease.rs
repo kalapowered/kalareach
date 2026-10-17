@@ -4113,7 +4113,8 @@ async fn the_end_of_a_paste_lets_a_reply_out_when_the_session_comes_free() {
 /// The application asks the terminal for the colour of two hundred palette entries inside a paste,
 /// which is more than one drain of the lane takes. The keystroke that ends the paste lets the first
 /// of them out, and the ordinary keystrokes after it, which take the input domain and not the
-/// session, ask for the rest: nothing is printed and nothing else is typed that would.
+/// session, ask for the rest. The application prints nothing after it asks, so there is no output
+/// for the ingest to drain the lane behind.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[cfg_attr(
     windows,
@@ -4126,7 +4127,7 @@ async fn replies_one_drain_of_the_lane_did_not_take_follow_the_keystrokes_that_c
             "stty raw -echo; printf '\\033[?2004hkr-ready.'; \
              ( while cat '{}' >/dev/null; do i=0; \
                while [ $i -lt {ENTRIES} ]; do printf '\\033]4;%d;?\\033\\\\' $i; i=$((i+1)); done; \
-               printf 'kr-asked.'; done ) & exec tee '{}'",
+               printf 'kr-asked.'; done ) & exec cat > '{}'",
             trigger.display(),
             received.display()
         )
