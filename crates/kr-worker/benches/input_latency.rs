@@ -1114,9 +1114,12 @@ fn keeping(pipe: &std::path::Path) -> String {
     )
 }
 
+/// One read of the pipe: the instant it returned, and what it returned.
+type PipeRead = (Instant, Vec<u8>);
+
 /// What the pipe has delivered, each read with the instant it returned.
 struct Receipt {
-    reads: Arc<std::sync::Mutex<Vec<(Instant, Vec<u8>)>>>,
+    reads: Arc<std::sync::Mutex<Vec<PipeRead>>>,
 }
 
 impl Receipt {
