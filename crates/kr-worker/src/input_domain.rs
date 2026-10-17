@@ -385,7 +385,8 @@ pub struct InputDomain {
     /// revision reaches is gone in the same hold.
     revision: Option<AuthorityRevision>,
     /// Steps of the root editor's machine that need the session, left here by a keystroke or the
-    /// timer, which cannot take it. The pump carries them out.
+    /// timer, which cannot take it: events, nothing else. The next stimulus the session applies
+    /// hands them back in front of its own steps, or the pump carries them out.
     owed: Vec<Step>,
     /// Whether the response lane held replies the gate allows out after the last time it was
     /// drained. A keystroke that sees this asks the pump to look again, because the lane is the
@@ -731,7 +732,7 @@ impl InputDomain {
         Ok(())
     }
 
-    /// Leaves steps for the pump, which takes the session to carry them out.
+    /// Leaves steps for the session to carry out: the pump, or the next stimulus it applies.
     ///
     /// A keystroke and the timer leave only `editor_busy` events: the stimuli they make cannot
     /// order the removal of an attachment, an interrupt or the answer to a command hook, which are
@@ -1008,7 +1009,7 @@ impl InputDomain {
     ///
     /// Returns [`WorkerError::LeaseLost`] for a stale epoch or a caller that does not hold the
     /// lease, and an invalid-argument failure when the sequence does not follow.
-    pub fn accept(
+    pub(crate) fn accept(
         &mut self,
         attachment_id: AttachmentId,
         epoch: u64,
@@ -1168,7 +1169,7 @@ impl InputDomain {
     /// The timer runs whether or not more input arrives, so a lone Escape is never waiting for
     /// another keystroke. Returns how many bytes were forwarded, and the steps that need the
     /// session.
-    pub fn expire_paste_prefix(&mut self, now: Instant) -> (usize, Vec<Step>) {
+    pub(crate) fn expire_paste_prefix(&mut self, now: Instant) -> (usize, Vec<Step>) {
         let epoch = self.lease.epoch();
         let mut owed = Vec::new();
         let expired = match self.framer.expire(now) {
@@ -1211,7 +1212,7 @@ impl InputDomain {
     ///
     /// Returns the steps that need the session, and whether a prefix was forwarded, which closes a
     /// frame that was open and so opens the gate the response lane was waiting on.
-    pub fn set_bracketed_paste(&mut self, enabled: bool) -> (Vec<Step>, bool) {
+    pub(crate) fn set_bracketed_paste(&mut self, enabled: bool) -> (Vec<Step>, bool) {
         let released = self.framer.set_bracketed_paste(enabled);
         self.release_prefix(released)
     }
