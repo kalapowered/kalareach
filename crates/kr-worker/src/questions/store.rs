@@ -482,6 +482,7 @@ impl Store {
         )?;
         #[cfg(feature = "testing")]
         self.commit_stall.stand();
+        crate::input_domain::assert_not_held("a question ledger commit");
         transaction.commit().map_err(QuestionError::unavailable)?;
         Ok(Created {
             question,
@@ -981,6 +982,7 @@ impl Store {
             pending_since_ms: row.pending_since_ms,
         };
         write_event(&transaction, &event_of(kind, &resolved, now))?;
+        crate::input_domain::assert_not_held("a question ledger commit");
         transaction.commit().map_err(QuestionError::unavailable)?;
         Ok(resolved)
     }

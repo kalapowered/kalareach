@@ -1,13 +1,18 @@
 //! Timestamps along a keystroke's path, for the input measurement.
 //!
-//! A held prefix reaches the application when the recogniser's timer takes the session at its
-//! deadline, and the measurement sees it when its own poll takes the session again. Every one of
-//! those acquisitions, and every observation of the session's processes that falls between them,
-//! can lengthen the figure, and a figure alone cannot say which. This records, for each
-//! acquisition of the session that lies on that path, the instants it began to wait, held the
-//! session and let go of it; for the recogniser's timer, when it woke against the deadline it slept
-//! for; for an observation of the session's processes, when it began and ended reading them; and
-//! for the output ingest, the steps of its work and its write to the spool.
+//! A held prefix reaches the application when the recogniser's timer takes the input domain at its
+//! deadline, and the measurement sees it when its own poll takes the session. Every one of those
+//! acquisitions, and every observation of the session's processes that falls between them, can
+//! lengthen the figure, and a figure alone cannot say which. This records, for each acquisition
+//! that lies on that path, the instants it began to wait, held the lock and let go of it; for the
+//! recogniser's timer, when it woke against the deadline it slept for; for an observation of the
+//! session's processes, when it began and ended reading them; and for the output ingest, the steps
+//! of its work and its write to the spool.
+//!
+//! A keystroke and the timer take the input domain and not the session, so the acquisitions at
+//! [`Site::InputAcceptance`], [`Site::TimerLook`] and [`Site::TimerForward`] measure the wait for
+//! that lock, which nothing holds across a disk call. The ingest and the supervision take the
+//! session, and the figures at their sites measure the wait for it.
 //!
 //! All of it is on one monotonic clock in one process, so the intervals can be laid side by side.
 //!
@@ -24,13 +29,13 @@ pub use shipped::{LockTrace, Shared};
 /// Where on a keystroke's path an event happened.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Site {
-    /// An input write took the session to accept a batch and feed the recogniser.
+    /// An input write took the input domain to accept a batch and feed the recogniser.
     InputAcceptance,
-    /// The recogniser's timer took the session to read the deadline of the prefix it holds.
+    /// The recogniser's timer took the input domain to read the deadline of the prefix it holds.
     TimerLook,
     /// The recogniser's timer woke from its sleep, against the deadline it slept for.
     TimerWake,
-    /// The recogniser's timer took the session to forward the prefix it held.
+    /// The recogniser's timer took the input domain to forward the prefix it held.
     TimerForward,
     /// The output ingest took the session to record what the application wrote.
     Ingest,

@@ -930,6 +930,7 @@ impl Ledger {
                 params![SCHEMA_VERSION],
             )
             .map_err(|error| self.fault(error))?;
+        crate::input_domain::assert_not_held("a broker ledger commit");
         transaction.commit().map_err(|error| self.fault(error))
     }
 
@@ -1116,6 +1117,7 @@ impl Ledger {
             )?;
         }
         write_event(&self.faults, &transaction, event)?;
+        crate::input_domain::assert_not_held("a broker ledger commit");
         transaction.commit().map_err(|error| self.fault(error))?;
         self.announce();
         Ok(())
@@ -1207,6 +1209,7 @@ impl Ledger {
             });
         }
         write_event(&self.faults, &transaction, event)?;
+        crate::input_domain::assert_not_held("a broker ledger commit");
         transaction.commit().map_err(|error| faults.of(error))?;
         self.announce();
         Ok(true)
@@ -1277,6 +1280,7 @@ impl Ledger {
             )));
         }
         write_event(&self.faults, &transaction, event)?;
+        crate::input_domain::assert_not_held("a broker ledger commit");
         transaction.commit().map_err(|error| self.fault(error))?;
         self.announce();
         Ok(())
@@ -1494,6 +1498,7 @@ impl Ledger {
             )));
         }
         write_event(&self.faults, &transaction, event)?;
+        crate::input_domain::assert_not_held("a broker ledger commit");
         transaction.commit().map_err(|error| self.fault(error))?;
         self.announce();
         Ok(())
@@ -1640,6 +1645,7 @@ impl Ledger {
                 transaction.last_insert_rowid()
             }
         };
+        crate::input_domain::assert_not_held("a broker ledger commit");
         transaction.commit().map_err(|error| faults.of(error))?;
         if !events.is_empty() {
             self.announce();
