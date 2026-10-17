@@ -74,7 +74,6 @@ async function readAgain(page: Page): Promise<void> {
   })
 }
 
-
 /** Lets the page draw two frames, in which what was asked of it (a scroll, an insertion) has happened. */
 async function drawn(page: Page): Promise<void> {
   await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))))

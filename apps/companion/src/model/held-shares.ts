@@ -225,6 +225,8 @@ export class HeldBook {
    * wrote the acceptance, stays out of sight until a later one does not.
    */
   taken(invitationId: string): void {
+    // The same holds for a read that was started before the host wrote the acceptance.
+    this.#newest += 1
     this.#taken.add(invitationId)
     this.#change({
       offers: this.#view.offers.filter((offer) => offer.invitation_id !== invitationId),
@@ -238,6 +240,10 @@ export class HeldBook {
    */
   keep(attempt: AttemptView): void {
     if (attempt.kind !== 'redeem') return
+    // A read that was started before this acceptance can answer after it, with a list of
+    // acceptances that does not have it, and must not take it away: it is let go, and the read the
+    // page asks for next replaces it.
+    this.#newest += 1
     this.#change({
       attempts: [...this.#view.attempts.filter((each) => each.action_id !== attempt.action_id), attempt]
     })

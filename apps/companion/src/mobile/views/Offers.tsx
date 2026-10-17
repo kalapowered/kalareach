@@ -54,45 +54,62 @@ const SCROLLED = 8
 const SHEET = '[data-testid="sheet"]'
 
 /**
- * Puts the focus somewhere that is still there once a sheet has left, when the sheet's own return of
- * it found nothing: the row that opened it can be gone by then (an accepted invitation, one put
- * off), or go a moment after, when a read says so. It acts only when the sheet is gone and focus is
- * on nothing (the page's body, or something that was taken away), and it stops for good at the
- * person's next press or key, so it never moves focus the person has moved.
+ * Keeps focus from being lost with a row that goes.
  *
- * The function this returns is called when the sheet is closed. Whatever it waits for is let go when
- * the screen goes.
+ * A row that has focus (the one that opened the card, which the sheet gives focus back to when it
+ * closes) can be taken away, by an acceptance or by a read, while the card is still open or after
+ * it has closed. Focus then falls to the page's body. This watches the area it is given: when the
+ * element that last had focus in it has gone, it waits for the card to leave if one is open, and then
+ * puts focus on what `find` returns, but only if focus is on nothing. Every observer it makes is its
+ * own and ends with the area, and nothing it does depends on a press or a key, so a person who
+ * moves focus themselves, or a screen reader's cursor, is never taken from where they put it.
  */
-function useFocusAfterSheet(find: () => HTMLElement | null): () => void {
-  const stop = useRef<() => void>(() => undefined)
-  useEffect(
-    () => () => {
-      stop.current()
-    },
-    []
-  )
-  return () => {
-    stop.current()
+function useKeepFocus(area: React.RefObject<HTMLElement | null>, find: () => HTMLElement | null): void {
+  const where = useRef(find)
+  useEffect(() => {
+    where.current = find
+  })
+  useEffect(() => {
+    const within = area.current
+    if (within === null) return
+    let last: Element | null = null
+    let waiting: MutationObserver | null = null
+    const stopWaiting = () => {
+      waiting?.disconnect()
+      waiting = null
+    }
     const settle = () => {
+      if (last === null || last.isConnected) {
+        stopWaiting()
+        return
+      }
+      // A card that is open holds focus; what it was opened from is dealt with once it has left.
       if (document.querySelector(SHEET) !== null) return
       const active = document.activeElement
-      if (active === null || active === document.body || !active.isConnected) find()?.focus()
+      last = null
+      stopWaiting()
+      // Focus put on a row is noted by the listener above, so it is the row that is watched next.
+      if (active === null || active === document.body || !active.isConnected) where.current()?.focus()
     }
-    settle()
-    const observer = new MutationObserver(settle)
-    observer.observe(document.body, { childList: true, subtree: true })
-    const taken = () => {
-      stop.current()
+    const noted = (event: FocusEvent) => {
+      last = event.target instanceof Element ? event.target : null
     }
-    window.addEventListener('pointerdown', taken, true)
-    window.addEventListener('keydown', taken, true)
-    stop.current = () => {
-      observer.disconnect()
-      window.removeEventListener('pointerdown', taken, true)
-      window.removeEventListener('keydown', taken, true)
-      stop.current = () => undefined
+    within.addEventListener('focusin', noted)
+    const removal = new MutationObserver(() => {
+      if (last === null || last.isConnected) return
+      settle()
+      if (last !== null && waiting === null) {
+        waiting = new MutationObserver(settle)
+        waiting.observe(document.body, { childList: true, subtree: true })
+      }
+    })
+    removal.observe(within, { childList: true, subtree: true })
+    return () => {
+      within.removeEventListener('focusin', noted)
+      removal.disconnect()
+      stopWaiting()
     }
-  }
+  }, [area])
 }
 
 /** The invitations, and the acceptances not seen to the end. */
@@ -172,7 +189,8 @@ export function Offers({ surface }: { readonly surface: Surface }): ReactNode {
     }
   }, [view, desk, port, book, say])
 
-  const afterSheet = useFocusAfterSheet(
+  useKeepFocus(
+    head,
     () =>
       head.current?.querySelector<HTMLElement>('[data-offer]') ??
       head.current?.querySelector<HTMLElement>('[data-attempt]') ??
@@ -200,12 +218,10 @@ export function Offers({ surface }: { readonly surface: Surface }): ReactNode {
           say(`Waiting to hear from the host about ${sessionWords(offer.display_number)}.`, 'pending')
         }
         closeCardOf(offer)
-        afterSheet()
       })
       .catch((failure: unknown) => {
         closeCardOf(offer)
         say(failureText(failure), 'danger')
-        afterSheet()
       })
       .finally(() => {
         setAccepting(null)
@@ -216,7 +232,6 @@ export function Offers({ surface }: { readonly surface: Surface }): ReactNode {
   const notNow = (offer: ShareOffer) => {
     setOpen(null)
     book.putOff(offer.invitation_id)
-    afterSheet()
   }
 
   const askHost = (attempt: AttemptView) => {
@@ -304,7 +319,7 @@ export function Offers({ surface }: { readonly surface: Surface }): ReactNode {
                       className="m-row"
                       data-tone="warning"
                       data-offer={offer.invitation_id}
-                                           style={{ minBlockSize: target }}
+                      style={{ minBlockSize: target }}
                       onClick={() => {
                         setOpen(offer.invitation_id)
                       }}

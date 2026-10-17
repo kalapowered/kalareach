@@ -6,9 +6,14 @@
  * does not, and the row under the person's finger jumps. Neither is left to the engine: the first
  * rows that are in view are remembered with where they are drawn in the scrolling area and where the
  * list was scrolled to, and when the list changes with the scroll position where it was, the scroll
- * position moves by exactly how far the first of them that is still there moved. A list that has been scrolled since (by the person, by the engine's own
- * anchoring, by a scroll that was asked for) is not corrected: the row moved because the list did,
- * and a correction would take the scroll back. A change below the row moves nothing.
+ * position moves by exactly how far the first of them that is still there moved. A list that has
+ * been scrolled since (by the person, by the engine's own anchoring, by a scroll that was asked for)
+ * is not corrected: the row moved because the list did, and a correction would take the scroll
+ * back. A change below the row moves nothing.
+ *
+ * A row that is in view and goes (an invitation that was accepted, an attempt that was removed) is
+ * not made up for: what is after it stays where it was and what is above it comes into view. The
+ * person was looking at what is after it, and it is what stays.
  *
  * At the top of the list nothing is anchored: a row that arrives there is simply the first, which is
  * where a person who has not scrolled expects it.

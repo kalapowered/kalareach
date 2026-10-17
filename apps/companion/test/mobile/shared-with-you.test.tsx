@@ -57,6 +57,13 @@ function start(options?: {
   return { controls, port }
 }
 
+/** Lets what is already on its way finish, for a test that asserts nothing happened. */
+async function settled(): Promise<void> {
+  await act(async () => {
+    await new Promise((resolve) => setTimeout(resolve, 0))
+  })
+}
+
 async function openTab(name: string): Promise<void> {
   await userEvent.click(await screen.findByRole('button', { name }))
 }
@@ -222,6 +229,88 @@ describe('an invitation at the head of the inbox (KR-REQ-18.13)', () => {
     await waitFor(() => {
       expect(document.activeElement?.id).toBe('main')
     })
+  })
+
+  it('keeps the acceptance the host did not settle against a list of acceptances asked for before it', async () => {
+    // A read of the acceptances is held after it has been asked, and answers after the acceptance.
+    let hold = false
+    const waiting: (() => void)[] = []
+    const { controls, port } = start({
+      before: (c) => c.sharing.offer(),
+      through: (host) => ({
+        ...host,
+        attemptsList: async () => {
+          const listed = await host.attemptsList()
+          if (hold) {
+            hold = false
+            await new Promise<void>((resolve) => {
+              waiting.push(resolve)
+            })
+          }
+          return listed
+        }
+      })
+    })
+    const row = await screen.findByRole('button', { name: new RegExp(INVITATION) })
+    hold = true
+    await readAgain(port)
+    await waitFor(() => {
+      expect(waiting).toHaveLength(1)
+    })
+    // The answer to the acceptance is lost, and so are the reads that follow it.
+    controls.sharing.loseNextAnswer()
+    controls.sharing.failNextHeld('the connection to the host was lost', 3)
+    await userEvent.click(row)
+    await userEvent.click(await screen.findByTestId('accept-offer'))
+    await screen.findByTestId('accept-attempt')
+    await waitFor(() => {
+      expect(screen.queryByTestId('sheet')).toBeNull()
+    })
+
+    // The held read answers now, with the acceptances as they were before this one.
+    waiting[0]?.()
+    await settled()
+    expect(screen.getByTestId('accept-attempt')).toBeInTheDocument()
+    await userEvent.click(screen.getByRole('button', { name: new RegExp(INVITATION) }))
+    expect(await screen.findByTestId('accept-offer')).toBeDisabled()
+    expect(controls.sharing.sent().redeem).toBe(1)
+  })
+
+  it('arms nothing when the host answers an acceptance after the screen has gone', async () => {
+    let release: () => void = () => undefined
+    const gate = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    start({
+      before: (c) => c.sharing.offer(),
+      through: (host) => ({
+        ...host,
+        grantRedeem: async (params) => {
+          const done = await host.grantRedeem(params)
+          await gate
+          return done
+        }
+      })
+    })
+    await userEvent.click(await screen.findByRole('button', { name: new RegExp(INVITATION) }))
+    await userEvent.click(await screen.findByTestId('accept-offer'))
+    await userEvent.keyboard('{Escape}')
+    await waitFor(() => {
+      expect(screen.queryByTestId('sheet')).toBeNull()
+    })
+    await openTab('Sessions')
+    await waitFor(() => {
+      expect(screen.queryByTestId('offers')).toBeNull()
+    })
+
+    release()
+    await screen.findByText(/^Accepted\. Session 3 is shared with you until /)
+    // Focus falls to nothing and something changes in the page: no leftover moves it to the region
+    // of a screen the person has gone to.
+    ;(document.activeElement as HTMLElement | null)?.blur()
+    document.body.append(document.createElement('div'))
+    await settled()
+    expect(document.activeElement).toBe(document.body)
   })
 
   it('puts focus on what is still there once the card has gone: the next invitation, or the screen', async () => {
