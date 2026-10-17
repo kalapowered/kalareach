@@ -102,6 +102,8 @@ struct Authority {
     lookups: Lookups,
     /// Whether the next write of a replacement grant fails.
     write_fails: std::sync::atomic::AtomicBool,
+    /// Whether the next revocation of a grant fails.
+    revocation_fails: std::sync::atomic::AtomicBool,
     /// This host's clock, as a test moves it.
     now: std::sync::atomic::AtomicU64,
     /// The one read of a grant the host refuses to answer, and what it refuses with: a host that
@@ -191,6 +193,7 @@ impl Authority {
             identity,
             lookups: Lookups::default(),
             write_fails: std::sync::atomic::AtomicBool::new(false),
+            revocation_fails: std::sync::atomic::AtomicBool::new(false),
             now: std::sync::atomic::AtomicU64::new(0),
             refusing: Mutex::new(None),
             spent: Mutex::new(std::collections::BTreeMap::new()),
@@ -280,6 +283,12 @@ impl Authority {
                     .expect("the held lookup is released");
             }
         }
+    }
+
+    /// Makes the next revocation of a grant fail, as a store that cannot be written would.
+    fn fail_the_next_revocation(&self) {
+        self.revocation_fails
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Makes the next write of a replacement grant fail.
@@ -515,6 +524,17 @@ impl VoiceAuthority for Authority {
         // Held here, after the grant to replace has been read and before it is withdrawn: that is
         // the window a second change would read the same grant in.
         self.hold_lookup_if_armed();
+        if self
+            .revocation_fails
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(kr_voice::VoiceError::Host(
+                kr_protocol::error::ProtocolError::new(
+                    kr_protocol::error::ErrorCode::StorageUnavailable,
+                    "the store could not write the revocation".to_owned(),
+                ),
+            ));
+        }
         let mut store = self.store.lock().expect("the store");
         // The cascade: a revoked parent takes its descendants with it.
         let mut going = vec![grant_id];
@@ -2182,6 +2202,97 @@ async fn stopping_a_voice_session_revokes_its_grant_before_the_broker_is_told() 
         .await
         .expect_err("it is over");
     assert_eq!(error.reason(), Some(VoiceRefusal::UnknownVoiceSession));
+}
+
+/// KR-REQ-15.14: a stop whose revocation fails has revoked nothing, and says so by leaving the voice
+/// session known: its grant is live, so the stop can be asked again and a context read is still
+/// answered. The broker is not told a call is over while its grant is not.
+#[tokio::test]
+async fn a_stop_whose_revocation_fails_leaves_the_voice_session_to_be_stopped_again() {
+    let fixture = fixture();
+    let voice_session_id = started(&fixture, None).await;
+    fixture.authority.fail_the_next_revocation();
+
+    let failed = fixture
+        .coordinator
+        .stop(device(PHONE), &VoiceStopParams { voice_session_id }, 12_000)
+        .await
+        .expect_err("the grant could not be revoked");
+
+    assert_ne!(failed.reason(), Some(VoiceRefusal::UnknownVoiceSession));
+    assert_eq!(
+        fixture.coordinator.live_sessions(),
+        1,
+        "the voice session is still known"
+    );
+    assert!(fixture.broker.closed().is_empty());
+    let read = fixture
+        .coordinator
+        .context(
+            device(PHONE),
+            &VoiceContextParams {
+                voice_session_id,
+                session_id: session(SESSION_A),
+                selected: CanonicalSet::from_iter([]),
+                delegation_id: Nullable::null(),
+            },
+        )
+        .await;
+    assert!(
+        read.is_ok(),
+        "a live grant still reads its context: {read:?}"
+    );
+
+    let stopped = fixture
+        .coordinator
+        .stop(device(PHONE), &VoiceStopParams { voice_session_id }, 12_500)
+        .await
+        .expect("the second stop revokes it");
+    assert!(fixture.authority.is_revoked(stopped.revoked_grant_id));
+    assert_eq!(fixture.coordinator.live_sessions(), 0);
+    assert_eq!(fixture.broker.closed(), vec!["call-managed".to_owned()]);
+}
+
+/// KR-REQ-15.14: a device the host revokes holds no call afterwards. Its voice session leaves, its
+/// grant is revoked first when the device's revocation has not already withdrawn it, and the call is
+/// closed at the service so that nothing keeps running for a device the host no longer pairs. A
+/// grant that cannot be revoked keeps its session known and its call open.
+#[tokio::test]
+async fn revoking_a_device_ends_the_calls_it_holds() {
+    let fixture = fixture();
+    let _ = started(&fixture, None).await;
+
+    // Another device's revocation leaves this device's call alone.
+    assert_eq!(
+        fixture
+            .coordinator
+            .end_calls_of_revoked_device(device(0x55), 11_000)
+            .await,
+        0
+    );
+    assert_eq!(fixture.coordinator.live_sessions(), 1);
+
+    fixture.authority.fail_the_next_revocation();
+    assert_eq!(
+        fixture
+            .coordinator
+            .end_calls_of_revoked_device(device(PHONE), 12_000)
+            .await,
+        0
+    );
+    assert_eq!(fixture.coordinator.live_sessions(), 1, "still known");
+    assert!(fixture.broker.closed().is_empty(), "the call is still open");
+
+    assert_eq!(
+        fixture
+            .coordinator
+            .end_calls_of_revoked_device(device(PHONE), 12_500)
+            .await,
+        1
+    );
+    assert_eq!(fixture.coordinator.live_sessions(), 0);
+    assert_eq!(fixture.broker.closed(), vec!["call-managed".to_owned()]);
+    assert_eq!(fixture.authority.revocations(), vec![12_500]);
 }
 
 /// KR-REQ-15.02 and 15.17: a call whose device went silent is over at its own deadline, whatever
