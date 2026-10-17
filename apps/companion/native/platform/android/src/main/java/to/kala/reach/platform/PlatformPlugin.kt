@@ -252,6 +252,10 @@ class PlatformPlugin(private val activity: Activity) : Plugin(activity) {
     @Command
     fun callState(invoke: Invoke) = carryOut(invoke) { bridge -> CallWire.held(bridge.held()) }
 
+    @Command
+    fun callAlive(invoke: Invoke) =
+        carryOut(invoke) { bridge -> CallWire.held(bridge.alive(CallWire.call(invoke.getRawArgs()))) }
+
     /**
      * Runs one command on the registered bridge and answers `invoke` with its JSON result, or with
      * why it could not, once whatever happens. `afterwards` runs before the answer is sent, so
