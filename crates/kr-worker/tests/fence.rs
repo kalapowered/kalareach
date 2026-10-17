@@ -3239,6 +3239,7 @@ async fn asks_the_real_worker_before_each_command(
                 .session()
                 .last_command_block()
                 .map(|block| block.prompt_generation.0.get());
+            let replies_before = host_replies_accounted(&shell);
             keys.type_line(&shell, "kr-probe hold");
             let (token, fenced) = tokio::time::timeout(Duration::from_secs(30), async {
                 let mut started = None;
@@ -3292,6 +3293,22 @@ async fn asks_the_real_worker_before_each_command(
                         "the {:?} package's held line was answered after the shell's deadline on \
                          attempt {attempt} (each published fence kept from the writer: \
                          {fence_hold:?}), so it is typed again at the next prompt",
+                        package.kind()
+                    );
+                    probes.release();
+                    printed += 1;
+                    shell.produced(b"probe-ran", printed).await;
+                    previous = "kr-probe hold".to_owned();
+                }
+                None if !fenced
+                    && attempt < ATTEMPTS
+                    && host_replies_accounted(&shell) > replies_before =>
+                {
+                    eprintln!(
+                        "the {:?} package's held line was typed behind a fence that a reply of \
+                         the host to the shell's own question invalidated on attempt {attempt} \
+                         (each published fence kept from the writer: {fence_hold:?}), so it is \
+                         typed again at the next prompt",
                         package.kind()
                     );
                     probes.release();
@@ -3385,7 +3402,37 @@ async fn a_reader_the_line_starts_keeps_the_lines_capability(
     keys: &mut RealKeys,
 ) {
     const LINE: &str = "begin; breakpoint; end; kr-probe hold";
-    back_at_the_prompt(shell, probes, "sh -c 'exit 7'").await;
+    // A line typed behind a fence that a reply of the host invalidated holds no capability; it is
+    // let finish and typed again at the next prompt, a bounded number of times.
+    const ATTEMPTS: usize = 5;
+    let mut previous = "sh -c 'exit 7'";
+    for attempt in 1..=ATTEMPTS {
+        if a_reader_the_line_starts_keeps_the_lines_capability_once(shell, probes, keys, previous)
+            .await
+        {
+            return;
+        }
+        eprintln!(
+            "the line was typed behind a fence that a reply of the host to the shell's own \
+             question invalidated on attempt {attempt}, so it is typed again at the next prompt"
+        );
+        previous = LINE;
+    }
+    panic!("the line was typed behind a fence a reply of the host invalidated {ATTEMPTS} times");
+}
+
+/// One attempt at [`a_reader_the_line_starts_keeps_the_lines_capability`], after the line
+/// `previous` finished. Returns false, with the line let finish, when the line's command ran
+/// without its capability and a reply of the host was accounted since the line was typed.
+#[cfg(unix)]
+async fn a_reader_the_line_starts_keeps_the_lines_capability_once(
+    shell: &RealShell,
+    probes: &RealProbes,
+    keys: &mut RealKeys,
+    previous: &str,
+) -> bool {
+    const LINE: &str = "begin; breakpoint; end; kr-probe hold";
+    back_at_the_prompt(shell, probes, previous).await;
     // (1) The reader revision of the fence the first prompt published, and the generation of the
     // block before this line's.
     let first_revision = {
@@ -3403,6 +3450,7 @@ async fn a_reader_the_line_starts_keeps_the_lines_capability(
         .map(|block| block.prompt_generation.0.get());
     probes.hold();
     let before = probes.runs().len();
+    let replies_before = host_replies_accounted(shell);
     keys.type_line(shell, LINE);
 
     // (2) The worker holds the line's running block, at a newer prompt than the line before.
@@ -3460,10 +3508,14 @@ async fn a_reader_the_line_starts_keeps_the_lines_capability(
         .skip(before)
         .find(|(arguments, _)| arguments.first().map(String::as_str) == Some("hold"))
         .expect("the probe ran");
-    let token = environment
-        .get("KR_DETACH_TOKEN")
-        .cloned()
-        .expect("the line's command carries the line's capability");
+    let Some(token) = environment.get("KR_DETACH_TOKEN").cloned() else {
+        assert!(
+            host_replies_accounted(shell) > replies_before,
+            "the line's command carries the line's capability"
+        );
+        probes.release();
+        return false;
+    };
     let session = shell.runtime.session();
     assert_eq!(
         session.fence().expect("a driver").detach_for_token(&token),
@@ -3484,6 +3536,24 @@ async fn a_reader_the_line_starts_keeps_the_lines_capability(
     );
     drop(session);
     probes.release();
+    true
+}
+
+/// How many bytes of the host's own answers to the shell have been accounted so far.
+///
+/// A shell asks its terminal questions of its own, and the worker answers them in the terminal
+/// without a lease. An answer that is queued after a fence was published invalidates the fence,
+/// because the bytes it puts into the terminal are no one's typing: a line typed behind that fence
+/// goes unattributed, which is how the worker keeps a line from being given to a client that did
+/// not type all of it. Whether one arrives after a prompt's fence is the machine's: it depends on
+/// when the question's bytes reach the worker beside the shell's report of its reader.
+#[cfg(unix)]
+fn host_replies_accounted(shell: &RealShell) -> u64 {
+    shell
+        .runtime
+        .session()
+        .fence()
+        .map_or(0, kr_worker::fence::FenceDriver::host_reply_bytes)
 }
 
 /// Waits until the line `command` has finished and the reader is back at its prompt behind a valid
