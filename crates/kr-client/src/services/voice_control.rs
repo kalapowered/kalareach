@@ -81,7 +81,7 @@ use super::json;
 use super::voice::{
     VOICE_CLIENT_ABSENT_SECONDS, VOICE_CONTEXT_BURST, VOICE_CONTEXT_BYTES,
     VOICE_CONTEXT_PER_MINUTE, VOICE_CONTROL_FRAME_BYTES, VOICE_HEARTBEAT_SECONDS, VOICE_SCOPE,
-    VoiceCommand, VoiceContextFrame, VoiceControlEvent, VoiceSession, read_control_event,
+    VoiceCommand, VoiceContextFrame, VoiceControlEvent, read_control_event, voice_control_path,
 };
 use crate::error::{ClientError, Result};
 use crate::shown::{Said, ServiceMessage, Shown};
@@ -201,30 +201,40 @@ impl fmt::Debug for ControlTarget {
 }
 
 impl ControlTarget {
-    /// The control socket of `session`, at the service `origin` created it on
-    /// ([`super::voice::ManagedVoiceBroker::origin`]).
+    /// The control socket of the call `call_id`, which the host says is at `descriptor_origin`
+    /// and `control_path`, for a device whose account is signed in at `service_origin`.
+    ///
+    /// The account's token is presented to the socket this names, so where it goes cannot be a
+    /// host's word. The descriptor's origin has to be the service's origin, in the one spelling this
+    /// crate compares origins in, and the path has to be the service's own shape for this call's
+    /// control (`voiceControlPath` of the service's contract). The socket is opened at the service
+    /// origin as the device spells it.
     ///
     /// # Errors
     ///
-    /// Returns an error when the session's control path is not an absolute path that a request
-    /// line can carry.
-    pub fn new(origin: &str, session: &VoiceSession) -> Result<Self> {
-        let path = &session.control_path;
-        if !path.starts_with('/')
-            || path.starts_with("//")
-            || !path
-                .bytes()
-                .all(|byte| byte.is_ascii_graphic() && !matches!(byte, b'?' | b'#' | b'\\'))
-            || session.call_id.is_empty()
-        {
+    /// Returns an error when either origin is not one this crate accepts, when they are not the
+    /// same origin, when the call identifier is empty, or when the path is not the call's control
+    /// path.
+    pub fn at(
+        service_origin: &str,
+        descriptor_origin: &str,
+        control_path: &str,
+        call_id: &str,
+    ) -> Result<Self> {
+        if !super::voice::same_origin(service_origin, descriptor_origin) {
             return Err(local(
-                "a call's control path is an absolute path with no query or fragment",
+                "the host named a voice service that is not the one this device's account is                  signed in at, so this device presents no token there",
+            ));
+        }
+        if call_id.is_empty() || control_path != voice_control_path(call_id) {
+            return Err(local(
+                "a call's control path is the voice service's control path for that call",
             ));
         }
         Ok(Self {
-            origin: origin.to_owned(),
-            path: path.clone(),
-            call_id: session.call_id.clone(),
+            origin: service_origin.to_owned(),
+            path: control_path.to_owned(),
+            call_id: call_id.to_owned(),
         })
     }
 }

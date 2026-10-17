@@ -146,6 +146,29 @@ impl ControlRoute {
             .expect("a loopback port");
         let port = listener.local_addr().expect("an address").port();
         let scheme = if tls.is_some() { "https" } else { "http" };
+        let route = Self::detached(format!("{scheme}://127.0.0.1:{port}"), windows);
+        let serving = Arc::clone(&route.shared);
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let (shared, tls) = (Arc::clone(&serving), tls.clone());
+                tokio::spawn(async move {
+                    match tls {
+                        Some(acceptor) => {
+                            if let Ok(stream) = acceptor.accept(stream).await {
+                                connection(shared, stream).await;
+                            }
+                        }
+                        None => connection(shared, stream).await,
+                    }
+                });
+            }
+        });
+        route
+    }
+
+    /// A route with no listener of its own, for a server that also answers other requests: it
+    /// serves the streams it is handed ([`Self::serve`]), and says `origin` is where it answers.
+    pub fn detached(origin: String, windows: Option<(Duration, Duration)>) -> Self {
         let shared = Arc::new(Shared {
             state: Mutex::new(State {
                 refusals: VecDeque::new(),
@@ -169,26 +192,15 @@ impl ControlRoute {
             }),
             changed: Notify::new(),
         });
-        let serving = Arc::clone(&shared);
-        tokio::spawn(async move {
-            while let Ok((stream, _)) = listener.accept().await {
-                let (shared, tls) = (Arc::clone(&serving), tls.clone());
-                tokio::spawn(async move {
-                    match tls {
-                        Some(acceptor) => {
-                            if let Ok(stream) = acceptor.accept(stream).await {
-                                connection(shared, stream).await;
-                            }
-                        }
-                        None => connection(shared, stream).await,
-                    }
-                });
-            }
-        });
-        Self {
-            origin: format!("{scheme}://127.0.0.1:{port}"),
-            shared,
-        }
+        Self { origin, shared }
+    }
+
+    /// Serves one connection a server accepted: the upgrade, and the socket after it.
+    pub async fn serve<S>(&self, stream: S)
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        connection(Arc::clone(&self.shared), stream).await;
     }
 
     /// The origin the route answers on.
@@ -198,7 +210,7 @@ impl ControlRoute {
 
     /// The control target of the call the route holds.
     pub fn target(&self) -> ControlTarget {
-        ControlTarget::new(&self.origin, &session()).expect("a control target")
+        ControlTarget::at(&self.origin, &self.origin, PATH, CALL).expect("a control target")
     }
 
     /// Announces a delegation: every open socket is told, and the next `ready` lists it.
