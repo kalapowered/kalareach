@@ -447,6 +447,47 @@ An attempt is said not to have happened, as far as the host shows, only after th
 
 A hand-over asks the host to describe the plan and put it to the owner devices, and sends nothing that changes who holds the session. The page holds a reference to it, and the plan, the action and the parameters stay in native code. It asks every second whether an owner device has answered, and when one has, native code checks that the plan the host described names the session, the grant and the receiving device that were asked for, and sends the transfer once. The hand-over leaves native code's table in the same step that keeps the record of the transfer, so a cancel either came first and nothing is sent, or comes later and finds nothing to cancel. The panel tells the person how the send went whether or not it is still on screen, and leaving it before the send lets the hand-over go. What the page has been told of a result is kept for as long as the page lives, so leaving the tab does not lose it. A hand-over that has not been answered when its challenge runs out is shown as that, and Ask again starts a new one. If the host does not answer the request for the owner devices' confirmation, only its answer to the first request is final. When the repeats run out, the page says it is not known whether an owner device was asked, and that one can still be shown the request for up to two minutes, though nothing this application sends will hand anything over.
 
+## Settings and settings sync
+
+The colour mode setting can be set in one location: `settings.json` in the application data
+directory. When the application's window is opened, the colour mode is already in the window's
+document, as data the page reads and never code it runs, so the initial draw of the window will be
+in the correct colour mode. The colour mode can only be changed via a command, which will write the
+new colour mode to `settings.json` before doing anything else. No state is stored in webview
+storage, all reads will be from `settings.json`. If multiple companions are running on the same
+device, a choice made in one is found by the others. When the colour mode is changed, it will take a
+lock on `settings.lock` to prevent race conditions.
+
+The settings can be synchronised across devices, which stores an encrypted copy of the settings in
+an encrypted collection on a settings sync service, so another device of the same person finds them.
+Syncing is disabled by default, to enable it navigate to the Account sheet and turn it on. No
+account is needed, requests to the settings sync service are authenticated using the signature of
+the device making the request, no token is ever transmitted. The collection is stored on the
+settings sync service specified by the sync service setting at the time sync was turned on. Changing
+the sync service setting later will not migrate the collection to the new sync service. The logic
+for settings syncing is in `src-tauri/src/settings/sync.rs`, which records the collection under
+`settings-sync/` on this computer before any requests are made, and each step holds a lock on
+`settings-sync/sync.lock` while it runs. A sync step is run every 5 minutes while the application is
+open.
+
+A sync step performs the following steps to bring the settings on the device and the settings sync
+service into a consistent state: If there is a pending response from a previous write, query the
+settings sync service for the response. If there is a conflict, do nothing until the conflict is
+resolved by the user. If the settings on the device differ from the last known consistent state,
+perform a write to the settings sync service to publish the changes. The service refuses the write
+when something was written to it in between, and keeps what the other device wrote beside this
+device's own for the person to choose between. Otherwise perform a read from the settings sync
+service to sync the settings on the device to any changes made by another device. A clock never
+decides between two devices.
+
+When there is a conflict between the settings on two devices, the user is prompted to resolve the
+conflict in the settings card of the Account sheet. The conflict is resolved inline, with each
+option rendering the settings as they would appear. The options are not selected by default, the
+first option is the settings currently on the device. Each option shows a time, only so the person
+can recognise it. The buttons to resolve the conflict are labelled with the action they will take.
+Once the conflict is resolved, all other versions of the settings are discarded. If the service
+cannot be told of the choice, the choice stands and the next sync step sends it.
+
 ## The sync service and recovery
 
 The sync service is a setting of its own. It is the managed service, `https://reach.kala.to`, until
