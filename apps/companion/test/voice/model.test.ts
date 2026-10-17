@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest'
 
 import type { VoiceManagedTerms, VoicePrepareResult } from '@kalareach/protocol'
 
-import type { VoiceCallState, VoiceEnded } from '../../src/host/port'
+import type { VoiceCallState, VoiceClosure, VoiceEnded } from '../../src/host/port'
 
 import {
   CAPTURE_DISPLAY,
@@ -14,6 +14,7 @@ import {
   callLength,
   choiceFromPreparation,
   choiceWithRate,
+  closureWords,
   controlAvailable,
   endedWords,
   needsHost,
@@ -21,12 +22,24 @@ import {
   rateWords,
   requestedSeconds,
   runningCallFrom,
+  serviceWords,
   speechCouldHaveBeenHeard,
   type CaptureState,
   type ProviderChoice,
   type RunningCall,
   type VoiceControl
 } from '../../src/voice/model'
+
+/** How a call that ended on this device ended, with the host's grant withdrawn. */
+function endedFor(): VoiceEnded {
+  return {
+    cause: 'native_ended',
+    words: 'The call ended on this device.',
+    closed_locally: true,
+    host: { kind: 'revoked', fence: { kind: 'not_owed' }, broker_notified: true },
+    broker: 'closed_by_host'
+  }
+}
 
 /** What the host says an append acknowledgement does not establish. */
 const ADMISSION_MEANS =
@@ -103,6 +116,7 @@ function call(over: Partial<RunningCall> = {}): RunningCall {
 function callState(over: Partial<VoiceCallState> = {}): VoiceCallState {
   return {
     running: true,
+    setting_up: false,
     capture: 'capturing',
     playing: true,
     control: 'connected',
@@ -305,10 +319,12 @@ describe('what a call that ended tells a person', () => {
   })
 
   // The grant may be live until the call was to close, so the host's silence is said as owed.
-  it('says the grant may still be open when the host was not told', () => {
+  it('says the grant may still be open when the host did not confirm that it withdrew it', () => {
     const words = endedWords(ended({ host: { kind: 'not_told', words: 'The host could not be reached.' } }))
-    expect(words).toContain('The host was not told, so its grant may still be open: The host could not be reached.')
-    expect(words).not.toContain('withdrew')
+    expect(words).toContain(
+      "The host did not confirm that it withdrew the call's grant, so it may still be open: The host could not be reached."
+    )
+    expect(words).not.toContain('The host withdrew')
   })
 
   it('says what the host refused, and that the grant ends when the call was to close', () => {
@@ -317,10 +333,9 @@ describe('what a call that ended tells a person', () => {
     expect(words).toContain('ends when the call was to close')
   })
 
-  it('says when the media may not have stopped, and when the voice service has not confirmed', () => {
-    const words = endedWords(ended({ closed_locally: false, broker: 'not_confirmed' }))
+  it('says when the media may not have stopped', () => {
+    const words = endedWords(ended({ closed_locally: false }))
     expect(words).toContain("could not confirm that the call's microphone stopped")
-    expect(words).toContain('has not confirmed that it closed the call')
     expect(endedWords(ended())).not.toContain('microphone stopped')
   })
 
@@ -341,21 +356,76 @@ describe('what is owed', () => {
       words: 'The host could not be reached in time.',
       action_id: null,
       voice_session_id: 'vs-1',
-      until_ms: Date.UTC(2026, 9, 17, 12, 30)
+      until_ms: Date.UTC(2026, 9, 17, 12, 30),
+      host_reference: 'ref-1',
+      host_name: "Ric's Mac"
     })
-    expect(words).toContain('may still hold open ends by itself at')
+    expect(words).toContain("Ric's Mac may still hold open ends by itself at")
     expect(words).toContain('The host could not be reached in time.')
   })
 
-  it('leaves the words of a start that was never answered as they are', () => {
+  it('names the host a start that was never answered was asked of', () => {
     const words = owedWords({
       kind: 'start_unknown',
       words: 'The host never said whether it created the call.',
       action_id: 'a-1',
       voice_session_id: null,
-      until_ms: 1
+      until_ms: 1,
+      host_reference: 'ref-1',
+      host_name: "Ric's Mac"
     })
-    expect(words).toBe('The host never said whether it created the call.')
+    expect(words).toBe("The host never said whether it created the call. It was asked of Ric's Mac.")
+  })
+})
+
+describe('what the voice service did about a call that ended', () => {
+  // The service is asked last and the screen does not wait for it, so what it did is said apart
+  // from the rest of the end, once it is known.
+  it('says nothing while the service has still to answer, or when it closed the call', () => {
+    for (const broker of ['pending', 'closed', 'closed_by_host', 'closed_by_service', 'closed_over_http', 'not_needed']) {
+      expect(serviceWords({ ...endedFor(), broker })).toBeNull()
+    }
+  })
+
+  it('says the service has not confirmed, and that a call this device cannot name may be held', () => {
+    expect(serviceWords({ ...endedFor(), broker: 'not_confirmed' })).toContain(
+      'has not confirmed that it closed the call'
+    )
+    expect(serviceWords({ ...endedFor(), broker: 'unknown' })).toContain(
+      'cannot name it to close it'
+    )
+  })
+})
+
+describe('what the screen says when it ends a call', () => {
+  const none = (over: Partial<VoiceClosure> = {}): VoiceClosure => ({
+    closed_locally: true,
+    fence: { kind: 'not_owed' },
+    host_failure: null,
+    ...over
+  })
+
+  it('adds nothing when the call stopped here and the host owed no fence', () => {
+    expect(closureWords(none())).toBeNull()
+  })
+
+  // The microphone is the first thing a person wants to know stopped.
+  it('does not say the call is closed when this device could not confirm the media stopped', () => {
+    const words = closureWords(none({ closed_locally: false }))
+    expect(words).toContain("could not confirm that the call's microphone stopped")
+    expect(words).not.toContain('is closed')
+  })
+
+  it('says the host did not confirm when it could not be told or did not answer', () => {
+    const words = closureWords(
+      none({
+        fence: null,
+        host_failure: { code: 'RESOURCE_UNAVAILABLE', message: 'RESOURCE_UNAVAILABLE: No answer.', user_action: 'wait' }
+      })
+    )
+    expect(words).toContain("This device's call is closed.")
+    expect(words).toContain('The host did not confirm that it withdrew the grant, so it may still be open: No answer.')
+    expect(words).not.toContain('RESOURCE_UNAVAILABLE')
   })
 })
 

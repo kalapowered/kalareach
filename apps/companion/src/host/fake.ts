@@ -555,6 +555,13 @@ export interface FakeHostControls {
   endVoiceCall(ended?: Partial<VoiceEnded>): void
   /** Starts a call that no screen asked for, as a screen that is loaded again finds one. */
   holdAVoiceCall(): void
+  /**
+   * Makes the device busy setting a call up with no call to name yet, as it is while the
+   * microphone question is asked or the host has not said whether it made the call.
+   */
+  settingUpAVoiceCall(): void
+  /** Sets what the voice service did about the call that last ended, once it has said. */
+  settleVoiceBroker(broker: string): void
   /** Sets whether the host the call belongs to is reached: `reachable` or `lost`. */
   setVoiceHost(host: 'reachable' | 'lost'): void
   /** Sets the warning a person is told before starting, or none. */
@@ -875,6 +882,7 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
     call: null,
     delegations: [],
     host: 'reachable',
+    settingUp: false,
     ended: null,
     warning: null,
     owed: [],
@@ -2053,6 +2061,15 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
     },
 
     voiceStop: () => {
+      if (voice.settingUp) {
+        // A stop that names nothing ends what the device is making.
+        voice.settingUp = false
+        voice.ended = {
+          ...endedBy('requested', 'You ended the call.', { kind: 'not_needed' }),
+          broker: 'not_needed'
+        }
+        return Promise.resolve({ closed_locally: true, fence: null, host_failure: null })
+      }
       const running = voice.call
       voice.call = null
       voice.host = 'none'
@@ -2630,6 +2647,7 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
     },
     endVoiceCall(ended) {
       voice.call = null
+      voice.settingUp = false
       voice.host = 'none'
       voice.ended = {
         ...endedBy('native_ended', 'The call ended on this device: from its notification, by the system, or at its time limit.', {
@@ -2640,7 +2658,18 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
         ...ended
       }
     },
+    settleVoiceBroker(broker) {
+      if (voice.ended) voice.ended = { ...voice.ended, broker }
+    },
+    settingUpAVoiceCall() {
+      voice.call = null
+      voice.settingUp = true
+      voice.ended = null
+      voice.delegations = []
+      voice.host = 'none'
+    },
     holdAVoiceCall() {
+      voice.settingUp = false
       const session = fakeVoiceSession([SESSION_MAIN], VOICE_NOW_MS + 1_800_000)
       voice.call = { session, capture: voice.startCapture, playing: true }
       voice.ended = null
@@ -2656,10 +2685,12 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
     oweVoice(owed) {
       voice.owed.push({
         kind: 'revocation',
-        words: 'The host was not told, so its grant may still be open.',
+        words: 'The host did not confirm that it withdrew the grant.',
         action_id: null,
         voice_session_id: VOICE_SESSION,
-        until_ms: VOICE_NOW_MS + 1_800_000,
+        until_ms: Date.now() + 1_800_000,
+        host_reference: 'a-host',
+        host_name: 'Your Mac',
         ...owed
       })
     },
@@ -2763,6 +2794,8 @@ interface VoiceState {
   delegations: VoiceDelegationRow[]
   /** Whether the host the call belongs to is reached. */
   host: string
+  /** Whether the device is setting up a call that has no descriptor yet. */
+  settingUp: boolean
   /** How the last call ended. */
   ended: VoiceEnded | null
   /** What a person is told before starting. */
@@ -2818,10 +2851,16 @@ export type VoiceTermsState = 'published' | 'closed' | 'unread'
 /** What the call this device is holding is doing. */
 function voiceCallState(voice: VoiceState): VoiceCallState {
   const running = voice.call
-  const left = { ended: voice.ended, warning: voice.warning, owed: voice.owed }
+  // What has lapsed is forgotten, as the device forgets it.
+  const left = {
+    ended: voice.ended,
+    warning: voice.warning,
+    owed: voice.owed.filter((owed) => owed.until_ms > Date.now())
+  }
   if (!running) {
     return {
       running: false,
+      setting_up: voice.settingUp,
       capture: 'idle',
       playing: false,
       control: 'none',
@@ -2833,6 +2872,7 @@ function voiceCallState(voice: VoiceState): VoiceCallState {
   }
   return {
     running: true,
+    setting_up: false,
     capture: running.capture,
     playing: running.playing,
     control: voice.brokerReachable ? 'connected' : 'unreachable',

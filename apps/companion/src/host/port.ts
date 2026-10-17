@@ -682,6 +682,12 @@ export type VoiceMute = 'microphone' | 'playback'
 export interface VoiceCallState {
   /** Whether this device is holding a call that is permitted. */
   readonly running: boolean
+  /**
+   * Whether this device holds a call that does not run: one being set up, before the host has said
+   * whether it made it too, or one being given up. There may be no call to name yet, and it can be
+   * ended without naming it.
+   */
+  readonly setting_up: boolean
   /** What the microphone is doing, in the native layer's own vocabulary. */
   readonly capture: string
   /** Whether the model's voice is coming out of this device. */
@@ -734,8 +740,9 @@ export interface VoiceEnded {
   readonly host: VoiceHostEnd
   /**
    * What the voice service did: `pending` while its closure is awaited, then `closed`,
-   * `closed_by_service`, `closed_by_host`, `closed_over_http` or `not_confirmed`; `not_needed`
-   * when the host never created a call.
+   * `closed_by_service`, `closed_by_host`, `closed_over_http` or `not_confirmed`; `unknown` when
+   * the host never said whether it made a call, so the service may hold one this device cannot
+   * name; `not_needed` when the host never created a call.
    */
   readonly broker: string
 }
@@ -744,8 +751,11 @@ export interface VoiceEnded {
 export interface VoiceDelegationRow {
   /** The provider's identifier. Correlation data, never authority. */
   readonly delegation_id: string
-  /** Where in the call it happened, in milliseconds from its start. */
-  readonly offset_ms: number
+  /**
+   * Where in the call it happened, in milliseconds from its start, or null when the voice service
+   * did not say: a delegation listed when the control attached.
+   */
+  readonly offset_ms: number | null
   /** What became of it: always `not_done` in this version, which acts on no spoken request. */
   readonly state: string
   /** Whether the model was told so. */
@@ -764,6 +774,10 @@ export interface VoiceOwed {
   readonly voice_session_id: string | null
   /** The moment the grant ends by itself, in milliseconds since the epoch. */
   readonly until_ms: number
+  /** What the list of hosts names the host this is owed to by. */
+  readonly host_reference: string
+  /** The name the host gives people. */
+  readonly host_name: string
 }
 
 /**
@@ -1502,7 +1516,7 @@ export interface HostPort {
    * be reached (KR-REQ-15.17). The answer says both halves separately rather than reporting a
    * revocation that may not have happened.
    */
-  voiceStop(voiceSessionId: string, subject: SessionSubject): Promise<VoiceClosure>
+  voiceStop(voiceSessionId: string | null, subject: SessionSubject): Promise<VoiceClosure>
 
   /** Reads the context the host selected for this call, to be sent on as a bounded request. */
   voiceContext(params: unknown): Promise<VoiceContextResult>

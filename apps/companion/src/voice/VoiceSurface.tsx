@@ -62,6 +62,11 @@ export interface VoiceSurfaceActions {
   readonly stopPlayback: () => void
   /** Ends the call and revokes its grant. Local, and the host is told after. */
   readonly hangUp: () => void
+  /**
+   * Ends what the device is making when there is no call to name yet. Local, and the host is
+   * asked after, as a hang-up is.
+   */
+  readonly endSetup: () => void
   /** Cancels the current turn on a host. Typed, and it names the turn. */
   readonly cancelTask: (turn: CurrentTurn) => void
   /** Asks the host what it selected for the call. A read from the host; nothing is sent onward. */
@@ -91,6 +96,16 @@ export interface VoiceSurfaceProps {
    * next start. Shown before a call and never in place of what the person is deciding.
    */
   readonly aftermath?: readonly string[]
+  /**
+   * Whether the device is busy making a call that does not run yet, which this screen is asked to
+   * say instead of offering a second start. There may be no call to name.
+   */
+  readonly settingUp?: boolean
+  /**
+   * Counts the calls that have left this screen. A screen that appears after one takes focus, so
+   * that the control that was pressed going away does not leave focus on nothing.
+   */
+  readonly focusToken?: number
   readonly actions: VoiceSurfaceActions
 }
 
@@ -102,10 +117,15 @@ export function VoiceSurface({
   busy,
   notice,
   aftermath = [],
+  settingUp = false,
+  focusToken = 0,
   actions
 }: VoiceSurfaceProps): React.ReactElement {
   if (call) {
     return <CallScreen call={call} currentTurn={currentTurn} busy={busy} notice={notice} actions={actions} />
+  }
+  if (settingUp) {
+    return <SettingUpScreen notice={notice} onEnd={actions.endSetup} />
   }
   if (choice) {
     return (
@@ -114,6 +134,7 @@ export function VoiceSurface({
         busy={busy}
         notice={notice}
         aftermath={aftermath}
+        focusOnShow={focusToken > 0}
         onStart={actions.start}
       />
     )
@@ -124,6 +145,44 @@ export function VoiceSurface({
       <p className="kr-voice__refusal" role="status">
         {notice ?? 'Asking this host what a voice session would be allowed to do…'}
       </p>
+    </section>
+  )
+}
+
+/**
+ * The screen while the device is making a call that does not run yet.
+ *
+ * It offers no second start: the device holds one call at a time, and a start made now would be
+ * turned away. It says what is true, that a call is being made or given up and that the person's
+ * only act is to end it, which needs no call to be named.
+ */
+function SettingUpScreen({
+  notice,
+  onEnd
+}: {
+  readonly notice: string | null
+  readonly onEnd: () => void
+}): React.ReactElement {
+  const id = useId()
+  return (
+    <section className="kr-voice" aria-labelledby={`${id}-heading`}>
+      <h1 id={`${id}-heading`} className="kr-voice__title">
+        Starting a voice session
+      </h1>
+      <p className="kr-voice__note" role="status">
+        This device is making a call, or ending one. Nothing is listening yet, and the call goes on
+        to the screen below when it runs.
+      </p>
+      {notice && (
+        <p className="kr-voice__refusal" role="status">
+          {notice}
+        </p>
+      )}
+      <div className="kr-voice__controls">
+        <button type="button" className="kr-voice__control kr-voice__control--end" onClick={onEnd}>
+          End the call
+        </button>
+      </div>
     </section>
   )
 }
@@ -142,6 +201,7 @@ function ProviderChoiceScreen({
   busy,
   notice,
   aftermath,
+  focusOnShow,
   onStart
 }: {
   readonly choice: ProviderChoice
@@ -151,16 +211,23 @@ function ProviderChoiceScreen({
   readonly notice: string | null
   /** What the last call left. */
   readonly aftermath: readonly string[]
+  /** Whether a call has just left this screen, so that focus goes to its heading. */
+  readonly focusOnShow: boolean
   readonly onStart: () => void
 }): React.ReactElement {
   const id = useId()
+  const heading = useRef<HTMLHeadingElement | null>(null)
+  const takeFocus = useRef(focusOnShow)
+  useEffect(() => {
+    if (takeFocus.current) heading.current?.focus()
+  }, [])
   const terms = choice.managed
   const seconds = terms ? requestedSeconds(terms) : null
   const startable = terms !== null && terms.enabled && seconds !== null
 
   return (
     <section className="kr-voice" aria-labelledby={`${id}-heading`}>
-      <h1 id={`${id}-heading`} className="kr-voice__title">
+      <h1 id={`${id}-heading`} className="kr-voice__title" ref={heading} tabIndex={-1}>
         Start a voice session
       </h1>
 
@@ -581,7 +648,11 @@ const REQUEST_WORDS: Readonly<Record<ContextRequest['outcome'], string>> = {
 function DelegationRow({ delegation }: { readonly delegation: Delegation }): React.ReactElement {
   return (
     <li className="kr-voice__delegation">
-      <span className="kr-voice__kind">Asked {(delegation.offsetMs / 1000).toFixed(1)} seconds in</span>
+      <span className="kr-voice__kind">
+        {delegation.offsetMs === null
+          ? 'Asked before this device was listening'
+          : `Asked ${(delegation.offsetMs / 1000).toFixed(1)} seconds in`}
+      </span>
       <span className="kr-voice__summary">
         {delegation.told
           ? 'Not done. The voice was told so.'

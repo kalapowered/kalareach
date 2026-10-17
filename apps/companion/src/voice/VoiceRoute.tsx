@@ -17,11 +17,12 @@ import {
   callAsReported,
   choiceFromPreparation,
   choiceWithRate,
+  closureWords,
   endedWords,
-  fenceWords,
   owedWords,
   requestedSeconds,
   runningCallFrom,
+  serviceWords,
   type ContextRequest,
   type ProviderChoice,
   type RunningCall
@@ -30,10 +31,9 @@ import { useApp } from '../app/state'
 import {
   failureCode,
   failureMessage as portFailureMessage,
-  failureWords,
   follow
 } from '../host/port'
-import type { VoiceCallState } from '../host/port'
+import type { VoiceCallState, VoiceClosure } from '../host/port'
 import type { Surface } from '../mobile/platform'
 
 /** The message to show for a failure, whatever shape it arrived in. */
@@ -106,10 +106,21 @@ export function VoiceRoute({
   const [left, setLeft] = useState<VoiceCallState | null>(null)
   /** How the call that ended before this screen was shown ended, said once, when it is shown. */
   const [endedBefore, setEndedBefore] = useState<string | null>(null)
-  /** Whether the device is setting up a call that this screen did not ask for. */
+  /**
+   * Whether the device is busy with a call that does not run yet: one this screen did not ask for,
+   * or one it asked for and was loaded again before the host answered. There may be no call to name.
+   */
   const [setUp, setSetUp] = useState(false)
+  /** Whether the last reading found the device setting a call up, to say how that ended. */
+  const settingUpBefore = useRef(false)
   /** True while this screen's own hang-up is waiting for the host, which says its own words. */
   const hangingUp = useRef(false)
+  /**
+   * How many times a call has left the screen. Focus goes to the heading of what replaces it: the
+   * control that was pressed is gone, and focus left on nothing would send a keyboard or
+   * screen-reader user back to the top of the document.
+   */
+  const [leftCount, setLeftCount] = useState(0)
 
   /**
    * Whether this device's connection to the host is carrying requests.
@@ -245,18 +256,24 @@ export function VoiceRoute({
   const settle = useCallback((state: VoiceCallState) => {
     const described = state.session
     if (state.running && described !== null) {
+      settingUpBefore.current = false
       setSetUp(false)
       setCall((running) =>
         running ? callAsReported(running, state) : runningCallFrom(described, state, '')
       )
       return
     }
-    // A call being set up has its descriptor and does not run yet: it is read again until it does
-    // or is given up.
-    setSetUp(described !== null)
+    // A call being set up, or given up, is read again until it runs or is over. It may have no
+    // descriptor yet, so the device's own word that it is busy decides.
+    const busy = state.setting_up || described !== null
+    const watchedSettingUp = settingUpBefore.current
+    settingUpBefore.current = busy
+    setSetUp(busy)
     setLeft(state)
-    if (held.current !== null && described === null) {
+    if (busy) return
+    if (held.current !== null || watchedSettingUp) {
       setCall(null)
+      setLeftCount((count) => count + 1)
       if (!hangingUp.current) {
         setNotice(
           state.ended
@@ -274,7 +291,7 @@ export function VoiceRoute({
     void ask(() => port.voiceCallState())
       .then((state) => {
         if (!current) return
-        if (!state.running && state.session === null && state.ended) {
+        if (!state.running && !state.setting_up && state.session === null && state.ended) {
           setEndedBefore(endedWords(state.ended))
         }
         settle(state)
@@ -287,10 +304,12 @@ export function VoiceRoute({
     }
   }, [port, settle])
 
-  // The call's own state, re-read while one runs or is being set up. The native layer owns the
-  // microphone, and the interruptions that matter most are the ones nothing asked for.
+  // The call's own state, re-read while one runs or is being set up, and while the voice service
+  // has still to say whether it closed the call that ended. The native layer owns the microphone,
+  // and the interruptions that matter most are the ones nothing asked for.
+  const reading = call !== null || setUp || left?.ended?.broker === 'pending'
   useEffect(() => {
-    if (!call && !setUp) return
+    if (!reading) return
     let current = true
     const read = () => {
       void ask(() => port.voiceCallState())
@@ -306,13 +325,41 @@ export function VoiceRoute({
       current = false
       window.clearInterval(timer)
     }
-  }, [call, port, setUp, settle])
+  }, [port, reading, settle])
+
+  // What this device owes lapses by itself, and the device stops saying it then: the screen reads
+  // again at the first lapse it is waiting for, so a warning does not outlive what it warns of.
+  const nextLapse = useMemo(() => {
+    const ends = (left?.owed ?? []).map((owed) => owed.until_ms)
+    return ends.length === 0 ? null : Math.min(...ends)
+  }, [left])
+  useEffect(() => {
+    if (nextLapse === null) return
+    let current = true
+    const timer = window.setTimeout(
+      () => {
+        void ask(() => port.voiceCallState())
+          .then((state) => {
+            if (current) settle(state)
+          })
+          .catch(() => undefined)
+      },
+      // A little after the lapse, and never longer than a timer can hold.
+      Math.min(Math.max(nextLapse - Date.now(), 0) + 50, 2_000_000_000)
+    )
+    return () => {
+      current = false
+      window.clearTimeout(timer)
+    }
+  }, [nextLapse, port, settle])
 
   /** What the last call left, as lines a person reads before starting another. */
   const aftermath = useMemo(() => {
     const lines: string[] = []
     if (endedBefore !== null) lines.push(endedBefore)
     for (const owed of left?.owed ?? []) lines.push(owedWords(owed))
+    const service = left?.ended ? serviceWords(left.ended) : null
+    if (service !== null) lines.push(service)
     if (left?.warning) lines.push(left.warning)
     return lines
   }, [endedBefore, left])
@@ -333,6 +380,35 @@ export function VoiceRoute({
           setHostReachable(false)
         }
       ),
+    [port]
+  )
+
+  /**
+   * Asks the device to end its call, named or not, and says what it did in its own words: whether
+   * the microphone stopped here, and whether the host confirmed that it withdrew the grant. What
+   * the call left is read once those words are said, and adds none.
+   */
+  const endTheCall = useCallback(
+    (voiceSessionId: string | null, closed: (closure: VoiceClosure) => void) => {
+      hangingUp.current = true
+      void ask(() => port.voiceStop(voiceSessionId, {}))
+        .then((closure) => {
+          closed(closure)
+          setNotice(closureWords(closure, shown.current?.sessionNames ?? {}))
+        })
+        .catch((error: unknown) => {
+          setNotice(failureMessage(error))
+        })
+        .finally(() => {
+          hangingUp.current = false
+          void ask(() => port.voiceCallState()).then(
+            (state) => {
+              if (state.session === null && !state.setting_up) setLeft(state)
+            },
+            () => undefined
+          )
+        })
+    },
     [port]
   )
 
@@ -410,6 +486,7 @@ export function VoiceRoute({
             const state = await ask(() => port.voiceCallState()).catch(
               (): VoiceCallState => ({
                 running: true,
+                setting_up: false,
                 capture: 'unavailable',
                 playing: false,
                 control: 'none',
@@ -453,33 +530,22 @@ export function VoiceRoute({
       hangUp: () => {
         const running = held.current
         if (!running) return
-        hangingUp.current = true
-        void ask(() => port.voiceStop(running.voiceSessionId, {}))
-          .then((closure) => {
-            if (closure.closed_locally) setCall(null)
-            const unconfirmed =
-              closure.fence === null ? null : fenceWords(closure.fence, choice?.sessionNames ?? {})
-            setNotice(
-              closure.host_failure
-                ? `This device's call is closed. The host was not told, so its grant may still be open: ${failureWords(closure.host_failure)}`
-                : unconfirmed === null
-                  ? null
-                  : `This device's call is closed and its grant withdrawn. ${unconfirmed}`
-            )
-          })
-          .catch((error: unknown) => {
-            setNotice(failureMessage(error))
-          })
-          .finally(() => {
-            hangingUp.current = false
-            // What the call left is read once the hang-up has said its own words, and adds none.
-            void ask(() => port.voiceCallState()).then(
-              (state) => {
-                if (state.session === null) setLeft(state)
-              },
-              () => undefined
-            )
-          })
+        endTheCall(running.voiceSessionId, (closure) => {
+          if (closure.closed_locally) {
+            setCall(null)
+            setLeftCount((count) => count + 1)
+          }
+        })
+      },
+
+      // Ends what the device is making when there is no call to name yet, and a call being made
+      // that this screen was loaded again to find.
+      endSetup: () => {
+        endTheCall(null, () => {
+          settingUpBefore.current = false
+          setSetUp(false)
+          setLeftCount((count) => count + 1)
+        })
       },
 
       cancelTask: (turn) => {
@@ -554,7 +620,7 @@ export function VoiceRoute({
           })
       }
     }),
-    [busy, choice, port, prepare, sessionIds, settle]
+    [busy, choice, endTheCall, port, prepare, sessionIds, settle]
   )
 
   if (needsGrant !== null && !call) {
@@ -590,6 +656,8 @@ export function VoiceRoute({
         busy={busy}
         notice={notice}
         aftermath={aftermath}
+        settingUp={setUp && !call}
+        focusToken={leftCount}
         actions={actions}
       />
     </Region>

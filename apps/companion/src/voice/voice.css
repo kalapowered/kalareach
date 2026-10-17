@@ -42,6 +42,11 @@
   margin: 0;
 }
 
+/* The heading takes focus when a call has left the screen. It is not a control, so it draws no ring. */
+.kr-voice__title[tabindex='-1']:focus {
+  outline: none;
+}
+
 .kr-voice__panel h2 {
   font-size: 1rem;
   line-height: 1.3;

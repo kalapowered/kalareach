@@ -93,6 +93,7 @@ function actions(): VoiceSurfaceActions {
     setMicrophoneMuted: vi.fn(),
     stopPlayback: vi.fn(),
     hangUp: vi.fn(),
+    endSetup: vi.fn(),
     cancelTask: vi.fn(),
     readSelection: vi.fn()
   }
@@ -522,6 +523,53 @@ describe('while a call is running', () => {
       }
     }
   )
+
+  // A delegation the voice service listed when the control attached has no offset, and is not said
+  // to have been asked at the start of the call.
+  it('does not place a delegation in the call when the service gave no offset', () => {
+    render(
+      <VoiceSurface
+        choice={choice()}
+        call={call({
+          delegations: [
+            { delegationId: 'd-0', offsetMs: null, told: true },
+            { delegationId: 'd-1', offsetMs: 1200, told: true }
+          ]
+        })}
+        currentTurn={null}
+        busy={false}
+        notice={null}
+        actions={actions()}
+      />
+    )
+    expect(screen.getByText('Asked before this device was listening')).toBeInTheDocument()
+    expect(screen.getByText('Asked 1.2 seconds in')).toBeInTheDocument()
+    expect(screen.queryByText('Asked 0.0 seconds in')).not.toBeInTheDocument()
+  })
+
+  // The device is making a call that has no descriptor to name: the screen offers no second start,
+  // which the device would turn away, and offers the one thing that can be done.
+  it('offers an end and no start while the device is setting a call up', async () => {
+    const person = userEvent.setup()
+    const acted = actions()
+    render(
+      <VoiceSurface
+        choice={choice()}
+        call={null}
+        currentTurn={null}
+        busy={false}
+        notice={null}
+        settingUp
+        actions={acted}
+      />
+    )
+    expect(screen.queryByRole('button', { name: 'Start voice session' })).not.toBeInTheDocument()
+
+    await person.click(screen.getByRole('button', { name: 'End the call' }))
+
+    expect(acted.endSetup).toHaveBeenCalledTimes(1)
+    expect(acted.hangUp).not.toHaveBeenCalled()
+  })
 
   // Section 13 line 879: every control this screen adds meets the platform's target minimum and
   // carries a name a screen reader can speak.

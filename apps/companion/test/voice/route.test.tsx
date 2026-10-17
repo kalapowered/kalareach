@@ -116,13 +116,13 @@ describe('before a call exists', () => {
   it('shows the warning and what is owed before a start', async () => {
     start((controls) => {
       controls.setVoiceWarning('The last call found that this voice service has no such call.')
-      controls.oweVoice({ words: 'The host was not told, so its grant may still be open.' })
+      controls.oweVoice({ words: 'The host did not confirm that it withdrew the grant.' })
     })
     await waitForChoice()
 
     const left = await screen.findByRole('status', { name: 'The last call' })
     expect(within(left).getByText(/no such call/)).toBeInTheDocument()
-    expect(within(left).getByText(/its grant may still be open/)).toBeInTheDocument()
+    expect(within(left).getByText(/did not confirm that it withdrew the grant/)).toBeInTheDocument()
   })
 
   // A call that ended while no screen looked is said to have ended, in the device's words, when a
@@ -140,7 +140,9 @@ describe('before a call exists', () => {
 
     const left = await screen.findByRole('status', { name: 'The last call' })
     expect(within(left).getByText(/from its notification/)).toBeInTheDocument()
-    expect(within(left).getByText(/The host was not told, so its grant may still be open/)).toBeInTheDocument()
+    expect(
+      within(left).getByText(/The host did not confirm that it withdrew the call's grant, so it may still be open/)
+    ).toBeInTheDocument()
   })
 
   // A host that will not answer the preparation leaves the person with its refusal, not with a
@@ -396,13 +398,13 @@ describe('while a call is running', () => {
     await person.click(screen.getByRole('button', { name: 'End session' }))
 
     await waitFor(() => {
-      expect(screen.getByText(/its grant may still be open/)).toBeInTheDocument()
+      expect(screen.getByText(/may still be open/)).toBeInTheDocument()
     })
     expect(screen.queryByRole('heading', { name: 'Voice session' })).not.toBeInTheDocument()
     // The host's words and never the protocol code the client library puts before them. The call is
     // closed and there is nothing here to try again, so no action is said after them.
-    const said = screen.getByText(/its grant may still be open/).textContent ?? ''
-    expect(said.endsWith('its grant may still be open: This host cannot be contacted right now.')).toBe(true)
+    const said = screen.getByText(/may still be open/).textContent ?? ''
+    expect(said.endsWith('so it may still be open: This host cannot be contacted right now.')).toBe(true)
     expect(said).not.toContain('RESOURCE_UNAVAILABLE')
   })
 
@@ -509,7 +511,108 @@ describe('while a call is running', () => {
       expect(screen.queryByRole('heading', { name: 'Voice session' })).not.toBeInTheDocument()
     })
     expect(screen.getByText(/from its notification/)).toBeInTheDocument()
-    expect(screen.getByText(/its grant may still be open: The host could not be reached\./)).toBeInTheDocument()
+    expect(screen.getByText(/so it may still be open: The host could not be reached\./)).toBeInTheDocument()
+  })
+
+  // The device is busy making a call that has no descriptor yet: a screen loaded again finds that,
+  // offers no second start, and can end what the device is making without naming it.
+  it('finds a device that is setting a call up and ends it without naming it', async () => {
+    const person = userEvent.setup()
+    const { port } = start((controls) => {
+      controls.settingUpAVoiceCall()
+    })
+    const stopped = vi.spyOn(port, 'voiceStop')
+
+    const end = await screen.findByRole('button', { name: 'End the call' })
+    expect(screen.queryByRole('button', { name: 'Start voice session' })).not.toBeInTheDocument()
+    await person.click(end)
+
+    await waitForChoice()
+    expect(stopped).toHaveBeenCalledWith(null, {})
+    // The control that was pressed is gone, and focus goes to what replaced it.
+    expect(screen.getByRole('heading', { name: 'Start a voice session' })).toHaveFocus()
+  })
+
+  // A setup the screen watched is over when the device says so, in the device's words.
+  it('says how a call that was being set up ended', async () => {
+    const { controls } = start((controls) => {
+      controls.settingUpAVoiceCall()
+    })
+    await screen.findByRole('button', { name: 'End the call' })
+
+    controls.endVoiceCall({
+      cause: 'start_unknown',
+      words: 'The host never said whether it created the call. Nothing is running on this device.',
+      host: { kind: 'not_told', words: 'The host never said whether it created the call.' }
+    })
+
+    await waitForChoice()
+    expect(screen.getByText(/Nothing is running on this device/)).toBeInTheDocument()
+  })
+
+  it('takes up a call that was being set up once it runs', async () => {
+    const { controls } = start((controls) => {
+      controls.settingUpAVoiceCall()
+    })
+    await screen.findByRole('button', { name: 'End the call' })
+
+    controls.holdAVoiceCall()
+
+    await screen.findByRole('heading', { name: 'Voice session' })
+    expect(screen.getByRole('button', { name: 'End session' })).toBeEnabled()
+  })
+
+  // What the device owes stops being said when it lapses, with no other change on the screen.
+  it('stops saying what is owed when it has lapsed', async () => {
+    start((controls) => {
+      controls.oweVoice({ until_ms: Date.now() + 400 })
+    })
+    await waitForChoice()
+    expect(await screen.findByRole('status', { name: 'The last call' })).toBeInTheDocument()
+
+    await waitFor(() => {
+      expect(screen.queryByRole('status', { name: 'The last call' })).not.toBeInTheDocument()
+    })
+  })
+
+  // The voice service is asked after the host and the screen does not wait for it: what it came to
+  // is said when it is known.
+  it('says what the voice service came to once it has said', async () => {
+    const { controls } = start()
+    await waitForChoice()
+    await userEvent.setup().click(screen.getByRole('button', { name: 'Start voice session' }))
+    await screen.findByRole('button', { name: 'End session' })
+    controls.endVoiceCall({ broker: 'pending' })
+    await waitForChoice()
+    expect(screen.queryByText(/has not confirmed that it closed the call/)).not.toBeInTheDocument()
+
+    controls.settleVoiceBroker('not_confirmed')
+
+    await waitFor(() => {
+      expect(screen.getByText(/has not confirmed that it closed the call/)).toBeInTheDocument()
+    })
+  })
+
+  // The microphone is the first thing to say: a stop whose media this device could not confirm
+  // stopped is not reported as a call that is closed, and the call stays on the screen.
+  it('does not say the call is closed when this device could not confirm the media stopped', async () => {
+    const person = userEvent.setup()
+    const { port } = start((controls) => {
+      controls.holdAVoiceCall()
+    })
+    vi.spyOn(port, 'voiceStop').mockResolvedValue({
+      closed_locally: false,
+      fence: null,
+      host_failure: null
+    })
+
+    await person.click(await screen.findByRole('button', { name: 'End session' }))
+
+    await waitFor(() => {
+      expect(screen.getByText(/could not confirm that the call's microphone stopped/)).toBeInTheDocument()
+    })
+    expect(screen.queryByText(/This device's call is closed/)).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'End session' })).toBeInTheDocument()
   })
 
   // The delegations the voice announced are rows the device keeps, and this version did nothing

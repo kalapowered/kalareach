@@ -26,8 +26,10 @@ import type {
   VoiceStopResult
 } from '@kalareach/protocol'
 
+import { failureWords } from '../host/port'
 import type {
   VoiceCallState,
+  VoiceClosure,
   VoiceDelegationRow,
   VoiceEnded,
   VoiceFence,
@@ -390,8 +392,8 @@ export const NOT_ACTED_ON_WORDS = 'Not done: this version does not act on spoken
 export interface Delegation {
   /** The provider's opaque identifier. Correlation data, never authority. */
   readonly delegationId: string
-  /** Where in the call it happened, in milliseconds from the start. */
-  readonly offsetMs: number
+  /** Where in the call it happened, in milliseconds from the start, or null when it is not known. */
+  readonly offsetMs: number | null
   /** Whether the model was told that nothing was done. */
   readonly told: boolean
 }
@@ -516,15 +518,52 @@ export function endedWords(
       )
       break
     case 'not_told':
-      parts.push(`The host was not told, so its grant may still be open: ${ended.host.words}`)
+      // Not told, or told and silent: either way the host has not said it withdrew the grant.
+      parts.push(
+        `The host did not confirm that it withdrew the call's grant, so it may still be open: ${ended.host.words}`
+      )
       break
     default:
       break
   }
-  if (ended.broker === 'not_confirmed') {
-    parts.push('The voice service has not confirmed that it closed the call; it closes it at its own deadline.')
-  }
   return parts.join(' ')
+}
+
+/**
+ * What the screen says of the voice service's part in a call's end, once it is known, or null when
+ * there is nothing to add: the service confirmed the closure, or there was no call to close.
+ *
+ * It is said apart from the rest of the end, because it arrives last: the service is asked after
+ * the host, and the screen does not wait for it.
+ */
+export function serviceWords(ended: VoiceEnded): string | null {
+  switch (ended.broker) {
+    case 'not_confirmed':
+      return 'The voice service has not confirmed that it closed the call; it closes it at its own deadline.'
+    case 'unknown':
+      return 'If the host made a call, the voice service holds it and closes it at its own deadline: this device cannot name it to close it.'
+    default:
+      return null
+  }
+}
+
+/**
+ * What the screen says of the end of a call it asked to end, or null when there is nothing to add:
+ * the call's media stopped here and the host's answer showed nothing its workers still owe.
+ */
+export function closureWords(
+  closure: VoiceClosure,
+  names: Readonly<Record<string, string>> = {}
+): string | null {
+  const here = closure.closed_locally
+    ? "This device's call is closed"
+    : "This device could not confirm that the call's microphone stopped"
+  if (closure.host_failure) {
+    return `${here}. The host did not confirm that it withdrew the grant, so it may still be open: ${failureWords(closure.host_failure)}`
+  }
+  const unconfirmed = closure.fence === null ? null : fenceWords(closure.fence, names)
+  if (unconfirmed === null) return closure.closed_locally ? null : `${here}.`
+  return `${here} and its grant withdrawn. ${unconfirmed}`
 }
 
 /**
@@ -532,9 +571,9 @@ export function endedWords(
  * stands until the moment the host's grant ends by itself.
  */
 export function owedWords(owed: VoiceOwed): string {
-  if (owed.kind !== 'revocation') return owed.words
+  if (owed.kind !== 'revocation') return `${owed.words} It was asked of ${owed.host_name}.`
   const until = new Date(owed.until_ms).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-  return `A grant the host may still hold open ends by itself at ${until}. ${owed.words}`
+  return `A grant ${owed.host_name} may still hold open ends by itself at ${until}. ${owed.words}`
 }
 
 /** Every capture state the surface can draw, by its wire name. */

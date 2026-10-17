@@ -157,7 +157,7 @@ test.describe('at the largest text size on a screen 320 points wide', () => {
           )
           window.krTestHost?.oweVoice({
             words:
-              'The host was not told, so its grant may still be open: the host could not be reached in time.'
+              'The host did not confirm that it withdrew the grant: the host could not be reached in time.'
           })
         })
         await page.getByTestId('voice-entry').click()
@@ -315,7 +315,7 @@ test.describe('at the largest text size on a screen 320 points wide', () => {
           )
           window.krTestHost?.oweVoice({
             words:
-              'The host was not told, so its grant may still be open: the host could not be reached in time.'
+              'The host did not confirm that it withdrew the grant: the host could not be reached in time.'
           })
         })
         await page.getByTestId('voice-entry').click()
