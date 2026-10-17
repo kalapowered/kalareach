@@ -590,17 +590,22 @@ pub async fn hosted_with(epoch: Epoch) -> Hosted {
         .map(String::as_str)
         .chain(["--version"])
         .collect();
-    let placed = std::panic::catch_unwind(|| {
-        kr_ipc::testing::place_and_start_once(&host_source, &host_program, &first_start);
-    });
-    assert!(
-        placed.is_ok(),
-        "this world starts the plugin host with {host_arguments:?}, and the one at {} would not \
-         start that way: a host with its epoch held is built with \
-         `cargo build -p kr-plugin-host --features testing`, which a workspace test run does \
-         itself",
-        host_source.display()
-    );
+    let place = || kr_ipc::testing::place_and_start_once(&host_source, &host_program, &first_start);
+    if host_arguments.is_empty() {
+        place();
+    } else if let Err(panic) = std::panic::catch_unwind(place) {
+        let said = panic
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| panic.downcast_ref::<&str>().map(|text| (*text).to_owned()))
+            .unwrap_or_default();
+        panic!(
+            "this world starts the plugin host with {host_arguments:?}, which the one at {} would \
+             not take: {said}. A host with its epoch held is built with `cargo build -p \
+             kr-plugin-host --features testing`, which a workspace test run does itself",
+            host_source.display()
+        );
+    }
 
     let (launched, launches) = std::sync::mpsc::channel::<WorkerLaunch>();
     let (service, task) = platform_supervisor(&environment);
