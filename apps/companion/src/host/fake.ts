@@ -569,7 +569,7 @@ export interface FakeHostControls {
   setVoiceWarning(words: string | null): void
   /** Leaves something owed at the host, until the moment the call would have closed. */
   oweVoice(owed: Partial<VoiceOwed>): void
-  /** Settles everything owed, as the device does when a host it owed a revocation answers it. */
+  /** Settles every revocation owed, as the device does when the host it owed it revokes the grant. */
   settleOwedVoice(): void
   /** Changes what the pairing screen shows, as native code would publish it. */
   setPairing(change: Partial<PairingView>): void
@@ -2716,7 +2716,7 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
       oweRevocation(owed)
     },
     settleOwedVoice() {
-      voice.owed.length = 0
+      voice.owed = voice.owed.filter((owed) => owed.kind !== 'revocation')
     },
     setPairing(change) {
       publishPairing(change)

@@ -555,7 +555,13 @@ impl Shared {
                     }
                 }
             }
-            if let (HostEnd::NotTold { words }, Some((_, until_ms)), Some(id), Some(host), true) = (
+            if let (
+                HostEnd::NotTold { words } | HostEnd::Refused { words },
+                Some((_, until_ms)),
+                Some(id),
+                Some(host),
+                true,
+            ) = (
                 &host_end,
                 &kept.service_call,
                 kept.voice_session_id,
@@ -617,10 +623,9 @@ impl Calls {
 
     /// Says that the host a call left a grant at is reached, over `session`, so that what this
     /// device owes it is asked once more: each revocation owed to `host` in `environment` that has
-    /// not lapsed goes to the host again. That the host revoked the grant, or says it holds no such
-    /// voice session, settles it; a host that could not do it now, or does not answer, leaves it
-    /// owed until the grant lapses. It runs on a task of its own and the screen does not wait for
-    /// it.
+    /// not lapsed goes to the host again. That the host revoked the grant settles it; a refusal, or
+    /// no answer, leaves it owed until the grant lapses, because a refusal does not say the grant
+    /// is gone. It runs on a task of its own and the screen does not wait for it.
     pub fn host_reached(
         &self,
         host: kr_protocol::ids::DeviceId,
@@ -660,7 +665,9 @@ impl Calls {
                     shared.timings.host_within,
                 )
                 .await;
-                if !matches!(end, HostEnd::NotTold { .. }) {
+                // Only a revocation done settles it: a refusal may come from a host that did not
+                // look at the session, and the grant is then still live.
+                if matches!(end, HostEnd::Revoked { .. }) {
                     shared.settled(&voice_session_id.to_string());
                 }
             }
@@ -795,6 +802,10 @@ impl Calls {
             shared.timings.host_within,
         )
         .await;
+        // A host that revoked the grant settles what this device owed it for that call.
+        if matches!(end, HostEnd::Revoked { .. }) {
+            shared.settled(&voice_session_id.to_string());
+        }
         Ok(Closed {
             local: false,
             host: end,

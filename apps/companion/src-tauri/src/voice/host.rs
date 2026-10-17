@@ -161,9 +161,13 @@ impl<R: Runtime> HostReach for AppReach<R> {
 /// Asks `host` to revoke the grant of the voice session `voice_session_id`, and says what came
 /// of it.
 ///
-/// What is kept apart is what the host answered: the stop revoked the grant, the host refused the
-/// stop (it no longer knows the call, so the grant it may hold ends when the call was to close),
-/// or the host was not told or did not answer in time (the revocation is owed).
+/// What is kept apart is what the host answered: the stop revoked the grant, the host refused
+/// the stop, or the host was not told or did not answer in time. Only the first is a revocation
+/// done. A refusal is not: the host answers `PermissionDenied` both when it holds no such voice
+/// session (the grant is then already gone) and before it looks at the session at all, when the
+/// device's right to stop is not admitted, when its window has expired or when its grants cannot
+/// be read, and the grant is then still live. So a refusal leaves the revocation owed, until the
+/// moment the grant ends by itself.
 pub async fn revoke(
     session: &Arc<Session>,
     environment_id: EnvironmentId,
@@ -196,7 +200,9 @@ pub async fn revoke(
                 words: error.message,
             },
         },
-        Ok(Err(kr_client::ClientError::Host(error))) => end_of_refusal(&error),
+        Ok(Err(kr_client::ClientError::Host(error))) => HostEnd::Refused {
+            words: error.message,
+        },
         Ok(Err(error)) => HostEnd::NotTold {
             words: error.to_string(),
         },
@@ -213,46 +219,4 @@ fn told_the_service(answer: &kr_client::Settled) -> bool {
         kr_cbor::CanonicalValue::Map(result)
             if matches!(result.get("broker_notified"), Some(kr_cbor::CanonicalValue::Bool(true)))
     )
-}
-
-/// What a host's refusal of a stop came to.
-///
-/// A refusal that says the host holds no such voice session, or does not let this device stop it
-/// (`PermissionDenied`), is the host's last word: the grant it holds ends when the call was to
-/// close. Any other refusal is a host that could not do it now, such as a store that would not
-/// write the revocation, and the host then keeps the session and its live grant for a stop asked
-/// again: nothing was revoked, and the revocation is still owed.
-pub(super) fn end_of_refusal(error: &kr_protocol::error::ProtocolError) -> HostEnd {
-    if error.code == kr_protocol::error::ErrorCode::PermissionDenied {
-        HostEnd::Refused {
-            words: error.message.clone(),
-        }
-    } else {
-        HostEnd::NotTold {
-            words: format!("The host could not revoke the grant now: {}", error.message),
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn refusal(code: kr_protocol::error::ErrorCode) -> kr_protocol::error::ProtocolError {
-        kr_protocol::error::ProtocolError::new(code, "the host's words".to_owned())
-    }
-
-    /// Only a host that holds no such voice session is done with a revocation. A host whose store
-    /// refused to write it holds the grant live, and a revocation owed to it stays owed.
-    #[test]
-    fn only_a_refusal_that_says_no_such_voice_session_is_final() {
-        assert!(matches!(
-            end_of_refusal(&refusal(kr_protocol::error::ErrorCode::PermissionDenied)),
-            HostEnd::Refused { .. }
-        ));
-        assert!(matches!(
-            end_of_refusal(&refusal(kr_protocol::error::ErrorCode::StorageUnavailable)),
-            HostEnd::NotTold { .. }
-        ));
-    }
 }

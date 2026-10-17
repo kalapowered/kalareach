@@ -1451,8 +1451,11 @@ impl Owner {
                 .to_owned(),
             });
         });
-        if let (HostEnd::NotTold { words }, Some(descriptor), Some(host)) =
-            (&host_end, &self.descriptor, &self.host)
+        if let (
+            HostEnd::NotTold { words } | HostEnd::Refused { words },
+            Some(descriptor),
+            Some(host),
+        ) = (&host_end, &self.descriptor, &self.host)
         {
             // The grant may be live at the host until the moment the call was to close, by the
             // host's reading of the clock.

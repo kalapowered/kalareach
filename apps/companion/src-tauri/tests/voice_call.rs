@@ -1829,7 +1829,7 @@ enum FailsAt {
     /// became of a start.
     Reaching,
     /// The first look at the host a call belongs to, which the owner takes before it asks
-    /// native code for anything; it fails whatever `told` says.
+    /// native code for anything; it fails while `told` is not set, as the others do not.
     InUse,
 }
 
@@ -1894,7 +1894,8 @@ fn request_of(scene: &Scene, prepared: &serde_json::Value) -> companion_tauri::v
     }
 }
 
-/// A reach to the scene's host that fails where `at` says once `told` is set.
+/// A reach to the scene's host that fails where `at` says: once `told` is set, or, for `InUse`,
+/// while it is not.
 fn failing_reach(scene: &Scene, at: FailsAt, told: usize) -> Arc<FailsWhenTold> {
     Arc::new(FailsWhenTold {
         inner: companion_tauri::voice::AppReach::new(scene.phone.companion.app.handle().clone()),
@@ -2114,6 +2115,27 @@ async fn a_failed_open_says_it_is_ending_while_it_cleans_up() {
     scene.stop_host().await;
 }
 
+/// Waits until the kept file, read as it is on disk, satisfies `until`, and returns it. Read raw: a
+/// write that has not finished has a staged file that `Kept::read` would take away.
+async fn kept_file_where(
+    directory: &std::path::Path,
+    until: impl Fn(&serde_json::Value) -> bool,
+) -> serde_json::Value {
+    tokio::time::timeout(WATCHDOG, async {
+        loop {
+            if let Ok(bytes) = std::fs::read(directory.join("voice-kept.json"))
+                && let Ok(file) = serde_json::from_slice::<serde_json::Value>(&bytes)
+                && until(&file)
+            {
+                return file;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("the kept file never held what was waited for")
+}
+
 /// The note that the voice service had no such call for this account outlives the process: a
 /// device launched again finds it standing for the same host, account and service, and not for
 /// another.
@@ -2133,6 +2155,8 @@ async fn the_note_that_the_service_had_no_such_call_survives_a_launch() {
         }
         other => panic!("the phone is signed in: {other:?}"),
     };
+    // The note is in the file once the write that follows the ending has finished.
+    kept_file_where(scene.phone.data.path(), |file| !file["note"].is_null()).await;
     let relaunched = Calls::on_phone(
         ScriptedCalls::new() as Arc<dyn companion_platform::call::CallPlatform>,
         service_at(scene.stand_in.origin()),
@@ -2157,14 +2181,9 @@ async fn the_note_that_the_service_had_no_such_call_survives_a_launch() {
     scene.stop_host().await;
 }
 
-/// A revocation this device could not tell its host is kept across a launch, and is asked again when
-/// the host is reached: an answer of any kind settles it. A host that did not answer in time, and
-/// that knows no such call when it is asked again, is no longer owed a revocation. (The connection
-/// loop's own call of `host_reached` is six lines; the host is reached again here by that call, as
-/// the loop makes it, since a restarted host in this suite is at an address the phone cannot reach.)
+/// A revocation this device could not tell its host outlives the process, with the host's name.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_revocation_owed_to_a_host_survives_a_launch_and_is_asked_again_when_the_host_is_reached()
-{
+async fn a_revocation_owed_to_a_host_survives_a_launch() {
     let timings = Timings {
         host_within: Duration::from_secs(2),
         ..quick()
@@ -2185,20 +2204,23 @@ async fn a_revocation_owed_to_a_host_survives_a_launch_and_is_asked_again_when_t
         .expect("the stop is answered");
     scene.stand_in.release_closes();
     assert!(closure["host_failure"].is_object(), "{closure}");
-    let owed = scene
+    scene
         .state_where("a revocation owed", |state| {
             state["owed"][0]["kind"] == "revocation"
         })
         .await;
-    assert_eq!(owed["owed"].as_array().map(Vec::len), Some(1), "{owed}");
+    kept_file_where(scene.phone.data.path(), |file| {
+        file["owed"].as_array().is_some_and(|owed| owed.len() == 1)
+    })
+    .await;
 
-    // A device launched again over the same directory holds the same debt, with the host's name.
     let relaunched = Calls::on_phone(
         ScriptedCalls::new() as Arc<dyn companion_platform::call::CallPlatform>,
         service_at(scene.stand_in.origin()),
         quick(),
         Kept::at(scene.phone.data.path()),
     );
+
     let state = relaunched.state(None);
     assert_eq!(state.owed.len(), 1, "{state:?}");
     assert_eq!(
@@ -2206,10 +2228,29 @@ async fn a_revocation_owed_to_a_host_survives_a_launch_and_is_asked_again_when_t
         voice_session_id
     );
     assert!(!state.owed[0].host_name.is_empty());
+    scene.stop_host().await;
+}
 
-    // The host did revoke the grant: only its answer was late. The phone reaches the host, and the
-    // host is asked again by the device that was launched again, from what the file kept of the
-    // host's identity, answers that it knows no such voice session, and the entry is settled.
+/// A host that is reached again is asked once more for each revocation it is owed, from what the file
+/// kept of its identity, and only a host that revokes the grant settles one. A host that refuses has
+/// not said that the grant is gone: the host refuses a stop of a call it holds, too, when the stop is
+/// not admitted, so the revocation stays owed until the grant ends by itself.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn only_a_host_that_revokes_the_grant_settles_what_it_was_owed() {
+    let mut scene = scene().await;
+    scene.stand_in.end_the_control_when_a_call_is_closed();
+    let started = scene.start().await;
+    let live: kr_protocol::ids::VoiceSessionId = started["value"]["outcome"]["started"]["session"]
+        ["voice_session_id"]
+        .as_str()
+        .expect("a voice session")
+        .parse()
+        .expect("an identifier");
+    scene
+        .state_where("an attached control", |state| {
+            state["control"] == "connected"
+        })
+        .await;
     let connection = scene
         .phone
         .companion
@@ -2220,25 +2261,64 @@ async fn a_revocation_owed_to_a_host_survives_a_launch_and_is_asked_again_when_t
     let companion_tauri::connection::Standing::Paired { host, .. } = connection.standing() else {
         panic!("the phone is a paired device");
     };
+    // Two revocations are owed to the host: one for a voice session it does not hold, asked first,
+    // and one for the call it holds, which only a revocation settles.
+    let unknown = kr_protocol::ids::VoiceSessionId::new(kr_ipc::new_uuid());
+    let owed = |id: kr_protocol::ids::VoiceSessionId| companion_tauri::voice::OwedView {
+        kind: "revocation".to_owned(),
+        words: "The host did not answer.".to_owned(),
+        action_id: None,
+        voice_session_id: Some(id.to_string()),
+        until_ms: now_ms() + 1_800_000,
+        host_reference: "a-host".to_owned(),
+        host_name: "A host".to_owned(),
+        host: Some((host.host_device_id, connection.environment_id())),
+    };
+    let directory = scene.phone.data.path().join("relaunch");
+    Kept::at(&directory)
+        .write(&companion_tauri::voice::KeptVoice {
+            owed: vec![owed(unknown), owed(live)],
+            note: None,
+        })
+        .expect("the file is written");
+    let relaunched = Calls::on_phone(
+        ScriptedCalls::new() as Arc<dyn companion_platform::call::CallPlatform>,
+        service_at(scene.stand_in.origin()),
+        quick(),
+        Kept::at(&directory),
+    );
+    assert_eq!(relaunched.state(None).owed.len(), 2);
+
     relaunched.host_reached(
         host.host_device_id,
         connection.environment_id(),
         connection.session(),
     );
+
     tokio::time::timeout(WATCHDOG, async {
-        while !relaunched.state(None).owed.is_empty() {
+        while relaunched.state(None).owed.len() != 1 {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
     })
     .await
-    .expect("the host asked again and the entry settled");
-    // What was settled is not owed after the next launch either.
-    let again = Calls::on_phone(
-        ScriptedCalls::new() as Arc<dyn companion_platform::call::CallPlatform>,
-        service_at(scene.stand_in.origin()),
-        quick(),
-        Kept::at(scene.phone.data.path()),
+    .expect("the host revoked the grant it held and the entry was settled");
+    let left = relaunched.state(None);
+    assert_eq!(
+        left.owed[0].voice_session_id.as_deref(),
+        Some(unknown.to_string().as_str()),
+        "the host that holds no such voice session did not settle its entry"
     );
-    assert!(again.state(None).owed.is_empty());
+    // What was settled is settled in the file too.
+    let file = kept_file_where(&directory, |file| {
+        file["owed"].as_array().is_some_and(|owed| owed.len() == 1)
+    })
+    .await;
+    assert_eq!(file["owed"][0]["voice_session_id"], unknown.to_string());
+    // The call the host held ended with its revocation.
+    scene
+        .state_where("the call the host revoked, ended", |state| {
+            state["running"] == false && state["ended"].is_object()
+        })
+        .await;
     scene.stop_host().await;
 }

@@ -191,8 +191,9 @@ pub enum HostEnd {
         /// Whether the host also told the voice service the call ended.
         broker_notified: bool,
     },
-    /// The host answered the stop with a refusal. It no longer knows the call, or does not let
-    /// this device stop it, and a grant it holds ends at the moment the call was to close.
+    /// The host answered the stop with a refusal. It may hold no such call, or may not have looked
+    /// at it, and a grant it holds ends at the moment the call was to close: the revocation is
+    /// owed.
     Refused {
         /// What the host said.
         words: String,
