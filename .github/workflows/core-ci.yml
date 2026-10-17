@@ -823,6 +823,17 @@ jobs:
         if: ${{ !cancelled() && matrix.part == 'second' }}
         run: cargo test --locked -p kr-flush
 
+      # A process that is ending releases its locks on a store's write-ahead index before the
+      # system removes its mapping of it, and the next process to open the store in that interval
+      # is told its disk failed. Every store a daemon opens waits that out, through the flush
+      # crate's open, and each has a case that holds its index mapped the way an ending process
+      # does and fails unless the open waits. The stores whose crates this job runs whole
+      # (the attention store, the plugin catalogue, the project and transfer stores, the worker's
+      # journal) are checked by those steps; these are the other eight.
+      - name: Test that each store waits for the holder that is letting go of it
+        if: ${{ !cancelled() && matrix.part == 'second' }}
+        run: cargo test --locked -p kr-controller -p kr-changeset -p kr-delivery -p kr-describe -p kr-automation --lib a_previous_holder_that_is_letting_go
+
       # The contact skill installed and removed on this platform: the installer's own tests, the
       # crash accounting among them, and a configuration refused before anything is written where
       # it carries an entry set on it or is encrypted, replaced with the same access where its
