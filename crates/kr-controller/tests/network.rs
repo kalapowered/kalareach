@@ -34,7 +34,6 @@ use iroh::{Endpoint, EndpointAddr};
 use kr_client::cursors::{Restoration, RestorationStep};
 use kr_client::ipc::IpcTransport;
 use kr_client::session::Session;
-use kr_client::transport::NetworkTransport;
 use kr_controller::registry::Registry;
 use kr_controller::service::net::devices::DeviceRecord;
 use kr_controller::service::net::{self, Network, NetworkSetup};
