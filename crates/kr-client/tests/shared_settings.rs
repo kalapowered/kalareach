@@ -395,6 +395,11 @@ async fn an_object_sealed_under_another_epoch_is_refused_by_name_and_not_as_tamp
         panic!("the service's own refusal, not a failure to open: {error:?}");
     };
     assert_eq!(error.code(), ErrorCode::ResyncRequired);
+    let said = error.to_string();
+    assert!(
+        said.contains("epoch 0") && said.contains("epoch 1"),
+        "the refusal names the two epochs: {said}"
+    );
     // The same epoch reads it.
     assert!(matches!(
         old.fetch(SyncObjectKind::Settings, object_id, now())

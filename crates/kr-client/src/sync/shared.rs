@@ -15,12 +15,13 @@
 //! to one epoch too. So a value of this type and the [`CollectionSealer`](super::CollectionSealer)
 //! beside it are built together for the epoch the installed key record carries, and a client built
 //! over them writes under that epoch and no other. When the collection moves to a newer epoch,
-//! both are built again from the installed record; this type never reads the epoch from the
-//! service, because a ciphertext sealed under one key must not travel under the name of another.
+//! both are built again from the installed record; this type never takes the epoch it writes
+//! under from the service, because a ciphertext sealed under one key must not travel under the name
+//! of another.
 //!
-//! # The two answers that are not data
+//! # The three answers that are not data
 //!
-//! A shared collection can answer a request with two things the single-object interface has no
+//! A shared collection can answer a request with three things the single-object interface has no
 //! word for, and each is said in the words it has:
 //!
 //! * **A write under an epoch the collection has retired** stored nothing and held nothing, and is
@@ -30,6 +31,9 @@
 //!   fenced and never ran, which is what a request that stored nothing and never will is.
 //! * **A collection that does not list this installation** is answered as one that does not exist.
 //!   It is refused as [`ErrorCode::UnknownSession`], as the same answer is everywhere else.
+//! * **An object sealed under another epoch than the one this reads** is not opened with the key of
+//!   this one. It is refused as [`ErrorCode::ResyncRequired`] naming both epochs, where the sealer
+//!   would say only that it did not authenticate and the answer would read as tampering.
 
 use std::sync::Arc;
 

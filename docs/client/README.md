@@ -1140,8 +1140,8 @@ for one collection and one epoch. Writes to this using a different (retired) epo
 was fenced and didn't run. Talking to a collection that doesn't list this installation will produce
 `UnknownSession` errors. The sealer returned by `SharedCollectionService::sealer` will also be for
 the same epoch, so that what a client seals and what it asks the service to write are for one epoch.
-The epoch is never read from the service, and an object sealed under another epoch is refused by
-name instead of failing to open.
+The epoch a client writes under never comes from the service, and an object sealed under another
+epoch is refused by name instead of failing to open.
 
 An answer names where the collection's key records stood, `services::KeyHead`, when the service
 named it: a write and a comparison in a collection a key record has claimed, and a status query or
