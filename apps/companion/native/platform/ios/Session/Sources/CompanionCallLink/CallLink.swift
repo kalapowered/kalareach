@@ -33,7 +33,7 @@ public enum CallLink {
 
   /// The commands the adapter takes.
   public static let commands = [
-    "callOpen", "callOffer", "callAccept", "callPermit", "callMute", "callStop", "callState",
+    "callOpen", "callOffer", "callAccept", "callPermit", "callMute", "callStop", "callState", "callAlive",
   ]
 
   /// What a command's answer is: the result as JSON text, or a code from the closed set and a

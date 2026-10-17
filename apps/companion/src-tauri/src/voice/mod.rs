@@ -50,6 +50,8 @@ pub struct Timings {
     pub local_within: Duration,
     /// How long the host is given to answer a stop or a question.
     pub host_within: Duration,
+    /// How long the host is given to answer a start before the answer is taken as lost.
+    pub start_within: Duration,
     /// How long the account is given to produce its voice token.
     pub token_within: Duration,
     /// How long the voice service's own route is given to close a call.
@@ -65,6 +67,7 @@ impl Default for Timings {
             silent_signs: 3,
             local_within: Duration::from_secs(20),
             host_within: Duration::from_secs(20),
+            start_within: Duration::from_secs(90),
             token_within: Duration::from_secs(20),
             close_within: Duration::from_secs(15),
             repeat_delays: [
@@ -423,7 +426,7 @@ impl Calls {
                 .map(|session| session.voice_session_id);
             // A page that names another call than the one held is stale: it ends nothing of the
             // held call's, and asks the host about what it named.
-            if voice_session_id.is_none() || held.is_none() || voice_session_id == held {
+            if voice_session_id.is_none() || (held.is_some() && voice_session_id == held) {
                 let (reply, answer) = oneshot::channel();
                 if commands.send(Cmd::Stop(reply)).await.is_ok()
                     && let Ok(closed) = answer.await

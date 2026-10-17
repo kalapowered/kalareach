@@ -25,7 +25,7 @@
 //! | A page that is loaded again finds the call and can end it | `a_page_that_is_loaded_again_finds_the_call_and_ends_it` |
 //! | Native code that stops answering the signs of life ends the call | `native_code_that_stops_answering_ends_the_call` |
 //! | A sign-out during the call ends it | `signing_out_during_a_call_ends_it` |
-//! | A host that is lost and found again is told to the model both times | `a_host_that_is_lost_and_found_again_is_told_to_the_model_both_times` |
+//! | A lost host is told to the model, and a refusal to vouch for the call is not its return | `a_host_that_is_lost_is_told_to_the_model_and_a_refusal_is_not_its_return` |
 
 #[path = "../../../../crates/kr-controller/tests/net_support/mod.rs"]
 mod net_support;
@@ -382,11 +382,16 @@ async fn a_call_runs_from_the_pages_start_to_its_hang_up() {
         session["answer_sdp"], "",
         "the provider's answer, which holds the call's ICE credentials, is native code's and not the page's"
     );
+    let steps: Vec<String> = scene
+        .platform
+        .commands()
+        .into_iter()
+        .filter(|command| command != "alive")
+        .collect();
     assert_eq!(
-        scene.platform.commands()[..4],
+        steps[..4],
         ["open", "offer", "accept", "permit"],
-        "{:?}",
-        scene.platform.commands()
+        "{steps:?}"
     );
     assert_eq!(
         scene.platform.answer().as_deref(),
@@ -637,13 +642,19 @@ async fn a_failed_connection_ends_the_call_with_no_page() {
 /// ends the call when it holds none.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn news_that_was_lost_is_checked_against_what_native_code_holds() {
-    let scene = scene().await;
+    // No sign of life is due for an hour, so only the check of lost news can end this call.
+    let timings = Timings {
+        tick: Duration::from_secs(3600),
+        ..quick()
+    };
+    let scene = scene_with(timings, Some(phone_grant(PHONE_TOKEN, 3600)), None).await;
     scene.start().await;
     scene
         .state_where("a running call", |state| state["running"] == true)
         .await;
 
     // The call ends and its end is never heard: a number is skipped.
+    let signs_before = scene.platform.count("alive");
     scene.platform.end_without_saying_so();
     scene.platform.lose_some_news();
 
@@ -651,6 +662,15 @@ async fn news_that_was_lost_is_checked_against_what_native_code_holds() {
         .state_where("the end", |state| state["ended"]["cause"] == "native_gone")
         .await;
     assert_eq!(ended["ended"]["host"]["kind"], "revoked");
+    assert!(
+        scene.platform.count("held") >= 1,
+        "native code was asked what it holds"
+    );
+    assert_eq!(
+        scene.platform.count("alive"),
+        signs_before,
+        "no sign of life ended it"
+    );
     scene.host.stop().await;
 }
 
@@ -924,11 +944,12 @@ async fn signing_out_during_a_call_ends_it() {
     scene.host.stop().await;
 }
 
-/// The host connection is lost during the call. The call goes on, the model is told once by a
-/// fixed sentence, and when the host is reached again it is told that too, and the screen's state
-/// says which.
+/// The host connection is lost during the call. The call goes on, and the model is told by a fixed
+/// sentence. When a connection to the host is made again, the host's refusal to say that the call
+/// is still its own (this one names a session the host never held) is not taken for its return:
+/// the screen is told so in words, still says the host is lost, and the model is told nothing more.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_host_that_is_lost_and_found_again_is_told_to_the_model_both_times() {
+async fn a_host_that_is_lost_is_told_to_the_model_and_a_refusal_is_not_its_return() {
     let scene = scene().await;
     scene.start().await;
     scene
@@ -960,26 +981,27 @@ async fn a_host_that_is_lost_and_found_again_is_told_to_the_model_both_times() {
         .close();
 
     scene
-        .state_where("a host that is lost", |state| state["host"] == "lost")
-        .await;
-    scene
-        .state_where("a host that is found again", |state| {
-            state["host"] == "reachable"
-        })
-        .await;
-    scene
         .stand_in
         .control()
-        .until("both sentences", |report| {
+        .until("the sentence for a lost host", |report| {
             report
                 .sent
                 .iter()
                 .filter(|sent| sent.command == "instructions")
                 .count()
-                >= 3
+                >= 2
         })
         .await;
-    assert_eq!(scene.state()["running"], true, "the call went on");
+    let refused = scene
+        .state_where("the host's refusal", |state| state["warning"].is_string())
+        .await;
+    assert_eq!(refused["host"], "lost", "a refusal is not a return");
+    assert_eq!(refused["running"], true, "the call went on");
+    assert_eq!(
+        instructions(&scene),
+        2,
+        "the model was told once of the loss"
+    );
     let _ = scene.call("voice_stop", json!({ "voiceSessionId": null }));
     scene.host.stop().await;
 }

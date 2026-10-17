@@ -330,5 +330,6 @@ class CallWireTest {
         override fun setMuted(call: String, what: CallMute, muted: Boolean) = Unit
         override fun stop(call: String) = Unit
         override fun held() = HeldCall(null, VoiceCaptureState.IDLE, microphoneMuted = false, playing = false)
+        override fun alive(call: String) = held()
     }
 }

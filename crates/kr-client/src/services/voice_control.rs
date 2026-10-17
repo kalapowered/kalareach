@@ -223,7 +223,7 @@ impl ControlTarget {
     ) -> Result<Self> {
         if !super::voice::same_origin(service_origin, descriptor_origin) {
             return Err(local(
-                "the host named a voice service that is not the one this device's account is                  signed in at, so this device presents no token there",
+                "the host named a voice service that is not the one this device's account is signed in at, so this device presents no token there",
             ));
         }
         if call_id.is_empty() || control_path != voice_control_path(call_id) {
