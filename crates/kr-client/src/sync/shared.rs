@@ -12,7 +12,7 @@
 //! # One epoch per value
 //!
 //! The epoch is part of what a write asks, and the sealer that made the write's ciphertext belongs
-//! to one epoch too. So a value of this type and the [`CollectionSealer`](super::CollectionSealer)
+//! to one epoch too. So a value of this type and the [`CollectionSealer`]
 //! beside it are built together for the epoch the installed key record carries, and a client built
 //! over them writes under that epoch and no other. When the collection moves to a newer epoch,
 //! both are built again from the installed record; this type never takes the epoch it writes
