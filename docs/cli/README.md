@@ -1469,11 +1469,12 @@ document is the host's whole result with the failure's code and status beside it
 ## `kr device`
 
 `kr device list [--include-revoked]` lists the devices paired with this host: each one's
-identifier, its name, whether it is an owner device, and the last authority revision it
-acknowledged. `--json` also gives each device's platform, when its pairing ends, whether the host
-finds the pairing run out and whether the pairing opens every session. A device that is offline
-cannot apply a revocation it has not received, and the acknowledgement is how you see which devices
-have.
+identifier, whether it is revoked, an owner device or paired, and its name. It ends with the
+authority revision in force, and says when the revocation feed is unreachable or was removed.
+`--json` also gives each device's platform, when its pairing ends, whether the host finds the
+pairing run out and whether the pairing opens every session, with the same feed state. A host that
+cannot read the feed cannot apply a revocation it has not received, and the feed state is how you
+see whether the list may be stale.
 
 `kr device revoke <device>` revokes a device and every grant it holds. An identifier this host never
 paired is refused with `RESOURCE_UNAVAILABLE` and nothing is sent; a device already revoked answers
