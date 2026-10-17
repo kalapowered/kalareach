@@ -267,9 +267,23 @@ impl Controller {
         // destination sends under the device's own pairing grant, which the unmarked record still
         // holds, and nothing else would stop it. The error is answered after the destination is
         // ended.
-        let ends_calls = lapsed.is_none();
-        if ends_calls {
+        // A device the host no longer pairs holds no call: the voice sessions it started end, and
+        // the service is told to close the calls, instead of running to their deadlines. On a task
+        // of its own, so that a service that answers slowly holds neither the fence nor this
+        // answer: the revocation does not wait for the provider's billing. It starts here, before
+        // the record's error is answered, because a record that could not be marked leaves the
+        // grants withdrawn all the same, and a call that nothing ends would run to its deadline.
+        if lapsed.is_none() {
             self.retire_push_destination(device_id);
+            if let Some(voice) = self.voice.get() {
+                let voice = std::sync::Arc::clone(voice);
+                tokio::spawn(async move {
+                    voice
+                        .coordinator()
+                        .end_calls_of_revoked_device(device_id, now_ms)
+                        .await;
+                });
+            }
         }
         recorded?;
         let answer = match lapsed {
@@ -295,19 +309,6 @@ impl Controller {
                 .await
             }
         };
-        // A device the host no longer pairs holds no call: the voice sessions it started end, and
-        // the service is told to close the calls, instead of running to their deadlines. After the
-        // fence, on a task of its own, so that a service that answers slowly holds neither the
-        // fence nor this answer: the revocation does not wait for the provider's billing.
-        if ends_calls && let Some(voice) = self.voice.get() {
-            let voice = std::sync::Arc::clone(voice);
-            tokio::spawn(async move {
-                voice
-                    .coordinator()
-                    .end_calls_of_revoked_device(device_id, now_ms)
-                    .await;
-            });
-        }
         answer
     }
 

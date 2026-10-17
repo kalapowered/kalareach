@@ -576,9 +576,10 @@ impl Coordinator {
     /// leaves is the calls: a voice session stays in the registry, and the call stays open at the
     /// service, until its own deadline. A device the host no longer pairs holds no call, so each
     /// of its voice sessions is ended as a stop would end it: its grant is revoked first when it
-    /// is still live (a grant that cannot be revoked leaves its voice session known, to be ended
-    /// by a stop or by the deadline), then the record leaves and the service is told so it can
-    /// finalise the call.
+    /// is still live (a grant that cannot be revoked leaves its voice session known and its call
+    /// open at the service, to be ended by the sweep of calls that are over at the call's
+    /// deadline: a device the host revoked sends no stop), then the record leaves and the service
+    /// is told so it can finalise the call.
     ///
     /// # Panics
     ///
