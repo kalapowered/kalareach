@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures::StreamExt as _;
-use iroh::endpoint::Connection;
+use iroh::endpoint::{ConnectError, ConnectingError, Connection, ConnectionError};
 use iroh::{Endpoint, EndpointAddr, EndpointId, RelayUrl, TransportAddr};
 use kr_protocol::hello::ALPN;
 use kr_transport::clock::ManualClock;
@@ -166,6 +166,51 @@ async fn a_pkarr_server_that_never_answers_ends_the_lookup_with_a_failure() {
     );
 }
 
+/// How long a case lets a dial go on before it takes the host for gone.
+///
+/// It ends a dial that never ends and decides nothing else: the transport ends a dial that nobody
+/// answers by itself, after its own thirty seconds, and a dial that is answered ends the wait at
+/// once.
+const DIAL_HUNG: Duration = Duration::from_secs(300);
+
+/// Dials `address` from `endpoint` until a connection is made, and returns it.
+///
+/// A dial the transport gave up on, because nothing answered it inside its thirty seconds, is made
+/// again, as a client reconnects once the transport is declared unavailable: the host has read no
+/// frame of it, so nothing it keeps depends on that dial. Any other failure is the case's.
+///
+/// # Panics
+///
+/// Panics when a dial fails for any other reason, or when [`DIAL_HUNG`] passes first.
+async fn dial(endpoint: &Endpoint, address: EndpointAddr) -> Connection {
+    let gave_up_unanswered = |error: &ConnectError| {
+        matches!(
+            error,
+            ConnectError::Connecting {
+                source: ConnectingError::ConnectionError {
+                    source: ConnectionError::TimedOut,
+                    ..
+                },
+                ..
+            } | ConnectError::Connection {
+                source: ConnectionError::TimedOut,
+                ..
+            }
+        )
+    };
+    tokio::time::timeout(DIAL_HUNG, async {
+        loop {
+            match endpoint.connect(address.clone(), ALPN).await {
+                Err(error) if gave_up_unanswered(&error) => {}
+                outcome => return outcome,
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("no dial was answered in {DIAL_HUNG:?}"))
+    .unwrap_or_else(|error| panic!("the device reaches the host: {error}"))
+}
+
 /// Accepts one connection on the host and authorises it against the one device it paired.
 fn accept_paired(
     host: &Side,
@@ -178,12 +223,14 @@ fn accept_paired(
         record: device.record,
     };
     tokio::spawn(async move {
-        let connection = endpoint
-            .accept()
-            .await
-            .expect("an incoming connection")
-            .await
-            .expect("a connection");
+        // The first connection that is made. A dial the device gave up on and made again leaves an
+        // attempt that ends without one, and the host takes the next.
+        let connection = loop {
+            let incoming = endpoint.accept().await.expect("an incoming connection");
+            if let Ok(connection) = incoming.await {
+                break connection;
+            }
+        };
         let challenges = support::ledger();
         let issuer = support::windows(&ManualClock::new());
         let admitted = handshake::accept(
@@ -610,10 +657,7 @@ async fn a_device_with_a_stale_bundle_resolves_the_pinned_host_again_on_its_new_
         .expect("an address from the bundle");
 
     let accepting = accept_paired(&host, &device);
-    let connection = tokio::time::timeout(PATIENCE, device.endpoint.connect(hinted.clone(), ALPN))
-        .await
-        .expect("the device reaches the host in time")
-        .expect("a connection while the bundle is current");
+    let connection = dial(&device.endpoint, hinted.clone()).await;
     handshake::connect(&connection, &device.identity, &host.record)
         .await
         .expect("the paired host");
@@ -659,10 +703,7 @@ async fn a_device_with_a_stale_bundle_resolves_the_pinned_host_again_on_its_new_
     // Dialled with the stale bundle, the device finds the host where it is now, and the host it
     // finds is the one it paired with.
     let accepting = accept_paired(&host, &device);
-    let connection = tokio::time::timeout(PATIENCE, device.endpoint.connect(hinted, ALPN))
-        .await
-        .expect("the device reaches the moved host in time")
-        .expect("a connection with a stale bundle");
+    let connection = dial(&device.endpoint, hinted).await;
     let authorised = handshake::connect(&connection, &device.identity, &host.record)
         .await
         .expect("the moved host is the paired host");
