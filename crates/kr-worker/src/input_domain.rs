@@ -29,7 +29,13 @@
 //! attachment's subscription, the removal of an attachment, the interrupt of the foreground
 //! process group, and the answer to a command hook. [`InputDomain::apply_effects`] carries out
 //! every other step in the machine's order and hands these back, with whatever the machine ordered
-//! after one of them, for the session to carry out with this lock let go.
+//! after one of them (an `editor_busy` event holds nothing back, because it only tells a
+//! subscriber what happened), for the session to carry out with this lock let go.
+//!
+//! What a keystroke or the timer leaves for the session is only ever an `editor_busy` event. It
+//! waits in the domain until the next stimulus the session applies, which hands it back in front of
+//! its own steps in the same hold, or until the pump takes it, so the events a subscriber is told
+//! are told in the order the machine produced them.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -381,9 +387,9 @@ pub struct InputDomain {
     /// Steps of the root editor's machine that need the session, left here by a keystroke or the
     /// timer, which cannot take it. The pump carries them out.
     owed: Vec<Step>,
-    /// Whether the response lane still holds replies after the last time it was drained. A
-    /// keystroke or the timer that sees this asks the pump to look again, because the lane is the
-    /// session's and they do not take the session.
+    /// Whether the response lane held replies the gate allows out after the last time it was
+    /// drained. A keystroke that sees this asks the pump to look again, because the lane is the
+    /// session's and a keystroke does not take the session.
     replies_waiting: bool,
     /// The last takeover receipt the machine completed.
     takeover_receipt: Option<TakeoverReceipt>,
@@ -726,7 +732,15 @@ impl InputDomain {
     }
 
     /// Leaves steps for the pump, which takes the session to carry them out.
+    ///
+    /// A keystroke and the timer leave only `editor_busy` events: the stimuli they make cannot
+    /// order the removal of an attachment, an interrupt or the answer to a command hook, which are
+    /// the steps whose order against bytes matters.
     pub(crate) fn owe(&mut self, steps: Vec<Step>) {
+        debug_assert!(
+            steps.iter().all(|step| matches!(step, Step::EditorBusy(_))),
+            "a keystroke or the timer left a step for the session that is not an event: {steps:?}"
+        );
         self.owed.extend(steps);
     }
 
@@ -746,8 +760,8 @@ impl InputDomain {
         self.replies_waiting = waiting;
     }
 
-    /// Returns whether the response lane held replies when it was last drained, which the next
-    /// keystroke or timer pass asks the pump to take.
+    /// Returns whether the response lane held replies the gate allows out when it was last
+    /// drained, which the next keystroke asks the pump to take.
     #[must_use]
     pub const fn replies_waiting(&self) -> bool {
         self.replies_waiting
@@ -1250,7 +1264,7 @@ impl InputDomain {
     }
 
     /// Returns the root-editor driver for a stimulus.
-    pub const fn fence_mut(&mut self) -> Option<&mut FenceDriver> {
+    pub(crate) const fn fence_mut(&mut self) -> Option<&mut FenceDriver> {
         self.fence.as_mut()
     }
 
@@ -1376,7 +1390,10 @@ impl InputDomain {
                 close_session: effects.close_session,
                 ..FenceOutcome::default()
             },
-            owed: Vec::new(),
+            // What an earlier keystroke or pass of the timer left for the session goes first: the
+            // machine produced it first. A caller that is a keystroke or the timer leaves the
+            // whole list again, in the same order, in the same hold.
+            owed: std::mem::take(&mut self.owed),
         };
         // Set by the first step that later steps must wait for.
         let mut behind_a_session_step = false;
@@ -1533,6 +1550,52 @@ mod tests {
             matches!(applied.owed.as_slice(), [Step::EditorBusy(_)]),
             "the event is the only thing left for the session"
         );
+    }
+
+    /// An event a keystroke left for the session is told before the events the next stimulus the
+    /// session applies produces, and a keystroke after that leaves its event behind them.
+    #[test]
+    fn events_are_told_in_the_order_the_machine_produced_them() {
+        let (first, second, third) = (
+            AttachmentId::new(kr_ipc::new_uuid()),
+            AttachmentId::new(kr_ipc::new_uuid()),
+            AttachmentId::new(kr_ipc::new_uuid()),
+        );
+        let mut input = domain();
+        // A keystroke sweeps an exchange that timed out: its event waits for the session.
+        let keystroke = input.apply_effects(Effects {
+            steps: vec![editor_busy(first)],
+            ..Effects::default()
+        });
+        input.owe(keystroke.owed);
+
+        // The next stimulus the session applies produces an event of its own.
+        let applied = input.apply_effects(Effects {
+            steps: vec![editor_busy(second)],
+            ..Effects::default()
+        });
+        let told = |steps: &[Step]| -> Vec<AttachmentId> {
+            steps
+                .iter()
+                .map(|step| match step {
+                    Step::EditorBusy(event) => event.attachment_id,
+                    other => panic!("not an event: {other:?}"),
+                })
+                .collect()
+        };
+        assert_eq!(
+            told(&applied.owed),
+            [first, second],
+            "the older event is told first"
+        );
+        assert!(!input.is_owed(), "and nothing is left to be told twice");
+
+        // A keystroke after that leaves its event behind the ones already handed over.
+        let keystroke = input.apply_effects(Effects {
+            steps: vec![editor_busy(third)],
+            ..Effects::default()
+        });
+        assert_eq!(told(&keystroke.owed), [third]);
     }
 
     /// A step that must wait for a session step still does when an event came before it.

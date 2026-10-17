@@ -3114,10 +3114,12 @@ impl Session {
         let mut input = shared.lock();
         let replies = self.engine.drain_replies(input.lane_gate());
         let applied = input.queue_replies(replies);
-        // One drain takes a bounded part of the lane. What is left is looked at again whenever a
-        // keystroke or the recogniser's timer next passes: they cannot take this session, so they
-        // are told here that something waits.
-        input.set_replies_waiting(self.engine.replies_pending());
+        // One drain takes a bounded part of the lane. What is left, and the gate lets out, is
+        // looked at again whenever a keystroke next passes: it cannot take this session, so it is
+        // told here that something waits. What a closed gate holds back is let out by the
+        // keystroke that opens the gate.
+        let waiting = self.engine.replies_pending() && input.lane_gate().allows_write();
+        input.set_replies_waiting(waiting);
         drop(input);
         // The machine's answer to them can let more out, and is looked at again, which must find
         // this batch already queued.
@@ -3750,6 +3752,8 @@ impl Session {
             input
                 .capabilities(id)
                 .cloned()
+                // An attachment that is leaving has lost its capabilities before the table lets it
+                // go, and its summary shows none.
                 .unwrap_or_else(CanonicalSet::new)
         })
     }
