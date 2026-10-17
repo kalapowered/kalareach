@@ -498,7 +498,9 @@ pub fn start<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
     if !is_a_run_name(&request.run) {
         return;
     }
-    let platform = companion_platform::call::NativeCalls::new(app.clone());
+    let platform = companion_platform::call::NativeCalls::new(
+        companion_platform::call::PluginCommands::new(app.clone()),
+    );
     tauri::async_runtime::spawn(async move {
         let closes_at = u64::try_from(
             std::time::SystemTime::now()
@@ -742,6 +744,13 @@ mod tests {
                     microphone_muted: *self.muted.lock().unwrap(),
                     playing: false,
                 })
+            })
+        }
+
+        fn alive<'a>(&'a self, call: &'a CallId) -> CallFuture<'a, Held> {
+            Box::pin(async move {
+                self.named(call)?;
+                self.held().await
             })
         }
     }

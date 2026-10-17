@@ -557,11 +557,18 @@ pub trait CallPlatform: Send + Sync {
 
     /// What native code reports of the call it holds.
     fn held(&self) -> CallFuture<'_, Held>;
+
+    /// Tells native code that the caller still owns the call, and answers what it holds, as
+    /// [`Self::held`] does.
+    ///
+    /// Native code ends a call whose owner has given no sign for a stated time. A refusal that
+    /// says the call has ended, or that no call by that name is held, is also the answer to
+    /// whether the call is still there.
+    fn alive<'a>(&'a self, call: &'a CallId) -> CallFuture<'a, Held>;
 }
 
 /// The shapes of the commands Rust sends to native code and of what native code answers, which
 /// [`NativeCalls`] speaks and the tests hold to the fixtures.
-#[cfg(any(mobile, test))]
 mod wire {
     use serde::{Deserialize, Serialize};
 
@@ -641,77 +648,167 @@ mod wire {
     pub(crate) struct Nothing {}
 }
 
-#[cfg(any(mobile, test))]
 use wire::*;
 
 #[cfg(mobile)]
-pub use native::NativeCalls;
+pub use native::PluginCommands;
+pub use native::{CommandFuture, Commands, Deadlines, NativeCalls};
 
-#[cfg(mobile)]
 mod native {
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::Arc;
+    use std::time::Duration;
+
     use serde::Serialize;
     use serde::de::DeserializeOwned;
-    use tauri::{AppHandle, Manager as _, Runtime};
 
     use super::{
         AcceptRequest, AcceptResponse, Answered, CallFailure, CallFuture, CallId, CallPlatform,
-        CallRequest, FailureKind, Held, Mute, MuteRequest, Nothing, OfferResponse, OpenRequest,
-        OpenResponse, OpenedCall, PermitRequest, PermitResponse, event_queue,
+        CallRequest, EventSink, FailureKind, Held, Mute, MuteRequest, Nothing, OfferResponse,
+        OpenRequest, OpenResponse, OpenedCall, PermitRequest, PermitResponse, event_queue,
     };
 
-    /// The voice call of a phone, reached through the platform plugin's native half.
-    pub struct NativeCalls<R: Runtime> {
-        app: AppHandle<R>,
+    /// What native code gives back for one command.
+    pub type CommandFuture =
+        Pin<Box<dyn Future<Output = Result<serde_json::Value, CallFailure>> + Send>>;
+
+    /// How a command reaches native code, as JSON.
+    ///
+    /// On a phone this is the platform plugin's native half. A test gives its own, which answers
+    /// as scripted.
+    pub trait Commands: Send + Sync + 'static {
+        /// The channel native code reports one call's news on, delivering to `sink`, as the value
+        /// the command that opens a call takes for it.
+        fn channel(&self, sink: EventSink) -> serde_json::Value;
+
+        /// Sends one command and waits for the answer. Native code answers every command, however
+        /// long it takes; the plugin keeps the place its answer goes to until it comes, so the
+        /// future is run to its end by [`NativeCalls`] even when the caller has given up on it.
+        fn invoke(&self, method: &'static str, arguments: serde_json::Value) -> CommandFuture;
     }
 
-    impl<R: Runtime> NativeCalls<R> {
-        /// The calls of the application `app` runs.
+    /// How long each kind of command may take before the caller goes on without its answer.
+    ///
+    /// Native code is waited on for a reason of its own in each: a person answering the
+    /// microphone question, the media engine making or applying a description, the engine's
+    /// teardown. A caller that waited without a bound would hold a revocation behind any of them.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct Deadlines {
+        /// Opening a call, which may ask the person for the microphone and for notifications.
+        pub open: Duration,
+        /// Making the offer and applying the answer, which native code gives 30 seconds each.
+        pub description: Duration,
+        /// Permitting the call.
+        pub permit: Duration,
+        /// A mute, a stop, a sign, a read of what is held.
+        pub quick: Duration,
+    }
+
+    impl Default for Deadlines {
+        fn default() -> Self {
+            Self {
+                open: Duration::from_secs(150),
+                description: Duration::from_secs(45),
+                permit: Duration::from_secs(30),
+                quick: Duration::from_secs(15),
+            }
+        }
+    }
+
+    /// Which deadline a command waits for.
+    #[derive(Clone, Copy)]
+    enum Wait {
+        Open,
+        Description,
+        Permit,
+        Quick,
+    }
+
+    /// The voice call of a phone, reached through the platform plugin's native half.
+    pub struct NativeCalls<C: Commands> {
+        commands: Arc<C>,
+        deadlines: Deadlines,
+    }
+
+    impl<C: Commands> NativeCalls<C> {
+        /// The calls native code holds, reached through `commands`.
         #[must_use]
-        pub const fn new(app: AppHandle<R>) -> Self {
-            Self { app }
+        pub fn new(commands: C) -> Self {
+            Self {
+                commands: Arc::new(commands),
+                deadlines: Deadlines::default(),
+            }
         }
 
+        /// The same calls with other deadlines, for a test.
+        #[must_use]
+        pub const fn with_deadlines(mut self, deadlines: Deadlines) -> Self {
+            self.deadlines = deadlines;
+            self
+        }
+
+        /// Sends one command and reads its answer, within the command's deadline.
+        ///
+        /// The command runs in a task of its own, so that going on without its answer drops
+        /// nothing the plugin still has to answer into: Tauri's reply to a command panics when
+        /// the place it replies to is gone. A command that has not been answered by its deadline
+        /// is `Unavailable`, and what it does later is native code's: a caller that cannot tell
+        /// asks what native code holds.
         async fn command<T: DeserializeOwned>(
             &self,
-            method: &str,
+            method: &'static str,
+            wait: Wait,
             arguments: impl Serialize,
         ) -> Result<T, CallFailure> {
-            let platform = self.app.state::<crate::Platform<R>>();
-            platform
-                .handle
-                .run_mobile_plugin_async(method, arguments)
-                .await
-                .map_err(|error| match error {
-                    tauri::plugin::mobile::PluginInvokeError::InvokeRejected(rejected) => {
-                        CallFailure::new(
-                            rejected
-                                .code
-                                .as_deref()
-                                .map_or(FailureKind::Unavailable, FailureKind::from_code),
-                            rejected.message.unwrap_or_default(),
-                        )
-                    }
-                    other => CallFailure::new(FailureKind::Unavailable, other.to_string()),
-                })
+            let within = match wait {
+                Wait::Open => self.deadlines.open,
+                Wait::Description => self.deadlines.description,
+                Wait::Permit => self.deadlines.permit,
+                Wait::Quick => self.deadlines.quick,
+            };
+            let arguments = serde_json::to_value(arguments)
+                .map_err(|error| CallFailure::new(FailureKind::Unavailable, error.to_string()))?;
+            let running = tokio::spawn(self.commands.invoke(method, arguments));
+            let answered = match tokio::time::timeout(within, running).await {
+                Ok(Ok(answered)) => answered?,
+                Ok(Err(_)) => {
+                    return Err(CallFailure::new(
+                        FailureKind::Unavailable,
+                        "the command ended without an answer",
+                    ));
+                }
+                Err(_) => {
+                    return Err(CallFailure::new(
+                        FailureKind::Unavailable,
+                        format!(
+                            "native code did not answer within {} seconds",
+                            within.as_secs()
+                        ),
+                    ));
+                }
+            };
+            serde_json::from_value(answered).map_err(|error| {
+                CallFailure::new(
+                    FailureKind::Unavailable,
+                    format!("native code answered with something unreadable: {error}"),
+                )
+            })
         }
     }
 
-    impl<R: Runtime> CallPlatform for NativeCalls<R> {
+    impl<C: Commands> CallPlatform for NativeCalls<C> {
         fn open(&self) -> CallFuture<'_, OpenedCall> {
             Box::pin(async move {
                 let call = CallId::next();
                 let (sink, events) = event_queue(call.clone());
                 // Held by native code for the call's life, so the news reaches this queue
                 // whatever the page is doing.
-                let channel = tauri::ipc::Channel::<serde_json::Value>::new(move |body| {
-                    if let tauri::ipc::InvokeResponseBody::Json(text) = body {
-                        sink.deliver_json(&text);
-                    }
-                    Ok(())
-                });
+                let channel = self.commands.channel(sink);
                 let opened: OpenResponse = self
                     .command(
                         "callOpen",
+                        Wait::Open,
                         OpenRequest {
                             call: call.clone(),
                             events: channel,
@@ -728,8 +825,9 @@ mod native {
 
         fn offer<'a>(&'a self, call: &'a CallId) -> CallFuture<'a, String> {
             Box::pin(async move {
-                let offered: OfferResponse =
-                    self.command("callOffer", CallRequest { call }).await?;
+                let offered: OfferResponse = self
+                    .command("callOffer", Wait::Description, CallRequest { call })
+                    .await?;
                 Ok(offered.sdp)
             })
         }
@@ -737,7 +835,11 @@ mod native {
         fn accept<'a>(&'a self, call: &'a CallId, answer: &'a str) -> CallFuture<'a, Answered> {
             Box::pin(async move {
                 let accepted: AcceptResponse = self
-                    .command("callAccept", AcceptRequest { call, sdp: answer })
+                    .command(
+                        "callAccept",
+                        Wait::Description,
+                        AcceptRequest { call, sdp: answer },
+                    )
                     .await?;
                 Ok(Answered {
                     uses_dtx: accepted.uses_dtx,
@@ -755,6 +857,7 @@ mod native {
                 let permitted: PermitResponse = self
                     .command(
                         "callPermit",
+                        Wait::Permit,
                         PermitRequest {
                             call,
                             voice_session_id,
@@ -769,7 +872,7 @@ mod native {
         fn mute<'a>(&'a self, call: &'a CallId, what: Mute, muted: bool) -> CallFuture<'a, ()> {
             Box::pin(async move {
                 let _: Nothing = self
-                    .command("callMute", MuteRequest { call, what, muted })
+                    .command("callMute", Wait::Quick, MuteRequest { call, what, muted })
                     .await?;
                 Ok(())
             })
@@ -777,13 +880,78 @@ mod native {
 
         fn stop<'a>(&'a self, call: &'a CallId) -> CallFuture<'a, ()> {
             Box::pin(async move {
-                let _: Nothing = self.command("callStop", CallRequest { call }).await?;
+                let _: Nothing = self
+                    .command("callStop", Wait::Quick, CallRequest { call })
+                    .await?;
                 Ok(())
             })
         }
 
         fn held(&self) -> CallFuture<'_, Held> {
-            Box::pin(async move { self.command("callState", serde_json::json!({})).await })
+            Box::pin(async move {
+                self.command("callState", Wait::Quick, serde_json::json!({}))
+                    .await
+            })
+        }
+
+        fn alive<'a>(&'a self, call: &'a CallId) -> CallFuture<'a, Held> {
+            Box::pin(async move {
+                self.command("callAlive", Wait::Quick, CallRequest { call })
+                    .await
+            })
+        }
+    }
+
+    /// The platform plugin's native half, as the way commands reach native code on a phone.
+    #[cfg(mobile)]
+    pub struct PluginCommands<R: tauri::Runtime> {
+        app: tauri::AppHandle<R>,
+    }
+
+    #[cfg(mobile)]
+    impl<R: tauri::Runtime> PluginCommands<R> {
+        /// The commands of the application `app` runs.
+        #[must_use]
+        pub const fn new(app: tauri::AppHandle<R>) -> Self {
+            Self { app }
+        }
+    }
+
+    #[cfg(mobile)]
+    impl<R: tauri::Runtime> Commands for PluginCommands<R> {
+        fn channel(&self, sink: EventSink) -> serde_json::Value {
+            let channel = tauri::ipc::Channel::<serde_json::Value>::new(move |body| {
+                if let tauri::ipc::InvokeResponseBody::Json(text) = body {
+                    sink.deliver_json(&text);
+                }
+                Ok(())
+            });
+            serde_json::to_value(channel).unwrap_or(serde_json::Value::Null)
+        }
+
+        fn invoke(&self, method: &'static str, arguments: serde_json::Value) -> CommandFuture {
+            use tauri::Manager as _;
+
+            let app = self.app.clone();
+            Box::pin(async move {
+                let platform = app.state::<crate::Platform<R>>();
+                platform
+                    .handle
+                    .run_mobile_plugin_async(method, arguments)
+                    .await
+                    .map_err(|error| match error {
+                        tauri::plugin::mobile::PluginInvokeError::InvokeRejected(rejected) => {
+                            CallFailure::new(
+                                rejected
+                                    .code
+                                    .as_deref()
+                                    .map_or(FailureKind::Unavailable, FailureKind::from_code),
+                                rejected.message.unwrap_or_default(),
+                            )
+                        }
+                        other => CallFailure::new(FailureKind::Unavailable, other.to_string()),
+                    })
+            })
         }
     }
 }
@@ -892,7 +1060,7 @@ mod tests {
         assert_eq!(
             holding,
             Held {
-                call: Some(call),
+                call: Some(call.clone()),
                 capture: CaptureState::MutedByPerson,
                 microphone_muted: true,
                 playing: true
@@ -902,6 +1070,107 @@ mod tests {
         assert_eq!(idle.call, None);
         assert_eq!(idle.capture, CaptureState::Idle);
         assert!(!idle.microphone_muted);
+
+        let alive = of("callAlive", 0);
+        assert_eq!(json(&CallRequest { call: &call }), alive.request);
+        let held: Held = serde_json::from_value(alive.response).expect("a state");
+        assert_eq!(held.call, Some(CallId("c1".to_owned())));
+        assert_eq!(held.capture, CaptureState::Capturing);
+    }
+
+    /// Native code that is never asked to do anything, or never answers: the commands a test of
+    /// the deadlines sends reach this.
+    struct Unanswering {
+        started: Arc<AtomicUsize>,
+        finished: Arc<AtomicUsize>,
+        release: Arc<Notify>,
+    }
+
+    impl Commands for Unanswering {
+        fn channel(&self, _sink: EventSink) -> serde_json::Value {
+            serde_json::json!("__CHANNEL__:1")
+        }
+
+        fn invoke(&self, _method: &'static str, _arguments: serde_json::Value) -> CommandFuture {
+            let (started, finished, release) = (
+                Arc::clone(&self.started),
+                Arc::clone(&self.finished),
+                Arc::clone(&self.release),
+            );
+            Box::pin(async move {
+                started.fetch_add(1, Ordering::SeqCst);
+                release.notified().await;
+                finished.fetch_add(1, Ordering::SeqCst);
+                Ok(serde_json::json!({}))
+            })
+        }
+    }
+
+    fn quick() -> Deadlines {
+        let short = std::time::Duration::from_millis(50);
+        Deadlines {
+            open: short,
+            description: short,
+            permit: short,
+            quick: short,
+        }
+    }
+
+    /// A command that native code does not answer ends at its deadline as unavailable, for every
+    /// kind of command: a revocation is never held behind native code.
+    #[tokio::test]
+    async fn a_command_native_code_does_not_answer_is_unavailable_at_its_deadline() {
+        let calls = NativeCalls::new(Unanswering {
+            started: Arc::default(),
+            finished: Arc::default(),
+            release: Arc::default(),
+        })
+        .with_deadlines(quick());
+        let call = CallId("c1".to_owned());
+
+        for failure in [
+            calls.open().await.err(),
+            calls.offer(&call).await.err(),
+            calls.accept(&call, "v=0").await.err(),
+            calls.permit(&call, "id", 1).await.err(),
+            calls.mute(&call, Mute::Microphone, true).await.err(),
+            calls.stop(&call).await.err(),
+            calls.held().await.err(),
+            calls.alive(&call).await.err(),
+        ] {
+            let failure = failure.expect("the command ends at its deadline");
+            assert_eq!(failure.kind, FailureKind::Unavailable);
+            assert!(failure.message.contains("did not answer"), "{failure}");
+        }
+    }
+
+    /// Going on without an answer does not drop the command: it is run to its end, so what the
+    /// plugin answers into is still there when native code answers late.
+    #[tokio::test]
+    async fn a_command_given_up_on_is_run_to_its_end() {
+        let finished = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(Notify::new());
+        let started = Arc::new(AtomicUsize::new(0));
+        let calls = NativeCalls::new(Unanswering {
+            started: Arc::clone(&started),
+            finished: Arc::clone(&finished),
+            release: Arc::clone(&release),
+        })
+        .with_deadlines(quick());
+        let call = CallId("c1".to_owned());
+
+        assert!(calls.stop(&call).await.is_err(), "the caller goes on");
+        assert_eq!(started.load(Ordering::SeqCst), 1);
+        assert_eq!(finished.load(Ordering::SeqCst), 0);
+
+        release.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            while finished.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the command the caller gave up on still ends");
     }
 
     /// Each item of news in the fixture is one Rust reads, and writes back as it is.
