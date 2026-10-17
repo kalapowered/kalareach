@@ -7652,9 +7652,10 @@ impl WorkerService {
             self.runtime.flush_locked(&mut input);
             // A paste that has just closed, or a frame that has just completed, opens the gate the
             // response lane was waiting on, and an application that asked a question during one of
-            // those would otherwise wait for its answer until the next byte of output. Letting the
-            // reply out needs the session, which the pump takes.
-            (accepted, opened_the_gate || owes)
+            // those would otherwise wait for its answer until the next byte of output. So would
+            // the replies one drain of the lane did not take. Letting them out needs the session,
+            // which the pump takes.
+            (accepted, opened_the_gate || owes || input.replies_waiting())
         };
         if pump {
             self.runtime.input().wake_pump();

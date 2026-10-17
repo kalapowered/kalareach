@@ -4097,6 +4097,60 @@ async fn the_end_of_a_paste_lets_a_reply_out_when_the_session_comes_free() {
     a_reply_waits_for_an_open_paste(true).await;
 }
 
+/// KR-PERF-002: the replies one drain of the response lane did not take come out behind the
+/// keystrokes that follow.
+///
+/// The application asks the terminal for the colour of two hundred palette entries inside a paste,
+/// which is more than one drain of the lane takes. The keystroke that ends the paste lets the first
+/// of them out, and the ordinary keystrokes after it, which take the input domain and not the
+/// session, ask for the rest: nothing is printed and nothing else is typed that would.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    windows,
+    ignore = "the application's input is read through a named pipe trigger"
+)]
+async fn replies_one_drain_of_the_lane_did_not_take_follow_the_keystrokes_that_come_after() {
+    const ENTRIES: usize = 200;
+    let mut rig = Rig::from_script(|received, trigger| {
+        format!(
+            "stty raw -echo; printf '\\033[?2004hkr-ready.'; \
+             ( while cat '{}' >/dev/null; do i=0; \
+               while [ $i -lt {ENTRIES} ]; do printf '\\033]4;%d;?\\033\\\\' $i; i=$((i+1)); done; \
+               printf 'kr-asked.'; done ) & exec tee '{}'",
+            trigger.display(),
+            received.display()
+        )
+    })
+    .await;
+    retained_within(&rig.wired.runtime, b"kr-ready.", LIVENESS_DEADLINE).await;
+    rig.write(b"\x1b[200~hello").await;
+    assert!(rig.until_everything_typed_arrived().await.is_some());
+
+    rig.pull_the_trigger().await;
+    retained_within(&rig.wired.runtime, b"kr-asked.", LIVENESS_DEADLINE).await;
+    assert_eq!(
+        count(&rig.received(), b"\x1b]4;"),
+        0,
+        "an answer was written into the middle of the paste"
+    );
+
+    rig.write(b"\x1b[201~").await;
+    let answered = tokio::time::timeout(Duration::from_secs(20), async {
+        while count(&rig.received(), b"\x1b]4;") < ENTRIES {
+            rig.write(b"k").await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    assert!(
+        answered.is_ok(),
+        "the keystrokes after the paste did not let out the rest of the lane: {} of {ENTRIES} \
+         answers reached the application",
+        count(&rig.received(), b"\x1b]4;")
+    );
+    rig.close().await;
+}
+
 /// KR-PERF-002: once a close is admitted a keystroke is refused at once, and it does
 /// not wait for the session to be free to hear so.
 ///

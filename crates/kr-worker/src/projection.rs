@@ -465,6 +465,13 @@ impl TerminalEngine {
         self.engine.bracketed_paste()
     }
 
+    /// Returns whether replies are still waiting in the response lane, whether the gate holds them
+    /// back or one drain was not enough to take them all.
+    #[must_use]
+    pub fn replies_pending(&self) -> bool {
+        self.engine.lane().pending() > 0
+    }
+
     /// Takes whatever the response lane is allowed to write right now.
     ///
     /// The lane holds a reply back while a bracketed paste or a human input frame is open, so the

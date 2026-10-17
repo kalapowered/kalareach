@@ -341,6 +341,10 @@ pub struct InputDomain {
     /// Steps of the root editor's machine that need the session, left here by a keystroke or the
     /// timer, which cannot take it. The pump carries them out.
     owed: Vec<Step>,
+    /// Whether the response lane still holds replies after the last time it was drained. A
+    /// keystroke or the timer that sees this asks the pump to look again, because the lane is the
+    /// session's and they do not take the session.
+    replies_waiting: bool,
     /// The last takeover receipt the machine completed.
     takeover_receipt: Option<TakeoverReceipt>,
     /// The callers waiting for a reader to say what it did with their launch.
@@ -396,6 +400,7 @@ impl InputDomain {
             fence: None,
             revision: None,
             owed: Vec::new(),
+            replies_waiting: false,
             takeover_receipt: None,
             launches: BTreeMap::new(),
             late_installations: Vec::new(),
@@ -694,6 +699,18 @@ impl InputDomain {
     #[must_use]
     pub fn is_owed(&self) -> bool {
         !self.owed.is_empty()
+    }
+
+    /// Records whether the response lane still holds replies after a drain.
+    pub(crate) const fn set_replies_waiting(&mut self, waiting: bool) {
+        self.replies_waiting = waiting;
+    }
+
+    /// Returns whether the response lane held replies when it was last drained, which the next
+    /// keystroke or timer pass asks the pump to take.
+    #[must_use]
+    pub const fn replies_waiting(&self) -> bool {
+        self.replies_waiting
     }
 
     // -----------------------------------------------------------------------------------------
