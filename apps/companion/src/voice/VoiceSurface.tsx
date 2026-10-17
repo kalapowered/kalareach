@@ -172,9 +172,17 @@ function SettingUpScreen({
   readonly onEnd: () => void
 }): React.ReactElement {
   const id = useId()
+  const heading = useRef<HTMLHeadingElement | null>(null)
+  const wasEnding = useRef(ending)
+  // The control that was pressed goes when the end begins, so focus goes to what says so: left on
+  // nothing, a keyboard or screen-reader user would be sent back to the top of the document.
+  useEffect(() => {
+    if (ending && !wasEnding.current) heading.current?.focus()
+    wasEnding.current = ending
+  }, [ending])
   return (
     <section className="kr-voice" aria-labelledby={`${id}-heading`}>
-      <h1 id={`${id}-heading`} className="kr-voice__title">
+      <h1 id={`${id}-heading`} className="kr-voice__title" ref={heading} tabIndex={-1}>
         {ending ? 'Ending a voice session' : 'Starting a voice session'}
       </h1>
       <p className="kr-voice__note" role="status">

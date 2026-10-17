@@ -565,7 +565,12 @@ export function closureWords(
   }
   const unconfirmed = closure.fence === null ? null : fenceWords(closure.fence, names)
   if (!closure.closed_locally) {
-    return unconfirmed === null ? `${here}.` : `${here}. ${unconfirmed}`
+    // A fence is in the answer only when the host revoked the grant, so that is said apart from
+    // the microphone, which could not be confirmed.
+    if (closure.fence === null) return `${here}.`
+    return unconfirmed === null
+      ? `${here}. The host withdrew the call's grant.`
+      : `${here}. The host withdrew the call's grant. ${unconfirmed}`
   }
   return unconfirmed === null ? null : `${here} and its grant withdrawn. ${unconfirmed}`
 }

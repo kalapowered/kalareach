@@ -895,6 +895,19 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
     scope: 1,
     startCapture: seed.capture
   }
+  /** What the device owes when it could not finish ending a call, as it records it. */
+  const oweRevocation = (owed: Partial<VoiceOwed> = {}): void => {
+    voice.owed.push({
+      kind: 'revocation',
+      words: 'The host did not confirm that it withdrew the grant.',
+      action_id: null,
+      voice_session_id: VOICE_SESSION,
+      until_ms: Date.now() + 1_800_000,
+      host_reference: 'a-host',
+      host_name: 'Your Mac',
+      ...owed
+    })
+  }
   const voiceStarts: VoiceStartRequest[] = []
   const voiceAllows: VoiceAllowRequest[] = []
   const usedHosts: string[] = []
@@ -2068,7 +2081,17 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
         // when the device says so, and not before.
         if (voice.ending) refuse('PERMISSION_DENIED', 'This device is already ending its call.')
         voice.ending = true
-        return Promise.resolve({ closed_locally: true, fence: null, host_failure: null })
+        // The host has not said whether it made a call, as the device answers a stop meanwhile.
+        return Promise.resolve({
+          closed_locally: true,
+          fence: null,
+          host_failure: {
+            code: 'RESOURCE_UNAVAILABLE',
+            message:
+              'RESOURCE_UNAVAILABLE: The host has not said whether it made the call. This device is still asking it, and ends the call if it did.',
+            user_action: 'wait'
+          }
+        })
       }
       const running = voice.call
       voice.call = null
@@ -2079,6 +2102,8 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
             kind: 'not_told',
             words: 'This host cannot be contacted right now.'
           })
+          // What the host was not told is owed, as the device records it.
+          oweRevocation({ words: 'This host cannot be contacted right now.' })
         }
         return Promise.resolve({
           closed_locally: running !== null,
@@ -2686,16 +2711,7 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
       voice.warning = words
     },
     oweVoice(owed) {
-      voice.owed.push({
-        kind: 'revocation',
-        words: 'The host did not confirm that it withdrew the grant.',
-        action_id: null,
-        voice_session_id: VOICE_SESSION,
-        until_ms: Date.now() + 1_800_000,
-        host_reference: 'a-host',
-        host_name: 'Your Mac',
-        ...owed
-      })
+      oweRevocation(owed)
     },
     setPairing(change) {
       publishPairing(change)

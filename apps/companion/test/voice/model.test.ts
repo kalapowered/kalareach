@@ -429,6 +429,7 @@ describe('what the screen says when it ends a call', () => {
       })
     )
     expect(words).toContain("could not confirm that the call's microphone stopped.")
+    expect(words).toContain("The host withdrew the call's grant.")
     expect(words).not.toContain('and its grant withdrawn')
   })
 

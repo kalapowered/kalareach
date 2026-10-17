@@ -408,9 +408,38 @@ export function VoiceRoute({
   )
 
   /**
-   * Asks the device to end its call, named or not, and says what it did in its own words: whether
-   * the microphone stopped here, and whether the host confirmed that it withdrew the grant. What
-   * the call left is read once those words are said, and adds none.
+   * Whether a read of the device is owed after an end, until one has succeeded: what the end left
+   * owed is only known from that read, and the person is told it as soon as it is.
+   */
+  const [leftUnread, setLeftUnread] = useState(false)
+  useEffect(() => {
+    if (!leftUnread) return
+    let current = true
+    let retry: number | undefined
+    const read = () => {
+      void ask(() => port.voiceCallState())
+        .then((state) => {
+          if (!current) return
+          settle(state)
+          setLeftUnread(false)
+        })
+        .catch(() => {
+          // The read failed, and what was left owed is not yet known: ask again.
+          if (current) retry = window.setTimeout(read, 1_000)
+        })
+    }
+    read()
+    return () => {
+      current = false
+      if (retry !== undefined) window.clearTimeout(retry)
+    }
+  }, [leftUnread, port, settle])
+
+  /**
+   * Asks the device to end its call, named or not, and says what it did in its own words when the
+   * call was named: whether the microphone stopped here, and whether the host confirmed that it
+   * withdrew the grant. A call that was not named is a setup, whose end the device says itself
+   * when it is done. What the end left is read once those words are said, and adds none.
    */
   const endTheCall = useCallback(
     (voiceSessionId: string | null, closed: (closure: VoiceClosure) => void) => {
@@ -418,19 +447,16 @@ export function VoiceRoute({
       void ask(() => port.voiceStop(voiceSessionId, {}))
         .then((closure) => {
           closed(closure)
-          setNotice(closureWords(closure, shown.current?.sessionNames ?? {}))
+          setNotice(
+            voiceSessionId === null ? null : closureWords(closure, shown.current?.sessionNames ?? {})
+          )
         })
         .catch((error: unknown) => {
           setNotice(failureMessage(error))
         })
         .finally(() => {
           hangingUp.current = false
-          void ask(() => port.voiceCallState()).then(
-            (state) => {
-              if (state.session === null && !state.setting_up) setLeft(state)
-            },
-            () => undefined
-          )
+          setLeftUnread(true)
         })
     },
     [port]

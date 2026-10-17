@@ -534,9 +534,13 @@ describe('while a call is running', () => {
     // made: the screen says it is ending, offers neither a start nor a second end, and goes on
     // reading until the device says it is done.
     expect(stopped).toHaveBeenCalledWith(null, {})
-    await screen.findByRole('heading', { name: 'Ending a voice session' })
+    const ending = await screen.findByRole('heading', { name: 'Ending a voice session' })
     expect(screen.queryByRole('button', { name: 'End the call' })).not.toBeInTheDocument()
     expect(screen.queryByRole('button', { name: 'Start voice session' })).not.toBeInTheDocument()
+    // The control that was pressed is gone, and focus goes to the words that say what follows.
+    expect(ending).toHaveFocus()
+    // The call is not said to be closed: the device is still asking the host, and says so itself.
+    expect(screen.queryByText(/This device's call is closed/)).not.toBeInTheDocument()
 
     controls.endVoiceCall({
       cause: 'requested',
@@ -579,11 +583,45 @@ describe('while a call is running', () => {
     expect(screen.getByRole('button', { name: 'End session' })).toBeEnabled()
   })
 
+  // What an end left owed is only known from a read of the device, and a read that fails is asked
+  // again: the person is told that a grant may still be open as soon as the device says so.
+  it('keeps asking the device what an end left until it answers', async () => {
+    const person = userEvent.setup()
+    const { controls, port } = start()
+    await waitForChoice()
+    await person.click(screen.getByRole('button', { name: 'Start voice session' }))
+    await screen.findByRole('button', { name: 'End session' })
+    controls.setConnected(false)
+    const real = port.voiceCallState.bind(port)
+    const stop = port.voiceStop.bind(port)
+    let stopped = false
+    let failed = false
+    vi.spyOn(port, 'voiceStop').mockImplementation(async (...asked) => {
+      const answer = await stop(...asked)
+      stopped = true
+      return answer
+    })
+    vi.spyOn(port, 'voiceCallState').mockImplementation(() => {
+      if (stopped && !failed) {
+        failed = true
+        return Promise.reject(new Error('the device did not answer'))
+      }
+      return real()
+    })
+
+    await person.click(screen.getByRole('button', { name: 'End session' }))
+
+    expect(
+      await screen.findByText(/may still hold a grant for this call open/, {}, { timeout: 6000 })
+    ).toBeInTheDocument()
+    expect(failed).toBe(true)
+  })
+
   // The device reads as busy while it finishes the end of a call this screen holds. The screen's
   // own hang-up says its own words, and the read in between does not turn the call into a setup.
   it('does not show the setup screen for the end of the call it holds', async () => {
     const person = userEvent.setup()
-    const { port } = start((controls) => {
+    const { controls, port } = start((controls) => {
       controls.holdAVoiceCall()
     })
     const real = port.voiceCallState.bind(port)
@@ -610,6 +648,8 @@ describe('while a call is running', () => {
     expect(screen.queryByRole('heading', { name: 'Ending a voice session' })).not.toBeInTheDocument()
     expect(screen.getByRole('heading', { name: 'Voice session' })).toBeInTheDocument()
     reading.mockRestore()
+    // The device finishes the end it was asked for, and then says the call is over.
+    controls.endVoiceCall({ cause: 'requested', words: 'You ended the call.' })
     await act(async () => {
       finish({ closed_locally: true, fence: { kind: 'not_owed' }, host_failure: null })
       await Promise.resolve()
