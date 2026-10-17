@@ -98,6 +98,7 @@ mod feed;
 mod http;
 mod mailbox;
 mod relay;
+mod settings;
 mod sync;
 mod web;
 

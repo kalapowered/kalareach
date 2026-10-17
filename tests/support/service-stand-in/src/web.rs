@@ -237,6 +237,11 @@ struct State {
     /// Whether the account's backup storage refuses the write of a bundle, as an account with no
     /// allowance does.
     bundle_writes_refused: bool,
+    /// The settings collections, by home and collection.
+    settings: crate::settings::Collections,
+    /// Whether the settings-sync allowance refuses the write of an object or a key record, as a
+    /// principal with none left does.
+    settings_writes_refused: bool,
     /// The mailboxes, by the identifier of each recipient's stored-envelope key.
     mailboxes: BTreeMap<String, crate::mailbox::Mailbox>,
     /// The relay control plane's authorisations and leases.
@@ -547,6 +552,12 @@ impl ServiceWeb {
     /// one again.
     pub fn refuse_bundle_writes(&self, refused: bool) {
         self.state.lock().expect("the state").bundle_writes_refused = refused;
+    }
+
+    /// The settings-sync allowance admits no write of an object or a key record from now on, or
+    /// admits one again.
+    pub fn refuse_settings_writes(&self, refused: bool) {
+        self.state.lock().expect("the state").settings_writes_refused = refused;
     }
 
     /// The sealed bundle the service holds at `locator`, if it holds one.
@@ -958,11 +969,26 @@ impl ServiceWeb {
         if method == "sync.compare_exchange" {
             let State {
                 bundles,
+                settings,
                 tokens,
                 bundle_writes_refused,
+                settings_writes_refused,
                 ..
             } = &mut *state;
-            return bundles.handle(tokens, body, token, now_ms(), !*bundle_writes_refused);
+            return crate::sync::route(
+                (bundles, settings),
+                tokens,
+                &crate::sync::Arrival {
+                    body,
+                    signature: &signature,
+                    token,
+                    now_ms: now_ms(),
+                },
+                crate::sync::Allowances {
+                    bundles: !*bundle_writes_refused,
+                    settings: !*settings_writes_refused,
+                },
+            );
         }
         match method {
             "mailbox.deliver" => {
@@ -1140,6 +1166,25 @@ pub(crate) fn answered(data: serde_json::Value) -> ServiceHttpAnswer {
 #[must_use]
 pub fn refusal(status: u16, code: &str, message: &str) -> ServiceHttpAnswer {
     refusal_after(status, code, message, None)
+}
+
+/// A refusal that carries members of its own beside the code and the message, in the service's
+/// envelope.
+pub(crate) fn refusal_with(
+    status: u16,
+    code: &str,
+    message: &str,
+    members: serde_json::Value,
+) -> ServiceHttpAnswer {
+    let mut error = serde_json::json!({ "code": code, "message": message });
+    if let (Some(error), Some(members)) = (error.as_object_mut(), members.as_object()) {
+        error.extend(members.clone());
+    }
+    ServiceHttpAnswer {
+        status,
+        body: serde_json::to_vec(&serde_json::json!({ "ok": false, "error": error }))
+            .expect("a refusal"),
+    }
 }
 
 /// A refusal that asks the caller to wait `retry_after_seconds`, in the service's envelope.
