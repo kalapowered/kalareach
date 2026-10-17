@@ -1009,25 +1009,20 @@ impl SessionRuntime {
                         // resident window meanwhile, and the next batch is not taken until this
                         // one is written, so the spool receives the output in the order it came.
                         if let Some(write) = owed {
-                            let lost =
-                                write.failed("the write to the spool did not complete".to_owned());
                             let writing_trace = ingest_trace.clone();
-                            let written = tokio::task::spawn_blocking(move || {
+                            let made = tokio::task::spawn_blocking(move || {
                                 let mut span = writing_trace.acquisition(Site::SpoolWrite);
-                                let written = write.perform(&bytes);
+                                let made = write.perform(&bytes);
                                 span.held();
-                                written
+                                made
                             })
                             .await;
-                            let failed = match written {
-                                Ok(Ok(())) => None,
-                                Ok(Err(failed)) => Some(failed),
-                                Err(_) => Some(lost),
-                            };
-                            if let Some(failed) = failed
+                            // A write that failed, or was lost with the thread that made it, left
+                            // its settlement in the spool, and the session settles it.
+                            if !matches!(made, Ok(true))
                                 && let Ok(mut session) = ingest_session.lock()
                             {
-                                session.settle_failed_spool_write(failed);
+                                session.settle_spool_write();
                             }
                         }
                         // Every attachment has been handed this batch and the spool has it, so a
