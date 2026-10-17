@@ -286,7 +286,7 @@ impl Controller {
             }
         }
         recorded?;
-        let answer = match lapsed {
+        match lapsed {
             // Nothing was withdrawn and nothing is owed, so there is nothing to finish.
             Some(error) if !owes => Err(error),
             Some(error) => {
@@ -308,8 +308,7 @@ impl Controller {
                 )
                 .await
             }
-        };
-        answer
+        }
     }
 
     /// Transfers control of a session, then fences what the transfer took away.
