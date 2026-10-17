@@ -22,7 +22,6 @@ use kr_client::services::{
     SyncRequestStatus,
 };
 use kr_client::sync::sync_collection;
-use kr_crypto::keys::DeviceKeys;
 use kr_crypto::secret::Secret;
 use kr_protocol::error::ErrorCode;
 use kr_protocol::ids::{SyncConflictId, SyncObjectId};
@@ -54,18 +53,15 @@ fn sealed(plaintext: &[u8]) -> Vec<u8> {
     kr_cbor::to_canonical_vec(&object).expect("canonical bytes")
 }
 
-/// One device: its keys and the client it reaches the service with.
+/// One device: the client it reaches the service with, signing as an installation of its own.
 struct Device {
-    keys: DeviceKeys,
     service: Arc<ManagedSyncService>,
 }
 
 impl Device {
     fn on(web: &Arc<ServiceWeb>) -> Self {
-        let keys = DeviceKeys::generate().expect("a device's keys");
-        // The client signs with the authorisation key the device's keys name.
         let signer = Arc::new(recording::Keyed {
-            key: keys.authorisation.clone(),
+            key: kr_crypto::keys::AuthorisationKeyPair::generate().expect("a key"),
             signer: ServiceRequestSigner::Installation,
         });
         let service = ManagedSyncService::new(
@@ -74,7 +70,6 @@ impl Device {
             signer as _,
         );
         Self {
-            keys,
             service: Arc::new(service),
         }
     }
