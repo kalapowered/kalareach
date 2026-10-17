@@ -1,10 +1,10 @@
 //! `kr device`: the devices paired with this host, and revoking one.
 //!
 //! Both go through the control daemon under this user's own authority on this host, which is the
-//! local owner's. A listing shows, beside each device, the last authority revision it
-//! acknowledged: a device that is offline cannot apply a revocation it has not received, and a
-//! person deciding whether a revocation has taken effect needs to see which have answered. A
-//! revocation names the device by its identifier and takes every grant the device holds with it.
+//! local owner's. A listing shows how the revocation feed stands beside the devices: an offline
+//! host cannot apply a revocation it has not received, and a person deciding whether a revocation
+//! has taken effect needs to know whether the host has read the feed lately. A revocation names
+//! the device by its identifier and takes every grant the device holds with it.
 
 use kr_client::shown;
 use kr_client::shown::Shown;
