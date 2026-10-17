@@ -958,7 +958,9 @@ async fn keystrokes(
     let epoch = view
         .lease
         .ok_or_else(|| "the keystrokes' view holds the input lease".to_owned())?;
-    let window = record::Window::open();
+    // Opened inside the stress window, whose processor figure the work that reads a host's speed
+    // would be part of.
+    let window = record::Window::open_without_speed();
     let mut samples = Vec::with_capacity(KEYSTROKES);
     for sequence in 0..KEYSTROKES {
         let params = InputWriteParams {

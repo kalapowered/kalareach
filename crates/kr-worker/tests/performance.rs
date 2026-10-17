@@ -870,13 +870,13 @@ async fn idle(host: &Host, owned: &mut Owned) -> Result<Idle, String> {
 
     // The host is read at the two edges of the processor window itself, which is the interval the
     // figure is an average over.
-    let started = Instant::now();
     let window = record::Window::open();
+    let started = Instant::now();
     let before = each(&workers, daemon, processor_seconds)?;
     tokio::time::sleep(IDLE_WINDOW).await;
     let after = each(&workers, daemon, processor_seconds)?;
-    let conditions = window.close();
     let elapsed = started.elapsed().as_secs_f64();
+    let conditions = window.close();
     // Per process, because a total that missed its bound does not say what spent the time. A
     // reading that went backwards is an identifier that is no longer the process it was, and a
     // pair of readings that do not line up is not a difference: both are refused rather than
