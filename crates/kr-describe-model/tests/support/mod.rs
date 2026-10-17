@@ -5,7 +5,6 @@
 // Each test file takes the parts it needs.
 #![allow(dead_code)]
 
-use std::io::Write;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -28,13 +27,14 @@ pub fn cache_directory() -> Option<PathBuf> {
     })
 }
 
-/// Says, on the standard error stream, that a test did not run and why.
+/// Says, in the test's own output, that it did not run and why.
 ///
-/// The test harness keeps whatever a passing test prints, so a test that returned early would read
-/// "ok" in the summary and nothing else. The stream is written to directly, which the harness's
-/// capture does not reach, so the line is in the run's output either way.
+/// A test that returns early passes, so the harness's summary reads "ok" and says nothing more. The
+/// line starts `skipped:`, which the conformance report reads as a case that did not run, and it
+/// is written to the test's captured output in one piece: the harness shows it under the test's
+/// name (`--show-output`), where the report finds it, and no other writer's output can break it.
 pub fn did_not_run(test: &str, why: &str) {
-    let _ = writeln!(std::io::stderr(), "{test}: DID NOT RUN: {why}");
+    println!("skipped: {test} did not run: {why}");
 }
 
 /// The selected profile and where this host keeps its weights.
