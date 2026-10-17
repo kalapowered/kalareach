@@ -151,15 +151,22 @@ impl Rig {
         self.runtime().synchronised_before_serving().await;
     }
 
-    /// Waits until a pass that began after this call has finished, which leaves no pass running
-    /// that began before it: what a connection waits for is exactly that, and the pass it started
-    /// is the only one that began after the pairing's. The wait for a synchronisation ends
-    /// silently at its bound, so the bound is made longer than `within` allows, and the wait can
-    /// then end only with its pass or fail the case.
+    /// Waits until a pass that began after this call has finished, twice over, which leaves no
+    /// pass running that began before the first call and none that a wake stored by then would
+    /// start: a pass that a wake started after the first call's ticket was taken has ended before
+    /// the second call returns. What a connection waits for is exactly such a pass, and the pass
+    /// it starts is then the only one that can read what is published afterwards. The wait for a
+    /// synchronisation ends silently at its bound, so the bound is made longer than `within`
+    /// allows, and the wait can then end only with its pass or fail the case. The bound stays for
+    /// the connection's own wait, which `within` limits as well.
     async fn until_the_carrier_is_idle(&self) {
         self.runtime()
             .wait_for_a_synchronisation_at_most(Duration::from_secs(3600));
-        within("the pass the setup asked for ends", self.poll()).await;
+        within("the passes the setup asked for end", async {
+            self.poll().await;
+            self.poll().await;
+        })
+        .await;
     }
 
     /// A request the owner signs and publishes, naming `target`, under a fixed identity.
@@ -371,13 +378,21 @@ impl Rig {
         device: &Device,
         record: &kr_controller::service::net::devices::DeviceRecord,
     ) -> Kept {
-        match paired_dial(&self.host, device, record).try_dial().await {
+        let dialled = within(
+            "the host answers the device's connection",
+            paired_dial(&self.host, device, record).try_dial(),
+        )
+        .await;
+        match dialled {
             Ok(transport) => {
                 let session =
                     kr_client::session::Session::start(Arc::new(transport)).expect("a session");
-                self.doctor_as(&session)
-                    .await
-                    .expect_err("the revocation reached the host before the first request");
+                within(
+                    "the host answers the device's first request",
+                    self.doctor_as(&session),
+                )
+                .await
+                .expect_err("the revocation reached the host before the first request");
                 Kept::Refused
             }
             Err(error) => {
