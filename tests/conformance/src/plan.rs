@@ -1227,6 +1227,26 @@ fn windows() -> Vec<Step> {
             &["test", "--locked", "-p", "kr-flush"],
         ),
         qualified_only(
+            "each store waits for the holder that is letting go of it",
+            &[
+                "test",
+                "--locked",
+                "-p",
+                "kr-controller",
+                "-p",
+                "kr-changeset",
+                "-p",
+                "kr-delivery",
+                "-p",
+                "kr-describe",
+                "-p",
+                "kr-automation",
+                "--lib",
+                "a_previous_holder_that_is_letting_go",
+            ],
+            "a_previous_holder_that_is_letting_go",
+        ),
+        qualified_only(
             "the contact skill's installer",
             &[
                 "test",
