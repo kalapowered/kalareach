@@ -681,6 +681,34 @@ fn the_real_process_names_its_class_and_refuses_a_file_that_is_not_the_profiles(
     assert!(status.success(), "{status:?}");
 }
 
+/// A case that needs the weights, on a host without them, returns early and says so in its own
+/// output on a line that starts `skipped:`, which the conformance report reads as a case that did
+/// not run. This program is run again for one case, with an empty cache and every test's output
+/// shown under its name, as the report runs it.
+#[test]
+fn a_case_that_needs_weights_this_host_lacks_says_so_on_a_line_of_its_own() {
+    const CASE: &str = "the_real_model_stops_a_job_it_is_told_to_cancel";
+    let empty_cache = tempfile::tempdir().expect("an empty cache directory");
+    let ran = Command::new(std::env::current_exe().expect("this test program"))
+        .args(["--exact", CASE, "--show-output", "--test-threads=1"])
+        .env("KR_DESCRIBE_MODEL_CACHE", empty_cache.path())
+        .output()
+        .expect("this test program runs again");
+    let shown = String::from_utf8_lossy(&ran.stdout);
+    assert!(ran.status.success(), "{shown}");
+    let header = format!("---- {CASE} stdout ----");
+    let mut its_output = shown.lines().skip_while(|line| *line != header);
+    assert!(
+        its_output.next().is_some(),
+        "no output shown for {CASE}:\n{shown}"
+    );
+    let first = its_output.next().unwrap_or_default();
+    assert!(
+        first.starts_with("skipped:") && first.contains(CASE),
+        "the first line of {CASE}'s output is {first:?}:\n{shown}"
+    );
+}
+
 /// Turns at the real clock until `done` holds, waiting for the process between turns.
 fn run_until(
     driver: &mut Driver,
