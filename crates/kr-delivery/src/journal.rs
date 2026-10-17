@@ -698,7 +698,7 @@ impl DeliveryJournal {
     /// cannot be created, and [`DeliveryError::JournalUnreadable`] when the file holds a schema
     /// version below the oldest this build brings forward or above the one it writes.
     pub fn open(path: &Path) -> Result<Self> {
-        Self::prepare(Connection::open(path)?)
+        Self::prepare(kr_flush::release::open_connection(path, None)?)
     }
 
     /// Opens a journal that lives only as long as it is held.

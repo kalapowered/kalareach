@@ -138,7 +138,8 @@ impl DescriptionStore {
             detail: format!("the runtime root could not be made: {error}"),
         })?;
         let connection =
-            Connection::open(runtime_root.join("descriptions.sqlite3")).map_err(store_error)?;
+            kr_flush::release::open_connection(&runtime_root.join("descriptions.sqlite3"), None)
+                .map_err(store_error)?;
         Self::apply_schema(&connection)?;
         Ok(Self { connection })
     }
@@ -759,7 +760,7 @@ fn from_sqlite(value: i64, what: &'static str) -> Result<u64> {
 
 fn store_error(error: rusqlite::Error) -> DescribeError {
     DescribeError::Store {
-        detail: error.to_string(),
+        detail: kr_flush::release::describe(&error),
     }
 }
 
