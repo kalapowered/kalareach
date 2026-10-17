@@ -195,6 +195,7 @@ class PlatformPlugin: Plugin, ASWebAuthenticationPresentationContextProviding {
   @objc public func callMute(_ invoke: Invoke) { forward(invoke) }
   @objc public func callStop(_ invoke: Invoke) { forward(invoke) }
   @objc public func callState(_ invoke: Invoke) { forward(invoke) }
+  @objc public func callAlive(_ invoke: Invoke) { forward(invoke) }
 
   /// Hands one command to the application's call and answers `invoke` with what it answers.
   private func forward(_ invoke: Invoke, news: CallLink.News? = nil) {

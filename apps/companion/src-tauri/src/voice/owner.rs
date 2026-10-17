@@ -66,7 +66,7 @@ use crate::error::{CommandError, Result};
 /// What the model is told, once, as the call is attached: this version does not act on the host.
 const HOST_ACTIONS_UNAVAILABLE: &str = "In this version the phone cannot act on the person's \
     computer. If the person asks for something to be done there, say that nothing can be done \
-    from this call yet. Do not say or imply that anything was done.";
+    from this call. Do not say or imply that anything was done.";
 
 /// What the model is told of a delegation: nothing was done.
 const NOTHING_WAS_DONE: &str = "Nothing was done on the person's computer: this version does not \
@@ -99,7 +99,7 @@ enum Probe {
     /// The host answered on this connection.
     Back(Arc<Session>),
     /// The host answered with a refusal.
-    Refused(Arc<Session>, String),
+    Refused(String),
     /// The host could not be reached yet.
     Unreached,
 }
@@ -180,6 +180,8 @@ pub(super) struct Owner {
     stops: Vec<oneshot::Sender<Closed>>,
     /// Seconds of call the start asked for.
     requested: u32,
+    /// When the owner gives native code a sign while a step runs.
+    signs: tokio::time::Interval,
 }
 
 /// Waits for the next news of the call, or for ever when there is no call.
@@ -230,6 +232,7 @@ impl Owner {
     ) -> Self {
         let (internal_tx, internal) = mpsc::unbounded_channel();
         let account = tokens.subscribe();
+        let timings = shared.timings;
         Self {
             id,
             shared,
@@ -254,6 +257,11 @@ impl Owner {
             silent_signs: 0,
             stops: Vec::new(),
             requested: 0,
+            signs: {
+                let mut signs = tokio::time::interval(timings.tick);
+                signs.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                signs
+            },
         }
     }
 
@@ -297,7 +305,20 @@ impl Owner {
                         return Err(cause);
                     }
                 }
+                // Native code ends a call whose owner gives no sign, and a setup can take long.
+                _ = self.signs.tick() => self.give_a_sign(),
             }
+        }
+    }
+
+    /// Tells native code the owner is there, on a task of its own; what it answers is read when the
+    /// call runs.
+    fn give_a_sign(&self) {
+        if let Some(call) = self.call.clone() {
+            let platform = self.platform();
+            tokio::spawn(async move {
+                let _ = platform.alive(&call).await;
+            });
         }
     }
 
@@ -334,28 +355,29 @@ impl Owner {
     /* ------------------------------------------------------------------------------------- */
 
     pub(super) async fn start(&mut self, request: StartRequest) -> Result<Outcome> {
-        self.view(|state| {
-            *state = VoiceCallState::no_call();
-            state.warning = None;
-        });
         self.requested = request.duration_seconds;
         let host = self.reach.in_use()?;
         self.host = Some(host.clone());
         self.generation = Some(self.pre_check().await?);
 
         // The call is opened, which asks the person for the microphone.
-        let platform = self.platform();
-        let opened = match self.wait(async move { platform.open().await }).await {
-            Ok(Ok(opened)) => opened,
-            Ok(Err(failure)) => return Err(self.open_failed(failure).await),
-            Err(cause) => return self.abandon(cause).await,
+        // Not interrupted: native code makes the call it is asked for, and a call made after the
+        // caller gave up would have no owner. A stop that comes meanwhile waits in the inbox.
+        let opened = match self.platform().open().await {
+            Ok(opened) => opened,
+            Err(failure) => return Err(self.open_failed(failure).await),
         };
+        self.view(|state| {
+            *state = VoiceCallState::no_call();
+        });
         let call = opened.call.clone();
         self.call = Some(call.clone());
         self.events = Some(opened.events);
         self.shared
             .keep_for_emergency(self.id, Some(call.clone()), Some(&host), None, &self.reach);
-        self.view(|state| state.running = false);
+        if let Some(cause) = self.pending_cause() {
+            return self.abandon(cause).await;
+        }
 
         let platform = self.platform();
         let offered = {
@@ -421,20 +443,21 @@ impl Owner {
         // The send is not interrupted: a request the host has been given is answered or lost, and
         // a call it created has to be found, so nothing here drops it half way. A stop that comes
         // meanwhile waits in the inbox and is read as soon as the answer is.
-        let sent = host.session.send(&composed).await;
+        let sent = match tokio::time::timeout(
+            self.shared.timings.start_within,
+            host.session.send(&composed),
+        )
+        .await
+        {
+            Ok(sent) => sent,
+            Err(_) => Err(ClientError::SubmissionUncertain { action_id }),
+        };
         let created = match sent {
             Ok(Settled::Result(value)) => {
                 host.session.settle(action_id).await;
                 match value.to_typed::<VoiceStartResult>() {
                     Ok(result) => Reached::Result(result),
-                    Err(error) => {
-                        return self
-                            .abandon_with(
-                                Cause::Step("the host's answer could not be read".to_owned()),
-                                CommandError::local_failure(error.to_string()),
-                            )
-                            .await;
-                    }
+                    Err(_) => Reached::Unknown,
                 }
             }
             Ok(Settled::Receipt(receipt)) => {
@@ -442,14 +465,11 @@ impl Owner {
                 Reached::Receipt(receipt)
             }
             Err(ClientError::SubmissionUncertain { .. } | ClientError::OutcomeUnknown { .. }) => {
-                match self.reconcile(&composed, &host, action_id).await {
-                    Ok(reached) => reached,
-                    Err(cause) => return self.abandon(cause).await,
-                }
+                self.reconcile(&composed, &host, action_id).await
             }
             Err(error) => {
                 host.session.settle(action_id).await;
-                self.stop_native().await;
+                self.stop_native(HostEnd::NotNeeded).await;
                 self.release();
                 return Err(CommandError::from(error));
             }
@@ -457,19 +477,40 @@ impl Owner {
 
         let result = match created {
             Reached::Receipt(receipt) => {
-                self.stop_native().await;
+                self.stop_native(HostEnd::NotNeeded).await;
                 self.release();
                 return Ok(Outcome::Over(Started::Receipt(receipt)));
             }
             Reached::Unknown => {
-                self.stop_native().await;
+                self.stop_native(HostEnd::NotTold {
+                    words:
+                        "The host never said whether it created the call, so a grant it made may \
+                            still be open until the moment the call was to close."
+                            .to_owned(),
+                })
+                .await;
+                self.view(|state| {
+                    state.ended = Some(EndedView {
+                        owner: self.id,
+                        cause: "start_unknown".to_owned(),
+                        words:
+                            "The host never said whether it created the call. Nothing is running \
+                                on this device."
+                                .to_owned(),
+                        closed_locally: true,
+                        host: HostEnd::NotTold {
+                            words: "The host never said whether it created the call.".to_owned(),
+                        },
+                        broker: "not_confirmed".to_owned(),
+                    });
+                });
                 self.release();
                 return Ok(Outcome::Over(Started::Unknown { action_id }));
             }
             Reached::Result(result) => result,
         };
         let VoiceStartOutcome::Started { session } = &result.outcome else {
-            self.stop_native().await;
+            self.stop_native(HostEnd::NotNeeded).await;
             self.release();
             return Ok(Outcome::Over(Started::Result(result)));
         };
@@ -678,16 +719,32 @@ impl Owner {
     }
 
     /// Stops the call's media when nothing was created at the host.
-    async fn stop_native(&mut self) {
+    async fn stop_native(&mut self, host: HostEnd) {
         if let Some(call) = self.call.take() {
             self.stop_media(&call).await;
         }
         self.events = None;
+        let closed = Closed { local: true, host };
         for reply in self.stops.drain(..) {
-            let _ = reply.send(Closed {
-                local: true,
-                host: HostEnd::NotNeeded,
-            });
+            let _ = reply.send(closed.clone());
+        }
+        self.answer_queued(&closed);
+    }
+
+    /// Answers whoever asked the owner for something while it was busy ending: a stop gets what
+    /// the end came to, and a mute is told there is no call.
+    fn answer_queued(&mut self, closed: &Closed) {
+        while let Ok(cmd) = self.inbox.try_recv() {
+            match cmd {
+                Cmd::Stop(reply) => {
+                    let _ = reply.send(closed.clone());
+                }
+                Cmd::Mute { reply, .. } => {
+                    let _ = reply.send(Err(CommandError::refused(
+                        "this device is not holding a voice call",
+                    )));
+                }
+            }
         }
     }
 
@@ -703,26 +760,33 @@ impl Owner {
         composed: &ComposedMutation,
         host: &CallHost,
         action_id: ActionId,
-    ) -> std::result::Result<Reached, Cause> {
+    ) -> Reached {
         let delays = self.shared.timings.repeat_delays;
         let within = self.shared.timings.host_within;
         let mut reached = Reached::Unknown;
         'asking: for delay in delays {
-            self.wait(tokio::time::sleep(delay)).await?;
+            if self.wait(tokio::time::sleep(delay)).await.is_err() {
+                break 'asking;
+            }
             let reach = Arc::clone(&self.reach);
             let paired = host.paired.clone();
             let original = Arc::clone(&host.session);
             let session = match self
                 .wait(async move { reach.session_to(&paired, Some(&original)).await })
-                .await?
+                .await
             {
-                Ok(session) => session,
-                Err(_) => continue,
+                Ok(Ok(session)) => session,
+                Ok(Err(_)) => continue,
+                Err(_) => break 'asking,
             };
             let asking = session.repeat(composed);
-            let answered = self
+            let Ok(answered) = self
                 .wait(async move { tokio::time::timeout(within, asking).await })
-                .await?;
+                .await
+            else {
+                session.settle(action_id).await;
+                break 'asking;
+            };
             match answered {
                 Ok(Ok(Settled::Result(value))) => {
                     if let Ok(result) = value.to_typed::<VoiceStartResult>() {
@@ -735,17 +799,13 @@ impl Owner {
                         break 'asking;
                     }
                 }
-                Ok(Ok(Settled::Receipt(receipt))) => {
-                    session.settle(action_id).await;
-                    reached = Reached::Receipt(receipt);
-                    break 'asking;
-                }
-                Ok(Err(_)) | Err(_) => {}
+                // A receipt is a lost answer again, and a refusal says nothing of the original.
+                Ok(Ok(Settled::Receipt(_)) | Err(_)) | Err(_) => {}
             }
             session.settle(action_id).await;
         }
         host.session.settle(action_id).await;
-        Ok(reached)
+        reached
     }
 
     /* ------------------------------------------------------------------------------------- */
@@ -808,16 +868,6 @@ impl Owner {
                     ))));
                 }
                 Ok(()) => {
-                    if what == Mute::Microphone
-                        && let Some(control) = control
-                    {
-                        let command = if muted {
-                            VoiceCommand::Mute
-                        } else {
-                            VoiceCommand::Unmute
-                        };
-                        let _ = control.send(command, None, None).await;
-                    }
                     if let Ok(held) = platform.held().await {
                         let mut view = shared.view.lock().expect("the view lock is not poisoned");
                         view.capture = capture_word(held.capture);
@@ -828,6 +878,18 @@ impl Owner {
                         .lock()
                         .expect("the view lock is not poisoned")
                         .clone()));
+                    // The service is told after the person has their answer: it is advice to the
+                    // provider, and the mute does not wait for it.
+                    if what == Mute::Microphone
+                        && let Some(control) = control
+                    {
+                        let command = if muted {
+                            VoiceCommand::Mute
+                        } else {
+                            VoiceCommand::Unmute
+                        };
+                        let _ = control.send(command, None, None).await;
+                    }
                 }
             }
         });
@@ -1011,12 +1073,13 @@ impl Owner {
                     Probe::Back(session) => {
                         self.host_back(&session);
                     }
-                    Probe::Refused(session, words) => {
-                        self.host_back(&session);
+                    // The host answered a refusal: it may not know the call, or may not let this
+                    // device read what the probe reads. It is reached, and not known to be back.
+                    Probe::Refused(words) => {
                         self.view(|state| {
                             state.warning = Some(format!(
-                                "The host answered but did not recognise this call: {words} \
-                                 Hang up if you did not expect that."
+                                "The host answered but would not say the call is still its own: \
+                                 {words}"
                             ));
                         });
                     }
@@ -1185,6 +1248,7 @@ impl Owner {
         for reply in self.stops.drain(..) {
             let _ = reply.send(closed.clone());
         }
+        self.answer_queued(&closed);
 
         if needs_broker {
             let broker = self.finalise(&cause, closing, &host_end).await;
@@ -1259,13 +1323,13 @@ impl Owner {
         ) else {
             return "not_confirmed";
         };
+        // On a task of its own: the close takes the account's token, and a refresh that the wait
+        // below gave up on half way could lose the token it rotated.
+        let call_id = descriptor.call_id.clone();
+        let closing = tokio::spawn(async move { broker.close(&call_id).await });
         if matches!(
-            tokio::time::timeout(
-                self.shared.timings.close_within,
-                broker.close(&descriptor.call_id)
-            )
-            .await,
-            Ok(Ok(_))
+            tokio::time::timeout(self.shared.timings.close_within, closing).await,
+            Ok(Ok(Ok(_)))
         ) {
             return "closed_over_http";
         }
@@ -1345,7 +1409,7 @@ async fn probe_host(
     .await
     {
         Ok(Ok(_)) => Probe::Back(session),
-        Ok(Err(ClientError::Host(error))) => Probe::Refused(session, error.message),
+        Ok(Err(ClientError::Host(error))) => Probe::Refused(error.message),
         _ => Probe::Unreached,
     }
 }

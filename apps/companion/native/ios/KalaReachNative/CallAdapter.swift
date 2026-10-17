@@ -453,6 +453,10 @@ public final class CallAdapter: NSObject {
             return "{}"
         case "callState":
             return await state()
+        case "callAlive":
+            // The owner is there. The call is named, so a sign for a call that has ended says so.
+            _ = try engine(CallWire.decode(CallWire.Call.self, arguments).call)
+            return await state()
         default:
             throw CallRefusal(code: CallRefusal.engine, message: "this build takes no such command")
         }
@@ -547,6 +551,12 @@ public final class CallAdapter: NSObject {
             if case .ended = item { finish(held.id) }
             if case .capture(let state) = item { self.held?.capture = state }
             held.news.offer(item)
+            // A connection that has failed for good carries no call: it ends here, and the owner
+            // is told by the end.
+            if case .connection("failed") = item {
+                let engine = held.engine
+                engineQueue.async { engine.stop() }
+            }
         }
     }
 
