@@ -257,7 +257,10 @@ impl Tree {
         reference: &Ref,
     ) -> Result<Vec<(String, usize)>, String> {
         let own = |found: Vec<usize>| -> Vec<(String, usize)> {
-            found.into_iter().map(|at| (index.name.clone(), at)).collect()
+            found
+                .into_iter()
+                .map(|at| (index.name.clone(), at))
+                .collect()
         };
         match reference {
             Ref::In { krate, names } => self.follow_in(krate, names, &item.label),
@@ -266,7 +269,11 @@ impl Tree {
                 if !found.is_empty() {
                     return Ok(own(found));
                 }
-                match index.imports.get(&item.file).and_then(|i| i.workspace.get(name)) {
+                match index
+                    .imports
+                    .get(&item.file)
+                    .and_then(|i| i.workspace.get(name))
+                {
                     Some((krate, original)) => {
                         self.follow_in(krate, std::slice::from_ref(original), &item.label)
                     }
@@ -310,9 +317,16 @@ impl Tree {
         name: &str,
     ) -> Result<Vec<(String, usize)>, String> {
         let own = |found: Vec<usize>| -> Vec<(String, usize)> {
-            found.into_iter().map(|at| (index.name.clone(), at)).collect()
+            found
+                .into_iter()
+                .map(|at| (index.name.clone(), at))
+                .collect()
         };
-        if let Some(found) = index.in_file.get(&item.file).and_then(|names| names.get(name)) {
+        if let Some(found) = index
+            .in_file
+            .get(&item.file)
+            .and_then(|names| names.get(name))
+        {
             return Ok(own(found.clone()));
         }
         let Some(imports) = index.imports.get(&item.file) else {
@@ -468,8 +482,8 @@ impl CrateIndex {
         for path in files {
             let text = std::fs::read_to_string(&path)
                 .map_err(|error| format!("{}: {error}", path.display()))?;
-            let file = syn::parse_file(&text)
-                .map_err(|error| format!("{}: {error}", path.display()))?;
+            let file =
+                syn::parse_file(&text).map_err(|error| format!("{}: {error}", path.display()))?;
             let relative = path
                 .strip_prefix(root)
                 .unwrap_or(&path)
@@ -560,7 +574,13 @@ impl CrateIndex {
             if let syn::Item::Impl(block) = item {
                 for inner in &block.items {
                     if let syn::ImplItem::Fn(method) = inner {
-                        self.push_method(method, file, krate, workspace, &type_name(&block.self_ty));
+                        self.push_method(
+                            method,
+                            file,
+                            krate,
+                            workspace,
+                            &type_name(&block.self_ty),
+                        );
                     }
                 }
             }
@@ -770,7 +790,14 @@ fn use_leaves(
             prefix.pop();
         }
         syn::UseTree::Name(name) => {
-            record_import(prefix, &name.ident.to_string(), &name.ident.to_string(), workspace, own, imports);
+            record_import(
+                prefix,
+                &name.ident.to_string(),
+                &name.ident.to_string(),
+                workspace,
+                own,
+                imports,
+            );
         }
         syn::UseTree::Rename(rename) => {
             record_import(
@@ -874,8 +901,11 @@ impl Collector<'_> {
                     // `krate::a::b` is a path with its segments.
                     let mut chain: Vec<String> = Vec::new();
                     let mut end = at;
-                    while let (Some(TokenTree::Punct(one)), Some(TokenTree::Punct(two)), Some(TokenTree::Ident(next))) =
-                        (flat.get(end + 1), flat.get(end + 2), flat.get(end + 3))
+                    while let (
+                        Some(TokenTree::Punct(one)),
+                        Some(TokenTree::Punct(two)),
+                        Some(TokenTree::Ident(next)),
+                    ) = (flat.get(end + 1), flat.get(end + 2), flat.get(end + 3))
                     {
                         if one.as_char() != ':' || two.as_char() != ':' {
                             break;
@@ -913,10 +943,10 @@ impl Collector<'_> {
                         .and_then(|rest| rest.strip_suffix('"'))
                     {
                         let segments: Vec<String> = inner.split("::").map(str::to_owned).collect();
-                        if segments
-                            .iter()
-                            .all(|name| !name.is_empty() && name.chars().all(|ch| ch.is_alphanumeric() || ch == '_'))
-                        {
+                        if segments.iter().all(|name| {
+                            !name.is_empty()
+                                && name.chars().all(|ch| ch.is_alphanumeric() || ch == '_')
+                        }) {
                             self.refs.push(Ref::Attribute(segments));
                         }
                     }

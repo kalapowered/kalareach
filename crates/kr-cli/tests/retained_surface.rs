@@ -109,7 +109,10 @@ fn roots(tree: &Tree) -> Vec<Root> {
         roots.push(root(&name, "kr_protocol", &[&name], Depth::Rules));
     }
     for (label, names) in [
-        ("the rights beside a forwarded mutation", vec!["worker_rights"]),
+        (
+            "the rights beside a forwarded mutation",
+            vec!["worker_rights"],
+        ),
         ("ActionTarget::validate", vec!["ActionTarget::validate"]),
         ("Dimensions::validate", vec!["Dimensions::validate"]),
         (
@@ -118,12 +121,7 @@ fn roots(tree: &Tree) -> Vec<Root> {
         ),
         ("RevisionReach::is_host", vec!["RevisionReach::is_host"]),
     ] {
-        roots.push(root(
-            label,
-            "kr_protocol",
-            &names,
-            Depth::Everything,
-        ));
+        roots.push(root(label, "kr_protocol", &names, Depth::Everything));
     }
     roots.push(root(
         "the limits of every frame",
@@ -204,7 +202,9 @@ fn the_rules_of_the_surface_are_the_ones_the_previous_release_had() {
             };
             let before = before["digest"].as_str().unwrap_or_default();
             if before != now.digest && same_for(label, &now.digest).is_none() {
-                let names: BTreeSet<&str> = before_items(&recorded[label.as_str()]).into_iter().collect();
+                let names: BTreeSet<&str> = before_items(&recorded[label.as_str()])
+                    .into_iter()
+                    .collect();
                 let now_names: BTreeSet<&str> = now.items.iter().map(String::as_str).collect();
                 problems.push(format!(
                     "level {}: what {label} names changed (digest {} now, {before} recorded); items only recorded: {:?}; items only now: {:?}",
@@ -303,7 +303,9 @@ fn answer(accepted: bool) -> &'static str {
 #[test]
 fn every_type_with_a_rule_that_the_surface_holds_is_covered() {
     let tree = tree();
-    let with_rules = tree.types_with_rules("kr_protocol").expect("the types with rules");
+    let with_rules = tree
+        .types_with_rules("kr_protocol")
+        .expect("the types with rules");
     let surface = kr_protocol::retained::current();
     let held = tree
         .held_by("kr_protocol", surface.names().map(str::to_owned).collect())
@@ -359,8 +361,10 @@ fn record_the_rules_of_the_surface() {
     // release's: every root must digest the same in both.
     let here = follow_all(&Tree::at(&repository()).expect("this checkout"));
     for (label, followed) in &in_release {
-        let (now, then): (BTreeSet<&String>, BTreeSet<&String>) =
-            (here[label].items.iter().collect(), followed.items.iter().collect());
+        let (now, then): (BTreeSet<&String>, BTreeSet<&String>) = (
+            here[label].items.iter().collect(),
+            followed.items.iter().collect(),
+        );
         assert_eq!(
             here[label].digest,
             followed.digest,
@@ -450,8 +454,16 @@ fn a_change_inside_a_helper_a_rule_calls_moves_its_digest() {
             .digest
     };
     let untouched = tempfile::tempdir().expect("a temporary directory");
-    copy_crates(&repository(), untouched.path(), &["kr-protocol", "kr-cbor", "kr-worker"]);
-    assert_eq!(alone(untouched.path()), alone(copy.path()), "the macro alone does not show the change");
+    copy_crates(
+        &repository(),
+        untouched.path(),
+        &["kr-protocol", "kr-cbor", "kr-worker"],
+    );
+    assert_eq!(
+        alone(untouched.path()),
+        alone(copy.path()),
+        "the macro alone does not show the change"
+    );
 
     // A comment and the layout around it move nothing.
     let text = std::fs::read_to_string(&ids).expect("ids.rs");
