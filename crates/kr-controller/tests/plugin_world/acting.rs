@@ -41,7 +41,7 @@ use kr_worker::broker::{
     BrokerTransport, Credential, ManagedProcess, TransportHandle, UpstreamDispatch, subject,
 };
 
-use super::{Hosted, PATIENCE, build, component, hosted, install};
+use super::{Epoch, Hosted, PATIENCE, build, component, hosted_with, install};
 
 pub fn instance() -> ApplicationInstanceId {
     ApplicationInstanceId::new(Uuid::from_bytes([2; 16]))
@@ -177,7 +177,7 @@ impl Acting {
 
     async fn assemble(registration: Registration) -> Option<Self> {
         let wasm = component("preparing")?;
-        let hosted = hosted().await;
+        let hosted = hosted_with(Epoch::Held).await;
         let source = install(&hosted.environment(), &wasm);
         let runtime = match registration {
             Registration::ByHand { .. } => Some(Arc::new(hosted.runtime().await)),
