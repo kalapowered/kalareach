@@ -208,7 +208,8 @@ impl Feed {
                     return answered.map(|state| (state, after_unknown || after_decline));
                 }
             }
-            // The service asks for the feed to be read before a change is sent again.
+            // The service asks for the feed to be read after an unknown answer, and before any
+            // change is sent again; after a decline it costs one read.
             self.host_client.read(self.address(), None, false).await?;
         }
     }
