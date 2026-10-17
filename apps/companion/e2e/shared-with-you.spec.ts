@@ -22,6 +22,42 @@ const SIZES = [
   { name: 'largest', ratio: LARGEST }
 ] as const
 
+/**
+ * The letters the page is drawn in. The system's own face differs from one platform to the next, and
+ * a layout that holds only for the widths of the face it was drawn with does not hold: the second is
+ * as wide as the widest face a phone, a desktop browser or the Linux runner is likely to draw with,
+ * so what fits in it fits in the narrower ones.
+ */
+const FACES = [
+  { name: 'the system face', suffix: '', shot: '', css: null },
+  {
+    name: 'a wide face',
+    suffix: ' in a wide face',
+    shot: '-wide',
+    css: ':root { --font-ui: Verdana, "DejaVu Sans", sans-serif !important; }'
+  }
+] as const
+
+/** Sets the page's face from its first frame, where `css` is the rule that says it. */
+async function withFace(page: Page, css: string | null): Promise<void> {
+  if (css === null) return
+  await page.addInitScript((rule) => {
+    const apply = (): boolean => {
+      const root = document.documentElement as HTMLElement | null
+      if (root === null) return false
+      const style = document.createElement('style')
+      style.textContent = rule
+      root.append(style)
+      return true
+    }
+    if (!apply()) {
+      new MutationObserver((_, observer) => {
+        if (apply()) observer.disconnect()
+      }).observe(document, { childList: true })
+    }
+  }, css)
+}
+
 /** The ratio the system gives the page, set before it loads, as a phone that already had it opens it. */
 async function withSystemTextScale(page: Page, ratio: number): Promise<void> {
   await page.addInitScript((value) => {
@@ -102,105 +138,143 @@ async function unreachable(page: Page, scope: string): Promise<string[]> {
 
 for (const surface of ['ios', 'android'] as const) {
   for (const size of SIZES) {
-    test.describe(`what is shared with a phone on ${surface} at the ${size.name} text size`, () => {
-      test.beforeEach(async ({ page }) => {
-        await withSystemTextScale(page, size.ratio)
-        await page.setViewportSize({ width: 320, height: 720 })
-      })
+    for (const face of FACES) {
+      test.describe(`what is shared with a phone on ${surface} at the ${size.name} text size${face.suffix}`, () => {
+        test.beforeEach(async ({ page }) => {
+          await withSystemTextScale(page, size.ratio)
+          await withFace(page, face.css)
+          await page.setViewportSize({ width: 320, height: 720 })
+        })
 
-      // KR-REQ-18.13: the invitations lay out whatever the text size, and every control is reachable.
-      test('lays the invitations at the head of the inbox out inside the screen', async ({ page }) => {
-        await open(page, surface, 'attention', offers)
-        const across = await page.evaluate(() => ({
-          page: document.documentElement.scrollWidth,
-          screen: window.innerWidth
-        }))
-        expect(across.page, 'the page is no wider than the screen').toBeLessThanOrEqual(across.screen)
-        expect(await overrunning(page, '[data-testid="offers"]')).toEqual([])
-        expect(await unreachable(page, '[data-testid="offers"]')).toEqual([])
+        // KR-REQ-18.13: the invitations lay out whatever the text size, and every control is reachable.
+        test('lays the invitations at the head of the inbox out inside the screen', async ({ page }) => {
+          await open(page, surface, 'attention', offers)
+          const across = await page.evaluate(() => ({
+            page: document.documentElement.scrollWidth,
+            screen: window.innerWidth
+          }))
+          expect(across.page, 'the page is no wider than the screen').toBeLessThanOrEqual(across.screen)
+          expect(await overrunning(page, '[data-testid="offers"]')).toEqual([])
+          expect(await unreachable(page, '[data-testid="offers"]')).toEqual([])
 
-        // The tab for this screen counts the two invitations, inside the bar and clear of its label.
-        await expect(page.locator('.m-tab-badge')).toHaveText('2')
-        await expect(page.getByRole('button', { name: /^Attention\s*, 2 waiting for you$/ })).toBeVisible()
-        expect(await overrunning(page, '.m-tabbar')).toEqual([])
+          // The tab for this screen counts the two invitations, inside the bar and clear of its label.
+          await expect(page.locator('.m-tab-badge')).toHaveText('2')
+          await expect(page.getByRole('button', { name: /^Attention\s*, 2 waiting for you$/ })).toBeVisible()
+          expect(await overrunning(page, '.m-tabbar')).toEqual([])
 
-        // The control: with the text kept from wrapping the same measure sees the rows run out.
-        await page.screenshot({ path: shot(`offers-${surface}-${size.name}`) })
-        await stopWrapping(page, ['[data-testid="offers"]'])
-        expect(await overrunning(page, '[data-testid="offers"]')).not.toEqual([])
-      })
+          // The control: with the text kept from wrapping the same measure sees the rows run out.
+          await page.screenshot({ path: shot(`offers-${surface}-${size.name}${face.shot}`) })
+          await stopWrapping(page, ['[data-testid="offers"]'])
+          expect(await overrunning(page, '[data-testid="offers"]')).not.toEqual([])
+        })
 
-      test('lays the card an invitation opens out inside the screen, with Accept and Not now reachable', async ({
-        page
-      }) => {
-        await open(page, surface, 'attention', offers)
-        await page.getByTestId('offers').getByRole('button').first().click()
-        const card = page.getByTestId('offer-card')
-        await expect(card).toBeVisible()
-        await expect(page.getByTestId('sheet')).toHaveAttribute('data-presentation', 'here')
-        expect(await overrunning(page, '[data-testid="offer-card"]')).toEqual([])
-        const accept = page.getByTestId('accept-offer')
-        const notNow = page.getByTestId('not-now')
-        await accept.scrollIntoViewIfNeeded()
-        for (const control of [accept, notNow]) {
-          const box = await control.boundingBox()
-          const target = surface === 'ios' ? 44 : 48
-          expect(box?.width ?? 0, 'target width').toBeGreaterThanOrEqual(target)
-          expect(box?.height ?? 0, 'target height').toBeGreaterThanOrEqual(target)
-        }
-        await accept.click({ trial: true })
-        await notNow.click({ trial: true })
-        await page.screenshot({ path: shot(`card-${surface}-${size.name}`) })
-        await stopWrapping(page, ['[data-testid="offer-card"]'])
-        expect(await overrunning(page, '[data-testid="offer-card"]')).not.toEqual([])
-      })
+        // KR-REQ-18.13: what is drawn under the invitations once some are put off or accepted without
+        // the host's answer arriving (the acceptances not settled, and the one that was hidden) lays
+        // out whatever the text size and the face, and every control is reachable.
+        test('lays the acceptances not settled, and what was put off, out inside the screen', async ({ page }) => {
+          await open(page, surface, 'attention', offers)
+          await page.evaluate(() => {
+            window.krTestHost?.sharing.offer({ session: '5' })
+          })
+          await readAgain(page)
+          await expect(page.locator('[data-offer]')).toHaveCount(3)
+          // Two invitations are accepted and the host's answers are lost: two acceptances not settled.
+          for (const session of ['3', '4']) {
+            await page.evaluate(() => {
+              window.krTestHost?.sharing.loseNextAnswer()
+            })
+            await page.getByRole('button', { name: new RegExp(`shared session ${session} with you`) }).click()
+            await page.getByTestId('accept-offer').click()
+            await expect(page.getByTestId('sheet')).toBeHidden()
+          }
+          await expect(page.getByTestId('accept-attempt')).toHaveCount(2)
+          // One acceptance is hidden, and the third invitation is put off.
+          await page.getByTestId('attempt-hide').first().click()
+          await expect(page.getByTestId('hidden-attempts')).toBeVisible()
+          await page.getByRole('button', { name: /shared session 5 with you/ }).click()
+          await page.getByTestId('not-now').click()
+          await expect(page.getByTestId('hidden-offers')).toBeVisible()
+          await expect(page.getByTestId('sheet')).toBeHidden()
 
-      // KR-REQ-18.13: the shares held, and the one that ended, lay out inside the screen.
-      test('lays the shares held and the one that ended out inside the screen', async ({ page }) => {
-        await open(page, surface, 'sessions', async (loaded) => {
-          await loaded.evaluate(() => {
-            const host = window.krTestHost
-            if (host === undefined) throw new Error('no scripted host')
-            host.sharing.offer({ session: '3', role: 'controller' })
-            host.sharing.offer({ session: '4' })
-            host.reachAsPhone({
-              rights: ['session.view'],
-              host: 'studio-with-a-long-name-that-has-to-wrap'
+          expect(await overrunning(page, '[data-testid="offers"]')).toEqual([])
+          expect(await unreachable(page, '[data-testid="offers"]')).toEqual([])
+          await page.screenshot({ path: shot(`settled-${surface}-${size.name}${face.shot}`) })
+          await stopWrapping(page, ['[data-testid="offers"]'])
+          expect(await overrunning(page, '[data-testid="offers"]')).not.toEqual([])
+        })
+
+        test('lays the card an invitation opens out inside the screen, with Accept and Not now reachable', async ({
+          page
+        }) => {
+          await open(page, surface, 'attention', offers)
+          await page.getByTestId('offers').getByRole('button').first().click()
+          const card = page.getByTestId('offer-card')
+          await expect(card).toBeVisible()
+          await expect(page.getByTestId('sheet')).toHaveAttribute('data-presentation', 'here')
+          expect(await overrunning(page, '[data-testid="offer-card"]')).toEqual([])
+          const accept = page.getByTestId('accept-offer')
+          const notNow = page.getByTestId('not-now')
+          await accept.scrollIntoViewIfNeeded()
+          for (const control of [accept, notNow]) {
+            const box = await control.boundingBox()
+            const target = surface === 'ios' ? 44 : 48
+            expect(box?.width ?? 0, 'target width').toBeGreaterThanOrEqual(target)
+            expect(box?.height ?? 0, 'target height').toBeGreaterThanOrEqual(target)
+          }
+          await accept.click({ trial: true })
+          await notNow.click({ trial: true })
+          await page.screenshot({ path: shot(`card-${surface}-${size.name}${face.shot}`) })
+          await stopWrapping(page, ['[data-testid="offer-card"]'])
+          expect(await overrunning(page, '[data-testid="offer-card"]')).not.toEqual([])
+        })
+
+        // KR-REQ-18.13: the shares held, and the one that ended, lay out inside the screen.
+        test('lays the shares held and the one that ended out inside the screen', async ({ page }) => {
+          await open(page, surface, 'sessions', async (loaded) => {
+            await loaded.evaluate(() => {
+              const host = window.krTestHost
+              if (host === undefined) throw new Error('no scripted host')
+              host.sharing.offer({ session: '3', role: 'controller' })
+              host.sharing.offer({ session: '4' })
+              host.reachAsPhone({
+                rights: ['session.view'],
+                host: 'studio-with-a-long-name-that-has-to-wrap'
+              })
             })
           })
-        })
-        // Accept both, then the host stops listing one.
-        await page.getByRole('button', { name: /^Attention\b/ }).click()
-        for (const session of ['3', '4']) {
-          await page.getByRole('button', { name: new RegExp(`shared session ${session} with you`) }).click()
-          await page.getByTestId('accept-offer').click()
-          await expect(page.getByTestId('sheet')).toBeHidden()
-        }
-        // The toast that says so is held while the pointer rests on it, and it lies over the tab bar.
-        await page.mouse.move(2, 2)
-        await expect(page.locator('.toast')).toBeHidden()
-        await page.getByRole('button', { name: 'Sessions', exact: true }).click()
-        const shared = page.getByTestId('shared-with-you')
-        await expect(shared.getByRole('button')).toHaveCount(2)
-        await page.evaluate(() => {
-          const host = window.krTestHost
-          const first = host?.sharing.held()[0]
-          if (host === undefined || first === undefined) throw new Error('nothing held')
-          host.sharing.endShare(first.grant.grant_id)
-          host.sharing.failNextHeld('the connection to the host was lost')
-        })
-        await readAgain(page)
-        await expect(shared.getByText(/Not refreshed just now/)).toBeVisible()
-        await readAgain(page)
-        await expect(page.getByTestId('ended-share')).toHaveCount(1)
+          // Accept both, then the host stops listing one.
+          await page.getByRole('button', { name: /^Attention\b/ }).click()
+          for (const session of ['3', '4']) {
+            await page.getByRole('button', { name: new RegExp(`shared session ${session} with you`) }).click()
+            await page.getByTestId('accept-offer').click()
+            await expect(page.getByTestId('sheet')).toBeHidden()
+          }
+          // The toast that says so is held while the pointer rests on it, and it lies over the tab bar.
+          await page.mouse.move(2, 2)
+          await expect(page.locator('.toast')).toBeHidden()
+          await page.getByRole('button', { name: 'Sessions', exact: true }).click()
+          const shared = page.getByTestId('shared-with-you')
+          await expect(shared.getByRole('button')).toHaveCount(2)
+          await page.evaluate(() => {
+            const host = window.krTestHost
+            const first = host?.sharing.held()[0]
+            if (host === undefined || first === undefined) throw new Error('nothing held')
+            host.sharing.endShare(first.grant.grant_id)
+            host.sharing.failNextHeld('the connection to the host was lost')
+          })
+          await readAgain(page)
+          await expect(shared.getByText(/Not refreshed just now/)).toBeVisible()
+          await readAgain(page)
+          await expect(page.getByTestId('ended-share')).toHaveCount(1)
 
-        expect(await overrunning(page, '[data-testid="shared-with-you"]')).toEqual([])
-        expect(await unreachable(page, '[data-testid="shared-with-you"]')).toEqual([])
-        await page.screenshot({ path: shot(`shared-${surface}-${size.name}`) })
-        await stopWrapping(page, ['[data-testid="shared-with-you"]'])
-        expect(await overrunning(page, '[data-testid="shared-with-you"]')).not.toEqual([])
+          expect(await overrunning(page, '[data-testid="shared-with-you"]')).toEqual([])
+          expect(await unreachable(page, '[data-testid="shared-with-you"]')).toEqual([])
+          await page.screenshot({ path: shot(`shared-${surface}-${size.name}${face.shot}`) })
+          await stopWrapping(page, ['[data-testid="shared-with-you"]'])
+          expect(await overrunning(page, '[data-testid="shared-with-you"]')).not.toEqual([])
+        })
       })
-    })
+    }
   }
 }
 
