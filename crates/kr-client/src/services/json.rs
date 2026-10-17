@@ -234,10 +234,11 @@ mod tests {
     /// The types a service module parses text into. None of them is JSON. A `parse` into any other
     /// type, or into one the compiler infers, fails the walk: `Value` implements `FromStr`, and an
     /// inferred type or another name for it could be it.
-    const PARSED_INTO: [&str; 5] = [
+    const PARSED_INTO: [&str; 6] = [
         "u32",
         "u64",
         "Uuid",
+        "jiff::Timestamp",
         "std::net::Ipv4Addr",
         "std::net::Ipv6Addr",
     ];

@@ -117,6 +117,13 @@ pub const BACKUP_WRITE_SCOPE: &str = "backup.write";
 /// device restoring from a recovery kit asks for.
 pub const BACKUP_RESTORE_SCOPE: &str = "backup.restore";
 
+/// The scope an account token needs before the host that holds it can make the account the payer of
+/// its relay leases.
+///
+/// The host's own sign-in asks for it when the host selects the relay lease service, and the
+/// application's sign-in does not: leases are asked for by the host, never by a companion.
+pub const RELAY_LEASE_SCOPE: &str = "relay.lease";
+
 /// The scopes every authorisation asks for, whatever resources it asks for beside them.
 ///
 /// The identity claims, which the ID token an exchange is checked by carries and the identity read
@@ -124,8 +131,8 @@ pub const BACKUP_RESTORE_SCOPE: &str = "backup.restore";
 pub const IDENTITY_SCOPES: [&str; 4] = ["openid", "profile", "email", "offline_access"];
 
 /// The scopes this build knows by name beside the ones an application sign-in asks for: the ones
-/// an authorisation for one purpose asks for.
-const PURPOSE_SCOPES: [&str; 2] = [BACKUP_WRITE_SCOPE, BACKUP_RESTORE_SCOPE];
+/// an authorisation for one purpose asks for, and the one a host's own sign-in asks for.
+const PURPOSE_SCOPES: [&str; 3] = [BACKUP_WRITE_SCOPE, BACKUP_RESTORE_SCOPE, RELAY_LEASE_SCOPE];
 
 /// A scope this build knows, as this build's own name for it: one an application sign-in or an
 /// authorisation for one purpose asks for.
@@ -1585,8 +1592,9 @@ struct GrantDocument {
 ///
 /// A domain-separated digest of the issuer, the account's subject and the origin of the service the
 /// token is presented to. Two marks are equal while it is the same account at the same service.
-/// Nothing in a mark says who the account is, and the subject it was made from never leaves the
-/// sign-in: a caller that must know a token is still its account's holds the mark and compares it.
+/// Nothing in a mark says who the account is, and the subject it was made from leaves the sign-in
+/// only in a [`TokenOfAccount`], for the one request that names the account in its signed body: a
+/// caller that must know a token is still its account's holds the mark and compares it.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct AccountMark([u8; 32]);
 
@@ -2701,7 +2709,26 @@ fn not_granted(scope: &str) -> ClientError {
 
 impl AccountTokenSource for SignedInAccount {
     fn token<'a>(&'a self, scope: &'a str) -> ServiceFuture<'a, AccountToken> {
-        Box::pin(async move { self.token_for(scope, |_, token| token).await })
+        Box::pin(async move { self.token_for(scope, false, |_, token| token).await })
+    }
+}
+
+/// A token with the account it belongs to, from one read of the grant.
+///
+/// A request that names the account in its signed body, beside the token that proves it, is the one
+/// caller that needs the account's identifier. The identifier goes into that body and nowhere else.
+pub struct TokenOfAccount {
+    /// The access token for the scope that was asked for.
+    pub token: AccountToken,
+    /// The account's stable identifier, as the service names it.
+    pub account_id: String,
+}
+
+impl fmt::Debug for TokenOfAccount {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TokenOfAccount")
+            .finish_non_exhaustive()
     }
 }
 
@@ -2731,16 +2758,38 @@ impl SignedInAccount {
         origin: &'a str,
     ) -> ServiceFuture<'a, (AccountToken, AccountMark)> {
         Box::pin(async move {
-            self.token_for(scope, |grant, token| (token, grant.mark_at(origin)))
+            self.token_for(scope, false, |grant, token| (token, grant.mark_at(origin)))
                 .await
         })
     }
 
-    /// Reads the grant once, refreshes it when the token is near its end, and shapes the answer
-    /// from the grant the token belongs to.
+    /// The token for `scope` with the account it belongs to, both from one read of the grant. With
+    /// `renew` the access token is replaced by a refresh whether or not it is near its end, for a
+    /// caller whose service refused it as one that may have ended in transit.
+    ///
+    /// # Errors
+    ///
+    /// As [`AccountTokenSource::token`].
+    pub fn token_of_account<'a>(
+        &'a self,
+        scope: &'a str,
+        renew: bool,
+    ) -> ServiceFuture<'a, TokenOfAccount> {
+        Box::pin(async move {
+            self.token_for(scope, renew, |grant, token| TokenOfAccount {
+                token,
+                account_id: grant.subject.clone(),
+            })
+            .await
+        })
+    }
+
+    /// Reads the grant once, refreshes it when the token is near its end or `renew` asks, and
+    /// shapes the answer from the grant the token belongs to.
     async fn token_for<T>(
         &self,
         scope: &str,
+        renew: bool,
         shape: impl Fn(&StoredGrant, AccountToken) -> T,
     ) -> Result<T> {
         let queued = {
@@ -2756,7 +2805,7 @@ impl SignedInAccount {
                 return Err(not_granted(scope));
             }
             let now = (self.clock_ms)();
-            if stored.access_expires_at_ms > now.saturating_add(ACCESS_MARGIN_MS) {
+            if !renew && stored.access_expires_at_ms > now.saturating_add(ACCESS_MARGIN_MS) {
                 return Ok(shape(&stored, stored.access_token.clone()));
             }
             match self.service.refresh(&stored).await? {

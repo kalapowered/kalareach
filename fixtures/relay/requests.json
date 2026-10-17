@@ -1,0 +1,17 @@
+{
+  "cases": [
+    {
+      "cbor_hex": "8278186b722d72656c61792d70617965722d7369676e2d696e2f31a16a6163636f756e745f6964782433663262386331652d356434612d346536662d396137622d316332643365346635613662",
+      "description": "A host that is signed in to an account asks the relay service to make that account its payer. The bearer token beside the request names an account too, and it has to be this one.",
+      "domain": "kr-relay-payer-sign-in/1",
+      "id": "payer_sign_in",
+      "json": {
+        "account_id": "3f2b8c1e-5d4a-4e6f-9a7b-1c2d3e4f5a6b"
+      },
+      "sha256": "fef97d53a05de31af9761714047be00e59efdda1a2b13a004188e2302a1d62a3"
+    }
+  ],
+  "description": "The request bodies a native client sends to the relay control plane beyond a lease and its revocation, and the exact bytes each body's digest covers.",
+  "name": "relay-requests",
+  "note": "cbor_hex is the canonical KR-CBOR-1 encoding of CBOR([domain, body]), the bytes a credential's body digest is taken over; sha256 is its digest. json is the managed HTTP representation of the body. An account identifier is text, whatever the account system's identifiers look like."
+}

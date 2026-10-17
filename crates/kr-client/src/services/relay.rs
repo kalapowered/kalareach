@@ -68,6 +68,7 @@ use kr_protocol::service::{GatewayOrigin, ServiceRequestSigner};
 use serde::{Deserialize, Serialize};
 
 use super::ServiceFuture;
+use super::account::AccountToken;
 use super::{LeaseEndReason, LeasePayer, LeaseRequest, RelayDirection, RelayLeaseService};
 use crate::error::{ClientError, Result};
 use crate::retry::UserAction;
@@ -84,6 +85,19 @@ pub const RELAY_LEASE_ISSUE_METHOD: &str = "relay.lease.issue";
 
 /// The method name a revocation request's credential covers.
 pub const RELAY_LEASE_REVOKE_METHOD: &str = "relay.lease.revoke";
+
+/// The domain a payer sign-in request's body digest covers.
+pub const RELAY_PAYER_SIGN_IN_DOMAIN: &str = "kr-relay-payer-sign-in/1";
+
+/// The method name a payer sign-in request's credential covers.
+pub const RELAY_PAYER_SIGN_IN_METHOD: &str = "relay.payer.sign_in";
+
+/// The path a payer sign-in request is addressed to.
+pub const RELAY_PAYER_SIGN_IN_PATH: &str = "/api/relay/payer-authorisation/sign-in";
+
+/// How many seconds an authorisation has left when its holder asks for it again: below this the
+/// service renews it in place, and above it answers with it as it stands.
+pub const RELAY_PAYER_RENEW_BELOW_SECONDS: u64 = 1800;
 
 /// The path a lease request is addressed to.
 pub const RELAY_LEASE_PATH: &str = "/api/relay/lease";
@@ -306,6 +320,41 @@ impl RelayLeaseRevokeBody {
             RELAY_LEASE_REVOKE_DOMAIN,
             vec![kr_cbor::to_canonical_value(self)?],
         )))
+    }
+}
+
+/// The body of a payer sign-in request: the account the caller is signed in to.
+///
+/// The bearer token beside the request names an account too, and the two have to be the same one.
+#[derive(Clone, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RelayPayerSignInBody {
+    /// The account, as the account system names it: the `sub` its identity carries. It is text in
+    /// the signed body, whatever the account system's identifiers look like.
+    pub account_id: String,
+}
+
+impl RelayPayerSignInBody {
+    /// The bytes this body's digest is taken over.
+    ///
+    /// # Errors
+    ///
+    /// Returns a CBOR error when the body cannot be represented in KR-CBOR-1.
+    pub fn signing_input(&self) -> std::result::Result<Vec<u8>, CborError> {
+        Ok(kr_cbor::encode(&signing_value(
+            RELAY_PAYER_SIGN_IN_DOMAIN,
+            vec![kr_cbor::to_canonical_value(self)?],
+        )))
+    }
+}
+
+impl std::fmt::Debug for RelayPayerSignInBody {
+    /// Nothing: the account's identifier is what the sign-in names, and a rendering does not repeat
+    /// it.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RelayPayerSignInBody")
+            .finish_non_exhaustive()
     }
 }
 
@@ -643,6 +692,62 @@ pub struct RelayLeaseEnding {
     pub grace: Nullable<RelayGraceRemainder>,
 }
 
+/// The authorisation a payer sign-in opened for the caller, selected as its default payer.
+///
+/// Each sign-in opens one for the first caller that presents it. The caller asks again once fewer
+/// than [`RELAY_PAYER_RENEW_BELOW_SECONDS`] remain and is answered with the same authorisation,
+/// renewed in place, so its identifier and the leases billed under it do not change.
+#[derive(Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RelayPayerAuthorisation {
+    /// The authorisation record, which a lease request names beside the account.
+    pub authorisation_id: String,
+    /// The account that would be billed.
+    pub account_id: String,
+    /// Whether it was given to an installation or to a host.
+    pub subject_kind: String,
+    /// The installation identifier, or the host signing key, it was given to.
+    pub subject: String,
+    /// The most one lease under it may hold outstanding against the account's allowance.
+    pub byte_ceiling: U64,
+    /// When it came into force, as an RFC 3339 instant.
+    pub valid_from: String,
+    /// When it stops being in force, as an RFC 3339 instant. No lease under it lasts past this.
+    pub valid_until: String,
+    /// When the caller made it its default, or null.
+    pub selected_at: Nullable<String>,
+    /// When the account withdrew it, or null while it stands.
+    pub withdrawn_at: Nullable<String>,
+}
+
+crate::debug_fields!(RelayPayerAuthorisation { byte_ceiling });
+
+impl RelayPayerAuthorisation {
+    /// When the authorisation stops being in force, in UTC milliseconds on the service's clock, or
+    /// none when the service wrote an instant this client cannot read.
+    #[must_use]
+    pub fn valid_until_ms(&self) -> Option<u64> {
+        let instant = self.valid_until.parse::<jiff::Timestamp>().ok()?;
+        u64::try_from(instant.as_millisecond()).ok()
+    }
+
+    /// The payer a lease request names to be billed under this authorisation.
+    #[must_use]
+    pub fn payer(&self) -> LeasePayer {
+        LeasePayer::Account {
+            account_id: self.account_id.clone(),
+            authorisation_id: self.authorisation_id.clone(),
+        }
+    }
+}
+
+/// The answer to a payer sign-in request, in the service's envelope.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PayerSignedIn {
+    authorisation: RelayPayerAuthorisation,
+}
+
 /* -------------------------------------------------------------------------- */
 /* The client                                                                  */
 /* -------------------------------------------------------------------------- */
@@ -704,13 +809,15 @@ impl ManagedRelayLeaseService {
         })
     }
 
-    /// Sends one signed request and returns the `data` of its envelope.
+    /// Sends one signed request and returns the `data` of its envelope. A request for something an
+    /// account owns carries that account's token beside the credential.
     async fn call<T: Serialize>(
         &self,
         path: &str,
         method: &str,
         body: T,
         signing_input: Vec<u8>,
+        bearer: Option<&AccountToken>,
     ) -> Result<serde_json::Value> {
         let signature = self.credential(
             method,
@@ -727,7 +834,13 @@ impl ManagedRelayLeaseService {
                 ))
             })?;
         let url = format!("{}{path}", self.origin.as_str());
-        let answer = self.http.post_json(&url, &request, &[]).await?;
+        let authorisation = bearer.map(|token| format!("Bearer {}", token.expose()));
+        let headers: Vec<(&str, &str)> = authorisation
+            .as_deref()
+            .map(|value| ("authorization", value))
+            .into_iter()
+            .collect();
+        let answer = self.http.post_json(&url, &request, &headers).await?;
 
         data_of(&answer, method)
     }
@@ -744,6 +857,7 @@ impl RelayLeaseService for ManagedRelayLeaseService {
                     RELAY_LEASE_ISSUE_METHOD,
                     body,
                     signing_input,
+                    None,
                 )
                 .await?;
             let answer: TaggedAnswer = serde_json::from_value(data).map_err(|error| {
@@ -775,6 +889,7 @@ impl RelayLeaseService for ManagedRelayLeaseService {
                     RELAY_LEASE_REVOKE_METHOD,
                     body,
                     signing_input,
+                    None,
                 )
                 .await?;
             serde_json::from_value(data).map_err(|error| {
@@ -788,6 +903,41 @@ impl RelayLeaseService for ManagedRelayLeaseService {
                     ),
                 )
             })
+        })
+    }
+
+    fn sign_in_payer<'a>(
+        &'a self,
+        account_id: &'a str,
+        token: &'a AccountToken,
+    ) -> ServiceFuture<'a, RelayPayerAuthorisation> {
+        Box::pin(async move {
+            let body = RelayPayerSignInBody {
+                account_id: account_id.to_owned(),
+            };
+            let signing_input = body.signing_input()?;
+            let data = self
+                .call(
+                    RELAY_PAYER_SIGN_IN_PATH,
+                    RELAY_PAYER_SIGN_IN_METHOD,
+                    body,
+                    signing_input,
+                    Some(token),
+                )
+                .await?;
+            serde_json::from_value::<PayerSignedIn>(data)
+                .map(|answer| answer.authorisation)
+                .map_err(|error| {
+                    // Asking again reads the same authorisation, so nothing is left undone, and
+                    // this client still cannot say what the service meant.
+                    unreadable(
+                        200,
+                        crate::shown!(
+                            "this client cannot read its sign-in answer: {}",
+                            Shown::json(&error)
+                        ),
+                    )
+                })
         })
     }
 }
@@ -910,11 +1060,12 @@ fn classify(code: &str, status: u16) -> (ErrorCode, UserAction) {
 /// handled it.
 ///
 /// A revocation may: a repeated revocation finishes whatever the first did not and answers with the
-/// settlement as it stands. A lease request may not: the service may have reserved bytes and
+/// settlement as it stands. A payer sign-in may: a repeat under the same sign-in reads the same
+/// authorisation. A lease request may not: the service may have reserved bytes and
 /// installed a lease before it failed, so what became of it is unknown, and a caller sends it again
 /// only to find that out, never as a retry the caller did not decide on.
 fn repeat_is_safe(method: &str) -> bool {
-    method == RELAY_LEASE_REVOKE_METHOD
+    method == RELAY_LEASE_REVOKE_METHOD || method == RELAY_PAYER_SIGN_IN_METHOD
 }
 
 /// An answer this client could not read, classified by the status that carried it.

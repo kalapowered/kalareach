@@ -17,11 +17,11 @@ use std::sync::{Arc, Mutex};
 
 use kr_client::retry::{RequestClass, UserAction};
 use kr_client::services::relay::{
-    ManagedRelayLeaseService, RelayLeaseIssueBody, RelayLeaseRevokeBody,
+    ManagedRelayLeaseService, RelayLeaseIssueBody, RelayLeaseRevokeBody, RelayPayerSignInBody,
 };
 use kr_client::services::{
-    LeaseEndReason, LeasePayer, LeaseRequest, RelayDirection, RelayLeaseAnswer, RelayLeaseService,
-    ServiceHttp, ServiceHttpAnswer, ServiceSigner,
+    AccountToken, LeaseEndReason, LeasePayer, LeaseRequest, RelayDirection, RelayLeaseAnswer,
+    RelayLeaseService, ServiceHttp, ServiceHttpAnswer, ServiceSigner,
 };
 use kr_client::{ClientError, Result};
 use kr_crypto::keys::AuthorisationKeyPair;
@@ -56,9 +56,12 @@ const LEASE_REVOKE_SHA256: &str =
 /// A service that records what it was sent and answers with what it was told to.
 #[derive(Debug)]
 struct Recorder {
-    sent: Mutex<Vec<(String, Vec<u8>)>>,
+    sent: Mutex<Vec<Sent>>,
     answer: Mutex<ServiceHttpAnswer>,
 }
+
+/// One request as it was sent: where, with what body, and under what headers.
+type Sent = (String, Vec<u8>, Vec<(String, String)>);
 
 impl Recorder {
     fn new(body: &str) -> Arc<Self> {
@@ -80,11 +83,17 @@ impl Recorder {
 
     fn last(&self) -> (String, serde_json::Value) {
         let sent = self.sent.lock().expect("what was sent");
-        let (url, body) = sent.last().expect("one request").clone();
+        let (url, body, _) = sent.last().expect("one request").clone();
         (
             url,
             serde_json::from_slice(&body).expect("a request this client wrote"),
         )
+    }
+
+    /// The headers of the latest request, beside the credential in its body.
+    fn last_headers(&self) -> Vec<(String, String)> {
+        let sent = self.sent.lock().expect("what was sent");
+        sent.last().expect("one request").2.clone()
     }
 }
 
@@ -96,12 +105,16 @@ impl ServiceHttp for Recorder {
         headers: &'a [(&'a str, &'a str)],
     ) -> kr_client::services::ServiceFuture<'a, ServiceHttpAnswer> {
         // A signed relay request carries its credential in the body, so it sends no headers of
-        // its own. Recorded rather than ignored, so the assertion below is about what was sent.
-        assert!(headers.is_empty(), "a relay request sends no extra headers");
-        self.sent
-            .lock()
-            .expect("what was sent")
-            .push((url.to_owned(), body.to_vec()));
+        // its own unless an account owns what it asks for. Recorded rather than ignored, so a test
+        // can assert on what was sent.
+        self.sent.lock().expect("what was sent").push((
+            url.to_owned(),
+            body.to_vec(),
+            headers
+                .iter()
+                .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+                .collect(),
+        ));
         let answer = self.answer.lock().expect("the answer").clone();
         Box::pin(async move { Ok(answer) })
     }
@@ -263,6 +276,10 @@ async fn the_credential_covers_the_canonical_body() {
 
     let (url, sent) = http.last();
     assert_eq!(url, "https://reach.kala.to/api/relay/lease");
+    assert!(
+        http.last_headers().is_empty(),
+        "a lease request sends no headers beside its credential"
+    );
 
     // The body is what this client meant to send, in the representation the service reads.
     let body = &sent["body"];
@@ -678,6 +695,10 @@ async fn a_revocation_reports_what_the_reservation_settled() {
 
     let (url, sent) = http.last();
     assert_eq!(url, "https://reach.kala.to/api/relay/lease/revoke");
+    assert!(
+        http.last_headers().is_empty(),
+        "a revocation sends no headers beside its credential"
+    );
     assert_eq!(sent["body"]["reason"], "unpaired");
     assert_eq!(
         sent["body"]["lease_id"],
@@ -833,14 +854,20 @@ fn payload_signature(sent: &serde_json::Value) -> Signature64 {
 
 /// The bytes the credential covered, rebuilt from what was sent.
 fn covered_bytes(sent: &serde_json::Value) -> Vec<u8> {
-    let payload = &sent["signature"]["payload"];
+    rebuilt_payload(&sent["signature"]["payload"])
+        .signing_input(ServiceRequestSigner::Installation)
+        .expect("canonical bytes")
+}
+
+/// The payload a credential carried, rebuilt from what was sent.
+fn rebuilt_payload(payload: &serde_json::Value) -> kr_client::services::relay::RelayRequestPayload {
     let digest =
         kr_protocol::scalars::from_base64url(payload["body_digest"].as_str().expect("a digest"))
             .expect("base64url");
     let nonce = kr_protocol::scalars::from_base64url(payload["nonce"].as_str().expect("a nonce"))
         .expect("base64url");
 
-    let rebuilt = kr_client::services::relay::RelayRequestPayload {
+    kr_client::services::relay::RelayRequestPayload {
         body_digest: kr_protocol::scalars::Digest256::from_bytes(
             <[u8; 32]>::try_from(digest.as_slice()).expect("32 bytes"),
         ),
@@ -856,11 +883,7 @@ fn covered_bytes(sent: &serde_json::Value) -> Vec<u8> {
                 .parse()
                 .expect("a counter"),
         ),
-    };
-
-    rebuilt
-        .signing_input(ServiceRequestSigner::Installation)
-        .expect("canonical bytes")
+    }
 }
 
 #[tokio::test]
@@ -873,4 +896,154 @@ async fn a_client_with_no_relay_service_says_so() {
         .expect_err("nothing is configured");
     assert_eq!(error.code(), ErrorCode::HostNotConfigured);
     assert!(matches!(error, ClientError::ServiceNotConfigured(what) if what == "relay leases"));
+}
+
+/// The authorisation a payer sign-in is answered with, in the shape the route serves.
+fn signed_in_answer(valid_until: &str) -> String {
+    serde_json::json!({
+        "ok": true,
+        "data": {
+            "authorisation": {
+                "authorisation_id": "55555555-5555-5555-5555-555555555555",
+                "account_id": ACCOUNT,
+                "subject_kind": "host",
+                "subject": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE",
+                "byte_ceiling": "8388608",
+                "valid_from": "2026-10-17T10:00:00.000Z",
+                "valid_until": valid_until,
+                "selected_at": "2026-10-17T10:00:00.000Z",
+                "withdrawn_at": null
+            }
+        }
+    })
+    .to_string()
+}
+
+/// The account a payer sign-in names.
+const ACCOUNT: &str = "3f2b8c1e-5d4a-4e6f-9a7b-1c2d3e4f5a6b";
+
+/// A host that is signed in asks the relay service to make its account the payer. The request is
+/// proven twice: by the host's credential over the canonical body, and by the bearer token of the
+/// sign-in. The answer is the authorisation, and a lease request names it as its payer.
+#[tokio::test]
+async fn a_payer_sign_in_presents_the_credential_and_the_account_token() {
+    let http = Recorder::new(&signed_in_answer("2026-10-17T11:00:00.000Z"));
+    let signer = Installation::new(ServiceRequestSigner::Host);
+    let service = ManagedRelayLeaseService::new(origin(), http.clone(), signer.clone());
+    let token = AccountToken::new("the-access-token").expect("a token");
+
+    let authorisation = service
+        .sign_in_payer(ACCOUNT, &token)
+        .await
+        .expect("an authorisation");
+
+    let (url, sent) = http.last();
+    assert_eq!(
+        url,
+        "https://reach.kala.to/api/relay/payer-authorisation/sign-in"
+    );
+    assert_eq!(
+        http.last_headers(),
+        vec![(
+            "authorization".to_owned(),
+            "Bearer the-access-token".to_owned()
+        )]
+    );
+    assert_eq!(sent["body"], serde_json::json!({ "account_id": ACCOUNT }));
+    let payload = &sent["signature"]["payload"];
+    assert_eq!(payload["method"], "relay.payer.sign_in");
+    assert_eq!(sent["signature"]["signer"], "host");
+    let canonical = RelayPayerSignInBody {
+        account_id: ACCOUNT.to_owned(),
+    }
+    .signing_input()
+    .expect("canonical bytes");
+    assert_eq!(
+        payload["body_digest"],
+        kr_protocol::scalars::to_base64url(&kr_cbor::sha256(&canonical))
+    );
+    let covered = SigningTranscript::from_canonical_bytes(
+        ServiceRequestSigner::Host.domain(),
+        rebuilt_payload(payload)
+            .signing_input(ServiceRequestSigner::Host)
+            .expect("canonical bytes"),
+    )
+    .expect("a domain-tagged transcript");
+    verify(&signer.public_key(), &covered, &payload_signature(&sent))
+        .expect("the credential verifies under the host's key");
+
+    assert_eq!(
+        authorisation.valid_until_ms(),
+        Some(1_792_234_800_000),
+        "the end of the authorisation, on the service's clock"
+    );
+    assert!(
+        authorisation.payer()
+            == LeasePayer::Account {
+                account_id: ACCOUNT.to_owned(),
+                authorisation_id: "55555555-5555-5555-5555-555555555555".to_owned(),
+            },
+        "a lease request names the account and the authorisation the sign-in opened"
+    );
+}
+
+/// The payer sign-in's body is the bytes the service rebuilds, held to the vector both sides pin.
+#[test]
+fn the_payer_sign_in_body_is_the_bytes_the_service_rebuilds() {
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("../../../fixtures/relay/requests.json"))
+            .expect("the vectors");
+    let case = fixture["cases"]
+        .as_array()
+        .and_then(|cases| cases.iter().find(|case| case["id"] == "payer_sign_in"))
+        .expect("the payer sign-in vector");
+    let body = RelayPayerSignInBody {
+        account_id: case["json"]["account_id"]
+            .as_str()
+            .expect("an account")
+            .to_owned(),
+    };
+    let canonical = body.signing_input().expect("canonical bytes");
+    assert_eq!(hex(&canonical), case["cbor_hex"].as_str().expect("bytes"));
+    assert_eq!(
+        hex(&kr_cbor::sha256(&canonical)),
+        case["sha256"].as_str().expect("a digest")
+    );
+}
+
+/// A sign-in only the person can mend is the service's `REAUTHENTICATION_REQUIRED`, which this
+/// client reports as a sign-in to make and names, so a caller can take a fresh token once before it
+/// asks the person. The service's own failure is safe to ask again: a repeat under the same sign-in
+/// reads the same authorisation, so it is a transient fault and not an unknown outcome.
+#[tokio::test]
+async fn a_payer_sign_in_the_service_turns_back_says_what_to_do() {
+    let http = Recorder::new(&signed_in_answer("2026-10-17T11:00:00.000Z"));
+    let service = ManagedRelayLeaseService::new(
+        origin(),
+        http.clone(),
+        Installation::new(ServiceRequestSigner::Host),
+    );
+    let token = AccountToken::new("the-access-token").expect("a token");
+
+    http.answer_with(
+        401,
+        r#"{"ok":false,"error":{"code":"REAUTHENTICATION_REQUIRED","message":"Sign this device in again."}}"#,
+    );
+    let error = service
+        .sign_in_payer(ACCOUNT, &token)
+        .await
+        .expect_err("the person has to sign in");
+    assert_eq!(error.service_code(), Some("REAUTHENTICATION_REQUIRED"));
+    assert_eq!(error.user_action(), UserAction::SignIn);
+
+    http.answer_with(
+        500,
+        r#"{"ok":false,"error":{"code":"INTERNAL","message":"Try again."}}"#,
+    );
+    let error = service
+        .sign_in_payer(ACCOUNT, &token)
+        .await
+        .expect_err("the service failed");
+    assert_eq!(error.code(), ErrorCode::UpstreamUnavailable);
+    assert_eq!(error.user_action(), UserAction::Wait);
 }

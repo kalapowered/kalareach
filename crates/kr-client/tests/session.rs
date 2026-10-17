@@ -2611,6 +2611,14 @@ impl RelayLeaseService for ForkServices {
     ) -> kr_client::services::ServiceFuture<'a, kr_client::services::RelayLeaseEnding> {
         self.refuses("relay.revoke")
     }
+
+    fn sign_in_payer<'a>(
+        &'a self,
+        _account_id: &'a str,
+        _token: &'a kr_client::services::AccountToken,
+    ) -> kr_client::services::ServiceFuture<'a, kr_client::services::RelayPayerAuthorisation> {
+        self.refuses("relay.payer.sign_in")
+    }
 }
 
 impl kr_client::services::PushService for ForkServices {

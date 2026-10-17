@@ -855,6 +855,7 @@ ordering cases test what they claim to test.
 | `relay/receipts.json` | Two consumption receipts of one reservation, showing the cumulative count |
 | `relay/instances.json` | A relay instance registration and an announced key rotation |
 | `relay/envelopes.json` | The install, revoke, report and registration messages that carry them |
+| `relay/requests.json` | The body a host signs to ask the relay service to make its signed-in account the payer, with the bytes its digest covers |
 | `crypto/relay.json` | Ed25519 signatures over those objects, by the relay instance key and the service admission key |
 | `accounts/leases.json` | The signing input of every account authority object, with the role ceilings and lifetimes |
 

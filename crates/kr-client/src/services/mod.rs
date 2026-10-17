@@ -155,8 +155,8 @@ pub use mailbox::{
 };
 pub use relay::{
     ManagedRelayLeaseService, RelayAllowance, RelayGraceRemainder, RelayLeaseAnswer,
-    RelayLeaseEnding, RelayLeaseGrant, RelayLeaseRefusal, RelayWarning, ServiceHttp,
-    ServiceHttpAnswer, ServiceSigner,
+    RelayLeaseEnding, RelayLeaseGrant, RelayLeaseRefusal, RelayPayerAuthorisation, RelayWarning,
+    ServiceHttp, ServiceHttpAnswer, ServiceSigner,
 };
 pub use storage::{
     ArchiveAnswer, BackupState, ManagedStorageService, NewUpload, ObjectDeleted, ObjectRange,
@@ -378,6 +378,25 @@ pub trait RelayLeaseService: Send + Sync + std::fmt::Debug {
         lease_id: RelayLeaseId,
         reason: LeaseEndReason,
     ) -> ServiceFuture<'a, RelayLeaseEnding>;
+
+    /// Makes the account this caller is signed in to its payer, from the sign-in itself.
+    ///
+    /// The request carries two proofs and needs both: the caller's credential, which says which
+    /// caller this is, and `token`, the bearer token of its account sign-in, which says which
+    /// account and that the sign-in asked to bill relay traffic to it. `account_id` names the
+    /// account and has to be the token's. The answer is the authorisation the sign-in opened,
+    /// selected as this caller's default: a lease request names it in its payer, and it lasts an
+    /// hour from each time it is asked for again once fewer than
+    /// [`relay::RELAY_PAYER_RENEW_BELOW_SECONDS`] seconds remain.
+    ///
+    /// The service answers `REAUTHENTICATION_REQUIRED` when the person has to sign the caller in
+    /// again, and a caller that is answered it takes a fresh token once before it asks the person,
+    /// because a token that ended in transit gets the same answer as a sign-in that ended.
+    fn sign_in_payer<'a>(
+        &'a self,
+        account_id: &'a str,
+        token: &'a account::AccountToken,
+    ) -> ServiceFuture<'a, relay::RelayPayerAuthorisation>;
 }
 
 /// Where a device registers for push.
@@ -1428,6 +1447,14 @@ impl RelayLeaseService for NullService {
         _lease_id: RelayLeaseId,
         _reason: LeaseEndReason,
     ) -> ServiceFuture<'a, RelayLeaseEnding> {
+        unconfigured(ManagedService::RelayLeases.as_str())
+    }
+
+    fn sign_in_payer<'a>(
+        &'a self,
+        _account_id: &'a str,
+        _token: &'a AccountToken,
+    ) -> ServiceFuture<'a, relay::RelayPayerAuthorisation> {
         unconfigured(ManagedService::RelayLeases.as_str())
     }
 }
