@@ -147,7 +147,7 @@ impl ScriptedCalls {
         self.inner().held_cannot_be_read = true;
     }
 
-    /// Holds `step` (`open`, `offer`, `accept`, `permit` or `stop`): the command is given and counted, and
+    /// Holds `step` (`open`, `offer`, `accept`, `permit`, `held` or `stop`): the command is given and counted, and
     /// does not return until [`Self::release`] lets it.
     pub fn hold(&self, step: &'static str) {
         self.inner().held_steps.push(step);
@@ -388,6 +388,7 @@ impl CallPlatform for ScriptedCalls {
     fn held(&self) -> CallFuture<'_, Held> {
         Box::pin(async move {
             self.inner().commands.push("held".to_owned());
+            self.gate("held").await;
             if self.inner().held_cannot_be_read {
                 return Err(CallFailure::new(
                     FailureKind::Engine,

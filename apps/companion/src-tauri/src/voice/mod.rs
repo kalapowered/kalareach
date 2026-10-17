@@ -374,6 +374,28 @@ impl Shared {
             }
         };
         let Some(kept) = kept else {
+            // The owner failed before it kept anything to finish: no call was named to it, and it
+            // wrote no end. This one says the call stopped working, and that nothing is known of
+            // the media, before the slot is free for another.
+            let mut view = self.view.lock().expect("the view lock is not poisoned");
+            if view.owner == owner {
+                view.running = false;
+                view.session = None;
+                view.control = "none".to_owned();
+                view.host = "none".to_owned();
+                if view.ended.as_ref().is_none_or(|ended| ended.owner != owner) {
+                    view.ended = Some(EndedView {
+                        owner,
+                        cause: "owner_failed".to_owned(),
+                        words: "This device's call stopped working, so the call was ended."
+                            .to_owned(),
+                        closed_locally: false,
+                        host: HostEnd::NotNeeded,
+                        broker: "not_needed".to_owned(),
+                    });
+                }
+            }
+            drop(view);
             self.release(owner);
             return;
         };
@@ -391,10 +413,14 @@ impl Shared {
                 _ => None,
             }
         };
-        self.view
-            .lock()
-            .expect("the view lock is not poisoned")
-            .begin_ending(owner);
+        {
+            let mut view = self.view.lock().expect("the view lock is not poisoned");
+            view.begin_ending(owner);
+            // The call is being ended, not running, from here on.
+            if view.owner <= owner {
+                view.running = false;
+            }
+        }
         let (closed_locally, host_end) = tokio::join!(local, toward_host);
         let toward_host_asked = host_end.is_some();
         // A start the host was not heard to answer may have made a call, so it is not a host that

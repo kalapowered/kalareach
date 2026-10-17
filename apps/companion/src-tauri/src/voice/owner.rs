@@ -142,11 +142,11 @@ pub(super) async fn drive(shared: Arc<Shared>, launch: Launch) {
             }
         }
         Ok(Outcome::Over(started)) => {
-            owner.note_not_started(declined_words(&started));
+            owner.finish_without_call(declined_words(&started));
             let _ = reply.send(Ok(started));
         }
         Err(error) => {
-            owner.note_not_started(Some(error.message.clone()));
+            owner.finish_without_call(Some(plain_words(&error)));
             let _ = reply.send(Err(error));
         }
     }
@@ -160,6 +160,17 @@ pub(super) async fn drive(shared: Arc<Shared>, launch: Launch) {
     owner.shared.forget_emergency(owner.id);
 }
 
+/// A failure's words without the protocol code that a host's message begins with: a person reads
+/// the words, and the code is for the page's own branching.
+fn plain_words(error: &CommandError) -> String {
+    let prefix = format!("{}: ", error.code.as_str());
+    error
+        .message
+        .strip_prefix(&prefix)
+        .unwrap_or(&error.message)
+        .to_owned()
+}
+
 /// What a person is told of a start that ended with no call, when the answer was not one the owner
 /// wrote an end for: the service's or the host's own words.
 fn declined_words(started: &Started) -> Option<String> {
@@ -168,14 +179,13 @@ fn declined_words(started: &Started) -> Option<String> {
             VoiceStartOutcome::Started { .. } => None,
             VoiceStartOutcome::Unavailable { message, .. }
             | VoiceStartOutcome::CreationUnknown { message, .. }
-            | VoiceStartOutcome::PreparationChanged { message } => Some(message.clone()),
-            VoiceStartOutcome::RateChanged { .. } => Some(
-                "The rate changed after it was shown, so nothing was started, held or charged."
-                    .to_owned(),
-            ),
+            | VoiceStartOutcome::PreparationChanged { message }
+            | VoiceStartOutcome::RateChanged { message, .. } => Some(message.clone()),
         },
+        // A receipt does not show whether the host made a call, so no more is said than that this
+        // device holds none.
         Started::Receipt(_) => Some(
-            "The host answered with a receipt and not with a call, so no call was started."
+            "This device holds no call: the host answered with a receipt and not with a call."
                 .to_owned(),
         ),
         // The owner wrote what an unknown start left.
@@ -316,6 +326,19 @@ impl Owner {
 
     fn platform(&self) -> Arc<dyn CallPlatform> {
         Arc::clone(&self.shared.platform)
+    }
+
+    /// Finishes a start that ended with no call: how it ended is written, what is queued is
+    /// answered, and the slot is freed, in that order, so that nothing reads a free device with no
+    /// end for the start that held it.
+    fn finish_without_call(&mut self, words: Option<String>) {
+        self.note_not_started(words);
+        let closed = Closed {
+            local: self.media_stopped.unwrap_or(true),
+            host: HostEnd::NotNeeded,
+        };
+        self.close_inbox(&closed);
+        self.shared.release(self.id);
     }
 
     /// Writes how a start that ended with no call ended, unless the owner already wrote an end for
@@ -478,7 +501,6 @@ impl Owner {
         // A stop that came while the token was checked gives the call up before anything is made.
         if self.pending_cause().is_some() {
             self.stop_native(HostEnd::NotNeeded).await;
-            self.release();
             return Err(CommandError::unavailable(
                 "The call was given up before it began.",
             ));
@@ -609,7 +631,6 @@ impl Owner {
             Err(error) => {
                 host.session.settle(action_id).await;
                 self.stop_native(HostEnd::NotNeeded).await;
-                self.release();
                 return Err(CommandError::from(error));
             }
         };
@@ -621,7 +642,6 @@ impl Owner {
             match created {
                 Reached::Receipt(receipt) => {
                     self.stop_native(HostEnd::NotNeeded).await;
-                    self.release();
                     return Ok(Outcome::Over(Started::Receipt(receipt)));
                 }
                 Reached::Unknown => {
@@ -658,14 +678,12 @@ impl Owner {
                     state.owe(now_ms(), OwedView::start_unknown(action_id, until_ms, &host));
                 });
                     self.shared.start_was_answered(self.id);
-                    self.release();
                     return Ok(Outcome::Over(Started::Unknown { action_id }));
                 }
                 Reached::Result(result) => result,
             };
         let VoiceStartOutcome::Started { session } = &result.outcome else {
             self.stop_native(HostEnd::NotNeeded).await;
-            self.release();
             return Ok(Outcome::Over(Started::Result(result)));
         };
         let descriptor = (**session).clone();
@@ -851,6 +869,9 @@ impl Owner {
     /// What a call that native code would not open is told as, and whatever native code may have
     /// made after all is stopped.
     async fn open_failed(&mut self, failure: CallFailure) -> CommandError {
+        // Cleaning up has begun, and the screen is told so before native code is asked anything.
+        let id = self.id;
+        self.view(|state| state.begin_ending(id));
         let error = match failure.kind {
             FailureKind::MicrophoneRefused => CommandError::refused(
                 "Kala Reach has no permission to use the microphone, so no call was started. \
@@ -877,15 +898,6 @@ impl Owner {
             }
         }
         self.media_stopped = Some(local);
-        self.view(|state| state.begin_ending(self.id));
-        // A stop that waited meanwhile is told what became of the media, as the end of any other
-        // call tells it.
-        let closed = Closed {
-            local,
-            host: HostEnd::NotNeeded,
-        };
-        self.close_inbox(&closed);
-        self.release();
         error
     }
 

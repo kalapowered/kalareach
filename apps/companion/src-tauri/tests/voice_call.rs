@@ -1827,6 +1827,9 @@ enum FailsAt {
     /// The first reach for a connection to the host, which the owner takes when it asks what
     /// became of a start.
     Reaching,
+    /// The first look at the host a call belongs to, which the owner takes before it asks
+    /// native code for anything.
+    InUse,
 }
 
 /// A host reach that fails the way a bug does: the first time it is asked for what `at` names after
@@ -1841,6 +1844,10 @@ impl companion_tauri::voice::HostReach for FailsWhenTold {
     fn in_use(
         &self,
     ) -> Result<companion_tauri::voice::CallHost, companion_tauri::error::CommandError> {
+        assert!(
+            self.at != FailsAt::InUse || self.told.load(Ordering::SeqCst) != 0,
+            "the owner fails"
+        );
         self.inner.in_use()
     }
 
@@ -2010,5 +2017,98 @@ async fn an_owner_that_fails_while_asking_what_became_of_a_start_leaves_the_star
         "{ended}"
     );
     scene.stand_in.release_creations();
+    scene.stop_host().await;
+}
+
+/// The owner fails before it has kept anything to finish: no call was named to it, and it wrote no
+/// end. The supervisor writes one, so that a screen that reads the device after the slot is free
+/// finds that the call stopped working, and that nothing is known of the media, and the next call
+/// starts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_owner_that_fails_before_it_keeps_anything_still_leaves_an_end() {
+    let mut scene = scene().await;
+    let prepared = scene.prepared().await;
+    let reach = failing_reach(&scene, FailsAt::InUse, 0);
+    let calls = scene.phone.companion.app.state::<Calls>();
+
+    let refused = calls
+        .start(
+            request_of(&scene, &prepared),
+            Arc::clone(&reach) as Arc<dyn companion_tauri::voice::HostReach>,
+            Arc::clone(&scene.tokens),
+        )
+        .await;
+
+    assert!(refused.is_err(), "the owner failed before it could answer");
+    let ended = scene
+        .state_where("the owner's failure", |state| {
+            state["ended"]["cause"] == "owner_failed" && state["setting_up"] == false
+        })
+        .await;
+    assert_eq!(ended["ended"]["closed_locally"], false, "{ended}");
+    // The slot is free: the next call starts.
+    let again = scene.start().await;
+    assert!(again["value"]["outcome"]["started"].is_object(), "{again}");
+    let _ = scene.call("voice_stop", json!({ "voiceSessionId": null }));
+    scene.stop_host().await;
+}
+
+/// The host refuses the start itself, with a refusal that carries its protocol code in the words
+/// the client library writes. A screen that reads the device afterwards is told the host's words and
+/// not the code, as the screen's own start is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_start_the_host_refuses_is_recorded_in_its_words_and_without_its_code() {
+    let mut scene = scene().await;
+    let prepared = scene.prepared().await;
+    let mut request = scene.start_request(&prepared);
+    request["sessionIds"] =
+        json!([kr_protocol::ids::SessionId::new(kr_ipc::new_uuid()).to_string()]);
+
+    let answer = scene.call("voice_start", request);
+
+    let state = scene.state();
+    assert_eq!(state["ended"]["cause"], "not_started", "{answer:?} {state}");
+    let words = state["ended"]["words"].as_str().expect("words");
+    assert!(!words.is_empty(), "{state}");
+    for code in [
+        "PERMISSION_DENIED: ",
+        "INVALID_ARGUMENT: ",
+        "RESOURCE_UNAVAILABLE: ",
+    ] {
+        assert!(!words.starts_with(code), "{words}");
+    }
+    scene.stop_host().await;
+}
+
+/// The device's open fails, and while it cleans up what native code may hold, the device says it is
+/// ending, not making a call: the screen is not offered an end that the cleanup has already begun.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_open_says_it_is_ending_while_it_cleans_up() {
+    let mut scene = scene().await;
+    scene.platform.hold("held");
+    let _holding = scene.platform.release_when_done("held");
+    scene.platform.fail_the_open_after_making_the_call();
+    let prepared = scene.prepared().await;
+    let starting = scene
+        .phone
+        .companion
+        .start_call("voice_start", scene.start_request(&prepared));
+    tokio::time::timeout(WATCHDOG, async {
+        while scene.platform.count("held") == 0 {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("the owner asked native code what it holds");
+
+    let cleaning = scene.state();
+
+    assert_eq!(cleaning["setting_up"], true, "{cleaning}");
+    assert_eq!(cleaning["ending"], true, "{cleaning}");
+    scene.platform.release("held");
+    starting
+        .await
+        .expect("the start ran")
+        .expect_err("a call that could not be opened is not a call started");
     scene.stop_host().await;
 }
