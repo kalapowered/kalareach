@@ -20,7 +20,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use iroh::endpoint::{ConnectingError, ConnectionError};
+use iroh::endpoint::{ConnectError, ConnectingError, ConnectionError};
 use iroh::{Endpoint, EndpointAddr};
 use kr_client::cursors::StreamCursors;
 use kr_client::error::ClientError;
@@ -89,6 +89,24 @@ fn gave_up_unanswered(error: &ClientError) -> bool {
         error,
         ClientError::Transport(kr_transport::TransportError::Connect(message))
             if *message == ConnectingError::from(ConnectionError::TimedOut).to_string()
+    )
+}
+
+/// Whether iroh ended a dial because nothing answered it inside the transport's inactivity
+/// threshold.
+fn connect_gave_up_unanswered(error: &ConnectError) -> bool {
+    matches!(
+        error,
+        ConnectError::Connecting {
+            source: ConnectingError::ConnectionError {
+                source: ConnectionError::TimedOut,
+                ..
+            },
+            ..
+        } | ConnectError::Connection {
+            source: ConnectionError::TimedOut,
+            ..
+        }
     )
 }
 
@@ -411,6 +429,10 @@ impl Device {
     /// Returns the unpaired connection the device asks about its pairing on, and the value it
     /// displays for the owner to compare.
     ///
+    /// The dial is made once. The candidate's handshake has ten seconds from its start and no
+    /// message extends them, so a dial the transport gave up on after its 30-second inactivity
+    /// threshold, made again, could not finish this pairing.
+    ///
     /// # Errors
     ///
     /// Returns why the host could not be reached or refused the binding.
@@ -470,6 +492,35 @@ impl Device {
         })
     }
 
+    /// Dials the host a direct invitation pins until it answers.
+    ///
+    /// A dial the transport gave up on, because nothing answered it inside its inactivity
+    /// threshold, is made again on a new connection: the host has read nothing of such a dial, so
+    /// no invitation is spent by it.
+    async fn reach_pinned_host(
+        &self,
+        address: &EndpointAddr,
+    ) -> Result<iroh::endpoint::Connection, String> {
+        let dial = async {
+            loop {
+                let attempt = bounded(
+                    "the connection to the pinned host",
+                    self.endpoint
+                        .connect(address.clone(), kr_protocol::hello::ALPN),
+                )
+                .await?;
+                match attempt {
+                    Err(error) if connect_gave_up_unanswered(&error) => {}
+                    outcome => return Ok::<_, String>(outcome),
+                }
+            }
+        };
+        tokio::time::timeout(REACH, dial)
+            .await
+            .map_err(|_| format!("the pinned host was not reached within {REACH:?}"))??
+            .map_err(|error| format!("the pinned host could not be reached: {error}"))
+    }
+
     /// Redeems the direct invitation `qr_text` names, over loopback iroh to the pinned endpoint.
     ///
     /// # Errors
@@ -483,13 +534,7 @@ impl Device {
         };
         let payload: DirectQrPayload = *payload;
         let address = address_of(&payload.endpoint_id, &payload.network_config);
-        let connection = bounded(
-            "the connection to the pinned host",
-            self.endpoint
-                .connect(address.clone(), kr_protocol::hello::ALPN),
-        )
-        .await?
-        .map_err(|error| format!("the pinned host could not be reached: {error}"))?;
+        let connection = self.reach_pinned_host(&address).await?;
         let mut unpaired = bounded(
             "the unpaired handshake",
             handshake::connect_unpaired(&connection, &self.unpaired),
