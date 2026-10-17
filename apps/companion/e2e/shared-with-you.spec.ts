@@ -74,6 +74,12 @@ async function readAgain(page: Page): Promise<void> {
   })
 }
 
+
+/** Lets the page draw two frames, in which what was asked of it (a scroll, an insertion) has happened. */
+async function drawn(page: Page): Promise<void> {
+  await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))))
+}
+
 /** Every control a person can touch under `selector`, scrolled to and pressed in a trial. */
 async function unreachable(page: Page, scope: string): Promise<string[]> {
   const controls = page.locator(scope).locator('button:visible:not([disabled])')
@@ -219,6 +225,7 @@ test.describe('a new invitation while the inbox is scrolled', () => {
       element.scrollTop = 180
     })
     await expect.poll(() => main.evaluate((element) => element.scrollTop)).toBeGreaterThan(100)
+    await drawn(page)
     const before = { top: await probe(page), scrolled: await main.evaluate((element) => element.scrollTop) }
 
     await page.evaluate(() => {
@@ -231,7 +238,7 @@ test.describe('a new invitation while the inbox is scrolled', () => {
 
     // Nothing the person can see has moved, though the list grew above it. The browser tells a page
     // what a box's size became just before it draws the next frame, so the place is read after two.
-    await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))))
+    await drawn(page)
     const after = await page.evaluate(() => ({
       top: document.querySelector('.m-list [data-attention]')?.getBoundingClientRect().top ?? Number.NaN,
       scrolled: document.querySelector('.m-main')?.scrollTop ?? Number.NaN
@@ -273,7 +280,7 @@ test.describe('a new invitation while the inbox is scrolled', () => {
     await expect(pill).toBeVisible()
     await pill.click()
     // At once: the position is at the top by the time the click has returned and a frame has drawn.
-    await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))))
+    await drawn(page)
     expect(await main.evaluate((element) => element.scrollTop)).toBeLessThanOrEqual(8)
   })
 
@@ -315,6 +322,7 @@ test.describe('a share that arrives while the sessions are scrolled', () => {
       element.scrollTop = 900
     })
     await expect.poll(() => main.evaluate((element) => element.scrollTop)).toBeGreaterThan(800)
+    await drawn(page)
 
     // The first session in view, by its identity, and where it is drawn.
     const place = (id: string | null) =>
@@ -338,7 +346,7 @@ test.describe('a share that arrives while the sessions are scrolled', () => {
     })
     await readAgain(page)
     await expect(page.getByTestId('shared-with-you')).toBeAttached()
-    await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))))
+    await drawn(page)
     const after = await place(before?.id ?? null)
     expect(after, 'the session is still drawn').not.toBeNull()
     expect(
@@ -346,5 +354,56 @@ test.describe('a share that arrives while the sessions are scrolled', () => {
       `the session under the finger kept its place (${JSON.stringify({ before, after })})`
     ).toBeLessThanOrEqual(1)
     expect(after?.scrolled ?? 0, 'the scroll position took up the new rows').toBeGreaterThan(before?.scrolled ?? 0)
+  })
+
+  // KR-REQ-18.13: when the share that is in view is the one that goes, the rows beside it are still
+  // where they were: the place is kept by another row that is still there.
+  test('keeps the rows in view where they are when the share in view is the one that ends', async ({ page }) => {
+    await page.goto('/harness.html?surface=ios&tab=sessions')
+    await expect(page.locator('.m-shell')).toBeVisible()
+    const ids = await page.evaluate(() => {
+      const host = window.krTestHost
+      if (host === undefined) throw new Error('no scripted host')
+      host.reachAsPhone({ rights: ['session.view'] })
+      return [3, 4, 5, 6, 7, 8, 9, 10].map((session) => host.sharing.hold({ session: String(session) }).grant.grant_id)
+    })
+    const main = page.locator('.m-main')
+    await expect(page.getByTestId('shared-with-you').getByRole('button')).toHaveCount(8)
+    // The person has scrolled until the third share is the first one in view.
+    await page.evaluate((id) => {
+      const scroller = document.querySelector('.m-main') as HTMLElement
+      const row = document.querySelector<HTMLElement>(`[data-share="${id}"]`)
+      if (row === null) throw new Error('no such share')
+      scroller.scrollTop += row.getBoundingClientRect().top - scroller.getBoundingClientRect().top + 4
+    }, ids[2])
+    await expect.poll(() => main.evaluate((element) => element.scrollTop)).toBeGreaterThan(100)
+    await drawn(page)
+
+    const place = (id: string) =>
+      page.evaluate((wanted) => {
+        const row = document.querySelector<HTMLElement>(`[data-share="${wanted}"]`)
+        const scroller = document.querySelector('.m-main') as HTMLElement
+        return row === null ? null : row.getBoundingClientRect().top - scroller.getBoundingClientRect().top
+      }, id)
+    const before = await place(ids[3] ?? '')
+    expect(before).not.toBeNull()
+
+    // The share in view ends, and two more are listed above it: the list above the rows in view
+    // grows by a row, and the row that was first in view is not there to be kept by.
+    await page.evaluate((id) => {
+      const host = window.krTestHost
+      if (host === undefined) throw new Error('no scripted host')
+      host.sharing.endShare(id)
+      host.sharing.hold({ session: '1' })
+      host.sharing.hold({ session: '2' })
+    }, ids[2])
+    await readAgain(page)
+    await expect(page.getByTestId('ended-share')).toHaveCount(1)
+    await drawn(page)
+    const after = await place(ids[3] ?? '')
+    expect(
+      Math.abs((after ?? Number.NaN) - (before ?? Number.NaN)),
+      `the share beside it kept its place (${JSON.stringify({ before, after })})`
+    ).toBeLessThanOrEqual(1)
   })
 })

@@ -4,9 +4,9 @@
  * A list that is read again every few seconds can gain a row above the one a person has scrolled to.
  * Chromium moves the scroll position by itself to keep the row in place (scroll anchoring); WebKit
  * does not, and the row under the person's finger jumps. Neither is left to the engine: the first
- * row that is in view is remembered with where it is drawn and where the list was scrolled to, and
- * when the list changes with the scroll position where it was, the scroll position moves by exactly
- * how far that row moved. A list that has been scrolled since (by the person, by the engine's own
+ * rows that are in view are remembered with where they are drawn in the scrolling area and where the
+ * list was scrolled to, and when the list changes with the scroll position where it was, the scroll
+ * position moves by exactly how far the first of them that is still there moved. A list that has been scrolled since (by the person, by the engine's own
  * anchoring, by a scroll that was asked for) is not corrected: the row moved because the list did,
  * and a correction would take the scroll back. A change below the row moves nothing.
  *
@@ -25,37 +25,49 @@ const ROWS = '.m-row, .sw-heading, .sw-attempt, .m-filters, .m-empty'
 /** The nearest scrolling area of a list on the phone. */
 const SCROLLER = '.m-main'
 
-/** Keeps the first row in view of the list `content` holds where it is while the list changes. */
+/** Rows in view, where each was drawn, and where the list was scrolled to when they were taken. */
+interface Kept {
+  readonly rows: readonly { readonly row: Element; readonly top: number }[]
+  readonly scrolled: number
+}
+
+/** How many rows in view are remembered, so that one that is replaced leaves another to go by. */
+const REMEMBERED = 4
+
+/** Keeps the first rows in view of the list `content` holds where they are while the list changes. */
 export function useKeepPlace(content: RefObject<HTMLElement | null>): void {
   useEffect(() => {
     const element = content.current
     const scroller = element?.closest<HTMLElement>(SCROLLER) ?? null
     if (element === null || scroller === null) return
 
-    let kept: { readonly row: Element; readonly top: number; readonly scrolled: number } | null = null
+    // The first rows in view, each with where it is drawn from the top of the scrolling area (so the
+    // area itself moving, a bar above it changing height, is not the list moving), and the position
+    // the list was scrolled to when they were taken.
+    let kept: Kept | null = null
 
-    // The first row whose lower edge is below the top of what is in view, and where it is.
     const take = () => {
-      if (scroller.scrollTop <= SCROLLED) {
-        kept = null
-        return
-      }
-      const edge = scroller.getBoundingClientRect().top
       kept = null
+      if (scroller.scrollTop <= SCROLLED) return
+      const edge = scroller.getBoundingClientRect().top
+      const rows: { row: Element; top: number }[] = []
       for (const row of element.querySelectorAll(ROWS)) {
         const box = row.getBoundingClientRect()
-        if (box.height > 0 && box.bottom > edge + 1) {
-          kept = { row, top: box.top, scrolled: scroller.scrollTop }
-          return
-        }
+        if (box.height > 0 && box.bottom > edge + 1) rows.push({ row, top: box.top - edge })
+        if (rows.length === REMEMBERED) break
       }
+      if (rows.length > 0) kept = { rows, scrolled: scroller.scrollTop }
     }
 
     const restore = () => {
       const before = kept
-      if (before !== null && before.row.isConnected && scroller.scrollTop === before.scrolled) {
-        const by = before.row.getBoundingClientRect().top - before.top
-        if (Math.abs(by) > 0.5) scroller.scrollTop += by
+      if (before !== null && scroller.scrollTop === before.scrolled) {
+        // The first of the rows that is still there is the one to go by.
+        const still = before.rows.find(({ row }) => row.isConnected)
+        if (still !== undefined) {
+          const by = still.row.getBoundingClientRect().top - scroller.getBoundingClientRect().top - still.top
+          if (Math.abs(by) > 0.5) scroller.scrollTop += by
+        }
       }
       take()
     }

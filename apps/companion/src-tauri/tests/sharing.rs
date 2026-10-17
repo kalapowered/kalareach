@@ -2246,12 +2246,36 @@ async fn an_offer_to_a_guest_tells_what_it_carries_and_none_of_the_screen_the_is
         .await
         .expect_err("a guest lists no session");
     assert_eq!(code_of(&refused), "PERMISSION_DENIED", "{refused}");
-    // The host answers a guest's inbox with nothing in it, never with what a session holds.
+    // The session is waiting for an answer, which is what an inbox is for. The host's owner sees it,
+    // which is the control: the guest's inbox is empty because the host leaves the item out of it,
+    // and not because there is nothing to leave out.
+    adopted.workers[0].ask("is this the plan you meant?");
+    tokio::time::timeout(WATCHDOG, async {
+        loop {
+            let inbox = issuer
+                .call("attention_read", well_formed_inbox_read())
+                .await
+                .expect("the owner's inbox is read");
+            if inbox["items"]
+                .as_array()
+                .is_some_and(|items| !items.is_empty())
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the owner is shown what the session is waiting for");
     let inbox = phone
         .call("attention_read", well_formed_inbox_read())
         .await
         .expect("a guest's inbox is read");
-    assert_eq!(inbox["items"], json!([]), "{inbox}");
+    assert_eq!(
+        inbox["items"],
+        json!([]),
+        "the host answers a guest with an inbox that has nothing in it: {inbox}"
+    );
     // The session itself is not one the guest can read, shared or not, until one is shared with it.
     let refused = phone
         .call(

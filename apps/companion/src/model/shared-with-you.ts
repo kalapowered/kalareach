@@ -31,9 +31,18 @@ export function sessionWords(displayNumber: string): string {
   return `session ${displayNumber}`
 }
 
-/** What an invitation is called: the sentence the row and the card both start with. */
+/** What native calls a host that gave it no name this computer could read. */
+const UNNAMED_BY_NATIVE = 'your host'
+
+/**
+ * What an invitation is called: the sentence the row and the card both start with. A host's name is
+ * its owner's own text and starts the sentence as it is written; only the words native puts in
+ * place of a name are capitalised.
+ */
 export function offerTitle(host: string | null, offer: ShareOffer): string {
-  return `${sentenceCase(hostWords(host))} shared ${sessionWords(offer.display_number)} with you.`
+  const named = hostWords(host)
+  const first = named.toLowerCase() === UNNAMED_BY_NATIVE ? sentenceCase(named) : named
+  return `${first} shared ${sessionWords(offer.display_number)} with you.`
 }
 
 /**
@@ -94,7 +103,7 @@ export function showsLines(offer: ShareOffer, nowMs: number): readonly string[] 
   const from = Number(offer.history_from_ms)
   const lines = [
     from === 0
-      ? 'Everything the host has kept of the session.'
+      ? 'What the session does, from its start.'
       : `What the session does from ${momentWords(from, nowMs)}.`
   ]
   if (offer.includes_live_screen) lines.push('The terminal as it is when you open it.')

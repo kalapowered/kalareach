@@ -147,7 +147,6 @@ export function MobileSessions({
         })
         .catch((failure: unknown) => {
           if (!current()) return
-          if (failureCode(failure) === 'PERMISSION_DENIED') setHeld({ at: key, rows: [] })
           setProblem({
             at: key,
             message: failureMessage(failure),
@@ -199,9 +198,7 @@ export function MobileSessions({
               : 'Reading what is shared with this phone…'}
         </p>
       ) : null}
-      {rows && rows.length === 0 && !noneOfItsOwn ? (
-        <p className="m-empty">No sessions on this host.</p>
-      ) : null}
+      {rows && rows.length === 0 ? <p className="m-empty">No sessions on this host.</p> : null}
       {rows && rows.length > 0 && sharedHere ? (
         <h2 className="sw-heading" id="own-sessions-heading">
           On this host
@@ -256,10 +253,10 @@ export function MobileSessions({
           })}
         </ul>
       ) : null}
-      {!rows && !error && connected === false ? (
+      {!rows && !error && !noneOfItsOwn && connected === false ? (
         <p className="m-empty">No host is being reached.</p>
       ) : null}
-      {!rows && !error && connected !== false ? (
+      {!rows && !error && !noneOfItsOwn && connected !== false ? (
         <p className="m-empty">Reading the sessions…</p>
       ) : null}
     </div>

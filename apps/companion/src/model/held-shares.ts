@@ -144,6 +144,7 @@ export class HeldBook {
   #baseline = true
   #known = new Set<string>()
   #putOff = new Set<string>()
+  #taken = new Set<string>()
 
   constructor(port: HostPort, cadenceMs: number = HELD_READ_CADENCE_MS) {
     this.#port = port
@@ -186,6 +187,7 @@ export class HeldBook {
       this.#newest += 1
       this.#known = new Set()
       this.#putOff = new Set()
+      this.#taken = new Set()
       this.#baseline = true
       this.#view = { ...NOTHING, arrived: { seq: this.#view.arrived.seq, invitationIds: [] } }
       this.#told()
@@ -216,9 +218,18 @@ export class HeldBook {
     this.#cadence?.now()
   }
 
-  /** Reads now and settles once the answer has been taken in or has failed. */
-  readNow(): Promise<void> {
-    return this.#read()
+  /**
+   * The host answered an acceptance with its result: the invitation is no longer offered, and the
+   * page need not wait for a read to say so. It is out of sight at once, and is let go of once a
+   * read no longer lists it. One that a read still lists, because it was asked before the host
+   * wrote the acceptance, stays out of sight until a later one does not.
+   */
+  taken(invitationId: string): void {
+    this.#taken.add(invitationId)
+    this.#change({
+      offers: this.#view.offers.filter((offer) => offer.invitation_id !== invitationId),
+      hidden: this.#view.hidden.filter((id) => id !== invitationId)
+    })
   }
 
   /**
@@ -295,7 +306,10 @@ export class HeldBook {
 
   /** A complete read, taken in. */
   #apply(held: Held, attempts: readonly AttemptView[], hostName: string | null): void {
-    const offers = [...held.offers].sort(newestFirst)
+    // What the host still lists of an invitation the person has accepted is not shown, and what it
+    // no longer lists is let go of.
+    this.#taken = new Set(held.offers.map((offer) => offer.invitation_id).filter((id) => this.#taken.has(id)))
+    const offers = held.offers.filter((offer) => !this.#taken.has(offer.invitation_id)).sort(newestFirst)
     const shares = [...held.shares].sort(byNumber)
     const listed = new Set(shares.map((share) => share.grant.grant_id))
     // A share that was held and is not listed has ended. One that is listed again is not ended.

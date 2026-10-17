@@ -54,10 +54,11 @@ const SCROLLED = 8
 const SHEET = '[data-testid="sheet"]'
 
 /**
- * Puts the focus somewhere that is still there once a sheet has left, when the sheet's own return
- * of it found nothing: the row that opened it can be gone by then (an accepted invitation, one put
- * off). Focus that is on something in the page is left where it is, and the person's own press or
- * key takes the matter over, so this never moves focus the person has moved.
+ * Puts the focus somewhere that is still there once a sheet has left, when the sheet's own return of
+ * it found nothing: the row that opened it can be gone by then (an accepted invitation, one put
+ * off), or go a moment after, when a read says so. It acts only when the sheet is gone and focus is
+ * on nothing (the page's body, or something that was taken away), and it stops for good at the
+ * person's next press or key, so it never moves focus the person has moved.
  *
  * The function this returns is called when the sheet is closed. Whatever it waits for is let go when
  * the screen goes.
@@ -72,16 +73,13 @@ function useFocusAfterSheet(find: () => HTMLElement | null): () => void {
   )
   return () => {
     stop.current()
-    const settle = (): boolean => {
-      if (document.querySelector(SHEET) !== null) return false
+    const settle = () => {
+      if (document.querySelector(SHEET) !== null) return
       const active = document.activeElement
       if (active === null || active === document.body || !active.isConnected) find()?.focus()
-      return true
     }
-    if (settle()) return
-    const observer = new MutationObserver(() => {
-      if (settle()) stop.current()
-    })
+    settle()
+    const observer = new MutationObserver(settle)
     observer.observe(document.body, { childList: true, subtree: true })
     const taken = () => {
       stop.current()
@@ -181,11 +179,19 @@ export function Offers({ surface }: { readonly surface: Surface }): ReactNode {
       document.getElementById('main')
   )
 
+  /** Closes the card of `offer` and no other: another may have been opened while this was sent. */
+  const closeCardOf = (offer: ShareOffer) => {
+    setOpen((current) => (current === offer.invitation_id ? null : current))
+  }
+
   const accept = (offer: ShareOffer) => {
     setAccepting(offer.invitation_id)
     ask(() => port.grantRedeem({ invitation_id: offer.invitation_id }))
-      .then(async (done) => {
+      .then((done) => {
         if (done.attempt.phase === 'closed' && done.attempt.outcome === 'happened') {
+          // The host answered with its result, so the invitation is no longer offered: it is out of
+          // sight at once, and the next read says the same.
+          book.taken(offer.invitation_id)
           if (desk.firstTime(done.attempt.action_id)) say(acceptedWords(offer, Date.now()))
         } else {
           // The host's answer was lost or did not settle it. The row for the acceptance says where
@@ -193,14 +199,11 @@ export function Offers({ surface }: { readonly surface: Surface }): ReactNode {
           book.keep(done.attempt)
           say(`Waiting to hear from the host about ${sessionWords(offer.display_number)}.`, 'pending')
         }
-        // The card stays until what the host lists is read, so the row it was opened from is gone,
-        // or is still there, when the card leaves, and focus is put back by what is true then.
-        await book.readNow()
-        setOpen(null)
+        closeCardOf(offer)
         afterSheet()
       })
       .catch((failure: unknown) => {
-        setOpen(null)
+        closeCardOf(offer)
         say(failureText(failure), 'danger')
         afterSheet()
       })
@@ -294,15 +297,14 @@ export function Offers({ surface }: { readonly surface: Surface }): ReactNode {
 
             {offers.length > 0 ? (
               <ul className="m-list">
-                {offers.map((offer, index) => (
+                {offers.map((offer) => (
                   <li key={offer.invitation_id}>
                     <button
                       type="button"
                       className="m-row"
                       data-tone="warning"
                       data-offer={offer.invitation_id}
-                      data-focus-after={index === 0 ? '' : undefined}
-                      style={{ minBlockSize: target }}
+                                           style={{ minBlockSize: target }}
                       onClick={() => {
                         setOpen(offer.invitation_id)
                       }}
@@ -327,7 +329,6 @@ export function Offers({ surface }: { readonly surface: Surface }): ReactNode {
                 className="m-row sw-quiet"
                 data-tone="muted"
                 data-testid="hidden-offers"
-                data-focus-after={offers.length === 0 ? '' : undefined}
                 style={{ minBlockSize: target }}
                 onClick={() => {
                   book.showPutOff()

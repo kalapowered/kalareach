@@ -129,7 +129,7 @@ describe('an invitation at the head of the inbox (KR-REQ-18.13)', () => {
     start({ before: (c) => c.sharing.offer({ allHistory: true }) })
     await userEvent.click(await screen.findByRole('button', { name: new RegExp(INVITATION) }))
     const card = await screen.findByTestId('offer-card')
-    expect(within(card).getByText('Everything the host has kept of the session.')).toBeInTheDocument()
+    expect(within(card).getByText('What the session does, from its start.')).toBeInTheDocument()
     expect(within(card).queryByText(/^What the session does from /)).toBeNull()
   })
 
@@ -153,40 +153,70 @@ describe('an invitation at the head of the inbox (KR-REQ-18.13)', () => {
     })
   })
 
-  it('keeps the card open until the list the host gives has been read, so the invitation is gone when it closes', async () => {
-    // The read of what the host lists after the acceptance is held until the test lets it go.
-    let gate: Promise<void> | null = null
-    let release: () => void = () => undefined
-    const { controls } = start({
+  it('takes the accepted invitation out of sight at once, and a list from before the acceptance does not bring it back', async () => {
+    // Once told to, the host's list is served as it was before the acceptance: a read asked for
+    // before the host wrote it, which can answer after.
+    let beforeIt: Awaited<ReturnType<HostPort['grantHeld']>> | null = null
+    let serveThat = false
+    const { controls, port } = start({
       before: (c) => c.sharing.offer(),
-      through: (port) => ({
-        ...port,
+      through: (host) => ({
+        ...host,
         grantHeld: async () => {
-          const held = await port.grantHeld()
-          if (gate !== null) await gate
-          return held
+          const held = await host.grantHeld()
+          if (!serveThat) beforeIt = held
+          return serveThat && beforeIt !== null ? beforeIt : held
         }
       })
     })
     const row = await screen.findByRole('button', { name: new RegExp(INVITATION) })
     await userEvent.click(row)
     const accept = await screen.findByTestId('accept-offer')
-    gate = new Promise<void>((resolve) => {
-      release = resolve
-    })
+    serveThat = true
     await userEvent.click(accept)
-    // Accepted, and the toast says so, but the list that says the invitation is gone is not in yet.
+
+    // The host answered, so the card goes and so does the invitation, whatever the list says next.
     expect(await screen.findByText(/^Accepted\. Session 3 is shared with you until /)).toBeInTheDocument()
     expect(controls.sharing.sent().redeem).toBe(1)
-    expect(screen.getByTestId('sheet')).toBeInTheDocument()
-    expect(screen.getByTestId('accept-offer')).toBeDisabled()
-
-    release()
     await waitFor(() => {
       expect(screen.queryByTestId('sheet')).toBeNull()
     })
-    // The card has gone and so has the row it was opened from: nothing is left of the invitation.
+    await readAgain(port)
+    await readAgain(port)
     expect(screen.queryByRole('button', { name: new RegExp(INVITATION) })).toBeNull()
+
+    // A list from after it does not have the invitation, and the page lets go of it.
+    serveThat = false
+    await readAgain(port)
+    await waitFor(() => {
+      expect(screen.queryByTestId('offers')).toBeNull()
+    })
+  })
+
+  it('puts focus on the screen when an invitation is gone by the time the host refuses to accept it', async () => {
+    const offered = { id: '' }
+    const { controls } = start({
+      before: (c) => {
+        offered.id = c.sharing.offer().invitation_id
+      }
+    })
+    const row = await screen.findByRole('button', { name: new RegExp(INVITATION) })
+    await userEvent.click(row)
+    const accept = await screen.findByTestId('accept-offer')
+    // The issuer withdraws it after the phone read its list: the host refuses the acceptance, and
+    // the list that says it is gone is read after the card has closed.
+    controls.sharing.withdrawOffer(offered.id)
+    await userEvent.click(accept)
+    expect(await screen.findByText(/no longer offered to this device/)).toBeInTheDocument()
+    await waitFor(() => {
+      expect(screen.queryByTestId('sheet')).toBeNull()
+    })
+    await waitFor(() => {
+      expect(screen.queryByTestId('offers')).toBeNull()
+    })
+    await waitFor(() => {
+      expect(document.activeElement?.id).toBe('main')
+    })
   })
 
   it('puts focus on what is still there once the card has gone: the next invitation, or the screen', async () => {
@@ -473,6 +503,8 @@ describe('a guest, whose pairing holds no view of any session (KR-REQ-25.28)', (
     })
     expect(await screen.findByText('The sessions could not be read')).toBeInTheDocument()
     expect(screen.queryByText('Nothing is shared with this phone.')).toBeNull()
+    // The host told this device nothing of its sessions, so the screen does not say there are none.
+    expect(screen.queryByText('No sessions on this host.')).toBeNull()
   })
 })
 
@@ -534,6 +566,7 @@ describe('a host that does not know the read (KR-REQ-18.13)', () => {
     // With nothing shared to list, a guest's refusal stays the failure it was before shares existed.
     expect(await screen.findByText('The sessions could not be read')).toBeInTheDocument()
     expect(screen.queryByText('Nothing is shared with this phone.')).toBeNull()
+    expect(screen.queryByText('No sessions on this host.')).toBeNull()
   })
 })
 
