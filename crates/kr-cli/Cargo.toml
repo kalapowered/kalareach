@@ -88,7 +88,7 @@ kr-changeset.workspace = true
 # The destination tests also read the daemon's delivery journal for the destination a command made.
 kr-delivery.workspace = true
 kr-describe.workspace = true
-kr-plugin-catalogue.workspace = true
+kr-plugin-catalogue = { workspace = true, features = ["testing"] }
 kr-plugin-sdk.workspace = true
 kr-project.workspace = true
 kr-transfer.workspace = true
@@ -111,6 +111,14 @@ tempfile.workspace = true
 kr-service-stand-in = { path = "../../tests/support/service-stand-in" }
 # The stored-format checks read the types a store keeps from their definitions in the source.
 syn.workspace = true
+# The upgrade suite's device pairs with an installed host's daemon over the network on the loopback
+# interface, and connects to it, as a phone does.
+iroh.workspace = true
+kr-transport.workspace = true
+# And it installs a plugin package into the host's catalogue, and asks the plugin runtime what it
+# holds.
+kr-plugin-service.workspace = true
+url.workspace = true
 # The retained-surface check follows the helpers a validator calls through their source, token by token.
 proc-macro2.workspace = true
 quote.workspace = true

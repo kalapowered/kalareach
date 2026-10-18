@@ -418,6 +418,14 @@ struct Assembled {
     /// Programs of the release written from these bytes in place of the workspace's own, by the name
     /// they have in `bin/`.
     written: Vec<(String, Vec<u8>)>,
+    /// Files of the release copied from a file on disk, by their path in the release: a shell
+    /// package built elsewhere.
+    copied: Vec<(String, PathBuf)>,
+    /// Files of the release written from these bytes, by their path in the release.
+    data: Vec<(String, Vec<u8>)>,
+    /// Whether the release carries the placeholder module tree, which a real shell package
+    /// replaces.
+    placeholder_modules: bool,
 }
 
 impl Assembled {
@@ -498,6 +506,9 @@ impl Assembled {
             root: root.to_owned(),
             programs,
             written: Vec::new(),
+            copied: Vec::new(),
+            data: Vec::new(),
+            placeholder_modules: true,
         }
     }
 
@@ -649,8 +660,22 @@ impl Assembled {
             std::fs::create_dir_all(file.parent().expect("a directory")).expect("the tree");
             std::fs::write(&file, contents).expect("a file");
         };
-        for (path, contents) in module_tree() {
-            write(path, contents.as_bytes());
+        if self.placeholder_modules {
+            for (path, contents) in module_tree() {
+                write(path, contents.as_bytes());
+            }
+        }
+        for (path, source) in &self.copied {
+            let file = directory.join(path);
+            // A package built where the release will be is already there.
+            if *source == file {
+                continue;
+            }
+            std::fs::create_dir_all(file.parent().expect("a directory")).expect("the tree");
+            std::fs::copy(source, &file).expect("a file of a shell package");
+        }
+        for (path, contents) in &self.data {
+            write(path, contents);
         }
         write(kr_cli::update::release::CHANNEL_ROOT, self.root.as_bytes());
         write(
@@ -1613,25 +1638,20 @@ impl Host {
 
     /// Creates a session with a release's `kr`, and returns its display number and identifier.
     fn new_session(&self, kr: &Path) -> (String, SessionId) {
+        self.new_session_as(kr, &["--shell", "/bin/sh"])
+    }
+
+    fn new_session_as(&self, kr: &Path, shell: &[&str]) -> (String, SessionId) {
         let cwd = self.tree.root().display().to_string();
-        let output = self.run(
-            kr,
-            &[
-                "new",
-                "--invisible",
-                "--headless",
-                "--cwd",
-                &cwd,
-                "--shell",
-                "/bin/sh",
-                "--startup",
-                "interactive",
-                "--json",
-            ],
-        );
+        let mut arguments = vec!["new", "--invisible", "--headless", "--cwd", &cwd];
+        arguments.extend_from_slice(shell);
+        arguments.extend_from_slice(&["--startup", "interactive", "--json"]);
+        let output = self.run(kr, &arguments);
         assert!(
             output.status.success(),
-            "kr new: {}",
+            "kr new said {}: {}{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
         let created: Value = serde_json::from_slice(&output.stdout).expect("kr printed JSON");
@@ -1900,7 +1920,9 @@ impl Host {
         );
         assert!(
             output.status.success(),
-            "kr host install: {}",
+            "kr host install said {}: {}{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
         start_each_once(&self.store.release_directory(assembled.name()));
