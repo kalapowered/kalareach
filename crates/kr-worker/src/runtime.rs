@@ -1531,8 +1531,8 @@ impl SessionRuntime {
     /// Notes that something happened that may have started a process the session owns, so the
     /// supervision looks at the boundary shortly after this rather than on a clock.
     pub fn note_activity(&self) {
-        // The mark is flags and a wake-up and takes no lock, so it is made from wherever this is
-        // called, whatever the caller holds.
+        // The mark is flags and a wake-up that waits for nothing and takes none of the locks this
+        // host orders, so it is made from wherever this is called, whatever the caller holds.
         self.sink.activity.note();
     }
 
