@@ -35,7 +35,7 @@ use companion_tauri::AppState;
 use companion_tauri::device::DeviceIdentity;
 use companion_tauri::drafts::DraftHost;
 use companion_tauri::settings::{DraftHosts, Holds, HostPrivacy, SETTINGS_EVENT};
-use kr_client::drafts::{Draft, DraftSealer, DraftStore, DraftSync, DraftTarget};
+use kr_client::drafts::{Draft, DraftSealer, DraftStore, DraftSync, DraftTarget, SyncCheckpoint};
 use kr_client::services::{
     HttpDeadlines, HttpService, ManagedSyncService, ServiceSigner, SyncBackupService,
     managed_response_limits,
@@ -1980,25 +1980,25 @@ async fn a_private_host_is_read_once_for_all_its_drafts_in_a_pass() {
     assert_eq!(computer.hosts.reads_of(environment), 1);
 }
 
-/// A host that goes private while a publication is out at the service moves the store's generation
-/// while the answer is out, so the answer is discarded when it comes: nothing is noted of the draft,
-/// and the draft goes again when the host lets it.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_host_that_goes_private_while_a_publication_is_out_has_the_answer_discarded() {
-    let computer = Computer::new().await;
+/// The first publication of a draft is held at the service: it acts on it and gives its answer
+/// when it is let go. The host says `says` meanwhile, and the answer is let go once the pass has
+/// read the host again. What is noted of the draft is returned.
+async fn host_says_while_a_publication_is_out(
+    computer: &Computer,
+    says: HostPrivacy,
+) -> Option<SyncCheckpoint> {
     let (environment, studio) = host(1, "studio");
     computer
         .hosts
         .say(environment, HostPrivacy::Off { generation: 1 });
-    let page = with_sync_on(&computer).await;
+    let page = with_sync_on(computer).await;
     page.drafts_on(true).expect("drafts sync is on");
     let (draft, _) = page.write_draft(Some(&studio), "a prompt on its way out");
 
     // The pass asks the collection once for the settings and then publishes the draft, so the
-    // publication is the second request. The service acts on it, and the answer is given when it
-    // is let go.
+    // publication is the second request.
     let web = computer.served.web();
-    let asked = sync_requests(&computer);
+    let asked = sync_requests(computer);
     web.fail(SYNC_PATH, 2, Moment::Slow);
     let settings = page.app.state::<AppState>().settings().expect("settings");
     let step = tokio::spawn({
@@ -2007,38 +2007,77 @@ async fn a_host_that_goes_private_while_a_publication_is_out_has_the_answer_disc
     });
     web.requests_reach(SYNC_PATH, asked + 2).await;
     let reads = computer.hosts.reads_of(environment);
-    computer
-        .hosts
-        .say(environment, HostPrivacy::On { generation: 2 });
-    // The pass reads the host again while the publication is out, and moves the store's generation.
-    computer.hosts.read_after(environment, reads).await;
-    let store = SyncStore::open(
-        computer
-            .data
-            .path()
-            .join("settings-sync")
-            .join("drafts")
-            .join(environment.to_string())
-            .join("store"),
-    )
-    .expect("the host's store");
-    while !store.privacy().expect("the generation").fenced {
-        tokio::task::yield_now().await;
+    let fenced = matches!(says, HostPrivacy::On { .. });
+    computer.hosts.say(environment, says);
+    let patience = std::time::Duration::from_secs(60);
+    if fenced {
+        // The pass reads the host while the publication is out, and moves the store's generation.
+        tokio::time::timeout(patience, computer.hosts.read_after(environment, reads))
+            .await
+            .expect("the pass read the host again");
+        let store = SyncStore::open(
+            computer
+                .data
+                .path()
+                .join("settings-sync")
+                .join("drafts")
+                .join(environment.to_string())
+                .join("store"),
+        )
+        .expect("the host's store");
+        tokio::time::timeout(patience, async {
+            while !store.privacy().expect("the generation").fenced {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the store was moved to the host's generation");
+    } else {
+        // A second read is made after the first has been acted on.
+        tokio::time::timeout(patience, computer.hosts.read_after(environment, reads + 1))
+            .await
+            .expect("the pass read the host twice");
     }
     web.release_held();
     step.await.expect("the step ran").expect("the step ended");
 
-    let held = page
-        .app
+    page.app
         .state::<AppState>()
         .drafts()
         .store()
-        .expect("drafts");
+        .expect("drafts")
+        .checkpoint(draft)
+        .expect("the note")
+}
+
+/// A host that goes private while a publication is out at the service moves the store's generation
+/// while the answer is out, so the answer is discarded when it comes: nothing is noted of the draft,
+/// and the draft goes again when the host lets it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_host_that_goes_private_while_a_publication_is_out_has_the_answer_discarded() {
+    let computer = Computer::new().await;
+    let noted =
+        host_says_while_a_publication_is_out(&computer, HostPrivacy::On { generation: 2 }).await;
     assert_eq!(
-        held.checkpoint(draft).expect("the note"),
-        None,
+        noted, None,
         "the answer to a publication admitted under the old generation is not noted"
     );
+}
+
+/// A host that cannot be read while a publication is out says nothing about its privacy mode: the
+/// content was let go while it could be read, and the answer to a write the service applied is
+/// noted as it would be.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_host_that_cannot_be_read_while_a_publication_is_out_leaves_the_answer_to_be_noted() {
+    let computer = Computer::new().await;
+    let noted = host_says_while_a_publication_is_out(
+        &computer,
+        HostPrivacy::Unreadable {
+            reason: "the connection dropped".to_owned(),
+        },
+    )
+    .await;
+    assert!(noted.is_some(), "the draft is noted as published");
 }
 
 /// A host that goes private while a pass is out at the service is read again just before each draft
@@ -2181,6 +2220,26 @@ async fn a_privacy_change_that_settles_a_lost_answer_leaves_the_removal_owed() {
         "and it did not come back as a copy: {:?}",
         page.kept_drafts()
     );
+}
+
+/// A second window throwing away a draft the first already threw away leaves what the first owed:
+/// the removal is still made.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_second_discard_of_a_removed_draft_keeps_what_the_first_owed() {
+    let computer = Computer::new().await;
+    let (environment, studio) = host(1, "studio");
+    computer
+        .hosts
+        .say(environment, HostPrivacy::Off { generation: 1 });
+    let page = with_sync_on(&computer).await;
+    let (draft, version, elsewhere) =
+        with_a_publication_whose_answer_was_lost(&computer, &page, &studio).await;
+
+    assert_eq!(page.discard_draft(draft, &version)["removed"], true);
+    assert_eq!(page.discard_draft(draft, &version)["removed"], false);
+    page.sync_now();
+    page.sync_now();
+    assert_eq!(elsewhere.draft_at(draft).await, None, "it was removed");
 }
 
 /// Turning drafts sync off does not turn off what the service is owed: a draft sent while it is off

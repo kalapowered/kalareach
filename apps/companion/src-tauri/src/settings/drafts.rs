@@ -881,10 +881,15 @@ impl DraftsSync {
         let watching = async {
             loop {
                 tokio::time::sleep(WATCH_EVERY).await;
+                // A host that cannot be read now says nothing: the content was let go while it
+                // could, and a store fenced for a read that failed would refuse the answer to a
+                // write the service has applied.
                 let state = self.hosts.privacy(environment).await;
-                // A store that cannot be moved to the mode the host reports refuses the answer all
-                // the same, when the publication settles against the generation it holds.
-                let _ = apply_privacy(&host.client, &state);
+                if !matches!(state, HostPrivacy::Unreadable { .. }) {
+                    // A store that cannot be moved to the mode the host reports refuses the answer
+                    // all the same, when the publication settles against the generation it holds.
+                    let _ = apply_privacy(&host.client, &state);
+                }
             }
         };
         tokio::select! {
@@ -1097,7 +1102,8 @@ struct Removals<'a> {
 struct Removal<'a> {
     sync: &'a DraftsSync,
     draft: DraftId,
-    /// Whether the entry was written, because drafts sync has been used.
+    /// Whether this removal wrote the entry, because drafts sync has been used and no other removal
+    /// of the draft had.
     recorded: bool,
     ended: bool,
     _records: MutexGuard<'a, ()>,
@@ -1157,6 +1163,7 @@ impl DraftWatch for DraftsSync {
         // Nothing is owed for a draft that never could have reached a service: drafts sync has
         // never been on here, so no store of a host's exists.
         let used = self.enabled().unwrap_or(false) || !self.host_stores().is_empty();
+        let mut recorded = false;
         if used {
             // A record that cannot be read is not written over: the removal is refused, and the
             // draft stays.
@@ -1164,18 +1171,22 @@ impl DraftWatch for DraftsSync {
             let hosts: BTreeMap<String, HostRecord> =
                 self.read(HOSTS).ok().flatten().unwrap_or_default();
             let key = draft.to_string();
-            owed.retain(|owes| owes.draft != key);
-            owed.push(Owed {
-                host: hosts.get(&key).map(|host| host.environment.clone()),
-                draft: key,
-                note: None,
-            });
-            self.write(REMOVALS, &owed)?;
+            // An entry another window's removal made stays as it is, with the note it holds: this
+            // removal made none, so it withdraws none.
+            if owed.iter().all(|owes| owes.draft != key) {
+                owed.push(Owed {
+                    host: hosts.get(&key).map(|host| host.environment.clone()),
+                    draft: key,
+                    note: None,
+                });
+                self.write(REMOVALS, &owed)?;
+                recorded = true;
+            }
         }
         Ok(Box::new(Removal {
             sync: self,
             draft,
-            recorded: used,
+            recorded,
             ended: false,
             _records: records,
             _file: file,
