@@ -157,7 +157,10 @@ impl Terminal {
 
 impl Drop for Terminal {
     fn drop(&mut self) {
-        if let Ok(child) = self.child.get_mut() {
+        // A program that has ended was reaped, and its number may be another process's by now.
+        if let Ok(child) = self.child.get_mut()
+            && matches!(child.try_wait(), Ok(None))
+        {
             let _ = child.kill();
             let _ = child.wait();
         }
