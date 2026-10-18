@@ -271,6 +271,20 @@ impl Rig {
             .expect("settings sync is on");
     }
 
+    /// Settings sync is told of the revoked device `phone`: its key is in the membership as a
+    /// device a revocation required to be taken out.
+    async fn settings_sync_hears_of(&self, phone: &Device) {
+        let key = *phone.keys().authorisation.public();
+        let membership = self.data.path().join("settings-sync").join("membership");
+        tokio::time::timeout(WATCHDOG, async {
+            while !somewhere_in(&membership, key.as_bytes()) {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .expect("settings sync is told of the revoked device");
+    }
+
     /// The host reads its feed, carries out what it finds and acknowledges it.
     async fn host_polls(&self) {
         let carrier = self.host.controller().feed_runtime().expect("a carrier");
@@ -415,15 +429,7 @@ async fn a_revocation_is_called_done_only_once_the_hosts_acknowledgement_is_read
     assert_eq!(rig.publications(), 1);
     // Settings sync is told of the device the request names, which it fences at once: its key is
     // in the membership as a device a feed verified revoked.
-    let phone_key = *rig.phone.keys().authorisation.public();
-    let membership = rig.data.path().join("settings-sync").join("membership");
-    tokio::time::timeout(WATCHDOG, async {
-        while !somewhere_in(&membership, phone_key.as_bytes()) {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-    })
-    .await
-    .expect("settings sync is told of the revoked device");
+    rig.settings_sync_hears_of(&rig.phone).await;
     let reasons = rig.ceremony.reasons();
     assert_eq!(reasons.len(), 1, "the person is asked once: {reasons:?}");
     assert!(
@@ -712,6 +718,7 @@ async fn a_feed_that_cannot_be_read_is_said_and_nothing_is_sent() {
 async fn the_host_on_this_computer_takes_the_revocation_itself_and_its_answer_is_the_acknowledgement()
  {
     let rig = Rig::start().await;
+    rig.with_settings_sync().await;
     // The owner's first connection to the host settles what the host admits connections under, and
     // a connection admitted before it is withdrawn.
     rig.view().await;
@@ -751,6 +758,9 @@ async fn the_host_on_this_computer_takes_the_revocation_itself_and_its_answer_is
     assert_eq!(phone_state(&done, "direct"), "done", "{done}");
     assert_eq!(rig.publications(), 0, "no feed was involved");
     assert_eq!(rig.ceremony.reasons().len(), 1);
+    // The host's own answer is told to settings sync, which takes the device out of the settings
+    // it shares: the connection it would ask the host over is the one the revocation withdrew.
+    rig.settings_sync_hears_of(&rig.phone).await;
     let again = rig
         .revoke(
             local["reference"].as_str().expect("a reference"),
@@ -893,5 +903,20 @@ async fn a_host_on_this_computer_whose_connection_cannot_be_replaced_is_not_said
     assert_eq!(
         after["contact"], "silent",
         "a connection that cannot be replaced says nothing of this computer's right: {after}"
+    );
+
+    // A host that did not answer just now is not offered a ceremony that could not succeed.
+    let listed = the_phone(&after);
+    let refused = rig
+        .revoke(
+            after["reference"].as_str().expect("a reference"),
+            listed["reference"].as_str().expect("a reference"),
+        )
+        .expect_err("the host did not answer, so nothing could be sent");
+    assert_eq!(refused["code"], "RESOURCE_UNAVAILABLE", "{refused}");
+    assert!(
+        rig.ceremony.reasons().is_empty(),
+        "the person is not asked: {:?}",
+        rig.ceremony.reasons()
     );
 }

@@ -463,10 +463,13 @@ nothing is published for it. A host that does not answer keeps the device list i
 this application asked, for as long as the application runs, shown with the time of that list, and a
 revocation is still published for it.
 
-A revocation this computer sent is passed to settings sync, which stops publishing at once and takes
-the device out of the shared settings at its next step, before any host has acknowledged the request
-or lists the device as revoked. A step already under way may publish once more under the key the
-device holds.
+A revocation this computer sent is told to settings sync, whether it went through a host's feed or
+the host on this computer took it directly. Settings sync stops sending at once, before any host has
+acknowledged the request or lists the device as revoked. That includes a step already under way:
+nothing written after the revocation leaves under a key the device holds, and what was held back is
+sent once the device is out, under the key that follows its removal. A send already on its way
+cannot be called back. The device is taken out of the shared settings in a step of its own, after
+the one in hand.
 
 ## Sharing a session
 

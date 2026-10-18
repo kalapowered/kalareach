@@ -37,11 +37,13 @@
 //!
 //! # Settings sync
 //!
-//! A revocation this computer sent is verified here (it is this computer's own signature on a
-//! request addressed to that host) and the device it names is passed to settings sync, which fences
-//! publication at once, before any host has acknowledged the request, and takes the device out of the
-//! shared settings at its next step. A step already past its check may still publish once more under
-//! the key the device holds, as any publication a moment earlier would have.
+//! A revocation this computer sent is told to settings sync, which holds publication at once,
+//! before any host has acknowledged the request, and takes the device out of the shared settings in
+//! a step of its own. For a host reached through its feed the proof is this computer's own signature
+//! on a request addressed to that host; for the host on this computer it is that host's answer to
+//! `device.revoke`. Settings sync holds every send of settings and drafts from the moment it is told,
+//! a step already under way included, so nothing written after the revocation is sent under a key
+//! the device holds. A send already on its way cannot be called back.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -684,6 +686,11 @@ impl Revocations {
             (DeviceStanding::Active | DeviceStanding::Refused { .. }, _)
             | (DeviceStanding::Sent { .. }, Route::Direct) => {}
         }
+        if found.route() == Route::Direct && host_now.contact != Contact::Answered {
+            return Err(CommandError::unavailable(
+                "the host on this computer did not answer, so nothing was sent",
+            ));
+        }
         if let Some(feed) = &host_now.feed {
             if feed.removed {
                 return Err(CommandError::refused(
@@ -712,6 +719,16 @@ impl Revocations {
                     _ => connection.clone(),
                 };
                 self.revoke_direct(&over, &summary).await?;
+                // The host's own answer is as good as a verified request in a feed.
+                self.tell(
+                    context,
+                    summary
+                        .keys
+                        .0
+                        .iter()
+                        .map(|keys| keys.authorisation)
+                        .collect(),
+                );
             }
             Host::Paired(paired) => {
                 let origin = context.origin.as_ref().ok_or_else(|| {
