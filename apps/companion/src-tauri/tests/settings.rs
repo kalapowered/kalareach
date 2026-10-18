@@ -28,13 +28,13 @@
 //! members, and how a device joins is not under test here.
 #![cfg(desktop)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
 use companion_tauri::AppState;
 use companion_tauri::device::DeviceIdentity;
 use companion_tauri::drafts::DraftHost;
-use companion_tauri::settings::{DraftHosts, HostPrivacy, SETTINGS_EVENT};
+use companion_tauri::settings::{DraftHosts, Holds, HostPrivacy, SETTINGS_EVENT};
 use kr_client::drafts::{Draft, DraftSealer, DraftStore, DraftSync, DraftTarget};
 use kr_client::services::{
     HttpDeadlines, HttpService, ManagedSyncService, ServiceSigner, SyncBackupService,
@@ -114,18 +114,41 @@ struct Computer {
     hosts: Arc<ScriptedHosts>,
 }
 
-/// What this computer can read of each host's privacy mode, as a test says it: a host nobody said
-/// anything of is one this computer is not connected to.
-#[derive(Default)]
+/// What this computer can learn of each host, as a test says it.
+///
+/// A session belongs to one host ([`ScriptedHosts::belongs`]), and the hosts this computer is
+/// connected to are the ones the test connects ([`ScriptedHosts::connect`]): a connected host holds
+/// the sessions that belong to it and no others. A host's privacy mode is what the test said of it,
+/// and a host nobody said anything of is one this computer cannot read.
 struct ScriptedHosts {
     said: Mutex<BTreeMap<EnvironmentId, HostPrivacy>>,
     /// What a host says from the read after the number of reads named, as a host that went private
     /// while a pass was out at the service does.
     turning: Mutex<BTreeMap<EnvironmentId, (u32, HostPrivacy)>>,
     reads: Mutex<BTreeMap<EnvironmentId, u32>>,
+    /// The host each session belongs to.
+    owners: Mutex<BTreeMap<SessionId, DraftHost>>,
+    /// The hosts this computer is connected to.
+    connected: Mutex<BTreeSet<EnvironmentId>>,
+    /// How many times a host was asked whether it holds a session.
+    asked: Mutex<u32>,
+    /// How many times the privacy mode of each host was read, for a test that waits for a read.
+    read_count: tokio::sync::watch::Sender<BTreeMap<EnvironmentId, u32>>,
 }
 
 impl ScriptedHosts {
+    fn new() -> Self {
+        Self {
+            said: Mutex::default(),
+            turning: Mutex::default(),
+            reads: Mutex::default(),
+            owners: Mutex::default(),
+            connected: Mutex::default(),
+            asked: Mutex::default(),
+            read_count: tokio::sync::watch::channel(BTreeMap::new()).0,
+        }
+    }
+
     fn say(&self, host: EnvironmentId, state: HostPrivacy) {
         self.said.lock().expect("the record").insert(host, state);
     }
@@ -138,9 +161,65 @@ impl ScriptedHosts {
             .expect("the record")
             .insert(host, (after, state));
     }
+
+    /// `session` belongs to `host`.
+    fn belongs(&self, session: SessionId, host: &DraftHost) {
+        self.owners
+            .lock()
+            .expect("the record")
+            .insert(session, host.clone());
+    }
+
+    /// This computer is connected to `host` as well.
+    fn connect(&self, host: &DraftHost) {
+        self.connected
+            .lock()
+            .expect("the record")
+            .insert(host.environment);
+    }
+
+    fn times_asked_who_holds(&self) -> u32 {
+        *self.asked.lock().expect("the record")
+    }
+
+    /// How many times the privacy mode of `host` was read.
+    fn reads_of(&self, host: EnvironmentId) -> u32 {
+        self.reads
+            .lock()
+            .expect("the record")
+            .get(&host)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Waits until the privacy mode of `host` has been read more than `after` times.
+    async fn read_after(&self, host: EnvironmentId, after: u32) {
+        let mut reads = self.read_count.subscribe();
+        reads
+            .wait_for(|count| count.get(&host).copied().unwrap_or(0) > after)
+            .await
+            .expect("the hosts are kept");
+    }
 }
 
 impl DraftHosts for ScriptedHosts {
+    fn holds(
+        &self,
+        session: SessionId,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Holds> + Send + '_>> {
+        *self.asked.lock().expect("the record") += 1;
+        let connected = self.connected.lock().expect("the record").clone();
+        let answer = if connected.is_empty() {
+            Holds::Unknown
+        } else {
+            match self.owners.lock().expect("the record").get(&session) {
+                Some(host) if connected.contains(&host.environment) => Holds::Here(host.clone()),
+                _ => Holds::NotHere,
+            }
+        };
+        Box::pin(std::future::ready(answer))
+    }
+
     fn privacy(
         &self,
         environment: EnvironmentId,
@@ -151,6 +230,9 @@ impl DraftHosts for ScriptedHosts {
             *asked += 1;
             *asked
         };
+        self.read_count.send_modify(|counts| {
+            *counts.entry(environment).or_default() += 1;
+        });
         let turned = self
             .turning
             .lock()
@@ -178,7 +260,7 @@ impl Computer {
             served: serve().await,
             data: tempfile::tempdir().expect("a directory"),
             secrets: Arc::new(MemoryStore::new()),
-            hosts: Arc::new(ScriptedHosts::default()),
+            hosts: Arc::new(ScriptedHosts::new()),
         }
     }
 
@@ -231,7 +313,12 @@ impl Computer {
         let window = tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
             .build()
             .expect("a window");
-        let page = Page { app, window, heard };
+        let page = Page {
+            app,
+            window,
+            heard,
+            hosts: Arc::clone(&self.hosts),
+        };
         page.call(
             "sync_service_set",
             json!({ "origin": self.served.origin() }),
@@ -300,6 +387,8 @@ struct Page {
     window: tauri::WebviewWindow<MockRuntime>,
     /// Every view the page was told of by the backend itself.
     heard: Arc<Mutex<Vec<Value>>>,
+    /// What this computer learns of its hosts.
+    hosts: Arc<ScriptedHosts>,
 }
 
 impl Page {
@@ -355,16 +444,30 @@ impl Page {
         self.call("settings_drafts_set", json!({ "enabled": enabled }))
     }
 
-    /// A draft the person wrote for a session of `host`, saved as the page saves one, and what the
-    /// store says it is: its identity and its version.
+    /// A draft the person wrote for a session of `host` while this computer was connected to it,
+    /// saved as the page saves one, and what the store says it is: its identity and its version. A
+    /// draft for no host is for a session no host holds, written while this computer is connected
+    /// to none.
     fn write_draft(&self, host: Option<&DraftHost>, text: &str) -> (DraftId, String) {
+        self.write_draft_while(host, host, text)
+    }
+
+    /// A draft for a session of `of`, written while this computer is connected to `connected`.
+    fn write_draft_while(
+        &self,
+        of: Option<&DraftHost>,
+        connected: Option<&DraftHost>,
+        text: &str,
+    ) -> (DraftId, String) {
+        let session = self.session_of(of);
+        self.connect(connected);
         let saved = self
             .app
             .state::<AppState>()
             .drafts()
             .save(
-                serde_json::from_value(draft_params(None, None, text)).expect("parameters"),
-                host.cloned(),
+                serde_json::from_value(draft_params(None, None, text, session))
+                    .expect("parameters"),
                 TimestampMs::new(now_ms()),
             )
             .expect("the draft is saved");
@@ -378,26 +481,74 @@ impl Page {
         )
     }
 
-    /// The draft written again, as the page writes a later version.
+    /// The draft written again, as the page writes a later version, while this computer is
+    /// connected to `connected`.
     fn rewrite_draft(
         &self,
-        host: Option<&DraftHost>,
+        of: Option<&DraftHost>,
+        connected: Option<&DraftHost>,
         id: DraftId,
         version: &str,
         text: &str,
     ) -> String {
+        let session = self.session_of(of);
+        self.connect(connected);
         let saved = self
             .app
             .state::<AppState>()
             .drafts()
             .save(
-                serde_json::from_value(draft_params(Some((id, version)), None, text))
+                serde_json::from_value(draft_params(Some((id, version)), None, text, session))
                     .expect("parameters"),
-                host.cloned(),
                 TimestampMs::new(now_ms()),
             )
             .expect("the draft is saved");
         serde_json::to_value(saved).expect("a value")["draft"]["revision"]
+            .as_str()
+            .expect("a version")
+            .to_owned()
+    }
+
+    /// The session a draft for `host` is for, which belongs to it.
+    fn session_of(&self, host: Option<&DraftHost>) -> SessionId {
+        let Some(host) = host else {
+            return SessionId::new(Uuid::from_bytes([0x7f; 16]));
+        };
+        let number = u8::from_str_radix(&host.environment.to_string()[..2], 16).expect("a number");
+        let session = SessionId::new(Uuid::from_bytes([number | 0x80; 16]));
+        self.hosts.belongs(session, host);
+        session
+    }
+
+    /// This computer is connected to `host`, when there is one, as well.
+    fn connect(&self, host: Option<&DraftHost>) {
+        if let Some(host) = host {
+            self.hosts.connect(host);
+        }
+    }
+
+    /// The draft pointed at a session of `to`, which this computer is connected to, as the person
+    /// does by choosing where it goes.
+    fn retarget_draft(&self, id: DraftId, version: &str, to: &DraftHost) -> String {
+        let session = self.session_of(Some(to));
+        self.connect(Some(to));
+        let retargeted = self
+            .app
+            .state::<AppState>()
+            .drafts()
+            .retarget(
+                serde_json::from_value(json!({
+                    "id": id,
+                    "expectedRevision": version,
+                    "sessionId": session,
+                    "applicationInstanceId": null,
+                    "agentBindingRevision": null
+                }))
+                .expect("parameters"),
+                TimestampMs::new(now_ms()),
+            )
+            .expect("the draft is retargeted");
+        serde_json::to_value(retargeted).expect("a value")["revision"]
             .as_str()
             .expect("a version")
             .to_owned()
@@ -423,11 +574,16 @@ impl Page {
 }
 
 /// The parameters of a save of a draft for a session.
-fn draft_params(replacing: Option<(DraftId, &str)>, instance: Option<&str>, text: &str) -> Value {
+fn draft_params(
+    replacing: Option<(DraftId, &str)>,
+    instance: Option<&str>,
+    text: &str,
+    session: SessionId,
+) -> Value {
     json!({
         "id": replacing.map(|(id, _)| id),
         "expectedRevision": replacing.map(|(_, version)| version),
-        "sessionId": "8a7b6c50-22bb-4c3d-8e4f-000000000101",
+        "sessionId": session,
         "applicationInstanceId": instance,
         "agentBindingRevision": instance.map(|_| "1"),
         "state": "open",
@@ -436,7 +592,7 @@ fn draft_params(replacing: Option<(DraftId, &str)>, instance: Option<&str>, text
     })
 }
 
-/// A host a draft is written for, with a name.
+/// A host, with a name.
 fn host(number: u8, name: &str) -> (EnvironmentId, DraftHost) {
     let environment = EnvironmentId::new(Uuid::from_bytes([number; 16]));
     (
@@ -1382,7 +1538,13 @@ async fn a_draft_is_published_sealed_once_drafts_sync_is_on_and_again_only_when_
     assert_eq!(elsewhere.draft_at(draft).await, Some(1));
 
     // Edited, it is: the same object at its next write.
-    page.rewrite_draft(Some(&studio), draft, &version, "a prompt to send tomorrow");
+    page.rewrite_draft(
+        Some(&studio),
+        Some(&studio),
+        draft,
+        &version,
+        "a prompt to send tomorrow",
+    );
     page.sync_now();
     assert_eq!(elsewhere.draft_at(draft).await, Some(2));
 
@@ -1460,7 +1622,13 @@ async fn an_edit_made_while_the_host_is_private_is_not_sent() {
     computer
         .hosts
         .say(environment, HostPrivacy::On { generation: 2 });
-    page.rewrite_draft(Some(&studio), draft, &version, "second, while private");
+    page.rewrite_draft(
+        Some(&studio),
+        Some(&studio),
+        draft,
+        &version,
+        "second, while private",
+    );
     let view = page.sync_now();
     assert_eq!(elsewhere.draft_at(draft).await, Some(1), "nothing left");
     assert_eq!(
@@ -1686,13 +1854,12 @@ async fn a_draft_saved_while_drafts_sync_is_off_wakes_nothing() {
     assert!(woken(Arc::clone(&settings)).await, "a save asks for a pass");
 }
 
-/// The host a draft was written for is the one that was connected when it was first written. A later
-/// save from a window that was left open, or while another host is connected, does not move it, so
-/// a draft written for a host in privacy mode is not published because another host allows it. A
-/// retarget, which is the person choosing a session on the connected host, does.
+/// A draft is for the host that holds its session, and a host is not given a draft by being the one
+/// connected when the draft is saved: the draft of a private host that was written while no host
+/// was connected, or a draft saved again for a mark while another host is connected, stays here
+/// until the host that holds its session says so, and then it is held to that host's mode.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_draft_keeps_the_host_it_was_written_for_when_another_host_is_connected_at_a_later_save()
-{
+async fn a_draft_is_given_to_no_host_by_being_saved_while_that_host_is_connected() {
     let computer = Computer::new().await;
     let (private, studio) = host(1, "studio");
     let (open, laptop) = host(2, "laptop");
@@ -1701,9 +1868,11 @@ async fn a_draft_keeps_the_host_it_was_written_for_when_another_host_is_connecte
         .say(private, HostPrivacy::On { generation: 3 });
     computer.hosts.say(open, HostPrivacy::Off { generation: 1 });
     let page = with_sync_on(&computer).await;
-    let (draft, version) = page.write_draft(Some(&studio), "written for the studio");
-    // The laptop is connected when the application saves the draft again, for a mark.
+    // Written for a session of the studio while this computer was connected to no host, and saved
+    // again, as the page does to mark it, while it is connected to the laptop.
+    let (draft, version) = page.write_draft_while(Some(&studio), None, "written for the studio");
     page.rewrite_draft(
+        Some(&studio),
         Some(&laptop),
         draft,
         &version,
@@ -1714,11 +1883,161 @@ async fn a_draft_keeps_the_host_it_was_written_for_when_another_host_is_connecte
     assert_eq!(
         computer.elsewhere().draft_at(draft).await,
         None,
-        "the studio is private, whichever host is connected now"
+        "the laptop is not the host of a session it does not hold"
     );
     assert_eq!(
         kept_here(&view),
+        vec![(String::new(), "unknown_host".to_owned(), 1)]
+    );
+
+    // The studio is connected, says it holds the session, and is private.
+    computer.hosts.connect(&studio);
+    let view = page.sync_now();
+    assert_eq!(computer.elsewhere().draft_at(draft).await, None);
+    assert_eq!(
+        kept_here(&view),
         vec![("studio".to_owned(), "private".to_owned(), 1)]
+    );
+
+    // And when the studio lets its drafts go, this one goes.
+    computer
+        .hosts
+        .say(private, HostPrivacy::Off { generation: 4 });
+    page.sync_now();
+    assert_eq!(computer.elsewhere().draft_at(draft).await, Some(1));
+}
+
+/// A host is asked about a draft's session until one says it holds it, and not again once it has:
+/// and a host that cannot be asked is asked once for the whole pass.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_host_that_cannot_be_asked_is_asked_once_for_all_the_drafts_of_a_pass() {
+    let computer = Computer::new().await;
+    let (_unread, studio) = host(1, "studio");
+    let page = with_sync_on(&computer).await;
+    for turn in 0..3 {
+        page.write_draft_while(
+            Some(&studio),
+            None,
+            &format!("written for the studio {turn}"),
+        );
+    }
+    page.drafts_on(true).expect("drafts sync is on");
+    assert_eq!(
+        computer.hosts.times_asked_who_holds(),
+        1,
+        "the first question had no answer, and the pass asked no more"
+    );
+}
+
+/// Sending a draft to a session of another host makes it that host's draft: what the first host
+/// said of the old session says nothing of the new one, so the draft waits for the second host and
+/// is held to its mode, though the first host would let it go.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_draft_sent_to_a_session_of_another_host_is_held_to_that_hosts_mode() {
+    let computer = Computer::new().await;
+    let (open, studio) = host(1, "studio");
+    let (private, laptop) = host(2, "laptop");
+    computer.hosts.say(open, HostPrivacy::Off { generation: 1 });
+    computer
+        .hosts
+        .say(private, HostPrivacy::On { generation: 5 });
+    let page = with_sync_on(&computer).await;
+    let (draft, version) = page.write_draft(Some(&studio), "written for the studio");
+    page.drafts_on(true).expect("drafts sync is on");
+    assert_eq!(computer.elsewhere().draft_at(draft).await, Some(1));
+
+    page.retarget_draft(draft, &version, &laptop);
+    let view = page.sync_now();
+    assert_eq!(
+        computer.elsewhere().draft_at(draft).await,
+        Some(1),
+        "nothing more of it left"
+    );
+    assert_eq!(
+        kept_here(&view),
+        vec![("laptop".to_owned(), "private".to_owned(), 1)]
+    );
+}
+
+/// A host that reads as private is private for the rest of the pass: it is not asked again for
+/// every draft of it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_private_host_is_read_once_for_all_its_drafts_in_a_pass() {
+    let computer = Computer::new().await;
+    let (environment, studio) = host(1, "studio");
+    computer
+        .hosts
+        .say(environment, HostPrivacy::On { generation: 2 });
+    let page = with_sync_on(&computer).await;
+    for turn in 0..3 {
+        page.write_draft(Some(&studio), &format!("written for the studio {turn}"));
+    }
+    let view = page.drafts_on(true).expect("drafts sync is on");
+    assert_eq!(
+        kept_here(&view),
+        vec![("studio".to_owned(), "private".to_owned(), 3)]
+    );
+    assert_eq!(computer.hosts.reads_of(environment), 1);
+}
+
+/// A host that goes private while a publication is out at the service moves the store's generation
+/// while the answer is out, so the answer is discarded when it comes: nothing is noted of the draft,
+/// and the draft goes again when the host lets it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_host_that_goes_private_while_a_publication_is_out_has_the_answer_discarded() {
+    let computer = Computer::new().await;
+    let (environment, studio) = host(1, "studio");
+    computer
+        .hosts
+        .say(environment, HostPrivacy::Off { generation: 1 });
+    let page = with_sync_on(&computer).await;
+    page.drafts_on(true).expect("drafts sync is on");
+    let (draft, _) = page.write_draft(Some(&studio), "a prompt on its way out");
+
+    // The pass asks the collection once for the settings and then publishes the draft, so the
+    // publication is the second request. The service acts on it, and the answer is given when it
+    // is let go.
+    let web = computer.served.web();
+    let asked = sync_requests(&computer);
+    web.fail(SYNC_PATH, 2, Moment::Slow);
+    let settings = page.app.state::<AppState>().settings().expect("settings");
+    let step = tokio::spawn({
+        let settings = Arc::clone(&settings);
+        async move { settings.sync_now().await }
+    });
+    web.requests_reach(SYNC_PATH, asked + 2).await;
+    let reads = computer.hosts.reads_of(environment);
+    computer
+        .hosts
+        .say(environment, HostPrivacy::On { generation: 2 });
+    // The pass reads the host again while the publication is out, and moves the store's generation.
+    computer.hosts.read_after(environment, reads).await;
+    let store = SyncStore::open(
+        computer
+            .data
+            .path()
+            .join("settings-sync")
+            .join("drafts")
+            .join(environment.to_string())
+            .join("store"),
+    )
+    .expect("the host's store");
+    while !store.privacy().expect("the generation").fenced {
+        tokio::task::yield_now().await;
+    }
+    web.release_held();
+    step.await.expect("the step ran").expect("the step ended");
+
+    let held = page
+        .app
+        .state::<AppState>()
+        .drafts()
+        .store()
+        .expect("drafts");
+    assert_eq!(
+        held.checkpoint(draft).expect("the note"),
+        None,
+        "the answer to a publication admitted under the old generation is not noted"
     );
 }
 
@@ -1809,6 +2128,190 @@ async fn a_draft_thrown_away_while_its_first_publication_is_out_leaves_nothing_a
     );
 }
 
+/// The first publication of a draft is applied and its answer is lost.
+async fn with_a_publication_whose_answer_was_lost(
+    computer: &Computer,
+    page: &Page,
+    studio: &DraftHost,
+) -> (DraftId, String, Elsewhere) {
+    let (draft, version) = page.write_draft(Some(studio), "sent before the answer came back");
+    // The pass asks the collection once for the settings and then publishes the draft, so it is the
+    // second request.
+    computer.served.web().fail(SYNC_PATH, 2, Moment::After);
+    page.drafts_on(true).expect("drafts sync is on");
+    let elsewhere = computer.elsewhere();
+    assert_eq!(elsewhere.draft_at(draft).await, Some(1), "it landed");
+    (draft, version, elsewhere)
+}
+
+/// A host that goes private after a publication's answer was lost, and before the pass that asks
+/// what became of it, has that publication settled under a generation it has moved past, which
+/// notes nothing of where the draft landed. A draft sent meanwhile is still owed a removal: it is
+/// made against the place the publication left it, when the host lets it, and the draft does not
+/// come back as another device's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_privacy_change_that_settles_a_lost_answer_leaves_the_removal_owed() {
+    let computer = Computer::new().await;
+    let (environment, studio) = host(1, "studio");
+    computer
+        .hosts
+        .say(environment, HostPrivacy::Off { generation: 1 });
+    let page = with_sync_on(&computer).await;
+    let (draft, version, elsewhere) =
+        with_a_publication_whose_answer_was_lost(&computer, &page, &studio).await;
+
+    assert_eq!(page.discard_draft(draft, &version)["removed"], true);
+    computer
+        .hosts
+        .say(environment, HostPrivacy::On { generation: 2 });
+    page.sync_now();
+    assert_eq!(
+        elsewhere.draft_at(draft).await,
+        Some(1),
+        "the host is private, so the removal waits"
+    );
+    computer
+        .hosts
+        .say(environment, HostPrivacy::Off { generation: 3 });
+    page.sync_now();
+    page.sync_now();
+    assert_eq!(elsewhere.draft_at(draft).await, None, "it was removed");
+    assert!(
+        page.kept_drafts().is_empty(),
+        "and it did not come back as a copy: {:?}",
+        page.kept_drafts()
+    );
+}
+
+/// Turning drafts sync off does not turn off what the service is owed: a draft sent while it is off
+/// whose first publication never got an answer is removed when it is on again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_draft_sent_while_drafts_sync_is_off_is_still_removed_at_the_service() {
+    let computer = Computer::new().await;
+    let (environment, studio) = host(1, "studio");
+    computer
+        .hosts
+        .say(environment, HostPrivacy::Off { generation: 1 });
+    let page = with_sync_on(&computer).await;
+    let (draft, version, elsewhere) =
+        with_a_publication_whose_answer_was_lost(&computer, &page, &studio).await;
+
+    page.drafts_on(false).expect("off");
+    assert_eq!(page.discard_draft(draft, &version)["removed"], true);
+    page.drafts_on(true).expect("on");
+    page.sync_now();
+    assert_eq!(elsewhere.draft_at(draft).await, None, "it was removed");
+    assert!(
+        page.kept_drafts().is_empty(),
+        "and it did not come back as a copy: {:?}",
+        page.kept_drafts()
+    );
+}
+
+/// A draft sent to a session of another host after its first publication lost its answer is still
+/// owed a removal where the publication went: the removal is found through the store of the host
+/// the publication left through, and not only the host the draft is for now.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_draft_sent_to_another_host_after_a_lost_answer_is_still_removed_where_it_was_published()
+{
+    let computer = Computer::new().await;
+    let (first, studio) = host(1, "studio");
+    let (second, laptop) = host(2, "laptop");
+    computer
+        .hosts
+        .say(first, HostPrivacy::Off { generation: 1 });
+    computer
+        .hosts
+        .say(second, HostPrivacy::Off { generation: 1 });
+    let page = with_sync_on(&computer).await;
+    let (draft, version, elsewhere) =
+        with_a_publication_whose_answer_was_lost(&computer, &page, &studio).await;
+
+    let moved = page.retarget_draft(draft, &version, &laptop);
+    assert_eq!(page.discard_draft(draft, &moved)["removed"], true);
+    page.sync_now();
+    page.sync_now();
+    assert_eq!(elsewhere.draft_at(draft).await, None, "it was removed");
+    assert!(
+        page.kept_drafts().is_empty(),
+        "and it did not come back as a copy: {:?}",
+        page.kept_drafts()
+    );
+}
+
+/// A host whose store cannot be opened is one this computer cannot send for, and says why; the
+/// drafts of the other hosts go on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_host_whose_store_cannot_be_opened_does_not_stop_the_drafts_of_the_others() {
+    let computer = Computer::new().await;
+    let (broken, studio) = host(1, "studio");
+    let (steady, laptop) = host(2, "laptop");
+    computer
+        .hosts
+        .say(broken, HostPrivacy::Off { generation: 1 });
+    computer
+        .hosts
+        .say(steady, HostPrivacy::Off { generation: 1 });
+    let page = with_sync_on(&computer).await;
+    let (held, _) = page.write_draft(Some(&studio), "written for the studio");
+    let (sent, _) = page.write_draft(Some(&laptop), "written for the laptop");
+    // Where the studio's store is to be, there is a file.
+    let place = computer
+        .data
+        .path()
+        .join("settings-sync/drafts")
+        .join(broken.to_string());
+    std::fs::create_dir_all(&place).expect("a directory");
+    std::fs::write(place.join("store"), b"not a store").expect("a file");
+
+    let view = page.drafts_on(true).expect("drafts sync is on");
+    let elsewhere = computer.elsewhere();
+    assert_eq!(elsewhere.draft_at(held).await, None);
+    assert_eq!(elsewhere.draft_at(sent).await, Some(1), "the laptop's went");
+    let kept = kept_here(&view);
+    assert_eq!(kept.len(), 1, "{view}");
+    assert_eq!(
+        (kept[0].0.as_str(), kept[0].1.as_str()),
+        ("studio", "unreadable")
+    );
+    assert!(
+        view["sync"]["drafts"]["kept_here"][0]["detail"].is_string(),
+        "and the view says why: {view}"
+    );
+}
+
+/// A record of what the service is owed that this version cannot read is not written over: the
+/// removal is refused and the draft stays, since one the service is owed for and no record of it is
+/// a draft that comes back as another device's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_ledger_this_version_cannot_read_is_not_written_over_and_the_draft_stays() {
+    let computer = Computer::new().await;
+    let (environment, studio) = host(1, "studio");
+    computer
+        .hosts
+        .say(environment, HostPrivacy::Off { generation: 1 });
+    let page = with_sync_on(&computer).await;
+    let (draft, version) = page.write_draft(Some(&studio), "a prompt");
+    page.drafts_on(true).expect("drafts sync is on");
+    let ledger = computer
+        .data
+        .path()
+        .join("settings-sync/drafts/removals.json");
+    std::fs::write(&ledger, b"this is not a list").expect("the ledger is spoiled");
+
+    let refused = page.call(
+        "device_draft_discard",
+        json!({ "params": { "id": draft, "expectedRevision": version } }),
+    );
+    assert!(refused.is_err(), "the removal is refused: {refused:?}");
+    assert_eq!(page.kept_drafts().len(), 1, "the draft stays");
+    assert_eq!(
+        std::fs::read(&ledger).expect("the ledger"),
+        b"this is not a list",
+        "and the record is as it was"
+    );
+}
+
 /// A draft of another device that its device removes is gone at the service, and what this computer
 /// kept to ask about it goes too, so the list of what it asks about does not grow with every draft
 /// that ever came down. The copy that was kept stays: it is the person's to keep or throw away.
@@ -1837,6 +2340,11 @@ async fn a_draft_the_other_device_removed_is_forgotten_here_and_the_kept_copy_st
         .unwrap_or_default()
     };
     assert_eq!(pulled(), vec![theirs.draft_id.to_string()]);
+    assert_eq!(
+        from_other_devices(&page.kept_drafts()),
+        1,
+        "the copy is another device's"
+    );
 
     // The other device throws its draft away, and the service no longer holds it.
     let note = other
@@ -1856,6 +2364,19 @@ async fn a_draft_the_other_device_removed_is_forgotten_here_and_the_kept_copy_st
         2,
         "the copy stays beside the own draft"
     );
+    assert_eq!(
+        from_other_devices(&page.kept_drafts()),
+        1,
+        "and it is still said to be another device's, not another window's"
+    );
+}
+
+/// How many of the drafts kept here were written on another device.
+fn from_other_devices(drafts: &[Value]) -> usize {
+    drafts
+        .iter()
+        .filter(|draft| draft["fromAnotherDevice"] == true)
+        .count()
 }
 
 /// A host that reports an older privacy generation than this computer holds for it (its state was
@@ -1874,13 +2395,14 @@ async fn a_host_that_reports_an_older_generation_than_this_computer_holds_is_not
         .say(steady, HostPrivacy::Off { generation: 1 });
     let page = with_sync_on(&computer).await;
     page.write_draft(Some(&studio), "written for the studio");
-    let (kept, _) = page.write_draft(Some(&laptop), "written for the laptop");
+    page.write_draft(Some(&laptop), "written for the laptop");
     page.drafts_on(true).expect("drafts sync is on");
 
     // The studio's state is reset: it is private again, at generation 1 of a new history.
     computer.hosts.say(reset, HostPrivacy::On { generation: 1 });
     let (written_after, _) =
         page.write_draft(Some(&studio), "written for the studio, after the reset");
+    let (kept, _) = page.write_draft(Some(&laptop), "written for the laptop, after the reset");
     let view = page.sync_now();
     let elsewhere = computer.elsewhere();
     assert_eq!(

@@ -538,15 +538,12 @@ impl SettingsSync {
         // The settings agree. Drafts go in the same collection under the same epoch, when the
         // person asked for that, and what stops them never stops this step.
         self.drafts
-            .pass(
-                &super::drafts::Collection {
-                    service,
-                    collection: status.collection,
-                    epoch,
-                    keys: Arc::new(self.keys()),
-                },
-                now_ms,
-            )
+            .pass(&super::drafts::Collection {
+                service,
+                collection: status.collection,
+                epoch,
+                keys: Arc::new(self.keys()),
+            })
             .await;
         Ok(Progress::Agreed)
     }

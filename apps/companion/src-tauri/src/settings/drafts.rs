@@ -14,57 +14,68 @@
 //! at that host's generation, and the settings store is never fenced: the colour mode carries no
 //! session content.
 //!
+//! Which host a draft is for is never guessed from what the application is connected to when the
+//! draft is saved. It is established when the host says it holds the draft's session, and the
+//! record keeps the session it was established for, so a draft sent to another session has no host
+//! until the host of that one says so. Until then the draft is kept here.
+//!
 //! What a device can read of a host's privacy mode is [`DraftHosts`]'s to say, and it says one of
 //! three things. A host with privacy mode off lets its drafts be published; a host with it on does
 //! not, and an answer that arrives after the host went private is discarded by the store's
-//! generation; and a host this device cannot read, because it is not connected to it or holds no
-//! right to ask, is treated as private. A draft whose host this device does not know, because it was
-//! written while no host was connected, is kept here too. Each draft kept here, and why, is in the
-//! view the page shows.
+//! generation, which is moved while the answer is out; and a host this device cannot read, because
+//! it is not connected to it or holds no right to ask, is treated as private. Each draft kept here,
+//! and why, is in the view the page shows.
 //!
 //! # What lives where
 //!
 //! Everything is under `settings-sync/drafts` and holds no secret and no draft text.
 //!
 //! * `on.json`: whether the person turned drafts sync on.
-//! * `hosts.json`: which host each draft was written for, by the host's environment.
-//! * `removals.json`: drafts thrown away or sent whose copy the service still holds, each with the
-//!   position it was at, until the service has removed it.
+//! * `hosts.json`: which host held the session each draft is for, by the host's environment, and
+//!   which session that was.
+//! * `removals.json`: drafts thrown away or sent whose copy the service may still hold, each with
+//!   the position it was at when this device knew it, until the service has removed it.
 //! * `pulled.json`: the other devices' drafts this device has brought down, so a later look at the
 //!   collection asks only for what has changed.
+//! * `copies.json`: the other devices' drafts of which a copy is kept here, for as long as it is.
 //! * `<environment>/store` and `pull/store`: the sync stores. The second belongs to no host: what it
 //!   holds came down, nothing in it left.
 //!
 //! # A pass
 //!
-//! One pass, in this order: the work of each host's store that left without an answer is asked
-//! about; removals owed to the service are made; each draft of this device whose host allows it is
+//! One pass, in this order: the removals the service is owed are read; the host of each draft that
+//! has none is asked; the work of each host's store that left without an answer is asked about;
+//! removals owed to the service are made; each draft of this device whose host allows it is
 //! published if it changed; and the drafts of other devices that are new or changed are brought
 //! down beside this device's own.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::Duration;
 
 use kr_client::ClientError;
 use kr_client::drafts::{
-    Draft, DraftError, DraftRemoval, DraftSealer, DraftSync, Published, SyncCheckpoint,
+    Draft, DraftError, DraftRemoval, DraftSealer, DraftStore, DraftSync, Published, SyncCheckpoint,
 };
 use kr_client::services::sync::KnownRevision;
-use kr_client::services::{ManagedSyncService, SyncBackupService};
+use kr_client::services::{ManagedSyncService, SyncBackupService, SyncPosition};
 use kr_client::sync::membership::CollectionRef;
-use kr_client::sync::{CollectionKeys, SharedCollectionService, SyncClient, SyncError, SyncStore};
+use kr_client::sync::{
+    CollectionKeys, RequestState, SharedCollectionService, SyncClient, SyncError, SyncStore,
+};
 use kr_ipc::paths::{
     create_private_directory, flush_path_names, read_owner_only_file, write_owner_only_file,
 };
-use kr_protocol::ids::{DraftId, EnvironmentId, SyncObjectId};
-use kr_protocol::scalars::{TimestampMs, Uuid};
+use kr_protocol::ids::{DraftId, EnvironmentId, SessionId, SyncObjectId};
+use kr_protocol::scalars::Uuid;
 use kr_protocol::sync::SyncObjectKind;
 use serde::{Deserialize, Serialize};
 
 use super::Told;
-use crate::drafts::{DraftDesk, DraftHost, DraftWatch};
+use crate::drafts::{DraftDesk, DraftHost, DraftWatch, Removing};
 use crate::error::{CommandError, Result};
+use crate::recovery::now;
 
 /// The directory under settings sync's own that drafts keep their records in.
 const DIRECTORY: &str = "drafts";
@@ -72,12 +83,17 @@ const ON: &str = "on.json";
 const HOSTS: &str = "hosts.json";
 const REMOVALS: &str = "removals.json";
 const PULLED: &str = "pulled.json";
+const COPIES: &str = "copies.json";
 const RECORDS_LOCK: &str = "records.lock";
 const STORE: &str = "store";
 const PULL: &str = "pull";
 
 /// The most a record may be, in bytes. Each is a list of identifiers.
 const RECORD_LIMIT: u64 = 1024 * 1024;
+
+/// How long a publication is out before the host's privacy mode is read again, and then how often.
+/// A publication that finishes sooner asks the host nothing.
+const WATCH_EVERY: Duration = Duration::from_secs(1);
 
 /// What a device can read of one host's privacy mode.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -99,8 +115,26 @@ pub enum HostPrivacy {
     },
 }
 
+/// What the host this device is connected to says of a session.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Holds {
+    /// The host holds the session, or held it before it closed.
+    Here(DraftHost),
+    /// This device is connected to a host, and the host holds no such session.
+    NotHere,
+    /// This device could not tell: it is not connected, holds no right to ask, or the host did not
+    /// answer.
+    Unknown,
+}
+
 /// What drafts sync asks of the hosts this device knows.
 pub trait DraftHosts: Send + Sync {
+    /// Whether the host this device is connected to holds `session`.
+    fn holds(
+        &self,
+        session: SessionId,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Holds> + Send + '_>>;
+
     /// Privacy mode at the host of `environment`, as this device can read it now.
     fn privacy(
         &self,
@@ -108,10 +142,13 @@ pub trait DraftHosts: Send + Sync {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = HostPrivacy> + Send + '_>>;
 }
 
-/// The host a draft was written for, as the record keeps it.
+/// The host a draft is for, as the record keeps it: the host that held the session, when it was
+/// asked.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct HostRecord {
+    /// The session the host said it holds. A draft that is for another session since has no host.
+    session: String,
     environment: String,
     name: Option<String>,
 }
@@ -124,7 +161,7 @@ pub enum Why {
     Private,
     /// This device cannot read privacy mode at the host the draft is for.
     Unreadable,
-    /// The draft was written while no host was connected, so no host is known to say.
+    /// No host has said it holds the draft's session, so no host is known to say.
     UnknownHost,
     /// The draft is larger than a synchronised draft may be.
     TooLarge,
@@ -188,7 +225,7 @@ pub struct DraftsSync {
     hosts: Arc<dyn DraftHosts>,
     told: Arc<Told>,
     wake: tokio::sync::Notify,
-    /// Taken for the length of a change to one of the small records.
+    /// Taken for the length of a change to one of the small records the desk's thread changes.
     records: Mutex<()>,
     /// What the last pass found.
     last: Mutex<Last>,
@@ -217,6 +254,41 @@ pub struct Collection<'a> {
     pub epoch: u64,
     /// Where the collection's keys are.
     pub keys: Arc<dyn CollectionKeys>,
+}
+
+/// The store a host's drafts leave through, and the client that fences it.
+struct HostStore {
+    drafts: DraftSync,
+    client: SyncClient,
+}
+
+/// What a pass knows of each host a draft or a removal is for.
+#[derive(Default)]
+struct Hosts {
+    /// What each host's privacy mode was when it was last read this pass.
+    privacy: BTreeMap<EnvironmentId, HostPrivacy>,
+    /// The hosts whose store is open, fenced or let go to match.
+    stores: BTreeMap<EnvironmentId, HostStore>,
+}
+
+/// What this device knows of where the service holds a draft that left.
+#[derive(Default)]
+struct Seen {
+    /// The newest place any record of this device names.
+    position: Option<SyncPosition>,
+    /// Whether a publication of it may still land, or may already have.
+    out: Out,
+}
+
+/// How much of a draft's publication is unaccounted for.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+enum Out {
+    #[default]
+    Nothing,
+    /// Ended too late to say whether it ran: it may be at the service, and nothing more will run.
+    Unaccounted,
+    /// Sent with no answer: it may still land.
+    Dispatched,
 }
 
 impl DraftsSync {
@@ -291,7 +363,7 @@ impl DraftsSync {
         Ok(())
     }
 
-    /// Has a pass taken up what changed, but only when drafts sync is on: typing in a draft that is
+    /// Has a pass take up what changed, but only when drafts sync is on: typing in a draft that is
     /// kept on this computer reaches no service and wakes nothing.
     fn wake_when_on(&self) {
         if self.enabled().unwrap_or(false) {
@@ -307,32 +379,30 @@ impl DraftsSync {
     /// One pass, under the step settings sync holds.
     ///
     /// It never fails the step it is in: what stopped it is in the view, and the next pass goes on.
-    pub async fn pass(&self, on: &Collection<'_>, now: TimestampMs) {
-        let outcome = self.pass_in(on, now).await;
+    pub async fn pass(&self, on: &Collection<'_>) {
+        let outcome = self.pass_in(on).await;
         {
             let mut last = self.last.lock().unwrap_or_else(PoisonError::into_inner);
-            match outcome {
-                Ok((kept, problem)) => {
-                    *last = Last {
-                        kept,
-                        problem: problem.map(|error| error.message),
+            // The person may have turned drafts sync off while this pass was out at the service:
+            // what it found is not shown over the reset that made.
+            if !self.enabled().unwrap_or(false) {
+                *last = Last::default();
+            } else {
+                match outcome {
+                    Ok((kept, problem)) => {
+                        *last = Last {
+                            kept,
+                            problem: problem.map(|error| error.message),
+                        }
                     }
+                    Err(error) => last.problem = Some(error.message),
                 }
-                Err(error) => last.problem = Some(error.message),
             }
         }
         self.told.tell();
     }
 
-    #[allow(
-        clippy::too_many_lines,
-        reason = "one pass, in the order the module doc gives"
-    )]
-    async fn pass_in(
-        &self,
-        on: &Collection<'_>,
-        now: TimestampMs,
-    ) -> Result<(Vec<KeptHere>, Option<CommandError>)> {
+    async fn pass_in(&self, on: &Collection<'_>) -> Result<(Vec<KeptHere>, Option<CommandError>)> {
         if !self.enabled()? {
             return Ok((Vec::new(), None));
         }
@@ -344,67 +414,40 @@ impl DraftsSync {
         let sealer: Arc<dyn DraftSealer> = Arc::new(shared.sealer(Arc::clone(&on.keys)));
         let service: Arc<dyn SyncBackupService> = Arc::clone(&shared) as _;
         let store = self.desk.store()?;
+        // The removals owed are read before the drafts are listed. A removal takes its entry
+        // before it takes the draft, under the lock this read takes, so an entry read here is of a
+        // draft that is gone, and a draft listed after it is one no removal is in hand for.
+        let owed = self.owed()?;
         let listing = blocking({
             let store = store.clone();
             move || store.list().map_err(crate::drafts::failure)
         })
         .await?;
+        self.keep_copies_listed(&listing.drafts)?;
         let own: Vec<Draft> = listing
             .drafts
             .into_iter()
             .filter(|draft| draft.conflict_of.0.is_none())
             .collect();
-        let hosts_of: BTreeMap<String, HostRecord> = self.read(HOSTS)?.unwrap_or_default();
-        let owed: Vec<Owed> = self.read(REMOVALS)?.unwrap_or_default();
+        let mut problem = None;
+        let hosts_of = self.establish_hosts(&own).await?;
 
-        // What each host's privacy mode is now, for every host a draft or a removal is for.
-        let mut privacy: BTreeMap<EnvironmentId, HostPrivacy> = BTreeMap::new();
-        let environments = own
+        let proven = |draft: &Draft| proven_host(&hosts_of, draft);
+        let environments: BTreeSet<EnvironmentId> = own
             .iter()
-            .filter_map(|draft| hosts_of.get(&draft.draft_id.to_string()))
-            .map(|host| &host.environment)
-            .chain(owed.iter().filter_map(|owes| owes.host.as_ref()))
-            .filter_map(|text| environment_of(text));
+            .filter_map(proven)
+            .chain(
+                owed.iter()
+                    .filter_map(|owes| owes.host.as_deref().and_then(environment_of)),
+            )
+            .collect();
         let names: BTreeMap<EnvironmentId, String> = hosts_of
             .values()
             .filter_map(|host| Some((environment_of(&host.environment)?, host.name.clone()?)))
             .collect();
-        for environment in environments {
-            if let std::collections::btree_map::Entry::Vacant(slot) = privacy.entry(environment) {
-                slot.insert(self.hosts.privacy(environment).await);
-            }
-        }
-
-        // The store of each host, fenced or let go to match what its privacy mode is.
-        let mut stores: BTreeMap<EnvironmentId, (DraftSync, SyncClient)> = BTreeMap::new();
-        let mut disagreed: Vec<(EnvironmentId, String)> = Vec::new();
-        for (environment, state) in &privacy {
-            let directory = self.directory.join(environment.to_string()).join(STORE);
-            let client = SyncClient::new(
-                Arc::clone(&service),
-                Arc::clone(&sealer),
-                SyncStore::open(&directory).map_err(super::sync::sync_failure)?,
-            );
-            if let Err(error) = apply_privacy(&client, state) {
-                disagreed.push((*environment, error.message));
-                continue;
-            }
-            let drafts = DraftSync::new(
-                Arc::clone(&service),
-                Arc::clone(&sealer),
-                SyncStore::open(&directory).map_err(super::sync::sync_failure)?,
-            );
-            // Work that left without an answer is asked about first, as a cleanup would.
-            drafts
-                .reconcile_unsettled(&store, now)
-                .await
-                .map_err(super::sync::sync_failure)?;
-            stores.insert(*environment, (drafts, client));
-        }
-        // A host whose store disagrees with what it reports is not believed this pass.
-        for (environment, reason) in disagreed {
-            privacy.insert(environment, HostPrivacy::Unreadable { reason });
-        }
+        let mut hosts = self
+            .open_hosts(&service, &sealer, &store, &environments, &mut problem)
+            .await;
         let pull_directory = self.directory.join(PULL).join(STORE);
         let puller = DraftSync::new(
             Arc::clone(&service),
@@ -412,130 +455,24 @@ impl DraftsSync {
             SyncStore::open(&pull_directory).map_err(super::sync::sync_failure)?,
         );
 
-        // Removals the service is owed. A host's are made through its store, so they wait while
-        // the host's privacy mode is on; one with no host goes through the store of what came down.
-        let mut made: BTreeSet<String> = BTreeSet::new();
-        let mut problem = None;
-        for owes in &owed {
-            let id = draft_of(&owes.draft);
-            let drafts = match owes.host.as_deref().and_then(environment_of) {
-                Some(environment) => stores.get(&environment).map(|(drafts, _)| drafts),
-                None => Some(&puller),
-            };
-            let (Some(drafts), Some(id)) = (drafts, id) else {
-                continue;
-            };
-            // The newest note the draft store holds for it: an answer to a publication that was
-            // out when the draft left settles a note after the draft is gone, and that position is
-            // where the service holds the draft now.
-            let newest = {
-                let store = store.clone();
-                blocking(move || store.checkpoint(id).map_err(crate::drafts::failure)).await?
-            };
-            let Some(position) = newest.or(owes.note).map(|note| note.position) else {
-                // Nothing is known of it at the service. It is owed only while a publication of it
-                // is still out, whose answer will say where it landed.
-                let out = drafts
-                    .store()
-                    .requests()
-                    .map_err(super::sync::sync_failure)?
-                    .items
-                    .iter()
-                    .any(|record| record.object_id.get() == id.get() && record.dispatched());
-                if !out {
-                    made.insert(owes.draft.clone());
-                }
-                continue;
-            };
-            match drafts.remove(id, position, now).await {
-                Ok(DraftRemoval::Removed { .. } | DraftRemoval::AlreadyGone) => {
-                    made.insert(owes.draft.clone());
-                }
-                // Written since the position this device named, which is this device's own later
-                // publication: the removal is still owed, against where that one left it.
-                Ok(DraftRemoval::Moved { .. }) => {}
-                // The host is private: the removal waits for it.
-                Err(SyncError::Fenced { .. }) => {}
-                Err(error) => {
-                    problem.get_or_insert_with(|| super::sync::sync_failure(error));
-                }
-            }
-        }
-        // What was made leaves the ledger, and what was added to it while the pass ran stays.
-        let still_owed = self.forget_removals(&made)?;
-
-        // The drafts of this device, published where their host allows it.
-        let mut kept: BTreeMap<(Option<EnvironmentId>, Why, Option<String>), u64> = BTreeMap::new();
-        for draft in &own {
-            // The person may have turned drafts sync off while this pass was out at the service.
-            if !self.enabled()? {
-                break;
-            }
-            let host = hosts_of
-                .get(&draft.draft_id.to_string())
-                .and_then(|host| environment_of(&host.environment));
-            let Some(host) = host else {
-                *kept.entry((None, Why::UnknownHost, None)).or_default() += 1;
-                continue;
-            };
-            let note = {
-                let (store, id) = (store.clone(), draft.draft_id);
-                blocking(move || store.checkpoint(id).map_err(crate::drafts::failure)).await?
-            };
-            if note.is_some_and(|note| note.published_revision.0 == Some(draft.revision)) {
-                continue;
-            }
-            // The host's privacy mode is read again, and its store fenced or let go to match,
-            // just before this draft leaves: the pass may have waited on the service since the
-            // first read, and a host that went private in that time is private for this draft.
-            let state = self.hosts.privacy(host).await;
-            let why = match &state {
-                HostPrivacy::Off { .. } => None,
-                HostPrivacy::On { .. } => Some((Why::Private, None)),
-                HostPrivacy::Unreadable { reason } => Some((Why::Unreadable, Some(reason.clone()))),
-            };
-            if let Some((_, client)) = stores.get(&host)
-                && let Err(error) = apply_privacy(client, &state)
-            {
-                *kept
-                    .entry((Some(host), Why::Unreadable, Some(error.message)))
-                    .or_default() += 1;
-                continue;
-            }
-            if let Some((why, detail)) = why {
-                *kept.entry((Some(host), why, detail)).or_default() += 1;
-                continue;
-            }
-            let Some((drafts, _)) = stores.get(&host) else {
-                // The host had nothing to read when the pass began, so it has no store yet: the
-                // next pass makes one.
-                *kept.entry((Some(host), Why::Unreadable, None)).or_default() += 1;
-                continue;
-            };
-            match drafts
-                .publish(&store, draft.draft_id, draft.revision, now)
-                .await
-            {
-                Ok(Published::Conflicted { .. }) => self.told.tell(),
-                Ok(Published::Accepted { .. } | Published::Discarded { .. }) => {}
-                Err(SyncError::Fenced { .. }) => {
-                    *kept.entry((Some(host), Why::Private, None)).or_default() += 1;
-                }
-                Err(error) if too_large(&error) => {
-                    *kept.entry((Some(host), Why::TooLarge, None)).or_default() += 1;
-                }
-                // The person wrote the draft again, or sent it, since this pass listed the drafts:
-                // the next pass takes what is there then.
-                Err(error) if changed_since_listed(&error) => {}
-                // One draft's failure is not the others': the pass goes on and says what stopped.
-                Err(error) => {
-                    problem.get_or_insert_with(|| super::sync::sync_failure(error));
-                }
-            }
-        }
-
+        let still_owed = self
+            .make_removals(
+                on,
+                &Removals {
+                    owed: &owed,
+                    own: &own,
+                    hosts: &hosts,
+                    puller: &puller,
+                    store: &store,
+                },
+                &mut problem,
+            )
+            .await?;
+        let kept = self
+            .publish_drafts(&own, &hosts_of, &mut hosts, &store, &mut problem)
+            .await?;
         if let Err(error) = self
-            .bring_down(on, &puller, &store, &own, &still_owed, now)
+            .bring_down(on, &puller, &store, &own, &still_owed)
             .await
         {
             problem.get_or_insert(error);
@@ -553,6 +490,409 @@ impl DraftsSync {
         Ok((kept, problem))
     }
 
+    /// The host of each draft, asked of the host this device is connected to when the draft has
+    /// none for the session it is for now.
+    ///
+    /// A host that cannot be asked is asked no more this pass, and a draft the host says it does
+    /// not hold keeps no host: it stays here until a host that holds its session is connected.
+    async fn establish_hosts(&self, own: &[Draft]) -> Result<BTreeMap<String, HostRecord>> {
+        let mut hosts_of: BTreeMap<String, HostRecord> = self.read(HOSTS)?.unwrap_or_default();
+        let ids: BTreeSet<String> = own.iter().map(|draft| draft.draft_id.to_string()).collect();
+        let mut changed = false;
+        hosts_of.retain(|key, _| {
+            let keep = ids.contains(key);
+            changed |= !keep;
+            keep
+        });
+        let mut asking = true;
+        for draft in own {
+            let (key, session) = (draft.draft_id.to_string(), draft.target.session_id);
+            if !asking || proven_host(&hosts_of, draft).is_some() {
+                continue;
+            }
+            match self.hosts.holds(session).await {
+                Holds::Here(host) => {
+                    hosts_of.insert(
+                        key,
+                        HostRecord {
+                            session: session.to_string(),
+                            environment: host.environment.to_string(),
+                            name: host.name,
+                        },
+                    );
+                    changed = true;
+                }
+                Holds::NotHere => {}
+                Holds::Unknown => asking = false,
+            }
+        }
+        if changed {
+            self.write(HOSTS, &hosts_of)?;
+        }
+        Ok(hosts_of)
+    }
+
+    /// Reads each host's privacy mode, and opens its store fenced or let go to match.
+    ///
+    /// A host whose store cannot be opened, or that disagrees with what its store holds, is not
+    /// believed this pass and is treated as one this device cannot read; the others go on.
+    async fn open_hosts(
+        &self,
+        service: &Arc<dyn SyncBackupService>,
+        sealer: &Arc<dyn DraftSealer>,
+        store: &DraftStore,
+        environments: &BTreeSet<EnvironmentId>,
+        problem: &mut Option<CommandError>,
+    ) -> Hosts {
+        let mut hosts = Hosts::default();
+        for environment in environments {
+            let state = self.hosts.privacy(*environment).await;
+            let opened = self
+                .open_host(service, sealer, store, *environment, &state)
+                .await;
+            match opened {
+                Ok(host) => {
+                    hosts.stores.insert(*environment, host);
+                    hosts.privacy.insert(*environment, state);
+                }
+                Err(error) => {
+                    hosts.privacy.insert(
+                        *environment,
+                        HostPrivacy::Unreadable {
+                            reason: error.message.clone(),
+                        },
+                    );
+                    problem.get_or_insert(error);
+                }
+            }
+        }
+        hosts
+    }
+
+    async fn open_host(
+        &self,
+        service: &Arc<dyn SyncBackupService>,
+        sealer: &Arc<dyn DraftSealer>,
+        store: &DraftStore,
+        environment: EnvironmentId,
+        state: &HostPrivacy,
+    ) -> Result<HostStore> {
+        let directory = self.directory.join(environment.to_string()).join(STORE);
+        let client = SyncClient::new(
+            Arc::clone(service),
+            Arc::clone(sealer),
+            SyncStore::open(&directory).map_err(super::sync::sync_failure)?,
+        );
+        apply_privacy(&client, state)?;
+        let drafts = DraftSync::new(
+            Arc::clone(service),
+            Arc::clone(sealer),
+            SyncStore::open(&directory).map_err(super::sync::sync_failure)?,
+        );
+        // Work that left without an answer is asked about first, as a cleanup would.
+        drafts
+            .reconcile_unsettled(store, now())
+            .await
+            .map_err(super::sync::sync_failure)?;
+        Ok(HostStore { drafts, client })
+    }
+
+    /// Makes the removals the service is owed, and returns the ones that still are.
+    ///
+    /// A removal is owed while the service may hold the draft. Where it holds it is the newest
+    /// place any record of this device names: the draft store's note, the ledger's, and the
+    /// publication record of every host's store, since a note is written only under the privacy
+    /// generation in force and a draft may have left through another host's store than the one it
+    /// is for now. A publication that may still land is waited for. One that ended unaccounted is
+    /// found by asking the service what it holds. A removal against a place the draft has moved
+    /// from is made again against where it is, which only this device's own later publication can
+    /// have put it.
+    async fn make_removals(
+        &self,
+        on: &Collection<'_>,
+        removals: &Removals<'_>,
+        problem: &mut Option<CommandError>,
+    ) -> Result<Vec<Owed>> {
+        let mut made: BTreeSet<String> = BTreeSet::new();
+        let mut listed: Option<Option<kr_client::services::SyncComparison>> = None;
+        for owes in removals.owed {
+            let Some(id) = draft_of(&owes.draft) else {
+                made.insert(owes.draft.clone());
+                continue;
+            };
+            // An entry of a draft that is still stored is no removal's: it is what a removal that
+            // did not happen left.
+            if removals.own.iter().any(|draft| draft.draft_id == id) {
+                made.insert(owes.draft.clone());
+                continue;
+            }
+            // A host's removals are made through its store, so they wait while the host's privacy
+            // mode is on; one with no host goes through the store of what came down.
+            let drafts = match owes.host.as_deref().and_then(environment_of) {
+                Some(environment) => removals
+                    .hosts
+                    .stores
+                    .get(&environment)
+                    .map(|host| &host.drafts),
+                None => Some(removals.puller),
+            };
+            let Some(drafts) = drafts else { continue };
+            let seen = match self.seen_of(id, owes.note, removals.store).await {
+                Ok(seen) => seen,
+                Err(error) => {
+                    problem.get_or_insert(error);
+                    continue;
+                }
+            };
+            let position = match (seen.position, seen.out) {
+                (_, Out::Dispatched) => continue,
+                (Some(position), _) => position,
+                (None, Out::Nothing) => {
+                    made.insert(owes.draft.clone());
+                    continue;
+                }
+                (None, Out::Unaccounted) => {
+                    if listed.is_none() {
+                        listed = Some(
+                            on.service
+                                .compare_shared(&on.collection, &[], false, None)
+                                .await
+                                .map_err(CommandError::from)?,
+                        );
+                    }
+                    let held = listed
+                        .iter()
+                        .flatten()
+                        .flat_map(|found| &found.objects)
+                        .find(|held| held.object_id.get() == id.get());
+                    match held {
+                        Some(held) => held.position,
+                        None => {
+                            made.insert(owes.draft.clone());
+                            continue;
+                        }
+                    }
+                }
+            };
+            let mut at = position;
+            for attempt in 0..2 {
+                match drafts.remove(id, at, now()).await {
+                    Ok(DraftRemoval::Removed { .. } | DraftRemoval::AlreadyGone) => {
+                        made.insert(owes.draft.clone());
+                    }
+                    // Written since the place this device named, which only this device's own
+                    // later publication can have done: the removal is made again against it.
+                    Ok(DraftRemoval::Moved { current }) if attempt == 0 => {
+                        at = current;
+                        continue;
+                    }
+                    Ok(DraftRemoval::Moved { .. }) => {}
+                    // The host is private: the removal waits for it.
+                    Err(SyncError::Fenced { .. }) => {}
+                    Err(error) => {
+                        problem.get_or_insert_with(|| super::sync::sync_failure(error));
+                    }
+                }
+                break;
+            }
+        }
+        // What was made leaves the ledger, and so does the note a settled publication wrote of a
+        // draft that was gone by then: nothing is left of a draft whose copy is gone.
+        for id in made.iter().filter_map(|draft| draft_of(draft)) {
+            let store = removals.store.clone();
+            if let Err(error) =
+                blocking(move || store.forget_checkpoint(id).map_err(crate::drafts::failure)).await
+            {
+                problem.get_or_insert(error);
+            }
+        }
+        // What was added to the ledger while the pass ran stays.
+        self.forget_removals(&made)
+    }
+
+    /// What this device knows of where the service holds the draft, and whether a publication of
+    /// it is unaccounted for, in every host's store.
+    async fn seen_of(
+        &self,
+        id: DraftId,
+        ledger: Option<SyncCheckpoint>,
+        store: &DraftStore,
+    ) -> Result<Seen> {
+        let note = {
+            let store = store.clone();
+            blocking(move || store.checkpoint(id).map_err(crate::drafts::failure)).await?
+        };
+        let mut seen = Seen {
+            position: newer(
+                note.map(|note| note.position),
+                ledger.map(|note| note.position),
+            ),
+            out: Out::Nothing,
+        };
+        for directory in self.host_stores() {
+            let held = SyncStore::open(&directory).map_err(super::sync::sync_failure)?;
+            for publication in held
+                .publications()
+                .map_err(super::sync::sync_failure)?
+                .items
+                .iter()
+                .filter(|publication| publication.object_id.get() == id.get())
+            {
+                seen.position = newer(seen.position, Some(publication.position));
+            }
+            for request in held
+                .requests()
+                .map_err(super::sync::sync_failure)?
+                .items
+                .iter()
+                .filter(|request| request.object_id.get() == id.get())
+            {
+                let out = match request.state {
+                    RequestState::Dispatched { .. } => Out::Dispatched,
+                    RequestState::Unaccounted => Out::Unaccounted,
+                    _ => Out::Nothing,
+                };
+                seen.out = seen.out.max(out);
+            }
+        }
+        Ok(seen)
+    }
+
+    /// The directory of every host's store there is on this computer.
+    fn host_stores(&self) -> Vec<PathBuf> {
+        let Ok(entries) = std::fs::read_dir(&self.directory) else {
+            return Vec::new();
+        };
+        entries
+            .filter_map(std::result::Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| environment_of(name).is_some())
+            })
+            .map(|entry| entry.path().join(STORE))
+            .filter(|path| path.is_dir())
+            .collect()
+    }
+
+    /// Publishes the drafts of this device where their host allows it.
+    ///
+    /// The host's privacy mode is read again just before a draft leaves while it reads as off: the
+    /// pass may have waited on the service since the first read, and a host that went private in
+    /// that time is private for this draft. Once it reads as anything else it is that for the rest
+    /// of the pass, and nothing asks it again.
+    async fn publish_drafts(
+        &self,
+        own: &[Draft],
+        hosts_of: &BTreeMap<String, HostRecord>,
+        hosts: &mut Hosts,
+        store: &DraftStore,
+        problem: &mut Option<CommandError>,
+    ) -> Result<BTreeMap<(Option<EnvironmentId>, Why, Option<String>), u64>> {
+        let mut kept: BTreeMap<(Option<EnvironmentId>, Why, Option<String>), u64> = BTreeMap::new();
+        for draft in own {
+            if !self.enabled()? {
+                break;
+            }
+            let Some(host) = proven_host(hosts_of, draft) else {
+                *kept.entry((None, Why::UnknownHost, None)).or_default() += 1;
+                continue;
+            };
+            let note = {
+                let (store, id) = (store.clone(), draft.draft_id);
+                blocking(move || store.checkpoint(id).map_err(crate::drafts::failure)).await?
+            };
+            if note.is_some_and(|note| note.published_revision.0 == Some(draft.revision)) {
+                continue;
+            }
+            let state = match hosts.privacy.get(&host) {
+                Some(state @ (HostPrivacy::On { .. } | HostPrivacy::Unreadable { .. })) => {
+                    state.clone()
+                }
+                _ => {
+                    let state = self.hosts.privacy(host).await;
+                    hosts.privacy.insert(host, state.clone());
+                    state
+                }
+            };
+            let why = match &state {
+                HostPrivacy::Off { .. } => None,
+                HostPrivacy::On { .. } => Some((Why::Private, None)),
+                HostPrivacy::Unreadable { reason } => Some((Why::Unreadable, Some(reason.clone()))),
+            };
+            let Some(opened) = hosts.stores.get(&host) else {
+                // The host's store could not be opened, or the host could not be read when the
+                // pass began and reads as off now: either way the next pass makes one.
+                let detail = why.and_then(|(_, detail)| detail);
+                *kept
+                    .entry((Some(host), Why::Unreadable, detail))
+                    .or_default() += 1;
+                continue;
+            };
+            if let Err(error) = apply_privacy(&opened.client, &state) {
+                *kept
+                    .entry((Some(host), Why::Unreadable, Some(error.message)))
+                    .or_default() += 1;
+                continue;
+            }
+            if let Some((why, detail)) = why {
+                *kept.entry((Some(host), why, detail)).or_default() += 1;
+                continue;
+            }
+            // The person may have turned drafts sync off while the host was asked.
+            if !self.enabled()? {
+                break;
+            }
+            match self.publish_watched(host, opened, store, draft).await {
+                Ok(Published::Conflicted { .. }) => self.told.tell(),
+                Ok(Published::Accepted { .. } | Published::Discarded { .. }) => {}
+                Err(SyncError::Fenced { .. }) => {
+                    *kept.entry((Some(host), Why::Private, None)).or_default() += 1;
+                }
+                Err(error) if too_large(&error) => {
+                    *kept.entry((Some(host), Why::TooLarge, None)).or_default() += 1;
+                }
+                // The person wrote the draft again, or sent it, since this pass listed the drafts:
+                // the next pass takes what is there then.
+                Err(error) if changed_since_listed(&error) => {}
+                // One draft's failure is not the others': the pass goes on and says what stopped.
+                Err(error) => {
+                    problem.get_or_insert_with(|| super::sync::sync_failure(error));
+                }
+            }
+        }
+        Ok(kept)
+    }
+
+    /// Publishes one draft, and while the publication is out reads the host's privacy mode again
+    /// now and then, so that a host that goes private in that time moves the store's generation
+    /// and the answer, when it comes, is discarded and not acted on.
+    async fn publish_watched(
+        &self,
+        environment: EnvironmentId,
+        host: &HostStore,
+        store: &DraftStore,
+        draft: &Draft,
+    ) -> std::result::Result<Published, SyncError> {
+        let publish = host
+            .drafts
+            .publish(store, draft.draft_id, draft.revision, now());
+        let watching = async {
+            loop {
+                tokio::time::sleep(WATCH_EVERY).await;
+                let state = self.hosts.privacy(environment).await;
+                // A store that cannot be moved to the mode the host reports refuses the answer all
+                // the same, when the publication settles against the generation it holds.
+                let _ = apply_privacy(&host.client, &state);
+            }
+        };
+        tokio::select! {
+            outcome = publish => outcome,
+            () = watching => unreachable!("a watch that ends is a loop that broke"),
+        }
+    }
+
     /// The drafts of other devices that are new or changed, kept beside this device's own.
     ///
     /// The comparison names what this device already holds, so the answer is only what changed, and
@@ -561,11 +901,13 @@ impl DraftsSync {
         &self,
         on: &Collection<'_>,
         puller: &DraftSync,
-        store: &kr_client::drafts::DraftStore,
+        store: &DraftStore,
         own: &[Draft],
         owed: &[Owed],
-        now: TimestampMs,
     ) -> Result<()> {
+        if !self.enabled()? {
+            return Ok(());
+        }
         let mut pulled: BTreeSet<String> = self.read(PULLED)?.unwrap_or_default();
         let mine: BTreeSet<String> = own.iter().map(|draft| draft.draft_id.to_string()).collect();
         let leaving: BTreeSet<&str> = owed.iter().map(|owes| owes.draft.as_str()).collect();
@@ -618,13 +960,20 @@ impl DraftsSync {
             .iter()
             .filter(|held| held.kind == SyncObjectKind::Draft)
         {
+            // The person may have turned drafts sync off while this pass was out at the service.
+            if !self.enabled()? {
+                break;
+            }
             let id = DraftId::new(held.object_id.get());
             // A draft this device holds is published by this device, which reconciles it by the
             // rules of a refused write; one it is removing is not brought back.
             if mine.contains(&id.to_string()) || leaving.contains(id.to_string().as_str()) {
                 continue;
             }
-            match puller.fetch_beside(store, id, now).await {
+            // Where a copy came from is on disk before the copy is, so that a copy is never kept
+            // that the person is told another window made.
+            self.keep_copy_of(id)?;
+            match puller.fetch_beside(store, id, now()).await {
                 Ok(_) => {
                     pulled.insert(id.to_string());
                     self.write(PULLED, &pulled)?;
@@ -641,10 +990,47 @@ impl DraftsSync {
         problem.map_or(Ok(()), Err)
     }
 
+    /// Notes that a copy is to be kept beside the draft of another device.
+    fn keep_copy_of(&self, of: DraftId) -> Result<()> {
+        let mut copies: BTreeSet<String> = self.read(COPIES)?.unwrap_or_default();
+        if copies.insert(of.to_string()) {
+            self.write(COPIES, &copies)?;
+        }
+        Ok(())
+    }
+
+    /// Lets go of the copies' origins whose copy is no longer kept, so that the record does not
+    /// grow with every draft that ever came down.
+    fn keep_copies_listed(&self, drafts: &[Draft]) -> Result<()> {
+        let Some(mut copies): Option<BTreeSet<String>> = self.read(COPIES)? else {
+            return Ok(());
+        };
+        let before = copies.len();
+        copies.retain(|of| {
+            drafts.iter().any(|draft| {
+                draft
+                    .conflict_of
+                    .0
+                    .is_some_and(|held| held.to_string() == *of)
+            })
+        });
+        if copies.len() != before {
+            self.write(COPIES, &copies)?;
+        }
+        Ok(())
+    }
+
+    /// The removals the service is owed, read under the lock a removal takes its entry under.
+    fn owed(&self) -> Result<Vec<Owed>> {
+        let _records = self.records.lock().unwrap_or_else(PoisonError::into_inner);
+        let _file = self.records_file()?;
+        Ok(self.read(REMOVALS)?.unwrap_or_default())
+    }
+
     /// Takes the removals the service has made out of the ledger, and returns what is still owed.
     ///
-    /// The ledger is read again under the lock the watcher takes to add to it, so a removal added
-    /// while a pass was out at the service is not written over.
+    /// The ledger is read again under the lock the desk's thread takes to add to it, so a removal
+    /// added while a pass was out at the service is not written over.
     fn forget_removals(&self, made: &BTreeSet<String>) -> Result<Vec<Owed>> {
         let _records = self.records.lock().unwrap_or_else(PoisonError::into_inner);
         let _file = self.records_file()?;
@@ -697,66 +1083,132 @@ impl DraftsSync {
     }
 }
 
-impl DraftWatch for DraftsSync {
-    fn is_a_device_copy(&self, of: DraftId) -> bool {
-        self.read::<BTreeSet<String>>(PULLED)
-            .ok()
-            .flatten()
-            .is_some_and(|pulled| pulled.contains(&of.to_string()))
-    }
+/// What the removals of one pass are made from.
+struct Removals<'a> {
+    owed: &'a [Owed],
+    own: &'a [Draft],
+    hosts: &'a Hosts,
+    puller: &'a DraftSync,
+    store: &'a DraftStore,
+}
 
-    fn saved(&self, draft: DraftId, host: Option<DraftHost>, replace: bool) {
-        let _records = self.records.lock().unwrap_or_else(PoisonError::into_inner);
-        // A record that cannot be locked is not changed: the draft keeps no host, which is the
-        // draft kept here, and the next save tries again.
-        let Ok(_file) = self.records_file() else {
-            return;
-        };
-        if let Some(host) = host {
-            let mut hosts: BTreeMap<String, HostRecord> =
-                self.read(HOSTS).ok().flatten().unwrap_or_default();
-            let key = draft.to_string();
-            let value = HostRecord {
-                environment: host.environment.to_string(),
-                name: host.name,
+/// A removal in hand: the ledger holds its entry, and the lock the pass reads the ledger under is
+/// held until the removal ends.
+struct Removal<'a> {
+    sync: &'a DraftsSync,
+    draft: DraftId,
+    /// Whether the entry was written, because drafts sync has been used.
+    recorded: bool,
+    ended: bool,
+    _records: MutexGuard<'a, ()>,
+    _file: std::fs::File,
+}
+
+impl Removing for Removal<'_> {
+    fn removed(mut self: Box<Self>, note: Option<SyncCheckpoint>) {
+        self.ended = true;
+        // The draft is gone. A note found only now, read with the removal, is the newest this
+        // device has: the entry is brought up to it, and made if sync was not thought used.
+        if self.recorded || note.is_some() {
+            let Ok(mut owed) = self
+                .sync
+                .read::<Vec<Owed>>(REMOVALS)
+                .map(Option::unwrap_or_default)
+            else {
+                return;
             };
-            // The host a draft was written for is the one that was connected when it was first
-            // written. A later save, from a window that was left open or from a connection to
-            // another host, is not a reason to move it: only the person's own choice of a session
-            // on the connected host (a retarget) does.
-            if (replace || !hosts.contains_key(&key)) && hosts.get(&key) != Some(&value) {
-                hosts.insert(key, value);
-                // A record that cannot be kept leaves the draft with no host, which is the draft kept
-                // here, and the next save tries again.
-                let _ = self.write(HOSTS, &hosts);
+            let key = self.draft.to_string();
+            match owed.iter_mut().find(|owes| owes.draft == key) {
+                Some(owes) => owes.note = note.or(owes.note),
+                None => owed.push(Owed {
+                    draft: key,
+                    host: None,
+                    note,
+                }),
             }
+            let _ = self.sync.write(REMOVALS, &owed);
+            self.sync.wake_when_on();
         }
+    }
+}
+
+impl Drop for Removal<'_> {
+    fn drop(&mut self) {
+        if self.ended || !self.recorded {
+            return;
+        }
+        // The draft was not removed: nothing is owed for it.
+        let key = self.draft.to_string();
+        if let Ok(Some(mut owed)) = self.sync.read::<Vec<Owed>>(REMOVALS) {
+            owed.retain(|owes| owes.draft != key);
+            let _ = self.sync.write(REMOVALS, &owed);
+        }
+    }
+}
+
+impl DraftWatch for DraftsSync {
+    fn saved(&self) {
         self.wake_when_on();
     }
 
-    fn gone(&self, draft: DraftId, note: Option<SyncCheckpoint>) {
-        let _records = self.records.lock().unwrap_or_else(PoisonError::into_inner);
-        let Ok(_file) = self.records_file() else {
-            return;
-        };
-        let mut hosts: BTreeMap<String, HostRecord> =
-            self.read(HOSTS).ok().flatten().unwrap_or_default();
-        let host = hosts
-            .remove(&draft.to_string())
-            .map(|host| host.environment);
-        let _ = self.write(HOSTS, &hosts);
-        // A draft that never reached the service owes it nothing, unless a publication of it is
-        // still out, which only drafts sync being on can mean.
-        if note.is_some() || self.enabled().unwrap_or(false) {
-            let mut owed: Vec<Owed> = self.read(REMOVALS).ok().flatten().unwrap_or_default();
+    fn removing(&self, draft: DraftId) -> Result<Box<dyn Removing + '_>> {
+        let records = self.records.lock().unwrap_or_else(PoisonError::into_inner);
+        let file = self.records_file()?;
+        // Nothing is owed for a draft that never could have reached a service: drafts sync has
+        // never been on here, so no store of a host's exists.
+        let used = self.enabled().unwrap_or(false) || !self.host_stores().is_empty();
+        if used {
+            // A record that cannot be read is not written over: the removal is refused, and the
+            // draft stays.
+            let mut owed: Vec<Owed> = self.read(REMOVALS)?.unwrap_or_default();
+            let hosts: BTreeMap<String, HostRecord> =
+                self.read(HOSTS).ok().flatten().unwrap_or_default();
+            let key = draft.to_string();
+            owed.retain(|owes| owes.draft != key);
             owed.push(Owed {
-                draft: draft.to_string(),
-                host,
-                note,
+                host: hosts.get(&key).map(|host| host.environment.clone()),
+                draft: key,
+                note: None,
             });
-            let _ = self.write(REMOVALS, &owed);
-            self.wake_when_on();
+            self.write(REMOVALS, &owed)?;
         }
+        Ok(Box::new(Removal {
+            sync: self,
+            draft,
+            recorded: used,
+            ended: false,
+            _records: records,
+            _file: file,
+        }))
+    }
+
+    fn is_a_device_copy(&self, of: DraftId) -> bool {
+        self.read::<BTreeSet<String>>(COPIES)
+            .ok()
+            .flatten()
+            .is_some_and(|copies| copies.contains(&of.to_string()))
+    }
+}
+
+/// The host a draft is for, when a host said it holds the session the draft is for now.
+fn proven_host(hosts_of: &BTreeMap<String, HostRecord>, draft: &Draft) -> Option<EnvironmentId> {
+    let record = hosts_of.get(&draft.draft_id.to_string())?;
+    if record.session != draft.target.session_id.to_string() {
+        return None;
+    }
+    environment_of(&record.environment)
+}
+
+/// The later of two places, by their order in the object's writes.
+fn newer(a: Option<SyncPosition>, b: Option<SyncPosition>) -> Option<SyncPosition> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(if b.write_sequence > a.write_sequence {
+            b
+        } else {
+            a
+        }),
+        (a, None) => a,
+        (None, b) => b,
     }
 }
 

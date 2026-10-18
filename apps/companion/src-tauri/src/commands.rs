@@ -273,13 +273,25 @@ pub const NATIVE_METHODS: &[(&str, &[Method])] = &[
     // host is up: the connection carries none on its handshake.
     ("hosts_use", &[Method::HostInfo, Method::SessionOpen]),
     ("owner_confirmations", &[Method::OwnerConfirmationPending]),
-    // Settings sync keeps drafts in step host by host, and reads each host's privacy mode from the
-    // connection this application holds to it before any draft of that host leaves. Every command
-    // that can run a pass is named, and the page supplies none of the method's parameters.
-    ("settings_colour_mode_set", &[Method::PrivacyStatus]),
-    ("settings_sync_turn_on", &[Method::PrivacyStatus]),
-    ("settings_sync_now", &[Method::PrivacyStatus]),
-    ("settings_drafts_set", &[Method::PrivacyStatus]),
+    // Settings sync keeps drafts in step host by host. Before a draft leaves it asks the connected
+    // host whether the host holds the draft's session, and reads the host's privacy mode. Every
+    // command that can run a pass is named, and the page supplies none of the methods' parameters.
+    (
+        "settings_colour_mode_set",
+        &[Method::SessionRead, Method::PrivacyStatus],
+    ),
+    (
+        "settings_sync_turn_on",
+        &[Method::SessionRead, Method::PrivacyStatus],
+    ),
+    (
+        "settings_sync_now",
+        &[Method::SessionRead, Method::PrivacyStatus],
+    ),
+    (
+        "settings_drafts_set",
+        &[Method::SessionRead, Method::PrivacyStatus],
+    ),
     (
         "owner_confirmation_review",
         &[
@@ -994,9 +1006,7 @@ pub async fn device_drafts(state: State<'_, AppState>) -> Result<Value> {
 pub async fn device_draft_save(state: State<'_, AppState>, params: Value) -> Result<Value> {
     let typed: crate::drafts::SaveParams = decode(params)?;
     let drafts = state.drafts();
-    // The host this application is connected to is the host of the session the draft is for.
-    let host = state.connected_host();
-    encode(&blocking(move || drafts.save(typed, host, kr_ipc::now_ms())).await?)
+    encode(&blocking(move || drafts.save(typed, kr_ipc::now_ms())).await?)
 }
 
 /// Points a draft at a session and conversation a person chose.
@@ -1004,8 +1014,7 @@ pub async fn device_draft_save(state: State<'_, AppState>, params: Value) -> Res
 pub async fn device_draft_retarget(state: State<'_, AppState>, params: Value) -> Result<Value> {
     let typed: crate::drafts::RetargetParams = decode(params)?;
     let drafts = state.drafts();
-    let host = state.connected_host();
-    encode(&blocking(move || drafts.retarget(typed, host, kr_ipc::now_ms())).await?)
+    encode(&blocking(move || drafts.retarget(typed, kr_ipc::now_ms())).await?)
 }
 
 /// Throws away a draft, if it is still the version the person was shown.

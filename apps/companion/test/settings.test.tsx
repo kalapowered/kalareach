@@ -489,7 +489,7 @@ describe('drafts in settings sync\'s card', () => {
     expect(notes[0]).toHaveTextContent(/privacy mode is on there/)
     expect(notes[1]).toHaveTextContent(/2 drafts for laptop stay on this device/)
     expect(notes[1]).toHaveTextContent(/not connected to that host/)
-    expect(notes[2]).toHaveTextContent(/written while no host was connected/)
+    expect(notes[2]).toHaveTextContent(/until this device is connected to the host it is for/)
 
     // Turned off, nothing is said of drafts that are not being kept in step.
     act(() => {

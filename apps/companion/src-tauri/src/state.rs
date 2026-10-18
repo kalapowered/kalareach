@@ -314,25 +314,6 @@ impl AppState {
             .ok_or_else(CommandError::not_connected)
     }
 
-    /// The host this application is connected to, as a draft written now is written for it: the
-    /// environment its sessions live in, and what it is called. Nothing when no host is connected.
-    #[must_use]
-    pub fn connected_host(&self) -> Option<crate::drafts::DraftHost> {
-        let held = self
-            .connection
-            .read()
-            .expect("the state lock is not poisoned");
-        let connection = held.as_ref()?;
-        let name = match connection.standing() {
-            crate::connection::Standing::Owner => Some("this computer".to_owned()),
-            crate::connection::Standing::Paired { host, .. } => host.name.clone(),
-        };
-        Some(crate::drafts::DraftHost {
-            environment: connection.environment_id(),
-            name,
-        })
-    }
-
     /// What the interface is told about the connection.
     #[must_use]
     pub fn connection_state(&self) -> ConnectionState {

@@ -74,8 +74,7 @@ fn read_removals(file: &Path) -> Vec<DiscardParams> {
         .unwrap_or_default()
 }
 
-/// The host a draft was written for: the environment its sessions live in, and what the person
-/// calls it.
+/// A host: the environment its sessions live in, and what the person calls it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DraftHost {
     /// The host's environment.
@@ -86,24 +85,30 @@ pub struct DraftHost {
 
 /// Whoever keeps the drafts in step with other devices is told what happens to a draft here.
 ///
-/// It is told after the change is on disk and it changes nothing: the desk's answer to the page is
-/// what the store said.
+/// It is told after the change is on disk, except for a removal, which it is told of first: what
+/// this watch is told never changes what the desk answers the page.
 pub trait DraftWatch: Send + Sync {
-    /// A draft of this device was stored. `host` is the host this application was connected to when
-    /// the person wrote it, which is the host of the session it is for, when there was one.
-    ///
-    /// `replace` is true only when the person chose the session the draft now goes to, which is a
-    /// choice of a session on the connected host; a plain save never moves the host a draft was
-    /// first written for.
-    fn saved(&self, draft: DraftId, host: Option<DraftHost>, replace: bool);
+    /// A draft of this device was stored, or sent to another session.
+    fn saved(&self);
 
-    /// A draft of this device was removed, taking with it the note of where the service held it,
-    /// when it had been there.
-    fn gone(&self, draft: DraftId, note: Option<SyncCheckpoint>);
+    /// A draft of this device is about to be removed. Whatever the service is owed for it is on
+    /// disk before this returns, and held until the removal ends, so that a removal cannot be
+    /// carried out with its obligation lost.
+    ///
+    /// # Errors
+    ///
+    /// Returns why the obligation could not be recorded, in which case the draft is not removed.
+    fn removing(&self, draft: DraftId) -> Result<Box<dyn Removing + '_>>;
 
     /// Whether a copy kept beside `of` is another device's draft brought down, and not a draft of
     /// this device that another window of this application changed first.
     fn is_a_device_copy(&self, of: DraftId) -> bool;
+}
+
+/// A removal in hand. Dropped without [`Removing::removed`], it withdraws what it recorded.
+pub trait Removing {
+    /// The draft was removed, with the note of where the service held it, when it had been there.
+    fn removed(self: Box<Self>, note: Option<SyncCheckpoint>);
 }
 
 /// The drafts of this device, and the place they are kept.
@@ -140,7 +145,7 @@ impl DraftDesk {
     ///
     /// Returns why the store cannot be used: no place for it, an owner file that cannot be read, or
     /// a directory that cannot be made private.
-    pub(crate) fn store(&self) -> Result<DraftStore> {
+    pub fn store(&self) -> Result<DraftStore> {
         let mut opened = self.opened.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(store) = opened.as_ref() {
             return Ok(store.clone());
@@ -309,25 +314,17 @@ impl DraftDesk {
 
     /// Saves a draft: creates it when it has no identity yet, else replaces the version it names.
     ///
-    /// `host` is the host this application is connected to, which is the host of the session the
-    /// draft is for.
-    ///
     /// # Errors
     ///
     /// Returns the rule the save broke, or the store's failure.
-    pub fn save(
-        &self,
-        params: SaveParams,
-        host: Option<DraftHost>,
-        now: TimestampMs,
-    ) -> Result<Saved> {
+    pub fn save(&self, params: SaveParams, now: TimestampMs) -> Result<Saved> {
         let saved = self.save_in_store(params, now)?;
         // A copy kept beside another window's draft is this device's own and is not published: the
         // draft it sits beside is.
         if saved.of.is_none()
             && let Some(watch) = self.watch.get()
         {
-            watch.saved(saved.draft.id, host, false);
+            watch.saved();
         }
         Ok(saved)
     }
@@ -398,15 +395,10 @@ impl DraftDesk {
     ///
     /// Returns a revision conflict when the draft moved since the version named, or the store's
     /// failure.
-    pub fn retarget(
-        &self,
-        params: RetargetParams,
-        host: Option<DraftHost>,
-        now: TimestampMs,
-    ) -> Result<StoredDraft> {
+    pub fn retarget(&self, params: RetargetParams, now: TimestampMs) -> Result<StoredDraft> {
         let retargeted = self.retarget_in_store(params, now)?;
         if let Some(watch) = self.watch.get() {
-            watch.saved(retargeted.id, host, true);
+            watch.saved();
         }
         Ok(retargeted)
     }
@@ -457,12 +449,18 @@ impl DraftDesk {
     /// Returns a revision conflict when the draft moved since, or the store's failure. A draft that
     /// is not there is already removed.
     pub fn discard(&self, params: &DiscardParams) -> Result<Discarded> {
-        let removed = self.store()?.remove_at(params.id, params.expected_revision);
+        let store = self.store()?;
+        // What the service is owed for the draft is on disk before the draft is gone.
+        let removing = match self.watch.get() {
+            Some(watch) => Some(watch.removing(params.id)?),
+            None => None,
+        };
+        let removed = store.remove_at(params.id, params.expected_revision);
         match removed {
             Ok(removed) => {
                 self.clear_removal(params.id, None);
-                if let (Some(gone), Some(watch)) = (&removed, self.watch.get()) {
-                    watch.gone(params.id, gone.note);
+                if let (Some(gone), Some(removing)) = (&removed, removing) {
+                    removing.removed(gone.note);
                 }
                 Ok(Discarded {
                     removed: removed.is_some(),

@@ -56,7 +56,7 @@ export function describeKeptHere(kept: KeptDrafts): string {
         (kept.detail === null ? '.' : `: ${kept.detail}.`)
       )
     case 'unknown_host':
-      return `${countDrafts(kept.drafts)} written while no host was connected ${stays} on this device.`
+      return `${countDrafts(kept.drafts)} ${stays} on this device until this device is connected to the host ${kept.drafts === 1 ? 'it is' : 'they are'} for.`
     case 'too_large':
       return `${countDrafts(kept.drafts)} ${kept.drafts === 1 ? 'is' : 'are'} too large to keep in step and ${stays} on this device.`
   }
