@@ -134,12 +134,14 @@ const GRACE_PERIOD: Duration = Duration::from_secs(5);
 /// How long section 7 lets output drain after the owned processes have stopped.
 const DRAIN_PERIOD: Duration = Duration::from_secs(2);
 
-/// How many explicit closes are watched before the machine is judged too busy to watch one.
+/// How many closes the cases that watch a fixed number of them watch before the machine is judged
+/// too busy to watch one.
 ///
 /// Every timing check of a close is a bound read from a watch that samples the process table. A
 /// watch that was not scheduled at the moment a check depends on has seen neither a pass nor a
 /// failure: that close says so, and another is watched. A bound that what was seen contradicts
-/// fails at once.
+/// fails at once. The explicit close of `kr close` watches another for as long as the last one
+/// showed nothing either way, and is ended by the liveness bound.
 const CLOSE_ATTEMPTS: usize = 3;
 
 /// How close to a moment a sample has to be to speak for it.

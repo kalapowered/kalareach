@@ -3218,10 +3218,11 @@ async fn asks_the_real_worker_before_each_command(
         // no answer within its deadline runs the line without its capability, which is how it
         // keeps a command from waiting on the worker. What the worker recorded for the line, and
         // what the shell traced, say which happened. Keys typed at the prompt reach the shell only
-        // behind its fence, so a line the worker did not record as fenced fails at once; a fenced
-        // line the shell had its answer for must carry its capability; and a fenced line the shell
-        // had no answer for in time is let finish and typed again at the next prompt, a bounded
-        // number of times.
+        // behind its fence, so a line the worker did not record as fenced went behind a fence a
+        // reply of the host to the shell's own question had invalidated, or it fails; a fenced line
+        // the shell had its answer for must carry its capability; and a fenced line the shell had
+        // no answer for in time, or one typed behind a fence that reply invalidated, is let finish
+        // and typed again at the next prompt, a bounded number of times.
         const ATTEMPTS: usize = 5;
         let mut previous = sourced;
         let mut attempt = 0;
@@ -3472,6 +3473,16 @@ async fn a_reader_the_line_starts_keeps_the_lines_capability_once(
         .last_command_block()
         .expect("the line's block")
         .prompt_generation;
+    // The worker's own record of the line's acceptance, read before the nested reader starts: a
+    // line it recorded as typed behind its fence has a capability, and losing it from here on is
+    // a fault of the nested reader whatever else the host said to the shell.
+    let fenced = shell
+        .runtime
+        .session()
+        .fence()
+        .expect("a driver")
+        .detach_target()
+        == DetachTarget::Attachment(keys.attachment_id);
     // (3) A fence with a later reader revision: the nested reader's.
     the_worker_reaches("a published fence of a later reader", || {
         shell
@@ -3510,8 +3521,9 @@ async fn a_reader_the_line_starts_keeps_the_lines_capability_once(
         .expect("the probe ran");
     let Some(token) = environment.get("KR_DETACH_TOKEN").cloned() else {
         assert!(
-            host_replies_accounted(shell) > replies_before,
-            "the line's command carries the line's capability"
+            !fenced && host_replies_accounted(shell) > replies_before,
+            "the line's command carries the line's capability (the worker recorded the line as \
+             typed behind its fence: {fenced})"
         );
         probes.release();
         return false;
