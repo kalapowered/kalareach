@@ -91,10 +91,10 @@ pub const WINDOW_RENEWAL: std::time::Duration =
 /// waits on silence: the operating system tells this worker when its peer has gone, and a client
 /// of this host reads until it does. The exception is a bridge, whose invoker ends an attached
 /// stream that has said nothing for longer than a few of these, so the connection a bridge's
-/// helper makes is sent one on a clock. Every other connection is sent none: the control daemon
-/// holds three to each session and a view can be attached for days, and a clock on each would
-/// wake an idle host several times in ten seconds. For an idle one, the window renewal is the only
-/// clock the connection loop keeps.
+/// helper makes is sent one on a clock. Every other connection is sent none on a clock: the
+/// control daemon holds three to each session and a view can be attached for days, and a clock on
+/// each would wake an idle host several times in ten seconds. When such a connection is idle, the
+/// window renewal is the only clock the connection loop keeps.
 pub const LOCAL_KEEPALIVE: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// How often the host looks at its own clocks while it is idle.
@@ -8632,9 +8632,10 @@ pub struct ConnectionState {
     /// It is a record of how the connection arrived and never authority. What a request may do is
     /// decided by the operating-system identity of the peer and the actor envelope built from it,
     /// and no decision about authority reads this, so a later reader must not take it for
-    /// something checked. One thing does read it: an attachment made on a connection whose origin
-    /// says its terminal takes no clipboard writes is sent none. That only narrows what the
-    /// attachment is sent.
+    /// something checked. Two things read it. An attachment made on a connection whose origin says
+    /// its terminal takes no clipboard writes is sent none, which only narrows what the attachment
+    /// is sent. And a connection that has one is sent a keepalive on a clock, because a bridge's
+    /// invoker waits on silence; that gives the connection nothing.
     pub origin: Option<kr_protocol::local::BridgeOrigin>,
     /// What the peer said it can receive. Nothing this worker sends exceeds it.
     pub peer_limits: kr_protocol::hello::ReceiveLimits,
