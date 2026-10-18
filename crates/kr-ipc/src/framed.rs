@@ -27,6 +27,7 @@ use crate::error::{IpcError, Result};
 /// The frames a link read and wrote, kept in order for a test that records a real exchange.
 ///
 /// Each is the payload of one frame, the canonical bytes of one message, with the direction it went.
+/// A frame written is kept when its writing begins, so one the peer never took is kept too.
 /// It is a way into a link that only a test takes, so it exists only with the `testing` feature.
 #[cfg(feature = "testing")]
 #[derive(Clone, Debug, Default)]
@@ -686,6 +687,13 @@ impl FrameWriter {
                 "write",
                 std::io::Error::other("a frame is already part way to the peer"),
             ));
+        }
+        #[cfg(feature = "testing")]
+        if let Some(tap) = &self.tap {
+            tap.keep(
+                true,
+                frame.get(FRAME_LENGTH_PREFIX_LEN..).unwrap_or_default(),
+            );
         }
         self.pending.clear();
         self.pending.extend_from_slice(frame);

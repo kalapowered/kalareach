@@ -288,8 +288,8 @@ impl Updated {
     async fn new() -> Self {
         let before = previous();
         let one = before.assembled(1);
-        let two =
-            Assembled::at_this_level("0.75.0+bbbbbbbbbbbb", 2).retaining_what_this_build_does();
+        let two = Assembled::at_this_level(&format!("{PACKAGE_VERSION}+bbbbbbbbbbbb"), 2)
+            .retaining_what_this_build_does();
         let mut host = Host::bare();
         host.install(&one);
         let started_through_current = host.store.stable(Program::Controller);
@@ -603,6 +603,27 @@ async fn the_frames_the_controller_sends_on_its_own_are_read_by_the_worker_of_th
     })
     .await
     .expect("the worker takes the privacy generation");
+    // The snapshot of plugin admissions a daemon sends every worker: here one with no package.
+    let admitted = link
+        .exchange_admissions(
+            vec![kr_protocol::admission::PluginAdmissions {
+                environment_id,
+                frame: kr_protocol::admission::FrameId {
+                    generation: ControllerGeneration::new(1_000),
+                    revision: kr_protocol::scalars::U64::new(3),
+                    round: kr_protocol::scalars::U64::new(1),
+                },
+                part: 1,
+                parts: 1,
+                policy: kr_protocol::admission::RevocationPolicy::WarnOnly,
+                packages: Vec::new(),
+                releases: Vec::new(),
+            }],
+            std::time::Duration::from_secs(30),
+        )
+        .await
+        .expect("the worker takes the plugin admissions");
+    assert_eq!(admitted.len(), 1);
     let read = link
         .request(
             kr_protocol::method::Method::SessionRead,
@@ -616,15 +637,35 @@ async fn the_frames_the_controller_sends_on_its_own_are_read_by_the_worker_of_th
     let read: SessionReadResult = link.decode(&read).expect("the answer reads at the level");
     assert_eq!(read.session.session_id, updated.session_id);
 
-    // Every frame of the exchange reads under the level the worker stated; what this side wrote
-    // reads back the same under it.
+    // Every frame of the exchange reads under the level the worker stated, which is the level of
+    // the release before; what this side wrote reads back the same under it.
+    let retained = kr_protocol::retained::RETAINED
+        .iter()
+        .find(|retained| retained.level == previous().level)
+        .expect("the release before is a retained level");
+    let level = Level::retained(retained);
+    assert_eq!(
+        format!("{:?}", link.level()),
+        format!("{level:?}"),
+        "the link speaks the worker's level"
+    );
     let frames = tap.frames();
-    assert!(frames.len() >= 12, "{} frames", frames.len());
-    let level = Level::retained(&kr_protocol::retained::RETAINED[0]);
+    let mut keys = Vec::new();
+    let mut reaches = Vec::new();
     for frame in &frames {
         let decoded = level
             .decode(&frame.payload, &kr_cbor::Limits::DEFAULT)
             .unwrap_or_else(|error| panic!("a frame reads under the level: {error:?}"));
+        let document = serde_json::to_value(&decoded).expect("a frame is a document");
+        let (key, body) = document
+            .as_object()
+            .and_then(|object| object.iter().next())
+            .map(|(key, body)| (key.clone(), body.clone()))
+            .expect("a frame names its kind");
+        if key == "authority_revision" {
+            reaches.push(body.get("reach").is_some());
+        }
+        keys.push(key);
         if frame.written {
             assert_eq!(
                 level
@@ -635,6 +676,33 @@ async fn the_frames_the_controller_sends_on_its_own_are_read_by_the_worker_of_th
             );
         }
     }
+    assert_eq!(
+        keys,
+        [
+            "verify_challenge",
+            "verify_proof",
+            "generation_token",
+            "generation_accepted",
+            "local_access",
+            "local_access_ack",
+            "authority_revision",
+            "authority_revision_ack",
+            "authority_revision",
+            "authority_revision_ack",
+            "privacy_generation",
+            "privacy_generation_ack",
+            "plugin_admissions",
+            "plugin_admissions_ack",
+            "request",
+            "response",
+        ],
+        "the exchange, frame by frame"
+    );
+    assert_eq!(
+        reaches,
+        [false, true],
+        "a revision without reach, then one with it"
+    );
     if std::env::var_os("KR_RECORD_FRAMES").is_some() {
         let record: Vec<Value> = frames
             .iter()
@@ -650,6 +718,10 @@ async fn the_frames_the_controller_sends_on_its_own_are_read_by_the_worker_of_th
             serde_json::to_string_pretty(&record).expect("a record")
         );
     }
+    // The session is closed with the release before's own `kr`, which reaches the worker itself now
+    // that no daemon runs.
+    host.close(&updated.kr_before(), &updated.display);
+    host.worker_ended(&updated.worker).await;
 }
 
 /// KR-REQ-26.10, KR-REQ-26.08: a rollback to the release before goes on while only its session is
