@@ -2290,12 +2290,16 @@ async fn an_entry_left_for_a_draft_that_is_still_stored_is_dropped_and_the_draft
     );
     let left: Vec<Value> =
         serde_json::from_slice(&std::fs::read(&ledger).expect("the ledger")).expect("a list");
-    assert!(
-        left.is_empty(),
-        "and the entry is gone: {left:?} {}",
-        page.view()
-    );
+    assert!(left.is_empty(), "and the entry is gone: {left:?}");
+    // A draft that forgot its note would be published against nothing, refused, and kept beside
+    // the service's copy of itself.
     assert_eq!(computer.elsewhere().draft_at(draft).await, Some(1));
+    assert_eq!(
+        page.kept_drafts().len(),
+        1,
+        "and no copy of its own text was kept beside it: {:?}",
+        page.kept_drafts()
+    );
 }
 
 /// A host that refuses to say whether it holds one session does not keep this computer from asking
