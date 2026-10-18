@@ -183,6 +183,33 @@ impl SyncBackupService for SharedCollectionService {
         })
     }
 
+    fn compare_remove<'a>(
+        &'a self,
+        collection: &'a str,
+        request_id: Uuid,
+        signed_at_ms: u64,
+        expected: Option<crate::services::SyncPosition>,
+    ) -> ServiceFuture<'a, SyncExchanged> {
+        Box::pin(async move {
+            match self
+                .service
+                .remove_shared(
+                    &self.collection,
+                    collection,
+                    self.epoch,
+                    request_id,
+                    signed_at_ms,
+                    expected,
+                )
+                .await?
+            {
+                Keyed::Answered { answer, .. } => Ok(answer),
+                Keyed::Retired { .. } => Err(retired()),
+                Keyed::Absent => Err(absent()),
+            }
+        })
+    }
+
     fn request_status<'a>(
         &'a self,
         _collection: &'a str,

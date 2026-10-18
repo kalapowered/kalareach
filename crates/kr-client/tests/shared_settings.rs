@@ -1,5 +1,6 @@
-//! Settings in a collection a key record has claimed, written through the clients that write a
-//! device's own settings, against the stand-in `settings_answers.rs` holds to a recording.
+//! Settings and drafts in a collection a key record has claimed, written through the clients that
+//! write a device's own settings and drafts, against the stand-in `settings_answers.rs` holds to a
+//! recording.
 //!
 //! A claimed collection takes no write that does not name the epoch it is sealed under, so the
 //! settings client reaches it through [`SharedCollectionService`], built with the sealer for the
@@ -14,11 +15,21 @@
 //! | KR-REQ-20.13, a write is sealed and the service holds no plaintext | `settings_written_into_a_claimed_collection_are_read_back_sealed_under_its_key` |
 //! | KR-REQ-20.11, sync-collection half, a write under a retired epoch is not stored | `a_write_under_a_retired_epoch_stores_nothing_and_the_work_is_settled_as_never_run` |
 //! | KR-REQ-20.11, sync-collection half, a client of one epoch does not read an object sealed under another as if it were its own | `an_object_sealed_under_another_epoch_is_refused_by_name_and_not_as_tampering` |
+//! | KR-REQ-20.13, a draft removed on a device leaves the service no content, and its place is free | `a_removed_draft_leaves_nothing_to_read_and_a_second_removal_finds_it_gone` |
+//! | KR-REQ-20.13, a collection that holds as many drafts as it may takes another once one is removed | `a_full_collection_takes_another_draft_once_one_is_removed` |
+//! | KR-REQ-20.13, a removal never replaces what another device wrote, and keeps nothing | `a_removal_after_another_device_wrote_removes_nothing_and_keeps_no_copy` |
+//! | KR-REQ-24.28, no removal leaves while privacy mode is on | `no_removal_is_sent_while_privacy_mode_is_on` |
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use kr_client::services::{ManagedSyncService, ServiceHttp, SyncBackupService, SyncFetched};
+use kr_client::drafts::{
+    DraftRemoval, DraftSealer, DraftStore, DraftSync, DraftTarget, Published as DraftPublished,
+    draft_collection,
+};
+use kr_client::services::{
+    ManagedSyncService, ServiceHttp, SyncBackupService, SyncExchanged, SyncFetched,
+};
 use kr_client::sync::membership::{CollectionRef, KeyRecordService, RekeyAnswer};
 use kr_client::sync::{
     CollectionKeys, MemoryCollectionKeys, Published, Restored, SettingValue,
@@ -33,7 +44,8 @@ use kr_crypto::secret::SymmetricKey;
 use kr_protocol::collection_keys::CollectionKeyRecord;
 use kr_protocol::error::ErrorCode;
 use kr_protocol::ids::{
-    DeviceId, SyncCollectionId, SyncKeyEpoch, SyncKeyRecordRevision, SyncObjectId,
+    DeviceId, DraftId, SessionId, SyncCollectionId, SyncKeyEpoch, SyncKeyRecordRevision,
+    SyncObjectId,
 };
 use kr_protocol::scalars::{TimestampMs, Uuid};
 use kr_protocol::service::{GatewayOrigin, ServiceRequestSigner, installation_id};
@@ -406,5 +418,286 @@ async fn an_object_sealed_under_another_epoch_is_refused_by_name_and_not_as_tamp
             .await
             .expect("a fetch"),
         Restored::Settings { .. }
+    ));
+}
+
+/* -------------------------------------------------------------------------- */
+/* Drafts                                                                      */
+/* -------------------------------------------------------------------------- */
+
+/// One device's drafts in the shared collection: its draft store, its draft half over a store of
+/// its own, and the settings client over that same store, which is the client privacy mode drives.
+struct DraftDevice {
+    drafts: DraftStore,
+    sync: DraftSync,
+    client: SyncClient,
+    _directory: tempfile::TempDir,
+}
+
+impl Home {
+    fn draft_device(&self) -> DraftDevice {
+        let directory = tempfile::tempdir().expect("a directory");
+        let epoch = self.epoch();
+        let shared =
+            SharedCollectionService::new(Arc::clone(&self.service), self.collection, epoch);
+        let sealer: Arc<dyn DraftSealer> =
+            Arc::new(shared.sealer(Arc::clone(&self.secrets) as Arc<dyn CollectionKeys>));
+        let shared = Arc::new(shared);
+        let store = || SyncStore::open(directory.path().join("sync")).expect("the sync store");
+        DraftDevice {
+            drafts: DraftStore::open(
+                directory.path().join("drafts"),
+                DeviceId::new(installation_id(self.keys.authorisation.public()).get()),
+            )
+            .expect("a draft store"),
+            sync: DraftSync::new(
+                Arc::clone(&shared) as Arc<dyn SyncBackupService>,
+                Arc::clone(&sealer),
+                store(),
+            ),
+            client: SyncClient::new(shared, sealer, store()),
+            _directory: directory,
+        }
+    }
+}
+
+impl DraftDevice {
+    /// A draft for a session, written and published, and where the service holds it.
+    async fn published(&self, text: &str) -> (DraftId, kr_client::services::SyncPosition) {
+        let draft = self
+            .drafts
+            .create(
+                DraftTarget::session(SessionId::new(identity())),
+                text.to_owned(),
+                now(),
+            )
+            .expect("a draft");
+        self.sync
+            .publish(&self.drafts, draft.draft_id, draft.revision, now())
+            .await
+            .expect("a publication");
+        let note = self
+            .drafts
+            .checkpoint(draft.draft_id)
+            .expect("the note is readable")
+            .expect("the publication left a note");
+        (draft.draft_id, note.position)
+    }
+}
+
+/// What a shared collection holds, as the service counts it.
+async fn held_objects(home: &Home) -> u64 {
+    home.service
+        .compare_shared(&home.collection, &[], false, None)
+        .await
+        .expect("a comparison")
+        .expect("a member")
+        .stored
+        .objects
+        .get()
+}
+
+/// A draft thrown away on a device is removed at the service: what it held is gone for a reader, and
+/// asking again after an answer was lost finds it gone and says so.
+#[tokio::test]
+async fn a_removed_draft_leaves_nothing_to_read_and_a_second_removal_finds_it_gone() {
+    let web = Arc::new(ServiceWeb::new());
+    let home = Home::claim(&web).await;
+    let device = home.draft_device();
+    let (draft, position) = device.published("a prompt to send later").await;
+    assert_eq!(held_objects(&home).await, 1);
+
+    let removed = device
+        .sync
+        .remove(draft, position, now())
+        .await
+        .expect("a removal");
+    let DraftRemoval::Removed { position: gone } = removed else {
+        panic!("the service removed it: {removed:?}");
+    };
+    assert!(gone.is_removal(), "a removal has no revision: {gone:?}");
+    assert_eq!(held_objects(&home).await, 0, "its place is free");
+
+    // A reader finds nothing to open, where it found a sealed draft before.
+    let shared =
+        SharedCollectionService::new(Arc::clone(&home.service), home.collection, home.epoch());
+    assert!(matches!(
+        shared
+            .fetch(&draft_collection(draft))
+            .await
+            .expect("a read"),
+        SyncFetched::Absent { .. }
+    ));
+
+    // The answer to the first removal may never have come back: asking again is a new request
+    // against the same position, and the object is already gone.
+    assert_eq!(
+        device
+            .sync
+            .remove(draft, position, now())
+            .await
+            .expect("a second removal"),
+        DraftRemoval::AlreadyGone
+    );
+}
+
+/// A collection holds a fixed number of objects. Drafts that are sent and thrown away would fill it
+/// for good if their sealed copies stayed, and every later draft would be refused.
+#[tokio::test]
+async fn a_full_collection_takes_another_draft_once_one_is_removed() {
+    let web = Arc::new(ServiceWeb::new());
+    let home = Home::claim(&web).await;
+    let device = home.draft_device();
+    let mut first = None;
+    for number in 0..kr_protocol::sync::MAX_SYNC_OBJECTS_PER_COLLECTION {
+        let published = device.published(&format!("draft {number}")).await;
+        first.get_or_insert(published);
+    }
+    assert_eq!(
+        held_objects(&home).await,
+        kr_protocol::sync::MAX_SYNC_OBJECTS_PER_COLLECTION
+    );
+
+    // One more is refused: there is no place for it.
+    let extra = device
+        .drafts
+        .create(
+            DraftTarget::session(SessionId::new(identity())),
+            "one too many".to_owned(),
+            now(),
+        )
+        .expect("a draft");
+    let refused = device
+        .sync
+        .publish(&device.drafts, extra.draft_id, extra.revision, now())
+        .await
+        .expect_err("a full collection takes no new object");
+    assert_eq!(refused.code(), ErrorCode::QuotaExceeded);
+
+    // A draft that was sent is removed, and the one that was refused now has a place.
+    let (sent, position) = first.expect("a first draft");
+    assert!(matches!(
+        device.sync.remove(sent, position, now()).await,
+        Ok(DraftRemoval::Removed { .. })
+    ));
+    let accepted = device
+        .sync
+        .publish(&device.drafts, extra.draft_id, extra.revision, now())
+        .await
+        .expect("the freed place takes it");
+    assert!(matches!(accepted, DraftPublished::Accepted { .. }));
+}
+
+/// Another device wrote the draft after this device last saw it, so a removal compared against the
+/// position this device holds is refused. It removes nothing and keeps nothing: a removal carries no
+/// content, and what the other device wrote stays where it is.
+#[tokio::test]
+async fn a_removal_after_another_device_wrote_removes_nothing_and_keeps_no_copy() {
+    let web = Arc::new(ServiceWeb::new());
+    let home = Home::claim(&web).await;
+    let device = home.draft_device();
+    let (draft, position) = device.published("what this device wrote").await;
+
+    // The other device's write of the same draft, against the revision this device published.
+    let theirs = device
+        .drafts
+        .load(draft)
+        .expect("the draft")
+        .text
+        .replace("this", "that");
+    let mut their_draft = device.drafts.load(draft).expect("the draft");
+    their_draft.text = theirs;
+    let sealed =
+        SharedCollectionService::new(Arc::clone(&home.service), home.collection, home.epoch())
+            .sealer(Arc::clone(&home.secrets) as Arc<dyn CollectionKeys>);
+    let ciphertext = sealed
+        .seal(&DraftStore::encode_payload(&their_draft).expect("canonical bytes"))
+        .expect("sealed");
+    let wrote = home
+        .service
+        .exchange_shared(
+            &home.collection,
+            &draft_collection(draft),
+            home.epoch(),
+            identity(),
+            now().get(),
+            Some(position),
+            &ciphertext,
+        )
+        .await
+        .expect("the other device's write");
+    assert!(matches!(
+        wrote,
+        kr_client::services::Keyed::Answered {
+            answer: SyncExchanged::Applied { .. },
+            ..
+        }
+    ));
+    let copies_before = home
+        .service
+        .compare_shared(&home.collection, &[], true, None)
+        .await
+        .expect("a comparison")
+        .expect("a member")
+        .copies
+        .len();
+
+    let removed = device
+        .sync
+        .remove(draft, position, now())
+        .await
+        .expect("a removal");
+    assert!(
+        matches!(removed, DraftRemoval::Moved { current } if !current.is_removal()),
+        "the draft moved on: {removed:?}"
+    );
+    assert_eq!(
+        held_objects(&home).await,
+        1,
+        "what the other device wrote stays"
+    );
+    let copies_after = home
+        .service
+        .compare_shared(&home.collection, &[], true, None)
+        .await
+        .expect("a comparison")
+        .expect("a member")
+        .copies
+        .len();
+    assert_eq!(
+        copies_after, copies_before,
+        "a refused removal keeps nothing"
+    );
+}
+
+/// Privacy mode stops what leaves a device, and a removal is a request that leaves it: none is sent
+/// while the device's store is fenced, and the object stays where it is.
+#[tokio::test]
+async fn no_removal_is_sent_while_privacy_mode_is_on() {
+    let web = Arc::new(ServiceWeb::new());
+    let home = Home::claim(&web).await;
+    let device = home.draft_device();
+    let (draft, position) = device.published("kept while private").await;
+    let before = web.requests_to("/api/sync/exchange");
+
+    device.client.fence(7).expect("the fence is recorded");
+    let refused = device
+        .sync
+        .remove(draft, position, now())
+        .await
+        .expect_err("a fenced device removes nothing");
+    assert!(matches!(refused, SyncError::Fenced { generation: 7 }));
+    assert_eq!(
+        web.requests_to("/api/sync/exchange"),
+        before,
+        "nothing was sent"
+    );
+    assert_eq!(held_objects(&home).await, 1);
+
+    // The fence lifts, and the removal goes.
+    device.client.resume(8).expect("production resumes");
+    assert!(matches!(
+        device.sync.remove(draft, position, now()).await,
+        Ok(DraftRemoval::Removed { .. })
     ));
 }

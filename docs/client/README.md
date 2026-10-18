@@ -1143,6 +1143,20 @@ the same epoch, so that what a client seals and what it asks the service to writ
 The epoch a client writes under never comes from the service, and an object sealed under another
 epoch is refused by name instead of failing to open.
 
+An object can be removed from a collection a key record has claimed.
+`SyncBackupService::compare_remove` is an exchange that carries no object. It compares against the
+revision the caller last saw. A removal that holds takes a place in the object's order of writes, so
+the answer is a position with no revision, and the object stops counting against the 256 objects a
+collection may hold. A removal that loses its comparison keeps nothing, because it carries no
+content. A service of one object that is never removed, such as the recovery bundle's, refuses it by
+default.
+
+`DraftSync::remove` uses it for a draft that was sent or thrown away. `DraftStore::remove_at` hands
+back the note that went with the draft, and the caller removes the draft from the service against
+the position in that note. Each call is a new request, and asking again after a lost answer finds
+the object already gone, so nothing of a removal is recorded in the store. Like a publication, it is
+refused while privacy mode is on.
+
 An answer names where the collection's key records stood, `services::KeyHead`, when the service
 named it: a write and a comparison in a collection a key record has claimed, and a status query or
 fence about a receipt that recorded it. A status query about an identity nothing was recorded for,

@@ -488,6 +488,14 @@ pub struct SyncCheckpoint {
     pub published_revision: Nullable<DraftRevision>,
 }
 
+/// What removing a draft took with it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DraftGone {
+    /// Where the draft stood on the synchronisation service when it went, when this device had
+    /// published it or fetched it. Nothing when it never reached the service.
+    pub note: Option<SyncCheckpoint>,
+}
+
 /// What a listing found, including what it could not read.
 ///
 /// One damaged file does not hide the drafts beside it, and it is not dropped either: it is named,
@@ -828,15 +836,21 @@ impl DraftStore {
     /// writer stored since, so reading the stored draft, comparing its revision and removing it
     /// happen under one exclusive lock, as an update's comparison does.
     ///
-    /// Answers whether a draft was removed: a draft that is not there is already gone, and nothing
-    /// was removed.
+    /// Answers what the removal took: the note that went with the draft is read under that lock too,
+    /// so a caller that has to remove the draft from the service as well compares against the
+    /// position the draft had here when it went. A draft that is not there is already gone, and
+    /// nothing was removed.
     ///
     /// # Errors
     ///
     /// Returns [`DraftError::RevisionConflict`] when the stored draft has moved on,
     /// [`DraftError::NotOwned`] when it belongs to another device, [`DraftError::Corrupt`] when its
     /// file cannot be read, and [`DraftError::Storage`] when a file cannot be removed.
-    pub fn remove_at(&self, draft_id: DraftId, expected: DraftRevision) -> Result<bool> {
+    pub fn remove_at(
+        &self,
+        draft_id: DraftId,
+        expected: DraftRevision,
+    ) -> Result<Option<DraftGone>> {
         let guard = self.exclusive()?;
         let outcome = (|| {
             let stored = match self.read(draft_id) {
@@ -846,7 +860,7 @@ impl DraftStore {
                         &error,
                         ClientError::Draft(held) if matches!(**held, DraftError::Unknown { .. })
                     );
-                    return if gone { Ok(false) } else { Err(error) };
+                    return if gone { Ok(None) } else { Err(error) };
                 }
             };
             self.check_owner(&stored)?;
@@ -858,9 +872,10 @@ impl DraftStore {
                 }
                 .into());
             }
+            let note = self.read_checkpoint(draft_id)?;
             remove_if_present(&self.draft_path(draft_id))?;
             self.remove_file(&self.checkpoint_path(draft_id))?;
-            Ok(true)
+            Ok(Some(DraftGone { note }))
         })();
         drop(guard);
         outcome
@@ -1502,6 +1517,30 @@ pub struct Resolved {
     pub service: Resolutions,
 }
 
+/// What asking the service to remove a draft's object did.
+///
+/// A removal is a compared write that carries no content, so it keeps nothing when it loses, and it
+/// is safe to ask again: a removal already carried out is answered as one the object has left.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DraftRemoval {
+    /// The service removed the object, and its removal took this place in the object's order. The
+    /// object no longer counts against what the collection may hold.
+    Removed {
+        /// Where the removal stands.
+        position: SyncPosition,
+    },
+    /// The service holds no such object: it never held one, or a removal, this device's earlier
+    /// attempt among them, already took it.
+    AlreadyGone,
+    /// Another device wrote the draft after the position this device named, so nothing was
+    /// removed. The content the service holds is that device's, and
+    /// [`DraftSync::fetch_beside`] brings it down beside any draft here.
+    Moved {
+        /// Where the service holds the draft.
+        current: SyncPosition,
+    },
+}
+
 /// What bringing a draft down beside the local one did.
 enum BroughtDown {
     /// It was kept beside the local draft, and the note was written.
@@ -1841,6 +1880,61 @@ impl DraftSync {
             } => Err(SyncError::LateResult {
                 produced_under,
                 current,
+            }),
+        }
+    }
+
+    /// Removes a draft's object from the service, comparing against the position this device last
+    /// saw it at.
+    ///
+    /// A draft that was sent or thrown away on this device leaves nothing to publish, and the sealed
+    /// copy the service holds would count against what the collection may hold for ever. The caller
+    /// names the position the draft's note held before the draft was removed here, because the note
+    /// goes with the draft.
+    ///
+    /// Each call is a request of its own, signed now, and nothing is recorded in the store: a
+    /// removal sends no content, so there is nothing of it to account for, and asking again after a
+    /// lost answer finds the object already gone and says so. It is refused while privacy mode is on,
+    /// as a publication is.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SyncError::Fenced`] while privacy mode is on, [`SyncError::SignedBeforeCutoff`]
+    /// when the service refused the attempt as signed before its cutoff, and the service's refusal
+    /// or the failure of the exchange otherwise.
+    pub async fn remove(
+        &self,
+        draft_id: DraftId,
+        expected: SyncPosition,
+        now: TimestampMs,
+    ) -> crate::sync::Result<DraftRemoval> {
+        let privacy = self.store.privacy()?;
+        if privacy.fenced {
+            return Err(SyncError::Fenced {
+                generation: privacy.generation.get(),
+            });
+        }
+        // A note that names a removal names no object to compare against: it is already gone.
+        if expected.is_removal() {
+            return Ok(DraftRemoval::AlreadyGone);
+        }
+        match self
+            .service
+            .compare_remove(
+                &draft_collection(draft_id),
+                fresh_uuid()?,
+                now.get(),
+                Some(expected),
+            )
+            .await?
+        {
+            SyncExchanged::Applied { position } => Ok(DraftRemoval::Removed { position }),
+            SyncExchanged::Refused { current, .. } => Ok(match current {
+                Some(current) if !current.is_removal() => DraftRemoval::Moved { current },
+                _ => DraftRemoval::AlreadyGone,
+            }),
+            SyncExchanged::SignedBeforeCutoff => Err(SyncError::SignedBeforeCutoff {
+                object_id: SyncObjectId::new(draft_id.get()),
             }),
         }
     }
@@ -2752,13 +2846,49 @@ mod tests {
             store
                 .remove_at(later.draft_id, later.revision)
                 .expect("removed")
+                .is_some()
         );
         assert!(drafts(&store).is_empty());
         // A draft that is not there is already gone.
         assert!(
-            !store
+            store
                 .remove_at(later.draft_id, later.revision)
                 .expect("nothing to remove")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_removal_hands_back_the_note_that_went_with_the_draft() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let store = store(&directory);
+        let published = store
+            .create(open_target(), "published".to_owned(), TimestampMs::new(1))
+            .expect("a draft");
+        let never = store
+            .create(open_target(), "never sent".to_owned(), TimestampMs::new(1))
+            .expect("a draft");
+        let note = SyncCheckpoint {
+            position: at(3),
+            published_revision: Nullable::some(published.revision),
+        };
+        store
+            .record_checkpoint(published.draft_id, note)
+            .expect("a note");
+
+        let gone = store
+            .remove_at(published.draft_id, published.revision)
+            .expect("removed")
+            .expect("it was there");
+        assert_eq!(gone.note, Some(note), "where the service held it");
+        assert_eq!(store.checkpoint(published.draft_id).expect("read"), None);
+        let gone = store
+            .remove_at(never.draft_id, never.revision)
+            .expect("removed")
+            .expect("it was there");
+        assert_eq!(
+            gone.note, None,
+            "a draft that never left has nothing at the service"
         );
     }
 

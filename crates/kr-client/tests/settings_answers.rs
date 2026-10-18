@@ -30,6 +30,7 @@
 
 use std::sync::Arc;
 
+use kr_client::drafts::draft_collection;
 use kr_client::services::sync::KnownRevision;
 use kr_client::services::{
     HttpDeadlines, HttpService, Keyed, ManagedSyncService, ServiceHttp, SyncBackupService,
@@ -47,7 +48,9 @@ use kr_crypto::keys::DeviceKeys;
 use kr_crypto::secret::{Secret, SymmetricKey};
 use kr_crypto::store::StoreSelection;
 use kr_protocol::collection_keys::CollectionKeyRecord;
-use kr_protocol::ids::{SyncCollectionId, SyncKeyEpoch, SyncKeyRecordRevision, SyncObjectId};
+use kr_protocol::ids::{
+    DraftId, SyncCollectionId, SyncKeyEpoch, SyncKeyRecordRevision, SyncObjectId,
+};
 use kr_protocol::scalars::{TimestampMs, Uuid};
 use kr_protocol::service::{GatewayOrigin, ServiceRequestSigner};
 use kr_protocol::sync::{MAX_SYNC_CONFLICT_COPIES, SyncObjectKind};
@@ -558,6 +561,133 @@ async fn run_the_script(http: &Arc<dyn ServiceHttp>, origin: &GatewayOrigin, jou
     journal.step("read the key records as a stranger");
     let answer = b.service.records_after(&shared, 0).await;
     journal.decoded(decoded(&answer, debug));
+
+    // A removal is a compared write: it takes a place in the object's order, frees the object's
+    // place in the collection, and one that loses its comparison keeps nothing.
+    let gone_id = SyncObjectId::new(identity());
+    let gone = draft_collection(DraftId::new(gone_id.get()));
+
+    journal.step("write an object to be removed");
+    let answer = a
+        .service
+        .exchange_shared(
+            &shared,
+            &gone,
+            epoch,
+            identity(),
+            now_ms(),
+            None,
+            &sealed(b"to be removed"),
+        )
+        .await;
+    let gone_at = match &answer {
+        Ok(Keyed::Answered {
+            answer: SyncExchanged::Applied { position },
+            ..
+        }) => Some(*position),
+        _ => None,
+    };
+    journal.decoded(decoded(&answer, |keyed| shown_keyed(keyed, shown)));
+
+    journal.step("remove it against a revision that is not its own");
+    let elsewhere = SyncPosition::at(1, SyncRevision::new(identity()), None);
+    let answer = a
+        .service
+        .remove_shared(&shared, &gone, epoch, identity(), now_ms(), Some(elsewhere))
+        .await;
+    journal.decoded(decoded(&answer, |keyed| shown_keyed(keyed, shown)));
+
+    journal.step("read the collection with the object still held");
+    let answer = a.service.compare_shared(&shared, &[], true, None).await;
+    journal.decoded(decoded(&answer, |found| {
+        found
+            .as_ref()
+            .map_or("the collection is absent".to_owned(), shown_comparison)
+    }));
+
+    journal.step("remove it against its revision");
+    let removal = identity();
+    let answer = a
+        .service
+        .remove_shared(&shared, &gone, epoch, removal, now_ms(), gone_at)
+        .await;
+    journal.decoded(decoded(&answer, |keyed| shown_keyed(keyed, shown)));
+
+    journal.step("remove it again under the same request identity");
+    let answer = a
+        .service
+        .remove_shared(&shared, &gone, epoch, removal, now_ms(), gone_at)
+        .await;
+    journal.decoded(decoded(&answer, |keyed| shown_keyed(keyed, shown)));
+
+    journal.step("ask what became of the removal");
+    let answer = a.service.status_shared(&shared, removal).await;
+    journal.decoded(decoded(&answer, |keyed| shown_keyed(keyed, shown_status)));
+
+    journal.step("remove it again under a new request identity");
+    let answer = a
+        .service
+        .remove_shared(&shared, &gone, epoch, identity(), now_ms(), gone_at)
+        .await;
+    journal.decoded(decoded(&answer, |keyed| shown_keyed(keyed, shown)));
+
+    journal.step("remove the object as a stranger");
+    let answer = b
+        .service
+        .remove_shared(&shared, &gone, epoch, identity(), now_ms(), gone_at)
+        .await;
+    journal.decoded(decoded(&answer, |keyed| shown_keyed(keyed, shown)));
+
+    journal.step("read naming the removed object as held");
+    let known = gone_at
+        .and_then(|position| position.revision.0)
+        .map(|revision| KnownRevision {
+            object_id: gone_id,
+            revision,
+        });
+    let answer = a
+        .service
+        .compare_shared(&shared, known.as_slice(), false, None)
+        .await;
+    journal.decoded(decoded(&answer, |found| {
+        found
+            .as_ref()
+            .map_or("the collection is absent".to_owned(), |found| {
+                format!(
+                    "{}, {} removed, at {:?}",
+                    shown_comparison(found),
+                    found.removed.len(),
+                    found
+                        .removed
+                        .iter()
+                        .map(|removed| removed.position.map(|position| position.write_sequence))
+                        .collect::<Vec<_>>()
+                )
+            })
+    }));
+
+    journal.step("write the removed object again against no revision");
+    let answer = a
+        .service
+        .exchange_shared(
+            &shared,
+            &gone,
+            epoch,
+            identity(),
+            now_ms(),
+            None,
+            &sealed(b"written again"),
+        )
+        .await;
+    journal.decoded(decoded(&answer, |keyed| shown_keyed(keyed, shown)));
+
+    journal.step("remove an object the collection never held");
+    let never_held = draft_collection(DraftId::new(identity()));
+    let answer = a
+        .service
+        .remove_shared(&shared, &never_held, epoch, identity(), now_ms(), None)
+        .await;
+    journal.decoded(decoded(&answer, |keyed| shown_keyed(keyed, shown)));
 
     // The next record moves the epoch on, keeping the one member.
     let rotation = |previous: &CollectionKeyRecord, key: u8| -> CollectionKeyRecord {

@@ -975,6 +975,32 @@ pub trait SyncBackupService: Send + Sync + std::fmt::Debug {
         })
     }
 
+    /// Removes an object, comparing against where the caller last saw it, as
+    /// [`Self::compare_exchange`] writes one.
+    ///
+    /// The removal takes a place in the object's order of writes, so an applied removal answers a
+    /// position with no revision, and the object no longer counts against what the collection may
+    /// hold. A comparison that fails is [`SyncExchanged::Refused`] with nothing retained: a removal
+    /// carries no content to keep. Presenting the identity of a removal again is answered from its
+    /// receipt, as a write is.
+    ///
+    /// The default refuses. A service whose one object is never removed, a recovery bundle's, has
+    /// nothing to remove, and says so rather than sending a request that could not be understood.
+    fn compare_remove<'a>(
+        &'a self,
+        _collection: &'a str,
+        _request_id: Uuid,
+        _signed_at_ms: u64,
+        _expected: Option<SyncPosition>,
+    ) -> ServiceFuture<'a, SyncExchanged> {
+        Box::pin(async {
+            Err(ClientError::refusal(
+                kr_protocol::error::ErrorCode::UnsupportedCapability,
+                crate::shown::Shown::said("this service does not remove an object"),
+            ))
+        })
+    }
+
     /// Returns what the service recorded about one request.
     ///
     /// It reads the receipt and nothing else, so the answer is about that request even when the

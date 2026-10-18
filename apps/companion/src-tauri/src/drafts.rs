@@ -370,7 +370,9 @@ impl DraftDesk {
         match removed {
             Ok(removed) => {
                 self.clear_removal(params.id, None);
-                Ok(Discarded { removed })
+                Ok(Discarded {
+                    removed: removed.is_some(),
+                })
             }
             Err(error) => {
                 // A draft that another window changed is theirs now: the removal of the version

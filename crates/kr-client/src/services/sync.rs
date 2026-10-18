@@ -336,17 +336,22 @@ struct ExchangeBody<'a> {
     ///
     /// Present and null rather than absent, which is the shape the service's contract declares.
     expected_revision: Option<SyncRevision>,
-    object: &'a SealedSyncObject,
+    /// The sealed object, or none when the write removes the object.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    object: Option<&'a SealedSyncObject>,
 }
 
 impl fmt::Debug for ExchangeBody<'_> {
-    /// What the object is, how large it declares itself, whether the write names a revision and
-    /// which epoch it names. Never the ciphertext or the nonce.
+    /// What the object is, how large it declares itself or that the write removes it, whether the
+    /// write names a revision and which epoch it names. Never the ciphertext or the nonce.
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("ExchangeBody")
-            .field("kind", &self.kind)
-            .field("size_bucket_bytes", &self.object.size_bucket_bytes)
+        let mut shown = formatter.debug_struct("ExchangeBody");
+        shown.field("kind", &self.kind);
+        match self.object {
+            Some(object) => shown.field("size_bucket_bytes", &object.size_bucket_bytes),
+            None => shown.field("removes", &true),
+        };
+        shown
             .field("expects_an_object", &self.expected_revision.is_some())
             .field("key_epoch", &self.key_epoch)
             .finish_non_exhaustive()
@@ -1327,6 +1332,64 @@ impl ManagedSyncService {
         expected: Option<SyncPosition>,
         ciphertext: &[u8],
     ) -> Result<Keyed<SyncExchanged>> {
+        self.exchange_in(
+            collection,
+            object,
+            epoch,
+            request_id,
+            signed_at_ms,
+            expected,
+            Some(ciphertext),
+        )
+        .await
+    }
+
+    /// Removes one object from a shared collection, comparing against where this device last saw
+    /// it, as [`Self::exchange_shared`] writes one.
+    ///
+    /// A removal declares the epoch the collection is at too: it is a compared write like any
+    /// other. It takes a place in the object's order of writes, so the answer is a position with no
+    /// revision, and the object no longer counts against what the collection may hold. A removal
+    /// that loses its comparison is refused and keeps nothing: it carries no content.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::exchange_shared`].
+    pub async fn remove_shared(
+        &self,
+        collection: &CollectionRef,
+        object: &str,
+        epoch: u64,
+        request_id: Uuid,
+        signed_at_ms: u64,
+        expected: Option<SyncPosition>,
+    ) -> Result<Keyed<SyncExchanged>> {
+        self.exchange_in(
+            collection,
+            object,
+            epoch,
+            request_id,
+            signed_at_ms,
+            expected,
+            None,
+        )
+        .await
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "each is a separate fact the request states: where, what, under which key, as which request, when, and against which revision"
+    )]
+    async fn exchange_in(
+        &self,
+        collection: &CollectionRef,
+        object: &str,
+        epoch: u64,
+        request_id: Uuid,
+        signed_at_ms: u64,
+        expected: Option<SyncPosition>,
+        ciphertext: Option<&[u8]>,
+    ) -> Result<Keyed<SyncExchanged>> {
         let named = Collection::named(object)?;
         if named.is_the_bundle() {
             return Err(malformed(
@@ -1334,14 +1397,14 @@ impl ManagedSyncService {
             ));
         }
         a_counter("a key epoch", epoch)?;
-        let sealed = sealed_object(ciphertext)?;
+        let sealed = ciphertext.map(sealed_object).transpose()?;
         let request = exchange_body(
             Address::shared(collection),
             named,
             Some(epoch),
             request_id,
             expected,
-            &sealed,
+            sealed.as_ref(),
         );
         let answer = self.ask(&request, Some(signed_at_ms)).await?;
         if signed_before_cutoff(&answer) {
@@ -1777,7 +1840,7 @@ impl ManagedSyncService {
                 None,
                 request_id,
                 expected,
-                &object,
+                Some(&object),
             );
             self.dispatch(&request, Some(signed_at_ms), None).await
         };
@@ -2264,7 +2327,7 @@ fn exchange_body<'a>(
     key_epoch: Option<u64>,
     request_id: Uuid,
     expected: Option<SyncPosition>,
-    object: &'a SealedSyncObject,
+    object: Option<&'a SealedSyncObject>,
 ) -> SyncRequest<'a> {
     SyncRequest::Exchange(ExchangeBody {
         request_id,

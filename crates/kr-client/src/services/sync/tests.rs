@@ -427,7 +427,7 @@ fn the_largest_exchange_fits_the_request_the_service_admits() {
         kind: SyncObjectKind::Settings,
         object_id: SyncObjectId::new(identity(2)),
         expected_revision: Some(revision(3)),
-        object: &largest,
+        object: Some(&largest),
     }))
     .expect("a request");
     // A credential is a few hundred bytes. What matters is that the room left for it is ample.
@@ -2283,7 +2283,7 @@ fn a_rendering_of_a_request_an_object_or_a_copy_carries_nothing_sealed() {
             kind: SyncObjectKind::Settings,
             object_id: SyncObjectId::new(identity(2)),
             expected_revision: Some(revision(3)),
-            object: &object,
+            object: Some(&object),
         },
         "ExchangeBody{kind:Settings,size_bucket_bytes:U64(1024),expects_an_object:true,key_epoch:Some(U64(3)),..}",
     );
