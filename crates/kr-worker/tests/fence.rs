@@ -61,6 +61,11 @@ use kr_worker::session::{Session, SessionConfig};
 /// How long a test waits for something that should already have happened.
 const SOON: Duration = Duration::from_secs(5);
 
+/// How long a case waits for a real package to register and qualify, or for the worker to close the
+/// session it lost, before it takes the package for hung. Nothing is decided by it: a package that
+/// is slow because the machine is busy is waited for, and the case ends on what the worker reports.
+const PACKAGE_HANG_GUARD: Duration = Duration::from_secs(600);
+
 /// How long the machine holds input for a reader's exchange, which is the 250 ms rule: a case that
 /// is about that deadline passing moves its session's clock this far.
 const THE_HOLD: Duration = Duration::from_millis(kr_protocol::root::FENCE_EXCHANGE_TIMEOUT.get());
@@ -2711,7 +2716,7 @@ impl RealShell {
         // secret and is registered; then its own entry reports that the hooks are live after the
         // startup files, which is what qualifies the session.
         let qualified = if wait_ready {
-            tokio::time::timeout(Duration::from_secs(30), async {
+            let ready = async {
                 loop {
                     {
                         let session = runtime.session();
@@ -2723,16 +2728,27 @@ impl RealShell {
                     }
                     tokio::time::sleep(Duration::from_millis(50)).await;
                 }
-            })
-            .await
-            .unwrap_or_else(|_| {
-                panic!(
-                    "the {} package at {} did not register and qualify on this host's endpoint at {}",
+            };
+            // The worker says when the package has registered and qualified, and when it closes the
+            // session instead, which it does for a package that is lost before it qualifies. The
+            // case goes on with whichever it says; the guard ends only a package that says nothing.
+            tokio::select! {
+                shell = ready => shell,
+                closed = runtime.wait_closed() => panic!(
+                    "the {} package at {} closed its session before it registered and qualified on \
+                     this host's endpoint at {}: {closed:?}",
                     package.kind().as_str(),
                     package.directory.display(),
                     address.path
-                )
-            })
+                ),
+                () = tokio::time::sleep(PACKAGE_HANG_GUARD) => panic!(
+                    "the {} package at {} neither registered and qualified on this host's endpoint \
+                     at {} nor closed its session",
+                    package.kind().as_str(),
+                    package.directory.display(),
+                    address.path
+                ),
+            }
         } else {
             None
         };
