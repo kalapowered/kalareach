@@ -424,6 +424,21 @@ async fn cli(host: &Host) -> LocalClient {
 
 use kr_protocol::local::LocalClientKind;
 
+/// A connection a process bridge's helper made, which is the one kind that is sent a keepalive.
+async fn bridged(host: &Host) -> LocalClient {
+    LocalClient::connect_for_bridge(
+        &host.endpoint,
+        build(),
+        kr_protocol::local::BridgeOrigin {
+            environment_id: host.environment_id,
+            ingress: kr_protocol::actor::ActorIngress::LocalIpc,
+            clipboard_writes: true,
+        },
+    )
+    .await
+    .expect("connects")
+}
+
 fn prompt_mutation(client: &LocalClient, host: &Host, request_id: u64) -> MutationRequest {
     MutationRequest {
         request_id: RequestId::new(request_id),
@@ -1409,9 +1424,10 @@ impl UpstreamDispatch for WaitingUpstream {
 /// own mutation is still with the upstream.
 ///
 /// Section 12 has the same socket carry this client's keystrokes, its interrupt and its keepalive.
-/// The prompt is admitted, the marker is committed and the operation is with the upstream, which
-/// has not answered. Everything else this connection asks for is answered while that is true, and
-/// the prompt's own answer arrives when the upstream speaks.
+/// The client is a process bridge's helper, since a keepalive is sent on that kind of connection
+/// alone. The prompt is admitted, the marker is committed and the operation is with the
+/// upstream, which has not answered. Everything else this connection asks for is answered while
+/// that is true, and the prompt's own answer arrives when the upstream speaks.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_11_32_input_interrupt_and_keepalive_are_served_during_a_pending_mutation() {
     let host = host().await;
@@ -1425,7 +1441,7 @@ async fn kr_req_11_32_input_interrupt_and_keepalive_are_served_during_a_pending_
         &host,
         Some(Arc::clone(&upstream) as Arc<dyn UpstreamDispatch>),
     );
-    let mut client = cli(&host).await;
+    let mut client = bridged(&host).await;
     // A real terminal attachment on this connection, taken before anything is outstanding. Its
     // identifier is what the lease, the keystrokes and the interrupt all name.
     let attached: kr_protocol::attachment::SessionAttachResult = client

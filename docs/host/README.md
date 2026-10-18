@@ -4303,7 +4303,7 @@ So every wait in a worker is on something that happens rather than on a clock.
 | the processes the session owns | input the session accepted and output it produced, which is where a new process usually comes from | the same sweep, for everything that comes from neither |
 | the login a desktop-bound session is tied to | nothing this host can subscribe to, so it is asked on every wake: one kernel query about the process that owns the login session, at most once a second | the same sweep |
 | a held paste prefix | its own deadline, which exists only while a prefix is held | nothing |
-| an attached view | the frames its connection carries | one keepalive per connection every ten seconds, which section 23 requires of a local connection |
+| an attached view | the frames its connection carries | a keepalive every ten seconds on a connection a process bridge made, which its invoker reads for silence; any other view has the 150-second window renewal and no other clock |
 
 The sweep is a window rather than a guarantee, and it is worth saying exactly what that costs. A
 process that starts and ends between two observations of the ownership boundary is not in the

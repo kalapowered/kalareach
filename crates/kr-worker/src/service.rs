@@ -84,10 +84,16 @@ use crate::trace::Site;
 pub const WINDOW_RENEWAL: std::time::Duration =
     std::time::Duration::from_millis(MAX_WINDOW_VALIDITY.as_millis() as u64 / 2);
 
-/// How often a local connection sends a keepalive.
+/// How often a connection a process bridge made is sent a keepalive.
 ///
-/// Section 23 puts it at ten seconds while the connection is active. A Unix socket or a named pipe
-/// has no keepalive underneath it, so the control stream carries one itself.
+/// Section 23 puts the network's keepalive at ten seconds while the connection is active. A Unix
+/// socket or a named pipe has no keepalive underneath it, and nothing that reads one directly
+/// waits on silence: the operating system tells this worker when its peer has gone, and a client
+/// of this host reads until it does. The exception is a bridge, whose invoker ends an attached
+/// stream that has said nothing for longer than a few of these, so the connection a bridge's
+/// helper makes is sent one. Every other connection is sent none: the control daemon holds three
+/// to each session and a view can be attached for days, and a clock on each would wake an idle
+/// host several times in ten seconds. The window renewal is the only clock they keep.
 pub const LOCAL_KEEPALIVE: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// How often the host looks at its own clocks while it is idle.
@@ -248,6 +254,8 @@ pub struct WorkerService {
     /// The frozen copies the connections of this worker are reading their recoveries out of.
     recoveries: crate::recovery::RecoveryCopies,
     build_id: kr_protocol::ids::BuildId,
+    /// How often a connection a process bridge made is sent a keepalive.
+    keepalive: std::time::Duration,
     /// A pause between a durable receipt acceptance and the broker's admission of the same
     /// mutation, which this host's own tests arm to stand inside that interval. It is compiled
     /// away in every shipped build.
@@ -577,6 +585,7 @@ impl WorkerService {
             plugin_runtime: None,
             recoveries: crate::recovery::RecoveryCopies::new(),
             build_id: binding.build_id,
+            keepalive: LOCAL_KEEPALIVE,
             #[cfg(feature = "testing")]
             admission_pause: Mutex::new(None),
             #[cfg(feature = "testing")]
@@ -615,6 +624,15 @@ impl WorkerService {
     /// daemon tells (a test, a tool) serves its local caller as it always did.
     pub fn hold_local_access_until_told(&self) {
         self.gate.hold_until_told();
+    }
+
+    /// Sends a connection a process bridge made a keepalive every `period` rather than every
+    /// [`LOCAL_KEEPALIVE`], so a test sees several of them without waiting for ten seconds each.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub const fn with_keepalive(mut self, period: std::time::Duration) -> Self {
+        self.keepalive = period;
+        self
     }
 
     /// Holds the plugin admissions, and the connectors they carry, that this worker read before it
@@ -1663,12 +1681,15 @@ impl WorkerService {
         let withdrawn = Arc::clone(&registration.withdrawn);
         state.attachments = Arc::clone(&registration.attachments);
         state.withdrawn = Arc::clone(&registration.withdrawn);
-        // Both timers fire once immediately; that first tick is consumed here so a connection is
+        // The timer fires once immediately; that first tick is consumed here so a connection is
         // not handed a replacement window before it has read the one in its acknowledgement.
         let mut renewal = tokio::time::interval(WINDOW_RENEWAL);
         renewal.tick().await;
-        let mut keepalive = tokio::time::interval(LOCAL_KEEPALIVE);
-        keepalive.tick().await;
+        // When the next keepalive is due, on a connection a process bridge made, and never on any
+        // other: nothing else reads this stream for silence, so another connection keeps no
+        // keepalive clock and its host is not woken for it. The hello is what says which it is,
+        // so the first is set once the loop has served it.
+        let mut keepalive_due: Option<tokio::time::Instant> = None;
         // The withdrawal is a latch rather than a single permit, so this loop acts on it once and
         // then stops watching it: the connection stays open to refuse the next request.
         let mut fenced = false;
@@ -1686,6 +1707,9 @@ impl WorkerService {
             std::collections::VecDeque::new();
         let mut held: Option<Box<ReadyPreparation>> = None;
         loop {
+            if keepalive_due.is_none() && state.owes_keepalive() {
+                keepalive_due = Some(tokio::time::Instant::now() + self.keepalive);
+            }
             let next: Next = if let Some(queued) = backlog.pop_front() {
                 match queued {
                     Some(message) => Next::Frame(message),
@@ -1746,7 +1770,14 @@ impl WorkerService {
                         }
                         continue;
                     }
-                    _ = keepalive.tick(), if state.negotiated => {
+                    () = async {
+                        match keepalive_due {
+                            Some(due) => tokio::time::sleep_until(due).await,
+                            None => std::future::pending().await,
+                        }
+                    } => {
+                        // The next pass of the loop sets the next one.
+                        keepalive_due = None;
                         let beat = ControlFrame::Event(ControlEvent::Keepalive);
                         if !write_frame(&writable, &writer, &beat, &withdrawn, !fenced).await {
                             break;
@@ -8769,6 +8800,12 @@ impl ConnectionState {
             .lock()
             .expect("the attachment list is not poisoned")
             .retain(|held| *held != attachment_id);
+    }
+
+    /// Returns whether this connection is owed a keepalive: it has negotiated and a process
+    /// bridge's helper made it, which is the one reader of this stream that waits on silence.
+    fn owes_keepalive(&self) -> bool {
+        self.negotiated && self.origin.is_some()
     }
 
     /// Returns whether this connection owns the attachment.
