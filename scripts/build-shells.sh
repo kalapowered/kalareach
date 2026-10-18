@@ -6,10 +6,21 @@
 #   scripts/build-shells.sh --zsh            build one
 #   scripts/build-shells.sh --zsh --bash --check-patches
 #                                            apply the patches to a scratch tree and stop
+#   scripts/build-shells.sh --fish --check-sources
+#                                            check every source the Rust build uses and stop
 #
 # Upstream is never vendored. Each package's manifest pins one release tarball by URL and SHA-256;
-# this script fetches it, verifies the digest, applies the ordered patches in shells/<shell>/patches
-# and copies the bridge sources from shells/<shell>/src into the tree.
+# scripts/place-shell-sources.sh puts it in the cache and this script verifies the digest, applies
+# the ordered patches in shells/<shell>/patches and copies the bridge sources from
+# shells/<shell>/src into the tree.
+#
+# A shell whose tree holds a Cargo.lock is also built without a fetch. The lock names every crate
+# and every git repository the compiler would download. This script checks each crate against the
+# checksum the lock holds and each repository against the revision and the tree digest the
+# manifest's `cargo.git` pins, then replaces cargo's sources with those verified files: the crates
+# as a directory source and each repository as a local mirror of its pinned revision. A lock that
+# names any other source stops the build here, never at a server. The compilation and the shell's
+# own tests then run with cargo offline, in a cargo home that belongs to the build alone.
 #
 # The identity is a digest of the inputs: the upstream archive, this script, the manifest with the
 # flags it pins, every patch, every added source, the startup entry and the compiler. The same inputs give the same identity, so a rebuild
@@ -31,6 +42,7 @@ force=0
 run_upstream_tests=1
 require_upstream_tests=0
 check_patches_only=0
+check_sources_only=0
 jobs="${KR_SHELL_BUILD_JOBS:-4}"
 # A shell's own test suite is worth running and is not worth waiting on for ever: some of these
 # suites drive a terminal and can stall on a loaded machine. The outcome is recorded either way.
@@ -52,6 +64,7 @@ usage: build-shells.sh [--zsh] [--bash] [--fish] [--all] [options]
   --no-upstream-tests    skip the shell's own test suite
   --require-upstream-tests  fail the build unless the shell's own test suite passes
   --check-patches        apply the patches to a scratch tree, report, and stop
+  --check-sources        check the sources a Rust shell is built from, report, and stop
   --jobs N               parallel compilation jobs (default 4)
   --test-timeout N       seconds to allow the shell's own test suite (default 900)
   --prefix DIR           where packages are installed (default: the platform cache directory)
@@ -69,6 +82,7 @@ while [ $# -gt 0 ]; do
         --no-upstream-tests) run_upstream_tests=0 ;;
         --require-upstream-tests) require_upstream_tests=1 ;;
         --check-patches) check_patches_only=1 ;;
+        --check-sources) check_sources_only=1 ;;
         --jobs) shift; jobs="${1:-4}" ;;
         --test-timeout) shift; test_timeout="${1:-900}" ;;
         --prefix) shift; prefix="${1:?--prefix needs a directory}" ;;
@@ -85,8 +99,9 @@ fi
 
 needed="curl make patch tar python3"
 if [ "$build_fish" -eq 1 ]; then
-    # The fish package is a Rust shell built through CMake, so it needs both.
-    needed="$needed cmake cargo rustc"
+    # The fish package is a Rust shell built through CMake, so it needs both, and its pinned
+    # repositories are checked with git.
+    needed="$needed cmake cargo rustc git"
 fi
 for tool in $needed; do
     if ! command -v "$tool" >/dev/null 2>&1; then
@@ -314,6 +329,238 @@ with open(destination, "w", encoding="utf-8") as handle:
 PYTHON
 }
 
+# Checks every source a Rust shell's Cargo.lock names against its pin and lays them out for cargo:
+#
+#   $4/registry/<crate>-<version>/   each crate, unpacked from the file whose digest the lock holds
+#   $4/mirrors/<name>.git            each pinned repository, holding its revision as refs/heads/pinned
+#   $2/.cargo/config.toml            the source replacements, appended to the tree's own configuration
+#
+# Nothing is written until every file has passed, and every refusal names the source and both
+# digests. The lock is read line by line and strictly, so a line or a source this does not know is
+# a failure rather than something skipped.
+prepare_cargo_sources() {
+    python3 - "$1" "$2" "$3" "$4" <<'PYTHON'
+import hashlib
+import io
+import json
+import os
+import pathlib
+import re
+import subprocess
+import sys
+import tarfile
+
+manifest_path, tree, sources, cargo_dir = sys.argv[1:5]
+lock_path = os.path.join(tree, "Cargo.lock")
+REGISTRY = "registry+https://github.com/rust-lang/crates.io-index"
+TREE_RULE = b"kr-git-tree/1\n"
+
+
+def fail(text):
+    print("build-shells: " + text, file=sys.stderr)
+    sys.exit(1)
+
+
+def sha256(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+# Cargo.lock, version 4: a version line, then one [[package]] block for each package.
+packages = []
+current = None
+inside_list = False
+lock_version = None
+with open(lock_path, encoding="utf-8") as handle:
+    for number, raw in enumerate(handle, 1):
+        line = raw.rstrip("\n")
+        if inside_list:
+            inside_list = line != "]"
+            continue
+        if line == "" or line.startswith("#"):
+            continue
+        if line == "[[package]]":
+            current = {}
+            packages.append(current)
+            continue
+        if current is None:
+            version = re.fullmatch(r"version = (\d+)", line)
+            if version is None or lock_version is not None:
+                fail("Cargo.lock line %d is not one this check reads" % number)
+            lock_version = version.group(1)
+            continue
+        if line == "dependencies = [":
+            inside_list = True
+            continue
+        pair = re.fullmatch(r'(name|version|source|checksum) = "([^"\\]*)"', line)
+        if pair is None or pair.group(1) in current:
+            fail("Cargo.lock line %d is not one this check reads" % number)
+        current[pair.group(1)] = pair.group(2)
+if lock_version != "4":
+    fail("Cargo.lock has format version %s and this check reads version 4" % lock_version)
+
+registry = []
+repositories = {}
+for package in packages:
+    name, version = package.get("name"), package.get("version")
+    if not name or not version:
+        fail("Cargo.lock has a package with no name or version")
+    source = package.get("source")
+    if source is None:
+        continue
+    if source == REGISTRY:
+        checksum = package.get("checksum", "")
+        if not re.fullmatch(r"[0-9a-f]{64}", checksum):
+            fail("Cargo.lock holds no checksum for %s %s" % (name, version))
+        registry.append((name, version, checksum))
+        continue
+    git = re.fullmatch(r"git\+([^?#]+)(?:\?(rev|tag|branch)=([^#]+))?#([0-9a-f]{40})", source)
+    if git is None:
+        fail("Cargo.lock takes %s %s from %s, a source this build does not place" % (name, version, source))
+    url, kind, value, commit = git.groups()
+    repositories[(url, commit)] = (kind, value)
+
+with open(manifest_path, encoding="utf-8") as handle:
+    pinned = (json.load(handle).get("cargo") or {}).get("git", [])
+entries = {}
+for entry in pinned:
+    key = (entry["url"], entry["revision"])
+    if key in entries:
+        fail("the manifest pins %s at %s twice" % key)
+    entries[key] = entry
+for key in repositories:
+    if key not in entries:
+        fail("Cargo.lock takes a repository from %s at %s and the manifest pins none like it" % key)
+for key in entries:
+    if key not in repositories:
+        fail("the manifest pins %s at %s and Cargo.lock does not use it" % key)
+
+# Every file is read once and judged before anything is unpacked, so a refusal costs nothing.
+crates = {}
+for name, version, checksum in registry:
+    path = os.path.join(sources, "%s-%s.crate" % (name, version))
+    if not os.path.isfile(path):
+        fail("%s is not in %s; scripts/place-shell-sources.sh puts it there" % (os.path.basename(path), sources))
+    with open(path, "rb") as handle:
+        data = handle.read()
+    actual = sha256(data)
+    if actual != checksum:
+        fail("%s has digest %s and Cargo.lock pins %s" % (os.path.basename(path), actual, checksum))
+    crates[(name, version)] = data
+
+git_env = dict(os.environ, GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1")
+
+
+def git(*args, directory=None, binary=False):
+    command = ["git"] + (["-C", directory] if directory else []) + list(args)
+    done = subprocess.run(command, env=git_env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if done.returncode != 0:
+        raise RuntimeError(done.stderr.decode(errors="replace").strip())
+    return done.stdout if binary else done.stdout.decode().strip()
+
+
+def tree_digest(mirror, revision):
+    # The files of a revision, by git's own objects and not by a checkout: so a line-ending setting,
+    # an attributes file or the git version cannot change it. A record is the file's mode, the
+    # SHA-256 of its bytes and its path, ended by a NUL, which no path holds.
+    listing = git("ls-tree", "-r", "-z", "--full-tree", revision, directory=mirror, binary=True)
+    files = []
+    for record in listing.split(b"\0"):
+        if record:
+            meta, path = record.split(b"\t", 1)
+            mode, kind, object_id = meta.decode().split(" ")
+            if kind != "blob" or mode == "160000":
+                raise RuntimeError("it holds a submodule or a non-file at %s" % path.decode(errors="replace"))
+            files.append((path, mode, object_id))
+    files.sort()
+    digest = hashlib.sha256(TREE_RULE)
+    for path, mode, object_id in files:
+        body = git("cat-file", "blob", object_id, directory=mirror, binary=True)
+        digest.update(mode.encode() + b" " + sha256(body).encode() + b" " + path + b"\0")
+    return digest.hexdigest()
+
+
+mirrors = {}
+for (url, revision), entry in entries.items():
+    bundle = os.path.join(sources, "%s-%s.bundle" % (entry["name"], revision[:12]))
+    if not os.path.isfile(bundle):
+        fail("%s is not in %s; scripts/place-shell-sources.sh puts it there" % (os.path.basename(bundle), sources))
+    mirror = os.path.join(cargo_dir, "mirrors", entry["name"] + ".git")
+    try:
+        git("init", "--quiet", "--bare", mirror)
+        git("-c", "transfer.fsckObjects=true", "fetch", "--quiet", "--no-tags", bundle,
+            "refs/heads/pinned:refs/heads/pinned", directory=mirror)
+        found = git("rev-parse", "--verify", "refs/heads/pinned^{commit}", directory=mirror)
+    except RuntimeError as error:
+        fail("%s is not a bundle of %s: %s" % (os.path.basename(bundle), entry["name"], error))
+    if found != revision:
+        fail("%s holds commit %s and the manifest pins %s" % (os.path.basename(bundle), found, revision))
+    try:
+        actual = tree_digest(mirror, revision)
+    except RuntimeError as error:
+        fail("%s: %s" % (os.path.basename(bundle), error))
+    if actual != entry["sha256"]:
+        fail("%s holds a tree with digest %s and the manifest pins %s" % (os.path.basename(bundle), actual, entry["sha256"]))
+    # A fetch by git's own client asks the mirror for its HEAD.
+    git("symbolic-ref", "HEAD", "refs/heads/pinned", directory=mirror)
+    mirrors[(url, revision)] = mirror
+
+registry_dir = os.path.join(cargo_dir, "registry")
+extract = {"filter": "data"} if hasattr(tarfile, "data_filter") else {}
+for (name, version), data in crates.items():
+    top = "%s-%s" % (name, version)
+    with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as archive:
+        for member in archive.getmembers():
+            parts = member.name.split("/")
+            if parts[0] != top or ".." in parts or member.name.startswith("/") or not (member.isfile() or member.isdir()):
+                fail("%s-%s.crate holds %s, which is not a file of %s" % (name, version, member.name, top))
+        archive.extractall(registry_dir, **extract)
+    checksum = next(c for n, v, c in registry if (n, v) == (name, version))
+    with open(os.path.join(registry_dir, top, ".cargo-checksum.json"), "w", encoding="utf-8") as handle:
+        json.dump({"files": {}, "package": checksum}, handle)
+
+
+def quote(text):
+    return json.dumps(str(text))
+
+
+config = os.path.join(tree, ".cargo", "config.toml")
+existing = open(config, encoding="utf-8").read() if os.path.isfile(config) else ""
+if re.search(r"^\s*\[(source|http|net)\b", existing, re.M):
+    fail("%s already configures sources, the network or the proxy" % config)
+lines = [
+    "",
+    "[source.crates-io]",
+    'replace-with = "kr-crates"',
+    "",
+    "[source.kr-crates]",
+    "directory = %s" % quote(registry_dir),
+]
+for index, ((url, revision), mirror) in enumerate(sorted(mirrors.items())):
+    kind, value = repositories[(url, revision)]
+    lines += [
+        "",
+        "[source.kr-git-%d-locked]" % index,
+        "git = %s" % quote(url),
+    ]
+    if kind:
+        lines.append("%s = %s" % (kind, quote(value)))
+    lines += [
+        'replace-with = "kr-git-%d"' % index,
+        "",
+        "[source.kr-git-%d]" % index,
+        "git = %s" % quote(pathlib.Path(mirror).as_uri()),
+        "rev = %s" % quote(revision),
+    ]
+# Placing every source above is what keeps cargo off the network. This makes a source the checks
+# missed fail at once on a dead local port, never by reaching a host.
+lines += ["", "[http]", 'proxy = "127.0.0.1:9"', ""]
+os.makedirs(os.path.dirname(config), exist_ok=True)
+with open(config, "a", encoding="utf-8") as handle:
+    handle.write(("" if existing.endswith("\n") or not existing else "\n") + "\n".join(lines))
+print("build-shells: %d crates and %d repositories checked against their pins" % (len(crates), len(mirrors)))
+PYTHON
+}
+
 build_package() {
     local shell_name="$1"
     local package="$root/shells/$shell_name"
@@ -329,11 +576,9 @@ build_package() {
 
     mkdir -p "$cache"
     local archive="$cache/$m_archive"
-    if [ ! -f "$archive" ]; then
-        echo "build-shells: fetching $m_archive"
-        curl --fail --location --silent --show-error --output "$archive.part" "$m_url"
-        mv "$archive.part" "$archive"
-    fi
+    # Everything a package is built from is placed first, from the URL its manifest names or a
+    # listed mirror. What is already there is left alone and judged below.
+    bash "$root/scripts/place-shell-sources.sh" --prefix "$prefix" "--$shell_name"
     local actual
     actual="$(digest "$archive")"
     if [ "$actual" != "$m_sha256" ]; then
@@ -394,7 +639,8 @@ startup=$(digest "$package/$m_startup") $m_startup"
     local executable="$destination/$m_binary"
     local module_directory="$destination/$m_module_directory"
 
-    if [ "$check_patches_only" -eq 0 ] && [ "$force" -eq 0 ] && [ -f "$record" ] && [ -x "$executable" ]; then
+    if [ "$check_patches_only" -eq 0 ] && [ "$check_sources_only" -eq 0 ] && [ "$force" -eq 0 ] \
+        && [ -f "$record" ] && [ -x "$executable" ]; then
         if [ "$require_upstream_tests" -eq 1 ]; then
             # A cached package satisfies the requirement only if the suite passed when it was built.
             local recorded
@@ -443,6 +689,34 @@ startup=$(digest "$package/$m_startup") $m_startup"
         return 0
     fi
 
+    # A tree with a Cargo.lock is built from the sources the lock names, checked and laid out here,
+    # and cargo reaches no server after this. The cargo home is the build's own, so nothing the
+    # person's account keeps in theirs is read, and a source that was not placed cannot be fetched.
+    local -a cargo_env=()
+    if [ -f "$source_tree/Cargo.lock" ]; then
+        local cargo_dir="$work/cargo"
+        mkdir -p "$cargo_dir/home"
+        prepare_cargo_sources "$package/manifest.json" "$source_tree" "$cache" "$cargo_dir" || return 1
+        cargo_env=("CARGO_HOME=$cargo_dir/home" CARGO_NET_OFFLINE=true CARGO_NET_GIT_FETCH_WITH_CLI=false)
+        # This fills cargo's own copy of each repository from the verified mirror. It is the one
+        # cargo step that is not offline, and it can only read the local sources: the proxy the
+        # configuration names does not answer.
+        (
+            cd "$source_tree"
+            env CARGO_HOME="$cargo_dir/home" CARGO_NET_GIT_FETCH_WITH_CLI=false cargo fetch --locked
+        ) > "$work/cargo-fetch.log" 2>&1 || {
+            tail -40 "$work/cargo-fetch.log" >&2
+            echo "build-shells: cargo could not resolve $shell_name from the placed sources" >&2
+            return 1
+        }
+    elif [ "$check_sources_only" -eq 1 ]; then
+        echo "build-shells: $shell_name builds from no cargo sources"
+    fi
+    if [ "$check_sources_only" -eq 1 ]; then
+        echo "build-shells: $shell_name sources check out ($identity)"
+        return 0
+    fi
+
     # A patch to a file a release also ships a generated form of — a configure script beside its
     # configure.ac, a parser beside its grammar — leaves the source newer than the product, and
     # the release's own makefile then tries to regenerate it with tools a person building a shell
@@ -461,7 +735,7 @@ startup=$(digest "$package/$m_startup") $m_startup"
     if [ "$m_build_system" = "cmake" ]; then
         (
             # shellcheck disable=SC2086
-            env $m_environment CFLAGS="$m_cflags" \
+            env ${cargo_env[@]+"${cargo_env[@]}"} $m_environment CFLAGS="$m_cflags" \
                 cmake -S "$source_tree" -B "$source_tree/build" \
                     -DCMAKE_INSTALL_PREFIX="$destination" $m_configure
         ) > "$work/configure.log" 2>&1 || {
@@ -489,7 +763,7 @@ startup=$(digest "$package/$m_startup") $m_startup"
     echo "build-shells: compiling $shell_name"
     if [ "$m_build_system" = "cmake" ]; then
         # shellcheck disable=SC2086
-        env $m_environment CFLAGS="$m_cflags" \
+        env ${cargo_env[@]+"${cargo_env[@]}"} $m_environment CFLAGS="$m_cflags" \
             cmake --build "$source_tree/build" -j"$jobs" > "$work/make.log" 2>&1 || {
             tail -40 "$work/make.log" >&2
             echo "build-shells: compiling $shell_name failed" >&2
@@ -507,7 +781,7 @@ startup=$(digest "$package/$m_startup") $m_startup"
     local summary=
     local -a test_argv
     if [ "$m_build_system" = "cmake" ]; then
-        test_argv=(env $m_environment cmake --build "$source_tree/build" --target "$m_test_command")
+        test_argv=(env ${cargo_env[@]+"${cargo_env[@]}"} $m_environment cmake --build "$source_tree/build" --target "$m_test_command")
     else
         test_argv=(make -C "$source_tree" "$m_test_command")
     fi
@@ -574,7 +848,7 @@ startup=$(digest "$package/$m_startup") $m_startup"
     mkdir -p "$destination"
     if [ "$m_build_system" = "cmake" ]; then
         # shellcheck disable=SC2086
-        env $m_environment cmake --install "$source_tree/build" > "$work/install.log" 2>&1 || {
+        env ${cargo_env[@]+"${cargo_env[@]}"} $m_environment cmake --install "$source_tree/build" > "$work/install.log" 2>&1 || {
             tail -40 "$work/install.log" >&2
             echo "build-shells: installing $shell_name failed" >&2
             exit 1

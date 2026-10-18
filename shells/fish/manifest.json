@@ -22,8 +22,29 @@
     "-std=gnu17"
   ],
   "environment": {
-    "FISH_BUILD_DOCS": "0",
-    "CARGO_NET_GIT_FETCH_WITH_CLI": "true"
+    "FISH_BUILD_DOCS": "0"
+  },
+  "cargo": {
+    "git": [
+      {
+        "name": "fluent-rs",
+        "url": "https://github.com/danielrainer/fluent-rs",
+        "revision": "cf712bced280b217b6307edabc2089b3e57204ab",
+        "sha256": "e65253205b833ba4d17aef30dfe7e76562698827505c07cf8e5b68c20d40f78c"
+      },
+      {
+        "name": "fluent-ftl-tools",
+        "url": "https://codeberg.org/danielrainer/fluent-ftl-tools",
+        "revision": "5917664c8f2e4928ef1e480ff5c13bbe1e226066",
+        "sha256": "786d7bb525bfb6e16e320223687903c40b881bf59d0634fc80f270d61b36daac"
+      },
+      {
+        "name": "rust-pcre2",
+        "url": "https://github.com/fish-shell/rust-pcre2",
+        "revision": "85b7afba1a9d9bd445779800e5bcafeb732e4421",
+        "sha256": "a725e14783767a5147d5c17e894813a630bddb368bfa07ead47ad8dfeacfa31c"
+      }
+    ]
   },
   "binary": "bin/fish",
   "module_directory": "share/fish",
