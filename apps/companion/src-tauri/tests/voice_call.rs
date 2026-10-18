@@ -2332,6 +2332,11 @@ async fn a_named_stop_settles_the_entry_owed_to_the_host_that_revoked_and_no_oth
     })
     .await;
     assert_eq!(file["owed"][0]["voice_session_id"], live.to_string());
+    // The entry that is left is the other host's: both were owed for the same voice session.
+    assert_eq!(
+        file["owed"][0]["host_device_id"],
+        serde_json::to_value(another_host.0).expect("a value")
+    );
     scene.stop_host().await;
 }
 
