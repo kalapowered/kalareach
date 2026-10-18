@@ -208,10 +208,38 @@ mod tests {
         assert!(matches!(refusal, Refusal::Launch(_)), "{refusal}");
     }
 
+    /// Set in the program that runs the case below on a host with no container runtime.
+    const WITHOUT_A_RUNTIME: &str = "KR_TEST_HOST_WITHOUT_A_CONTAINER_RUNTIME";
+
+    /// The case's name as the test program lists it.
+    const THE_CASE: &str =
+        "bridge::verify::tests::a_helper_that_cannot_be_started_says_which_program_it_was";
+
     #[tokio::test]
     async fn a_helper_that_cannot_be_started_says_which_program_it_was() {
         // A host without the platform's launcher reports the program it could not run, rather than
         // a refusal about authority that would send a person looking in the wrong place.
+        //
+        // Whether the machine a suite runs on has podman, and how soon it answers, is not what the
+        // case is about, so it runs again as a program whose search path holds nothing: a runtime
+        // that is installed here cannot start, and one that is slow is never asked.
+        if std::env::var_os(WITHOUT_A_RUNTIME).is_none() {
+            let nothing = tempfile::tempdir().expect("an empty directory");
+            let output =
+                std::process::Command::new(std::env::current_exe().expect("this test program"))
+                    .args(["--exact", THE_CASE, "--test-threads=1"])
+                    .env("PATH", nothing.path())
+                    .env(WITHOUT_A_RUNTIME, "1")
+                    .output()
+                    .expect("this test program runs again");
+            let report = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && report.contains("1 passed"),
+                "{report}{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
         let refusal = through_bridge(
             &actor(ActorIngress::LocalIpc),
             false,
@@ -224,15 +252,10 @@ mod tests {
         )
         .await;
         match refusal {
-            // Either the runtime is absent here, or it is present and knows no such container.
             Err(Refusal::NotStarted { program, .. }) => {
                 assert_eq!(program, crate::bridge::launch::CONTAINER_RUNTIME);
             }
-            Err(other) => assert!(
-                matches!(other, Refusal::Stream { .. } | Refusal::Unreadable { .. }),
-                "{other}"
-            ),
-            Ok(verification) => panic!("no container answered, yet {verification:?} came back"),
+            other => panic!("the runtime cannot be started here, yet {other:?} came back"),
         }
     }
 }
