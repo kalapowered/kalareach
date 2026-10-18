@@ -6,10 +6,13 @@
 //! device one of its hosts lists as paired and holding the right to manage the host. This module is
 //! the companion's half of that:
 //!
-//! * **The hosts' device lists** are asked of every host this computer can ask ([`Hosts::device_lists`])
+//! * **The hosts' device lists** are asked of every host this computer owns ([`Hosts::device_lists`])
 //!   and handed to the membership as what each host says of each device's keys, its right to manage
 //!   the host and whether it was revoked. A host that revoked a device is how the membership learns
-//!   to take that device out.
+//!   to take that device out. A host that does not answer says nothing about any device, so while
+//!   one is silent every device the collection lists is vouched for as it was: silence takes no
+//!   device out, and only an answering host that revokes one does. A device a host lists whose
+//!   right to manage the host has run out with its grant is not one to share with.
 //! * **The owner's presence** is asked for through the platform's ceremony, with what it would do as
 //!   its reason, before a device is added to the collection and before this computer joins one. The
 //!   page names a device by an opaque reference and never holds a key. Taking a device out needs no
@@ -20,7 +23,7 @@
 //! Every operation here takes the step settings sync holds, so the ceremony a person is at keeps the
 //! next background step waiting rather than running under it.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -28,9 +31,10 @@ use kr_client::pairing::owner::{CeremonyKind, CeremonyOutcome};
 use kr_client::services::ManagedSyncService;
 use kr_client::sync::membership::{
     CollectionRef, Device, DeviceDirectory, Ended, HostAnswers, HostDevice, HostReport, Outcome,
-    SyncMembership,
+    Refreshed, SyncMembership,
 };
 use kr_protocol::scalars::AuthorisationKey;
+use kr_protocol::service::installation_id;
 use serde::Serialize;
 
 use super::{Record, SettingsSync, installation_id_of, member_failure, now};
@@ -94,6 +98,8 @@ pub struct Candidate {
 pub struct Offer {
     /// What a command names it by.
     pub reference: String,
+    /// The device that shares it, when a host lists it.
+    pub name: Option<String>,
 }
 
 /// What became of a change.
@@ -121,7 +127,13 @@ pub(super) enum Ask {
 /// What this computer knows of the devices its hosts listed, shared by every membership it opens.
 #[derive(Default)]
 pub(super) struct Listed {
+    /// What each device is called, by the host that listed it first at the last full list.
     names: Mutex<BTreeMap<AuthorisationKey, String>>,
+    /// The devices two hosts list with different stored-envelope keys: nothing is shared with one,
+    /// because a key sealed to the wrong one of the two is a key given to whoever holds it.
+    disputed: Mutex<BTreeSet<AuthorisationKey>>,
+    /// The devices the collection lists, as the membership last showed them.
+    members: Mutex<Vec<Device>>,
     last: Mutex<Option<(Instant, HostAnswers)>>,
 }
 
@@ -132,6 +144,28 @@ impl Listed {
             .unwrap_or_else(PoisonError::into_inner)
             .get(device)
             .cloned()
+    }
+
+    /// The name of the device whose installation is `home`, when a host lists it.
+    fn name_of_installation(&self, home: kr_protocol::ids::InstallationId) -> Option<String> {
+        self.names
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .find(|(key, _)| installation_id(key) == home)
+            .map(|(_, name)| name.clone())
+    }
+
+    fn is_disputed(&self, device: &AuthorisationKey) -> bool {
+        self.disputed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains(device)
+    }
+
+    /// Keeps the devices the collection lists, for the answers a silent host leaves out.
+    pub(super) fn keep_members(&self, members: Vec<Device>) {
+        *self.members.lock().unwrap_or_else(PoisonError::into_inner) = members;
     }
 }
 
@@ -172,34 +206,74 @@ impl DeviceDirectory for HostsDirectory {
             {
                 return Ok(Some(answers.clone()));
             }
-            let lists = self.hosts.device_lists().await;
-            if lists.is_empty() {
+            let asked = self.hosts.device_lists().await;
+            if asked.lists.is_empty() {
                 return Ok(None);
             }
             let mut reports = Vec::new();
-            let mut names = self
-                .listed
-                .names
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            for list in &lists {
+            let mut names = BTreeMap::new();
+            let mut stored: BTreeMap<AuthorisationKey, BTreeSet<_>> = BTreeMap::new();
+            for list in &asked.lists {
                 let mut devices = Vec::new();
                 for summary in &list.devices {
                     // A device whose four keys the host does not report yet is not one another
                     // device seals to: the pairing the owner approved is what binds a key to a
                     // device.
                     let Some(keys) = summary.keys.0 else { continue };
-                    names.insert(keys.authorisation, summary.display_name.clone());
+                    names
+                        .entry(keys.authorisation)
+                        .or_insert_with(|| summary.display_name.clone());
+                    stored
+                        .entry(keys.authorisation)
+                        .or_default()
+                        .insert(keys.stored_envelope);
                     devices.push(HostDevice {
                         authorisation: keys.authorisation,
                         stored_envelope: keys.stored_envelope,
-                        manages_host: summary.manages_host,
+                        // A grant that has run out manages nothing, whatever actions it listed.
+                        manages_host: summary.manages_host && !summary.grant_expired,
                         revoked: summary.revoked,
                     });
                 }
                 reports.push(HostReport { devices });
             }
-            drop(names);
+            if asked.silent {
+                // A host that did not answer may be the one that lists a device the collection
+                // lists, and absence from the others' lists is no reason to take it out. Every
+                // device the collection lists is vouched for, as far as the hosts that did not
+                // answer go; an answering host that reports one revoked still takes it out.
+                let members = self
+                    .listed
+                    .members
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .clone();
+                reports.push(HostReport {
+                    devices: members
+                        .iter()
+                        .map(|member| HostDevice {
+                            authorisation: member.authorisation,
+                            stored_envelope: member.stored_envelope,
+                            manages_host: true,
+                            revoked: false,
+                        })
+                        .collect(),
+                });
+            }
+            *self
+                .listed
+                .names
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = names;
+            *self
+                .listed
+                .disputed
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = stored
+                .into_iter()
+                .filter(|(_, keys)| keys.len() > 1)
+                .map(|(device, _)| device)
+                .collect();
             let answers = HostAnswers { reports };
             *self
                 .listed
@@ -236,8 +310,27 @@ impl SettingsSync {
             cached.members.clear();
             cached.candidates.clear();
             cached.out = false;
+            self.listed.keep_members(Vec::new());
             return;
         };
+        self.listed
+            .keep_members(status.members.iter().map(|member| member.device).collect());
+        let outcomes = membership
+            .outcomes()
+            .unwrap_or_default()
+            .iter()
+            .map(|outcome| happened(outcome, &name))
+            .collect();
+        if status.out {
+            // A computer that was taken out has no devices to take out or to share with: what its
+            // last record listed is not its to act on.
+            let mut cached = self.devices.lock().unwrap_or_else(PoisonError::into_inner);
+            cached.members.clear();
+            cached.candidates.clear();
+            cached.outcomes = outcomes;
+            cached.out = true;
+            return;
+        }
         let members = status
             .members
             .iter()
@@ -256,25 +349,18 @@ impl SettingsSync {
             .candidates()
             .unwrap_or_default()
             .iter()
+            .filter(|device| !self.listed.is_disputed(&device.authorisation))
             .map(|device| Candidate {
                 reference: installation_id_of(device),
                 name: name(device),
             })
             .collect();
-        let outcomes = membership
-            .outcomes()
-            .unwrap_or_default()
-            .iter()
-            .map(|outcome| happened(outcome, &name))
-            .collect();
         let mut cached = self.devices.lock().unwrap_or_else(PoisonError::into_inner);
         cached.members = members;
         cached.candidates = candidates;
         cached.outcomes = outcomes;
-        cached.out = status.out;
-        if !status.out {
-            cached.offers.clear();
-        }
+        cached.out = false;
+        cached.offers.clear();
     }
 
     /// The membership of this computer's collection, with the hosts asked for as much as `ask` says.
@@ -307,6 +393,10 @@ impl SettingsSync {
             )?
             .members()
             .map_err(member_failure)?;
+        if let Some(status) = &held {
+            self.listed
+                .keep_members(status.members.iter().map(|member| member.device).collect());
+        }
         Ok(match held {
             Some(status)
                 if status.members.len() > 1
@@ -373,10 +463,19 @@ impl SettingsSync {
             }
             offered.push(entry.collection);
         }
+        if !offered.is_empty() {
+            // An offer is named for the device that shares it, as the hosts call it. What they
+            // answer is for the names alone; nothing is decided on it here.
+            let _ =
+                HostsDirectory::new(Arc::clone(&self.hosts), Arc::clone(&self.listed), Ask::Now)
+                    .answers()
+                    .await;
+        }
         let offers = offered
             .iter()
             .map(|collection| Offer {
                 reference: collection.collection_id.to_string(),
+                name: self.listed.name_of_installation(collection.home),
             })
             .collect();
         *self.offered.lock().unwrap_or_else(PoisonError::into_inner) = offered;
@@ -407,13 +506,21 @@ impl SettingsSync {
             .ok_or_else(|| CommandError::refused("settings sync is not on"))?;
         let service = self.managed(&record.origin()?)?;
         let mut membership = self.membership_asking(&service, Ask::Now)?;
-        membership.refresh().await.map_err(member_failure)?;
+        // The hosts are asked, and what they answer is what the device is chosen from. A refresh
+        // none of them answered leaves the answers of an earlier one in place, which are not what
+        // a key is given on.
+        Self::answered(membership.refresh().await.map_err(member_failure)?)?;
         let device = membership
             .candidates()
             .map_err(member_failure)?
             .into_iter()
             .find(|device| installation_id_of(device) == reference)
             .ok_or_else(|| CommandError::refused("no host lists that device any more"))?;
+        if self.listed.is_disputed(&device.authorisation) {
+            return Err(CommandError::refused(
+                "your hosts do not agree on the keys of that device, so nothing is shared with it",
+            ));
+        }
         let name = self
             .listed
             .name_of(&device.authorisation)
@@ -427,6 +534,21 @@ impl SettingsSync {
             &format!("Share your settings with {name}"),
         )
         .await?;
+        // The person took their time, and a host may have revoked the device since: the hosts are
+        // asked again, and the device must still be one they list.
+        let again = match membership.refresh().await {
+            Ok(refreshed) => Self::answered(refreshed),
+            Err(error) => Err(member_failure(error)),
+        };
+        let listed = membership
+            .candidates()
+            .is_ok_and(|candidates| candidates.contains(&device));
+        if again.is_err() || !listed {
+            membership.cancel(&plan);
+            return Err(again.err().unwrap_or_else(|| {
+                CommandError::refused("no host lists that device any more, so nothing was shared")
+            }));
+        }
         let ended = membership.authorise(&plan, now()).map_err(member_failure)?;
         drop(membership);
         // The key moves on with the addition, and the new device reads only what is sealed under
@@ -438,6 +560,19 @@ impl SettingsSync {
                  being taken out",
             )),
             Ended::Done | Ended::Cancelled => Ok(()),
+        }
+    }
+
+    /// Whether a refresh was answered by a host and recorded what it said.
+    fn answered(refreshed: Refreshed) -> Result<()> {
+        match refreshed {
+            Refreshed::Recorded => Ok(()),
+            Refreshed::NoHostAnswered => Err(CommandError::unavailable(
+                "none of your hosts answered, so who may be given your settings could not be checked",
+            )),
+            _ => Err(CommandError::refused(
+                "this computer is not sharing settings now: it was taken out, or holds none",
+            )),
         }
     }
 
@@ -512,10 +647,14 @@ impl SettingsSync {
         let plan = membership
             .plan_join(collection, now())
             .map_err(member_failure)?;
+        let sharer = self.listed.name_of_installation(collection.home);
         self.confirmed(
             &mut membership,
             &plan,
-            "Join the settings your other device shares",
+            &match sharer {
+                Some(name) => format!("Join the settings {name} shares"),
+                None => "Join the settings your other device shares".to_owned(),
+            },
         )
         .await?;
         membership
@@ -523,13 +662,7 @@ impl SettingsSync {
             .await
             .map_err(member_failure)?;
         drop(membership);
-        let mut record = Record {
-            version: Record::VERSION,
-            service_origin: origin.as_str().to_owned(),
-            collection_id: collection.collection_id,
-            started: false,
-            sealed_epoch: 0,
-        };
+        let mut record = Record::of(&origin, collection.collection_id);
         self.keep(&record)?;
         self.settle(&mut record, &service, Ask::Now)
             .await

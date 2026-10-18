@@ -21,7 +21,7 @@ use kr_protocol::session::{SessionReadParams, SessionReadResult};
 use kr_protocol::sharing::{DeviceListParams, DeviceListResult};
 use tauri::{AppHandle, Manager as _, Runtime};
 
-use super::drafts::{Holds, HostPrivacy, Hosts};
+use super::drafts::{Holds, HostLists, HostPrivacy, Hosts};
 use crate::connection::{Connection, Standing};
 use crate::drafts::DraftHost;
 use crate::error::CommandError;
@@ -141,38 +141,64 @@ async fn listed(session: &Arc<Session>) -> Option<DeviceListResult> {
 impl<R: Runtime> Hosts for ConnectedHosts<R> {
     fn device_lists(
         &self,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<DeviceListResult>> + Send + '_>>
-    {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = HostLists> + Send + '_>> {
         Box::pin(async move {
             let state = self.app.state::<AppState>();
-            let mut lists = Vec::new();
+            let mut found = HostLists::default();
             let mut asked = None;
             if let Ok(connection) = state.connection() {
-                lists.extend(listed(&connection.session()).await);
+                // The connection this application holds to a host is asked over, when the right
+                // to list the host's devices is the one it holds. A host that is not this
+                // computer's to manage lists nothing to it, and its silence means nothing.
+                let owns = match connection.standing() {
+                    Standing::Owner => true,
+                    Standing::Paired { rights, .. } => rights.contains(&ActionRight::HostManage),
+                };
+                if owns {
+                    match listed(&connection.session()).await {
+                        Some(list) => found.lists.push(list),
+                        None => found.silent = true,
+                    }
+                }
                 if let Standing::Paired { host, .. } = connection.standing() {
                     asked = Some(host.host_device_id);
                 }
             }
-            // The other hosts this computer is paired with, each on a connection made for the
-            // question and let go after it.
+            // The other hosts this computer owns, each on a connection made for the question and
+            // let go after it. They are asked at the same time, so that a host that is asleep
+            // keeps the others waiting for one wait and not for each.
             let Ok(device) = state.device() else {
-                return lists;
+                found.silent = true;
+                return found;
             };
-            let pairing = device.pairing();
-            for host in pairing.hosts.list().unwrap_or_default() {
-                if asked == Some(host.host_device_id) {
-                    continue;
-                }
-                let identity = pairing.candidate.paired_identity(host.device_id);
-                let visit = async {
-                    let session = pairing.link.connect_paired(&host, &identity).await.ok()?;
-                    listed(&Arc::new(session)).await
-                };
-                if let Ok(Some(list)) = tokio::time::timeout(ANSWER_WITHIN, visit).await {
-                    lists.push(list);
+            let visits: Vec<_> = device
+                .owner_hosts()
+                .into_iter()
+                .filter(|host| asked != Some(host.host_device_id))
+                .map(|host| {
+                    let device = Arc::clone(&device);
+                    tauri::async_runtime::spawn(async move {
+                        let pairing = device.pairing();
+                        let identity = pairing.candidate.paired_identity(host.device_id);
+                        let visit = async {
+                            let session =
+                                pairing.link.connect_paired(&host, &identity).await.ok()?;
+                            listed(&Arc::new(session)).await
+                        };
+                        tokio::time::timeout(ANSWER_WITHIN, visit)
+                            .await
+                            .ok()
+                            .flatten()
+                    })
+                })
+                .collect();
+            for visit in visits {
+                match visit.await {
+                    Ok(Some(list)) => found.lists.push(list),
+                    Ok(None) | Err(_) => found.silent = true,
                 }
             }
-            lists
+            found
         })
     }
 

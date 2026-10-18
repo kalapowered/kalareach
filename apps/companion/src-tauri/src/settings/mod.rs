@@ -47,7 +47,7 @@ pub(crate) fn locked_file(path: &Path) -> std::io::Result<std::fs::File> {
     Ok(file)
 }
 
-pub use drafts::{DraftsView, Holds, HostPrivacy, Hosts, KeptHere, Why};
+pub use drafts::{DraftsView, Holds, HostLists, HostPrivacy, Hosts, KeptHere, Why};
 pub use sync::{
     Candidate, ConflictView, DeviceCandidate, DevicesView, Happened, Keep, Member, Offer, Other,
     SettingsSync, SyncParts, SyncState, SyncView,

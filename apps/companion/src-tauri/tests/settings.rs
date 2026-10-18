@@ -35,7 +35,7 @@ use std::time::Duration;
 use companion_tauri::AppState;
 use companion_tauri::device::DeviceIdentity;
 use companion_tauri::drafts::DraftHost;
-use companion_tauri::settings::{Holds, HostPrivacy, Hosts, SETTINGS_EVENT};
+use companion_tauri::settings::{Holds, HostLists, HostPrivacy, Hosts, SETTINGS_EVENT};
 use kr_client::drafts::{Draft, DraftSealer, DraftStore, DraftSync, DraftTarget, SyncCheckpoint};
 use kr_client::pairing::BoxFuture;
 use kr_client::pairing::owner::{Ceremony, CeremonyKind, CeremonyOutcome};
@@ -124,6 +124,8 @@ struct Computer {
 struct ScriptedCeremony {
     answer: Mutex<CeremonyOutcome>,
     asked: Mutex<Vec<String>>,
+    /// What happens while the person is being asked, as the world does not wait for them.
+    meanwhile: Mutex<Option<Box<dyn Fn() + Send>>>,
 }
 
 impl ScriptedCeremony {
@@ -131,7 +133,13 @@ impl ScriptedCeremony {
         Arc::new(Self {
             answer: Mutex::new(CeremonyOutcome::Confirmed),
             asked: Mutex::new(Vec::new()),
+            meanwhile: Mutex::new(None),
         })
+    }
+
+    /// `then` happens while the person is being asked, once.
+    fn while_asking(&self, then: impl Fn() + Send + 'static) {
+        *self.meanwhile.lock().expect("the record") = Some(Box::new(then));
     }
 
     fn will_answer(&self, answer: CeremonyOutcome) {
@@ -154,6 +162,9 @@ impl Ceremony for ScriptedCeremony {
             .lock()
             .expect("the record")
             .push(reason.to_owned());
+        if let Some(then) = self.meanwhile.lock().expect("the record").take() {
+            then();
+        }
         let answer = *self.answer.lock().expect("the answer");
         Box::pin(async move { answer })
     }
@@ -167,6 +178,8 @@ struct Listed {
     keys: Option<DevicePublicKeys>,
     manages_host: bool,
     revoked: bool,
+    /// Whether its grant has run out, which a host reports beside the actions the grant lists.
+    expired: bool,
 }
 
 /// What this computer can learn of each host, as a test says it.
@@ -188,8 +201,12 @@ struct ScriptedHosts {
     /// The hosts that refuse to say whether they hold a session, as one does for a session outside
     /// the right it gave this device.
     refusing: Mutex<BTreeSet<EnvironmentId>>,
-    /// The devices the hosts this computer can ask list.
+    /// The devices the host this computer can ask lists.
     devices: Mutex<Vec<Listed>>,
+    /// The devices a second host lists, when there is one.
+    second: Mutex<Option<Vec<Listed>>>,
+    /// Whether a host this computer owns does not answer.
+    silent: Mutex<bool>,
     /// How many times a host was asked whether it holds a session.
     asked: Mutex<u32>,
 }
@@ -204,6 +221,8 @@ impl ScriptedHosts {
             connected: Mutex::default(),
             refusing: Mutex::default(),
             devices: Mutex::default(),
+            second: Mutex::default(),
+            silent: Mutex::default(),
             asked: Mutex::default(),
         }
     }
@@ -245,9 +264,19 @@ impl ScriptedHosts {
             .insert(host.environment);
     }
 
-    /// The hosts this computer can ask list exactly `devices`.
+    /// The host this computer can ask lists exactly `devices`.
     fn list(&self, devices: Vec<Listed>) {
         *self.devices.lock().expect("the record") = devices;
+    }
+
+    /// A second host lists exactly `devices`.
+    fn list_at_a_second_host(&self, devices: Vec<Listed>) {
+        *self.second.lock().expect("the record") = Some(devices);
+    }
+
+    /// A host this computer owns does not answer, or answers again.
+    fn go_silent(&self, silent: bool) {
+        *self.silent.lock().expect("the record") = silent;
     }
 
     fn times_asked_who_holds(&self) -> u32 {
@@ -268,30 +297,28 @@ impl ScriptedHosts {
 impl Hosts for ScriptedHosts {
     fn device_lists(
         &self,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<Output = Vec<kr_protocol::sharing::DeviceListResult>>
-                + Send
-                + '_,
-        >,
-    > {
-        let devices = self.devices.lock().expect("the record").clone();
-        let lists = if devices.is_empty() {
-            Vec::new()
-        } else {
-            vec![kr_protocol::sharing::DeviceListResult {
-                devices: devices
-                    .iter()
-                    .enumerate()
-                    .map(|(number, device)| listed_device(number, device))
-                    .collect(),
-                authority_revision: kr_protocol::ids::AuthorityRevision::new(1),
-                feed_synchronised_at_ms: Nullable::null(),
-                feed_stale: false,
-                feed_removed: false,
-            }]
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = HostLists> + Send + '_>> {
+        let list_of = |devices: &[Listed]| kr_protocol::sharing::DeviceListResult {
+            devices: devices
+                .iter()
+                .enumerate()
+                .map(|(number, device)| listed_device(number, device))
+                .collect(),
+            authority_revision: kr_protocol::ids::AuthorityRevision::new(1),
+            feed_synchronised_at_ms: Nullable::null(),
+            feed_stale: false,
+            feed_removed: false,
         };
-        Box::pin(std::future::ready(lists))
+        let devices = self.devices.lock().expect("the record").clone();
+        let mut lists = Vec::new();
+        if !devices.is_empty() {
+            lists.push(list_of(&devices));
+        }
+        if let Some(second) = &*self.second.lock().expect("the record") {
+            lists.push(list_of(second));
+        }
+        let silent = *self.silent.lock().expect("the record");
+        Box::pin(std::future::ready(HostLists { lists, silent }))
     }
 
     fn holds(
@@ -363,7 +390,7 @@ fn listed_device(number: usize, device: &Listed) -> kr_protocol::sharing::Device
         manages_host: device.manages_host,
         platform: kr_protocol::pairing::DevicePlatform::Macos,
         grant_expires_at_ms: Nullable::null(),
-        grant_expired: false,
+        grant_expired: device.expired,
         all_sessions: true,
     }
 }
@@ -403,6 +430,7 @@ impl Computer {
             }),
             manages_host: true,
             revoked: false,
+            expired: false,
         }
     }
 
@@ -3009,7 +3037,7 @@ async fn a_second_device_is_given_the_key_joins_and_reads_what_the_first_wrote()
         .expect("the collection is joined");
     assert_eq!(
         other.ceremony.reasons(),
-        vec!["Join the settings your other device shares".to_owned()]
+        vec!["Join the settings this-mac shares".to_owned()]
     );
 
     // Settings the first wrote reach the phone once the first has sealed them under the new key.
@@ -3188,6 +3216,15 @@ async fn a_device_a_host_lists_without_its_keys_or_the_right_to_manage_is_not_of
         .list(vec![this.listed("this-mac"), without_the_right]);
     assert_eq!(page.devices_refresh()["candidates"], json!([]));
 
+    let mut expired = other.listed("the-phone");
+    expired.expired = true;
+    this.hosts.list(vec![this.listed("this-mac"), expired]);
+    assert_eq!(
+        page.devices_refresh()["candidates"],
+        json!([]),
+        "a grant that has run out manages nothing, whatever it listed"
+    );
+
     this.hosts
         .list(vec![this.listed("this-mac"), other.listed("the-phone")]);
     assert_eq!(
@@ -3210,4 +3247,303 @@ async fn a_reference_the_page_was_not_shown_names_no_device() {
     assert!(page.unshare("00000000000000000000000000000000").is_err());
     assert!(page.join("00000000-0000-0000-0000-000000000000").is_err());
     assert!(this.ceremony.reasons().is_empty(), "nobody was asked");
+}
+
+/// The record a computer's settings sync keeps, as the file holds it.
+fn sync_record(computer: &Computer) -> Value {
+    serde_json::from_slice(
+        &std::fs::read(computer.data.path().join("settings-sync").join("sync.json"))
+            .expect("the record sync keeps"),
+    )
+    .expect("a record")
+}
+
+/// The reference the page was shown for the device called `name`, among `list`'s entries.
+fn reference_of(list: &Value, name: &str) -> String {
+    list.as_array()
+        .expect("a list")
+        .iter()
+        .find(|entry| entry["name"] == name)
+        .unwrap_or_else(|| panic!("{name} is in {list}"))["reference"]
+        .as_str()
+        .expect("a reference")
+        .to_owned()
+}
+
+/// A host that does not answer says nothing of any device: the devices only it lists stay in the
+/// shared settings. A host that answers and reports one revoked takes it out, and so does one that
+/// answers and lists no such device.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_host_that_does_not_answer_takes_no_device_out_but_one_that_does_can() {
+    let (this, other) = two_computers().await;
+    let page = with_sync_on(&this).await;
+    let phone = other.start();
+    let shown = page.devices_refresh();
+    page.share(&first_reference(&shown["candidates"]))
+        .expect("shared");
+    phone
+        .join(&first_reference(&phone.devices_refresh()["offers"]))
+        .expect("joined");
+    page.sync_now();
+    let members = |view: &Value| {
+        view["sync"]["devices"]["members"]
+            .as_array()
+            .expect("m")
+            .len()
+    };
+
+    // The host that answers lists this computer alone, and another host this computer owns is
+    // asleep: the phone may be listed there.
+    this.hosts.list(vec![this.listed("this-mac")]);
+    this.hosts.go_silent(true);
+    assert_eq!(members(&page.sync_now()), 2, "silence takes nobody out");
+
+    // The host that answers reports it revoked, whoever else is silent.
+    let mut revoked = other.listed("the-phone");
+    revoked.revoked = true;
+    this.hosts.list(vec![this.listed("this-mac"), revoked]);
+    assert_eq!(members(&page.sync_now()), 1, "a revocation is an answer");
+
+    // And the phone, given the key again, goes out when the host that answers lists no such device.
+    this.hosts
+        .list(vec![this.listed("this-mac"), other.listed("the-phone")]);
+    this.hosts.go_silent(false);
+    let shown = page.devices_refresh();
+    page.share(&first_reference(&shown["candidates"]))
+        .expect("shared again");
+    assert_eq!(page.devices()["members"].as_array().expect("m").len(), 2);
+    this.hosts.list(vec![this.listed("this-mac")]);
+    assert_eq!(
+        members(&page.sync_now()),
+        1,
+        "absence from an answering host is not silence"
+    );
+}
+
+/// Two hosts that list one device under different stored-envelope keys leave it nothing to be
+/// given: a key sealed to the wrong one of the two is a key given to whoever holds it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hosts_that_disagree_on_a_devices_keys_give_it_no_key() {
+    let (this, other) = two_computers().await;
+    let page = with_sync_on(&this).await;
+    let shown = page.devices_refresh();
+    let reference = first_reference(&shown["candidates"]);
+
+    let mut disputed = other.listed("the-phone");
+    disputed.keys = disputed.keys.map(|mut keys| {
+        keys.stored_envelope = *kr_crypto::keys::DeviceKeys::generate()
+            .expect("keys")
+            .stored_envelope
+            .public();
+        keys
+    });
+    this.hosts
+        .list_at_a_second_host(vec![this.listed("this-mac"), disputed]);
+    assert_eq!(page.devices_refresh()["candidates"], json!([]));
+    assert!(page.share(&reference).is_err(), "nothing is shared");
+    assert!(this.ceremony.reasons().is_empty(), "nobody was asked");
+}
+
+/// A key is given on what the hosts say when the person confirms, and not on what they said before:
+/// when none answers, or the device has been revoked meanwhile, nothing is shared.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_share_is_given_on_what_the_hosts_say_at_the_time_of_the_confirmation() {
+    let (this, other) = two_computers().await;
+    let page = with_sync_on(&this).await;
+    let phone = other.start();
+    let reference = first_reference(&page.devices_refresh()["candidates"]);
+    let members = || page.devices()["members"].as_array().expect("m").len();
+
+    // No host answers: what they said last time is not what a key is given on.
+    this.hosts.list(vec![]);
+    assert!(page.share(&reference).is_err());
+    assert!(this.ceremony.reasons().is_empty(), "nobody was asked");
+
+    // The hosts answer, then none does while the person is being asked.
+    let devices = vec![this.listed("this-mac"), other.listed("the-phone")];
+    this.hosts.list(devices.clone());
+    let hosts = Arc::clone(&this.hosts);
+    this.ceremony.while_asking(move || hosts.list(vec![]));
+    assert!(page.share(&reference).is_err());
+    assert_eq!(this.ceremony.reasons().len(), 1, "the person was asked");
+    assert_eq!(members(), 1);
+
+    // The hosts answer, and one reports the device revoked while the person is being asked.
+    this.hosts.list(devices);
+    let hosts = Arc::clone(&this.hosts);
+    let mut revoked = other.listed("the-phone");
+    revoked.revoked = true;
+    let this_mac = this.listed("this-mac");
+    this.ceremony
+        .while_asking(move || hosts.list(vec![this_mac.clone(), revoked.clone()]));
+    assert!(page.share(&reference).is_err());
+    assert_eq!(members(), 1);
+    assert_eq!(
+        phone.devices_refresh()["offers"],
+        json!([]),
+        "no key was given"
+    );
+}
+
+/// A device that was not the last to write the settings still seals them again for a device added
+/// later, so that device is not left waiting for the writer: it may be gone, or taken out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_member_that_did_not_write_the_settings_seals_them_again_for_a_device_added_later() {
+    let this = Computer::new().await;
+    let second = Computer::beside(&this).await;
+    let third = Computer::beside(&this).await;
+    let devices = vec![
+        this.listed("the-mac"),
+        second.listed("the-phone"),
+        third.listed("the-tablet"),
+    ];
+    for computer in [&this, &second, &third] {
+        computer.hosts.list(devices.clone());
+    }
+    let page = with_sync_on(&this).await;
+    page.choose("dark");
+    let phone = second.start();
+    let tablet = third.start();
+
+    // The first computer writes the settings and shares them with the phone, which follows them.
+    let shown = page.devices_refresh();
+    page.share(&reference_of(&shown["candidates"], "the-phone"))
+        .expect("shared with the phone");
+    phone
+        .join(&first_reference(&phone.devices_refresh()["offers"]))
+        .expect("the phone joins");
+    page.sync_now();
+    assert_eq!(phone.sync_now()["colour_mode"], "dark");
+
+    // The phone takes the first computer out, and the key moves on: what the first computer wrote
+    // is not believed by the phone until it has been sealed again.
+    let mac = reference_of(&phone.devices()["members"], "the-mac");
+    phone
+        .unshare(&mac)
+        .expect("the first computer is taken out");
+    assert_eq!(
+        sync_record(&second)["floor"],
+        2,
+        "the epoch of the removal is the oldest the phone believes"
+    );
+
+    // The phone shares with the tablet. The settings were written by the first computer, and the
+    // phone seals them again for the tablet all the same.
+    let shown = phone.devices_refresh();
+    phone
+        .share(&reference_of(&shown["candidates"], "the-tablet"))
+        .expect("shared with the tablet");
+    tablet
+        .join(&first_reference(&tablet.devices_refresh()["offers"]))
+        .expect("the tablet joins");
+    phone.sync_now();
+    let view = tablet.sync_now();
+    assert_eq!(view["colour_mode"], "dark", "{view}");
+    assert_eq!(view["sync"]["devices"]["waiting"], false);
+}
+
+/// A computer that chose a colour before it joined, and cannot read what the service holds, waits
+/// with its choice kept: it asks, and sends nothing over what it cannot compare with.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_computer_that_cannot_read_what_the_service_holds_waits_and_sends_nothing_over_it() {
+    let (this, other) = two_computers().await;
+    let page = with_sync_on(&this).await;
+    let phone = other.start();
+    phone.choose("light");
+
+    // Another device wrote the settings, this computer chose something else before it followed, and
+    // the choice waits for the person. A computer with a choice waiting seals nothing again, so the
+    // settings stay sealed under the first key when the phone is given the second.
+    let elsewhere = this.elsewhere();
+    assert!(matches!(
+        elsewhere.write("light").await,
+        Published::Accepted { .. }
+    ));
+    assert_eq!(page.choose("system")["sync"]["conflicts"], 1);
+    let shown = page.devices_refresh();
+    page.share(&first_reference(&shown["candidates"]))
+        .expect("shared");
+
+    let writes = || {
+        this.served
+            .web()
+            .arrived()
+            .iter()
+            .filter(|arrived| arrived.path == SYNC_PATH && arrived.body.get("exchange").is_some())
+            .count()
+    };
+    let (written, copies) = (writes(), elsewhere.copies_kept().await);
+    phone
+        .join(&first_reference(&phone.devices_refresh()["offers"]))
+        .expect("joined");
+    let view = phone.sync_now();
+    assert_eq!(view["sync"]["devices"]["waiting"], true, "{view}");
+    assert!(view["sync"]["problem"].is_null(), "{view}");
+    assert_eq!(view["colour_mode"], "light", "its choice is kept");
+    assert_eq!(
+        writes(),
+        written,
+        "nothing was written over what it cannot read"
+    );
+    assert_eq!(
+        elsewhere.copies_kept().await,
+        copies,
+        "no refused write was left"
+    );
+}
+
+/// A record that names another collection than the membership says this computer is in, as one does
+/// when a step stopped between joining and writing it down, is put right by the membership's word.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_record_naming_another_collection_than_the_membership_is_put_right() {
+    let (this, other) = two_computers().await;
+    let page = with_sync_on(&this).await;
+    page.choose("dark");
+    let phone = other.start();
+    page.share(&first_reference(&page.devices_refresh()["candidates"]))
+        .expect("shared");
+    phone
+        .join(&first_reference(&phone.devices_refresh()["offers"]))
+        .expect("joined");
+    page.sync_now();
+    let joined = sync_record(&other)["collection_id"].clone();
+    drop(phone);
+
+    // The step stopped before the record was written: it still names a collection of its own.
+    let path = other.data.path().join("settings-sync").join("sync.json");
+    let mut record = sync_record(&other);
+    record["collection_id"] = json!("00000000-0000-4000-8000-000000000001");
+    std::fs::write(&path, serde_json::to_vec(&record).expect("a record")).expect("written");
+
+    let phone = other.start();
+    let view = phone.sync_now();
+    assert_eq!(sync_record(&other)["collection_id"], joined);
+    assert_eq!(view["colour_mode"], "dark", "{view}");
+}
+
+/// A draft another device sealed before this computer joined is one this computer cannot read yet.
+/// That is not a fault to report at every pass.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_draft_sealed_before_this_computer_joined_is_not_a_problem_for_it() {
+    let (this, other) = two_computers().await;
+    let page = with_sync_on(&this).await;
+    page.drafts_on(true).expect("drafts sync is on");
+    let elsewhere = this.elsewhere();
+    elsewhere
+        .drafts()
+        .publish("written before the phone joined")
+        .await;
+    page.share(&first_reference(&page.devices_refresh()["candidates"]))
+        .expect("shared");
+
+    let phone = other.start();
+    phone
+        .join(&first_reference(&phone.devices_refresh()["offers"]))
+        .expect("joined");
+    phone.drafts_on(true).expect("drafts sync is on");
+    for _ in 0..2 {
+        let view = phone.sync_now();
+        assert!(view["sync"]["drafts"]["problem"].is_null(), "{view}");
+    }
+    assert!(phone.kept_drafts().is_empty(), "it cannot read the draft");
 }

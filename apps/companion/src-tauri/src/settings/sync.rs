@@ -14,10 +14,11 @@
 //!   synchronised object is a copy of it for the service, made when a setting changes, and a
 //!   remote change is written to the file before the page hears of it.
 //! * **The record** is `settings-sync/sync.json`: the service the collection is kept at, the
-//!   collection's identity, the identity of the settings object in it, and whether the collection's
-//!   first key record is known to have been kept. It is made and flushed before anything is sent,
-//!   because a collection claimed under an identity this device had not written down is one nobody
-//!   finds again. It holds nothing secret.
+//!   collection's identity (the settings object in it has the same identity), whether the
+//!   collection's first key record is known to have been kept, and which devices it listed the last
+//!   time this computer looked, with the oldest epoch whose objects it believes. It is made and
+//!   flushed before anything is sent, because a collection claimed under an identity this device
+//!   had not written down is one nobody finds again. It holds nothing secret.
 //! * **The sync store** is `settings-sync/store`: this device's copy of the object, where it last
 //!   stood at the service, the content other devices wrote that it keeps for the person to choose
 //!   from, and the account of every write that left.
@@ -48,13 +49,19 @@
 //!    changed nothing, the other device's settings are taken as this device's own: there is no
 //!    choice to make, only a lineage to follow. If this device has chosen nothing yet and the
 //!    service holds settings, those are taken the same way.
+//! 5. When the service holds the settings this device holds, and they were sealed under an epoch
+//!    before the collection's newest, this device seals them again under the newest, as the same
+//!    settings with a new revision: a device added since opens only what is sealed under its own
+//!    epoch or a later one, and a device taken out may hold the key of every epoch before. Any
+//!    member that holds the settings does this, not only the one that wrote them.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use kr_client::pairing::owner::Ceremony;
 use kr_client::services::{
-    HttpDeadlines, HttpService, ManagedSyncService, managed_response_limits,
+    HttpDeadlines, HttpService, ManagedSyncService, SyncBackupService, managed_response_limits,
 };
 use kr_client::sync::membership::{
     CollectionRef, Device, DeviceDirectory, KeyRecordService, SyncMembership,
@@ -239,11 +246,22 @@ struct Record {
     collection_id: SyncCollectionId,
     /// True once the collection's first key record is known to be kept and installed.
     started: bool,
-    /// The newest epoch this computer sealed its settings under, or nought before it sealed any.
-    /// The key of a collection moves on whenever a device is added or removed, and a device added
-    /// can open only what is sealed under its own epoch or a later one, so the settings this
-    /// computer wrote are sealed again when the epoch has moved past this one.
-    sealed_epoch: u64,
+    /// The oldest epoch whose objects this computer believes. A device taken out keeps every key
+    /// it held, so what an epoch before the last removal sealed is believed again only once a
+    /// member has sealed it again under a later epoch.
+    floor: u64,
+    /// The newest epoch this computer looked at, with the devices it listed, so that a device
+    /// missing from the next record shows that one was taken out.
+    seen: Option<Seen>,
+}
+
+/// The epoch of the record this computer last looked at and the devices it listed, by the
+/// installation each is.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Seen {
+    epoch: u64,
+    members: BTreeSet<String>,
 }
 
 impl Record {
@@ -253,6 +271,38 @@ impl Record {
     /// collection's, so a device that joins a collection knows it without being told.
     fn object_id(&self) -> SyncObjectId {
         SyncObjectId::new(self.collection_id.get())
+    }
+
+    /// A record for a collection this computer has just started or joined.
+    fn of(origin: &GatewayOrigin, collection_id: SyncCollectionId) -> Self {
+        Self {
+            version: Self::VERSION,
+            service_origin: origin.as_str().to_owned(),
+            collection_id,
+            started: false,
+            floor: 0,
+            seen: None,
+        }
+    }
+
+    /// Notes the devices the installed record of `epoch` lists. The floor rises to `epoch` the
+    /// first time a record is seen (nothing before it was sealed under a key this computer holds),
+    /// and whenever a device that was listed is not, or the epoch moved by more than one record
+    /// (what happened in between is not known). Returns whether the record changed.
+    fn observe(&mut self, epoch: u64, members: BTreeSet<String>) -> bool {
+        let before = (self.floor, self.seen.clone());
+        match &self.seen {
+            None => self.floor = epoch,
+            Some(seen) if epoch > seen.epoch => {
+                if epoch - seen.epoch > 1 || !seen.members.is_subset(&members) {
+                    self.floor = epoch;
+                }
+            }
+            Some(seen) if epoch < seen.epoch => return false,
+            Some(_) => {}
+        }
+        self.seen = Some(Seen { epoch, members });
+        before != (self.floor, self.seen.clone())
     }
 
     fn origin(&self) -> Result<GatewayOrigin> {
@@ -501,13 +551,7 @@ impl SettingsSync {
                         SyncCollectionId::new(fresh_object_id().map_err(CommandError::from)?.get())
                     }
                 };
-                let record = Record {
-                    version: Record::VERSION,
-                    service_origin: origin.as_str().to_owned(),
-                    collection_id,
-                    started: false,
-                    sealed_epoch: 0,
-                };
+                let record = Record::of(&origin, collection_id);
                 self.keep(&record)?;
                 record
             }
@@ -600,13 +644,30 @@ impl SettingsSync {
         let Some((epoch, _)) = status.installed else {
             return Ok(Progress::Starting);
         };
+        // The membership is the word on which collection this computer is in. A step that stopped
+        // between joining another and writing it down finds the record naming the one before, and
+        // everything kept for that one (the object's identity, what was seen of its devices) is
+        // let go with it.
+        if record.collection_id != status.collection.collection_id {
+            *record = Record::of(&record.origin()?, status.collection.collection_id);
+            self.keep(record)?;
+        }
+        let members = status
+            .members
+            .iter()
+            .map(|member| installation_id_of(&member.device))
+            .collect();
+        let mut changed = record.observe(epoch, members);
         if !record.started {
             record.started = true;
+            changed = true;
+        }
+        if changed {
             self.keep(record)?;
             self.told.tell();
         }
-        let client = self.client(service, status.collection, epoch)?;
-        self.agree(&client, record, epoch, now_ms).await?;
+        let (client, sealed) = self.client(service, status.collection, epoch, record.floor)?;
+        self.agree(&client, &sealed, record, epoch, now_ms).await?;
         // The settings agree. Drafts go in the same collection under the same epoch, when the
         // person asked for that, and what stops them never stops this step.
         self.drafts
@@ -614,6 +675,7 @@ impl SettingsSync {
                 service,
                 collection: status.collection,
                 epoch,
+                floor: record.floor,
                 keys: Arc::new(self.keys()),
             })
             .await;
@@ -721,7 +783,7 @@ impl SettingsSync {
                 CommandError::local_failure("the collection has no key installed")
             })?,
         );
-        let client = self.client(&service, collection, epoch)?;
+        let (client, _) = self.client(&service, collection, epoch, record.floor)?;
         // The choice first, on this computer; the service is told after, and may be told later.
         if let Some(mode) = chosen {
             self.local.set_colour_mode(mode)?;
@@ -751,12 +813,15 @@ impl SettingsSync {
     async fn agree(
         &self,
         client: &SyncClient,
-        record: &mut Record,
+        sealed: &SharedCollectionService,
+        record: &Record,
         epoch: u64,
         now_ms: TimestampMs,
     ) -> Result<()> {
         let object_id = record.object_id();
         let store = client.store();
+        self.waiting
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         client
             .reconcile_unsettled(now_ms)
             .await
@@ -790,19 +855,34 @@ impl SettingsSync {
         if let Some(mode) = chosen
             && held.as_ref().and_then(colour_mode_of) != Some(mode)
         {
-            if held.is_none()
-                && store
+            if held.is_none() {
+                // The first object this computer makes is published against nothing, and the
+                // service refuses it where another device wrote first, keeping what it holds beside
+                // it. What it holds may be sealed under epochs this computer was given no key for:
+                // it could not be compared, and every step would leave one more refused write at
+                // the service. So the service is asked first, and a computer that cannot read what
+                // it holds waits, with its choice kept, for a member to seal it again.
+                if store.checkpoint(object_id).map_err(sync_failure)?.is_none()
+                    && let Err(SyncError::Client(error)) = client
+                        .fetch(SyncObjectKind::Settings, object_id, now_ms)
+                        .await
+                    && error.code() == ErrorCode::HostNotConfigured
+                {
+                    self.is_waiting();
+                    return Ok(());
+                }
+                if store
                     .checkpoint(object_id)
                     .map_err(sync_failure)?
                     .is_some_and(|note| note.published_revision.0.is_none())
-            {
-                // The first object this computer makes is published against nothing. A note kept
-                // without an object, and with no write of this computer's own named in it, names a
-                // write this computer read and did not take (the person chose while it was being
-                // read, or the step stopped before it was taken), and a publication against it
-                // would replace that write without a choice: forgotten, the publication is refused
-                // and keeps that content beside this computer's own.
-                store.forget_checkpoint(object_id).map_err(sync_failure)?;
+                {
+                    // A note kept without an object, and with no write of this computer's own named
+                    // in it, names a write this computer read and did not take (the person chose
+                    // while it was being read, or the step stopped before it was taken), and a
+                    // publication against it would replace that write without a choice: forgotten,
+                    // the publication is refused and keeps that content beside this computer's own.
+                    store.forget_checkpoint(object_id).map_err(sync_failure)?;
+                }
             }
             let object = self.object_of(object_id, held.as_ref(), mode, now_ms)?;
             store.put_object(&object).map_err(sync_failure)?;
@@ -810,52 +890,44 @@ impl SettingsSync {
         }
         let note = store.checkpoint(object_id).map_err(sync_failure)?;
         let agreed = note.and_then(|note| note.published_revision.0);
-        // The key moved on since these settings were sealed, and a device added since opens only
-        // what is sealed under the newer one: the settings this computer wrote are sealed again,
-        // as a new revision with the content they have.
-        let me = DeviceId::new(installation_id(self.parts.keys.authorisation.public()).get());
-        if record.sealed_epoch < epoch
-            && let Some(object) = &held
-            && agreed == Some(object.revision)
-            && object.device_id == me
-        {
-            let again = SyncObject {
-                revision: fresh_revision().map_err(CommandError::from)?,
-                updated_at_ms: now_ms,
-                ..object.clone()
-            };
-            store.put_object(&again).map_err(sync_failure)?;
-            held = Some(again);
-        }
         let changed = held
             .as_ref()
             .is_some_and(|object| agreed != Some(object.revision));
         if changed {
             return match client.publish(object_id, now_ms).await {
-                Ok(Published::Accepted { .. }) => {
-                    if record.sealed_epoch < epoch {
-                        record.sealed_epoch = epoch;
-                        self.keep(record)?;
-                    }
-                    Ok(())
-                }
-                Ok(Published::Discarded { .. }) => Ok(()),
+                Ok(Published::Accepted { .. } | Published::Discarded { .. }) => Ok(()),
                 Ok(Published::Conflicted { .. }) => {
                     self.told.tell();
+                    Ok(())
+                }
+                Err(SyncError::Client(error)) if error.code() == ErrorCode::HostNotConfigured => {
+                    self.is_waiting();
                     Ok(())
                 }
                 Err(error) => Err(sync_failure(error)),
             };
         }
-        self.waiting
-            .store(false, std::sync::atomic::Ordering::Relaxed);
-        match client
+        let fetched = client
             .fetch(SyncObjectKind::Settings, object_id, now_ms)
-            .await
-        {
+            .await;
+        // The service's word on the epoch it sealed the object under, which decides only whether to
+        // seal it again.
+        let old = sealed
+            .last_sealed_under()
+            .is_some_and(|under| under < epoch);
+        let agreed_object = held
+            .clone()
+            .filter(|object| agreed == Some(object.revision));
+        match fetched {
             Ok(Restored::Settings { object, copy }) => match (held, copy) {
                 // The service holds what this computer holds: they agree, and the note says so.
-                (Some(held), None) => Self::agreed(store, object_id, held.revision),
+                (Some(held), None) => {
+                    Self::agreed(store, object_id, held.revision)?;
+                    if old {
+                        self.seal_again(client, held, chosen, now_ms).await?;
+                    }
+                    Ok(())
+                }
                 // A device that held nothing is seeing the object for the first time.
                 (None, Some(_)) => Ok(()),
                 // This computer has changed nothing since it last agreed, and another device has
@@ -870,13 +942,71 @@ impl SettingsSync {
             Ok(Restored::ClientSelection { .. }) => Ok(()),
             // The collection holds no such object yet: there is nothing to follow.
             Err(SyncError::Client(error)) if error.code() == ErrorCode::UnknownSession => Ok(()),
-            // The settings are sealed under keys this computer was not given: it joined after
-            // they were. A device that holds them seals them again, and until then there is
-            // nothing to read, which is waiting and not a fault.
+            // The settings are sealed under keys this computer will not use: it joined after they
+            // were, or a device was taken out since. A member that holds the settings and last
+            // agreed with the service about them seals them again; one that does not has nothing to
+            // read until then, which is waiting and not a fault.
             Err(SyncError::Client(error)) if error.code() == ErrorCode::HostNotConfigured => {
-                self.waiting
-                    .store(true, std::sync::atomic::Ordering::Relaxed);
-                self.told.tell();
+                match agreed_object {
+                    Some(object) if old => self.seal_again(client, object, chosen, now_ms).await,
+                    _ => {
+                        self.is_waiting();
+                        Ok(())
+                    }
+                }
+            }
+            Err(error) => Err(sync_failure(error)),
+        }
+    }
+
+    /// Notes that what the service holds cannot be read here yet, and tells the page.
+    fn is_waiting(&self) {
+        self.waiting
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        self.told.tell();
+    }
+
+    /// Seals the settings this computer and the service both hold again under the collection's
+    /// newest epoch: the same settings, a new revision, published against where they stand. It
+    /// carries no choice of the person's, so when another device wrote first, that device's
+    /// settings continue this computer's and nothing is asked of them.
+    async fn seal_again(
+        &self,
+        client: &SyncClient,
+        held: SyncObject,
+        chosen: Option<ColourMode>,
+        now_ms: TimestampMs,
+    ) -> Result<()> {
+        let object_id = held.object_id;
+        let store = client.store();
+        let again = SyncObject {
+            revision: fresh_revision().map_err(CommandError::from)?,
+            ..held.clone()
+        };
+        store.put_object(&again).map_err(sync_failure)?;
+        match client.publish(object_id, now_ms).await {
+            Ok(Published::Accepted { .. }) => Ok(()),
+            Ok(Published::Conflicted { copy, .. }) => {
+                store.put_object(&held).map_err(sync_failure)?;
+                let other = store
+                    .conflicts(object_id)
+                    .map_err(sync_failure)?
+                    .items
+                    .into_iter()
+                    .find(|kept| kept.conflict_id == copy)
+                    .map(|kept| kept.other);
+                match other {
+                    Some(other) => {
+                        self.follow(client, object_id, &other, chosen, Some(copy))
+                            .await
+                    }
+                    None => Ok(()),
+                }
+            }
+            Ok(Published::Discarded { .. }) => store.put_object(&held).map_err(sync_failure),
+            Err(SyncError::Client(error)) if error.code() == ErrorCode::HostNotConfigured => {
+                store.put_object(&held).map_err(sync_failure)?;
+                self.is_waiting();
                 Ok(())
             }
             Err(error) => Err(sync_failure(error)),
@@ -1049,20 +1179,27 @@ impl SettingsSync {
         .map_err(member_failure)
     }
 
-    /// The client that writes the collection under `epoch`, with the sealer for the same epoch.
+    /// The client that writes the collection under `epoch`, with the sealer for the same epoch and
+    /// the service it reads through, which says what epoch the object it last found was sealed
+    /// under.
     fn client(
         &self,
         service: &Arc<ManagedSyncService>,
         collection: kr_client::sync::membership::CollectionRef,
         epoch: u64,
-    ) -> Result<SyncClient> {
-        let shared = SharedCollectionService::new(Arc::clone(service), collection, epoch);
+        floor: u64,
+    ) -> Result<(SyncClient, Arc<SharedCollectionService>)> {
+        let shared = Arc::new(
+            SharedCollectionService::new(Arc::clone(service), collection, epoch)
+                .believing_from(floor),
+        );
         let sealer = shared.sealer(Arc::new(self.keys()) as Arc<dyn CollectionKeys>);
-        Ok(SyncClient::new(
-            Arc::new(shared),
+        let client = SyncClient::new(
+            Arc::clone(&shared) as Arc<dyn SyncBackupService>,
             Arc::new(sealer),
             self.store()?,
-        ))
+        );
+        Ok((client, shared))
     }
 }
 
@@ -1091,12 +1228,121 @@ pub(super) fn sync_failure(error: SyncError) -> CommandError {
     }
 }
 
-/// What a membership failure is to the person.
+/// What a membership failure is to the person, in words that name no record or file.
 fn member_failure(error: kr_client::sync::membership::MembershipError) -> CommandError {
     use kr_client::sync::membership::MembershipError;
 
     match error {
         MembershipError::Service(error) | MembershipError::Keys(error) => CommandError::from(error),
-        other => CommandError::local_failure(other.to_string()),
+        MembershipError::NoHostAnswered => CommandError::unavailable(
+            "none of your hosts answered, so who may share your settings could not be checked",
+        ),
+        MembershipError::NotCommitted => {
+            CommandError::refused("no host lists that device as one of yours any more")
+        }
+        MembershipError::NotListed => CommandError::refused(
+            "the other device has not shared its settings with this computer yet, or has taken \
+             it out",
+        ),
+        MembershipError::AlreadyMember | MembershipError::AlreadyListed => CommandError::refused(
+            "this computer already shares settings, and that device already does",
+        ),
+        MembershipError::Out => CommandError::refused(
+            "this computer was taken out of the shared settings; it joins them again when you \
+             confirm here",
+        ),
+        MembershipError::NoMembership | MembershipError::NotInstalled => {
+            CommandError::refused("this computer is not sharing settings yet")
+        }
+        MembershipError::CannotRemoveSelf => {
+            CommandError::refused("a computer does not take itself out; another one does")
+        }
+        MembershipError::NotAMember => {
+            CommandError::refused("that device does not share the settings")
+        }
+        MembershipError::Plan(_) => CommandError::refused(
+            "the confirmation is no longer valid, so nothing was changed; try again",
+        ),
+        MembershipError::Busy
+        | MembershipError::PutBackWhileRead
+        | MembershipError::KeysStillHeld
+        | MembershipError::UnsettledRequest => CommandError::unavailable(
+            "the settings were being changed at the same moment; try again in a little while",
+        ),
+        MembershipError::BrokenChain | MembershipError::Exhausted => CommandError::local_failure(
+            "what the service holds for these settings cannot be followed from here, so this \
+             computer waits for you to join them again",
+        ),
+        _ => CommandError::local_failure(
+            "who shares the settings could not be read or kept on this computer",
+        ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn members(names: &[&str]) -> BTreeSet<String> {
+        names.iter().map(|name| (*name).to_owned()).collect()
+    }
+
+    fn record() -> Record {
+        let origin = GatewayOrigin::new("https://reach.example").expect("an origin");
+        Record::of(
+            &origin,
+            SyncCollectionId::new(kr_protocol::scalars::Uuid::from_bytes([1; 16])),
+        )
+    }
+
+    #[test]
+    fn the_first_record_seen_is_the_oldest_believed() {
+        let mut one = record();
+        assert!(one.observe(0, members(&["a"])));
+        assert_eq!(one.floor, 0);
+        let mut joined = record();
+        assert!(joined.observe(4, members(&["a", "b"])));
+        assert_eq!(
+            joined.floor, 4,
+            "a device that joins holds no key before its own"
+        );
+    }
+
+    #[test]
+    fn a_device_added_leaves_the_floor_where_it_was() {
+        let mut one = record();
+        one.observe(0, members(&["a"]));
+        assert!(one.observe(1, members(&["a", "b"])));
+        assert_eq!(one.floor, 0);
+        assert!(!one.observe(1, members(&["a", "b"])), "nothing changed");
+    }
+
+    #[test]
+    fn a_device_taken_out_raises_the_floor_to_the_epoch_it_was_taken_out_at() {
+        let mut one = record();
+        one.observe(0, members(&["a", "b"]));
+        one.observe(1, members(&["a", "b", "c"]));
+        one.observe(2, members(&["a", "c"]));
+        assert_eq!(one.floor, 2);
+        one.observe(3, members(&["a", "c", "d"]));
+        assert_eq!(one.floor, 2, "an addition after it leaves it");
+    }
+
+    #[test]
+    fn records_that_were_not_all_seen_raise_the_floor_whatever_they_listed() {
+        let mut one = record();
+        one.observe(1, members(&["a", "b"]));
+        // A device may have been taken out and listed again between the two looks.
+        one.observe(4, members(&["a", "b"]));
+        assert_eq!(one.floor, 4);
+    }
+
+    #[test]
+    fn a_record_older_than_the_one_seen_changes_nothing() {
+        let mut one = record();
+        one.observe(3, members(&["a"]));
+        assert!(!one.observe(2, members(&["a", "z"])));
+        assert_eq!(one.floor, 3);
+        assert_eq!(one.seen.as_ref().map(|seen| seen.epoch), Some(3));
     }
 }

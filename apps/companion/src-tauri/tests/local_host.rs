@@ -504,11 +504,15 @@ async fn the_connected_host_is_asked_which_devices_it_lists() {
     let host = Host::start().await;
     let hosts =
         companion_tauri::settings::connected::ConnectedHosts::new(host.app.handle().clone());
-    let lists = hosts.device_lists().await;
-    assert_eq!(lists.len(), 1, "the host answered once: {lists:?}");
+    let asked = hosts.device_lists().await;
     assert!(
-        lists[0].devices.is_empty(),
-        "nothing is paired with a new host: {lists:?}"
+        !asked.silent,
+        "every host this computer owns answered: {asked:?}"
+    );
+    assert_eq!(asked.lists.len(), 1, "the host answered once: {asked:?}");
+    assert!(
+        asked.lists[0].devices.is_empty(),
+        "nothing is paired with a new host: {asked:?}"
     );
 }
 

@@ -127,19 +127,23 @@ pub enum Holds {
     Refused,
 }
 
+/// What the hosts this device owns said when asked who they list.
+#[derive(Clone, Debug, Default)]
+pub struct HostLists {
+    /// The lists of the hosts that answered.
+    pub lists: Vec<kr_protocol::sharing::DeviceListResult>,
+    /// Whether a host this device owns did not answer. A device that no answering host lists is
+    /// then not known to be gone: the host that did not answer may be the one that lists it.
+    pub silent: bool,
+}
+
 /// What settings sync asks of the hosts this device knows: drafts sync, which host holds a session
 /// and where its privacy mode stands; and sharing the settings, which devices each host lists.
 pub trait Hosts: Send + Sync {
-    /// What each host this device can ask lists as its devices, for the hosts that answered.
+    /// What each host this device owns lists as its devices.
     fn device_lists(
         &self,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<Output = Vec<kr_protocol::sharing::DeviceListResult>>
-                + Send
-                + '_,
-        >,
-    >;
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = HostLists> + Send + '_>>;
 
     /// Whether the host this device is connected to holds `session`.
     fn holds(
@@ -267,6 +271,8 @@ pub struct Collection<'a> {
     pub collection: CollectionRef,
     /// The epoch the collection's objects are sealed under now.
     pub epoch: u64,
+    /// The oldest epoch whose objects this device believes.
+    pub floor: u64,
     /// Where the collection's keys are.
     pub keys: Arc<dyn CollectionKeys>,
 }
@@ -600,11 +606,10 @@ impl DraftsSync {
         if !self.enabled()? {
             return Ok((Vec::new(), None));
         }
-        let shared = Arc::new(SharedCollectionService::new(
-            Arc::clone(on.service),
-            on.collection,
-            on.epoch,
-        ));
+        let shared = Arc::new(
+            SharedCollectionService::new(Arc::clone(on.service), on.collection, on.epoch)
+                .believing_from(on.floor),
+        );
         let sealer: Arc<dyn DraftSealer> = Arc::new(shared.sealer(Arc::clone(&on.keys)));
         let service: Arc<dyn SyncBackupService> = Arc::clone(&shared) as _;
         let store = self.desk.store()?;
@@ -1235,6 +1240,11 @@ impl DraftsSync {
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     self.told.tell();
                 }
+                // A draft sealed under an epoch this device does not believe, or holds no key
+                // for, is one it cannot read yet: it was written before this device joined or
+                // before a device was taken out, and is not a fault to report at every pass.
+                Err(SyncError::Client(error))
+                    if error.code() == kr_protocol::error::ErrorCode::HostNotConfigured => {}
                 // One draft this version cannot open does not keep the others from coming down.
                 Err(error) => {
                     problem.get_or_insert_with(|| super::sync::sync_failure(error));
