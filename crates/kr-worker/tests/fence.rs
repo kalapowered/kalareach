@@ -3266,7 +3266,9 @@ async fn asks_the_real_worker_before_each_command(
                             {
                                 // The line is held, so no reader has started since its acceptance:
                                 // what the worker recorded and the host's answers accounted are read in
-                                // one hold of the session.
+                                // one hold of the session. An answer to the prompt's own question can
+                                // come after the acceptance and is in the count, though it
+                                // invalidated nothing.
                                 let driver = session.fence().expect("a driver");
                                 let fenced = driver.detach_target()
                                     == DetachTarget::Attachment(keys.attachment_id);
@@ -3325,7 +3327,7 @@ async fn asks_the_real_worker_before_each_command(
                      ({bypass}, each published fence kept from the writer: {fence_hold:?}, \
                      attempt {attempt}, the line {} through the fence and the shell {} its \
                      answer, bytes of the host's answers accounted between the fence being \
-                     seen valid and the line's acceptance: {}): {}",
+                     seen valid and the held line's block being seen running: {}): {}",
                     package.kind(),
                     if fenced { "went" } else { "did not go" },
                     if answered { "had" } else { "did not have" },
@@ -3480,9 +3482,11 @@ async fn a_reader_the_line_starts_keeps_the_lines_capability_once(
         .last_command_block()
         .expect("the line's block")
         .prompt_generation;
-    // The worker's own record of the line's acceptance, read before the nested reader starts: a
-    // line it recorded as typed behind its fence has a capability, and losing it from here on is
-    // a fault of the nested reader whatever else the host said to the shell.
+    // The worker's own record of the line's acceptance, read where the line's running block is
+    // seen, with the host's answers accounted by then: a line it recorded as typed behind its
+    // fence has a capability, and losing it from here on is a fault of the nested reader whatever
+    // else the host said to the shell. The nested reader may have entered by now, and its entry
+    // draws an answer of its own, so a line the worker did not record as fenced is typed again.
     let (fenced, host_bytes) = {
         let session = shell.runtime.session();
         let driver = session.fence().expect("a driver");
@@ -3529,8 +3533,9 @@ async fn a_reader_the_line_starts_keeps_the_lines_capability_once(
         .expect("the probe ran");
     let Some(token) = environment.get("KR_DETACH_TOKEN").cloned() else {
         // Two reasons a line goes without its capability that are not the nested reader's: it was
-        // typed behind a fence a reply of the host invalidated, which the worker did not record as
-        // fenced, or the shell had no answer for it in time, which its trace says.
+        // typed behind a fence that a reply of the host invalidated or that never stood, which the
+        // worker did not record as fenced, or the shell had no answer for it in time, which its
+        // trace says.
         let host_replied = host_bytes > host_bytes_before;
         let unanswered = probes
             .trace()
@@ -3576,30 +3581,48 @@ async fn a_reader_the_line_starts_keeps_the_lines_capability_once(
 /// The bridge reports a line's block finished when the next reader starts, and the fence that
 /// reader answers is valid only after that, so the two together say the prompt is the next one.
 ///
-/// Returns what the session held at the moment the fence was seen valid, read in the same hold of
-/// it. An answer of the host accounted after that invalidates the fence while it stands, and a
-/// count or a revision read later would have missed what changed in between.
+/// A shell asks its terminal a question of its own as a prompt starts, and the host's answer is
+/// accounted within milliseconds of the fence being published, which invalidates it. So the fence
+/// has to stand across two looks, with no answer accounted between them: a line typed at the first
+/// look it was valid would race that answer at every prompt. A line typed behind a fence the
+/// answer invalidates after all is still typed again by the callers.
+///
+/// Returns what the session held at the second look, read in the same hold of it. An answer of the
+/// host accounted after that invalidates the fence while it stands, and a count or a revision read
+/// later would have missed what changed in between.
 #[cfg(unix)]
 async fn back_at_the_prompt(shell: &RealShell, probes: &RealProbes, command: &str) -> AtThePrompt {
     tokio::time::timeout(Duration::from_secs(30), async {
+        let mut last = None;
         loop {
             {
                 let session = shell.runtime.session();
                 let finished = session
                     .last_command_block()
                     .is_some_and(|block| block.command == command && block.finished());
-                let fenced = session
+                let look = session
                     .fence()
-                    .is_some_and(|driver| driver.state() == FenceState::Fenced);
-                if finished && fenced {
-                    let driver = session.fence().expect("a driver");
-                    return AtThePrompt {
-                        host_bytes: driver.host_reply_bytes(),
-                        reader_revision: driver
-                            .fence()
-                            .expect("a valid fence is published")
-                            .reader_revision,
-                    };
+                    .filter(|driver| finished && driver.state() == FenceState::Fenced)
+                    .and_then(|driver| {
+                        driver.fence().map(|fence| {
+                            (
+                                fence.fence_id,
+                                driver.host_reply_bytes(),
+                                fence.reader_revision,
+                            )
+                        })
+                    });
+                match look {
+                    Some((fence_id, host_bytes, reader_revision))
+                        if last == Some((fence_id, host_bytes)) =>
+                    {
+                        return AtThePrompt {
+                            host_bytes,
+                            reader_revision,
+                        };
+                    }
+                    Some((fence_id, host_bytes, _)) => last = Some((fence_id, host_bytes)),
+                    None => last = None,
                 }
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -3620,7 +3643,8 @@ async fn back_at_the_prompt(shell: &RealShell, probes: &RealProbes, command: &st
     })
 }
 
-/// What [`back_at_the_prompt`] read in the hold of the session in which it found the fence valid.
+/// What [`back_at_the_prompt`] read in the hold of the session in which it found the fence valid
+/// for the second time.
 #[cfg(unix)]
 struct AtThePrompt {
     /// How many bytes of the host's own answers to the shell had been accounted.
