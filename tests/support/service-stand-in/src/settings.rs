@@ -19,8 +19,8 @@
 //! receipt would have been swept. The receipt is read before membership, so an installation that
 //! was removed after it sent a request can still ask what became of it.
 //!
-//! A write of an object spends the principal's settings-sync allowance; a test arranges for it to be
-//! spent with [`crate::ServiceWeb::refuse_settings_writes`]. A removal stores nothing and is not
+//! A write of an object spends the principal's settings-sync allowance; a test arranges for it to
+//! be spent with [`crate::ServiceWeb::refuse_settings_writes`]. A removal stores nothing and is not
 //! refused when the allowance is spent.
 //!
 //! A removal (an exchange that names no object) is a compared write like any other: it takes a place
