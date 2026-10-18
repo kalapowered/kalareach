@@ -67,6 +67,12 @@ class PlatformPlugin: Plugin, ASWebAuthenticationPresentationContextProviding {
   private let attempts = SessionAttempts()
   private let protection = ProtectedData()
 
+  /// The window is made on the main thread once the application object exists, which is when
+  /// what the system says about protected data can first be read.
+  override public func load(webview: WKWebView) {
+    protection.refresh()
+  }
+
   @objc public func capabilities(_ invoke: Invoke) {
     let httpsCallback = takesHttpsCallback(ProcessInfo.processInfo.operatingSystemVersion)
     let group = Bundle.main.object(forInfoDictionaryKey: "KRPrivateKeychainGroup") as? String
