@@ -497,16 +497,17 @@ Reading the fields:
   pre-authorisation surface.
 - `input.write` is the only method with `ordered_stream` idempotency and an `input_lease` freshness
   context. Raw input is an ordered stream per connection, never replayed after a reconnect.
-- The only thing relating a response to its request is the `request_id`. On a local client's
+- The only thing that correlates a response with a request is its `request_id`. On a local client's
   connection, the worker answers an `input.write` as soon as it has taken the batch, so the answer
   can come before the answer to an earlier read on the same connection, or to an earlier
   `terminal.resize`, `terminal.geometry.transfer`, `attachment.configure` or `attachment.viewport`.
-  A write still follows every earlier write, and it follows every other earlier mutation, an attach,
-  a detach, an input acquire, release or interrupt, or a close among them. The exceptions are the
-  mutations whose answers the worker gives after it has handled them: a `shell.launch`, an agent
-  mutation and a `plugin.action.invoke`; a `plugin.action.invoke` that a component prepares is
-  handled after the frames behind it. That way, a read that is answered after a write can show what
-  the write did. A client does not assume that answers come back in the order it sent the requests.
+  However, a write still follows every earlier write, and it follows every other earlier mutation,
+  an attach, a detach, an input acquire, release or interrupt, or a close among them. The exceptions
+  are a `shell.launch` that waits for the reader, the five agent mutations and a
+  `plugin.action.invoke` that goes to an upstream, whose answers a task of their own writes later,
+  and a `plugin.action.invoke` that a component prepares, which the worker runs after the frames
+  sent while it was prepared. A read that is answered after a write can show what the write did. A
+  client does not assume that answers come back in the order it sent the requests.
 
 ### Rights and capabilities are not the same thing
 

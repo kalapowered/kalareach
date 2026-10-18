@@ -1462,7 +1462,7 @@ enum AgainstReport {
     During(Within),
     /// After the report had released the session.
     After(Duration),
-    /// The report's hold was not recorded.
+    /// The write's acceptance or the report's hold was not recorded.
     Unrecorded,
 }
 

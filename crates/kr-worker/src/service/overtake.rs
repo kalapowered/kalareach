@@ -27,7 +27,7 @@
 //!
 //! The task reads no more from the connection once it holds [`MOST_HELD`] frames that it cannot
 //! serve, and a key it has not read by then waits for the request, as it did before. Frames the
-//! loop had already read ahead of a finished preparation are all judged, however many there are.
+//! loop had already read ahead of a finished preparation are not held to that limit.
 //! The task ends when the request does, and the loop writes the request's answer after that, so a
 //! key that arrives while a large answer is being written to a slow peer waits for the write, up to
 //! the bound on a write. While a client keeps the connection's loop supplied with frames the task

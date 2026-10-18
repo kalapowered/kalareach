@@ -44,10 +44,10 @@
 //! the session. A keystroke is served from the domain and from the few facts of the connection it
 //! reads, which the connection keeps apart from the rest of its state, so while such a request runs
 //! on a local client's connection a task beside it reads the connection ahead and serves the
-//! keystrokes it finds. A keystroke goes ahead of a read and of a resize, a transfer of the size, a
-//! change of what an attachment claims and a viewport report; it never goes ahead of an earlier
-//! keystroke or of any other request, and it does not apply to the control daemon's connections.
-//! Taking the domain is all it does, in the order above.
+//! keystrokes it finds. The task serves a keystroke ahead of a read and of a resize, a transfer of
+//! the size, a change of what an attachment claims and a viewport report, and of nothing else; none
+//! of this applies to the control daemon's connections. Taking the domain is all it does, in the
+//! order above.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};

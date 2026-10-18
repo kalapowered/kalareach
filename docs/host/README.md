@@ -2261,9 +2261,10 @@ disk or the session on such a request, it still reads on, and hands the batch to
 once. Once it holds sixteen of these requests the worker stops reading ahead, and a batch it has not
 read by then waits for the request that is running. Every other mutation, an attach, a detach, an
 input acquire, release or interrupt, or a close among them, and every frame that is not a request
-still holds a batch back, so the batch meets the state the client asked for. A key sent right after
-a resize can reach the application before the pseudo-terminal has its new size, and a read sent
-before a key can show what the key did.
+still holds a batch back, so the batch meets the state the client asked for. The exception is a
+`plugin.action.invoke` that a component prepares: a batch sent while the component prepares it is
+taken before the action's effect. A key sent right after a resize can reach the application before
+the pseudo-terminal has its new size, and a read sent before a key can show what the key did.
 
 ## Who owns the size
 
