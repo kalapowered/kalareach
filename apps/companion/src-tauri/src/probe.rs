@@ -8,7 +8,7 @@
 //! answer to the offer is built here from the offer's own sections, so the connection is described
 //! and applied but never carries media: what is proved is the bridge, not a provider. A request
 //! that also names a harness runs a whole call against a host and a voice service the script
-//! started ([`harness`]).
+//! started ([`harness`](crate::probe::harness)).
 //!
 //! Compiled into debug builds only. A release build has no request to read.
 

@@ -5,7 +5,7 @@
 //! answer, permitting it, keeping the control socket to the voice service, and ending it by
 //! whatever cause. The page asks and reads; it holds nothing a loaded page would lose.
 //!
-//! One call at a time, one task for each ([`owner`]). The screen reads the call from the record
+//! One call at a time, one task for each (`owner`). The screen reads the call from the record
 //! that task keeps ([`VoiceCallState`]), so a screen that is loaded again finds the call it left,
 //! and a call that ends while no screen is looking (the notification's stop, a failed connection,
 //! the voice service closing it) is ended in full: the media, the host's grant and the call at the

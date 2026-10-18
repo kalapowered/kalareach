@@ -1920,7 +1920,7 @@ struct VoiceAllow {
 ///
 /// Replacing the standing grant ends the calls under it, and when a close sent under one of them
 /// can still reach a worker the host's answer names the workers that have not acknowledged the
-/// fence. That is passed on as a stop's is (see [`fence_of`]): the barrier less the names of the
+/// fence. That is passed on as a stop's is (see `fence_of`): the barrier less the names of the
 /// actions the fence named, `not_owed` when the replacement owed none, and `unreadable` when the
 /// answer gave no status this build can read, so the screen can say that those workers are still
 /// to confirm, or that it cannot tell.

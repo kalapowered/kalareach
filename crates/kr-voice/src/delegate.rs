@@ -1358,7 +1358,7 @@ impl Coordinator {
     /// broker that cannot be reached does not hold a revocation open. A revocation the store
     /// refuses leaves the voice session and its live grant known, so the stop can be asked again
     /// and a read under the grant is still answered. The answer waits for the broker's reply for
-    /// [`BROKER_CLOSE_WAIT`] at most, which is less than the time a phone gives a stop, and says
+    /// `BROKER_CLOSE_WAIT` at most, which is less than the time a phone gives a stop, and says
     /// whether the broker confirmed the close. A close that is still going on after that is
     /// finished in the background, and counts as open until it ends. Section 15 ¶1: the
     /// terminal sessions it reached keep running, and they are named in the answer so nobody has to
