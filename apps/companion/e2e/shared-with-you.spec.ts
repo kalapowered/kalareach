@@ -570,32 +570,38 @@ test.describe('the pill for a new invitation', () => {
     }
   }
 
-  // The room is the pill's own, measured: when the pill grows, the room kept clear of it grows by as
-  // much, and is still its lower edge and a little clear space under it.
-  test('keeps the room it clears in step with the pill when the pill grows', async ({ page }) => {
+  // The room is the pill's own, measured: when the pill's words need more lines, the room kept clear of
+  // it grows with it, and is still its lower edge and the foot of its margin. The pill is measured at
+  // rest, not in its entry.
+  test('keeps the room it clears in step with the pill when its words need more lines', async ({ page }) => {
+    await page.emulateMedia({ reducedMotion: 'reduce' })
     await withSystemTextScale(page, 1)
     await page.setViewportSize({ width: 320, height: 720 })
     await withPill(page)
-    const room = () =>
-      page.evaluate(() =>
-        Number.parseFloat(document.querySelector<HTMLElement>('.m-main')?.style.getPropertyValue('--pill-room') ?? '')
-      )
-    // The pill's lower edge, from the top of the area; the room is that and a little clear space.
-    const edge = () =>
-      page.evaluate(
-        () =>
-          (document.querySelector('.sw-new-button')?.getBoundingClientRect().bottom ?? Number.NaN) -
-          (document.querySelector('.m-main')?.getBoundingClientRect().top ?? Number.NaN)
-      )
-    const small = { room: await room(), edge: await edge() }
-    expect(small.room - small.edge, 'the clear space under the pill').toBeGreaterThan(0)
-    expect(small.room - small.edge, 'is a small one').toBeLessThan(12)
+    const now = () =>
+      page.evaluate(() => {
+        const pill = document.querySelector<HTMLElement>('.sw-new-button')
+        const area = document.querySelector<HTMLElement>('.m-main')
+        if (pill === null || area === null) return null
+        const words = document.createRange()
+        words.selectNodeContents(pill)
+        return {
+          lines: new Set(Array.from(words.getClientRects()).map((line) => Math.round(line.top))).size,
+          room: Number.parseFloat(area.style.getPropertyValue('--pill-room')),
+          edge: pill.getBoundingClientRect().bottom - area.getBoundingClientRect().top,
+          foot: Number.parseFloat(getComputedStyle(pill).marginBlockEnd)
+        }
+      })
+    const one = await now()
+    expect(one?.lines, 'lines of words in the pill').toBe(1)
+    // The height is a whole number of pixels, so the room is within one of the edge and the foot.
+    expect(Math.abs((one?.room ?? Number.NaN) - (one?.edge ?? Number.NaN) - (one?.foot ?? Number.NaN))).toBeLessThan(1)
 
-    await page.addStyleTag({ content: '.sw-new-button { padding-block: 40px !important }' })
-    await expect.poll(room, 'the room after the pill grew').toBeGreaterThan(small.room + 40)
-    const grown = { room: await room(), edge: await edge() }
-    expect(grown.room - grown.edge, 'the clear space under the grown pill').toBeGreaterThan(0)
-    expect(grown.room - grown.edge, 'is a small one').toBeLessThan(12)
+    await page.addStyleTag({ content: '.sw-new-button { max-inline-size: 6em !important }' })
+    await expect.poll(async () => (await now())?.lines ?? 0, 'lines of words in the pill after it narrowed').toBeGreaterThan(1)
+    await expect.poll(async () => (await now())?.room ?? 0, 'the room after the pill grew').toBeGreaterThan((one?.room ?? 0) + 10)
+    const more = await now()
+    expect(Math.abs((more?.room ?? Number.NaN) - (more?.edge ?? Number.NaN) - (more?.foot ?? Number.NaN))).toBeLessThan(1)
   })
 
   // A sheet that the inbox has open is drawn in the scrolling area but is over the pill, and scrolls
@@ -613,7 +619,7 @@ test.describe('the pill for a new invitation', () => {
         const element = document.querySelector(each)
         return element === null ? 'none' : getComputedStyle(element).scrollMarginTop
       }, selector)
-    expect(await margin('.m-filter'), 'what is under the pill keeps the room').not.toBe('0px')
+    expect(Number.parseFloat(await margin('.m-filter')), 'what is under the pill keeps the room').toBeGreaterThan(0)
     expect(await margin('[data-testid="accept-offer"]'), 'a control in the sheet').toBe('0px')
     expect(await margin('[data-testid="offer-card"] li'), 'the words in the sheet').toBe('0px')
   })
