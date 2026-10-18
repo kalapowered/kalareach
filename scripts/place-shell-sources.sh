@@ -14,11 +14,12 @@
 # tree digest the manifest pins. A shell built this way fetches nothing once these are placed.
 #
 # A file that is already in <prefix>/sources stays. Any other is fetched from the URL its manifest
-# or lock names and, when that server does not answer, from each mirror listed below. An archive
-# or a crate that arrives is checked against its pin before it is kept, and the next server is
-# tried when the bytes differ. An archive that was already there and differs is reported and
-# stops the run. A placed repository or an existing crate is judged by build-shells.sh before it
-# is used.
+# or lock names and, for an archive and a repository, when that server does not answer, from each
+# mirror listed below. An archive or a crate that arrives is checked against its pin before it is
+# kept; for an archive the next server is tried when the bytes differ, and a crate has one server.
+# An archive that is already there with other bytes is removed and placed again, so a cache left
+# by an older pin never blocks a run. A repository, and a crate that was already there, are judged
+# by build-shells.sh before they are used.
 
 set -euo pipefail
 
@@ -33,6 +34,11 @@ prefix="${KR_SHELL_PREFIX:-$default_prefix}"
 
 selected=""
 print_key=0
+
+absolute_prefix() {
+    mkdir -p "$prefix"
+    prefix="$(cd "$prefix" && pwd)"
+}
 
 usage() {
     cat >&2 <<'USAGE'
@@ -61,6 +67,11 @@ done
 if [ -z "$selected" ]; then
     echo "place-shell-sources: name at least one shell" >&2
     usage
+fi
+
+# The prefix is used from other directories below, so it is made absolute first.
+if [ "$print_key" -eq 0 ]; then
+    absolute_prefix
 fi
 
 needed="curl python3"
@@ -188,12 +199,12 @@ place_archive() {
     local destination="$sources/$archive" actual source placed
     if [ -f "$destination" ]; then
         actual="$(digest_file "$destination")"
-        if [ "$actual" != "$sha256" ]; then
-            echo "place-shell-sources: $archive has digest $actual and the manifest pins $sha256" >&2
-            exit 1
+        if [ "$actual" = "$sha256" ]; then
+            echo "place-shell-sources: $archive is already in $sources"
+            return 0
         fi
-        echo "place-shell-sources: $archive is already in $sources"
-        return 0
+        echo "place-shell-sources: $archive in $sources has digest $actual and the manifest pins $sha256; placing it again" >&2
+        rm -f -- "${destination:?}"
     fi
     mkdir -p "$sources"
 
@@ -224,7 +235,7 @@ place_archive() {
 # Places the .crate file of every crates.io package in the Cargo.lock of a shell's archive.
 place_crates() {
     local archive="$1" directory="$2" sources="$3"
-    local scratch lock crate version checksum file url actual count=0 fetched=0
+    local scratch lock crates crate version checksum file url actual count=0 fetched=0
     # The file is unpacked as the build unpacks it: a release that lists the lock twice leaves the
     # later one, which a stream of the member would not show.
     scratch="$(mktemp -d "${TMPDIR:-/tmp}/kr-place-lock.XXXXXX")"
@@ -236,6 +247,8 @@ place_crates() {
     fi
     lock="$(cat "$scratch/$directory/Cargo.lock")"
     rm -rf -- "${scratch:?}"
+    # Read into a variable first, so that a parser that fails stops the run here.
+    crates="$(registry_crates <<<"$lock")"
     while IFS=$'\t' read -r crate version checksum; do
         count=$((count + 1))
         file="$sources/$crate-$version.crate"
@@ -258,7 +271,7 @@ place_crates() {
         fi
         mv "$file.part" "$file"
         fetched=$((fetched + 1))
-    done < <(registry_crates <<<"$lock")
+    done <<<"$crates"
     echo "place-shell-sources: $count crates in the lock of $archive, $fetched fetched"
 }
 

@@ -97,6 +97,10 @@ if [ "$build_zsh" -eq 0 ] && [ "$build_bash" -eq 0 ] && [ "$build_fish" -eq 0 ];
     usage
 fi
 
+# Every path below is used from other directories, so the prefix is made absolute first.
+mkdir -p "$prefix"
+prefix="$(cd "$prefix" && pwd)"
+
 needed="curl make patch tar python3"
 if [ "$build_fish" -eq 1 ]; then
     # The fish package is a Rust shell built through CMake, so it needs both, and its pinned
@@ -335,9 +339,9 @@ PYTHON
 #   $4/mirrors/<name>.git            each pinned repository, holding its revision as refs/heads/pinned
 #   $2/.cargo/config.toml            the source replacements, appended to the tree's own configuration
 #
-# Nothing is written until every file has passed, and every refusal names the source and both
-# digests. The lock is read line by line and strictly, so a line or a source this does not know is
-# a failure rather than something skipped.
+# Nothing cargo reads is written until every file has passed, and a refusal names the source and
+# the digest it found where there is one. The lock is read line by line and strictly, so a line or
+# a source this does not know is a failure rather than something skipped.
 prepare_cargo_sources() {
     python3 - "$1" "$2" "$3" "$4" <<'PYTHON'
 import hashlib
@@ -374,7 +378,10 @@ with open(lock_path, encoding="utf-8") as handle:
     for number, raw in enumerate(handle, 1):
         line = raw.rstrip("\n")
         if inside_list:
-            inside_list = line != "]"
+            if line == "]":
+                inside_list = False
+            elif re.fullmatch(r' "[^"\\]*",', line) is None:
+                fail("Cargo.lock line %d is not one this check reads" % number)
             continue
         if line == "" or line.startswith("#"):
             continue
@@ -389,12 +396,17 @@ with open(lock_path, encoding="utf-8") as handle:
             lock_version = version.group(1)
             continue
         if line == "dependencies = [":
+            if "dependencies" in current:
+                fail("Cargo.lock line %d is not one this check reads" % number)
+            current["dependencies"] = ""
             inside_list = True
             continue
         pair = re.fullmatch(r'(name|version|source|checksum) = "([^"\\]*)"', line)
         if pair is None or pair.group(1) in current:
             fail("Cargo.lock line %d is not one this check reads" % number)
         current[pair.group(1)] = pair.group(2)
+if inside_list:
+    fail("Cargo.lock ends inside a dependency list")
 if lock_version != "4":
     fail("Cargo.lock has format version %s and this check reads version 4" % lock_version)
 
@@ -524,6 +536,8 @@ def quote(text):
 
 
 config = os.path.join(tree, ".cargo", "config.toml")
+if os.path.exists(os.path.join(tree, ".cargo", "config")):
+    fail("%s holds a .cargo/config, which cargo reads in place of config.toml" % tree)
 existing = open(config, encoding="utf-8").read() if os.path.isfile(config) else ""
 if re.search(r"^\s*\[(source|http|net)\b", existing, re.M):
     fail("%s already configures sources, the network or the proxy" % config)
@@ -697,13 +711,15 @@ startup=$(digest "$package/$m_startup") $m_startup"
         local cargo_dir="$work/cargo"
         mkdir -p "$cargo_dir/home"
         prepare_cargo_sources "$package/manifest.json" "$source_tree" "$cache" "$cargo_dir" || return 1
-        cargo_env=("CARGO_HOME=$cargo_dir/home" CARGO_NET_OFFLINE=true CARGO_NET_GIT_FETCH_WITH_CLI=false)
+        cargo_env=("CARGO_HOME=$cargo_dir/home" CARGO_NET_OFFLINE=true CARGO_NET_GIT_FETCH_WITH_CLI=false
+            CARGO_HTTP_PROXY=127.0.0.1:9)
         # This fills cargo's own copy of each repository from the verified mirror. It is the one
-        # cargo step that is not offline, and it can only read the local sources: the proxy the
-        # configuration names does not answer.
+        # cargo step that is not offline, and it can only read the local sources: the proxy named
+        # here and in the configuration does not answer, whatever the caller's environment says.
         (
             cd "$source_tree"
-            env CARGO_HOME="$cargo_dir/home" CARGO_NET_GIT_FETCH_WITH_CLI=false cargo fetch --locked
+            env CARGO_HOME="$cargo_dir/home" CARGO_NET_OFFLINE=false CARGO_NET_GIT_FETCH_WITH_CLI=false \
+                CARGO_HTTP_PROXY=127.0.0.1:9 cargo fetch --locked
         ) > "$work/cargo-fetch.log" 2>&1 || {
             tail -40 "$work/cargo-fetch.log" >&2
             echo "build-shells: cargo could not resolve $shell_name from the placed sources" >&2
