@@ -462,6 +462,8 @@ impl KeyRecordService for ServiceView {
 struct Hosts {
     reports: Mutex<Vec<HostReport>>,
     silent: Mutex<bool>,
+    /// A host answered and another did not.
+    partly_silent: Mutex<bool>,
 }
 
 impl Hosts {
@@ -511,6 +513,20 @@ impl Hosts {
     fn silence(&self, silent: bool) {
         *self.silent.lock().expect("unpoisoned hosts") = silent;
     }
+
+    /// Another host does not answer, or answers again.
+    fn leave_one_host_silent(&self, silent: bool) {
+        *self.partly_silent.lock().expect("unpoisoned hosts") = silent;
+    }
+
+    /// The first host no longer lists the device at all.
+    fn forget(&self, device: Device) {
+        for report in self.reports().iter_mut() {
+            report
+                .devices
+                .retain(|known| known.authorisation != device.authorisation);
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -523,6 +539,7 @@ impl DeviceDirectory for HostsView {
         } else {
             Some(HostAnswers {
                 reports: self.0.reports().clone(),
+                silent: *self.0.partly_silent.lock().expect("unpoisoned hosts"),
             })
         };
         Box::pin(std::future::ready(Ok(answer)))
@@ -1141,6 +1158,43 @@ async fn removing_a_device_gives_the_rest_a_key_it_cannot_open() {
         old.expose(),
         owner.held(&collection, joined).expect("kept").expose()
     );
+}
+
+/// KR-REQ-20.11, check 3: a host that did not answer may be the one that lists a member, so a
+/// member that no answering host mentions is not taken out; an answering host that mentions it
+/// without the right to manage the host, or reports it revoked, still takes it out, and so does
+/// one that is not silent when the member is missing from its list.
+#[tokio::test]
+async fn a_host_that_did_not_answer_takes_no_member_out_but_one_that_did_can() {
+    let world = World::default();
+    let mut owner = Node::new(&world);
+    let mut other = Node::new(&world);
+    let mut third = Node::new(&world);
+    let _ = collection_of(&world, &mut owner, &mut [&mut other, &mut third]).await;
+
+    // The answering host lists the owner alone, and another host did not answer.
+    world.hosts.forget(other.device());
+    world.hosts.leave_one_host_silent(true);
+    owner.refresh().await;
+    assert!(owner.removals().is_empty(), "silence is not absence");
+
+    // The answering host mentions the third device, without the right to manage the host.
+    world.hosts.commit(third.device(), false);
+    owner.refresh().await;
+    assert_eq!(
+        owner.removals(),
+        vec![third.device()],
+        "a host that answers is believed about the devices it mentions"
+    );
+
+    // A host that did answer, and lists no such device, takes the other out too.
+    world.hosts.leave_one_host_silent(false);
+    owner.refresh().await;
+    let mut removals = owner.removals();
+    removals.sort();
+    let mut both = vec![other.device(), third.device()];
+    both.sort();
+    assert_eq!(removals, both);
 }
 
 /* -------------------------------------------------------------------------- */
@@ -3074,6 +3128,7 @@ impl DeviceDirectory for GatedHosts {
             self.gate.wait().await;
             Ok(Some(HostAnswers {
                 reports: self.hosts.reports().clone(),
+                ..HostAnswers::default()
             }))
         })
     }

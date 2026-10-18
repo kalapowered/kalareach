@@ -224,6 +224,12 @@ pub struct HostReport {
 pub struct HostAnswers {
     /// The reports.
     pub reports: Vec<HostReport>,
+    /// Whether a host this device is paired with did not answer. A device that no answering host
+    /// mentions is then not known to be gone, because the host that did not answer may be the one
+    /// that lists it, so check 3 gives it the benefit of the doubt. A device an answering host does
+    /// mention is judged by what that host says, silent hosts or not.
+    #[serde(default)]
+    pub silent: bool,
 }
 
 /// The host answers as this device recorded them, with every revocation it verified from an
@@ -253,6 +259,12 @@ impl RecordedAnswers {
     /// Check 3 for a device other than this one.
     #[must_use]
     pub fn passes(&self, device: &Device) -> bool {
+        let mentioned = self.hosts.reports.iter().any(|report| {
+            report
+                .devices
+                .iter()
+                .any(|reported| reported.authorisation == device.authorisation)
+        });
         let listed = self.hosts.reports.iter().any(|report| {
             report.devices.iter().any(|reported| {
                 reported.authorisation == device.authorisation
@@ -260,7 +272,7 @@ impl RecordedAnswers {
                     && reported.manages_host
                     && !reported.revoked
             })
-        });
+        }) || (self.hosts.silent && !mentioned);
         let revoked = self.verified.contains(&device.authorisation)
             || self.hosts.reports.iter().any(|report| {
                 report.devices.iter().any(|reported| {
@@ -289,8 +301,9 @@ impl RecordedAnswers {
 pub trait DeviceDirectory: Send + Sync + std::fmt::Debug {
     /// Asks every host this device is paired with for its device list.
     ///
-    /// Returns one report per host that answered, and nothing when none did: check 3 cannot run
-    /// then, and a refresh records nothing.
+    /// Returns one report per host that answered, with [`HostAnswers::silent`] set when a host this
+    /// device is paired with did not, and nothing when none did: check 3 cannot run then, and a
+    /// refresh records nothing.
     fn answers(&self) -> ServiceFuture<'_, Option<HostAnswers>>;
 }
 

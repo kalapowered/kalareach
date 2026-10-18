@@ -101,6 +101,7 @@ impl DeviceDirectory for Hosts {
             reports: vec![HostReport {
                 devices: vec![self.device],
             }],
+            ..HostAnswers::default()
         };
         Box::pin(std::future::ready(Ok(Some(answers))))
     }

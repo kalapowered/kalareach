@@ -61,8 +61,8 @@ pub struct SharedCollectionService {
     epoch: u64,
     /// The oldest epoch whose objects are believed.
     floor: u64,
-    /// The epoch the service said the object it last found was sealed under.
-    last_sealed: Mutex<Option<u64>>,
+    /// The epoch the service said the object it last found was sealed under, and where it holds it.
+    last_found: Mutex<Option<(Option<u64>, crate::services::SyncPosition)>>,
 }
 
 impl std::fmt::Debug for SharedCollectionService {
@@ -92,7 +92,7 @@ impl SharedCollectionService {
             collection,
             epoch,
             floor: epoch,
-            last_sealed: Mutex::new(None),
+            last_found: Mutex::new(None),
         }
     }
 
@@ -109,10 +109,20 @@ impl SharedCollectionService {
     /// whether to seal an object again and never to choose a key.
     #[must_use]
     pub fn last_sealed_under(&self) -> Option<u64> {
-        *self
-            .last_sealed
+        self.last_found
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
+            .and_then(|(epoch, _)| epoch)
+    }
+
+    /// Where the service held the object it last found, whether or not it was opened: a refusal
+    /// to open it leaves the place that a caller who decides to write over it compares against.
+    #[must_use]
+    pub fn last_found_at(&self) -> Option<crate::services::SyncPosition> {
+        self.last_found
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .map(|(_, position)| position)
     }
 
     /// The collection this reaches.
@@ -325,9 +335,9 @@ impl SyncBackupService for SharedCollectionService {
                 });
             };
             *self
-                .last_sealed
+                .last_found
                 .lock()
-                .unwrap_or_else(PoisonError::into_inner) = held.epoch;
+                .unwrap_or_else(PoisonError::into_inner) = Some((held.epoch, held.position));
             // The sealer this is read with holds this epoch's key and the keys of the epochs down
             // to the floor that this device was given, so an object sealed under one of them is
             // read with its own key. One sealed under a later epoch, or under none, is refused
