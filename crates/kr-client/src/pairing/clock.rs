@@ -36,8 +36,8 @@
 //! * **Across a reboot, a wall clock not set back since the identity was made** never reads as the
 //!   same boot. A later boot starts later than the earlier boot's last launch by the time the
 //!   machine was off, so the boot time moves forward by more than the counter that launch saw. The
-//!   comparison allows for the sampling's error (below), so it holds for any time off longer than
-//!   a fifth of a second.
+//!   comparison leaves out a fifth of a second of that counter for the sampling's error, which is
+//!   more than the error, so it holds for any time off.
 //! * **Across a reboot, a wall clock set back since the identity was made** (or lost, as a clock
 //!   does that loses its time), by about the real time between the start of the boot the identity
 //!   was made in and the start of the new boot, to within a minute, reads as the same boot when
@@ -74,8 +74,10 @@ use crate::error::{ClientError, Result};
 /// The most the boot time may have moved, either way, for a launch to be the same boot.
 const TOLERANCE_MS: i128 = 60_000;
 
-/// What the comparison with the previous launch's counter allows for the sampling's error: two
-/// samples, each off by half of [`STEADY_MS`], and a millisecond of rounding in each.
+/// What the comparison with the previous launch's counter allows for the sampling's error. Two
+/// samples are each off by at most half of [`STEADY_MS`] and a few milliseconds of rounding, about
+/// 104 ms between them; this is the whole of it with a margin, and it is far below any time a
+/// machine is off.
 const SAMPLING_ERROR_MS: i128 = 200;
 
 /// How far apart a sample's two monotonic readings may be. The wall reading falls between them, so
@@ -164,7 +166,7 @@ struct Sample {
 }
 
 /// What a launch leaves for the next one.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct BootRecord {
     version: u32,
@@ -175,6 +177,8 @@ struct BootRecord {
     /// The counter at the latest launch that kept `id`.
     seen_ms: u64,
 }
+
+crate::debug_as_name!(BootRecord);
 
 /// The two clocks a sample reads, in the order a sample needs them.
 trait Clocks {
