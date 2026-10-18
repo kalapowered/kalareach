@@ -1866,7 +1866,7 @@ pub const IGNORED_RUNS: &[IgnoredRun] = &[
         cases: &[],
         runs: Runs::Command {
             file: "scripts/real-package-cases.sh",
-            fragments: &["cargo test -p kr-controller --test shell -- --ignored"],
+            fragments: &["step cargo test -p kr-controller --test shell -- --ignored"],
         },
     },
     IgnoredRun {
@@ -1875,7 +1875,7 @@ pub const IGNORED_RUNS: &[IgnoredRun] = &[
         cases: &[],
         runs: Runs::Command {
             file: "scripts/real-package-cases.sh",
-            fragments: &["cargo test -p kr-worker --test fence -- --ignored --exact"],
+            fragments: &["step cargo test -p kr-worker --test fence -- --ignored --exact"],
         },
     },
     IgnoredRun {

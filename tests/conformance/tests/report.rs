@@ -960,7 +960,7 @@ fn a_helper_is_named_beside_the_flags_that_ask_for_it() {
     let far = held_to(&[helper("spawns_far.txt")]);
     assert_eq!(far.problems.len(), 1, "{:?}", far.problems);
     assert!(
-        far.problems[0].contains("never asks for tests::is_ignored"),
+        far.problems[0].contains("starts tests::is_ignored without"),
         "{:?}",
         far.problems
     );

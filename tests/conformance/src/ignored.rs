@@ -272,13 +272,16 @@ fn missing_helper(root: &Path, file: &str, covered: &BTreeSet<String>) -> Option
         words.extend(code.iter().filter_map(|line| constant_for(line, name)));
         let named: Vec<usize> = (0..code.len())
             .filter(|&at| {
-                !code[at].contains("fn ") && words.iter().any(|word| contains_token(code[at], word))
+                !code[at].contains("fn ")
+                    && !code[at].starts_with("const ")
+                    && !code[at].starts_with("pub const ")
+                    && words.iter().any(|word| contains_token(code[at], word))
             })
             .collect();
         if named.is_empty() {
             return Some(format!("{file} never starts {name}"));
         }
-        let asks = named.iter().any(|&at| {
+        let asks = named.iter().all(|&at| {
             let near = code
                 [at.saturating_sub(HELPER_REACH)..(at + HELPER_REACH + 1).min(code.len())]
                 .join(" ");
@@ -286,7 +289,7 @@ fn missing_helper(root: &Path, file: &str, covered: &BTreeSet<String>) -> Option
         });
         if !asks {
             return Some(format!(
-                "{file} never asks for {name} with `--ignored` and `--exact` near its name"
+                "{file} starts {name} without `--ignored` and `--exact` near its name"
             ));
         }
     }
