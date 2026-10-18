@@ -2938,7 +2938,7 @@ impl Wired {
     #[allow(clippy::too_many_arguments)]
     async fn type_for(
         &self,
-        daemon: &mut LocalClient,
+        daemon: &mut Client<impl Codec>,
         revision: u64,
         deadline_boot_ms: u64,
         epoch: InputLeaseEpoch,
@@ -2973,7 +2973,7 @@ impl Wired {
     /// The phone takes the lease again at `revision`, and the answer says what that discarded.
     async fn acquire_result_for(
         &self,
-        daemon: &mut LocalClient,
+        daemon: &mut Client<impl Codec>,
         revision: u64,
         attachment_id: AttachmentId,
     ) -> kr_protocol::input::InputAcquireResult {
