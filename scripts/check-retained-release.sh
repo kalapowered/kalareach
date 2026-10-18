@@ -9,8 +9,8 @@
 #   1. takes the release before this one, the newest tag `packages/v<version>+<commit>` in the
 #      commit's history at a compatibility level below its own, and fails unless that level is the
 #      newest this build retains (`kr-protocol-gen --predecessor`);
-#   2. holds that release's schema, table of public majors and plugin host protocol to the ones the
-#      level kept, and moves the level's record (`retained/<level>/RELEASE` and its row in
+#   2. holds that release's schema and table of public majors to the ones the level kept, and moves
+#      the level's record (`retained/<level>/RELEASE` and its row in
 #      docs/releases/support-window.md) to the release when it names an earlier one of the level
 #      (`kr-protocol-gen --release-commit`);
 #   3. checks the rules the level kept against the source tree of that release, which the
