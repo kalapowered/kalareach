@@ -1155,7 +1155,8 @@ default.
 back the note that went with the draft, and the caller removes the draft from the service against
 the position in that note. Each call is a new request, and asking again after a lost answer finds
 the object already gone, so nothing of a removal is recorded in the store. Like a publication, it is
-refused while privacy mode is on.
+refused while privacy mode is on. A removal stores nothing, so the service takes no hold against the
+settings-sync allowance for it, and a principal whose allowance is spent can still make one.
 
 An answer names where the collection's key records stood, `services::KeyHead`, when the service
 named it: a write and a comparison in a collection a key record has claimed, and a status query or
