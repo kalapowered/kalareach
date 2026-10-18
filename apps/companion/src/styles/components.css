@@ -1150,6 +1150,15 @@ textarea::placeholder {
   flex: none;
 }
 
+/* The two answers to a question about one device: side by side while they fit, wrapped if not. */
+.device-choice {
+  display: flex;
+  flex: none;
+  flex-wrap: wrap;
+  gap: var(--gap-2);
+  max-width: 100%;
+}
+
 .account-section-title {
   margin: var(--gap-2) 0 0;
   font-size: 0.6875rem;

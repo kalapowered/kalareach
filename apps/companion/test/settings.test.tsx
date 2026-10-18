@@ -558,9 +558,43 @@ describe('the devices that share the settings', () => {
     }
   }
 
-  it('is not shown while settings sync is off and nothing is offered', async () => {
-    const { sheet } = await openOnAccount()
-    expect(within(sheet).queryByTestId('settings-devices')).toBeNull()
+  const chosenService = {
+    origin: 'https://reach.kala.to',
+    host: 'reach.kala.to',
+    is_default: true
+  }
+
+  it('sends nothing to the sync service while settings sync is off until the person asks to look', async () => {
+    const { person, controls, sheet } = await openOnAccount()
+    act(() => {
+      controls.settings.change({ sync: { service: chosenService } })
+    })
+    const card = await within(sheet).findByTestId('settings-devices')
+    expect(controls.settings.devicesAsked).toEqual([])
+    expect(within(card).queryByTestId('settings-devices-members')).toBeNull()
+    await person.click(within(card).getByTestId('settings-devices-look'))
+    expect(controls.settings.devicesAsked).toEqual(['refresh'])
+  })
+
+  it('says, where settings sync starts, that starting a collection of its own cannot be undone by joining', async () => {
+    const { controls, sheet } = await openOnAccount()
+    act(() => {
+      controls.settings.change({
+        sync: {
+          state: 'off',
+          service: chosenService,
+          devices: {
+            ...sharing.devices,
+            members: [],
+            candidates: [],
+            offers: [{ reference: 'c-1', name: 'the-laptop' }]
+          }
+        }
+      })
+    })
+    const settings = await within(sheet).findByTestId('settings-sync')
+    expect(within(settings).getByTestId('settings-sync-start-own')).toHaveTextContent(/cannot join/)
+    expect(within(settings).getByTestId('settings-sync-turn-on')).not.toHaveClass('btn-primary')
   })
 
   it('offers a device the hosts list, shares with it by naming it, and shows it as a member', async () => {
@@ -580,7 +614,7 @@ describe('the devices that share the settings', () => {
     expect(within(card).getByTestId('settings-devices-status')).toHaveTextContent(/1 other device/)
   })
 
-  it('takes a member out by naming it, without being asked to confirm', async () => {
+  it('asks once before taking a member out, names it in both answers, and keeps it on the safe one', async () => {
     const { person, controls, sheet } = await openOnAccount()
     act(() => {
       controls.settings.change({
@@ -600,7 +634,21 @@ describe('the devices that share the settings', () => {
     const card = await within(sheet).findByTestId('settings-devices')
     // This computer is a member and has no control for taking itself out.
     expect(within(card).getAllByRole('button', { name: /^Take .* out$/ })).toHaveLength(1)
+    const trigger = within(card).getByRole('button', { name: 'Take the-phone out' })
+    await person.click(trigger)
+    expect(controls.settings.devicesAsked).not.toContain('remove phone')
+    expect(within(card).getByTestId('settings-devices-taking-out')).toHaveTextContent('the-phone')
+    const keep = within(card).getByRole('button', { name: 'Keep the-phone in' })
+    expect(keep).toHaveFocus()
+
+    // Keeping it sends nothing and gives focus back to the control that asked.
+    await person.click(keep)
+    expect(controls.settings.devicesAsked).not.toContain('remove phone')
+    expect(within(card).queryByTestId('settings-devices-taking-out')).toBeNull()
+    expect(within(card).getByRole('button', { name: 'Take the-phone out' })).toHaveFocus()
+
     await person.click(within(card).getByRole('button', { name: 'Take the-phone out' }))
+    await person.click(within(card).getByRole('button', { name: 'Take the-phone out now' }))
     expect(controls.settings.devicesAsked).toContain('remove phone')
     await waitFor(() => {
       expect(within(card).getByTestId('settings-devices-members')).not.toHaveTextContent(
@@ -614,13 +662,16 @@ describe('the devices that share the settings', () => {
     act(() => {
       controls.settings.change({
         sync: {
-          devices: { ...sharing.devices, members: [], candidates: [], offers: [{ reference: 'c-1' }] }
+          devices: { ...sharing.devices, members: [], candidates: [], offers: [{ reference: 'c-1', name: 'the-laptop' }] }
         }
       })
     })
     const card = await within(sheet).findByTestId('settings-devices')
     expect(within(card).getByTestId('settings-devices-offer')).toBeInTheDocument()
-    await person.click(within(card).getByRole('button', { name: 'Join' }))
+    expect(within(card).getByText('Settings shared by the-laptop')).toBeInTheDocument()
+    await person.click(
+      within(card).getByRole('button', { name: 'Join the settings shared by the-laptop' })
+    )
     expect(controls.settings.devicesAsked).toContain('join c-1')
     await waitFor(() => {
       expect(within(card).queryByTestId('settings-devices-offer')).toBeNull()
@@ -658,6 +709,26 @@ describe('the devices that share the settings', () => {
     await waitFor(() => {
       expect(within(card).queryByTestId('settings-devices-outcome')).toBeNull()
     })
+  })
+
+  it('lists two outcomes that say the same thing, each once', async () => {
+    const { controls, sheet } = await openOnAccount()
+    act(() => {
+      controls.settings.change({
+        sync: {
+          ...sharing,
+          devices: {
+            ...sharing.devices,
+            outcomes: [
+              { what: 'addition', ended: 'refused', name: 'the-phone' },
+              { what: 'addition', ended: 'refused', name: 'the-phone' }
+            ]
+          }
+        }
+      })
+    })
+    const card = await within(sheet).findByTestId('settings-devices')
+    expect(within(card).getAllByTestId('settings-devices-outcome')).toHaveLength(2)
   })
 
   it('waits for another device to seal the settings, and says so, when this computer joined after them', async () => {

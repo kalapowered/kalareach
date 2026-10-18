@@ -10,6 +10,7 @@
 import type {
   ColourMode,
   DeviceHappened,
+  DeviceOffer,
   DevicesView,
   KeptDrafts,
   SettingsChoice,
@@ -150,8 +151,43 @@ export function describeDevices(devices: DevicesView): string {
 
 /** Why this computer has not yet read the shared settings. */
 export const DEVICES_WAITING =
-  'The shared settings are sealed for devices that joined before this one. Another of your devices ' +
-  'seals them again when it next checks, and they appear here then.'
+  'The shared settings are sealed for devices that joined before this one. A device that already ' +
+  'has them seals them again when it next checks, and they appear here then.'
+
+/** What the person is asked before a device is taken out of the shared settings. */
+export function describeTakingOut(name: string): string {
+  return (
+    `Take ${name} out? It reads nothing written from now on. To share with it again you confirm ` +
+    'on this computer and on that device.'
+  )
+}
+
+/** What an offer says of the device that shares it. */
+export function describeOffer(offer: DeviceOffer): string {
+  return offer.name === null
+    ? 'Settings shared by another of your devices'
+    : `Settings shared by ${offer.name}`
+}
+
+/** Said under the button that starts settings sync, when another device already shares some. */
+export const DEVICES_START_OWN =
+  'Another of your devices already shares settings. Join them in the card below: a computer that ' +
+  'starts its own cannot join those afterwards.'
+
+/**
+ * Texts with a key each, the second of two equal texts keyed apart from the first, for a list whose
+ * rows have no identity but their words.
+ */
+export function uniqueKeys(
+  texts: readonly string[]
+): readonly { readonly text: string; readonly key: string }[] {
+  const seen = new Map<string, number>()
+  return texts.map((text) => {
+    const times = (seen.get(text) ?? 0) + 1
+    seen.set(text, times)
+    return { text, key: `${text}#${String(times)}` }
+  })
+}
 
 /** Why no device can be added or joined from this computer. */
 export const DEVICES_CANNOT_CONFIRM =

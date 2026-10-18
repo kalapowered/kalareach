@@ -47,6 +47,7 @@ import {
   describeStaysAt
 } from '../model/recovery'
 import {
+  DEVICES_START_OWN,
   DRAFTS_SYNC_HELP,
   SETTINGS_SYNC_HELP,
   describeKeptHere,
@@ -189,11 +190,12 @@ export function SyncPanel({
     refresh()
   }, [refresh, standing])
 
-  // The first time the settings are read, the card looks for the person's other devices once: a
-  // computer that shares none finds out whether another does, and one that does sees who its hosts
-  // list. Asking again is the person's.
+  // The first time the settings are read with sync on, the card looks for the person's other devices
+  // once: a computer that shares none finds out whether another does, and one that does sees who
+  // its hosts list. With sync off nothing is sent to the service until the person asks. Asking
+  // again is the person's.
   const looked = useRef(false)
-  const lookFor = settings !== null && settings.sync.service !== null
+  const lookFor = settings !== null && settings.sync.state === 'on'
   useEffect(() => {
     if (!lookFor || looked.current) return
     looked.current = true
@@ -396,6 +398,11 @@ export function SyncPanel({
                 {settings?.sync.state === 'off' ? (
                   <p className="account-note">{SETTINGS_SYNC_HELP}</p>
                 ) : null}
+                {settings?.sync.state === 'off' && settings.sync.devices.offers.length > 0 ? (
+                  <p className="account-note" data-testid="settings-sync-start-own">
+                    {DEVICES_START_OWN}
+                  </p>
+                ) : null}
                 {settings !== null && describeWaiting(settings.sync) !== null ? (
                   <p className="account-note" data-testid="settings-sync-waiting">
                     {describeWaiting(settings.sync)}
@@ -433,7 +440,7 @@ export function SyncPanel({
                 ) : null}
                 {settings !== null && settings.sync.state !== 'on' && settings.sync.service !== null ? (
                   <Button
-                    tone="primary"
+                    tone={settings.sync.devices.offers.length > 0 ? 'default' : 'primary'}
                     data-testid="settings-sync-turn-on"
                     data-wraps
                     disabled={busy}
@@ -544,9 +551,9 @@ export function SyncPanel({
             </div>
           </Card>
           {settings !== null &&
-          (settings.sync.state === 'on' ||
-            settings.sync.devices.offers.length > 0 ||
-            settings.sync.devices.out) ? (
+          (settings.sync.state !== 'off' ||
+            settings.sync.service !== null ||
+            settings.sync.devices.offers.length > 0) ? (
             <>
               <p className="account-section-title">Your other devices</p>
               <Card data-card="devices" data-testid="settings-devices">
@@ -561,11 +568,7 @@ export function SyncPanel({
                       step('devices', () => port.settingsDevicesRefresh().then(() => null))
                     }}
                     onShare={(reference) => {
-                      step('devices', () =>
-                        port
-                          .settingsDeviceShare(reference)
-                          .then(() => 'Shared. It can read your settings once it joins.')
-                      )
+                      step('devices', () => port.settingsDeviceShare(reference).then(() => null))
                     }}
                     onRemove={(reference) => {
                       step('devices', () =>

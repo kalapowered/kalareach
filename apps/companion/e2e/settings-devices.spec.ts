@@ -4,7 +4,8 @@
  * The card names each device and puts one control beside it. What a component test cannot hold is
  * layout and the keyboard: that the words and the controls stay inside the card at every text size
  * and in a face as wide as the Linux runner's, that no control is smaller than a finger needs, and
- * that a device is shared with, taken out and an offer joined from the keyboard alone.
+ * that a device is shared with, taken out (after one question) and an offer joined from the keyboard
+ * alone.
  *
  * Every screenshot goes under `/tmp`, named for the engine and the case.
  */
@@ -36,7 +37,7 @@ const EVERYTHING = {
       { reference: 'b', name: 'the-phone', this_computer: false, vouched: true }
     ],
     candidates: [{ reference: 'c', name: 'the-tablet-in-the-kitchen' }],
-    offers: [{ reference: 'o' }],
+    offers: [{ reference: 'o', name: 'the-laptop' }],
     outcomes: [{ what: 'addition', ended: 'refused', name: LONG_NAME }]
   }
 } as const
@@ -113,6 +114,9 @@ for (const [surface, size, face] of [
     await expect(card.getByTestId('settings-devices-outcome')).toBeVisible()
     await expect(card.getByTestId('settings-devices-waiting')).toBeVisible()
     await expect(card.getByTestId('settings-devices-offer')).toBeVisible()
+    // The question about taking a device out is part of the card too, with a long name in it.
+    await card.getByRole('button', { name: `Take ${LONG_NAME} out` }).click()
+    await expect(card.getByTestId('settings-devices-taking-out')).toBeVisible()
 
     expect(await overrunning(page, '[data-testid="settings-devices"]')).toEqual([])
     // Every control is inside the card, and no smaller than a finger needs.
@@ -151,7 +155,8 @@ test('shares with a device, takes one out and joins an offer from the keyboard a
   }
   await press(card.getByRole('button', { name: 'Share settings with the-tablet-in-the-kitchen' }))
   await press(card.getByRole('button', { name: 'Take the-phone out' }))
-  await press(card.getByRole('button', { name: 'Join' }))
+  await press(card.getByRole('button', { name: 'Take the-phone out now' }))
+  await press(card.getByRole('button', { name: 'Join the settings shared by the-laptop' }))
   await expect
     .poll(() => page.evaluate(() => window.krTestHost?.settings.devicesAsked))
     .toEqual(['refresh', 'share c', 'remove b', 'join o'])

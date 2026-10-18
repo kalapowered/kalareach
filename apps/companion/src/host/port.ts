@@ -387,6 +387,8 @@ export interface DeviceCandidate {
 /** Settings another of the person's devices shares, which this computer could join. */
 export interface DeviceOffer {
   readonly reference: string
+  /** What the device that shares it is called, when a host lists it. */
+  readonly name: string | null
 }
 
 /** What became of a change the person asked for or a host required. */
