@@ -2258,12 +2258,12 @@ Keystroke batches do not wait for a read, a viewport report, a resize, a transfe
 change of an attachment's claim that comes before them on the same connection. The client sends its
 keys, its viewport reports and its resizes on one connection. The worker reads ahead past such a
 request while it waits for the disk or the session, and then passes the batch to the recogniser
-immediately. The worker reads ahead past sixteen of these requests at most; a batch behind more of
-them waits for the request that is running. Every other mutation, an attach, a detach, an input
-acquire, release or interrupt, or a close among them, and every frame that is not a request still
-holds a batch back, so the batch meets the state the client asked for. A key sent right after a
-resize can reach the application before the pseudo-terminal has its new size, and a read sent before
-a key can show what the key did.
+immediately. The worker holds at most sixteen of these requests while it reads ahead, and a batch
+behind that many waits for the request that is running. Every other mutation, an attach, a detach,
+an input acquire, release or interrupt, or a close among them, and every frame that is not a request
+still holds a batch back, so the batch meets the state the client asked for. A key sent right after
+a resize can reach the application before the pseudo-terminal has its new size, and a read sent
+before a key can show what the key did.
 
 ## Who owns the size
 
