@@ -27,6 +27,8 @@ include!("support/update_harness.rs");
 struct Previous {
     /// The release's name, from the retained surface's record of it.
     release: ReleaseName,
+    /// The commit it was built from.
+    commit: String,
     /// The compatibility level it speaks.
     level: CompatibilityLevel,
     /// Its programs, copied once to the internal disk.
@@ -37,14 +39,30 @@ impl Previous {
     /// A release of the release before's own programs, at its own level, carrying this process's
     /// channel root.
     fn assembled(&self, sequence: u64) -> Assembled {
-        let version = PackageVersion::new(self.level.major(), self.level.minor().unwrap_or(0), 0);
-        Assembled::of_programs(
+        // The release's version is the one its name states, and its manifest names its own commit.
+        let version = self
+            .release
+            .as_str()
+            .split('+')
+            .next()
+            .and_then(|text| {
+                let mut numbers = text.split('.').map(|part| part.parse::<u16>().ok());
+                Some(PackageVersion::new(
+                    numbers.next()??,
+                    numbers.next()??,
+                    numbers.next()??,
+                ))
+            })
+            .expect("a release name states a version");
+        let mut assembled = Assembled::of_programs(
             self.programs,
             self.release.as_str(),
             sequence,
             (self.level, version),
             the_root(),
-        )
+        );
+        assembled.manifest.commit = CommitId::new(self.commit.clone()).expect("a commit");
+        assembled
     }
 }
 
@@ -81,10 +99,16 @@ const PREVIOUS_PROGRAMS: [&str; 6] = [
 fn previous() -> &'static Previous {
     static PREVIOUS: OnceLock<Previous> = OnceLock::new();
     PREVIOUS.get_or_init(|| {
-        let level = &kr_protocol::retained::RETAINED[0];
+        // The release before is the newest level this build retains.
+        let level = kr_protocol::retained::RETAINED
+            .iter()
+            .max_by_key(|level| level.level)
+            .expect("a level is retained");
         let record = level.release;
         let commit = recorded(record, "commit");
         let release = release(&recorded(record, "release"));
+        // Held until the programs are copied: another run for another commit removes this tree.
+        let _held = cache_lock();
         let built = build_previous(&commit);
         let directory = support::command_binaries().join("previous");
         std::fs::create_dir_all(&directory).expect("a directory for the programs");
@@ -102,6 +126,7 @@ fn previous() -> &'static Previous {
         copied.push(placed("kr-describe-inference", ours, &directory));
         Previous {
             release,
+            commit,
             level: level.level,
             programs: Box::leak(copied.into_boxed_slice()),
         }
@@ -125,14 +150,8 @@ fn placed(
     )
 }
 
-/// Builds the programs of `commit` in a tree and a target directory of their own under the cache,
-/// unless an earlier run built them from the same commit with the same compiler, and returns the
-/// directory they are in.
-///
-/// One run at a time builds a commit, under a lock. A stamp of the commit and the compiler is
-/// written once the tree is extracted, and the build is made when a program is missing. Any other
-/// commit's tree is removed.
-fn build_previous(commit: &str) -> PathBuf {
+/// The lock on the cache, taken for one run at a time and held until the guard is dropped.
+fn cache_lock() -> std::fs::File {
     let cache = cache_root();
     std::fs::create_dir_all(&cache).expect("the cache directory");
     let lock = std::fs::OpenOptions::new()
@@ -142,10 +161,37 @@ fn build_previous(commit: &str) -> PathBuf {
         .open(cache.join(".lock"))
         .expect("the cache's lock");
     lock.lock().expect("the cache's lock is taken");
+    lock
+}
+
+/// Builds the programs of `commit` in a tree and a target directory of their own under the cache,
+/// and returns the directory they are in. The caller holds [`cache_lock`].
+///
+/// The commit has to be in this checkout's repository, whether or not an earlier run built it: a
+/// checkout without it fails here, and so does a build that fails. A stamp of the commit and the
+/// compiler is written once the tree is extracted, so a tree is extracted once; the build is run
+/// every time, and takes seconds when nothing changed. Any other commit's tree is removed.
+fn build_previous(commit: &str) -> PathBuf {
+    let cache = cache_root();
+    let present = Command::new("git")
+        .arg("-C")
+        .arg(repository())
+        .args(["cat-file", "-e", &format!("{commit}^{{commit}}")])
+        .status()
+        .unwrap_or_else(|error| panic!("git did not start: {error}"));
+    assert!(
+        present.success(),
+        "the release before is not in this repository: {commit} is absent; the suite does not skip"
+    );
     let toolchain = Command::new("rustc")
         .arg("-vV")
         .output()
         .expect("rustc runs");
+    assert!(
+        toolchain.status.success(),
+        "rustc -vV said {}",
+        toolchain.status
+    );
     let stamp = format!("{commit}\n{}", String::from_utf8_lossy(&toolchain.stdout));
     let place = cache.join(commit);
     let tree = place.join("tree");
@@ -178,18 +224,19 @@ fn build_previous(commit: &str) -> PathBuf {
         );
         std::fs::write(place.join("stamp"), &stamp).expect("the stamp");
     }
-    if !PREVIOUS_PROGRAMS
-        .iter()
-        .all(|name| programs.join(name).is_file())
     {
         // The packages build every binary they have: the release before is these programs of it.
+        // The environment is this process's without what a test run sets for this tree, so the
+        // older tree builds with its own settings and the toolchain it pins.
         let output = Command::new("cargo")
             .current_dir(&tree)
             .env_clear()
-            .envs(std::env::vars().filter(|(name, _)| {
-                !name.starts_with("CARGO_") || name == "CARGO_HOME" || name.starts_with("CARGO_NET")
+            .envs(std::env::vars_os().filter(|(name, _)| {
+                let name = name.to_string_lossy();
+                let carried = ["CARGO_HOME", "CARGO_NET", "CARGO_HTTP", "CARGO_REGISTR"];
+                (!name.starts_with("CARGO") || carried.iter().any(|kept| name.starts_with(kept)))
+                    && !["RUSTFLAGS", "RUSTUP_TOOLCHAIN", "RUSTC_WRAPPER"].contains(&&*name)
             }))
-            .env_remove("RUSTFLAGS")
             .env("CARGO_TARGET_DIR", place.join("target"))
             .args(["build", "--locked", "-p", "kr-cli", "-p", "kr-controller"])
             .args(["-p", "kr-worker", "-p", "kr-hook", "-p", "kr-plugin-host"])
@@ -338,6 +385,12 @@ async fn kr_host_update_goes_on_beside_a_live_worker_of_the_release_before() {
         "the session is listed: {listed}"
     );
 
+    // The worker of the release before holds its release, and this build's store sees the hold.
+    assert!(
+        host.store.held(updated.one.name()).expect("asks"),
+        "the release the worker runs is held by it"
+    );
+
     // The new daemon closes it, and the release the worker held is let go.
     host.close(&updated.kr_now(), &updated.display);
     host.worker_ended(&updated.worker).await;
@@ -367,7 +420,7 @@ async fn a_second_start_of_the_daemon_leaves_the_session_readable_by_the_release
     let read: Value = serde_json::from_slice(&read.stdout).expect("a document");
     assert_eq!(read["session_id"], updated.session_id.to_string(), "{read}");
     updated.the_worker_is_as_it_was().await;
-    host.close(&updated.kr_before(), &updated.display);
+    host.close(&updated.kr_now(), &updated.display);
     host.worker_ended(&updated.worker).await;
 }
 
@@ -413,25 +466,35 @@ async fn the_kr_of_this_release_hands_the_worker_of_the_release_before_to_the_kr
     );
     let listed: Value = serde_json::from_slice(&listed.stdout).expect("a document");
     assert_eq!(listed["questions"], serde_json::json!([]), "{listed}");
-    assert_eq!(
-        listed["unread"].as_array().map(Vec::len),
-        Some(1),
-        "{listed}"
+    let unread = listed["unread"]
+        .as_array()
+        .expect("a list of unread sessions");
+    assert_eq!(unread.len(), 1, "{listed}");
+    let note = unread[0].to_string();
+    assert!(
+        note.contains(&format!("session {} was not read", updated.display))
+            && note.contains(&updated.kr_before().display().to_string()),
+        "the note names the session and the kr that reads it: {note}"
     );
 
-    // Handed over: the answer is the release before's own, not this release's refusal.
-    let detached = host.run(&updated.kr_now(), &["detach", &updated.display]);
-    let said = format!(
-        "{}{}",
-        String::from_utf8_lossy(&detached.stdout),
-        String::from_utf8_lossy(&detached.stderr)
+    // Handed over: the answer is the release before's own, whatever it is, and not this release's
+    // refusal. The release before's `kr` is asked the same thing directly for the comparison.
+    let session = updated.session_id.to_string();
+    let direct = host.run(&updated.kr_before(), &["--json", "detach", &session]);
+    let handed = host.run(&updated.kr_now(), &["--json", "detach", &updated.display]);
+    let (direct_said, handed_said): (Value, Value) = (
+        serde_json::from_slice(&direct.stdout).expect("the release before answers in JSON"),
+        serde_json::from_slice(&handed.stdout).expect("the handed-over kr answers in JSON"),
     );
-    assert!(
-        !said.contains("was not read"),
-        "kr detach was handed to the kr of the worker's release: {said}"
+    assert_eq!(
+        handed.status.code(),
+        direct.status.code(),
+        "{handed_said} against {direct_said}"
     );
+    assert_eq!(handed_said["code"], direct_said["code"], "{handed_said}");
+    assert_ne!(handed_said["code"], "UNSUPPORTED_SCHEMA", "{handed_said}");
     updated.the_worker_is_as_it_was().await;
-    host.close(&updated.kr_before(), &updated.display);
+    host.close(&updated.kr_now(), &updated.display);
     host.worker_ended(&updated.worker).await;
 }
 
@@ -464,6 +527,11 @@ async fn a_rollback_to_the_release_before_goes_on_beside_its_session_and_waits_f
         host.store.current().expect("reads"),
         Some(updated.two.name().clone()),
         "nothing was switched"
+    );
+    assert_eq!(
+        host.daemon_build().await,
+        format!("kr-controller/{}", updated.two.name()),
+        "the daemon this release started is serving again"
     );
     host.close(&updated.kr_now(), &display);
     host.worker_ended(&worker_now).await;
