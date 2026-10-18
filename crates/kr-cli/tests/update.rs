@@ -524,7 +524,10 @@ fn a_program_not_built_from_this_tree_is_refused() {
         built_from_another_tree(&program, "kr-controller", &repository),
         None
     );
-    // A list that names none of its crate's sources.
+    // A list that names none of its crate's sources. The program is made older first, because a
+    // file written now is stamped with the kernel's coarse clock, which can read earlier than the
+    // exact time just given to the program, and then the list would be one of an earlier build.
+    set_time(&program, long_ago);
     listing(&[]);
     let why = built_from_another_tree(&program, "kr-controller", &repository)
         .expect("a list of nothing is refused");
