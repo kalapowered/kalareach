@@ -59,14 +59,18 @@
   line-height: 1.45;
 }
 
-/* A row that is not a control: a share that ended, which leads nowhere. */
-.sw-ended {
+/*
+ * A row that is not a control: a share that ended, which leads nowhere. These rules name the row's
+ * own class as well, since the rules of the row itself are later in the bundle and equal them
+ * otherwise.
+ */
+.m-row.sw-ended {
   cursor: default;
   background: transparent;
   border-style: dashed;
 }
 
-.sw-ended:active {
+.m-row.sw-ended:active {
   transform: none;
   background: transparent;
 }
@@ -78,7 +82,7 @@
 }
 
 /* The row that stands for what the person put off, and the row that stands for attempts they hid. */
-.sw-quiet {
+.m-row.sw-quiet {
   display: flex;
   flex-wrap: wrap;
   align-items: baseline;
@@ -176,8 +180,7 @@
  * word where the button ends, and the button stays inside the box that holds it, so every control
  * can be reached whatever the size of the text and the face it is in.
  */
-.sw-group .btn,
-.sw-footer .btn {
+.sw-group .btn {
   max-inline-size: 100%;
   text-align: center;
   white-space: normal;
@@ -189,13 +192,15 @@
 /*
  * It sits in the flow with no height of its own and sticks to the top of the scrolling area, so it
  * stays over the content however far the person has scrolled and takes no room when it is not
- * shown.
+ * shown. The pill takes the height its words need and is never wider than the column: at the
+ * largest text size they wrap, and a word that is wider breaks where the column ends.
  */
 .sw-new {
   position: sticky;
   inset-block-start: 0;
   z-index: 3;
   display: flex;
+  align-items: flex-start;
   justify-content: center;
   block-size: 0;
   overflow: visible;
@@ -204,6 +209,8 @@
 
 .sw-new-button {
   pointer-events: auto;
+  max-inline-size: 100%;
+  overflow-wrap: anywhere;
   margin-block-start: var(--gap-2);
   padding: var(--gap-2) var(--gap-4);
   border: 1px solid var(--accent-line);
