@@ -20,8 +20,19 @@ mod stored_formats;
 mod support;
 #[path = "../../kr-controller/tests/teardown/mod.rs"]
 mod teardown;
+// A device pairs with the installed host's daemon over the network. The pairing calls are the ones
+// the control daemon's own network suites make.
+#[path = "upgrade/door.rs"]
+mod door;
+// A person's terminal: a program run on a pseudo-terminal that a case types at.
+#[path = "../../kr-controller/tests/net_support/pairing.rs"]
+mod pairing;
+#[path = "upgrade/terminal.rs"]
+mod terminal;
 
 include!("support/update_harness.rs");
+
+use serde_json::json;
 
 /// The release before this one, built from its commit.
 struct Previous {
@@ -269,6 +280,177 @@ impl Assembled {
     }
 }
 
+/// Where this tree's managed shell packages are installed: the prefix the build script writes to,
+/// which a run of the suite names with `KR_SHELL_PACKAGES` or `KR_SHELL_PREFIX`.
+fn shell_prefix() -> PathBuf {
+    for variable in ["KR_SHELL_PACKAGES", "KR_SHELL_PREFIX"] {
+        if let Some(value) = std::env::var_os(variable).filter(|value| !value.is_empty()) {
+            return PathBuf::from(value);
+        }
+    }
+    let home = PathBuf::from(std::env::var_os("HOME").expect("a home directory"));
+    if cfg!(target_os = "macos") {
+        home.join("Library/Caches/kalareach/shells")
+    } else if let Some(cache) = std::env::var_os("XDG_CACHE_HOME").filter(|value| !value.is_empty())
+    {
+        PathBuf::from(cache).join("kalareach/shells")
+    } else {
+        home.join(".cache/kalareach/shells")
+    }
+}
+
+/// Builds the managed zsh package of `tree` by its own build script, installed under `prefix`. The
+/// upstream archives this tree's build fetched are placed beside it, so nothing is fetched again.
+/// A package that does not build fails the suite.
+fn build_zsh(tree: &Path, prefix: &Path) {
+    let sources = prefix.join("sources");
+    std::fs::create_dir_all(&sources).expect("a directory for the shell sources");
+    if let Ok(ours) = std::fs::read_dir(shell_prefix().join("sources")) {
+        for entry in ours.flatten() {
+            let target = sources.join(entry.file_name());
+            if !target.exists() {
+                std::fs::copy(entry.path(), target).expect("an archive is placed");
+            }
+        }
+    }
+    let output = Command::new("bash")
+        .current_dir(tree)
+        .args([
+            "scripts/build-shells.sh",
+            "--zsh",
+            "--no-upstream-tests",
+            "--prefix",
+        ])
+        .arg(prefix)
+        .output()
+        .expect("bash runs");
+    assert!(
+        output.status.success(),
+        "the zsh package of {} did not build: {}",
+        tree.display(),
+        String::from_utf8_lossy(&output.stderr)
+            .lines()
+            .rev()
+            .take(40)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+}
+
+/// Builds the managed zsh package of `tree` where the release called `name` will be in `host`'s
+/// store, and keeps it beside the store, with the place it was built at free again; returns the
+/// prefix it is kept under.
+///
+/// A package states the path it was built at in its handshake, the shell's executable and its
+/// module directory, and a session's worker accepts it only as the package it launched. A package
+/// built elsewhere and placed in a release is not that package, so the build is made at the
+/// release's own path and the release is installed there from what is kept.
+fn zsh_built_for(host: &Host, tree: &Path, name: &ReleaseName) -> PathBuf {
+    let versions = host.store.versions();
+    let created = !versions.exists();
+    let place = host.store.release_directory(name);
+    let prefix = place.join("shells");
+    build_zsh(tree, &prefix);
+    // What the build fetched and compiled from is not part of the package.
+    std::fs::remove_dir_all(prefix.join("sources")).expect("the build's sources go");
+    let kept = host.scratch(&format!("zsh-for-{name}")).join("shells");
+    std::fs::rename(&prefix, &kept).expect("the package is kept");
+    std::fs::remove_dir_all(if created { &versions } else { &place })
+        .expect("the place is free again");
+    kept
+}
+
+impl Assembled {
+    /// This release carrying the managed zsh package installed under `prefix` in place of the
+    /// placeholder module tree: every file of the package, the pointer to it, and the stable entry
+    /// a startup file sources, all listed in the manifest.
+    fn with_zsh_package(mut self, prefix: &Path) -> Self {
+        use kr_shell_integration::host::package::ShellPackage;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let zsh = prefix.join("zsh");
+        let identity = std::fs::read_to_string(zsh.join("current"))
+            .unwrap_or_else(|error| panic!("{} names no zsh package: {error}", zsh.display()))
+            .trim()
+            .to_owned();
+        let directory = zsh.join(&identity);
+        let package = ShellPackage::read(&directory)
+            .unwrap_or_else(|error| panic!("{} is no zsh package: {error:?}", directory.display()));
+        self.manifest
+            .files
+            .retain(|file| !file.path.as_str().starts_with("shells/zsh/package/"));
+        self.placeholder_modules = false;
+        let listed = |path: &str, contents: &[u8], mode: FileMode| ReleaseFile {
+            path: ReleasePath::new(path).expect("a path"),
+            length: U64::new(contents.len() as u64),
+            sha256: Digest256::from_bytes(kr_cbor::sha256(contents)),
+            mode,
+        };
+        let mut pending = vec![directory.clone()];
+        while let Some(current) = pending.pop() {
+            for entry in std::fs::read_dir(&current).expect("the package's directory") {
+                let path = entry.expect("an entry").path();
+                // A link in the package is carried as the file it names: a release has no links.
+                if path.is_dir() {
+                    pending.push(path);
+                    continue;
+                }
+                let relative = path.strip_prefix(&directory).expect("inside the package");
+                let released = format!("shells/zsh/{identity}/{}", relative.display());
+                let mode = if std::fs::metadata(&path)
+                    .expect("the file's mode")
+                    .permissions()
+                    .mode()
+                    & 0o111
+                    != 0
+                {
+                    FileMode::Executable
+                } else {
+                    FileMode::Regular
+                };
+                let bytes = std::fs::read(&path).expect("a file of the package");
+                self.manifest.files.push(listed(&released, &bytes, mode));
+                self.copied.push((released, path));
+            }
+        }
+        let entry = package.startup_entry();
+        let entry_name = entry.file_name().expect("the entry has a name");
+        let entry_bytes = std::fs::read(&entry).expect("the package's startup entry");
+        for (path, contents) in [
+            (
+                "shells/zsh/current".to_owned(),
+                format!("{identity}\n").into_bytes(),
+            ),
+            (
+                format!("shells/zsh/{}", entry_name.to_string_lossy()),
+                entry_bytes,
+            ),
+        ] {
+            self.manifest
+                .files
+                .push(listed(&path, &contents, FileMode::Regular));
+            self.data.push((path, contents));
+        }
+        self.manifest
+            .shells
+            .push(kr_protocol::update::ReleaseShell {
+                shell: "zsh".to_owned(),
+                identity,
+                patch_revisions: package
+                    .manifest
+                    .shell
+                    .patches
+                    .iter()
+                    .map(|patch| patch.revision.clone())
+                    .collect(),
+            });
+        self
+    }
+}
+
 /// A host on the release before, with a live session, updated by that release's own `kr` to this
 /// build's release.
 struct Updated {
@@ -282,26 +464,273 @@ struct Updated {
     session_id: SessionId,
     /// The process of the session's worker before the update.
     worker: kr_protocol::identity::ProcessStartIdentity,
+    /// The pipes of the session's contact server, for a host set up with one.
+    contact: Option<ContactPipes>,
+    /// The stand-in agent the session's root shell started, for a host set up with one.
+    agent: Option<Agent>,
+}
+
+impl Host {
+    /// Creates a session with a release's `kr` whose root shell is that release's managed zsh.
+    fn new_managed_session(&self, kr: &Path) -> (String, SessionId) {
+        self.new_session_as(kr, &["--shell", "zsh", "--shell-mode", "managed"])
+    }
+}
+
+/// What a host on the release before is set up with.
+#[derive(Clone, Copy, Default)]
+struct Setup {
+    /// The configuration document puts the host's daemon on the network, on the loopback interface
+    /// alone, from the first release's daemon on.
+    network: bool,
+    /// Each release carries the managed zsh package it was built with, and the session's root
+    /// shell is that package's zsh.
+    zsh: bool,
+    /// The session's root shell waits at a gate and then becomes the contact server of whichever
+    /// release is current, with its standard streams on named pipes.
+    contact: bool,
+    /// A plugin package whose component the host's plugin runtime runs is installed and enabled
+    /// before the first daemon opens the catalogue.
+    plugin: bool,
+    /// The session's root shell starts a stand-in agent, a process of its own that outlasts the
+    /// shell, before it goes on as the shell.
+    agent: bool,
+}
+
+/// The named pipes the contact server of a session runs on.
+struct ContactPipes {
+    /// The root shell waits to read a line from here.
+    gate: PathBuf,
+    /// The server's standard input.
+    to_server: PathBuf,
+    /// The server's standard output.
+    from_server: PathBuf,
 }
 
 impl Updated {
     async fn new() -> Self {
+        Self::start(Setup::default()).await
+    }
+
+    /// As [`Self::new`], with the host's daemon on the network.
+    async fn on_the_network() -> Self {
+        Self::start(Setup {
+            network: true,
+            ..Setup::default()
+        })
+        .await
+    }
+
+    /// As [`Self::on_the_network`], with a stand-in agent started by the session's root shell.
+    async fn on_the_network_with_an_agent() -> Self {
+        Self::start(Setup {
+            network: true,
+            agent: true,
+            ..Setup::default()
+        })
+        .await
+    }
+
+    /// As [`Self::new`], with the managed zsh package of each release.
+    async fn with_zsh() -> Self {
+        Self::start(Setup {
+            zsh: true,
+            ..Setup::default()
+        })
+        .await
+    }
+
+    /// As [`Self::new`], with a session whose root shell becomes the contact server once the test
+    /// opens its gate.
+    async fn with_a_contact_session() -> Self {
+        Self::start(Setup {
+            contact: true,
+            ..Setup::default()
+        })
+        .await
+    }
+
+    async fn start(setup: Setup) -> Self {
+        Self::prepare(setup).await.update().await
+    }
+
+    /// A host on the release before with its live session, not yet updated.
+    async fn prepare(setup: Setup) -> Prepared {
+        let Setup {
+            network: on_the_network,
+            zsh,
+            contact,
+            plugin,
+            agent,
+        } = setup;
         let before = previous();
-        let one = before.assembled(1);
-        let two = Assembled::at_this_level(&format!("{PACKAGE_VERSION}+bbbbbbbbbbbb"), 2)
+        let mut one = before.assembled(1);
+        let mut two = Assembled::at_this_level(&format!("{PACKAGE_VERSION}+bbbbbbbbbbbb"), 2)
             .retaining_what_this_build_does();
         let mut host = Host::bare();
+        if zsh {
+            // Each release carries the zsh package built where the release will be.
+            let kept = zsh_built_for(
+                &host,
+                &cache_root().join(&before.commit).join("tree"),
+                one.name(),
+            );
+            one = one.with_zsh_package(&kept);
+            let kept = zsh_built_for(&host, &repository(), two.name());
+            two = two.with_zsh_package(&kept);
+        }
         host.install(&one);
+        if on_the_network {
+            // The document is what puts a host on the network: this one joins on loopback alone,
+            // and selects no relay and no discovery.
+            let mut document = kr_protocol::hostinfo::configuration::ConfigurationDocument::empty();
+            document.revision = 1;
+            document.network.enabled = Nullable::some(true);
+            document.network.bind_address = Nullable::some("127.0.0.1:0".to_owned());
+            let path = kr_worker::config::document_path(&host.tree.environment());
+            std::fs::create_dir_all(path.parent().expect("the document has a directory"))
+                .expect("the state directory");
+            kr_ipc::paths::write_owner_only_file(
+                &path,
+                kr_protocol::hostinfo::configuration::contents(&document).as_bytes(),
+            )
+            .expect("the configuration document");
+        }
+        if plugin {
+            install_plugin(&host).await;
+        }
         let started_through_current = host.store.stable(Program::Controller);
         host.start_daemon(&started_through_current).await;
-        let (display, session_id) = host.new_session(&host.program(one.name(), Program::Kr));
+        let kr = host.program(one.name(), Program::Kr);
+        let mut pipes = None;
+        let mut started_agent = None;
+        let (display, session_id) = if agent {
+            let (display, session_id, made) = host.new_session_with_an_agent(&kr, "session");
+            started_agent = Some(made);
+            (display, session_id)
+        } else if zsh {
+            host.new_managed_session(&kr)
+        } else if contact {
+            let directory = host.scratch("contact");
+            let made = ContactPipes {
+                gate: directory.join("gate"),
+                to_server: directory.join("to-server"),
+                from_server: directory.join("from-server"),
+            };
+            for pipe in [&made.gate, &made.to_server, &made.from_server] {
+                let status = Command::new("mkfifo")
+                    .arg(pipe)
+                    .status()
+                    .expect("mkfifo runs");
+                assert!(status.success(), "a pipe is made");
+            }
+            // Named for the shell it stands for, because the worker recognises a shell by its name.
+            let shell = directory.join("sh");
+            std::fs::write(
+                &shell,
+                format!(
+                    "#!/bin/sh\nPATH=/usr/bin:/bin\nexport PATH\nKR_RUNTIME_DIR='{runtime}'\n\
+                     KR_STATE_DIR='{state}'\nexport KR_RUNTIME_DIR KR_STATE_DIR\n\
+                     read -r _ < '{gate}'\nexec '{server}' agent-tools --stdio < '{to}' > '{from}'\n",
+                    runtime = host.tree.paths().runtime_root().display(),
+                    state = host.tree.paths().state_root().display(),
+                    gate = made.gate.display(),
+                    // Through `current`: the release that is current when the gate opens.
+                    server = host.store.stable(Program::Kr).display(),
+                    to = made.to_server.display(),
+                    from = made.from_server.display(),
+                ),
+            )
+            .expect("the contact session's shell");
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755))
+                    .expect("executable");
+            }
+            pipes = Some(made);
+            host.new_session_as(&kr, &["--shell", &shell.display().to_string()])
+        } else {
+            host.new_session(&kr)
+        };
         let worker = host.worker_process(session_id);
         assert_eq!(
             host.worker_build(session_id).await,
             format!("kr-worker/{}", one.name()),
             "the session's worker is the release before's"
         );
+        Prepared {
+            host,
+            one,
+            two,
+            display,
+            session_id,
+            worker,
+            contact: pipes,
+            agent: started_agent,
+        }
+    }
 
+    /// The release before's `kr`, and this release's.
+    fn kr_before(&self) -> PathBuf {
+        self.host.program(self.one.name(), Program::Kr)
+    }
+
+    fn kr_now(&self) -> PathBuf {
+        self.host.program(self.two.name(), Program::Kr)
+    }
+
+    /// The worker still runs the release before, and is the process it was.
+    async fn the_worker_is_as_it_was(&self) {
+        assert_eq!(
+            self.host.worker_build(self.session_id).await,
+            format!("kr-worker/{}", self.one.name()),
+            "the worker still runs the release before"
+        );
+        assert_eq!(
+            self.host.worker_process(self.session_id),
+            self.worker,
+            "and it is the process it was"
+        );
+        if let Some(agent) = &self.agent {
+            assert_eq!(
+                kr_ipc::identity::process_state(&agent.identity),
+                kr_ipc::identity::ProcessState::Running,
+                "and the agent its shell started is the process it was, running"
+            );
+        }
+    }
+}
+
+/// A host on the release before with its live session, before the update.
+struct Prepared {
+    host: Host,
+    one: Assembled,
+    two: Assembled,
+    display: String,
+    session_id: SessionId,
+    worker: kr_protocol::identity::ProcessStartIdentity,
+    contact: Option<ContactPipes>,
+    agent: Option<Agent>,
+}
+
+impl Prepared {
+    /// The release before's `kr`, and this release's once it is current.
+    fn kr_before(&self) -> PathBuf {
+        self.host.program(self.one.name(), Program::Kr)
+    }
+
+    /// Updates the host to this build's release with the release before's own `kr`.
+    async fn update(self) -> Updated {
+        let Self {
+            host,
+            one,
+            two,
+            display,
+            session_id,
+            worker,
+            contact: pipes,
+            agent,
+        } = self;
         let archive = host.scratch("archives").join("two.tar.gz");
         two.archive(&archive);
         let (output, said) = host.kr_json(&[
@@ -326,39 +755,18 @@ impl Updated {
             format!("kr-controller/{}", two.name()),
             "the daemon is of the new release"
         );
-        let updated = Self {
+        let updated = Updated {
             host,
             one,
             two,
             display,
             session_id,
             worker,
+            contact: pipes,
+            agent,
         };
         updated.the_worker_is_as_it_was().await;
         updated
-    }
-
-    /// The release before's `kr`, and this release's.
-    fn kr_before(&self) -> PathBuf {
-        self.host.program(self.one.name(), Program::Kr)
-    }
-
-    fn kr_now(&self) -> PathBuf {
-        self.host.program(self.two.name(), Program::Kr)
-    }
-
-    /// The worker still runs the release before, and is the process it was.
-    async fn the_worker_is_as_it_was(&self) {
-        assert_eq!(
-            self.host.worker_build(self.session_id).await,
-            format!("kr-worker/{}", self.one.name()),
-            "the worker still runs the release before"
-        );
-        assert_eq!(
-            self.host.worker_process(self.session_id),
-            self.worker,
-            "and it is the process it was"
-        );
     }
 }
 
@@ -476,6 +884,13 @@ async fn the_kr_of_this_release_hands_the_worker_of_the_release_before_to_the_kr
             && note.contains(&updated.kr_before().display().to_string()),
         "the note names the session and the kr that reads it: {note}"
     );
+
+    // `kr attach` of this release is handed to the `kr` of the release before, which attaches: a
+    // person types at the session through it, and the worker is the process it was.
+    let typing = terminal_for(host, &updated.kr_now(), &["attach", &updated.display]);
+    typing.ready().await;
+    updated.the_worker_is_as_it_was().await;
+    drop(typing);
 
     // Handed over: the answer is the release before's own, whatever it is, and not this release's
     // refusal. The release before's `kr` is asked the same thing directly for the comparison.
@@ -780,6 +1195,867 @@ async fn a_rollback_to_the_release_before_goes_on_beside_its_session_and_waits_f
         "the daemon is the release before's again"
     );
     updated.the_worker_is_as_it_was().await;
+    host.close(&updated.kr_before(), &updated.display);
+    host.worker_ended(&updated.worker).await;
+}
+
+/// A mutation's expected-state evidence for a method that needs none.
+#[derive(serde::Serialize)]
+struct Empty {}
+
+/// KR-REQ-26.06, KR-REQ-23.34, KR-ACC-035: a device paired with the updated host's daemon over the
+/// network, as a phone is, meets the worker of the release before through the new daemon. The
+/// daemon lists the session, reads it, its description, and its attention inbox
+/// at the worker's level, and closes it for the device, answering with what the worker answered;
+/// the worker is the process it was throughout.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_device_at_the_door_of_the_updated_host_meets_the_worker_of_the_release_before() {
+    use kr_protocol::describe::{SessionDescribeParams, SessionDescribeResult};
+    use kr_protocol::session::{
+        SessionCloseParams, SessionCloseResult, SessionListParams, SessionListResult,
+        SessionReadParams, SessionReadResult,
+    };
+
+    let updated = Updated::on_the_network_with_an_agent().await;
+    let host = &updated.host;
+    let door = door::Door::pair_the_first_owner(
+        &host
+            .tree
+            .environment()
+            .controller_endpoint()
+            .expect("an endpoint"),
+        host.tree.environment_id(),
+    )
+    .await;
+    let session = &door.session;
+    let session_id = updated.session_id;
+
+    let listed: SessionListResult = session
+        .read(
+            Method::SessionList,
+            &SessionListParams {
+                environment_id: Nullable::null(),
+                include_closed: false,
+            },
+        )
+        .await
+        .expect("the device lists the sessions");
+    let summary = listed
+        .sessions
+        .iter()
+        .find(|summary| summary.session_id == session_id)
+        .unwrap_or_else(|| panic!("the session is listed: {listed:?}"));
+    assert!(summary.closure.0.is_none(), "{summary:?}");
+
+    let read: SessionReadResult = session
+        .read(Method::SessionRead, &SessionReadParams { session_id })
+        .await
+        .expect("the device reads the session");
+    assert_eq!(read.session.session_id, session_id, "{read:?}");
+
+    let described: SessionDescribeResult = session
+        .read(
+            Method::SessionDescribe,
+            &SessionDescribeParams { session_id },
+        )
+        .await
+        .expect("the device reads the description");
+    assert_eq!(described.session_id, session_id, "{described:?}");
+
+    // The attention inbox the daemon keeps for the session, built from what the worker reported.
+    let attention: kr_protocol::attention::AttentionReadResult = session
+        .read(
+            Method::AttentionRead,
+            &kr_protocol::attention::AttentionReadParams {
+                session_id: Nullable::some(session_id),
+                include_acknowledged: true,
+                max_items: U64::new(50),
+                after: Nullable::null(),
+            },
+        )
+        .await
+        .expect("the device reads the attention inbox");
+    assert!(attention.gaps.is_empty(), "{attention:?}");
+
+    // The worker is the process it was, and runs the release before.
+    updated.the_worker_is_as_it_was().await;
+
+    // The device closes the session, and the worker's own answer comes back through the daemon.
+    let settled = session
+        .mutate(
+            Method::SessionClose,
+            kr_protocol::envelope::ActionTarget {
+                environment_id: host.tree.environment_id(),
+                session_id: Nullable::some(session_id),
+                session_epoch: Nullable::some(kr_protocol::ids::SessionEpoch::V1),
+                application_instance_id: Nullable::null(),
+                agent_binding_revision: Nullable::null(),
+            },
+            None,
+            &Empty {},
+            &SessionCloseParams { session_id },
+            kr_protocol::scalars::DurationMs::new(120_000),
+        )
+        .await
+        .expect("the device closes the session");
+    let closed: SessionCloseResult = settled
+        .to_typed()
+        .expect("the host answers with the closure the worker gave");
+    assert_eq!(closed.session_id, session_id, "{closed:?}");
+    host.worker_ended(&updated.worker).await;
+    host.released(updated.one.name()).await;
+
+    // The daemon keeps the closed session's record, with the worker's closure.
+    let closed = until(
+        "the closed session to be listed with its closure",
+        || async {
+            let listed: SessionListResult = session
+                .read(
+                    Method::SessionList,
+                    &SessionListParams {
+                        environment_id: Nullable::null(),
+                        include_closed: true,
+                    },
+                )
+                .await
+                .ok()?;
+            listed
+                .sessions
+                .into_iter()
+                .find(|summary| summary.session_id == session_id && summary.closure.0.is_some())
+        },
+    )
+    .await;
+    assert!(closed.closure.0.is_some(), "{closed:?}");
+}
+
+/// A terminal running `program` with the arguments, as a person's does on this host.
+fn terminal_for(host: &Host, program: &Path, arguments: &[&str]) -> terminal::Terminal {
+    let mut command = portable_pty::CommandBuilder::new(program);
+    command.args(arguments);
+    command.env_clear();
+    command.env("PATH", "/usr/bin:/bin");
+    command.env("KR_RUNTIME_DIR", host.tree.paths().runtime_root());
+    command.env("KR_STATE_DIR", host.tree.paths().state_root());
+    terminal::Terminal::run(command, host.tree.root())
+}
+
+/// What a directory tree holds, by relative path: the file's device and inode and its digest.
+/// A tree whose files are the files they were has the same identity before and after.
+fn tree_identity(root: &Path) -> std::collections::BTreeMap<String, (u64, u64, String)> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let mut found = std::collections::BTreeMap::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        for entry in std::fs::read_dir(&directory).expect("a directory of the tree") {
+            let path = entry.expect("an entry").path();
+            let metadata = std::fs::symlink_metadata(&path).expect("the entry's metadata");
+            if metadata.is_dir() {
+                pending.push(path);
+            } else if metadata.is_file() {
+                let bytes = std::fs::read(&path).expect("a file of the tree");
+                found.insert(
+                    path.strip_prefix(root)
+                        .expect("inside the tree")
+                        .display()
+                        .to_string(),
+                    (
+                        metadata.dev(),
+                        metadata.ino(),
+                        hexadecimal(&kr_cbor::sha256(&bytes)),
+                    ),
+                );
+            }
+        }
+    }
+    found
+}
+
+/// KR-REQ-26.06, KR-ACC-035: a session whose root shell is the release before's managed zsh keeps
+/// that shell, and its modules, through an update and a rollback. The shell sources the stable
+/// entry of whichever release is current and its own bridge builtin answers, a session created
+/// after the update runs the new release's package, and the files of the release before's package
+/// are the files they were.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_zsh_of_the_release_before_reads_the_stable_entry_of_the_current_release_and_keeps_its_modules()
+ {
+    let updated = Updated::with_zsh().await;
+    let host = &updated.host;
+    let identity = std::fs::read_to_string(
+        host.store
+            .release_directory(updated.one.name())
+            .join("shells/zsh/current"),
+    )
+    .expect("the release before's package pointer");
+    let package = host
+        .store
+        .release_directory(updated.one.name())
+        .join("shells/zsh")
+        .join(identity.trim());
+    let modules = tree_identity(&package);
+    assert!(
+        modules.keys().any(|path| path == "bin/zsh"),
+        "the package's files are listed: {:?}",
+        modules.keys().collect::<Vec<_>>()
+    );
+
+    // The session's root shell is the release before's own zsh.
+    let said = host.run(
+        &updated.kr_before(),
+        &["--json", "status", &updated.display],
+    );
+    let said = String::from_utf8_lossy(&said.stdout).into_owned();
+    assert!(
+        said.contains(&format!(
+            "/versions/{}/shells/zsh/{}/bin/zsh",
+            updated.one.name(),
+            identity.trim()
+        )),
+        "the root shell is the release before's zsh: {said}"
+    );
+
+    // A person at the session sources the stable entry, which is the current release's, and the
+    // shell's own bridge builtin answers it.
+    let entry = host.store.stable_shells().join("zsh/kr-zshrc.zsh");
+    let terminal = terminal_for(host, &updated.kr_before(), &["attach", &updated.display]);
+    terminal.ready().await;
+    terminal.type_line(&format!(
+        ". '{}'; echo \"ENTRY-$?-A\"; builtin kr-bridge status; echo \"BRIDGE-$?-B\"",
+        entry.display()
+    ));
+    terminal.expect("ENTRY-0-A").await;
+    terminal.expect("BRIDGE-0-B").await;
+    updated.the_worker_is_as_it_was().await;
+    assert_eq!(
+        tree_identity(&package),
+        modules,
+        "the package's files are the files they were"
+    );
+
+    // A session created now runs the new release's package.
+    let (display, created) = host.new_managed_session(&updated.kr_now());
+    let said = host.run(&updated.kr_now(), &["--json", "status", &display]);
+    let said = String::from_utf8_lossy(&said.stdout).into_owned();
+    assert!(
+        said.contains(&format!("/versions/{}/shells/zsh/", updated.two.name())),
+        "a new session's shell is the new release's zsh: {said}"
+    );
+    let worker_now = host.worker_process(created);
+    host.close(&updated.kr_now(), &display);
+    host.worker_ended(&worker_now).await;
+
+    // And back: the release before is current again, the same shell sources its entry.
+    let (output, said) = host.kr_json(&["host", "rollback", "--json"]);
+    assert_eq!(output.status.code(), Some(0), "kr host rollback: {said}");
+    terminal.type_line(&format!(
+        ". '{}'; echo \"ENTRY-$?-C\"; builtin kr-bridge status; echo \"BRIDGE-$?-D\"",
+        entry.display()
+    ));
+    terminal.expect("ENTRY-0-C").await;
+    terminal.expect("BRIDGE-0-D").await;
+    updated.the_worker_is_as_it_was().await;
+    assert_eq!(
+        tree_identity(&package),
+        modules,
+        "the package's files are the files they were"
+    );
+    host.close(&updated.kr_before(), &updated.display);
+    host.worker_ended(&updated.worker).await;
+}
+
+impl Updated {
+    /// Opens the gate of the contact session, so its root shell becomes the contact server of
+    /// the release that is current, and connects a Model Context Protocol client to that server.
+    async fn contact_client(&self) -> rmcp::service::RunningService<rmcp::RoleClient, ()> {
+        use rmcp::ServiceExt as _;
+
+        let pipes = self
+            .contact
+            .as_ref()
+            .expect("a host set up with a contact session");
+        let gate = pipes.gate.clone();
+        tokio::task::spawn_blocking(move || {
+            use std::io::Write as _;
+
+            let mut gate = std::fs::OpenOptions::new()
+                .write(true)
+                .open(gate)
+                .expect("opens the gate");
+            gate.write_all(b"\n").expect("lets the root shell past");
+        })
+        .await
+        .expect("the gate is opened");
+        // Both ends of both pipes meet: the server opens its input first and its output second,
+        // so these two opens have to be waiting at the same time.
+        let to_server = pipes.to_server.clone();
+        let from_server = pipes.from_server.clone();
+        let writer = tokio::task::spawn_blocking(move || {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(to_server)
+                .expect("opens the server's input")
+        });
+        let reader = tokio::task::spawn_blocking(move || {
+            std::fs::File::open(from_server).expect("opens the server's output")
+        });
+        let writer = tokio::time::timeout(LIVENESS_DEADLINE, writer)
+            .await
+            .expect("the server opened its input")
+            .expect("the open finished");
+        let reader = tokio::time::timeout(LIVENESS_DEADLINE, reader)
+            .await
+            .expect("the server opened its output")
+            .expect("the open finished");
+        ().serve((
+            tokio::fs::File::from_std(reader),
+            tokio::fs::File::from_std(writer),
+        ))
+        .await
+        .expect("the tool server answered the handshake")
+    }
+}
+
+/// Calls one contact tool and returns its structured content and whether it failed.
+async fn call_tool(
+    client: &rmcp::service::RunningService<rmcp::RoleClient, ()>,
+    name: &str,
+    arguments: Value,
+) -> (Value, bool) {
+    let result = client
+        .call_tool(
+            rmcp::model::CallToolRequestParams::new(name.to_owned())
+                .with_arguments(arguments.as_object().cloned().unwrap_or_default()),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("{name} answered: {error}"));
+    let content = result
+        .structured_content
+        .clone()
+        .unwrap_or_else(|| panic!("{name} returned structured content"));
+    (content, result.is_error.unwrap_or_default())
+}
+
+/// KR-REQ-26.06, KR-ACC-035: the contact server of this release, the root of a session whose worker
+/// is of the release before, asks the person's question through that release's `kr`. The `kr` of
+/// this release does not read the worker, so it lists the question as unread and does not answer
+/// it; the `kr` of the release before lists and answers it, and the server returns the answer.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_contact_server_of_this_release_asks_the_worker_of_the_release_before_and_gets_its_answer()
+ {
+    let updated = Updated::with_a_contact_session().await;
+    let host = &updated.host;
+    let client = updated.contact_client().await;
+    let (created, failed) = call_tool(
+        &client,
+        "ask_user",
+        json!({
+            "request_id": "ask-1",
+            "agent_name": "a test agent",
+            "context": "two ways to do it",
+            "question": "which one?",
+            "type": "select",
+            "choices": [
+                {"choice_id": "left", "label": "Left"},
+                {"choice_id": "right", "label": "Right"}
+            ]
+        }),
+    )
+    .await;
+    assert!(!failed, "the question was created: {created}");
+    assert_eq!(created["state"], "pending", "{created}");
+    let question_id = created["question_id"]
+        .as_str()
+        .expect("an identifier")
+        .to_owned();
+    let token = created["caller_token"]
+        .as_str()
+        .expect("a token")
+        .to_owned();
+
+    // This release's `kr` does not read the worker: the question is not among its questions, and
+    // the session it did not read is named with the `kr` that reads it.
+    let listed = host.run(&updated.kr_now(), &["--json", "question", "list"]);
+    assert!(
+        listed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&listed.stderr)
+    );
+    let listed: Value = serde_json::from_slice(&listed.stdout).expect("a document");
+    assert_eq!(listed["questions"], json!([]), "{listed}");
+    assert_eq!(
+        listed["unread"].as_array().map(Vec::len),
+        Some(1),
+        "{listed}"
+    );
+    let refused = host.run(
+        &updated.kr_now(),
+        &["question", "answer", &question_id, "--other", "neither"],
+    );
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&refused.stdout),
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    assert!(
+        !refused.status.success(),
+        "this release's kr does not answer it: {said}"
+    );
+    assert!(
+        said.contains(&updated.kr_before().display().to_string()),
+        "and it names the kr that reads the worker: {said}"
+    );
+
+    // The release before's `kr` lists and answers it.
+    let theirs = host.run(&updated.kr_before(), &["--json", "question", "list"]);
+    assert!(
+        theirs.status.success(),
+        "{}",
+        String::from_utf8_lossy(&theirs.stderr)
+    );
+    let theirs: Value = serde_json::from_slice(&theirs.stdout).expect("a document");
+    assert_eq!(
+        theirs["questions"][0]["question_id"],
+        question_id.as_str(),
+        "{theirs}"
+    );
+    let answered = host.run(
+        &updated.kr_before(),
+        &[
+            "question",
+            "answer",
+            &question_id,
+            "--other",
+            "neither",
+            "--json",
+        ],
+    );
+    assert!(
+        answered.status.success(),
+        "the release before's kr answers: {}",
+        String::from_utf8_lossy(&answered.stderr)
+    );
+
+    let (waited, failed) = call_tool(
+        &client,
+        "wait_for_answer",
+        json!({"question_id": question_id, "caller_token": token, "wait_seconds": 20}),
+    )
+    .await;
+    assert!(!failed, "the wait answered: {waited}");
+    assert_eq!(waited["state"], "answered", "{waited}");
+    assert_eq!(waited["answer"]["text"], "neither", "{waited}");
+
+    updated.the_worker_is_as_it_was().await;
+    drop(client);
+    host.close(&updated.kr_before(), &updated.display);
+    host.worker_ended(&updated.worker).await;
+}
+
+/// The catalogue's own builder of signed generations, for a package this suite writes.
+#[allow(dead_code)]
+#[path = "../../kr-plugin-catalogue/tests/support/mod.rs"]
+mod generations;
+
+/// The variable that makes a placed copy of this binary a program a person starts in a session: it
+/// sleeps for as many seconds as it names.
+const STAND_IN: &str = "KR_RUNTIME_STAND_IN";
+
+/// The variable naming a file the program writes its process number to once it runs.
+const STAND_IN_RUNNING: &str = "KR_RUNTIME_STAND_IN_RUNNING";
+
+/// The stand-in program's body. Run by the test harness with nothing set, it does nothing.
+#[test]
+fn the_stand_in_program() {
+    if let Ok(seconds) = std::env::var(STAND_IN) {
+        if let Some(running) = std::env::var_os(STAND_IN_RUNNING) {
+            std::fs::write(running, std::process::id().to_string()).expect("says it is running");
+        }
+        let until = Instant::now() + Duration::from_secs(seconds.parse().unwrap_or(60));
+        std::thread::sleep(until.saturating_duration_since(Instant::now()));
+    }
+}
+
+fn the_plugin() -> kr_protocol::ids::PluginId {
+    kr_protocol::ids::PluginId::new("kalareach/example-declarative").expect("an identifier")
+}
+
+fn directory_url(path: &Path) -> url::Url {
+    url::Url::from_directory_path(std::fs::canonicalize(path).expect("an existing directory"))
+        .expect("an absolute path")
+}
+
+/// The example declarative package with the built test component shipped in it, written into
+/// `into`. The component is built by `scripts/build-plugin-fixtures.sh`; the suite fails, and does
+/// not skip, when it is absent.
+fn write_package(into: &Path) {
+    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/plugins");
+    let component = std::fs::read(fixtures.join("components/build/well-behaved.wasm"))
+        .unwrap_or_else(|error| {
+            panic!(
+                "the test component is not built ({error}); run scripts/build-plugin-fixtures.sh"
+            )
+        });
+    let example = fixtures.join("valid/example-declarative");
+    std::fs::create_dir_all(into).expect("a package directory");
+    std::fs::copy(
+        example.join("presentation.json"),
+        into.join("presentation.json"),
+    )
+    .expect("the presentation");
+    let mut manifest: Value = serde_json::from_slice(
+        &std::fs::read(example.join("plugin.json")).expect("the example manifest"),
+    )
+    .expect("a manifest");
+    manifest["payloads"]
+        .as_array_mut()
+        .expect("the manifest lists its payloads")
+        .push(json!({
+            "role": "component",
+            "path": "component.wasm",
+            "digest": kr_plugin_sdk::digest::PayloadDigest::of(&component).to_string(),
+            "size_bytes": component.len().to_string(),
+        }));
+    std::fs::write(
+        into.join("plugin.json"),
+        serde_json::to_vec_pretty(&manifest).expect("a manifest"),
+    )
+    .expect("the manifest");
+    std::fs::write(into.join("component.wasm"), component).expect("the component");
+}
+
+/// Enrols a repository holding the package as the owner acting directly, synchronises it, and
+/// installs and enables the package, before any daemon opens the catalogue.
+async fn install_plugin(host: &Host) {
+    use kr_plugin_catalogue::transport::RepositoryTransport;
+    use kr_plugin_catalogue::{
+        CapabilityCeiling, Catalogue, Enrolment, InstallationGrant, RepositoryId, RepositoryKind,
+    };
+
+    let published = tempfile::tempdir().expect("a directory on the internal disk");
+    let package = published.path().join("package");
+    write_package(&package);
+    let generation = generations::Generation::build(
+        published.path(),
+        generations::GenerationSpec {
+            package: Some(package),
+            ..generations::GenerationSpec::default()
+        },
+    )
+    .await;
+    let environment = host.tree.environment();
+    let directory = generation.directory();
+    let mut catalogue = Catalogue::open(
+        &environment.state_dir().join("catalogue"),
+        Arc::new(RepositoryTransport::local_only(
+            "this test reads its repository from disk",
+        )),
+    )
+    .expect("an openable catalogue");
+    let id = RepositoryId::new("development").expect("an identifier");
+    catalogue
+        .enrol(
+            Enrolment::new(
+                id.clone(),
+                RepositoryKind::Local,
+                directory_url(&directory.join("metadata")),
+                directory_url(&directory.join("targets")),
+                std::fs::read(directory.join("root.json")).expect("a trust root"),
+                kr_plugin_sdk::limits::RepositoryBudgets::defaults(),
+                CapabilityCeiling::default_ceiling(),
+            )
+            .expect("an enrollable repository"),
+            true,
+        )
+        .expect("the owner adopted the root");
+    catalogue.sync(&id).await.expect("a generation");
+    let version = kr_plugin_sdk::version::PackageVersion::parse("0.1.0").expect("a version");
+    let digest = catalogue
+        .index(&id)
+        .expect("activated")
+        .find(&the_plugin(), &version)
+        .expect("the package")
+        .manifest_digest;
+    catalogue
+        .install(
+            &id,
+            host.tree.environment_id(),
+            &the_plugin(),
+            &version,
+            digest,
+            InstallationGrant::none(),
+        )
+        .await
+        .expect("installed");
+    catalogue
+        .set_enabled(host.tree.environment_id(), &the_plugin(), true)
+        .await
+        .expect("enabled");
+}
+
+/// Waits for `check` to give something, and fails with `what` when it never does.
+async fn until<T, F, Fut>(what: &str, mut check: F) -> T
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Option<T>>,
+{
+    let started = Instant::now();
+    loop {
+        if let Some(found) = check().await {
+            return found;
+        }
+        assert!(
+            started.elapsed() < LIVENESS_DEADLINE,
+            "waited {:?} for {what}",
+            started.elapsed()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+impl Host {
+    /// The process of the plugin runtime this host's environment publishes, when one is.
+    fn plugin_host(&self) -> Option<kr_protocol::identity::ProcessStartIdentity> {
+        kr_plugin_service::launcher::read_descriptor(&self.tree.environment())
+            .ok()
+            .flatten()
+            .map(|descriptor| descriptor.process_start_identity)
+    }
+
+    /// What the plugin runtime says it holds, asked as a connection of this test's own.
+    async fn plugin_health(&self) -> Option<kr_plugin_service::protocol::HostHealth> {
+        let client = kr_plugin_service::client::PluginClient::connect(&self.tree.environment())
+            .await
+            .ok()?;
+        client.health().await.ok()
+    }
+
+    /// Waits until the plugin runtime holds `bindings` bindings, and returns what it reports.
+    async fn plugin_holding(&self, bindings: u64) -> kr_plugin_service::protocol::HostHealth {
+        until("the plugin runtime to hold the bindings", || async {
+            self.plugin_health()
+                .await
+                .filter(|health| health.live_bindings == bindings)
+        })
+        .await
+    }
+
+    /// Ends the plugin runtime this host's environment publishes, by the process recorded for it.
+    async fn end_the_plugin_host(&self) {
+        let Some(runtime) = self.plugin_host() else {
+            return;
+        };
+        let ended = Command::new("kill")
+            .arg(runtime.pid.get().to_string())
+            .status()
+            .expect("kill runs");
+        assert!(ended.success(), "the recorded runtime is ended");
+        until("the plugin runtime to end", || async {
+            matches!(
+                kr_ipc::identity::process_state(&runtime),
+                kr_ipc::identity::ProcessState::Ended
+            )
+            .then_some(())
+        })
+        .await;
+    }
+
+    /// A copy of this test's binary named for the program the example package recognises, placed
+    /// on the internal disk.
+    fn plugin_agent(&self) -> PathBuf {
+        let agent = self.scratch("agent").join("example-agent");
+        kr_ipc::testing::place_and_start_once(
+            &std::env::current_exe().expect("this test's own binary"),
+            &agent,
+            &["--exact", "the_stand_in_program", "--test-threads", "1"],
+        );
+        agent
+    }
+}
+
+/// The command line a process was started with, as the operating system reports it.
+fn command_of(process: &kr_protocol::identity::ProcessStartIdentity) -> String {
+    let output = Command::new("ps")
+        .args(["-o", "args=", "-p", &process.pid.get().to_string()])
+        .output()
+        .expect("ps runs");
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+/// Types the program the package recognises at a terminal's prompt, and returns its process once
+/// it is running. The worker finds the program in the terminal's foreground and binds the package.
+async fn start_agent(
+    host: &Host,
+    typing: &terminal::Terminal,
+    agent: &Path,
+) -> kr_protocol::identity::ProcessStartIdentity {
+    let running = host
+        .scratch("agent-running")
+        .join(format!("running-{}", kr_ipc::new_uuid()));
+    typing.type_line(&format!(
+        "{STAND_IN}=300 {STAND_IN_RUNNING}='{}' '{}' --exact the_stand_in_program \
+         --test-threads 1 --nocapture",
+        running.display(),
+        agent.display()
+    ));
+    let pid = until("the program the line started to run", || async {
+        std::fs::read_to_string(&running)
+            .ok()
+            .and_then(|said| said.trim().parse::<u32>().ok())
+    })
+    .await;
+    kr_ipc::identity::process_start_identity(pid).expect("the program runs")
+}
+
+/// KR-REQ-05.06, KR-REQ-26.06, KR-ACC-035: the plugin runtime the release before started outlives
+/// the update and serves the worker of a session of this release, which registers with it; and
+/// once that runtime is ended, the next session's worker asks the daemon of this release, which
+/// starts a runtime of this release.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_plugin_runtime_of_the_release_before_survives_the_update_and_is_replaced_by_this_releases()
+ {
+    let prepared = Updated::prepare(Setup {
+        plugin: true,
+        ..Setup::default()
+    })
+    .await;
+    let host_ref = &prepared.host;
+    let agent = host_ref.plugin_agent();
+    let first = terminal_for(
+        host_ref,
+        &prepared.kr_before(),
+        &["attach", &prepared.display],
+    );
+    first.ready().await;
+    start_agent(host_ref, &first, &agent).await;
+    host_ref.plugin_holding(1).await;
+    let old_runtime = host_ref
+        .plugin_host()
+        .expect("the release before started a runtime");
+    assert!(
+        command_of(&old_runtime).contains(&format!(
+            "/versions/{}/bin/kr-plugin-host",
+            prepared.one.name()
+        )),
+        "the runtime is the release before's: {}",
+        command_of(&old_runtime)
+    );
+
+    let updated = prepared.update().await;
+    let host = &updated.host;
+    assert_eq!(
+        host.plugin_host(),
+        Some(old_runtime.clone()),
+        "the update left the runtime alone"
+    );
+    host.plugin_holding(1).await;
+
+    // A session of this release: its worker registers with the runtime that is running.
+    let (second_display, second_session) = host.new_session(&updated.kr_now());
+    let second_worker = host.worker_process(second_session);
+    let second = terminal_for(host, &updated.kr_now(), &["attach", &second_display]);
+    second.ready().await;
+    start_agent(host, &second, &agent).await;
+    host.plugin_holding(2).await;
+    assert_eq!(
+        host.plugin_host(),
+        Some(old_runtime.clone()),
+        "the new worker registered with the runtime of the release before"
+    );
+
+    // The runtime of the release before ends, by the process recorded for it, and a session
+    // created after that gets a runtime of this release.
+    host.end_the_plugin_host().await;
+    until("the runtime of the release before to end", || async {
+        matches!(
+            kr_ipc::identity::process_state(&old_runtime),
+            kr_ipc::identity::ProcessState::Ended
+        )
+        .then_some(())
+    })
+    .await;
+    let (third_display, third_session) = host.new_session(&updated.kr_now());
+    let third_worker = host.worker_process(third_session);
+    let third = terminal_for(host, &updated.kr_now(), &["attach", &third_display]);
+    third.ready().await;
+    start_agent(host, &third, &agent).await;
+    let new_runtime = until("a runtime of this release to be published", || async {
+        host.plugin_host()
+            .filter(|published| *published != old_runtime)
+    })
+    .await;
+    assert!(
+        command_of(&new_runtime).contains(&format!(
+            "/versions/{}/bin/kr-plugin-host",
+            updated.two.name()
+        )),
+        "the new runtime is this release's: {}",
+        command_of(&new_runtime)
+    );
+    until("the new runtime to hold the binding", || async {
+        host.plugin_health()
+            .await
+            .filter(|health| health.live_bindings >= 1)
+    })
+    .await;
+
+    updated.the_worker_is_as_it_was().await;
+    host.end_the_plugin_host().await;
+    host.close(&updated.kr_now(), &third_display);
+    host.worker_ended(&third_worker).await;
+    host.close(&updated.kr_now(), &second_display);
+    host.worker_ended(&second_worker).await;
+    host.close(&updated.kr_before(), &updated.display);
+    host.worker_ended(&updated.worker).await;
+}
+
+/// KR-REQ-05.06, KR-REQ-26.06, KR-ACC-035: a program the package recognises, started in the session
+/// of the release before after the update, makes its worker ask the daemon of this release for the
+/// plugin runtime. The daemon starts one of this release, the worker registers with it, and a
+/// session of this release registers with the same runtime.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_worker_of_the_release_before_asks_this_releases_daemon_for_the_plugin_runtime() {
+    let updated = Updated::prepare(Setup {
+        plugin: true,
+        ..Setup::default()
+    })
+    .await
+    .update()
+    .await;
+    let host = &updated.host;
+    assert_eq!(
+        host.plugin_host(),
+        None,
+        "no program has wanted a runtime yet"
+    );
+    let agent = host.plugin_agent();
+    let old = terminal_for(host, &updated.kr_before(), &["attach", &updated.display]);
+    old.ready().await;
+    start_agent(host, &old, &agent).await;
+    host.plugin_holding(1).await;
+    let runtime = host.plugin_host().expect("the daemon started a runtime");
+    assert!(
+        command_of(&runtime).contains(&format!(
+            "/versions/{}/bin/kr-plugin-host",
+            updated.two.name()
+        )),
+        "the runtime is this release's: {}",
+        command_of(&runtime)
+    );
+
+    // A session of this release registers with the runtime that is running.
+    let (display, session_id) = host.new_session(&updated.kr_now());
+    let worker = host.worker_process(session_id);
+    let now = terminal_for(host, &updated.kr_now(), &["attach", &display]);
+    now.ready().await;
+    start_agent(host, &now, &agent).await;
+    host.plugin_holding(2).await;
+    assert_eq!(host.plugin_host(), Some(runtime), "one runtime serves both");
+
+    updated.the_worker_is_as_it_was().await;
+    host.end_the_plugin_host().await;
+    host.close(&updated.kr_now(), &display);
+    host.worker_ended(&worker).await;
     host.close(&updated.kr_before(), &updated.display);
     host.worker_ended(&updated.worker).await;
 }
