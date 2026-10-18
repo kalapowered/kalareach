@@ -1446,8 +1446,63 @@ struct OwnHold {
     held: Duration,
     /// The key was answered before the viewport report it followed.
     answered_first: bool,
-    /// Where the worker took the write into its input domain.
-    accepted: Option<Within>,
+    /// Where the worker took the write into its input domain, against the report's own hold of the
+    /// session.
+    accepted: AgainstReport,
+}
+
+/// Where an instant on a key's path fell against the session hold of the report sent just ahead of
+/// it on the same connection.
+#[derive(Clone, Copy)]
+enum AgainstReport {
+    /// Before the report took the session: the key did not wait for the report's commits to begin.
+    Before,
+    /// While the report held the session.
+    During(Within),
+    /// After the report had released the session.
+    After(Duration),
+    /// The report's hold was not recorded.
+    Unrecorded,
+}
+
+impl AgainstReport {
+    /// Places `at`, in nanoseconds on the recorder's clock, against the first hold of the session
+    /// that began after `sent`, which is the report's: nothing else mutates in this measurement.
+    fn of(spans: &[(u64, u64)], sent: u64, at: Option<u64>) -> Self {
+        let Some(at) = at else {
+            return Self::Unrecorded;
+        };
+        let Some((from, to)) = spans
+            .iter()
+            .filter(|(from, _)| *from >= sent)
+            .min_by_key(|(from, _)| *from)
+            .copied()
+        else {
+            return Self::Unrecorded;
+        };
+        if at < from {
+            Self::Before
+        } else if at <= to {
+            Self::During(Within {
+                into: Duration::from_nanos(at - from),
+                of: Duration::from_nanos(to - from),
+            })
+        } else {
+            Self::After(Duration::from_nanos(at - to))
+        }
+    }
+
+    fn describe(self) -> String {
+        match self {
+            Self::Before => "the write was taken before its report took the session".to_owned(),
+            Self::During(place) => Within::describe(Some(place), "the write was taken"),
+            Self::After(after) => format!(
+                "the write was taken {} after its report released the session",
+                milliseconds(after)
+            ),
+            Self::Unrecorded => "the report's hold of the session was not recorded".to_owned(),
+        }
+    }
 }
 
 impl OnItsOwnConnection {
@@ -1644,7 +1699,7 @@ async fn measure_recogniser_on_its_own_connection(
             } else {
                 "after"
             },
-            Within::describe(hold.accepted, "the write was taken")
+            hold.accepted.describe()
         ));
     }
     lines.push(format!(
@@ -1653,10 +1708,23 @@ async fn measure_recogniser_on_its_own_connection(
     ));
     lines.push(format!(
         "  viewport reports  {} sent and answered beside the {} holds; the key was answered \
-         before the report in {} of them",
+         before the report in {} of them, and taken before the report took the session in {}, \
+         while it held it in {} and after it released it in {}",
         own.viewports,
         own.holds.len(),
-        own.holds.iter().filter(|hold| hold.answered_first).count()
+        own.holds.iter().filter(|hold| hold.answered_first).count(),
+        own.holds
+            .iter()
+            .filter(|hold| matches!(hold.accepted, AgainstReport::Before))
+            .count(),
+        own.holds
+            .iter()
+            .filter(|hold| matches!(hold.accepted, AgainstReport::During(_)))
+            .count(),
+        own.holds
+            .iter()
+            .filter(|hold| matches!(hold.accepted, AgainstReport::After(_)))
+            .count()
     ));
     record::report(
         RECORD,
@@ -1702,6 +1770,7 @@ async fn recogniser_on_its_own_connection(
         for length in 1..delimiter.len() {
             let prefix = &delimiter[..length];
             expected.extend_from_slice(prefix);
+            let before_report = Instant::now();
             let viewport = send_viewport(hosted, &mut client, attachment_id).await?;
             let started = Instant::now();
             let key = send_key(
@@ -1738,7 +1807,13 @@ async fn recogniser_on_its_own_connection(
             } else {
                 format!("the {name} delimiter's prefix of {length} bytes, behind a viewport report")
             };
-            measured.push((what, held, answered_first, trace.offset(started)));
+            measured.push((
+                what,
+                held,
+                answered_first,
+                trace.offset(before_report),
+                trace.offset(started),
+            ));
         }
     }
     // A delimiter split across two frames, recognised once, the second half behind a report too.
@@ -1790,7 +1865,7 @@ async fn recogniser_on_its_own_connection(
         .collect();
     let holds = measured
         .into_iter()
-        .map(|(what, held, answered_first, began)| {
+        .map(|(what, held, answered_first, sent, began)| {
             let taken = recording
                 .events
                 .iter()
@@ -1801,7 +1876,7 @@ async fn recogniser_on_its_own_connection(
                 what,
                 held,
                 answered_first,
-                accepted: taken.and_then(|at| place(&spans, at)),
+                accepted: AgainstReport::of(&spans, sent, taken),
             }
         })
         .collect();

@@ -4484,7 +4484,7 @@ async fn a_lone_escape_sent_after_a_mutation_on_its_own_connection_reaches_the_a
     assert_eq!(
         answers.order,
         vec![escape, viewport],
-        "the Escape was answered ahead of the mutation it followed"
+        "the Escape was not answered ahead of the mutation it followed"
     );
     disk.stop();
     rig.close().await;
@@ -4544,7 +4544,7 @@ async fn a_lone_escape_sent_after_a_read_waiting_for_the_session_reaches_the_app
     assert_eq!(
         answers.order,
         vec![escape, read],
-        "the Escape was answered ahead of the read it followed"
+        "the Escape was not answered ahead of the read it followed"
     );
     rig.close().await;
 }
@@ -4660,7 +4660,7 @@ async fn the_frames_sent_around_a_mutation_on_its_own_connection_are_each_answer
 
 /// KR-PERF-002: a key frame cut part way when the mutation it follows ends is read whole.
 ///
-/// The worker reads ahead of the mutation, and the mutation ends while the key is part read. The
+/// The worker reads ahead of the mutation, and the mutation can end while the key is part read. The
 /// rest of the key arrives afterwards and the key is answered once, accepted and delivered.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_key_frame_cut_part_way_when_the_mutation_before_it_ends_is_read_whole() {
@@ -4680,10 +4680,9 @@ async fn a_key_frame_cut_part_way_when_the_mutation_before_it_ends_is_read_whole
         .write_frame(&bytes[..cut])
         .await
         .expect("the first part is written");
-    // Time for the worker to take the first part. The case does not depend on it having: a worker
-    // that has not taken it yet reads the whole frame afterwards, and both are right.
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
+    // The task reading ahead takes the first part while the mutation finishes its remaining
+    // commits, and a task that has not yet taken it leaves the whole frame to the loop. The frame
+    // is read whole and answered once either way, which is all this case asserts.
     standing.release.send(()).expect("lets the stall go");
     let mut answers = Answers::default();
     let answer = answers

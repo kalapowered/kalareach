@@ -4427,9 +4427,14 @@ impl WorkerService {
     ///
     /// A keystroke takes the input domain and the connection's facts and nothing else, on whatever
     /// thread it arrived on, so it is served the same way by the connection's own loop and by the
-    /// task that serves keystrokes while that loop is busy with a request that waits. What a read
-    /// does after its checks, and a keystroke cannot, is end the subscription and the snapshot it
-    /// started: a keystroke starts neither.
+    /// task that serves keystrokes while that loop is busy with a request that waits.
+    ///
+    /// A read whose authority check fails after it ran also ends the subscription and the snapshot
+    /// reading it started, and a keystroke cannot reach those. That is safe because the check can
+    /// fail only on a controller connection, which is withdrawn when it does and never passes the
+    /// check again, and because the loop takes a subscription in the pass that sets it, so none
+    /// is waiting when a keystroke is served. A change that lets the check fail and pass again
+    /// has to give a keystroke the same clearing.
     fn keystroke(&self, facts: &ConnectionFacts, request: &Request, caller: &Caller) -> Served {
         // When the request reached this handler. A held prefix's deadline runs from here, so
         // nothing a request waits for on its way to the input domain, the checks of a local owner's

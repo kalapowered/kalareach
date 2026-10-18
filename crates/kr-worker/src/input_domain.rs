@@ -41,12 +41,12 @@
 //!
 //! A keystroke reaches the domain on the connection it was sent on, and that connection's loop can
 //! be busy with an earlier request of the same client: a mutation's commits, or a read waiting for
-//! the session. The loop serves a keystroke from the domain and from a small copy of the
-//! connection's facts, so while such a request runs a task beside it reads the connection ahead and
-//! serves the keystrokes it finds. A keystroke goes ahead of a read and of a mutation that leaves
-//! the lease, the capabilities, the fence, the paste framing and the attachments alone; it never
-//! goes ahead of an earlier keystroke or of a request that could change what it meets. Taking the
-//! domain is all it does, in the order above.
+//! the session. A keystroke is served from the domain and from the few facts of the connection it
+//! reads, which the connection keeps apart from the rest of its state, so while such a request runs
+//! a task beside it reads the connection ahead and serves the keystrokes it finds. A keystroke goes
+//! ahead of a read and of a resize, a transfer of the size, a change of what an attachment claims
+//! and a viewport report; it never goes ahead of an earlier keystroke or of any other request.
+//! Taking the domain is all it does, in the order above.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};

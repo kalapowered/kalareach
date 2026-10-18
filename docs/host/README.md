@@ -2254,12 +2254,16 @@ rather than an admitted action, so no receipt, intent or result is written for a
 nothing replays one. Nor is delivery proof of effect: bytes written into a pseudo-terminal whose
 application is not reading have reached the terminal and done nothing at all.
 
-Keystroke batches are processed without waiting for work on the same connection that cannot change
-what the batch meets, allowing the worker to read past a viewport report, a resize or a read that is
-waiting for the disk or the session, and to pass the batch to the recogniser immediately. A batch
-sent after an attach, a detach, an input acquire, release or interrupt, or a close still waits for
-it, to ensure that the batch meets the state the client asked for. A key sent right after a resize
-can reach the application before the pseudo-terminal has its new size.
+Keystroke batches do not wait for a read, a viewport report, a resize, a transfer of the size or a
+change of an attachment's claim that comes before them on the same connection. The client sends its
+keys, its viewport reports and its resizes on one connection. The worker reads ahead past such a
+request while it waits for the disk or the session, and then passes the batch to the recogniser
+immediately. The worker reads ahead past sixteen of these requests at most; a batch behind more of
+them waits for the request that is running. Every other mutation, an attach, a detach, an input
+acquire, release or interrupt, or a close among them, and every frame that is not a request still
+holds a batch back, so the batch meets the state the client asked for. A key sent right after a
+resize can reach the application before the pseudo-terminal has its new size, and a read sent before
+a key can show what the key did.
 
 ## Who owns the size
 

@@ -26,10 +26,12 @@
 //! # Limits
 //!
 //! The task reads ahead of at most [`MOST_HELD`] frames that it cannot serve; a key behind more
-//! than that waits for the request, as it did before. While a client keeps the connection's loop
-//! supplied with frames the task handed back, the loop does not look at its withdrawal, window
-//! renewal, keepalive or finished-preparation branches; that ends with the burst and touches no
-//! other connection.
+//! than that waits for the request, as it did before. The task ends when the request does, and the
+//! loop writes the request's answer after that, so a key that arrives while a large answer is being
+//! written to a slow peer waits for the write, up to the bound on a write. While a client keeps the
+//! connection's loop supplied with frames the task handed back, the loop does not look at its
+//! withdrawal, window renewal, keepalive or finished-preparation branches; that ends with the burst
+//! and touches no other connection.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -244,7 +246,10 @@ async fn run(
     }
 }
 
-/// Serves one key and writes its answer, and says whether the answer was written whole.
+/// Serves one key and writes its answer, and says whether the connection can go on: it cannot when
+/// the answer was not written, whether the stream was cut part way or nothing of it was written (a
+/// withdrawal, an answer that could not be encoded, the local owner's lease refusing it). The loop
+/// ends the connection in each case, as it does when an answer of its own is not written.
 async fn serve(
     service: &WorkerService,
     facts: &ConnectionFacts,
