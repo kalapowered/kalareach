@@ -27,7 +27,7 @@ use kr_protocol::update::ReleaseName;
 pub const MARKER: &str = "KR_HELPER_FROM";
 
 /// A worker of a release other than this `kr`'s, as it stated itself.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Other {
     /// What the worker said it is, where it said anything.
     pub stated: Option<LocalBuild>,
@@ -98,7 +98,6 @@ impl Other {
 }
 
 /// The `kr` of another release in this host's store, and the hold that keeps the release there.
-#[derive(Debug)]
 pub struct Stored {
     /// The release.
     pub release: ReleaseName,
@@ -129,20 +128,31 @@ impl Stored {
     }
 }
 
+/// A worker that answered its hello and proved it is the worker its descriptor names, and what it
+/// stated of its build.
+pub struct Stated {
+    /// What the worker said it is, where it said anything.
+    pub build: Option<LocalBuild>,
+    /// The connection the statement came over, which a command that goes on to read this worker
+    /// uses rather than making a second one.
+    pub client: kr_ipc::client::LocalClient,
+}
+
 /// What the worker behind `descriptor` states of its build, when it answers its hello and proves it
 /// is the worker the descriptor names inside [`STATED_WITHIN`]; none when it does not, and then the
 /// command goes on to say what is wrong in its own way.
-pub async fn stated_by(
-    descriptor: &kr_protocol::worker::WorkerDescriptor,
-) -> Option<Option<LocalBuild>> {
-    let opened = tokio::time::timeout(
+pub async fn stated_by(descriptor: &kr_protocol::worker::WorkerDescriptor) -> Option<Stated> {
+    let client = tokio::time::timeout(
         STATED_WITHIN,
         crate::resolve::open_worker(descriptor, crate::build_id()),
     )
     .await
     .ok()?
     .ok()?;
-    Some(opened.acknowledgement().build.clone())
+    Some(Stated {
+        build: client.acknowledgement().build.clone(),
+        client,
+    })
 }
 
 /// Refuses to read a worker that runs another release, and says which release and which command
@@ -184,7 +194,7 @@ pub fn hand_over(stated: Option<&LocalBuild>, arguments: &[OsString]) -> Option<
 }
 
 /// A worker this command did not read, because it runs another release.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Unread {
     /// The session, as a person names it.
     pub display: u64,
@@ -218,5 +228,25 @@ impl Unread {
                 release
             ),
         }
+    }
+}
+
+// What a worker stated of its build, and a release name read from it, are text that arrived, so
+// these are shown by their type alone.
+impl std::fmt::Debug for Other {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("Other").finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for Stored {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("Stored").finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for Unread {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("Unread").finish_non_exhaustive()
     }
 }

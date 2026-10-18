@@ -1005,17 +1005,27 @@ impl Drop for UndeliveredTyping {
 
 /// Attaches this terminal to a session and drives it until the attachment ends.
 ///
+/// `opened` is a connection the caller already made to the session's worker, and answered the hello
+/// and proof on; the attachment goes over it. Without one the worker is opened after this terminal
+/// has been asked what it is.
+///
 /// # Errors
 ///
 /// Returns the host's refusal, a terminal failure, or the failure the attachment ended with.
 pub async fn run(
     descriptor: &WorkerDescriptor,
+    opened: Option<kr_ipc::client::LocalClient>,
     owed: UndeliveredTyping,
     options: AttachOptions,
 ) -> Result<(AttachOutcome, SessionId)> {
     run_over(
         Attaching::from(descriptor),
-        || crate::resolve::open_worker(descriptor, crate::build_id()),
+        || async move {
+            match opened {
+                Some(client) => Ok(client),
+                None => crate::resolve::open_worker(descriptor, crate::build_id()).await,
+            }
+        },
         owed,
         options,
     )

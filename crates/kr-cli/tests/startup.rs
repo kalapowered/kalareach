@@ -1906,7 +1906,13 @@ async fn a_worker_that_withholds_its_attachments(host: &Standalone, session_id: 
                             },
                             capabilities: CanonicalSet::new(),
                             max_receive: kr_protocol::hello::ReceiveLimits::default(),
-                            build: None,
+                            // A worker states the build it runs, and `kr status` reads only a worker
+                            // of its own compatibility level.
+                            build: Some(kr_protocol::local::LocalBuild {
+                                build_id: BuildId::new("kr-worker/0.1.0")
+                                    .expect("a build identifier"),
+                                protocol_version: kr_protocol::hello::PACKAGE_VERSION,
+                            }),
                         }))
                     }
                     ControlFrame::VerifyChallenge(challenge) => ControlFrame::VerifyProof(

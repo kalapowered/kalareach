@@ -172,32 +172,39 @@ enum Resumed {
 /// replaced began when it was started in place of one.
 #[cfg(unix)]
 fn resumed(started: std::time::Instant) -> Resumed {
-    resumed_at(
+    resumed_by(
         started,
         crate::helper::Marker::of_this_process(),
-        kr_ipc::clock::boot_elapsed_ms(),
+        std::time::Instant::now,
+        kr_ipc::clock::boot_elapsed_ms,
     )
 }
 
-/// [`resumed`] given the marker and what the continuous clock says.
+/// [`resumed`] given the marker and the two clocks: this process's own, and the machine's
+/// continuous one that the marker's deadline is kept on.
+///
+/// Neither is read when there is no marker. This process's clock is read first and the machine's
+/// second, so that a pause between the two readings shortens what is left instead of lengthening
+/// it.
 #[cfg(unix)]
-fn resumed_at(
+fn resumed_by(
     started: std::time::Instant,
     marker: Option<crate::helper::Marker>,
-    now_ms: u64,
+    own_now: impl FnOnce() -> std::time::Instant,
+    machine_now: impl FnOnce() -> u64,
 ) -> Resumed {
     use crate::helper::Standing;
 
-    match marker.and_then(|marker| marker.standing(now_ms)) {
+    let Some(marker) = marker else {
+        return Resumed::At(started);
+    };
+    let now = own_now();
+    match marker.standing(machine_now()) {
         None => Resumed::At(started),
         Some(Standing::Passed) => Resumed::Passed,
         Some(Standing::Left(left)) => {
             let spent = HOOK_DEADLINE.saturating_sub(left);
-            Resumed::At(
-                std::time::Instant::now()
-                    .checked_sub(spent)
-                    .unwrap_or(started),
-            )
+            Resumed::At(now.checked_sub(spent).unwrap_or(started))
         }
     }
 }
@@ -235,6 +242,10 @@ fn run_with(
             }
         },
     };
+    // A forwarder being started in this one's place is waited for, and one not yet started is not
+    // started once the answer is out: only one process answers.
+    #[cfg(unix)]
+    crate::helper::claim_answer();
     answer();
     let answered = std::time::Instant::now();
     if let Some(failure) = failure {
@@ -642,12 +653,14 @@ mod tests {
             })
         };
         // On its own: the whole deadline, from its own start.
-        let Resumed::At(own) = resumed_at(started, None, 10_000) else {
+        let Resumed::At(own) = resumed_by(started, None, std::time::Instant::now, || 10_000) else {
             panic!("a hook on its own is given its deadline");
         };
         assert_eq!(own, started);
         // A hundred and fifty milliseconds left of five hundred: three hundred and fifty spent.
-        let Resumed::At(began) = resumed_at(started, marker(10_150), 10_000) else {
+        let Resumed::At(began) =
+            resumed_by(started, marker(10_150), std::time::Instant::now, || 10_000)
+        else {
             panic!("a hook with time left is given it");
         };
         let spent = std::time::Instant::now().saturating_duration_since(began);
@@ -658,11 +671,11 @@ mod tests {
         assert!(HOOK_DEADLINE.saturating_sub(spent) <= Duration::from_millis(150));
         // The deadline ended, exactly and before.
         assert!(matches!(
-            resumed_at(started, marker(10_000), 10_000),
+            resumed_by(started, marker(10_000), std::time::Instant::now, || 10_000),
             Resumed::Passed
         ));
         assert!(matches!(
-            resumed_at(started, marker(9_000), 10_000),
+            resumed_by(started, marker(9_000), std::time::Instant::now, || 10_000),
             Resumed::Passed
         ));
         // A marker with no deadline, as a channel's, leaves the hook's own start.
@@ -671,9 +684,69 @@ mod tests {
             deadline_ms: None,
         });
         assert!(matches!(
-            resumed_at(started, channel, 10_000),
+            resumed_by(started, channel, std::time::Instant::now, || 10_000),
             Resumed::At(at) if at == started
         ));
+    }
+
+    /// A run claims its answer before it writes it, so a forwarder that has not yet been started in
+    /// its place is not started afterwards.
+    #[cfg(unix)]
+    #[test]
+    fn a_run_claims_its_answer_before_it_writes_it() {
+        let claimed = std::cell::Cell::new(None);
+        run_with(
+            std::time::Instant::now(),
+            |_| Ok(()),
+            || claimed.set(Some(crate::helper::has_answered())),
+            |_| {},
+        );
+        assert_eq!(claimed.get(), Some(true));
+    }
+
+    /// The hook's own clock is read before the machine's, so a pause between the two readings
+    /// shortens what a hook started in place of another is given, and neither is read for a hook
+    /// started on its own.
+    #[cfg(unix)]
+    #[test]
+    fn a_hook_started_in_place_of_another_reads_its_own_clock_before_the_machines() {
+        use crate::helper::Marker;
+        use std::cell::RefCell;
+
+        let started = std::time::Instant::now();
+        let readings = RefCell::new(Vec::new());
+        let marker = Some(Marker {
+            from: "0.1.0+aaaaaaaaaaaa".to_owned(),
+            deadline_ms: Some(10_150),
+        });
+        let _ = resumed_by(
+            started,
+            marker,
+            || {
+                readings.borrow_mut().push("own");
+                std::time::Instant::now()
+            },
+            || {
+                readings.borrow_mut().push("machine");
+                10_000
+            },
+        );
+        assert_eq!(*readings.borrow(), ["own", "machine"]);
+
+        readings.borrow_mut().clear();
+        let _ = resumed_by(
+            started,
+            None,
+            || {
+                readings.borrow_mut().push("own");
+                std::time::Instant::now()
+            },
+            || {
+                readings.borrow_mut().push("machine");
+                10_000
+            },
+        );
+        assert!(readings.borrow().is_empty());
     }
 
     /// A run waits for its diagnostic no later than its deadline, or the allowance after an answer

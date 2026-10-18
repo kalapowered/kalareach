@@ -3661,7 +3661,7 @@ async fn kr_req_10_49_a_retried_close_is_answered_and_the_kept_answer_is_settled
 
 /// KR-REQ-10.49: the close result a worker kept inside its answer is read in the shape of the
 /// worker's level too. One that does not read there is refused by name and the close is not sent
-/// again; the daemon settles nothing from it.
+/// again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_10_49_a_kept_close_result_that_does_not_read_is_refused_not_passed_on() {
     use kr_protocol::envelope::ControlFrame;

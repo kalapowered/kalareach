@@ -951,6 +951,37 @@ async fn a_kept_answer_whose_question_moved_is_retired_unsent() {
     assert_eq!(host.answers_received(), 0, "nothing was sent");
 }
 
+/// A kept answer is decided on only by a worker whose frames this command reads. A worker of
+/// another release answers in a shape this command is not sure to read, so a question that looks
+/// to have moved on in its reply retires nothing: the answer stays kept and nothing is sent. The
+/// control is the same question read by a worker that states this build, which retires the answer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_worker_of_another_release_retires_no_kept_answer() {
+    let host = kept_answer().await;
+    let question = host.question();
+    {
+        let mut state = host.state();
+        state.behaviour = Behaviour::IsOfAnEarlierBuild;
+        state.question.revision = QuestionRevision::new(2);
+    }
+
+    let shown = host.kr(&["question", "drafts"]);
+    let shown = String::from_utf8_lossy(&shown.stdout);
+    assert!(!shown.contains("retired"), "{shown}");
+    assert!(host.kept().is_file(), "the answer is still kept");
+    let (status, document) = host.json(&["question", "send", &question]);
+    assert_ne!(status, Some(0), "{document}");
+    assert!(host.kept().is_file(), "and still kept after a send");
+    assert_eq!(host.answers_received(), 0, "nothing was sent");
+
+    host.behave(Behaviour::Serves);
+    let shown = host.kr(&["question", "drafts"]);
+    let shown = String::from_utf8_lossy(&shown.stdout);
+    assert!(shown.contains("retired"), "{shown}");
+    assert!(!host.kept().exists(), "a worker that is read retires it");
+    assert_eq!(host.answers_received(), 0);
+}
+
 /// KR-REQ-11.63: an answer the worker took and whose reply was lost is kept as an answer whose
 /// outcome is not known, and is never called unsent. The next `kr question drafts` finds the
 /// question answered and retires it, so it is never sent twice.

@@ -875,7 +875,22 @@ impl Workers {
             });
         };
         match open_worker(&descriptor, self.build_id.clone()).await {
-            Ok(client) => Ok(client),
+            // A worker of another release is not read: its questions are in the shape of its own
+            // release, so nothing is decided about a kept answer from it, and none is retired.
+            Ok(client) => match Other::of(client.acknowledgement().build.as_ref()) {
+                None => Ok(client),
+                Some(other) => {
+                    self.failed(
+                        ErrorCode::UnsupportedSchema,
+                        Unread {
+                            display: descriptor.display_number.get(),
+                            other,
+                        }
+                        .said("question"),
+                    );
+                    Err(ClientError::ConnectionEnded)
+                }
+            },
             // A worker that cannot be reached may have ended with its session; only a closure
             // its daemon keeps says so.
             Err(error) => match self.record(session_id, true).await {

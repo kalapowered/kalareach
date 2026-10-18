@@ -4094,6 +4094,22 @@ fn kr_goes_on_as_it_always_did_where_no_other_kr_is_for_the_worker() {
     );
     assert!(!releases.recorded.exists(), "no other kr was started");
     window.wait_until_put_back("the terminal to be back as kr found it");
+    // A detach is refused the same way, and the worker is sent nothing.
+    let ran = releases.run(&host, &["detach", "900"], Some("0.1.0+aaaaaaaaaaaa"));
+    assert_eq!(
+        ran.status.code(),
+        Some(8),
+        "{}",
+        String::from_utf8_lossy(&ran.stderr)
+    );
+    assert!(
+        worker
+            .asked()
+            .iter()
+            .all(|method| method != "session.detach"),
+        "nothing was sent to the worker: {:?}",
+        worker.asked()
+    );
     drop(worker);
 
     // A worker whose release the store lacks.
@@ -4225,10 +4241,16 @@ fn the_contact_tools_serve_when_the_session_they_look_for_does_not_answer() {
         )
         .expect("the request");
     input.flush().expect("sent");
-    let mut line = String::new();
-    BufReader::new(child.stdout.take().expect("their output"))
-        .read_line(&mut line)
-        .expect("their answer");
+    let output = child.stdout.take().expect("their output");
+    let (first, answered) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut line = String::new();
+        let _ = BufReader::new(output).read_line(&mut line);
+        let _ = first.send(line);
+    });
+    let line = answered
+        .recv_timeout(LIVENESS_DEADLINE)
+        .unwrap_or_else(|_| String::from("no answer"));
     drop(input);
     let _ = child.kill();
     let _ = child.wait();
@@ -4237,6 +4259,77 @@ fn the_contact_tools_serve_when_the_session_they_look_for_does_not_answer() {
         "the tools answered the request after they gave up looking: {line}"
     );
     assert!(!releases.recorded.exists(), "no other kr was started");
+}
+
+/// Tools that find a session whose worker runs another release, and that no `kr` of that release
+/// takes over, refuse each call by name and create nothing in the session.
+#[test]
+fn the_contact_tools_refuse_a_worker_of_another_release_that_no_kr_takes_over() {
+    use std::io::{BufRead as _, BufReader};
+
+    let host = Host::start();
+    let releases = Releases::new(&host);
+    let worker = AnotherBuild::start(&host, releases.stated());
+    let mut command = std::process::Command::new(&releases.kr);
+    command
+        .args(["agent-tools", "--stdio"])
+        .env_clear()
+        .envs(host.variables())
+        // Set, as it is for a `kr` started in another's place: the tools do not hand over again.
+        .env("KR_HELPER_FROM", "0.1.0+aaaaaaaaaaaa")
+        .current_dir(host.root())
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+    let mut child = command.spawn().expect("the tools start");
+    let mut input = child.stdin.take().expect("their input");
+    let output = child.stdout.take().expect("their output");
+    let (lines, read) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(output).lines().map_while(Result::ok) {
+            if lines.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    input
+        .write_all(
+            b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\
+              \"protocolVersion\":\"2025-06-18\",\"capabilities\":{},\
+              \"clientInfo\":{\"name\":\"test\",\"version\":\"0\"}}}\n\
+              {\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n\
+              {\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\
+              \"name\":\"send_notification\",\"arguments\":{\"dedup_id\":\"refused\",\
+              \"text\":\"done\",\"severity\":\"info\"}}}\n",
+        )
+        .expect("the requests");
+    input.flush().expect("sent");
+    let answer = loop {
+        let line = read
+            .recv_timeout(LIVENESS_DEADLINE)
+            .expect("the tools answered the call");
+        let document: Value = serde_json::from_str(&line).expect("a message");
+        if document["id"] == 2 {
+            break document;
+        }
+    };
+    drop(input);
+    let _ = child.kill();
+    let _ = child.wait();
+    assert_eq!(answer["result"]["isError"], true, "{answer}");
+    assert_eq!(
+        answer["result"]["structuredContent"]["code"], "UNSUPPORTED_SCHEMA",
+        "{answer}"
+    );
+    assert!(!releases.recorded.exists(), "no other kr was started");
+    assert!(
+        worker
+            .asked()
+            .iter()
+            .all(|method| method == "question.read_own"),
+        "nothing but the probe every worker is sent: {:?}",
+        worker.asked()
+    );
 }
 
 /// A command that reads a worker of another release's questions does not: it says which session it
@@ -4268,6 +4361,20 @@ fn the_question_commands_say_which_worker_they_did_not_read_and_who_does() {
             ],
         );
     }
+    {
+        let command = ["status", "900"];
+        let ran = releases.run(&host, &command, None);
+        assert_eq!(
+            ran.status.code(),
+            Some(8),
+            "{command:?}: {}",
+            String::from_utf8_lossy(&ran.stderr)
+        );
+        says_each(
+            &String::from_utf8_lossy(&ran.stderr),
+            &["session 900 was not read", "kr-worker/0.2.0+bbbbbbbbbbbb"],
+        );
+    }
     let listed = releases.run(&host, &["--json", "question", "list"], None);
     assert!(
         listed.status.success(),
@@ -4278,11 +4385,11 @@ fn the_question_commands_say_which_worker_they_did_not_read_and_who_does() {
     assert_eq!(document["questions"], serde_json::json!([]));
     assert_eq!(document["unread"].as_array().map(Vec::len), Some(1));
     assert!(
-        worker
-            .asked()
-            .iter()
-            .all(|method| method != "question.read"),
-        "no question read was sent: {:?}",
+        worker.asked().iter().all(|method| !matches!(
+            method.as_str(),
+            "question.read" | "session.read" | "session.close"
+        )),
+        "nothing of the session was read or closed: {:?}",
         worker.asked()
     );
 }

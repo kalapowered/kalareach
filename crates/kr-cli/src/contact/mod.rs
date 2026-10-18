@@ -848,6 +848,20 @@ impl Contact {
             return Ok(bound.clone());
         }
         let bound = bind::discover(&self.build_id).await?;
+        // A worker of another release answers in a shape these tools do not read, and no tool of
+        // its release was started in their place: each call says so and creates nothing.
+        if let Some(stated) = crate::helper::stated_by(&bound.descriptor).await
+            && let Some(other) = crate::helper::Other::of(stated.build.as_ref())
+        {
+            return Err(CliError::Refused(kr_client::error::refusal(
+                ErrorCode::UnsupportedSchema,
+                crate::helper::Unread {
+                    display: bound.descriptor.display_number.get(),
+                    other,
+                }
+                .said("agent-tools"),
+            )));
+        }
         *held = Some(bound.clone());
         Ok(bound)
     }
@@ -876,7 +890,8 @@ impl ServerHandler for Contact {
     }
 }
 
-/// How long the tools look for the session they serve before they start serving without a hand-over.
+/// How long the tools look for the session they serve, and for what its worker states of its build,
+/// before they start serving without a hand-over.
 pub const DISCOVERY_BOUND: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Runs the contact tools over this process's standard input and output.
@@ -888,14 +903,23 @@ pub async fn run_stdio(build_id: BuildId) -> crate::error::Result<()> {
     // Before anything is read from standard input: a session whose worker runs another release is
     // served by that release's own tools. A session none holds is the tools' own answer, call by
     // call, so a discovery that finds nothing in time goes on to serve.
-    if let Ok(Ok(bound)) =
-        tokio::time::timeout(DISCOVERY_BOUND, crate::bind::discover(&build_id)).await
-        && let Some(stated) = crate::helper::stated_by(&bound.descriptor).await
-    {
-        let _ =
-            crate::helper::hand_over(stated.as_ref(), &["agent-tools".into(), "--stdio".into()]);
+    let contact = Contact::new(build_id.clone());
+    let looked = tokio::time::timeout(DISCOVERY_BOUND, async {
+        let bound = crate::bind::discover(&build_id).await.ok()?;
+        let stated = crate::helper::stated_by(&bound.descriptor).await?;
+        Some((bound, stated))
+    })
+    .await;
+    if let Ok(Some((bound, stated))) = looked {
+        let _ = crate::helper::hand_over(
+            stated.build.as_ref(),
+            &["agent-tools".into(), "--stdio".into()],
+        );
+        // The session is known now, and a worker this process reads is not looked for again.
+        if crate::helper::Other::of(stated.build.as_ref()).is_none() {
+            *contact.bound.lock().await = Some(bound);
+        }
     }
-    let contact = Contact::new(build_id);
     let calls = Arc::clone(&contact.calls);
     let transport = ServedTransport {
         inner: rmcp::transport::async_rw::AsyncRwTransport::new_server(

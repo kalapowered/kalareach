@@ -36,10 +36,12 @@ pub enum Command {
     /// Create a session.
     #[command(visible_alias = "n")]
     New(NewArguments),
-    /// Attach to an existing session. Never resumes or creates a replacement.
+    /// Attach to an existing session. Never resumes or creates a replacement. A session whose
+    /// worker is of another compatibility level is attached through the `kr` of its release.
     #[command(visible_alias = "a")]
     Attach(AttachArguments),
-    /// Detach this attachment.
+    /// Detach this attachment. A session whose worker is of another compatibility level is
+    /// detached through the `kr` of its release.
     #[command(visible_alias = "d")]
     Detach(DetachArguments),
     /// Close a session and terminate the processes it owns.
@@ -57,7 +59,8 @@ pub enum Command {
     /// Install the contact skill and its tool configuration for an agent.
     #[command(subcommand)]
     Skill(SkillCommand),
-    /// Run the contact tools for the agent that launched this process.
+    /// Run the contact tools for the agent that launched this process. Tools in a session whose
+    /// worker is of another compatibility level are served by the `kr` of its release.
     AgentTools(AgentToolsArguments),
     /// Write a closed session's retained output to a file you name.
     Export(ExportArguments),

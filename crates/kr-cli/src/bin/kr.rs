@@ -294,6 +294,7 @@ async fn run(cli: Cli) -> Result<Completion> {
             };
             // A worker of another release is reached by that release's own kr, with the session
             // named by its identifier: this one does not read its frames.
+            let mut opened = None;
             if let Some(stated) = kr_cli::helper::stated_by(&descriptor).await {
                 let mut handed = vec!["attach".into(), descriptor.session_id.to_string().into()];
                 for (set, flag) in [
@@ -305,10 +306,13 @@ async fn run(cli: Cli) -> Result<Completion> {
                         handed.push(flag.into());
                     }
                 }
-                let _ = kr_cli::helper::hand_over(stated.as_ref(), &with_json(handed, cli.json));
+                let _ =
+                    kr_cli::helper::hand_over(stated.build.as_ref(), &with_json(handed, cli.json));
+                opened = Some(stated.client);
             }
             let (outcome, session_id) = kr_cli::session::run(
                 &descriptor,
+                opened,
                 kr_cli::session::UndeliveredTyping::new(0),
                 AttachOptions {
                     take_geometry: arguments.take_geometry,
@@ -336,6 +340,12 @@ async fn run(cli: Cli) -> Result<Completion> {
                     client.acknowledgement().build.as_ref(),
                     &with_json(handed, cli.json),
                 );
+                // Not handed over, and not a worker this one reads: nothing is sent to it.
+                kr_cli::helper::read_only_same(
+                    client.acknowledgement().build.as_ref(),
+                    descriptor.display_number.get(),
+                    "detach",
+                )?;
             }
             let attachment_id = match arguments.attachment.as_deref() {
                 Some(text) => Some(text.parse().map_err(|_| {
@@ -1353,6 +1363,7 @@ async fn present(
             let (_, descriptor) = find(paths, &selector, Some(created.session.environment_id))?;
             let (outcome, _) = kr_cli::session::run(
                 &descriptor,
+                None,
                 owed,
                 AttachOptions {
                     // A terminal that created the session is the session's terminal: it claims the

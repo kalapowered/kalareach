@@ -257,8 +257,9 @@ async fn kr_req_12_18_the_channel_negotiates_and_carries_frames_both_ways_and_no
 /// read them, recorded in `channel-frames-0.74.json` (a file, not frames this build wrote): the
 /// approval this forwarder relays is the one that worker reads, and the verdict that worker wrote,
 /// which carries no `jsonrpc` member, reaches Claude Code as a notification of the same method and
-/// parameters. A worker of that release is reached by this forwarder directly, so these frames are
-/// the whole of what the two read of each other.
+/// parameters. A worker of that release is reached by this forwarder directly. That worker carries
+/// no message into the session (it refuses to), so no such frame was recorded; the case above
+/// checks the message this forwarder reads.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn kr_req_12_18_the_frames_of_a_worker_of_the_release_before_cross_as_it_wrote_and_read_them()
 {
