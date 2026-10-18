@@ -23,7 +23,7 @@ Since running sessions continue to use the worker process that started them, it 
 <!-- retained-levels:begin -->
 | Level | Release | Built |
 | --- | --- | --- |
-| 0.74 | 0.74.0+d59b70150cd2 | 2026-10-17T18:47:29+02:00 |
+| 0.74 | 0.74.0+7643db0083b2 | 2026-10-18T15:41:58+02:00 |
 <!-- retained-levels:end -->
 
 The day a release was built is the committer date of its commit.
