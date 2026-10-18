@@ -3968,6 +3968,7 @@ mod tests {
                 device_id: DeviceId::new(Uuid::from_bytes([0x33; 16])),
                 updated_at_ms: TimestampMs::new(1_764_000_000_000),
                 body: SyncBody::Settings(SyncSettings::default()),
+                went_over: Vec::new(),
             })
             .expect("stored");
         let staged = store

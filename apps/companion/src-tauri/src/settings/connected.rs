@@ -130,8 +130,33 @@ enum Listing {
     /// gave the right has run out or been revoked. Such a host is not this computer's to ask, and
     /// is not one that failed to answer.
     Refused,
-    /// It did not answer in time, or could not be reached.
+    /// It did not answer in time, could not be reached, or refused for a reason that says nothing
+    /// of its devices.
     Silent,
+}
+
+impl Listing {
+    /// What a refusal with `code` says. Only the refusal to list the host's devices to this
+    /// computer is an answer about them. A host that refuses for another reason, such as a protocol
+    /// this computer does not speak or a limit it has reached, may be the one that lists a device,
+    /// so it counts as one that did not answer.
+    fn of_refusal(code: ErrorCode) -> Self {
+        if code == ErrorCode::PermissionDenied {
+            Self::Refused
+        } else {
+            Self::Silent
+        }
+    }
+
+    /// What a failed connection to a host says. A host that does not find this computer paired
+    /// answers the hello as it would an unpaired peer, which this computer ends itself, so it
+    /// reads as a connection lost, as a host that is asleep does.
+    fn of_link(error: &LinkError) -> Self {
+        match error {
+            LinkError::Refused(refusal) => Self::of_refusal(refusal.code),
+            _ => Self::Silent,
+        }
+    }
 }
 
 /// What a host lists as its devices, asked over `session`.
@@ -148,9 +173,7 @@ async fn listed(session: &Arc<Session>) -> Listing {
     .await;
     match asked {
         Ok(Ok(list)) => Listing::Listed(list),
-        Ok(Err(ClientError::Host(refused))) if refused.code == ErrorCode::PermissionDenied => {
-            Listing::Refused
-        }
+        Ok(Err(ClientError::Host(refused))) => Listing::of_refusal(refused.code),
         Ok(Err(_)) | Err(_) => Listing::Silent,
     }
 }
@@ -174,7 +197,7 @@ impl<R: Runtime> Hosts for ConnectedHosts<R> {
                 if owns {
                     match listed(&connection.session()).await {
                         Listing::Listed(list) => found.lists.push(list),
-                        Listing::Refused => {}
+                        Listing::Refused => found.refused = true,
                         Listing::Silent => found.silent = true,
                     }
                 }
@@ -201,10 +224,7 @@ impl<R: Runtime> Hosts for ConnectedHosts<R> {
                         let visit = async {
                             match pairing.link.connect_paired(&host, &identity).await {
                                 Ok(session) => listed(&Arc::new(session)).await,
-                                // A host that answers with a refusal of its own is awake: it will
-                                // not list its devices to this computer, which is not a silence.
-                                Err(LinkError::Refused(_)) => Listing::Refused,
-                                Err(_) => Listing::Silent,
+                                Err(error) => Listing::of_link(&error),
                             }
                         };
                         tokio::time::timeout(ANSWER_WITHIN, visit)
@@ -216,7 +236,7 @@ impl<R: Runtime> Hosts for ConnectedHosts<R> {
             for visit in visits {
                 match visit.await {
                     Ok(Listing::Listed(list)) => found.lists.push(list),
-                    Ok(Listing::Refused) => {}
+                    Ok(Listing::Refused) => found.refused = true,
                     Ok(Listing::Silent) | Err(_) => found.silent = true,
                 }
             }
@@ -326,5 +346,30 @@ mod tests {
         assert!(!refuses_everything(ErrorCode::PermissionDenied));
         assert!(refuses_everything(ErrorCode::RateLimited));
         assert!(refuses_everything(ErrorCode::EnvironmentUnavailable));
+    }
+
+    /// A host that refuses to list its devices to this computer has answered. One that refuses for
+    /// another reason, or whose connection ends, has not: it may be the host that lists a device.
+    #[test]
+    fn only_a_refusal_to_list_the_hosts_devices_is_an_answer() {
+        let refused = |code| LinkError::Refused(kr_protocol::error::ProtocolError::new(code, "no"));
+        assert!(matches!(
+            Listing::of_link(&refused(ErrorCode::PermissionDenied)),
+            Listing::Refused
+        ));
+        for code in [
+            ErrorCode::UnsupportedSchema,
+            ErrorCode::RateLimited,
+            ErrorCode::EnvironmentUnavailable,
+        ] {
+            assert!(
+                matches!(Listing::of_link(&refused(code)), Listing::Silent),
+                "{code} says nothing of the host's devices"
+            );
+        }
+        assert!(matches!(
+            Listing::of_link(&LinkError::Lost("gone".to_owned())),
+            Listing::Silent
+        ));
     }
 }

@@ -1097,6 +1097,7 @@ fn object(object_id: SyncObjectId, device_byte: u8, body: SyncBody, at_ms: u64) 
         device_id: device(device_byte),
         updated_at_ms: TimestampMs::new(at_ms),
         body,
+        went_over: Vec::new(),
     }
 }
 

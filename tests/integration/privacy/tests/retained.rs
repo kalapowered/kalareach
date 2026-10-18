@@ -263,6 +263,7 @@ async fn kr_req_24_29_what_is_at_the_services_stays_until_its_own_authorised_act
                     .collect(),
                 pinned_labels: std::collections::BTreeSet::new(),
             }),
+            went_over: Vec::new(),
         };
         let published = settings("dark");
         client.store().put_object(&published).expect("stored");

@@ -192,6 +192,7 @@ fn settings(object_id: SyncObjectId, colour: &str) -> SyncObject {
             )]),
             pinned_labels: std::collections::BTreeSet::new(),
         }),
+        went_over: Vec::new(),
     }
 }
 

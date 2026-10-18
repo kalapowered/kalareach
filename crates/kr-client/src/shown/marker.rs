@@ -717,6 +717,7 @@ mod cases {
                 .collect(),
                 pinned_labels: [MARKER.to_owned()].into_iter().collect(),
             }),
+            went_over: Vec::new(),
         };
         assert_unmarked("a settings object", &debug_renderings(&object));
         store.put_object(&object).expect("stored");

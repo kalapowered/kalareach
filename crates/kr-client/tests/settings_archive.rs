@@ -297,6 +297,7 @@ impl Owner {
                 ]),
                 pinned_labels: BTreeSet::from(["release".to_owned()]),
             }),
+            went_over: Vec::new(),
         };
         store.put_object(&settings).expect("the settings");
         Self {

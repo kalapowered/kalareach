@@ -135,6 +135,10 @@ pub struct HostLists {
     /// Whether a host this device owns did not answer. A device that no answering host lists is
     /// then not known to be gone: the host that did not answer may be the one that lists it.
     pub silent: bool,
+    /// Whether a host this device owns answered that it will not list its devices to this
+    /// computer, as a host does once the right to manage it has run out or been revoked. That is
+    /// an answer: this computer can vouch for nobody to that host.
+    pub refused: bool,
 }
 
 /// What settings sync asks of the hosts this device knows: drafts sync, which host holds a session

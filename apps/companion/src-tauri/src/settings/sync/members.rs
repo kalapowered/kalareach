@@ -10,10 +10,12 @@
 //!   and handed to the membership as what each host says of each device's keys, its right to manage
 //!   the host and whether it was revoked. A host that revoked a device is how the membership learns
 //!   to take that device out. A host that does not answer says nothing about any device: the
-//!   membership is told that one was silent, and a device no answering host mentions is then not
-//!   taken out, while one an answering host mentions is judged by what that host says. A device a
-//!   host lists whose right to manage the host has run out with its grant is not one to share
-//!   with.
+//!   membership is told that one was silent. A device this computer's hosts vouched for before,
+//!   and that no answering host mentions, is then not taken out, and the next key is wrapped to it
+//!   as before; a device an answering host mentions is judged by what that host says. Silence
+//!   accepts, opens and adds nothing: a record, a key or an addition still needs a host that
+//!   answered to list the device. A device a host lists whose right to manage the host has run out
+//!   with its grant is not one to share with.
 //! * **The owner's presence** is asked for through the platform's ceremony, with what it would do as
 //!   its reason, before a device is added to the collection and before this computer joins one. The
 //!   page names a device by an opaque reference and never holds a key. Taking a device out needs no
@@ -81,8 +83,9 @@ pub struct Member {
     pub name: String,
     /// Whether it is this computer.
     pub this_computer: bool,
-    /// Whether a host still lists it as able to manage the host. One that no host does is taken
-    /// out at the next step.
+    /// Whether a host still lists it as able to manage the host, or none that answered mentions it
+    /// while one did not answer and its hosts vouched for it before. One that is not is taken out at
+    /// the next step.
     pub vouched: bool,
 }
 
@@ -213,7 +216,9 @@ impl DeviceDirectory for HostsDirectory {
                 return Ok(Some(answers.clone()));
             }
             let asked = self.hosts.device_lists().await;
-            if asked.lists.is_empty() {
+            // Hosts that all refuse to list their devices to this computer have answered: it can
+            // vouch for nobody to them. No host that answered at all leaves check 3 unable to run.
+            if asked.lists.is_empty() && !asked.refused {
                 return Ok(None);
             }
             let mut reports = Vec::new();

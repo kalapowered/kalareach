@@ -60,6 +60,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use kr_client::pairing::owner::Ceremony;
+use kr_client::services::SyncPosition;
 use kr_client::services::{
     HttpDeadlines, HttpService, ManagedSyncService, SyncBackupService, managed_response_limits,
 };
@@ -261,13 +262,15 @@ struct Record {
     resealing: Option<Resealing>,
 }
 
-/// The settings being sealed again: the revision this computer held, and the one it put in the
-/// store to publish. A step that stops between the two finds either.
+/// The settings being sealed again: the revision this computer held, the one it put in the store to
+/// publish, and where the service held the settings it held. A step that stops between the two
+/// finds either.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Resealing {
     from: SyncRevisionId,
     to: SyncRevisionId,
+    at: SyncPosition,
 }
 
 impl Resealing {
@@ -873,25 +876,31 @@ impl SettingsSync {
         // continue this computer's.
         let waiting = store.conflicts(object_id).map_err(sync_failure)?.items;
         if !waiting.is_empty() {
-            let sealing_only = record.resealing.is_some()
-                && chosen == held.as_ref().and_then(colour_mode_of)
+            // Settings another device wrote over the ones being sealed again are not those
+            // settings continued: the person chooses.
+            let sealing_only = record.resealing.is_some_and(|marker| {
+                !waiting
+                    .iter()
+                    .any(|copy| replaces(&copy.other, Some(marker.at), chosen))
+            }) && chosen == held.as_ref().and_then(colour_mode_of)
                 && chosen.is_some();
             if sealing_only
                 && let Some(newest) = waiting
                     .iter()
                     .max_by_key(|copy| copy.other.updated_at_ms.get())
             {
+                // The marker stays until the other device's settings are in place: a step that
+                // stops in between finds the copy and the marker again.
+                self.follow(
+                    client,
+                    object_id,
+                    &newest.other,
+                    chosen,
+                    Some(newest.conflict_id),
+                )
+                .await?;
                 record.resealing = None;
-                self.keep(record)?;
-                return self
-                    .follow(
-                        client,
-                        object_id,
-                        &newest.other,
-                        chosen,
-                        Some(newest.conflict_id),
-                    )
-                    .await;
+                return self.keep(record);
             }
             let mine = chosen;
             if mine.is_none()
@@ -920,27 +929,25 @@ impl SettingsSync {
                 // service refuses it where another device wrote first, keeping what it holds beside
                 // it. What it holds may be sealed under epochs this computer was given no key for:
                 // it could not be compared, and every step would leave one more refused write at
-                // the service. So the service is asked first, and a computer that cannot read what
-                // it holds waits, with its choice kept, for a member to seal it again.
-                if store.checkpoint(object_id).map_err(sync_failure)?.is_none() {
-                    match client
-                        .fetch(SyncObjectKind::Settings, object_id, now_ms)
-                        .await
+                // the service. So the service is asked first, at every step that would make the
+                // object, whatever a read before it left behind, and a computer that cannot read
+                // what it holds waits, with its choice kept, for a member to seal it again.
+                match client
+                    .fetch(SyncObjectKind::Settings, object_id, now_ms)
+                    .await
+                {
+                    Ok(_) => {}
+                    // The service holds nothing yet: this computer makes the first object.
+                    Err(SyncError::Client(error)) if error.code() == ErrorCode::UnknownSession => {}
+                    Err(SyncError::Client(error))
+                        if error.code() == ErrorCode::HostNotConfigured =>
                     {
-                        Ok(_) => {}
-                        // The service holds nothing yet: this computer makes the first object.
-                        Err(SyncError::Client(error))
-                            if error.code() == ErrorCode::UnknownSession => {}
-                        Err(SyncError::Client(error))
-                            if error.code() == ErrorCode::HostNotConfigured =>
-                        {
-                            self.is_waiting();
-                            return Ok(());
-                        }
-                        // An answer that did not come says nothing of what the service holds, and
-                        // the first object is not made on it: the next step asks again.
-                        Err(error) => return Err(sync_failure(error)),
+                        self.is_waiting();
+                        return Ok(());
                     }
+                    // An answer that did not come says nothing of what the service holds, and the
+                    // first object is not made on it: the next step asks again.
+                    Err(error) => return Err(sync_failure(error)),
                 }
                 if store
                     .checkpoint(object_id)
@@ -1014,7 +1021,13 @@ impl SettingsSync {
                 // A device that held nothing is seeing the object for the first time.
                 (None, Some(_)) => Ok(()),
                 // This computer has changed nothing since it last agreed, and another device has
-                // written since: the other device's settings continue this computer's.
+                // written since: the other device's settings continue this computer's, unless
+                // they were written over the settings this computer holds without reading them.
+                // The person chooses between the two then, and the copy waits.
+                (Some(_), Some(_)) if replaces(&object, note.map(|note| note.position), chosen) => {
+                    self.told.tell();
+                    Ok(())
+                }
                 (Some(_), Some(copy)) => {
                     self.follow(client, object_id, &object, chosen, Some(copy))
                         .await
@@ -1049,8 +1062,11 @@ impl SettingsSync {
     }
 
     /// Publishes the change the person made. Where the service refuses it and holds an object from
-    /// before the floor that this computer cannot read, the object is not believed: the person's
-    /// change is made against where it stands, once, and replaces it.
+    /// before the floor that this computer cannot read, the object is not believed here: the
+    /// person's change is made against where it stands, once, and replaces it. It says which write
+    /// it went over, so that a device that holds that write is asked, where a device that does not
+    /// follows. Nothing that was not believed is shown to anybody, and nothing a device holds is
+    /// replaced without that device's person choosing.
     async fn publish_change(
         &self,
         client: &SyncClient,
@@ -1082,7 +1098,23 @@ impl SettingsSync {
                         && has_note
                         && unbelieved
                         && let Some(found) = sealed.last_found_at()
-                        && store
+                        && let Some(held) = store.object(object_id).map_err(sync_failure)?
+                    {
+                        // The change is marked with the place it goes over before it is made
+                        // against that place, so no write over that place is ever made without
+                        // the mark.
+                        let mut over = held.went_over.clone();
+                        if !over.contains(&found) {
+                            over.push(found);
+                        }
+                        store
+                            .put_object(&SyncObject {
+                                revision: fresh_revision().map_err(CommandError::from)?,
+                                went_over: over,
+                                ..held
+                            })
+                            .map_err(sync_failure)?;
+                        if store
                             .record_checkpoint(
                                 object_id,
                                 SyncCheckpoint {
@@ -1091,8 +1123,9 @@ impl SettingsSync {
                                 },
                             )
                             .map_err(sync_failure)?
-                    {
-                        continue;
+                        {
+                            continue;
+                        }
                     }
                     self.is_waiting();
                     Ok(())
@@ -1128,9 +1161,18 @@ impl SettingsSync {
             revision: fresh_revision().map_err(CommandError::from)?,
             ..held.clone()
         };
+        let at = client
+            .store()
+            .checkpoint(held.object_id)
+            .map_err(sync_failure)?
+            .map(|note| note.position)
+            .ok_or_else(|| {
+                CommandError::local_failure("this computer has no note of where the settings stand")
+            })?;
         record.resealing = Some(Resealing {
             from: held.revision,
             to: again.revision,
+            at,
         });
         self.keep(record)?;
         client.store().put_object(&again).map_err(sync_failure)?;
@@ -1161,8 +1203,6 @@ impl SettingsSync {
                 self.keep(record)
             }
             Ok(Published::Conflicted { copy, .. }) => {
-                record.resealing = None;
-                self.keep(record)?;
                 let other = store
                     .conflicts(object_id)
                     .map_err(sync_failure)?
@@ -1170,13 +1210,18 @@ impl SettingsSync {
                     .into_iter()
                     .find(|kept| kept.conflict_id == copy)
                     .map(|kept| kept.other);
-                match other {
-                    Some(other) => {
-                        self.follow(client, object_id, &other, chosen, Some(copy))
-                            .await
-                    }
-                    None => Ok(()),
+                // The marker is spent once the other device's settings are in place, or once they
+                // are left for the person: a step that stops in between finds both again.
+                if let Some(other) = other
+                    && !replaces(&other, record.resealing.map(|marker| marker.at), chosen)
+                {
+                    self.follow(client, object_id, &other, chosen, Some(copy))
+                        .await?;
                 }
+                record.resealing = None;
+                self.keep(record)?;
+                self.told.tell();
+                Ok(())
             }
             Ok(Published::Discarded { .. }) => {
                 record.resealing = None;
@@ -1272,6 +1317,10 @@ impl SettingsSync {
             device_id: DeviceId::new(installation_id(self.parts.keys.authorisation.public()).get()),
             updated_at_ms: now_ms,
             body: SyncBody::Settings(settings),
+            // What the settings this one is made from went over is still not settled.
+            went_over: previous
+                .map(|object| object.went_over.clone())
+                .unwrap_or_default(),
         })
     }
 
@@ -1382,6 +1431,14 @@ impl SettingsSync {
     }
 }
 
+/// Whether `other` was made over the settings that stood at `held` without reading them, and says
+/// something other than the person's colour mode: it replaces what a device holds, which that
+/// device's person chooses to let go of or not. Settings that say what the device's say replace
+/// nothing.
+fn replaces(other: &SyncObject, held: Option<SyncPosition>, chosen: Option<ColourMode>) -> bool {
+    held.is_some_and(|held| other.went_over.contains(&held)) && colour_mode_of(other) != chosen
+}
+
 /// The colour mode a settings object carries, when it carries one this build reads.
 fn colour_mode_of(object: &SyncObject) -> Option<ColourMode> {
     match &object.body {
@@ -1415,6 +1472,10 @@ fn member_failure(error: kr_client::sync::membership::MembershipError) -> Comman
         MembershipError::Service(error) | MembershipError::Keys(error) => CommandError::from(error),
         MembershipError::NoHostAnswered => CommandError::unavailable(
             "none of your hosts answered, so who may share your settings could not be checked",
+        ),
+        MembershipError::HostSilent => CommandError::unavailable(
+            "one of your hosts did not answer, so the settings were not joined; try again when it \
+             does",
         ),
         MembershipError::NotCommitted => {
             CommandError::refused("no host lists that device as one of yours any more")

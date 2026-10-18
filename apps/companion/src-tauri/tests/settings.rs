@@ -209,6 +209,8 @@ struct ScriptedHosts {
     second: Mutex<Option<Vec<Listed>>>,
     /// Whether a host this computer owns does not answer.
     silent: Mutex<bool>,
+    /// Whether a host this computer owns refuses to list its devices to it.
+    refusing_lists: Mutex<bool>,
     /// How many times a host was asked whether it holds a session.
     asked: Mutex<u32>,
 }
@@ -225,6 +227,7 @@ impl ScriptedHosts {
             devices: Mutex::default(),
             second: Mutex::default(),
             silent: Mutex::default(),
+            refusing_lists: Mutex::default(),
             asked: Mutex::default(),
         }
     }
@@ -281,6 +284,11 @@ impl ScriptedHosts {
         *self.silent.lock().expect("the record") = silent;
     }
 
+    /// A host this computer owns refuses to list its devices to it, or lists them again.
+    fn refuse_to_list(&self, refusing: bool) {
+        *self.refusing_lists.lock().expect("the record") = refusing;
+    }
+
     fn times_asked_who_holds(&self) -> u32 {
         *self.asked.lock().expect("the record")
     }
@@ -320,7 +328,15 @@ impl Hosts for ScriptedHosts {
             lists.push(list_of(second));
         }
         let silent = *self.silent.lock().expect("the record");
-        Box::pin(std::future::ready(HostLists { lists, silent }))
+        let refused = *self.refusing_lists.lock().expect("the record");
+        if refused {
+            lists.clear();
+        }
+        Box::pin(std::future::ready(HostLists {
+            lists,
+            silent,
+            refused,
+        }))
     }
 
     fn holds(
@@ -1054,6 +1070,7 @@ impl Elsewhere {
                 device_id: self.device,
                 updated_at_ms: TimestampMs::new(now_ms()),
                 body: SyncBody::Settings(settings),
+                went_over: Vec::new(),
             })
             .expect("the object is kept");
         self.client
@@ -3298,6 +3315,18 @@ async fn a_reference_the_page_was_not_shown_names_no_device() {
 }
 
 /// The record a computer's settings sync keeps, as the file holds it.
+/// Where the service held the settings this computer's own store last agreed with, as the record
+/// keeps a place.
+fn position_of(own: &OwnStore) -> Value {
+    let note = own
+        .client
+        .store()
+        .checkpoint(own.object_id)
+        .expect("a store")
+        .expect("a note of where the settings stand");
+    serde_json::to_value(note.position).expect("a position")
+}
+
 fn sync_record(computer: &Computer) -> Value {
     serde_json::from_slice(
         &std::fs::read(computer.data.path().join("settings-sync").join("sync.json"))
@@ -3365,6 +3394,69 @@ async fn a_host_that_does_not_answer_takes_no_device_out_but_one_that_does_can()
         members(&page.sync_now()),
         1,
         "absence from an answering host is not silence"
+    );
+}
+
+/// A computer does not join the settings while a host of its own does not answer: the offer stays,
+/// and the join is made when the host answers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_computer_does_not_join_the_settings_while_a_host_of_its_own_does_not_answer() {
+    let (this, other) = two_computers().await;
+    let page = with_sync_on(&this).await;
+    let phone = other.start();
+    page.share(&first_reference(&page.devices_refresh()["candidates"]))
+        .expect("shared");
+    let offer = first_reference(&phone.devices_refresh()["offers"]);
+
+    other.hosts.go_silent(true);
+    phone.join(&offer).expect_err("a host did not answer");
+    assert_eq!(
+        phone.devices_refresh()["offers"]
+            .as_array()
+            .expect("offers")
+            .len(),
+        1,
+        "the offer stands"
+    );
+
+    other.hosts.go_silent(false);
+    phone.join(&offer).expect("joined");
+    assert_eq!(phone.sync_now()["sync"]["devices"]["out"], false);
+}
+
+/// Hosts that all answer that they will not list their devices to this computer have answered:
+/// this computer can vouch for nobody to them. The devices it shared the settings with are taken
+/// out and the key moves on, where hosts that said nothing would have left them in.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hosts_that_all_refuse_to_list_their_devices_leave_this_computer_vouching_for_nobody() {
+    let (this, other) = two_computers().await;
+    let page = with_sync_on(&this).await;
+    page.choose("dark");
+    let phone = other.start();
+    page.share(&first_reference(&page.devices_refresh()["candidates"]))
+        .expect("shared");
+    phone
+        .join(&first_reference(&phone.devices_refresh()["offers"]))
+        .expect("joined");
+    page.sync_now();
+    assert_eq!(phone.sync_now()["colour_mode"], "dark");
+
+    this.hosts.refuse_to_list(true);
+    let view = page.sync_now();
+    assert_eq!(
+        view["sync"]["devices"]["members"]
+            .as_array()
+            .expect("members")
+            .len(),
+        1,
+        "{view}"
+    );
+    page.choose("light");
+    page.sync_now();
+    let view = phone.sync_now();
+    assert_eq!(
+        view["colour_mode"], "dark",
+        "what was written after the key moved on did not reach it: {view}"
     );
 }
 
@@ -3606,6 +3698,7 @@ async fn a_sealing_a_step_stopped_in_is_finished_as_it_was_begun() {
     record["resealing"] = json!({
         "from": serde_json::to_value(held.revision).expect("a revision"),
         "to": serde_json::to_value(again.revision).expect("a revision"),
+        "at": position_of(&own),
     });
     std::fs::write(&path, serde_json::to_vec(&record).expect("a record")).expect("written");
     phone.choose("light");
@@ -3617,6 +3710,115 @@ async fn a_sealing_a_step_stopped_in_is_finished_as_it_was_begun() {
         sync_record(&this).get("resealing").is_none(),
         "the marker is spent"
     );
+}
+
+/// Runs `step` while the settings file cannot be written, as it cannot when the disk fails, and
+/// lets it be written again after.
+#[cfg(unix)]
+fn while_the_settings_cannot_be_written<T>(computer: &Computer, step: impl FnOnce() -> T) -> T {
+    use std::os::unix::fs::PermissionsExt as _;
+    let directory = computer.data.path();
+    std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o500))
+        .expect("the directory is read only");
+    let done = step();
+    std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))
+        .expect("the directory is writable again");
+    done
+}
+
+/// The mark that settings are being sealed again outlasts the following of another device's
+/// settings, so a step that stops in between does not leave the person to be asked about settings
+/// they never changed.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_following_that_stops_leaves_the_sealing_marked_and_asks_nothing_after() {
+    let (this, other) = two_computers().await;
+    let page = with_sync_on(&this).await;
+    page.choose("dark");
+    let phone = other.start();
+    page.share(&first_reference(&page.devices_refresh()["candidates"]))
+        .expect("shared");
+    phone
+        .join(&first_reference(&phone.devices_refresh()["offers"]))
+        .expect("joined");
+    page.sync_now();
+
+    // The other device's settings are kept beside the settings this computer was sealing again.
+    phone.choose("light");
+    let own = this.client_on_its_own_store(1);
+    let (client, object_id) = (&own.client, own.object_id);
+    let store = client.store();
+    let held = store.object(object_id).expect("a store").expect("settings");
+    client
+        .fetch(
+            SyncObjectKind::Settings,
+            object_id,
+            TimestampMs::new(now_ms()),
+        )
+        .await
+        .expect("the other device's settings are kept beside this computer's");
+    let path = this.data.path().join("settings-sync").join("sync.json");
+    let mut record = sync_record(&this);
+    let revision = serde_json::to_value(held.revision).expect("a revision");
+    record["resealing"] = json!({ "from": revision, "to": revision, "at": position_of(&own) });
+    std::fs::write(&path, serde_json::to_vec(&record).expect("a record")).expect("written");
+
+    // The step stops where it takes the other device's settings.
+    let stopped =
+        while_the_settings_cannot_be_written(&this, || page.call("settings_sync_now", json!({})));
+    assert!(stopped.is_err(), "the step says it stopped");
+    let view = page.sync_now();
+    assert_eq!(view["sync"]["conflicts"], 0, "{view}");
+    assert_eq!(view["colour_mode"], "light", "{view}");
+}
+
+/// The same when the sealing was refused by the other device's write in the step itself.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_following_that_stops_after_a_refused_sealing_asks_nothing_after() {
+    let (this, other) = two_computers().await;
+    let page = with_sync_on(&this).await;
+    page.choose("dark");
+    let phone = other.start();
+    page.share(&first_reference(&page.devices_refresh()["candidates"]))
+        .expect("shared");
+    phone
+        .join(&first_reference(&phone.devices_refresh()["offers"]))
+        .expect("joined");
+    page.sync_now();
+    assert_eq!(phone.sync_now()["colour_mode"], "dark");
+
+    let own = this.client_on_its_own_store(1);
+    let (client, object_id) = (&own.client, own.object_id);
+    let held = client
+        .store()
+        .object(object_id)
+        .expect("a store")
+        .expect("settings");
+    let again = SyncObject {
+        revision: fresh_revision().expect("a revision"),
+        ..held.clone()
+    };
+    client
+        .store()
+        .put_object(&again)
+        .expect("the sealing began");
+    let path = this.data.path().join("settings-sync").join("sync.json");
+    let mut record = sync_record(&this);
+    record["resealing"] = json!({
+        "from": serde_json::to_value(held.revision).expect("a revision"),
+        "to": serde_json::to_value(again.revision).expect("a revision"),
+        "at": position_of(&own),
+    });
+    std::fs::write(&path, serde_json::to_vec(&record).expect("a record")).expect("written");
+    phone.choose("light");
+
+    let stopped =
+        while_the_settings_cannot_be_written(&this, || page.call("settings_sync_now", json!({})));
+    assert!(stopped.is_err(), "the step says it stopped");
+    let view = page.sync_now();
+    assert_eq!(view["sync"]["conflicts"], 0, "{view}");
+    assert_eq!(view["colour_mode"], "light", "{view}");
 }
 
 /// A record that names another collection than the membership says this computer is in, as one does
@@ -3798,6 +4000,242 @@ async fn settings_a_taken_out_device_wrote_last_are_waited_for_and_then_written_
     assert_eq!(writes(), settled, "nothing more is written once it agrees");
 }
 
+/// The person's three computers, sharing the settings, each joined and agreed on `dark`: the first
+/// (`this`), a phone and a tablet.
+async fn three_computers_sharing() -> (Computer, Computer, Computer, Page, Page, Page) {
+    let this = Computer::new().await;
+    let phone_computer = Computer::beside(&this).await;
+    let tablet_computer = Computer::beside(&this).await;
+    let devices = vec![
+        this.listed("this-mac"),
+        phone_computer.listed("the-phone"),
+        tablet_computer.listed("the-tablet"),
+    ];
+    for computer in [&this, &phone_computer, &tablet_computer] {
+        computer.hosts.list(devices.clone());
+    }
+    let page = with_sync_on(&this).await;
+    let phone = phone_computer.start();
+    let tablet = tablet_computer.start();
+    for (name, joiner) in [("the-phone", &phone), ("the-tablet", &tablet)] {
+        let shown = page.devices_refresh();
+        page.share(&reference_of(&shown["candidates"], name))
+            .expect("shared");
+        joiner
+            .join(&first_reference(&joiner.devices_refresh()["offers"]))
+            .expect("joined");
+    }
+    for member in [&page, &phone, &tablet] {
+        assert_eq!(member.sync_now()["colour_mode"], "dark");
+    }
+    (this, phone_computer, tablet_computer, page, phone, tablet)
+}
+
+/// The change the first computer makes goes over what the tablet last wrote once the tablet is taken
+/// out, as the write of a device nobody believes. The phone never held that write, so it follows the
+/// change and is asked nothing, and nobody is offered what the tablet wrote.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_change_over_the_last_write_of_a_device_taken_out_asks_nobody_and_offers_it_to_nobody() {
+    let (_this, _phone_computer, _tablet_computer, page, phone, tablet) =
+        three_computers_sharing().await;
+    tablet.choose("light");
+    page.unshare(&reference_of(&page.devices()["members"], "the-tablet"))
+        .expect("the tablet is taken out");
+    assert_eq!(page.sync_now()["sync"]["devices"]["waiting"], true);
+
+    let view = page.choose("system");
+    assert_eq!(view["sync"]["conflicts"], 0, "{view}");
+    let view = phone.sync_now();
+    assert_eq!(view["colour_mode"], "system", "{view}");
+    assert_eq!(view["sync"]["conflicts"], 0, "{view}");
+    assert!(
+        phone
+            .call("settings_conflicts", json!({}))
+            .expect("a read")
+            .is_null(),
+        "the write of the device taken out is offered to nobody"
+    );
+    assert_eq!(page.sync_now()["sync"]["conflicts"], 0);
+}
+
+/// The change the first computer makes goes over a write of the phone's that it could not believe
+/// because a device was taken out since. The phone holds that write, so it keeps the change beside
+/// it and its person chooses; and what they choose is what the other computers come to hold.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_change_over_the_write_of_a_member_asks_the_member_before_it_replaces_it() {
+    let (_this, _phone_computer, _tablet_computer, page, phone, _tablet) =
+        three_computers_sharing().await;
+    phone.choose("light");
+    page.unshare(&reference_of(&page.devices()["members"], "the-tablet"))
+        .expect("the tablet is taken out");
+    assert_eq!(page.sync_now()["sync"]["devices"]["waiting"], true);
+
+    let view = page.choose("system");
+    assert_eq!(view["sync"]["conflicts"], 0, "{view}");
+    let view = phone.sync_now();
+    assert_eq!(
+        view["colour_mode"], "light",
+        "its person has not chosen: {view}"
+    );
+    assert_eq!(view["sync"]["conflicts"], 1, "{view}");
+    let versions = phone
+        .call("settings_conflicts", json!({}))
+        .expect("the versions");
+    assert_eq!(versions["mine"]["colour_mode"], "light");
+    assert_eq!(versions["others"][0]["colour_mode"], "system");
+    // Later steps leave the choice where it is.
+    assert_eq!(phone.sync_now()["sync"]["conflicts"], 1);
+
+    // Keeping the phone's own settings is what the first computer then holds.
+    let view = phone
+        .call(
+            "settings_conflict_resolve",
+            json!({ "keep": { "choice": "mine" } }),
+        )
+        .expect("the choice is recorded");
+    assert_eq!(view["colour_mode"], "light");
+    assert_eq!(view["sync"]["conflicts"], 0);
+    let view = page.sync_now();
+    assert_eq!(view["colour_mode"], "light", "{view}");
+    assert_eq!(view["sync"]["conflicts"], 0, "{view}");
+}
+
+/// A change made from the settings that went over a write is still one that went over it: the device
+/// that held the write is asked when it meets either.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_later_change_made_from_settings_that_went_over_a_write_still_asks_the_device_that_held_it()
+ {
+    let (_this, _phone_computer, _tablet_computer, page, phone, _tablet) =
+        three_computers_sharing().await;
+    phone.choose("light");
+    page.unshare(&reference_of(&page.devices()["members"], "the-tablet"))
+        .expect("the tablet is taken out");
+    page.sync_now();
+    page.choose("system");
+    // The first computer changes its mind before the phone has looked.
+    page.choose("dark");
+
+    let view = phone.sync_now();
+    assert_eq!(view["colour_mode"], "light", "{view}");
+    assert_eq!(view["sync"]["conflicts"], 1, "{view}");
+}
+
+/// A computer that holds no settings of its own, and meets what the service holds sealed before a
+/// device was taken out, asks what the service holds again at each step instead of making its first
+/// settings and publishing them: each of those would leave one more refused write at the service.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_computer_holding_no_settings_asks_again_what_it_cannot_read_instead_of_writing() {
+    let this = Computer::new().await;
+    let phone_computer = Computer::beside(&this).await;
+    let tablet_computer = Computer::beside(&this).await;
+    let devices = vec![
+        this.listed("this-mac"),
+        phone_computer.listed("the-phone"),
+        tablet_computer.listed("the-tablet"),
+    ];
+    for computer in [&this, &phone_computer, &tablet_computer] {
+        computer.hosts.list(devices.clone());
+    }
+    let page = with_sync_on(&this).await;
+    let phone = phone_computer.start();
+    let tablet = tablet_computer.start();
+
+    // The phone joins and reads the settings, and cannot take them: a directory stands where the
+    // lock on its settings file is made. It holds nothing, and a note of where they stand.
+    let lock = phone_computer.data.path().join("settings.lock");
+    std::fs::create_dir(&lock).expect("a directory where the lock goes");
+    page.share(&reference_of(
+        &page.devices_refresh()["candidates"],
+        "the-phone",
+    ))
+    .expect("shared");
+    phone
+        .join(&first_reference(&phone.devices_refresh()["offers"]))
+        .expect_err("the settings could not be taken");
+    std::fs::remove_dir(&lock).expect("the directory goes");
+
+    // The tablet joins, writes, and is taken out before anyone has read what it wrote.
+    page.share(&reference_of(
+        &page.devices_refresh()["candidates"],
+        "the-tablet",
+    ))
+    .expect("shared");
+    tablet
+        .join(&first_reference(&tablet.devices_refresh()["offers"]))
+        .expect("joined");
+    page.sync_now();
+    tablet.sync_now();
+    tablet.choose("light");
+    page.unshare(&reference_of(&page.devices()["members"], "the-tablet"))
+        .expect("the tablet is taken out");
+
+    let writes = || {
+        this.served
+            .web()
+            .arrived()
+            .iter()
+            .filter(|arrived| arrived.path == SYNC_PATH && arrived.body.get("exchange").is_some())
+            .count()
+    };
+    let elsewhere = this.elsewhere();
+    let (written, copies) = (writes(), elsewhere.copies_kept().await);
+    phone.choose("system");
+    for _ in 0..3 {
+        let view = phone.sync_now();
+        assert_eq!(view["sync"]["devices"]["waiting"], true, "{view}");
+        assert!(view["sync"]["problem"].is_null(), "{view}");
+        assert_eq!(view["colour_mode"], "system", "its choice is kept: {view}");
+    }
+    assert_eq!(
+        writes(),
+        written,
+        "nothing was written over what it cannot read"
+    );
+    assert_eq!(
+        elsewhere.copies_kept().await,
+        copies,
+        "no refused write was left at the service"
+    );
+}
+
+/// Settings written over the ones this computer was sealing again are not those settings
+/// continued: the person is asked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn settings_written_over_the_ones_being_sealed_again_are_left_for_the_person() {
+    let (_this, phone_computer, _tablet_computer, page, phone, _tablet) =
+        three_computers_sharing().await;
+    phone.choose("light");
+    let own = phone_computer.client_on_its_own_store(1);
+    let held = own
+        .client
+        .store()
+        .object(own.object_id)
+        .expect("a store")
+        .expect("settings");
+    let at = position_of(&own);
+    page.unshare(&reference_of(&page.devices()["members"], "the-tablet"))
+        .expect("the tablet is taken out");
+    page.sync_now();
+    page.choose("system");
+    assert_eq!(phone.sync_now()["sync"]["conflicts"], 1);
+
+    // What a lost answer to the phone's sealing again of its settings leaves behind: the marker
+    // that says the settings were being sealed again when the change that went over them arrived.
+    let path = phone_computer
+        .data
+        .path()
+        .join("settings-sync")
+        .join("sync.json");
+    let mut record = sync_record(&phone_computer);
+    let revision = serde_json::to_value(held.revision).expect("a revision");
+    record["resealing"] = json!({ "from": revision, "to": revision, "at": at });
+    std::fs::write(&path, serde_json::to_vec(&record).expect("a record")).expect("written");
+
+    let view = phone.sync_now();
+    assert_eq!(view["colour_mode"], "light", "{view}");
+    assert_eq!(view["sync"]["conflicts"], 1, "{view}");
+}
+
 /// Another device's settings that were refused to settings this computer was only sealing again are
 /// that device's to continue: the person is asked nothing, for they changed nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3833,7 +4271,7 @@ async fn content_refused_to_settings_only_sealed_again_is_followed_and_asks_noth
     let path = this.data.path().join("settings-sync").join("sync.json");
     let mut record = sync_record(&this);
     let revision = serde_json::to_value(held.revision).expect("a revision");
-    record["resealing"] = json!({ "from": revision, "to": revision });
+    record["resealing"] = json!({ "from": revision, "to": revision, "at": position_of(&own) });
     std::fs::write(&path, serde_json::to_vec(&record).expect("a record")).expect("written");
 
     let view = page.sync_now();

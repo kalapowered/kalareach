@@ -210,6 +210,7 @@ fn settings_object(object_id: SyncObjectId, device_id: DeviceId, theme: &str) ->
                 .collect(),
             pinned_labels: std::collections::BTreeSet::new(),
         }),
+        went_over: Vec::new(),
     }
 }
 

@@ -578,6 +578,7 @@ fn settings_object(object_id: SyncObjectId, by: u8, body: SyncSettings, at_ms: u
         device_id: device(by),
         updated_at_ms: TimestampMs::new(at_ms),
         body: SyncBody::Settings(body),
+        went_over: Vec::new(),
     }
 }
 

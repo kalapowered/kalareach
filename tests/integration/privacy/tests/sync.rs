@@ -197,6 +197,7 @@ fn settings_object(object_id: SyncObjectId, by: u8, body: SyncSettings) -> SyncO
         device_id: device(by),
         updated_at_ms: now(),
         body: SyncBody::Settings(body),
+        went_over: Vec::new(),
     }
 }
 

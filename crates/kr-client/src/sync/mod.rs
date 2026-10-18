@@ -66,6 +66,8 @@ use kr_protocol::scalars::{Nullable, TimestampMs, U64};
 use kr_protocol::sync::{MAX_SYNC_OBJECT_PLAINTEXT_BYTES, SyncObjectKind};
 use serde::{Deserialize, Serialize};
 
+use crate::services::SyncPosition;
+
 pub use client::{
     Cancelled, Exported, Fenced, KeptExplicitly, Published, Reconciled, Removed, Resolutions,
     Resolved, Restored, Resumed, SyncClient, fresh_object_id, fresh_revision,
@@ -164,6 +166,15 @@ pub struct SyncObject {
     pub updated_at_ms: TimestampMs,
     /// What it carries.
     pub body: SyncBody,
+    /// The writes of the service this object, or an object it descends from, was made over
+    /// without being read: where the service held an object its writer could not believe, such as
+    /// one a device taken out last sealed, and the writer's change went over it. A device that
+    /// still holds the write at one of these places has not seen this object follow it, so it
+    /// keeps this one beside its own for the person to choose, where it would have followed it.
+    /// Every object made from this one carries them on, until a device that held one of them has
+    /// chosen.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub went_over: Vec<SyncPosition>,
 }
 
 impl SyncObject {
