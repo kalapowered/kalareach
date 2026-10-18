@@ -22,17 +22,18 @@ pub fn record_of(source: &str) -> Result<Option<String>, String> {
     // Comments are taken out before anything is looked for, so a bracket or a declaration inside
     // one is neither the end of the table nor the table.
     let code = without_comments(source)?;
-    if !code.contains("PUBLIC_MAJORS") {
+    let outside = masked(&code);
+    if !outside.contains("PUBLIC_MAJORS") {
         return Ok(None);
     }
-    if code.matches(START).count() != 1 || code.matches("PUBLIC_MAJORS:").count() != 1 {
+    if outside.matches(START).count() != 1 || outside.matches("PUBLIC_MAJORS:").count() != 1 {
         return Err(
             "PUBLIC_MAJORS is named in a form this reader does not read (it reads exactly one \
              `pub const PUBLIC_MAJORS: &[PublicMajor] = &[ .. ];`)"
                 .to_owned(),
         );
     }
-    let start = code.find(START).ok_or("no table")?;
+    let start = outside.find(START).ok_or("no table")?;
     let inside = start + START.len();
     let length = closing(&code[inside..], '[', ']').ok_or("the table does not end")?;
     let after = code[inside + length + 1..].trim_start();
@@ -91,6 +92,41 @@ pub fn record_without_a_table(source: &str) -> Result<String, String> {
     ))
 }
 
+/// `code` with the inside of every string and character literal replaced by `x`, byte for byte, so
+/// that where a declaration is can be found without taking one that a string holds for one.
+fn masked(code: &str) -> String {
+    let characters: Vec<char> = code.chars().collect();
+    let mut out = String::with_capacity(code.len());
+    let (mut index, mut quoted) = (0, false);
+    while index < characters.len() {
+        let here = characters[index];
+        if quoted {
+            if here == '\\' {
+                out.push('x');
+                if let Some(escaped) = characters.get(index + 1) {
+                    out.extend(std::iter::repeat_n('x', escaped.len_utf8()));
+                    index += 1;
+                }
+            } else if here == '"' {
+                quoted = false;
+                out.push('"');
+            } else {
+                out.extend(std::iter::repeat_n('x', here.len_utf8()));
+            }
+        } else if here == '"' {
+            quoted = true;
+            out.push('"');
+        } else if here == '\'' && characters.get(index + 2) == Some(&'\'') {
+            out.push_str("'x'");
+            index += 2;
+        } else {
+            out.push(here);
+        }
+        index += 1;
+    }
+    out
+}
+
 /// `source` without its `//` and `/* */` comments; text between double quotes is left alone.
 fn without_comments(source: &str) -> Result<String, String> {
     let characters: Vec<char> = source.chars().collect();
@@ -109,6 +145,10 @@ fn without_comments(source: &str) -> Result<String, String> {
             } else if here == '"' {
                 quoted = false;
             }
+        } else if here == '\'' && characters.get(index + 2) == Some(&'\'') {
+            kept.extend(&characters[index..index + 3]);
+            index += 3;
+            continue;
         } else if here == '"' {
             quoted = true;
             kept.push(here);
@@ -219,11 +259,15 @@ fn versions_of(source: &str, value: &str) -> Result<Vec<String>, String> {
 /// The build's own constant, or `ProtocolVersion::new(major, minor)` with two numbers.
 fn version_of(source: &str, entry: &str) -> Result<String, String> {
     let call = if entry == "PROTOCOL_VERSION" {
-        let rest = source
-            .split(PROTOCOL_DECLARATION)
-            .nth(1)
-            .ok_or("PROTOCOL_VERSION is not declared in the source")?;
-        squeeze(rest.split(';').next().unwrap_or_default())
+        let outside = masked(source);
+        if outside.matches(PROTOCOL_DECLARATION).count() != 1 {
+            return Err("PROTOCOL_VERSION is not declared exactly once in the source".to_owned());
+        }
+        let at = outside
+            .find(PROTOCOL_DECLARATION)
+            .ok_or("PROTOCOL_VERSION is not declared in the source")?
+            + PROTOCOL_DECLARATION.len();
+        squeeze(source[at..].split(';').next().unwrap_or_default())
     } else {
         entry.to_owned()
     };

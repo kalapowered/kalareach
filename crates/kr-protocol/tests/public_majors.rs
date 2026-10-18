@@ -177,6 +177,11 @@ fn a_replaced_major_needs_a_later_one() {
 /// before this one is the landing's to keep: a release names its predecessor by retaining it.)
 #[test]
 fn every_retained_level_records_its_table_and_is_below_this_one() {
+    fn first_with_a_table() -> kr_protocol::update::CompatibilityLevel {
+        kr_protocol::update::CompatibilityLevel::of(kr_protocol::hello::PackageVersion::new(
+            0, 75, 0,
+        ))
+    }
     for level in &RETAINED {
         assert!(
             level.public_majors.is_some(),
@@ -188,6 +193,17 @@ fn every_retained_level_records_its_table_and_is_below_this_one() {
             "level {} is not below this build's own",
             level.level
         );
+        // From the first release that listed a table on, the record is the table's own, with the
+        // digest of its source; only a release before it records the one major it negotiated.
+        if level.level >= first_with_a_table() {
+            assert!(
+                level
+                    .public_majors
+                    .is_some_and(|record| record.contains("digest=")),
+                "level {} was cut from a release that listed a table, and records none",
+                level.level
+            );
+        }
     }
 }
 

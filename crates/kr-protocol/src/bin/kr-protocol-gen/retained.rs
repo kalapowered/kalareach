@@ -91,7 +91,16 @@ pub fn problems(directory: &Path) -> Vec<String> {
             retained.public_majors,
             std::fs::read_to_string(directory.join(&level).join("PUBLIC_MAJORS")),
         ) {
-            (Some(embedded), Ok(on_disk)) if on_disk == embedded => {}
+            (Some(embedded), Ok(on_disk)) if on_disk == embedded => {
+                // From the first release that listed a table on, the record is the table's own,
+                // with the digest of its source, and not the one major of a release without one.
+                if retained.level >= kr_protocol::update::CompatibilityLevel::of(
+                    kr_protocol::hello::PackageVersion::new(0, 75, 0),
+                ) && !embedded.contains("digest=")
+                {
+                    problems.push(format!("{level}/PUBLIC_MAJORS has no digest of the table's source"));
+                }
+            }
             (Some(_), Ok(_)) => problems.push(format!(
                 "{level}/PUBLIC_MAJORS on disk is not the one built in"
             )),
@@ -481,6 +490,17 @@ pub const PUBLIC_MAJORS: &[PublicMajor] = &[
         );
         let twice = format!("{TWO_ROWS}{TWO_ROWS}");
         assert!(record_of(&twice).is_err(), "two declarations are refused");
+        // A declaration a string holds is not a declaration, and a quote in a character literal does
+        // not open a string.
+        let example = format!(
+            "const EXAMPLE: &str = \"pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(9, 0);\";\nconst QUOTE: u8 = b'\"';\nconst PATH: &str = \"// not a comment\";\n{TWO_ROWS}"
+        );
+        assert_eq!(record_of(&example), record_of(TWO_ROWS));
+        let version = "const EXAMPLE: &str = \"pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(9, 0);\";\npub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(1, 0);\n";
+        assert_eq!(
+            crate::public_majors::record_without_a_table(version).as_deref(),
+            Ok("major=1 versions=1.0 replaced=- supported_until=- retired=false\n")
+        );
         // A comment that only looks like a row is not one, and does not move the digest.
         let commented = TWO_ROWS.replace(
             "// the first",

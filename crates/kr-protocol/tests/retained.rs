@@ -701,4 +701,38 @@ fn the_exchange_recorded_with_a_real_worker_of_the_release_before_reads_under_it
         }
     }
     assert_eq!(both_ways, [true, true], "frames went both ways");
+    // The exchange is the one the upgrade suite makes, frame by frame.
+    let kinds: Vec<String> = record
+        .iter()
+        .map(|entry| {
+            let payload = hex::decode(entry["payload"].as_str().expect("a payload")).expect("hex");
+            let frame = level.decode(&payload, &limits()).expect("it reads");
+            let document = serde_json::to_value(&frame).expect("a frame is a document");
+            document
+                .as_object()
+                .and_then(|object| object.keys().next().cloned())
+                .expect("a frame names its kind")
+        })
+        .collect();
+    assert_eq!(
+        kinds,
+        [
+            "verify_challenge",
+            "verify_proof",
+            "generation_token",
+            "generation_accepted",
+            "local_access",
+            "local_access_ack",
+            "authority_revision",
+            "authority_revision_ack",
+            "authority_revision",
+            "authority_revision_ack",
+            "privacy_generation",
+            "privacy_generation_ack",
+            "plugin_admissions",
+            "plugin_admissions_ack",
+            "request",
+            "response",
+        ]
+    );
 }
