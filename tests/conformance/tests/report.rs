@@ -798,7 +798,7 @@ fn outcomes_entry(cases: &'static [&'static str], runs: Runs) -> IgnoredRun {
 #[test]
 fn a_step_is_one_command_that_names_what_it_selects_and_is_found_where_it_is_said_to_be() {
     // The words of two lines are not one command.
-    let two = held_to(&[outcomes_run(&["name = \"outcomes\"", "harness"])]);
+    let two = held_to(&[outcomes_run(&["name = \"own\"", "harness"])]);
     assert_eq!(two.problems.len(), 1, "{:?}", two.problems);
     assert!(
         two.problems[0].contains("holds no command with"),
@@ -820,7 +820,7 @@ fn a_step_is_one_command_that_names_what_it_selects_and_is_found_where_it_is_sai
     let partial = held_to(&[all("partial.sh")]);
     assert_eq!(partial.problems.len(), 1, "{:?}", partial.problems);
     assert!(
-        partial.problems[0].contains("does not name is_ignored_"),
+        partial.problems[0].contains("does not name tests::is_ignored_"),
         "{:?}",
         partial.problems
     );
@@ -834,6 +834,16 @@ fn a_step_is_one_command_that_names_what_it_selects_and_is_found_where_it_is_sai
         },
     )]);
     assert!(module.problems.is_empty(), "{:?}", module.problems);
+
+    // A word is not found inside a longer one.
+    let prefix = held_to(&[outcomes_entry(
+        &[],
+        Runs::Command {
+            file: "ci.sh",
+            fragments: &["--ignor"],
+        },
+    )]);
+    assert_eq!(prefix.problems.len(), 1, "{:?}", prefix.problems);
 
     // A step of the report's own plan is found in the plan.
     let plan = |fragments| outcomes_entry(&[], Runs::Plan { fragments });

@@ -90,7 +90,7 @@ pub fn check(map: &Map, root: &Path, runs: &[IgnoredRun]) -> Findings {
         let problem = match run.runs {
             Runs::Command { file, fragments } => missing_command(root, file, fragments, matched),
             Runs::Plan { fragments } => missing_step(&plan, fragments, matched),
-            Runs::Helper { file } => missing_helper(root, file),
+            Runs::Helper { file } => missing_helper(root, file, matched),
             Runs::ByHand { why } => {
                 unrun_notes.push(format!("{name} is run by hand: {why}"));
                 None
@@ -170,13 +170,23 @@ fn missing_command(
         Ok(text) => text,
         Err(error) => return Some(format!("{file} cannot be read: {error}")),
     };
-    if !commands(&text).any(|line| holds_all(&line, fragments)) {
+    let lines: Vec<String> = commands(&text).collect();
+    let Some(line) = lines.iter().find(|line| holds_all(line, fragments)) else {
         return Some(format!(
             "{file} holds no command with {}",
             quoted(fragments)
         ));
+    };
+    // A command that selects tests by name has to name each of the tests this entry is for, in the
+    // commands of the file and not in a comment.
+    if contains_token(line, "--exact") {
+        let active = lines.join("\n");
+        return covered
+            .iter()
+            .find(|name| !contains_token(&active, name))
+            .map(|name| format!("{file} does not name {name}"));
     }
-    unnamed(&text, fragments, covered).map(|short| format!("{file} does not name {short}"))
+    None
 }
 
 /// Why no step of the report's own plan has all of `fragments`, or does not name a test the step
@@ -188,39 +198,66 @@ fn missing_step(plan: &[String], fragments: &[&str], covered: &BTreeSet<String>)
             quoted(fragments)
         ));
     };
-    unnamed(step, fragments, covered).map(|short| format!("its step does not name {short}"))
+    if contains_token(step, "--exact") {
+        return covered
+            .iter()
+            .find(|name| !contains_token(step, name))
+            .map(|name| format!("its step does not name {name}"));
+    }
+    None
 }
 
-/// Why `file` does not start a helper as a process of its own, or `None` when it does: the file of
-/// a test that runs one of its own ignored tests holds the flags that ask for an ignored test
-/// by name.
-fn missing_helper(root: &Path, file: &str) -> Option<String> {
+/// Why `file` does not start the helpers `covered` as processes of their own, or `None` when it
+/// does: the file names each helper in its code, and a few lines of its code together ask for an
+/// ignored test by name with `--ignored` and `--exact`. A comment, an attribute and the reason an
+/// `#[ignore]` gives are not code.
+fn missing_helper(root: &Path, file: &str, covered: &BTreeSet<String>) -> Option<String> {
     let text = match std::fs::read_to_string(root.join(file)) {
         Ok(text) => text,
         Err(error) => return Some(format!("{file} cannot be read: {error}")),
     };
-    ["--ignored", "--exact"]
-        .into_iter()
-        .find(|flag| !text.contains(flag))
-        .map(|flag| format!("{file} never asks for an ignored test by name: it holds no `{flag}`"))
-}
-
-/// A test in `covered` that `text` does not name, when the fragments select tests with `--exact`.
-fn unnamed<'a>(text: &str, fragments: &[&str], covered: &'a BTreeSet<String>) -> Option<&'a str> {
-    if !fragments
-        .iter()
-        .any(|fragment| fragment.contains("--exact"))
-    {
-        return None;
+    let code: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| {
+            !line.starts_with("//") && !line.starts_with("#[") && !line.starts_with("ignore")
+        })
+        .collect();
+    let named = |name: &str| {
+        code.iter()
+            .any(|line| !line.contains("fn ") && contains_token(line, name))
+    };
+    if let Some(name) = covered.iter().find(|name| !named(name)) {
+        return Some(format!("{file} never starts {name}"));
     }
-    covered
-        .iter()
-        .map(|name| name.rsplit("::").next().unwrap_or(name))
-        .find(|short| !text.contains(short))
+    let asks = code.windows(8).any(|lines| {
+        let together = lines.join(" ");
+        contains_token(&together, "--ignored") && contains_token(&together, "--exact")
+    });
+    (!asks).then(|| {
+        format!(
+            "{file} never asks for an ignored test by name: no `--ignored` and `--exact` together"
+        )
+    })
 }
 
 fn holds_all(line: &str, fragments: &[&str]) -> bool {
-    fragments.iter().all(|fragment| line.contains(fragment))
+    fragments
+        .iter()
+        .all(|fragment| contains_token(line, fragment))
+}
+
+/// Whether `text` holds `word` as whole words: not as the start or the end of a longer name, so
+/// that `--test fish` is not found in `--test fish_sources`.
+fn contains_token(text: &str, word: &str) -> bool {
+    let joins = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '-';
+    text.match_indices(word).any(|(at, _)| {
+        text[..at].chars().next_back().is_none_or(|c| !joins(c))
+            && text[at + word.len()..]
+                .chars()
+                .next()
+                .is_none_or(|c| !joins(c))
+    })
 }
 
 fn quoted(fragments: &[&str]) -> String {

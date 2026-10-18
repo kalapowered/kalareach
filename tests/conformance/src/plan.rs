@@ -1912,7 +1912,7 @@ pub const IGNORED_RUNS: &[IgnoredRun] = &[
     IgnoredRun {
         package: "kr-attention",
         target: "--test consumer",
-        cases: &[],
+        cases: &["the_consumer_half_of_the_crash_test"],
         runs: Runs::Helper {
             file: "crates/kr-attention/tests/consumer.rs",
         },
@@ -1920,7 +1920,7 @@ pub const IGNORED_RUNS: &[IgnoredRun] = &[
     IgnoredRun {
         package: "kr-worker",
         target: "--test host",
-        cases: &[],
+        cases: &["a_survivor_of_a_crashed_session_tries_to_act_as_it"],
         runs: Runs::Helper {
             file: "crates/kr-worker/tests/host.rs",
         },
@@ -1928,7 +1928,7 @@ pub const IGNORED_RUNS: &[IgnoredRun] = &[
     IgnoredRun {
         package: "kr-worker",
         target: "--test live_ownership",
-        cases: &[],
+        cases: &["the_worker_half_of_the_death_test"],
         runs: Runs::Helper {
             file: "crates/kr-worker/tests/live_ownership.rs",
         },
@@ -1936,7 +1936,7 @@ pub const IGNORED_RUNS: &[IgnoredRun] = &[
     IgnoredRun {
         package: "kr-worker",
         target: "--test windows_endpoint",
-        cases: &[],
+        cases: &["a_bridge_helper", "agent_runs_a_helper"],
         runs: Runs::Helper {
             file: "crates/kr-worker/tests/windows_endpoint.rs",
         },
@@ -1944,7 +1944,7 @@ pub const IGNORED_RUNS: &[IgnoredRun] = &[
     IgnoredRun {
         package: "kr-hook",
         target: "--test launch_windows",
-        cases: &[],
+        cases: &["scripted_launcher_helper"],
         runs: Runs::Helper {
             file: "crates/kr-hook/tests/launch_windows.rs",
         },
