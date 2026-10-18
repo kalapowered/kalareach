@@ -1834,8 +1834,9 @@ enum FailsAt {
     InUse,
 }
 
-/// A host reach that fails the way a bug does: the first time it is asked for what `at` names after
-/// it is told to, it panics, in the task that owns the call.
+/// A host reach that fails the way a bug does: the first time it is asked for what `at` names, once
+/// it is told to (and for `InUse`, before it is told to), it panics, in the task that owns the
+/// call.
 struct FailsWhenTold {
     inner: companion_tauri::voice::AppReach<tauri::test::MockRuntime>,
     told: AtomicUsize,
@@ -2245,6 +2246,92 @@ async fn a_revocation_owed_to_a_host_survives_a_launch() {
         state.owed[0].host,
         Some((host.host_device_id, connection.environment_id()))
     );
+    scene.stop_host().await;
+}
+
+/// A stop that names a voice session this device holds no call for asks the host about it, and the
+/// host that revokes the grant settles the entry owed to it for that session, and no other host's:
+/// another host may hold a voice session of the same identifier, and what is owed to it is not
+/// what this host answered for.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_named_stop_settles_the_entry_owed_to_the_host_that_revoked_and_no_other() {
+    let mut scene = scene().await;
+    scene.stand_in.end_the_control_when_a_call_is_closed();
+    let started = scene.start().await;
+    let live: kr_protocol::ids::VoiceSessionId = started["value"]["outcome"]["started"]["session"]
+        ["voice_session_id"]
+        .as_str()
+        .expect("a voice session")
+        .parse()
+        .expect("an identifier");
+    scene
+        .state_where("an attached control", |state| {
+            state["control"] == "connected"
+        })
+        .await;
+    let connection = scene
+        .phone
+        .companion
+        .app
+        .state::<companion_tauri::AppState>()
+        .connection()
+        .expect("the phone is connected");
+    let companion_tauri::connection::Standing::Paired { host, .. } = connection.standing() else {
+        panic!("the phone is a paired device");
+    };
+    let owed_to = |host: (kr_protocol::ids::DeviceId, kr_protocol::ids::EnvironmentId)| {
+        companion_tauri::voice::OwedView {
+            kind: "revocation".to_owned(),
+            words: "The host did not answer.".to_owned(),
+            action_id: None,
+            voice_session_id: Some(live.to_string()),
+            until_ms: now_ms() + 1_800_000,
+            host_reference: "a-host".to_owned(),
+            host_name: "A host".to_owned(),
+            host: Some(host),
+        }
+    };
+    let this_host = (host.host_device_id, connection.environment_id());
+    let another_host = (
+        kr_protocol::ids::DeviceId::new(kr_ipc::new_uuid()),
+        kr_protocol::ids::EnvironmentId::new(kr_ipc::new_uuid()),
+    );
+    let directory = scene.phone.data.path().join("relaunch-named");
+    Kept::at(&directory)
+        .write(&companion_tauri::voice::KeptVoice {
+            owed: vec![owed_to(another_host), owed_to(this_host)],
+            note: None,
+        })
+        .expect("the file is written");
+    // A device launched again holds no call, so the stop that names the voice session is the host's
+    // to answer alone.
+    let relaunched = Calls::on_phone(
+        ScriptedCalls::new() as Arc<dyn companion_platform::call::CallPlatform>,
+        service_at(scene.stand_in.origin()),
+        quick(),
+        Kept::at(&directory),
+    );
+    assert_eq!(relaunched.state(None).owed.len(), 2);
+    let reach = companion_tauri::voice::AppReach::new(scene.phone.companion.app.handle().clone());
+
+    let closed = relaunched
+        .stop(Some(live), &reach)
+        .await
+        .expect("the host is asked");
+
+    assert!(
+        matches!(closed.host, companion_tauri::voice::HostEnd::Revoked { .. }),
+        "{closed:?}"
+    );
+    let left = relaunched.state(None);
+    assert_eq!(left.owed.len(), 1, "{left:?}");
+    assert_eq!(left.owed[0].host, Some(another_host));
+    // What was settled is settled in the file too.
+    let file = kept_file_where(&directory, |file| {
+        file["owed"].as_array().is_some_and(|owed| owed.len() == 1)
+    })
+    .await;
+    assert_eq!(file["owed"][0]["voice_session_id"], live.to_string());
     scene.stop_host().await;
 }
 
