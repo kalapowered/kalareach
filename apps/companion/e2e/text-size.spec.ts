@@ -93,6 +93,7 @@ test.describe('at the largest text size on a screen 320 points wide', () => {
     ['the attention inbox', '&tab=attention', null],
     ['the session list', '&tab=sessions', null],
     ['the hosts', '&tab=hosts', null],
+    ['the hosts when the pairing records could not be opened', '&tab=hosts&pairing_records=unavailable', null],
     [
       'the hosts with one paired',
       '&tab=hosts',

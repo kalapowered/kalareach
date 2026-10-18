@@ -1446,6 +1446,21 @@
   line-height: 1.55;
 }
 
+/*
+ * At the largest text size a heading's longest word is wider than the column, and a path in the
+ * cause of a failure is one long word at any size: both break where they must rather than run past
+ * the column.
+ */
+.pairing-section h1,
+.pairing-unavailable {
+  overflow-wrap: anywhere;
+}
+
+/* A heading breaks at a syllable where the engine knows them, before it breaks anywhere. */
+.pairing-section h1 {
+  hyphens: auto;
+}
+
 .pairing-settings {
   display: flex;
   flex-direction: column;

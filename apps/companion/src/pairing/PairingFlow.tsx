@@ -254,10 +254,18 @@ export function PairingFlow({
   }
 
   if (view === null) {
+    // The records could not be read, or opened at all: the words are native code's own, and say
+    // what does not work, why, and what to do. They stay in place of the column, because there is
+    // nothing to enter a code into.
     return failure ? (
-      <p className="small danger-text" role="alert">
-        {failure}
-      </p>
+      <div className="pairing-column">
+        <section aria-labelledby="pairing-unavailable" className="pairing-section">
+          <h1 id="pairing-unavailable">Cannot pair</h1>
+          <p role="alert" className="pairing-unavailable" data-testid="records-failure">
+            {failure}
+          </p>
+        </section>
+      </div>
     ) : null
   }
 

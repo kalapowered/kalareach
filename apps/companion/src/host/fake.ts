@@ -171,6 +171,18 @@ function refuse(code: string, message: string): never {
   throw new FakeHostError(code, message).toPayload()
 }
 
+/**
+ * What native code says when the pairing records could not be opened (`AppState::device`): what
+ * does not work, the cause, and what to do. The cause is a real one: a phone's cache directory
+ * that cannot be written, with its long path.
+ */
+const RECORDS_UNAVAILABLE_WORDS =
+  'This device cannot pair with a host or use the hosts it is paired with, because its pairing ' +
+  "records could not be opened. The cause: this device's boot could not be recorded: write the boot " +
+  'record /var/mobile/Containers/Data/Application/6F1D2C0E-5B1A-4C57-9A3E-0D5E1B7C42AA/Library/Caches/' +
+  'to.kala.reach/pairing-boot: No space left on device (os error 28). Close KalaReach and open it ' +
+  'again to try once more.'
+
 function receipt(actionId: string, state: Receipt['state'], method: string): Receipt {
   return {
     accepted_deadline_ms: String(FAKE_NOW_MS + 60_000),
@@ -738,6 +750,10 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
     invitation: null,
     hosts: []
   }
+  /** Whether the address asks this host to be a device whose pairing records could not be opened. */
+  const recordsUnavailable =
+    typeof window !== 'undefined' &&
+    new URLSearchParams(window.location.search).get('pairing_records') === 'unavailable'
   const pairingListeners = new Set<(view: PairingView) => void>()
   const publishPairing = (change: Partial<PairingView>) => {
     pairing = { ...pairing, ...change }
@@ -1734,7 +1750,10 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
       }
       return terminalOpensAnswer.then(() => view.handle)
     },
-    pairingView: () => Promise.resolve(pairing),
+    pairingView: () => {
+      if (recordsUnavailable) refuse('RESOURCE_UNAVAILABLE', RECORDS_UNAVAILABLE_WORDS)
+      return Promise.resolve(pairing)
+    },
     pairingSetOrigin: (origin) => {
       const trimmed = origin.trim().replace(/\/$/, '')
       if (!/^https:\/\/[a-z0-9.-]+(:[0-9]+)?$/.test(trimmed)) {
