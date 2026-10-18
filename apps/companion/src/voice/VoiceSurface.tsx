@@ -296,8 +296,14 @@ function ProviderChoiceScreen({
     inFlight.current = target === end.current || target === endingNote.current ? target : null
   }
   const forget = (event: React.FocusEvent) => {
-    // A control that is taken away may be blurred as it goes, which is not the person's move.
-    if (event.target === inFlight.current && inFlight.current.isConnected) inFlight.current = null
+    // A window that loses focus blurs the element that holds it in the page, with no element to
+    // take it, and the page no longer has focus. That is not the person moving focus on the page:
+    // the record is kept, and focus is repaired if the element goes meanwhile. (An element that
+    // React takes away is not blurred through here: React does not dispatch events while it
+    // removes.)
+    if (event.target === inFlight.current && (event.relatedTarget !== null || document.hasFocus())) {
+      inFlight.current = null
+    }
   }
   useLayoutEffect(() => {
     const lost = inFlight.current

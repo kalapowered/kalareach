@@ -1,4 +1,4 @@
-import { render, screen, within } from '@testing-library/react'
+import { fireEvent, render, screen, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { describe, expect, it, vi } from 'vitest'
 
@@ -289,6 +289,52 @@ describe('before voice starts', () => {
 
       rerender(screenWith(OVER))
       expect(heading).toHaveFocus()
+    })
+
+    it('leaves focus on a control outside the screen that the person moved it to', () => {
+      const { rerender } = render(
+        <>
+          <button type="button">Elsewhere</button>
+          {screenWith(IN_FLIGHT)}
+        </>
+      )
+      screen.getByRole('button', { name: 'End the call' }).focus()
+      rerender(
+        <>
+          <button type="button">Elsewhere</button>
+          {screenWith(ENDING)}
+        </>
+      )
+      expect(screen.getByText(/is ending its call/)).toHaveFocus()
+      // The person moves focus out of the screen, to another control of the page.
+      const elsewhere = screen.getByRole('button', { name: 'Elsewhere' })
+      elsewhere.focus()
+
+      rerender(
+        <>
+          <button type="button">Elsewhere</button>
+          {screenWith(OVER)}
+        </>
+      )
+
+      expect(elsewhere).toHaveFocus()
+    })
+
+    it('repairs focus when the window loses focus while the end runs and the start is over before it is back', () => {
+      const { rerender } = render(screenWith(IN_FLIGHT))
+      screen.getByRole('button', { name: 'End the call' }).focus()
+      rerender(screenWith(ENDING))
+      const said = screen.getByText(/is ending its call/)
+      expect(said).toHaveFocus()
+      // The window goes to another application: the page's focused element is blurred, and the page
+      // itself no longer has focus. That is not the person moving focus on the page.
+      const hasFocus = vi.spyOn(document, 'hasFocus').mockReturnValue(false)
+      fireEvent.focusOut(said)
+      hasFocus.mockRestore()
+
+      rerender(screenWith(OVER))
+
+      expect(screen.getByRole('button', { name: 'Start voice session' })).toHaveFocus()
     })
 
     it('leaves focus where the person put it', () => {
