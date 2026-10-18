@@ -821,21 +821,24 @@ async fn a_second_call_for_a_device_being_revoked_sends_nothing_and_asks_nobody(
         .await
         .expect("the dialog is shown");
     let second = rig.app.start_call("revocation_revoke", body);
-    let second = tokio::time::timeout(WATCHDOG, second)
-        .await
-        .expect("the second call does not wait for the dialog")
-        .expect("the call ends")
-        .expect("it is shown what stands");
-    assert_eq!(phone_state(&second, "feed"), "active");
-    assert_eq!(rig.ceremony.reasons().len(), 1, "nobody was asked twice");
-    assert_eq!(rig.publications(), 0, "nothing was sent for it");
-
+    let second = tokio::time::timeout(WATCHDOG, second).await;
+    let asked_meanwhile = rig.ceremony.reasons().len();
+    let sent_meanwhile = rig.publications();
+    // The dialog ends whatever the second call did, so that a failure here ends the case.
     release.notify_one();
     let first = tokio::time::timeout(WATCHDOG, first)
         .await
         .expect("the first call ends")
         .expect("the call ends")
         .expect("the person confirmed and the request was published");
+
+    let second = second
+        .expect("the second call does not wait for the dialog")
+        .expect("the call ends")
+        .expect("it is shown what stands");
+    assert_eq!(phone_state(&second, "feed"), "active");
+    assert_eq!(asked_meanwhile, 1, "nobody was asked twice");
+    assert_eq!(sent_meanwhile, 0, "nothing was sent for it");
     assert!(["sent", "done"].contains(&phone_state(&first, "feed").as_str()));
     assert_eq!(rig.publications(), 1, "one request for one device");
 }
