@@ -13,12 +13,12 @@
 # repository is named by the revision the lock holds and checked by build-shells.sh against the
 # tree digest the manifest pins. A shell built this way fetches nothing once these are placed.
 #
-# A file that is already in <prefix>/sources stays. Any other is fetched from the URL its manifest
+# A crate or a repository that is already in <prefix>/sources stays. Any other is fetched from the URL its manifest
 # or lock names and, for an archive and a repository, when that server does not answer, from each
 # mirror listed below. An archive or a crate that arrives is checked against its pin before it is
 # kept; for an archive the next server is tried when the bytes differ, and a crate has one server.
-# An archive that is already there with other bytes is removed and placed again, so a cache left
-# by an older pin never blocks a run. A repository, and a crate that was already there, are judged
+# An archive that is already there with other bytes is replaced, in one step, by the pinned bytes,
+# so a cache left by an older pin never blocks a run. A repository, and a crate that was already there, are judged
 # by build-shells.sh before they are used.
 
 set -euo pipefail
@@ -106,6 +106,9 @@ import sys
 
 with open(sys.argv[1], encoding="utf-8") as handle:
     upstream = json.load(handle)["upstream"]
+for key in ("archive", "directory"):
+    if "/" in upstream[key] or upstream[key] in ("", ".", ".."):
+        sys.exit("place-shell-sources: the manifest's %s %r is not a plain name" % (key, upstream[key]))
 print("%s\t%s\t%s\t%s" % (upstream["archive"], upstream["url"], upstream["sha256"],
                           upstream["directory"]))
 PYTHON
@@ -117,11 +120,14 @@ PYTHON
 pinned_repositories() {
     python3 - "$1" <<'PYTHON'
 import json
+import re
 import sys
 
 with open(sys.argv[1], encoding="utf-8") as handle:
     cargo = json.load(handle).get("cargo")
 for entry in (cargo or {}).get("git", []):
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", entry["name"]):
+        sys.exit("place-shell-sources: the manifest's repository name %r is not a plain name" % entry["name"])
     print("%s\t%s\t%s\t%s" % (entry["name"], entry["url"], entry["revision"], entry["sha256"]))
 PYTHON
 }
@@ -150,6 +156,9 @@ REGISTRY = "registry+https://github.com/rust-lang/crates.io-index"
 package = {}
 def flush():
     if package.get("source") == REGISTRY:
+        if not (re.fullmatch(r"[A-Za-z0-9_.-]+", package["name"])
+                and re.fullmatch(r"[A-Za-z0-9_.+-]+", package["version"])):
+            sys.exit("place-shell-sources: Cargo.lock names a crate that is not a plain name")
         print("%s\t%s\t%s" % (package["name"], package["version"], package["checksum"]))
     package.clear()
 for line in sys.stdin:
@@ -204,7 +213,6 @@ place_archive() {
             return 0
         fi
         echo "place-shell-sources: $archive in $sources has digest $actual and the manifest pins $sha256; placing it again" >&2
-        rm -f -- "${destination:?}"
     fi
     mkdir -p "$sources"
 
@@ -250,6 +258,7 @@ place_crates() {
     # Read into a variable first, so that a parser that fails stops the run here.
     crates="$(registry_crates <<<"$lock")"
     while IFS=$'\t' read -r crate version checksum; do
+        [ -n "$crate" ] || continue
         count=$((count + 1))
         file="$sources/$crate-$version.crate"
         if [ -f "$file" ]; then

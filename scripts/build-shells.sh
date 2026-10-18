@@ -339,8 +339,9 @@ PYTHON
 #   $4/mirrors/<name>.git            each pinned repository, holding its revision as refs/heads/pinned
 #   $2/.cargo/config.toml            the source replacements, appended to the tree's own configuration
 #
-# Nothing cargo reads is written until every file has passed, and a refusal names the source and
-# the digest it found where there is one. The lock is read line by line and strictly, so a line or
+# Cargo is pointed at no file until every file has passed; the crates and the configuration are
+# written after the last check. A refusal names the source and the digest it found where there is
+# one. The lock is read line by line and strictly, so a line or
 # a source this does not know is a failure rather than something skipped.
 prepare_cargo_sources() {
     python3 - "$1" "$2" "$3" "$4" <<'PYTHON'
@@ -673,8 +674,16 @@ startup=$(digest "$package/$m_startup") $m_startup"
     work="$(mktemp -d "${TMPDIR:-/tmp}/kr-shell-$shell_name.XXXXXX")"
     trap 'rm -rf "${work:?}"' RETURN
 
+    # The archive is copied before it is judged and the copy is unpacked, so the bytes that were
+    # checked are the bytes that are built, whatever else uses the cache meanwhile.
+    cp "$archive" "$work/$m_archive"
+    actual="$(digest "$work/$m_archive")"
+    if [ "$actual" != "$m_sha256" ]; then
+        echo "build-shells: $m_archive has digest $actual and the manifest pins $m_sha256" >&2
+        return 1
+    fi
     echo "build-shells: unpacking $m_archive"
-    tar -x -f "$archive" -C "$work"
+    tar -x -f "$work/$m_archive" -C "$work"
     local source_tree="$work/$m_directory"
     if [ ! -d "$source_tree" ]; then
         echo "build-shells: $m_archive does not hold $m_directory" >&2
@@ -704,22 +713,26 @@ startup=$(digest "$package/$m_startup") $m_startup"
     fi
 
     # A tree with a Cargo.lock is built from the sources the lock names, checked and laid out here,
-    # and cargo reaches no server after this. The cargo home is the build's own, so nothing the
-    # person's account keeps in theirs is read, and a source that was not placed cannot be fetched.
+    # and cargo reaches no server after this. The cargo home is the build's own, so the
+    # configuration and credentials the account keeps in its own are not read, and a source that
+    # was not placed cannot be fetched.
     local -a cargo_env=()
     if [ -f "$source_tree/Cargo.lock" ]; then
         local cargo_dir="$work/cargo"
         mkdir -p "$cargo_dir/home"
         prepare_cargo_sources "$package/manifest.json" "$source_tree" "$cache" "$cargo_dir" || return 1
         cargo_env=("CARGO_HOME=$cargo_dir/home" CARGO_NET_OFFLINE=true CARGO_NET_GIT_FETCH_WITH_CLI=false
-            CARGO_HTTP_PROXY=127.0.0.1:9)
+            CARGO_HTTP_PROXY=127.0.0.1:9 NO_PROXY= no_proxy=)
         # This fills cargo's own copy of each repository from the verified mirror. It is the one
-        # cargo step that is not offline, and it can only read the local sources: the proxy named
-        # here and in the configuration does not answer, whatever the caller's environment says.
+        # cargo step that is not offline, so it is held to local sources: git is the client, and
+        # it is allowed the file protocol only, with none of the account's git configuration; the
+        # proxy named here and in the configuration does not answer, and no host is exempt from
+        # it, whatever the caller's environment says.
         (
             cd "$source_tree"
-            env CARGO_HOME="$cargo_dir/home" CARGO_NET_OFFLINE=false CARGO_NET_GIT_FETCH_WITH_CLI=false \
-                CARGO_HTTP_PROXY=127.0.0.1:9 cargo fetch --locked
+            env CARGO_HOME="$cargo_dir/home" CARGO_NET_OFFLINE=false CARGO_NET_GIT_FETCH_WITH_CLI=true \
+                GIT_ALLOW_PROTOCOL=file GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
+                CARGO_HTTP_PROXY=127.0.0.1:9 NO_PROXY= no_proxy= cargo fetch --locked
         ) > "$work/cargo-fetch.log" 2>&1 || {
             tail -40 "$work/cargo-fetch.log" >&2
             echo "build-shells: cargo could not resolve $shell_name from the placed sources" >&2
