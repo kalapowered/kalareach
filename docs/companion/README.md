@@ -478,6 +478,26 @@ Revoking it again finishes the job. A device that a view finds revoked by this c
 signature in a host's feed, or that the host on this computer lists as revoked, whoever revoked it,
 is taken out the same way. A send already on its way cannot be called back.
 
+The Devices screen sits after Hosts in the desktop navigation and shows one card for each host, the
+one on this computer first. A card says how requests reach its host. For a host reached through its
+feed it also says what the feed holds: when the host last acknowledged a request, how many requests
+wait for it, and whether the feed removed it. Each device has a row that says in words where its
+revocation stands, with a badge for sent, acknowledged, revoked or refused. A request that has not
+been acknowledged is never called revoked.
+
+The control is named for this computer's ceremony: "Revoke with Touch ID", "Revoke with your
+password" or "Revoke with Windows Hello". The row asks no second question, because the system's
+dialog names the device and the host and is the confirmation. A computer with no ceremony shows no
+control and says so. A host the feed removed, and a host whose feed this computer could not read,
+show no control either, and the card says why. A device whose request the host refused can be
+revoked again.
+
+While a request waits for its host, the screen looks again every ten seconds, and each look connects
+to the hosts it lists, which read their feeds when a device connects. What changes is said in a live
+region, and once a request is sent, focus goes to the words that say where it stands. Those words
+fade in over the state duration and nothing travels, so reduced motion changes nothing about them.
+This screen is the desktop's: a phone has no ceremony to confirm with, so it revokes nothing.
+
 ## Sharing a session
 
 There is a "Sharing" tab in the settings of a session. It lists who has access, and then has a form for sharing the session.
