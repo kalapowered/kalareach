@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>NSPrivacyAccessedAPITypes</key>
+	<array>
+		<!--
+			System boot time. The pairing clock reads the machine's boot-scoped counter and the wall
+			clock to tell one boot from another, and the attempt budget's windows are timers on that
+			counter. Reason 35F9.1: measure the time that has elapsed between events within the app
+			and calculate timers. Nothing read here, or derived from it, leaves the device.
+		-->
+		<dict>
+			<key>NSPrivacyAccessedAPIType</key>
+			<string>NSPrivacyAccessedAPICategorySystemBootTime</string>
+			<key>NSPrivacyAccessedAPITypeReasons</key>
+			<array>
+				<string>35F9.1</string>
+			</array>
+		</dict>
+		<!--
+			File timestamps. The application's own stores read the size and the kind of the files and
+			directories it keeps in its container (the pairing records, the attempt budget, the
+			drafts). Reason C617.1: metadata of files inside the app container.
+		-->
+		<dict>
+			<key>NSPrivacyAccessedAPIType</key>
+			<string>NSPrivacyAccessedAPICategoryFileTimestamp</string>
+			<key>NSPrivacyAccessedAPITypeReasons</key>
+			<array>
+				<string>C617.1</string>
+			</array>
+		</dict>
+	</array>
+</dict>
+</plist>
