@@ -47,9 +47,10 @@ pub(crate) fn locked_file(path: &Path) -> std::io::Result<std::fs::File> {
     Ok(file)
 }
 
-pub use drafts::{DraftHosts, DraftsView, Holds, HostPrivacy, KeptHere, Why};
+pub use drafts::{DraftsView, Holds, HostPrivacy, Hosts, KeptHere, Why};
 pub use sync::{
-    Candidate, ConflictView, Keep, Other, SettingsSync, SyncParts, SyncState, SyncView,
+    Candidate, ConflictView, DeviceCandidate, DevicesView, Happened, Keep, Member, Offer, Other,
+    SettingsSync, SyncParts, SyncState, SyncView,
 };
 
 /// The event the backend publishes the settings on, as a [`SettingsView`].
@@ -361,7 +362,8 @@ impl Settings {
         data: &Path,
         parts: SyncParts,
         desk: Arc<crate::drafts::DraftDesk>,
-        hosts: Arc<dyn DraftHosts>,
+        hosts: Arc<dyn Hosts>,
+        ceremony: Arc<dyn kr_client::pairing::owner::Ceremony>,
     ) -> Result<()> {
         let sync = SettingsSync::open(
             data,
@@ -370,6 +372,7 @@ impl Settings {
             Arc::clone(&self.told),
             desk,
             hosts,
+            ceremony,
         )?;
         let _ = self.sync.set(sync);
         Ok(())
@@ -478,14 +481,93 @@ impl Settings {
         }
     }
 
-    /// Brings this computer and the sync service to the same settings, when sync is on.
+    /// Brings this computer and the sync service to the same settings, when sync is on, and asks
+    /// the hosts who they list.
     ///
     /// # Errors
     ///
     /// Returns what stopped the step.
     pub async fn sync_now(&self) -> Result<SettingsView> {
         if let Some(sync) = self.sync.get() {
+            sync.catch_up_now().await?;
+        }
+        Ok(self.view())
+    }
+
+    /// As [`Self::sync_now`] for the background: the hosts are asked only when there is somebody to
+    /// check, and not more than once a minute.
+    ///
+    /// # Errors
+    ///
+    /// Returns what stopped the step.
+    pub async fn sync_quietly(&self) -> Result<SettingsView> {
+        if let Some(sync) = self.sync.get() {
             sync.catch_up().await?;
+        }
+        Ok(self.view())
+    }
+
+    /// Asks every host who it lists and, on a computer that shares no settings, which collections
+    /// other devices share with it.
+    ///
+    /// # Errors
+    ///
+    /// Returns what stopped the step.
+    pub async fn devices_refresh(&self) -> Result<SettingsView> {
+        let Some(sync) = self.sync.get() else {
+            return Err(CommandError::refused("settings sync is not on"));
+        };
+        sync.devices_refresh().await?;
+        Ok(self.view())
+    }
+
+    /// Gives the settings' key to the device `reference` names, once the person confirms.
+    ///
+    /// # Errors
+    ///
+    /// Returns a refusal when the device is not one a host lists or the person does not confirm.
+    pub async fn device_share(&self, reference: &str) -> Result<SettingsView> {
+        let Some(sync) = self.sync.get() else {
+            return Err(CommandError::refused("settings sync is not on"));
+        };
+        sync.share(reference).await?;
+        Ok(self.view())
+    }
+
+    /// Takes the device `reference` names out of the shared settings.
+    ///
+    /// # Errors
+    ///
+    /// Returns a refusal when the device does not share the settings.
+    pub async fn device_remove(&self, reference: &str) -> Result<SettingsView> {
+        let Some(sync) = self.sync.get() else {
+            return Err(CommandError::refused("settings sync is not on"));
+        };
+        sync.remove(reference).await?;
+        Ok(self.view())
+    }
+
+    /// Joins the collection `reference` names, once the person confirms.
+    ///
+    /// # Errors
+    ///
+    /// Returns a refusal when the offer is gone or the person does not confirm.
+    pub async fn device_join(&self, reference: &str) -> Result<SettingsView> {
+        let Some(sync) = self.sync.get() else {
+            return Err(CommandError::refused("settings sync is not on"));
+        };
+        sync.join(reference).await?;
+        Ok(self.view())
+    }
+
+    /// Lets go of the outcomes the page has shown.
+    ///
+    /// # Errors
+    ///
+    /// Returns what stopped it.
+    pub async fn devices_dismiss(&self) -> Result<SettingsView> {
+        if let Some(sync) = self.sync.get() {
+            sync.dismiss_outcomes().await?;
         }
         Ok(self.view())
     }

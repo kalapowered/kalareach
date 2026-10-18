@@ -52,10 +52,13 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 
+use kr_client::pairing::owner::Ceremony;
 use kr_client::services::{
     HttpDeadlines, HttpService, ManagedSyncService, managed_response_limits,
 };
-use kr_client::sync::membership::{DeviceDirectory, HostAnswers, KeyRecordService, SyncMembership};
+use kr_client::sync::membership::{
+    CollectionRef, Device, DeviceDirectory, KeyRecordService, SyncMembership,
+};
 use kr_client::sync::{
     CollectionKeys, Published, Restored, SettingValue, SharedCollectionService,
     StoredCollectionKeys, SyncBody, SyncCheckpoint, SyncClient, SyncError, SyncObject,
@@ -73,7 +76,12 @@ use kr_protocol::service::{GatewayOrigin, installation_id};
 use kr_protocol::sync::SyncObjectKind;
 use serde::{Deserialize, Serialize};
 
-use super::{ColourMode, LocalSettings};
+mod members;
+
+use members::{Ask, Listed};
+pub use members::{Candidate as DeviceCandidate, DevicesView, Happened, Member, Offer};
+
+use super::{ColourMode, Hosts, LocalSettings};
 use crate::error::{CommandError, Result};
 use crate::recovery::{DeviceSigner, now};
 use crate::sync_service::{SyncService, SyncServiceView, host_of};
@@ -133,6 +141,8 @@ pub struct SyncView {
     pub problem: Option<String>,
     /// Drafts, which travel in the same collection when the person turns that on.
     pub drafts: super::drafts::DraftsView,
+    /// Who shares the settings.
+    pub devices: DevicesView,
 }
 
 impl SyncView {
@@ -148,6 +158,15 @@ impl SyncView {
             paused: false,
             problem: None,
             drafts: super::drafts::DraftsView::off(),
+            devices: DevicesView {
+                can_confirm: false,
+                out: false,
+                waiting: false,
+                members: Vec::new(),
+                candidates: Vec::new(),
+                offers: Vec::new(),
+                outcomes: Vec::new(),
+            },
         }
     }
 }
@@ -218,14 +237,23 @@ struct Record {
     service_origin: String,
     /// The collection, as the service names it.
     collection_id: SyncCollectionId,
-    /// The settings object in it.
-    object_id: SyncObjectId,
     /// True once the collection's first key record is known to be kept and installed.
     started: bool,
+    /// The newest epoch this computer sealed its settings under, or nought before it sealed any.
+    /// The key of a collection moves on whenever a device is added or removed, and a device added
+    /// can open only what is sealed under its own epoch or a later one, so the settings this
+    /// computer wrote are sealed again when the epoch has moved past this one.
+    sealed_epoch: u64,
 }
 
 impl Record {
-    const VERSION: u32 = 1;
+    const VERSION: u32 = 2;
+
+    /// The settings object of the collection. One collection holds one, and its identity is the
+    /// collection's, so a device that joins a collection knows it without being told.
+    fn object_id(&self) -> SyncObjectId {
+        SyncObjectId::new(self.collection_id.get())
+    }
 
     fn origin(&self) -> Result<GatewayOrigin> {
         GatewayOrigin::new(self.service_origin.as_str()).map_err(|error| {
@@ -247,6 +275,18 @@ pub struct SettingsSync {
     problem: Mutex<Option<String>>,
     told: Arc<super::Told>,
     drafts: Arc<super::drafts::DraftsSync>,
+    /// What this computer can ask of its hosts.
+    hosts: Arc<dyn Hosts>,
+    /// The platform's ceremony, which adding and joining ask the person to complete.
+    ceremony: Arc<dyn Ceremony>,
+    /// Who shares the settings, as the last step found it.
+    devices: Mutex<DevicesView>,
+    /// What the hosts listed, shared by every membership this computer opens.
+    listed: Arc<Listed>,
+    /// The collections the service said name this installation, which a join can name.
+    offered: Mutex<Vec<CollectionRef>>,
+    /// Whether the settings the service holds are sealed under keys this computer has not been given.
+    waiting: std::sync::atomic::AtomicBool,
 }
 
 impl std::fmt::Debug for SettingsSync {
@@ -254,16 +294,6 @@ impl std::fmt::Debug for SettingsSync {
         formatter
             .debug_struct("SettingsSync")
             .finish_non_exhaustive()
-    }
-}
-
-/// A device with no host to ask. A collection of one device has no other member to check.
-#[derive(Debug)]
-struct NoHosts;
-
-impl DeviceDirectory for NoHosts {
-    fn answers(&self) -> kr_client::services::ServiceFuture<'_, Option<HostAnswers>> {
-        Box::pin(std::future::ready(Ok(None)))
     }
 }
 
@@ -294,7 +324,8 @@ impl SettingsSync {
         parts: SyncParts,
         told: Arc<super::Told>,
         desk: Arc<crate::drafts::DraftDesk>,
-        hosts: Arc<dyn super::drafts::DraftHosts>,
+        hosts: Arc<dyn Hosts>,
+        ceremony: Arc<dyn Ceremony>,
     ) -> Result<Self> {
         let directory = data.join(DIRECTORY);
         create_private_directory(&directory)
@@ -308,7 +339,7 @@ impl SettingsSync {
         let drafts = Arc::new(super::drafts::DraftsSync::open(
             &directory,
             Arc::clone(&desk),
-            hosts,
+            Arc::clone(&hosts),
             Arc::clone(&told),
         )?);
         desk.watched_by(Arc::clone(&drafts) as Arc<dyn crate::drafts::DraftWatch>);
@@ -320,6 +351,12 @@ impl SettingsSync {
             problem: Mutex::new(None),
             told,
             drafts,
+            hosts,
+            ceremony,
+            devices: Mutex::new(DevicesView::default()),
+            listed: Arc::new(Listed::default()),
+            offered: Mutex::new(Vec::new()),
+            waiting: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -375,6 +412,7 @@ impl SettingsSync {
                     paused: false,
                     problem,
                     drafts: self.drafts.view(),
+                    devices: self.devices_view(),
                 };
             }
             Err(error) => {
@@ -387,6 +425,7 @@ impl SettingsSync {
                     paused: false,
                     problem: Some(error.message),
                     drafts: self.drafts.view(),
+                    devices: self.devices_view(),
                 };
             }
         };
@@ -394,7 +433,7 @@ impl SettingsSync {
             Ok(store) => {
                 let outstanding = store.unsettled().unwrap_or(0);
                 let conflicts = store
-                    .conflicts(record.object_id)
+                    .conflicts(record.object_id())
                     .map_or(0, |copies| copies.len() as u64);
                 let paused = store.privacy().is_ok_and(|privacy| privacy.fenced);
                 (outstanding, conflicts, paused, None)
@@ -414,6 +453,7 @@ impl SettingsSync {
             paused,
             problem: problem.or(trouble),
             drafts: self.drafts.view(),
+            devices: self.devices_view(),
         }
     }
 
@@ -447,21 +487,33 @@ impl SettingsSync {
         let mut record = match self.record()? {
             Some(record) => record,
             None => {
+                let origin = self.parts.service.origin().clone();
+                // A collection this computer joined, whose record was not kept before the
+                // application stopped, is the one to go on with: starting another would leave the
+                // settings of the first where nothing reads them.
+                let held = self
+                    .membership_asking(&self.managed(&origin)?, Ask::Never)?
+                    .members()
+                    .map_err(member_failure)?;
+                let collection_id = match held {
+                    Some(status) => status.collection.collection_id,
+                    None => {
+                        SyncCollectionId::new(fresh_object_id().map_err(CommandError::from)?.get())
+                    }
+                };
                 let record = Record {
                     version: Record::VERSION,
-                    service_origin: self.parts.service.origin().as_str().to_owned(),
-                    collection_id: SyncCollectionId::new(
-                        fresh_object_id().map_err(CommandError::from)?.get(),
-                    ),
-                    object_id: fresh_object_id().map_err(CommandError::from)?,
+                    service_origin: origin.as_str().to_owned(),
+                    collection_id,
                     started: false,
+                    sealed_epoch: 0,
                 };
                 self.keep(&record)?;
                 record
             }
         };
         let service = self.managed(&record.origin()?)?;
-        let mut membership = self.membership(&service)?;
+        let mut membership = self.membership_asking(&service, Ask::Never)?;
         if membership.members().map_err(member_failure)?.is_none() {
             membership
                 .start(record.collection_id, now())
@@ -469,7 +521,9 @@ impl SettingsSync {
                 .map_err(member_failure)?;
         }
         drop(membership);
-        self.settle(&mut record, &service).await.map(|_| ())
+        self.settle(&mut record, &service, Ask::Now)
+            .await
+            .map(|_| ())
     }
 
     /* ---------------------------------------------------------------------- */
@@ -477,25 +531,37 @@ impl SettingsSync {
     /* ---------------------------------------------------------------------- */
 
     /// Brings this computer and the service to the same settings, when sync is on. Nothing happens
-    /// when it is off.
+    /// when it is off. The hosts are asked who they list only when there is somebody to check, and
+    /// not more than once a minute.
     ///
     /// # Errors
     ///
     /// Returns what stopped the step: the service could not be reached, or a local record could
     /// not be kept. The step is safe to run again, and the page is told what stopped it.
     pub async fn catch_up(&self) -> Result<()> {
-        let outcome = self.catch_up_in_a_step().await;
+        let outcome = self.catch_up_in_a_step(Ask::Recent).await;
         self.finished(&outcome);
         outcome
     }
 
-    async fn catch_up_in_a_step(&self) -> Result<()> {
+    /// As [`Self::catch_up`], for a person who asked: the hosts are asked again.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::catch_up`].
+    pub async fn catch_up_now(&self) -> Result<()> {
+        let outcome = self.catch_up_in_a_step(Ask::Now).await;
+        self.finished(&outcome);
+        outcome
+    }
+
+    async fn catch_up_in_a_step(&self, ask: Ask) -> Result<()> {
         let _step = self.step().await?;
         let Some(mut record) = self.record()? else {
             return Ok(());
         };
         let service = self.managed(&record.origin()?)?;
-        self.settle(&mut record, &service).await.map(|_| ())
+        self.settle(&mut record, &service, ask).await.map(|_| ())
     }
 
     /// Records how a step ended, for the page.
@@ -512,10 +578,16 @@ impl SettingsSync {
         &self,
         record: &mut Record,
         service: &Arc<ManagedSyncService>,
+        ask: Ask,
     ) -> Result<Progress> {
         let now_ms = now();
-        let mut membership = self.membership(service)?;
-        membership.reconcile(now_ms).await.map_err(member_failure)?;
+        let ask = self.ask_for(service, ask)?;
+        let mut membership = self.membership_asking(service, ask)?;
+        let reconciled = membership.reconcile(now_ms).await.map_err(member_failure);
+        // What the membership holds is shown whatever the reconciliation could do.
+        self.note_devices(&membership);
+        self.told.tell();
+        reconciled?;
         if !membership.publishes().map_err(member_failure)? {
             return Ok(Progress::Starting);
         }
@@ -534,7 +606,7 @@ impl SettingsSync {
             self.told.tell();
         }
         let client = self.client(service, status.collection, epoch)?;
-        self.agree(&client, record.object_id, now_ms).await?;
+        self.agree(&client, record, epoch, now_ms).await?;
         // The settings agree. Drafts go in the same collection under the same epoch, when the
         // person asked for that, and what stops them never stops this step.
         self.drafts
@@ -562,13 +634,13 @@ impl SettingsSync {
         };
         let store = self.store()?;
         let copies = store
-            .conflicts(record.object_id)
+            .conflicts(record.object_id())
             .map_err(sync_failure)?
             .items;
         if copies.is_empty() {
             return Ok(None);
         }
-        let held = store.object(record.object_id).map_err(sync_failure)?;
+        let held = store.object(record.object_id()).map_err(sync_failure)?;
         Ok(Some(ConflictView {
             mine: Candidate {
                 colour_mode: self
@@ -612,7 +684,7 @@ impl SettingsSync {
         };
         let store = self.store()?;
         let copies = store
-            .conflicts(record.object_id)
+            .conflicts(record.object_id())
             .map_err(sync_failure)?
             .items;
         if copies.is_empty() {
@@ -637,7 +709,7 @@ impl SettingsSync {
         };
         let service = self.managed(&record.origin()?)?;
         let status = self
-            .membership(&service)?
+            .membership_asking(&service, Ask::Never)?
             .members()
             .map_err(member_failure)?
             .ok_or_else(|| {
@@ -655,8 +727,8 @@ impl SettingsSync {
             self.local.set_colour_mode(mode)?;
             // The window is in the mode the file holds, whatever becomes of the rest of this step.
             self.told.tell();
-            let held = store.object(record.object_id).map_err(sync_failure)?;
-            let object = self.object_of(record.object_id, held.as_ref(), mode, now())?;
+            let held = store.object(record.object_id()).map_err(sync_failure)?;
+            let object = self.object_of(record.object_id(), held.as_ref(), mode, now())?;
             store.put_object(&object).map_err(sync_failure)?;
         }
         for copy in copies {
@@ -667,7 +739,10 @@ impl SettingsSync {
         }
         // Sending the choice may fail and the choice stands: the step that next reaches the service
         // sends it, and the page is told what this one could not do.
-        let sent = self.settle(&mut record, &service).await.map(|_| ());
+        let sent = self
+            .settle(&mut record, &service, Ask::Recent)
+            .await
+            .map(|_| ());
         self.finished(&sent);
         Ok(())
     }
@@ -676,9 +751,11 @@ impl SettingsSync {
     async fn agree(
         &self,
         client: &SyncClient,
-        object_id: SyncObjectId,
+        record: &mut Record,
+        epoch: u64,
         now_ms: TimestampMs,
     ) -> Result<()> {
+        let object_id = record.object_id();
         let store = client.store();
         client
             .reconcile_unsettled(now_ms)
@@ -733,12 +810,36 @@ impl SettingsSync {
         }
         let note = store.checkpoint(object_id).map_err(sync_failure)?;
         let agreed = note.and_then(|note| note.published_revision.0);
+        // The key moved on since these settings were sealed, and a device added since opens only
+        // what is sealed under the newer one: the settings this computer wrote are sealed again,
+        // as a new revision with the content they have.
+        let me = DeviceId::new(installation_id(self.parts.keys.authorisation.public()).get());
+        if record.sealed_epoch < epoch
+            && let Some(object) = &held
+            && agreed == Some(object.revision)
+            && object.device_id == me
+        {
+            let again = SyncObject {
+                revision: fresh_revision().map_err(CommandError::from)?,
+                updated_at_ms: now_ms,
+                ..object.clone()
+            };
+            store.put_object(&again).map_err(sync_failure)?;
+            held = Some(again);
+        }
         let changed = held
             .as_ref()
             .is_some_and(|object| agreed != Some(object.revision));
         if changed {
             return match client.publish(object_id, now_ms).await {
-                Ok(Published::Accepted { .. } | Published::Discarded { .. }) => Ok(()),
+                Ok(Published::Accepted { .. }) => {
+                    if record.sealed_epoch < epoch {
+                        record.sealed_epoch = epoch;
+                        self.keep(record)?;
+                    }
+                    Ok(())
+                }
+                Ok(Published::Discarded { .. }) => Ok(()),
                 Ok(Published::Conflicted { .. }) => {
                     self.told.tell();
                     Ok(())
@@ -746,6 +847,8 @@ impl SettingsSync {
                 Err(error) => Err(sync_failure(error)),
             };
         }
+        self.waiting
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         match client
             .fetch(SyncObjectKind::Settings, object_id, now_ms)
             .await
@@ -767,6 +870,15 @@ impl SettingsSync {
             Ok(Restored::ClientSelection { .. }) => Ok(()),
             // The collection holds no such object yet: there is nothing to follow.
             Err(SyncError::Client(error)) if error.code() == ErrorCode::UnknownSession => Ok(()),
+            // The settings are sealed under keys this computer was not given: it joined after
+            // they were. A device that holds them seals them again, and until then there is
+            // nothing to read, which is waiting and not a fault.
+            Err(SyncError::Client(error)) if error.code() == ErrorCode::HostNotConfigured => {
+                self.waiting
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                self.told.tell();
+                Ok(())
+            }
             Err(error) => Err(sync_failure(error)),
         }
     }
@@ -922,13 +1034,17 @@ impl SettingsSync {
         StoredCollectionKeys::in_store(Arc::clone(&self.parts.secrets), SCOPE)
     }
 
-    fn membership(&self, service: &Arc<ManagedSyncService>) -> Result<SyncMembership> {
+    fn membership_with(
+        &self,
+        service: &Arc<ManagedSyncService>,
+        directory: Arc<dyn DeviceDirectory>,
+    ) -> Result<SyncMembership> {
         SyncMembership::open(
             self.directory.join(MEMBERSHIP),
             &self.parts.keys,
             self.keys(),
             Arc::clone(service) as Arc<dyn KeyRecordService>,
-            Arc::new(NoHosts),
+            directory,
         )
         .map_err(member_failure)
     }
@@ -959,6 +1075,11 @@ fn colour_mode_of(object: &SyncObject) -> Option<ColourMode> {
         },
         SyncBody::ClientSelection(_) => None,
     }
+}
+
+/// The identifier a device is named by to the page: the installation its authorisation key derives.
+fn installation_id_of(device: &Device) -> String {
+    installation_id(&device.authorisation).to_string()
 }
 
 /// What a sync failure is to the person.

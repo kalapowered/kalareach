@@ -522,8 +522,9 @@ fn open_recovery(app: &tauri::AppHandle) {
     // Telling the page comes first, so a step that begins at once is heard.
     watch_settings(app);
     let hosts = std::sync::Arc::new(settings::connected::ConnectedHosts::new(app.clone()));
-    let taking_part =
-        device.and_then(|device| start_settings_sync(app, &data, device.identity(), hosts));
+    let ceremony = verify::platform_ceremony(app.get_webview_window("main"));
+    let taking_part = device
+        .and_then(|device| start_settings_sync(app, &data, device.identity(), hosts, ceremony));
     match taking_part {
         Ok(()) => keep_settings_in_step(app),
         Err(error) => {
@@ -549,8 +550,9 @@ pub fn watch_settings<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
 
 /// Lets this computer take part in settings sync, on `identity`'s keys and secure store and the
 /// sync service the setting names, with its records under `data`. The drafts of this computer's
-/// draft desk travel in the same collection when the person turns that on, and `hosts` says what
-/// this computer can read of each host's privacy mode.
+/// draft desk travel in the same collection when the person turns that on, `hosts` says what this
+/// computer can read of each host's privacy mode and which devices each lists, and `ceremony` is
+/// what adding a device to the settings and joining them ask the person to complete.
 ///
 /// # Errors
 ///
@@ -560,7 +562,8 @@ pub fn start_settings_sync<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     data: &std::path::Path,
     identity: &device::DeviceIdentity,
-    hosts: std::sync::Arc<dyn settings::DraftHosts>,
+    hosts: std::sync::Arc<dyn settings::Hosts>,
+    ceremony: std::sync::Arc<dyn kr_client::pairing::owner::Ceremony>,
 ) -> Result<()> {
     use std::sync::Arc;
 
@@ -576,6 +579,7 @@ pub fn start_settings_sync<R: tauri::Runtime>(
         },
         state.drafts(),
         hosts,
+        ceremony,
     )
 }
 
@@ -599,7 +603,7 @@ fn keep_settings_in_step(app: &tauri::AppHandle) {
                 tokio::time::sleep(SETTINGS_INTERVAL).await;
                 continue;
             };
-            let _ = settings.sync_now().await;
+            let _ = settings.sync_quietly().await;
             tokio::select! {
                 () = tokio::time::sleep(SETTINGS_INTERVAL) => {}
                 () = settings.drafts_changed() => tokio::time::sleep(DRAFTS_SETTLE).await,

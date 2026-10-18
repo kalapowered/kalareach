@@ -19,7 +19,7 @@
 //! record keeps the session it was established for, so a draft sent to another session has no host
 //! until the host of that one says so. Until then the draft is kept here.
 //!
-//! What a device can read of a host's privacy mode is [`DraftHosts`]'s to say, and it says one of
+//! What a device can read of a host's privacy mode is [`Hosts`]'s to say, and it says one of
 //! three things. A host with privacy mode off lets its drafts be published; a host with it on does
 //! not, and an answer that arrives after the host went private is discarded by the store's
 //! generation, which is moved before the answer is settled; and a host this device cannot read,
@@ -127,8 +127,20 @@ pub enum Holds {
     Refused,
 }
 
-/// What drafts sync asks of the hosts this device knows.
-pub trait DraftHosts: Send + Sync {
+/// What settings sync asks of the hosts this device knows: drafts sync, which host holds a session
+/// and where its privacy mode stands; and sharing the settings, which devices each host lists.
+pub trait Hosts: Send + Sync {
+    /// What each host this device can ask lists as its devices, for the hosts that answered.
+    fn device_lists(
+        &self,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Vec<kr_protocol::sharing::DeviceListResult>>
+                + Send
+                + '_,
+        >,
+    >;
+
     /// Whether the host this device is connected to holds `session`.
     fn holds(
         &self,
@@ -225,7 +237,7 @@ struct Owed {
 pub struct DraftsSync {
     directory: PathBuf,
     desk: Arc<DraftDesk>,
-    hosts: Arc<dyn DraftHosts>,
+    hosts: Arc<dyn Hosts>,
     told: Arc<Told>,
     wake: tokio::sync::Notify,
     /// Taken for the length of a change to one of the small records the desk's thread changes.
@@ -288,7 +300,7 @@ fn cannot_hold() -> kr_client::ClientError {
 /// its own passed it.
 struct Gate {
     inner: Arc<dyn SyncBackupService>,
-    hosts: Arc<dyn DraftHosts>,
+    hosts: Arc<dyn Hosts>,
     environment: EnvironmentId,
     client: Arc<SyncClient>,
     seen: Arc<Mutex<Option<HostPrivacy>>>,
@@ -446,7 +458,7 @@ impl SyncBackupService for Gate {
 
 /// What a pass knows of each host a draft or a removal is for.
 #[derive(Default)]
-struct Hosts {
+struct PassHosts {
     /// What each host's privacy mode was when it was last read this pass.
     privacy: BTreeMap<EnvironmentId, HostPrivacy>,
     /// The hosts whose store is open, fenced or let go to match.
@@ -482,7 +494,7 @@ impl DraftsSync {
     pub fn open(
         settings_sync: &std::path::Path,
         desk: Arc<DraftDesk>,
-        hosts: Arc<dyn DraftHosts>,
+        hosts: Arc<dyn Hosts>,
         told: Arc<Told>,
     ) -> Result<Self> {
         let directory = settings_sync.join(DIRECTORY);
@@ -726,8 +738,8 @@ impl DraftsSync {
         store: &DraftStore,
         environments: &BTreeSet<EnvironmentId>,
         problem: &mut Option<CommandError>,
-    ) -> Hosts {
-        let mut hosts = Hosts::default();
+    ) -> PassHosts {
+        let mut hosts = PassHosts::default();
         for environment in environments {
             let state = self.hosts.privacy(*environment).await;
             let opened = self
@@ -1031,7 +1043,7 @@ impl DraftsSync {
         &self,
         own: &[Draft],
         hosts_of: &BTreeMap<String, HostRecord>,
-        hosts: &mut Hosts,
+        hosts: &mut PassHosts,
         store: &DraftStore,
         problem: &mut Option<CommandError>,
     ) -> Result<BTreeMap<(Option<EnvironmentId>, Why, Option<String>), u64>> {
@@ -1329,7 +1341,7 @@ impl DraftsSync {
 struct Removals<'a> {
     owed: &'a [Owed],
     own: &'a [Draft],
-    hosts: &'a Hosts,
+    hosts: &'a PassHosts,
     puller: &'a DraftSync,
     store: &'a DraftStore,
 }

@@ -18,9 +18,10 @@ use kr_protocol::method::Method;
 use kr_protocol::privacy::{PrivacyReport, PrivacyStatusParams};
 use kr_protocol::rights::ActionRight;
 use kr_protocol::session::{SessionReadParams, SessionReadResult};
+use kr_protocol::sharing::{DeviceListParams, DeviceListResult};
 use tauri::{AppHandle, Manager as _, Runtime};
 
-use super::drafts::{DraftHosts, Holds, HostPrivacy};
+use super::drafts::{Holds, HostPrivacy, Hosts};
 use crate::connection::{Connection, Standing};
 use crate::drafts::DraftHost;
 use crate::error::CommandError;
@@ -120,7 +121,61 @@ fn unreadable(reason: impl Into<String>) -> HostPrivacy {
     }
 }
 
-impl<R: Runtime> DraftHosts for ConnectedHosts<R> {
+/// What a host lists as its devices, asked over `session`, or nothing when it does not say in time
+/// or does not let this device ask (listing devices needs the right to manage the host).
+async fn listed(session: &Arc<Session>) -> Option<DeviceListResult> {
+    tokio::time::timeout(
+        ANSWER_WITHIN,
+        session.read::<_, DeviceListResult>(
+            Method::DeviceList,
+            &DeviceListParams {
+                include_revoked: true,
+            },
+        ),
+    )
+    .await
+    .ok()?
+    .ok()
+}
+
+impl<R: Runtime> Hosts for ConnectedHosts<R> {
+    fn device_lists(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<DeviceListResult>> + Send + '_>>
+    {
+        Box::pin(async move {
+            let state = self.app.state::<AppState>();
+            let mut lists = Vec::new();
+            let mut asked = None;
+            if let Ok(connection) = state.connection() {
+                lists.extend(listed(&connection.session()).await);
+                if let Standing::Paired { host, .. } = connection.standing() {
+                    asked = Some(host.host_device_id);
+                }
+            }
+            // The other hosts this computer is paired with, each on a connection made for the
+            // question and let go after it.
+            let Ok(device) = state.device() else {
+                return lists;
+            };
+            let pairing = device.pairing();
+            for host in pairing.hosts.list().unwrap_or_default() {
+                if asked == Some(host.host_device_id) {
+                    continue;
+                }
+                let identity = pairing.candidate.paired_identity(host.device_id);
+                let visit = async {
+                    let session = pairing.link.connect_paired(&host, &identity).await.ok()?;
+                    listed(&Arc::new(session)).await
+                };
+                if let Ok(Some(list)) = tokio::time::timeout(ANSWER_WITHIN, visit).await {
+                    lists.push(list);
+                }
+            }
+            lists
+        })
+    }
+
     fn holds(
         &self,
         session: SessionId,

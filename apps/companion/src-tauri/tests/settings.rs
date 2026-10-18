@@ -30,12 +30,15 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use companion_tauri::AppState;
 use companion_tauri::device::DeviceIdentity;
 use companion_tauri::drafts::DraftHost;
-use companion_tauri::settings::{DraftHosts, Holds, HostPrivacy, SETTINGS_EVENT};
+use companion_tauri::settings::{Holds, HostPrivacy, Hosts, SETTINGS_EVENT};
 use kr_client::drafts::{Draft, DraftSealer, DraftStore, DraftSync, DraftTarget, SyncCheckpoint};
+use kr_client::pairing::BoxFuture;
+use kr_client::pairing::owner::{Ceremony, CeremonyKind, CeremonyOutcome};
 use kr_client::services::{
     HttpDeadlines, HttpService, ManagedSyncService, ServiceSigner, SyncBackupService,
     managed_response_limits,
@@ -50,7 +53,8 @@ use kr_crypto::store::MemoryStore;
 use kr_protocol::ids::{
     DeviceId, DraftId, EnvironmentId, SessionId, SyncCollectionId, SyncObjectId,
 };
-use kr_protocol::scalars::{AuthorisationKey, Signature64, TimestampMs, Uuid};
+use kr_protocol::pairing::DevicePublicKeys;
+use kr_protocol::scalars::{AuthorisationKey, Nullable, Signature64, TimestampMs, Uuid};
 use kr_protocol::service::{GatewayOrigin, ServiceRequestSigner, installation_id};
 use kr_protocol::sync::SyncObjectKind;
 use kr_service_stand_in::{Moment, Served, serve};
@@ -107,11 +111,61 @@ fn now_ms() -> u64 {
 /// What survives the application being closed: the service, the data directory and the secure
 /// store, which holds the device's keys and, once sync is on, the collection's.
 struct Computer {
-    served: Served,
+    served: Arc<Served>,
     data: tempfile::TempDir,
     secrets: Arc<MemoryStore>,
     /// What this computer can read of each host's privacy mode.
     hosts: Arc<ScriptedHosts>,
+    /// What the person does when this computer asks them to confirm.
+    ceremony: Arc<ScriptedCeremony>,
+}
+
+/// The platform's ceremony, answered as a test says.
+struct ScriptedCeremony {
+    answer: Mutex<CeremonyOutcome>,
+    asked: Mutex<Vec<String>>,
+}
+
+impl ScriptedCeremony {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            answer: Mutex::new(CeremonyOutcome::Confirmed),
+            asked: Mutex::new(Vec::new()),
+        })
+    }
+
+    fn will_answer(&self, answer: CeremonyOutcome) {
+        *self.answer.lock().expect("the answer") = answer;
+    }
+
+    /// What the dialog said each time it was shown.
+    fn reasons(&self) -> Vec<String> {
+        self.asked.lock().expect("the record").clone()
+    }
+}
+
+impl Ceremony for ScriptedCeremony {
+    fn kind(&self) -> CeremonyKind {
+        CeremonyKind::TouchId
+    }
+
+    fn verify<'a>(&'a self, reason: &'a str, _within: Duration) -> BoxFuture<'a, CeremonyOutcome> {
+        self.asked
+            .lock()
+            .expect("the record")
+            .push(reason.to_owned());
+        let answer = *self.answer.lock().expect("the answer");
+        Box::pin(async move { answer })
+    }
+}
+
+/// A device a host lists: what it is called, its keys, and what the host says of it.
+#[derive(Clone)]
+struct Listed {
+    name: String,
+    keys: DevicePublicKeys,
+    manages_host: bool,
+    revoked: bool,
 }
 
 /// What this computer can learn of each host, as a test says it.
@@ -133,6 +187,8 @@ struct ScriptedHosts {
     /// The hosts that refuse to say whether they hold a session, as one does for a session outside
     /// the right it gave this device.
     refusing: Mutex<BTreeSet<EnvironmentId>>,
+    /// The devices the hosts this computer can ask list.
+    devices: Mutex<Vec<Listed>>,
     /// How many times a host was asked whether it holds a session.
     asked: Mutex<u32>,
 }
@@ -146,6 +202,7 @@ impl ScriptedHosts {
             owners: Mutex::default(),
             connected: Mutex::default(),
             refusing: Mutex::default(),
+            devices: Mutex::default(),
             asked: Mutex::default(),
         }
     }
@@ -187,6 +244,11 @@ impl ScriptedHosts {
             .insert(host.environment);
     }
 
+    /// The hosts this computer can ask list exactly `devices`.
+    fn list(&self, devices: Vec<Listed>) {
+        *self.devices.lock().expect("the record") = devices;
+    }
+
     fn times_asked_who_holds(&self) -> u32 {
         *self.asked.lock().expect("the record")
     }
@@ -202,7 +264,35 @@ impl ScriptedHosts {
     }
 }
 
-impl DraftHosts for ScriptedHosts {
+impl Hosts for ScriptedHosts {
+    fn device_lists(
+        &self,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Vec<kr_protocol::sharing::DeviceListResult>>
+                + Send
+                + '_,
+        >,
+    > {
+        let devices = self.devices.lock().expect("the record").clone();
+        let lists = if devices.is_empty() {
+            Vec::new()
+        } else {
+            vec![kr_protocol::sharing::DeviceListResult {
+                devices: devices
+                    .iter()
+                    .enumerate()
+                    .map(|(number, device)| listed_device(number, device))
+                    .collect(),
+                authority_revision: kr_protocol::ids::AuthorityRevision::new(1),
+                feed_synchronised_at_ms: Nullable::null(),
+                feed_stale: false,
+                feed_removed: false,
+            }]
+        };
+        Box::pin(std::future::ready(lists))
+    }
+
     fn holds(
         &self,
         session: SessionId,
@@ -260,13 +350,58 @@ impl DraftHosts for ScriptedHosts {
     }
 }
 
+/// One entry of a host's device list.
+fn listed_device(number: usize, device: &Listed) -> kr_protocol::sharing::DeviceSummary {
+    kr_protocol::sharing::DeviceSummary {
+        device_id: DeviceId::new(Uuid::from_bytes([u8::try_from(number).expect("a few"); 16])),
+        display_name: device.name.clone(),
+        grant_id: kr_protocol::ids::GrantId::new(Uuid::from_bytes([0x90; 16])),
+        paired_at_ms: TimestampMs::new(1),
+        revoked: device.revoked,
+        keys: Nullable::some(device.keys),
+        manages_host: device.manages_host,
+        platform: kr_protocol::pairing::DevicePlatform::Macos,
+        grant_expires_at_ms: Nullable::null(),
+        grant_expired: false,
+        all_sessions: true,
+    }
+}
+
 impl Computer {
     async fn new() -> Self {
         Self {
-            served: serve().await,
+            served: Arc::new(serve().await),
             data: tempfile::tempdir().expect("a directory"),
             secrets: Arc::new(MemoryStore::new()),
             hosts: Arc::new(ScriptedHosts::new()),
+            ceremony: ScriptedCeremony::new(),
+        }
+    }
+
+    /// Another computer of the same person, reaching the same sync service.
+    async fn beside(other: &Self) -> Self {
+        Self {
+            served: Arc::clone(&other.served),
+            data: tempfile::tempdir().expect("a directory"),
+            secrets: Arc::new(MemoryStore::new()),
+            hosts: Arc::new(ScriptedHosts::new()),
+            ceremony: ScriptedCeremony::new(),
+        }
+    }
+
+    /// This computer as a host lists it.
+    fn listed(&self, name: &str) -> Listed {
+        let keys = self.identity().keys;
+        Listed {
+            name: name.to_owned(),
+            keys: DevicePublicKeys {
+                transport: *keys.transport.public(),
+                authorisation: *keys.authorisation.public(),
+                stored_envelope: *keys.stored_envelope.public(),
+                notification_preview: *keys.notification_preview.public(),
+            },
+            manages_host: true,
+            revoked: false,
         }
     }
 
@@ -292,6 +427,11 @@ impl Computer {
                 companion_tauri::commands::settings_conflicts,
                 companion_tauri::commands::settings_conflict_resolve,
                 companion_tauri::commands::settings_drafts_set,
+                companion_tauri::commands::settings_devices_refresh,
+                companion_tauri::commands::settings_device_share,
+                companion_tauri::commands::settings_device_remove,
+                companion_tauri::commands::settings_devices_dismiss,
+                companion_tauri::commands::settings_join,
                 companion_tauri::commands::device_drafts,
                 companion_tauri::commands::device_draft_discard,
             ])
@@ -304,7 +444,8 @@ impl Computer {
             app.handle(),
             self.data.path(),
             &self.identity(),
-            Arc::clone(&self.hosts) as Arc<dyn DraftHosts>,
+            Arc::clone(&self.hosts) as Arc<dyn Hosts>,
+            Arc::clone(&self.ceremony) as Arc<dyn Ceremony>,
         )
         .expect("settings sync opens");
         companion_tauri::watch_settings(app.handle());
@@ -343,8 +484,7 @@ impl Computer {
         .expect("a record");
         let collection_id: SyncCollectionId =
             serde_json::from_value(record["collection_id"].clone()).expect("a collection");
-        let object_id: SyncObjectId =
-            serde_json::from_value(record["object_id"].clone()).expect("an object");
+        let object_id = SyncObjectId::new(collection_id.get());
         let keys = self.identity().keys;
         let origin = self.origin();
         let http = HttpService::with(
@@ -444,6 +584,31 @@ impl Page {
     fn sync_now(&self) -> Value {
         self.call("settings_sync_now", json!({}))
             .expect("sync runs")
+    }
+
+    /// The devices the page is shown, as the last step found them.
+    fn devices(&self) -> Value {
+        self.view()["sync"]["devices"].clone()
+    }
+
+    /// The page asks every host who it lists.
+    fn devices_refresh(&self) -> Value {
+        self.call("settings_devices_refresh", json!({}))
+            .expect("the hosts are asked")["sync"]["devices"]
+            .clone()
+    }
+
+    /// The page names a device it was shown and the person confirms (or not) on this computer.
+    fn share(&self, reference: &str) -> Result<Value, Value> {
+        self.call("settings_device_share", json!({ "reference": reference }))
+    }
+
+    fn unshare(&self, reference: &str) -> Result<Value, Value> {
+        self.call("settings_device_remove", json!({ "reference": reference }))
+    }
+
+    fn join(&self, reference: &str) -> Result<Value, Value> {
+        self.call("settings_join", json!({ "reference": reference }))
     }
 
     fn drafts_on(&self, enabled: bool) -> Result<Value, Value> {
@@ -2774,4 +2939,163 @@ async fn a_host_that_reports_an_older_generation_than_this_computer_holds_is_not
             .any(|(host, _, drafts)| host == "studio" && *drafts == 1),
         "the view says the studio's draft stays: {view}"
     );
+}
+
+/* -------------------------------------------------------------------------- */
+/* Another device joins                                                        */
+/* -------------------------------------------------------------------------- */
+
+/// A reference of the first entry of `list`, which a page names a device or an offer by.
+fn first_reference(list: &Value) -> String {
+    list[0]["reference"]
+        .as_str()
+        .expect("a reference")
+        .to_owned()
+}
+
+/// The person's two computers, both listed as owner devices by the hosts each can ask.
+async fn two_computers() -> (Computer, Computer) {
+    let this = Computer::new().await;
+    let other = Computer::beside(&this).await;
+    let devices = vec![this.listed("this-mac"), other.listed("the-phone")];
+    this.hosts.list(devices.clone());
+    other.hosts.list(devices);
+    (this, other)
+}
+
+/// A second device the hosts list is offered the settings, the person confirms on the first, the
+/// second finds the offer and joins when the person confirms there, and the settings the first
+/// wrote follow it: the key moved on when the device was added, and the first sealed the settings
+/// under the new one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_second_device_is_given_the_key_joins_and_reads_what_the_first_wrote() {
+    let (this, other) = two_computers().await;
+    let page = with_sync_on(&this).await;
+    page.choose("dark");
+    let phone = other.start();
+
+    // Nothing shares anything yet, and the phone is a device the first computer's hosts list.
+    let offers = phone.devices_refresh();
+    assert_eq!(offers["offers"], json!([]), "{offers}");
+    let shown = page.devices_refresh();
+    assert_eq!(shown["candidates"][0]["name"], "the-phone", "{shown}");
+    assert_eq!(shown["members"].as_array().expect("members").len(), 1);
+
+    // The person confirms on the first computer, with what is asked of them in the dialog.
+    page.share(&first_reference(&shown["candidates"]))
+        .expect("the device is shared with");
+    assert_eq!(
+        this.ceremony.reasons(),
+        vec!["Share your settings with the-phone".to_owned()]
+    );
+    let shown = page.devices();
+    assert_eq!(
+        shown["members"].as_array().expect("members").len(),
+        2,
+        "{shown}"
+    );
+    assert_eq!(shown["candidates"], json!([]), "{shown}");
+
+    // The phone is offered the collection and joins it when the person confirms there.
+    let offers = phone.devices_refresh();
+    assert_eq!(
+        offers["offers"].as_array().expect("offers").len(),
+        1,
+        "{offers}"
+    );
+    phone
+        .join(&first_reference(&offers["offers"]))
+        .expect("the collection is joined");
+    assert_eq!(
+        other.ceremony.reasons(),
+        vec!["Join the settings your other device shares".to_owned()]
+    );
+
+    // Settings the first wrote reach the phone once the first has sealed them under the new key.
+    page.sync_now();
+    let view = phone.sync_now();
+    assert_eq!(view["colour_mode"], "dark", "{view}");
+    assert_eq!(
+        view["sync"]["devices"]["members"]
+            .as_array()
+            .expect("members")
+            .len(),
+        2
+    );
+
+    // And a change on the phone reaches the first.
+    phone.choose("light");
+    assert_eq!(page.sync_now()["colour_mode"], "light");
+}
+
+/// A person who does not confirm on the computer that holds the settings gives nobody the key, and
+/// a computer that cannot ask them adds and joins nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_device_is_not_given_the_key_unless_the_person_confirms() {
+    let (this, other) = two_computers().await;
+    let page = with_sync_on(&this).await;
+    let phone = other.start();
+    let shown = page.devices_refresh();
+    let reference = first_reference(&shown["candidates"]);
+
+    this.ceremony.will_answer(CeremonyOutcome::NotConfirmed);
+    assert!(page.share(&reference).is_err(), "it was not confirmed");
+    this.ceremony.will_answer(CeremonyOutcome::Unavailable);
+    assert!(page.share(&reference).is_err(), "there was no way to ask");
+
+    let shown = page.devices();
+    assert_eq!(
+        shown["members"].as_array().expect("members").len(),
+        1,
+        "{shown}"
+    );
+    assert_eq!(
+        shown["candidates"].as_array().expect("candidates").len(),
+        1,
+        "{shown}"
+    );
+    let offers = phone.devices_refresh();
+    assert_eq!(offers["offers"], json!([]), "{offers}");
+}
+
+/// A device taken out is given no key for what is written afterwards.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_device_taken_out_does_not_read_what_is_written_afterwards() {
+    let (this, other) = two_computers().await;
+    let page = with_sync_on(&this).await;
+    page.choose("dark");
+    let phone = other.start();
+    let shown = page.devices_refresh();
+    page.share(&first_reference(&shown["candidates"]))
+        .expect("shared");
+    let offers = phone.devices_refresh();
+    phone
+        .join(&first_reference(&offers["offers"]))
+        .expect("joined");
+    page.sync_now();
+    assert_eq!(phone.sync_now()["colour_mode"], "dark");
+
+    let members = page.devices()["members"].clone();
+    let phone_ref = members
+        .as_array()
+        .expect("members")
+        .iter()
+        .find(|member| member["this_computer"] == false)
+        .map(|member| {
+            member["reference"]
+                .as_str()
+                .expect("a reference")
+                .to_owned()
+        })
+        .expect("the phone is a member");
+    page.unshare(&phone_ref).expect("the device is taken out");
+    page.choose("light");
+    page.sync_now();
+
+    let view = phone.sync_now();
+    assert_eq!(
+        view["colour_mode"], "dark",
+        "what was written after the key moved on did not reach it: {view}"
+    );
+    assert_eq!(view["sync"]["devices"]["out"], true, "{view}");
 }

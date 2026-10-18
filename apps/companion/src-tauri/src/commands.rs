@@ -201,6 +201,11 @@ pub const NAMED_COMMANDS: &[(&str, Option<Method>)] = &[
     ("settings_conflicts", None),
     ("settings_conflict_resolve", None),
     ("settings_drafts_set", None),
+    ("settings_devices_refresh", None),
+    ("settings_device_share", None),
+    ("settings_device_remove", None),
+    ("settings_devices_dismiss", None),
+    ("settings_join", None),
 ];
 
 /// The commands that reach a session's worker or name a session on a host this device is paired
@@ -272,24 +277,82 @@ pub const NATIVE_METHODS: &[(&str, &[Method])] = &[
     // host is up: the connection carries none on its handshake.
     ("hosts_use", &[Method::HostInfo, Method::SessionOpen]),
     ("owner_confirmations", &[Method::OwnerConfirmationPending]),
-    // Settings sync keeps drafts in step host by host. Before a draft leaves it asks the connected
-    // host whether the host holds the draft's session, and reads the host's privacy mode. Every
-    // command that can run a pass is named, and the page supplies none of the methods' parameters.
+    // Settings sync keeps drafts in step host by host and shares the settings' key between the
+    // person's devices. Before a draft leaves it asks the connected host whether the host holds the
+    // draft's session, and reads the host's privacy mode; before a device is given the key, and when
+    // a step checks who still may hold it, it asks each host it can who it lists. Every command that
+    // can run a step is named, and the page supplies none of the methods' parameters.
     (
         "settings_colour_mode_set",
-        &[Method::SessionRead, Method::PrivacyStatus],
+        &[
+            Method::SessionRead,
+            Method::PrivacyStatus,
+            Method::DeviceList,
+        ],
     ),
     (
         "settings_sync_turn_on",
-        &[Method::SessionRead, Method::PrivacyStatus],
+        &[
+            Method::SessionRead,
+            Method::PrivacyStatus,
+            Method::DeviceList,
+        ],
     ),
     (
         "settings_sync_now",
-        &[Method::SessionRead, Method::PrivacyStatus],
+        &[
+            Method::SessionRead,
+            Method::PrivacyStatus,
+            Method::DeviceList,
+        ],
     ),
     (
         "settings_drafts_set",
-        &[Method::SessionRead, Method::PrivacyStatus],
+        &[
+            Method::SessionRead,
+            Method::PrivacyStatus,
+            Method::DeviceList,
+        ],
+    ),
+    (
+        "settings_conflict_resolve",
+        &[
+            Method::SessionRead,
+            Method::PrivacyStatus,
+            Method::DeviceList,
+        ],
+    ),
+    (
+        "settings_devices_refresh",
+        &[
+            Method::SessionRead,
+            Method::PrivacyStatus,
+            Method::DeviceList,
+        ],
+    ),
+    (
+        "settings_device_share",
+        &[
+            Method::SessionRead,
+            Method::PrivacyStatus,
+            Method::DeviceList,
+        ],
+    ),
+    (
+        "settings_device_remove",
+        &[
+            Method::SessionRead,
+            Method::PrivacyStatus,
+            Method::DeviceList,
+        ],
+    ),
+    (
+        "settings_join",
+        &[
+            Method::SessionRead,
+            Method::PrivacyStatus,
+            Method::DeviceList,
+        ],
     ),
     (
         "owner_confirmation_review",
@@ -503,6 +566,11 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'static
         settings_conflicts,
         settings_conflict_resolve,
         settings_drafts_set,
+        settings_devices_refresh,
+        settings_device_share,
+        settings_device_remove,
+        settings_devices_dismiss,
+        settings_join,
     ]
 }
 
@@ -3228,6 +3296,11 @@ mod tests {
         "settings_conflicts",
         "settings_conflict_resolve",
         "settings_drafts_set",
+        "settings_devices_refresh",
+        "settings_device_share",
+        "settings_device_remove",
+        "settings_devices_dismiss",
+        "settings_join",
     ];
 
     #[test]
@@ -3373,6 +3446,15 @@ mod tests {
                 "settings_conflict_resolve",
                 // Whether drafts are kept in step too. The page names a switch and nothing else.
                 "settings_drafts_set",
+                // Who shares the settings: asking the hosts who they list, giving a device the
+                // key once the person confirms on this computer, taking one out, and joining what
+                // another device shares. The page names a device by a reference this computer
+                // showed it, never a key, and the person's presence is the platform's ceremony.
+                "settings_devices_refresh",
+                "settings_device_share",
+                "settings_device_remove",
+                "settings_devices_dismiss",
+                "settings_join",
                 // The raw terminal view's five. The view attaches on the session's own worker,
                 // which the control daemon does not proxy for this computer, so the page names a
                 // session, a size, its moves and the person's input, and native code makes every
@@ -4220,6 +4302,52 @@ pub async fn settings_drafts_set(
     enabled: bool,
 ) -> Result<crate::settings::SettingsView> {
     state.settings()?.drafts_set(enabled).await
+}
+
+/// Asks every host who it lists, brings this computer and the sync service to the same settings, and
+/// on a computer that shares none, looks for collections other devices share with it.
+#[tauri::command]
+pub async fn settings_devices_refresh(
+    state: State<'_, AppState>,
+) -> Result<crate::settings::SettingsView> {
+    state.settings()?.devices_refresh().await
+}
+
+/// A device the person's hosts list is given the settings' key, once the person confirms it on this
+/// computer with the platform's ceremony. The page names the device by the reference it was shown.
+#[tauri::command]
+pub async fn settings_device_share(
+    state: State<'_, AppState>,
+    reference: String,
+) -> Result<crate::settings::SettingsView> {
+    state.settings()?.device_share(&reference).await
+}
+
+/// A device is taken out of the shared settings. Taking rights away asks for no ceremony.
+#[tauri::command]
+pub async fn settings_device_remove(
+    state: State<'_, AppState>,
+    reference: String,
+) -> Result<crate::settings::SettingsView> {
+    state.settings()?.device_remove(&reference).await
+}
+
+/// The outcomes of changes the page has shown are let go.
+#[tauri::command]
+pub async fn settings_devices_dismiss(
+    state: State<'_, AppState>,
+) -> Result<crate::settings::SettingsView> {
+    state.settings()?.devices_dismiss().await
+}
+
+/// This computer joins the settings another of the person's devices shares, once the person
+/// confirms it here with the platform's ceremony. The page names the offer by its reference.
+#[tauri::command]
+pub async fn settings_join(
+    state: State<'_, AppState>,
+    reference: String,
+) -> Result<crate::settings::SettingsView> {
+    state.settings()?.device_join(&reference).await
 }
 
 /// Records which version the person keeps. The page names this computer's own or a copy this
