@@ -1229,6 +1229,14 @@ mod tests {
             bridge.validate_as(&declaration, Some(&hook), None).is_err(),
             "a worker outside a store has no release of its own"
         );
+        // A worker that runs from a file outside any store, as this test does, has none either.
+        let loose = Running::of_image(&this_exe).expect("this test is a program outside a store");
+        assert!(
+            bridge
+                .validate_as(&declaration, Some(&hook), Some(&loose))
+                .is_err(),
+            "a worker that runs outside a store has no release of its own"
+        );
         // A program of the worker's own release that is not its forwarder is refused.
         let stranger = store
             .release_directory(&ReleaseName::new("0.1.0+aaaaaaaaaaaa").expect("a release"))
