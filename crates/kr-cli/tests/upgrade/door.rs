@@ -33,141 +33,204 @@ fn loopback() -> EndpointConfig {
     }
 }
 
-/// A device that is paired with a host as its first owner and connected to it.
+/// A device that is paired with a host and connected to it as its first owner.
 pub struct Door {
     /// The identity the host gave the device.
     pub device_id: DeviceId,
     /// The device's session with the host.
     pub session: Session,
+    /// The keys the device holds, which confirm what an owner device confirms.
+    pub keys: DeviceKeys,
     /// The endpoint the device dials from, kept for as long as the session is.
     _endpoint: Endpoint,
 }
 
+/// A device the host has paired, with what it needs to dial the host again.
+struct Paired {
+    device_id: DeviceId,
+    keys: DeviceKeys,
+    endpoint: Endpoint,
+    revision: DeviceKeyRevision,
+    payload: kr_protocol::pairing::DirectQrPayload,
+    host: PairedPeer,
+    build: kr_protocol::ids::BuildId,
+}
+
+/// Pairs a new device, called `name`, with the host whose control daemon answers on `controller`:
+/// the owner's half over the daemon's own socket, as the command line does, confirmed by `signer`,
+/// and the device's half as a candidate on an endpoint of its own.
+async fn pair(
+    controller: &LocalEndpoint,
+    environment_id: EnvironmentId,
+    name: &str,
+    kind: InviteGrantKind,
+    proposal: &kr_protocol::pairing::ProposedGrant,
+    signer: &Signer<'_>,
+) -> (Paired, bool) {
+    let build = super::build();
+    let keys = DeviceKeys::generate().expect("device keys");
+    let endpoint = kr_transport::endpoint::bind_dialer(&loopback(), &keys.transport)
+        .await
+        .expect("a dialling endpoint");
+    let own_endpoint = *keys.transport.public();
+    let revision = DeviceKeyRevision::new(1);
+    // Before it is paired a device presents the identifier it expects to be given; the host
+    // gives it its own at the commit.
+    let unpaired = LocalIdentity::new(
+        DeviceId::new(kr_ipc::new_uuid()),
+        revision,
+        own_endpoint,
+        keys.authorisation.clone(),
+        build.clone(),
+    );
+    let declared = CandidateIdentity {
+        keys: keys.public_keys(),
+        device_key_revision: revision,
+        device_name: DeviceName::new(name).expect("a name"),
+        platform: DevicePlatform::Android,
+        endpoint_id: own_endpoint,
+    };
+
+    let mut client = LocalClient::connect(controller, LocalClientKind::Cli, build.clone())
+        .await
+        .expect("reaches the daemon");
+    let invited = pairing::invite_direct(environment_id, &mut client, kind, proposal, signer)
+        .await
+        .expect("the host issues the invitation");
+
+    // The device's half: dial the host the invitation pins, prove the invitation's secret, and
+    // keep what the host said of itself, which is what a later connection is checked against.
+    let payload = pairing::direct_payload(&invited);
+    let connection = pairing::dial_until_connected(&endpoint, pairing::host_addr(&payload)).await;
+    let mut candidate = handshake::connect_unpaired(&connection, &unpaired)
+        .await
+        .expect("an unpaired connection");
+    let PairRedeemResult::Challenge(challenge) = candidate
+        .call(
+            Method::PairRedeem,
+            &PairRedeemParams::Challenge {
+                invitation_id: payload.invitation_id,
+            },
+        )
+        .await
+        .expect("the host issues a challenge")
+    else {
+        panic!("the first redemption step answers with a challenge");
+    };
+    let live_host = pairing::HostPeer(*challenge.endpoint_id.as_bytes());
+    let (proof, _transcript) = redeem_proof(
+        &payload,
+        &challenge,
+        &keys.authorisation,
+        &declared,
+        &live_host,
+    )
+    .expect("a redemption proof");
+    let locked: PairRedeemResult = candidate
+        .call(
+            Method::PairRedeem,
+            &PairRedeemParams::Direct(Box::new(proof)),
+        )
+        .await
+        .expect("the host accepts the redemption");
+    assert!(
+        matches!(locked, PairRedeemResult::Locked { .. }),
+        "a redemption locks the invitation"
+    );
+    let host = PairedPeer {
+        device_id: candidate.selection.device_id,
+        device_key_revision: challenge.device_key_revision,
+        authorisation: challenge.host_keys.authorisation,
+        endpoint_id: payload.endpoint_id,
+    };
+
+    let confirmed =
+        pairing::confirm_candidate(environment_id, &mut client, invited.invitation_id, signer)
+            .await
+            .expect("the device is confirmed");
+    connection.close(0u32.into(), b"paired");
+    (
+        Paired {
+            device_id: confirmed.device_id,
+            keys,
+            endpoint,
+            revision,
+            payload,
+            host,
+            build,
+        },
+        confirmed.event.first_owner,
+    )
+}
+
 impl Door {
     /// Pairs a new device with the host whose control daemon answers on `controller`, as the
-    /// host's first owner, and connects it.
+    /// host's first owner, and connects it. The first owner is confirmed by a key made for the
+    /// ceremony, which is what the command line does at an interactive terminal.
     pub async fn pair_the_first_owner(
         controller: &LocalEndpoint,
         environment_id: EnvironmentId,
     ) -> Self {
-        let build = super::build();
-        let keys = DeviceKeys::generate().expect("device keys");
-        let endpoint = kr_transport::endpoint::bind_dialer(&loopback(), &keys.transport)
-            .await
-            .expect("a dialling endpoint");
-        let own_endpoint = *keys.transport.public();
-        let revision = DeviceKeyRevision::new(1);
-        // Before it is paired a device presents the identifier it expects to be given; the host
-        // gives it its own at the commit.
-        let unpaired = LocalIdentity::new(
-            DeviceId::new(kr_ipc::new_uuid()),
-            revision,
-            own_endpoint,
-            keys.authorisation.clone(),
-            build.clone(),
-        );
-        let declared = CandidateIdentity {
-            keys: keys.public_keys(),
-            device_key_revision: revision,
-            device_name: DeviceName::new("A test phone").expect("a name"),
-            platform: DevicePlatform::Android,
-            endpoint_id: own_endpoint,
-        };
-
-        // The owner's half, over the daemon's own socket. The first owner is confirmed by a key
-        // made for the ceremony, which is what the command line does at an interactive terminal.
         let ceremony = DeviceKeys::generate().expect("a ceremony key");
-        let signer = Signer::Bootstrap(&ceremony.authorisation);
-        let mut client = LocalClient::connect(controller, LocalClientKind::Cli, build.clone())
-            .await
-            .expect("reaches the daemon");
-        let invited = pairing::invite_direct(
+        let (paired, first_owner) = pair(
+            controller,
             environment_id,
-            &mut client,
+            "A test phone",
             InviteGrantKind::PersonalOwner,
             &kr_pairing::grants::personal_owner_grant(),
-            &signer,
+            &Signer::Bootstrap(&ceremony.authorisation),
         )
-        .await
-        .expect("the host issues its first owner's invitation");
-
-        // The device's half: dial the host the invitation pins, prove the invitation's secret, and
-        // keep what the host said of itself, which is what a later connection is checked against.
-        let payload = pairing::direct_payload(&invited);
-        let connection =
-            pairing::dial_until_connected(&endpoint, pairing::host_addr(&payload)).await;
-        let mut candidate = handshake::connect_unpaired(&connection, &unpaired)
-            .await
-            .expect("an unpaired connection");
-        let PairRedeemResult::Challenge(challenge) = candidate
-            .call(
-                Method::PairRedeem,
-                &PairRedeemParams::Challenge {
-                    invitation_id: payload.invitation_id,
-                },
-            )
-            .await
-            .expect("the host issues a challenge")
-        else {
-            panic!("the first redemption step answers with a challenge");
-        };
-        let live_host = pairing::HostPeer(*challenge.endpoint_id.as_bytes());
-        let (proof, _transcript) = redeem_proof(
-            &payload,
-            &challenge,
-            &keys.authorisation,
-            &declared,
-            &live_host,
-        )
-        .expect("a redemption proof");
-        let locked: PairRedeemResult = candidate
-            .call(
-                Method::PairRedeem,
-                &PairRedeemParams::Direct(Box::new(proof)),
-            )
-            .await
-            .expect("the host accepts the redemption");
-        assert!(
-            matches!(locked, PairRedeemResult::Locked { .. }),
-            "a redemption locks the invitation"
-        );
-        let host = PairedPeer {
-            device_id: candidate.selection.device_id,
-            device_key_revision: challenge.device_key_revision,
-            authorisation: challenge.host_keys.authorisation,
-            endpoint_id: payload.endpoint_id,
-        };
-
-        let confirmed =
-            pairing::confirm_candidate(environment_id, &mut client, invited.invitation_id, &signer)
-                .await
-                .expect("the first owner is confirmed");
-        assert!(
-            confirmed.event.first_owner,
-            "the bootstrap establishes the first owner"
-        );
-        connection.close(0u32.into(), b"paired");
+        .await;
+        assert!(first_owner, "the bootstrap establishes the first owner");
 
         // And the paired device connects, as itself.
-        let paired = LocalIdentity::new(
-            confirmed.device_id,
-            revision,
-            own_endpoint,
-            keys.authorisation.clone(),
-            build,
+        let identity = LocalIdentity::new(
+            paired.device_id,
+            paired.revision,
+            *paired.keys.transport.public(),
+            paired.keys.authorisation.clone(),
+            paired.build,
         );
         let transport = pairing::connect_until_answered(
-            &endpoint,
-            pairing::host_addr(&payload),
-            &paired,
-            &host,
+            &paired.endpoint,
+            pairing::host_addr(&paired.payload),
+            &identity,
+            &paired.host,
         )
         .await
         .expect("the paired device connects");
         Self {
-            device_id: confirmed.device_id,
+            device_id: paired.device_id,
             session: Session::start(Arc::new(transport)).expect("a session"),
-            _endpoint: endpoint,
+            keys: paired.keys,
+            _endpoint: paired.endpoint,
         }
+    }
+
+    /// Pairs a second device, called `name`, as a guest: it holds no right and no session, as a
+    /// person who is shown one session holds none until a share names it. The first owner confirms
+    /// it with this device's keys.
+    pub async fn pair_a_guest(
+        &self,
+        controller: &LocalEndpoint,
+        environment_id: EnvironmentId,
+        name: &str,
+    ) -> DeviceId {
+        let (paired, first_owner) = pair(
+            controller,
+            environment_id,
+            name,
+            InviteGrantKind::SessionInvitation,
+            &kr_pairing::grants::guest_grant(
+                kr_ipc::now_ms().get(),
+                24 * 60 * 60 * 1000,
+                environment_id,
+            )
+            .expect("a guest grant"),
+            &Signer::OwnerDevice(&self.keys),
+        )
+        .await;
+        assert!(!first_owner, "a guest is not the first owner");
+        paired.device_id
     }
 }

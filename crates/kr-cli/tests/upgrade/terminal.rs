@@ -22,7 +22,7 @@ const QUESTION: &[u8] = b"\x1b[c";
 pub struct Terminal {
     seen: Arc<Mutex<Vec<u8>>>,
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
-    child: Box<dyn Child + Send + Sync>,
+    child: Mutex<Box<dyn Child + Send + Sync>>,
     _master: Box<dyn MasterPty + Send>,
 }
 
@@ -70,7 +70,7 @@ impl Terminal {
         Self {
             seen,
             writer,
-            child,
+            child: Mutex::new(child),
             _master: pty.master,
         }
     }
@@ -113,6 +113,29 @@ impl Terminal {
         String::from_utf8_lossy(&self.seen.lock().expect("the output is not poisoned")).into_owned()
     }
 
+    /// Waits until the program has ended, and returns its exit code.
+    pub async fn ended(&self) -> u32 {
+        let started = Instant::now();
+        loop {
+            let status = self
+                .child
+                .lock()
+                .expect("the child is not poisoned")
+                .try_wait()
+                .expect("the program's state is readable");
+            if let Some(status) = status {
+                return status.exit_code();
+            }
+            assert!(
+                started.elapsed() < WAIT,
+                "the program ran on for {:?}; the terminal shows: {}",
+                started.elapsed(),
+                self.text().escape_debug()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
     /// Waits until the terminal has shown `marker`, and returns what it showed up to the end of it.
     pub async fn expect(&self, marker: &str) -> String {
         let started = Instant::now();
@@ -134,7 +157,9 @@ impl Terminal {
 
 impl Drop for Terminal {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        if let Ok(child) = self.child.get_mut() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     }
 }

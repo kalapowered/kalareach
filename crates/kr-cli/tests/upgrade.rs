@@ -2106,3 +2106,196 @@ async fn a_worker_of_the_release_before_asks_this_releases_daemon_for_the_plugin
     host.close(&updated.kr_before(), &updated.display);
     host.worker_ended(&updated.worker).await;
 }
+
+/// KR-REQ-05.06, KR-REQ-26.06, KR-ACC-035: the plugin runtime of the release before ends while a
+/// program the package recognises still runs in the session of the release before. The worker,
+/// left without a runtime, asks the daemon of this release for another; the daemon starts one of
+/// this release and the worker registers with it, so the program's binding survives the end of the
+/// runtime that held it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_worker_of_the_release_before_registers_again_with_the_runtime_of_this_release_when_its_own_ends()
+ {
+    let prepared = Updated::prepare(Setup {
+        plugin: true,
+        ..Setup::default()
+    })
+    .await;
+    let agent = prepared.host.plugin_agent();
+    let terminal = terminal_for(
+        &prepared.host,
+        &prepared.kr_before(),
+        &["attach", &prepared.display],
+    );
+    terminal.ready().await;
+    start_agent(&prepared.host, &terminal, &agent).await;
+    prepared.host.plugin_holding(1).await;
+    let old_runtime = prepared
+        .host
+        .plugin_host()
+        .expect("the release before started a runtime");
+
+    let updated = prepared.update().await;
+    let host = &updated.host;
+    host.plugin_holding(1).await;
+    assert_eq!(
+        host.plugin_host(),
+        Some(old_runtime.clone()),
+        "the update left the runtime alone"
+    );
+
+    // The runtime of the release before ends, by the process recorded for it, with the program
+    // still running.
+    host.end_the_plugin_host().await;
+    let new_runtime = until("a runtime of this release to be published", || async {
+        host.plugin_host()
+            .filter(|published| *published != old_runtime)
+    })
+    .await;
+    assert!(
+        command_of(&new_runtime).contains(&format!(
+            "/versions/{}/bin/kr-plugin-host",
+            updated.two.name()
+        )),
+        "the new runtime is this release's: {}",
+        command_of(&new_runtime)
+    );
+    // The binding the new runtime holds is the one the worker of the release before registered.
+    host.plugin_holding(1).await;
+    assert_eq!(
+        host.plugin_host(),
+        Some(new_runtime),
+        "one runtime serves it"
+    );
+
+    updated.the_worker_is_as_it_was().await;
+    host.end_the_plugin_host().await;
+    drop(terminal);
+    host.close(&updated.kr_now(), &updated.display);
+    host.worker_ended(&updated.worker).await;
+}
+
+/// KR-REQ-26.06, KR-ACC-029, KR-ACC-035: what the worker of the release before wrote to the
+/// session's terminal is kept by the daemon of this release when the session closes, and `kr
+/// export` of this release reads it back through the daemon.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_output_of_a_session_of_the_release_before_is_exported_through_the_daemon_of_this_release()
+ {
+    let updated = Updated::new().await;
+    let host = &updated.host;
+    let typing = terminal_for(host, &updated.kr_before(), &["attach", &updated.display]);
+    typing.ready().await;
+    // The shell computes the marker, so the line as typed does not hold it.
+    typing.type_line("echo KEPT-$((6*7))-OUTPUT");
+    typing.expect("KEPT-42-OUTPUT").await;
+    drop(typing);
+
+    host.close(&updated.kr_now(), &updated.display);
+    host.worker_ended(&updated.worker).await;
+    let file = host.scratch("export").join("session.json");
+    // The daemon refuses an export until it has seen the worker end and has the session's output.
+    let said = until("the closed session to be exported", || async {
+        let output = host.run(
+            &updated.kr_now(),
+            &[
+                "export",
+                &updated.session_id.to_string(),
+                "--output",
+                &file.display().to_string(),
+            ],
+        );
+        output.status.success().then_some(output)
+    })
+    .await;
+    let document: Value = serde_json::from_slice(&std::fs::read(&file).expect("the exported file"))
+        .expect("the export is one JSON document");
+    assert_eq!(
+        document["session"]["session_id"],
+        updated.session_id.to_string(),
+        "{said:?}"
+    );
+    let mut output = Vec::new();
+    for chunk in document["output"]["chunks"]
+        .as_array()
+        .expect("the retained output is a list of pieces")
+    {
+        use base64::Engine as _;
+        output.extend(
+            base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(chunk["base64url"].as_str().expect("base64 text"))
+                .expect("the piece decodes"),
+        );
+    }
+    assert!(
+        String::from_utf8_lossy(&output).contains("KEPT-42-OUTPUT"),
+        "the export holds what the session showed: {}",
+        String::from_utf8_lossy(&output).escape_debug()
+    );
+    assert!(
+        document["closure"].is_object(),
+        "and the worker's closure: {document}"
+    );
+}
+
+/// KR-REQ-23.34, KR-REQ-26.06, KR-ACC-035: the `kr` of the release before issues a share of its
+/// session with the live screen to a paired device, at a terminal. The daemon of this release reads
+/// the lines on the screen from the worker of the release before, as the share asks, and holds the
+/// share, which `kr share list` of this release shows.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_share_with_the_live_screen_of_the_session_of_the_release_before_is_issued_through_the_daemon_of_this_release()
+ {
+    let updated = Updated::on_the_network().await;
+    let host = &updated.host;
+    let controller = host
+        .tree
+        .environment()
+        .controller_endpoint()
+        .expect("an endpoint");
+    let environment_id = host.tree.environment_id();
+    let owner = door::Door::pair_the_first_owner(&controller, environment_id).await;
+    owner
+        .pair_a_guest(&controller, environment_id, "A guest phone")
+        .await;
+
+    let issuing = terminal_for(
+        host,
+        &updated.kr_before(),
+        &[
+            "share",
+            "invite",
+            &updated.display,
+            "--to",
+            "A guest phone",
+            "--live",
+        ],
+    );
+    issuing.expect("to issue this invitation").await;
+    issuing.type_line("share");
+    let code = issuing.ended().await;
+    assert_eq!(
+        code,
+        0,
+        "the release before's kr issued the share: {}",
+        issuing.text().escape_debug()
+    );
+
+    let listed = host.run(&updated.kr_now(), &["--json", "share", "list"]);
+    assert!(
+        listed.status.success(),
+        "kr share list: {}",
+        String::from_utf8_lossy(&listed.stderr)
+    );
+    let listed: Value = serde_json::from_slice(&listed.stdout).expect("a document");
+    let held: Vec<&Value> = listed["grants"]
+        .as_array()
+        .expect("a list of shares")
+        .iter()
+        .filter(|share| share["recipient_name"] == "A guest phone")
+        .collect();
+    assert_eq!(held.len(), 1, "the guest holds the share: {listed}");
+    assert_eq!(held[0]["live_screen"], true, "{listed}");
+
+    updated.the_worker_is_as_it_was().await;
+    host.close(&updated.kr_now(), &updated.display);
+    host.worker_ended(&updated.worker).await;
+    drop(owner);
+}
