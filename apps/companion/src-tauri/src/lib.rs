@@ -440,13 +440,13 @@ fn watch_for_unlock(app: &tauri::AppHandle) {
     }
 }
 
-/// Opens the pairing records at an unlock when a start before it could not, tells the page, and
-/// starts what needs them.
+/// Opens the pairing records at an unlock when a start before it could not, starts what needs
+/// them, and then tells the page, so that what the page asks for next is there.
 #[cfg(target_os = "ios")]
 fn open_after_unlock(app: &tauri::AppHandle) {
     if open_records(app) {
-        tell_the_page_the_records_are_open(app);
         start_with_records(app);
+        tell_the_page_the_records_are_open(app);
     }
 }
 
