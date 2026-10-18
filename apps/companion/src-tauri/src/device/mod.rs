@@ -8,8 +8,9 @@
 //!
 //! ```text
 //!   <app data>/secrets          keys and the budget's key, when the platform has no store
-//!   <app data>/pairing-budget   this computer's tries with each code
+//!   <app data>/pairing-budget   this computer's tries with each code ([`BUDGET_DIRECTORY`])
 //!   <app data>/pairing          the hosts it is paired with, and an attempt still waiting
+//!                               ([`HOSTS_DIRECTORY`])
 //!   <app data>/pairing-origin   the origin it sends codes through, when it is not the default
 //! ```
 
@@ -47,6 +48,13 @@ use crate::error::{CommandError, Result};
 
 /// How long a pasted invitation is held before it is dropped unused.
 pub const HELD_FOR: Duration = Duration::from_secs(5 * 60);
+
+/// The directory of this computer's tries with each code, under the application's data directory.
+pub const BUDGET_DIRECTORY: &str = "pairing-budget";
+
+/// The directory of the hosts this computer is paired with, under the application's data
+/// directory.
+pub const HOSTS_DIRECTORY: &str = "pairing";
 
 /// The origin codes go through, as the page shows and changes it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -161,14 +169,13 @@ pub struct Parts {
 impl Parts {
     /// This computer's own parts: `secrets`, the application's one secure store
     /// (`companion_platform::secrets::open`, the same store the account keeps its tokens in); the
-    /// pairing service over the platform's TLS verifier; endpoints on every interface; and this
-    /// boot's clock.
+    /// pairing service over the platform's TLS verifier; endpoints on every interface; and
+    /// `clock`, this boot's.
     ///
     /// # Errors
     ///
-    /// Returns a local failure when the TLS verifier or the clock cannot be set.
-    pub fn platform(secrets: Arc<dyn SecretStore>) -> Result<Self> {
-        let clock = DeviceClock::current().map_err(CommandError::from)?;
+    /// Returns a local failure when the TLS verifier cannot be set.
+    pub fn platform(secrets: Arc<dyn SecretStore>, clock: DeviceClock) -> Result<Self> {
         let room = RoomConnector::platform().map_err(|error| {
             CommandError::local_failure(format!(
                 "the pairing service's TLS could not be set: {error}"
@@ -197,14 +204,15 @@ impl Device {
     ) -> Result<Arc<Self>> {
         let identity = DeviceIdentity::in_store(parts.secrets)?;
         let budget = DurableClientBudgetStore::open(
-            data.join("pairing-budget"),
+            data.join(BUDGET_DIRECTORY),
             Arc::clone(&identity.secrets),
             identity::SCOPE,
         )
         .map_err(|error| {
             CommandError::local_failure(format!("the attempt budget could not be opened: {error}"))
         })?;
-        let hosts = PairedHosts::open(data.join("pairing")).map_err(|failure| failed(&failure))?;
+        let hosts =
+            PairedHosts::open(data.join(HOSTS_DIRECTORY)).map_err(|failure| failed(&failure))?;
         let pool = EndpointPool::new(identity.keys.transport.clone());
         let pool = match parts.bind {
             Some(address) => pool.bound_to(address),

@@ -16,6 +16,11 @@ struct SessionArguments: Decodable {
   let scheme: String
 }
 
+/// A directory the application keeps something in.
+struct PathArguments: Decodable {
+  let path: String
+}
+
 /// Which attempt a call is about.
 struct AttemptArguments: Decodable {
   let attempt: String
@@ -58,6 +63,38 @@ class PlatformPlugin: Plugin, ASWebAuthenticationPresentationContextProviding {
     let httpsCallback = takesHttpsCallback(ProcessInfo.processInfo.operatingSystemVersion)
     let group = Bundle.main.object(forInfoDictionaryKey: "KRPrivateKeychainGroup") as? String
     invoke.resolve(Capabilities(httpsCallback: httpsCallback, privateKeychainGroup: group))
+  }
+
+  /// Marks a directory as not to be backed up, and answers only when the system says it is: the
+  /// records in it mean something only beside keys that a backup does not carry to another phone.
+  @objc public func keepOutOfBackup(_ invoke: Invoke) throws {
+    let arguments = try invoke.parseArgs(PathArguments.self)
+    var url = URL(fileURLWithPath: arguments.path, isDirectory: true)
+    do {
+      var values = URLResourceValues()
+      values.isExcludedFromBackup = true
+      try url.setResourceValues(values)
+      let kept = try url.resourceValues(forKeys: [.isExcludedFromBackupKey])
+      guard kept.isExcludedFromBackup == true else {
+        invoke.reject("the system does not say that \(arguments.path) is excluded from the backup")
+        return
+      }
+      invoke.resolve(["done": true])
+    } catch {
+      invoke.reject("\(arguments.path) could not be excluded from the backup: \(error.localizedDescription)")
+    }
+  }
+
+  /// Whether the system says a directory is excluded from the backup.
+  @objc public func backupExclusion(_ invoke: Invoke) throws {
+    let arguments = try invoke.parseArgs(PathArguments.self)
+    let url = URL(fileURLWithPath: arguments.path, isDirectory: true)
+    do {
+      let kept = try url.resourceValues(forKeys: [.isExcludedFromBackupKey])
+      invoke.resolve(["excluded": kept.isExcludedFromBackup == true])
+    } catch {
+      invoke.reject("\(arguments.path) could not be asked about the backup: \(error.localizedDescription)")
+    }
   }
 
   @objc public func authenticate(_ invoke: Invoke) throws {

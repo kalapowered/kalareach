@@ -31,6 +31,9 @@ pub mod agent;
 pub mod commands;
 pub mod connection;
 pub mod device;
+/// The checks a debug build runs on a phone for what the device keeps for itself.
+#[cfg(debug_assertions)]
+pub mod device_probe;
 pub mod drafts;
 pub mod error;
 pub mod export;
@@ -60,6 +63,8 @@ pub mod audio;
 
 pub use error::{CommandError, Result};
 pub use state::AppState;
+
+use kr_protocol::error::ErrorCode;
 
 /// Builds and runs the desktop application.
 ///
@@ -132,6 +137,8 @@ pub fn run() {
             hosts::resume(app.handle());
             #[cfg(all(debug_assertions, mobile))]
             probe::start(app.handle());
+            #[cfg(all(debug_assertions, mobile))]
+            device_probe::start(app.handle());
             open_recovery(app.handle());
             Ok(())
         })
@@ -303,34 +310,106 @@ fn watch_drops(app: &tauri::AppHandle) {
 /// Opens this computer as a device that pairs, and as an owner device of the hosts it owns, on
 /// this computer's own parts, ceremony and pasteboard, and starts telling the page about both.
 ///
-/// A computer whose keys or records cannot be opened still runs: the pairing commands say so, and
-/// everything else works as it did.
+/// A computer whose keys or records cannot be opened still runs: the pairing commands say why
+/// they cannot, in words the page shows where the pairing screen would be, and everything else
+/// works as it did.
 fn open_pairing(app: &tauri::AppHandle) {
+    use tauri::Manager as _;
+
+    if let Err(error) = open_the_records(app) {
+        tracing::warn!(%error, "this computer's pairing records could not be opened");
+        app.state::<AppState>().records_not_opened(&error.message);
+    }
+}
+
+fn open_the_records(app: &tauri::AppHandle) -> Result<()> {
     use std::sync::Arc;
 
     use tauri::Manager as _;
 
-    let Ok(data) = app.path().app_data_dir() else {
-        tracing::warn!("no application data directory, so this computer cannot pair");
-        return;
-    };
+    let data = app.path().app_data_dir().map_err(|error| {
+        error::CommandError::stated(
+            ErrorCode::ResourceUnavailable,
+            format!("there is no application data directory: {error}"),
+        )
+    })?;
+    keep_records_out_of_backup(app, &data)?;
     // The application's one secure store, as the account opens it: on a phone the native one,
     // which the keyring the host's own store goes through does not reach.
     let secrets = companion_platform::secrets::open(app).map_err(|error| {
-        error::CommandError::local_failure(format!("the secret store could not be opened: {error}"))
-    });
-    let opened = secrets.and_then(device::Parts::platform).and_then(|parts| {
-        start_pairing(
-            app,
-            &data,
-            parts,
-            verify::platform_ceremony(app.get_webview_window("main")),
-            Arc::new(pairing::NativePaste::new(app.clone())),
+        error::CommandError::stated(
+            ErrorCode::ResourceUnavailable,
+            format!("the secret store could not be opened: {error}"),
         )
-    });
-    if let Err(error) = opened {
-        tracing::warn!(%error, "this computer's pairing records could not be opened");
+    })?;
+    let parts = device::Parts::platform(secrets, application_clock(app)?)?;
+    start_pairing(
+        app,
+        &data,
+        parts,
+        verify::platform_ceremony(app.get_webview_window("main")),
+        Arc::new(pairing::NativePaste::new(app.clone())),
+    )
+}
+
+/// The clock this computer's pairing attempts are measured on.
+///
+/// The Apple mobile systems name no boot to an application, so a phone keeps the small record its
+/// clock reads the boot from beside the application's caches (see
+/// [`kr_client::pairing::clock`]). Every other system's kernel names its boot.
+#[cfg(all(target_vendor = "apple", not(target_os = "macos")))]
+fn application_clock(app: &tauri::AppHandle) -> Result<kr_client::pairing::clock::DeviceClock> {
+    use tauri::Manager as _;
+
+    let caches = app.path().app_cache_dir().map_err(|error| {
+        error::CommandError::stated(
+            ErrorCode::ResourceUnavailable,
+            format!("there is no application cache directory: {error}"),
+        )
+    })?;
+    kr_client::pairing::clock::DeviceClock::resumed(&caches.join("pairing-boot")).map_err(|error| {
+        error::CommandError::stated(
+            ErrorCode::ResourceUnavailable,
+            format!("this device's boot could not be recorded: {error}"),
+        )
+    })
+}
+
+#[cfg(not(all(target_vendor = "apple", not(target_os = "macos"))))]
+fn application_clock(_app: &tauri::AppHandle) -> Result<kr_client::pairing::clock::DeviceClock> {
+    kr_client::pairing::clock::DeviceClock::current().map_err(error::CommandError::from)
+}
+
+/// Marks the directories of the pairing records as not to be backed up, before they are opened.
+///
+/// Their records mean something only beside this device's keychain keys, and those keys stay on
+/// this device: a backup restored onto another phone would bring the records without the keys,
+/// and the attempt budget would then refuse every code. With no records restored the person pairs
+/// again.
+#[cfg(target_os = "ios")]
+fn keep_records_out_of_backup(app: &tauri::AppHandle, data: &std::path::Path) -> Result<()> {
+    for name in [device::HOSTS_DIRECTORY, device::BUDGET_DIRECTORY] {
+        let directory = data.join(name);
+        let unavailable = |what: &str, error: &dyn std::fmt::Display| {
+            error::CommandError::stated(
+                ErrorCode::ResourceUnavailable,
+                format!("{} could not be {what}: {error}", directory.display()),
+            )
+        };
+        kr_ipc::paths::create_private_directory(&directory)
+            .map_err(|error| unavailable("made", &error))?;
+        companion_platform::backup::keep_out(app, &directory)
+            .map_err(|error| unavailable("kept out of the backup", &error))?;
     }
+    Ok(())
+}
+
+#[cfg(not(target_os = "ios"))]
+const fn keep_records_out_of_backup(
+    _app: &tauri::AppHandle,
+    _data: &std::path::Path,
+) -> Result<()> {
+    Ok(())
 }
 
 /// Opens the sync service setting and, on this computer's own keys, recovery.

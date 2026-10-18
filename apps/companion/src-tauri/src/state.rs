@@ -8,6 +8,7 @@
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use kr_client::Session;
+use kr_protocol::error::ErrorCode;
 use kr_protocol::ids::EnvironmentId;
 
 use crate::connection::{Connection, ConnectionState, Standing};
@@ -24,6 +25,8 @@ pub struct AppState {
     connection: RwLock<Option<Connection>>,
     reason: RwLock<Option<String>>,
     device: OnceLock<Arc<Device>>,
+    /// Why the pairing records could not be opened, when they could not, in words for a person.
+    records_failure: OnceLock<String>,
     owner: OnceLock<Arc<Owner>>,
     paste: OnceLock<Arc<dyn PastePlatform>>,
     sync_service: OnceLock<Arc<SyncService>>,
@@ -60,6 +63,7 @@ impl AppState {
                 "this application has not reached a host yet".to_owned(),
             )),
             device: OnceLock::new(),
+            records_failure: OnceLock::new(),
             owner: OnceLock::new(),
             paste: OnceLock::new(),
             sync_service: OnceLock::new(),
@@ -345,26 +349,60 @@ impl AppState {
         let _ = self.paste.set(paste);
     }
 
+    /// Records why this computer's pairing records could not be opened, once, for the commands
+    /// that need them to say.
+    pub fn records_not_opened(&self, cause: &str) {
+        let _ = self.records_failure.set(cause.to_owned());
+    }
+
+    /// The failure of a command that needs the pairing records when they are not open.
+    ///
+    /// The words say what does not work and why, and what to do. They are stated and ask nothing
+    /// more of the person: waiting does not open the records, and the records are opened once, as
+    /// the application starts.
+    fn records_unavailable(&self) -> CommandError {
+        let why = self.records_failure.get().map_or_else(
+            || "its pairing records are not open.".to_owned(),
+            |cause| {
+                format!(
+                    "its pairing records could not be opened. The cause: {}.",
+                    cause.trim_end_matches('.')
+                )
+            },
+        );
+        CommandError::stated(
+            ErrorCode::ResourceUnavailable,
+            format!(
+                "This device cannot pair with a host or use the hosts it is paired with, because \
+                 {why} Close KalaReach and open it again to try once more."
+            ),
+        )
+    }
+
     /// This computer as a device that pairs.
     ///
     /// # Errors
     ///
-    /// Returns a local failure when its keys or records could not be opened.
+    /// Returns a stated local failure, with its cause, when its keys or records could not be
+    /// opened.
     pub fn device(&self) -> Result<Arc<Device>> {
-        self.device.get().cloned().ok_or_else(|| {
-            CommandError::local_failure("this computer's pairing records could not be opened")
-        })
+        self.device
+            .get()
+            .cloned()
+            .ok_or_else(|| self.records_unavailable())
     }
 
     /// This computer's owner confirmations.
     ///
     /// # Errors
     ///
-    /// Returns a local failure when its keys or records could not be opened.
+    /// Returns a stated local failure, with its cause, when its keys or records could not be
+    /// opened.
     pub fn owner(&self) -> Result<Arc<Owner>> {
-        self.owner.get().cloned().ok_or_else(|| {
-            CommandError::local_failure("this computer's pairing records could not be opened")
-        })
+        self.owner
+            .get()
+            .cloned()
+            .ok_or_else(|| self.records_unavailable())
     }
 
     /// Records the sync service this computer is set to use.
@@ -414,11 +452,13 @@ impl AppState {
     ///
     /// # Errors
     ///
-    /// Returns a local failure when its keys or records could not be opened.
+    /// Returns a stated local failure, with its cause, when its keys or records could not be
+    /// opened.
     pub fn paste(&self) -> Result<Arc<dyn PastePlatform>> {
-        self.paste.get().cloned().ok_or_else(|| {
-            CommandError::local_failure("this computer's pairing records could not be opened")
-        })
+        self.paste
+            .get()
+            .cloned()
+            .ok_or_else(|| self.records_unavailable())
     }
 
     /// Remembers that the person chose this destination in a save dialog.
@@ -561,6 +601,32 @@ mod tests {
             state.device().is_err(),
             "nothing pairs before the device is opened"
         );
+    }
+
+    /// When the pairing records could not be opened, every command that needs them says why in the
+    /// person's words, and asks for nothing to wait for: the records are opened once, at start.
+    #[test]
+    fn commands_that_need_the_pairing_records_say_why_they_did_not_open() {
+        let state = AppState::new();
+        state.records_not_opened("this device's boot could not be recorded: the disk is full");
+        for error in [
+            state.device().expect_err("not open"),
+            state.owner().expect_err("not open"),
+            state.paste().expect_err("not open"),
+        ] {
+            assert_eq!(error.code, ErrorCode::ResourceUnavailable);
+            assert_eq!(error.user_action, "nothing", "waiting does not open them");
+            assert!(
+                error.message.contains("the disk is full"),
+                "the cause is in the words: {}",
+                error.message
+            );
+            assert!(
+                error.message.contains("Close KalaReach and open it again"),
+                "and so is what to do: {}",
+                error.message
+            );
+        }
     }
 
     /// KR-REQ-13.21: an export is written only where a save dialog put it; a path the page names
