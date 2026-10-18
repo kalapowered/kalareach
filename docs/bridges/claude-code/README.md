@@ -51,7 +51,7 @@ file by the digest of what it wrote. A connection running another copy is refuse
 a registration written for a forwarder the host has since replaced is written again with the new
 path.
 
-It is possible that the forwarder an update made `current` is more recent than the worker it is intended to serve. If the registration names the release of a worker at compatibility level 0.75 or later, and that release is not the same as the release of the forwarder, the forwarder will instead run the `kr-hook` of that release with identical arguments, input and output, and the half second a hook has still running. If the worker is at an earlier level, it will only accept the forwarder `current` names, so the forwarder will talk to it directly. The forwarder will also talk to the worker directly if it cannot find the release it names in the store.
+It is possible that the forwarder an update made `current` is more recent than the worker it is intended to serve. If the registration names the release of a worker at compatibility level 0.75 or later, and that level and release are not the forwarder's own, the forwarder will instead run the `kr-hook` of that release with identical arguments, input and output, and what is left of the half second a hook has. If the worker is at an earlier level, it will only accept the forwarder `current` names, so the forwarder will talk to it directly. The forwarder will also talk to the worker directly if it cannot find the release it names in the store.
 
 The five hook events are the ones whose exit codes refuse nothing: the action has already happened,
 or the code is ignored. A hook here observes because the forwarder never answers anything but `{}`,
