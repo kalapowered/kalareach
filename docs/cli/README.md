@@ -1002,7 +1002,6 @@ configuration /home/someone/.config/kalareach/environments/ab12cd34/config.json 
   authority.origin = none from default, applies at the next start
   mailbox.origin = none from default, applies at the next start
   relay.origin = none from default, applies at the next start
-  relay.payer = false from default, applies at the next start
   session_limit ceiling 128
   enrolment ceiling 67108864 metadata bytes, 100000 entries, 5 generations retained, …;
     configured here: retained_generations
@@ -1874,8 +1873,9 @@ there is one and always prints it. The command ends when the daemon is listening
 says how the sign-in ended, and `kr account show` says it again, with how the last attempt that
 ended ended. Nothing any of the commands prints is a token. When signing in, the system asks for the
 scope of each service that the host presents its account to. That is, it asks for scope `voice`, if
-`voice.broker_origin` is the managed account service, and it asks for scope `backup.write`, if
-`storage.origin` has been set. If a host selects storage after having signed in already, it holds a
+`voice.broker_origin` is the managed account service, it asks for scope `backup.write`, if
+`storage.origin` has been set, and it asks for scope `relay.lease`, if `relay.origin` is the managed
+account service. If a host selects storage after having signed in already, it holds a
 grant without that scope. In that case, a person needs to sign in again. The command `kr doctor`
 will tell when that is needed for storage. The same holds for `voice` when the broker is selected
 after a sign-in made for storage alone; then a call is refused with a message that says the sign-in

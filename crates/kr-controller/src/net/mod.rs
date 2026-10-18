@@ -202,6 +202,8 @@ pub struct NetworkGuard {
     listener: std::sync::Mutex<Option<kr_transport::listener::NetworkListener>>,
     /// The tasks this host runs for itself, rather than for one connection.
     tasks: std::sync::Mutex<Vec<tokio::task::AbortHandle>>,
+    /// The relays the endpoint is selected to use, which the relay leases the host holds decide.
+    relays: std::sync::OnceLock<Arc<crate::relay_leases::endpoint::EndpointRelays>>,
 }
 
 impl NetworkGuard {
@@ -213,9 +215,10 @@ impl NetworkGuard {
 
     /// Returns the configuration a pairing invitation carries, with this endpoint's current hints.
     ///
-    /// The selected services are this host's own configuration. The direct addresses are the ones
-    /// this endpoint reports for itself now (`Self::direct_addresses`), taken as they stand,
-    /// because that is all a hint ever is.
+    /// The selected services are this host's own configuration, except the relays: a host that
+    /// holds relay leases is at the relay they are installed on, and a device is told that one. The
+    /// direct addresses are the ones this endpoint reports for itself now
+    /// (`Self::direct_addresses`), taken as they stand, because that is all a hint ever is.
     ///
     /// # Errors
     ///
@@ -226,6 +229,14 @@ impl NetworkGuard {
             .endpoint
             .to_network_config()
             .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
+        if let Some(relays) = self.relays.get() {
+            config.relay_urls = relays
+                .selected()
+                .iter()
+                .map(|relay| kr_protocol::pairing::NetworkHint::new(relay.as_str().to_owned()))
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
+        }
         config.direct_addresses = self
             .direct_addresses()
             .into_iter()
@@ -257,6 +268,16 @@ impl NetworkGuard {
     /// discovery services it publishes to and resolves from.
     pub(crate) fn endpoint(&self) -> &kr_transport::config::EndpointConfig {
         &self.host.endpoint
+    }
+
+    /// The endpoint itself, for a suite that asks it which relays it holds.
+    #[cfg(feature = "testing")]
+    pub(crate) fn iroh_endpoint(&self) -> Option<iroh::Endpoint> {
+        self.listener
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .map(|listener| listener.endpoint().clone())
     }
 
     /// Returns the sockets this endpoint is bound to, one per IP transport.
@@ -346,6 +367,13 @@ impl Network {
     #[must_use]
     pub fn bound_sockets(&self) -> Vec<std::net::SocketAddr> {
         self.guard.bound_sockets()
+    }
+
+    /// Returns the endpoint, for a suite that asks it which relays it holds.
+    #[cfg(feature = "testing")]
+    #[must_use]
+    pub fn endpoint_for_tests(&self) -> Option<iroh::Endpoint> {
+        self.guard.iroh_endpoint()
     }
 
     /// Returns the host's pairing service.
@@ -1339,6 +1367,7 @@ pub async fn register(controller: &Arc<Controller>, setup: NetworkSetup) -> Resu
         host: Arc::clone(&host),
         listener: std::sync::Mutex::new(None),
         tasks: std::sync::Mutex::new(vec![marking.abort_handle()]),
+        relays: std::sync::OnceLock::new(),
     });
     // Before the listener serves anything. The daemon reaches these connections through this
     // handle when it withdraws their registrations, and a connection admitted before the handle
@@ -1403,6 +1432,12 @@ pub async fn register(controller: &Arc<Controller>, setup: NetworkSetup) -> Resu
         )),
         other => ControllerError::NotConfigured(other.to_string()),
     })?;
+    let relays = Arc::new(crate::relay_leases::endpoint::EndpointRelays::new(
+        listener.endpoint().clone(),
+        &host.endpoint,
+    ));
+    // Set once: the daemon's network is registered once, and a second registration was refused above.
+    let _ = guard.relays.set(Arc::clone(&relays));
     *guard
         .listener
         .lock()
@@ -1410,7 +1445,7 @@ pub async fn register(controller: &Arc<Controller>, setup: NetworkSetup) -> Resu
     // The host is reachable now, so the devices it has paired can be given the relay lease they
     // connect through, and a device paired from here on is given one as it is paired.
     if let Some(keeper) = controller.relay_keeper() {
-        keeper.run(controller, Arc::clone(&host.devices), endpoint_id);
+        keeper.run(controller, Arc::clone(&host.devices), endpoint_id, relays);
     }
     Ok(Network { guard })
 }

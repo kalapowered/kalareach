@@ -3433,25 +3433,18 @@ async fn a_document_that_selects_a_mailbox_service_is_accepted_with_its_section(
     );
 }
 
-/// A document of level 4 that selects a relay lease service and the account that pays.
+/// A document of level 4 that selects a relay lease service.
 const WITH_A_RELAY: &[u8] = br#"{
   "version": 3,
   "level": 4,
   "revision": 5,
   "preferences": { "sleep_inhibition": "battery_too" },
-  "relay": {
-    "origin": "http://127.0.0.1:9",
-    "payer": {
-      "account_id": "0b0c4a1e-2f6a-4a7c-9b7e-5d1f3c2a8e41",
-      "authorisation_id": "7c1d9e52-3b4f-4d86-a0c2-91e5f6b73d08"
-    }
-  }
+  "relay": { "origin": "http://127.0.0.1:9" }
 }"#;
 
 /// KR-REQ-26.13: a daemon over a document that selects a relay lease service reads it as a section
 /// of the level it reads, accepts it, and keeps in the registry the document as it read it, with
-/// the section and its level; the report an owner reads shows the selection and that a payer is
-/// named, and never the account's identifiers.
+/// the section and its level; the report an owner reads shows the selection.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_document_that_selects_a_relay_lease_service_is_accepted_with_its_section() {
     let owner = DeviceKeys::generate().expect("owner keys");
@@ -3478,13 +3471,6 @@ async fn a_document_that_selects_a_relay_lease_service_is_accepted_with_its_sect
             .unwrap_or_else(|| panic!("{key} is reported"))
     };
     assert_eq!(row_of("relay.origin").value(), "http://127.0.0.1:9");
-    assert_eq!(row_of("relay.payer").value(), "true");
-    let report = format!("{result:?}");
-    assert!(
-        !report.contains("0b0c4a1e-2f6a-4a7c-9b7e-5d1f3c2a8e41")
-            && !report.contains("7c1d9e52-3b4f-4d86-a0c2-91e5f6b73d08"),
-        "the report names no account identifier"
-    );
     let ignored = result
         .configuration
         .values
@@ -3505,14 +3491,6 @@ async fn a_document_that_selects_a_relay_lease_service_is_accepted_with_its_sect
     let accepted = config::from_record(record.as_deref()).expect("accepted");
     assert_eq!(accepted.level, 4);
     assert_eq!(accepted.relay.origin(), Some("http://127.0.0.1:9"));
-    assert_eq!(
-        accepted
-            .relay
-            .payer()
-            .map(|payer| payer.account_id.as_str()),
-        Some("0b0c4a1e-2f6a-4a7c-9b7e-5d1f3c2a8e41"),
-        "the registry's copy states the payer"
-    );
     let file = std::fs::read(kr_worker::config::document_path(&environment)).expect("the file");
     assert_eq!(
         Some(accepted),

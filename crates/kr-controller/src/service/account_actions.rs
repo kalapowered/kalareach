@@ -38,8 +38,9 @@ impl Controller {
     /// the way is said on standard error, as for the voice broker.
     ///
     /// The sign-in asks for the scope of each service the host presents it to: voice where the
-    /// broker is the account service, and backup storage where the document selects a storage
-    /// service.
+    /// broker is the account service, backup storage where the document selects a storage
+    /// service, and the right to bill relay traffic where the relay lease service is the account
+    /// service. The account that pays for the leases is the one the host is signed in as.
     ///
     /// # Errors
     ///
@@ -71,12 +72,16 @@ impl Controller {
             )));
         }
         let broker = started.voice.broker_origin();
+        let relay_is_account_service = started.relay.origin() == Some(origin.as_str());
         let mut scopes = Vec::new();
         if broker == Some(origin.as_str()) {
             scopes.push(kr_client::services::voice::VOICE_SCOPE);
         }
         if storage.is_some() {
             scopes.push(kr_client::services::account::BACKUP_WRITE_SCOPE);
+        }
+        if relay_is_account_service {
+            scopes.push(kr_client::services::account::RELAY_LEASE_SCOPE);
         }
         let route = Self::outbound_of(started);
         let closed = match &route {
@@ -90,6 +95,7 @@ impl Controller {
         } else {
             match (broker, storage) {
                 (_, Some(_)) => None,
+                (_, None) if relay_is_account_service => None,
                 (None, None) => Some(SignInUnavailable::NoManagedService),
                 (Some(broker), None) if broker == origin => None,
                 (Some(_), None) => Some(SignInUnavailable::BrokerIsAnotherService),

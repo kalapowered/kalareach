@@ -67,6 +67,10 @@ pub struct Row {
     pub lease_id: Option<RelayLeaseId>,
     /// The authorisation the lease was asked for under, or none when no account was named.
     pub payer: Option<String>,
+    /// The relay the service installed the lease on, or none while the row names no lease. The
+    /// endpoint has to be at that relay for the lease to carry the pair, so the host holds it
+    /// across a restart.
+    pub relay_url: Option<String>,
     /// The cumulative bytes the reservation was asked for, or was granted.
     pub ceiling: u64,
     /// The bytes the relay had counted when the service last said.
@@ -133,14 +137,15 @@ fn endpoint_of(bytes: Vec<u8>) -> rusqlite::Result<EndpointKey> {
 fn write_row(connection: &Connection, row: &Row) -> rusqlite::Result<()> {
     connection.execute(
         "INSERT OR REPLACE INTO relay_leases
-             (destination, source, lease_id, payer, ceiling, consumed, expires_at_ms,
+             (destination, source, lease_id, payer, relay_url, ceiling, consumed, expires_at_ms,
               written_at_ms)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         params![
             row.destination.as_bytes().as_slice(),
             row.source.as_bytes().as_slice(),
             row.lease_id.map(|lease| lease.get().to_string()),
             row.payer,
+            row.relay_url,
             counter(row.ceiling),
             counter(row.consumed),
             counter(row.expires_at_ms),
@@ -218,6 +223,7 @@ impl Record {
                      source        BLOB NOT NULL CHECK (length(source) = 32),
                      lease_id      TEXT,
                      payer         TEXT,
+                     relay_url     TEXT,
                      ceiling       INTEGER NOT NULL CHECK (ceiling >= 0),
                      consumed      INTEGER NOT NULL CHECK (consumed >= 0),
                      expires_at_ms INTEGER NOT NULL CHECK (expires_at_ms >= 0),
@@ -291,6 +297,7 @@ impl Record {
             EndpointKey,
             Option<String>,
             Option<String>,
+            Option<String>,
             i64,
             i64,
             i64,
@@ -298,8 +305,8 @@ impl Record {
         );
         let rows: Vec<Stored> = self.with(|connection| {
             let mut statement = connection.prepare(
-                "SELECT source, destination, lease_id, payer, ceiling, consumed, expires_at_ms,
-                        written_at_ms
+                "SELECT source, destination, lease_id, payer, relay_url, ceiling, consumed,
+                        expires_at_ms, written_at_ms
                  FROM relay_leases ORDER BY rowid",
             )?;
             let rows = statement
@@ -313,6 +320,7 @@ impl Record {
                         row.get(5)?,
                         row.get(6)?,
                         row.get(7)?,
+                        row.get(8)?,
                     ))
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -320,12 +328,23 @@ impl Record {
         })?;
         rows.into_iter()
             .map(
-                |(source, destination, lease, payer, ceiling, consumed, expires, written)| {
+                |(
+                    source,
+                    destination,
+                    lease,
+                    payer,
+                    relay_url,
+                    ceiling,
+                    consumed,
+                    expires,
+                    written,
+                )| {
                     Ok(Row {
                         source,
                         destination,
                         lease_id: lease.as_deref().map(lease_of).transpose()?,
                         payer,
+                        relay_url,
                         ceiling: counter_of(ceiling),
                         consumed: counter_of(consumed),
                         expires_at_ms: counter_of(expires),

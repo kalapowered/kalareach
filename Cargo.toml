@@ -108,7 +108,9 @@ interprocess = { version = "=2.4.4", features = ["tokio"] }
 # defaults resolve references over HTTP and bring a TLS stack; every reference in those schemas is
 # to a definition in the same document.
 jsonschema = { version = "=0.58.6", default-features = false }
-iroh = { version = "=1.2.0", default-features = false, features = ["metrics", "portmapper", "tls-ring"] }
+# The net report is read to see that the relay a host's leases are installed on answers before the
+# relays the owner configured are set aside. Its API is not stable across releases; the version is exact.
+iroh = { version = "=1.2.0", default-features = false, features = ["metrics", "portmapper", "tls-ring", "unstable-net-report"] }
 iroh-base = { version = "=1.2.0", default-features = false, features = ["key", "relay"] }
 # The signed discovery record format, at the release iroh itself is built with. The transport
 # publishes and reads a Pkarr record over an HTTP client of its own, which takes the proxy the host

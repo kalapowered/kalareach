@@ -236,8 +236,7 @@ variables an older build read joins nothing because of them.
 | `storage.origin` | the managed storage service this host uploads its backups to | an `https` origin, or an `http` origin on a loopback address, in the spelling a gateway origin has, with no path and no trailing slash; the daemon refuses to start unless it is the managed account service |
 | `authority.origin` | the authority feed this host reads its remote revocations from, and where it reads its own mailbox, in which a remote owner announces a change to the feed; a section of level 2: a release that reads level 1 ignores it, and its host takes a device's revocation only from the owner at the machine | an `https` origin, or an `http` origin on a loopback address, in the spelling a gateway origin has, with no path and no trailing slash |
 | `mailbox.origin` | the mailbox service this host places the encrypted objects of its notifications in; a section of level 3, so a release that reads level 2 ignores it and its host places nothing, which leaves a notification whose detail does not fit reaching a device without it | an `https` origin, or an `http` origin on a loopback address, in the spelling a gateway origin has, with no path and no trailing slash |
-| `relay.origin` | the relay lease service this host asks for a lease for each paired device; a section of level 4 | an `https` origin, or an `http` origin on a loopback address, in the spelling a gateway origin has, with no path and no trailing slash |
-| `relay.payer` | the account that pays for those leases and the authorisation it gave this host's key | an object with `account_id` and `authorisation_id`, each a lower-case hyphenated UUID; it needs `relay.origin` |
+| `relay.origin` | the relay lease service this host asks for a lease for each paired device, billed to the account the host is signed in as; a section of level 4 | an `https` origin, or an `http` origin on a loopback address, in the spelling a gateway origin has, with no path and no trailing slash |
 
 A field the document does not write selects nothing, because there is no public relay or discovery
 server to fall back on. A URL or an origin names its host the one way the protocol spells every
@@ -305,10 +304,13 @@ able to issue such a lease. If a `relay` section is present in the document and 
 service, the daemon will request a lease for each device the host it is running on has been paired
 with. One lease covers both directions between this host's endpoint and the device's. Leases will be
 requested at the beginning of the daemon for each device already paired with, and again for each
-device paired with after that. The service installs a lease on the relay instance it chooses, and
-this host does not steer its endpoint there, so a lease carries a pair only where the relays in
-`network.relay_urls` include that instance. The daemon reads the `relay` section once, when it
-starts.
+device paired with after that. The daemon reads the `relay` section once, when it starts.
+
+The service will install the lease on a relay of its choice and name the relay in the answer to the request. The relay will only forward for the pair while it has a lease for the pair. Thus a device will only reach the host via the lease if the host is present at the relay where the service has installed the lease. The daemon therefore holds the host's endpoint to the relay its leases are installed on. It adds that relay beside the ones given in `network.relay_urls`, and sets those aside only once the endpoint has measured the relay and seen it answer. From then on that relay is the endpoint's home relay, and the daemon includes it when creating invitations to pair with the host. If the relay stops carrying the endpoint for around 30 seconds, the relays from `network.relay_urls` come back, though the daemon continues to hold the leases. At this point `kr doctor` will report that the relay is not answering, and the leased relay is left out of the endpoint's relays for a minute. If the relay stops carrying the endpoint again, the wait doubles, up to a maximum of fifteen minutes. The waits start again as soon as the relay carries the endpoint. A delay that the service asked for does not hold up this look at the relays.
+
+While the host does not have a lease, it will be present at the relays listed in `network.relay_urls`. A device that has already paired with the host will find the host there by resolving the host's identity again, as it does after any change of relay. While the daemon is holding the host at the relay where it has installed the lease, a device that has not yet paired with the host will only be able to reach the host at that relay if the relay is willing to forward for that device. A managed relay will not forward for a pair for which it does not hold a lease. Thus such a device will need a direct path to the host.
+
+A refill keeps the relay its lease was issued on. If the service starts issuing new leases on a different relay, the daemon will notice this when it gets the first new lease on the new relay. The daemon will then hold the endpoint at the new relay, end the old leases one by one and replace them with new leases. The relay is recorded together with the lease, so that if the daemon restarts, it begins to move the endpoint to that relay before it asks the service anything. If the leases are on two different relays when the daemon starts, it starts with the relay on which most of the leases are installed, and the first new lease it is given decides. Leases will not be replaced if the host has been signed out. A host that has no relay in its document will not use any relay and the daemon will not change that.
 
 Leases are issued for fifteen minutes at a time. When ten minutes or less remain on the life of a
 lease, the daemon will request a 'refill' of the lease, asking the managed service for more time on
@@ -329,32 +331,46 @@ new lease will be issued after sixteen devices have been paired with, and with s
 the sum is already 8 MiB, so none of them can be raised by a byte and each runs out at its whole
 hold. However, the daemon will be able to keep 15 or fewer idle leases alive at a time.
 
-A host key has no allowance with the relay service, and the managed service will refuse to issue
-leases for a host that does not name an account to use. The `payer` key of the `relay` section must
-name an account to use to pay for relay usage, as well as an authorisation that the holder of the
-named account has given to the key of the host the document belongs to. This information will be
-included in every request the daemon makes to the managed service to issue or extend a lease. The
-service labels such a lease as sponsored by the authorisation, because the host did not select it as
-its default. The account holder gives the authorisation through the relay service's
-payer-authorisation interface. They must name the signing key of the host that is to use the
-account, and they must name the maximum amount that can be outstanding on any one lease at any one
-time. This amount must be above 512 KiB, because a lease is raised by at least one byte beyond its
-first block of 512 KiB and a bound of exactly 512 KiB refuses that raise: the lease runs out at its
-whole hold and `kr doctor` says so. 1 MiB is the smallest sensible value. The authorisation can be
-given for up to a year at a time, and when the authorisation is withdrawn, all leases that were
-issued with the authorisation will be ended, and the next time the host running the daemon asks for
-any leases to be issued or extended, the managed service will refuse to, as the authorisation will
-have been withdrawn. However, signing the host out with `kr account sign-out` does not end the
-leases, as the lease service does not read that sign-in.
+A host key has no allowance with the relay service, so every lease it requests is billed to the
+account the host is signed in as. The `relay` section names no account. When the document selects
+this service (`relay.origin`), `kr account sign-in` will ask for the `relay.lease` scope, which
+permits a person to have relay traffic billed to their account. This service must be the managed
+account service, as the host does not present its account token to any other service; if it is
+another service, the daemon starts, asks for no lease and `kr doctor` warns. Before
+requesting a lease, the daemon will call this service, presenting the host's signing key and the
+token for its sign-in. The service will open a new authorisation for the sign-in, and bind it to the
+key, setting it as the default authorisation for the host. It then returns the authorisation, which
+the daemon includes in its lease requests, and stores with the lease.
+
+Each authorisation expires one hour after the most recent time it has been renewed, and leases
+cannot outlive their authorisation. The daemon will renew the authorisation whenever it has less
+than 1800 seconds to live, and also before requesting a lease if the authorisation has lapsed since
+the last lease request. The service will return the same authorisation again, so the leases billed
+under it keep their identifiers. If the person signs out of the account (using `kr account
+sign-out`), the authorisation will stop being renewed and any leases will expire within the hour. If
+the account holder withdraws the authorisation, the leases end at once. This is permanent for that
+sign-in.
+
+If a host is not signed in, or was signed in before selecting this service, it will not attempt to
+request a new lease, and `kr doctor` will inform the person that they need to sign in. The same will
+happen if the service indicates that the person needs to sign in again. This may be because there is
+no sign-in, the sign-in does not include the required scope, the sign-in has expired, the sign-in's
+authorisation is bound to a different key, or the account holder has withdrawn the authorisation. It
+may also happen if the sign-in token expired in transit to the service; in this case, the daemon
+will try again with a new token, and only prompt the user if that attempt also fails. Signing in
+again will create a new authorisation. Existing leases of the same account will continue to use the old
+authorisation (if any) for as long as they live, but new leased pairs will use the new one.
+
+If a lease is running under the authorisation of an earlier sign-in, that lease will expire (within the hour) because nothing renews that authorisation. At that point the daemon looks again and asks for the pair under the current authorisation (unless the service has asked it to wait), so the pair is without a lease only for as long as the two requests take.
 
 When a device is unpaired with, the daemon will tell the managed service to end the lease it has for
 the device, and it will give the reason as "the pair is no longer paired". The ending of the lease
 will be written to the host's record, and then sent to the managed service, and if it fails to be
 sent, or the host daemon restarts, then it will be sent again until the service answers. An ending
 that the service turns back for a reason only the owner can change is sent again after five minutes,
-and the daemon asks for nothing else until then. If the authorisation that is used to request leases
-is changed, the daemon will request that the old lease be ended, and then it will request a new
-lease for the pair. If the managed service says it has never issued a lease when asked to end one,
+and the daemon asks for nothing else until then. If the host is signed in as another account, the
+daemon will request that the old lease be ended, and then it will request a new lease for the
+pair. If the managed service says it has never issued a lease when asked to end one,
 the daemon asks again, no oftener than once a minute, and believes it only after three answers and
 once the longest a lease can live has passed since the first, because the service gives the same
 answer when a revocation raced a refill.
@@ -367,28 +383,29 @@ if the answer to the original request had arrived just in time. The record keeps
 such request until the longest a lease can live has passed, so a device unpaired in the meantime
 still has the lease ended that the service may have opened. A request that the service answers as
 having issued nothing, such as one for a device that is no longer paired when the service has no
-room, does not make the record younger. If the payer in the configuration document changes
-meanwhile, the daemon asks again under the payer the request was made for, ends the lease it finds,
-and then asks under the new payer. The service will refuse another authorisation of the same account
+room, does not make the record younger. If the host is signed in as another account, or if the host
+is signed in as the same account and the request may have issued a lease that the daemon wasn't
+informed of, the daemon will ask again under the payer the request was made for, end the lease that
+it finds, and then ask under the new payer. The service will refuse another authorisation of the
+same account
 for a pair that still has a lease, even one that has run out and is yet to be ended. For a device
 that is still paired, the daemon makes this ask however old the record is. When the record is older
 than the longest a lease can live, the daemon asks again after each wait until an answer lets the
 record go. An answer that the allowance is spent does, and so does any answer but a delay if the new
 payer is another account, because a lease of another account's payer is no obstacle to the new one.
-If the new payer is the same account, the daemon keeps the record, because the service says it could
-not issue a lease also for a lease whose relay it can no longer bill through, and answers invalid
-also for a lease in its grace window whose grace-raised hold passes the bound of the authorisation,
-and a lease behind either answer stands in the way of the new authorisation. The service answers
-invalid for a bound too small for a block only when it found no lease, and the daemon cannot tell
-the two apart, so the record stays. If the service answers that the old authorisation is not one it
+If the new payer is the same account, the daemon does not remove the record when it receives the
+invalid response from the service. This is because the daemon cannot tell from that answer whether a
+lease of the old authorisation stands in the way of a lease under the new one. So it asks again
+after the next wait. If the service answers that the old authorisation is not one it
 holds for this host's key, is no longer in force, or that the lease the pair holds belongs to
 another caller or another authorisation, it names no lease under that payer and the daemon drops the
 record at once. The service ends the leases of an authorisation that is withdrawn but not those of
 one that lapses, and a lease the daemon was never told of cannot be ended by asking, so a lease that
 lapsed with its authorisation runs out by itself. To clear a lease that stands in the way of the new
 authorisation, or a record the daemon keeps because it cannot tell, withdraw the authorisation you
-replaced: the service then ends its leases, also after a lapse, and refuses the next ask under it as
-forbidden, so the daemon drops the record. In any other case a refusal says nothing about the pair,
+replaced, or wait for it to lapse, which takes no longer than an hour once nothing renews it. The
+service will then refuse the next ask under it as forbidden, and the daemon will drop the record. In
+any other case a refusal says nothing about the pair,
 so the daemon keeps the record and waits as it does for any answer only the owner can change.
 
 Three kinds of answers to lease requests are not treated as errors. A spent allowance, and a service
@@ -400,8 +417,9 @@ directly to each other does not need a lease, and neither does a connection thro
 of the devices runs itself. The third kind of answer is a rejection that only the owner can remove,
 for example because the request did not mention any account that the service is willing to accept.
 `kr doctor` will indicate this kind of problem too, with its likely causes: the account, the
-authorisation, the clock of the machine and the service origin. The words the service used go to the
-daemon's log, because a diagnostic never repeats text that came from outside. In all these cases the
+authorisation, the clock of the machine and the service origin. The code the service answered with goes to
+the daemon's log, and its words do not, because a refusal can name the account and the
+authorisation. In all these cases the
 daemon waits for the greater of five minutes and the delay provided in the answer, before issuing
 another request for the same pair. If a pairing or revocation changes the set of pairs to be leased,
 the request is not issued earlier. It refills a lease no oftener than once a minute, whatever the
@@ -481,13 +499,16 @@ how the last attempt that ended ended. Nothing it prints or answers is a token.
 
 The browser signs in at the managed account service, and the code it brings back is redeemable there
 and nowhere else, so the exchange, every refresh and every revocation go to that one service. The
-host presents a token to the voice broker or the storage service its configuration names only when
-that service is the account service (the value of `voice.broker_origin` or `storage.origin` is
-`https://reach.kala.to`). The sign-in asks for the scope of each service it presents to (`voice` for
-the voice broker and `backup.write` for the storage service). A sign-in made before the host
+host presents a token to the voice broker, the storage service or the relay lease service its
+configuration names only when that service is the account service (the value of
+`voice.broker_origin`, `storage.origin` or `relay.origin` is `https://reach.kala.to`). The sign-in
+asks for the scope of each service it presents to (`voice` for
+the voice broker, `backup.write` for the storage service and `relay.lease` for the relay lease
+service, when that is the account service). A sign-in made before the host
 selected a service holds no scope for it, whichever service that is, and a person signs in again. If
-the host has no storage service selected and is either talking to another voice broker or no voice
-broker at all, then it won't sign in anywhere and won't present an account to any service, and `kr
+the host has no storage service or relay lease service selected and is either talking to another
+voice broker or no voice broker at all, then it won't sign in anywhere and won't present an account
+to any service, and `kr
 account sign-in` will tell the person so. It still reaches the account service for what it holds, so
 a grant it was signed in with while its broker was the managed one is shown by `kr account show`,
 revoked when a revocation waits, and ended by `kr account sign-out`. A host that started over a

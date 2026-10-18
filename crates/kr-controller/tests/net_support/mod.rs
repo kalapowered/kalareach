@@ -201,6 +201,12 @@ impl MovedWall {
         );
     }
 
+    /// The time this clock reads, in UTC milliseconds.
+    #[must_use]
+    pub fn now_ms(&self) -> u64 {
+        kr_ipc::now_ms().get() + self.0.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     /// The daemon's clocks with this wall clock.
     #[must_use]
     pub fn clocks(&self) -> Clocks {
@@ -426,17 +432,47 @@ impl Host {
     }
 
     /// Starts a daemon whose configuration document selects the relay lease service at `origin`,
-    /// when it names one, paying as the account `payer` names, whose carriers wait by `timer`, with
-    /// `owner` as its first owner.
+    /// when it names one, whose carriers wait by `timer`, with `owner` as its first owner. The
+    /// service is also the account service the host signs in at, as the managed one is, and the
+    /// host is signed in with `sign_in` before its first owner is paired, so the first pass that
+    /// the pairing wakes finds the sign-in.
     ///
     /// The host's own keys are `host_keys`, put where the daemon finds them when it starts, so a
-    /// suite can have the account authorise the host's key before the daemon
-    /// asks for the first lease.
+    /// suite knows the key the service sees.
     pub async fn start_with_relay(
         owner: &DeviceKeys,
         host_keys: &DeviceKeys,
         origin: Option<&str>,
-        payer: Option<(&str, &str)>,
+        sign_in: Option<kr_client::services::account::IssuedGrant>,
+        timer: Arc<dyn kr_controller::quiet::Timer>,
+        clocks: Clocks,
+    ) -> Self {
+        let account_at = origin.map_or(AccountAt::Managed, |origin| {
+            AccountAt::Origin(origin.to_owned())
+        });
+        Self::start_with_relay_on(
+            owner,
+            host_keys,
+            origin,
+            account_at,
+            sign_in,
+            loopback(),
+            timer,
+            clocks,
+        )
+        .await
+    }
+
+    /// As [`Self::start_with_relay`], over the endpoint `endpoint` names, with the account service
+    /// where `account_at` puts it.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn start_with_relay_on(
+        owner: &DeviceKeys,
+        host_keys: &DeviceKeys,
+        origin: Option<&str>,
+        account_at: AccountAt,
+        sign_in: Option<kr_client::services::account::IssuedGrant>,
+        endpoint: EndpointConfig,
         timer: Arc<dyn kr_controller::quiet::Timer>,
         clocks: Clocks,
     ) -> Self {
@@ -450,15 +486,15 @@ impl Host {
         )
         .expect("the host's keys are stored");
         drop(secrets);
-        write_relay_document(&temp, origin, payer);
+        write_relay_document(&temp, origin);
         let mut host = Self::start_on(
             temp,
             room::TestRoom::new(),
             NetworkSettings {
-                endpoint: loopback(),
+                endpoint,
                 ..NetworkSettings::default()
             },
-            AccountAt::Managed,
+            account_at,
             Arc::new(MemoryStore::new()),
             clocks,
             None,
@@ -468,6 +504,12 @@ impl Host {
             },
         )
         .await;
+        if let Some(sign_in) = sign_in {
+            host.controller()
+                .host_account()
+                .keep_for_test(sign_in)
+                .await;
+        }
         let (device, record) = bootstrap_owner(&host, owner).await;
         host.owner = Some(record);
         host.owner_device = Some(device);
@@ -918,26 +960,13 @@ pub fn write_feed_document(host: &kr_ipc::testing::TempHost, origin: Option<&str
 }
 
 /// Writes the configuration document that selects the relay lease service at `origin`, or none,
-/// and the account `payer` names as its account id and its authorisation id, into a host tree.
-pub fn write_relay_document(
-    host: &kr_ipc::testing::TempHost,
-    origin: Option<&str>,
-    payer: Option<(&str, &str)>,
-) {
+/// into a host tree.
+pub fn write_relay_document(host: &kr_ipc::testing::TempHost, origin: Option<&str>) {
     let mut document = kr_protocol::hostinfo::configuration::ConfigurationDocument::empty();
     document.revision = 1;
     document.relay.origin = origin.map_or_else(kr_protocol::scalars::Nullable::null, |origin| {
         kr_protocol::scalars::Nullable::some(origin.to_owned())
     });
-    document.relay.payer = payer.map_or_else(
-        kr_protocol::scalars::Nullable::null,
-        |(account_id, authorisation_id)| {
-            kr_protocol::scalars::Nullable::some(kr_protocol::hostinfo::configuration::RelayPayer {
-                account_id: account_id.to_owned(),
-                authorisation_id: authorisation_id.to_owned(),
-            })
-        },
-    );
     write_document(host, &document);
 }
 
@@ -977,9 +1006,19 @@ impl Device {
         Self::with_keys(DeviceKeys::generate().expect("device keys")).await
     }
 
+    /// Creates a device that has not been paired with anything, over the endpoint `config` names.
+    pub async fn create_on(config: &EndpointConfig) -> Self {
+        Self::with_keys_on(config, DeviceKeys::generate().expect("device keys")).await
+    }
+
     /// Creates an unpaired device holding `keys`.
     pub async fn with_keys(keys: DeviceKeys) -> Self {
-        let endpoint = kr_transport::endpoint::bind_dialer(&loopback(), &keys.transport)
+        Self::with_keys_on(&loopback(), keys).await
+    }
+
+    /// Creates an unpaired device holding `keys`, over the endpoint `config` names.
+    pub async fn with_keys_on(config: &EndpointConfig, keys: DeviceKeys) -> Self {
+        let endpoint = kr_transport::endpoint::bind_dialer(config, &keys.transport)
             .await
             .expect("a dialling endpoint");
         // The identity a device presents before it is paired carries the identifier it will be
@@ -1220,6 +1259,27 @@ impl PairedDial {
 
 /// How `device`, paired as `record`, dials `host`.
 pub fn paired_dial(host: &Host, device: &Device, record: &DeviceRecord) -> PairedDial {
+    let mut dial = paired_dial_by(host, device, record);
+    for socket in host.network.bound_sockets() {
+        dial.addr = dial.addr.with_ip_addr(socket);
+    }
+    dial
+}
+
+/// How `device`, paired as `record`, dials `host` through the relay at `relay` and by no other
+/// route: the host's address names that relay and no socket.
+pub fn paired_dial_through(
+    host: &Host,
+    device: &Device,
+    record: &DeviceRecord,
+    relay: &iroh::RelayUrl,
+) -> PairedDial {
+    let mut dial = paired_dial_by(host, device, record);
+    dial.addr = dial.addr.with_relay_url(relay.clone());
+    dial
+}
+
+fn paired_dial_by(host: &Host, device: &Device, record: &DeviceRecord) -> PairedDial {
     let pairing = host.network.pairing();
     let host_record = PairedPeer {
         device_id: pairing.identity().device_id,
@@ -1227,13 +1287,10 @@ pub fn paired_dial(host: &Host, device: &Device, record: &DeviceRecord) -> Paire
         authorisation: pairing.identity().keys.authorisation,
         endpoint_id: host.network.endpoint_id(),
     };
-    let mut addr = EndpointAddr::new(
+    let addr = EndpointAddr::new(
         iroh::PublicKey::from_bytes(host.network.endpoint_id().as_bytes())
             .expect("a usable endpoint identity"),
     );
-    for socket in host.network.bound_sockets() {
-        addr = addr.with_ip_addr(socket);
-    }
     PairedDial {
         endpoint: device.endpoint.clone(),
         addr,

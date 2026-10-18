@@ -10,8 +10,8 @@ use serde_json::Value;
 
 use super::{Levelled, Newer, Release, THIS_RELEASE};
 use crate::hostinfo::configuration::{
-    BASE_LEVEL, Change, ConfigurationDocument, DocumentState, EditRefused, RelayPayer, VERSION,
-    contents_in, edit_in, is_known_term, load_in, still_current,
+    BASE_LEVEL, Change, ConfigurationDocument, DocumentState, EditRefused, VERSION, contents_in,
+    edit_in, is_known_term, load_in, still_current,
 };
 use crate::hostinfo::export::Sentence;
 use crate::scalars::Nullable;
@@ -748,19 +748,10 @@ fn a_selected_mailbox_survives_the_file_and_the_registrys_copy() {
     );
 }
 
-/// The account that pays, as an owner copies it from the authorisation the account gave.
-fn a_payer() -> RelayPayer {
-    RelayPayer {
-        account_id: "0b0c4a1e-2f6a-4a7c-9b7e-5d1f3c2a8e41".to_owned(),
-        authorisation_id: "7c1d9e52-3b4f-4d86-a0c2-91e5f6b73d08".to_owned(),
-    }
-}
-
-/// A document that selects a relay lease service and a payer, as this build writes it.
+/// A document that selects a relay lease service, as this build writes it.
 fn with_a_relay() -> ConfigurationDocument {
     let mut document = ConfigurationDocument::empty();
     document.relay.origin = Nullable::some(FEED.to_owned());
-    document.relay.payer = Nullable::some(a_payer());
     document.ceilings.session_limit = Nullable::some(4);
     document
 }
@@ -783,7 +774,6 @@ fn a_document_with_no_relay_section_is_stamped_below_the_relays_level() {
     assert_eq!(json(&written)["level"], 4, "{written}");
     assert_eq!(json(&written)["mailbox"]["origin"], FEED, "{written}");
     assert_eq!(json(&written)["relay"]["origin"], FEED, "{written}");
-    assert!(json(&written)["relay"]["payer"].is_null(), "{written}");
 }
 
 /// KR-REQ-26.13: a release that reads level 3 takes the relay section for a section of a newer
@@ -818,7 +808,6 @@ fn a_release_at_level_3_ignores_the_relay_section_and_applies_the_rest() {
     assert_eq!(used.ceilings.session_limit.0, Some(4));
     assert_eq!(used.mailbox.origin(), Some(FEED), "level 3 is still read");
     assert_eq!(used.relay.origin(), None, "the section is left out");
-    assert_eq!(used.relay.payer(), None, "and its payer with it");
     assert!(matches!(
         edit_in(&loaded, &Change::SessionLimit(Some(2)), &BEFORE_RELAY),
         Err(EditRefused::NotOurs(_))
@@ -847,8 +836,8 @@ fn an_unused_relay_section_is_not_written_and_a_release_at_level_3_reads_the_fil
 }
 
 /// KR-REQ-26.13: the upgrade half and the round trip of an active value. A document a release at
-/// level 3 wrote is read by this build as it was; once the owner selects a relay lease service and
-/// a payer the next write is at level 4 and keeps every other member; both survive the file, the
+/// level 3 wrote is read by this build as it was; once the owner selects a relay lease service the
+/// next write is at level 4 and keeps every other member; the selection survives the file, the
 /// typed document and the copy the registry keeps, which is the file's reading written again.
 #[test]
 fn a_selected_relay_survives_the_file_and_the_registrys_copy() {
@@ -866,11 +855,7 @@ fn a_selected_relay_survives_the_file_and_the_registrys_copy() {
     assert_eq!(json(&written)["level"], 4, "{written}");
     assert_eq!(json(&written)["ceilings"]["session_limit"], 4, "{written}");
     assert_eq!(json(&written)["mailbox"]["origin"], FEED, "{written}");
-    assert_eq!(
-        json(&written)["relay"]["payer"]["authorisation_id"],
-        a_payer().authorisation_id,
-        "{written}"
-    );
+    assert_eq!(json(&written)["relay"]["origin"], FEED, "{written}");
 
     let read = load_in(Some(written.as_bytes()), &THIS_RELEASE);
     assert_eq!(
@@ -881,7 +866,6 @@ fn a_selected_relay_survives_the_file_and_the_registrys_copy() {
     );
     let typed = read.document.expect("used");
     assert_eq!(typed.relay.origin(), Some(FEED));
-    assert_eq!(typed.relay.payer(), Some(&a_payer()));
     assert_eq!(typed.level, 4);
 
     let copy = contents_in(&typed, &THIS_RELEASE);

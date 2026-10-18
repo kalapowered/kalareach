@@ -1350,20 +1350,14 @@ impl ComposedBundle {
 ///   "storage": { "origin": "https://reach.example.com" },
 ///   "authority": { "origin": "https://reach.example.com" },
 ///   "mailbox": { "origin": "https://reach.example.com" },
-///   "relay": {
-///     "origin": "https://reach.example.com",
-///     "payer": {
-///       "account_id": "0b0c4a1e-2f6a-4a7c-9b7e-5d1f3c2a8e41",
-///       "authorisation_id": "7c1d9e52-3b4f-4d86-a0c2-91e5f6b73d08"
-///     }
-///   }
+///   "relay": { "origin": "https://reach.example.com" }
 /// }
 /// ```
 ///
 /// The `network`, `voice`, `storage`, `authority`, `mailbox` and `relay` sections are the only
 /// place a network selection, the voice broker's origin, the managed storage service's origin, the
-/// authority feed's origin, the mailbox service's origin or the relay lease service's origin and
-/// payer is chosen, and the daemon reads them when it starts ([`NetworkSelection`],
+/// authority feed's origin, the mailbox service's origin or the relay lease service's origin is
+/// chosen, and the daemon reads them when it starts ([`NetworkSelection`],
 /// [`VoiceSelection`], [`StorageSelection`], [`AuthoritySelection`], [`MailboxSelection`],
 /// [`RelaySelection`]). No environment variable reaches any of them.
 ///
@@ -2627,8 +2621,7 @@ pub mod configuration {
         }
     }
 
-    /// The relay lease service this host asks for a lease for each paired device, and the account
-    /// that pays for the leases.
+    /// The relay lease service this host asks for a lease for each paired device.
     ///
     /// A relay carries traffic between two endpoints only while it holds a lease the service
     /// signed for that pair. With a service selected here, the host keeps one lease with it for
@@ -2638,10 +2631,10 @@ pub mod configuration {
     /// start. Absent means this host asks for no lease: a device reaches it directly or through a
     /// relay its owner runs.
     ///
-    /// A host key draws on no allowance of its own, so the service turns away a host that names
-    /// no account. `payer` names the account that gave this host's key leave to spend its relay
-    /// allowance, and the authorisation it gave. Withdrawing the authorisation ends the leases
-    /// issued under it; signing this host out of the account does not.
+    /// A host key draws on no allowance of its own, so the leases are billed to the account this
+    /// host is signed in as (`kr account sign-in`), which the service must be the managed account
+    /// service for. Signing this host out stops the authorisation it opened from being renewed, so
+    /// its leases end within the hour.
     ///
     /// The section arrived with level 4. A release that reads level 3 does not know it: it applies
     /// the rest of the document, counts the section among the members it ignores, and does not
@@ -2653,15 +2646,12 @@ pub mod configuration {
         /// The service's origin: an `https` origin, or an `http` origin on a loopback address,
         /// spelled as a gateway origin is, with no path and no trailing slash.
         pub origin: Nullable<String>,
-        /// The account that pays, when this host names one.
-        pub payer: Nullable<RelayPayer>,
     }
 
     impl Default for RelaySelection {
         fn default() -> Self {
             Self {
                 origin: Nullable::null(),
-                payer: Nullable::null(),
             }
         }
     }
@@ -2672,24 +2662,6 @@ pub mod configuration {
         pub fn origin(&self) -> Option<&str> {
             self.origin.as_ref().map(String::as_str)
         }
-
-        /// The account that pays for the leases, when one is named.
-        #[must_use]
-        pub fn payer(&self) -> Option<&RelayPayer> {
-            self.payer.as_ref()
-        }
-    }
-
-    /// The account that pays for this host's relay leases, and the authorisation that account gave
-    /// this host's key.
-    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-    #[serde(deny_unknown_fields)]
-    pub struct RelayPayer {
-        /// The account, as a lower-case hyphenated UUID.
-        pub account_id: String,
-        /// The authorisation record the account gave this host's key, as a lower-case hyphenated
-        /// UUID.
-        pub authorisation_id: String,
     }
 
     /// How this environment's control daemon is started when a command finds none running.
@@ -3550,28 +3522,6 @@ pub mod configuration {
                          trailing slash",
                     ),
             );
-        }
-        if let Some(payer) = document.relay.payer() {
-            if document.relay.origin().is_none() {
-                problems.push(Sentence::new().stated(
-                    "relay.payer is named but relay.origin is not, so there is no service to \
-                     pay for",
-                ));
-            }
-            for (key, value) in [
-                ("relay.payer.account_id", &payer.account_id),
-                ("relay.payer.authorisation_id", &payer.authorisation_id),
-            ] {
-                if value.parse::<crate::scalars::Uuid>().is_err()
-                    || *value != value.to_ascii_lowercase()
-                {
-                    problems.push(
-                        Sentence::new()
-                            .stated(key)
-                            .stated(" is not a lower-case hyphenated UUID"),
-                    );
-                }
-            }
         }
         if problems.is_empty() {
             Ok(())
@@ -4545,13 +4495,6 @@ pub mod configuration {
         about: "the relay lease service this host asks for a lease for each paired device",
     };
 
-    /// The account that pays for this host's relay leases.
-    pub const RELAY_PAYER: Selection = Selection {
-        key: "relay.payer",
-        about: "the account, and the authorisation it gave this host, that pay for its relay \
-                leases",
-    };
-
     /// How this environment's control daemon is started when a command finds none running.
     pub const STARTUP_CONTROLLER: Selection = Selection {
         key: "startup.controller",
@@ -4560,7 +4503,7 @@ pub mod configuration {
     };
 
     /// Every selection this host reads when it starts, in the order `kr doctor` prints them.
-    pub const SELECTIONS: [Selection; 18] = [
+    pub const SELECTIONS: [Selection; 17] = [
         NETWORK_ENABLED,
         NETWORK_BIND_ADDRESS,
         NETWORK_RELAY_URLS,
@@ -4577,7 +4520,6 @@ pub mod configuration {
         AUTHORITY_ORIGIN,
         MAILBOX_ORIGIN,
         RELAY_ORIGIN,
-        RELAY_PAYER,
         STARTUP_CONTROLLER,
     ];
 
@@ -4995,11 +4937,6 @@ pub mod configuration {
                 RELAY_ORIGIN,
                 document.relay.origin.is_present(),
                 location(document.relay.origin()),
-            ),
-            row(
-                RELAY_PAYER,
-                document.relay.payer.is_present(),
-                switch(document.relay.payer().is_some()),
             ),
             row(
                 STARTUP_CONTROLLER,
@@ -8761,10 +8698,6 @@ mod tests {
         document.authority.origin = Nullable::some("https://reach.example.com".to_owned());
         document.mailbox.origin = Nullable::some("https://reach.example.com".to_owned());
         document.relay.origin = Nullable::some("https://reach.example.com".to_owned());
-        document.relay.payer = Nullable::some(configuration::RelayPayer {
-            account_id: "0b0c4a1e-2f6a-4a7c-9b7e-5d1f3c2a8e41".to_owned(),
-            authorisation_id: "7c1d9e52-3b4f-4d86-a0c2-91e5f6b73d08".to_owned(),
-        });
         document.level = 4;
         configuration::validate(&document).expect("a complete selection");
         let written = configuration::contents(&document);
@@ -9095,53 +9028,9 @@ mod tests {
                 "{origin}: {problems:?}"
             );
         }
-        let payer = |account: &str, authorisation: &str| {
-            Nullable::some(configuration::RelayPayer {
-                account_id: account.to_owned(),
-                authorisation_id: authorisation.to_owned(),
-            })
-        };
         let mut document = ConfigurationDocument::empty();
         document.relay.origin = Nullable::some("http://127.0.0.1:8787".to_owned());
-        document.relay.payer = payer(
-            "0b0c4a1e-2f6a-4a7c-9b7e-5d1f3c2a8e41",
-            "7c1d9e52-3b4f-4d86-a0c2-91e5f6b73d08",
-        );
-        configuration::validate(&document).expect("a loopback origin and a payer are usable");
-        for (account, authorisation, key) in [
-            (
-                "not-a-uuid",
-                "7c1d9e52-3b4f-4d86-a0c2-91e5f6b73d08",
-                "relay.payer.account_id",
-            ),
-            (
-                "0b0c4a1e-2f6a-4a7c-9b7e-5d1f3c2a8e41",
-                "7C1D9E52-3B4F-4D86-A0C2-91E5F6B73D08",
-                "relay.payer.authorisation_id",
-            ),
-        ] {
-            document.relay.payer = payer(account, authorisation);
-            let problems = configuration::validate(&document).expect_err("a payer it refuses");
-            assert!(
-                problems
-                    .iter()
-                    .any(|problem| problem.as_str().contains(key)),
-                "{key}: {problems:?}"
-            );
-        }
-        // A payer with no service to pay for is a document that says something it cannot do.
-        let mut document = ConfigurationDocument::empty();
-        document.relay.payer = payer(
-            "0b0c4a1e-2f6a-4a7c-9b7e-5d1f3c2a8e41",
-            "7c1d9e52-3b4f-4d86-a0c2-91e5f6b73d08",
-        );
-        let problems = configuration::validate(&document).expect_err("a payer with no service");
-        assert!(
-            problems
-                .iter()
-                .any(|problem| problem.as_str().contains("relay.payer")),
-            "{problems:?}"
-        );
+        configuration::validate(&document).expect("a loopback origin is usable");
 
         // A document whose network section does not validate is not this host's to rewrite, so an
         // edit to any other section of it is refused rather than applied on top.

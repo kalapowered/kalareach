@@ -1368,7 +1368,9 @@ async fn every_local_write_method_the_daemon_performs_is_placed() {
         let error = refusal(&answered)
             .unwrap_or_else(|| panic!("{method:?} is performed and is placed on no list"));
         assert!(
-            error.message.contains("is not a mutation this daemon serves"),
+            error
+                .message
+                .contains("is not a mutation this daemon serves"),
             "{method:?} is performed and is placed on no list: {error:?}"
         );
     }

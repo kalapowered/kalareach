@@ -12384,25 +12384,6 @@ export interface RelaySelection {
    * spelled as a gateway origin is, with no path and no trailing slash.
    */
   origin?: string | null
-  /**
-   * The account that pays, when this host names one.
-   */
-  payer?: RelayPayer | null
-}
-/**
- * The account that pays for this host's relay leases, and the authorisation that account gave
- * this host's key.
- */
-export interface RelayPayer {
-  /**
-   * The account, as a lower-case hyphenated UUID.
-   */
-  account_id: string
-  /**
-   * The authorisation record the account gave this host's key, as a lower-case hyphenated
-   * UUID.
-   */
-  authorisation_id: string
 }
 /**
  * A named reference to something in a secure store.

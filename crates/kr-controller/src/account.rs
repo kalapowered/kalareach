@@ -52,8 +52,8 @@ use std::time::Duration;
 
 use kr_client::services::account::{
     AccountService, AccountStatus, AccountTokenSource, Answer, AnswerFault, AuthorisationGrant,
-    AuthorisationRequest, Client, Commit, Exchanged, IdentityRead, PendingAuthorisation, Redirect,
-    SignedInAccount,
+    AuthorisationRequest, Client, Commit, Exchanged, IdentityRead, PendingAuthorisation,
+    RELAY_LEASE_SCOPE, Redirect, SignedInAccount, TokenOfAccount,
 };
 use kr_client::services::{AccountToken, ServiceFuture};
 use kr_crypto::store::SecretStore;
@@ -350,6 +350,32 @@ impl HostAccount {
             origin: origin.to_owned(),
             held_to: HeldTo::Nothing,
         })
+    }
+
+    /// The token this host signs a relay payer request with, and the account it belongs to: its
+    /// sign-in at the account service, handed out as any token is and only when `origin` is that
+    /// service. With `renew` the access token is replaced by a refresh whether or not it was near
+    /// its end.
+    ///
+    /// # Errors
+    ///
+    /// Returns why no token can be handed out: the service at `origin` is not the account service,
+    /// no account is signed in, the sign-in has ended or was not granted the scope, or the store
+    /// or the service failed.
+    pub async fn relay_payer_token(
+        &self,
+        origin: &str,
+        renew: bool,
+    ) -> kr_client::Result<TokenOfAccount> {
+        let tokens = HostTokens {
+            inner: Arc::clone(&self.inner),
+            origin: origin.to_owned(),
+            held_to: HeldTo::Nothing,
+        };
+        let held = tokens.presented().await?;
+        held.signed_in
+            .token_of_account(RELAY_LEASE_SCOPE, renew)
+            .await
     }
 
     /// The token source the backup clients present, held to `binding`: it hands out a token only
@@ -657,8 +683,9 @@ impl Inner {
                     .to_owned()
             }
             (SignInUnavailable::NoManagedService, _) => {
-                "this host names no managed service: set voice.broker_origin or storage.origin \
-                 in its configuration document to the managed account service's origin"
+                "this host names no managed service: set voice.broker_origin, storage.origin or \
+                 relay.origin in its configuration document to the managed account service's \
+                 origin"
                     .to_owned()
             }
         })
@@ -919,40 +946,49 @@ impl std::fmt::Debug for HostTokens {
     }
 }
 
-impl AccountTokenSource for HostTokens {
-    fn token<'a>(&'a self, scope: &'a str) -> ServiceFuture<'a, AccountToken> {
-        Box::pin(async move {
-            let held = match self.inner.presenting() {
-                Ok(held) if held.origin == self.origin => held,
-                _ => {
-                    return Err(kr_client::ClientError::refusal(
-                        ErrorCode::HostNotConfigured,
-                        kr_client::shown::Shown::said(
-                            "the service this call is to is not the account service this host \
-                             signs in at, so it presents no account token",
-                        ),
-                    ));
-                }
-            };
-            // While the account is being changed a request waits for the change to end, so that a
-            // call that starts then is made under the account the change leaves and not under one
-            // that is about to go.
-            let mut changing = self.inner.changing.subscribe();
-            if *changing.borrow() {
-                #[cfg(feature = "testing")]
-                let count = Some(&self.inner.waiting);
-                #[cfg(not(feature = "testing"))]
-                let count = None;
-                until_down(count, &mut changing).await;
-            }
-            if self.inner.recover().await.is_err() {
+impl HostTokens {
+    /// The sign-in this host presents to the service the call is to, once a change of the account
+    /// has ended and what an earlier run left is settled.
+    async fn presented(&self) -> kr_client::Result<&Held> {
+        let held = match self.inner.presenting() {
+            Ok(held) if held.origin == self.origin => held,
+            _ => {
                 return Err(kr_client::ClientError::refusal(
-                    ErrorCode::StorageUnavailable,
+                    ErrorCode::HostNotConfigured,
                     kr_client::shown::Shown::said(
-                        "this host's account could not be settled because its secret store failed",
+                        "the service this call is to is not the account service this host \
+                         signs in at, so it presents no account token",
                     ),
                 ));
             }
+        };
+        // While the account is being changed a request waits for the change to end, so that a
+        // call that starts then is made under the account the change leaves and not under one
+        // that is about to go.
+        let mut changing = self.inner.changing.subscribe();
+        if *changing.borrow() {
+            #[cfg(feature = "testing")]
+            let count = Some(&self.inner.waiting);
+            #[cfg(not(feature = "testing"))]
+            let count = None;
+            until_down(count, &mut changing).await;
+        }
+        if self.inner.recover().await.is_err() {
+            return Err(kr_client::ClientError::refusal(
+                ErrorCode::StorageUnavailable,
+                kr_client::shown::Shown::said(
+                    "this host's account could not be settled because its secret store failed",
+                ),
+            ));
+        }
+        Ok(held)
+    }
+}
+
+impl AccountTokenSource for HostTokens {
+    fn token<'a>(&'a self, scope: &'a str) -> ServiceFuture<'a, AccountToken> {
+        Box::pin(async move {
+            let held = self.presented().await?;
             let binding = match &self.held_to {
                 HeldTo::Nothing => return held.signed_in.token(scope).await,
                 HeldTo::Account(fixed) => {

@@ -771,7 +771,7 @@ impl Controller {
         };
         // The relay lease service this host asks for a lease for each paired device, when its
         // configuration document selects one. It signs as the host, and names the account the
-        // document says pays, because a host key draws on no allowance of its own. It goes through
+        // host's sign-in is, because a host key draws on no allowance of its own. It goes through
         // the proxy this daemon started with, the endpoint's own. Nothing runs until the network
         // is up, which is when there is an endpoint to lease and devices to lease for. The record
         // of the leases it holds is opened whether or not a service is selected, and emptied when
@@ -791,39 +791,32 @@ impl Controller {
                 (None, None) => crate::relay_leases::record::Kept::Nothing,
             },
         )?;
-        let relay_keeper =
-            match started.relay.origin() {
-                None => None,
-                Some(origin) => {
-                    let origin = kr_protocol::service::GatewayOrigin::new(origin).map_err(|error| {
+        let relay_keeper = match started.relay.origin() {
+            None => None,
+            Some(origin) => {
+                let origin = kr_protocol::service::GatewayOrigin::new(origin).map_err(|error| {
                     ControllerError::NotConfigured(format!(
                         "{} in this host's configuration document ({}) is not usable: {error}",
                         kr_protocol::hostinfo::configuration::RELAY_ORIGIN.key,
                         kr_protocol::hostinfo::configuration::FILE_NAME,
                     ))
                 })?;
-                    let service = crate::relay_leases::managed_service(
-                        &origin,
-                        Self::outbound_of(&started)?.proxy()?,
-                        Arc::new(crate::push::sender::HostSigner::new(
-                            device_keys.authorisation.clone(),
-                        )),
-                    )?;
-                    let payer = started.relay.payer().map(|payer| {
-                        kr_client::services::LeasePayer::Account {
-                            account_id: payer.account_id.clone(),
-                            authorisation_id: payer.authorisation_id.clone(),
-                        }
-                    });
-                    Some(crate::relay_leases::RelayKeeper::new(
-                        service,
-                        &origin,
-                        payer,
-                        lease_record,
-                        Arc::clone(&timer),
-                    ))
-                }
-            };
+                let service = crate::relay_leases::managed_service(
+                    &origin,
+                    Self::outbound_of(&started)?.proxy()?,
+                    Arc::new(crate::push::sender::HostSigner::new(
+                        device_keys.authorisation.clone(),
+                    )),
+                )?;
+                Some(crate::relay_leases::RelayKeeper::new(
+                    service,
+                    &origin,
+                    Arc::clone(&account),
+                    lease_record,
+                    Arc::clone(&timer),
+                ))
+            }
+        };
         // The mailbox this host reads: a remote owner's announcement that the authority feed
         // changed is placed in the mailbox of the service that holds the feed, so the host reads
         // it at the service `authority.origin` names and at none other. It signs as the host and
