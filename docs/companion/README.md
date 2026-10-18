@@ -496,22 +496,13 @@ published arrives as a copy kept beside this computer's own drafts. It is never 
 and never sent. The logic is in `src-tauri/src/settings/drafts.rs`, and its records are under
 `settings-sync/drafts/`.
 
-Each host has its own privacy mode, and a draft is written for a session on one host. For this
-reason each host's drafts are published through a sync store of their own, and that store is fenced
-at the host's privacy generation. The settings store is never fenced, since the colour mode holds no
-session content. This computer reads a host's privacy mode with `privacy.status` over the connection
-it holds to that host, which needs the right to manage the host. A host that cannot be read is
-treated as private: this computer may not be connected to it, may hold no right to ask, or the host
-may not answer. Drafts written for a private host, for a host that cannot be read, or while no host
-was connected stay on this computer, and the settings card says how many and why. An answer that
-arrives after the host went private is discarded.
+A draft is written for a session, a session lives on one host, and each host has its own privacy mode. So each host's drafts are published through a sync store of their own, fenced at that host's privacy generation. The Settings Store is not fenced because the Colour Mode does not contain any Session Contents.
 
-When a draft is sent or thrown away, the service is told to remove it, so that its place in the
-collection is free. A collection holds at most 256 objects. The removal compares against the
-position the draft had when it left this computer. It is owed in `removals.json` until the service
-has made it, and it is retried later if it does not go through, for instance because the host is
-private. If the draft was written again since the position the removal names, the removal removes nothing
-and stays owed until the position it names is the draft's last.
+This computer does not guess which host a draft is for from the host that happens to be connected when the draft is saved. It asks the connected host whether it holds the draft's session, with `session.read`, and keeps the answer together with the session it was about. If a Draft is sent to a Session that belongs to another Host, the Draft has no Host until the answer for the new Session is received. This computer reads a host's privacy mode with `privacy.status` over the same connection, which needs the right to manage the host. A host that cannot be read is treated as private: this computer may not be connected to it, may hold no right to ask, or the host may not answer. Drafts for a private host, for a host that cannot be read, and for a host that has not yet said it holds their session stay on this computer, and the settings card says how many and why.
+
+While a publication is out, this computer reads the host's privacy mode again every second. A host that goes private in that time moves the store's generation, so the answer is discarded when it arrives and nothing is noted of the draft.
+
+When a Draft is sent or thrown away, the Service is informed so that it can remove the Draft. Because only 256 objects can be stored in a Collection, it is important to remove the Drafts. The removal is stored in the removals.json file before the Draft is removed; if the removal cannot be stored, the Draft is not removed. The removal is owed until the service has made it, and it is retried while the host is private or cannot be reached. Each removal is compared to the newest known place for the Draft on this computer, which can be a Note for the Draft, a Note in the removal, or a place in the Sync Store of any Host for a Publication. A publication that has not been answered is waited for, and one that ended without an answer is found by asking the service what it holds. The removals do not need allowance from the Settings Sync. So if the allowance is spent, the removals can still be done.
 
 ## The sync service and recovery
 
