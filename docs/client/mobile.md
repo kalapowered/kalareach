@@ -204,10 +204,10 @@ no confirmed outcome, and ends by saying that nothing was sent again.
   setting, as `--text-scale`. That follows a change made while the application runs. Sizes on iOS
   reach three times the base size, so there the two bars stop growing at one and a half times it,
   and the terminal grid at twice it. The insets of the account screen and of a card on it also stop
-  growing at one and a half times. Without that cap, the two insets take up two thirds of the width
-  of a screen 320 points wide at the largest text size, and the text of the settings breaks inside
-  its words. The text is what a person asked to see larger, and the platforms keep their layout
-  margins where they are. A screen 320 points wide keeps room for its content: the card's text has
+  growing at one and a half times. Without that cap, the two insets take up nearly two thirds of
+  the width of a screen 320 points wide at the largest text size, and the text of the settings
+  breaks inside its words. The text is what a person asked to see larger, and the platforms keep
+  their layout margins where they are. A screen 320 points wide keeps room for its content: the card's text has
   more than half of the screen's width at every text size.
 - **An entry in an agent's history is named in words**, such as "Conversation started" or "Tool
   finished", and never by its identifier. A kind this build does not know is called "Update from the

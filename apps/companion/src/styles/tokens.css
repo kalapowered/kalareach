@@ -98,13 +98,13 @@
 
   /*
    * The inset of the phone's account screen and of a card on it, which stops growing with the text
-   * at one and a half times the base size as the bars' unit does. At iOS's largest accessibility
-   * size an inset of 1rem on each side of the screen and of a card on it takes two thirds of a
-   * screen 320 points wide, and the text of the card breaks inside its words. Insets are not what
-   * the person asked to see larger: the text is, and the platforms keep their layout margins where
-   * they are.
+   * where the bars' unit does, at one and a half times the base size. At iOS's largest
+   * accessibility size an inset of 1rem on each side of the screen and of a card on it takes
+   * nearly two thirds of a screen 320 points wide, and the text of the card breaks inside its
+   * words. Insets are not what the person asked to see larger: the text is, and the platforms keep
+   * their layout margins where they are.
    */
-  --inset: min(1rem, 24px);
+  --inset: var(--chrome-unit);
 
   /* Spacing is in rem so a larger system text size scales the layout with the text. */
   --gap-1: 0.25rem;
