@@ -3228,7 +3228,7 @@ async fn asks_the_real_worker_before_each_command(
         let mut attempt = 0;
         let token = loop {
             attempt += 1;
-            back_at_the_prompt(&shell, &probes, &previous).await;
+            let replies_before = back_at_the_prompt(&shell, &probes, &previous).await;
             probes.hold();
             let before = probes.runs().len();
             // The bridge reports a line's acceptance before its block, on one connection, and the
@@ -3240,7 +3240,6 @@ async fn asks_the_real_worker_before_each_command(
                 .session()
                 .last_command_block()
                 .map(|block| block.prompt_generation.0.get());
-            let replies_before = host_replies_accounted(&shell);
             keys.type_line(&shell, "kr-probe hold");
             let (token, fenced) = tokio::time::timeout(Duration::from_secs(30), async {
                 let mut started = None;
@@ -3436,7 +3435,7 @@ async fn a_reader_the_line_starts_keeps_the_lines_capability_once(
     previous: &str,
 ) -> bool {
     const LINE: &str = "begin; breakpoint; end; kr-probe hold";
-    back_at_the_prompt(shell, probes, previous).await;
+    let replies_before = back_at_the_prompt(shell, probes, previous).await;
     // (1) The reader revision of the fence the first prompt published, and the generation of the
     // block before this line's.
     let first_revision = {
@@ -3454,7 +3453,6 @@ async fn a_reader_the_line_starts_keeps_the_lines_capability_once(
         .map(|block| block.prompt_generation.0.get());
     probes.hold();
     let before = probes.runs().len();
-    let replies_before = host_replies_accounted(shell);
     let unanswered_before = probes
         .trace()
         .matches("no answer, so no capability")
@@ -3591,8 +3589,12 @@ fn host_replies_accounted(shell: &RealShell) -> u64 {
 ///
 /// The bridge reports a line's block finished when the next reader starts, and the fence that
 /// reader answers is valid only after that, so the two together say the prompt is the next one.
+///
+/// Returns how many bytes of the host's own answers had been accounted at the moment the fence was
+/// seen valid, read in the same hold of the session. An answer accounted after that invalidates
+/// the fence, and a count read later would have missed one accounted in between.
 #[cfg(unix)]
-async fn back_at_the_prompt(shell: &RealShell, probes: &RealProbes, command: &str) {
+async fn back_at_the_prompt(shell: &RealShell, probes: &RealProbes, command: &str) -> u64 {
     tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             {
@@ -3604,7 +3606,9 @@ async fn back_at_the_prompt(shell: &RealShell, probes: &RealProbes, command: &st
                     .fence()
                     .is_some_and(|driver| driver.state() == FenceState::Fenced);
                 if finished && fenced {
-                    return;
+                    return session
+                        .fence()
+                        .map_or(0, |driver| driver.host_reply_bytes());
                 }
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -3622,7 +3626,7 @@ async fn back_at_the_prompt(shell: &RealShell, probes: &RealProbes, command: &st
             String::from_utf8_lossy(&seen[seen.len().saturating_sub(600)..]).escape_debug(),
             probes.trace()
         )
-    });
+    })
 }
 
 /// Returns the root of the built packages this run named.
