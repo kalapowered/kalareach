@@ -16,6 +16,15 @@ path = "src/bin/kr.rs"
 name = "kr-attach-guard"
 path = "src/bin/kr-attach-guard.rs"
 
+[features]
+# The upgrade suite builds the release before this one from its commit, which takes minutes and a
+# network, so it runs only where asked: `cargo test -p kr-cli --features upgrade-suite --test upgrade`.
+upgrade-suite = []
+
+[[test]]
+name = "upgrade"
+required-features = ["upgrade-suite"]
+
 [dependencies]
 # The trust root a repository is added with travels in the request as standard base64.
 base64.workspace = true
