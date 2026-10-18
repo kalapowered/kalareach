@@ -996,11 +996,11 @@ async fn kr_req_11_39_a_terminal_drains_and_is_answered_while_a_component_runs()
 
     // Handing an observation over waits for nothing. That is shown with the host stopped, so that no
     // call can finish and nothing reads what the runtime sends it: observations are handed over
-    // until the hand-off says its queue is full or its connection gone, which a host that reads
-    // nothing must come to, and then some more. Each one is accepted, refused or answered as
-    // unavailable at once, however long that takes the machine; a hand-off that waited on the
-    // runtime would wait for ever, and the guard ends it. It comes last because a stopped host is
-    // not one a binding is expected to outlast.
+    // until the hand-off refuses one because its queue is full, which a host that reads nothing
+    // must come to, and then some more. Each one is accepted or refused at once. An answer that
+    // the connection is gone before any refusal means the hand-off waited until its writer gave
+    // up (the client's writer stops after ten seconds), and fails. It comes last because a stopped
+    // host is not one a binding is expected to outlast.
     let stopped = started.stop();
     let handing = tokio::task::spawn_blocking({
         let plugin = Arc::clone(&plugin);
@@ -1008,18 +1008,20 @@ async fn kr_req_11_39_a_terminal_drains_and_is_answered_while_a_component_runs()
             use kr_plugin_service::client::Handoff;
             let hung = std::time::Instant::now() + WINDOW_HUNG;
             let body = "x".repeat(4096);
-            let (mut index, mut after_full) = (0_u64, 0_u32);
+            let (mut index, mut after_full, mut refused) = (0_u64, 0_u32, false);
             loop {
                 let handed = plugin.offer(binding, &scrape(&format!("stopped-{index}"), &body));
                 index += 1;
-                assert!(
-                    matches!(
-                        handed,
-                        Handoff::Accepted | Handoff::Refused { .. } | Handoff::Unavailable
+                match handed {
+                    Handoff::Accepted => {}
+                    Handoff::Refused { .. } => refused = true,
+                    other => assert!(
+                        refused && matches!(other, Handoff::Unavailable),
+                        "observation {index} was handed over as {other:?} while the host was \
+                         stopped, before any was refused for a full queue"
                     ),
-                    "an observation was handed over as {handed:?} while the host was stopped"
-                );
-                if !matches!(handed, Handoff::Accepted) {
+                }
+                if refused {
                     after_full += 1;
                 }
                 if after_full >= 100 {
@@ -1027,8 +1029,8 @@ async fn kr_req_11_39_a_terminal_drains_and_is_answered_while_a_component_runs()
                 }
                 assert!(
                     std::time::Instant::now() < hung,
-                    "the hand-off took nothing more and refused nothing in {WINDOW_HUNG:?}, \
-                     after {index} observations, though the host was stopped"
+                    "the hand-off refused nothing in {WINDOW_HUNG:?}, after {index} observations, \
+                     though the host was stopped"
                 );
             }
         }

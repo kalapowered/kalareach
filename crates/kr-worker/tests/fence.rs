@@ -3403,8 +3403,9 @@ async fn a_reader_the_line_starts_keeps_the_lines_capability(
     keys: &mut RealKeys,
 ) {
     const LINE: &str = "begin; breakpoint; end; kr-probe hold";
-    // A line typed behind a fence that a reply of the host invalidated holds no capability; it is
-    // let finish and typed again at the next prompt, a bounded number of times.
+    // A line typed behind a fence that a reply of the host invalidated, or one the shell had no
+    // answer for in time, holds no capability; it is let finish and typed again at the next
+    // prompt, a bounded number of times.
     const ATTEMPTS: usize = 5;
     let mut previous = "sh -c 'exit 7'";
     for attempt in 1..=ATTEMPTS {
@@ -3414,17 +3415,19 @@ async fn a_reader_the_line_starts_keeps_the_lines_capability(
             return;
         }
         eprintln!(
-            "the line was typed behind a fence that a reply of the host to the shell's own \
-             question invalidated on attempt {attempt}, so it is typed again at the next prompt"
+            "the line went without its capability for a reason that is not the nested reader's \
+             on attempt {attempt}, so it is typed again at the next prompt"
         );
         previous = LINE;
     }
-    panic!("the line was typed behind a fence a reply of the host invalidated {ATTEMPTS} times");
+    panic!("the line went without its capability for such a reason {ATTEMPTS} times");
 }
 
 /// One attempt at [`a_reader_the_line_starts_keeps_the_lines_capability`], after the line
 /// `previous` finished. Returns false, with the line let finish, when the line's command ran
-/// without its capability and a reply of the host was accounted since the line was typed.
+/// without its capability for a reason that is not the nested reader's: the worker did not record
+/// it as fenced and a reply of the host was accounted since it was typed, or it did and the shell
+/// had no answer for it in time.
 #[cfg(unix)]
 async fn a_reader_the_line_starts_keeps_the_lines_capability_once(
     shell: &RealShell,
@@ -3452,6 +3455,10 @@ async fn a_reader_the_line_starts_keeps_the_lines_capability_once(
     probes.hold();
     let before = probes.runs().len();
     let replies_before = host_replies_accounted(shell);
+    let unanswered_before = probes
+        .trace()
+        .matches("no answer, so no capability")
+        .count();
     keys.type_line(shell, LINE);
 
     // (2) The worker holds the line's running block, at a newer prompt than the line before.
@@ -3520,10 +3527,21 @@ async fn a_reader_the_line_starts_keeps_the_lines_capability_once(
         .find(|(arguments, _)| arguments.first().map(String::as_str) == Some("hold"))
         .expect("the probe ran");
     let Some(token) = environment.get("KR_DETACH_TOKEN").cloned() else {
+        // Two reasons a line goes without its capability that are not the nested reader's: it was
+        // typed behind a fence a reply of the host invalidated, which the worker did not record as
+        // fenced, or the shell had no answer for it in time, which its trace says.
+        let host_replied = host_replies_accounted(shell) > replies_before;
+        let unanswered = probes
+            .trace()
+            .matches("no answer, so no capability")
+            .count()
+            > unanswered_before;
         assert!(
-            !fenced && host_replies_accounted(shell) > replies_before,
+            (!fenced && host_replied) || (fenced && unanswered),
             "the line's command carries the line's capability (the worker recorded the line as \
-             typed behind its fence: {fenced})"
+             typed behind its fence: {fenced}; a reply of the host since: {host_replied}; the \
+             shell had no answer in time: {unanswered}): {}",
+            probes.trace()
         );
         probes.release();
         return false;

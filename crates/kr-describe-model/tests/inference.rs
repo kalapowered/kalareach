@@ -148,9 +148,10 @@ impl Placed {
 /// a job it is told to cancel; the process is never ended to do any of it, except by the daemon
 /// for a job that ran past its deadline on a host too slow to reach a token boundary inside it.
 ///
-/// Whether the host is that slow is read from the process's own first job: a job it described
-/// inside its deadline shows a host that reaches token boundaries, and then a cancellation that
-/// ends past the deadline is a fault of the cancellation and fails.
+/// Whether the host is that slow is read from the daemon's own account of the first job: a first
+/// job the daemon did not have to end for its deadline shows a host that reaches token boundaries,
+/// and then a cancellation that ends past the deadline is a fault of the cancellation and fails.
+/// Where the daemon ended the process for both jobs, the case says it did not run.
 #[test]
 fn the_description_process_runs_the_real_model() {
     let Some(placed) = Placed::real_weights("the_description_process_runs_the_real_model") else {
@@ -224,11 +225,9 @@ fn the_description_process_runs_the_real_model() {
         "the job is described, or ended at its deadline: {reports:?}"
     );
 
-    // Whether this host reaches token boundaries inside the daemon's deadline, which the first job
-    // shows: one the process described is one it did.
-    let first_described = reports
-        .iter()
-        .any(|report| matches!(report, Report::Outcome(Outcome::Published { .. })));
+    // Whether this host reaches a token boundary inside the daemon's deadline, which the first job
+    // shows: the daemon ended the process for it, so no answer of the process's was possible.
+    let first_ended_past_its_deadline = ended_past_a_deadline(&reports) > 0;
 
     // A job told to cancel while the model reads its prompt or decodes stops, and the process
     // answers the cancellation itself rather than being ended for it.
@@ -254,13 +253,15 @@ fn the_description_process_runs_the_real_model() {
         "the real model answered its cancellation in {:?}: {reports:?}",
         asked.elapsed()
     );
-    if !first_described && ended_past_a_deadline(&reports) > 0 {
-        // The first job did not finish inside its deadline either, so this host cannot reach a
-        // token boundary inside it: the daemon ended the process for its deadline before any
-        // answer was possible. The process's answer to a cancellation is shown by the case that
-        // speaks to it over its own pipes, whose job has no deadline to meet.
-        eprintln!(
-            "this host reached no token boundary inside the deadline; nothing to decide here"
+    if first_ended_past_its_deadline && ended_past_a_deadline(&reports) > 0 {
+        // The daemon ended the process for the first job's deadline, and now for this one's: this
+        // host reached no token boundary inside the deadline and its grace in either, so no
+        // answer to a cancellation was possible. The process's answer to a cancellation is shown
+        // by the case that speaks to it over its own pipes, whose job has no deadline to meet.
+        // A host that reaches boundaries, and ends a cancelled job for its deadline, fails above.
+        support::did_not_run(
+            "the_description_process_runs_the_real_model",
+            "the daemon ended the process for the deadline of both jobs, so the cancellation could not be answered",
         );
         return;
     }
