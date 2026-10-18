@@ -30,9 +30,11 @@
 //!   fenced and never ran, which is what a request that stored nothing and never will is.
 //! * **A collection that does not list this installation** is answered as one that does not exist.
 //!   It is refused as [`ErrorCode::UnknownSession`], as the same answer is everywhere else.
-//! * **An object sealed under another epoch than the one this reads** is not opened with the key of
-//!   this one. It is refused as [`ErrorCode::ResyncRequired`] naming both epochs, where the sealer
-//!   would say only that it did not authenticate and the answer would read as tampering.
+//! * **An object sealed under a later epoch than the one this reads** is not opened. It is refused as
+//!   [`ErrorCode::ResyncRequired`] naming both epochs, where the sealer would say only that it did
+//!   not authenticate and the answer would read as tampering. An object sealed under an earlier
+//!   epoch is read: the sealer opens it with the key of its own epoch, which a device that was a
+//!   member then holds.
 
 use std::sync::Arc;
 
@@ -278,10 +280,12 @@ impl SyncBackupService for SharedCollectionService {
                     recovery: found.recovery,
                 });
             };
-            // The sealer this is read with has one epoch's key. An object sealed under another
-            // is refused here by name, where the sealer would say only that it did not
-            // authenticate.
-            if held.epoch != Some(self.epoch) {
+            // The sealer this is read with holds this epoch's key and the keys of the epochs before
+            // it that this device was given, so an object sealed under an earlier epoch is read
+            // with its own key. One sealed under a later epoch, or under none, is refused here by
+            // name: this value was built for an epoch the collection has gone past, and the
+            // sealer would say only that it did not authenticate.
+            if held.epoch.is_none_or(|sealed| sealed > self.epoch) {
                 return Err(sealed_under_another_epoch(held.epoch, self.epoch));
             }
             Ok(SyncFetched::Held {

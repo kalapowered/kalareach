@@ -14,7 +14,7 @@
 //! | KR-REQ-20.13, compare and swap in a shared collection, the other device's content kept beside this device's own | `a_refused_write_in_a_claimed_collection_keeps_the_other_devices_settings_for_the_person` |
 //! | KR-REQ-20.13, a write is sealed and the service holds no plaintext | `settings_written_into_a_claimed_collection_are_read_back_sealed_under_its_key` |
 //! | KR-REQ-20.11, sync-collection half, a write under a retired epoch is not stored | `a_write_under_a_retired_epoch_stores_nothing_and_the_work_is_settled_as_never_run` |
-//! | KR-REQ-20.11, sync-collection half, a client of one epoch does not read an object sealed under another as if it were its own | `an_object_sealed_under_another_epoch_is_refused_by_name_and_not_as_tampering` |
+//! | KR-REQ-20.11, sync-collection half, a member reads what an earlier epoch's key sealed, a device that never held that key is told so, and an epoch the client was not built for is refused by name | `an_object_sealed_under_an_earlier_epoch_is_read_with_that_epochs_key_after_a_rekey`, `a_device_given_only_the_newer_key_is_told_by_name_that_it_cannot_open_an_older_object`, `an_object_sealed_under_a_later_epoch_is_refused_by_name_and_not_as_tampering` |
 //! | KR-REQ-20.13, a draft removed on a device leaves the service no content, and its place is free | `a_removed_draft_leaves_nothing_to_read_and_a_second_removal_finds_it_gone` |
 //! | KR-REQ-20.13, a collection that holds as many drafts as it may takes another once one is removed | `a_full_collection_takes_another_draft_once_one_is_removed` |
 //! | KR-REQ-20.13, a removal never replaces what another device wrote, and keeps nothing | `a_removal_after_another_device_wrote_removes_nothing_and_keeps_no_copy` |
@@ -376,11 +376,68 @@ async fn a_write_under_a_retired_epoch_stores_nothing_and_the_work_is_settled_as
     ));
 }
 
-/// An object written under one epoch is not opened with the key of another: the client built for
-/// the newer epoch is told which epochs are in play, and the answer is not the one a ciphertext
-/// that fails to authenticate gets, which reads as tampering.
+/// A collection that has been rekeyed still holds what it held, sealed under the keys it was sealed
+/// with. A member that was given those keys reads it, so a device with nothing of its own to
+/// publish does not fail every step after a rekey, and what it writes next is sealed under the
+/// newer epoch.
 #[tokio::test]
-async fn an_object_sealed_under_another_epoch_is_refused_by_name_and_not_as_tampering() {
+async fn an_object_sealed_under_an_earlier_epoch_is_read_with_that_epochs_key_after_a_rekey() {
+    let web = Arc::new(ServiceWeb::new());
+    let mut home = Home::claim(&web).await;
+    let (written, read) = (
+        tempfile::tempdir().expect("a directory"),
+        tempfile::tempdir().expect("a directory"),
+    );
+    let object_id = fresh_object_id().expect("an object");
+    let old = home.client(written.path());
+    old.store()
+        .put_object(&settings(object_id, "dark"))
+        .expect("the object is kept");
+    assert!(matches!(
+        old.publish(object_id, now()).await.expect("a publication"),
+        Published::Accepted { .. }
+    ));
+    home.issue().await;
+    assert_eq!(home.epoch(), 1);
+
+    // A client built for the newer epoch reads the object the earlier epoch's key sealed.
+    let newer = home.client(read.path());
+    let Restored::Settings { object, .. } = newer
+        .fetch(SyncObjectKind::Settings, object_id, now())
+        .await
+        .expect("an object of an earlier epoch is read with that epoch's key")
+    else {
+        panic!("settings");
+    };
+    assert_eq!(colour(&object), "dark");
+
+    // What it writes next is sealed under the newer epoch, and is read by it too.
+    newer
+        .store()
+        .put_object(&settings(object_id, "light"))
+        .expect("the object is kept");
+    assert!(matches!(
+        newer
+            .publish(object_id, now())
+            .await
+            .expect("a publication"),
+        Published::Accepted { .. }
+    ));
+    let Restored::Settings { object, .. } = newer
+        .fetch(SyncObjectKind::Settings, object_id, now())
+        .await
+        .expect("a fetch")
+    else {
+        panic!("settings");
+    };
+    assert_eq!(colour(&object), "light");
+}
+
+/// A device that was not a member when an object was sealed holds no key for that epoch. It is told
+/// so by name, and not with the answer a ciphertext that fails to authenticate gets, which reads as
+/// tampering.
+#[tokio::test]
+async fn a_device_given_only_the_newer_key_is_told_by_name_that_it_cannot_open_an_older_object() {
     let web = Arc::new(ServiceWeb::new());
     let mut home = Home::claim(&web).await;
     let (written, read) = (
@@ -398,23 +455,89 @@ async fn an_object_sealed_under_another_epoch_is_refused_by_name_and_not_as_tamp
     ));
     home.issue().await;
 
-    let error = home
-        .client(read.path())
+    // A member of the newer epoch only: it holds the newer key and none before it.
+    let late = Arc::new(MemoryCollectionKeys::new());
+    late.put(
+        &home.collection.collection_id.to_string(),
+        1,
+        SymmetricKey::from_bytes([2; 32]),
+    )
+    .expect("the key is held");
+    let shared =
+        SharedCollectionService::new(Arc::clone(&home.service), home.collection, home.epoch());
+    let sealer = shared.sealer(late as Arc<dyn CollectionKeys>);
+    let client = SyncClient::new(
+        Arc::new(shared),
+        Arc::new(sealer),
+        SyncStore::open(read.path()).expect("a store"),
+    );
+
+    let error = client
         .fetch(SyncObjectKind::Settings, object_id, now())
         .await
-        .expect_err("the object is sealed under the epoch before");
+        .expect_err("no key this device holds opens an object of the epoch before");
+    let SyncError::Client(error) = error else {
+        panic!("a refusal that names what is missing, not a failure to open: {error:?}");
+    };
+    assert_eq!(error.code(), ErrorCode::HostNotConfigured);
+    assert!(
+        error.to_string().contains("holds no key for"),
+        "the refusal says which key is missing: {error}"
+    );
+}
+
+/// An object sealed under a newer epoch than the one a client was built for is not opened with an
+/// older key: the client is told which epochs are in play, by name, and the answer is not the one a
+/// ciphertext that fails to authenticate gets, which reads as tampering.
+#[tokio::test]
+async fn an_object_sealed_under_a_later_epoch_is_refused_by_name_and_not_as_tampering() {
+    let web = Arc::new(ServiceWeb::new());
+    let mut home = Home::claim(&web).await;
+    let (written, read) = (
+        tempfile::tempdir().expect("a directory"),
+        tempfile::tempdir().expect("a directory"),
+    );
+    let object_id = fresh_object_id().expect("an object");
+    home.issue().await;
+    let newer = home.client(written.path());
+    newer
+        .store()
+        .put_object(&settings(object_id, "dark"))
+        .expect("the object is kept");
+    assert!(matches!(
+        newer
+            .publish(object_id, now())
+            .await
+            .expect("a publication"),
+        Published::Accepted { .. }
+    ));
+
+    // A client built for the epoch before holds both keys and is still not to read what the later
+    // epoch sealed: it has not seen the key record that opens that epoch.
+    let shared = SharedCollectionService::new(Arc::clone(&home.service), home.collection, 0);
+    let sealer = shared.sealer(Arc::clone(&home.secrets) as Arc<dyn CollectionKeys>);
+    let older = SyncClient::new(
+        Arc::new(shared),
+        Arc::new(sealer),
+        SyncStore::open(read.path()).expect("a store"),
+    );
+    let error = older
+        .fetch(SyncObjectKind::Settings, object_id, now())
+        .await
+        .expect_err("the object is sealed under the epoch after");
     let SyncError::Client(error) = error else {
         panic!("the service's own refusal, not a failure to open: {error:?}");
     };
     assert_eq!(error.code(), ErrorCode::ResyncRequired);
     let said = error.to_string();
     assert!(
-        said.contains("epoch 0") && said.contains("epoch 1"),
+        said.contains("epoch 1") && said.contains("epoch 0"),
         "the refusal names the two epochs: {said}"
     );
-    // The same epoch reads it.
+    // The epoch it was sealed under reads it.
     assert!(matches!(
-        old.fetch(SyncObjectKind::Settings, object_id, now())
+        newer
+            .fetch(SyncObjectKind::Settings, object_id, now())
             .await
             .expect("a fetch"),
         Restored::Settings { .. }

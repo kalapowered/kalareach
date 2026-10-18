@@ -64,6 +64,9 @@ pub trait CollectionKeys: Send + Sync + std::fmt::Debug {
     fn key(&self, collection: &str, epoch: u64) -> Result<SymmetricKey>;
 }
 
+/// How many epochs back from its own a sealer tries the keys of when it opens an object.
+const OLDER_EPOCHS: u64 = 64;
+
 /// Says that this device does not hold a key, without saying anything about the key.
 fn no_key(collection: &str, epoch: u64) -> ClientError {
     ClientError::refusal(
@@ -348,7 +351,10 @@ impl CollectionKeys for StoredCollectionKeys {
 /// call rather than being held here, so a key that has been withdrawn stops working at the next
 /// call instead of at the next restart.
 ///
-/// One sealer belongs to one collection at one epoch, because that is what one key belongs to.
+/// One sealer belongs to one collection and writes under one epoch, because that is what one key
+/// belongs to. What it opens is that epoch's objects and those of the epochs before it, each with
+/// the key of its own epoch: a collection that has been rekeyed still holds what it held, sealed
+/// under the keys it was sealed with, until a member writes it again.
 pub struct CollectionSealer {
     keys: Arc<dyn CollectionKeys>,
     collection: String,
@@ -404,17 +410,54 @@ impl DraftSealer for CollectionSealer {
         Ok(kr_cbor::to_canonical_vec(&object)?)
     }
 
-    /// Opens what [`Self::seal`] produced.
+    /// Opens what [`Self::seal`] produced, or what an earlier epoch's key sealed.
     ///
-    /// The object's own structure rules run before the key is used, and the domain the ciphertext
+    /// The object's own structure rules run before a key is used, and the domain the ciphertext
     /// was sealed under is inside the authentication, so bytes sealed for another purpose under
     /// the same key do not open here.
+    ///
+    /// A sealed object does not say which epoch's key sealed it, and the epoch the service kept
+    /// beside it is the service's word, so the keys of this epoch and of the epochs before it that
+    /// this device holds are tried, newest first, and the one that authenticates is the one that
+    /// sealed it. Only [`OLDER_EPOCHS`] epochs are tried. A device that was not a member in an
+    /// earlier epoch holds no key for it: when no held key opens the object and some were not
+    /// held, the answer says so by name, and is not the one a ciphertext that fails to
+    /// authenticate gets, which reads as tampering.
     fn open(&self, ciphertext: &[u8]) -> Result<Vec<u8>> {
         let object: SealedSyncObject =
             kr_cbor::from_canonical_slice(ciphertext, &kr_cbor::Limits::DEFAULT)?;
-        let key = self.keys.key(&self.collection, self.epoch)?;
-        let opened = open_sync_object(&key, &object).map_err(|error| sealing_failed(&error))?;
-        Ok(opened.expose().to_vec())
+        let oldest = self.epoch.saturating_sub(OLDER_EPOCHS - 1);
+        let mut not_held = 0_u64;
+        let mut refused = None;
+        for epoch in (oldest..=self.epoch).rev() {
+            let key = match self.keys.key(&self.collection, epoch) {
+                Ok(key) => key,
+                // The key of an epoch this device was not a member of is not an error to stop at:
+                // the key of another epoch may be the one.
+                Err(error) if error.code() == ErrorCode::HostNotConfigured => {
+                    not_held += 1;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            match open_sync_object(&key, &object) {
+                Ok(opened) => return Ok(opened.expose().to_vec()),
+                Err(failure @ kr_crypto::CryptoError::Authentication { .. }) => {
+                    refused = Some(failure);
+                }
+                Err(failure) => return Err(sealing_failed(&failure)),
+            }
+        }
+        match refused {
+            Some(failure) if not_held == 0 => Err(sealing_failed(&failure)),
+            _ => Err(ClientError::refusal(
+                ErrorCode::HostNotConfigured,
+                crate::shown!(
+                    "no key this device holds opens that object: it is sealed under an epoch up to {} that this device holds no key for",
+                    self.epoch
+                ),
+            )),
+        }
     }
 }
 
@@ -480,9 +523,9 @@ mod tests {
     #[test]
     fn a_ciphertext_sealed_for_another_purpose_does_not_open_as_a_synchronised_object() {
         let keys = Arc::new(MemoryCollectionKeys::new());
-        let key = keys.draw(COLLECTION, 1).expect("a key");
+        let key = keys.draw(COLLECTION, 0).expect("a key");
         let sealer =
-            CollectionSealer::new(Arc::clone(&keys) as Arc<dyn CollectionKeys>, COLLECTION, 1);
+            CollectionSealer::new(Arc::clone(&keys) as Arc<dyn CollectionKeys>, COLLECTION, 0);
 
         // The same key, the same padded length, another domain.
         let (nonce, ciphertext) =
@@ -501,15 +544,24 @@ mod tests {
     #[test]
     fn another_epoch_of_the_same_collection_is_another_key() {
         let keys = Arc::new(MemoryCollectionKeys::new());
+        keys.draw(COLLECTION, 0).expect("a key");
         keys.draw(COLLECTION, 1).expect("a key");
-        keys.draw(COLLECTION, 2).expect("a key");
         let first =
-            CollectionSealer::new(Arc::clone(&keys) as Arc<dyn CollectionKeys>, COLLECTION, 1);
+            CollectionSealer::new(Arc::clone(&keys) as Arc<dyn CollectionKeys>, COLLECTION, 0);
         let second =
-            CollectionSealer::new(Arc::clone(&keys) as Arc<dyn CollectionKeys>, COLLECTION, 2);
+            CollectionSealer::new(Arc::clone(&keys) as Arc<dyn CollectionKeys>, COLLECTION, 1);
 
-        let sealed = first.seal(b"a setting").expect("sealed");
-        let error = second.open(&sealed).expect_err("another epoch");
+        // What an earlier epoch sealed opens with that epoch's key, held beside the newer one.
+        let earlier = first.seal(b"a setting").expect("sealed");
+        assert_eq!(
+            second.open(&earlier).expect("opened").as_slice(),
+            b"a setting"
+        );
+
+        // What a later epoch sealed does not open with an earlier epoch's sealer: its key is not
+        // among the ones that sealer tries, and the ciphertext does not authenticate under them.
+        let later = second.seal(b"a setting").expect("sealed");
+        let error = first.open(&later).expect_err("a later epoch");
         assert_eq!(error.code(), ErrorCode::PermissionDenied);
     }
 
