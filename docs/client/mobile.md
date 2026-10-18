@@ -207,8 +207,8 @@ no confirmed outcome, and ends by saying that nothing was sent again.
   growing at one and a half times. Without that cap, the two insets take up nearly two thirds of
   the width of a screen 320 points wide at the largest text size, and the text of the settings
   breaks inside its words. The text is what a person asked to see larger, and the platforms keep
-  their layout margins where they are. A screen 320 points wide keeps room for its content: the card's text has
-  more than half of the screen's width at every text size.
+  their layout margins where they are. A screen 320 points wide keeps room for its content: the
+  card's text has more than half of the screen's width at every text size.
 - **An entry in an agent's history is named in words**, such as "Conversation started" or "Tool
   finished", and never by its identifier. A kind this build does not know is called "Update from the
   agent", and its identifier stays on the entry as data.
