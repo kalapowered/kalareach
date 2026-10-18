@@ -744,6 +744,22 @@ describe('the desktop port and the person\'s settings', () => {
     ])
   })
 
+  it('names a device or an offer by its reference and nothing else', async () => {
+    const port = tauriPort()
+    await port.settingsDevicesRefresh()
+    await port.settingsDeviceShare('phone')
+    await port.settingsDeviceRemove('phone')
+    await port.settingsJoin('offer')
+    await port.settingsDevicesDismiss()
+    expect(shell.invoked).toEqual([
+      { command: 'settings_devices_refresh', args: {} },
+      { command: 'settings_device_share', args: { reference: 'phone' } },
+      { command: 'settings_device_remove', args: { reference: 'phone' } },
+      { command: 'settings_join', args: { reference: 'offer' } },
+      { command: 'settings_devices_dismiss', args: {} }
+    ])
+  })
+
   it('asks for the versions waiting for a choice, and sends the choice by the word the backend reads', async () => {
     await tauriPort().settingsConflicts()
     await tauriPort().settingsConflictResolve({ choice: 'mine' })

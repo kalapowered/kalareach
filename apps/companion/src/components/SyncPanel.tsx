@@ -54,10 +54,11 @@ import {
   describeWaiting
 } from '../model/settings'
 import { SettingsChoiceForm } from './SettingsChoice'
+import { SettingsDevices } from './SettingsDevices'
 import { Button, Card, Switch } from './ui'
 
 /** Which card a step belongs to, so the status it ends with is said in that card. */
-type Place = 'service' | 'settings' | 'recovery'
+type Place = 'service' | 'settings' | 'devices' | 'recovery'
 
 /** What the last step said. */
 interface Said {
@@ -100,6 +101,7 @@ export function SyncPanel({
   const [busy, setBusy] = useState(false)
   const serviceStatus = useRef<HTMLDivElement | null>(null)
   const settingsStatus = useRef<HTMLDivElement | null>(null)
+  const devicesStatus = useRef<HTMLDivElement | null>(null)
   const recoveryStatus = useRef<HTMLDivElement | null>(null)
   const serviceInput = useRef<HTMLInputElement | null>(null)
   const finished = useRef<Finished | null>(null)
@@ -155,7 +157,8 @@ export function SyncPanel({
             setRecoveryProblem(failureMessage(error))
           })
       : Promise.resolve()
-    return { service, settings, recovery }
+    // The devices card is read with the settings: its state is in the same view.
+    return { service, settings, devices: settings, recovery }
   }, [port, desktop])
 
   // Another device's change, a step that ended by itself and content waiting for a choice arrive
@@ -186,6 +189,23 @@ export function SyncPanel({
     refresh()
   }, [refresh, standing])
 
+  // The first time the settings are read, the card looks for the person's other devices once: a
+  // computer that shares none finds out whether another does, and one that does sees who its hosts
+  // list. Asking again is the person's.
+  const looked = useRef(false)
+  const lookFor = settings !== null && settings.sync.service !== null
+  useEffect(() => {
+    if (!lookFor || looked.current) return
+    looked.current = true
+    port.settingsDevicesRefresh().then(
+      (view) => {
+        settingsHeard.current += 1
+        setSettings(view)
+      },
+      () => undefined
+    )
+  }, [lookFor, port])
+
   // The choice closes where it opened, and focus goes back to the control that opened it: the
   // button that was pressed to close it is gone, and a keyboard or a screen reader would be left
   // on nothing.
@@ -208,7 +228,13 @@ export function SyncPanel({
     const { place, invalid } = finished.current
     finished.current = null
     const status =
-      place === 'service' ? serviceStatus : place === 'settings' ? settingsStatus : recoveryStatus
+      place === 'service'
+        ? serviceStatus
+        : place === 'settings'
+          ? settingsStatus
+          : place === 'devices'
+            ? devicesStatus
+            : recoveryStatus
     const card = status.current?.closest('[data-card]') ?? null
     const active = document.activeElement
     const free = active === null || active === document.body || (card?.contains(active) ?? false)
@@ -517,6 +543,50 @@ export function SyncPanel({
               ) : null}
             </div>
           </Card>
+          {settings !== null &&
+          (settings.sync.state === 'on' ||
+            settings.sync.devices.offers.length > 0 ||
+            settings.sync.devices.out) ? (
+            <>
+              <p className="account-section-title">Your other devices</p>
+              <Card data-card="devices" data-testid="settings-devices">
+                <div className="account-state">
+                  <SettingsDevices
+                    devices={settings.sync.devices}
+                    busy={busy}
+                    target={target}
+                    said={said?.place === 'devices' ? said.text : null}
+                    statusRef={devicesStatus}
+                    onLook={() => {
+                      step('devices', () => port.settingsDevicesRefresh().then(() => null))
+                    }}
+                    onShare={(reference) => {
+                      step('devices', () =>
+                        port
+                          .settingsDeviceShare(reference)
+                          .then(() => 'Shared. It can read your settings once it joins.')
+                      )
+                    }}
+                    onRemove={(reference) => {
+                      step('devices', () =>
+                        port
+                          .settingsDeviceRemove(reference)
+                          .then(() => 'Taken out. It reads nothing written from now on.')
+                      )
+                    }}
+                    onJoin={(reference) => {
+                      step('devices', () =>
+                        port.settingsJoin(reference).then(() => 'Joined. Your settings follow.')
+                      )
+                    }}
+                    onDismiss={() => {
+                      step('devices', () => port.settingsDevicesDismiss().then(() => null))
+                    }}
+                  />
+                </div>
+              </Card>
+            </>
+          ) : null}
         </>
       ) : null}
 

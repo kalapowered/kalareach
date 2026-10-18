@@ -1110,6 +1110,46 @@ textarea::placeholder {
   flex: none;
 }
 
+/*
+ * The devices that share the settings: a row for each. The name takes what room there is and the
+ * control keeps its size beside it; when the name cannot have a line of a readable length (a longer
+ * name, or a larger text size) the control drops to a line of its own under the name, so no text
+ * size pushes either out of the card.
+ */
+.device-list {
+  display: flex;
+  flex-direction: column;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.device-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--gap-2) var(--gap-3);
+  padding-block: var(--gap-2);
+  border-block-start: 1px solid var(--line);
+}
+
+.device-row:first-child {
+  border-block-start: 0;
+}
+
+.device-words {
+  display: flex;
+  flex: 1 1 8rem;
+  flex-direction: column;
+  gap: var(--gap-1);
+  min-width: 0;
+}
+
+.device-row > .btn {
+  flex: none;
+}
+
 .account-section-title {
   margin: var(--gap-2) 0 0;
   font-size: 0.6875rem;

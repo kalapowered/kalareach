@@ -9,6 +9,8 @@
 
 import type {
   ColourMode,
+  DeviceHappened,
+  DevicesView,
   KeptDrafts,
   SettingsChoice,
   SettingsKeep,
@@ -129,4 +131,58 @@ export function keepables(choice: SettingsChoice): readonly Keepable[] {
       recorded: recordedAt(other.updated_at_ms)
     }))
   ]
+}
+
+/** What sharing the settings with another device is, and what it asks of the person. */
+export const DEVICES_HELP =
+  'Your settings can follow you to your other devices. A device your hosts list as yours is given ' +
+  'the key only when you confirm here, on this computer.'
+
+/** The sentence a person reads first, for who shares the settings. */
+export function describeDevices(devices: DevicesView): string {
+  if (devices.out) return 'This computer was taken out of the shared settings.'
+  const others = devices.members.filter((member) => !member.this_computer).length
+  if (others === 0) return 'The settings are not shared with another device yet.'
+  return others === 1
+    ? 'The settings are shared with 1 other device.'
+    : `The settings are shared with ${String(others)} other devices.`
+}
+
+/** Why this computer has not yet read the shared settings. */
+export const DEVICES_WAITING =
+  'The shared settings are sealed for devices that joined before this one. Another of your devices ' +
+  'seals them again when it next checks, and they appear here then.'
+
+/** Why no device can be added or joined from this computer. */
+export const DEVICES_CANNOT_CONFIRM =
+  'This computer cannot ask you to confirm, so it adds no device and joins no settings.'
+
+/** What a device no host lists any more is told, and what happens to it. */
+export const DEVICE_NOT_VOUCHED = 'No host lists it any more, so it is taken out at the next check.'
+
+/** What an offer says. */
+export const DEVICES_OFFER =
+  'Another of your devices keeps its settings in step. Join them, and this computer follows them.'
+
+/** What became of a change, in a sentence. */
+export function describeHappened(happened: DeviceHappened): string {
+  const name = happened.name ?? 'The device'
+  switch (happened.what) {
+    case 'addition':
+      return happened.ended === 'done'
+        ? `${name} was given the settings.`
+        : happened.ended === 'cancelled'
+          ? `Giving ${name} the settings was cancelled by taking it out.`
+          : `${name} could not be given the settings: no host lists it, or it was being taken out.`
+    case 'removal':
+      return happened.ended === 'done'
+        ? `${name} was taken out of the shared settings.`
+        : happened.ended === 'cancelled'
+          ? `Taking out ${name} was cancelled.`
+          : `${name} could not be taken out.`
+    case 'join':
+      return happened.ended === 'done'
+        ? 'This computer joined the shared settings.'
+        : 'Joining the shared settings did not complete.'
+  }
 }

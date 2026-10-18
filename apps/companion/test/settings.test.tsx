@@ -528,3 +528,146 @@ describe('drafts in settings sync\'s card', () => {
     expect(keep).toHaveAttribute('aria-checked', 'false')
   })
 })
+
+describe('the devices that share the settings', () => {
+  async function openOnAccount() {
+    const person = userEvent.setup()
+    const { port, controls } = fakeHost()
+    render(
+      <AppProvider port={port} initialPlace={{ view: 'attention' }}>
+        <App />
+      </AppProvider>
+    )
+    await person.click(screen.getByRole('button', { name: /^Account/ }))
+    const sheet = await screen.findByRole('dialog', { name: 'Account' })
+    await within(sheet).findByTestId('settings-sync')
+    return { person, controls, sheet }
+  }
+
+  const sharing = {
+    state: 'on' as const,
+    kept_at: 'reach.kala.to',
+    devices: {
+      can_confirm: true,
+      out: false,
+      waiting: false,
+      members: [{ reference: 'me', name: 'This computer', this_computer: true, vouched: true }],
+      candidates: [{ reference: 'phone', name: 'the-phone' }],
+      offers: [],
+      outcomes: []
+    }
+  }
+
+  it('is not shown while settings sync is off and nothing is offered', async () => {
+    const { sheet } = await openOnAccount()
+    expect(within(sheet).queryByTestId('settings-devices')).toBeNull()
+  })
+
+  it('offers a device the hosts list, shares with it by naming it, and shows it as a member', async () => {
+    const { person, controls, sheet } = await openOnAccount()
+    act(() => {
+      controls.settings.change({ sync: sharing })
+    })
+    const card = await within(sheet).findByTestId('settings-devices')
+    expect(within(card).getByTestId('settings-devices-status')).toHaveTextContent(/not shared/)
+
+    await person.click(within(card).getByRole('button', { name: 'Share settings with the-phone' }))
+    expect(controls.settings.devicesAsked).toContain('share phone')
+    await waitFor(() => {
+      expect(within(card).getByTestId('settings-devices-members')).toHaveTextContent('the-phone')
+    })
+    expect(within(card).queryByTestId('settings-devices-candidates')).toBeNull()
+    expect(within(card).getByTestId('settings-devices-status')).toHaveTextContent(/1 other device/)
+  })
+
+  it('takes a member out by naming it, without being asked to confirm', async () => {
+    const { person, controls, sheet } = await openOnAccount()
+    act(() => {
+      controls.settings.change({
+        sync: {
+          ...sharing,
+          devices: {
+            ...sharing.devices,
+            members: [
+              ...sharing.devices.members,
+              { reference: 'phone', name: 'the-phone', this_computer: false, vouched: true }
+            ],
+            candidates: []
+          }
+        }
+      })
+    })
+    const card = await within(sheet).findByTestId('settings-devices')
+    // This computer is a member and has no control for taking itself out.
+    expect(within(card).getAllByRole('button', { name: /^Take .* out$/ })).toHaveLength(1)
+    await person.click(within(card).getByRole('button', { name: 'Take the-phone out' }))
+    expect(controls.settings.devicesAsked).toContain('remove phone')
+    await waitFor(() => {
+      expect(within(card).getByTestId('settings-devices-members')).not.toHaveTextContent(
+        'the-phone'
+      )
+    })
+  })
+
+  it('offers the settings another device shares to a computer that shares none, and joins on a press', async () => {
+    const { person, controls, sheet } = await openOnAccount()
+    act(() => {
+      controls.settings.change({
+        sync: {
+          devices: { ...sharing.devices, members: [], candidates: [], offers: [{ reference: 'c-1' }] }
+        }
+      })
+    })
+    const card = await within(sheet).findByTestId('settings-devices')
+    expect(within(card).getByTestId('settings-devices-offer')).toBeInTheDocument()
+    await person.click(within(card).getByRole('button', { name: 'Join' }))
+    expect(controls.settings.devicesAsked).toContain('join c-1')
+    await waitFor(() => {
+      expect(within(card).queryByTestId('settings-devices-offer')).toBeNull()
+    })
+  })
+
+  it('says why nothing can be shared or joined from a computer that cannot ask the person', async () => {
+    const { controls, sheet } = await openOnAccount()
+    act(() => {
+      controls.settings.change({
+        sync: { ...sharing, devices: { ...sharing.devices, can_confirm: false } }
+      })
+    })
+    const card = await within(sheet).findByTestId('settings-devices')
+    expect(within(card).getByTestId('settings-devices-cannot-confirm')).toBeInTheDocument()
+    expect(within(card).getByRole('button', { name: 'Share settings with the-phone' })).toBeDisabled()
+  })
+
+  it('says what a change came to until the person dismisses it', async () => {
+    const { person, controls, sheet } = await openOnAccount()
+    act(() => {
+      controls.settings.change({
+        sync: {
+          ...sharing,
+          devices: {
+            ...sharing.devices,
+            outcomes: [{ what: 'addition', ended: 'refused', name: 'the-phone' }]
+          }
+        }
+      })
+    })
+    const card = await within(sheet).findByTestId('settings-devices')
+    expect(within(card).getByTestId('settings-devices-outcome')).toHaveTextContent('the-phone')
+    await person.click(within(card).getByTestId('settings-devices-dismiss'))
+    await waitFor(() => {
+      expect(within(card).queryByTestId('settings-devices-outcome')).toBeNull()
+    })
+  })
+
+  it('waits for another device to seal the settings, and says so, when this computer joined after them', async () => {
+    const { controls, sheet } = await openOnAccount()
+    act(() => {
+      controls.settings.change({
+        sync: { ...sharing, devices: { ...sharing.devices, waiting: true } }
+      })
+    })
+    const card = await within(sheet).findByTestId('settings-devices')
+    expect(within(card).getByTestId('settings-devices-waiting')).toBeInTheDocument()
+  })
+})

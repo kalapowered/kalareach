@@ -341,6 +341,8 @@ export interface FakeSettings {
   readonly colourModesSet: readonly string[]
   /** What the page asked drafts sync to be, in order. */
   readonly draftsSetTo: readonly boolean[]
+  /** What the page asked of the devices that share the settings, in order. */
+  readonly devicesAsked: readonly string[]
   /** How many times the page asked to turn settings sync on. */
   readonly syncTurnedOn: number
   /** How many times the page asked sync to run now. */
@@ -1001,11 +1003,21 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
       conflicts: 0,
       paused: false,
       problem: null,
-      drafts: { enabled: false, kept_here: [], problem: null, arrivals: 0 }
+      drafts: { enabled: false, kept_here: [], problem: null, arrivals: 0 },
+      devices: {
+        can_confirm: true,
+        out: false,
+        waiting: false,
+        members: [],
+        candidates: [],
+        offers: [],
+        outcomes: []
+      }
     }
   }
   const colourModesSet: string[] = []
   const draftsSetTo: boolean[] = []
+  const devicesAsked: string[] = []
   let choice: SettingsChoice | null = null
   const settingsKept: SettingsKeep[] = []
   let settingsSyncTurnOns = 0
@@ -2286,6 +2298,78 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
       })
       return Promise.resolve(settingsOf())
     },
+    settingsDevicesRefresh: () => {
+      devicesAsked.push('refresh')
+      return Promise.resolve(settingsOf())
+    },
+    settingsDeviceShare: (reference) => {
+      devicesAsked.push(`share ${reference}`)
+      const candidate = settings.sync.devices.candidates.find((one) => one.reference === reference)
+      if (candidate === undefined) refuse('PERMISSION_DENIED', 'No host lists that device any more.')
+      if (!settings.sync.devices.can_confirm) {
+        refuse('UNSUPPORTED_CAPABILITY', 'This computer has no way to ask you to confirm.')
+      }
+      setSettings({
+        ...settings,
+        sync: {
+          ...settings.sync,
+          devices: {
+            ...settings.sync.devices,
+            members: [
+              ...settings.sync.devices.members,
+              { reference, name: candidate.name, this_computer: false, vouched: true }
+            ],
+            candidates: settings.sync.devices.candidates.filter((one) => one.reference !== reference)
+          }
+        }
+      })
+      return Promise.resolve(settingsOf())
+    },
+    settingsDeviceRemove: (reference) => {
+      devicesAsked.push(`remove ${reference}`)
+      setSettings({
+        ...settings,
+        sync: {
+          ...settings.sync,
+          devices: {
+            ...settings.sync.devices,
+            members: settings.sync.devices.members.filter((one) => one.reference !== reference)
+          }
+        }
+      })
+      return Promise.resolve(settingsOf())
+    },
+    settingsJoin: (reference) => {
+      devicesAsked.push(`join ${reference}`)
+      if (!settings.sync.devices.offers.some((one) => one.reference === reference)) {
+        refuse('PERMISSION_DENIED', 'That offer is not there any more.')
+      }
+      setSettings({
+        ...settings,
+        sync: {
+          ...settings.sync,
+          state: 'on',
+          kept_at: syncService.host,
+          devices: {
+            ...settings.sync.devices,
+            out: false,
+            offers: [],
+            members: [
+              { reference: 'this', name: 'This computer', this_computer: true, vouched: true }
+            ]
+          }
+        }
+      })
+      return Promise.resolve(settingsOf())
+    },
+    settingsDevicesDismiss: () => {
+      devicesAsked.push('dismiss')
+      setSettings({
+        ...settings,
+        sync: { ...settings.sync, devices: { ...settings.sync.devices, outcomes: [] } }
+      })
+      return Promise.resolve(settingsOf())
+    },
     settingsConflicts: () => Promise.resolve(choice),
     settingsConflictResolve: (keep) => {
       if (choice === null) refuse('PERMISSION_DENIED', 'No content from another device is waiting.')
@@ -2385,6 +2469,7 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
     settings: {
       colourModesSet,
       draftsSetTo,
+      devicesAsked,
       get syncTurnedOn() {
         return settingsSyncTurnOns
       },

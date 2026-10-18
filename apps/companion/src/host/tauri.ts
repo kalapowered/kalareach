@@ -415,6 +415,11 @@ export function tauriPort(): HostPort {
     settingsSyncTurnOn: () => call<SettingsView>('settings_sync_turn_on', {}),
     settingsSyncNow: () => call<SettingsView>('settings_sync_now', {}),
     settingsDraftsSet: (enabled) => call<SettingsView>('settings_drafts_set', { enabled }),
+    settingsDevicesRefresh: () => call<SettingsView>('settings_devices_refresh', {}),
+    settingsDeviceShare: (reference) => call<SettingsView>('settings_device_share', { reference }),
+    settingsDeviceRemove: (reference) => call<SettingsView>('settings_device_remove', { reference }),
+    settingsJoin: (reference) => call<SettingsView>('settings_join', { reference }),
+    settingsDevicesDismiss: () => call<SettingsView>('settings_devices_dismiss', {}),
     settingsConflicts: () => call<SettingsChoice | null>('settings_conflicts', {}),
     settingsConflictResolve: (keep) =>
       call<SettingsView>('settings_conflict_resolve', { keep }),

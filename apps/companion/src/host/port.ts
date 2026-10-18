@@ -363,6 +363,51 @@ export interface SettingsSyncView {
   readonly problem: string | null
   /** Drafts, which travel in the same collection once the person asks for that. */
   readonly drafts: DraftsSyncView
+  /** Who shares the settings, and who could. */
+  readonly devices: DevicesView
+}
+
+/** A device that holds the key of the shared settings. */
+export interface DeviceMember {
+  /** What a command names it by. It is not a key. */
+  readonly reference: string
+  /** What the person's hosts call it. */
+  readonly name: string
+  readonly this_computer: boolean
+  /** Whether a host still lists it as able to manage the host. */
+  readonly vouched: boolean
+}
+
+/** A device a host lists that could be given the key. */
+export interface DeviceCandidate {
+  readonly reference: string
+  readonly name: string
+}
+
+/** Settings another of the person's devices shares, which this computer could join. */
+export interface DeviceOffer {
+  readonly reference: string
+}
+
+/** What became of a change the person asked for or a host required. */
+export interface DeviceHappened {
+  readonly what: 'addition' | 'removal' | 'join'
+  readonly ended: 'done' | 'cancelled' | 'refused'
+  readonly name: string | null
+}
+
+/** What the page is shown of who shares the settings. */
+export interface DevicesView {
+  /** Whether this computer can ask the person to confirm. Without it nothing is added or joined. */
+  readonly can_confirm: boolean
+  /** Whether this computer was taken out of the shared settings. */
+  readonly out: boolean
+  /** Whether the shared settings wait to be sealed again by another device, for this computer. */
+  readonly waiting: boolean
+  readonly members: readonly DeviceMember[]
+  readonly candidates: readonly DeviceCandidate[]
+  readonly offers: readonly DeviceOffer[]
+  readonly outcomes: readonly DeviceHappened[]
 }
 
 /** Why drafts are kept on this computer and not sent. */
@@ -1653,6 +1698,22 @@ export interface HostPort {
    * travel in its collection.
    */
   settingsDraftsSet(enabled: boolean): Promise<SettingsView>
+  /**
+   * Asks every host who it lists, brings this computer and the service to the same settings, and
+   * on a computer that shares none, looks for settings other devices share with it.
+   */
+  settingsDevicesRefresh(): Promise<SettingsView>
+  /**
+   * Gives the device `reference` names the key of the shared settings, once the person confirms on
+   * this computer with the platform's ceremony. Refused when they do not.
+   */
+  settingsDeviceShare(reference: string): Promise<SettingsView>
+  /** Takes the device `reference` names out of the shared settings. Needs no confirmation. */
+  settingsDeviceRemove(reference: string): Promise<SettingsView>
+  /** Joins the settings the offer `reference` names, once the person confirms on this computer. */
+  settingsJoin(reference: string): Promise<SettingsView>
+  /** Lets go of the outcomes the page has shown. */
+  settingsDevicesDismiss(): Promise<SettingsView>
   /** The versions of the settings to choose between, or null when two devices changed none. */
   settingsConflicts(): Promise<SettingsChoice | null>
   /**
