@@ -381,6 +381,13 @@ async fn a_major_the_table_retires_is_no_longer_negotiated() {
     ];
     assert_eq!(supported_versions_of(&table), vec![TWO]);
 
+    // What a host lists and a client offers by default is the table of this build.
+    let (host, _) = paired_pair().await;
+    assert_eq!(
+        host.identity.supported_versions,
+        kr_protocol::hello::supported_versions()
+    );
+
     // An old client that offers only the retired major is refused.
     let (mut host, client) = paired_pair().await;
     Arc::get_mut(&mut host.identity)

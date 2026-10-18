@@ -85,7 +85,8 @@ pub struct PublicMajor {
     /// only moves later.
     pub supported_until: Option<&'static str>,
     /// Whether this build stops negotiating the major. A major is retired only after its
-    /// `supported_until` has passed, in a release built after it had.
+    /// `supported_until` has passed, and only by a release whose predecessor was built after it
+    /// had.
     pub retired: bool,
 }
 

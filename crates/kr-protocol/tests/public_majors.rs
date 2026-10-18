@@ -112,6 +112,12 @@ fn intrinsic(table: &[PublicMajor]) -> Vec<String> {
         if row.retired && (row.replaced.is_none() || row.supported_until.is_none()) {
             broken.push(format!("major {} is retired without a window", row.major));
         }
+        if row.replaced.is_some() && !table.iter().any(|other| other.major > row.major) {
+            broken.push(format!(
+                "major {} is replaced and no later major is in the table",
+                row.major
+            ));
+        }
     }
     broken
 }
@@ -141,8 +147,8 @@ fn current_major_two() -> PublicMajor {
 }
 
 /// KR-REQ-20.24, KR-REQ-26.07: the table of this build holds to the rules that need no earlier
-/// table, lists the version this build implements, and the versions it lists are what a host
-/// offers and a client selects.
+/// table, lists the version this build implements, and the versions it lists are what a client
+/// offers and a host selects from.
 #[test]
 fn the_table_of_this_build_holds_to_the_rules_and_lists_its_own_version() {
     assert_eq!(intrinsic(PUBLIC_MAJORS), Vec::<String>::new());
@@ -155,6 +161,33 @@ fn the_table_of_this_build_holds_to_the_rules_and_lists_its_own_version() {
     }
     // The levels a worker may be at while the window lasts are never none.
     assert!(!RETAINED_WORKER_LEVELS.is_empty());
+}
+
+/// KR-REQ-26.07: a major that is replaced has a later major in the table, and a window needs a
+/// replacement.
+#[test]
+fn a_replaced_major_needs_a_later_one() {
+    let alone = [replaced_major_one()];
+    assert_eq!(intrinsic(&alone).len(), 1);
+    assert!(intrinsic(&[replaced_major_one(), current_major_two()]).is_empty());
+}
+
+/// KR-REQ-26.07: the release before this one keeps a record of its table whatever worker levels
+/// remain, from the first level whose release had a table.
+#[test]
+fn a_level_from_the_first_with_a_table_records_it() {
+    let first = kr_protocol::update::CompatibilityLevel::of(
+        kr_protocol::hello::PackageVersion::new(0, 75, 0),
+    );
+    for level in &RETAINED {
+        if level.level >= first {
+            assert!(
+                level.public_majors.is_some(),
+                "level {} was cut from a release that listed a table, and has no record of it",
+                level.level
+            );
+        }
+    }
 }
 
 /// KR-REQ-26.07: a table is held to the table of the release before it. The control passes; each
@@ -384,7 +417,11 @@ fn parse(recorded: &str) -> Vec<PublicMajor> {
                 versions: Box::leak(versions.into_boxed_slice()),
                 replaced: optional("replaced"),
                 supported_until: optional("supported_until"),
-                retired: field("retired") == "true",
+                retired: match field("retired") {
+                    "true" => true,
+                    "false" => false,
+                    other => panic!("retired is {other} in {line}"),
+                },
             }
         })
         .collect()
