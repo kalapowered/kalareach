@@ -40,6 +40,9 @@ use serde_json::{Value, json};
 
 #[path = "retained_surface/probes.rs"]
 mod probes;
+// The reader that `kr-protocol-gen` records a level's table of public majors with.
+#[path = "../../kr-protocol/src/bin/kr-protocol-gen/public_majors.rs"]
+mod public_majors;
 #[path = "retained_surface/walker.rs"]
 mod walker;
 
@@ -263,6 +266,37 @@ fn before_items(record: &Value) -> Vec<&str> {
         .flatten()
         .filter_map(Value::as_str)
         .collect()
+}
+
+/// The table of public majors a level recorded is the table in the tree of the release it names.
+///
+/// Unlike the records above, which this checkout is held to whatever tree is read, a table may
+/// legitimately differ in this checkout (a major replaced since), so this runs where the release's
+/// own tree is named: a landing sets `KR_RELEASE_TREE`, and the record is read out of that tree's
+/// `hello.rs` and compared whole, digest included. A record written by hand for a release that had
+/// no table needs a tree that has none.
+#[test]
+fn the_table_of_public_majors_a_level_recorded_is_the_one_in_its_release_tree() {
+    let Some(root) = std::env::var_os("KR_RELEASE_TREE") else {
+        return;
+    };
+    let source = std::fs::read_to_string(Path::new(&root).join("crates/kr-protocol/src/hello.rs"))
+        .unwrap_or_else(|error| panic!("hello.rs of the release tree: {error}"));
+    let found = public_majors::record_of(&source)
+        .unwrap_or_else(|error| panic!("the table in the release tree: {error}"));
+    let mut problems = Vec::new();
+    for level in &RETAINED {
+        match (level.public_majors, &found) {
+            (Some(recorded), Some(found)) if recorded == found => {}
+            (Some(recorded), None) if !recorded.contains("digest=") => {}
+            (None, None) => {}
+            (recorded, found) => problems.push(format!(
+                "level {}: recorded {:?}, the release tree has {:?}",
+                level.level, recorded, found
+            )),
+        }
+    }
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
 }
 
 /// A limit may be added and may not change or go.

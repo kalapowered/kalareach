@@ -20,6 +20,8 @@ use std::process::Command;
 
 use kr_protocol::retained::{RETAINED, RETAINED_WORKER_LEVELS, SURFACE_ROOTS, Surface};
 
+use crate::public_majors;
+
 /// The directory the retained levels are kept in.
 pub fn retained_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("retained")
@@ -153,6 +155,10 @@ pub fn retain(level: &str, commit: &str) -> Result<(), String> {
     let released = git(&["show", "-s", "--format=%cI", &full])?
         .trim()
         .to_owned();
+    // Everything read from the release is read before anything is written, so a source this tool
+    // cannot read leaves no half-cut level behind.
+    let plugin_host = plugin_host_at(&full)?;
+    let public_majors = public_majors_at(&full)?;
     std::fs::create_dir_all(&target).map_err(|error| error.to_string())?;
     let write = |name: &str, contents: String| {
         std::fs::write(target.join(name), contents).map_err(|error| format!("{name}: {error}"))
@@ -165,8 +171,8 @@ pub fn retain(level: &str, commit: &str) -> Result<(), String> {
             &full[..12]
         ),
     )?;
-    write("PLUGIN_HOST", format!("{}\n", plugin_host_at(&full)?))?;
-    if let Some(table) = public_majors_at(&full)? {
+    write("PLUGIN_HOST", format!("{plugin_host}\n"))?;
+    if let Some(table) = public_majors {
         write("PUBLIC_MAJORS", table)?;
     }
     write("frames.json", "[]\n".to_owned())?;
@@ -178,208 +184,8 @@ pub fn retain(level: &str, commit: &str) -> Result<(), String> {
 /// has no table.
 fn public_majors_at(commit: &str) -> Result<Option<String>, String> {
     let source = git(&["show", &format!("{commit}:crates/kr-protocol/src/hello.rs")])?;
-    render_public_majors(&source)
-}
-
-/// Reads the table of public majors out of the source of `hello.rs` and renders it as a record:
-/// a line per major (`major=.. versions=.. replaced=.. supported_until=.. retired=..`, a day or `-`)
-/// and the digest of the table item's source with its comments and layout taken out. A name or a
-/// shape this reader does not know is an error, never a skipped row.
-fn render_public_majors(source: &str) -> Result<Option<String>, String> {
-    const START: &str = "pub const PUBLIC_MAJORS: &[PublicMajor] = &[";
-    let Some(start) = source.find(START) else {
-        return Ok(None);
-    };
-    let inside = start + START.len();
-    let Some(length) = closing(&source[inside..], '[', ']') else {
-        return Err("the table of public majors does not end".to_owned());
-    };
-    let body = &source[inside..inside + length];
-    let mut record = String::new();
-    for row in body.split("PublicMajor {").skip(1) {
-        let Some(end) = closing(row, '{', '}') else {
-            return Err("a row of the table does not end".to_owned());
-        };
-        let mut major = None;
-        let mut versions = Vec::new();
-        let (mut replaced, mut supported_until, mut retired) =
-            ("-".to_owned(), "-".to_owned(), None);
-        for field in split_top(&row[..end]) {
-            let (name, value) = field
-                .split_once(':')
-                .ok_or_else(|| format!("a field of the table without a name: {field}"))?;
-            let value = value.trim();
-            match name.trim() {
-                "major" => major = Some(value.parse::<u16>().map_err(|e| format!("major: {e}"))?),
-                "versions" => {
-                    let list = value
-                        .strip_prefix("&[")
-                        .and_then(|rest| rest.strip_suffix(']'))
-                        .ok_or_else(|| format!("versions: {value}"))?;
-                    for entry in split_top(list) {
-                        versions.push(version_of(source, entry.trim())?);
-                    }
-                }
-                "replaced" => replaced = day_of(value)?,
-                "supported_until" => supported_until = day_of(value)?,
-                "retired" => retired = Some(value == "true"),
-                other => {
-                    return Err(format!(
-                        "a field of the table this reader does not know: {other}"
-                    ));
-                }
-            }
-        }
-        record.push_str(&format!(
-            "major={} versions={} replaced={replaced} supported_until={supported_until} retired={}\n",
-            major.ok_or("a row has no major")?,
-            versions.join(","),
-            retired.ok_or("a row has no retired")?,
-        ));
-    }
-    let item: String = source[start..inside + length + 1]
-        .lines()
-        .filter(|line| !line.trim_start().starts_with("//"))
-        .collect::<Vec<_>>()
-        .join(" ")
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
-    let digest: String = kr_cbor::sha256(item.as_bytes())
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect();
-    record.push_str(&format!("digest={digest}\n"));
-    Ok(Some(record))
-}
-
-/// The length of `text` up to the bracket that closes the one before it, `open` and `close` taken
-/// in pairs and text between double quotes passed over.
-fn closing(text: &str, open: char, close: char) -> Option<usize> {
-    let (mut depth, mut quoted) = (0_usize, false);
-    for (index, character) in text.char_indices() {
-        match character {
-            '"' => quoted = !quoted,
-            _ if quoted => {}
-            _ if character == open => depth += 1,
-            _ if character == close => {
-                if depth == 0 {
-                    return Some(index);
-                }
-                depth -= 1;
-            }
-            _ => {}
-        }
-    }
-    None
-}
-
-/// `text` split at the commas that are not inside brackets or quotes, empty parts left out.
-fn split_top(text: &str) -> Vec<&str> {
-    let (mut depth, mut quoted, mut from) = (0_usize, false, 0);
-    let mut parts = Vec::new();
-    for (index, character) in text.char_indices() {
-        match character {
-            '"' => quoted = !quoted,
-            _ if quoted => {}
-            '[' | '(' | '{' => depth += 1,
-            ']' | ')' | '}' => depth = depth.saturating_sub(1),
-            ',' if depth == 0 => {
-                parts.push(&text[from..index]);
-                from = index + 1;
-            }
-            _ => {}
-        }
-    }
-    parts.push(&text[from..]);
-    parts
-        .into_iter()
-        .map(str::trim)
-        .filter(|part| !part.is_empty())
-        .collect()
-}
-
-/// A version entry of a row: the build's own constant, or `ProtocolVersion::new(major, minor)`.
-fn version_of(source: &str, entry: &str) -> Result<String, String> {
-    let call = if entry == "PROTOCOL_VERSION" {
-        let declaration = "pub const PROTOCOL_VERSION: ProtocolVersion = ";
-        let rest = source
-            .split(declaration)
-            .nth(1)
-            .ok_or("PROTOCOL_VERSION is not declared in the source")?;
-        rest.split(';').next().unwrap_or_default().trim().to_owned()
-    } else {
-        entry.to_owned()
-    };
-    let numbers = call
-        .strip_prefix("ProtocolVersion::new(")
-        .and_then(|rest| rest.strip_suffix(')'))
-        .ok_or_else(|| format!("a version this reader does not know: {entry}"))?;
-    let (major, minor) = numbers
-        .split_once(',')
-        .ok_or_else(|| format!("a version: {entry}"))?;
-    Ok(format!("{}.{}", major.trim(), minor.trim()))
-}
-
-/// `None` is `-`, and `Some("day")` is the day.
-fn day_of(value: &str) -> Result<String, String> {
-    if value == "None" {
-        return Ok("-".to_owned());
-    }
-    value
-        .strip_prefix("Some(\"")
-        .and_then(|rest| rest.strip_suffix("\")"))
-        .map(str::to_owned)
-        .ok_or_else(|| format!("a day this reader does not know: {value}"))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::render_public_majors;
-
-    /// The table in this tree's own source reads as the one the build has.
-    #[test]
-    fn this_trees_table_is_read_as_it_is() {
-        let record = render_public_majors(include_str!("../../hello.rs"))
-            .expect("the source is read")
-            .expect("this tree has a table");
-        assert!(
-            record.starts_with(
-                "major=1 versions=1.0 replaced=- supported_until=- retired=false\ndigest="
-            ),
-            "{record}"
-        );
-    }
-
-    /// Rows with days, several versions and a retirement are read, the digest ignores comments and
-    /// layout, and a shape the reader does not know is an error.
-    #[test]
-    fn rows_with_days_and_versions_are_read_and_an_unknown_shape_is_refused() {
-        let source = "pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(2, 0);\n\
-            pub const PUBLIC_MAJORS: &[PublicMajor] = &[\n\
-                // the first\n\
-                PublicMajor { major: 1, versions: &[ProtocolVersion::new(1, 0), ProtocolVersion::new(1, 1)],\n\
-                    replaced: Some(\"2030-03-01\"), supported_until: Some(\"2031-09-01\"), retired: true },\n\
-                PublicMajor { major: 2, versions: &[PROTOCOL_VERSION], replaced: None,\n\
-                    supported_until: None, retired: false },\n\
-            ];\n";
-        let record = render_public_majors(source)
-            .expect("read")
-            .expect("a table");
-        let rows: Vec<&str> = record.lines().filter(|l| l.starts_with("major=")).collect();
-        assert_eq!(
-            rows,
-            [
-                "major=1 versions=1.0,1.1 replaced=2030-03-01 supported_until=2031-09-01 retired=true",
-                "major=2 versions=2.0 replaced=- supported_until=- retired=false",
-            ]
-        );
-        let reflowed = source.replace("// the first\n", "").replace("\n    ", " ");
-        assert_eq!(render_public_majors(&reflowed).unwrap(), Some(record));
-        assert!(render_public_majors("fn nothing() {}").unwrap().is_none());
-        let unknown = source.replace("retired: false", "retired: false, extra: 1");
-        assert!(render_public_majors(&unknown).is_err());
-    }
+    public_majors::record_of(&source)
+        .map_err(|error| format!("the table of public majors at {commit}: {error}"))
 }
 
 /// The protocol name the plugin host speaks at `commit`, read from that commit's source and not
@@ -437,6 +243,24 @@ pub fn release_commit(level: &str, commit: &str) -> Result<(), String> {
         lines.extend(found.iter().map(ToString::to_string));
         return Err(lines.join("\n"));
     }
+    // The table of public majors the level recorded is the table in the tree of the release it is
+    // moved to: a record with a digest is read again and must be the same, and a record written
+    // by hand for a release that had no table needs a release that has none.
+    let found = public_majors_at(&full)?;
+    match (retained.public_majors, found) {
+        (Some(recorded), Some(found)) if recorded == found => {}
+        (Some(recorded), None) if !recorded.contains("digest=") => {}
+        (None, None) => {}
+        (recorded, found) => {
+            return Err(format!(
+                "the table of public majors at {full} is not the one recorded for {level}; \
+                 rebase onto that release and cut the level again at the rebased commit.\n\
+                 recorded: {}\nat the commit: {}",
+                recorded.unwrap_or("none"),
+                found.as_deref().unwrap_or("none")
+            ));
+        }
+    }
     let recorded = retained
         .record("commit")
         .ok_or("the record names no commit")?;
@@ -472,5 +296,171 @@ pub fn release_commit(level: &str, commit: &str) -> Result<(), String> {
     )
     .map_err(|error| format!("{}: {error}", path.display()))?;
     println!("wrote {}", path.display());
+    update_document(level, &format!("{version}+{}", &full[..12]), &released)
+}
+
+/// Gives the row of `level` in the document on the support window its release and the day it was
+/// built, which the document's test holds equal to the records.
+fn update_document(level: &str, release: &str, released: &str) -> Result<(), String> {
+    let path = repository().join("docs/releases/support-window.md");
+    let text =
+        std::fs::read_to_string(&path).map_err(|error| format!("{}: {error}", path.display()))?;
+    let begin = "<!-- retained-levels:begin -->\n";
+    let end = "<!-- retained-levels:end -->";
+    let (Some(from), Some(to)) = (text.find(begin), text.find(end)) else {
+        return Err(format!(
+            "{} has no block of retained levels",
+            path.display()
+        ));
+    };
+    let from = from + begin.len();
+    let row = format!("| {level} |");
+    let mut changed = false;
+    let block: String = text[from..to]
+        .lines()
+        .map(|line| {
+            if line.starts_with(&row) {
+                changed = true;
+                format!("| {level} | {release} | {released} |\n")
+            } else {
+                format!("{line}\n")
+            }
+        })
+        .collect();
+    if !changed {
+        return Err(format!("{} has no row for level {level}", path.display()));
+    }
+    std::fs::write(&path, format!("{}{block}{}", &text[..from], &text[to..]))
+        .map_err(|error| format!("{}: {error}", path.display()))?;
+    println!("wrote {}", path.display());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::public_majors::record_of;
+
+    const TWO_ROWS: &str = r#"pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(2, 0);
+pub const PUBLIC_MAJORS: &[PublicMajor] = &[
+    // the first
+    PublicMajor {
+        major: 1,
+        versions: &[ProtocolVersion::new(1, 0), ProtocolVersion::new(1, 1)],
+        replaced: Some("2030-03-01"),
+        supported_until: Some("2031-09-01"),
+        retired: true,
+    },
+    PublicMajor {
+        major: 2,
+        versions: &[PROTOCOL_VERSION],
+        replaced: None, // none yet
+        supported_until: None,
+        retired: false,
+    },
+];
+"#;
+
+    /// The table in this tree's own source reads as the one the build has.
+    #[test]
+    fn this_trees_table_is_read_as_it_is() {
+        let record = record_of(include_str!("../../hello.rs"))
+            .expect("the source is read")
+            .expect("this tree has a table");
+        assert!(
+            record.starts_with(
+                "major=1 versions=1.0 replaced=- supported_until=- retired=false\ndigest="
+            ),
+            "{record}"
+        );
+    }
+
+    /// Rows with days, several versions, a constant and a retirement are read; the digest is the
+    /// same whatever the comments and layout, and moves with a row.
+    #[test]
+    fn rows_are_read_and_the_digest_ignores_comments_and_layout() {
+        let record = record_of(TWO_ROWS).expect("read").expect("a table");
+        let rows: Vec<&str> = record.lines().filter(|l| l.starts_with("major=")).collect();
+        assert_eq!(
+            rows,
+            [
+                "major=1 versions=1.0,1.1 replaced=2030-03-01 supported_until=2031-09-01 retired=true",
+                "major=2 versions=2.0 replaced=- supported_until=- retired=false",
+            ]
+        );
+        let reflowed = TWO_ROWS
+            .replace("    // the first\n", "")
+            .replace(" // none yet", "")
+            .replace("\n        ", " ");
+        assert_eq!(record_of(&reflowed).unwrap(), Some(record.clone()));
+        let moved = TWO_ROWS.replace("2031-09-01", "2031-09-02");
+        assert_ne!(record_of(&moved).unwrap(), Some(record));
+    }
+
+    /// A source with no table is no table, and every other shape is refused: a different
+    /// declaration, an entry that is not a literal, a value that is not a literal, a field twice or
+    /// unknown, and a table followed by more code.
+    #[test]
+    fn a_shape_the_reader_does_not_know_is_refused_and_a_source_without_a_table_is_not_one() {
+        assert_eq!(record_of("fn nothing() {}"), Ok(None));
+        let named_entry = TWO_ROWS.replace(
+            "    PublicMajor {\n        major: 2",
+            "    OLD,\n    PublicMajor {\n        major: 2",
+        );
+        for (what, source) in [
+            (
+                "another declaration",
+                TWO_ROWS.replace("pub const", "pub static"),
+            ),
+            (
+                "the type spelled otherwise",
+                TWO_ROWS.replace("&[PublicMajor]", "&'static [PublicMajor]"),
+            ),
+            ("a named entry", named_entry),
+            (
+                "a negated retired",
+                TWO_ROWS.replace("retired: false", "retired: !false"),
+            ),
+            (
+                "a named retired",
+                TWO_ROWS.replace("retired: false", "retired: LATER"),
+            ),
+            (
+                "a named version",
+                TWO_ROWS.replace(
+                    "ProtocolVersion::new(1, 1)",
+                    "ProtocolVersion::new(1, MINOR)",
+                ),
+            ),
+            (
+                "a day that is not a day",
+                TWO_ROWS.replace("2030-03-01", "March 2030"),
+            ),
+            (
+                "an unknown field",
+                TWO_ROWS.replace("retired: false", "retired: false, extra: 1"),
+            ),
+            (
+                "a field twice",
+                TWO_ROWS.replace("retired: false", "retired: false, retired: true"),
+            ),
+            (
+                "a missing field",
+                TWO_ROWS.replace("        retired: false,\n", ""),
+            ),
+            ("a major twice", TWO_ROWS.replace("major: 2", "major: 1")),
+            ("text after the table", TWO_ROWS.replace("];", "].len();")),
+            (
+                "a block comment",
+                TWO_ROWS.replace("// the first", "/* the first */"),
+            ),
+        ] {
+            assert!(record_of(&source).is_err(), "{what} is refused: {source}");
+        }
+        // A comment that only looks like a row is not one, and does not move the digest.
+        let commented = TWO_ROWS.replace(
+            "// the first",
+            "// PublicMajor { major: 9, versions: &[], replaced: None, supported_until: None, retired: false },",
+        );
+        assert_eq!(record_of(&commented), record_of(TWO_ROWS));
+    }
 }

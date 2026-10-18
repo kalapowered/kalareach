@@ -16,6 +16,7 @@
 //! ```
 
 mod method_index;
+mod public_majors;
 mod retained;
 
 use std::path::{Path, PathBuf};

@@ -272,7 +272,8 @@ pub static RETAINED: [RetainedLevel; 1] = [RetainedLevel::new(
     include_str!("../retained/0.74/PLUGIN_HOST"),
     &[],
     &[],
-)];
+)
+.with_public_majors(include_str!("../retained/0.74/PUBLIC_MAJORS"))];
 
 /// A level of a test's own: the surface this release retains besides its own, with its definitions
 /// changed by `edit`, and `declared` as the entries that cover what it differs by.
