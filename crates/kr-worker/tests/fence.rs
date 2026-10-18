@@ -3583,7 +3583,7 @@ fn host_replies_accounted(shell: &RealShell) -> u64 {
         .runtime
         .session()
         .fence()
-        .map_or(0, kr_worker::fence::FenceDriver::host_reply_bytes)
+        .map_or(0, |driver| driver.host_reply_bytes())
 }
 
 /// Waits until the line `command` has finished and the reader is back at its prompt behind a valid
