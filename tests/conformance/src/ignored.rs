@@ -434,7 +434,7 @@ fn plan_commands() -> Vec<String> {
 
 /// The commands of a script or a workflow, one to a line: the continuations joined, the white space
 /// made single, and what a comment holds left out. A comment on a line that continues another ends
-/// the command there, as it does for the shell.
+/// the command there, as it does for the shell. A line that only says something is not a command.
 fn commands(text: &str) -> impl Iterator<Item = String> + '_ {
     text.replace("\\\n", " ")
         .lines()
@@ -444,9 +444,15 @@ fn commands(text: &str) -> impl Iterator<Item = String> + '_ {
                 .collect::<Vec<_>>()
                 .join(" ")
         })
-        .filter(|line| !line.is_empty())
+        .filter(|line| !line.is_empty() && !says(line))
         .collect::<Vec<_>>()
         .into_iter()
+}
+
+/// Whether a line only says something: it begins with `echo` or `printf`, so words that look like a
+/// command after them are text.
+fn says(line: &str) -> bool {
+    matches!(line.split_whitespace().next(), Some("echo" | "printf"))
 }
 
 /// `line` up to the `#` that begins a comment: one at the start of the line or after white space,

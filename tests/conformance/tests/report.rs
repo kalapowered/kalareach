@@ -825,6 +825,15 @@ fn a_step_is_one_command_that_names_what_it_selects_and_is_found_where_it_is_sai
         partial.problems
     );
 
+    // A line that begins with echo says the words of a command and does not run them.
+    let said = held_to(&[all("said.sh")]);
+    assert_eq!(said.problems.len(), 1, "{:?}", said.problems);
+    assert!(
+        said.problems[0].contains("holds no command with"),
+        "{:?}",
+        said.problems
+    );
+
     // What follows a comment sign on a continued line is not part of the command.
     let commented = held_to(&[outcomes_entry(
         &[],
