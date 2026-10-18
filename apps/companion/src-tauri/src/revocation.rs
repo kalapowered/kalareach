@@ -15,8 +15,8 @@
 //!
 //! A revocation is done when the host's acknowledgement has been read and says the host's dispatch
 //! barrier held. A request that sits in the feed is **sent**, and the screen says only that; one the
-//! host acknowledged while some of its session workers have not stopped is **acknowledged** and says
-//! how many; a request the host refused is **refused** and says why. The acknowledgements are read
+//! host acknowledged while some of its session workers have not confirmed the fence is **acknowledged**
+//! and says how many; a request the host refused is **refused** and says why. The acknowledgements are read
 //! from the feed, which stores them and judges nothing: they are the service's word for what the
 //! host answered, not something this computer can check.
 //!
@@ -39,7 +39,9 @@
 //!
 //! A revocation this computer sent is verified here (it is this computer's own signature on a
 //! request addressed to that host) and the device it names is passed to settings sync, which fences
-//! publication at once and takes the device out of the shared settings when a host confirms it.
+//! publication at once, before any host has acknowledged the request, and takes the device out of the
+//! shared settings at its next step. A step already past its check may still publish once more under
+//! the key the device holds, as any publication a moment earlier would have.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -177,7 +179,7 @@ pub struct Acknowledged {
     pub at_ms: u64,
     /// The authority revision it issued.
     pub revision: u64,
-    /// How many session workers had not stopped yet, when the acknowledgement was made.
+    /// How many session workers had not confirmed the fence yet, when the acknowledgement was made.
     pub pending_workers: Option<u64>,
 }
 
@@ -213,14 +215,15 @@ pub enum DeviceStanding {
         /// Whether the host already lists the device as revoked.
         host_lists_revoked: bool,
     },
-    /// The host acknowledged, and some of its session workers have not stopped yet.
+    /// The host acknowledged, and some of its session workers have not confirmed the fence yet.
     Acknowledged {
         /// When the host acknowledged, in UTC milliseconds.
         at_ms: u64,
-        /// How many workers have not, when the host said.
+        /// How many workers have not, when the host said. Null when the host has not yet said that every
+        /// worker confirmed, and did not say how many have not.
         pending_workers: Option<u64>,
     },
-    /// The host acknowledged, and every worker it had stopped.
+    /// The host acknowledged, and every session worker confirmed the fence.
     Done {
         /// When the host acknowledged, in UTC milliseconds.
         at_ms: u64,
@@ -239,8 +242,28 @@ struct Memory {
     listed: BTreeMap<String, Listed>,
     /// What the host on this computer answered to this computer's revocations.
     direct: BTreeMap<DeviceId, Direct>,
-    /// The requests settings sync has been told of, or is being told of.
-    fed: BTreeSet<RevocationRequestId>,
+    /// The requests, each with the device it names, that settings sync has been told of, or is
+    /// being told of.
+    fed: BTreeSet<(RevocationRequestId, AuthorisationKey)>,
+    /// The revocations being asked for, by host and device reference, so that a second call for one
+    /// of them waits for neither the ceremony nor the request and sends nothing.
+    revoking: BTreeSet<String>,
+}
+
+/// A revocation being asked for, which stops being so when this goes, however the call ends.
+struct InFlight {
+    memory: Arc<Mutex<Memory>>,
+    key: String,
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.memory
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .revoking
+            .remove(&self.key);
+    }
 }
 
 /// A host's devices as last listed.
@@ -253,9 +276,10 @@ struct Listed {
 /// What the host on this computer answered to a revocation.
 #[derive(Clone, Copy)]
 enum Direct {
-    /// Every session worker it affects has stopped.
+    /// Every session worker it affects confirmed the fence.
     Done { at_ms: u64 },
-    /// It recorded the revocation, and some workers have not stopped. It says how many when it can.
+    /// It recorded the revocation, and some workers have not confirmed the fence. It says how many
+    /// when it can.
     Pending { at_ms: u64, workers: Option<u64> },
 }
 
@@ -472,18 +496,19 @@ impl Revocations {
             return;
         };
         for (request, device) in told {
-            if !self.memory().fed.insert(request) {
+            if !self.memory().fed.insert((request, device)) {
                 continue;
             }
             let (settings, memory) = (Arc::clone(settings), Arc::clone(&self.memory));
             tauri::async_runtime::spawn(async move {
-                if settings.feed_revocation(&device).await.is_err() {
-                    // Not told: the next view tells it again.
+                // Told only when the membership recorded it: a computer that shares no settings
+                // yet is told again at the next view, which a collection it joins since needs.
+                if !matches!(settings.feed_revocation(&device).await, Ok(true)) {
                     memory
                         .lock()
                         .unwrap_or_else(PoisonError::into_inner)
                         .fed
-                        .remove(&request);
+                        .remove(&(request, device));
                 }
             });
         }
@@ -535,7 +560,9 @@ impl Revocations {
                 if let Some(keys) = summary.keys.0 {
                     for request in &named {
                         let id = request.record.request.request_id;
-                        if request.record.rejected.0.is_none() && !fed.contains(&id) {
+                        if request.record.rejected.0.is_none()
+                            && !fed.contains(&(id, keys.authorisation))
+                        {
                             told.push((id, keys.authorisation));
                         }
                     }
@@ -551,6 +578,7 @@ impl Revocations {
                         &named,
                         direct.get(&summary.device_id).copied(),
                         reading.host.route(),
+                        reading.contact == Contact::Answered,
                     ),
                 }
             })
@@ -572,33 +600,17 @@ impl Revocations {
         }
     }
 
-    /// The requests in a host's feed that are this computer's own: published by this computer's
-    /// key, addressed to the host, signed as they say and naming devices.
+    /// The requests in a host's feed that are this computer's own.
     fn verified<'a>(&self, reading: &'a Reading) -> Vec<Verified<'a>> {
-        let (Host::Paired(host), Some(Ok(feed))) = (&reading.host, &reading.feed) else {
-            return Vec::new();
-        };
-        let key = self.key();
-        feed.records
-            .iter()
-            .filter(|record| record.published_by == key)
-            .filter(|record| record.request.issuer_device_id == host.device_id)
-            .filter(|record| {
-                kr_pairing::grants::verify_revocation_request(
-                    &record.request,
-                    host.host_device_id,
-                    &key,
-                )
-                .is_ok()
-            })
-            .filter_map(|record| match &record.request.target {
-                RevocationTarget::Devices { device_ids } => Some(Verified {
-                    record,
-                    devices: device_ids.into_iter().copied().collect(),
-                }),
-                RevocationTarget::Grants { .. } => None,
-            })
-            .collect()
+        match (&reading.host, &reading.feed) {
+            (Host::Paired(host), Some(Ok(feed))) => own_requests(
+                &feed.records,
+                host.device_id,
+                host.host_device_id,
+                &self.key(),
+            ),
+            _ => Vec::new(),
+        }
     }
 
     /// Revokes the device `device` names on the host `host` names, once the person confirms it
@@ -623,6 +635,16 @@ impl Revocations {
             .ok_or_else(|| {
                 CommandError::refused("that host is not one this computer can revoke on")
             })?;
+        // One revocation of a device at a time: a second call for it, from a second window or
+        // while the person is at the ceremony, sends nothing and asks nobody.
+        let key = format!("{host}/{device}");
+        if !self.memory().revoking.insert(key.clone()) {
+            return Ok(self.view(context).await);
+        }
+        let _in_flight = InFlight {
+            memory: Arc::clone(&self.memory),
+            key,
+        };
         let readings = self.read(vec![found.clone()], context).await;
         let reading = readings
             .first()
@@ -684,7 +706,16 @@ impl Revocations {
                 .await?;
         }
         match &found {
-            Host::Local(connection) => self.revoke_direct(connection, &summary).await?,
+            Host::Local(connection) => {
+                // The host withdraws the connections it admitted before each revocation, and the
+                // person took their time: the revocation goes over one it admits now.
+                let fresh = tokio::time::timeout(ANSWER_WITHIN, connection.another()).await;
+                let over = match fresh {
+                    Ok(Ok(fresh)) => fresh,
+                    _ => connection.clone(),
+                };
+                self.revoke_direct(&over, &summary).await?;
+            }
             Host::Paired(paired) => {
                 let origin = context.origin.as_ref().ok_or_else(|| {
                     CommandError::refused("this computer has no sync service to publish at")
@@ -741,7 +772,7 @@ impl Revocations {
                 }
             }
             // The host settled it with a receipt: it recorded the revocation and has not said
-            // that every worker stopped.
+            // that every worker confirmed the fence.
             kr_client::Settled::Receipt(_) => Direct::Pending {
                 at_ms,
                 workers: None,
@@ -787,6 +818,32 @@ fn feed_of(host: &PairedHost) -> KeyId {
     )
 }
 
+/// The records of a feed that are this computer's own, naming devices: published by `key`, issued as
+/// the device `issuer` this computer is on the host `host`, and signed as they say. A feed judges no
+/// owner's authority, so what it says a record is does not make it this computer's.
+fn own_requests<'a>(
+    records: &'a [AuthorityFeedRecord],
+    issuer: DeviceId,
+    host: DeviceId,
+    key: &AuthorisationKey,
+) -> Vec<Verified<'a>> {
+    records
+        .iter()
+        .filter(|record| record.published_by == *key)
+        .filter(|record| record.request.issuer_device_id == issuer)
+        .filter(|record| {
+            kr_pairing::grants::verify_revocation_request(&record.request, host, key).is_ok()
+        })
+        .filter_map(|record| match &record.request.target {
+            RevocationTarget::Devices { device_ids } => Some(Verified {
+                record,
+                devices: device_ids.into_iter().copied().collect(),
+            }),
+            RevocationTarget::Grants { .. } => None,
+        })
+        .collect()
+}
+
 /// Where a device's revocation stands, from what the host lists of it, the requests this computer
 /// sent for it, and what the host on this computer answered.
 fn standing(
@@ -794,6 +851,7 @@ fn standing(
     requests: &[&Verified<'_>],
     direct: Option<Direct>,
     route: Route,
+    host_answered: bool,
 ) -> DeviceStanding {
     if route == Route::Direct {
         return match direct {
@@ -809,7 +867,7 @@ fn standing(
         };
     }
     // The furthest any request for the device has got: acknowledged complete, acknowledged with
-    // workers still running, waiting in the feed, refused.
+    // workers yet to confirm the fence, waiting in the feed, refused.
     let mut furthest: Option<(u8, DeviceStanding)> = None;
     for request in requests {
         let record = request.record;
@@ -822,6 +880,15 @@ fn standing(
                 {
                     let at_ms = acknowledgement.acknowledged_at_ms.get();
                     match acknowledgement.completion {
+                        // The feed's word that the host finished is not the host's own: a host that
+                        // answers just now and does not list the device as revoked has not said so.
+                        RevocationCompletion::Complete if host_answered && !device.revoked => (
+                            3,
+                            DeviceStanding::Acknowledged {
+                                at_ms,
+                                pending_workers: None,
+                            },
+                        ),
                         RevocationCompletion::Complete => (4, DeviceStanding::Done { at_ms }),
                         RevocationCompletion::Pending { pending_workers } => (
                             3,
@@ -902,12 +969,13 @@ async fn visit(
         Host::Local(connection) => {
             let mut listing = listed(&connection.session()).await;
             // A change of the host's authority, a revocation among them, withdraws the connections
-            // it admitted before, and the host says to open a new one.
-            if matches!(listing, Listing::Refused)
-                && let Ok(Ok(fresh)) =
-                    tokio::time::timeout(ANSWER_WITHIN, connection.another()).await
-            {
-                listing = listed(&fresh.session()).await;
+            // it admitted before, and the host says to open a new one. What a fresh connection is
+            // answered is the host's word; one that cannot be opened says nothing of the host.
+            if matches!(listing, Listing::Refused) {
+                listing = match tokio::time::timeout(ANSWER_WITHIN, connection.another()).await {
+                    Ok(Ok(fresh)) => listed(&fresh.session()).await,
+                    _ => Listing::Silent,
+                };
             }
             (listing, None)
         }
@@ -1041,7 +1109,16 @@ mod tests {
         }
     }
 
+    /// What the screen says when the host answered just now.
     fn standing_of(revoked: bool, records: &[AuthorityFeedRecord]) -> DeviceStanding {
+        standing_when(revoked, true, records)
+    }
+
+    fn standing_when(
+        revoked: bool,
+        host_answered: bool,
+        records: &[AuthorityFeedRecord],
+    ) -> DeviceStanding {
         let verified: Vec<Verified<'_>> = records
             .iter()
             .map(|record| Verified {
@@ -1050,14 +1127,14 @@ mod tests {
             })
             .collect();
         let named: Vec<&Verified<'_>> = verified.iter().collect();
-        standing(&device(revoked), &named, None, Route::Feed)
+        standing(&device(revoked), &named, None, Route::Feed, host_answered)
     }
 
-    /// A pending acknowledgement is not done: some of the host's workers have not stopped, and the
+    /// A pending acknowledgement is not done: some of the host's workers have not confirmed, and the
     /// screen says how many. No host that can be started here is in that state, so this table is
     /// the one place it is held.
     #[test]
-    fn a_request_is_done_only_when_the_hosts_acknowledgement_says_every_worker_stopped() {
+    fn a_request_is_done_only_when_the_hosts_acknowledgement_and_list_say_every_worker_confirmed() {
         let sent = record(10, None, None);
         let pending = record(
             11,
@@ -1097,6 +1174,20 @@ mod tests {
             standing_of(true, std::slice::from_ref(&complete)),
             DeviceStanding::Done { at_ms: 200 }
         );
+        // The feed's word that the host finished is the service's. A host that answers just now and
+        // does not list the device as revoked has not said it did, and one that does not answer has
+        // said nothing either way.
+        assert_eq!(
+            standing_of(false, std::slice::from_ref(&complete)),
+            DeviceStanding::Acknowledged {
+                at_ms: 200,
+                pending_workers: None
+            }
+        );
+        assert_eq!(
+            standing_when(false, false, std::slice::from_ref(&complete)),
+            DeviceStanding::Done { at_ms: 200 }
+        );
         assert_eq!(
             standing_of(false, std::slice::from_ref(&refused)),
             DeviceStanding::Refused {
@@ -1120,5 +1211,61 @@ mod tests {
             standing_of(true, &[refused, sent, pending, complete]),
             DeviceStanding::Done { at_ms: 200 }
         );
+    }
+
+    /// A record is this computer's own only when this computer's key published it, as the device it
+    /// is on that host, and signed it for that host: the service that holds a feed judges none of
+    /// that, and a record that is taken for this computer's own takes a device out of the settings.
+    #[test]
+    fn a_record_is_this_computers_own_only_when_this_computer_signed_it_for_this_host() {
+        use kr_crypto::keys::AuthorisationKeyPair;
+
+        let mine = AuthorisationKeyPair::generate().expect("a key");
+        let theirs = AuthorisationKeyPair::generate().expect("a key");
+        let (me, host, other_host) = (
+            DeviceId::new(id(3)),
+            DeviceId::new(id(4)),
+            DeviceId::new(id(5)),
+        );
+        let named = || RevocationTarget::Devices {
+            device_ids: CanonicalSet::from_iter([DeviceId::new(id(1))]),
+        };
+        let signed = |key: &AuthorisationKeyPair, issuer, host, number: u8| {
+            let request = kr_pairing::grants::sign_revocation_request(
+                key,
+                RevocationRequestId::new(id(number)),
+                issuer,
+                host,
+                named(),
+                TimestampMs::new(99),
+            )
+            .expect("a request");
+            AuthorityFeedRecord {
+                sequence: U64::new(u64::from(number)),
+                request,
+                published_by: *mine.public(),
+                published_at_ms: U64::new(100),
+                acknowledgement: Nullable::null(),
+                rejected: Nullable::null(),
+            }
+        };
+        let genuine = signed(&mine, me, host, 20);
+        // Published by this computer's key, but signed by another key.
+        let forged = signed(&theirs, me, host, 21);
+        // Signed by this computer, for another host.
+        let elsewhere = signed(&mine, me, other_host, 22);
+        // Issued as another device on this host.
+        let borrowed = signed(&mine, DeviceId::new(id(6)), host, 23);
+        // Published by another key altogether.
+        let mut stranger = signed(&theirs, me, host, 24);
+        stranger.published_by = *theirs.public();
+        let records = [genuine, forged, elsewhere, borrowed, stranger];
+
+        let own = own_requests(&records, me, host, mine.public());
+        let ids: Vec<RevocationRequestId> = own
+            .iter()
+            .map(|request| request.record.request.request_id)
+            .collect();
+        assert_eq!(ids, [RevocationRequestId::new(id(20))]);
     }
 }

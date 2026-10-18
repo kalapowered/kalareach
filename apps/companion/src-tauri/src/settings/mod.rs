@@ -574,6 +574,8 @@ impl Settings {
 
     /// Records that a revocation of `device`, sent from this computer, is in a host's feed, so that
     /// settings sync stops publishing at once and takes the device out of the shared settings.
+    /// Says whether settings sync recorded it: a computer that shares no settings has none to record
+    /// it in.
     ///
     /// # Errors
     ///
@@ -581,10 +583,10 @@ impl Settings {
     pub async fn feed_revocation(
         &self,
         device: &kr_protocol::scalars::AuthorisationKey,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         match self.sync.get() {
             Some(sync) => sync.feed_revocation(device).await,
-            None => Ok(()),
+            None => Ok(false),
         }
     }
 }

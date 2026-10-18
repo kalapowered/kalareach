@@ -55,6 +55,8 @@ const WATCHDOG: Duration = Duration::from_secs(120);
 struct Scripted {
     answer: Mutex<CeremonyOutcome>,
     asked: Mutex<Vec<String>>,
+    /// While set, the person is still at the dialog: it says when it was shown and ends when told.
+    held: Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
 }
 
 impl Scripted {
@@ -62,7 +64,16 @@ impl Scripted {
         Arc::new(Self {
             answer: Mutex::new(answer),
             asked: Mutex::new(Vec::new()),
+            held: Mutex::new(None),
         })
+    }
+
+    /// The next dialog stays up until the returned `release` is notified; `shown` says it is up.
+    fn hold_the_dialog(&self) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
+        let shown = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        *self.held.lock().expect("the hold") = Some((Arc::clone(&shown), Arc::clone(&release)));
+        (shown, release)
     }
 
     fn reasons(&self) -> Vec<String> {
@@ -81,7 +92,14 @@ impl Ceremony for Scripted {
             .expect("the record")
             .push(reason.to_owned());
         let answer = *self.answer.lock().expect("the answer");
-        Box::pin(async move { answer })
+        let held = self.held.lock().expect("the hold").take();
+        Box::pin(async move {
+            if let Some((shown, release)) = held {
+                shown.notify_one();
+                release.notified().await;
+            }
+            answer
+        })
     }
 }
 
@@ -208,6 +226,19 @@ impl Rig {
         rig
     }
 
+    /// The host pairs one more device, which is not the one `phone` names.
+    async fn pairs_another(&self) -> Device {
+        let another = Device::create().await;
+        pair_with(
+            &self.host,
+            &another,
+            &self.owner,
+            proposal(&[ActionRight::SessionView]),
+        )
+        .await;
+        another
+    }
+
     /// This computer is set to use the sync service at `origin`.
     fn sync_service_is(&self, origin: &str) {
         self.app
@@ -323,6 +354,17 @@ fn the_phone(host: &Value) -> Value {
         .find(|device| device["this_computer"] == false && device["manages_host"] == false)
         .unwrap_or_else(|| panic!("the host lists no paired device: {host}"))
         .clone()
+}
+
+/// Every device of `host` that is neither this computer nor an owner of the host.
+fn the_phones(host: &Value) -> Vec<Value> {
+    host["devices"]
+        .as_array()
+        .expect("devices")
+        .iter()
+        .filter(|device| device["this_computer"] == false && device["manages_host"] == false)
+        .cloned()
+        .collect()
 }
 
 /// The phone's state on the first host of `view` reached by `route`.
@@ -716,4 +758,137 @@ async fn the_host_on_this_computer_takes_the_revocation_itself_and_its_answer_is
         )
         .expect_err("it is revoked");
     assert_eq!(again["code"], "PERMISSION_DENIED", "{again}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_host_on_this_computer_takes_a_second_revocation_though_the_first_withdrew_the_connection()
+ {
+    let rig = Rig::start().await;
+    rig.pairs_another().await;
+    rig.view().await;
+    rig.host_polls().await;
+    let endpoint = rig.host.endpoint().clone();
+    let reopen: companion_tauri::connection::Reopen = Arc::new({
+        let endpoint = endpoint.clone();
+        move || {
+            let endpoint = endpoint.clone();
+            Box::pin(async move { local_connection(&endpoint).await })
+        }
+    });
+    let connection = local_connection(&endpoint)
+        .await
+        .expect("connects to the control endpoint")
+        .reopening(reopen);
+    rig.app.app.state::<AppState>().connected(connection);
+
+    let view = rig.view().await;
+    let local = host_by(&view, "direct");
+    let phones = the_phones(&local);
+    assert_eq!(phones.len(), 2, "two devices are paired: {local}");
+    for phone in &phones {
+        // Each revocation withdraws the connection the host admitted before it, and the next goes
+        // over the one the host admits then.
+        let done = rig
+            .revoke(
+                local["reference"].as_str().expect("a reference"),
+                phone["reference"].as_str().expect("a reference"),
+            )
+            .expect("the host on this computer revokes the device");
+        let revoked = host_by(&done, "direct");
+        assert!(
+            the_phones(&revoked)
+                .iter()
+                .find(|each| each["reference"] == phone["reference"])
+                .is_some_and(|each| each["standing"]["state"] == "done"),
+            "{done}"
+        );
+    }
+    assert_eq!(rig.ceremony.reasons().len(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_second_call_for_a_device_being_revoked_sends_nothing_and_asks_nobody() {
+    let rig = Rig::start().await;
+    let view = rig.view().await;
+    let host = host_by(&view, "feed");
+    let phone = the_phone(&host);
+    let body = json!({ "host": host["reference"], "device": phone["reference"] });
+    let (shown, release) = rig.ceremony.hold_the_dialog();
+
+    // The person is at the dialog, and a second window asks for the same revocation.
+    let first = rig.app.start_call("revocation_revoke", body.clone());
+    tokio::time::timeout(WATCHDOG, shown.notified())
+        .await
+        .expect("the dialog is shown");
+    let second = rig.app.start_call("revocation_revoke", body);
+    let second = tokio::time::timeout(WATCHDOG, second)
+        .await
+        .expect("the second call does not wait for the dialog")
+        .expect("the call ends")
+        .expect("it is shown what stands");
+    assert_eq!(phone_state(&second, "feed"), "active");
+    assert_eq!(rig.ceremony.reasons().len(), 1, "nobody was asked twice");
+    assert_eq!(rig.publications(), 0, "nothing was sent for it");
+
+    release.notify_one();
+    let first = tokio::time::timeout(WATCHDOG, first)
+        .await
+        .expect("the first call ends")
+        .expect("the call ends")
+        .expect("the person confirmed and the request was published");
+    assert!(["sent", "done"].contains(&phone_state(&first, "feed").as_str()));
+    assert_eq!(rig.publications(), 1, "one request for one device");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_host_on_this_computer_whose_connection_cannot_be_replaced_is_not_said_to_refuse_this_computer()
+ {
+    let rig = Rig::start().await;
+    rig.view().await;
+    rig.host_polls().await;
+    // This computer's connection to its own host cannot be opened again.
+    let connection = local_connection(rig.host.endpoint())
+        .await
+        .expect("connects to the control endpoint")
+        .reopening(Arc::new(|| {
+            Box::pin(async {
+                Err(companion_tauri::error::CommandError::unavailable(
+                    "the host did not answer",
+                ))
+            })
+        }));
+    rig.app.app.state::<AppState>().connected(connection);
+    assert_eq!(host_by(&rig.view().await, "direct")["contact"], "answered");
+
+    // The owner at the machine revokes a device, which withdraws the connection this one was
+    // admitted on. The host says so, which says nothing of what this computer may do there.
+    let phone = rig
+        .host
+        .controller()
+        .devices()
+        .devices()
+        .expect("the device directory answers")
+        .into_iter()
+        .find(|record| {
+            record.is_paired()
+                && Some(record.device_id) != rig.host.owner.as_ref().map(|owner| owner.device_id)
+        })
+        .expect("the paired device");
+    let mut client = rig.host.client().await;
+    let _: kr_protocol::sharing::RevocationResult = net_support::pairing::mutate(
+        rig.host.environment_id,
+        &mut client,
+        kr_protocol::method::Method::DeviceRevoke,
+        &kr_protocol::sharing::DeviceRevokeParams {
+            device_id: phone.device_id,
+        },
+    )
+    .await
+    .expect("the owner at the machine revokes the device");
+
+    let after = host_by(&rig.view().await, "direct");
+    assert_eq!(
+        after["contact"], "silent",
+        "a connection that cannot be replaced says nothing of this computer's right: {after}"
+    );
 }

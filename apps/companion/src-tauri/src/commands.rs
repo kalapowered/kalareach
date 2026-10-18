@@ -365,13 +365,28 @@ pub const NATIVE_METHODS: &[(&str, &[Method])] = &[
         ],
     ),
     // The devices of the host on this computer, and of each host this computer owns, are listed; a
-    // revocation reaches the host on this computer by `device.revoke` over the connection the
-    // application holds to it, and any other host through its feed, which is a service and not a
-    // host method. The page names a host and a device by references native code gave it.
-    ("revocation_view", &[Method::DeviceList]),
+    // revocation reaches the host on this computer by `device.revoke` over a connection that host
+    // admits, and any other host through its feed, which is a service and not a host method. A
+    // revocation this computer sent is passed to settings sync, which runs a step of its own: it
+    // asks the hosts who they list and reads the connected host's sessions and privacy mode, as
+    // every command that can run a step is named to do. The page names a host and a device by
+    // references native code gave it.
+    (
+        "revocation_view",
+        &[
+            Method::DeviceList,
+            Method::SessionRead,
+            Method::PrivacyStatus,
+        ],
+    ),
     (
         "revocation_revoke",
-        &[Method::DeviceList, Method::DeviceRevoke],
+        &[
+            Method::DeviceList,
+            Method::DeviceRevoke,
+            Method::SessionRead,
+            Method::PrivacyStatus,
+        ],
     ),
     // A view attaches, subscribes, reports its size and its window's place, takes and gives back
     // the input lease, writes the person's wheel turns and keys under it, and detaches, all on the

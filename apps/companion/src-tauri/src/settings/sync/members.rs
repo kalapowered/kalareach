@@ -650,36 +650,46 @@ impl SettingsSync {
 
     /// Records that a revocation of `device`, sent from this computer and verified here, is in a
     /// host's feed, and carries out the removal it requires as far as the hosts and the service
-    /// allow. Settings sync stops publishing at once; a host that has not caught up yet does not
-    /// undo it.
+    /// allow. Publication stops at once, before any host acknowledges the request: the record is
+    /// made without waiting for a step in hand, which may be waiting on the network, and a step that
+    /// starts after it finds publication fenced. The removal itself is a step of its own, after the
+    /// one in hand.
+    ///
+    /// Says whether the membership recorded it: a computer that shares no settings has none to
+    /// record it in.
     ///
     /// # Errors
     ///
     /// Returns what stopped the recording. A service that cannot be reached afterwards is not a
-    /// failure of it: the next step carries the removal out.
-    pub async fn feed_revocation(&self, device: &AuthorisationKey) -> Result<()> {
-        let outcome = self.feed_revocation_in_a_step(device).await;
-        self.finished(&outcome);
-        outcome
-    }
-
-    async fn feed_revocation_in_a_step(&self, device: &AuthorisationKey) -> Result<()> {
-        let _step = self.step().await?;
-        let Some(mut record) = self.record()? else {
-            return Ok(());
+    /// failure of it: the next step carries the removal out, and the page says what stopped.
+    pub async fn feed_revocation(&self, device: &AuthorisationKey) -> Result<bool> {
+        let Some(record) = self.record()? else {
+            return Ok(false);
         };
         let service = self.managed(&record.origin()?)?;
         let mut membership = self.membership_asking(&service, Ask::Never)?;
         match membership.feed_revocation(device) {
             Ok(()) => {}
-            // This computer shares no settings, so the revocation changes nothing here.
-            Err(MembershipError::NoMembership) => return Ok(()),
+            Err(MembershipError::NoMembership) => return Ok(false),
             Err(error) => return Err(member_failure(error)),
         }
         self.note_devices(&membership);
         drop(membership);
-        let _ = self.settle(&mut record, &service, Ask::Now).await;
-        Ok(())
+        self.told.tell();
+        let settled = self.remove_in_a_step_after_a_revocation().await;
+        self.finished(&settled);
+        Ok(true)
+    }
+
+    async fn remove_in_a_step_after_a_revocation(&self) -> Result<()> {
+        let _step = self.step().await?;
+        let Some(mut record) = self.record()? else {
+            return Ok(());
+        };
+        let service = self.managed(&record.origin()?)?;
+        self.settle(&mut record, &service, Ask::Now)
+            .await
+            .map(|_| ())
     }
 
     /// Joins the collection `reference` names, once the person confirms it here.

@@ -3259,13 +3259,15 @@ async fn a_revocation_in_a_hosts_feed_takes_a_member_out_before_any_host_says_so
     page.sync_now();
     assert_eq!(phone.sync_now()["colour_mode"], "dark");
 
-    page.app
+    let recorded = page
+        .app
         .state::<AppState>()
         .settings()
         .expect("settings are open")
         .feed_revocation(other.identity().keys.authorisation.public())
         .await
         .expect("the revocation is recorded");
+    assert!(recorded, "the membership recorded it");
     // Both computers' hosts still list the phone as it was.
     page.choose("light");
     let view = page.sync_now();

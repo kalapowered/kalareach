@@ -435,9 +435,10 @@ by references native code gave it. It holds no key and no identifier, and it can
 performs it in native code.
 
 Two routes lead to a host, and the host decides which. The host on this computer takes
-`device.revoke` from native code over the connection the application holds to it, and its answer,
-with the state of its dispatch barrier, is its acknowledgement. Any other host this computer owns is
-reached through its authority feed. Native code signs a revocation request with this computer's
+`device.revoke` from native code, and its answer, with the state of its dispatch barrier, is its
+acknowledgement. The host withdraws the connections it admitted before each revocation, so the
+revocation goes over a connection the host admits then. Any other host this computer owns is reached
+through its authority feed. Native code signs a revocation request with this computer's
 authorisation key and publishes it at the sync service. The host reads the feed when a device
 connects and every 30 seconds, carries the request out, and acknowledges it in the same feed. A
 paired device cannot send `device.revoke` to a host, so the feed is the only way to a host that is
@@ -446,8 +447,10 @@ platform's ceremony first, and a computer with no ceremony revokes nothing.
 
 A revocation is done only once the host's acknowledgement has been read. A request in the feed that
 its host has not acknowledged is shown as sent, and nothing more. One the host acknowledged while
-some of its session workers have not stopped yet is shown as acknowledged, with the number still
-running. A request the host refused is shown as refused, with the reason. The acknowledgements are
+some of its session workers have not confirmed the revocation yet is shown as acknowledged, with the
+number that have not. An acknowledgement the host's own list does not bear out is shown the same
+way: the feed says the host finished, and the host, answering just now, does not list the device as
+revoked. A request the host refused is shown as refused, with the reason. The acknowledgements are
 read from the feed, which stores them and judges nothing, so they are the service's word for what
 the host answered and not something this computer can check.
 
@@ -457,12 +460,13 @@ service it is set to use, and the screen names that service. A host that reads a
 sees the request and never acknowledges it, so the request stays sent and cannot be mistaken for a
 success. A host whose feed answers that it was removed is listed as not reachable by feed, and
 nothing is published for it. A host that does not answer keeps the device list it gave the last time
-this application asked, shown with the time of that list, and a revocation is still published for
-it.
+this application asked, for as long as the application runs, shown with the time of that list, and a
+revocation is still published for it.
 
 A revocation this computer sent is passed to settings sync, which stops publishing at once and takes
-the device out of the shared settings once a host confirms it, without waiting for a host's own list
-to say that the device is revoked.
+the device out of the shared settings at its next step, before any host has acknowledged the request
+or lists the device as revoked. A step already under way may publish once more under the key the
+device holds.
 
 ## Sharing a session
 
