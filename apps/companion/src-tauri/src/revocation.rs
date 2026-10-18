@@ -112,8 +112,9 @@ pub enum Contact {
 /// What the screen is shown of every host this computer can revoke devices on.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct RevocationView {
-    /// Whether this computer can ask the person to confirm: without a ceremony it revokes nothing.
-    pub can_confirm: bool,
+    /// The ceremony this computer asks the person to confirm with, which names the control. Without
+    /// one it revokes nothing.
+    pub ceremony: CeremonyKind,
     /// The service a request for a paired host is published at, as its host name and port. Null
     /// when this computer has no sync service setting to publish at.
     pub feed_origin: Option<String>,
@@ -162,6 +163,8 @@ pub struct FeedView {
     pub last_acknowledgement: Option<Acknowledged>,
     /// How many requests wait for the host.
     pub outstanding: u64,
+    /// How often a host reads its feed while it is online, in seconds, as the feed states it.
+    pub poll_interval_seconds: Option<u32>,
 }
 
 /// What the feed holds of a host's last acknowledgement.
@@ -452,7 +455,7 @@ impl Revocations {
             .collect();
         self.tell(context, told);
         RevocationView {
-            can_confirm: self.ceremony.kind() != CeremonyKind::None,
+            ceremony: self.ceremony.kind(),
             feed_origin: context.origin.as_ref().map(host_of),
             hosts,
         }
@@ -872,6 +875,7 @@ fn feed_view(feed: &std::result::Result<FeedRead, String>, reading: &Reading) ->
                 }
             }),
             outstanding: read.summary.outstanding.get(),
+            poll_interval_seconds: Some(read.summary.poll_interval_seconds),
         },
         Err(problem) => FeedView {
             read: false,
@@ -880,6 +884,7 @@ fn feed_view(feed: &std::result::Result<FeedRead, String>, reading: &Reading) ->
             host_wrote_here: false,
             last_acknowledgement: None,
             outstanding: 0,
+            poll_interval_seconds: None,
         },
     }
 }

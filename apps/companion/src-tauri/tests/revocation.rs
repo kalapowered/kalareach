@@ -341,6 +341,15 @@ async fn a_revocation_is_called_done_only_once_the_hosts_acknowledgement_is_read
     let host = host_by(&before, "feed");
     assert_eq!(host["contact"], "answered");
     assert_eq!(host["name"], "the test host");
+    assert_eq!(
+        before["ceremony"], "touch_id",
+        "the screen names the ceremony the control asks for"
+    );
+    assert_eq!(
+        host["feed"]["poll_interval_seconds"],
+        json!(30),
+        "the screen says how often the host reads its feed"
+    );
     assert_eq!(phone_state(&before, "feed"), "active");
     assert_eq!(
         before["feed_origin"],
