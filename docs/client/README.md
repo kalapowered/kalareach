@@ -658,11 +658,16 @@ A host this device is paired with that did not answer is said so in the answers
 (`HostAnswers::silent`). The host that did not answer may be the one that lists a device, so a
 device that this device's hosts vouched for at an earlier answer, and that no answering host
 mentions, is not taken out for it, and the next epoch's key is wrapped to it as before
-(`RecordedAnswers::retains`). Nothing else is relaxed: a record's issuer, the device that opened an
-epoch, a device to add and the recipient of a key must each be listed by a host that answered
-(`RecordedAnswers::passes`). A device an answering host mentions is judged by what that host says,
-silent hosts or not: one it lists without the right to manage the host, with other keys, or as
-revoked is not kept.
+(`RecordedAnswers::retains`). Nothing is accepted, opened or added on silence: a record's issuer,
+the device that opened an epoch, a device to add and the recipient of a key must each be listed by a
+host that answered (`RecordedAnswers::passes`). A record whose issuer only a silent host lists waits
+for that host. It is neither accepted nor refused, its issuer is not taken out for it, and this
+device builds nothing on it, since a record built on the one before would wrap the next key to a
+device the waiting record took out. A device an answering host mentions is judged by what that host
+says, silent hosts or not: one it lists without the right to manage the host, with other keys, or as
+revoked is not kept. A join waits while a host is silent (`MembershipError::HostSilent`): a device
+the collection lists that only that host lists has not been vouched for yet, and the first answers a
+joining device records would take it out.
 
 A collection put back from an archive names its history on every key-record answer, and the
 membership file records the history its records were read in: the one its first record applied
@@ -1161,7 +1166,13 @@ later epoch. The service says which epoch an object was sealed under, and
 `SharedCollectionService::last_sealed_under` hands that to the caller, to decide whether to seal the
 object again and never to choose a key. `SharedCollectionService::last_found_at` says where the
 service held the object it last found, whether or not it was opened, so that a caller who decides to
-write over an object it does not believe compares against the place it stands at. A device that
+write over an object it does not believe compares against the place it stands at. That caller says
+which write it went over: the object it publishes carries the place in `SyncObject::went_over`, and
+every object made from that one carries it on. A device that holds the write at one of those places
+and meets such an object keeps it as a copy beside its own for the person to choose, where a device
+that never held the write follows it. So a write that a member holds is not replaced without that
+member's person choosing, and a write that no member holds, such as the last one of a device taken
+out, is offered to nobody. A device that
 holds no key for an epoch at or after the floor is told so by name, instead of getting the
 authentication failure that a tampered ciphertext gets. An object sealed under a later epoch than
 the client was built for is refused by name instead of failing to open. The epoch a client writes
