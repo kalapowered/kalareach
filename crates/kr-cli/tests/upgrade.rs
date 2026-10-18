@@ -444,7 +444,8 @@ async fn a_rollback_to_the_release_before_goes_on_beside_its_session_and_waits_f
     let host = &updated.host;
 
     // A session of this release: the older release's daemon does not retain its level.
-    let (display, _) = host.new_session(&updated.kr_now());
+    let (display, session_now) = host.new_session(&updated.kr_now());
+    let worker_now = host.worker_process(session_now);
     let (output, said) = host.kr_json(&["host", "rollback", "--json"]);
     assert_eq!(
         output.status.code(),
@@ -465,6 +466,7 @@ async fn a_rollback_to_the_release_before_goes_on_beside_its_session_and_waits_f
         "nothing was switched"
     );
     host.close(&updated.kr_now(), &display);
+    host.worker_ended(&worker_now).await;
 
     // With only the release before's session live the rollback goes on.
     let (output, said) = host.kr_json(&["host", "rollback", "--json"]);
