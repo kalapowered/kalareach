@@ -9,7 +9,9 @@
 //!
 //! The control shows that placed sources are enough: the run has no server to reach, as far as a
 //! client that obeys the proxy variables goes. Each mutation then changes one thing a pin covers,
-//! and the build must refuse it before it configures anything.
+//! and the check must refuse it and name the source. The sources a case changes are the ones the
+//! current pins name, taken from the manifest and the release's lock, because a cache that was
+//! restored from an older run also holds files no pin names.
 //!
 //! They need the archive, the crates and the repositories placed (`scripts/place-shell-sources.sh
 //! --fish`), which an ordinary run does not have, so they are left out of one. A run that placed
@@ -67,8 +69,9 @@ struct Tree {
 impl Tree {
     fn new() -> Self {
         let placed = placed_sources();
+        let archive = upstream(&repository_root().join("shells/fish/manifest.json")).0;
         assert!(
-            placed.join("fish-4.9.3.tar.xz").is_file(),
+            placed.join(archive).is_file(),
             "the Fish sources are not placed in {}; run scripts/place-shell-sources.sh --fish",
             placed.display()
         );
@@ -142,19 +145,60 @@ impl Tree {
             .expect("the manifest");
     }
 
-    /// The name of the one placed file whose name starts with `start` and ends with `end`.
-    fn placed_file(&self, start: &str, end: &str) -> String {
-        let mut names: Vec<String> = fs::read_dir(&self.sources)
-            .expect("the sources")
-            .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
-            .filter(|name| name.starts_with(start) && name.ends_with(end))
-            .collect();
-        names.sort();
-        names
-            .into_iter()
-            .next()
-            .unwrap_or_else(|| panic!("no placed file {start}*{end}"))
+    fn manifest(&self) -> serde_json::Value {
+        let path = self.root.join("shells/fish/manifest.json");
+        serde_json::from_slice(&fs::read(path).expect("the manifest")).expect("JSON")
     }
+
+    /// The name of the bundle the manifest pins for the repository `name`, and its revision.
+    fn pinned_bundle(&self, name: &str) -> (String, String) {
+        let manifest = self.manifest();
+        let entry = manifest["cargo"]["git"]
+            .as_array()
+            .expect("the pins")
+            .iter()
+            .find(|entry| entry["name"] == name)
+            .unwrap_or_else(|| panic!("the manifest pins no {name}"));
+        let revision = entry["revision"].as_str().expect("a revision").to_owned();
+        (format!("{name}-{}.bundle", &revision[..12]), revision)
+    }
+
+    /// The `.crate` file the lock of the pinned release names first.
+    fn locked_crate(&self) -> String {
+        let (archive, directory) = upstream(&self.root.join("shells/fish/manifest.json"));
+        let scratch = tempfile::tempdir().expect("a scratch directory");
+        let lock = format!("{directory}/Cargo.lock");
+        let unpacked = Command::new("tar")
+            .arg("-x")
+            .arg("-f")
+            .arg(self.sources.join(archive))
+            .arg("-C")
+            .arg(scratch.path())
+            .arg(&lock)
+            .status()
+            .expect("tar to run");
+        assert!(unpacked.success(), "tar could not read {lock}");
+        let text = fs::read_to_string(scratch.path().join(lock)).expect("the lock");
+        let (mut name, mut version) = (String::new(), String::new());
+        for line in text.lines() {
+            if let Some(value) = line.strip_prefix("name = ") {
+                name = value.trim_matches('"').to_owned();
+            } else if let Some(value) = line.strip_prefix("version = ") {
+                version = value.trim_matches('"').to_owned();
+            } else if line == "source = \"registry+https://github.com/rust-lang/crates.io-index\"" {
+                return format!("{name}-{version}.crate");
+            }
+        }
+        panic!("the lock names no crates.io package");
+    }
+}
+
+/// The archive file name and the directory it unpacks to, from a manifest.
+fn upstream(manifest: &Path) -> (String, String) {
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(manifest).expect("the manifest")).expect("JSON");
+    let text = |key: &str| manifest["upstream"][key].as_str().expect(key).to_owned();
+    (text("archive"), text("directory"))
 }
 
 fn git(directory: &Path, arguments: &[&str]) -> String {
@@ -187,31 +231,28 @@ fn said(output: &Output) -> String {
     )
 }
 
-/// The build refused: it exited with a failure, said which source and stopped before it
-/// configured anything.
+/// The check refused: it exited with a failure and said which source.
 fn assert_refused(output: &Output, source: &str) {
     let said = said(output);
-    assert!(!output.status.success(), "the build went on: {said}");
+    assert!(!output.status.success(), "the check passed: {said}");
     assert!(
         said.contains(source),
         "the refusal does not name {source}: {said}"
     );
-    assert!(
-        !said.contains("configuring"),
-        "the build went on to configure: {said}"
-    );
 }
 
-/// Sources that are placed are enough: the check passes with no server to ask, and fetches
-/// nothing.
+/// Sources that are placed are enough: the check passes with no server to ask. A fetch would fail
+/// against the closed port, so passing is the evidence that nothing was fetched.
 #[test]
 #[ignore = "needs the Fish sources placed; it runs with --include-ignored where they are, as continuous integration's shell-packages job does"]
 fn placed_sources_need_no_server() {
     let tree = Tree::new();
     let output = tree.check();
-    let said = said(&output);
-    assert!(output.status.success(), "the check failed: {said}");
-    assert!(!said.contains("fetching"), "the check fetched: {said}");
+    assert!(
+        output.status.success(),
+        "the check failed: {}",
+        said(&output)
+    );
 }
 
 /// A crate whose bytes are not the ones the lock holds a checksum for never reaches cargo.
@@ -219,7 +260,7 @@ fn placed_sources_need_no_server() {
 #[ignore = "needs the Fish sources placed; it runs with --include-ignored where they are, as continuous integration's shell-packages job does"]
 fn a_crate_with_other_bytes_is_refused() {
     let tree = Tree::new();
-    let name = tree.placed_file("", ".crate");
+    let name = tree.locked_crate();
     tree.change_file(&name, |mut bytes| {
         let middle = bytes.len() / 2;
         bytes[middle] ^= 0xff;
@@ -234,7 +275,7 @@ fn a_crate_with_other_bytes_is_refused() {
 #[ignore = "needs the Fish sources placed; it runs with --include-ignored where they are, as continuous integration's shell-packages job does"]
 fn a_bundle_of_another_commit_with_the_pinned_tree_is_refused() {
     let tree = Tree::new();
-    let name = tree.placed_file("fluent-ftl-tools-", ".bundle");
+    let (name, _) = tree.pinned_bundle("fluent-ftl-tools");
     let scratch = tempfile::tempdir().expect("a scratch directory");
     let repository = scratch.path().join("repository.git");
     git(
@@ -274,7 +315,7 @@ fn a_bundle_of_another_commit_with_the_pinned_tree_is_refused() {
 #[ignore = "needs the Fish sources placed; it runs with --include-ignored where they are, as continuous integration's shell-packages job does"]
 fn a_repository_with_another_tree_digest_is_refused() {
     let tree = Tree::new();
-    let name = tree.placed_file("fluent-ftl-tools-", ".bundle");
+    let (name, _) = tree.pinned_bundle("fluent-ftl-tools");
     tree.change_manifest(|manifest| {
         for entry in manifest["cargo"]["git"].as_array_mut().expect("the pins") {
             if entry["name"] == "fluent-ftl-tools" {
@@ -290,9 +331,10 @@ fn a_repository_with_another_tree_digest_is_refused() {
 #[ignore = "needs the Fish sources placed; it runs with --include-ignored where they are, as continuous integration's shell-packages job does"]
 fn a_repository_the_manifest_does_not_pin_is_refused() {
     let tree = Tree::new();
+    let (_, revision) = tree.pinned_bundle("fluent-rs");
     tree.change_manifest(|manifest| {
         let pins = manifest["cargo"]["git"].as_array_mut().expect("the pins");
         pins.retain(|entry| entry["name"] != "fluent-rs");
     });
-    assert_refused(&tree.check(), "cf712bced280b217b6307edabc2089b3e57204ab");
+    assert_refused(&tree.check(), &revision);
 }
