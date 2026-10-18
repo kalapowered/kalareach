@@ -194,7 +194,7 @@ no confirmed outcome, and ends by saying that nothing was sent again.
 - Every control is at least 44 points on iOS and 48 density-independent pixels on Android, in both
   dimensions.
 - **Text follows the person's text size**, from the smallest setting to the largest accessibility
-  size. Spacing is in `rem`, so the layout grows with the text, up to a cap where growing would take
+  size. Spacing is in `rem` up to a cap, so the layout grows with the text until growing would take
   the screen from its text. On Android, the web view multiplies the size of the root element by the
   font scale factor, and the system restarts the activity when the font scale changes, which reloads
   the page at the new size. The activity does not take the change itself, because its web view would
@@ -202,13 +202,15 @@ no confirmed outcome, and ends by saying that nothing was sent again.
   stays at 16px. The page reads the size of an element set in `-apple-system-body`, a font keyword
   WebKit ties to Dynamic Type, and multiplies the root by its ratio to the size at the default
   setting, as `--text-scale`. That follows a change made while the application runs. Sizes on iOS
-  reach three times the base size, so there the two bars stop growing at one and a half times it,
-  and the terminal grid at twice it. The insets of the account screen and of a card on it also stop
-  growing at one and a half times. Without that cap, the two insets take up nearly two thirds of
-  the width of a screen 320 points wide at the largest text size, and the text of the settings
-  breaks inside its words. The text is what a person asked to see larger, and the platforms keep
-  their layout margins where they are. A screen 320 points wide keeps room for its content: the
-  card's text has more than half of the screen's width at every text size.
+  reach three times the base size, so there the two bars and the spacing scale stop growing at one
+  and a half times it, and the terminal grid at twice it. The spacing is one scale for every screen:
+  the gutters of a tab, the insets of a card or a row, and the gaps between them. Without that cap,
+  the gutters and the insets of a row take up nearly two thirds of the width of a screen 320 points
+  wide at the largest text size, and the words of the row break inside themselves. Text is what the
+  user is asking to grow, and the platform layout margins don't grow. On every tab of a screen 320
+  points wide, the text of a card or a row keeps more than half of the width at every text size. A
+  pill that lies over the content, such as the one that tells of a new invitation, is sized as the
+  bars are, and the scroll area keeps a control that has focus out from under it.
 - **An entry in an agent's history is named in words**, such as "Conversation started" or "Tool
   finished", and never by its identifier. A kind this build does not know is called "Update from the
   agent", and its identifier stays on the entry as data.
