@@ -47,7 +47,7 @@ pub fn git_in(repository: &Path, arguments: &[&str]) -> Result<String, String> {
     String::from_utf8(output.stdout).map_err(|error| error.to_string())
 }
 
-fn is_ancestor(repository: &Path, ancestor: &str, descendant: &str) -> Result<bool, String> {
+pub fn is_ancestor(repository: &Path, ancestor: &str, descendant: &str) -> Result<bool, String> {
     let status = Command::new("git")
         .args(["merge-base", "--is-ancestor", ancestor, descendant])
         .current_dir(repository)
@@ -123,66 +123,70 @@ fn release_of(repository: &Path, tag: &str) -> Result<Release, String> {
     })
 }
 
-/// The release before the one at `commit`: the newest release tagged in its history at a level
-/// below its own.
+/// The releases before the one at `commit`: those tagged in its history at the highest level below
+/// its own, oldest first, so the last is the release before. Releases of a lower level than that
+/// are the business of the release that retained them.
 ///
 /// # Errors
 ///
-/// When no such release is tagged, when the tags do not lie on one line of history (so none is the
-/// newest), or when the newest tag states another version than its commit's package.
-pub fn before(repository: &Path, commit: &str) -> Result<Release, String> {
+/// When no release below the commit's level is tagged, when the tags of that level do not lie on
+/// one line of history (so none is the newest), when two tags name one commit, or when a tag
+/// states another version than its commit's package.
+pub fn before(repository: &Path, commit: &str) -> Result<Vec<Release>, String> {
     let level = CompatibilityLevel::of(package_version_at(repository, commit)?);
     let tags = git_in(
         repository,
         &["tag", "--merged", commit, "--list", "packages/v*"],
     )?;
-    let mut releases = Vec::new();
+    let mut below = Vec::new();
     for tag in tags.lines() {
         let release = release_of(repository, tag)?;
         if release.level() < level {
-            releases.push(release);
+            below.push(release);
         }
     }
-    let mut newest: Option<(usize, Release)> = None;
-    for release in releases.iter().cloned() {
-        let depth: usize = git_in(repository, &["rev-list", "--count", &release.commit])?
-            .trim()
-            .parse()
-            .map_err(|error| format!("git rev-list --count: {error}"))?;
-        if newest.as_ref().is_none_or(|(deepest, _)| depth > *deepest) {
-            newest = Some((depth, release));
-        }
-    }
-    let Some((_, newest)) = newest else {
+    let Some(highest) = below.iter().map(Release::level).max() else {
         return Err(format!(
             "no release below level {level} is tagged in the history of {commit}; fetch the \
              release tags (git fetch --tags)"
         ));
     };
-    for release in &releases {
-        if release.commit != newest.commit
-            && !is_ancestor(repository, &release.commit, &newest.commit)?
-        {
+    let mut releases = Vec::new();
+    for release in below
+        .into_iter()
+        .filter(|release| release.level() == highest)
+    {
+        let depth: usize = git_in(repository, &["rev-list", "--count", &release.commit])?
+            .trim()
+            .parse()
+            .map_err(|error| format!("git rev-list --count: {error}"))?;
+        let stated = package_version_at(repository, &release.commit)?;
+        if stated != release.version {
             return Err(format!(
-                "{} is not in the history of {}, so neither is the release before this one",
-                release.tag, newest.tag
+                "{} states {} and its commit's package is {stated}",
+                release.tag, release.version
             ));
         }
-        if release.commit == newest.commit && release.tag != newest.tag {
+        releases.push((depth, release));
+    }
+    releases.sort_by_key(|(depth, _)| *depth);
+    let releases: Vec<Release> = releases.into_iter().map(|(_, release)| release).collect();
+    for pair in releases.windows(2) {
+        let (older, newer) = (&pair[0], &pair[1]);
+        if older.commit == newer.commit {
             return Err(format!(
                 "{} and {} tag the same commit",
-                release.tag, newest.tag
+                older.tag, newer.tag
+            ));
+        }
+        if !is_ancestor(repository, &older.commit, &newer.commit)? {
+            return Err(format!(
+                "{} is not in the history of {}, so neither is the release before this one",
+                older.tag, newer.tag
             ));
         }
     }
-    let stated = package_version_at(repository, &newest.commit)?;
-    if stated != newest.version {
-        return Err(format!(
-            "{} states {} and its commit's package is {stated}",
-            newest.tag, newest.version
-        ));
-    }
-    Ok(newest)
+    Ok(releases)
 }
 
 /// Whether the newest of `retained` is the level of `release`.
@@ -246,10 +250,19 @@ mod tests {
             history
         }
 
+        /// Runs git in the repository with nothing of the caller's environment, configuration or
+        /// hooks: whatever runs these tests, they change this repository and no other.
         fn git(&self, arguments: &[&str]) -> String {
             let output = Command::new("git")
+                .env_clear()
+                .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+                .env("HOME", &self.directory)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
                 .args(["-c", "user.name=a", "-c", "user.email=a@example.invalid"])
                 .args(["-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false"])
+                .args(["-c", "core.hooksPath=/dev/null"])
                 .args(arguments)
                 .current_dir(&self.directory)
                 .output()
@@ -282,8 +295,11 @@ mod tests {
             tag
         }
 
-        fn before(&self, commit: &str) -> Result<Release, String> {
-            before(&self.directory, commit)
+        /// The release before `commit`, and the tags of its level up to it.
+        fn before(&self, commit: &str) -> Result<(Release, Vec<String>), String> {
+            let mut releases = before(&self.directory, commit)?;
+            let tags = releases.iter().map(|release| release.tag.clone()).collect();
+            Ok((releases.pop().expect("at least one"), tags))
         }
     }
 
@@ -297,33 +313,43 @@ mod tests {
         CompatibilityLevel::of(PackageVersion::new(0, minor, 0))
     }
 
-    /// The release before the one being cut is the newest tag below its level in its own history:
-    /// not a release of its own level, not a release of a higher level, not one on a branch that
-    /// is not merged, and not the older ones of the level before.
+    /// The release before the one being cut is the newest tag of the highest level below its own
+    /// that is in its history: not a release of its own level, not one on a branch that is not
+    /// merged, not one after it, not an older level's patch tagged later, and not the older
+    /// releases of the level before.
     #[test]
-    fn the_release_before_is_the_newest_tag_of_a_lower_level_in_the_history() {
+    fn the_release_before_is_the_newest_tag_of_the_highest_lower_level_in_the_history() {
         let history = History::new("newest");
         let older = history.commit("0.73.0", "older");
         history.release("0.73.0", &older);
         let first = history.commit("0.74.0", "first of the level");
-        history.release("0.74.0", &first);
+        let first_tag = history.release("0.74.0", &first);
         history.git(&["checkout", "-q", "-b", "side"]);
         let aside = history.commit("0.74.0", "released on a branch that is left");
         history.release("0.74.0", &aside);
         history.git(&["checkout", "-q", "main"]);
         let last = history.commit("0.74.0", "last of the level");
-        let tag = history.release("0.74.0", &last);
+        let last_tag = history.release("0.74.0", &last);
+        // A fix to the level before that one, released after this level's last release.
+        let patch = history.commit("0.73.1", "a patch of the level before");
+        history.release("0.73.1", &patch);
+        let early = history.commit("0.75.0", "an earlier cut of the level");
+        history.release("0.75.0", &early);
         let cut = history.commit("0.75.0", "the release being cut");
-        history.release(
-            "0.75.0",
-            &history.commit("0.75.0", "an earlier cut of the level"),
-        );
-        let found = history.before(&cut).expect("a release before");
-        assert_eq!(found.tag, tag);
+        // A release tagged after the commit is not in its history.
+        history.release("0.76.0", &history.commit("0.76.0", "a later level"));
+
+        let (found, level_tags) = history.before(&cut).expect("a release before");
+        assert_eq!(found.tag, last_tag);
         assert_eq!(found.commit, last);
         assert_eq!(found.level(), level(74));
+        assert_eq!(
+            level_tags,
+            [first_tag, last_tag],
+            "every release of the level, oldest first"
+        );
         // The commit that is the last of a level has the one before it.
-        assert_eq!(history.before(&last).expect("before").commit, older);
+        assert_eq!(history.before(&last).expect("before").0.commit, older);
     }
 
     /// What cannot name a release before is an error and not a guess.
@@ -337,15 +363,31 @@ mod tests {
         // A tag of the level being cut is not a release before it.
         history.release("0.75.0", &cut);
         assert!(history.before(&cut).is_err());
-        // Nor is a tag that names another commit than it points at.
+        // Nor is a tag that is not of the form,
+        history.git(&["tag", "packages/vnext", &first]);
+        let error = history.before(&cut).expect_err("a stray tag");
+        assert!(error.contains("is not of the form"), "{error}");
+        history.git(&["tag", "-d", "packages/vnext"]);
+        // or one whose commit part is not the twelve characters the release script gives,
+        history.git(&["tag", "packages/v0.74.0+abc", &first]);
+        let error = history.before(&cut).expect_err("a short name");
+        assert!(error.contains("is not of the form"), "{error}");
+        history.git(&["tag", "-d", "packages/v0.74.0+abc"]);
+        // or one that names another commit than it points at,
         history.git(&["tag", "packages/v0.74.0+000000000000", &first]);
         let error = history.before(&cut).expect_err("a wrong name");
         assert!(error.contains("which it does not name"), "{error}");
+        history.git(&["tag", "-d", "packages/v0.74.0+000000000000"]);
+        // or one whose version is not its commit's.
+        history.release("0.74.1", &first);
+        let error = history.before(&cut).expect_err("a wrong version");
+        assert!(error.contains("its commit's package is 0.74.0"), "{error}");
     }
 
-    /// Two releases that neither contains cannot be ordered, so neither is called the newest.
+    /// Two releases of the level that neither contains cannot be ordered, so neither is called the
+    /// newest; releases of a lower level on a branch that was merged do not matter.
     #[test]
-    fn tags_that_are_not_on_one_line_of_history_are_refused() {
+    fn tags_of_the_level_that_are_not_on_one_line_of_history_are_refused() {
         let history = History::new("branches");
         history.commit("0.73.0", "base");
         history.git(&["checkout", "-q", "-b", "side"]);
@@ -358,9 +400,15 @@ mod tests {
         let cut = history.commit("0.75.0", "cut");
         let error = history.before(&cut).expect_err("two lines");
         assert!(error.contains("is not in the history of"), "{error}");
+        // Once a later level is released, those two are the business of the release that retained
+        // them, and the release before the next cut is the later one.
+        let later = history.commit("0.75.0", "later");
+        let tag = history.release("0.75.0", &later);
+        let next = history.commit("0.76.0", "next cut");
+        assert_eq!(history.before(&next).expect("one line").0.tag, tag);
     }
 
-    /// The newest retained level has to be the release before this one's.
+    /// The newest retained level has to be the level of the release before.
     #[test]
     fn the_newest_retained_level_is_the_level_of_the_release_before() {
         let release = Release {

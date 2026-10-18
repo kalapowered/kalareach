@@ -13,7 +13,7 @@
 //! kr-protocol-gen --docs-dir P      write the index to, and read the documentation from, P
 //! kr-protocol-gen --retain L --commit C           cut retained level L from the release at C
 //! kr-protocol-gen --release-commit L C            move level L's record to release C, the release before this one, if its schema is the kept one
-//! kr-protocol-gen --predecessor                   print the level and commit of the release before this one, which has to be the newest retained level
+//! kr-protocol-gen --predecessor                   print the level, commit and tag of the release before this one, which has to be the newest retained level
 //! ```
 
 mod method_index;
