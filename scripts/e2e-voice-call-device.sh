@@ -258,6 +258,11 @@ run_ios() {
     [ -d "$app" ] || { say "the build left no application"; return 2; }
     build_harness || return 2
 
+    # A simulator that is already running is someone else's: it is neither used nor shut down.
+    if xcrun simctl list devices booted | grep -q "$udid"; then
+        say "the simulator $device is already running, which is left alone"
+        return 3
+    fi
     say "starting the simulator $device"
     xcrun simctl boot "$udid" >/dev/null 2>&1
     xcrun simctl bootstatus "$udid" -b >/dev/null 2>&1
