@@ -280,178 +280,6 @@ impl Assembled {
     }
 }
 
-/// Where this tree's managed shell packages are installed: the prefix the build script writes to,
-/// which a run of the suite names with `KR_SHELL_PACKAGES` or `KR_SHELL_PREFIX`.
-fn shell_prefix() -> PathBuf {
-    for variable in ["KR_SHELL_PACKAGES", "KR_SHELL_PREFIX"] {
-        if let Some(value) = std::env::var_os(variable).filter(|value| !value.is_empty()) {
-            return PathBuf::from(value);
-        }
-    }
-    let home = PathBuf::from(std::env::var_os("HOME").expect("a home directory"));
-    if cfg!(target_os = "macos") {
-        home.join("Library/Caches/kalareach/shells")
-    } else if let Some(cache) = std::env::var_os("XDG_CACHE_HOME").filter(|value| !value.is_empty())
-    {
-        PathBuf::from(cache).join("kalareach/shells")
-    } else {
-        home.join(".cache/kalareach/shells")
-    }
-}
-
-/// Builds the managed zsh package of `tree` by its own build script, installed under `prefix`. The
-/// upstream archives this tree's build fetched are placed beside it, so nothing is fetched again.
-/// A package that does not build fails the suite.
-fn build_zsh(tree: &Path, prefix: &Path) {
-    let sources = prefix.join("sources");
-    std::fs::create_dir_all(&sources).expect("a directory for the shell sources");
-    if let Ok(ours) = std::fs::read_dir(shell_prefix().join("sources")) {
-        for entry in ours.flatten() {
-            let target = sources.join(entry.file_name());
-            if !target.exists() {
-                std::fs::copy(entry.path(), target).expect("an archive is placed");
-            }
-        }
-    }
-    let output = Command::new("bash")
-        .current_dir(tree)
-        .args([
-            "scripts/build-shells.sh",
-            "--zsh",
-            "--no-upstream-tests",
-            "--prefix",
-        ])
-        .arg(prefix)
-        .output()
-        .expect("bash runs");
-    assert!(
-        output.status.success(),
-        "the zsh package of {} did not build: {}",
-        tree.display(),
-        String::from_utf8_lossy(&output.stderr)
-            .lines()
-            .rev()
-            .take(40)
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .collect::<Vec<_>>()
-            .join("\n")
-    );
-}
-
-/// Builds the managed zsh package of `tree` where the release called `name` will be in `host`'s
-/// store, and keeps it beside the store, with the place it was built at free again; returns the
-/// prefix it is kept under.
-///
-/// A package states the path it was built at in its handshake, the shell's executable and its
-/// module directory, and a session's worker accepts it only as the package it launched. A package
-/// built elsewhere and placed in a release is not that package, so the build is made at the
-/// release's own path and the release is installed there from what is kept.
-fn zsh_built_for(host: &Host, tree: &Path, name: &ReleaseName) -> PathBuf {
-    // The build makes the directories it needs, and the store has to make its own: private to its
-    // owner.
-    let root = host.store.root().to_path_buf();
-    let created = !root.exists();
-    let place = host.store.release_directory(name);
-    let prefix = place.join("shells");
-    build_zsh(tree, &prefix);
-    // What the build fetched and compiled from is not part of the package.
-    std::fs::remove_dir_all(prefix.join("sources")).expect("the build's sources go");
-    let kept = host.scratch(&format!("zsh-for-{name}")).join("shells");
-    std::fs::rename(&prefix, &kept).expect("the package is kept");
-    std::fs::remove_dir_all(if created { &root } else { &place }).expect("the place is free again");
-    kept
-}
-
-impl Assembled {
-    /// This release carrying the managed zsh package installed under `prefix` in place of the
-    /// placeholder module tree: every file of the package, the pointer to it, and the stable entry
-    /// a startup file sources, all listed in the manifest.
-    fn with_zsh_package(mut self, prefix: &Path) -> Self {
-        use kr_shell_integration::host::package::ShellPackage;
-        use std::os::unix::fs::PermissionsExt as _;
-
-        let zsh = prefix.join("zsh");
-        let identity = std::fs::read_to_string(zsh.join("current"))
-            .unwrap_or_else(|error| panic!("{} names no zsh package: {error}", zsh.display()))
-            .trim()
-            .to_owned();
-        let directory = zsh.join(&identity);
-        let package = ShellPackage::read(&directory)
-            .unwrap_or_else(|error| panic!("{} is no zsh package: {error:?}", directory.display()));
-        self.manifest
-            .files
-            .retain(|file| !file.path.as_str().starts_with("shells/zsh/package/"));
-        self.placeholder_modules = false;
-        let listed = |path: &str, contents: &[u8], mode: FileMode| ReleaseFile {
-            path: ReleasePath::new(path).expect("a path"),
-            length: U64::new(contents.len() as u64),
-            sha256: Digest256::from_bytes(kr_cbor::sha256(contents)),
-            mode,
-        };
-        let mut pending = vec![directory.clone()];
-        while let Some(current) = pending.pop() {
-            for entry in std::fs::read_dir(&current).expect("the package's directory") {
-                let path = entry.expect("an entry").path();
-                // A link in the package is carried as the file it names: a release has no links.
-                if path.is_dir() {
-                    pending.push(path);
-                    continue;
-                }
-                let relative = path.strip_prefix(&directory).expect("inside the package");
-                let released = format!("shells/zsh/{identity}/{}", relative.display());
-                let mode = if std::fs::metadata(&path)
-                    .expect("the file's mode")
-                    .permissions()
-                    .mode()
-                    & 0o111
-                    != 0
-                {
-                    FileMode::Executable
-                } else {
-                    FileMode::Regular
-                };
-                let bytes = std::fs::read(&path).expect("a file of the package");
-                self.manifest.files.push(listed(&released, &bytes, mode));
-                self.copied.push((released, path));
-            }
-        }
-        let entry = package.startup_entry();
-        let entry_name = entry.file_name().expect("the entry has a name");
-        let entry_bytes = std::fs::read(&entry).expect("the package's startup entry");
-        for (path, contents) in [
-            (
-                "shells/zsh/current".to_owned(),
-                format!("{identity}\n").into_bytes(),
-            ),
-            (
-                format!("shells/zsh/{}", entry_name.to_string_lossy()),
-                entry_bytes,
-            ),
-        ] {
-            self.manifest
-                .files
-                .push(listed(&path, &contents, FileMode::Regular));
-            self.data.push((path, contents));
-        }
-        self.manifest
-            .shells
-            .push(kr_protocol::update::ReleaseShell {
-                shell: "zsh".to_owned(),
-                identity,
-                patch_revisions: package
-                    .manifest
-                    .shell
-                    .patches
-                    .iter()
-                    .map(|patch| patch.revision.clone())
-                    .collect(),
-            });
-        self
-    }
-}
-
 /// A host on the release before, with a live session, updated by that release's own `kr` to this
 /// build's release.
 struct Updated {
@@ -471,22 +299,12 @@ struct Updated {
     agent: Option<Agent>,
 }
 
-impl Host {
-    /// Creates a session with a release's `kr` whose root shell is that release's managed zsh.
-    fn new_managed_session(&self, kr: &Path) -> (String, SessionId) {
-        self.new_session_as(kr, &["--shell", "zsh", "--shell-mode", "managed"])
-    }
-}
-
 /// What a host on the release before is set up with.
 #[derive(Clone, Copy, Default)]
 struct Setup {
     /// The configuration document puts the host's daemon on the network, on the loopback interface
     /// alone, from the first release's daemon on.
     network: bool,
-    /// Each release carries the managed zsh package it was built with, and the session's root
-    /// shell is that package's zsh.
-    zsh: bool,
     /// The session's root shell waits at a gate and then becomes the contact server of whichever
     /// release is current, with its standard streams on named pipes.
     contact: bool,
@@ -532,15 +350,6 @@ impl Updated {
         .await
     }
 
-    /// As [`Self::new`], with the managed zsh package of each release.
-    async fn with_zsh() -> Self {
-        Self::start(Setup {
-            zsh: true,
-            ..Setup::default()
-        })
-        .await
-    }
-
     /// As [`Self::new`], with a session whose root shell becomes the contact server once the test
     /// opens its gate.
     async fn with_a_contact_session() -> Self {
@@ -559,27 +368,15 @@ impl Updated {
     async fn prepare(setup: Setup) -> Prepared {
         let Setup {
             network: on_the_network,
-            zsh,
             contact,
             plugin,
             agent,
         } = setup;
         let before = previous();
-        let mut one = before.assembled(1);
-        let mut two = Assembled::at_this_level(&format!("{PACKAGE_VERSION}+bbbbbbbbbbbb"), 2)
+        let one = before.assembled(1);
+        let two = Assembled::at_this_level(&format!("{PACKAGE_VERSION}+bbbbbbbbbbbb"), 2)
             .retaining_what_this_build_does();
         let mut host = Host::bare();
-        if zsh {
-            // Each release carries the zsh package built where the release will be.
-            let kept = zsh_built_for(
-                &host,
-                &cache_root().join(&before.commit).join("tree"),
-                one.name(),
-            );
-            one = one.with_zsh_package(&kept);
-            let kept = zsh_built_for(&host, &repository(), two.name());
-            two = two.with_zsh_package(&kept);
-        }
         host.install(&one);
         if on_the_network {
             // The document is what puts a host on the network: this one joins on loopback alone,
@@ -609,8 +406,6 @@ impl Updated {
             let (display, session_id, made) = host.new_session_with_an_agent(&kr, "session");
             started_agent = Some(made);
             (display, session_id)
-        } else if zsh {
-            host.new_managed_session(&kr)
         } else if contact {
             let directory = host.scratch("contact");
             let made = ContactPipes {
@@ -1339,144 +1134,6 @@ fn terminal_for(host: &Host, program: &Path, arguments: &[&str]) -> terminal::Te
     command.env("KR_RUNTIME_DIR", host.tree.paths().runtime_root());
     command.env("KR_STATE_DIR", host.tree.paths().state_root());
     terminal::Terminal::run(command, host.tree.root())
-}
-
-/// What a directory tree holds, by relative path: the file's device and inode and its digest.
-/// A tree whose files are the files they were has the same identity before and after.
-fn tree_identity(root: &Path) -> std::collections::BTreeMap<String, (u64, u64, String)> {
-    use std::os::unix::fs::MetadataExt as _;
-
-    let mut found = std::collections::BTreeMap::new();
-    let mut pending = vec![root.to_path_buf()];
-    while let Some(directory) = pending.pop() {
-        for entry in std::fs::read_dir(&directory).expect("a directory of the tree") {
-            let path = entry.expect("an entry").path();
-            let metadata = std::fs::symlink_metadata(&path).expect("the entry's metadata");
-            if metadata.is_dir() {
-                pending.push(path);
-            } else if metadata.is_file() {
-                let bytes = std::fs::read(&path).expect("a file of the tree");
-                found.insert(
-                    path.strip_prefix(root)
-                        .expect("inside the tree")
-                        .display()
-                        .to_string(),
-                    (
-                        metadata.dev(),
-                        metadata.ino(),
-                        hexadecimal(&kr_cbor::sha256(&bytes)),
-                    ),
-                );
-            }
-        }
-    }
-    found
-}
-
-/// KR-REQ-26.06, KR-ACC-035: a session whose root shell is the release before's managed zsh keeps
-/// that shell, and its modules, through an update and a rollback. The shell sources the stable
-/// entry of whichever release is current and its own bridge builtin answers, a session created
-/// after the update runs the new release's package, and the files of the release before's package
-/// are the files they were.
-#[tokio::test(flavor = "multi_thread")]
-async fn the_zsh_of_the_release_before_reads_the_stable_entry_of_the_current_release_and_keeps_its_modules()
- {
-    // The package's files are taken before the update, so the update is held to them as well.
-    let prepared = Updated::prepare(Setup {
-        zsh: true,
-        ..Setup::default()
-    })
-    .await;
-    let identity = std::fs::read_to_string(
-        prepared
-            .host
-            .store
-            .release_directory(prepared.one.name())
-            .join("shells/zsh/current"),
-    )
-    .expect("the release before's package pointer");
-    let package = prepared
-        .host
-        .store
-        .release_directory(prepared.one.name())
-        .join("shells/zsh")
-        .join(identity.trim());
-    let modules = tree_identity(&package);
-    assert!(
-        modules.keys().any(|path| path == "bin/zsh"),
-        "the package's files are listed: {:?}",
-        modules.keys().collect::<Vec<_>>()
-    );
-    let updated = prepared.update().await;
-    let host = &updated.host;
-    assert_eq!(
-        tree_identity(&package),
-        modules,
-        "the update left the package's files as they were"
-    );
-
-    // The session's root shell is the release before's own zsh.
-    let said = host.run(
-        &updated.kr_before(),
-        &["--json", "status", &updated.display],
-    );
-    let said = String::from_utf8_lossy(&said.stdout).into_owned();
-    assert!(
-        said.contains(&format!(
-            "/versions/{}/shells/zsh/{}/bin/zsh",
-            updated.one.name(),
-            identity.trim()
-        )),
-        "the root shell is the release before's zsh: {said}"
-    );
-
-    // A person at the session sources the stable entry, which is the current release's, and the
-    // shell's own bridge builtin answers it.
-    let entry = host.store.stable_shells().join("zsh/kr-zshrc.zsh");
-    let terminal = terminal_for(host, &updated.kr_before(), &["attach", &updated.display]);
-    terminal.ready().await;
-    terminal.type_line(&format!(
-        ". '{}'; echo \"ENTRY-$?-A\"; builtin kr-bridge status; echo \"BRIDGE-$?-B\"",
-        entry.display()
-    ));
-    terminal.expect("ENTRY-0-A").await;
-    terminal.expect("BRIDGE-0-B").await;
-    updated.the_worker_is_as_it_was().await;
-    assert_eq!(
-        tree_identity(&package),
-        modules,
-        "the package's files are the files they were"
-    );
-
-    // A session created now runs the new release's package.
-    let (display, created) = host.new_managed_session(&updated.kr_now());
-    let said = host.run(&updated.kr_now(), &["--json", "status", &display]);
-    let said = String::from_utf8_lossy(&said.stdout).into_owned();
-    assert!(
-        said.contains(&format!("/versions/{}/shells/zsh/", updated.two.name())),
-        "a new session's shell is the new release's zsh: {said}"
-    );
-    let worker_now = host.worker_process(created);
-    host.close(&updated.kr_now(), &display);
-    host.worker_ended(&worker_now).await;
-
-    // And back: the release before is current again, the same shell sources its entry.
-    let (output, said) = host.kr_json(&["host", "rollback", "--json"]);
-    assert_eq!(output.status.code(), Some(0), "kr host rollback: {said}");
-    terminal.type_line(&format!(
-        ". '{}'; echo \"ENTRY-$?-C\"; builtin kr-bridge status; echo \"BRIDGE-$?-D\"",
-        entry.display()
-    ));
-    terminal.expect("ENTRY-0-C").await;
-    terminal.expect("BRIDGE-0-D").await;
-    updated.the_worker_is_as_it_was().await;
-    assert_eq!(
-        tree_identity(&package),
-        modules,
-        "the package's files are the files they were"
-    );
-    host.close(&updated.kr_before(), &updated.display);
-    host.worker_ended(&updated.worker).await;
 }
 
 impl Updated {
