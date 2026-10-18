@@ -47,6 +47,7 @@ pub mod probe;
 pub mod questions;
 pub mod recovery;
 pub mod remote;
+pub mod revocation;
 pub mod settings;
 pub mod setup;
 pub mod sharing;
@@ -820,6 +821,7 @@ pub fn start_pairing<R: tauri::Runtime>(
             }
         }
     })?;
+    let revocations = revocation::Revocations::new(Arc::clone(&device), Arc::clone(&ceremony));
     let emitter = app.clone();
     let owner = owner::Owner::new(Arc::clone(&device), ceremony, move || {
         if let Ok(owner) = emitter.state::<AppState>().owner() {
@@ -827,7 +829,7 @@ pub fn start_pairing<R: tauri::Runtime>(
         }
     });
     app.state::<AppState>()
-        .opened(Arc::clone(&device), Arc::clone(&owner), paste);
+        .opened(Arc::clone(&device), Arc::clone(&owner), paste, revocations);
     device.start();
     owner.start();
     Ok(())

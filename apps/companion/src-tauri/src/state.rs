@@ -41,6 +41,7 @@ pub struct AppState {
     /// application's start and an unlock) are made one after the other.
     opening_records: Mutex<()>,
     owner: OnceLock<Arc<Owner>>,
+    revocations: OnceLock<Arc<crate::revocation::Revocations>>,
     paste: OnceLock<Arc<dyn PastePlatform>>,
     sync_service: OnceLock<Arc<SyncService>>,
     recovery: OnceLock<Arc<Recovery>>,
@@ -79,6 +80,7 @@ impl AppState {
             records_failure: RwLock::new(None),
             opening_records: Mutex::new(()),
             owner: OnceLock::new(),
+            revocations: OnceLock::new(),
             paste: OnceLock::new(),
             sync_service: OnceLock::new(),
             recovery: OnceLock::new(),
@@ -357,10 +359,17 @@ impl AppState {
 
     /// Records this computer as a device that pairs, once it has been opened, and where it pastes
     /// invitations from.
-    pub fn opened(&self, device: Arc<Device>, owner: Arc<Owner>, paste: Arc<dyn PastePlatform>) {
+    pub fn opened(
+        &self,
+        device: Arc<Device>,
+        owner: Arc<Owner>,
+        paste: Arc<dyn PastePlatform>,
+        revocations: Arc<crate::revocation::Revocations>,
+    ) {
         let _ = self.device.set(device);
         let _ = self.owner.set(owner);
         let _ = self.paste.set(paste);
+        let _ = self.revocations.set(revocations);
         // Once they are open, so that nothing that asks in between hears of a failure that is over.
         *self
             .records_failure
@@ -444,6 +453,30 @@ impl AppState {
             .get()
             .cloned()
             .ok_or_else(|| self.records_unavailable())
+    }
+
+    /// This computer's revocations of devices on the hosts it owns.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stated local failure, with its cause, when its keys or records could not be
+    /// opened.
+    pub fn revocations(&self) -> Result<Arc<crate::revocation::Revocations>> {
+        self.revocations
+            .get()
+            .cloned()
+            .ok_or_else(|| self.records_unavailable())
+    }
+
+    /// What a revocation is told of this application beyond this computer's records: the host on
+    /// this computer, when the application is connected to it, the sync service, and settings.
+    #[must_use]
+    pub fn revocation_context(&self) -> crate::revocation::Context {
+        crate::revocation::Context {
+            local: self.connection().ok(),
+            origin: self.sync_service().ok().map(|service| service.origin()),
+            settings: self.settings().ok(),
+        }
     }
 
     /// Records the sync service this computer is set to use.

@@ -489,6 +489,8 @@ impl Companion {
                 companion_tauri::commands::pairing_stop,
                 companion_tauri::commands::owner_confirmations,
                 companion_tauri::commands::owner_confirmation_review,
+                companion_tauri::commands::revocation_view,
+                companion_tauri::commands::revocation_revoke,
                 companion_tauri::commands::hosts_use,
                 companion_tauri::commands::hosts_forget,
                 companion_tauri::commands::connection_state,

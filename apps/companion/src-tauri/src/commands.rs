@@ -153,6 +153,9 @@ pub const NAMED_COMMANDS: &[(&str, Option<Method>)] = &[
     // The owner's confirmations of this computer's hosts.
     ("owner_confirmations", None),
     ("owner_confirmation_review", None),
+    // The devices of the hosts this computer owns, and revoking one of them.
+    ("revocation_view", None),
+    ("revocation_revoke", None),
     // The host a phone's commands go to.
     ("hosts_use", None),
     ("hosts_forget", None),
@@ -361,6 +364,15 @@ pub const NATIVE_METHODS: &[(&str, &[Method])] = &[
             Method::OwnerConfirmationComplete,
         ],
     ),
+    // The devices of the host on this computer, and of each host this computer owns, are listed; a
+    // revocation reaches the host on this computer by `device.revoke` over the connection the
+    // application holds to it, and any other host through its feed, which is a service and not a
+    // host method. The page names a host and a device by references native code gave it.
+    ("revocation_view", &[Method::DeviceList]),
+    (
+        "revocation_revoke",
+        &[Method::DeviceList, Method::DeviceRevoke],
+    ),
     // A view attaches, subscribes, reports its size and its window's place, takes and gives back
     // the input lease, writes the person's wheel turns and keys under it, and detaches, all on the
     // session's worker. The page supplies a session, a grid, its moves and the person's input; what
@@ -531,6 +543,8 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'static
         pairing_stop,
         owner_confirmations,
         owner_confirmation_review,
+        revocation_view,
+        revocation_revoke,
         hosts_use,
         hosts_forget,
         voice_prepare,
@@ -2303,6 +2317,32 @@ pub async fn owner_confirmation_review(
     state.owner()?.review(&request.reference).await
 }
 
+/// The devices of the host on this computer and of every host this computer owns, each with where a
+/// revocation of it stands, and what each host's feed holds of its last acknowledgement. Every host
+/// and every feed is asked.
+#[tauri::command]
+pub async fn revocation_view(
+    state: State<'_, AppState>,
+) -> Result<crate::revocation::RevocationView> {
+    Ok(state.revocations()?.view(&state.revocation_context()).await)
+}
+
+/// Revokes a device on a host this computer owns, once the person confirms it with the platform's
+/// ceremony. The page names a host and a device by the references the view gave it, never a key, an
+/// identifier or a method: native code sends the revocation to the host on this computer directly
+/// and to any other host through its feed.
+#[tauri::command]
+pub async fn revocation_revoke(
+    state: State<'_, AppState>,
+    host: String,
+    device: String,
+) -> Result<crate::revocation::RevocationView> {
+    state
+        .revocations()?
+        .revoke(&state.revocation_context(), &host, &device)
+        .await
+}
+
 /// Opens an external link, after checking its scheme.
 #[tauri::command]
 pub async fn open_external(app: tauri::AppHandle, url: String) -> Result<links::Approved> {
@@ -3261,6 +3301,8 @@ mod tests {
         "pairing_stop",
         "owner_confirmations",
         "owner_confirmation_review",
+        "revocation_view",
+        "revocation_revoke",
         "hosts_use",
         "hosts_forget",
         "voice_prepare",
@@ -3400,6 +3442,10 @@ mod tests {
                 "pairing_stop",
                 "owner_confirmations",
                 "owner_confirmation_review",
+                // The devices of the hosts this computer owns, and revoking one of them: native
+                // code lists them, asks the person, and sends the revocation itself.
+                "revocation_view",
+                "revocation_revoke",
                 // The host a phone's commands go to: it pairs, then it chooses, and it may forget.
                 "hosts_use",
                 "hosts_forget",
@@ -3534,6 +3580,7 @@ mod tests {
             Method::OwnerConfirmationComplete,
             Method::OwnerConfirmationRequest,
             Method::GrantTransfer,
+            Method::DeviceRevoke,
         ] {
             assert!(!page.contains(&method), "{method} is a page method");
         }
@@ -3547,6 +3594,12 @@ mod tests {
         assert_eq!(
             performing(Method::OwnerConfirmationComplete),
             BTreeSet::from(["owner_confirmation_review"])
+        );
+        // A device is revoked at the host on this computer by the one command that asks the person
+        // first, and at any other host through its feed, which is no host method.
+        assert_eq!(
+            performing(Method::DeviceRevoke),
+            BTreeSet::from(["revocation_revoke"])
         );
         assert_eq!(
             performing(Method::PairFinish),

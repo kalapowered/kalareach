@@ -29,7 +29,7 @@ use crate::error::CommandError;
 use crate::state::AppState;
 
 /// How long the host is given to say where privacy mode stands.
-const ANSWER_WITHIN: Duration = Duration::from_secs(10);
+pub(crate) const ANSWER_WITHIN: Duration = Duration::from_secs(10);
 
 /// One connection to one host: a reconnection to the same host is another. The session is held
 /// weakly, so its address is not given to another while the cache names it.
@@ -123,7 +123,7 @@ fn unreadable(reason: impl Into<String>) -> HostPrivacy {
 }
 
 /// What a host said when asked for its devices.
-enum Listing {
+pub(crate) enum Listing {
     /// Its list.
     Listed(DeviceListResult),
     /// It answered that this device may not list its devices, as a host does once the grant that
@@ -151,7 +151,7 @@ impl Listing {
     /// What a failed connection to a host says. A host that does not find this computer paired
     /// answers the hello as it would an unpaired peer, which this computer ends itself, so it
     /// reads as a connection lost, as a host that is asleep does.
-    fn of_link(error: &LinkError) -> Self {
+    pub(crate) fn of_link(error: &LinkError) -> Self {
         match error {
             LinkError::Refused(refusal) => Self::of_refusal(refusal.code),
             _ => Self::Silent,
@@ -160,7 +160,7 @@ impl Listing {
 }
 
 /// What a host lists as its devices, asked over `session`.
-async fn listed(session: &Arc<Session>) -> Listing {
+pub(crate) async fn listed(session: &Arc<Session>) -> Listing {
     let asked = tokio::time::timeout(
         ANSWER_WITHIN,
         session.read::<_, DeviceListResult>(
