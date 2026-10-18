@@ -49,8 +49,8 @@ async function withSystemTextScale(page: Page, ratio: number): Promise<void> {
  * Sets the page's face to one as wide as the Linux runner draws with, from the page's first frame.
  * The system's own face differs from one platform to the next, and a layout that holds only for the
  * widths of the face it was drawn with does not hold. DejaVu Sans, which the runner draws the page
- * in, sets about a tenth more text across a line than a phone's or a Mac's does; Verdana is as wide
- * and every Mac has it, with DejaVu Sans after it for the machine that has none.
+ * in, sets the same text about a tenth wider across a line than a phone's or a Mac's face does;
+ * Verdana is as wide and every Mac has it, with DejaVu Sans after it for the machine that has none.
  */
 async function withWideFace(page: Page): Promise<void> {
   await page.addInitScript(() => {
@@ -487,8 +487,8 @@ test.describe('at the largest text size on a screen 320 points wide', () => {
       })
     }
 
-    // The same start, in a face wider than the system's: the words that say the end has begun take
-    // more lines, and the control that was pressed and the words together are taller than the screen
+    // The same start, in a face as wide as the runner's: the words that say the end has begun take
+    // more lines than in a phone's face, and the control that was pressed and the words together are taller than the screen
     // they are on. The control stays on the screen, as the words are brought into view only as far
     // as that allows.
     test(`keeps the control that gives a start up on the screen when the words beside it need more than the screen, in a wide face, on ${surface}`, async ({
@@ -515,7 +515,8 @@ test.describe('at the largest text size on a screen 320 points wide', () => {
       await expect(words).toBeFocused()
 
       // The face is the one drawn, not only the one named: a machine with neither face would set the
-      // page in the fallback, narrower than either, and the case would pass for nothing.
+      // page in the fallback, narrower than either, and would fail further down for its heights, not
+      // for its face.
       const drawnWide = await page.evaluate(() => {
         const context = document.createElement('canvas').getContext('2d')
         if (context === null) return false
