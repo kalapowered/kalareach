@@ -3443,16 +3443,17 @@ async fn a_draft_saved_after_a_revocation_is_not_sent_under_the_key_the_removed_
         .await
         .expect("the settings are sealed under an epoch");
 
-    // The step in hand has read the settings, and the drafts are the next it does.
+    // The step asks the service for the collection's key records and then for the settings; its
+    // answer to the second is out, and the drafts are the next it does.
     let web = this.served.web();
     let asked = sync_requests(&this);
-    web.fail(SYNC_PATH, 1, Moment::Slow);
+    web.fail(SYNC_PATH, 2, Moment::Slow);
     let settings = page.app.state::<AppState>().settings().expect("settings");
     let step = tokio::spawn({
         let settings = Arc::clone(&settings);
         async move { settings.sync_now().await }
     });
-    web.requests_reach(SYNC_PATH, asked + 1).await;
+    web.requests_reach(SYNC_PATH, asked + 2).await;
     let revoked = [phone_key];
     let mut revoking = std::pin::pin!(settings.revocations_sent(&revoked));
     assert!(
