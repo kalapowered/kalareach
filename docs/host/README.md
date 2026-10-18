@@ -1443,8 +1443,9 @@ and what it will not tell this host.
 A desktop is not a permission. Screen capture and input injection each need an operating-system
 permission that selecting a desktop does not carry, and `environment.capabilities` answers each of
 them separately, in the shared capability-evidence shape, saying what produced the answer and what
-makes it stale. Nothing there performs the operation a capability is: a platform query can refuse
-either of them and cannot establish one, so an answer nothing has run says exactly that. There is no
+makes it stale. No read there performs the operation a capability is: a platform query can refuse
+either of them and cannot establish one, so an answer nothing has run says exactly that. The owner
+asks for the operations with `environment.capabilities.check`, which `docs/host/platforms.md` describes. There is no
 general desktop-control interface here either: desktop automation means the user's own tools running
 in the selected context under the permissions they were granted.
 
@@ -1483,10 +1484,11 @@ nothing was established either way rather than claiming an answer.
 
 Every result is a capability record in the shared shape: the state, `disclosed_probe` as what
 produced it, the exact facility it was established about, and what makes it stale. That last part
-is what decides when a check runs again: the facility or the host agent being replaced, an
-operating-system permission changing, a new login, or a different execution profile. Time is not on
-the list. Nothing about a permission changes because an hour passed, and a check that re-ran on a
-clock would take an image of your screen for no reason.
+is what decides when findings stop standing: a facility being installed, removed or replaced, the
+host agent being replaced, a new login, or a different execution profile. An operating-system permission changing is on the list but
+cannot be read, so it is found when you ask for the checks again. Time is not on the list. Nothing
+about a permission changes because an hour passed, and a check that re-ran on a clock would take an
+image of your screen for no reason. Nothing runs again on its own.
 
 ### What each answer means
 
@@ -1500,7 +1502,7 @@ cannot be done.
 One more answer belongs to the person rather than to the host. macOS gives a new grant to a process
 when that process starts, so an application that was already running when you granted something is
 still running without it. When a permission has been granted and the capability still reports that
-the permission is required, the answer is to open KalaReach again.
+the permission is required, the answer is to start a new session and run the checks again.
 
 A tool-specific permission stays its own record throughout. An accessibility grant this context
 holds says nothing about a screen image, and no part of this ever reports one as evidence for the

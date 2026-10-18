@@ -224,8 +224,8 @@ operating system did not confirm an assertion instead of claiming one.
 Selecting a desktop is not evidence that anything may be done on it. `environment.capabilities`
 answers each capability separately, says what produced the answer, and says what makes it stale.
 
-Nothing here performs the operation a capability is, and nothing here changes a screen, a clipboard
-or an input queue. A platform query settles the two capabilities whose only conditions are which
+Nothing in this answer performs the operation a capability is, and nothing changes a screen, a
+clipboard or an input queue; the disclosed checks below are asked for separately. A platform query settles the two capabilities whose only conditions are which
 desktop this is and what is installed: the display server, and launching an application. For the
 rest, a query can refuse a capability and cannot establish one, because the operation itself is the
 check and no permission is granted by asking about it. So each record says which of those happened.
@@ -247,6 +247,36 @@ that this host could not identify its facility rather than claiming anything abo
 is for noticing a
 change rather than for proving one: a capability record is evidence about what is feasible, never
 authority, and nothing here signs it.
+
+### The disclosed checks
+
+Reading `environment.capabilities` doesn't trigger any check. Taking an image of the screen, or
+starting an application, are effects and a read must not have them. If the caller wants those to
+happen they call `environment.capabilities.check`, after the interface has shown what each check
+does. Only the owner may call it, on the host's socket. It returns immediately with where the checks
+stand, because a run can take about two minutes.
+
+The checks run in a session's own worker. A platform files a screen image or the accessibility tree
+under the signed program that asks, and the daemon is a different program from a worker, so the
+daemon makes a connection to the newest session which has the profile the host uses to make sessions
+with, with a worker which speaks this release's protocol. With no such session nothing starts, and
+the answer says so. Only one run may happen at a time.
+
+The worker will read the owner's nominated file in each context. It takes an image of the screen,
+reads the accessibility tree and starts an application only on macOS, and only where the platform
+doesn't refuse the capability. The platform refuses in a container, in contexts without a graphical
+login, when the desktop is locked and when it has ended. The worker will never perform synthetic
+input, that record is kept by the platform.
+
+The worker's findings replace the platform's record of each capability in
+`environment.capabilities`, except where the platform is refusing the capability. The read check has
+no platform record, so its record is added. The findings are valid until the worker goes away (or is
+replaced), a new login occurs (new desktop generation), the execution profile changes or a tool
+the checks use is installed, removed or replaced. When any of those things happen the findings are
+dropped and the state will report `stale`. The checks won't be run automatically again. One thing they can't detect is a
+change in permission, so the user needs to request a check again if that happens. A grant that macOS
+gives only to a process when it starts reaches the next session's worker. A daemon restart also
+loses the findings.
 
 The revision every record carries advances whenever any of this changes. It is kept in the
 environment's state directory and written before it is handed out, so a host that restarts does not
