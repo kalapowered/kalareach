@@ -328,7 +328,8 @@ native code does the rest with `kr-client`'s pairing module:
 - The host its commands go to is kept in `command-host`, written whole and renamed into place, and a
   choice that could not be kept is not made.
 - A phone that iOS started before its first unlock cannot open its records. The commands say the
-  device is locked, and the records open at the unlock without another start.
+  device is locked, and the records open at the unlock, or when the application comes to the front,
+  without another start.
 - On iOS the `pairing`, `pairing-budget` and `recovery` directories are kept out of the device's
   backup. Their keys stay on this phone, so a restore onto another phone leaves no records there,
   and the person pairs again.

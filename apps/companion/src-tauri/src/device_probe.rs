@@ -18,7 +18,9 @@
 //! * a launch that asks for it starts with the device modelled as locked (`protection::model`):
 //!   the records are not open and the words say the device is locked, then the device is unlocked
 //!   and the records open in place, the page is told and recovery opens with them, with no
-//!   relaunch.
+//!   relaunch. One launch is told by the system's own notification, as a running process is, and
+//!   one only by the application coming to the foreground, as a process that was suspended at the
+//!   unlock is.
 //!
 //! Compiled into debug builds only. A release build has no request to read.
 
@@ -41,9 +43,23 @@ struct Request {
     secret: String,
     /// The tries the budget has left after this launch's charge, or none when it refuses the code.
     tries_left: Option<u32>,
-    /// Whether the launch was started with the device modelled as locked.
+    /// Whether the launch was started with the device modelled as locked, and how it is told of the
+    /// unlock.
     #[serde(default)]
-    locked: bool,
+    locked: Option<Told>,
+}
+
+/// How a launch that starts with the device modelled as locked is told of the unlock.
+#[cfg(target_os = "ios")]
+use companion_platform::protection::model::Told;
+
+/// Only the iOS simulator models a locked device, so no other platform names how it is told.
+#[cfg(not(target_os = "ios"))]
+#[derive(Clone, Copy, Debug, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum Told {
+    ByTheSystem,
+    OnComingForward,
 }
 
 fn is_a_name(text: &str) -> bool {
@@ -96,8 +112,8 @@ pub fn start<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
         };
         append(&format!("run={}\nlaunch={}\n", request.run, request.launch));
         let mut found = Vec::new();
-        if request.locked {
-            found.extend(after_unlocking(&app));
+        if let Some(told) = request.locked {
+            found.extend(after_unlocking(&app, told));
         }
         found.extend(checks(&app, &data, &request));
         for found in found {
@@ -115,14 +131,14 @@ const UNLOCK_WITHIN: std::time::Duration = std::time::Duration::from_secs(30);
 /// A launch that started with the device modelled as locked: the records are not open and the
 /// words say why, then the device is unlocked and the records open without a relaunch.
 #[cfg(target_os = "ios")]
-fn after_unlocking<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> Vec<Check> {
+fn after_unlocking<R: tauri::Runtime>(app: &tauri::AppHandle<R>, told: Told) -> Vec<Check> {
     use tauri::Listener as _;
 
     let state = app.state::<crate::AppState>();
     // The event the page listens on, heard as the page hears it, before anything is unlocked.
-    let (told, heard) = std::sync::mpsc::channel();
+    let (news, heard) = std::sync::mpsc::channel();
     app.listen(crate::pairing::PAIRING_EVENT, move |_| {
-        let _ = told.send(());
+        let _ = news.send(());
     });
     let mut found = Vec::new();
     match state.device() {
@@ -147,11 +163,15 @@ fn after_unlocking<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> Vec<Check> {
             return found;
         }
     }
-    if let Err(error) = companion_platform::protection::model::unlock(app) {
+    if let Err(error) = companion_platform::protection::model::unlock(app, told) {
         found.push(check("unlock: the notification is posted", false, error));
         return found;
     }
-    found.push(check("unlock: the notification is posted", true, "posted"));
+    found.push(check(
+        "unlock: the notification is posted",
+        true,
+        format!("posted: {told:?}"),
+    ));
     let told_the_page = heard.recv_timeout(UNLOCK_WITHIN).is_ok();
     found.push(check(
         "unlock: the page is told",
@@ -182,7 +202,7 @@ fn after_unlocking<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> Vec<Check> {
 }
 
 #[cfg(not(target_os = "ios"))]
-fn after_unlocking<R: tauri::Runtime>(_app: &tauri::AppHandle<R>) -> Vec<Check> {
+fn after_unlocking<R: tauri::Runtime>(_app: &tauri::AppHandle<R>, _told: Told) -> Vec<Check> {
     vec![check(
         "locked start",
         false,

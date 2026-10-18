@@ -22,6 +22,9 @@
 #      protected data is available is posted by the application's own test hook): the records are
 #      not open and the words say the device is locked, then the unlock opens them in the same
 #      process, the page is told, and recovery opens with them; the boot identity is launch 3's
+#   5. the same, except that the unlock is not announced: a process that was started before it and
+#      suspended is not running when the system says it, so only the application coming to the
+#      foreground (the person opening it) is posted
 #
 # The first start has no request and no data directory: a new installation has none, and the
 # application makes it. It shows that the application makes the data directory and the three record
@@ -119,13 +122,14 @@ mkdir -p "$directory"
 started=$SECONDS
 
 # Launches the application once and reads what it wrote.
-launch() { # <n> <secret> <tries left or "null"> [locked]
-    local n=$1 secret=$2 tries=$3 locked=${4:-false} result="$directory/device-result-$run-$1.txt" waited=0
+launch() { # <n> <secret> <tries left or "null"> [by_the_system|on_coming_forward]
+    local n=$1 secret=$2 tries=$3 locked=${4:-} result="$directory/device-result-$run-$1.txt" waited=0 told=null
+    [ -z "$locked" ] || told="\"$locked\""
     printf '{"run":"%s","launch":%s,"item":"%s","secret":"%s","tries_left":%s,"locked":%s}\n' \
-        "$run" "$n" "$item" "$secret" "$tries" "$locked" >"$directory/device-request.json"
+        "$run" "$n" "$item" "$secret" "$tries" "$told" >"$directory/device-request.json"
     say "launch $n"
     # A launch that asks for the locked device starts the application with the model switched on.
-    if [ "$locked" = true ]; then
+    if [ -n "$locked" ]; then
         SIMCTL_CHILD_KR_MODEL_LOCKED_DEVICE=1 xcrun simctl launch "$udid" "$app_id" >/dev/null \
             || { say "the application did not start"; failed=1; return; }
     else
@@ -159,7 +163,7 @@ launch() { # <n> <secret> <tries left or "null"> [locked]
         "the recovery records are out of the backup"; do
         [ "$(grep -c "^check=$name ok=" "$result")" = 1 ] || { say "launch $n did not report \"$name\" once"; failed=1; }
     done
-    if [ "$locked" = true ]; then
+    if [ -n "$locked" ]; then
         for name in "locked start: the records are not open" \
             "locked start: the words say the device is locked" "unlock: the notification is posted" \
             "unlock: the page is told" "unlock: the records open without a relaunch" \
@@ -177,19 +181,22 @@ say "the boot record after launch 1: $(ls "$caches" 2>&1 | tr '\n' ' ')"
 launch 2 read_and_delete 3
 rm -f "$caches/pairing-boot"
 launch 3 absent null
-launch 4 absent null true
+launch 4 absent null by_the_system
+launch 5 absent null on_coming_forward
 
 elapsed=$((SECONDS - started))
-say "the four launches took $elapsed s"
+say "the five launches took $elapsed s"
 [ "$elapsed" -lt 240 ] || { say "the launches took four minutes or more, so a refusal at the end may be the window's"; failed=1; }
 first="$(digest 1)"
 second="$(digest 2)"
 third="$(digest 3)"
 fourth="$(digest 4)"
-say "boot identity digests: $first $second $third $fourth"
+fifth="$(digest 5)"
+say "boot identity digests: $first $second $third $fourth $fifth"
 [ -n "$first" ] && [ "$first" = "$second" ] || { say "a relaunch in the same boot changed the boot identity"; failed=1; }
 [ -n "$third" ] && [ "$third" != "$first" ] || { say "a deleted boot record did not give another boot identity"; failed=1; }
 [ -n "$fourth" ] && [ "$fourth" = "$third" ] || { say "the locked launch, in the same boot as launch 3, did not keep launch 3's boot identity"; failed=1; }
+[ -n "$fifth" ] && [ "$fifth" = "$third" ] || { say "the second locked launch, in the same boot as launch 3, did not keep launch 3's boot identity"; failed=1; }
 [ -f "$caches/pairing-boot" ] || { say "launch 3 left no boot record in the caches"; failed=1; }
 for name in pairing pairing-budget recovery; do
     say "backup attributes of $name: $(xattr -l "$support/$name" 2>&1 | tr '\n' ' ')"

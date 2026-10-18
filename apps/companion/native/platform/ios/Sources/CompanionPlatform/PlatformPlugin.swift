@@ -21,6 +21,13 @@ struct PathArguments: Decodable {
   let path: String
 }
 
+#if DEBUG
+  /// The notification a debug build on a simulator is asked to post.
+  struct NotificationArguments: Decodable {
+    let name: String
+  }
+#endif
+
 /// Which attempt a call is about.
 struct AttemptArguments: Decodable {
   let attempt: String
@@ -112,12 +119,21 @@ class PlatformPlugin: Plugin, ASWebAuthenticationPresentationContextProviding {
   }
 
   #if DEBUG
-    /// Posts the notification the system posts when protected data becomes available, for a debug
+    /// Posts one of the notifications the system posts when the device is unlocked, for a debug
     /// build on a simulator, which never locks: the device is modelled as locked and then unlocked.
-    @objc public func postProtectedDataAvailable(_ invoke: Invoke) {
+    @objc public func postSystemNotification(_ invoke: Invoke) throws {
+      let name: Notification.Name
+      switch try invoke.parseArgs(NotificationArguments.self).name {
+      case "protectedDataDidBecomeAvailable":
+        name = UIApplication.protectedDataDidBecomeAvailableNotification
+      case "willEnterForeground":
+        name = UIApplication.willEnterForegroundNotification
+      default:
+        invoke.reject("only the unlock and foreground notifications are posted")
+        return
+      }
       DispatchQueue.main.async {
-        NotificationCenter.default.post(
-          name: UIApplication.protectedDataDidBecomeAvailableNotification, object: nil)
+        NotificationCenter.default.post(name: name, object: nil)
         invoke.resolve(["done": true])
       }
     }

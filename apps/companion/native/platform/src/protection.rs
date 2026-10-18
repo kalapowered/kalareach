@@ -3,8 +3,8 @@
 //! iOS keeps an application's files and keychain items out of its reach from a restart until the
 //! person first unlocks the device. A launch in the background before that (a silent push is one)
 //! starts the process with nothing it keeps readable, and the system posts a notification when that
-//! changes. [`is_available`] asks whether the data can be read now, and [`on_available`] calls a
-//! function each time the system says it can be.
+//! changes. [`is_available`] asks whether the data can be read now, and [`on_unlock`] calls a
+//! function each time the person may have unlocked the device.
 //!
 //! No other system the companion runs on holds back an application's data in this way, so there
 //! the data is always available and nothing is listened for.
@@ -51,8 +51,13 @@ const fn available<R: Runtime>(_app: &AppHandle<R>) -> bool {
     true
 }
 
-/// Calls `listener` each time the system says the device's protected data has become available:
-/// at the first unlock after the device started, and at each unlock after that.
+/// Calls `listener` each time the device may have been unlocked: when the system says protected
+/// data has become available, at the first unlock after the device started and at each unlock after
+/// that, and when the application comes to the foreground.
+///
+/// The second is there because a process that was started before the unlock and suspended is not
+/// running when the system says it, and a person who opens the application has unlocked the device.
+/// The listener is called whether or not the data can be read, and checks for itself.
 ///
 /// The listener runs on the system's thread for the notification, so it starts any work of its
 /// own on another. Where nothing is held back, it is never called.
@@ -61,7 +66,7 @@ const fn available<R: Runtime>(_app: &AppHandle<R>) -> bool {
 ///
 /// Returns an error when the native half cannot be asked to listen.
 #[cfg(target_os = "ios")]
-pub fn on_available<R: Runtime>(
+pub fn on_unlock<R: Runtime>(
     app: &AppHandle<R>,
     listener: impl Fn() + Send + Sync + 'static,
 ) -> Result<(), PlatformError> {
@@ -87,7 +92,7 @@ pub fn on_available<R: Runtime>(
 ///
 /// Never fails here.
 #[cfg(not(target_os = "ios"))]
-pub fn on_available<R: Runtime>(
+pub fn on_unlock<R: Runtime>(
     _app: &AppHandle<R>,
     _listener: impl Fn() + Send + Sync + 'static,
 ) -> Result<(), PlatformError> {
@@ -99,8 +104,7 @@ pub fn on_available<R: Runtime>(
 /// The model has two halves, each at the place the application reads the system. While the device
 /// is modelled as locked, the secure store refuses every read and write with the words the
 /// keychain gives for a device that has not been unlocked. [`unlock`] ends that and has the
-/// system's own notification for protected data posted, which the native half observes as it
-/// observes the system's.
+/// system's own notification posted, which the native half observes as it observes the system's.
 #[cfg(all(debug_assertions, target_os = "ios"))]
 pub mod model {
     use std::sync::Arc;
@@ -131,16 +135,40 @@ pub mod model {
         LOCKED.load(Ordering::SeqCst)
     }
 
-    /// Unlocks the modelled device, as the person does, and has the system's notification that
-    /// protected data is available posted.
+    /// What a process is told when the device is unlocked.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum Told {
+        /// The system posts that protected data has become available, to the running process.
+        ByTheSystem,
+        /// The process was suspended at the unlock and is told nothing then: the application
+        /// comes to the foreground, as it does when the person opens it.
+        OnComingForward,
+    }
+
+    /// Unlocks the modelled device, as the person does, and has the notification `told` names
+    /// posted.
     ///
     /// # Errors
     ///
     /// Returns an error when the native half cannot post the notification.
-    pub fn unlock<R: Runtime>(app: &AppHandle<R>) -> std::result::Result<(), PlatformError> {
+    pub fn unlock<R: Runtime>(
+        app: &AppHandle<R>,
+        told: Told,
+    ) -> std::result::Result<(), PlatformError> {
+        #[derive(serde::Serialize)]
+        struct Post {
+            name: &'static str,
+        }
+
         LOCKED.store(false, Ordering::SeqCst);
+        let name = match told {
+            Told::ByTheSystem => "protectedDataDidBecomeAvailable",
+            Told::OnComingForward => "willEnterForeground",
+        };
         let platform = app.state::<crate::Platform<R>>();
-        let _: serde_json::Value = platform.call_blocking("postProtectedDataAvailable", ())?;
+        let _: serde_json::Value =
+            platform.call_blocking("postSystemNotification", Post { name })?;
         Ok(())
     }
 

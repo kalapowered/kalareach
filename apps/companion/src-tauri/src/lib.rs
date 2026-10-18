@@ -387,7 +387,7 @@ fn watch_drops(app: &tauri::AppHandle) {
 /// A computer whose keys or records cannot be opened still runs: the pairing commands say why
 /// they cannot, in words the page shows where the pairing screen would be, and everything else
 /// works as it did. A phone that was started before its first unlock cannot open them yet, and
-/// opens them in place when the system says the device has been unlocked ([`open_after_unlock`]).
+/// opens them in place when the device may have been unlocked ([`open_after_unlock`]).
 fn open_pairing(app: &tauri::AppHandle) {
     // The system is listened to before the first try, so an unlock that falls between the try and
     // the wait is heard.
@@ -425,12 +425,12 @@ fn open_records(app: &tauri::AppHandle) -> bool {
     }
 }
 
-/// Has the pairing records opened again each time the system says the device's protected data has
-/// become available, until they are open.
+/// Has the pairing records opened again each time the device may have been unlocked, until they
+/// are open.
 #[cfg(target_os = "ios")]
 fn watch_for_unlock(app: &tauri::AppHandle) {
     let handle = app.clone();
-    let watching = companion_platform::protection::on_available(app, move || {
+    let watching = companion_platform::protection::on_unlock(app, move || {
         // The system calls this on its own thread, which must not wait for the native half.
         let handle = handle.clone();
         tauri::async_runtime::spawn_blocking(move || open_after_unlock(&handle));
@@ -440,8 +440,9 @@ fn watch_for_unlock(app: &tauri::AppHandle) {
     }
 }
 
-/// Opens the pairing records at an unlock when a start before it could not, starts what needs
-/// them, and then tells the page, so that what the page asks for next is there.
+/// Opens the pairing records at an unlock, or when the application comes to the foreground, when a
+/// start before it could not, starts what needs them, and then tells the page, so that what the page
+/// asks for next is there.
 #[cfg(target_os = "ios")]
 fn open_after_unlock(app: &tauri::AppHandle) {
     if open_records(app) {
