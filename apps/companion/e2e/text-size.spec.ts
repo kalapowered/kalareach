@@ -28,9 +28,6 @@ const SESSION = '8a7b6c50-22bb-4c3d-8e4f-000000000101'
 /** The largest accessibility size's body text, 53 points, against 17 at the default setting. */
 const LARGEST = 53 / 17
 
-/** How much wider than the system's own letters the wide face sets them, in em. */
-const WIDER_LETTERS = 0.06
-
 /** The ratio the system gives the page, set before it loads, as a phone that already had it opens it. */
 async function withSystemTextScale(page: Page, ratio: number): Promise<void> {
   await page.addInitScript((value) => {
@@ -49,14 +46,15 @@ async function withSystemTextScale(page: Page, ratio: number): Promise<void> {
 }
 
 /**
- * Sets the letters of the voice screen wider by `em`, from the page's first frame, as a face wider
- * than the system's would set them. The system's own face differs from one platform to the next
- * (the Mac's is narrower than the one the Linux runner draws), and a layout that holds only for the
- * widths of the face it was drawn with does not hold. The rule is written to outrank the page's own.
+ * Sets the page's face to one as wide as the Linux runner draws with, from the page's first frame.
+ * The system's own face differs from one platform to the next, and a layout that holds only for the
+ * widths of the face it was drawn with does not hold. DejaVu Sans, which the runner draws the page
+ * in, sets about a tenth more text across a line than a phone's or a Mac's does; Verdana is as wide
+ * and every Mac has it, with DejaVu Sans after it for the machine that has none.
  */
-async function withWiderLetters(page: Page, em: number): Promise<void> {
-  await page.addInitScript((spacing) => {
-    const css = `:root .kr-voice, :root .kr-voice * { letter-spacing: ${spacing}em; }`
+async function withWideFace(page: Page): Promise<void> {
+  await page.addInitScript(() => {
+    const css = ':root { --font-ui: Verdana, "DejaVu Sans", sans-serif !important; }'
     const apply = (): boolean => {
       const root = document.documentElement as HTMLElement | null
       if (root === null) return false
@@ -70,7 +68,7 @@ async function withWiderLetters(page: Page, em: number): Promise<void> {
         if (apply()) observer.disconnect()
       }).observe(document, { childList: true })
     }
-  }, em)
+  })
 }
 
 const rootSize = (page: Page): Promise<number> =>
@@ -497,7 +495,7 @@ test.describe('at the largest text size on a screen 320 points wide', () => {
       page
     }) => {
       await withSystemTextScale(page, LARGEST)
-      await withWiderLetters(page, WIDER_LETTERS)
+      await withWideFace(page)
       await page.setViewportSize({ width: 320, height: 720 })
       await page.goto(`/harness.html?surface=${surface}&tab=sessions`)
       await page.evaluate(() => {
@@ -516,20 +514,36 @@ test.describe('at the largest text size on a screen 320 points wide', () => {
       const words = page.getByText('This device is ending its call.')
       await expect(words).toBeFocused()
 
-      // The case is the form it says it is: the control and the words together are taller than
-      // the part of the screen that scrolls, so it cannot go on passing after it has stopped
-      // covering that form.
+      // The face is the one drawn, not only the one named: a machine with neither face would set the
+      // page in the fallback, narrower than either, and the case would pass for nothing.
+      const drawnWide = await page.evaluate(() => {
+        const context = document.createElement('canvas').getContext('2d')
+        if (context === null) return false
+        const sample = 'This device is ending its call. This screen changes when that is done.'
+        context.font = '16px Verdana, "DejaVu Sans", monospace'
+        const wide = context.measureText(sample).width
+        context.font = '16px monospace'
+        return wide !== context.measureText(sample).width
+      })
+      expect(drawnWide, 'a wide face is installed').toBe(true)
+      // The case is the form it says it is: the control and the words together are taller than the
+      // part of the screen that scrolls, so it cannot go on passing after it has stopped covering
+      // that form. An element that is not there is a failure, not a measure of nothing.
       const room = await page.evaluate(() => {
-        const control = document.querySelector('.kr-voice__control--end')?.getBoundingClientRect()
-        const note = document.querySelector('.kr-voice__note[tabindex="-1"]')?.getBoundingClientRect()
-        const screen = document.querySelector('.m-main')?.getBoundingClientRect()
-        return { needed: (note?.bottom ?? 0) - (control?.top ?? 0), visible: screen?.height ?? 0 }
+        const box = (selector: string): DOMRect => {
+          const found = document.querySelector(selector)
+          if (found === null) throw new Error(`${selector} is not on the screen`)
+          return found.getBoundingClientRect()
+        }
+        const control = box('.kr-voice__control--end')
+        const note = box('.kr-voice__note[tabindex="-1"]')
+        return { needed: note.bottom - control.top, visible: box('.m-main').height }
       })
       expect(room.needed, 'the control and the words are taller than the part of the screen that scrolls').toBeGreaterThan(
         room.visible
       )
 
-      // Whole, to the sub-point that a scroll to an edge lands on.
+      // Whole, give or take a sub-point.
       await expect(ending).toBeInViewport({ ratio: 0.99 })
       await expect(words).toBeInViewport()
       await page.screenshot({

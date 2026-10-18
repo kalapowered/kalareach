@@ -284,8 +284,9 @@ function ProviderChoiceScreen({
   useEffect(() => {
     if (waiting && ending && !wasEnding.current) {
       endingNote.current?.focus({ preventScroll: true })
-      endingNote.current?.scrollIntoView({ block: 'nearest' })
-      end.current?.scrollIntoView({ block: 'nearest' })
+      // Each scroll is complete before the next one measures: the second corrects the first.
+      endingNote.current?.scrollIntoView({ block: 'nearest', behavior: 'instant' })
+      end.current?.scrollIntoView({ block: 'nearest', behavior: 'instant' })
     }
     wasEnding.current = waiting && ending
   }, [ending, waiting])

@@ -221,10 +221,11 @@
   color: var(--danger);
 }
 
-/* The control that gives a start up is brought into view with a gap to the bar it is scrolled
-   against, not flush with it, where the words beside it are too tall for it to stay with them. */
-.kr-voice__control--end {
-  scroll-margin-block: var(--gap-2);
+/* The control that gives a start up is brought into view with a gap to the bar above it, not flush
+   with it, where the words beside it are too tall for it to stay with them. Only the top gap: a
+   gap below as well would make the room it needs taller than the control on a short screen. */
+.kr-voice__begin > .kr-voice__control--end {
+  scroll-margin-block-start: var(--gap-2);
 }
 
 .kr-voice__panel--cancel {
