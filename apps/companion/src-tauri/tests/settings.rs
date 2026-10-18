@@ -2409,6 +2409,67 @@ async fn an_entry_left_for_a_draft_that_is_still_stored_is_dropped_and_the_draft
     );
 }
 
+/// A stale entry for a draft that is still stored is dropped by the pass that reads it, and a discard
+/// that adopts it while that pass is out at the service keeps it: the draft is removed afterwards.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_discard_that_adopts_a_stale_entry_while_a_pass_is_out_keeps_the_removal_owed() {
+    let computer = Computer::new().await;
+    let (environment, studio) = host(1, "studio");
+    computer
+        .hosts
+        .say(environment, HostPrivacy::Off { generation: 1 });
+    let page = with_sync_on(&computer).await;
+    let (first, first_version) = page.write_draft(Some(&studio), "a prompt sent first");
+    let (second, second_version) = page.write_draft(Some(&studio), "a prompt kept");
+    page.drafts_on(true).expect("drafts sync is on");
+    let elsewhere = computer.elsewhere();
+    assert_eq!(elsewhere.draft_at(first).await, Some(1));
+    assert_eq!(elsewhere.draft_at(second).await, Some(1));
+
+    // The first draft is thrown away, and an entry is left behind for the second, which is still
+    // stored: the ledger reads the first's removal, then the second's stale entry.
+    assert_eq!(page.discard_draft(first, &first_version)["removed"], true);
+    let ledger = computer
+        .data
+        .path()
+        .join("settings-sync/drafts/removals.json");
+    let mut entries: Vec<Value> =
+        serde_json::from_slice(&std::fs::read(&ledger).expect("the ledger")).expect("a list");
+    entries.push(json!({
+        "id": "6c1e9a52-0000-4000-8000-000000000001",
+        "draft": second,
+        "host": null,
+        "note": null
+    }));
+    kr_ipc::paths::write_owner_only_file(&ledger, &serde_json::to_vec(&entries).expect("a ledger"))
+        .expect("the stale entry");
+
+    // The pass asks the collection once for the settings and then removes the first draft, which
+    // is the second request; the service gives its answer when it is let go.
+    let web = computer.served.web();
+    let asked = sync_requests(&computer);
+    web.fail(SYNC_PATH, 2, Moment::Slow);
+    let settings = page.app.state::<AppState>().settings().expect("settings");
+    let step = tokio::spawn({
+        let settings = Arc::clone(&settings);
+        async move { settings.sync_now().await }
+    });
+    web.requests_reach(SYNC_PATH, asked + 2).await;
+    assert_eq!(page.discard_draft(second, &second_version)["removed"], true);
+    web.release_held();
+    step.await.expect("the step ran").expect("the step ended");
+
+    page.sync_now();
+    page.sync_now();
+    assert_eq!(elsewhere.draft_at(first).await, None);
+    assert_eq!(
+        elsewhere.draft_at(second).await,
+        None,
+        "the draft thrown away while the pass was out at the service was removed"
+    );
+    assert!(page.kept_drafts().is_empty(), "{:?}", page.kept_drafts());
+}
+
 /// A host that refuses to say whether it holds one session does not keep this computer from asking
 /// about the others.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
