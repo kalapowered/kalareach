@@ -76,8 +76,9 @@ const TOLERANCE_MS: i128 = 60_000;
 
 /// What the comparison with the previous launch's counter allows for the sampling's error. Two
 /// samples are each off by at most half of [`STEADY_MS`] and a few milliseconds of rounding, about
-/// 104 ms between them; this is the whole of it with a margin, and it is far below any time a
-/// machine is off.
+/// 104 ms between them; this is the whole of it with a margin. The margin costs something only
+/// near the start of a boot, where it takes a fifth of a second from the forward step a launch may
+/// show.
 const SAMPLING_ERROR_MS: i128 = 200;
 
 /// How far apart a sample's two monotonic readings may be. The wall reading falls between them, so

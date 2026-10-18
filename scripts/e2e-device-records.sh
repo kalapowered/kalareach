@@ -17,9 +17,11 @@
 #      gone, the boot identity is another, and the same code is refused as spent
 #
 # The first start has no request and no data directory: a new installation has none, and the
-# application makes it. It shows the records open there, and the two record directories excluded
-# from the backup, as the host's `xattr` reads them. The three launches then run within four minutes
-# of one another, so that a refusal in the last cannot be the five-minute window ending.
+# application makes it. It shows that the application makes the data directory and the two record
+# directories there and marks both of them as excluded from the backup, as the host's `xattr`
+# reads them. It does not show the records open: the probe's request needs the data directory, so
+# the launches below are the ones that report the records open. The three launches run within four
+# minutes of one another, so that a refusal in the last cannot be the five-minute window ending.
 #
 # It claims what the lines say and nothing more: a check the application did not report is a check
 # that did not run, and any line that is not `ok=1`, a launch that never says `done=1`, or an
@@ -85,13 +87,15 @@ failed=0
 [ ! -e "$support" ] || { say "the fresh installation already has $support"; exit 2; }
 say "first start, in a container with no data directory"
 xcrun simctl launch "$udid" "$app_id" >/dev/null || { say "the application did not start"; exit 2; }
+excluded() { xattr -l "$1" 2>/dev/null | grep -q 'com_apple_backup_excludeItem'; }
+# Until both directories exist and read as excluded: the application makes each before it marks it.
 waited=0
-while [ ! -d "$support/pairing-budget" ] || [ ! -d "$support/pairing" ]; do
+while ! { [ -d "$support/pairing" ] && excluded "$support/pairing" \
+    && [ -d "$support/pairing-budget" ] && excluded "$support/pairing-budget"; }; do
     sleep 2
     waited=$((waited + 2))
     [ "$waited" -lt 60 ] || break
 done
-excluded() { xattr -l "$1" 2>/dev/null | grep -q 'com_apple_backup_excludeItem'; }
 for name in pairing pairing-budget; do
     if [ -d "$support/$name" ] && excluded "$support/$name"; then
         say "after the first start of a new installation, $name exists and is excluded from the backup"

@@ -390,8 +390,9 @@ fn application_clock(_app: &tauri::AppHandle) -> Result<kr_client::pairing::cloc
 fn keep_records_out_of_backup(app: &tauri::AppHandle, data: &std::path::Path) -> Result<()> {
     use std::os::unix::fs::DirBuilderExt as _;
 
-    // A new installation has no data directory yet: the system names it and does not make it. The
-    // records' directories are made inside it, owner-only, as the attempt budget makes its own.
+    // A new installation has no data directory yet: the system names it and does not make it. It
+    // is made here, owner-only with any parent it is missing, as the attempt budget makes its own
+    // path; the records' directories are made inside it.
     std::fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)
