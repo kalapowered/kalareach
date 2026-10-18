@@ -1285,6 +1285,133 @@ pub fn a_launch_is_installed_and_accepted_on_the_reader_thread(kind: ShellKind) 
     );
 }
 
+/// A command the caller already quoted for the target shell, which the reader installs as it was
+/// given, and what it prints.
+///
+/// A pipeline is the plainest text that only means something to a shell: the reader that installed
+/// it as one word, or quoted it again, would print nothing of this.
+fn pipeline_for(kind: ShellKind) -> (&'static str, &'static str) {
+    match kind {
+        ShellKind::PowerShell => ("'abc' | ForEach-Object { $_.ToUpper() }", "ABC"),
+        _ => ("printf '%s\\n' abc | tr a-c X-Z", "XYZ"),
+    }
+}
+
+/// KR-REQ-23.54: a launch is quoted for the shell that reads it and is never evaluated.
+///
+/// The first launch is an executable whose path has a space in it, with an argument vector that
+/// holds an embedded quote, a backslash, an empty word, a glob, a tilde, a variable, a splatting
+/// word, two separators and a command substitution. The executable prints each argument it was
+/// given between angle brackets, so the line that appears is the argument vector that arrived, and
+/// the echo of the installed line, which carries quotes and no brackets, cannot produce it. The
+/// second launch is a pipeline the caller quoted for the shell itself, which runs as written.
+pub fn a_launch_is_quoted_for_its_own_shell_and_never_evaluated(kind: ShellKind) {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let package = Package::built(kind);
+    let mut session = Session::start(&package);
+    session.first_prompt();
+    session.forget_events();
+    assert!(session.answered("kr-ready"));
+
+    let directory = session.home().join("kr launch directory");
+    std::fs::create_dir_all(&directory).expect("a directory with a space in its name");
+    let program = directory.join("show arguments");
+    std::fs::write(
+        &program,
+        "#!/bin/sh\nfor argument in \"$@\"; do printf '<%s>' \"$argument\"; done\nprintf '\\n'\n",
+    )
+    .expect("a program that prints its arguments");
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))
+        .expect("the program can be run");
+
+    let substitution = match kind {
+        ShellKind::Fish => "(echo substituted)",
+        _ => "$(echo substituted)",
+    };
+    let words = [
+        "it's",
+        r"a\b",
+        "",
+        "*",
+        "~",
+        "$HOME",
+        "@payload",
+        "a;b",
+        "a|b",
+        substitution,
+    ];
+    let expected: String = words.iter().map(|word| format!("<{word}>")).collect();
+    let mut vector = vec![told(&program)];
+    vector.extend(words.iter().map(|word| (*word).to_owned()));
+
+    let (enter, fence) = session.fenced_prompt(20);
+    let before_install = session.written();
+    let id = session.ask(WorkerRequest::Launch(LaunchMailboxRequest {
+        session_id: session.session_id,
+        transaction: LaunchTransactionId::new(Uuid::from_bytes([0x75; 16])),
+        fence_id: fence.fence_id,
+        command: LaunchCommand::Arguments(vector),
+        expected_prompt_generation: enter.prompt_generation,
+        expected_buffer_revision: enter.editor.buffer_revision,
+        expected_cwd_revision: enter.cwd_revision,
+        deadline_ms: LAUNCH_BUDGET_NOT_UNDER_TEST,
+    }));
+    let BridgeAnswer::Launch(decision) = session.answer(id) else {
+        panic!("the reader answered a launch with something else")
+    };
+    assert!(
+        matches!(decision, LaunchDecision::Accepted(_)),
+        "an empty fenced prompt refused a launch: {decision:?}"
+    );
+    session.nudge();
+    session.expect_event("command_accepted", |event| {
+        matches!(event, BridgeEvent::CommandAccepted(_))
+    });
+    session.expect_event("editor_leave", |event| {
+        matches!(event, BridgeEvent::EditorLeave(_))
+    });
+    assert!(
+        session
+            .drew_after(before_install, &expected, REPLY)
+            .was_drawn(),
+        "the arguments that ran are not the arguments the caller named; wanted {expected}:\n{}",
+        session.terminal_output()
+    );
+
+    let (pipeline, printed) = pipeline_for(kind);
+    let (enter, fence) = session.fenced_prompt(21);
+    let before_install = session.written();
+    let id = session.ask(WorkerRequest::Launch(LaunchMailboxRequest {
+        session_id: session.session_id,
+        transaction: LaunchTransactionId::new(Uuid::from_bytes([0x76; 16])),
+        fence_id: fence.fence_id,
+        command: LaunchCommand::QuotedCommand(pipeline.to_owned()),
+        expected_prompt_generation: enter.prompt_generation,
+        expected_buffer_revision: enter.editor.buffer_revision,
+        expected_cwd_revision: enter.cwd_revision,
+        deadline_ms: LAUNCH_BUDGET_NOT_UNDER_TEST,
+    }));
+    let BridgeAnswer::Launch(decision) = session.answer(id) else {
+        panic!("the reader answered a launch with something else")
+    };
+    assert!(
+        matches!(decision, LaunchDecision::Accepted(_)),
+        "an empty fenced prompt refused a launch: {decision:?}"
+    );
+    session.nudge();
+    session.expect_event("command_accepted", |event| {
+        matches!(event, BridgeEvent::CommandAccepted(_))
+    });
+    assert!(
+        session
+            .drew_after(before_install, printed, REPLY)
+            .was_drawn(),
+        "a command the caller quoted was not run as written:\n{}",
+        session.terminal_output()
+    );
+}
+
 /// `launch-reader-decisions`: the reader's own check, one case per reason it can produce here.
 pub fn the_reader_refuses_a_launch_its_own_state_does_not_match(kind: ShellKind) {
     let package = Package::built(kind);

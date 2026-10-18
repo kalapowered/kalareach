@@ -14,7 +14,7 @@
 //! | [`scripted`] | The reference bridge: the client half of the endpoint, driven frame by frame by its caller |
 //! | [`package`] | Which qualified shell package a session launches, with its executable, flags and module tree |
 //! | [`startup`] | The marked, guarded startup entries: where they go, what they contain and how they are removed |
-//! | [`quoting`] | Per-shell quoting of a launch, without `eval` and without interpolation |
+//! | [`quoting`] | Per-shell quoting of one word, as the startup entries write a path |
 //! | [`refusal`] | Why a startup entry was not written or taken out, in this host's own words |
 //! | [`terminal`] | The terminal application a presented session opens, in the order section 7 fixes |
 //! | [`command`] | Opt-in command integration, and the command blocks the private hooks report |

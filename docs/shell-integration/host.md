@@ -186,9 +186,10 @@ string and no private key injection; a bridge that offers key injection is refus
 
 ### Quoting
 
-An argument vector is preserved literally and quoted for the target shell. `eval` is never used, and
-neither is `Invoke-Expression`: the text that reaches the editor is the command itself, so what the
-person sees on the line is what runs.
+The reader quotes the argument vector, on its own thread and in its own language, so what the
+person sees on the line is what runs. `eval` is never used, and neither is `Invoke-Expression`.
+Every word is single-quoted, the first one included, because a bare word at the start of a line
+could be a reserved word, an assignment or an alias:
 
 | Shell | An embedded `'` |
 | --- | --- |
@@ -196,7 +197,10 @@ person sees on the line is what runs.
 | Fish | `'it\'s'` |
 | PowerShell | `'it''s'` |
 
-A command the caller has already quoted for its target shell is installed exactly as given.
+PowerShell puts the call operator before the line, since a quoted word at the start of a line is a
+string and not a program. A command the caller has already quoted for its target shell is
+installed exactly as given. The host quotes one thing itself: the path of a package in a startup
+entry, by the same single-quote rule.
 
 ## Launching the root shell
 

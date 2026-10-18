@@ -79,6 +79,13 @@ fn a_launch_is_installed_and_accepted_on_the_reader_thread() {
     shellpkg::a_launch_is_installed_and_accepted_on_the_reader_thread(PWSH);
 }
 
+/// KR-REQ-23.54
+#[test]
+#[ignore = "drives this tree's qualified PSReadLine package; it runs with --include-ignored where the packages are built and qualified, as continuous integration's shell-packages job does"]
+fn a_launch_is_quoted_for_its_own_shell_and_never_evaluated() {
+    shellpkg::a_launch_is_quoted_for_its_own_shell_and_never_evaluated(PWSH);
+}
+
 /// KR-REQ-07.37
 #[test]
 #[ignore = "drives this tree's qualified PSReadLine package; it runs with --include-ignored where the packages are built and qualified, as continuous integration's shell-packages job does"]

@@ -476,9 +476,9 @@ pub fn entry(
     let text = package_entry.to_str().ok_or_else(|| NotText {
         path: package_entry.to_path_buf(),
     })?;
-    // The path is quoted for the shell that will read this file, by the same rules a launch is
-    // quoted by. An installation directory with an apostrophe in it would otherwise end the string
-    // and turn the rest of the path into shell syntax.
+    // The path is quoted for the shell that will read this file. An installation directory with an
+    // apostrophe in it would otherwise end the string and turn the rest of the path into shell
+    // syntax.
     let path = crate::host::quoting::quote(kind, text);
     let mut body = String::new();
     let (marker_begin, marker_end) = target.placement.markers();

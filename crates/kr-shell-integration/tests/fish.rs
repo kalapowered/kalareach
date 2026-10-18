@@ -85,6 +85,13 @@ fn a_launch_is_installed_and_accepted_on_the_reader_thread() {
     shellpkg::a_launch_is_installed_and_accepted_on_the_reader_thread(FISH);
 }
 
+/// KR-REQ-23.54
+#[test]
+#[ignore = "drives this tree's built Fish package; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
+fn a_launch_is_quoted_for_its_own_shell_and_never_evaluated() {
+    shellpkg::a_launch_is_quoted_for_its_own_shell_and_never_evaluated(FISH);
+}
+
 /// KR-REQ-07.36
 #[test]
 #[ignore = "drives this tree's built Fish package; it runs with --include-ignored where the packages are built, as continuous integration's shell-packages job does"]
