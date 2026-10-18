@@ -1906,3 +1906,76 @@ impl Host {
         start_each_once(&self.store.release_directory(assembled.name()));
     }
 }
+
+/// Sends one step of the handover to this host's daemon on `client`, targeting `target`, for
+/// `attempt` where the step names one.
+async fn handover_step(
+    host: &Host,
+    client: &mut LocalClient,
+    step: HandoverStep,
+    attempt: Option<Uuid>,
+    target: &ReleaseName,
+) -> Result<kr_protocol::envelope::ParamsValue, kr_protocol::error::ProtocolError> {
+    handover_step_of(host.tree.environment_id(), client, step, attempt, target).await
+}
+
+/// Sends one step of the handover to the daemon of `environment` on `client`, and returns what came
+/// back: the daemon's answer, or the failure of the call itself.
+async fn handover_call_of(
+    environment: kr_protocol::ids::EnvironmentId,
+    client: &mut LocalClient,
+    step: HandoverStep,
+    attempt: Option<Uuid>,
+    target: &ReleaseName,
+) -> Result<
+    Result<kr_protocol::envelope::ParamsValue, kr_protocol::error::ProtocolError>,
+    kr_ipc::IpcError,
+> {
+    client
+        .mutate(
+            Method::HostUpdateHandover,
+            ActionId::new(kr_ipc::new_uuid()),
+            ActionTarget::environment(environment),
+            &HostUpdateHandoverParams {
+                step,
+                target: target.clone(),
+                attempt: Nullable(attempt),
+            },
+        )
+        .await
+}
+
+/// Sends one step of the handover to the daemon of `environment` on `client`, for a step whose
+/// answer always reaches the caller: a daemon that refuses a step, or takes any step but a stop,
+/// goes on serving and writes its answer.
+async fn handover_step_of(
+    environment: kr_protocol::ids::EnvironmentId,
+    client: &mut LocalClient,
+    step: HandoverStep,
+    attempt: Option<Uuid>,
+    target: &ReleaseName,
+) -> Result<kr_protocol::envelope::ParamsValue, kr_protocol::error::ProtocolError> {
+    handover_call_of(environment, client, step, attempt, target)
+        .await
+        .expect("the call reaches the daemon")
+}
+
+/// Tells the daemon of `environment` to stop under `attempt`, and returns its refusal when it
+/// refused.
+///
+/// A daemon that takes a stop ends, and may end before it has written its answer, so an answer
+/// that does not come because the connection ended is not a refusal: the daemon's end is what says
+/// the stop was taken, and the caller waits for that and for how it ended. A refusal is an answer,
+/// and the daemon that gives one serves on. Any other failure of the call is returned as it is.
+async fn handover_stop_of(
+    environment: kr_protocol::ids::EnvironmentId,
+    client: &mut LocalClient,
+    attempt: Option<Uuid>,
+    target: &ReleaseName,
+) -> Result<Option<kr_protocol::error::ProtocolError>, kr_ipc::IpcError> {
+    match handover_call_of(environment, client, HandoverStep::Stop, attempt, target).await {
+        Ok(answer) => Ok(answer.err()),
+        Err(kr_ipc::IpcError::PeerClosed | kr_ipc::IpcError::TruncatedFrame { .. }) => Ok(None),
+        Err(other) => Err(other),
+    }
+}

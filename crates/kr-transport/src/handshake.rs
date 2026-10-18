@@ -42,7 +42,7 @@ use kr_protocol::extension::{self, ExtensionDefinition};
 use kr_protocol::frame::StreamKind;
 use kr_protocol::hello::{
     ActionWindow, ClientOffer, ConnectAccepted, ConnectProof, ConnectReply, HelloReply,
-    HostSelection, PROTOCOL_VERSION, ProtocolVersion, ReceiveLimits, select_version,
+    HostSelection, ProtocolVersion, ReceiveLimits, select_version,
 };
 use kr_protocol::ids::{
     BootEpoch, BuildId, CapabilityId, ClockEpoch, ConnectionId, DeviceId, DeviceKeyRevision,
@@ -842,6 +842,7 @@ fn negotiate_limits(host: ReceiveLimits, client: ReceiveLimits) -> ReceiveLimits
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kr_protocol::hello::PROTOCOL_VERSION;
     use kr_protocol::scalars::U64;
 
     /// KR-REQ-23.13: the negotiated limits are the smaller of the two declared in hello.

@@ -273,22 +273,12 @@ fn this_table_holds_to_the_table_of_each_retained_release_that_recorded_one() {
         let Some(recorded) = level.public_majors else {
             continue;
         };
-        let previous = parse(recorded);
+        let rows = parse(recorded);
         let released = level
             .release
             .lines()
             .find_map(|line| line.strip_prefix("released="))
             .expect("a release record names the day it was built");
-        let rows: Vec<PublicMajor> = previous
-            .iter()
-            .map(|row| PublicMajor {
-                major: row.major,
-                versions: Box::leak(row.versions.clone().into_boxed_slice()),
-                replaced: row.replaced.map(|text| &*Box::leak(text.into())),
-                supported_until: row.supported_until.map(|text| &*Box::leak(text.into())),
-                retired: row.retired,
-            })
-            .collect();
         assert_eq!(
             broken(&rows, released, PUBLIC_MAJORS),
             Vec::<String>::new(),
@@ -366,17 +356,11 @@ fn the_support_window_document_shows_the_table_and_the_retained_levels() {
     assert_eq!(block(&document, "retained-levels"), render_levels());
 }
 
-/// One recorded row.
-struct Recorded {
-    major: u16,
-    versions: Vec<ProtocolVersion>,
-    replaced: Option<String>,
-    supported_until: Option<String>,
-    retired: bool,
-}
-
-/// Reads a recorded table.
-fn parse(recorded: &str) -> Vec<Recorded> {
+/// Reads a recorded table. The text of a recorded row lives for the rest of the process.
+fn parse(recorded: &str) -> Vec<PublicMajor> {
+    fn leak(text: &str) -> &'static str {
+        Box::leak(text.to_owned().into_boxed_str())
+    }
     recorded
         .lines()
         .filter(|line| line.starts_with("major="))
@@ -386,19 +370,20 @@ fn parse(recorded: &str) -> Vec<Recorded> {
                     .find_map(|word| word.strip_prefix(&format!("{name}=")))
                     .unwrap_or_else(|| panic!("{name} is missing in {line}"))
             };
-            let optional = |name: &str| (field(name) != "-").then(|| field(name).to_owned());
-            Recorded {
+            let optional = |name: &str| (field(name) != "-").then(|| leak(field(name)));
+            let versions: Vec<ProtocolVersion> = field("versions")
+                .split(',')
+                .map(|version| {
+                    let (major, minor) = version.split_once('.').expect("major.minor");
+                    ProtocolVersion::new(
+                        major.parse().expect("a major"),
+                        minor.parse().expect("a minor"),
+                    )
+                })
+                .collect();
+            PublicMajor {
                 major: field("major").parse().expect("a major"),
-                versions: field("versions")
-                    .split(',')
-                    .map(|version| {
-                        let (major, minor) = version.split_once('.').expect("major.minor");
-                        ProtocolVersion::new(
-                            major.parse().expect("a major"),
-                            minor.parse().expect("a minor"),
-                        )
-                    })
-                    .collect(),
+                versions: Box::leak(versions.into_boxed_slice()),
                 replaced: optional("replaced"),
                 supported_until: optional("supported_until"),
                 retired: field("retired") == "true",

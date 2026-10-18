@@ -14,7 +14,7 @@
 //! and a network.
 
 #![cfg(unix)]
-#![allow(dead_code)]
+#![allow(dead_code, unused_imports)]
 
 mod stored_formats;
 mod support;
@@ -37,7 +37,7 @@ impl Previous {
     /// A release of the release before's own programs, at its own level, carrying this process's
     /// channel root.
     fn assembled(&self, sequence: u64) -> Assembled {
-        let version = PackageVersion::new(self.level.major(), self.level.minor(), 0);
+        let version = PackageVersion::new(self.level.major(), self.level.minor().unwrap_or(0), 0);
         Assembled::of_programs(
             self.programs,
             self.release.as_str(),
