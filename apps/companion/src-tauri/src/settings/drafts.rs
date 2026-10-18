@@ -1245,11 +1245,6 @@ impl DraftsSync {
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     self.told.tell();
                 }
-                // A draft sealed under an epoch this device does not believe, or holds no key
-                // for, is one it cannot read yet: it was written before this device joined or
-                // before a device was taken out, and is not a fault to report at every pass.
-                Err(SyncError::Client(error))
-                    if error.code() == kr_protocol::error::ErrorCode::HostNotConfigured => {}
                 // One draft this version cannot open does not keep the others from coming down.
                 Err(error) => {
                     problem.get_or_insert_with(|| super::sync::sync_failure(error));

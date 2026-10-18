@@ -593,7 +593,7 @@ describe('the devices that share the settings', () => {
       })
     })
     const settings = await within(sheet).findByTestId('settings-sync')
-    expect(within(settings).getByTestId('settings-sync-start-own')).toHaveTextContent(/cannot join/)
+    expect(within(settings).getByTestId('settings-sync-start-own')).toHaveTextContent(/join them in the card below/)
     expect(within(settings).getByTestId('settings-sync-turn-on')).not.toHaveClass('btn-primary')
   })
 
@@ -704,16 +704,27 @@ describe('the devices that share the settings', () => {
     })
   })
 
-  it('says why nothing can be shared or joined from a computer that cannot ask the person', async () => {
+  it('offers a computer that cannot ask the person neither a share nor a join, and says where to do it', async () => {
     const { controls, sheet } = await openOnAccount()
     act(() => {
       controls.settings.change({
-        sync: { ...sharing, devices: { ...sharing.devices, can_confirm: false } }
+        sync: {
+          ...sharing,
+          devices: {
+            ...sharing.devices,
+            can_confirm: false,
+            offers: [{ reference: 'c-1', name: 'the-laptop' }]
+          }
+        }
       })
     })
     const card = await within(sheet).findByTestId('settings-devices')
-    expect(within(card).getByTestId('settings-devices-cannot-confirm')).toBeInTheDocument()
-    expect(within(card).getByRole('button', { name: 'Share settings with the-phone' })).toBeDisabled()
+    expect(within(card).getByTestId('settings-devices-cannot-confirm')).toHaveTextContent(
+      /Mac or a Windows computer/
+    )
+    expect(within(card).queryByRole('button', { name: /^Share settings with/ })).toBeNull()
+    expect(within(card).queryByRole('button', { name: /^Join the settings/ })).toBeNull()
+    expect(within(card).queryByTestId('settings-devices-offer')).toBeNull()
   })
 
   it('says what a change came to until the person dismisses it', async () => {

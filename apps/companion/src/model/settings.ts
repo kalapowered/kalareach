@@ -178,8 +178,8 @@ export function offerLabel(offer: DeviceOffer): string {
 
 /** Said under the button that starts settings sync, when another device already shares some. */
 export const DEVICES_START_OWN =
-  'Another of your devices already shares settings. Join them in the card below: a computer that ' +
-  'starts its own cannot join those afterwards.'
+  'Another of your devices already shares settings. To use them here, join them in the card below. ' +
+  'A computer that starts settings sync of its own cannot join another\'s yet, and cannot leave its own.'
 
 /**
  * Texts with a key each, the second of two equal texts keyed apart from the first, for a list whose
@@ -196,9 +196,10 @@ export function uniqueKeys(
   })
 }
 
-/** Why no device can be added or joined from this computer. */
+/** Why no device can be added or joined from this computer, and where it can be done. */
 export const DEVICES_CANNOT_CONFIRM =
-  'This computer cannot ask you to confirm, so it adds no device and joins no settings.'
+  'This computer cannot ask you to confirm, so it can neither share your settings nor join settings ' +
+  'another device shares. Do that on a Mac or a Windows computer.'
 
 /** What a device no host lists any more is told, and what happens to it. */
 export const DEVICE_NOT_VOUCHED = 'No host lists it any more, so it is taken out at the next check.'

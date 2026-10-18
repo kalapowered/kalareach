@@ -95,7 +95,7 @@ export function SettingsDevices({
           ))}
         </ul>
       ) : null}
-      {devices.candidates.length > 0 ? (
+      {devices.candidates.length > 0 && devices.can_confirm ? (
         <>
           <p className="account-note">Your hosts list these devices as yours.</p>
           <ul className="device-list" data-testid="settings-devices-candidates">
@@ -107,7 +107,7 @@ export function SettingsDevices({
                 <Button
                   tone="primary"
                   data-wraps
-                  disabled={busy || !devices.can_confirm}
+                  disabled={busy}
                   aria-label={`Share settings with ${candidate.name}`}
                   style={{ minBlockSize: target }}
                   onClick={() => {
@@ -121,7 +121,7 @@ export function SettingsDevices({
           </ul>
         </>
       ) : null}
-      {devices.offers.length > 0 ? (
+      {devices.offers.length > 0 && devices.can_confirm ? (
         <>
           <p className="account-note" data-testid="settings-devices-offer">
             {DEVICES_OFFER}
@@ -135,7 +135,7 @@ export function SettingsDevices({
                 <Button
                   tone="primary"
                   data-wraps
-                  disabled={busy || !devices.can_confirm}
+                  disabled={busy}
                   aria-label={offerLabel(offer)}
                   style={{ minBlockSize: target }}
                   onClick={() => {
