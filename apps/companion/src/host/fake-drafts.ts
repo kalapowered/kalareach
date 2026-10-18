@@ -85,6 +85,30 @@ export class FakeDraftStore {
     }
   }
 
+  /**
+   * Keeps another device's draft beside this device's own, as native code does when it brings one
+   * down from the sync service: a copy that says it came from another device, and that nothing sends.
+   */
+  arrive(request: { readonly of: string; readonly sessionId: string; readonly text: string }): StoredDraft {
+    const at = this.#tick()
+    const made: StoredDraft = {
+      id: `00000000-0000-4000-9000-${String(++this.#counter).padStart(12, '0')}`,
+      revision: '1',
+      sessionId: request.sessionId,
+      applicationInstanceId: null,
+      agentBindingRevision: null,
+      state: 'open',
+      text: request.text,
+      attachments: [],
+      copyOf: request.of,
+      fromAnotherDevice: true,
+      createdAtMs: at,
+      updatedAtMs: at
+    }
+    this.#put(made)
+    return made
+  }
+
   /** Makes the store refuse to open, as a device whose store cannot be read does. */
   breakOpening(): void {
     this.#opens = false

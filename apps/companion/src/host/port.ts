@@ -361,6 +361,33 @@ export interface SettingsSyncView {
   readonly paused: boolean
   /** What the last step could not do, in words, until a step succeeds. */
   readonly problem: string | null
+  /** Drafts, which travel in the same collection once the person asks for that. */
+  readonly drafts: DraftsSyncView
+}
+
+/** Why drafts are kept on this computer and not sent. */
+export type DraftsKeptWhy = 'private' | 'unreadable' | 'unknown_host' | 'too_large'
+
+/** Drafts kept on this computer and not sent, for one reason. */
+export interface KeptDrafts {
+  /** What the host is called, when the host is known and has a name. */
+  readonly host: string | null
+  readonly why: DraftsKeptWhy
+  /** When this computer could not read a host's privacy mode: what it said. */
+  readonly detail: string | null
+  readonly drafts: number
+}
+
+/** What the page is shown of keeping drafts in step. */
+export interface DraftsSyncView {
+  /** Whether the person turned it on. */
+  readonly enabled: boolean
+  /** The drafts kept on this computer and not sent, with why. */
+  readonly kept_here: readonly KeptDrafts[]
+  /** What the last step could not do, in words, until a step succeeds. */
+  readonly problem: string | null
+  /** How many drafts of other devices have been brought down since the application started. */
+  readonly arrivals: number
 }
 
 /** One version of the settings the person is asked to choose between. */
@@ -789,8 +816,10 @@ export interface StoredDraft {
   readonly text: string
   /** The completed uploads on it, without their previews. */
   readonly attachments: readonly AttachmentHandle[]
-  /** The draft this one was kept beside when two windows changed the same draft. */
+  /** The draft this one was kept beside: when two windows changed the same draft, or when another device wrote it. */
   readonly copyOf: string | null
+  /** True when the copy is another device's draft, brought down. */
+  readonly fromAnotherDevice?: boolean
   readonly createdAtMs: string
   readonly updatedAtMs: string
 }
@@ -1532,6 +1561,11 @@ export interface HostPort {
   settingsSyncTurnOn(): Promise<SettingsView>
   /** Brings this computer and the sync service to the same settings now, when sync is on. */
   settingsSyncNow(): Promise<SettingsView>
+  /**
+   * Turns the keeping of drafts in step on or off. Refused while settings sync is off, since drafts
+   * travel in its collection.
+   */
+  settingsDraftsSet(enabled: boolean): Promise<SettingsView>
   /** The versions of the settings to choose between, or null when two devices changed none. */
   settingsConflicts(): Promise<SettingsChoice | null>
   /**

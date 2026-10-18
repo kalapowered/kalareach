@@ -488,6 +488,31 @@ can recognise it. The buttons to resolve the conflict are labelled with the acti
 Once the conflict is resolved, all other versions of the settings are discarded. If the service
 cannot be told of the choice, the choice stands and the next sync step sends it.
 
+Drafts can be kept in step between devices through the same collection as the settings. This is a
+second choice, made in the settings card of the Account sheet once settings sync is on, because an
+unsent prompt is more sensitive than a colour mode. When this computer publishes a draft, it is
+sealed with the collection's key, and only this computer can change it. A draft that another device
+published arrives as a copy kept beside this computer's own drafts. It is never opened in a composer
+and never sent. The logic is in `src-tauri/src/settings/drafts.rs`, and its records are under
+`settings-sync/drafts/`.
+
+Each host has its own privacy mode, and a draft is written for a session on one host. For this
+reason each host's drafts are published through a sync store of their own, and that store is fenced
+at the host's privacy generation. The settings store is never fenced, since the colour mode holds no
+session content. This computer reads a host's privacy mode with `privacy.status` over the connection
+it holds to that host, which needs the right to manage the host. A host that cannot be read is
+treated as private: this computer may not be connected to it, may hold no right to ask, or the host
+may not answer. Drafts written for a private host, for a host that cannot be read, or while no host
+was connected stay on this computer, and the settings card says how many and why. An answer that
+arrives after the host went private is discarded.
+
+When a draft is sent or thrown away, the service is told to remove it, so that its place in the
+collection is free. A collection holds at most 256 objects. The removal compares against the
+position the draft had when it left this computer. It is owed in `removals.json` until the service
+has made it, and it is retried later if it does not go through, for instance because the host is
+private. If the draft was written again since the position the removal names, the removal removes nothing
+and stays owed until the position it names is the draft's last.
+
 ## The sync service and recovery
 
 The sync service is a setting of its own. It is the managed service, `https://reach.kala.to`, until

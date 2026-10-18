@@ -46,9 +46,15 @@ import {
   describeRecovery,
   describeStaysAt
 } from '../model/recovery'
-import { SETTINGS_SYNC_HELP, describeSettingsSync, describeWaiting } from '../model/settings'
+import {
+  DRAFTS_SYNC_HELP,
+  SETTINGS_SYNC_HELP,
+  describeKeptHere,
+  describeSettingsSync,
+  describeWaiting
+} from '../model/settings'
 import { SettingsChoiceForm } from './SettingsChoice'
-import { Button, Card } from './ui'
+import { Button, Card, Switch } from './ui'
 
 /** Which card a step belongs to, so the status it ends with is said in that card. */
 type Place = 'service' | 'settings' | 'recovery'
@@ -454,6 +460,42 @@ export function SyncPanel({
                   </Button>
                 ) : null}
               </div>
+              {settings?.sync.state === 'on' ? (
+                <div
+                  className="account-switch"
+                  data-testid="drafts-sync"
+                  data-state={settings.sync.drafts.enabled ? 'on' : 'off'}
+                >
+                  <div className="account-switch-words">
+                    <p className="account-lead">Keep drafts in step</p>
+                    <p className="account-note">{DRAFTS_SYNC_HELP}</p>
+                    {settings.sync.drafts.enabled
+                      ? settings.sync.drafts.kept_here.map((kept) => (
+                          <p
+                            className="account-note"
+                            data-testid="drafts-kept-here"
+                            key={`${kept.host ?? ''}/${kept.why}`}
+                          >
+                            {describeKeptHere(kept)}
+                          </p>
+                        ))
+                      : null}
+                    {settings.sync.drafts.enabled && settings.sync.drafts.problem !== null ? (
+                      <p className="account-note" data-testid="drafts-problem">
+                        {settings.sync.drafts.problem}
+                      </p>
+                    ) : null}
+                  </div>
+                  <Switch
+                    checked={settings.sync.drafts.enabled}
+                    label="Keep drafts in step"
+                    disabled={busy}
+                    onChange={(next) => {
+                      step('settings', () => port.settingsDraftsSet(next).then(() => null))
+                    }}
+                  />
+                </div>
+              ) : null}
               {choice !== null && (settings?.sync.conflicts ?? 0) > 0 ? (
                 <SettingsChoiceForm
                   choice={choice}

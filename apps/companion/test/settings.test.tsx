@@ -423,3 +423,108 @@ describe('the choice between two versions of the settings', () => {
     expect(options[1]).toBeDisabled()
   })
 })
+
+describe('drafts in settings sync\'s card', () => {
+  async function openOnCard() {
+    const person = userEvent.setup()
+    const { port, controls } = fakeHost()
+    render(
+      <AppProvider port={port} initialPlace={{ view: 'attention' }}>
+        <App />
+      </AppProvider>
+    )
+    await person.click(screen.getByRole('button', { name: /^Account/ }))
+    const sheet = await screen.findByRole('dialog', { name: 'Account' })
+    const card = await within(sheet).findByTestId('settings-sync')
+    return { person, controls, card, sheet }
+  }
+
+  it('is offered only once settings sync is on, off to begin with, and is turned on and off by one press', async () => {
+    const { person, controls, card } = await openOnCard()
+    expect(within(card).queryByTestId('drafts-sync')).toBeNull()
+
+    act(() => {
+      controls.settings.change({ sync: { state: 'on', kept_at: 'reach.kala.to' } })
+    })
+    const row = await within(card).findByTestId('drafts-sync')
+    const keep = within(row).getByRole('switch', { name: 'Keep drafts in step' })
+    expect(keep).toHaveAttribute('aria-checked', 'false')
+
+    await person.click(keep)
+    await waitFor(() => {
+      expect(keep).toHaveAttribute('aria-checked', 'true')
+    })
+    expect(controls.settings.draftsSetTo).toEqual([true])
+
+    await person.click(keep)
+    await waitFor(() => {
+      expect(keep).toHaveAttribute('aria-checked', 'false')
+    })
+    expect(controls.settings.draftsSetTo).toEqual([true, false])
+  })
+
+  it('says which drafts stay on this device and why, host by host, only while it is on', async () => {
+    const { controls, card } = await openOnCard()
+    act(() => {
+      controls.settings.change({
+        sync: {
+          state: 'on',
+          kept_at: 'reach.kala.to',
+          drafts: {
+            enabled: true,
+            problem: null,
+            arrivals: 0,
+            kept_here: [
+              { host: 'studio', why: 'private', detail: null, drafts: 1 },
+              { host: 'laptop', why: 'unreadable', detail: 'this computer is not connected to that host', drafts: 2 },
+              { host: null, why: 'unknown_host', detail: null, drafts: 1 }
+            ]
+          }
+        }
+      })
+    })
+    const notes = await within(card).findAllByTestId('drafts-kept-here')
+    expect(notes).toHaveLength(3)
+    expect(notes[0]).toHaveTextContent(/1 draft for studio stays on this device/)
+    expect(notes[0]).toHaveTextContent(/privacy mode is on there/)
+    expect(notes[1]).toHaveTextContent(/2 drafts for laptop stay on this device/)
+    expect(notes[1]).toHaveTextContent(/not connected to that host/)
+    expect(notes[2]).toHaveTextContent(/written while no host was connected/)
+
+    // Turned off, nothing is said of drafts that are not being kept in step.
+    act(() => {
+      controls.settings.change({
+        sync: { drafts: { enabled: false, problem: null, arrivals: 0, kept_here: [] } }
+      })
+    })
+    await waitFor(() => {
+      expect(within(card).queryByTestId('drafts-kept-here')).toBeNull()
+    })
+  })
+
+  it('says why the backend refused the switch, and leaves it where it was', async () => {
+    const person = userEvent.setup()
+    const { port, controls } = fakeHost()
+    const refusing = {
+      ...port,
+      settingsDraftsSet: () => Promise.reject(new Error('Settings sync is not on any more.'))
+    }
+    render(
+      <AppProvider port={refusing} initialPlace={{ view: 'attention' }}>
+        <App />
+      </AppProvider>
+    )
+    await person.click(screen.getByRole('button', { name: /^Account/ }))
+    const sheet = await screen.findByRole('dialog', { name: 'Account' })
+    const card = await within(sheet).findByTestId('settings-sync')
+    act(() => {
+      controls.settings.change({ sync: { state: 'on', kept_at: 'reach.kala.to' } })
+    })
+    const keep = await within(card).findByRole('switch', { name: 'Keep drafts in step' })
+    await person.click(keep)
+    await waitFor(() => {
+      expect(card).toHaveTextContent('Settings sync is not on any more.')
+    })
+    expect(keep).toHaveAttribute('aria-checked', 'false')
+  })
+})

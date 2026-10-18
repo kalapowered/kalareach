@@ -323,6 +323,8 @@ export interface FakeRecovery {
 export interface FakeSettings {
   /** The colour modes the page asked to keep, in order. */
   readonly colourModesSet: readonly string[]
+  /** What the page asked drafts sync to be, in order. */
+  readonly draftsSetTo: readonly boolean[]
   /** How many times the page asked to turn settings sync on. */
   readonly syncTurnedOn: number
   /** How many times the page asked sync to run now. */
@@ -922,10 +924,12 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
       outstanding: 0,
       conflicts: 0,
       paused: false,
-      problem: null
+      problem: null,
+      drafts: { enabled: false, kept_here: [], problem: null, arrivals: 0 }
     }
   }
   const colourModesSet: string[] = []
+  const draftsSetTo: boolean[] = []
   let choice: SettingsChoice | null = null
   const settingsKept: SettingsKeep[] = []
   let settingsSyncTurnOns = 0
@@ -2162,6 +2166,17 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
       settingsSyncRuns += 1
       return Promise.resolve(settingsOf())
     },
+    settingsDraftsSet: (enabled) => {
+      if (enabled && settings.sync.state !== 'on') {
+        return refused('PERMISSION_DENIED', 'Turn on settings sync first: drafts are kept in its collection.')
+      }
+      draftsSetTo.push(enabled)
+      setSettings({
+        ...settings,
+        sync: { ...settings.sync, drafts: { ...settings.sync.drafts, enabled } }
+      })
+      return Promise.resolve(settingsOf())
+    },
     settingsConflicts: () => Promise.resolve(choice),
     settingsConflictResolve: (keep) => {
       if (choice === null) refuse('PERMISSION_DENIED', 'No content from another device is waiting.')
@@ -2260,6 +2275,7 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
     },
     settings: {
       colourModesSet,
+      draftsSetTo,
       get syncTurnedOn() {
         return settingsSyncTurnOns
       },

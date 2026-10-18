@@ -734,11 +734,13 @@ describe('the desktop port and the person\'s settings', () => {
     await port.settingsSetColourMode('dark')
     await port.settingsSyncTurnOn()
     await port.settingsSyncNow()
+    await port.settingsDraftsSet(true)
     expect(shell.invoked).toEqual([
       { command: 'settings_view', args: {} },
       { command: 'settings_colour_mode_set', args: { mode: 'dark' } },
       { command: 'settings_sync_turn_on', args: {} },
-      { command: 'settings_sync_now', args: {} }
+      { command: 'settings_sync_now', args: {} },
+      { command: 'settings_drafts_set', args: { enabled: true } }
     ])
   })
 

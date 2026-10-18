@@ -415,6 +415,7 @@ export function tauriPort(): HostPort {
     settingsSetColourMode: (mode) => call<SettingsView>('settings_colour_mode_set', { mode }),
     settingsSyncTurnOn: () => call<SettingsView>('settings_sync_turn_on', {}),
     settingsSyncNow: () => call<SettingsView>('settings_sync_now', {}),
+    settingsDraftsSet: (enabled) => call<SettingsView>('settings_drafts_set', { enabled }),
     settingsConflicts: () => call<SettingsChoice | null>('settings_conflicts', {}),
     settingsConflictResolve: (keep) =>
       call<SettingsView>('settings_conflict_resolve', { keep }),

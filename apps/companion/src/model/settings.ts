@@ -7,7 +7,13 @@
  * choice; the key, the identities and the content stay in native code.
  */
 
-import type { ColourMode, SettingsChoice, SettingsKeep, SettingsSyncView } from '../host/port'
+import type {
+  ColourMode,
+  KeptDrafts,
+  SettingsChoice,
+  SettingsKeep,
+  SettingsSyncView
+} from '../host/port'
 
 /** What settings sync is, and what it is not. */
 export const SETTINGS_SYNC_HELP =
@@ -23,6 +29,36 @@ export function describeSettingsSync(sync: SettingsSyncView): string {
       return `Waiting for ${sync.kept_at ?? 'the sync service'} to start keeping your settings.`
     case 'on':
       return `Your settings are kept in step through ${sync.kept_at ?? 'the sync service'}.`
+  }
+}
+
+/** What keeping drafts in step does, said where the person turns it on. */
+export const DRAFTS_SYNC_HELP =
+  'Your unsent prompts follow you to your other devices, sealed like your settings. A draft from ' +
+  'another device is kept beside yours and is never sent.'
+
+/** The drafts, counted: "1 draft", "3 drafts". */
+function countDrafts(count: number): string {
+  return count === 1 ? '1 draft' : `${count} drafts`
+}
+
+/** Why some drafts stay on this device and are not sent, in words. */
+export function describeKeptHere(kept: KeptDrafts): string {
+  const stays = kept.drafts === 1 ? 'stays' : 'stay'
+  const place = kept.host === null ? 'that host' : kept.host
+  switch (kept.why) {
+    case 'private':
+      return `${countDrafts(kept.drafts)} for ${place} ${stays} on this device while privacy mode is on there.`
+    case 'unreadable':
+      return (
+        `${countDrafts(kept.drafts)} for ${place} ${stays} on this device because this device cannot ` +
+        `read whether privacy mode is on there` +
+        (kept.detail === null ? '.' : `: ${kept.detail}.`)
+      )
+    case 'unknown_host':
+      return `${countDrafts(kept.drafts)} written while no host was connected ${stays} on this device.`
+    case 'too_large':
+      return `${countDrafts(kept.drafts)} ${kept.drafts === 1 ? 'is' : 'are'} too large to keep in step and ${stays} on this device.`
   }
 }
 

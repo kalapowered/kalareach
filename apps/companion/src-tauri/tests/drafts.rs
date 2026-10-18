@@ -970,7 +970,7 @@ fn windows_that_save_against_one_version_at_once_lose_no_text() {
             serde_json::to_value(
                 state
                     .drafts()
-                    .save(params, kr_protocol::scalars::TimestampMs::new(1))
+                    .save(params, None, kr_protocol::scalars::TimestampMs::new(1))
                     .expect("the draft is made"),
             )
             .expect("an answer")
@@ -1007,7 +1007,7 @@ fn windows_that_save_against_one_version_at_once_lose_no_text() {
                     start.wait();
                     state
                         .drafts()
-                        .save(params, kr_protocol::scalars::TimestampMs::new(2))
+                        .save(params, None, kr_protocol::scalars::TimestampMs::new(2))
                         .expect("a save never loses what it was given");
                 })
             })

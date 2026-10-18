@@ -131,6 +131,8 @@ pub struct SyncView {
     pub paused: bool,
     /// What the last step could not do, in words, until a step succeeds.
     pub problem: Option<String>,
+    /// Drafts, which travel in the same collection when the person turns that on.
+    pub drafts: super::drafts::DraftsView,
 }
 
 impl SyncView {
@@ -145,6 +147,7 @@ impl SyncView {
             conflicts: 0,
             paused: false,
             problem: None,
+            drafts: super::drafts::DraftsView::off(),
         }
     }
 }
@@ -243,6 +246,7 @@ pub struct SettingsSync {
     steps: tokio::sync::Mutex<()>,
     problem: Mutex<Option<String>>,
     told: Arc<super::Told>,
+    drafts: Arc<super::drafts::DraftsSync>,
 }
 
 impl std::fmt::Debug for SettingsSync {
@@ -289,6 +293,8 @@ impl SettingsSync {
         local: Arc<LocalSettings>,
         parts: SyncParts,
         told: Arc<super::Told>,
+        desk: Arc<crate::drafts::DraftDesk>,
+        hosts: Arc<dyn super::drafts::DraftHosts>,
     ) -> Result<Self> {
         let directory = data.join(DIRECTORY);
         create_private_directory(&directory)
@@ -299,6 +305,13 @@ impl SettingsSync {
                     "the directory settings sync keeps its records in could not be made: {error}"
                 ))
             })?;
+        let drafts = Arc::new(super::drafts::DraftsSync::open(
+            &directory,
+            Arc::clone(&desk),
+            hosts,
+            Arc::clone(&told),
+        )?);
+        desk.watched_by(Arc::clone(&drafts) as Arc<dyn crate::drafts::DraftWatch>);
         Ok(Self {
             directory,
             parts,
@@ -306,7 +319,14 @@ impl SettingsSync {
             steps: tokio::sync::Mutex::new(()),
             problem: Mutex::new(None),
             told,
+            drafts,
         })
+    }
+
+    /// Drafts, kept in step through the same collection.
+    #[must_use]
+    pub fn drafts(&self) -> &super::drafts::DraftsSync {
+        &self.drafts
     }
 
     /// Takes this process's turn and then the lock a second companion on this machine would wait
@@ -354,6 +374,7 @@ impl SettingsSync {
                     conflicts: 0,
                     paused: false,
                     problem,
+                    drafts: self.drafts.view(),
                 };
             }
             Err(error) => {
@@ -365,6 +386,7 @@ impl SettingsSync {
                     conflicts: 0,
                     paused: false,
                     problem: Some(error.message),
+                    drafts: self.drafts.view(),
                 };
             }
         };
@@ -391,6 +413,7 @@ impl SettingsSync {
             conflicts,
             paused,
             problem: problem.or(trouble),
+            drafts: self.drafts.view(),
         }
     }
 
@@ -512,6 +535,19 @@ impl SettingsSync {
         }
         let client = self.client(service, status.collection, epoch)?;
         self.agree(&client, record.object_id, now_ms).await?;
+        // The settings agree. Drafts go in the same collection under the same epoch, when the
+        // person asked for that, and what stops them never stops this step.
+        self.drafts
+            .pass(
+                &super::drafts::Collection {
+                    service,
+                    collection: status.collection,
+                    epoch,
+                    keys: Arc::new(self.keys()),
+                },
+                now_ms,
+            )
+            .await;
         Ok(Progress::Agreed)
     }
 
@@ -929,7 +965,7 @@ fn colour_mode_of(object: &SyncObject) -> Option<ColourMode> {
 }
 
 /// What a sync failure is to the person.
-fn sync_failure(error: SyncError) -> CommandError {
+pub(super) fn sync_failure(error: SyncError) -> CommandError {
     CommandError {
         code: error.code(),
         user_action: error.user_action().as_str().into(),

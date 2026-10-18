@@ -201,6 +201,7 @@ pub const NAMED_COMMANDS: &[(&str, Option<Method>)] = &[
     ("settings_sync_now", None),
     ("settings_conflicts", None),
     ("settings_conflict_resolve", None),
+    ("settings_drafts_set", None),
 ];
 
 /// The commands that reach a session's worker or name a session on a host this device is paired
@@ -272,6 +273,13 @@ pub const NATIVE_METHODS: &[(&str, &[Method])] = &[
     // host is up: the connection carries none on its handshake.
     ("hosts_use", &[Method::HostInfo, Method::SessionOpen]),
     ("owner_confirmations", &[Method::OwnerConfirmationPending]),
+    // Settings sync keeps drafts in step host by host, and reads each host's privacy mode from the
+    // connection this application holds to it before any draft of that host leaves. Every command
+    // that can run a pass is named, and the page supplies none of the method's parameters.
+    ("settings_colour_mode_set", &[Method::PrivacyStatus]),
+    ("settings_sync_turn_on", &[Method::PrivacyStatus]),
+    ("settings_sync_now", &[Method::PrivacyStatus]),
+    ("settings_drafts_set", &[Method::PrivacyStatus]),
     (
         "owner_confirmation_review",
         &[
@@ -484,6 +492,7 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke) -> bool + Send + Sync + 'static
         settings_sync_now,
         settings_conflicts,
         settings_conflict_resolve,
+        settings_drafts_set,
     ]
 }
 
@@ -985,7 +994,9 @@ pub async fn device_drafts(state: State<'_, AppState>) -> Result<Value> {
 pub async fn device_draft_save(state: State<'_, AppState>, params: Value) -> Result<Value> {
     let typed: crate::drafts::SaveParams = decode(params)?;
     let drafts = state.drafts();
-    encode(&blocking(move || drafts.save(typed, kr_ipc::now_ms())).await?)
+    // The host this application is connected to is the host of the session the draft is for.
+    let host = state.connected_host();
+    encode(&blocking(move || drafts.save(typed, host, kr_ipc::now_ms())).await?)
 }
 
 /// Points a draft at a session and conversation a person chose.
@@ -993,7 +1004,8 @@ pub async fn device_draft_save(state: State<'_, AppState>, params: Value) -> Res
 pub async fn device_draft_retarget(state: State<'_, AppState>, params: Value) -> Result<Value> {
     let typed: crate::drafts::RetargetParams = decode(params)?;
     let drafts = state.drafts();
-    encode(&blocking(move || drafts.retarget(typed, kr_ipc::now_ms())).await?)
+    let host = state.connected_host();
+    encode(&blocking(move || drafts.retarget(typed, host, kr_ipc::now_ms())).await?)
 }
 
 /// Throws away a draft, if it is still the version the person was shown.
@@ -3194,6 +3206,7 @@ mod tests {
         "settings_sync_now",
         "settings_conflicts",
         "settings_conflict_resolve",
+        "settings_drafts_set",
     ];
 
     #[test]
@@ -3337,6 +3350,8 @@ mod tests {
                 // is shown neither key nor identity.
                 "settings_conflicts",
                 "settings_conflict_resolve",
+                // Whether drafts are kept in step too. The page names a switch and nothing else.
+                "settings_drafts_set",
                 // The raw terminal view's five. The view attaches on the session's own worker,
                 // which the control daemon does not proxy for this computer, so the page names a
                 // session, a size, its moves and the person's input, and native code makes every
@@ -4177,6 +4192,17 @@ pub fn settings_conflicts(
     state: State<'_, AppState>,
 ) -> Result<Option<crate::settings::ConflictView>> {
     state.settings()?.conflicts()
+}
+
+/// Turns the keeping of drafts in step with the person's other devices on or off. Settings sync has
+/// to be on first: drafts travel in its collection. A draft that arrives from another device is kept
+/// beside this computer's own and is never sent anywhere.
+#[tauri::command]
+pub async fn settings_drafts_set(
+    state: State<'_, AppState>,
+    enabled: bool,
+) -> Result<crate::settings::SettingsView> {
+    state.settings()?.drafts_set(enabled).await
 }
 
 /// Records which version the person keeps. The page names this computer's own or a copy this

@@ -28,6 +28,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{CommandError, Result};
 
+pub mod connected;
+pub mod drafts;
 pub mod sync;
 
 /// Opens `path`, making it when it is not there, and takes the exclusive lock on it. The lock is
@@ -45,6 +47,7 @@ pub(crate) fn locked_file(path: &Path) -> std::io::Result<std::fs::File> {
     Ok(file)
 }
 
+pub use drafts::{DraftHosts, DraftsView, HostPrivacy, KeptHere, Why};
 pub use sync::{
     Candidate, ConflictView, Keep, Other, SettingsSync, SyncParts, SyncState, SyncView,
 };
@@ -353,9 +356,21 @@ impl Settings {
     /// # Errors
     ///
     /// Returns a local failure when sync's directory cannot be made.
-    pub fn take_part(&self, data: &Path, parts: SyncParts) -> Result<()> {
-        let sync =
-            SettingsSync::open(data, Arc::clone(&self.local), parts, Arc::clone(&self.told))?;
+    pub fn take_part(
+        &self,
+        data: &Path,
+        parts: SyncParts,
+        desk: Arc<crate::drafts::DraftDesk>,
+        hosts: Arc<dyn DraftHosts>,
+    ) -> Result<()> {
+        let sync = SettingsSync::open(
+            data,
+            Arc::clone(&self.local),
+            parts,
+            Arc::clone(&self.told),
+            desk,
+            hosts,
+        )?;
         let _ = self.sync.set(sync);
         Ok(())
     }
@@ -425,6 +440,42 @@ impl Settings {
         };
         sync.resolve(keep).await?;
         Ok(self.view())
+    }
+
+    /// Turns the keeping of drafts in step on or off.
+    ///
+    /// Drafts travel in the settings collection, so settings sync has to be on first. Turning drafts
+    /// sync on starts a pass at once.
+    ///
+    /// # Errors
+    ///
+    /// Returns a refusal when settings sync is not on, and a local failure when the choice cannot be
+    /// kept.
+    pub async fn drafts_set(&self, enabled: bool) -> Result<SettingsView> {
+        let Some(sync) = self.sync.get() else {
+            return Err(CommandError::refused("settings sync is not on"));
+        };
+        if enabled && sync.view().state != SyncState::On {
+            return Err(CommandError::refused(
+                "turn on settings sync first: drafts are kept in its collection",
+            ));
+        }
+        sync.drafts().set_enabled(enabled)?;
+        if enabled {
+            // Whatever stopped the pass is in the view the page reads next.
+            let _ = sync.catch_up().await;
+        }
+        Ok(self.view())
+    }
+
+    /// Waits until something drafts sync keeps in step has changed here: a draft was saved or
+    /// removed, or the person turned it on or off. It never returns while this computer cannot take
+    /// part in settings sync.
+    pub async fn drafts_changed(&self) {
+        match self.sync.get() {
+            Some(sync) => sync.drafts().changed().await,
+            None => std::future::pending().await,
+        }
     }
 
     /// Brings this computer and the sync service to the same settings, when sync is on.

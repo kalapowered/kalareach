@@ -355,7 +355,9 @@ fn open_recovery(app: &tauri::AppHandle) {
     }
     // Telling the page comes first, so a step that begins at once is heard.
     watch_settings(app);
-    let taking_part = device.and_then(|device| start_settings_sync(app, &data, device.identity()));
+    let hosts = std::sync::Arc::new(settings::connected::ConnectedHosts::new(app.clone()));
+    let taking_part =
+        device.and_then(|device| start_settings_sync(app, &data, device.identity(), hosts));
     match taking_part {
         Ok(()) => keep_settings_in_step(app),
         Err(error) => {
@@ -380,7 +382,9 @@ pub fn watch_settings<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
 }
 
 /// Lets this computer take part in settings sync, on `identity`'s keys and secure store and the
-/// sync service the setting names, with its records under `data`.
+/// sync service the setting names, with its records under `data`. The drafts of this computer's
+/// draft desk travel in the same collection when the person turns that on, and `hosts` says what
+/// this computer can read of each host's privacy mode.
 ///
 /// # Errors
 ///
@@ -390,6 +394,7 @@ pub fn start_settings_sync<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     data: &std::path::Path,
     identity: &device::DeviceIdentity,
+    hosts: std::sync::Arc<dyn settings::DraftHosts>,
 ) -> Result<()> {
     use std::sync::Arc;
 
@@ -403,24 +408,36 @@ pub fn start_settings_sync<R: tauri::Runtime>(
             secrets: Arc::clone(&identity.secrets),
             service: state.sync_service()?,
         },
+        state.drafts(),
+        hosts,
     )
 }
 
 /// How long settings sync waits between looking for what another device changed.
 const SETTINGS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 
-/// Starts the task that brings this computer and the sync service to the same settings now and
-/// every [`SETTINGS_INTERVAL`] after. Nothing is sent while settings sync is off.
+/// How long a change to the drafts is let settle before a pass takes it up, so that a person typing
+/// is one pass and not one for every pause.
+const DRAFTS_SETTLE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Starts the task that brings this computer and the sync service to the same settings now, every
+/// [`SETTINGS_INTERVAL`] after, and shortly after a draft is saved or removed. Nothing is sent
+/// while settings sync is off.
 fn keep_settings_in_step(app: &tauri::AppHandle) {
     use tauri::Manager as _;
 
     let handle = app.clone();
     tauri::async_runtime::spawn(async move {
         loop {
-            if let Ok(settings) = handle.state::<AppState>().settings() {
-                let _ = settings.sync_now().await;
+            let Ok(settings) = handle.state::<AppState>().settings() else {
+                tokio::time::sleep(SETTINGS_INTERVAL).await;
+                continue;
+            };
+            let _ = settings.sync_now().await;
+            tokio::select! {
+                () = tokio::time::sleep(SETTINGS_INTERVAL) => {}
+                () = settings.drafts_changed() => tokio::time::sleep(DRAFTS_SETTLE).await,
             }
-            tokio::time::sleep(SETTINGS_INTERVAL).await;
         }
     });
 }

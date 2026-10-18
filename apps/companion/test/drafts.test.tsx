@@ -556,3 +556,32 @@ describe('the drafts no composer shows (KR-REQ-13.13)', () => {
     expect(screen.queryByTestId('kept-drafts-entry')).toBeNull()
   })
 })
+
+describe('a draft another device wrote (KR-REQ-20.13)', () => {
+  it('appears in the kept drafts when native code brings it down, says another device wrote it, and is never in a composer', async () => {
+    const device = new FakeDraftStore()
+    const person = userEvent.setup()
+    const { controls } = startOver(device, { view: 'sessions' })
+    await screen.findByTestId('session-row-1')
+    expect(screen.queryByTestId('kept-drafts-entry')).toBeNull()
+
+    // Native code brings the other device's draft down beside this device's own, and tells the
+    // page by the number of arrivals moving.
+    act(() => {
+      device.arrive({ of: 'bbbbbbbb-bbbb-4bbb-8bbb-000000000001', sessionId: SESSION_MAIN, text: 'written on the laptop' })
+      controls.settings.change({
+        sync: { state: 'on', drafts: { enabled: true, kept_here: [], problem: null, arrivals: 1 } }
+      })
+    })
+    expect(await screen.findByTestId('kept-drafts-entry')).toHaveTextContent('One kept draft is not in a composer.')
+    await person.click(await screen.findByRole('button', { name: 'One kept draft' }))
+    const entry = await screen.findByTestId('kept-draft')
+    expect(within(entry).getByTestId('kept-draft-text')).toHaveTextContent('written on the laptop')
+    expect(entry).toHaveTextContent('Another device of yours wrote this draft')
+
+    // The session's composer holds nothing of it.
+    await person.click(screen.getByRole('button', { name: 'Sessions' }))
+    await person.click(await screen.findByTestId('session-row-1'))
+    expect(await screen.findByTestId('composer-input')).toHaveValue('')
+  })
+})

@@ -149,9 +149,15 @@ export function AppProvider({
   useEffect(() => {
     let stop: (() => void) | null = null
     let ended = false
+    // The drafts of other devices that were brought down are in the store, and this window reads
+    // the store again when their number moves.
+    let arrivals: number | null = null
     void port
       .onSettings((view) => {
         applyMode(view.colour_mode)
+        const brought = view.sync.drafts.arrivals
+        if (arrivals !== null && brought !== arrivals) void drafts.reload()
+        arrivals = brought
       })
       .then(
         (unlisten) => {
@@ -168,6 +174,7 @@ export function AppProvider({
           .settingsView()
           .then((view) => {
             if (!ended && modeApplications() === asked) applyMode(view.colour_mode)
+            arrivals ??= view.sync.drafts.arrivals
           })
           .catch(() => undefined)
       })
@@ -175,7 +182,7 @@ export function AppProvider({
       ended = true
       stop?.()
     }
-  }, [port])
+  }, [port, drafts])
 
   // The drafts kept on this device are read once, and written as the window is hidden or closed.
   // A write is also made at every change, so these two are a second chance, not the only one.

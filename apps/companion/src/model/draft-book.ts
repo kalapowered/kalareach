@@ -69,6 +69,8 @@ export type KeptWhy =
   | 'conflicted'
   /** Another window changed the draft while this one had it, and this is the text kept beside. */
   | 'copy'
+  /** Another device wrote this draft, and it is kept beside this device's own. */
+  | 'device'
   /** Another draft of a session whose composer holds a different one. */
   | 'other'
   /** The text of a prompt the host did not take, or could not say it took. */
@@ -2032,7 +2034,9 @@ export class DraftBook {
   #keptList(): readonly KeptDraft[] {
     const why = (stored: StoredDraft): KeptWhy =>
       stored.copyOf !== null
-        ? 'copy'
+        ? stored.fromAnotherDevice === true
+          ? 'device'
+          : 'copy'
         : stored.state === 'orphaned'
           ? 'orphaned'
           : stored.state === 'conflicted'

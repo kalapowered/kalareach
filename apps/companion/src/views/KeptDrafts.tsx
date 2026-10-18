@@ -34,6 +34,8 @@ function whyWords(why: KeptWhy): string {
       return 'The conversation changed since this was written. Choose where it goes.'
     case 'copy':
       return 'Another window of this application changed this draft while you were writing in it, so what you wrote here is kept as its own draft.'
+    case 'device':
+      return 'Another device of yours wrote this draft. It is kept here, apart from your own, and nothing sends it.'
     case 'other':
       return 'This session’s composer holds a different draft.'
     case 'sent':

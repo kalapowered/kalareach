@@ -31,13 +31,14 @@
 //!   A discard that ends, even in another window's change, takes its entry out.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use kr_client::ClientError;
-use kr_client::drafts::{Draft, DraftError, DraftStore, DraftTarget};
+use kr_client::drafts::{Draft, DraftError, DraftStore, DraftTarget, SyncCheckpoint};
 use kr_protocol::error::ErrorCode;
 use kr_protocol::ids::{
-    AgentBindingRevision, ApplicationInstanceId, DeviceId, DraftId, DraftRevision, SessionId,
+    AgentBindingRevision, ApplicationInstanceId, DeviceId, DraftId, DraftRevision, EnvironmentId,
+    SessionId,
 };
 use kr_protocol::scalars::{Nullable, TimestampMs, Uuid};
 use kr_protocol::transfer::{AttachmentHandle, DraftState};
@@ -73,16 +74,61 @@ fn read_removals(file: &Path) -> Vec<DiscardParams> {
         .unwrap_or_default()
 }
 
+/// The host a draft was written for: the environment its sessions live in, and what the person
+/// calls it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DraftHost {
+    /// The host's environment.
+    pub environment: EnvironmentId,
+    /// What the host is called to the person, when it has a name.
+    pub name: Option<String>,
+}
+
+/// Whoever keeps the drafts in step with other devices is told what happens to a draft here.
+///
+/// It is told after the change is on disk and it changes nothing: the desk's answer to the page is
+/// what the store said.
+pub trait DraftWatch: Send + Sync {
+    /// A draft of this device was stored. `host` is the host this application was connected to when
+    /// the person wrote it, which is the host of the session it is for, when there was one.
+    ///
+    /// `replace` is true only when the person chose the session the draft now goes to, which is a
+    /// choice of a session on the connected host; a plain save never moves the host a draft was
+    /// first written for.
+    fn saved(&self, draft: DraftId, host: Option<DraftHost>, replace: bool);
+
+    /// A draft of this device was removed, taking with it the note of where the service held it,
+    /// when it had been there.
+    fn gone(&self, draft: DraftId, note: Option<SyncCheckpoint>);
+
+    /// Whether a copy kept beside `of` is another device's draft brought down, and not a draft of
+    /// this device that another window of this application changed first.
+    fn is_a_device_copy(&self, of: DraftId) -> bool;
+}
+
 /// The drafts of this device, and the place they are kept.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct DraftDesk {
     /// The application data directory, once it is known.
     data: Mutex<Option<PathBuf>>,
     /// The store, opened by the first command that needs it.
     opened: Mutex<Option<DraftStore>>,
+    /// Who keeps the drafts in step, once there is one.
+    watch: std::sync::OnceLock<Arc<dyn DraftWatch>>,
+}
+
+impl std::fmt::Debug for DraftDesk {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("DraftDesk").finish_non_exhaustive()
+    }
 }
 
 impl DraftDesk {
+    /// Has `watch` told what happens to a draft from now on. Only the first call has an effect.
+    pub fn watched_by(&self, watch: Arc<dyn DraftWatch>) {
+        let _ = self.watch.set(watch);
+    }
+
     /// Names the application data directory the drafts live under.
     pub fn keep_at(&self, data: PathBuf) {
         *self.data.lock().unwrap_or_else(PoisonError::into_inner) = Some(data);
@@ -94,7 +140,7 @@ impl DraftDesk {
     ///
     /// Returns why the store cannot be used: no place for it, an owner file that cannot be read, or
     /// a directory that cannot be made private.
-    fn store(&self) -> Result<DraftStore> {
+    pub(crate) fn store(&self) -> Result<DraftStore> {
         let mut opened = self.opened.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(store) = opened.as_ref() {
             return Ok(store.clone());
@@ -123,7 +169,19 @@ impl DraftDesk {
     pub fn read(&self) -> Result<Stored> {
         let listing = self.store()?.list().map_err(failure)?;
         Ok(Stored {
-            drafts: listing.drafts.iter().map(StoredDraft::of).collect(),
+            drafts: listing
+                .drafts
+                .iter()
+                .map(|draft| {
+                    let mut stored = StoredDraft::of(draft);
+                    stored.from_another_device = draft.conflict_of.0.is_some_and(|of| {
+                        self.watch
+                            .get()
+                            .is_some_and(|watch| watch.is_a_device_copy(of))
+                    });
+                    stored
+                })
+                .collect(),
             unreadable: listing.unreadable.len(),
             pending_removals: self.removals(),
         })
@@ -251,10 +309,30 @@ impl DraftDesk {
 
     /// Saves a draft: creates it when it has no identity yet, else replaces the version it names.
     ///
+    /// `host` is the host this application is connected to, which is the host of the session the
+    /// draft is for.
+    ///
     /// # Errors
     ///
     /// Returns the rule the save broke, or the store's failure.
-    pub fn save(&self, params: SaveParams, now: TimestampMs) -> Result<Saved> {
+    pub fn save(
+        &self,
+        params: SaveParams,
+        host: Option<DraftHost>,
+        now: TimestampMs,
+    ) -> Result<Saved> {
+        let saved = self.save_in_store(params, now)?;
+        // A copy kept beside another window's draft is this device's own and is not published: the
+        // draft it sits beside is.
+        if saved.of.is_none()
+            && let Some(watch) = self.watch.get()
+        {
+            watch.saved(saved.draft.id, host, false);
+        }
+        Ok(saved)
+    }
+
+    fn save_in_store(&self, params: SaveParams, now: TimestampMs) -> Result<Saved> {
         let store = self.store()?;
         let target = DraftTarget {
             session_id: params.session_id,
@@ -320,7 +398,20 @@ impl DraftDesk {
     ///
     /// Returns a revision conflict when the draft moved since the version named, or the store's
     /// failure.
-    pub fn retarget(&self, params: RetargetParams, now: TimestampMs) -> Result<StoredDraft> {
+    pub fn retarget(
+        &self,
+        params: RetargetParams,
+        host: Option<DraftHost>,
+        now: TimestampMs,
+    ) -> Result<StoredDraft> {
+        let retargeted = self.retarget_in_store(params, now)?;
+        if let Some(watch) = self.watch.get() {
+            watch.saved(retargeted.id, host, true);
+        }
+        Ok(retargeted)
+    }
+
+    fn retarget_in_store(&self, params: RetargetParams, now: TimestampMs) -> Result<StoredDraft> {
         let store = self.store()?;
         let mut draft = match store.load(params.id) {
             Ok(draft) => draft,
@@ -370,6 +461,9 @@ impl DraftDesk {
         match removed {
             Ok(removed) => {
                 self.clear_removal(params.id, None);
+                if let (Some(gone), Some(watch)) = (&removed, self.watch.get()) {
+                    watch.gone(params.id, gone.note);
+                }
                 Ok(Discarded {
                     removed: removed.is_some(),
                 })
@@ -491,7 +585,7 @@ fn stale(id: DraftId, expected: DraftRevision, current: DraftRevision) -> Comman
 /// Maps the store's failure to the one the page reads.
 ///
 /// A draft too large to store says so with the code that means a limit, because no retry helps.
-fn failure(error: ClientError) -> CommandError {
+pub(crate) fn failure(error: ClientError) -> CommandError {
     if let ClientError::Draft(draft) = &error
         && matches!(
             **draft,
@@ -585,8 +679,11 @@ pub struct StoredDraft {
     pub text: String,
     /// The completed uploads on it.
     pub attachments: Vec<AttachmentHandle>,
-    /// The draft this one was kept beside, when another window had changed that one first.
+    /// The draft this one was kept beside, when another window had changed that one first, or when
+    /// another device had written it.
     pub copy_of: Option<DraftId>,
+    /// Whether that was another device: the copy is its draft as it wrote it, brought down.
+    pub from_another_device: bool,
     /// When it was made.
     pub created_at_ms: TimestampMs,
     /// When it was last changed.
@@ -605,6 +702,7 @@ impl StoredDraft {
             text: draft.text.clone(),
             attachments: draft.attachments.clone(),
             copy_of: draft.conflict_of.0,
+            from_another_device: false,
             created_at_ms: draft.created_at_ms,
             updated_at_ms: draft.updated_at_ms,
         }
