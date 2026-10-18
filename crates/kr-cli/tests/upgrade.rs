@@ -2193,7 +2193,8 @@ async fn the_output_of_a_session_of_the_release_before_is_exported_through_the_d
     host.worker_ended(&updated.worker).await;
     let file = host.scratch("export").join("session.json");
     // The daemon refuses an export until it has seen the worker end and has the session's output.
-    let said = until("the closed session to be exported", || async {
+    let started = Instant::now();
+    loop {
         let output = host.run(
             &updated.kr_now(),
             &[
@@ -2203,15 +2204,23 @@ async fn the_output_of_a_session_of_the_release_before_is_exported_through_the_d
                 &file.display().to_string(),
             ],
         );
-        output.status.success().then_some(output)
-    })
-    .await;
+        if output.status.success() {
+            break;
+        }
+        assert!(
+            started.elapsed() < LIVENESS_DEADLINE,
+            "the closed session was not exported in {:?}: {}",
+            started.elapsed(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
     let document: Value = serde_json::from_slice(&std::fs::read(&file).expect("the exported file"))
         .expect("the export is one JSON document");
     assert_eq!(
         document["session"]["session_id"],
         updated.session_id.to_string(),
-        "{said:?}"
+        "{document}"
     );
     let mut output = Vec::new();
     for chunk in document["output"]["chunks"]
