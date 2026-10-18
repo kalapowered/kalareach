@@ -654,8 +654,8 @@ when a later record lists it again: it forgets the collection's keys and reads t
 again only after the owner confirms a join on it. So does a service that answers the collection
 as absent, or with a chain this device cannot follow; that answer is recorded at once.
 
-A host this device is paired with that did not answer is said so in the answers
-(`HostAnswers::silent`). The host that did not answer may be the one that lists a device, so a
+A host this device is paired with that did not answer, or will not list its devices to it, is
+said so in the answers (`HostAnswers::silent`). The host that did not answer may be the one that lists a device, so a
 device that this device's hosts vouched for at an earlier answer, and that no answering host
 mentions, is not taken out for it, and the next epoch's key is wrapped to it as before
 (`RecordedAnswers::retains`). Nothing is accepted, opened or added on silence: a record's issuer,

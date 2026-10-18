@@ -3494,12 +3494,23 @@ async fn a_refusal_beside_a_silent_host_stops_this_computer_too() {
 
     this.hosts.refuse_to_list(true);
     this.hosts.go_silent(true);
-    page.call("settings_sync_now", json!({}))
+    let stopped = page
+        .call("settings_sync_now", json!({}))
         .expect_err("this computer says it cannot check who may share");
+    assert!(
+        stopped.to_string().contains("will not list their devices"),
+        "{stopped}"
+    );
     assert_eq!(
         page.devices()["members"].as_array().expect("members").len(),
         2,
         "nobody was taken out"
+    );
+    page.choose("light");
+    assert_eq!(
+        phone.sync_now()["colour_mode"],
+        "dark",
+        "nothing was published on the answers from before"
     );
 }
 
@@ -4246,6 +4257,38 @@ async fn a_choice_that_says_what_the_change_over_a_write_says_still_asks_the_dev
         view["sync"]["conflicts"], 0,
         "nothing is asked of the tablet: {view}"
     );
+
+    let view = phone.sync_now();
+    assert_eq!(view["colour_mode"], "light", "{view}");
+    assert_eq!(view["sync"]["conflicts"], 1, "{view}");
+}
+
+/// A third computer that keeps its own settings beside the change that went over a write carries
+/// what that change went over: the device that held the write is asked when it meets them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn keeping_its_own_settings_beside_a_change_that_went_over_a_write_still_asks_the_device_that_held_it()
+ {
+    let (_computers, pages) = computers_sharing(&["the-phone", "the-tablet", "the-laptop"]).await;
+    let [page, phone, tablet, _laptop] = &pages[..] else {
+        panic!("four computers");
+    };
+    phone.choose("light");
+    tablet.sync_now();
+    page.unshare(&reference_of(&page.devices()["members"], "the-laptop"))
+        .expect("the laptop is taken out");
+    page.sync_now();
+    page.choose("system");
+
+    // The tablet followed the phone, then changed its mind before reading what went over it.
+    let view = tablet.choose("dark");
+    assert_eq!(view["sync"]["conflicts"], 1, "{view}");
+    let view = tablet
+        .call(
+            "settings_conflict_resolve",
+            json!({ "keep": { "choice": "mine" } }),
+        )
+        .expect("the choice is recorded");
+    assert_eq!(view["colour_mode"], "dark");
 
     let view = phone.sync_now();
     assert_eq!(view["colour_mode"], "light", "{view}");

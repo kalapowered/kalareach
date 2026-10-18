@@ -224,8 +224,9 @@ pub struct HostReport {
 pub struct HostAnswers {
     /// The reports.
     pub reports: Vec<HostReport>,
-    /// Whether a host this device is paired with did not answer. The host that did not answer may
-    /// be the one that lists a device, so a device that this device's hosts vouched for before, and
+    /// Whether a host this device is paired with did not answer, or will not list its devices to
+    /// it, which a directory may count as silence. The host that did not answer may be the one
+    /// that lists a device, so a device that this device's hosts vouched for before, and
     /// that no answering host mentions, is not taken out for that, and the next epoch's key is
     /// wrapped to it as before ([`RecordedAnswers::retains`]). Nothing is accepted, opened or added
     /// on silence: a record's issuer, the opener of an epoch, a device to add and the issuer of a

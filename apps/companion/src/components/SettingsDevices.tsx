@@ -6,7 +6,8 @@
  * platform's own ceremony, and a computer joins the settings of another only when the person
  * confirms there. This card names devices and offers; native code holds the keys, shows nothing of
  * them, and asks the person. A member no host lists any more is taken out by the next check, unless
- * a host did not answer: the member stays, and so does the key it holds, until that host does. The
+ * a host did not answer or will not list its devices to this computer: the member stays, and so
+ * does the key it holds, until that host does. The
  * person can take one out at any time, which needs no ceremony but does ask once here, because
  * putting it back asks for two.
  *
