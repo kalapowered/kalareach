@@ -74,7 +74,9 @@ class PlatformPlugin: Plugin, ASWebAuthenticationPresentationContextProviding {
       var values = URLResourceValues()
       values.isExcludedFromBackup = true
       try url.setResourceValues(values)
-      let kept = try url.resourceValues(forKeys: [.isExcludedFromBackupKey])
+      // Asked of a new URL: one that set a value may answer from what it keeps of it.
+      let asked = URL(fileURLWithPath: arguments.path, isDirectory: true)
+      let kept = try asked.resourceValues(forKeys: [.isExcludedFromBackupKey])
       guard kept.isExcludedFromBackup == true else {
         invoke.reject("the system does not say that \(arguments.path) is excluded from the backup")
         return

@@ -1447,9 +1447,9 @@
 }
 
 /*
- * At the largest text size a heading's longest word is wider than the column, and a path in the
- * cause of a failure is one long word at any size: both break where they must rather than run past
- * the column.
+ * At the largest text size the longest word of any of the column's headings is wider than the
+ * column, and a path in the cause of a failure is one long word at any size: both break where they
+ * must rather than run past the column.
  */
 .pairing-section h1,
 .pairing-unavailable {

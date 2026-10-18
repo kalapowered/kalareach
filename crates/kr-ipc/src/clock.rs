@@ -128,8 +128,9 @@ pub fn transferred_deadline(destination_now: u64, remaining: Duration) -> Option
 /// 20 ppm is about 1.7 seconds a day. Which they are, by clock:
 ///
 /// * the daemon's clock record projects on `kr_transport`'s `ContinuousInstant`: on Apple systems
-///   that is `mach_continuous_time` (`CLOCK_MONOTONIC_RAW`), which nothing adjusts, and on Linux
-///   `CLOCK_BOOTTIME`, which keeps the wall clock's pace because the time service slews it;
+///   that is `mach_continuous_time` (`CLOCK_MONOTONIC_RAW`), which nothing adjusts, on Linux
+///   `CLOCK_BOOTTIME`, which keeps the wall clock's pace because the time service slews it, and
+///   elsewhere, Windows included, `std::time::Instant`, which nothing adjusts;
 /// * this crate's clock, which each worker's time contract reads, is `QueryInterruptTime` on
 ///   Windows, which nothing adjusts, `CLOCK_BOOTTIME` on Linux and, on Apple systems, a clock that
 ///   keeps the wall clock's pace, as described above.
