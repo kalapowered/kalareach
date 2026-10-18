@@ -226,9 +226,12 @@ pub struct HostAnswers {
     pub reports: Vec<HostReport>,
     /// Whether a host this device is paired with did not answer. The host that did not answer may
     /// be the one that lists a device, so a device that this device's hosts vouched for before, and
-    /// that no answering host mentions, is not taken out for that ([`RecordedAnswers::retains`]).
-    /// Nothing else changes: a record's issuer, the opener of an epoch, a device to add and the
-    /// recipient of a wrap must each be listed by a host that answered ([`RecordedAnswers::passes`]).
+    /// that no answering host mentions, is not taken out for that, and the next epoch's key is
+    /// wrapped to it as before ([`RecordedAnswers::retains`]). It is accepted, opened and added
+    /// nowhere: a record's issuer, the opener of an epoch, a device to add and the recipient of a
+    /// wrap must each be listed by a host that answered ([`RecordedAnswers::passes`]). A record
+    /// that only a silent host's device issued waits for that host to answer, and nothing is built
+    /// on it meanwhile, so no key is wrapped to a device that record took out.
     #[serde(default)]
     pub silent: bool,
 }
@@ -728,6 +731,11 @@ pub enum MembershipError {
     /// No host answered, so check 3 cannot run.
     #[error("no host this device is paired with answered")]
     NoHostAnswered,
+    /// A host this device is paired with did not answer. A device that only that host lists is
+    /// not yet vouched for here, so joining now would take it out of the collection, and a device
+    /// the owner confirmed with it.
+    #[error("a host this device is paired with did not answer")]
+    HostSilent,
     /// The collection's newest record does not list this device, or the collection answers as
     /// absent.
     #[error("the collection's newest key record does not list this device")]

@@ -242,6 +242,10 @@ impl Kinds for DeviceKinds {
         fresh.with_vouched()
     }
 
+    fn silent(answers: &RecordedAnswers) -> bool {
+        answers.hosts.silent
+    }
+
     fn revoke(answers: &mut RecordedAnswers, revocation: AuthorisationKey) {
         answers.verified.insert(revocation);
     }

@@ -1239,6 +1239,157 @@ async fn a_record_from_an_issuer_no_answering_host_lists_is_not_accepted_while_a
     );
 }
 
+/// KR-REQ-20.11, check 3: a member that was vouched for, listed only by the host that did not
+/// answer, and that issues a record meanwhile, is not taken out for it. The record waits for the
+/// host, and nothing is built on it.
+#[tokio::test]
+async fn a_vouched_member_that_issues_a_record_while_a_host_is_silent_is_not_taken_out() {
+    let world = World::default();
+    let mut owner = Node::new(&world);
+    let mut other = Node::new(&world);
+    let mut third = Node::new(&world);
+    let collection = collection_of(&world, &mut owner, &mut [&mut other, &mut third]).await;
+
+    // The answering host lists the owner alone; the host that lists the others did not answer.
+    world.hosts.forget(other.device());
+    world.hosts.forget(third.device());
+    world.hosts.leave_one_host_silent(true);
+    let newest = world.newest(&collection);
+    let epoch = epoch_of(&newest) + 1;
+    let record = issue(
+        &other,
+        &newest,
+        &[owner.device(), other.device(), third.device()],
+        epoch,
+        &fresh(),
+    );
+    let revision = record.payload.revision.get();
+    world.append(&collection, record);
+
+    owner.refresh().await;
+    let steps = run(&mut owner).await;
+    assert!(
+        owner.removals().is_empty(),
+        "an issuer the silent host lists is not taken out for being unlisted by the others"
+    );
+    assert!(
+        steps
+            .iter()
+            .all(|(step, _)| *step != Step::Installed { revision }),
+        "a record whose issuer no answering host lists is not installed"
+    );
+    assert_eq!(
+        world.newest(&collection).payload.revision.get(),
+        revision,
+        "nothing is built on a record that waits for a host"
+    );
+
+    // The host answers and lists the issuer: the record is installed, and nobody was taken out.
+    world.hosts.leave_one_host_silent(false);
+    world.hosts.commit(other.device(), true);
+    world.hosts.commit(third.device(), true);
+    owner.refresh().await;
+    run(&mut owner).await;
+    assert_eq!(owner.installed(), Some((epoch, revision)));
+    assert!(owner.removals().is_empty());
+}
+
+/// KR-REQ-20.11, check 3: while a host did not answer, a record from a vouched member that takes a
+/// device out waits for the host, and this device builds no record of its own on the one before it:
+/// that record would wrap the next key to the device the waiting record took out.
+#[tokio::test]
+async fn no_key_is_wrapped_to_a_device_a_record_waiting_for_a_host_took_out() {
+    let world = World::default();
+    let mut owner = Node::new(&world);
+    let mut other = Node::new(&world);
+    let mut third = Node::new(&world);
+    let collection = collection_of(&world, &mut owner, &mut [&mut other, &mut third]).await;
+
+    // A host that did not answer revoked the third device; the other device, which asks it, issues
+    // a record without it. The answering host knows neither of them.
+    world.hosts.forget(other.device());
+    world.hosts.forget(third.device());
+    world.hosts.leave_one_host_silent(true);
+    let newest = world.newest(&collection);
+    let epoch = epoch_of(&newest) + 1;
+    let without = issue(
+        &other,
+        &newest,
+        &[owner.device(), other.device()],
+        epoch,
+        &fresh(),
+    );
+    let revision = without.payload.revision.get();
+    world.append(&collection, without);
+
+    owner.refresh().await;
+    run(&mut owner).await;
+    assert_eq!(
+        world.newest(&collection).payload.revision.get(),
+        revision,
+        "this device issued no record over the one that took the third device out"
+    );
+    assert!(owner.removals().is_empty());
+
+    // The host answers: the other device is listed, the third is revoked, and the record is the
+    // one that stands.
+    world.hosts.leave_one_host_silent(false);
+    world.hosts.commit(other.device(), true);
+    world.hosts.revoke_at(0, third.device());
+    owner.refresh().await;
+    run(&mut owner).await;
+    assert_eq!(owner.installed(), Some((epoch, revision)));
+    assert!(
+        !lists(&world.newest(&collection), &third),
+        "the device the record took out is not listed by any record after it"
+    );
+}
+
+/// KR-REQ-20.11, check 3: a join waits while a host this device is paired with does not answer. A
+/// device the collection lists that only that host lists is not vouched for yet, and the first
+/// answers the joining device recorded would take it out of the collection.
+#[tokio::test]
+async fn a_join_waits_for_a_host_that_did_not_answer() {
+    let world = World::default();
+    let mut owner = Node::new(&world);
+    let mut joiner = Node::new(&world);
+    let collection = collection_of(&world, &mut owner, &mut []).await;
+    world.hosts.commit(joiner.device(), true);
+    owner.refresh().await;
+    let plan = owner
+        .membership
+        .plan_share(&joiner.auth(), now())
+        .expect("a committed device");
+    assert_eq!(
+        owner.membership.authorise(&plan, now()).expect("a plan"),
+        Ended::Done
+    );
+    owner.reconcile().await;
+
+    world.hosts.leave_one_host_silent(true);
+    let plan = joiner
+        .membership
+        .plan_join(collection, now())
+        .expect("a plan");
+    assert!(matches!(
+        joiner.membership.join(&plan, now()).await,
+        Err(MembershipError::HostSilent)
+    ));
+    assert!(
+        joiner.membership.members().expect("readable").is_none(),
+        "nothing was recorded"
+    );
+
+    world.hosts.leave_one_host_silent(false);
+    let plan = joiner
+        .membership
+        .plan_join(collection, now())
+        .expect("a plan");
+    joiner.membership.join(&plan, now()).await.expect("a join");
+    joiner.reconcile().await;
+    assert!(joiner.publishes());
+}
+
 /// Whether a device stays is not whether it passes: a device this device's hosts vouched for before,
 /// that no answering host mentions while a host did not answer, stays; one never vouched for, one an
 /// answering host mentions, and one reported revoked do not.
@@ -3577,6 +3728,7 @@ fn settings_on(node: &Node) -> (SyncStore, SyncObject) {
             ]),
             pinned_labels: BTreeSet::from(["release".to_owned()]),
         }),
+        went_over: Vec::new(),
     };
     store.put_object(&object).expect("the settings");
     store

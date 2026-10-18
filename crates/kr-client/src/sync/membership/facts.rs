@@ -69,6 +69,9 @@ pub(crate) trait Kinds:
     fn retains(answers: &Self::Answers, member: &Self::Member) -> bool {
         Self::passes(answers, member)
     }
+    /// Whether a host this device is paired with did not answer, so that the answers say nothing of
+    /// a device only that host lists.
+    fn silent(answers: &Self::Answers) -> bool;
     /// Records a revocation this device verified from an authority feed.
     fn revoke(answers: &mut Self::Answers, revocation: Self::Revocation);
     /// Returns the answers a refresh records: the hosts' answers now, and every revocation this
@@ -444,8 +447,10 @@ impl<K: Kinds> Facts<K> {
 
     /// Applies the recorded host answers, as every write that records them or moves the head
     /// does: a pending addition of a device that fails check 3 is refused, and a removal is
-    /// recorded for every device that fails it and is listed in the installed record or the head,
-    /// and for every issuer after the installed record that fails it.
+    /// recorded for every device that fails it, as [`Kinds::retains`] has it, and is listed in the
+    /// installed record or the head, and for every issuer after the installed record that fails it
+    /// the same way. An issuer that is kept only because a host did not answer is not taken out:
+    /// the record waits for the hosts ([`View::awaits_hosts`]).
     pub(crate) fn record_answers(&mut self, me: &K::Member, fetched: bool) {
         let passes =
             |answers: &K::Answers, member: &K::Member| member == me || K::passes(answers, member);
@@ -471,7 +476,13 @@ impl<K: Kinds> Facts<K> {
             self.after_installed()
                 .iter()
                 .filter_map(K::issuer)
-                .filter(|issuer| !passes(&self.answers, issuer)),
+                .filter(|issuer| {
+                    if weakened(Rule::SilenceTakesIssuerOut) {
+                        !passes(&self.answers, issuer)
+                    } else {
+                        !retains(&self.answers, issuer)
+                    }
+                }),
         );
         failing.remove(me);
         if weakened(Rule::RefreshRecordsNoRemoval) {
@@ -683,6 +694,18 @@ impl<K: Kinds> View<'_, K> {
     /// for an epoch this device holds, and for another epoch differs from every key it holds and
     /// every key it opened from an earlier record of another epoch since its join.
     pub(crate) fn accepted(&self, record: &K::Record) -> bool {
+        self.accepted_when(record, |member| self.passes(member))
+    }
+
+    /// Whether a record fails only because a host did not answer: it would be accepted if its
+    /// issuer and the opener of its epoch were judged as [`Kinds::retains`] judges a member the
+    /// collection lists. It is neither accepted nor refused until the hosts answer.
+    pub(crate) fn awaits_hosts(&self, record: &K::Record) -> bool {
+        !self.accepted(record) && self.accepted_when(record, |member| self.retains(member))
+    }
+
+    /// Checks 1 to 5 with check 3 for the issuer and the epoch's opener given as `listed`.
+    fn accepted_when(&self, record: &K::Record, listed: impl Fn(&K::Member) -> bool) -> bool {
         if !K::lists(record, &self.me) {
             return false;
         }
@@ -697,7 +720,7 @@ impl<K: Kinds> View<'_, K> {
         let Some(issuer) = K::issuer(record) else {
             return false;
         };
-        if !self.passes(&issuer) {
+        if !listed(&issuer) {
             return false;
         }
         let epoch = K::epoch(record);
@@ -705,7 +728,7 @@ impl<K: Kinds> View<'_, K> {
             let opener_passes = self
                 .facts
                 .opener(epoch)
-                .is_some_and(|opener| self.passes(&opener));
+                .is_some_and(|opener| listed(&opener));
             if !opener_passes {
                 return false;
             }
@@ -865,7 +888,21 @@ impl<K: Kinds> View<'_, K> {
         if self.facts.installed == 0 {
             return self.facts.join == 1 && self.facts.head == 0;
         }
+        // A head that waits for a host to answer is built on by nobody: a candidate made from the
+        // installed record would list a device that head may have taken out.
+        if self.head_awaits_hosts() && !weakened(Rule::BuildOnWaitingHead) {
+            return false;
+        }
         self.unsatisfied() || self.head_refused_listing_me()
+    }
+
+    /// The head is a record that lists this device and waits for a host to answer.
+    fn head_awaits_hosts(&self) -> bool {
+        self.facts.head != self.facts.installed
+            && self
+                .facts
+                .head_record()
+                .is_some_and(|head| K::lists(head, &self.me) && self.awaits_hosts(head))
     }
 
     /// Rows 6 and 7: an undispatched candidate is still what row 8 would build now.
@@ -939,6 +976,13 @@ pub(crate) enum Rule {
     NoWithdrawnCheck,
     /// Drop a dispatched candidate on leaving, before its request is settled.
     LeaveDropsDispatched,
+    /// Take out an issuer after the installed record that fails check 3 only because a host did
+    /// not answer.
+    SilenceTakesIssuerOut,
+    /// Build a candidate over a record that waits for a host to answer.
+    BuildOnWaitingHead,
+    /// Join a collection while a host does not answer.
+    JoinWhileSilent,
 }
 
 #[cfg(test)]

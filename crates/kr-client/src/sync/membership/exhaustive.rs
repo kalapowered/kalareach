@@ -9,7 +9,8 @@
 //! send that follows a dispatch mark, and an answer not yet taken). The service answers a device
 //! its newest record does not list as a missing collection, and goes on taking a request in
 //! flight after D is out. X also misbehaves: it wraps another key at the same epoch, reuses a key
-//! in a new epoch, or carries the key of any candidate D sent into a record of its own.
+//! in a new epoch, or carries the key of any candidate D sent into a record of its own. A host
+//! does not answer, and the hosts that answer stop listing a device.
 //!
 //! Records here are a few small numbers rather than signed records, so every reachable state
 //! within the budgets can be visited; the checks that need keys (the chain, the signature, the
@@ -38,7 +39,11 @@
 //! * I6: a candidate is built only for a cause, and lists only the installed record's members and
 //!   the addition the owner confirmed.
 //! * I7: publication only while every record from D's join record to the installed one lists D.
-//! * Liveness: once events stop, every state settles: nothing pending, the newest record installed
+//! * I8: a host that does not answer takes no member out that the recorded answers keep (a member
+//!   the hosts vouched for before, that no host which answered mentions), and no candidate is built
+//!   over a record that fails only for want of that host's answer, since it would list a device
+//!   that record took out.
+//! * Liveness: once events stop, and a host that did not answer answers, every state settles: nothing pending, the newest record installed
 //!   and publication open, or D out of the collection with its request settled and its keys
 //!   forgotten.
 //!
@@ -154,13 +159,20 @@ struct ModelRecord {
     key: KeyLabel,
 }
 
-/// Check 3's answers of the model: the devices the hosts report revoked, and those D verified
-/// from a feed.
+/// Check 3's answers of the model: the devices the hosts report revoked, the devices no host that
+/// answered mentions, those D verified from a feed, whether a host did not answer, and the devices
+/// the answers D recorded vouched for.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 struct ModelAnswers {
     hosts: u8,
     verified: u8,
+    unlisted: u8,
+    silent: bool,
+    vouched: u8,
 }
+
+/// The devices of the model, as a mask.
+const EVERY_DEVICE: u8 = 0b1111;
 
 /// The model's kinds.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -194,7 +206,14 @@ impl Kinds for ModelKinds {
     }
 
     fn passes(answers: &ModelAnswers, member: &Dev) -> bool {
-        (answers.hosts | answers.verified) & bit(*member) == 0
+        (answers.hosts | answers.verified | answers.unlisted) & bit(*member) == 0
+    }
+
+    fn retains(answers: &ModelAnswers, member: &Dev) -> bool {
+        Self::passes(answers, member)
+            || (answers.silent
+                && answers.vouched & bit(*member) != 0
+                && (answers.hosts | answers.verified) & bit(*member) == 0)
     }
 
     fn revoke(answers: &mut ModelAnswers, revocation: Dev) {
@@ -202,10 +221,36 @@ impl Kinds for ModelKinds {
     }
 
     fn refreshed(previous: &ModelAnswers, fresh: ModelAnswers) -> ModelAnswers {
-        ModelAnswers {
+        let mut answers = ModelAnswers {
             hosts: fresh.hosts,
             verified: previous.verified | fresh.verified,
+            unlisted: fresh.unlisted,
+            silent: fresh.silent,
+            vouched: previous.vouched,
+        };
+        let kept = devices_in(previous.vouched)
+            .filter(|device| Self::retains(&answers, device))
+            .fold(0, |mask, device| mask | bit(device));
+        answers.vouched = kept | Self::passing(&answers);
+        answers
+    }
+
+    fn first(fresh: ModelAnswers) -> ModelAnswers {
+        ModelAnswers {
+            vouched: Self::passing(&fresh),
+            ..fresh
         }
+    }
+
+    fn silent(answers: &ModelAnswers) -> bool {
+        answers.silent
+    }
+}
+
+impl ModelKinds {
+    /// The devices that pass check 3 at these answers.
+    fn passing(answers: &ModelAnswers) -> u8 {
+        EVERY_DEVICE & !(answers.hosts | answers.verified | answers.unlisted)
     }
 }
 
@@ -273,6 +318,12 @@ const FEED: usize = 7;
 const JOIN: usize = 8;
 /// A refresh a hostile service answers as if the collection were gone.
 const ABSENT: usize = 9;
+/// A host that does not answer.
+const SILENT: usize = 10;
+/// A host that stops listing a device.
+const UNLIST: usize = 11;
+/// How many kinds of event there are.
+const KINDS: usize = 12;
 
 /// One state of the whole model.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -289,6 +340,10 @@ struct World {
     volatile_outcomes: Vec<Outcome<Dev>>,
     /// What D's hosts would answer now.
     revoked: u8,
+    /// The devices no host that answers mentions now.
+    unlisted: u8,
+    /// Whether a host does not answer now.
+    silent: bool,
     /// Revocations D verified from a feed.
     verified: u8,
     /// History: the newest revision D has read.
@@ -303,7 +358,7 @@ struct World {
     /// each of them counts as holding that key.
     sent: BTreeMap<(u64, KeyLabel), u8>,
     next_request: u64,
-    budget: [u8; 10],
+    budget: [u8; KINDS],
 }
 
 fn collection() -> CollectionRef {
@@ -333,6 +388,8 @@ struct ModelEnv {
     store: Mutex<BTreeMap<u64, KeyLabel>>,
     service: Mutex<Service>,
     revoked: u8,
+    unlisted: u8,
+    silent: bool,
     next_request: Mutex<u64>,
     /// The newest revision a read returned.
     read: Mutex<u64>,
@@ -638,6 +695,9 @@ impl Environment for ModelEnv {
         ready(Some(ModelAnswers {
             hosts: self.revoked,
             verified: 0,
+            unlisted: self.unlisted,
+            silent: self.silent,
+            vouched: 0,
         }))
     }
 }
@@ -701,6 +761,8 @@ fn run_with<T>(
         store: Mutex::new(world.store.clone()),
         service: Mutex::new(world.service.clone()),
         revoked: world.revoked,
+        unlisted: world.unlisted,
+        silent: world.silent,
         next_request: Mutex::new(world.next_request),
         read: Mutex::new(0),
         sent: Mutex::new(None),
@@ -799,6 +861,12 @@ enum Label {
     Other(ModelRecord),
     Revoke(Dev),
     Feed(Dev),
+    /// A host does not answer.
+    Silence,
+    /// The host answers again.
+    Hear,
+    /// A host that answers stops mentioning a device.
+    Unlist(Dev),
 }
 
 /// One transition: the label, the world after it, and what D sent in it.
@@ -1203,6 +1271,8 @@ fn transitions(world: &World) -> Vec<Transition> {
             // The request and the keys of the membership D left are settled and forgotten
             // first, a step each; the join waits for them.
             Err(MembershipError::UnsettledRequest | MembershipError::KeysStillHeld) => {}
+            // A host that does not answer leaves a join waiting.
+            Err(MembershipError::HostSilent) if world.silent => {}
             Err(error) => panic!("a model join failed: {error}"),
         }
     }
@@ -1227,6 +1297,42 @@ fn transitions(world: &World) -> Vec<Transition> {
                 use_budget(&mut next, REVOKE);
                 out.push(Transition {
                     label: Label::Revoke(member),
+                    world: next,
+                    sent: None,
+                    writes: 0,
+                });
+            }
+        }
+    }
+    if has(world, SILENT) && !world.silent {
+        let mut next = world.clone();
+        next.silent = true;
+        use_budget(&mut next, SILENT);
+        out.push(Transition {
+            label: Label::Silence,
+            world: next,
+            sent: None,
+            writes: 0,
+        });
+    }
+    if world.silent {
+        let mut next = world.clone();
+        next.silent = false;
+        out.push(Transition {
+            label: Label::Hear,
+            world: next,
+            sent: None,
+            writes: 0,
+        });
+    }
+    if has(world, UNLIST) {
+        for member in DEVICES {
+            if world.unlisted & bit(member) == 0 {
+                let mut next = world.clone();
+                next.unlisted |= bit(member);
+                use_budget(&mut next, UNLIST);
+                out.push(Transition {
+                    label: Label::Unlist(member),
                     world: next,
                     sent: None,
                     writes: 0,
@@ -1406,6 +1512,12 @@ fn passes3(world: &World, device: Dev) -> bool {
     device == D || ModelKinds::passes(&world.facts.answers, &device)
 }
 
+/// Whether a device the collection lists stays, as the invariants state it: it passes check 3, or a
+/// host did not answer, the hosts vouched for it before, and nothing that answered mentions it.
+fn retains3(world: &World, device: Dev) -> bool {
+    device == D || ModelKinds::retains(&world.facts.answers, &device)
+}
+
 fn opener(world: &World, record: &ModelRecord) -> Option<ModelRecord> {
     world
         .service
@@ -1418,6 +1530,20 @@ fn opener(world: &World, record: &ModelRecord) -> Option<ModelRecord> {
 /// Checks 1 to 5, the epoch's opener included, as the invariants state them, over the service's
 /// own chain.
 fn acceptable(world: &World, record: &ModelRecord) -> bool {
+    acceptable_when(world, record, passes3)
+}
+
+/// A record that fails check 3 for its issuer or its epoch's opener only because a host did not
+/// answer: it waits for the host, and is neither accepted nor refused.
+fn awaits_hosts(world: &World, record: &ModelRecord) -> bool {
+    !acceptable(world, record) && acceptable_when(world, record, retains3)
+}
+
+fn acceptable_when(
+    world: &World,
+    record: &ModelRecord,
+    listed: impl Fn(&World, Dev) -> bool,
+) -> bool {
     if !ModelKinds::lists(record, &D) {
         return false;
     }
@@ -1427,7 +1553,7 @@ fn acceptable(world: &World, record: &ModelRecord) -> bool {
     let Some(first) = opener(world, record) else {
         return false;
     };
-    if !passes3(world, record.issuer) || !passes3(world, first.issuer) {
+    if !listed(world, record.issuer) || !listed(world, first.issuer) {
         return false;
     }
     if let Some(held) = world.store.get(&record.epoch) {
@@ -1723,6 +1849,22 @@ fn check_step(before: &World, transition: &Transition) -> Result<(), Violation> 
     {
         return violation("a key left the store while D is a member");
     }
+    // A join waits for a host that does not answer: the first answers a device records would
+    // otherwise take out a member only that host lists.
+    if matches!(label, Label::Join) && before.silent {
+        return violation("joined while a host did not answer");
+    }
+    // Silence takes no member out that the hosts' answers keep: a removal that was not pending
+    // before is the owner's, or one for a device the answers do not retain.
+    if !matches!(label, Label::OwnerRemove(_)) {
+        for member in after.facts.removals.difference(&before.facts.removals) {
+            if retains3(after, *member) {
+                return violation(format!(
+                    "{label:?} took out {member}, which the recorded answers keep"
+                ));
+            }
+        }
+    }
     // I6.
     let built = matches!(
         label,
@@ -1747,6 +1889,13 @@ fn check_step(before: &World, transition: &Transition) -> Result<(), Violation> 
             if !cause {
                 return violation(
                     "a candidate built for a change the installed record and the head already carry out",
+                );
+            }
+            // Silence builds nothing on a record that waits for a host: the candidate would list a
+            // device that record may have taken out.
+            if before.facts.head != before.facts.installed && awaits_hosts(before, &head_before) {
+                return violation(
+                    "a candidate built over a record that waits for a host to answer",
                 );
             }
         }
@@ -1908,6 +2057,8 @@ fn round_trips(facts: &Facts<ModelKinds>) -> Result<(), Violation> {
 fn settles(world: &World, settled: &mut HashSet<u128>) -> Result<(), Violation> {
     let mut path = Vec::new();
     let mut current = world.clone();
+    // Once events stop, a host that did not answer answers.
+    current.silent = false;
     for _ in 0..500 {
         let print = fingerprint(&current);
         if settled.contains(&print) {
@@ -2132,7 +2283,7 @@ fn start(
     facts: Facts<ModelKinds>,
     chain: Vec<ModelRecord>,
     store: BTreeMap<u64, KeyLabel>,
-    budget: [u8; 10],
+    budget: [u8; KINDS],
 ) -> World {
     let seen = facts.head;
     let next_request = if facts.candidate.is_some() { 2 } else { 1 };
@@ -2149,6 +2300,8 @@ fn start(
         inbox: None,
         volatile_outcomes: Vec::new(),
         revoked: 0,
+        unlisted: 0,
+        silent: false,
         verified: 0,
         seen,
         recorded_at: BTreeSet::new(),
@@ -2160,7 +2313,7 @@ fn start(
 }
 
 /// D turns settings sync on: its own first record is its only candidate.
-fn genesis(budget: [u8; 10]) -> World {
+fn genesis(budget: [u8; KINDS]) -> World {
     let record = ModelRecord {
         revision: 1,
         epoch: 0,
@@ -2179,7 +2332,7 @@ fn genesis(budget: [u8; 10]) -> World {
 }
 
 /// D holds the collection with A and X at revision 2, epoch 0.
-fn steady(budget: [u8; 10]) -> World {
+fn steady(budget: [u8; KINDS]) -> World {
     let first = ModelRecord {
         revision: 1,
         epoch: 0,
@@ -2233,21 +2386,23 @@ fn steady(budget: [u8; 10]) -> World {
 /// receipt, feed, join, and a refresh answered as if the collection were gone.
 fn configuration(name: &str) -> World {
     match name {
-        "genesis" => genesis([2, 1, 1, 1, 1, 1, 1, 0, 0, 0]),
-        "steady-owner" => steady([2, 1, 1, 1, 0, 1, 1, 0, 0, 0]),
-        "steady-others" => steady([1, 2, 1, 1, 0, 1, 0, 0, 0, 0]),
-        "steady-churn" => steady([2, 2, 1, 0, 0, 0, 0, 0, 0, 0]),
-        "feed" => steady([2, 1, 0, 1, 0, 1, 0, 1, 0, 0]),
-        "gap" => steady([1, 3, 0, 0, 0, 0, 0, 0, 1, 0]),
-        "expiry" => steady([2, 1, 0, 0, 0, 0, 1, 0, 0, 0]),
-        "join-feed" => steady([0, 2, 0, 0, 0, 0, 0, 1, 1, 0]),
-        "absent" => steady([2, 1, 0, 1, 0, 1, 1, 0, 1, 1]),
+        "genesis" => genesis([2, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0]),
+        "steady-owner" => steady([2, 1, 1, 1, 0, 1, 1, 0, 0, 0, 0, 0]),
+        "steady-others" => steady([1, 2, 1, 1, 0, 1, 0, 0, 0, 0, 0, 0]),
+        "steady-churn" => steady([2, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+        "feed" => steady([2, 1, 0, 1, 0, 1, 0, 1, 0, 0, 0, 0]),
+        "gap" => steady([1, 3, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0]),
+        "expiry" => steady([2, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0]),
+        "join-feed" => steady([0, 2, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0]),
+        "absent" => steady([2, 1, 0, 1, 0, 1, 1, 0, 1, 1, 0, 0]),
+        "silence" => steady([0, 2, 1, 0, 0, 0, 0, 0, 0, 0, 1, 1]),
+        "silence-join" => steady([0, 3, 0, 0, 0, 0, 0, 0, 1, 0, 1, 0]),
         other => panic!("no configuration {other}"),
     }
 }
 
 /// Every configuration of the model.
-const CONFIGURATIONS: [&str; 9] = [
+const CONFIGURATIONS: [&str; 11] = [
     "genesis",
     "steady-owner",
     "steady-others",
@@ -2257,10 +2412,12 @@ const CONFIGURATIONS: [&str; 9] = [
     "expiry",
     "join-feed",
     "absent",
+    "silence",
+    "silence-join",
 ];
 
 /// Each weakened rule and the configurations most likely to catch it.
-const WEAKENED: [(Rule, &[&str]); 19] = [
+const WEAKENED: [(Rule, &[&str]); 22] = [
     (Rule::NoOpenerCheck, &["steady-others", "genesis"]),
     (Rule::NoFreshKeyCheck, &["genesis", "steady-others"]),
     (Rule::BuildFromHead, &["genesis", "steady-owner"]),
@@ -2301,6 +2458,9 @@ const WEAKENED: [(Rule, &[&str]); 19] = [
         &["steady-owner", "genesis", "expiry"],
     ),
     (Rule::LeaveDropsDispatched, &["absent"]),
+    (Rule::SilenceTakesIssuerOut, &["silence"]),
+    (Rule::BuildOnWaitingHead, &["silence"]),
+    (Rule::JoinWhileSilent, &["silence-join"]),
 ];
 
 /// The largest search a configuration gets; one that reaches it fails as incomplete.
@@ -2363,7 +2523,7 @@ fn every_state_of(names: &[&'static str]) {
 /// writes, every
 /// invariant by its exact predicate, and every state settling once events stop.
 ///
-/// Its nine configurations visit some eighty million states, which takes about half an hour in a
+/// Its eleven configurations visit some eighty million states, which takes about half an hour in a
 /// release build and far longer in a debug one, so it runs on request:
 /// `cargo test --release -p kr-client --lib membership::exhaustive -- --ignored`. A run may name
 /// a subset in `KR_MEMBERSHIP_CONFIGURATIONS`, comma-separated.
@@ -2438,9 +2598,9 @@ fn a_file_no_sequence_of_writes_produces_is_refused_and_a_rejoin_offered() {
         /// It stays, since nothing can settle it.
         Stays,
     }
-    let mut installed_after_the_head = steady([0; 10]);
+    let mut installed_after_the_head = steady([0; KINDS]);
     installed_after_the_head.facts.installed = 3;
-    let mut without_an_identity = genesis([0; 10]);
+    let mut without_an_identity = genesis([0; KINDS]);
     if let Some(candidate) = &mut without_an_identity.facts.candidate {
         candidate.request = Uuid::NIL;
     }
@@ -2469,7 +2629,7 @@ fn a_file_no_sequence_of_writes_produces_is_refused_and_a_rejoin_offered() {
     let mut dispatched_in_a_bad_file = installed_after_the_head.clone();
     dispatched_in_a_bad_file.facts.candidate = Some(candidate.clone());
     dispatched_in_a_bad_file.next_request = 2;
-    let mut mark_changed = steady([0; 10]);
+    let mut mark_changed = steady([0; KINDS]);
     mark_changed.facts.candidate = Some(Candidate {
         mark: KeyLabel::Other { revision: 9 },
         ..candidate
@@ -2557,7 +2717,7 @@ fn a_file_no_sequence_of_writes_produces_is_refused_and_a_rejoin_offered() {
 #[test]
 fn the_last_epoch_or_revision_has_no_successor_and_nothing_is_built() {
     for (revision, epoch) in [(2, u64::MAX), (u64::MAX, 3)] {
-        let mut world = steady([0; 10]);
+        let mut world = steady([0; KINDS]);
         let last = ModelRecord {
             revision,
             epoch,

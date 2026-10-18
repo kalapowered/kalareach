@@ -860,6 +860,11 @@ impl<E: Environment> Reconciler<E> {
             .answers()
             .await?
             .ok_or(MembershipError::NoHostAnswered)?;
+        // A device the collection lists that only a host that did not answer lists is not vouched
+        // for here yet, and the first answers this device records would take it out.
+        if <E::Kinds as Kinds>::silent(&fresh) && !weakened(Rule::JoinWhileSilent) {
+            return Err(MembershipError::HostSilent);
+        }
         let KeyRecords::Records {
             records: chain,
             recovery,
