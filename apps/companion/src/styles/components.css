@@ -1155,6 +1155,56 @@ textarea::placeholder {
   flex: none;
 }
 
+/* The hosts, one card each, with room between them. */
+.devices-hosts {
+  display: flex;
+  flex-direction: column;
+  gap: var(--gap-4);
+}
+
+/* What is known of a host's feed, apart from the devices under it. */
+.revocation-feed {
+  display: flex;
+  flex-direction: column;
+  gap: var(--gap-1);
+  padding-block-end: var(--gap-3);
+  margin-block-end: var(--gap-2);
+  border-block-end: 1px solid var(--line);
+}
+
+/*
+ * A device's name and where its revocation stands, side by side while they fit: a longer name or a
+ * larger text size drops the standing to the next line, so neither is pushed out of the row.
+ */
+.device-title {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--gap-1) var(--gap-2);
+}
+
+/*
+ * What a row says of its request, in words. A change of standing puts new words in, and they fade
+ * in over the state duration without travelling, so reduced motion changes nothing about them and
+ * the keyboard rule makes them instant.
+ */
+.revocation-state {
+  opacity: 1;
+  transition: opacity var(--state) var(--ease-out);
+}
+
+@starting-style {
+  .revocation-state {
+    opacity: 0;
+  }
+}
+
+.revocation-state:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 4px;
+  border-radius: 6px;
+}
+
 /* The two answers to a question about one device: side by side while they fit, wrapped if not. */
 .device-choice {
   display: flex;

@@ -653,6 +653,91 @@ export type ReviewOutcome =
   | 'no_ceremony'
   | 'unknown'
 
+/* ---- Revoking a device -------------------------------------------------------------------------
+ *
+ * A computer that owns a host lists its devices and revokes one. The host on this computer takes the
+ * revocation from native code at once; any other host is reached through its authority feed, which
+ * the host reads and answers in. The page names a host and a device by references native code gave
+ * it, and a revocation is done only once the host's acknowledgement has been read.
+ */
+
+/** How a revocation request reaches a host. */
+export type RevocationRoute = 'direct' | 'feed'
+
+/** Whether a host listed its devices when asked just now. */
+export type RevocationContact = 'answered' | 'refused' | 'silent'
+
+/** Why a host refused a request. */
+export type RevocationRefusal = 'no_owner_authority' | 'unknown_target' | 'superseded'
+
+/** Where one device's revocation stands. Only `done` is a revocation carried out. */
+export type RevocationStanding =
+  | { readonly state: 'active' }
+  | { readonly state: 'revoked' }
+  | { readonly state: 'sent'; readonly at_ms: number; readonly host_lists_revoked: boolean }
+  | { readonly state: 'acknowledged'; readonly at_ms: number; readonly pending_workers: number | null }
+  | { readonly state: 'done'; readonly at_ms: number }
+  | { readonly state: 'refused'; readonly reason: RevocationRefusal }
+
+/** What a host's feed holds of its last acknowledgement. */
+export interface RevocationAcknowledged {
+  readonly at_ms: number
+  readonly revision: number
+  readonly pending_workers: number | null
+}
+
+/** A host's feed, as this computer read it. */
+export interface RevocationFeed {
+  readonly read: boolean
+  readonly problem: string | null
+  /** The feed answers that it removed the host: nothing published there reaches it. */
+  readonly removed: boolean
+  /** Whether the host has written anything in this feed. */
+  readonly host_wrote_here: boolean
+  readonly last_acknowledgement: RevocationAcknowledged | null
+  readonly outstanding: number
+  /** How often a host reads its feed while it is online, in seconds. */
+  readonly poll_interval_seconds: number | null
+}
+
+/** One device of a host. */
+export interface RevocationDevice {
+  readonly reference: string
+  readonly name: string
+  readonly platform: 'macos' | 'windows' | 'linux' | 'ios' | 'android'
+  /** Whether it holds the right to manage the host. */
+  readonly manages_host: boolean
+  /** Whether it is this computer, which does not revoke itself. */
+  readonly this_computer: boolean
+  readonly standing: RevocationStanding
+}
+
+/** One host this computer can revoke devices on. */
+export interface RevocationHost {
+  readonly reference: string
+  readonly name: string
+  readonly route: RevocationRoute
+  readonly contact: RevocationContact
+  /** When the devices below were listed, in UTC milliseconds. */
+  readonly listed_at_ms: number | null
+  /** When the host says it last read its feed, in UTC milliseconds. */
+  readonly host_synchronised_at_ms: number | null
+  /** Whether the host says it could not reach its feed at its last attempt. */
+  readonly host_feed_stale: boolean
+  readonly devices: readonly RevocationDevice[]
+  /** The host's feed, for a host reached through one. */
+  readonly feed: RevocationFeed | null
+}
+
+/** Every host this computer can revoke devices on. */
+export interface RevocationView {
+  /** The ceremony this computer offers, which names the revoke button. */
+  readonly ceremony: CeremonyKind
+  /** The service a request for a paired host is published at; null when there is none to publish at. */
+  readonly feed_origin: string | null
+  readonly hosts: readonly RevocationHost[]
+}
+
 /* ---- Voice ------------------------------------------------------------------------------------
  *
  * The page drives a voice call and never carries one. Section 15 ¶2 puts capture, playback and the
@@ -1627,6 +1712,18 @@ export interface HostPort {
    * and only a confirmed ceremony signs it. The page names the reference and nothing else.
    */
   ownerConfirmationReview(reference: string): Promise<ReviewOutcome>
+  /**
+   * The devices of every host this computer can revoke on, each with where a revocation of it
+   * stands. Every host and every feed is asked.
+   */
+  revocationView(): Promise<RevocationView>
+  /**
+   * Revokes the device `device` names on the host `host` names, once the person confirms with the
+   * platform's own ceremony, and answers with the view as it then stands. The page names references
+   * native code gave it and nothing else; a host other than the one on this computer is reached
+   * through its feed, so the answer says the request was sent and not that it was carried out.
+   */
+  revocationRevoke(host: string, device: string): Promise<RevocationView>
   /**
    * Tells `listener` each time the confirmations change. Resolves, with the function that stops
    * it, once the listener is registered: nothing published before then reaches it.

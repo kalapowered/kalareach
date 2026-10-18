@@ -62,6 +62,8 @@ import type {
   PairingView,
   PasteView,
   RecoveryView,
+  RevocationStanding,
+  RevocationView,
   SettingsChoice,
   SettingsKeep,
   SettingsSyncView,
@@ -370,6 +372,18 @@ export interface FakeSettings {
   readonly kept: readonly SettingsKeep[]
 }
 
+/** The devices of the hosts this computer owns, and the revocations asked for, as the backend reports them. */
+export interface FakeRevocation {
+  /** What the page asked to revoke, as "host device", in order. */
+  readonly asked: readonly string[]
+  /** Sets what the backend reports of the hosts, as it does when it reads them again. */
+  change(view: RevocationView): void
+  /** Sets where one device's revocation stands, as the host's acknowledgement would. */
+  stand(host: string, device: string, standing: RevocationStanding): void
+  /** Makes every revocation fail as one does that was not confirmed, with these words, or stops that. */
+  refuseWith(message: string | null): void
+}
+
 /** The sync service setting, as the backend reports it. */
 export interface FakeSyncService {
   /**
@@ -389,6 +403,8 @@ export interface FakeHostControls {
   readonly recovery: FakeRecovery
   /** The person's settings. */
   readonly settings: FakeSettings
+  /** The devices of the hosts this computer owns. */
+  readonly revocation: FakeRevocation
   /** The sync service setting. */
   readonly syncService: FakeSyncService
   /** Pushes one event to every subscriber. */
@@ -847,6 +863,9 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
   }
   const startedCodes: string[] = []
   let owner: OwnerView = { ceremony: 'touch_id', requests: [] }
+  let revocation: RevocationView = { ceremony: 'touch_id', feed_origin: 'reach.kala.to', hosts: [] }
+  const revocationAsked: string[] = []
+  let revocationRefusal: string | null = null
   const ownerListeners = new Set<(view: OwnerView) => void>()
   const publishOwner = (next: OwnerView) => {
     owner = next
@@ -2008,6 +2027,40 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
       return Promise.resolve(connectionNow())
     },
     onPairing: (listener) => register(pairingListeners, listener),
+    revocationView: () => Promise.resolve(revocation),
+    revocationRevoke: (host, device) => {
+      revocationAsked.push(`${host} ${device}`)
+      if (revocationRefusal !== null) return refused('PERMISSION_DENIED', revocationRefusal)
+      const found = revocation.hosts.find((each) => each.reference === host)
+      const row = found?.devices.find((each) => each.reference === device)
+      if (found === undefined || row === undefined) {
+        return refused('PERMISSION_DENIED', 'That device is not listed by that host.')
+      }
+      if (revocation.ceremony === 'none') {
+        return refused('UNSUPPORTED_CAPABILITY', 'This computer has no way to ask you to confirm.')
+      }
+      // The host on this computer answers at once. Any other host is sent a request and answers
+      // in its feed, when the test says it has.
+      const at_ms = Date.now()
+      const standing: RevocationStanding =
+        found.route === 'direct'
+          ? { state: 'done', at_ms }
+          : { state: 'sent', at_ms, host_lists_revoked: false }
+      revocation = {
+        ...revocation,
+        hosts: revocation.hosts.map((each) =>
+          each.reference === host
+            ? {
+                ...each,
+                devices: each.devices.map((one) =>
+                  one.reference === device ? { ...one, standing } : one
+                )
+              }
+            : each
+        )
+      }
+      return Promise.resolve(revocation)
+    },
     ownerConfirmations: () => Promise.resolve(owner),
     ownerConfirmationReview: (reference) => {
       reviewed.push(reference)
@@ -2537,6 +2590,30 @@ export function fakeHost(options: { readonly drafts?: FakeDraftStore } = {}): {
         choice = next
       },
       kept: settingsKept
+    },
+    revocation: {
+      asked: revocationAsked,
+      change(view) {
+        revocation = view
+      },
+      stand(host, device, standing) {
+        revocation = {
+          ...revocation,
+          hosts: revocation.hosts.map((each) =>
+            each.reference === host
+              ? {
+                  ...each,
+                  devices: each.devices.map((one) =>
+                    one.reference === device ? { ...one, standing } : one
+                  )
+                }
+              : each
+          )
+        }
+      },
+      refuseWith(message) {
+        revocationRefusal = message
+      }
     },
     syncService: {
       failKeeping(message) {

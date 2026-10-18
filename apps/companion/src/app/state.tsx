@@ -35,6 +35,7 @@ export type Place =
   | { readonly view: 'attention' }
   | { readonly view: 'sessions' }
   | { readonly view: 'hosts' }
+  | { readonly view: 'devices' }
   | { readonly view: 'changesets' }
   | { readonly view: 'plugins' }
   | { readonly view: 'pairing' }

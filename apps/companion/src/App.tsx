@@ -16,6 +16,7 @@ import { ShellConnection } from './app/rights'
 import { useApp, type Place } from './app/state'
 import { Attention } from './views/Attention'
 import { ChangeSets } from './views/ChangeSets'
+import { Devices } from './views/Devices'
 import { Hosts, Sessions } from './views/Sessions'
 import { Pairing } from './views/Pairing'
 import { Plugins } from './views/Plugins'
@@ -30,6 +31,7 @@ const NAVIGATION: readonly { readonly place: Place; readonly label: string }[] =
   { place: { view: 'attention' }, label: 'Attention' },
   { place: { view: 'sessions' }, label: 'Sessions' },
   { place: { view: 'hosts' }, label: 'Hosts' },
+  { place: { view: 'devices' }, label: 'Devices' },
   { place: { view: 'changesets' }, label: 'Change sets' },
   { place: { view: 'plugins' }, label: 'Plugins' }
 ]
@@ -202,6 +204,7 @@ export function App(): ReactNode {
           {place.view === 'attention' ? <Attention /> : null}
           {place.view === 'sessions' ? <Sessions /> : null}
           {place.view === 'hosts' ? <Hosts /> : null}
+          {place.view === 'devices' ? <Devices /> : null}
           {place.view === 'changesets' ? <ChangeSets /> : null}
           {place.view === 'plugins' ? <Plugins /> : null}
           {place.view === 'pairing' ? <Pairing /> : null}

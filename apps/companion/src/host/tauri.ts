@@ -32,6 +32,7 @@ import type {
   PairingView,
   PasteView,
   RecoveryView,
+  RevocationView,
   ReviewOutcome,
   SessionAgents,
   SessionSubject,
@@ -374,6 +375,9 @@ export function tauriPort(): HostPort {
     ownerConfirmationReview: (reference) =>
       call<ReviewOutcome>('owner_confirmation_review', { request: { reference } }),
     onConfirmations: (listener) => listening<OwnerView>(CONFIRMATIONS_EVENT, listener),
+    revocationView: () => call<RevocationView>('revocation_view', {}),
+    revocationRevoke: (host, device) =>
+      call<RevocationView>('revocation_revoke', { host, device }),
 
     openExternal: (url) => call<ApprovedLink>('open_external', { url }),
     importRemoteImage: (url) => call<ImportedImage>('import_remote_image', { url }),
