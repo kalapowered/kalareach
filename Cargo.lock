@@ -4985,6 +4985,7 @@ name = "kr-service-stand-in"
 version = "0.1.0"
 dependencies = [
  "base64 0.23.1",
+ "jiff",
  "kr-cbor",
  "kr-client",
  "kr-crypto",

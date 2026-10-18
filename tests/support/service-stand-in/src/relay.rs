@@ -35,6 +35,17 @@ const LEASE_REQUEST_DOMAIN: &str = "kr-relay-lease-request/1";
 /// The domain a revocation request's body digest covers.
 const LEASE_REVOKE_DOMAIN: &str = "kr-relay-lease-revoke/1";
 
+/// The domain a payer sign-in request's body digest covers.
+const PAYER_SIGN_IN_DOMAIN: &str = "kr-relay-payer-sign-in/1";
+
+/// How long the authorisation a sign-in opens lasts from each renewal, and how little of it must
+/// remain for the next sign-in to renew it in place.
+const SIGN_IN_AUTHORISATION_MS: u64 = 3600 * 1000;
+const SIGN_IN_RENEW_BELOW_MS: u64 = 1800 * 1000;
+
+/// The scope an account token needs before the host that holds it can make the account its payer.
+pub(crate) const RELAY_LEASE_SCOPE: &str = "relay.lease";
+
 /// How far a credential's time may be from the service's, either way.
 const FRESHNESS_MS: u64 = 5 * 60 * 1000;
 
@@ -62,9 +73,21 @@ struct Authorisation {
     /// The most one lease may hold outstanding under it.
     byte_ceiling: u64,
     withdrawn: bool,
-    /// Its validity window has ended. The service ends the leases of a withdrawn authorisation and
-    /// leaves those of one that lapsed to run out.
-    lapsed: bool,
+    /// When it came into force, in UTC milliseconds on the service's clock.
+    valid_from_ms: u64,
+    /// When it stops being in force, on the service's clock. No lease under it lasts past this.
+    valid_until_ms: u64,
+    /// The sign-in grant that opened it: a grant opens at most one.
+    grant: String,
+    /// When the caller made it its default, when it did.
+    selected_at_ms: Option<u64>,
+}
+
+impl Authorisation {
+    /// Whether it is in force at `service_now`.
+    const fn in_force(&self, service_now: u64) -> bool {
+        !self.withdrawn && service_now < self.valid_until_ms
+    }
 }
 
 /// What became of a lease.
@@ -83,11 +106,18 @@ struct Lease {
     source: String,
     destination: String,
     direction: RelayDirection,
+    /// The relay instance the lease was installed on when it was issued. A refill keeps it: only a
+    /// new lease goes to the instance the service selects now.
+    relay_url: String,
     /// The key that asked for it, which is the only one that may change it.
     requested_by: String,
     /// `account:<id>` or `installation:<id>`.
     payer: String,
     authorisation_id: Option<String>,
+    /// Whether the authorisation was not the caller's default when the lease was issued, so
+    /// that the account sponsors the lease. It is a fact of the lease and every revision keeps it,
+    /// whatever has happened to the authorisation since.
+    sponsored: bool,
     ceiling: u64,
     expires_at_ms: u64,
     consumed: u64,
@@ -115,22 +145,33 @@ pub struct RelayLeaseView {
     pub expires_at_ms: u64,
     /// The bytes the relay has counted.
     pub bytes_consumed: u64,
+    /// The relay instance it is installed on.
+    pub relay_url: String,
     /// The authorisation it was issued under, when an account pays.
     pub authorisation_id: Option<String>,
-    /// Whether the lease still carries traffic.
+    /// Whether the account sponsors it: the authorisation was not the caller's default when
+    /// the lease was issued.
+    pub sponsored: bool,
+    /// Whether the lease is installed: the service has not revoked it. Its deadline may have
+    /// passed.
     pub live: bool,
     /// Why it was ended, when it was: `unpaired`, `payer_withdrew` or `finished`.
     pub ended_for: Option<&'static str>,
 }
 
-/// What an account's authorisation gives a host: the ids a host names to be paid for by the
-/// account.
+/// An authorisation a sign-in opened, as a test reads it.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RelayPayerRecord {
-    /// The account that pays.
-    pub account_id: String,
-    /// The authorisation record.
+pub struct RelayAuthorisationView {
+    /// The authorisation record, which a lease request names.
     pub authorisation_id: String,
+    /// The account that is billed.
+    pub account_id: String,
+    /// The sign-in grant that opened it.
+    pub grant: String,
+    /// When it stops being in force, in UTC milliseconds on the service's clock.
+    pub valid_until_ms: u64,
+    /// Whether the account withdrew it.
+    pub withdrawn: bool,
 }
 
 /// Everything the relay control plane keeps.
@@ -154,6 +195,10 @@ pub(crate) struct Relay {
     warning: Option<u32>,
     /// The principal is inside its bounded grace, so every answer carries what is left of it.
     in_grace: bool,
+    /// The address of the relay instance new leases are installed on: the one the service selects.
+    relay_url: String,
+    /// The most one lease may hold outstanding under an authorisation a sign-in opens.
+    sign_in_bound: u64,
     /// The time of the request being answered, by the machine's clock.
     seen_ms: u64,
     counter: u64,
@@ -173,6 +218,8 @@ impl Default for Relay {
             aggregate_limit: OUTSTANDING_CEILING_BYTES,
             warning: None,
             in_grace: false,
+            relay_url: "https://relay-1.reach.kala.to".to_owned(),
+            sign_in_bound: OUTSTANDING_CEILING_BYTES,
             seen_ms: 0,
             counter: 0,
             issuer: AuthorisationKeyPair::generate().expect("an admission key"),
@@ -192,41 +239,6 @@ impl Relay {
         now_ms + self.clock_offset_ms
     }
 
-    pub(crate) fn authorise(
-        &mut self,
-        host: &AuthorisationKey,
-        byte_ceiling: u64,
-    ) -> RelayPayerRecord {
-        let account_id = self.identifier(1);
-        self.authorise_in(&account_id, host, byte_ceiling)
-    }
-
-    /// An account that has authorised a caller gives the same or another caller a further
-    /// authorisation, which the service keeps beside the first.
-    pub(crate) fn authorise_in(
-        &mut self,
-        account_id: &str,
-        host: &AuthorisationKey,
-        byte_ceiling: u64,
-    ) -> RelayPayerRecord {
-        let account_id = account_id.to_owned();
-        let authorisation_id = self.identifier(2);
-        self.authorisations.insert(
-            authorisation_id.clone(),
-            Authorisation {
-                account_id: account_id.clone(),
-                subject: crate::feed::key_text(host),
-                byte_ceiling,
-                withdrawn: false,
-                lapsed: false,
-            },
-        );
-        RelayPayerRecord {
-            account_id,
-            authorisation_id,
-        }
-    }
-
     /// The account withdraws an authorisation: it is no longer in force, and the leases issued
     /// under it are revoked, as the Worker's withdrawal does.
     pub(crate) fn withdraw(&mut self, authorisation_id: &str) {
@@ -244,12 +256,32 @@ impl Relay {
         }
     }
 
-    /// The authorisation's validity window ends: it is not in force from now on, and the leases
-    /// issued under it are left alone, as the Worker leaves them.
+    /// The authorisation's validity window ends now: it is not in force from now on, and no lease
+    /// issued under it outlasts it, as the Worker caps every lease at its authorisation's end.
     pub(crate) fn lapse(&mut self, authorisation_id: &str) {
+        let end = self.service_now(self.seen_ms);
         if let Some(held) = self.authorisations.get_mut(authorisation_id) {
-            held.lapsed = true;
+            held.valid_until_ms = held.valid_until_ms.min(end);
         }
+        for lease in self.leases.values_mut() {
+            if lease.authorisation_id.as_deref() == Some(authorisation_id) {
+                lease.expires_at_ms = lease.expires_at_ms.min(end);
+            }
+        }
+    }
+
+    /// The authorisations a sign-in opened, as a test reads them.
+    pub(crate) fn sign_ins(&self) -> Vec<RelayAuthorisationView> {
+        self.authorisations
+            .iter()
+            .map(|(id, held)| RelayAuthorisationView {
+                authorisation_id: id.clone(),
+                account_id: held.account_id.clone(),
+                grant: held.grant.clone(),
+                valid_until_ms: held.valid_until_ms,
+                withdrawn: held.withdrawn,
+            })
+            .collect()
     }
 
     /// The service ends a lease on its own, as when its record of the lease is lost.
@@ -289,6 +321,18 @@ impl Relay {
     /// The principal is inside its bounded grace, or is not: every answer carries what is left.
     pub(crate) const fn enter_grace(&mut self, in_grace: bool) {
         self.in_grace = in_grace;
+    }
+
+    /// The authorisations a sign-in opens from now on bound one lease at `bytes` outstanding. The
+    /// Worker bounds them at what a principal may hold; a test narrows it to put a refill past the
+    /// bound.
+    pub(crate) const fn bound_sign_ins(&mut self, bytes: u64) {
+        self.sign_in_bound = bytes;
+    }
+
+    /// The relay instance new leases are installed on is at `url`.
+    pub(crate) fn name_relay(&mut self, url: &str) {
+        url.clone_into(&mut self.relay_url);
     }
 
     /// The warnings an answer carries.
@@ -338,7 +382,9 @@ impl Relay {
                 byte_ceiling: lease.ceiling,
                 expires_at_ms: lease.expires_at_ms,
                 bytes_consumed: lease.consumed,
+                relay_url: lease.relay_url.clone(),
                 authorisation_id: lease.authorisation_id.clone(),
+                sponsored: lease.sponsored,
                 live: lease.state == LeaseState::Installed,
                 ended_for: lease.ended_for,
             })
@@ -569,25 +615,40 @@ pub(crate) fn issue(
         );
     }
 
-    // Who pays: the account a host names under an authorisation that account gave it. A host key
-    // draws on no allowance of its own, and this stand-in does not model a host selecting a default
-    // account, so a host that names none is turned away.
-    let (payer, authorisation_id, max_bytes) = match (&body.payer.0, proof.signer) {
+    // Who pays: the account a caller names under an authorisation that account gave it, and when a
+    // host names none, the account it selected as its default. A host key draws on no allowance of
+    // its own, so a host that names none and has selected none is turned away.
+    let service_now = relay.service_now(now_ms);
+    let named = match (&body.payer.0, proof.signer) {
         (
             Some(Payer::Account {
                 account_id,
                 authorisation_id,
             }),
             _,
-        ) => {
-            let Some(held) = relay.authorisations.get(authorisation_id) else {
+        ) => Some((account_id.clone(), authorisation_id.clone())),
+        (None, ServiceRequestSigner::Host) => relay
+            .authorisations
+            .iter()
+            .find(|(_, held)| {
+                held.subject == proof.key
+                    && held.selected_at_ms.is_some()
+                    && !held.withdrawn
+                    && held.in_force(service_now)
+            })
+            .map(|(id, held)| (held.account_id.clone(), id.clone())),
+        _ => None,
+    };
+    let (payer, authorisation_id, max_bytes, ends_at_ms, sponsored) = match (named, proof.signer) {
+        (Some((account_id, authorisation_id)), _) => {
+            let Some(held) = relay.authorisations.get(&authorisation_id) else {
                 return refusal(
                     403,
                     "FORBIDDEN",
                     "That account has not authorised this caller.",
                 );
             };
-            if held.account_id != *account_id || held.subject != proof.key {
+            if held.account_id != account_id || held.subject != proof.key {
                 return refusal(
                     403,
                     "FORBIDDEN",
@@ -597,16 +658,18 @@ pub(crate) fn issue(
             if held.withdrawn {
                 return refusal(403, "FORBIDDEN", "That authorisation has been withdrawn.");
             }
-            if held.lapsed {
+            if !held.in_force(service_now) {
                 return refusal(403, "FORBIDDEN", "That authorisation is not in force.");
             }
             (
                 format!("account:{account_id}"),
                 Some(authorisation_id.clone()),
                 held.byte_ceiling.min(OUTSTANDING_CEILING_BYTES),
+                held.valid_until_ms,
+                held.selected_at_ms.is_none(),
             )
         }
-        (_, ServiceRequestSigner::Host) => {
+        (None, ServiceRequestSigner::Host) => {
             return refusal(
                 403,
                 "FORBIDDEN",
@@ -614,10 +677,12 @@ pub(crate) fn issue(
                  of its own.",
             );
         }
-        (_, ServiceRequestSigner::Installation) => (
+        (None, ServiceRequestSigner::Installation) => (
             format!("installation:{}", proof.key),
             None,
             OUTSTANDING_CEILING_BYTES,
+            u64::MAX,
+            false,
         ),
     };
 
@@ -626,7 +691,6 @@ pub(crate) fn issue(
         text_of(&body.destination_endpoint_key),
     );
     // The lease this request is about: the one it named, or the one its pair holds.
-    let service_now = relay.service_now(now_ms);
     let mut found = match &body.lease_id.0 {
         Some(named) => match relay.leases.get(&named.get().to_string()) {
             Some(lease) if lease.state == LeaseState::Installed => Some(lease.clone()),
@@ -645,6 +709,25 @@ pub(crate) fn issue(
             })
             .cloned(),
     };
+    // A lease at or past its deadline carries nothing, whatever its record says, and nothing wakes
+    // at the deadline to close the record. It is read before anything else about the lease: the
+    // request that finds it ends it, and is answered as one for a pair that holds none, whoever
+    // asks and under whatever authorisation. A reservation that has passed its deadline has been
+    // settled, so a fresh one holds everything it is given: what a cumulative total meant to the
+    // one that is gone is not what it means to this one, and it is clamped to what the payer
+    // authorises, not refused for a figure the caller was right to ask for.
+    if let Some(lease) = &found
+        && service_now >= lease.expires_at_ms
+    {
+        let old = lease.lease_id.clone();
+        if let Some(expired) = relay.leases.get_mut(&old) {
+            expired.state = LeaseState::Revoked;
+            expired.revision += 1;
+            expired.ended_for = Some("expired");
+        }
+        found = None;
+        asked = asked.min(max_bytes);
+    }
     if let Some(lease) = &found {
         if lease.requested_by != proof.key {
             return refusal(
@@ -664,8 +747,8 @@ pub(crate) fn issue(
             return refusal(
                 403,
                 "FORBIDDEN",
-                "That lease was issued under another authorisation. Revoke it, or select the one \
-                 it names.",
+                "That lease was issued under another authorisation. Revoke it, or name the one it \
+                 names.",
             );
         }
         if lease.source != pair.0
@@ -683,22 +766,16 @@ pub(crate) fn issue(
                  Revoke the lease and ask for another.",
             );
         }
-        // A reservation that has passed its deadline has been settled, and there is nothing left to
-        // raise: the lease is fenced and the pair is given a new one, whose figures are the new
-        // reservation's.
-        if service_now >= lease.expires_at_ms {
-            let old = lease.lease_id.clone();
-            if let Some(expired) = relay.leases.get_mut(&old) {
-                expired.state = LeaseState::Revoked;
-                expired.revision += 1;
-                expired.ended_for = Some("expired");
-            }
-            found = None;
-            // A fresh reservation holds everything it is given, so what a cumulative total meant to
-            // the one that is gone is not what it means to this one: it is clamped to what the
-            // payer authorises, not refused for a figure the caller was right to ask for.
-            asked = asked.min(max_bytes);
-        }
+    }
+    let held = found.as_ref().map_or(0, |lease| lease.ceiling);
+    // A refill that asks for no more than the reservation holds raises nothing: it is answered as
+    // it stands, deadline included, because the ledger moves a deadline only with a raised ceiling,
+    // and it is not measured against what the payer authorises.
+    let raises = asked > held;
+    if let Some(lease) = &found
+        && !raises
+    {
+        return granted(relay, &payer, lease);
     }
     // What the payer authorises is a bound on what a lease holds outstanding: the cumulative
     // ceiling less what the relay has counted.
@@ -707,16 +784,6 @@ pub(crate) fn issue(
         return invalid(&format!(
             "That payer authorises at most {max_bytes} bytes outstanding for one lease."
         ));
-    }
-
-    let held = found.as_ref().map_or(0, |lease| lease.ceiling);
-    // A refill that asks for no more than the reservation holds is answered as it stands, deadline
-    // included: the ledger moves a deadline only with a raised ceiling.
-    let raises = asked > held;
-    if let Some(lease) = &found
-        && !raises
-    {
-        return granted(relay, &payer, lease);
     }
     if found.is_none() && relay.no_relay {
         return refused_answer(
@@ -747,7 +814,8 @@ pub(crate) fn issue(
         );
     }
 
-    let deadline = service_now + u64::from(body.duration_seconds) * 1000;
+    // No lease lasts past the authorisation that pays for it.
+    let deadline = (service_now + u64::from(body.duration_seconds) * 1000).min(ends_at_ms);
     let frozen = relay.frozen_deadlines;
     let lease = match found {
         Some(mut lease) => {
@@ -761,6 +829,7 @@ pub(crate) fn issue(
         None => Lease {
             lease_id: relay.identifier(3),
             reservation_id: relay.identifier(4),
+            relay_url: relay.relay_url.clone(),
             revision: 1,
             source: pair.0,
             destination: pair.1,
@@ -768,6 +837,7 @@ pub(crate) fn issue(
             requested_by: proof.key,
             payer: payer.clone(),
             authorisation_id,
+            sponsored,
             ceiling: asked,
             expires_at_ms: deadline,
             consumed: 0,
@@ -787,7 +857,7 @@ fn granted(relay: &Relay, payer: &str, lease: &Lease) -> ServiceHttpAnswer {
     answered(json!({
         "state": "issued",
         "lease": signed,
-        "relay_url": "https://relay-1.reach.kala.to",
+        "relay_url": lease.relay_url,
         "relay_instance_id": RELAY_INSTANCE,
         "region": "eu-central",
         "issuer_key_revision": "1",
@@ -811,10 +881,13 @@ fn signed_lease(relay: &Relay, lease: &Lease) -> Value {
     } else {
         json!({ "installation": { "installation_id": "00000007-0000-4000-8000-000000000001" } })
     };
-    // An authorisation the host named without selecting it as its default sponsors the lease.
-    let payer_authorisation = match &lease.authorisation_id {
-        Some(authorisation_id) => json!({ "sponsored": { "authorisation_id": authorisation_id } }),
-        None => Value::String("host_selected".to_owned()),
+    // An authorisation that was not the caller's default when the lease was issued sponsors
+    // it.
+    let payer_authorisation = match (&lease.authorisation_id, lease.sponsored) {
+        (Some(authorisation_id), true) => {
+            json!({ "sponsored": { "authorisation_id": authorisation_id } })
+        }
+        _ => Value::String("host_selected".to_owned()),
     };
     let value = json!({
         "lease_id": lease.lease_id,
@@ -888,6 +961,159 @@ fn refused_answer(relay: &Relay, payer: &str, state: &str, message: &str) -> Ser
         } else {
             Value::Null
         },
+    }))
+}
+
+/// The body of a payer sign-in request.
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct SignInBody {
+    account_id: String,
+}
+
+/// An instant as the Worker writes it: an ISO 8601 text in UTC with milliseconds.
+fn instant(ms: u64) -> String {
+    let milliseconds = i64::try_from(ms).expect("a time in range");
+    let timestamp = jiff::Timestamp::from_millisecond(milliseconds).expect("a time in range");
+    timestamp.strftime("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()
+}
+
+/// `relay.payer.sign_in`: makes the account a caller is signed in to the caller's payer, from the
+/// sign-in itself.
+///
+/// The request carries two proofs: the caller's credential, and the bearer token of an account
+/// sign-in that was issued the `relay.lease` scope. A grant opens at most one authorisation, for the
+/// first caller that presents it. It is renewed in place when fewer than half its hour remains, it
+/// lasts an hour from each renewal, and a withdrawal holds for that grant for ever. Every refusal
+/// that only signing in again mends is `REAUTHENTICATION_REQUIRED`.
+pub(crate) fn sign_in(
+    relay: &mut Relay,
+    tokens: &BTreeMap<String, crate::web::Token>,
+    origin: &str,
+    document: &Value,
+    bearer: Option<&str>,
+    now_ms: u64,
+) -> ServiceHttpAnswer {
+    relay.seen_ms = now_ms;
+    let Ok(body) = serde_json::from_value::<SignInBody>(document["body"].clone()) else {
+        return invalid("That sign-in payer request is not one this service reads.");
+    };
+    let canonical = kr_cbor::encode(&kr_cbor::signing_value(
+        PAYER_SIGN_IN_DOMAIN,
+        vec![kr_cbor::to_canonical_value(&body).expect("a canonical body")],
+    ));
+    let proof = match check_credential(
+        relay,
+        origin,
+        "relay.payer.sign_in",
+        document,
+        &canonical,
+        now_ms,
+    ) {
+        Ok(proof) => proof,
+        Err(refused) => return refused,
+    };
+    // No sign-in, one issued without the scope, one that has ended, or one that records no grant:
+    // the person signs the caller in again.
+    let sign_in_required = || {
+        refusal(
+            403,
+            "REAUTHENTICATION_REQUIRED",
+            "Sign this device in to its account again, and allow it to pay for relay traffic from \
+             that account.",
+        )
+    };
+    let Some(token) = bearer.and_then(|bearer| tokens.get(bearer)) else {
+        return sign_in_required();
+    };
+    let Some(grant) = token.grant.as_ref() else {
+        return sign_in_required();
+    };
+    if !token.live || !token.scopes.contains(RELAY_LEASE_SCOPE) {
+        return sign_in_required();
+    }
+    // The two proofs have to be about one pairing.
+    if token.account != body.account_id {
+        return refusal(
+            403,
+            "FORBIDDEN",
+            "That request names an account other than the one the sign-in belongs to.",
+        );
+    }
+    let service_now = relay.service_now(now_ms);
+    let opened = relay
+        .authorisations
+        .iter()
+        .find(|(_, held)| held.grant == *grant)
+        .map(|(id, _)| id.clone());
+    let authorisation_id = if let Some(id) = opened {
+        let held = relay
+            .authorisations
+            .get_mut(&id)
+            .expect("the one just found");
+        if held.account_id != body.account_id || held.subject != proof.key {
+            return refusal(
+                403,
+                "REAUTHENTICATION_REQUIRED",
+                "That sign-in belongs to a different key than the one this device signs with. \
+                 Sign the device in to its account again.",
+            );
+        }
+        if held.withdrawn {
+            return refusal(
+                403,
+                "REAUTHENTICATION_REQUIRED",
+                "This account withdrew the relay authorisation it gave this device. Sign the \
+                 device in to the account again to authorise it.",
+            );
+        }
+        if held.valid_until_ms.saturating_sub(service_now) < SIGN_IN_RENEW_BELOW_MS {
+            held.valid_until_ms = service_now + SIGN_IN_AUTHORISATION_MS;
+        }
+        id
+    } else {
+        let id = relay.identifier(2);
+        relay.authorisations.insert(
+            id.clone(),
+            Authorisation {
+                account_id: body.account_id.clone(),
+                subject: proof.key.clone(),
+                byte_ceiling: relay.sign_in_bound,
+                withdrawn: false,
+                valid_from_ms: service_now,
+                valid_until_ms: service_now + SIGN_IN_AUTHORISATION_MS,
+                grant: grant.clone(),
+                selected_at_ms: None,
+            },
+        );
+        id
+    };
+    // It is the caller's default, and whatever else the caller had selected is not.
+    for (id, held) in &mut relay.authorisations {
+        if held.subject == proof.key {
+            held.selected_at_ms = if *id == authorisation_id {
+                held.selected_at_ms.or(Some(service_now))
+            } else {
+                None
+            };
+        }
+    }
+    let held = &relay.authorisations[&authorisation_id];
+    answered(json!({
+        "authorisation": {
+            "authorisation_id": authorisation_id,
+            "account_id": held.account_id,
+            "subject_kind": match proof.signer {
+                ServiceRequestSigner::Host => "host",
+                ServiceRequestSigner::Installation => "installation",
+            },
+            "subject": held.subject,
+            "byte_ceiling": held.byte_ceiling.to_string(),
+            "valid_from": instant(held.valid_from_ms),
+            "valid_until": instant(held.valid_until_ms),
+            "selected_at": held.selected_at_ms.map(instant),
+            "withdrawn_at": Value::Null,
+        }
     }))
 }
 

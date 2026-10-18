@@ -4,6 +4,7 @@
 //! something that speaks HTTP/1.1. This is the least of one: it reads one request, hands it to the
 //! service and writes the one answer, and closes the connection.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -85,6 +86,24 @@ async fn connection(mut socket: TcpStream, web: Arc<ServiceWeb>) {
     let Some(received) = read_request(&mut socket).await else {
         return;
     };
+    if received.path.starts_with("/auth/oauth2/") {
+        let form: BTreeMap<String, String> = String::from_utf8_lossy(&received.body)
+            .split('&')
+            .filter_map(|pair| pair.split_once('='))
+            .map(|(name, value)| (name.to_owned(), value.to_owned()))
+            .collect();
+        let answer = web.oauth(&received.path, &form);
+        let head = format!(
+            "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            answer.status,
+            reason(answer.status),
+            answer.body.len()
+        );
+        let _ = socket.write_all(head.as_bytes()).await;
+        let _ = socket.write_all(&answer.body).await;
+        let _ = socket.shutdown().await;
+        return;
+    }
     let token = received
         .header("authorization")
         .and_then(|value| value.strip_prefix("Bearer "))

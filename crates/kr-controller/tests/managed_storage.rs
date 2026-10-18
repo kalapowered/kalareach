@@ -213,6 +213,11 @@ impl Rig {
         if let Some(moment) = arrangement.first_status {
             served.web().fail(STATUS, 1, moment);
         }
+        // The account system is down for the renewal: the grant stands and the token cannot be
+        // renewed, which is not an answer that the sign-in ended.
+        if matches!(arrangement.token, Token::NotRenewable) {
+            served.web().fail_token_endpoint(503);
+        }
         if arrangement.selects_the_service {
             write_document(&host, Some(served.origin()));
         }

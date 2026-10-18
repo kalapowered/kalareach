@@ -217,6 +217,8 @@ pub(crate) struct Token {
     pub(crate) account: String,
     pub(crate) scopes: BTreeSet<String>,
     pub(crate) live: bool,
+    /// The sign-in grant the token belongs to, when the account system recorded one.
+    pub(crate) grant: Option<String>,
 }
 
 /// Everything the service keeps.
@@ -250,6 +252,13 @@ struct State {
     mailboxes: BTreeMap<String, crate::mailbox::Mailbox>,
     /// The relay control plane's authorisations and leases.
     relay: crate::relay::Relay,
+    /// The sign-in grant each refresh token the account system holds belongs to.
+    refreshes: BTreeMap<String, String>,
+    /// How many refreshes the account system has answered.
+    refreshed: u32,
+    /// The status the token endpoint answers a refresh with instead of looking at it, when a test
+    /// has the account system fail.
+    token_endpoint_down: Option<u16>,
 }
 
 /// What the service did with one request.
@@ -316,6 +325,7 @@ impl ServiceWeb {
                     account: ACCOUNT.to_owned(),
                     scopes: BTreeSet::from([BACKUP_WRITE_SCOPE.to_owned()]),
                     live: true,
+                    grant: None,
                 },
             );
             state.tokens.insert(
@@ -324,6 +334,7 @@ impl ServiceWeb {
                     account: ACCOUNT.to_owned(),
                     scopes: BTreeSet::from([BACKUP_RESTORE_SCOPE.to_owned()]),
                     live: true,
+                    grant: None,
                 },
             );
         }
@@ -344,6 +355,21 @@ impl ServiceWeb {
                 account: account.to_owned(),
                 scopes: scopes.iter().map(|scope| (*scope).to_owned()).collect(),
                 live: true,
+                grant: None,
+            },
+        );
+    }
+
+    /// The service issues `token` to `account`, carrying `scopes`, as part of the sign-in grant
+    /// `grant`: the grant a relay payer sign-in opens its authorisation for.
+    pub fn issue_grant_token(&self, token: &str, account: &str, grant: &str, scopes: &[&str]) {
+        self.state.lock().expect("the state").tokens.insert(
+            token.to_owned(),
+            Token {
+                account: account.to_owned(),
+                scopes: scopes.iter().map(|scope| (*scope).to_owned()).collect(),
+                live: true,
+                grant: Some(grant.to_owned()),
             },
         );
     }
@@ -400,39 +426,9 @@ impl ServiceWeb {
             .unwrap_or_default()
     }
 
-    /// An account gives the host whose signing key is `host` leave to spend its relay allowance,
-    /// with at most `byte_ceiling` bytes outstanding for one lease, as an account's authorisation
-    /// does. Returns the ids a host names to be paid for.
-    pub fn authorise_relay_payer(
-        &self,
-        host: &kr_protocol::scalars::AuthorisationKey,
-        byte_ceiling: u64,
-    ) -> crate::relay::RelayPayerRecord {
-        self.state
-            .lock()
-            .expect("the state")
-            .relay
-            .authorise(host, byte_ceiling)
-    }
-
-    /// An account that has authorised a host gives it a further authorisation, as the account's
-    /// owner does to change the bound or to replace one that is about to lapse. The service keeps
-    /// both, and a pair's lease belongs to the one it was issued under.
-    pub fn authorise_relay_payer_in(
-        &self,
-        account_id: &str,
-        host: &kr_protocol::scalars::AuthorisationKey,
-        byte_ceiling: u64,
-    ) -> crate::relay::RelayPayerRecord {
-        self.state
-            .lock()
-            .expect("the state")
-            .relay
-            .authorise_in(account_id, host, byte_ceiling)
-    }
-
-    /// The authorisation's validity window ends: no request names it again, and the leases issued
-    /// under it stand until they run out, as the Worker leaves them.
+    /// The authorisation's validity window ends now: no request names it again, and no lease
+    /// issued under it lasts past this moment, as the Worker caps every lease at its
+    /// authorisation's end. The lease stays installed until something ends it.
     pub fn lapse_relay_authorisation(&self, authorisation_id: &str) {
         self.state
             .lock()
@@ -449,6 +445,117 @@ impl ServiceWeb {
             .expect("the state")
             .relay
             .withdraw(authorisation_id);
+    }
+
+    /// The account system holds `refresh` as the refresh token of the sign-in grant `grant`.
+    /// Presented at the token endpoint it answers with a new access token for the grant's account
+    /// and scopes, and a new refresh token that replaces it, as a refresh does.
+    pub fn issue_grant_refresh(&self, refresh: &str, grant: &str) {
+        self.state
+            .lock()
+            .expect("the state")
+            .refreshes
+            .insert(refresh.to_owned(), grant.to_owned());
+    }
+
+    /// The account system's token endpoint fails every refresh with `status`, which is not an
+    /// answer about the grant: the grant stands, and the renewal did not happen.
+    pub fn fail_token_endpoint(&self, status: u16) {
+        self.state.lock().expect("the state").token_endpoint_down = Some(status);
+    }
+
+    /// How many refreshes the account system has answered.
+    #[must_use]
+    pub fn token_refreshes(&self) -> u32 {
+        self.state.lock().expect("the state").refreshed
+    }
+
+    /// The account system's token endpoint, for the one grant a host asks it for: a refresh token.
+    /// A body is the form a client sends, as its members and their values, with no escaping,
+    /// which the tokens of a test do not need.
+    pub(crate) fn oauth(&self, path: &str, form: &BTreeMap<String, String>) -> ServiceHttpAnswer {
+        let plain = |status: u16, body: &serde_json::Value| ServiceHttpAnswer {
+            status,
+            body: serde_json::to_vec(body).expect("an answer"),
+        };
+        let refused = || plain(400, &serde_json::json!({ "error": "invalid_grant" }));
+        // A revocation is acknowledged, and a refresh token it names is no longer good.
+        if path == "/auth/oauth2/revoke" {
+            if let Some(token) = form.get("token") {
+                self.state
+                    .lock()
+                    .expect("the state")
+                    .refreshes
+                    .remove(token);
+            }
+            return plain(200, &serde_json::json!({}));
+        }
+        if path != "/auth/oauth2/token"
+            || form.get("grant_type").map(String::as_str) != Some("refresh_token")
+        {
+            return refused();
+        }
+        let mut state = self.state.lock().expect("the state");
+        if let Some(status) = state.token_endpoint_down {
+            return plain(
+                status,
+                &serde_json::json!({ "error": "temporarily_unavailable" }),
+            );
+        }
+        let Some(grant) = form
+            .get("refresh_token")
+            .and_then(|presented| state.refreshes.remove(presented))
+        else {
+            return refused();
+        };
+        let Some(mut was) = state
+            .tokens
+            .values()
+            .find(|held| held.grant.as_deref() == Some(grant.as_str()))
+            .cloned()
+        else {
+            return refused();
+        };
+        was.live = true;
+        state.refreshed += 1;
+        let (access, refresh) = (
+            format!("{grant}-access-{}", state.refreshed),
+            format!("{grant}-refresh-{}", state.refreshed),
+        );
+        state.tokens.insert(access.clone(), was);
+        state.refreshes.insert(refresh.clone(), grant);
+        plain(
+            200,
+            &serde_json::json!({
+                "access_token": access,
+                "token_type": "Bearer",
+                "expires_in": 600,
+                "refresh_token": refresh,
+            }),
+        )
+    }
+
+    /// The authorisations a payer sign-in opens from now on bound one lease at `bytes`
+    /// outstanding.
+    pub fn bound_relay_sign_ins(&self, bytes: u64) {
+        self.state
+            .lock()
+            .expect("the state")
+            .relay
+            .bound_sign_ins(bytes);
+    }
+
+    /// The relay instance the service installs new leases on is at `url`, which the answer to each
+    /// of them names. A lease already issued stays on the instance it was issued on, as a refill
+    /// does in the Worker; a test moves the selection to put one host's leases on two instances.
+    pub fn name_relay_url(&self, url: &str) {
+        self.state.lock().expect("the state").relay.name_relay(url);
+    }
+
+    /// The authorisations a payer sign-in opened, as the service holds them.
+    #[must_use]
+    pub fn relay_sign_ins(&self) -> Vec<crate::relay::RelayAuthorisationView> {
+        self.state.lock().expect("the state").relay.sign_ins()
     }
 
     /// The relay allowance of every account is spent, or is not.
@@ -896,6 +1003,11 @@ impl ServiceWeb {
             } else {
                 crate::relay::revoke(&mut state.relay, &self.origin, document, now_ms())
             };
+        }
+        if path == "/api/relay/payer-authorisation/sign-in" {
+            let mut state = self.state.lock().expect("the state");
+            let State { relay, tokens, .. } = &mut *state;
+            return crate::relay::sign_in(relay, tokens, &self.origin, document, token, now_ms());
         }
         let method = match path {
             "/api/storage/status" => "storage.status",
