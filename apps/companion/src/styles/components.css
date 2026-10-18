@@ -268,6 +268,8 @@ main {
    stays inside the box that holds it. */
 .btn[data-wraps] {
   white-space: normal;
+  /* A word wider than the button's room is broken, as one in a line of text is. */
+  overflow-wrap: anywhere;
   max-inline-size: 100%;
   text-align: center;
 }
@@ -1056,6 +1058,8 @@ textarea::placeholder {
   font-size: 0.9375rem;
   line-height: 1.45;
   color: var(--text);
+  /* A service's host is one word to a line, and at the largest text size a word is wider than the card. */
+  overflow-wrap: anywhere;
 }
 
 .account-note,
@@ -1064,6 +1068,7 @@ textarea::placeholder {
   font-size: 0.8125rem;
   line-height: 1.5;
   color: var(--muted);
+  overflow-wrap: anywhere;
 }
 
 .account-help {

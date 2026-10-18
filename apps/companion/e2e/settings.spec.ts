@@ -12,7 +12,7 @@
 
 import { expect, test, type Page } from '@playwright/test'
 
-import { overrunning } from './layout'
+import { overrunning, stopWrapping } from './layout'
 
 /** The largest accessibility size's body text, 53 points, against 17 at the default setting. */
 const LARGEST = 53 / 17
@@ -177,3 +177,102 @@ test('answers a press with a small scale, and not when the person asked for less
   expect(await preview.evaluate((each) => getComputedStyle(each).transitionDuration)).toBe('0s')
   await page.mouse.up()
 })
+
+// KR-REQ-13.19: at the largest text size on the narrowest screen, nothing runs past the screen's
+// edge or its box. The Linux runner draws the page in DejaVu Sans, which sets about a tenth more
+// text across a line than the faces of the Mac or the phone do, so a heading that fits there can
+// run past its box on the runner. Verdana is as wide and every Mac has it: these cases put the
+// page in it, with DejaVu Sans after it for the machine that has none.
+const WIDE_FACE =
+  ':root { --font-ui: Verdana, "DejaVu Sans", sans-serif !important; ' +
+  '--font-mono: Menlo, "DejaVu Sans Mono", monospace !important; }'
+
+const SESSION = '8a7b6c50-22bb-4c3d-8e4f-000000000101'
+
+/** A service host with nothing in it a line may break at, as a company's own might be. */
+const LONG_HOST = 'settings.synchronisation.example-company.com'
+
+/** Opens the harness on the narrowest phone at the largest text size, in the widest face. */
+async function atTheLargestSizeInAWideFace(page: Page, surface: 'ios' | 'android', address: string) {
+  await withTextScale(page, LARGEST)
+  await page.setViewportSize({ width: 320, height: 720 })
+  await page.goto(`/harness.html?surface=${surface}${address}`)
+  await page.addStyleTag({ content: WIDE_FACE })
+  await page.waitForSelector('.m-shell')
+}
+
+for (const surface of ['ios', 'android'] as const) {
+  test(`keeps the settings card, with everything it can say and its choice open, whole at the largest size in a wide face, ${surface}`, async ({
+    page
+  }) => {
+    await atTheLargestSizeInAWideFace(page, surface, '')
+    await page
+      .getByRole('navigation', { name: 'Sections' })
+      .getByRole('button', { name: /^Account/ })
+      .click()
+    // Before sync is on the card says what it would do and offers to turn it on: the longest of
+    // its words are in this state.
+    const off = page.getByTestId('settings-sync')
+    await expect(off).toHaveAttribute('data-state', 'off')
+    await expect(off.getByTestId('settings-sync-turn-on')).toBeVisible()
+    expect(await overrunning(page, '[data-testid="settings-sync"]'), 'the card before sync is on').toEqual([])
+    await page.evaluate(
+      ({ waiting, host }) => {
+        window.krTestHost?.settings.waitingForAChoice(waiting)
+        window.krTestHost?.settings.change({
+          sync: {
+            state: 'on',
+            kept_at: host,
+            outstanding: 1,
+            paused: true,
+            conflicts: waiting.others.length,
+            problem: 'The sync service could not be reached, so nothing was sent or received.'
+          }
+        })
+      },
+      { waiting: WAITING, host: LONG_HOST }
+    )
+    const card = page.getByTestId('settings-sync')
+    await card.getByTestId('settings-sync-choose').click()
+    await expect(card.getByTestId('settings-choice')).toBeVisible()
+    await expect(card.getByTestId('settings-sync-status')).toHaveCSS('font-family', /Verdana/)
+
+    const roots = ['[data-testid="settings-sync"]', '.account-section-title']
+    for (const root of roots) {
+      expect(await overrunning(page, root), `lines of ${root} that run past the screen or their box`).toEqual([])
+    }
+    await card.scrollIntoViewIfNeeded()
+    await page.screenshot({ path: shot(`wide-card-${surface}`), fullPage: true })
+    // The control: with the text kept from wrapping, the same measure sees the card run out.
+    await stopWrapping(page, roots)
+    expect(await overrunning(page, roots[0] ?? ''), 'the measure sees text that cannot wrap').not.toEqual([])
+  })
+
+  test(`keeps the appearance control and what it says of the settings whole at the largest size in a wide face, ${surface}`, async ({
+    page
+  }) => {
+    await atTheLargestSizeInAWideFace(page, surface, `&session=${SESSION}`)
+    await page.evaluate(() => {
+      window.krTestHost?.settings.change({ sync: { state: 'on', conflicts: 2 } })
+      window.krTestHost?.settings.failKeeping(
+        'The colour mode could not be kept on this computer, so it is back to what it was.'
+      )
+    })
+    await page.getByRole('button', { name: 'Settings' }).click()
+    const sheet = page.getByRole('dialog')
+    await expect(sheet).toBeVisible()
+    // The keeping fails, so the choice is taken back: pressing the version is what raises the problem.
+    await sheet.locator('.theme-option', { hasText: 'Dark' }).click()
+    await expect(sheet.getByTestId('theme-problem')).toBeVisible()
+    await expect(sheet.getByTestId('theme-waiting')).toBeVisible()
+    await expect(sheet.getByTestId('theme-problem')).toHaveCSS('font-family', /Verdana/)
+
+    const roots = ['.settings-content']
+    for (const root of roots) {
+      expect(await overrunning(page, root), `lines of ${root} that run past the screen or their box`).toEqual([])
+    }
+    await page.screenshot({ path: shot(`wide-appearance-${surface}`) })
+    await stopWrapping(page, roots)
+    expect(await overrunning(page, roots[0] ?? ''), 'the measure sees text that cannot wrap').not.toEqual([])
+  })
+}

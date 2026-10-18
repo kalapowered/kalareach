@@ -980,6 +980,8 @@
 
 .settings-content {
   min-width: 0;
+  /* At the largest text size on the narrowest screen a heading's one word is wider than the pane. */
+  overflow-wrap: anywhere;
 }
 
 .settings-content > h2 {
