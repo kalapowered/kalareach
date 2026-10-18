@@ -57,6 +57,7 @@
 //! | [`project`] | Project repositories, workspaces, inclusion previews and repository operations |
 //! | [`changeset`] | Immutable change-set versions, materialisations and the diff apply contract |
 //! | [`limits`] | Protocol defaults |
+//! | [`ordering`] | Which requests on a connection a keystroke goes ahead of, and the order that reading ahead keeps |
 //! | [`local`] | The local IPC handshake and the control-stream message union |
 //! | [`machine`] | Machine groups: the group an environment records, and the steps that change it |
 //! | [`identity`] | Boot, process-start and worker-profile identities |
@@ -151,6 +152,7 @@ pub mod local;
 pub mod machine;
 pub mod mailbox;
 pub mod method;
+pub mod ordering;
 pub mod organisation;
 pub mod pairing;
 pub mod preauth;

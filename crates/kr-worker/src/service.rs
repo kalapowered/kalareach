@@ -1825,9 +1825,9 @@ impl WorkerService {
                     // reading the connection ahead for keys. Frames it is handed are the ones this
                     // loop had read already; the reader is only its own to give when no
                     // preparation is waiting for those.
-                    let overtaking = (overtake::kind_of(&message) == overtake::Kind::Independent
-                        && state.facts.negotiated
-                        && !state.facts.controller
+                    let overtaking = (overtake::kind_of(&message)
+                        == kr_protocol::ordering::Kind::Independent
+                        && overtake::takes_keys_beside_a_request(&state.facts)
                         && (held.is_none() || !backlog.is_empty()))
                     .then(|| {
                         overtake::Overtaking::open(
@@ -4431,10 +4431,10 @@ impl WorkerService {
     ///
     /// A read whose authority check fails after it ran also ends the subscription and the snapshot
     /// reading it started, and a keystroke cannot reach those. That is safe because the check can
-    /// fail only on a controller connection, which is withdrawn when it does and never passes the
-    /// check again, and because the loop takes a subscription in the pass that sets it, and a read
-    /// served beside the keystroke clears its own when its check fails. A change that lets the
-    /// check fail and pass again has to give a keystroke the same clearing.
+    /// fail only on a controller connection, a proxy link among them, which is withdrawn when it
+    /// does and never passes the check again, and because the loop takes a subscription in the pass
+    /// that sets it, and a read served beside the keystroke clears its own when its check fails. A
+    /// change that lets the check fail and pass again has to give a keystroke the same clearing.
     fn keystroke(&self, facts: &ConnectionFacts, request: &Request, caller: &Caller) -> Served {
         // When the request reached this handler. A held prefix's deadline runs from here, so
         // nothing a request waits for on its way to the input domain, the checks of a local owner's
@@ -5144,51 +5144,72 @@ impl WorkerService {
         state: &mut ConnectionState,
         forwarded: &kr_protocol::local::ForwardedRequest,
     ) -> ControlFrame {
-        if state.facts.client_kind != LocalClientKind::Controller {
-            return failure(
-                forwarded.request.request_id,
-                &ProtocolError::new(
-                    ErrorCode::PermissionDenied,
-                    "only the control daemon forwards an admitted read",
-                ),
-            );
-        }
-        if !matches!(
-            forwarded.actor.ingress,
-            ActorIngress::LocalIpc | ActorIngress::PairedDevice
-        ) {
-            return failure(
-                forwarded.request.request_id,
-                &ProtocolError::new(
-                    ErrorCode::PermissionDenied,
-                    "this endpoint serves the local and paired-device ingresses",
-                ),
-            );
-        }
-        if forwarded.actor.ingress == ActorIngress::PairedDevice
-            && !forwarded.actor.device_id.is_present()
-        {
-            return failure(
-                forwarded.request.request_id,
-                &ProtocolError::new(
-                    ErrorCode::PermissionDenied,
-                    "a paired-device envelope names the device it acts for",
-                ),
-            );
-        }
-        // A forwarded read carries no rights, because nothing a read decides is decided from
-        // them: an attachment's capabilities are fixed where the attachment is admitted, which
-        // is a mutation, and every later operation is checked against what that admission
-        // granted rather than against the grant again.
-        let caller = Caller::forwarded(&forwarded.actor, &CanonicalSet::new())
-            .until(forwarded.authority_deadline_boot_ms.0.map(U64::get))
-            .within(forwarded.history.clone());
+        let caller = match Self::forwarded_caller(&state.facts, forwarded) {
+            Ok(caller) => caller,
+            Err(refusal) => return failure(forwarded.request.request_id, &refusal),
+        };
         if forwarded.request.method.method() == Some(Method::InputWrite) {
             let served = self.keystroke(&state.facts, &forwarded.request, &caller);
             state.answering_held = served.held;
             return served.reply;
         }
         self.request(state, &forwarded.request, &caller)
+    }
+
+    /// The caller a read the control daemon admitted is served as, or why it is refused: it does
+    /// not come from the daemon, or does not name who it is for.
+    ///
+    /// It reads the connection's facts and the frame and nothing else, so a keystroke that arrives
+    /// this way can be served beside a request that waits, as one that arrives as a request is.
+    fn forwarded_caller(
+        facts: &ConnectionFacts,
+        forwarded: &kr_protocol::local::ForwardedRequest,
+    ) -> std::result::Result<Caller, ProtocolError> {
+        if facts.client_kind != LocalClientKind::Controller {
+            return Err(ProtocolError::new(
+                ErrorCode::PermissionDenied,
+                "only the control daemon forwards an admitted read",
+            ));
+        }
+        if !matches!(
+            forwarded.actor.ingress,
+            ActorIngress::LocalIpc | ActorIngress::PairedDevice
+        ) {
+            return Err(ProtocolError::new(
+                ErrorCode::PermissionDenied,
+                "this endpoint serves the local and paired-device ingresses",
+            ));
+        }
+        if forwarded.actor.ingress == ActorIngress::PairedDevice
+            && !forwarded.actor.device_id.is_present()
+        {
+            return Err(ProtocolError::new(
+                ErrorCode::PermissionDenied,
+                "a paired-device envelope names the device it acts for",
+            ));
+        }
+        // A forwarded read carries no rights, because nothing a read decides is decided from
+        // them: an attachment's capabilities are fixed where the attachment is admitted, which
+        // is a mutation, and every later operation is checked against what that admission
+        // granted rather than against the grant again.
+        Ok(Caller::forwarded(&forwarded.actor, &CanonicalSet::new())
+            .until(forwarded.authority_deadline_boot_ms.0.map(U64::get))
+            .within(forwarded.history.clone()))
+    }
+
+    /// Serves the keystroke batch the control daemon forwarded for a paired device.
+    fn keystroke_of_a_forwarded_read(
+        &self,
+        facts: &ConnectionFacts,
+        forwarded: &kr_protocol::local::ForwardedRequest,
+    ) -> Served {
+        match Self::forwarded_caller(facts, forwarded) {
+            Ok(caller) => self.keystroke(facts, &forwarded.request, &caller),
+            Err(refusal) => Served {
+                reply: failure(forwarded.request.request_id, &refusal),
+                held: false,
+            },
+        }
     }
 
     fn receipted(

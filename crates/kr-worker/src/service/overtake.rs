@@ -13,21 +13,22 @@
 //!
 //! # What a key goes ahead of
 //!
-//! A key never goes ahead of an earlier key. It goes ahead of a read, and of a mutation that
-//! leaves alone everything a key meets: the lease, the capabilities, the fence, the paste framing,
-//! which attachments exist and the session's state. The geometry and the viewport are such. Every
-//! other frame, a mutation not named here and every frame that is not a request, keeps its place:
-//! a key sent after a detach is refused because the detach comes first, and a frame that is new to
-//! the protocol blocks keys until someone has decided it does not.
+//! `kr_protocol::ordering` says which requests a key goes ahead of and keeps the order of what is
+//! read ahead; this module maps the frames of a connection to it. A key is an `input.write` sent as
+//! a request, or forwarded by the control daemon for a paired device on its proxy link. It goes
+//! ahead of a read, and of a mutation that leaves alone everything a key meets (the geometry and
+//! the viewport). Every other frame keeps its place: a key sent after a detach is refused because
+//! the detach comes first, and a frame that is new to the protocol blocks keys until someone has
+//! decided it does not.
 //!
 //! The answer to a key can come before the answer to a request it went ahead of. A response names
 //! the request it answers, and the clients match on that.
 //!
 //! # Limits
 //!
-//! The task reads no more from the connection once it holds [`MOST_HELD`] frames that it cannot
-//! serve, and a key it has not read by then waits for the request, as it did before. Frames the
-//! loop had already read ahead of a finished preparation are not held to that limit.
+//! The task reads no more from the connection once it holds [`ordering::MOST_HELD`] frames that it
+//! cannot serve, and a key it has not read by then waits for the request, as it did before. Frames
+//! the loop had already read ahead of a finished preparation are not held to that limit.
 //! The task ends when the request does, and the loop writes the request's answer after that, so a
 //! key that arrives while a large answer is being written to a slow peer waits for the write, up to
 //! the bound on a write. While a client keeps the connection's loop supplied with frames the task
@@ -39,102 +40,33 @@ use std::sync::{Arc, Mutex};
 
 use kr_ipc::framed::{FrameReader, FrameWriter};
 use kr_protocol::envelope::ControlFrame;
-use kr_protocol::method::Method;
+use kr_protocol::local::ControllerConnectionRole;
+use kr_protocol::ordering::{self, Judgement, Kind, Sorting};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
 use super::{ConnectionFacts, Withdrawal, WorkerService, Writing, write_frame};
 
-/// How many frames the task holds that it cannot serve before it reads no more.
-pub(super) const MOST_HELD: usize = 16;
-
-/// What a frame is to the order a key keeps.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Kind {
-    /// An `input.write` sent as a request.
-    Key,
-    /// A frame a key goes ahead of: a read, and a mutation that leaves keys alone.
-    Independent,
-    /// Any other frame. A key does not go ahead of it.
-    Blocking,
+/// Whether the keys of a connection are served beside a request that waits: a local client's, and
+/// the control daemon's proxy link, which carries a paired device's. The daemon's other links carry
+/// its own housekeeping and no keys.
+pub(super) fn takes_keys_beside_a_request(facts: &ConnectionFacts) -> bool {
+    facts.negotiated
+        && (!facts.controller || facts.controller_role == ControllerConnectionRole::Proxy)
 }
 
 /// Returns what `frame` is to the order a key keeps.
 pub(super) fn kind_of(frame: &ControlFrame) -> Kind {
     match frame {
-        ControlFrame::Request(request) => match request.method.method() {
-            Some(Method::InputWrite) => Kind::Key,
-            _ => Kind::Independent,
-        },
-        ControlFrame::Mutation(mutation) => match mutation.method.method() {
-            Some(method) if leaves_keys_alone(method) => Kind::Independent,
-            _ => Kind::Blocking,
-        },
-        _ => Kind::Blocking,
-    }
-}
-
-/// Whether a mutation of `method` changes nothing a key meets.
-///
-/// The geometry owner's size, who owns the size, whether an attachment claims it and where an
-/// attachment's window is: none moves the lease, an attachment's capabilities, the fence, the
-/// paste framing, which attachments exist or the session's state. A method that is not named is
-/// taken to be able to.
-const fn leaves_keys_alone(method: Method) -> bool {
-    matches!(
-        method,
-        Method::TerminalResize
-            | Method::TerminalGeometryTransfer
-            | Method::AttachmentConfigure
-            | Method::AttachmentViewport
-    )
-}
-
-/// What becomes of a frame the task has read.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Judgement {
-    /// Serve it now.
-    Serve,
-    /// Hand it back to the loop, in its place.
-    Defer,
-}
-
-/// The order the task keeps, as a function of the frames in the order they were sent.
-#[derive(Debug, Default)]
-pub(super) struct Sorting {
-    /// A frame that keys do not go ahead of has been held, so no key goes ahead now.
-    blocked: bool,
-    /// How many frames that cannot be served are held.
-    held: usize,
-}
-
-impl Sorting {
-    /// Decides what becomes of the next frame. `None` stands for a frame that could not be read
-    /// or for the end of the stream.
-    pub(super) fn judge(&mut self, frame: Option<&ControlFrame>) -> Judgement {
-        let Some(frame) = frame else {
-            self.blocked = true;
-            return Judgement::Defer;
-        };
-        match kind_of(frame) {
-            Kind::Key if !self.blocked => Judgement::Serve,
-            // A key is never served before an earlier key, so one held holds every key after it.
-            Kind::Key => Judgement::Defer,
-            Kind::Independent => {
-                self.held += 1;
-                Judgement::Defer
-            }
-            Kind::Blocking => {
-                self.blocked = true;
-                Judgement::Defer
-            }
+        ControlFrame::Request(request) => ordering::request_kind(request.method.method()),
+        ControlFrame::ForwardedRead(forwarded) => {
+            ordering::request_kind(forwarded.request.method.method())
         }
-    }
-
-    /// Whether the connection may be read for another frame: a key could still be served, and the
-    /// frames held are few enough.
-    pub(super) const fn may_read(&self) -> bool {
-        !self.blocked && self.held < MOST_HELD
+        ControlFrame::Mutation(mutation) => ordering::mutation_kind(mutation.method.method()),
+        ControlFrame::Forwarded(forwarded) => {
+            ordering::mutation_kind(forwarded.mutation.method.method())
+        }
+        _ => Kind::Blocking,
     }
 }
 
@@ -228,9 +160,9 @@ async fn run(
             let _ = (&mut stop).await;
             break;
         };
-        match (sorting.judge(frame.as_ref()), frame) {
-            (Judgement::Serve, Some(ControlFrame::Request(request))) => {
-                if !serve(&service, &facts, &link, &request).await {
+        match (sorting.judge(frame.as_ref().map(kind_of)), frame) {
+            (Judgement::Serve, Some(key)) => {
+                if !serve(&service, &facts, &link, &key).await {
                     broken = true;
                     break;
                 }
@@ -255,15 +187,29 @@ async fn serve(
     service: &WorkerService,
     facts: &ConnectionFacts,
     link: &Link,
-    request: &kr_protocol::envelope::Request,
+    key: &ControlFrame,
 ) -> bool {
     // Taken before the answer is produced, as the loop takes it before it handles a frame: an
     // answer produced while the connection held its registration carries what that gave it, and a
     // withdrawal that lands before it reaches the peer must stop it.
     let protected = !link.withdrawn.is_set();
-    #[cfg(feature = "testing")]
-    service.record_received(&request.method, &request.params);
-    let served = service.keystroke_of_a_request(facts, request);
+    // Only a request is recorded as waiting for the local owner's lease and counted off after its
+    // answer, as the loop does: a forwarded read is neither.
+    let (served, counted) = match key {
+        ControlFrame::Request(request) => {
+            #[cfg(feature = "testing")]
+            service.record_received(&request.method, &request.params);
+            (
+                service.keystroke_of_a_request(facts, request),
+                Some(request.request_id),
+            )
+        }
+        ControlFrame::ForwardedRead(forwarded) => (
+            service.keystroke_of_a_forwarded_read(facts, forwarded),
+            None,
+        ),
+        _ => unreachable!("only a key is served ahead of a request"),
+    };
     let written = tokio::time::timeout(
         crate::runtime::ACCEPTANCE_WRITE_TIMEOUT,
         write_frame(
@@ -277,39 +223,41 @@ async fn serve(
     .await
     .unwrap_or_default();
     // Counted off whatever came of the write, as the loop does.
-    if let Some(local) = link.writable.local.as_ref() {
-        local.answered(request.request_id, served.held);
+    if let (Some(request_id), Some(local)) = (counted, link.writable.local.as_ref()) {
+        local.answered(request_id, served.held);
     }
     written
 }
 
 #[cfg(test)]
 mod tests {
+    use kr_protocol::actor::{ActorEnvelope, ActorIngress};
     use kr_protocol::envelope::{MutationRequest, ParamsValue, Request};
-    use kr_protocol::ids::{ActionId, RequestId};
-    use kr_protocol::method::MethodVersion;
-    use kr_protocol::scalars::{DurationMs, Nullable};
+    use kr_protocol::ids::{ActionId, ActorId, ConnectionId, ControllerGeneration, RequestId};
+    use kr_protocol::local::{ForwardedMutation, ForwardedRequest};
+    use kr_protocol::method::{Method, MethodVersion};
+    use kr_protocol::scalars::{CanonicalSet, DurationMs, Nullable, U64, Uuid};
 
     use super::*;
 
-    fn request(method: Method) -> Option<ControlFrame> {
-        Some(ControlFrame::Request(Request {
+    fn request(method: Method) -> ControlFrame {
+        ControlFrame::Request(Request {
             request_id: RequestId::new(1),
             method: method.into(),
             method_version: MethodVersion::V1,
             params: ParamsValue::empty(),
-        }))
+        })
     }
 
-    fn mutation(method: Method) -> Option<ControlFrame> {
-        Some(ControlFrame::Mutation(Box::new(MutationRequest {
+    fn mutation_of(method: Method) -> MutationRequest {
+        MutationRequest {
             request_id: RequestId::new(1),
             method: method.into(),
             method_version: MethodVersion::V1,
-            action_id: ActionId::new(kr_ipc::new_uuid()),
+            action_id: ActionId::new(Uuid::from_bytes([1; 16])),
             grant_id: Nullable::null(),
             target: kr_protocol::envelope::ActionTarget {
-                environment_id: kr_protocol::ids::EnvironmentId::new(kr_ipc::new_uuid()),
+                environment_id: kr_protocol::ids::EnvironmentId::new(Uuid::from_bytes([2; 16])),
                 session_id: Nullable::null(),
                 session_epoch: Nullable::null(),
                 application_instance_id: Nullable::null(),
@@ -319,90 +267,74 @@ mod tests {
             action_window_id: kr_protocol::ids::ActionWindowId::new("window").expect("an id"),
             requested_ttl_ms: DurationMs::new(1),
             params: ParamsValue::empty(),
-        })))
+        }
     }
 
-    /// The decisions for `frames`, in order, and whether the connection could still be read after
-    /// each.
-    fn judged(frames: &[Option<ControlFrame>]) -> Vec<(Judgement, bool)> {
-        let mut sorting = Sorting::default();
-        frames
-            .iter()
-            .map(|frame| (sorting.judge(frame.as_ref()), sorting.may_read()))
-            .collect()
+    fn actor() -> ActorEnvelope {
+        ActorEnvelope {
+            actor_id: ActorId::new("device:phone").expect("an actor"),
+            ingress: ActorIngress::PairedDevice,
+            device_id: Nullable::some(kr_protocol::ids::DeviceId::new(Uuid::from_bytes([3; 16]))),
+            grant_id: Nullable::null(),
+            grant_revision: Nullable::null(),
+            controller_generation: ControllerGeneration::new(1),
+            connection_id: ConnectionId::new(Uuid::from_bytes([4; 16])),
+        }
     }
 
-    /// KR-PERF-002: a key goes ahead of a read and of a mutation that leaves keys alone, and of
-    /// nothing else.
+    fn forwarded_read(method: Method) -> ControlFrame {
+        ControlFrame::ForwardedRead(Box::new(ForwardedRequest {
+            request: Request {
+                request_id: RequestId::new(1),
+                method: method.into(),
+                method_version: MethodVersion::V1,
+                params: ParamsValue::empty(),
+            },
+            actor: actor(),
+            authority_deadline_boot_ms: Nullable::null(),
+            history: None,
+        }))
+    }
+
+    fn forwarded(method: Method) -> ControlFrame {
+        ControlFrame::Forwarded(Box::new(ForwardedMutation {
+            mutation: mutation_of(method),
+            actor: actor(),
+            grant_rights: CanonicalSet::new(),
+            accepted_deadline_boot_ms: U64::new(1),
+            history: None,
+            screen_basis: None,
+        }))
+    }
+
+    /// KR-PERF-002: a worker maps a frame to the order a key keeps by the method it carries, the
+    /// control daemon's forwarded frames among them, and every frame that is not a request keeps
+    /// its place.
     #[test]
-    fn a_key_goes_ahead_of_reads_and_geometry_and_of_nothing_else() {
-        use Judgement::{Defer, Serve};
-        let key = request(Method::InputWrite);
-        let frames = [
-            request(Method::SessionRead),
-            mutation(Method::AttachmentViewport),
-            mutation(Method::TerminalResize),
-            key.clone(),
-            mutation(Method::SessionDetach),
-            key.clone(),
-            request(Method::SessionRead),
-            key,
-        ];
-        let decisions: Vec<_> = judged(&frames).into_iter().map(|(what, _)| what).collect();
+    fn a_frame_is_mapped_by_the_method_it_carries_and_a_frame_that_is_not_a_request_blocks_keys() {
+        assert_eq!(kind_of(&request(Method::InputWrite)), Kind::Key);
+        assert_eq!(kind_of(&request(Method::SessionRead)), Kind::Independent);
+        assert_eq!(kind_of(&forwarded_read(Method::InputWrite)), Kind::Key);
         assert_eq!(
-            decisions,
-            [Defer, Defer, Defer, Serve, Defer, Defer, Defer, Defer],
-            "a key is served ahead of the reads and the geometry before it, and held behind the \
-             detach and behind the key held ahead of it"
+            kind_of(&forwarded_read(Method::SessionOpen)),
+            Kind::Blocking
         );
-    }
-
-    /// KR-PERF-002: the connection is read for as long as a key could still be served, and for no
-    /// more than the most frames that cannot be.
-    #[test]
-    fn the_connection_is_read_until_a_key_cannot_be_served_or_too_many_frames_are_held() {
-        let reads = |count: usize| vec![request(Method::SessionRead); count];
-        assert!(
-            judged(&reads(MOST_HELD - 1))
-                .last()
-                .is_some_and(|(_, more)| *more)
-        );
-        assert!(
-            judged(&reads(MOST_HELD))
-                .last()
-                .is_some_and(|(_, more)| !*more)
-        );
-        assert!(
-            judged(&[mutation(Method::SessionClose)])
-                .last()
-                .is_some_and(|(_, more)| !*more),
-            "a frame a key does not go ahead of ends the reading"
-        );
-        assert!(
-            judged(&[None]).last().is_some_and(|(_, more)| !*more),
-            "so does a frame that could not be read"
-        );
-        // Keys served do not count against the frames held.
-        let keys = vec![request(Method::InputWrite); MOST_HELD * 2];
-        assert!(
-            judged(&keys)
-                .iter()
-                .all(|(what, more)| *what == Judgement::Serve && *more)
-        );
-    }
-
-    /// KR-PERF-002: a frame that is not a request blocks keys, whatever it is.
-    #[test]
-    fn a_frame_that_is_not_a_request_or_a_mutation_blocks_keys() {
-        let frame = Some(ControlFrame::Event(
-            kr_protocol::envelope::ControlEvent::Keepalive,
-        ));
         assert_eq!(
-            judged(&[frame, request(Method::InputWrite)])
-                .into_iter()
-                .map(|(what, _)| what)
-                .collect::<Vec<_>>(),
-            [Judgement::Defer, Judgement::Defer]
+            kind_of(&forwarded(Method::AttachmentViewport)),
+            Kind::Independent
+        );
+        assert_eq!(kind_of(&forwarded(Method::SessionDetach)), Kind::Blocking);
+        assert_eq!(
+            kind_of(&ControlFrame::Mutation(Box::new(mutation_of(
+                Method::TerminalResize
+            )))),
+            Kind::Independent
+        );
+        assert_eq!(
+            kind_of(&ControlFrame::Event(
+                kr_protocol::envelope::ControlEvent::Keepalive
+            )),
+            Kind::Blocking
         );
     }
 }
