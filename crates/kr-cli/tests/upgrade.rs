@@ -24,9 +24,9 @@ mod teardown;
 // the control daemon's own network suites make.
 #[path = "upgrade/door.rs"]
 mod door;
-// A person's terminal: a program run on a pseudo-terminal that a case types at.
 #[path = "../../kr-controller/tests/net_support/pairing.rs"]
 mod pairing;
+// A person's terminal: a program run on a pseudo-terminal that a case types at.
 #[path = "upgrade/terminal.rs"]
 mod terminal;
 
@@ -1381,17 +1381,24 @@ fn tree_identity(root: &Path) -> std::collections::BTreeMap<String, (u64, u64, S
 #[tokio::test(flavor = "multi_thread")]
 async fn the_zsh_of_the_release_before_reads_the_stable_entry_of_the_current_release_and_keeps_its_modules()
  {
-    let updated = Updated::with_zsh().await;
-    let host = &updated.host;
+    // The package's files are taken before the update, so the update is held to them as well.
+    let prepared = Updated::prepare(Setup {
+        zsh: true,
+        ..Setup::default()
+    })
+    .await;
     let identity = std::fs::read_to_string(
-        host.store
-            .release_directory(updated.one.name())
+        prepared
+            .host
+            .store
+            .release_directory(prepared.one.name())
             .join("shells/zsh/current"),
     )
     .expect("the release before's package pointer");
-    let package = host
+    let package = prepared
+        .host
         .store
-        .release_directory(updated.one.name())
+        .release_directory(prepared.one.name())
         .join("shells/zsh")
         .join(identity.trim());
     let modules = tree_identity(&package);
@@ -1399,6 +1406,13 @@ async fn the_zsh_of_the_release_before_reads_the_stable_entry_of_the_current_rel
         modules.keys().any(|path| path == "bin/zsh"),
         "the package's files are listed: {:?}",
         modules.keys().collect::<Vec<_>>()
+    );
+    let updated = prepared.update().await;
+    let host = &updated.host;
+    assert_eq!(
+        tree_identity(&package),
+        modules,
+        "the update left the package's files as they were"
     );
 
     // The session's root shell is the release before's own zsh.
@@ -1478,12 +1492,30 @@ impl Updated {
         let gate = pipes.gate.clone();
         tokio::task::spawn_blocking(move || {
             use std::io::Write as _;
+            use std::os::unix::fs::OpenOptionsExt as _;
 
-            let mut gate = std::fs::OpenOptions::new()
-                .write(true)
-                .open(gate)
-                .expect("opens the gate");
-            gate.write_all(b"\n").expect("lets the root shell past");
+            // A write end opened without waiting is refused until the root shell reads the gate.
+            let deadline = Instant::now() + LIVENESS_DEADLINE;
+            loop {
+                match std::fs::OpenOptions::new()
+                    .write(true)
+                    .custom_flags(libc::O_NONBLOCK)
+                    .open(&gate)
+                {
+                    Ok(mut gate) => {
+                        gate.write_all(b"\n").expect("lets the root shell past");
+                        return;
+                    }
+                    Err(error) if error.raw_os_error() == Some(libc::ENXIO) => {
+                        assert!(
+                            Instant::now() < deadline,
+                            "the root shell never read the gate"
+                        );
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                    Err(error) => panic!("opens the gate: {error}"),
+                }
+            }
         })
         .await
         .expect("the gate is opened");
@@ -1877,9 +1909,10 @@ impl Host {
 /// The command line a process was started with, as the operating system reports it.
 fn command_of(process: &kr_protocol::identity::ProcessStartIdentity) -> String {
     let output = Command::new("ps")
-        .args(["-o", "args=", "-p", &process.pid.get().to_string()])
+        .args(["-ww", "-o", "args=", "-p", &process.pid.get().to_string()])
         .output()
         .expect("ps runs");
+    assert!(output.status.success(), "ps said {}", output.status);
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
@@ -1910,8 +1943,8 @@ async fn start_agent(
 
 /// KR-REQ-05.06, KR-REQ-26.06, KR-ACC-035: the plugin runtime the release before started outlives
 /// the update and serves the worker of a session of this release, which registers with it; and
-/// once that runtime is ended, the next session's worker asks the daemon of this release, which
-/// starts a runtime of this release.
+/// once their programs and that runtime have ended, the next session's worker asks the daemon of
+/// this release, which starts a runtime of this release that holds that one binding.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_plugin_runtime_of_the_release_before_survives_the_update_and_is_replaced_by_this_releases()
  {
@@ -1928,7 +1961,7 @@ async fn the_plugin_runtime_of_the_release_before_survives_the_update_and_is_rep
         &["attach", &prepared.display],
     );
     first.ready().await;
-    start_agent(host_ref, &first, &agent).await;
+    let first_program = start_agent(host_ref, &first, &agent).await;
     host_ref.plugin_holding(1).await;
     let old_runtime = host_ref
         .plugin_host()
@@ -1956,13 +1989,25 @@ async fn the_plugin_runtime_of_the_release_before_survives_the_update_and_is_rep
     let second_worker = host.worker_process(second_session);
     let second = terminal_for(host, &updated.kr_now(), &["attach", &second_display]);
     second.ready().await;
-    start_agent(host, &second, &agent).await;
+    let second_program = start_agent(host, &second, &agent).await;
     host.plugin_holding(2).await;
     assert_eq!(
         host.plugin_host(),
         Some(old_runtime.clone()),
         "the new worker registered with the runtime of the release before"
     );
+
+    // Both programs end, by the processes recorded for them, and with them their bindings: a
+    // worker whose runtime ends asks the daemon for another while its program runs, so nothing
+    // is left to ask until the third session's program starts.
+    for program in [&first_program, &second_program] {
+        let ended = Command::new("kill")
+            .arg(program.pid.get().to_string())
+            .status()
+            .expect("kill runs");
+        assert!(ended.success(), "the recorded program is ended");
+    }
+    host.plugin_holding(0).await;
 
     // The runtime of the release before ends, by the process recorded for it, and a session
     // created after that gets a runtime of this release.
@@ -1993,21 +2038,22 @@ async fn the_plugin_runtime_of_the_release_before_survives_the_update_and_is_rep
         "the new runtime is this release's: {}",
         command_of(&new_runtime)
     );
-    until("the new runtime to hold the binding", || async {
-        host.plugin_health()
-            .await
-            .filter(|health| health.live_bindings >= 1)
-    })
-    .await;
+    // The binding it holds is the third session's, the only program that runs.
+    host.plugin_holding(1).await;
+    assert_eq!(
+        host.plugin_host(),
+        Some(new_runtime),
+        "one runtime serves it"
+    );
 
     updated.the_worker_is_as_it_was().await;
-    host.end_the_plugin_host().await;
     host.close(&updated.kr_now(), &third_display);
     host.worker_ended(&third_worker).await;
     host.close(&updated.kr_now(), &second_display);
     host.worker_ended(&second_worker).await;
     host.close(&updated.kr_before(), &updated.display);
     host.worker_ended(&updated.worker).await;
+    host.end_the_plugin_host().await;
 }
 
 /// KR-REQ-05.06, KR-REQ-26.06, KR-ACC-035: a program the package recognises, started in the session

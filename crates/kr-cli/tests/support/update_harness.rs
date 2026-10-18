@@ -667,10 +667,6 @@ impl Assembled {
         }
         for (path, source) in &self.copied {
             let file = directory.join(path);
-            // A package built where the release will be is already there.
-            if *source == file {
-                continue;
-            }
             std::fs::create_dir_all(file.parent().expect("a directory")).expect("the tree");
             std::fs::copy(source, &file).expect("a file of a shell package");
         }
