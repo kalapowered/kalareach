@@ -118,6 +118,7 @@ fn intrinsic(table: &[PublicMajor]) -> Vec<String> {
 
 const ONE: ProtocolVersion = ProtocolVersion::new(1, 0);
 const TWO: ProtocolVersion = ProtocolVersion::new(2, 0);
+const TWO_ONE: ProtocolVersion = ProtocolVersion::new(2, 1);
 
 fn replaced_major_one() -> PublicMajor {
     PublicMajor {
@@ -249,14 +250,11 @@ fn a_retired_major_is_not_listed_and_the_others_are_with_all_their_versions() {
             ..replaced_major_one()
         },
         PublicMajor {
-            versions: &[TWO, ProtocolVersion::new(2, 1)],
+            versions: &[TWO, TWO_ONE],
             ..current_major_two()
         },
     ];
-    assert_eq!(
-        supported_versions_of(&table),
-        vec![TWO, ProtocolVersion::new(2, 1)]
-    );
+    assert_eq!(supported_versions_of(&table), vec![TWO, TWO_ONE]);
     assert_eq!(
         select_version(&[ONE, ONE_ONE], &supported_versions_of(&table)).ok(),
         None
