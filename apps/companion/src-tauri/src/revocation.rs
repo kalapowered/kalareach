@@ -73,6 +73,9 @@ use crate::sync_service::host_of;
 /// How long the person is given at the ceremony.
 const CONFIRM_WITHIN: Duration = Duration::from_secs(90);
 
+/// How long a view gives one feed, page after page.
+const FEED_WITHIN: Duration = Duration::from_secs(20);
+
 /// The most pages of one feed a view reads: more records than that are more than this computer
 /// publishes.
 const FEED_PAGES: usize = 16;
@@ -901,7 +904,8 @@ async fn visit(
             // A change of the host's authority, a revocation among them, withdraws the connections
             // it admitted before, and the host says to open a new one.
             if matches!(listing, Listing::Refused)
-                && let Ok(fresh) = connection.another().await
+                && let Ok(Ok(fresh)) =
+                    tokio::time::timeout(ANSWER_WITHIN, connection.another()).await
             {
                 listing = listed(&fresh.session()).await;
             }
@@ -945,28 +949,33 @@ async fn visit(
     }
 }
 
-/// Reads a host's feed as its publisher sees it, page after page.
+/// Reads a host's feed as its publisher sees it, page after page, within [`FEED_WITHIN`] in all.
 async fn read_feed(
     client: &AuthorityFeedClient,
     feed: KeyId,
 ) -> std::result::Result<FeedRead, String> {
-    let mut records = Vec::new();
-    let mut after = None;
-    for _ in 0..FEED_PAGES {
-        let page = tokio::time::timeout(ANSWER_WITHIN, client.read(feed, after, false))
-            .await
-            .map_err(|_| "it did not answer in time".to_owned())?
-            .map_err(|error| CommandError::from(error).message)?;
-        records.extend(page.records);
-        if !page.more {
-            return Ok(FeedRead {
-                records,
-                summary: page.summary,
-            });
+    let read = async {
+        let mut records = Vec::new();
+        let mut after = None;
+        for _ in 0..FEED_PAGES {
+            let page = client
+                .read(feed, after, false)
+                .await
+                .map_err(|error| CommandError::from(error).message)?;
+            records.extend(page.records);
+            if !page.more {
+                return Ok(FeedRead {
+                    records,
+                    summary: page.summary,
+                });
+            }
+            after = Some(page.next_after_sequence.get());
         }
-        after = Some(page.next_after_sequence.get());
-    }
-    Err("it holds more requests than this computer reads".to_owned())
+        Err("it holds more requests than this computer reads".to_owned())
+    };
+    tokio::time::timeout(FEED_WITHIN, read)
+        .await
+        .unwrap_or_else(|_| Err("it did not answer in time".to_owned()))
 }
 
 #[cfg(test)]
