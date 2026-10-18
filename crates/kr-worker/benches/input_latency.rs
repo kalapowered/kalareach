@@ -845,6 +845,9 @@ fn paste_prefix_recogniser_deadline() {
     // below.
     let beside_mutations = runtime.block_on(measure_recogniser_beside_mutations(false));
     let beside_a_disk_writer = runtime.block_on(measure_recogniser_beside_mutations(true));
+    let on_its_own_connection = runtime.block_on(measure_recogniser_on_its_own_connection(false));
+    let on_its_own_connection_beside_a_disk_writer =
+        runtime.block_on(measure_recogniser_on_its_own_connection(true));
     closed.unwrap_or_else(|failure| panic!("the session this measurement created: {failure}"));
     // The requirement's own bound, on the deadline this host is built with. It is asserted here
     // rather than inferred from a figure, because a measurement with an allowance around it cannot
@@ -882,6 +885,19 @@ fn paste_prefix_recogniser_deadline() {
     beside_a_disk_writer
         .unwrap_or_else(|failure| {
             panic!("the measurement beside mutations and a disk writer: {failure}")
+        })
+        .assert_met(allowed);
+    on_its_own_connection
+        .unwrap_or_else(|failure| {
+            panic!("the measurement behind a mutation on its own connection: {failure}")
+        })
+        .assert_met(allowed);
+    on_its_own_connection_beside_a_disk_writer
+        .unwrap_or_else(|failure| {
+            panic!(
+                "the measurement behind a mutation on its own connection and a disk writer: \
+                 {failure}"
+            )
         })
         .assert_met(allowed);
 }
@@ -1405,6 +1421,395 @@ async fn recogniser_beside_mutations(
         split,
         conditions,
         mutations,
+    })
+}
+
+/// The holds taken again with the journalled mutation on the keystroke's own connection.
+///
+/// A client sends its keys and its viewport reports and resizes on one connection, so a key can
+/// follow a mutation of its own. Before each hold the connection sends a viewport report, a
+/// journalled mutation, and writes the prefix right behind it without waiting for the answer. What
+/// the worker did with the key is read from the order the two answers came back in, and from where
+/// its own record puts the key's acceptance among the spans in which a mutation held the session.
+struct OnItsOwnConnection {
+    holds: Vec<OwnHold>,
+    /// How long the split delimiter took to be recognised once its second half arrived.
+    split: Duration,
+    conditions: record::Conditions,
+    /// How many viewport reports the connection sent and had answered.
+    viewports: u64,
+}
+
+/// One hold taken behind a viewport report on the same connection.
+struct OwnHold {
+    what: String,
+    held: Duration,
+    /// The key was answered before the viewport report it followed.
+    answered_first: bool,
+    /// Where the worker took the write into its input domain.
+    accepted: Option<Within>,
+}
+
+impl OnItsOwnConnection {
+    /// Asserts the holds against the bound, after the figure has been kept.
+    fn assert_met(&self, allowed: Duration) {
+        assert!(
+            self.holds.iter().any(|hold| hold.answered_first),
+            "no key was answered before the mutation sent just ahead of it on its connection, so \
+             the figure says nothing about a key behind a mutation of its own connection"
+        );
+        for hold in &self.holds {
+            let (what, held) = (&hold.what, &hold.held);
+            assert!(
+                *held <= allowed,
+                "{what} was held for {held:?} behind a mutation on its own connection, beyond the \
+                 {RECOGNISER_DEADLINE:?} deadline and the stated allowance around it"
+            );
+            assert!(
+                *held >= RECOGNISER_DEADLINE,
+                "{what} was forwarded in {held:?}, before its deadline"
+            );
+        }
+        assert!(
+            self.split <= allowed,
+            "the split delimiter took {:?} to be recognised behind a mutation on its own connection",
+            self.split
+        );
+    }
+}
+
+/// What a connection has been answered, by request identifier, and in which order.
+#[derive(Default)]
+struct Answers {
+    outcomes:
+        std::collections::BTreeMap<kr_protocol::ids::RequestId, kr_protocol::envelope::Outcome>,
+    order: Vec<kr_protocol::ids::RequestId>,
+}
+
+impl Answers {
+    /// Reads `client` until `id` has been answered.
+    async fn until(
+        &mut self,
+        client: &mut LocalClient,
+        id: kr_protocol::ids::RequestId,
+    ) -> Result<kr_protocol::envelope::Outcome, String> {
+        while !self.outcomes.contains_key(&id) {
+            let frame = tokio::time::timeout(Duration::from_secs(30), client.recv())
+                .await
+                .map_err(|_| "an answer never came".to_owned())?
+                .map_err(|error| format!("the connection could not be read: {error}"))?;
+            if let ControlFrame::Response(response) = frame {
+                self.order.push(response.request_id);
+                self.outcomes.insert(response.request_id, response.outcome);
+            }
+        }
+        Ok(self.outcomes[&id].clone())
+    }
+}
+
+/// Where this measurement's own raw requests begin numbering, apart from the identifiers the
+/// client gives the calls it makes itself.
+const OWN_REQUESTS: u64 = 1_000_000;
+
+/// Sends a viewport report at the attachment's own size, which changes nothing and is journalled
+/// like any mutation, without waiting for its answer.
+async fn send_viewport(
+    hosted: &Hosted,
+    client: &mut LocalClient,
+    attachment_id: AttachmentId,
+) -> Result<kr_protocol::ids::RequestId, String> {
+    let mutation = client
+        .compose(
+            Method::AttachmentViewport,
+            ActionId::new(kr_ipc::new_uuid()),
+            hosted.target(),
+            &kr_protocol::attachment::AttachmentViewportParams {
+                attachment_id,
+                dimensions: Dimensions::new(80, 24),
+                position: Nullable::null(),
+                column: kr_protocol::scalars::U64::new(0),
+            },
+        )
+        .await
+        .map_err(|error| format!("the viewport report could not be built: {error}"))?;
+    let id = mutation.request_id;
+    client
+        .writer()
+        .write_message(&ControlFrame::Mutation(Box::new(mutation)))
+        .await
+        .map_err(|error| format!("the viewport report did not reach the worker: {error}"))?;
+    Ok(id)
+}
+
+/// Sends one `input.write` without waiting for its answer.
+async fn send_key(
+    hosted: &Hosted,
+    client: &mut LocalClient,
+    attachment_id: AttachmentId,
+    epoch: kr_protocol::ids::InputLeaseEpoch,
+    sequence: &mut u64,
+    bytes: &[u8],
+) -> Result<kr_protocol::ids::RequestId, String> {
+    let id = kr_protocol::ids::RequestId::new(OWN_REQUESTS + *sequence);
+    let params = kr_protocol::envelope::ParamsValue::from_typed(&InputWriteParams {
+        session_id: hosted.session_id,
+        attachment_id,
+        epoch,
+        sequence: kr_protocol::ids::InputSequence::new(*sequence),
+        bytes: Bytes::new(bytes.to_vec()),
+    })
+    .map_err(|error| format!("the write could not be encoded: {error}"))?;
+    *sequence += 1;
+    client
+        .writer()
+        .write_message(&ControlFrame::Request(kr_protocol::envelope::Request {
+            request_id: id,
+            method: Method::InputWrite.into(),
+            method_version: kr_protocol::method::MethodVersion::V1,
+            params,
+        }))
+        .await
+        .map_err(|error| format!("the write did not reach the worker: {error}"))?;
+    Ok(id)
+}
+
+/// Reads the answers to a viewport report and the key sent behind it, and returns the key's result
+/// and whether it was answered first.
+async fn both_answered(
+    client: &mut LocalClient,
+    answers: &mut Answers,
+    viewport: kr_protocol::ids::RequestId,
+    key: kr_protocol::ids::RequestId,
+) -> Result<(InputWriteResult, bool), String> {
+    let viewed = answers.until(client, viewport).await?;
+    let typed = answers.until(client, key).await?;
+    if let kr_protocol::envelope::Outcome::Error(error) = viewed {
+        return Err(format!(
+            "the viewport report was refused: {}",
+            error.message
+        ));
+    }
+    let kr_protocol::envelope::Outcome::Ok(value) = typed else {
+        return Err("the key was refused".to_owned());
+    };
+    let result = value
+        .to_typed()
+        .map_err(|error| format!("the answer did not decode: {error}"))?;
+    let position = |id| answers.order.iter().position(|seen| *seen == id);
+    Ok((result, position(key) < position(viewport)))
+}
+
+async fn measure_recogniser_on_its_own_connection(
+    beside_a_disk_writer: bool,
+) -> Result<OnItsOwnConnection, String> {
+    let kept = tempfile::tempdir().expect("a directory for what the application keeps");
+    let pipe = kept.path().join("received");
+    let made = std::process::Command::new("mkfifo")
+        .arg(&pipe)
+        .status()
+        .expect("mkfifo runs");
+    assert!(made.success(), "the pipe is made");
+    let receipt = Receipt::start(&pipe);
+    let writer = beside_a_disk_writer.then(|| DiskWriter::beside(kept.path()));
+    let hosted = hosted(&keeping(&pipe)).await;
+    let figures = recogniser_on_its_own_connection(&hosted, &receipt).await;
+    let closed = close(&hosted).await;
+    if let Some(writer) = writer {
+        writer.stop();
+    }
+    // The figure is kept before anything is asserted, as the others are.
+    let own = figures?;
+    let mut lines = own.conditions.lines();
+    lines.push(format!(
+        "  measurement       the same holds as the section above, each taken right behind a \
+         viewport report, a journalled mutation that holds the session across three commits, sent \
+         on the same connection and not waited for{}. A figure runs from the write to the byte \
+         reaching the application, which the root program passes to a pipe the test reads. \
+         Whether the key was answered before the report it followed is read from the order the two \
+         answers came back in; where the worker took the write is its own instant, set against the \
+         spans in which a mutation held the session.",
+        if beside_a_disk_writer {
+            ", and a writer that writes four megabytes to the same disk and syncs them, over and over"
+        } else {
+            ""
+        }
+    ));
+    for hold in &own.holds {
+        lines.push(format!(
+            "  held              {}: {}; the key was answered {} the report; {}",
+            milliseconds(hold.held),
+            hold.what,
+            if hold.answered_first {
+                "before"
+            } else {
+                "after"
+            },
+            Within::describe(hold.accepted, "the write was taken")
+        ));
+    }
+    lines.push(format!(
+        "  split delimiter   recognised once, in {}, and the framer recorded the paste it opened",
+        milliseconds(own.split)
+    ));
+    lines.push(format!(
+        "  viewport reports  {} sent and answered beside the {} holds; the key was answered \
+         before the report in {} of them",
+        own.viewports,
+        own.holds.len(),
+        own.holds.iter().filter(|hold| hold.answered_first).count()
+    ));
+    record::report(
+        RECORD,
+        if beside_a_disk_writer {
+            "KR-PERF-002 recogniser deadline for a held prefix behind a mutation on its own connection and a disk writer running"
+        } else {
+            "KR-PERF-002 recogniser deadline for a held prefix behind a mutation on its own connection"
+        },
+        &lines,
+    );
+    closed.map_err(|failure| format!("the session this measurement created: {failure}"))?;
+    Ok(own)
+}
+
+async fn recogniser_on_its_own_connection(
+    hosted: &Hosted,
+    receipt: &Receipt,
+) -> Result<OnItsOwnConnection, String> {
+    if arrival(
+        &hosted.runtime,
+        b"kr-ready.",
+        Instant::now(),
+        Duration::from_secs(20),
+    )
+    .await
+    .is_none()
+    {
+        return Err("the root program never started reading".to_owned());
+    }
+    let (mut client, attachment_id, epoch) = controlling(hosted).await;
+    let trace = hosted.runtime.trace();
+    trace.arm();
+    let viewports = Arc::new(AtomicU64::new(0));
+    let window = record::Window::open().beside(
+        "viewport reports (a journalled mutation each) on the keystroke's own connection",
+        Arc::clone(&viewports),
+    );
+    let mut sequence = 0_u64;
+    let mut answers = Answers::default();
+    let mut measured = Vec::new();
+    let mut expected = Vec::new();
+    for (name, delimiter) in [("start", &b"\x1b[200~"[..]), ("end", &b"\x1b[201~"[..])] {
+        for length in 1..delimiter.len() {
+            let prefix = &delimiter[..length];
+            expected.extend_from_slice(prefix);
+            let viewport = send_viewport(hosted, &mut client, attachment_id).await?;
+            let started = Instant::now();
+            let key = send_key(
+                hosted,
+                &mut client,
+                attachment_id,
+                epoch,
+                &mut sequence,
+                prefix,
+            )
+            .await?;
+            let held = receipt
+                .arrival(&expected, started, RECOGNISER_DEADLINE * 8)
+                .await
+                .ok_or_else(|| {
+                    format!(
+                        "a prefix of {length} bytes of the {name} delimiter never reached the \
+                         application on its own"
+                    )
+                })?;
+            let (accepted, answered_first) =
+                both_answered(&mut client, &mut answers, viewport, key).await?;
+            viewports.fetch_add(1, Ordering::AcqRel);
+            if accepted.held_prefix_bytes.get() != length as u64 {
+                return Err(format!(
+                    "a prefix of {length} bytes of the {name} delimiter was not held: {} held, {} \
+                     forwarded",
+                    accepted.held_prefix_bytes.get(),
+                    accepted.forwarded_bytes.get()
+                ));
+            }
+            let what = if length == 1 {
+                format!("a lone Escape, behind a viewport report (the {name} delimiter's pass)")
+            } else {
+                format!("the {name} delimiter's prefix of {length} bytes, behind a viewport report")
+            };
+            measured.push((what, held, answered_first, trace.offset(started)));
+        }
+    }
+    // A delimiter split across two frames, recognised once, the second half behind a report too.
+    let first = send_key(
+        hosted,
+        &mut client,
+        attachment_id,
+        epoch,
+        &mut sequence,
+        b"\x1b[20",
+    )
+    .await?;
+    answers.until(&mut client, first).await?;
+    expected.extend_from_slice(b"\x1b[20");
+    let viewport = send_viewport(hosted, &mut client, attachment_id).await?;
+    let started = Instant::now();
+    let second = send_key(
+        hosted,
+        &mut client,
+        attachment_id,
+        epoch,
+        &mut sequence,
+        b"0~kr-payload",
+    )
+    .await?;
+    expected.extend_from_slice(b"0~kr-payload");
+    let split = receipt
+        .arrival(&expected, started, RECOGNISER_DEADLINE * 8)
+        .await
+        .ok_or_else(|| "the split delimiter never completed".to_owned())?;
+    both_answered(&mut client, &mut answers, viewport, second).await?;
+    viewports.fetch_add(1, Ordering::AcqRel);
+    if !hosted.runtime.input().lock().paste_open() {
+        return Err("the split delimiter reached the application but opened no paste".to_owned());
+    }
+    let conditions = window.close();
+    let sent = viewports.load(Ordering::Acquire);
+    drop(client);
+    trace.disarm();
+    let recording = trace.recording();
+    if recording.overflowed {
+        return Err("the worker's recorder filled before the measurement ended".to_owned());
+    }
+    let spans: Vec<(u64, u64)> = recording
+        .events
+        .iter()
+        .filter(|event| event.site == Site::Mutation)
+        .map(|event| (event.held, event.released))
+        .collect();
+    let holds = measured
+        .into_iter()
+        .map(|(what, held, answered_first, began)| {
+            let taken = recording
+                .events
+                .iter()
+                .filter(|event| event.site == Site::InputAcceptance && event.held >= began)
+                .map(|event| event.held)
+                .min();
+            OwnHold {
+                what,
+                held,
+                answered_first,
+                accepted: taken.and_then(|at| place(&spans, at)),
+            }
+        })
+        .collect();
+    Ok(OnItsOwnConnection {
+        holds,
+        split,
+        conditions,
+        viewports: sent,
     })
 }
 
