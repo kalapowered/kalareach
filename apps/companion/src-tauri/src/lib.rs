@@ -530,12 +530,14 @@ fn application_clock(_app: &tauri::AppHandle) -> Result<kr_client::pairing::cloc
     kr_client::pairing::clock::DeviceClock::current().map_err(error::CommandError::from)
 }
 
-/// Marks the directories of the pairing records as not to be backed up, before they are opened.
+/// Marks the directories of the pairing records and of the recovery records as not to be backed up,
+/// before they are opened.
 ///
 /// Their records mean something only beside this device's keychain keys, and those keys stay on
 /// this device: a backup restored onto another phone would bring the records without the keys,
-/// and the attempt budget would then refuse every code. With no records restored the person pairs
-/// again.
+/// and the attempt budget would then refuse every code, and a recovery record would name a bundle
+/// whose seed is not there. With no records restored the person pairs again, and recovery is off
+/// until it is turned on.
 #[cfg(target_os = "ios")]
 fn keep_records_out_of_backup(app: &tauri::AppHandle, data: &std::path::Path) -> Result<()> {
     use std::os::unix::fs::DirBuilderExt as _;
@@ -553,7 +555,11 @@ fn keep_records_out_of_backup(app: &tauri::AppHandle, data: &std::path::Path) ->
                 format!("{} could not be made: {error}", data.display()),
             )
         })?;
-    for name in [device::HOSTS_DIRECTORY, device::BUDGET_DIRECTORY] {
+    for name in [
+        device::HOSTS_DIRECTORY,
+        device::BUDGET_DIRECTORY,
+        recovery::DIRECTORY,
+    ] {
         let directory = data.join(name);
         let unavailable = |what: &str, error: &dyn std::fmt::Display| {
             error::CommandError::stated(
