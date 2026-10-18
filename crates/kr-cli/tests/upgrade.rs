@@ -1895,9 +1895,16 @@ async fn the_output_of_a_session_of_the_release_before_is_exported_through_the_d
         "the export holds what the session showed: {}",
         String::from_utf8_lossy(&output).escape_debug()
     );
-    assert!(
-        document["closure"].is_object(),
+    // The closure the worker gave to the close this test asked for, not one the daemon wrote for a
+    // worker that was lost.
+    assert_eq!(
+        document["closure"]["reason"], "close_requested",
         "and the worker's closure: {document}"
+    );
+    assert_eq!(
+        document["closure"]["session_id"],
+        updated.session_id.to_string(),
+        "{document}"
     );
 }
 
