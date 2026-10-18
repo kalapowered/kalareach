@@ -982,7 +982,7 @@ function Get-KrLaunchText {
     '& ' + ($parts -join ' ')
 }
 
-# `decide_launch`, on the reader's own thread, in the order the reasons matter.
+# The launch check, on the reader's own thread, in the order the reasons matter.
 function Invoke-KrAnswerLaunch {
     param([uint64]$Id, [hashtable]$Request, [bool]$Revoked)
     $transaction = [byte[]]$Request['transaction']

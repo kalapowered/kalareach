@@ -6,7 +6,7 @@
 //! instead of recording whatever the code happened to do. Error codes and the hint text are written
 //! out as literals for the same reason.
 //!
-//! Four kinds of script, because the contract has four decision points:
+//! Three kinds of script, because the contract has three decision points the worker's host makes:
 //!
 //! * A **handshake** script drives [`decide_handshake`] and [`decide_activation`]: who is admitted,
 //!   who is refused and with which named reason, and what a shell that inherited nothing does.
@@ -14,8 +14,9 @@
 //!   with the state, the fence, the held batches in order and the actions in order.
 //! * A **pre-EOF** script drives [`BridgeFenceView`]: the detach condition, the gesture, the one
 //!   hint per prompt, and what the bridge does when the worker refuses a submitted detach.
-//! * A **launch** script drives [`decide_launch`]: the reader thread's own check of its buffer, its
-//!   revisions and its deadline before anything is installed.
+//!
+//! The reader thread's own check of a launch is not here: it is the readers', and each shell
+//! package's real-reader tests drive it.
 //!
 //! [`replay`] runs one scenario and returns what did not match. The harness runs every committed
 //! file through it, and each shell package's own tests run the same files against its bridge, so
@@ -28,10 +29,9 @@ use kr_protocol::input::InterruptAction;
 use kr_protocol::root::{
     AcceptedOrigin, CwdRevision, EditorBufferRevision, EditorBusyReason, EditorFence, EditorKeymap,
     EditorLeaveReason, EditorState, FenceAcknowledgement, FenceCause, FenceId, FenceState,
-    KeyQueueSnapshot, LAUNCH_READER_BUDGET, LaunchCommand, PendingReaderInput, PromptGeneration,
-    QueueDrainReport, ReaderContext, ReaderRevision, RootCommandAcceptedParams,
-    RootEditorEnterParams, RootEditorLeaveParams, RootEofDetachParams, ShellLaunchParams,
-    WithheldReason,
+    KeyQueueSnapshot, LaunchCommand, PendingReaderInput, PromptGeneration, QueueDrainReport,
+    ReaderContext, ReaderRevision, RootCommandAcceptedParams, RootEditorEnterParams,
+    RootEditorLeaveParams, RootEofDetachParams, ShellLaunchParams, WithheldReason,
 };
 use kr_protocol::scalars::{Bytes, DurationMs, Nullable, U64, Uuid};
 use serde::{Deserialize, Serialize};
@@ -52,8 +52,8 @@ use crate::contract::qualification::{
     QualificationReason, ShellKind,
 };
 use crate::contract::requests::{
-    CancellationReport, CancelledOperations, LaunchAccepted, LaunchDecision, LaunchMailboxRequest,
-    LaunchRejection, LaunchRejectionReason, LaunchTransactionId, ReaderLaunchState, decide_launch,
+    CancellationReport, CancelledOperations, LaunchAccepted, LaunchDecision, LaunchRejection,
+    LaunchRejectionReason, LaunchTransactionId,
 };
 use crate::contract::transport::{
     Activation, ActivationInputs, BridgeHello, HandshakeOutcome, ModuleEntry, ObservedPeer,
@@ -98,8 +98,6 @@ pub enum Script {
     Fence(FenceScript),
     /// The pre-EOF decision inside the bridge.
     PreEof(PreEofScript),
-    /// The reader thread's launch decision.
-    Launch(LaunchScript),
 }
 
 /// A handshake script.
@@ -258,49 +256,6 @@ pub enum PreEofStep {
     },
 }
 
-/// A reader-thread launch script.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct LaunchScript {
-    /// The request in the mailbox.
-    pub request: LaunchMailboxRequest,
-    /// The reader states it is decided against.
-    pub cases: Vec<LaunchCase>,
-}
-
-/// One reader state and the decision it must produce.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct LaunchCase {
-    /// The case's name.
-    pub name: String,
-    /// What the reader knows.
-    pub state: ReaderLaunchState,
-    /// What it must decide.
-    pub expect: LaunchExpectation,
-}
-
-/// What a reader must decide.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum LaunchExpectation {
-    /// Installed and submitted, leaving the buffer at this revision.
-    Installed {
-        /// What the reader installed, which must be the caller's own arguments: nothing quoted,
-        /// joined or re-split on the way.
-        installed: LaunchCommand,
-        /// The buffer revision after the install.
-        buffer_revision: EditorBufferRevision,
-    },
-    /// Refused, with nothing installed.
-    Rejected {
-        /// Why.
-        reason: LaunchRejectionReason,
-        /// The error the `shell.launch` caller receives.
-        code: ErrorCode,
-    },
-}
-
 /// What a replay found.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Replay {
@@ -342,7 +297,6 @@ pub fn replay(scenario: &Scenario) -> Replay {
         Script::Handshake(script) => replay_handshake(&scenario.id, script, &mut replay),
         Script::Fence(script) => replay_fence(&scenario.id, script, &mut replay),
         Script::PreEof(script) => replay_pre_eof(&scenario.id, script, &mut replay),
-        Script::Launch(script) => replay_launch(&scenario.id, script, &mut replay),
     }
     replay
 }
@@ -429,22 +383,6 @@ fn replay_pre_eof(id: &str, script: &PreEofScript, replay: &mut Replay) {
     }
 }
 
-fn replay_launch(id: &str, script: &LaunchScript, replay: &mut Replay) {
-    for case in &script.cases {
-        let actual = match decide_launch(&script.request, &case.state) {
-            LaunchDecision::Accepted(accepted) => LaunchExpectation::Installed {
-                installed: accepted.installed.clone(),
-                buffer_revision: accepted.buffer_revision,
-            },
-            LaunchDecision::Rejected(rejected) => LaunchExpectation::Rejected {
-                reason: rejected.reason,
-                code: rejected.reason.code(),
-            },
-        };
-        replay.check(id, &case.name, "decision", &actual, &case.expect);
-    }
-}
-
 /// Returns every committed scenario, in file-name order.
 #[must_use]
 pub fn scenarios() -> Vec<Scenario> {
@@ -470,11 +408,11 @@ pub fn scenarios() -> Vec<Scenario> {
         timeout_takeover(),
         timeout_launch(),
         launch_installed(),
-        launch_reader_decisions(),
         launch_cancelled_by_leave(),
         launch_cancelled_by_prior_input(),
         launch_cancelled_by_lease_change(),
         launch_cancelled_by_buffer_revision(),
+        launch_refused_outside_the_primary_prompt(),
         detach_during_launch(),
         eof_stale_fence(),
         eof_missing_fence(),
@@ -739,18 +677,6 @@ fn launch(prompt: u64, buffer: u64, requester: AttachmentId, index: u8) -> Stimu
 
 fn launched_command() -> LaunchCommand {
     LaunchCommand::Arguments(vec!["codex".to_owned(), "--resume".to_owned()])
-}
-
-/// An argument vector no interpolation could survive.
-///
-/// A space, a quotation mark, a dollar and a semicolon inside one argument. What the reader installs
-/// must be these three strings, not a line assembled from them and split again.
-fn quote_sensitive_command() -> LaunchCommand {
-    LaunchCommand::Arguments(vec![
-        "codex".to_owned(),
-        "--message".to_owned(),
-        "fix \"$HOME\"; rm -rf /".to_owned(),
-    ])
 }
 
 fn launch_accepted(index: u8, candidate: u8, prompt: u64, buffer: u64) -> Stimulus {
@@ -2413,171 +2339,6 @@ fn launch_installed() -> Scenario {
     )
 }
 
-fn launch_reader_decisions() -> Scenario {
-    let request = LaunchMailboxRequest {
-        session_id: session(),
-        transaction: transaction(1),
-        fence_id: fence(1),
-        command: quote_sensitive_command(),
-        expected_prompt_generation: PromptGeneration::new(4),
-        expected_buffer_revision: EditorBufferRevision::new(9),
-        expected_cwd_revision: CwdRevision::new(2),
-        deadline_ms: LAUNCH_READER_BUDGET,
-    };
-    let ready = ReaderLaunchState {
-        prompt_generation: PromptGeneration::new(4),
-        reader_revision: ReaderRevision::new(1),
-        reader_context: ReaderContext::Primary,
-        editor: empty_editor(9),
-        snapshot: KeyQueueSnapshot::drained(),
-        cwd_revision: CwdRevision::new(2),
-        fence_live: true,
-        revoked: false,
-        waited_ms: DurationMs::new(3),
-    };
-    let case = |name: &str, state: ReaderLaunchState, expect: LaunchExpectation| LaunchCase {
-        name: name.to_owned(),
-        state,
-        expect,
-    };
-    let rejected = |reason: LaunchRejectionReason, code: ErrorCode| LaunchExpectation::Rejected {
-        reason,
-        code,
-    };
-    Scenario {
-        id: "launch-reader-decisions".to_owned(),
-        purpose: "The reader thread's own check before anything is installed: this reader, this \
-                  fence, inside its deadline, with no input of the person's waiting and the prompt, \
-                  directory and buffer the caller expected."
-            .to_owned(),
-        covers: covers(&["KR-REQ-07.83", "KR-REQ-07.32", "KR-REQ-07.33"]),
-        shells: every_shell(),
-        script: Script::Launch(LaunchScript {
-            request,
-            cases: vec![
-                case(
-                    "an-empty-primary-prompt-at-the-expected-revisions",
-                    ready.clone(),
-                    LaunchExpectation::Installed {
-                        installed: quote_sensitive_command(),
-                        buffer_revision: EditorBufferRevision::new(10),
-                    },
-                ),
-                case(
-                    "a-revocation-the-reader-saw-in-the-same-step",
-                    ReaderLaunchState {
-                        revoked: true,
-                        ..ready.clone()
-                    },
-                    rejected(LaunchRejectionReason::Revoked, ErrorCode::EditorBusy),
-                ),
-                case(
-                    "a-fence-the-reader-no-longer-holds",
-                    ReaderLaunchState {
-                        fence_live: false,
-                        ..ready.clone()
-                    },
-                    rejected(LaunchRejectionReason::FenceInvalid, ErrorCode::EditorBusy),
-                ),
-                case(
-                    "a-continuation-line",
-                    ReaderLaunchState {
-                        reader_context: ReaderContext::Continuation,
-                        ..ready.clone()
-                    },
-                    rejected(LaunchRejectionReason::NotPrimaryReader, ErrorCode::EditorBusy),
-                ),
-                case(
-                    "the-readers-own-deadline-has-passed",
-                    ReaderLaunchState {
-                        waited_ms: DurationMs::new(250),
-                        ..ready.clone()
-                    },
-                    rejected(LaunchRejectionReason::Timeout, ErrorCode::EditorBusy),
-                ),
-                case(
-                    "input-the-person-typed-first",
-                    ReaderLaunchState {
-                        snapshot: KeyQueueSnapshot {
-                            keys: Bytes::new(Vec::new()),
-                            pending_bytes: U64::new(3),
-                            queued_keys: U64::ZERO,
-                        },
-                        ..ready.clone()
-                    },
-                    rejected(
-                        LaunchRejectionReason::QueuedPriorInput,
-                        ErrorCode::EditorBusy,
-                    ),
-                ),
-                case(
-                    "a-macro-still-feeding-the-reader",
-                    ReaderLaunchState {
-                        editor: editor(
-                            9,
-                            true,
-                            PendingReaderInput {
-                                macro_input: true,
-                                ..PendingReaderInput::NONE
-                            },
-                            EditorKeymap::Emacs,
-                        ),
-                        ..ready.clone()
-                    },
-                    rejected(
-                        LaunchRejectionReason::QueuedPriorInput,
-                        ErrorCode::EditorBusy,
-                    ),
-                ),
-                case(
-                    "another-prompt-than-the-caller-expected",
-                    ReaderLaunchState {
-                        prompt_generation: PromptGeneration::new(5),
-                        ..ready.clone()
-                    },
-                    rejected(
-                        LaunchRejectionReason::PromptGenerationMismatch,
-                        ErrorCode::DraftConflict,
-                    ),
-                ),
-                case(
-                    "another-working-directory",
-                    ReaderLaunchState {
-                        cwd_revision: CwdRevision::new(3),
-                        ..ready.clone()
-                    },
-                    rejected(
-                        LaunchRejectionReason::CwdRevisionMismatch,
-                        ErrorCode::DraftConflict,
-                    ),
-                ),
-                case(
-                    "something-typed-into-the-buffer",
-                    ReaderLaunchState {
-                        editor: typed_editor(9),
-                        ..ready.clone()
-                    },
-                    rejected(
-                        LaunchRejectionReason::BufferNotEmpty,
-                        ErrorCode::DraftConflict,
-                    ),
-                ),
-                case(
-                    "a-buffer-revision-that-has-moved",
-                    ReaderLaunchState {
-                        editor: empty_editor(11),
-                        ..ready
-                    },
-                    rejected(
-                        LaunchRejectionReason::BufferRevisionMismatch,
-                        ErrorCode::DraftConflict,
-                    ),
-                ),
-            ],
-        }),
-    }
-}
-
 fn launch_prelude() -> Vec<FenceStep> {
     vec![
         entered(1),
@@ -2760,6 +2521,53 @@ fn launch_cancelled_by_buffer_revision() -> Scenario {
         every_shell(),
         held_by_a(),
         steps,
+    )
+}
+
+fn launch_refused_outside_the_primary_prompt() -> Scenario {
+    fence_scenario(
+        "launch-refused-outside-the-primary-prompt",
+        "A launch belongs at the primary prompt. A reader that is reading a continuation line is \
+         somebody's unfinished input, so the worker refuses the launch itself, before anything \
+         reaches the reader's mailbox, and the fence it holds stays as it was.",
+        &["KR-REQ-07.83"],
+        every_shell(),
+        held_by_a(),
+        vec![
+            step(
+                0,
+                enter_in(1, 1, 1, ReaderContext::Continuation),
+                expect(
+                    FenceState::Unfenced,
+                    None,
+                    &[],
+                    vec![ask(1, 1, 1, FenceCause::EditorEntry)],
+                ),
+            ),
+            step(
+                5,
+                drained_in(1, 1, 1, empty_editor(1), ReaderContext::Continuation),
+                expect(
+                    FenceState::Fenced,
+                    Some(1),
+                    &[],
+                    vec![publish(1, 1, 1, 3, attachment_a())],
+                ),
+            ),
+            step(
+                10,
+                launch(1, 1, attachment_a(), 1),
+                expect(
+                    FenceState::Fenced,
+                    Some(1),
+                    &[],
+                    vec![reject_launch(
+                        LaunchRejectionReason::NotPrimaryReader,
+                        ErrorCode::EditorBusy,
+                    )],
+                ),
+            ),
+        ],
     )
 }
 
@@ -4597,34 +4405,32 @@ mod tests {
     }
 
     #[test]
-    fn the_launch_scenarios_name_every_rejection_reason() {
+    fn the_fence_scenarios_name_every_rejection_reason_the_worker_answers() {
         let mut named = Vec::new();
         for scenario in scenarios() {
-            match &scenario.script {
-                Script::Launch(script) => {
-                    for case in &script.cases {
-                        if let LaunchExpectation::Rejected { reason, .. } = case.expect {
-                            named.push(reason);
+            if let Script::Fence(script) = &scenario.script {
+                for step in &script.steps {
+                    for action in &step.expect.actions {
+                        // A reason reaches the caller as a rejection, or the reader as a
+                        // revocation, and either is the worker giving it.
+                        match action {
+                            ActionShape::RejectLaunch { reason, .. }
+                            | ActionShape::RevokeLaunch { reason, .. } => named.push(*reason),
+                            _ => {}
                         }
                     }
                 }
-                Script::Fence(script) => {
-                    for step in &script.steps {
-                        for action in &step.expect.actions {
-                            // A reason reaches the caller as a rejection and the reader as a
-                            // revocation, and the corpus must show it doing both.
-                            match action {
-                                ActionShape::RejectLaunch { reason, .. }
-                                | ActionShape::RevokeLaunch { reason, .. } => named.push(*reason),
-                                _ => {}
-                            }
-                        }
-                    }
-                }
-                Script::Handshake(_) | Script::PreEof(_) => {}
             }
         }
         for reason in LaunchRejectionReason::ALL {
+            // These two are the reader's own decisions, which the worker passes on as it passes
+            // every decision the reader makes; the real readers' case drives each of them.
+            if matches!(
+                reason,
+                LaunchRejectionReason::BufferNotEmpty | LaunchRejectionReason::CwdRevisionMismatch
+            ) {
+                continue;
+            }
             assert!(
                 named.contains(reason),
                 "no scenario produces {}",

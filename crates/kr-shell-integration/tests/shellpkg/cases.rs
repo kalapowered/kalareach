@@ -1412,7 +1412,7 @@ pub fn a_launch_is_quoted_for_its_own_shell_and_never_evaluated(kind: ShellKind)
     );
 }
 
-/// `launch-reader-decisions`: the reader's own check, one case per reason it can produce here.
+/// The reader's own check, one case per reason it can produce here.
 pub fn the_reader_refuses_a_launch_its_own_state_does_not_match(kind: ShellKind) {
     let package = Package::built(kind);
     let wait = pending_wait(kind);
@@ -1529,14 +1529,14 @@ pub fn the_reader_refuses_a_launch_its_own_state_does_not_match(kind: ShellKind)
         let _ = session.answer(cancel);
     }
 
-    // Every reason the corpus names is driven above, or is one the worker decides rather than the
-    // reader, or needs a reader this session cannot reach.
-    for reason in launch_rejection_reasons() {
+    // Every reason is driven above, or is one the worker decides rather than the reader, or needs
+    // a reader this session cannot reach.
+    for reason in LaunchRejectionReason::ALL.iter().copied() {
         assert!(
             driven_here(kind, reason)
                 || worker_side(reason)
                 || not_reachable_here(kind, reason).is_some(),
-            "{} is in the corpus and neither driven nor accounted for",
+            "{} is neither driven nor accounted for",
             reason.as_str()
         );
     }
@@ -1733,28 +1733,6 @@ fn worker_side(reason: LaunchRejectionReason) -> bool {
     )
 }
 
-/// The rejection reasons the committed corpus states, read from the scenario.
-fn launch_rejection_reasons() -> Vec<LaunchRejectionReason> {
-    let scenario = scenarios()
-        .into_iter()
-        .find(|scenario| scenario.id == "launch-reader-decisions")
-        .expect("the launch scenario is committed");
-    let Script::Launch(script) = scenario.script else {
-        panic!("the launch scenario drives the reader's decision");
-    };
-    script
-        .cases
-        .iter()
-        .filter_map(|case| match &case.expect {
-            kr_shell_integration::contract::fixtures::LaunchExpectation::Rejected {
-                reason,
-                ..
-            } => Some(*reason),
-            kr_shell_integration::contract::fixtures::LaunchExpectation::Installed { .. } => None,
-        })
-        .collect()
-}
-
 /// A-17 and `timeout-launch`: a revoked launch installs nothing and says so.
 pub fn a_revoked_launch_installs_nothing(kind: ShellKind) {
     let package = Package::built(kind);
@@ -1809,8 +1787,8 @@ pub fn a_revoked_launch_installs_nothing(kind: ShellKind) {
 
 /// A revocation in the same read binds the launch, in whichever order the two frames arrive.
 ///
-/// `ReaderLaunchState::revoked` is "a revocation for this transaction was in the frames this step
-/// read", so a worker that dispatched a launch and revoked it in the same breath has revoked it.
+/// A revocation for this transaction in the frames the reader's step read binds the launch, so a
+/// worker that dispatched a launch and revoked it in the same breath has revoked it.
 pub fn a_revocation_in_the_same_read_binds_the_launch(kind: ShellKind) {
     let package = Package::built(kind);
     let mut session = Session::start(&package);

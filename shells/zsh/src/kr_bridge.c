@@ -13,9 +13,9 @@
  * happens once, before the first primary reader, where there is no reader to hold up.
  *
  * The decisions this file takes are the contract's, reproduced exactly:
- * `decide_launch` for the mailbox, `detach_eligibility` and `BridgeFenceView::decide` for the
- * end-of-file gesture, and `decide_activation` for whether a starting shell attempts anything at
- * all.
+ * `detach_eligibility` and `BridgeFenceView::decide` for the end-of-file gesture, and
+ * `decide_activation` for whether a starting shell attempts anything at all. The launch check for
+ * the mailbox is this file's own, in the order section 7 gives the reasons.
  */
 
 /* The names of the lookups the module check makes are behind this on glibc. */
@@ -1839,7 +1839,7 @@ kr_launch_text(const kr_cbor_doc *doc, int command, size_t *length)
 }
 
 /*
- * `decide_launch`, on the reader's own thread, in the order the reasons matter.
+ * The launch check, on the reader's own thread, in the order the reasons matter.
  *
  * The revocation check is in this same step: the endpoint delivers frames in order, so a
  * revocation the worker sent before this step is one this step has already read.
@@ -2305,8 +2305,8 @@ kr_remember_revocation(const unsigned char transaction[KR_UUID_LEN])
 /*
  * Whether a revocation for this transaction is among the frames already read.
  *
- * `ReaderLaunchState::revoked` is "a revocation for this transaction was in the frames this step
- * read", so the answer is in those frames: the ones still waiting in the input buffer behind the
+ * A revocation for this transaction in the frames this step read binds the launch, so the answer
+ * is in those frames: the ones still waiting in the input buffer behind the
  * request being decided. Reading them here rather than remembering them keeps the answer exact
  * whatever order the worker put them in, and leaves nothing to fill up or fall out.
  */

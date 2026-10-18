@@ -20,8 +20,8 @@ use kr_protocol::error::ErrorCode;
 use kr_protocol::ids::InputLeaseEpoch;
 use kr_protocol::ids::SessionId;
 use kr_protocol::root::{
-    CwdRevision, EditorBufferRevision, EditorState, FenceId, KeyQueueSnapshot, LaunchCommand,
-    PromptGeneration, ReaderContext, ReaderRevision, RootEditorFenceParams, RootEditorFenceResult,
+    CwdRevision, EditorBufferRevision, FenceId, LaunchCommand, PromptGeneration, ReaderRevision,
+    RootEditorFenceParams, RootEditorFenceResult,
 };
 use kr_protocol::scalars::{DurationMs, U64, Uuid};
 use serde::{Deserialize, Serialize};
@@ -253,94 +253,6 @@ impl LaunchDecision {
     }
 }
 
-/// What the reader knows when it opens its mailbox.
-///
-/// Every field is read on the reader thread, at the moment it decides. That is the point of a
-/// mailbox rather than a message: the check and the install happen with nothing in between.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ReaderLaunchState {
-    /// The prompt the reader is at.
-    pub prompt_generation: PromptGeneration,
-    /// The reader's revision.
-    pub reader_revision: ReaderRevision,
-    /// Which reader is asking.
-    pub reader_context: ReaderContext,
-    /// Its buffer and pending operation.
-    pub editor: EditorState,
-    /// Its key queues at the same instant.
-    pub snapshot: KeyQueueSnapshot,
-    /// The shell's working-directory revision.
-    pub cwd_revision: CwdRevision,
-    /// Whether the fence the request names is still the reader's own.
-    pub fence_live: bool,
-    /// Whether a revocation for this transaction was in the frames this step read.
-    ///
-    /// The endpoint delivers frames in order, so a revocation the worker sent before this step is
-    /// one this step sees. Checking it here is what puts the decision between installing and
-    /// cancelling inside the reader's own atomic step rather than across two clocks.
-    pub revoked: bool,
-    /// How long the request has been in the mailbox, on the reader's own clock.
-    pub waited_ms: DurationMs,
-}
-
-/// Decides one launch on the reader thread.
-///
-/// The order is the order the reasons matter in. Identity first: this reader, this fence, inside its
-/// deadline. Then input the person typed before the launch arrived, which is theirs and goes first.
-/// Then what the caller expected, where a mismatch is an intervening local edit rather than a busy
-/// editor.
-#[must_use]
-pub fn decide_launch(request: &LaunchMailboxRequest, state: &ReaderLaunchState) -> LaunchDecision {
-    let reject = |reason: LaunchRejectionReason| {
-        LaunchDecision::Rejected(LaunchRejection {
-            transaction: request.transaction,
-            fence_id: request.fence_id,
-            reason,
-            prompt_generation: state.prompt_generation,
-            buffer_revision: state.editor.buffer_revision,
-        })
-    };
-    if state.revoked {
-        // The revocation was in the queue this step read, so the reader installs nothing and says
-        // so. That confirmation, not the worker's timer, is what the caller's answer rests on.
-        return reject(LaunchRejectionReason::Revoked);
-    }
-    if !state.fence_live {
-        return reject(LaunchRejectionReason::FenceInvalid);
-    }
-    if !state.reader_context.is_primary() {
-        return reject(LaunchRejectionReason::NotPrimaryReader);
-    }
-    if state.waited_ms.get() >= request.deadline_ms.get() {
-        return reject(LaunchRejectionReason::Timeout);
-    }
-    if !state.snapshot.is_drained() || state.editor.pending.macro_input {
-        return reject(LaunchRejectionReason::QueuedPriorInput);
-    }
-    if state.prompt_generation != request.expected_prompt_generation {
-        return reject(LaunchRejectionReason::PromptGenerationMismatch);
-    }
-    if state.cwd_revision != request.expected_cwd_revision {
-        return reject(LaunchRejectionReason::CwdRevisionMismatch);
-    }
-    if !state.editor.buffer_empty {
-        return reject(LaunchRejectionReason::BufferNotEmpty);
-    }
-    if state.editor.buffer_revision != request.expected_buffer_revision {
-        return reject(LaunchRejectionReason::BufferRevisionMismatch);
-    }
-    LaunchDecision::Accepted(LaunchAccepted {
-        transaction: request.transaction,
-        installed: request.command.clone(),
-        fence_id: request.fence_id,
-        prompt_generation: state.prompt_generation,
-        // Installing the command changes the buffer once.
-        buffer_revision: EditorBufferRevision::new(state.editor.buffer_revision.get() + 1),
-        reader_revision: state.reader_revision,
-    })
-}
-
 /// End the reader's pending key wait without losing the edit buffer.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -477,6 +389,7 @@ mod tests {
             LaunchRejectionReason::FenceInvalid,
             LaunchRejectionReason::NotPrimaryReader,
             LaunchRejectionReason::Timeout,
+            LaunchRejectionReason::Revoked,
         ] {
             assert_eq!(reason.code(), ErrorCode::EditorBusy, "{}", reason.as_str());
         }
@@ -503,6 +416,14 @@ mod tests {
     }
 
     #[test]
+    fn a_lost_confirmation_is_the_one_outcome_nobody_can_retry() {
+        assert_eq!(
+            LaunchRejectionReason::ConfirmationLost.code(),
+            ErrorCode::OutcomeUnknown
+        );
+    }
+
+    #[test]
     fn every_rejection_reason_has_a_distinct_wire_string() {
         let mut names: Vec<&str> = LaunchRejectionReason::ALL
             .iter()
@@ -516,53 +437,6 @@ mod tests {
 
     fn epoch() -> InputLeaseEpoch {
         InputLeaseEpoch::new(4)
-    }
-
-    fn request() -> LaunchMailboxRequest {
-        LaunchMailboxRequest {
-            session_id: SessionId::new(Uuid::from_bytes([0x11; 16])),
-            transaction: LaunchTransactionId::new(Uuid::from_bytes([0x71; 16])),
-            fence_id: FenceId::new(Uuid::from_bytes([0xF1; 16])),
-            command: LaunchCommand::Arguments(vec!["codex".to_owned()]),
-            expected_prompt_generation: PromptGeneration::new(4),
-            expected_buffer_revision: EditorBufferRevision::new(9),
-            expected_cwd_revision: CwdRevision::new(2),
-            deadline_ms: DurationMs::new(200),
-        }
-    }
-
-    fn reader() -> ReaderLaunchState {
-        ReaderLaunchState {
-            prompt_generation: PromptGeneration::new(4),
-            reader_revision: ReaderRevision::new(1),
-            reader_context: ReaderContext::Primary,
-            editor: EditorState {
-                buffer_revision: EditorBufferRevision::new(9),
-                buffer_empty: true,
-                keymap: kr_protocol::root::EditorKeymap::Emacs,
-                pending: kr_protocol::root::PendingReaderInput::NONE,
-            },
-            snapshot: KeyQueueSnapshot::drained(),
-            cwd_revision: CwdRevision::new(2),
-            fence_live: true,
-            revoked: false,
-            waited_ms: DurationMs::new(3),
-        }
-    }
-
-    #[test]
-    fn the_reader_installs_only_what_the_caller_asked_for() {
-        let decision = decide_launch(&request(), &reader());
-        let LaunchDecision::Accepted(accepted) = decision else {
-            panic!("an empty primary prompt at the expected revisions installs the command");
-        };
-        assert_eq!(accepted.transaction, request().transaction);
-        assert_eq!(accepted.buffer_revision, EditorBufferRevision::new(10));
-        // The literal arguments the caller named, not a string something reassembled.
-        assert_eq!(
-            accepted.installed,
-            LaunchCommand::Arguments(vec!["codex".to_owned()])
-        );
     }
 
     #[test]
@@ -581,103 +455,6 @@ mod tests {
         };
         assert_eq!(report.epoch, epoch());
         assert!(report.cancelled.any());
-    }
-
-    #[test]
-    fn a_revocation_the_reader_saw_installs_nothing() {
-        let decision = decide_launch(
-            &request(),
-            &ReaderLaunchState {
-                revoked: true,
-                ..reader()
-            },
-        );
-        assert_eq!(decision.rejection(), Some(LaunchRejectionReason::Revoked));
-        assert_eq!(LaunchRejectionReason::Revoked.code(), ErrorCode::EditorBusy);
-        // The one launch outcome nobody can retry under the same action identifier.
-        assert_eq!(
-            LaunchRejectionReason::ConfirmationLost.code(),
-            ErrorCode::OutcomeUnknown
-        );
-    }
-
-    #[test]
-    fn the_reader_names_the_first_reason_it_cannot_install() {
-        let cases: Vec<(LaunchRejectionReason, ReaderLaunchState)> = vec![
-            (
-                LaunchRejectionReason::FenceInvalid,
-                ReaderLaunchState {
-                    fence_live: false,
-                    ..reader()
-                },
-            ),
-            (
-                LaunchRejectionReason::NotPrimaryReader,
-                ReaderLaunchState {
-                    reader_context: ReaderContext::Continuation,
-                    ..reader()
-                },
-            ),
-            (
-                LaunchRejectionReason::Timeout,
-                ReaderLaunchState {
-                    waited_ms: DurationMs::new(200),
-                    ..reader()
-                },
-            ),
-            (
-                LaunchRejectionReason::QueuedPriorInput,
-                ReaderLaunchState {
-                    snapshot: KeyQueueSnapshot {
-                        queued_keys: U64::new(2),
-                        ..KeyQueueSnapshot::drained()
-                    },
-                    ..reader()
-                },
-            ),
-            (
-                LaunchRejectionReason::PromptGenerationMismatch,
-                ReaderLaunchState {
-                    prompt_generation: PromptGeneration::new(5),
-                    ..reader()
-                },
-            ),
-            (
-                LaunchRejectionReason::CwdRevisionMismatch,
-                ReaderLaunchState {
-                    cwd_revision: CwdRevision::new(3),
-                    ..reader()
-                },
-            ),
-            (
-                LaunchRejectionReason::BufferNotEmpty,
-                ReaderLaunchState {
-                    editor: EditorState {
-                        buffer_empty: false,
-                        ..reader().editor
-                    },
-                    ..reader()
-                },
-            ),
-            (
-                LaunchRejectionReason::BufferRevisionMismatch,
-                ReaderLaunchState {
-                    editor: EditorState {
-                        buffer_revision: EditorBufferRevision::new(11),
-                        ..reader().editor
-                    },
-                    ..reader()
-                },
-            ),
-        ];
-        for (expected, state) in cases {
-            assert_eq!(
-                decide_launch(&request(), &state).rejection(),
-                Some(expected),
-                "{}",
-                expected.as_str()
-            );
-        }
     }
 
     #[test]

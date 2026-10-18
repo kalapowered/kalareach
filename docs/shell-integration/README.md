@@ -460,7 +460,7 @@ The order at a successful launch is the reader's: it installs and submits the co
 mailbox, reports `command_accepted` for the line, and then leaves. The worker resolves that line's
 origin to the client that asked for the launch, which the reader cannot know.
 
-The reader's own check, in the order the reasons take precedence, is `decide_launch`: this reader
+The reader's own check runs in the order the reasons take precedence: this reader
 and this fence, inside the deadline, with no input of the person's waiting ahead of it, then the
 prompt generation, the working-directory revision and an empty buffer at the revision the caller
 named. The reason decides what the caller is told:
@@ -787,12 +787,13 @@ chord rather than the line discipline's own character, is qualified separately.
 
 ## The scenarios
 
-`fixtures/shell-bridge/` holds 40 scenarios, one JSON file each. Every file names what it
+`fixtures/shell-bridge/` holds 41 scenarios, one JSON file each. Every file names what it
 demonstrates, the requirement rows it covers, the shell packages that must reproduce it, and the
-exact outcome of every step, including the error codes and the hint text as literals. Four script
-kinds drive the four decision points: `handshake` drives the handshake and the activation decision,
-`fence` drives the state machine one stimulus at a time at a stated clock reading, `pre_eof` drives
-the decision inside the bridge, and `launch` drives the reader thread's own check.
+exact outcome of every step, including the error codes and the hint text as literals. Three script
+kinds drive the three decision points: `handshake` drives the handshake and the activation decision,
+`fence` drives the state machine one stimulus at a time at a stated clock reading, and `pre_eof`
+drives the decision inside the bridge. The reader thread's own launch checks are driven through each
+real reader by the package suites.
 
 ```bash
 # Replay every scenario against the contract.
@@ -819,9 +820,9 @@ cargo run -p kr-shell-integration --bin kr-shell-fixtures -- --check
 | `integration-lost` | A session that loses its hooks, and one whose root shell was replaced |
 | `timeout-editor-entry`, `timeout-takeover`, `timeout-launch` | The 250 ms release in each of the three places it applies, including an answer that arrives late with no timer stimulus first |
 | `launch-installed` | A launch the reader installs, and the accepted line attributed to the client that asked for it |
-| `launch-reader-decisions` | The reader thread's own decision table: one case per rejection reason, and a successful install of an argument vector no interpolation could survive |
 | `launch-confirmation-lost` | A revoked transaction whose confirmation never comes, and the unknown outcome the caller is told |
 | `launch-cancelled-by-leave`, `launch-cancelled-by-prior-input`, `launch-cancelled-by-lease-change`, `launch-cancelled-by-buffer-revision` | The four ways a launch is cancelled, which error each one is, and the held input released when the reader leaves |
+| `launch-refused-outside-the-primary-prompt` | A launch asked for at a reader that is reading a continuation line: the worker refuses it itself, and the fence stays as it was |
 | `detach-during-launch` | A valid gesture while a transaction holds the fence: the launch loses it and the detach goes through |
 | `eof-stale-fence`, `eof-missing-fence` | A detach the worker refuses, and a gesture the bridge consumes with one hint per prompt |
 | `eof-repeated-after-detach` | A repeated gesture that cannot adopt the next attachment's identity, and the hint a refused detach prints |

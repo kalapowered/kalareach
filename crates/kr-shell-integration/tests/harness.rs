@@ -180,10 +180,9 @@ fn every_decision_point_has_committed_scenarios() {
             Script::Handshake(_) => "handshake",
             Script::Fence(_) => "fence",
             Script::PreEof(_) => "pre_eof",
-            Script::Launch(_) => "launch",
         })
         .collect();
-    for kind in ["handshake", "fence", "pre_eof", "launch"] {
+    for kind in ["handshake", "fence", "pre_eof"] {
         assert!(
             kinds.contains(&kind),
             "no committed scenario drives the {kind} decision"
