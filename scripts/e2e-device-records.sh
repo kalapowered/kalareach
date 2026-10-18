@@ -158,7 +158,8 @@ launch() { # <n> <secret> <tries left or "null"> [by_the_system|on_coming_forwar
         esac
     done <"$result"
     # Each check the launch is claimed to make was made, once: a check that is missing proves nothing.
-    for name in "the pairing records open" "secret store" "the boot identity" "budget" \
+    for name in "the pairing records open" "the system says protected data is available" \
+        "secret store" "the boot identity" "budget" \
         "the paired hosts are out of the backup" "the budget is out of the backup" \
         "the recovery records are out of the backup"; do
         [ "$(grep -c "^check=$name ok=" "$result")" = 1 ] || { say "launch $n did not report \"$name\" once"; failed=1; }

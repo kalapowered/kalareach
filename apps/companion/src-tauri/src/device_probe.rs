@@ -227,6 +227,11 @@ fn checks<R: tauri::Runtime>(
             return found;
         }
     };
+    found.push(check(
+        "the system says protected data is available",
+        companion_platform::protection::is_available(app),
+        "available",
+    ));
     found.push(secret_item(app, request));
 
     let pairing = device.pairing();

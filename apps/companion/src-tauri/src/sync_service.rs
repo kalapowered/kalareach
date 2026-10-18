@@ -146,3 +146,31 @@ fn kept_origin(bytes: Vec<u8>) -> std::result::Result<GatewayOrigin, String> {
 fn managed() -> GatewayOrigin {
     GatewayOrigin::new(ACCOUNT_ORIGIN).expect("the managed service's origin is one")
 }
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    /// A phone started before its first unlock cannot read its files, and keeps the managed service
+    /// in the meantime. The setting is read again at the next use, so that once the files can be read
+    /// the service the person chose is the one used, and not the one that stood in for it.
+    #[test]
+    fn a_setting_that_could_not_be_read_is_read_again_and_the_choice_stands() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let data = tempfile::tempdir().expect("a directory");
+        let file = data.path().join(FILE);
+        std::fs::write(&file, "https://sync.example").expect("a setting");
+        // Wider than owner-only: the file is not read, as one that cannot be opened is not.
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).expect("a mode");
+        let service = SyncService::open(data.path());
+        assert!(
+            service.view().is_default,
+            "the managed service stands while the setting cannot be read"
+        );
+
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).expect("a mode");
+        assert_eq!(service.origin().as_str(), "https://sync.example");
+        assert!(!service.view().is_default);
+    }
+}
