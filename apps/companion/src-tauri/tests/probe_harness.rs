@@ -11,6 +11,9 @@
 //! | A call is followed from the invitation to its end, and every check reads it as healthy | `a_call_is_followed_from_the_invitation_to_the_end_native_code_tells` |
 //! | A call the person ends is not read as one native code ended | `a_call_the_person_ends_fails_the_check_that_reads_native_codes_end` |
 
+// The probe is in debug builds only, so a release build of this crate's tests has nothing to run.
+#![cfg(debug_assertions)]
+
 #[path = "../../../../crates/kr-controller/tests/net_support/mod.rs"]
 mod net_support;
 mod support;

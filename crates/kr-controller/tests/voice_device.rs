@@ -21,7 +21,10 @@
 //!
 //! `KR_HARNESS_PEER` is the name the phone reaches this machine by: `127.0.0.1` for a simulator,
 //! which shares the machine's network, and `10.0.2.2` for an emulator. `KR_HARNESS_SECONDS`
-//! bounds the whole run. No test here makes a live provider call.
+//! bounds the whole run. It is for the machines a simulator or an emulator runs on, which are Unix.
+//! No test here makes a live provider call.
+
+#![cfg(unix)]
 
 mod net_support;
 mod voice_support;
@@ -183,7 +186,17 @@ async fn a_phone_is_paired_and_runs_a_call_against_a_real_host() {
     let control = stand_in.control().report();
     let report = serde_json::json!({
         "creations": stand_in.count("/api/voice/sessions"),
-        "closes": stand_in.count("/api/voice/sessions/call-1/close"),
+        // The closes the host sent, which it signs with its own account's token: the phone may close
+        // a call over HTTP too, with its own, and that is not the host telling the service.
+        "host_closes": stand_in
+            .seen()
+            .iter()
+            .filter(|request| {
+                request.path == "/api/voice/sessions/call-1/close"
+                    && request.authorization.as_deref()
+                        == Some(format!("Bearer {}", voice_support::HOST_TOKEN).as_str())
+            })
+            .count(),
         "control_tokens": control
             .upgrades
             .iter()
