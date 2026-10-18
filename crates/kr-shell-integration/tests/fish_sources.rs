@@ -152,8 +152,8 @@ impl Tree {
     fn change_lock(&self, edit: impl FnOnce(String) -> String) {
         let manifest = self.manifest();
         let (archive, directory) = upstream(&self.root.join("shells/fish/manifest.json"));
-        // The archive is unpacked only if it is the pinned one, and the lock is edited only if it
-        // is a file the unpacking made in the scratch directory.
+        // The archive is read once, checked, and unpacked from the copy that was checked. The lock
+        // is edited only if the unpacking made it, as a plain file, inside the scratch directory.
         let original = fs::read(self.sources.join(&archive)).expect("the placed archive");
         assert_eq!(
             hex(&Sha256::digest(&original)),
@@ -161,19 +161,26 @@ impl Tree {
             "the placed {archive} is not the pinned archive"
         );
         let scratch = tempfile::tempdir().expect("a scratch directory");
+        let checked = scratch.path().join("checked.tar.xz");
+        fs::write(&checked, &original).expect("the copy of the archive");
+        let unpacked_into = scratch.path().join("unpacked");
+        fs::create_dir(&unpacked_into).expect("the directory to unpack into");
         let unpacked = Command::new("tar")
             .arg("-x")
             .arg("-f")
-            .arg(self.sources.join(&archive))
+            .arg(&checked)
             .arg("-C")
-            .arg(scratch.path())
+            .arg(&unpacked_into)
             .status()
             .expect("tar to run");
         assert!(unpacked.success(), "tar could not unpack {archive}");
-        let lock = scratch.path().join(&directory).join("Cargo.lock");
+        let lock = unpacked_into.join(&directory).join("Cargo.lock");
         assert!(
-            fs::symlink_metadata(&lock).expect("the lock").is_file(),
-            "the lock in {archive} is not a plain file"
+            fs::symlink_metadata(&lock).expect("the lock").is_file()
+                && fs::canonicalize(&lock)
+                    .expect("the lock")
+                    .starts_with(fs::canonicalize(&unpacked_into).expect("the directory")),
+            "the lock in {archive} is not a plain file inside the unpacked tree"
         );
         let text = fs::read_to_string(&lock).expect("the lock");
         fs::write(&lock, edit(text)).expect("the changed lock");
@@ -186,7 +193,7 @@ impl Tree {
             .arg("-f")
             .arg(&packed)
             .arg("-C")
-            .arg(scratch.path())
+            .arg(&unpacked_into)
             .arg(&directory)
             .status()
             .expect("tar to run");
@@ -288,8 +295,8 @@ fn said(output: &Output) -> String {
 }
 
 /// The check refused: it exited with a failure and said which source. The check is what refused:
-/// when it lets a source through, cargo's own import stops on the closed port, and says so in a
-/// line the check never prints.
+/// when it lets a source through, cargo's own import fails, and the script then prints a line that
+/// the check never prints.
 fn assert_refused(output: &Output, source: &str) {
     let said = said(output);
     assert!(!output.status.success(), "the check passed: {said}");
@@ -304,7 +311,8 @@ fn assert_refused(output: &Output, source: &str) {
 }
 
 /// Sources that are placed are enough: the check passes with no server to ask. A fetch would fail
-/// against the closed port, so passing is the evidence that nothing was fetched.
+/// against the closed port, so passing is the evidence that nothing was fetched, as far as a client
+/// that obeys the proxy variables goes.
 #[test]
 #[ignore = "needs the Fish sources placed; it runs with --include-ignored where they are, as continuous integration's shell-packages job does"]
 fn placed_sources_need_no_server() {
