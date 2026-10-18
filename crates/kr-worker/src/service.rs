@@ -76,6 +76,8 @@ use crate::session::GrantedInput;
 use crate::session::Session;
 use crate::trace::Site;
 
+mod overtake;
+
 /// How often the worker replaces a live connection's action window.
 ///
 /// Half the window's validity, which is the schedule the transport uses: an attached terminal that
@@ -763,8 +765,8 @@ impl WorkerService {
                 &ProtocolError::new(code, message),
             ))
         };
-        if state.client_kind != LocalClientKind::Controller
-            || state.controller_role != ControllerConnectionRole::Authority
+        if state.facts.client_kind != LocalClientKind::Controller
+            || state.facts.controller_role != ControllerConnectionRole::Authority
         {
             return refuse(
                 state,
@@ -773,12 +775,12 @@ impl WorkerService {
                  admissions",
             );
         }
-        if let Err(error) = self.check_authority(state) {
+        if let Err(error) = self.check_authority(&state.facts) {
             state.admissions_parts.clear();
             return Some(failure(RequestId::new(0), &error.to_protocol_error()));
         }
         if part.environment_id != self.environment_id
-            || state.generation != Some(part.frame.generation)
+            || state.facts.generation != Some(part.frame.generation)
         {
             return refuse(
                 state,
@@ -832,7 +834,7 @@ impl WorkerService {
                 .authority
                 .lock()
                 .expect("the authority lock is not poisoned");
-            if let Err(error) = Self::check_bound(state, &authority) {
+            if let Err(error) = Self::check_bound(&state.facts, &authority) {
                 return Some(failure(RequestId::new(0), &error.to_protocol_error()));
             }
             if let Some(prepared) = prepared {
@@ -1646,7 +1648,9 @@ impl WorkerService {
         peer: PeerIdentity,
     ) -> Result<()> {
         let connection_id = ConnectionId::new(kr_ipc::new_uuid());
-        let (mut reader, writer) = split(connection, StreamKind::Control);
+        let (reader, writer) = split(connection, StreamKind::Control);
+        // Out of this loop's hands for as long as a task serves keystrokes beside a request that waits.
+        let mut reader = Some(reader);
         // The lock is an ordinary one, because nothing is ever awaited while it is held: what
         // happens inside it is the authority check, one attempt that refuses to wait, and the
         // accounting for what that attempt sent. Waiting for the peer happens outside it, on the
@@ -1671,7 +1675,7 @@ impl WorkerService {
         let writer = Arc::new(Mutex::new(writer));
         let mut state =
             ConnectionState::new(connection_id, &peer, Arc::new(Mutex::new(Vec::new())));
-        state.local = Some(local_writes);
+        state.facts.local = Some(local_writes);
         // The caller's record is validated and the connection registered in one step. The
         // listener checked the peer when it accepted the connection; this is the final check, and
         // it happens where the registration is written, so nothing can be admitted in between.
@@ -1680,7 +1684,7 @@ impl WorkerService {
         }
         let registration = self.admit(connection_id, &writer, &writable);
         let withdrawn = Arc::clone(&registration.withdrawn);
-        state.attachments = Arc::clone(&registration.attachments);
+        state.facts.attachments = Arc::clone(&registration.attachments);
         state.withdrawn = Arc::clone(&registration.withdrawn);
         // The timer fires once immediately; that first tick is consumed here so a connection is
         // not handed a replacement window before it has read the one in its acknowledgement.
@@ -1722,7 +1726,10 @@ impl WorkerService {
                 Next::Prepared(Box::new(ready))
             } else {
                 tokio::select! {
-                    message = reader.read_message::<ControlFrame>() => match message {
+                    message = reader
+                        .as_mut()
+                        .expect("the connection's reader is in the loop's hands")
+                        .read_message::<ControlFrame>() => match message {
                         Ok(message) => Next::Frame(message),
                         Err(_) => break,
                     },
@@ -1743,8 +1750,8 @@ impl WorkerService {
                         // The daemon's attention link has no caller to tell why. A withdrawn one is
                         // closed instead, so the daemon opens the next at once rather than waiting
                         // out a request this connection will never answer.
-                        if state.controller
-                            && state.controller_role == ControllerConnectionRole::Attention
+                        if state.facts.controller
+                            && state.facts.controller_role == ControllerConnectionRole::Attention
                         {
                             break;
                         }
@@ -1755,8 +1762,8 @@ impl WorkerService {
                     // before a mutation. A connection whose registration has been withdrawn is no
                     // longer that: a replacement window for it would be a freshness resource issued
                     // to authority that has gone, so the renewal stops with the registration.
-                    _ = renewal.tick(), if state.negotiated => {
-                        if self.check_authority(&state).is_err() {
+                    _ = renewal.tick(), if state.facts.negotiated => {
+                        if self.check_authority(&state.facts).is_err() {
                             continue;
                         }
                         let Ok(window) = self.issue_window(connection_id) else {
@@ -1806,8 +1813,50 @@ impl WorkerService {
                 Next::Frame(_) => None,
             };
             state.answering_held = false;
+            // Set when a task that served keystrokes beside this request could not write an answer
+            // whole, after which nothing more can be written to the peer.
+            let mut stream_broken = false;
             let reply = match next {
-                Next::Frame(message) => self.handle(&mut state, &peer, message).await,
+                Next::Frame(message) => {
+                    // A request that waits, and that no key has to wait behind, is run with a task
+                    // reading the connection ahead for keys. Frames it is handed are the ones this
+                    // loop had read already; the reader is only its own to give when no
+                    // preparation is waiting for those.
+                    let overtaking = (overtake::kind_of(&message) == overtake::Kind::Independent
+                        && state.facts.negotiated
+                        && !state.facts.controller
+                        && (held.is_none() || !backlog.is_empty()))
+                    .then(|| {
+                        overtake::Overtaking::open(
+                            Arc::clone(&self),
+                            state.facts.clone(),
+                            overtake::Link {
+                                writable: writable.clone(),
+                                writer: Arc::clone(&writer),
+                                withdrawn: Arc::clone(&withdrawn),
+                            },
+                            overtake::Reading {
+                                reader: reader
+                                    .take()
+                                    .expect("the connection's reader is in the loop's hands"),
+                                pending: std::mem::take(&mut backlog),
+                                socket: held.is_none(),
+                            },
+                        )
+                    });
+                    let reply = self.handle(&mut state, &peer, message).await;
+                    if let Some(overtaking) = overtaking {
+                        // A task that panicked took the reader with it, and the connection ends
+                        // through the clean-up below.
+                        let Ok(closed) = overtaking.close().await else {
+                            break;
+                        };
+                        reader = Some(closed.reader);
+                        backlog = closed.deferred;
+                        stream_broken = closed.broken;
+                    }
+                    reply
+                }
                 Next::Prepared(ready) => {
                     // Asked of the operating system and not of the runtime, which learns that a
                     // peer closed only when it next turns its reactor, and whichever of the
@@ -1836,7 +1885,14 @@ impl WorkerService {
                             continue;
                         }
                         PeerState::Unread(queued) => {
-                            read_ahead(&mut reader, queued, &mut backlog).await;
+                            read_ahead(
+                                reader
+                                    .as_mut()
+                                    .expect("the connection's reader is in the loop's hands"),
+                                queued,
+                                &mut backlog,
+                            )
+                            .await;
                             held = Some(ready);
                             continue;
                         }
@@ -2010,12 +2066,13 @@ impl WorkerService {
                 // A write this bound abandons part way through leaves the connection carrying
                 // nothing more, which `false` is read as below. The close still happens: it was
                 // admitted.
-                let written = tokio::time::timeout(
-                    crate::runtime::ACCEPTANCE_WRITE_TIMEOUT,
-                    write_frame(&writable, &writer, &reply, &withdrawn, protected),
-                )
-                .await
-                .unwrap_or_default();
+                let written = !stream_broken
+                    && tokio::time::timeout(
+                        crate::runtime::ACCEPTANCE_WRITE_TIMEOUT,
+                        write_frame(&writable, &writer, &reply, &withdrawn, protected),
+                    )
+                    .await
+                    .unwrap_or_default();
                 // Whatever came of it, a final answer to a recorded request has been dealt with:
                 // written, replaced by its refusal, or dropped with the connection. An interim
                 // keepalive is not an answer.
@@ -2025,7 +2082,7 @@ impl WorkerService {
                     local.answered(request_id, answered_held);
                 }
                 if let Some((action_id, gate)) = closing {
-                    if written && state.client_kind == LocalClientKind::Controller {
+                    if written && state.facts.client_kind == LocalClientKind::Controller {
                         // The requester is not the peer that was just written to: the daemon still
                         // has to pass the acceptance on. Termination waits for it to say so, or for
                         // the bound this owner holds from here.
@@ -2074,6 +2131,9 @@ impl WorkerService {
                         break;
                     }
                 }
+            }
+            if stream_broken {
+                break;
             }
             if state.subscribed.is_none() {
                 continue;
@@ -2446,7 +2506,7 @@ impl WorkerService {
         if let Some(task) = state.page_task.take() {
             task.abort();
         }
-        for attachment_id in state.take_attachments() {
+        for attachment_id in state.facts.take_attachments() {
             let mut session = self.runtime.session();
             let _ = session.detach(attachment_id);
             // The fence this detach moved, and any terminator it produced, reach the writer here.
@@ -2486,8 +2546,8 @@ impl WorkerService {
         // The attention connection carries the attention requests and nothing else once it speaks
         // for a generation. It holds no authority to act and forwards no caller, so anything else
         // on it is refused rather than served.
-        if state.controller_role == ControllerConnectionRole::Attention
-            && state.controller
+        if state.facts.controller_role == ControllerConnectionRole::Attention
+            && state.facts.controller
             && !matches!(
                 message,
                 ControlFrame::AttentionSources(_)
@@ -2505,8 +2565,8 @@ impl WorkerService {
         }
         // The descriptions connection carries the facts request and nothing else, for the same
         // reason: it holds no authority to act and forwards no caller.
-        if state.controller_role == ControllerConnectionRole::Descriptions
-            && state.controller
+        if state.facts.controller_role == ControllerConnectionRole::Descriptions
+            && state.facts.controller
             && !matches!(message, ControlFrame::DescriptionFacts(_))
         {
             return Some(failure(
@@ -2565,18 +2625,23 @@ impl WorkerService {
             ControlFrame::Request(request) => {
                 #[cfg(feature = "testing")]
                 self.record_received(&request.method, &request.params);
+                if request.method.method() == Some(Method::InputWrite) {
+                    let served = self.keystroke_of_a_request(&state.facts, &request);
+                    state.answering_held = served.held;
+                    return Some(served.reply);
+                }
                 // A source that asked to wait waits here: outside the session lock, outside the
                 // dispatch barrier and outside any transaction. Section 11 makes a long poll an
                 // asynchronous subscription, renewed in bounded steps, that returns the same
                 // durable question when it times out and notifies nobody a second time.
                 self.wait_for_answer(state, &request).await;
-                let caller = Caller::local(state.actor_id.clone());
+                let caller = Caller::local(state.facts.actor_id.clone());
                 Some(self.request(state, &request, &caller))
             }
             ControlFrame::Mutation(mutation) => {
                 #[cfg(feature = "testing")]
                 self.record_received(&mutation.method, &mutation.params);
-                let caller = Caller::local(state.actor_id.clone());
+                let caller = Caller::local(state.facts.actor_id.clone());
                 let reply = self
                     .mutation(
                         state,
@@ -2607,7 +2672,7 @@ impl WorkerService {
                 // answers to now; an acknowledgement anywhere else is answered with nothing.
                 if self.check_attention_link(state).is_ok() {
                     self.attention_fence
-                        .acknowledged(state.connection_id, acknowledgement.sequence.get());
+                        .acknowledged(state.facts.connection_id, acknowledgement.sequence.get());
                 }
                 None
             }
@@ -2689,7 +2754,7 @@ impl WorkerService {
         peer: &PeerIdentity,
         hello: &LocalHello,
     ) -> ControlFrame {
-        if state.negotiated {
+        if state.facts.negotiated {
             // One connection, one identity. Sending a second hello would otherwise let a fenced
             // controller reintroduce itself as a local caller and skip the authority check.
             return failure(
@@ -2744,9 +2809,9 @@ impl WorkerService {
                 ),
             );
         }
-        state.negotiated = true;
-        state.client_kind = hello.client;
-        if let Some(local) = state.local.as_ref() {
+        state.facts.negotiated = true;
+        state.facts.client_kind = hello.client;
+        if let Some(local) = state.facts.local.as_ref() {
             local.set_local(hello.client != LocalClientKind::Controller);
         }
         state.origin = hello.origin;
@@ -2784,7 +2849,7 @@ impl WorkerService {
         }
         // The window is issued when the connection is authenticated, not when it was accepted, so
         // its deadline starts from the handshake the client will quote it against.
-        let Ok(action_window) = self.issue_window(state.connection_id) else {
+        let Ok(action_window) = self.issue_window(state.facts.connection_id) else {
             return failure(
                 RequestId::new(0),
                 &ProtocolError::new(
@@ -2796,7 +2861,7 @@ impl WorkerService {
         ControlFrame::HelloAck(Box::new(LocalHelloAck {
             selected_version: PROTOCOL_VERSION,
             role: LocalRole::Worker,
-            connection_id: state.connection_id,
+            connection_id: state.facts.connection_id,
             environment_id: self.environment_id,
             boot_identity: self.boot_identity.clone(),
             peer: peer.to_wire(),
@@ -2878,8 +2943,8 @@ impl WorkerService {
     /// Refuses a description facts request anywhere but on the daemon's current descriptions
     /// connection.
     fn check_descriptions_link(&self, state: &ConnectionState) -> Result<()> {
-        if state.client_kind != LocalClientKind::Controller
-            || state.controller_role != ControllerConnectionRole::Descriptions
+        if state.facts.client_kind != LocalClientKind::Controller
+            || state.facts.controller_role != ControllerConnectionRole::Descriptions
         {
             return Err(WorkerError::PermissionDenied {
                 detail: "description facts are read only over the control daemon's descriptions \
@@ -2887,7 +2952,7 @@ impl WorkerService {
                     .to_owned(),
             });
         }
-        self.check_authority(state)
+        self.check_authority(&state.facts)
     }
 
     /// Reads the facts a request asked for, holding it while there is nothing newer.
@@ -2959,7 +3024,7 @@ impl WorkerService {
             return Some(failure(request.request_id, &error.to_protocol_error()));
         }
         self.attention_fence.named(
-            state.connection_id,
+            state.facts.connection_id,
             request.recorded_generation.0.map(U64::get),
         );
         state.pending_page = Some(PendingPage {
@@ -2985,7 +3050,8 @@ impl WorkerService {
             return failure(request.request_id, &error.to_protocol_error());
         }
         let recorded = request.recorded_generation.0.map(U64::get);
-        self.attention_fence.named(state.connection_id, recorded);
+        self.attention_fence
+            .named(state.facts.connection_id, recorded);
         let noted = self.attention_fence.note();
         let mut answer =
             match self.read_attention(|journal| crate::attention_source::texts(journal, request)) {
@@ -2995,7 +3061,7 @@ impl WorkerService {
         if answer.texts.iter().any(|text| text.text.0.is_some()) {
             let leased = self.attention_fence.lease(
                 noted,
-                state.generation.map_or(0, ControllerGeneration::get),
+                state.facts.generation.map_or(0, ControllerGeneration::get),
                 answer.privacy_generation.0.map(U64::get),
                 recorded,
             );
@@ -3027,8 +3093,8 @@ impl WorkerService {
 
     /// Refuses an attention request anywhere but on the daemon's current attention connection.
     fn check_attention_link(&self, state: &ConnectionState) -> Result<()> {
-        if state.client_kind != LocalClientKind::Controller
-            || state.controller_role != ControllerConnectionRole::Attention
+        if state.facts.client_kind != LocalClientKind::Controller
+            || state.facts.controller_role != ControllerConnectionRole::Attention
         {
             return Err(WorkerError::PermissionDenied {
                 detail: "attention records are read only over the control daemon's attention \
@@ -3036,7 +3102,7 @@ impl WorkerService {
                     .to_owned(),
             });
         }
-        self.check_authority(state)
+        self.check_authority(&state.facts)
     }
 
     /// Reads the session's journal through the attention link's own reading connection.
@@ -3292,7 +3358,7 @@ impl WorkerService {
     /// afterwards could take the authority binding away from the connection that holds it, or give
     /// its own proxy the authority to announce a revocation.
     fn declare_role(state: &mut ConnectionState, role: ControllerConnectionRole) -> ControlFrame {
-        if state.client_kind != LocalClientKind::Controller {
+        if state.facts.client_kind != LocalClientKind::Controller {
             return failure(
                 RequestId::new(0),
                 &ProtocolError::new(
@@ -3301,7 +3367,7 @@ impl WorkerService {
                 ),
             );
         }
-        if state.controller {
+        if state.facts.controller {
             return failure(
                 RequestId::new(0),
                 &ProtocolError::new(
@@ -3311,7 +3377,7 @@ impl WorkerService {
                 ),
             );
         }
-        state.controller_role = role;
+        state.facts.controller_role = role;
         ControlFrame::ControllerRole(role)
     }
 
@@ -3368,13 +3434,14 @@ impl WorkerService {
                 authority.accepted_generation = Some(token.generation);
                 // A bound that carries a lease does not outlive the daemon that held the lease.
                 let lease_taken = self.gate.generation_accepted(token.generation);
-                match state.controller_role {
+                match state.facts.controller_role {
                     // Installing this connection fences whatever held the authority before it,
                     // including an earlier connection of the same generation.
                     ControllerConnectionRole::Authority => {
-                        if let Some(previous) =
-                            authority.bound_connection.replace(state.connection_id)
-                            && previous != state.connection_id
+                        if let Some(previous) = authority
+                            .bound_connection
+                            .replace(state.facts.connection_id)
+                            && previous != state.facts.connection_id
                             && !fenced.contains(&previous)
                         {
                             fenced.push(previous);
@@ -3384,22 +3451,25 @@ impl WorkerService {
                     // caller the daemon authenticated, and the daemon's own connection goes on
                     // holding the authority.
                     ControllerConnectionRole::Proxy => {
-                        authority.proxy_connections.insert(state.connection_id);
+                        authority
+                            .proxy_connections
+                            .insert(state.facts.connection_id);
                     }
                     // The daemon reads this session's attention sources over one connection, so
                     // a newer one replaces the one before it, whose held request goes with it.
                     // It becomes the privacy fence's current connection in the same step, and
                     // the statement of the fence it carries first goes out after the acceptance.
                     ControllerConnectionRole::Attention => {
-                        if let Some(previous) =
-                            authority.attention_connection.replace(state.connection_id)
-                            && previous != state.connection_id
+                        if let Some(previous) = authority
+                            .attention_connection
+                            .replace(state.facts.connection_id)
+                            && previous != state.facts.connection_id
                             && !fenced.contains(&previous)
                         {
                             fenced.push(previous);
                         }
                         state.pending_statement = Some(self.attention_fence.began(
-                            state.connection_id,
+                            state.facts.connection_id,
                             token.generation.get(),
                             || self.journal_generation(),
                         ));
@@ -3409,8 +3479,8 @@ impl WorkerService {
                     ControllerConnectionRole::Descriptions => {
                         if let Some(previous) = authority
                             .descriptions_connection
-                            .replace(state.connection_id)
-                            && previous != state.connection_id
+                            .replace(state.facts.connection_id)
+                            && previous != state.facts.connection_id
                             && !fenced.contains(&previous)
                         {
                             fenced.push(previous);
@@ -3428,8 +3498,8 @@ impl WorkerService {
                 if lease_taken {
                     self.withdraw_local_connections();
                 }
-                state.controller = true;
-                state.generation = Some(token.generation);
+                state.facts.controller = true;
+                state.facts.generation = Some(token.generation);
                 ControlFrame::GenerationAccepted(kr_protocol::worker::GenerationAccepted {
                     generation: token.generation,
                     fenced_previous: !fenced.is_empty(),
@@ -3456,8 +3526,8 @@ impl WorkerService {
         state: &ConnectionState,
         access: kr_protocol::worker::LocalAccess,
     ) -> ControlFrame {
-        if state.client_kind != LocalClientKind::Controller
-            || state.controller_role != ControllerConnectionRole::Authority
+        if state.facts.client_kind != LocalClientKind::Controller
+            || state.facts.controller_role != ControllerConnectionRole::Authority
         {
             return failure(
                 RequestId::new(0),
@@ -3478,10 +3548,10 @@ impl WorkerService {
                 .authority
                 .lock()
                 .expect("the authority lock is not poisoned");
-            if let Err(error) = Self::check_bound(state, &authority) {
+            if let Err(error) = Self::check_bound(&state.facts, &authority) {
                 return failure(RequestId::new(0), &error.to_protocol_error());
             }
-            let Some(generation) = state.generation else {
+            let Some(generation) = state.facts.generation else {
                 return failure(
                     RequestId::new(0),
                     &ProtocolError::new(
@@ -3561,8 +3631,8 @@ impl WorkerService {
         // must not be able to leave this worker holding a revision to fence on its own either. A
         // proxy connection is not that caller: it carries a device's requests and holds none of
         // this environment's authority.
-        if state.client_kind != LocalClientKind::Controller
-            || state.controller_role != ControllerConnectionRole::Authority
+        if state.facts.client_kind != LocalClientKind::Controller
+            || state.facts.controller_role != ControllerConnectionRole::Authority
         {
             return failure(
                 RequestId::new(0),
@@ -3573,7 +3643,7 @@ impl WorkerService {
                 ),
             );
         }
-        if let Err(error) = self.check_authority(state) {
+        if let Err(error) = self.check_authority(&state.facts) {
             return failure(RequestId::new(0), &error.to_protocol_error());
         }
         if notice.environment_id != self.environment_id {
@@ -3617,7 +3687,7 @@ impl WorkerService {
         // generation takes this same boundary before it changes the binding. The binding is looked
         // at again anyway, so that what follows depends on a check made here rather than on that
         // ordering holding somewhere else.
-        if let Err(error) = self.check_authority(state) {
+        if let Err(error) = self.check_authority(&state.facts) {
             return failure(RequestId::new(0), &error.to_protocol_error());
         }
         // How many names of this revision's evidence the daemon already has. A first announcement
@@ -3801,6 +3871,7 @@ impl WorkerService {
     ) -> ControlFrame {
         let session_id = self.runtime.session().id();
         let generation = state
+            .facts
             .generation
             .map_or(0, kr_protocol::ids::ControllerGeneration::get);
         let page = {
@@ -3847,8 +3918,8 @@ impl WorkerService {
         state: &ConnectionState,
         notice: &kr_protocol::privacy::PrivacyGenerationNotice,
     ) -> ControlFrame {
-        if state.client_kind != LocalClientKind::Controller
-            || state.controller_role != ControllerConnectionRole::Authority
+        if state.facts.client_kind != LocalClientKind::Controller
+            || state.facts.controller_role != ControllerConnectionRole::Authority
         {
             return failure(
                 RequestId::new(0),
@@ -3859,7 +3930,7 @@ impl WorkerService {
                 ),
             );
         }
-        if let Err(error) = self.check_authority(state) {
+        if let Err(error) = self.check_authority(&state.facts) {
             return failure(RequestId::new(0), &error.to_protocol_error());
         }
         if notice.environment_id != self.environment_id {
@@ -4050,15 +4121,15 @@ impl WorkerService {
     /// acts under the worker's own authority over its session. A controller acts for a generation,
     /// and a generation that has been superseded is exactly what fencing is for: the request is
     /// refused here, on the dispatch path, before anything reads its parameters.
-    fn check_authority(&self, state: &ConnectionState) -> Result<()> {
-        if state.client_kind != LocalClientKind::Controller {
+    fn check_authority(&self, facts: &ConnectionFacts) -> Result<()> {
+        if facts.client_kind != LocalClientKind::Controller {
             return Ok(());
         }
         let authority = self
             .authority
             .lock()
             .expect("the authority lock is not poisoned");
-        Self::check_bound(state, &authority)
+        Self::check_bound(facts, &authority)
     }
 
     /// Records the fence a refused announcement leaves behind, for a caller checked with it.
@@ -4086,7 +4157,7 @@ impl WorkerService {
             .authority
             .lock()
             .expect("the authority lock is not poisoned");
-        Self::check_bound(state, &authority)?;
+        Self::check_bound(&state.facts, &authority)?;
         // An announcement of a revision this worker has already fenced owes nothing, and recording
         // it would join its reach, which is the whole host's for a repeat or a continuation page,
         // with the reach of the next revision it is refused for.
@@ -4117,25 +4188,25 @@ impl WorkerService {
     /// The same refusal, against an authority the caller already holds the lock on.
     ///
     /// Reading the binding and acting on it under one lock is what closes the window between them.
-    fn check_bound(state: &ConnectionState, authority: &Authority) -> Result<()> {
-        if !state.controller {
+    fn check_bound(facts: &ConnectionFacts, authority: &Authority) -> Result<()> {
+        if !facts.controller {
             return Err(WorkerError::GenerationFenced {
                 detail: "this connection has not proved which controller generation it speaks for"
                     .to_owned(),
             });
         }
-        let bound = match state.controller_role {
+        let bound = match facts.controller_role {
             ControllerConnectionRole::Authority => {
-                authority.bound_connection == Some(state.connection_id)
+                authority.bound_connection == Some(facts.connection_id)
             }
             ControllerConnectionRole::Proxy => {
-                authority.proxy_connections.contains(&state.connection_id)
+                authority.proxy_connections.contains(&facts.connection_id)
             }
             ControllerConnectionRole::Attention => {
-                authority.attention_connection == Some(state.connection_id)
+                authority.attention_connection == Some(facts.connection_id)
             }
             ControllerConnectionRole::Descriptions => {
-                authority.descriptions_connection == Some(state.connection_id)
+                authority.descriptions_connection == Some(facts.connection_id)
             }
         };
         if !bound {
@@ -4144,7 +4215,7 @@ impl WorkerService {
                     .to_owned(),
             });
         }
-        if authority.accepted_generation != state.generation {
+        if authority.accepted_generation != facts.generation {
             return Err(WorkerError::GenerationFenced {
                 detail: format!(
                     "this worker accepts generation {}",
@@ -4169,10 +4240,10 @@ impl WorkerService {
     /// Returns the refusal of a held method.
     fn check_local_hold(
         &self,
-        state: &ConnectionState,
+        facts: &ConnectionFacts,
         method: Method,
     ) -> std::result::Result<Option<crate::local_gate::Allowed>, WorkerError> {
-        if state.client_kind == LocalClientKind::Controller
+        if facts.client_kind == LocalClientKind::Controller
             || kr_protocol::method::local_hold(method) == kr_protocol::method::LocalHold::Free
         {
             return Ok(None);
@@ -4214,13 +4285,13 @@ impl WorkerService {
     /// cannot be overtaken by it.
     fn check_local_dispatch(
         &self,
-        state: &ConnectionState,
+        facts: &ConnectionFacts,
         method: Method,
         caller: &Caller,
     ) -> Result<()> {
         // It takes the local gate's lock and may read the host's floor from the disk.
         crate::input_domain::assert_not_held("a check of the local owner's access");
-        self.check_local_hold(state, method)?;
+        self.check_local_hold(facts, method)?;
         if let Some(admitted) = caller.gate_restrictions
             && self.gate.restrictions() != admitted
         {
@@ -4233,42 +4304,49 @@ impl WorkerService {
         Ok(())
     }
 
-    fn request(
+    /// The checks every request passes before its method runs, whatever the method.
+    ///
+    /// Returns whether the local owner's lease held the request, which the accounting for its
+    /// answer needs on every way out after the lease was consulted, and either what the request
+    /// goes on with or the answer that refuses it.
+    fn precheck(
         &self,
-        state: &mut ConnectionState,
+        facts: &ConnectionFacts,
         request: &Request,
         caller: &Caller,
-    ) -> ControlFrame {
-        // When the request reached this handler. A held prefix's deadline runs from here, so
-        // nothing a request waits for on its way to the input domain, the checks of a local owner's
-        // access among them, is outside the deadline.
-        let arrived = std::time::Instant::now();
+    ) -> (bool, std::result::Result<Prechecked, ControlFrame>) {
         // Every request of a local connection is recorded as waiting for its answer, before
         // anything can answer it: the writer tells a held request's answer from the answer of
         // another request of the same identifier by what was recorded here.
-        if let Some(local) = state.local.as_ref() {
+        if let Some(local) = facts.local.as_ref() {
             local.free_request(request.request_id);
         }
-        if !state.negotiated {
-            return failure(request.request_id, &not_negotiated());
+        if !facts.negotiated {
+            return (false, Err(failure(request.request_id, &not_negotiated())));
         }
-        if let Err(error) = self.check_authority(state) {
-            return failure(request.request_id, &error.to_protocol_error());
+        if let Err(error) = self.check_authority(facts) {
+            return (
+                false,
+                Err(failure(request.request_id, &error.to_protocol_error())),
+            );
         }
         let restrictions = self.gate.restrictions();
         let allowed = match request.method.method() {
-            Some(method) => match self.check_local_hold(state, method) {
+            Some(method) => match self.check_local_hold(facts, method) {
                 Ok(allowed) => allowed,
-                Err(error) => return failure(request.request_id, &error.to_protocol_error()),
+                Err(error) => {
+                    return (
+                        false,
+                        Err(failure(request.request_id, &error.to_protocol_error())),
+                    );
+                }
             },
             None => None,
         };
+        let held = allowed.is_some();
         let bounded = Self::bound_by_lease(caller, allowed, restrictions);
         let caller = bounded.as_ref().unwrap_or(caller);
-        state.answering_held = allowed.is_some();
-        if allowed.is_some()
-            && let Some(local) = state.local.as_ref()
-        {
+        if held && let Some(local) = facts.local.as_ref() {
             local.hold_request(request.request_id);
         }
         // A read the daemon admitted under an authority revision this worker has installed past is
@@ -4276,49 +4354,62 @@ impl WorkerService {
         // write that travels as a request: bytes forwarded under the old revision can still be on
         // the socket when the new one is acknowledged.
         if let Err(error) = self.check_validated_revision(caller) {
-            return failure(request.request_id, &error.to_protocol_error());
+            return (
+                held,
+                Err(failure(request.request_id, &error.to_protocol_error())),
+            );
         }
         let Some(method) = request.method.method() else {
-            return failure(request.request_id, &unlisted());
+            return (held, Err(failure(request.request_id, &unlisted())));
         };
         if Self::entry(method, request.method_version, caller.ingress).is_none() {
-            return failure(request.request_id, &unlisted());
+            return (held, Err(failure(request.request_id, &unlisted())));
         }
-        // A keystroke takes the input domain and nothing else, on whatever thread it arrived on. A
-        // read can wait for the session or for the disk behind it, and that wait is made on a
-        // thread the executor can do without.
-        let outcome = if method == Method::InputWrite {
-            self.input_write(state, &request.params, caller, arrived)
-        } else {
-            off_the_executor(|| match method {
-                Method::SessionRead => self.session_read(&request.params, caller),
-                Method::SessionScreenPreview => {
-                    self.session_screen_preview(&request.params, caller)
-                }
-                Method::EventsSnapshot => self.events_snapshot(state, &request.params, caller),
-                Method::AgentInstances => self.agent_instances(state, &request.params, caller),
-                Method::HistoryPage => self.history_page(state, &request.params, caller),
-                Method::EventsSubscribe => self.events_subscribe(state, &request.params, caller),
-                Method::ActionRead => self.action_read(state, caller, &request.params),
-                Method::QuestionReadOwn => self.question_read_own(state, &request.params),
-                Method::QuestionRead => self.question_read(&request.params, caller),
-                Method::AgentCapabilities => self.agent_capabilities(&request.params),
-                Method::AgentSnapshot => self.agent_snapshot(state, &request.params, caller),
-                Method::AgentCommands => self.agent_commands(&request.params),
-                Method::AgentApprovalInspect => {
-                    self.agent_approval_inspect(state, &request.params, caller)
-                }
-                _ => Err(WorkerError::InvalidArgument(format!(
-                    "{} is not a read this worker serves",
-                    method.as_str()
-                ))),
-            })
+        (held, Ok(Prechecked { method, bounded }))
+    }
+
+    fn request(
+        &self,
+        state: &mut ConnectionState,
+        request: &Request,
+        caller: &Caller,
+    ) -> ControlFrame {
+        let (held, prechecked) = self.precheck(&state.facts, request, caller);
+        state.answering_held = held;
+        let prechecked = match prechecked {
+            Ok(prechecked) => prechecked,
+            Err(refusal) => return refusal,
         };
+        let method = prechecked.method;
+        let caller = prechecked.caller(caller);
+        // A read can wait for the session or for the disk behind it, and that wait is made on a
+        // thread the executor can do without.
+        let outcome = off_the_executor(|| match method {
+            Method::SessionRead => self.session_read(&request.params, caller),
+            Method::SessionScreenPreview => self.session_screen_preview(&request.params, caller),
+            Method::EventsSnapshot => self.events_snapshot(state, &request.params, caller),
+            Method::AgentInstances => self.agent_instances(state, &request.params, caller),
+            Method::HistoryPage => self.history_page(state, &request.params, caller),
+            Method::EventsSubscribe => self.events_subscribe(state, &request.params, caller),
+            Method::ActionRead => self.action_read(state, caller, &request.params),
+            Method::QuestionReadOwn => self.question_read_own(state, &request.params),
+            Method::QuestionRead => self.question_read(&request.params, caller),
+            Method::AgentCapabilities => self.agent_capabilities(&request.params),
+            Method::AgentSnapshot => self.agent_snapshot(state, &request.params, caller),
+            Method::AgentCommands => self.agent_commands(&request.params),
+            Method::AgentApprovalInspect => {
+                self.agent_approval_inspect(state, &request.params, caller)
+            }
+            _ => Err(WorkerError::InvalidArgument(format!(
+                "{} is not a read this worker serves",
+                method.as_str()
+            ))),
+        });
         // Checked again, now that the read has finished. A read that passed its check and then
         // waited for the session lock can complete after the authority behind it was withdrawn,
         // and what the contract forbids is *serving* that state rather than reading it. A
         // subscription this read started is ended with the connection it belongs to.
-        if let Err(error) = self.check_authority(state) {
+        if let Err(error) = self.check_authority(&state.facts) {
             state.subscribed = None;
             state.restoration = None;
             // So is a semantic snapshot it continued: the part is not served, and nothing this
@@ -4327,6 +4418,50 @@ impl WorkerService {
             return failure(request.request_id, &error.to_protocol_error());
         }
         respond(request.request_id, outcome)
+    }
+
+    /// Serves one keystroke batch: an `input.write` that arrived as a request.
+    ///
+    /// A keystroke takes the input domain and the connection's facts and nothing else, on whatever
+    /// thread it arrived on, so it is served the same way by the connection's own loop and by the
+    /// task that serves keystrokes while that loop is busy with a request that waits. What a read
+    /// does after its checks, and a keystroke cannot, is end the subscription and the snapshot it
+    /// started: a keystroke starts neither.
+    fn keystroke(&self, facts: &ConnectionFacts, request: &Request, caller: &Caller) -> Served {
+        // When the request reached this handler. A held prefix's deadline runs from here, so
+        // nothing a request waits for on its way to the input domain, the checks of a local owner's
+        // access among them, is outside the deadline.
+        let arrived = std::time::Instant::now();
+        debug_assert_eq!(request.method.method(), Some(Method::InputWrite));
+        let (held, prechecked) = self.precheck(facts, request, caller);
+        let prechecked = match prechecked {
+            Ok(prechecked) => prechecked,
+            Err(refusal) => {
+                return Served {
+                    reply: refusal,
+                    held,
+                };
+            }
+        };
+        let outcome = self.input_write(facts, &request.params, prechecked.caller(caller), arrived);
+        // Checked again, as a read's is: a keystroke that passed its check and then waited can
+        // finish after the authority behind it was withdrawn.
+        if let Err(error) = self.check_authority(facts) {
+            return Served {
+                reply: failure(request.request_id, &error.to_protocol_error()),
+                held,
+            };
+        }
+        Served {
+            reply: respond(request.request_id, outcome),
+            held,
+        }
+    }
+
+    /// Serves the keystroke batch a local client sent as a request.
+    fn keystroke_of_a_request(&self, facts: &ConnectionFacts, request: &Request) -> Served {
+        let caller = Caller::local(facts.actor_id.clone());
+        self.keystroke(facts, request, &caller)
     }
 
     /// Runs one mutation through the receipt contract.
@@ -4356,13 +4491,13 @@ impl WorkerService {
         freshness: Freshness,
         forwarded: bool,
     ) -> ControlFrame {
-        if let Some(local) = state.local.as_ref() {
+        if let Some(local) = state.facts.local.as_ref() {
             local.free_request(mutation.request_id);
         }
-        if !state.negotiated {
+        if !state.facts.negotiated {
             return failure(mutation.request_id, &not_negotiated());
         }
-        if let Err(error) = self.check_authority(state) {
+        if let Err(error) = self.check_authority(&state.facts) {
             return failure(mutation.request_id, &error.to_protocol_error());
         }
         let Some(method) = mutation.method.method() else {
@@ -4372,7 +4507,7 @@ impl WorkerService {
             return failure(mutation.request_id, &unlisted());
         };
         let restrictions = self.gate.restrictions();
-        let allowed = match self.check_local_hold(state, method) {
+        let allowed = match self.check_local_hold(&state.facts, method) {
             Ok(allowed) => allowed,
             Err(error) => return failure(mutation.request_id, &error.to_protocol_error()),
         };
@@ -4380,7 +4515,7 @@ impl WorkerService {
         let caller = bounded.as_ref().unwrap_or(caller);
         state.answering_held = allowed.is_some();
         if allowed.is_some()
-            && let Some(local) = state.local.as_ref()
+            && let Some(local) = state.facts.local.as_ref()
         {
             local.hold_request(mutation.request_id);
         }
@@ -4566,7 +4701,7 @@ impl WorkerService {
             .expect("the dispatch barrier is not poisoned");
         self.wait_inside_boundary();
         self.revalidate_time();
-        if let Err(error) = self.check_authority(state) {
+        if let Err(error) = self.check_authority(&state.facts) {
             return Err(self.reject_accepted(
                 caller,
                 mutation,
@@ -4574,7 +4709,7 @@ impl WorkerService {
                 error,
             ));
         }
-        if let Err(error) = self.check_local_dispatch(state, method, caller) {
+        if let Err(error) = self.check_local_dispatch(&state.facts, method, caller) {
             return Err(self.reject_accepted(
                 caller,
                 mutation,
@@ -4886,7 +5021,7 @@ impl WorkerService {
         method: Method,
     ) -> Result<()> {
         if !matches!(method, Method::AgentPromptSubmit | Method::AgentPromptQueue)
-            || state.client_kind == LocalClientKind::Controller
+            || state.facts.client_kind == LocalClientKind::Controller
         {
             return Ok(());
         }
@@ -4931,7 +5066,7 @@ impl WorkerService {
         // anchored: a frame it can count is a frame whose lifetime no later movement can lengthen.
         #[cfg(feature = "testing")]
         self.record_received(&forwarded.mutation.method, &forwarded.mutation.params);
-        if state.client_kind != LocalClientKind::Controller {
+        if state.facts.client_kind != LocalClientKind::Controller {
             return failure(
                 forwarded.mutation.request_id,
                 &ProtocolError::new(
@@ -4974,7 +5109,7 @@ impl WorkerService {
         // receipts are not its own, which is what makes passing a retained result on a read. The
         // daemon's authority connection carries a local caller's own action, and that caller is
         // answered the way it always was.
-        let proxied = state.controller_role == ControllerConnectionRole::Proxy;
+        let proxied = state.facts.controller_role == ControllerConnectionRole::Proxy;
         self.mutation(
             state,
             &forwarded.mutation,
@@ -5001,7 +5136,7 @@ impl WorkerService {
         state: &mut ConnectionState,
         forwarded: &kr_protocol::local::ForwardedRequest,
     ) -> ControlFrame {
-        if state.client_kind != LocalClientKind::Controller {
+        if state.facts.client_kind != LocalClientKind::Controller {
             return failure(
                 forwarded.request.request_id,
                 &ProtocolError::new(
@@ -5033,17 +5168,19 @@ impl WorkerService {
                 ),
             );
         }
-        self.request(
-            state,
-            &forwarded.request,
-            // A forwarded read carries no rights, because nothing a read decides is decided from
-            // them: an attachment's capabilities are fixed where the attachment is admitted, which
-            // is a mutation, and every later operation is checked against what that admission
-            // granted rather than against the grant again.
-            &Caller::forwarded(&forwarded.actor, &CanonicalSet::new())
-                .until(forwarded.authority_deadline_boot_ms.0.map(U64::get))
-                .within(forwarded.history.clone()),
-        )
+        // A forwarded read carries no rights, because nothing a read decides is decided from
+        // them: an attachment's capabilities are fixed where the attachment is admitted, which
+        // is a mutation, and every later operation is checked against what that admission
+        // granted rather than against the grant again.
+        let caller = Caller::forwarded(&forwarded.actor, &CanonicalSet::new())
+            .until(forwarded.authority_deadline_boot_ms.0.map(U64::get))
+            .within(forwarded.history.clone());
+        if forwarded.request.method.method() == Some(Method::InputWrite) {
+            let served = self.keystroke(&state.facts, &forwarded.request, &caller);
+            state.answering_held = served.held;
+            return served.reply;
+        }
+        self.request(state, &forwarded.request, &caller)
     }
 
     fn receipted(
@@ -5068,7 +5205,7 @@ impl WorkerService {
         // reboot or a step of the wall clock is revalidated here, on this mutation's own way
         // through, rather than left for a maintenance tick that may be a minute away.
         self.revalidate_time();
-        self.check_authority(state)?;
+        self.check_authority(&state.facts)?;
         // Inside the barrier, and before anything durable: an action the daemon validated under an
         // authority revision this worker has since installed past is an action whose authority has
         // been withdrawn. The daemon takes its lease before it forwards, but a request can arrive
@@ -5076,7 +5213,7 @@ impl WorkerService {
         // to be caught: a revocation is complete for a worker when the worker has stopped being
         // able to act under what it removed.
         self.check_validated_revision(caller)?;
-        self.check_local_dispatch(state, method, caller)?;
+        self.check_local_dispatch(&state.facts, method, caller)?;
         let digest = kr_protocol::digest::mutation_digest(mutation, &actor_id)
             .map_err(|error| WorkerError::InvalidArgument(error.to_string()))?;
 
@@ -5860,7 +5997,7 @@ impl WorkerService {
         crate::action::window::first_admission(
             &self.windows,
             &mutation.action_window_id,
-            state.connection_id,
+            state.facts.connection_id,
             self.boot_epoch,
             received_at,
             mutation.requested_ttl_ms,
@@ -5952,7 +6089,7 @@ impl WorkerService {
                 let params: SessionDetachParams = parse(&mutation.params)?;
                 let attachment_id = Self::detach_subject(session, &params)?;
                 if !caller.is_local_owner() {
-                    Self::check_attachment(state, attachment_id)?;
+                    Self::check_attachment(&state.facts, attachment_id)?;
                 }
                 if session.attachment_capabilities(attachment_id).is_some() {
                     Ok(())
@@ -5968,7 +6105,7 @@ impl WorkerService {
             }
             Method::AttachmentConfigure => {
                 let params: AttachmentConfigureParams = parse(&mutation.params)?;
-                Self::check_attachment(state, params.attachment_id)?;
+                Self::check_attachment(&state.facts, params.attachment_id)?;
                 if params.claim_geometry {
                     Self::check_capability(
                         session,
@@ -5980,7 +6117,7 @@ impl WorkerService {
             }
             Method::TerminalResize => {
                 let params: TerminalResizeParams = parse(&mutation.params)?;
-                Self::check_attachment(state, params.attachment_id)?;
+                Self::check_attachment(&state.facts, params.attachment_id)?;
                 Self::check_capability(
                     session,
                     params.attachment_id,
@@ -6002,18 +6139,18 @@ impl WorkerService {
             Method::InputAcquire => {
                 let params: InputAcquireParams = parse(&mutation.params)?;
                 Self::check_session(session, params.session_id)?;
-                Self::check_attachment(state, params.attachment_id)?;
+                Self::check_attachment(&state.facts, params.attachment_id)?;
                 Self::check_capability(session, params.attachment_id, AttachmentCapability::Input)
             }
             Method::InputRelease => {
                 let params: InputReleaseParams = parse(&mutation.params)?;
                 Self::check_session(session, params.session_id)?;
-                Self::check_attachment(state, params.attachment_id)
+                Self::check_attachment(&state.facts, params.attachment_id)
             }
             Method::InputInterrupt => {
                 let params: InputInterruptParams = parse(&mutation.params)?;
                 Self::check_session(session, params.session_id)?;
-                Self::check_attachment(state, params.attachment_id)?;
+                Self::check_attachment(&state.facts, params.attachment_id)?;
                 Self::check_capability(session, params.attachment_id, AttachmentCapability::Input)
             }
             Method::ShellLaunch => {
@@ -6044,7 +6181,7 @@ impl WorkerService {
             }
             Method::AttachmentViewport => {
                 let params: AttachmentViewportParams = parse(&mutation.params)?;
-                Self::check_attachment(state, params.attachment_id)
+                Self::check_attachment(&state.facts, params.attachment_id)
             }
             // Every question method names the session it acts in, and this endpoint serves one
             // session. Everything else a question can be refused for is checked here too, because
@@ -6594,14 +6731,14 @@ impl WorkerService {
     /// does not hold the keys cannot put one there under somebody else's name.
     fn launching_attachment(session: &Session, state: &ConnectionState) -> Result<AttachmentId> {
         let holder = session.lease().holder.0.ok_or(WorkerError::LeaseLost)?;
-        if !state.holds_attachment(holder) {
+        if !state.facts.holds_attachment(holder) {
             return Err(WorkerError::LeaseLost);
         }
         Ok(holder)
     }
 
-    fn check_attachment(state: &ConnectionState, attachment_id: AttachmentId) -> Result<()> {
-        if state.holds_attachment(attachment_id) {
+    fn check_attachment(facts: &ConnectionFacts, attachment_id: AttachmentId) -> Result<()> {
+        if facts.holds_attachment(attachment_id) {
             Ok(())
         } else {
             Err(WorkerError::UnknownAttachment {
@@ -6758,7 +6895,7 @@ impl WorkerService {
         let mut replacing = None;
         let page = match params.agent_resources_from.as_ref() {
             None => {
-                let subscribed = session.scoped_subscription(state.connection_id);
+                let subscribed = session.scoped_subscription(state.facts.connection_id);
                 let filter = Self::resource_filter(caller, Method::EventsSnapshot, || {
                     subscribed.map_or_else(|| kr_ipc::now_ms().get(), |(_, began)| began)
                 });
@@ -6776,7 +6913,7 @@ impl WorkerService {
             Some(from) => self
                 .recoveries
                 .resume(
-                    state.connection_id,
+                    state.facts.connection_id,
                     from.snapshot_id.get(),
                     from.after_resource_id,
                     self.clock.now(),
@@ -6792,7 +6929,13 @@ impl WorkerService {
         Self::within_the_frame(state, &answer)?;
         let encoded = encode(&answer)?;
         if let Some((attachment_id, filter, cursor, shown)) = replacing {
-            session.hold_resources(attachment_id, state.connection_id, filter, cursor, shown);
+            session.hold_resources(
+                attachment_id,
+                state.facts.connection_id,
+                filter,
+                cursor,
+                shown,
+            );
         }
         Ok(encoded)
     }
@@ -6838,7 +6981,7 @@ impl WorkerService {
             Some(from) => self
                 .recoveries
                 .resume(
-                    state.connection_id,
+                    state.facts.connection_id,
                     from.snapshot_id.get(),
                     from.after_resource_id,
                     self.clock.now(),
@@ -6976,7 +7119,7 @@ impl WorkerService {
             );
         }
         let page = self.recoveries.begin(
-            state.connection_id,
+            state.facts.connection_id,
             snapshot.cursor,
             snapshot.resources,
             self.clock.now(),
@@ -7110,7 +7253,7 @@ impl WorkerService {
         caller: &Caller,
     ) -> Result<ParamsValue> {
         let params: EventsSubscribeParams = parse(params)?;
-        Self::check_attachment(state, params.attachment_id)?;
+        Self::check_attachment(&state.facts, params.attachment_id)?;
         let mut session = self.runtime.session();
         Self::check_session(&session, params.session_id)?;
         // The session's agent instances, read under the lock that starts the queue below. The
@@ -7157,12 +7300,12 @@ impl WorkerService {
         match filter {
             Some(filter) => session.hold_resources(
                 params.attachment_id,
-                state.connection_id,
+                state.facts.connection_id,
                 filter,
                 recovered.page.cursor,
                 recovered.shown,
             ),
-            None => session.release_resources(params.attachment_id, state.connection_id),
+            None => session.release_resources(params.attachment_id, state.facts.connection_id),
         }
         let agent_resources = recovered.page;
         let oldest = session.oldest_retained_cursor();
@@ -7590,7 +7733,7 @@ impl WorkerService {
         crate::questions::binding::Binding::of(crate::questions::binding::verify(
             state.peer_pid,
             state.peer_process.as_ref(),
-            state.connection_id,
+            state.facts.connection_id,
             boundary.as_ref(),
             Some(self.broker.as_ref()),
         ))
@@ -7628,7 +7771,7 @@ impl WorkerService {
 
     fn input_write(
         &self,
-        state: &mut ConnectionState,
+        facts: &ConnectionFacts,
         params: &ParamsValue,
         caller: &Caller,
         arrived: std::time::Instant,
@@ -7638,7 +7781,7 @@ impl WorkerService {
         // for a moment when a lone Escape arrives, and the application's wait for it, which
         // section 27 puts at no more than the recogniser's deadline, began with the write.
         let params: InputWriteParams = parse(params)?;
-        Self::check_attachment(state, params.attachment_id)?;
+        Self::check_attachment(facts, params.attachment_id)?;
         // Raw input is its own stream with its own bound. Travelling inside a control frame does
         // not give a keystroke batch the control frame's allowance.
         if params.bytes.len() > kr_protocol::limits::MAX_INPUT_FRAME_LEN {
@@ -7653,7 +7796,7 @@ impl WorkerService {
         // none of which a lock that holds up a keystroke may wait for. Nothing the domain protects
         // depends on its order, and a restriction made since the request was admitted still
         // refuses the batch.
-        self.check_local_dispatch(state, Method::InputWrite, caller)?;
+        self.check_local_dispatch(facts, Method::InputWrite, caller)?;
         let (accepted, pump) = {
             let mut acquisition = self.runtime.trace().acquisition(Site::InputAcceptance);
             // The input domain and nothing else: whatever the session is busy with, this write
@@ -7706,7 +7849,6 @@ impl WorkerService {
         if pump {
             self.runtime.input().wake_pump();
         }
-        state.input_sequence = params.sequence.get();
         encode(&InputWriteResult {
             sequence: params.sequence,
             forwarded_bytes: U64::new(accepted.forwarded_bytes),
@@ -7806,7 +7948,7 @@ impl WorkerService {
                 if state.origin.is_some_and(|origin| !origin.clipboard_writes) {
                     session.decline_clipboard_writes(attachment_id);
                 }
-                state.add_attachment(attachment_id);
+                state.facts.add_attachment(attachment_id);
                 Ok((encode(&result)?, AfterEffect::None))
             }
             Method::SessionDetach => {
@@ -7832,7 +7974,7 @@ impl WorkerService {
                 // before the result is looked at, or a failed succession would leave it naming an
                 // attachment the session no longer has. The session let go of it as one made under
                 // a grant when it removed it.
-                state.remove_attachment(attachment_id);
+                state.facts.remove_attachment(attachment_id);
                 let result = outcome?;
                 Ok((encode(&result)?, AfterEffect::None))
             }
@@ -7880,7 +8022,7 @@ impl WorkerService {
                 let params: InputAcquireParams = parse(params)?;
                 let result = session.acquire_input(
                     params.attachment_id,
-                    state.connection_id,
+                    state.facts.connection_id,
                     params.expected_epoch.as_ref().map(|epoch| epoch.get()),
                 )?;
                 self.runtime.flush_input();
@@ -8612,9 +8754,35 @@ impl Drop for PrivacyTransition {
     }
 }
 
-/// What one connection knows about itself.
-#[derive(Debug)]
-pub struct ConnectionState {
+/// What a request has passed before its method runs, and what it goes on with.
+struct Prechecked {
+    method: Method,
+    /// The caller bounded by the local owner's lease, when the lease bounds it.
+    bounded: Option<Caller>,
+}
+
+impl Prechecked {
+    /// The caller the method runs as.
+    fn caller<'a>(&'a self, caller: &'a Caller) -> &'a Caller {
+        self.bounded.as_ref().unwrap_or(caller)
+    }
+}
+
+/// The answer to a keystroke batch, and whether the local owner's lease held it.
+struct Served {
+    reply: ControlFrame,
+    held: bool,
+}
+
+/// What a request reads of the connection it arrived on.
+///
+/// A keystroke is served from these and the input domain and from nothing else of the connection,
+/// so it can be served while the connection's own loop is busy with a request that waits. They are
+/// set in the frames the loop handles itself (the opening exchange, a role, a generation) and the
+/// handles in them are shared, so a copy taken while the loop is busy stays true for as long as it
+/// is busy.
+#[derive(Clone, Debug)]
+pub struct ConnectionFacts {
     /// The connection identity the host assigned.
     pub connection_id: ConnectionId,
     /// True once version negotiation has succeeded.
@@ -8626,6 +8794,63 @@ pub struct ConnectionState {
     /// What holds this connection's frames to the local owner's lease, once it has declared itself
     /// a local client. Absent for a connection built without a service (a test).
     pub(crate) local: Option<Arc<crate::local_gate::LocalWrites>>,
+    /// The generation this connection proved, when it is a controller.
+    pub generation: Option<ControllerGeneration>,
+    /// What a controller connection is for, as it declared before presenting a token.
+    pub controller_role: ControllerConnectionRole,
+    /// The attachments this connection owns.
+    ///
+    /// Shared with the connection's registration, so a withdrawal can take them back without
+    /// waiting for this connection's own loop to come back round.
+    pub attachments: Arc<Mutex<Vec<AttachmentId>>>,
+    /// The host-issued principal this connection acts under.
+    ///
+    /// It is built from the authenticated operating-system caller. A local caller never asserts
+    /// its own provenance and never borrows a device identity.
+    pub actor_id: ActorId,
+}
+
+impl ConnectionFacts {
+    /// Records an attachment this connection now owns.
+    fn add_attachment(&self, attachment_id: AttachmentId) {
+        self.attachments
+            .lock()
+            .expect("the attachment list is not poisoned")
+            .push(attachment_id);
+    }
+
+    /// Forgets an attachment this connection has given up.
+    fn remove_attachment(&self, attachment_id: AttachmentId) {
+        self.attachments
+            .lock()
+            .expect("the attachment list is not poisoned")
+            .retain(|held| *held != attachment_id);
+    }
+
+    /// Returns whether this connection owns the attachment.
+    fn holds_attachment(&self, attachment_id: AttachmentId) -> bool {
+        self.attachments
+            .lock()
+            .expect("the attachment list is not poisoned")
+            .contains(&attachment_id)
+    }
+
+    /// Takes every attachment this connection still owns.
+    fn take_attachments(&self) -> Vec<AttachmentId> {
+        std::mem::take(
+            &mut *self
+                .attachments
+                .lock()
+                .expect("the attachment list is not poisoned"),
+        )
+    }
+}
+
+/// What one connection knows about itself.
+#[derive(Debug)]
+pub struct ConnectionState {
+    /// What a request reads of this connection.
+    pub facts: ConnectionFacts,
     /// Where this connection's requests originally entered, when it is a process bridge's helper
     /// and said so in its hello. Kept for the life of the connection: a connection says hello once.
     ///
@@ -8639,10 +8864,6 @@ pub struct ConnectionState {
     pub origin: Option<kr_protocol::local::BridgeOrigin>,
     /// What the peer said it can receive. Nothing this worker sends exceeds it.
     pub peer_limits: kr_protocol::hello::ReceiveLimits,
-    /// The generation this connection proved, when it is a controller.
-    pub generation: Option<ControllerGeneration>,
-    /// What a controller connection is for, as it declared before presenting a token.
-    pub controller_role: ControllerConnectionRole,
     /// The event stream identifier notifications carry.
     pub stream_id: StreamId,
     /// The challenge this connection issued to a controller, consumed once.
@@ -8654,15 +8875,8 @@ pub struct ConnectionState {
     /// swept, and the sweep waits for the lock the installation holds, so an installation either
     /// sees the latch or is undone by the sweep.
     pub(crate) withdrawn: Arc<Withdrawal>,
-    /// The attachments this connection owns.
-    ///
-    /// Shared with the connection's registration, so a withdrawal can take them back without
-    /// waiting for this connection's own loop to come back round.
-    pub attachments: Arc<Mutex<Vec<AttachmentId>>>,
     /// The output subscription waiting to be started.
     pub subscribed: Option<(AttachmentId, crate::output::OutputStream)>,
-    /// The last input sequence accepted on this connection.
-    pub input_sequence: u64,
     /// A close that has been admitted and whose acceptance has not yet been written.
     pub close_gate: Option<(kr_protocol::ids::ActionId, crate::runtime::CloseGate)>,
     /// Whether the request this connection is answering now is one the local owner's lease
@@ -8709,11 +8923,6 @@ pub struct ConnectionState {
     semantic_snapshots: SemanticSnapshots,
     /// The delivery task this connection owns, cancelled when the connection goes.
     delivery: Option<Delivery>,
-    /// The host-issued principal this connection acts under.
-    ///
-    /// It is built from the authenticated operating-system caller. A local caller never asserts
-    /// its own provenance and never borrows a device identity.
-    pub actor_id: ActorId,
     /// The calling process the kernel named, where the platform reports one.
     ///
     /// It is what a question's source binding is established from, and it comes from the socket
@@ -8745,21 +8954,24 @@ impl ConnectionState {
         attachments: Arc<Mutex<Vec<AttachmentId>>>,
     ) -> Self {
         Self {
-            connection_id,
-            negotiated: false,
-            controller: false,
-            client_kind: LocalClientKind::Cli,
-            local: None,
+            facts: ConnectionFacts {
+                connection_id,
+                negotiated: false,
+                controller: false,
+                client_kind: LocalClientKind::Cli,
+                local: None,
+                generation: None,
+                controller_role: ControllerConnectionRole::Authority,
+                attachments,
+                actor_id: ActorId::new(format!("local:{}", peer.uid))
+                    .unwrap_or_else(|_| ActorId::new("local").expect("a valid principal")),
+            },
             origin: None,
             peer_limits: kr_protocol::hello::ReceiveLimits::default(),
-            generation: None,
-            controller_role: ControllerConnectionRole::Authority,
             stream_id: StreamId::new(OUTPUT_STREAM).expect("a valid stream name"),
             generation_nonce: None,
             withdrawn: Arc::new(Withdrawal::default()),
-            attachments,
             subscribed: None,
-            input_sequence: 0,
             close_gate: None,
             answering_held: false,
             pending_launch: None,
@@ -8777,8 +8989,6 @@ impl ConnectionState {
             restoration: None,
             semantic_snapshots: SemanticSnapshots::default(),
             delivery: None,
-            actor_id: ActorId::new(format!("local:{}", peer.uid))
-                .unwrap_or_else(|_| ActorId::new("local").expect("a valid principal")),
             peer_pid: peer.pid,
             peer_process: peer
                 .pid
@@ -8788,45 +8998,11 @@ impl ConnectionState {
         }
     }
 
-    /// Records an attachment this connection now owns.
-    fn add_attachment(&self, attachment_id: AttachmentId) {
-        self.attachments
-            .lock()
-            .expect("the attachment list is not poisoned")
-            .push(attachment_id);
-    }
-
-    /// Forgets an attachment this connection has given up.
-    fn remove_attachment(&self, attachment_id: AttachmentId) {
-        self.attachments
-            .lock()
-            .expect("the attachment list is not poisoned")
-            .retain(|held| *held != attachment_id);
-    }
-
     /// Returns whether this connection is owed a keepalive: it has negotiated and a process
     /// bridge's helper made it, and the bridge's invoker is the one reader of such a stream that
     /// waits on silence.
     fn owes_keepalive(&self) -> bool {
-        self.negotiated && self.origin.is_some()
-    }
-
-    /// Returns whether this connection owns the attachment.
-    fn holds_attachment(&self, attachment_id: AttachmentId) -> bool {
-        self.attachments
-            .lock()
-            .expect("the attachment list is not poisoned")
-            .contains(&attachment_id)
-    }
-
-    /// Takes every attachment this connection still owns.
-    fn take_attachments(&self) -> Vec<AttachmentId> {
-        std::mem::take(
-            &mut *self
-                .attachments
-                .lock()
-                .expect("the attachment list is not poisoned"),
-        )
+        self.facts.negotiated && self.origin.is_some()
     }
 
     fn next_request_id(&mut self) -> RequestId {
