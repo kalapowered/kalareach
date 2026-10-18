@@ -574,9 +574,11 @@ async fn a_token_of_another_account_ends_the_call_and_a_warning_stands_before_th
     let started = scene.start().await;
     assert!(started["value"]["outcome"]["started"].is_object());
 
+    // The device is busy with a call until it has finished ending it: it says so by what it is
+    // doing, and another start is refused until then.
     let ended = scene
         .state_where("a call that ended", |state| {
-            state["ended"]["cause"] == "no_such_call"
+            state["ended"]["cause"] == "no_such_call" && state["setting_up"] == false
         })
         .await;
     assert_eq!(ended["running"], false);
@@ -1574,6 +1576,12 @@ async fn forgetting_the_host_ends_the_call_and_owes_the_revocation() {
         .call("pairing_view", json!({}))
         .expect("the pairing screen")["hosts"][0]["reference"]
         .clone();
+    // The voice service confirms the closure late, as a busy one does: the end is reported while the
+    // device waits for it, and the closure is shown a moment after.
+    scene
+        .stand_in
+        .control()
+        .confirm_closures_after(Duration::from_secs(2));
     // The host goes away, and the person forgets it before it is back.
     scene.stop_host().await;
     scene
@@ -1613,8 +1621,13 @@ async fn forgetting_the_host_ends_the_call_and_owes_the_revocation() {
         closes + 120_000,
         "{ended}"
     );
-    // The host cannot tell the voice service, so the device does, by the call's own control.
-    assert_eq!(ended["ended"]["broker"], "closed", "{ended}");
+    // The host cannot tell the voice service, so the device does, by the call's own control. The end
+    // is reported while the service's closure is awaited, so the closure is waited for.
+    scene
+        .state_where("the closure at the service", |state| {
+            state["ended"]["broker"] == "closed"
+        })
+        .await;
     assert!(commands_sent(&scene).contains(&"close".to_owned()));
 }
 
@@ -1935,7 +1948,7 @@ async fn an_owner_that_fails_ends_the_call_it_held_in_full() {
 
     let ended = scene
         .state_where("the owner's failure", |state| {
-            state["ended"]["cause"] == "owner_failed"
+            state["ended"]["cause"] == "owner_failed" && state["setting_up"] == false
         })
         .await;
     assert_eq!(ended["running"], false);
