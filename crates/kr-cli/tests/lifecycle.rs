@@ -3355,9 +3355,9 @@ impl AnotherBuild {
 impl Drop for AnotherBuild {
     fn drop(&mut self) {
         let _ = kr_ipc::descriptor::retire(&self.environment, self.session_id);
-        if let Some(runtime) = self.runtime.take() {
-            runtime.shutdown_background();
-        }
+        // Dropped, not shut down in the background: the endpoint is free once this returns, so a
+        // case that starts another worker on the same display next finds nobody listening.
+        drop(self.runtime.take());
     }
 }
 
