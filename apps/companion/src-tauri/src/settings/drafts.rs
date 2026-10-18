@@ -22,9 +22,9 @@
 //! What a device can read of a host's privacy mode is [`DraftHosts`]'s to say, and it says one of
 //! three things. A host with privacy mode off lets its drafts be published; a host with it on does
 //! not, and an answer that arrives after the host went private is discarded by the store's
-//! generation, which is moved while the answer is out; and a host this device cannot read, because
-//! it is not connected to it or holds no right to ask, is treated as private. Each draft kept here,
-//! and why, is in the view the page shows.
+//! generation, which is moved before the answer is settled; and a host this device cannot read,
+//! because it is not connected to it or holds no right to ask, is treated as private. Each draft
+//! kept here, and why, is in the view the page shows.
 //!
 //! # What lives where
 //!
@@ -52,14 +52,16 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::Duration;
 
 use kr_client::ClientError;
 use kr_client::drafts::{
     Draft, DraftError, DraftRemoval, DraftSealer, DraftStore, DraftSync, Published, SyncCheckpoint,
 };
 use kr_client::services::sync::KnownRevision;
-use kr_client::services::{ManagedSyncService, SyncBackupService, SyncPosition};
+use kr_client::services::{
+    ManagedSyncService, ServiceFuture, SyncBackupService, SyncDispatch, SyncExchanged, SyncFetched,
+    SyncPosition, SyncRequestFence, SyncRequestStatus,
+};
 use kr_client::sync::membership::CollectionRef;
 use kr_client::sync::{
     CollectionKeys, RequestState, SharedCollectionService, SyncClient, SyncError, SyncStore,
@@ -91,10 +93,6 @@ const PULL: &str = "pull";
 /// The most a record may be, in bytes. Each is a list of identifiers.
 const RECORD_LIMIT: u64 = 1024 * 1024;
 
-/// How long a publication is out before the host's privacy mode is read again, and then how often.
-/// A publication that finishes sooner asks the host nothing.
-const WATCH_EVERY: Duration = Duration::from_secs(1);
-
 /// What a device can read of one host's privacy mode.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HostPrivacy {
@@ -122,9 +120,11 @@ pub enum Holds {
     Here(DraftHost),
     /// This device is connected to a host, and the host holds no such session.
     NotHere,
-    /// This device could not tell: it is not connected, holds no right to ask, or the host did not
-    /// answer.
+    /// This device could not tell: it is not connected, or the host did not answer.
     Unknown,
+    /// The host would not say for this session, as it refuses a session outside the right it
+    /// gave this device. Another session may still be answered.
+    Refused,
 }
 
 /// What drafts sync asks of the hosts this device knows.
@@ -211,6 +211,9 @@ impl DraftsView {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Owed {
+    /// Names this entry, so that a pass drops the entry it read and not one a removal has made
+    /// of the same draft since.
+    id: String,
     draft: String,
     /// The host the draft was for, when known.
     host: Option<String>,
@@ -259,7 +262,152 @@ pub struct Collection<'a> {
 /// The store a host's drafts leave through, and the client that fences it.
 struct HostStore {
     drafts: DraftSync,
-    client: SyncClient,
+    client: Arc<SyncClient>,
+    /// What the host's privacy mode read as the last time an answer was held for it.
+    seen: Arc<Mutex<Option<HostPrivacy>>>,
+}
+
+/// A host's service as its drafts reach it. An answer is not handed on until the host's privacy
+/// mode has been read again and the host's store moved to it, so the generation an answer is
+/// settled against is the one in force when the answer arrives, and not the one in force when
+/// the request left. A store that is already fenced stays fenced for the rest of the pass, so
+/// reading again could change nothing.
+struct Gate {
+    inner: Arc<dyn SyncBackupService>,
+    hosts: Arc<dyn DraftHosts>,
+    environment: EnvironmentId,
+    client: Arc<SyncClient>,
+    seen: Arc<Mutex<Option<HostPrivacy>>>,
+}
+
+impl std::fmt::Debug for Gate {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("Gate").finish_non_exhaustive()
+    }
+}
+
+impl Gate {
+    async fn read_again(&self) {
+        if self.client.is_fenced().unwrap_or(true) {
+            return;
+        }
+        let state = self.hosts.privacy(self.environment).await;
+        // A store that cannot be moved to the mode the host reports settles against the
+        // generation it holds all the same: the draft is then shown as kept here.
+        let _ = apply_privacy(&self.client, &state);
+        *self.seen.lock().unwrap_or_else(PoisonError::into_inner) = Some(state);
+    }
+}
+
+impl SyncBackupService for Gate {
+    fn compare_exchange<'a>(
+        &'a self,
+        collection: &'a str,
+        request_id: Uuid,
+        signed_at_ms: u64,
+        expected: Option<SyncPosition>,
+        ciphertext: &'a [u8],
+    ) -> ServiceFuture<'a, SyncExchanged> {
+        Box::pin(async move {
+            let answer = self
+                .inner
+                .compare_exchange(collection, request_id, signed_at_ms, expected, ciphertext)
+                .await;
+            self.read_again().await;
+            answer
+        })
+    }
+
+    fn compare_exchange_dispatched<'a>(
+        &'a self,
+        collection: &'a str,
+        request_id: Uuid,
+        signed_at_ms: u64,
+        expected: Option<SyncPosition>,
+        ciphertext: &'a [u8],
+    ) -> ServiceFuture<'a, SyncDispatch> {
+        Box::pin(async move {
+            let answer = self
+                .inner
+                .compare_exchange_dispatched(
+                    collection,
+                    request_id,
+                    signed_at_ms,
+                    expected,
+                    ciphertext,
+                )
+                .await;
+            self.read_again().await;
+            answer
+        })
+    }
+
+    fn compare_remove<'a>(
+        &'a self,
+        collection: &'a str,
+        request_id: Uuid,
+        signed_at_ms: u64,
+        expected: Option<SyncPosition>,
+    ) -> ServiceFuture<'a, SyncExchanged> {
+        Box::pin(async move {
+            let answer = self
+                .inner
+                .compare_remove(collection, request_id, signed_at_ms, expected)
+                .await;
+            self.read_again().await;
+            answer
+        })
+    }
+
+    fn request_status<'a>(
+        &'a self,
+        collection: &'a str,
+        request_id: Uuid,
+    ) -> ServiceFuture<'a, SyncRequestStatus> {
+        Box::pin(async move {
+            let answer = self.inner.request_status(collection, request_id).await;
+            self.read_again().await;
+            answer
+        })
+    }
+
+    fn fence_request<'a>(
+        &'a self,
+        collection: &'a str,
+        request_id: Uuid,
+        first_signed_at_ms: u64,
+        last_signed_at_ms: u64,
+    ) -> ServiceFuture<'a, SyncRequestFence> {
+        Box::pin(async move {
+            let answer = self
+                .inner
+                .fence_request(
+                    collection,
+                    request_id,
+                    first_signed_at_ms,
+                    last_signed_at_ms,
+                )
+                .await;
+            self.read_again().await;
+            answer
+        })
+    }
+
+    fn fetch<'a>(&'a self, collection: &'a str) -> ServiceFuture<'a, SyncFetched> {
+        Box::pin(async move {
+            let answer = self.inner.fetch(collection).await;
+            self.read_again().await;
+            answer
+        })
+    }
+
+    fn resolve<'a>(
+        &'a self,
+        collection: &'a str,
+        retained: kr_protocol::ids::SyncConflictId,
+    ) -> ServiceFuture<'a, bool> {
+        self.inner.resolve(collection, retained)
+    }
 }
 
 /// What a pass knows of each host a draft or a removal is for.
@@ -417,7 +565,7 @@ impl DraftsSync {
         // The removals owed are read before the drafts are listed. A removal takes its entry
         // before it takes the draft, under the lock this read takes, so an entry read here is of a
         // draft that is gone, and a draft listed after it is one no removal is in hand for.
-        let owed = self.owed()?;
+        let owed = tokio::task::block_in_place(|| self.owed())?;
         let listing = blocking({
             let store = store.clone();
             move || store.list().map_err(crate::drafts::failure)
@@ -440,6 +588,7 @@ impl DraftsSync {
                 owed.iter()
                     .filter_map(|owes| owes.host.as_deref().and_then(environment_of)),
             )
+            .chain(self.hosts_with_work_out())
             .collect();
         let names: BTreeMap<EnvironmentId, String> = hosts_of
             .values()
@@ -522,7 +671,7 @@ impl DraftsSync {
                     );
                     changed = true;
                 }
-                Holds::NotHere => {}
+                Holds::NotHere | Holds::Refused => {}
                 Holds::Unknown => asking = false,
             }
         }
@@ -578,14 +727,22 @@ impl DraftsSync {
         state: &HostPrivacy,
     ) -> Result<HostStore> {
         let directory = self.directory.join(environment.to_string()).join(STORE);
-        let client = SyncClient::new(
+        let client = Arc::new(SyncClient::new(
             Arc::clone(service),
             Arc::clone(sealer),
             SyncStore::open(&directory).map_err(super::sync::sync_failure)?,
-        );
+        ));
         apply_privacy(&client, state)?;
+        let seen = Arc::new(Mutex::new(Some(state.clone())));
+        let gate: Arc<dyn SyncBackupService> = Arc::new(Gate {
+            inner: Arc::clone(service),
+            hosts: Arc::clone(&self.hosts),
+            environment,
+            client: Arc::clone(&client),
+            seen: Arc::clone(&seen),
+        });
         let drafts = DraftSync::new(
-            Arc::clone(service),
+            gate,
             Arc::clone(sealer),
             SyncStore::open(&directory).map_err(super::sync::sync_failure)?,
         );
@@ -594,7 +751,11 @@ impl DraftsSync {
             .reconcile_unsettled(store, now())
             .await
             .map_err(super::sync::sync_failure)?;
-        Ok(HostStore { drafts, client })
+        Ok(HostStore {
+            drafts,
+            client,
+            seen,
+        })
     }
 
     /// Makes the removals the service is owed, and returns the ones that still are.
@@ -613,31 +774,32 @@ impl DraftsSync {
         removals: &Removals<'_>,
         problem: &mut Option<CommandError>,
     ) -> Result<Vec<Owed>> {
+        // The entries this pass ends, by identity, and the drafts whose note goes with them.
         let mut made: BTreeSet<String> = BTreeSet::new();
+        let mut forget: BTreeSet<DraftId> = BTreeSet::new();
         let mut listed: Option<Option<kr_client::services::SyncComparison>> = None;
         for owes in removals.owed {
             let Some(id) = draft_of(&owes.draft) else {
-                made.insert(owes.draft.clone());
+                made.insert(owes.id.clone());
                 continue;
             };
             // An entry of a draft that is still stored is no removal's: it is what a removal that
-            // did not happen left.
+            // did not happen left, and the draft keeps its note.
             if removals.own.iter().any(|draft| draft.draft_id == id) {
-                made.insert(owes.draft.clone());
+                made.insert(owes.id.clone());
                 continue;
             }
             // A host's removals are made through its store, so they wait while the host's privacy
             // mode is on; one with no host goes through the store of what came down.
             let drafts = match owes.host.as_deref().and_then(environment_of) {
-                Some(environment) => removals
-                    .hosts
-                    .stores
-                    .get(&environment)
-                    .map(|host| &host.drafts),
-                None => Some(removals.puller),
+                Some(environment) => match removals.hosts.stores.get(&environment) {
+                    Some(host) if host.client.is_fenced().unwrap_or(true) => continue,
+                    Some(host) => &host.drafts,
+                    None => continue,
+                },
+                None => removals.puller,
             };
-            let Some(drafts) = drafts else { continue };
-            let seen = match self.seen_of(id, owes.note, removals.store).await {
+            let seen = match self.seen_of(id, owes.note, removals.store, problem).await {
                 Ok(seen) => seen,
                 Err(error) => {
                     problem.get_or_insert(error);
@@ -648,7 +810,8 @@ impl DraftsSync {
                 (_, Out::Dispatched) => continue,
                 (Some(position), _) => position,
                 (None, Out::Nothing) => {
-                    made.insert(owes.draft.clone());
+                    made.insert(owes.id.clone());
+                    forget.insert(id);
                     continue;
                 }
                 (None, Out::Unaccounted) => {
@@ -668,7 +831,8 @@ impl DraftsSync {
                     match held {
                         Some(held) => held.position,
                         None => {
-                            made.insert(owes.draft.clone());
+                            made.insert(owes.id.clone());
+                            forget.insert(id);
                             continue;
                         }
                     }
@@ -678,7 +842,8 @@ impl DraftsSync {
             for attempt in 0..2 {
                 match drafts.remove(id, at, now()).await {
                     Ok(DraftRemoval::Removed { .. } | DraftRemoval::AlreadyGone) => {
-                        made.insert(owes.draft.clone());
+                        made.insert(owes.id.clone());
+                        forget.insert(id);
                     }
                     // Written since the place this device named, which only this device's own
                     // later publication can have done: the removal is made again against it.
@@ -696,9 +861,9 @@ impl DraftsSync {
                 break;
             }
         }
-        // What was made leaves the ledger, and so does the note a settled publication wrote of a
-        // draft that was gone by then: nothing is left of a draft whose copy is gone.
-        for id in made.iter().filter_map(|draft| draft_of(draft)) {
+        // The note a settled publication wrote of a draft that was gone by then goes too: nothing
+        // is left of a draft whose copy is gone.
+        for id in forget {
             let store = removals.store.clone();
             if let Err(error) =
                 blocking(move || store.forget_checkpoint(id).map_err(crate::drafts::failure)).await
@@ -707,7 +872,7 @@ impl DraftsSync {
             }
         }
         // What was added to the ledger while the pass ran stays.
-        self.forget_removals(&made)
+        tokio::task::block_in_place(|| self.forget_removals(&made))
     }
 
     /// What this device knows of where the service holds the draft, and whether a publication of
@@ -717,6 +882,7 @@ impl DraftsSync {
         id: DraftId,
         ledger: Option<SyncCheckpoint>,
         store: &DraftStore,
+        problem: &mut Option<CommandError>,
     ) -> Result<Seen> {
         let note = {
             let store = store.clone();
@@ -729,33 +895,78 @@ impl DraftsSync {
             ),
             out: Out::Nothing,
         };
-        for directory in self.host_stores() {
-            let held = SyncStore::open(&directory).map_err(super::sync::sync_failure)?;
-            for publication in held
-                .publications()
-                .map_err(super::sync::sync_failure)?
-                .items
-                .iter()
-                .filter(|publication| publication.object_id.get() == id.get())
-            {
-                seen.position = newer(seen.position, Some(publication.position));
+        // A record this build cannot read, a store it cannot open and a write into a history it
+        // does not follow say nothing of where the draft is: the service is asked what it holds.
+        let mut unknown = |error: Option<CommandError>, seen: &mut Seen| {
+            seen.out = seen.out.max(Out::Unaccounted);
+            if let Some(error) = error {
+                problem.get_or_insert(error);
             }
-            for request in held
-                .requests()
-                .map_err(super::sync::sync_failure)?
-                .items
-                .iter()
-                .filter(|request| request.object_id.get() == id.get())
-            {
-                let out = match request.state {
-                    RequestState::Dispatched { .. } => Out::Dispatched,
-                    RequestState::Unaccounted => Out::Unaccounted,
-                    _ => Out::Nothing,
-                };
-                seen.out = seen.out.max(out);
+        };
+        for directory in self.host_stores() {
+            let held = match SyncStore::open(&directory) {
+                Ok(held) => held,
+                Err(error) => {
+                    unknown(Some(super::sync::sync_failure(error)), &mut seen);
+                    continue;
+                }
+            };
+            match held.publications() {
+                Ok(listing) => {
+                    if !listing.unreadable.is_empty() {
+                        unknown(None, &mut seen);
+                    }
+                    for publication in listing
+                        .items
+                        .iter()
+                        .filter(|publication| publication.object_id.get() == id.get())
+                    {
+                        seen.position = newer(seen.position, Some(publication.position));
+                    }
+                }
+                Err(error) => unknown(Some(super::sync::sync_failure(error)), &mut seen),
+            }
+            match held.requests() {
+                Ok(listing) => {
+                    if !listing.unreadable.is_empty() {
+                        unknown(None, &mut seen);
+                    }
+                    for request in listing
+                        .items
+                        .iter()
+                        .filter(|request| request.object_id.get() == id.get())
+                    {
+                        let out = match request.state {
+                            RequestState::Dispatched { .. } => Out::Dispatched,
+                            RequestState::Unaccounted | RequestState::Diverged { .. } => {
+                                Out::Unaccounted
+                            }
+                            _ => Out::Nothing,
+                        };
+                        seen.out = seen.out.max(out);
+                    }
+                }
+                Err(error) => unknown(Some(super::sync::sync_failure(error)), &mut seen),
             }
         }
         Ok(seen)
+    }
+
+    /// The hosts whose store holds a publication that left without an answer, whatever draft it
+    /// was for and wherever that draft is for now: its answer is asked for, or it is waited for for
+    /// ever. A store that cannot be read is named too, so that opening it says why.
+    fn hosts_with_work_out(&self) -> Vec<EnvironmentId> {
+        self.host_stores()
+            .into_iter()
+            .filter(|directory| {
+                SyncStore::open(directory)
+                    .and_then(|held| held.requests())
+                    .map_or(true, |listing| {
+                        listing.items.iter().any(|request| request.dispatched())
+                    })
+            })
+            .filter_map(|directory| environment_of(directory.parent()?.file_name()?.to_str()?))
+            .collect()
     }
 
     /// The directory of every host's store there is on this computer.
@@ -844,9 +1055,34 @@ impl DraftsSync {
             if !self.enabled()? {
                 break;
             }
-            match self.publish_watched(host, opened, store, draft).await {
+            match opened
+                .drafts
+                .publish(store, draft.draft_id, draft.revision, now())
+                .await
+            {
                 Ok(Published::Conflicted { .. }) => self.told.tell(),
-                Ok(Published::Accepted { .. } | Published::Discarded { .. }) => {}
+                Ok(Published::Accepted { .. }) => {}
+                // The host went private, or could not be read, while the publication was out, and
+                // the answer was discarded: the draft is kept here for the reason the host gave.
+                Ok(Published::Discarded { .. }) => {
+                    let seen = opened
+                        .seen
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .clone();
+                    match seen {
+                        // It lets go again at a newer generation: the next pass publishes.
+                        Some(HostPrivacy::Off { .. }) => {}
+                        Some(HostPrivacy::Unreadable { reason }) => {
+                            *kept
+                                .entry((Some(host), Why::Unreadable, Some(reason)))
+                                .or_default() += 1;
+                        }
+                        Some(HostPrivacy::On { .. }) | None => {
+                            *kept.entry((Some(host), Why::Private, None)).or_default() += 1;
+                        }
+                    }
+                }
                 Err(SyncError::Fenced { .. }) => {
                     *kept.entry((Some(host), Why::Private, None)).or_default() += 1;
                 }
@@ -863,39 +1099,6 @@ impl DraftsSync {
             }
         }
         Ok(kept)
-    }
-
-    /// Publishes one draft, and while the publication is out reads the host's privacy mode again
-    /// now and then, so that a host that goes private in that time moves the store's generation
-    /// and the answer, when it comes, is discarded and not acted on.
-    async fn publish_watched(
-        &self,
-        environment: EnvironmentId,
-        host: &HostStore,
-        store: &DraftStore,
-        draft: &Draft,
-    ) -> std::result::Result<Published, SyncError> {
-        let publish = host
-            .drafts
-            .publish(store, draft.draft_id, draft.revision, now());
-        let watching = async {
-            loop {
-                tokio::time::sleep(WATCH_EVERY).await;
-                // A host that cannot be read now says nothing: the content was let go while it
-                // could, and a store fenced for a read that failed would refuse the answer to a
-                // write the service has applied.
-                let state = self.hosts.privacy(environment).await;
-                if !matches!(state, HostPrivacy::Unreadable { .. }) {
-                    // A store that cannot be moved to the mode the host reports refuses the answer
-                    // all the same, when the publication settles against the generation it holds.
-                    let _ = apply_privacy(&host.client, &state);
-                }
-            }
-        };
-        tokio::select! {
-            outcome = publish => outcome,
-            () = watching => unreachable!("a watch that ends is a loop that broke"),
-        }
     }
 
     /// The drafts of other devices that are new or changed, kept beside this device's own.
@@ -1041,7 +1244,7 @@ impl DraftsSync {
         let _file = self.records_file()?;
         let mut owed: Vec<Owed> = self.read(REMOVALS)?.unwrap_or_default();
         if !made.is_empty() {
-            owed.retain(|owes| !made.contains(&owes.draft));
+            owed.retain(|owes| !made.contains(&owes.id));
             self.write(REMOVALS, &owed)?;
         }
         Ok(owed)
@@ -1102,8 +1305,8 @@ struct Removals<'a> {
 struct Removal<'a> {
     sync: &'a DraftsSync,
     draft: DraftId,
-    /// Whether this removal wrote the entry, because drafts sync has been used and no other removal
-    /// of the draft had.
+    /// Whether this removal wrote the entry, because drafts sync has been used and none was there
+    /// for the draft.
     recorded: bool,
     ended: bool,
     _records: MutexGuard<'a, ()>,
@@ -1126,11 +1329,15 @@ impl Removing for Removal<'_> {
             let key = self.draft.to_string();
             match owed.iter_mut().find(|owes| owes.draft == key) {
                 Some(owes) => owes.note = note.or(owes.note),
-                None => owed.push(Owed {
-                    draft: key,
-                    host: None,
-                    note,
-                }),
+                None => {
+                    let Ok(id) = fresh_entry() else { return };
+                    owed.push(Owed {
+                        id,
+                        draft: key,
+                        host: None,
+                        note,
+                    });
+                }
             }
             let _ = self.sync.write(REMOVALS, &owed);
             self.sync.wake_when_on();
@@ -1171,17 +1378,23 @@ impl DraftWatch for DraftsSync {
             let hosts: BTreeMap<String, HostRecord> =
                 self.read(HOSTS).ok().flatten().unwrap_or_default();
             let key = draft.to_string();
-            // An entry another window's removal made stays as it is, with the note it holds: this
-            // removal made none, so it withdraws none.
-            if owed.iter().all(|owes| owes.draft != key) {
-                owed.push(Owed {
-                    host: hosts.get(&key).map(|host| host.environment.clone()),
-                    draft: key,
-                    note: None,
-                });
-                self.write(REMOVALS, &owed)?;
-                recorded = true;
+            let id = fresh_entry()?;
+            // An entry that is there already, another window's removal of the draft or what one
+            // that did not happen left, stays with the note it holds, under an identity of its
+            // own again: a pass that read it before this removal began does not drop it.
+            match owed.iter_mut().find(|owes| owes.draft == key) {
+                Some(held) => held.id = id,
+                None => {
+                    owed.push(Owed {
+                        id,
+                        host: hosts.get(&key).map(|host| host.environment.clone()),
+                        draft: key,
+                        note: None,
+                    });
+                    recorded = true;
+                }
             }
+            self.write(REMOVALS, &owed)?;
         }
         Ok(Box::new(Removal {
             sync: self,
@@ -1199,6 +1412,13 @@ impl DraftWatch for DraftsSync {
             .flatten()
             .is_some_and(|copies| copies.contains(&of.to_string()))
     }
+}
+
+/// A fresh identity for a ledger entry.
+fn fresh_entry() -> Result<String> {
+    kr_client::sync::fresh_object_id()
+        .map(|id| id.get().to_string())
+        .map_err(CommandError::from)
 }
 
 /// The host a draft is for, when a host said it holds the session the draft is for now.

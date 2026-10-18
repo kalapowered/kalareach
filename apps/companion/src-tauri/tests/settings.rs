@@ -130,10 +130,11 @@ struct ScriptedHosts {
     owners: Mutex<BTreeMap<SessionId, DraftHost>>,
     /// The hosts this computer is connected to.
     connected: Mutex<BTreeSet<EnvironmentId>>,
+    /// The hosts that refuse to say whether they hold a session, as one does for a session outside
+    /// the right it gave this device.
+    refusing: Mutex<BTreeSet<EnvironmentId>>,
     /// How many times a host was asked whether it holds a session.
     asked: Mutex<u32>,
-    /// How many times the privacy mode of each host was read, for a test that waits for a read.
-    read_count: tokio::sync::watch::Sender<BTreeMap<EnvironmentId, u32>>,
 }
 
 impl ScriptedHosts {
@@ -144,8 +145,8 @@ impl ScriptedHosts {
             reads: Mutex::default(),
             owners: Mutex::default(),
             connected: Mutex::default(),
+            refusing: Mutex::default(),
             asked: Mutex::default(),
-            read_count: tokio::sync::watch::channel(BTreeMap::new()).0,
         }
     }
 
@@ -178,6 +179,14 @@ impl ScriptedHosts {
             .insert(host.environment);
     }
 
+    /// `host` refuses to say whether it holds a session.
+    fn refuse_to_say(&self, host: &DraftHost) {
+        self.refusing
+            .lock()
+            .expect("the record")
+            .insert(host.environment);
+    }
+
     fn times_asked_who_holds(&self) -> u32 {
         *self.asked.lock().expect("the record")
     }
@@ -190,15 +199,6 @@ impl ScriptedHosts {
             .get(&host)
             .copied()
             .unwrap_or(0)
-    }
-
-    /// Waits until the privacy mode of `host` has been read more than `after` times.
-    async fn read_after(&self, host: EnvironmentId, after: u32) {
-        let mut reads = self.read_count.subscribe();
-        reads
-            .wait_for(|count| count.get(&host).copied().unwrap_or(0) > after)
-            .await
-            .expect("the hosts are kept");
     }
 }
 
@@ -213,6 +213,15 @@ impl DraftHosts for ScriptedHosts {
             Holds::Unknown
         } else {
             match self.owners.lock().expect("the record").get(&session) {
+                Some(host)
+                    if self
+                        .refusing
+                        .lock()
+                        .expect("the record")
+                        .contains(&host.environment) =>
+                {
+                    Holds::Refused
+                }
                 Some(host) if connected.contains(&host.environment) => Holds::Here(host.clone()),
                 _ => Holds::NotHere,
             }
@@ -230,9 +239,6 @@ impl DraftHosts for ScriptedHosts {
             *asked += 1;
             *asked
         };
-        self.read_count.send_modify(|counts| {
-            *counts.entry(environment).or_default() += 1;
-        });
         let turned = self
             .turning
             .lock()
@@ -1980,13 +1986,13 @@ async fn a_private_host_is_read_once_for_all_its_drafts_in_a_pass() {
     assert_eq!(computer.hosts.reads_of(environment), 1);
 }
 
-/// The first publication of a draft is held at the service: it acts on it and gives its answer
-/// when it is let go. The host says `says` meanwhile, and the answer is let go once the pass has
-/// read the host again. What is noted of the draft is returned.
+/// The first publication of a draft is held at the service: it acts on it and gives its answer when
+/// it is let go. The host says `says` meanwhile, without the pass having read it since. What is
+/// noted of the draft is returned, and what the pass reports.
 async fn host_says_while_a_publication_is_out(
     computer: &Computer,
     says: HostPrivacy,
-) -> Option<SyncCheckpoint> {
+) -> (Option<SyncCheckpoint>, Value) {
     let (environment, studio) = host(1, "studio");
     computer
         .hosts
@@ -2006,78 +2012,59 @@ async fn host_says_while_a_publication_is_out(
         async move { settings.sync_now().await }
     });
     web.requests_reach(SYNC_PATH, asked + 2).await;
-    let reads = computer.hosts.reads_of(environment);
-    let fenced = matches!(says, HostPrivacy::On { .. });
     computer.hosts.say(environment, says);
-    let patience = std::time::Duration::from_secs(60);
-    if fenced {
-        // The pass reads the host while the publication is out, and moves the store's generation.
-        tokio::time::timeout(patience, computer.hosts.read_after(environment, reads))
-            .await
-            .expect("the pass read the host again");
-        let store = SyncStore::open(
-            computer
-                .data
-                .path()
-                .join("settings-sync")
-                .join("drafts")
-                .join(environment.to_string())
-                .join("store"),
-        )
-        .expect("the host's store");
-        tokio::time::timeout(patience, async {
-            while !store.privacy().expect("the generation").fenced {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("the store was moved to the host's generation");
-    } else {
-        // A second read is made after the first has been acted on.
-        tokio::time::timeout(patience, computer.hosts.read_after(environment, reads + 1))
-            .await
-            .expect("the pass read the host twice");
-    }
     web.release_held();
-    step.await.expect("the step ran").expect("the step ended");
+    let view = step.await.expect("the step ran").expect("the step ended");
 
-    page.app
+    let noted = page
+        .app
         .state::<AppState>()
         .drafts()
         .store()
         .expect("drafts")
         .checkpoint(draft)
-        .expect("the note")
+        .expect("the note");
+    (noted, serde_json::to_value(view).expect("a view"))
 }
 
-/// A host that goes private while a publication is out at the service moves the store's generation
-/// while the answer is out, so the answer is discarded when it comes: nothing is noted of the draft,
-/// and the draft goes again when the host lets it.
+/// A host that goes private while a publication is out at the service is read again when the answer
+/// arrives, before the answer is settled: the answer is discarded and nothing is noted of the
+/// draft, whatever the pass had read of the host before, and the view says the draft is kept for
+/// the host's privacy mode.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_host_that_goes_private_while_a_publication_is_out_has_the_answer_discarded() {
     let computer = Computer::new().await;
-    let noted =
+    let (noted, view) =
         host_says_while_a_publication_is_out(&computer, HostPrivacy::On { generation: 2 }).await;
     assert_eq!(
         noted, None,
         "the answer to a publication admitted under the old generation is not noted"
     );
+    assert_eq!(
+        kept_here(&view),
+        vec![("studio".to_owned(), "private".to_owned(), 1)],
+        "{view}"
+    );
 }
 
-/// A host that cannot be read while a publication is out says nothing about its privacy mode: the
-/// content was let go while it could be read, and the answer to a write the service applied is
-/// noted as it would be.
+/// A host that cannot be read when the answer arrives is treated as private from then on: the store
+/// is fenced at the generation it holds, so what an answer brings down is withheld. The account of
+/// a write the service applied is kept all the same.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_host_that_cannot_be_read_while_a_publication_is_out_leaves_the_answer_to_be_noted() {
+async fn a_host_that_cannot_be_read_when_the_answer_arrives_is_treated_as_private() {
     let computer = Computer::new().await;
-    let noted = host_says_while_a_publication_is_out(
+    let (noted, view) = host_says_while_a_publication_is_out(
         &computer,
         HostPrivacy::Unreadable {
             reason: "the connection dropped".to_owned(),
         },
     )
     .await;
-    assert!(noted.is_some(), "the draft is noted as published");
+    assert!(noted.is_some(), "the write the service applied is noted");
+    assert!(
+        kept_here(&view).is_empty(),
+        "it left, and nothing waits: {view}"
+    );
 }
 
 /// A host that goes private while a pass is out at the service is read again just before each draft
@@ -2092,11 +2079,11 @@ async fn a_host_that_goes_private_during_a_pass_keeps_the_drafts_that_had_not_le
     let page = with_sync_on(&computer).await;
     let (first, _) = page.write_draft(Some(&studio), "the first");
     let (second, _) = page.write_draft(Some(&studio), "the second");
-    // The pass asks once when it begins and once before each draft: the host answers private from
-    // the third question, which is the one before the second draft.
+    // The pass asks once when it begins, once before each draft and once when each answer arrives:
+    // the host answers private from the fourth question, which is the one before the second draft.
     computer
         .hosts
-        .turn_after(environment, 2, HostPrivacy::On { generation: 2 });
+        .turn_after(environment, 3, HostPrivacy::On { generation: 2 });
 
     let view = page.drafts_on(true).expect("drafts sync is on");
     let elsewhere = computer.elsewhere();
@@ -2219,6 +2206,123 @@ async fn a_privacy_change_that_settles_a_lost_answer_leaves_the_removal_owed() {
         page.kept_drafts().is_empty(),
         "and it did not come back as a copy: {:?}",
         page.kept_drafts()
+    );
+}
+
+/// A publication that left through a host the draft is no longer for is asked about all the same:
+/// the draft is sent to a session of a host that is private, a pass proves that host, the person
+/// sends the prompt, and when the host lets go the removal is made, since the first host's store
+/// was reconciled and says where the draft landed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_publication_that_left_through_another_host_is_asked_about_though_the_draft_moved_on() {
+    let computer = Computer::new().await;
+    let (first, studio) = host(1, "studio");
+    let (second, laptop) = host(2, "laptop");
+    computer
+        .hosts
+        .say(first, HostPrivacy::Off { generation: 1 });
+    computer
+        .hosts
+        .say(second, HostPrivacy::On { generation: 2 });
+    let page = with_sync_on(&computer).await;
+    let (draft, version, elsewhere) =
+        with_a_publication_whose_answer_was_lost(&computer, &page, &studio).await;
+
+    let moved = page.retarget_draft(draft, &version, &laptop);
+    let view = page.sync_now();
+    assert_eq!(
+        kept_here(&view),
+        vec![("laptop".to_owned(), "private".to_owned(), 1)]
+    );
+    assert_eq!(page.discard_draft(draft, &moved)["removed"], true);
+    computer
+        .hosts
+        .say(second, HostPrivacy::Off { generation: 3 });
+    page.sync_now();
+    page.sync_now();
+    assert_eq!(elsewhere.draft_at(draft).await, None, "it was removed");
+    assert!(
+        page.kept_drafts().is_empty(),
+        "and it did not come back as a copy: {:?}",
+        page.kept_drafts()
+    );
+}
+
+/// An entry left for a draft that is still stored belongs to a removal that did not happen: it is
+/// dropped, and the draft keeps the note of where the service holds it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_entry_left_for_a_draft_that_is_still_stored_is_dropped_and_the_draft_keeps_its_note() {
+    let computer = Computer::new().await;
+    let (environment, studio) = host(1, "studio");
+    computer
+        .hosts
+        .say(environment, HostPrivacy::Off { generation: 1 });
+    let page = with_sync_on(&computer).await;
+    let (draft, _) = page.write_draft(Some(&studio), "a prompt");
+    page.drafts_on(true).expect("drafts sync is on");
+    let held = page
+        .app
+        .state::<AppState>()
+        .drafts()
+        .store()
+        .expect("drafts");
+    assert!(held.checkpoint(draft).expect("the note").is_some());
+
+    let ledger = computer
+        .data
+        .path()
+        .join("settings-sync/drafts/removals.json");
+    kr_ipc::paths::write_owner_only_file(
+        &ledger,
+        &serde_json::to_vec(&json!([{
+            "id": "6c1e9a52-0000-4000-8000-000000000001",
+            "draft": draft,
+            "host": null,
+            "note": null
+        }]))
+        .expect("a ledger"),
+    )
+    .expect("the stale entry");
+    page.sync_now();
+    assert!(
+        held.checkpoint(draft).expect("the note").is_some(),
+        "the draft kept its note"
+    );
+    let left: Vec<Value> =
+        serde_json::from_slice(&std::fs::read(&ledger).expect("the ledger")).expect("a list");
+    assert!(
+        left.is_empty(),
+        "and the entry is gone: {left:?} {}",
+        page.view()
+    );
+    assert_eq!(computer.elsewhere().draft_at(draft).await, Some(1));
+}
+
+/// A host that refuses to say whether it holds one session does not keep this computer from asking
+/// about the others.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refusal_about_one_session_does_not_stop_the_questions_about_the_others() {
+    let computer = Computer::new().await;
+    let (restricted, studio) = host(1, "studio");
+    let (answering, laptop) = host(2, "laptop");
+    computer
+        .hosts
+        .say(restricted, HostPrivacy::Off { generation: 1 });
+    computer
+        .hosts
+        .say(answering, HostPrivacy::Off { generation: 1 });
+    computer.hosts.refuse_to_say(&studio);
+    let page = with_sync_on(&computer).await;
+    let (refused, _) = page.write_draft(Some(&studio), "written for the studio");
+    let (answered, _) = page.write_draft(Some(&laptop), "written for the laptop");
+
+    let view = page.drafts_on(true).expect("drafts sync is on");
+    let elsewhere = computer.elsewhere();
+    assert_eq!(elsewhere.draft_at(refused).await, None);
+    assert_eq!(elsewhere.draft_at(answered).await, Some(1));
+    assert_eq!(
+        kept_here(&view),
+        vec![(String::new(), "unknown_host".to_owned(), 1)]
     );
 }
 
@@ -2356,7 +2460,8 @@ async fn a_ledger_this_version_cannot_read_is_not_written_over_and_the_draft_sta
         .data
         .path()
         .join("settings-sync/drafts/removals.json");
-    std::fs::write(&ledger, b"this is not a list").expect("the ledger is spoiled");
+    kr_ipc::paths::write_owner_only_file(&ledger, b"this is not a list")
+        .expect("the ledger is spoiled");
 
     let refused = page.call(
         "device_draft_discard",

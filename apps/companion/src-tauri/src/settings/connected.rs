@@ -3,14 +3,16 @@
 //!
 //! Only the host the application is connected to can be asked. It is asked whether it holds a
 //! session, which is how a draft comes to be known as that host's, and it is asked for its privacy
-//! mode, which `privacy.status` gives only a device the host gave the right to manage it. Everything
-//! else is a host this device cannot read, and its drafts stay on this device
+//! mode, which `privacy.status` gives only a device the host gave the right to manage it.
+//! Everything else is a host this device cannot read, and its drafts stay on this device
 //! ([`HostPrivacy::Unreadable`], [`Holds::Unknown`]).
 
 use std::collections::BTreeSet;
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
 
+use kr_client::ClientError;
 use kr_protocol::error::ErrorCode;
 use kr_protocol::ids::{EnvironmentId, SessionId};
 use kr_protocol::method::Method;
@@ -28,12 +30,15 @@ use crate::state::AppState;
 /// How long the host is given to say where privacy mode stands.
 const ANSWER_WITHIN: Duration = Duration::from_secs(10);
 
+/// One connection to one host: a reconnection to the same host is another.
+type Link = (EnvironmentId, usize);
+
 /// The hosts this application is connected to.
 pub struct ConnectedHosts<R: Runtime> {
     app: AppHandle<R>,
-    /// The sessions the host of one environment said it does not hold, so that a draft of another
-    /// host is not asked about again for as long as this application is connected to the same host.
-    not_held: Mutex<(Option<EnvironmentId>, BTreeSet<SessionId>)>,
+    /// The sessions the host of one connection said it does not hold, so that a draft of another
+    /// host is not asked about again for as long as this application keeps that connection.
+    not_held: Mutex<(Option<Link>, BTreeSet<SessionId>)>,
 }
 
 impl<R: Runtime> ConnectedHosts<R> {
@@ -46,23 +51,23 @@ impl<R: Runtime> ConnectedHosts<R> {
         }
     }
 
-    fn remember_not_held(&self, environment: EnvironmentId, session: SessionId) {
+    fn remember_not_held(&self, link: Link, session: SessionId) {
         let mut held = self
             .not_held
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if held.0 != Some(environment) {
-            *held = (Some(environment), BTreeSet::new());
+        if held.0 != Some(link) {
+            *held = (Some(link), BTreeSet::new());
         }
         held.1.insert(session);
     }
 
-    fn known_not_held(&self, environment: EnvironmentId, session: SessionId) -> bool {
+    fn known_not_held(&self, link: Link, session: SessionId) -> bool {
         let held = self
             .not_held
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        held.0 == Some(environment) && held.1.contains(&session)
+        held.0 == Some(link) && held.1.contains(&session)
     }
 }
 
@@ -95,7 +100,11 @@ impl<R: Runtime> DraftHosts for ConnectedHosts<R> {
                 return Holds::Unknown;
             };
             let host = host_of(&connection);
-            if self.known_not_held(host.environment, session) {
+            let link: Link = (
+                host.environment,
+                Arc::as_ptr(&connection.session()) as usize,
+            );
+            if self.known_not_held(link, session) {
                 return Holds::NotHere;
             }
             let asked = tokio::time::timeout(
@@ -111,15 +120,15 @@ impl<R: Runtime> DraftHosts for ConnectedHosts<R> {
             match asked {
                 // A session that has closed is still the host's: the draft was written for it.
                 Ok(Ok(_)) => Holds::Here(host),
-                Ok(Err(error)) => match CommandError::from(error).code {
+                Ok(Err(ClientError::Host(refused))) => match refused.code {
                     ErrorCode::SessionClosed => Holds::Here(host),
                     ErrorCode::UnknownSession => {
-                        self.remember_not_held(host.environment, session);
+                        self.remember_not_held(link, session);
                         Holds::NotHere
                     }
-                    _ => Holds::Unknown,
+                    _ => Holds::Refused,
                 },
-                Err(_) => Holds::Unknown,
+                Ok(Err(_)) | Err(_) => Holds::Unknown,
             }
         })
     }
