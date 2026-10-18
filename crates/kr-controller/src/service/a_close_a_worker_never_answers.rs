@@ -366,6 +366,24 @@ pub(super) async fn fake_world_on(
     clocks: Option<crate::service::Clocks>,
     serve: impl FnOnce(Listener, Arc<WorkerIdentity>, String) -> tokio::task::JoinHandle<()>,
 ) -> Silent {
+    fake_world_with(clocks, false, serve).await
+}
+
+/// The same world with the daemon's record already saying that the worker does not take what the
+/// host's local owner may do, as it says once the daemon has reached a worker that does not. A
+/// worker the daemon has not reached is one its publisher goes to by itself, so the record is made
+/// before the worker is listed and not after.
+pub(super) async fn fake_world_reached(
+    serve: impl FnOnce(Listener, Arc<WorkerIdentity>, String) -> tokio::task::JoinHandle<()>,
+) -> Silent {
+    fake_world_with(None, true, serve).await
+}
+
+async fn fake_world_with(
+    clocks: Option<crate::service::Clocks>,
+    reached: bool,
+    serve: impl FnOnce(Listener, Arc<WorkerIdentity>, String) -> tokio::task::JoinHandle<()>,
+) -> Silent {
     let temp = kr_ipc::testing::TempHost::create();
     let environment = temp.environment();
     let environment_id = temp.environment_id();
@@ -410,6 +428,9 @@ pub(super) async fn fake_world_on(
         descriptor,
         endpoint: worker_endpoint,
     };
+    if reached {
+        controller.local_access.note_worker(session_id, false, None);
+    }
     controller
         .directory
         .lock()
