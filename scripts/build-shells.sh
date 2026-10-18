@@ -341,8 +341,8 @@ PYTHON
 #
 # Cargo is pointed at no file until every file has passed; the crates and the configuration are
 # written after the last check. A refusal names the source and the digest it found where there is
-# one. The lock is read line by line and strictly, so a line or
-# a source this does not know is a failure rather than something skipped.
+# one. The lock is read line by line and strictly, so a line or a source this does not know is a
+# failure rather than something skipped.
 prepare_cargo_sources() {
     python3 - "$1" "$2" "$3" "$4" <<'PYTHON'
 import hashlib
@@ -715,7 +715,9 @@ startup=$(digest "$package/$m_startup") $m_startup"
     # A tree with a Cargo.lock is built from the sources the lock names, checked and laid out here,
     # and cargo reaches no server after this. The cargo home is the build's own, so the
     # configuration and credentials the account keeps in its own are not read, and a source that
-    # was not placed cannot be fetched.
+    # was not placed cannot be fetched. Cargo also reads a .cargo/config.toml in each parent of
+    # the scratch directory and its own library reads the account's git configuration and
+    # attributes; those belong to the account that runs the build, as its PATH does.
     local -a cargo_env=()
     if [ -f "$source_tree/Cargo.lock" ]; then
         local cargo_dir="$work/cargo"
@@ -725,12 +727,13 @@ startup=$(digest "$package/$m_startup") $m_startup"
             CARGO_HTTP_PROXY=127.0.0.1:9 NO_PROXY= no_proxy=)
         # This fills cargo's own copy of each repository from the verified mirror. It is the one
         # cargo step that is not offline, so it is held to local sources: git is the client, and
-        # it is allowed the file protocol only, with none of the account's git configuration; the
-        # proxy named here and in the configuration does not answer, and no host is exempt from
-        # it, whatever the caller's environment says.
+        # it is allowed the file protocol only, with no global or system git configuration and
+        # none passed in the environment; the proxy named here and in the configuration does not
+        # answer, and no host is exempt from it, whatever the caller's environment says.
         (
             cd "$source_tree"
-            env CARGO_HOME="$cargo_dir/home" CARGO_NET_OFFLINE=false CARGO_NET_GIT_FETCH_WITH_CLI=true \
+            env -u GIT_CONFIG_COUNT -u GIT_CONFIG_PARAMETERS \
+                CARGO_HOME="$cargo_dir/home" CARGO_NET_OFFLINE=false CARGO_NET_GIT_FETCH_WITH_CLI=true \
                 GIT_ALLOW_PROTOCOL=file GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
                 CARGO_HTTP_PROXY=127.0.0.1:9 NO_PROXY= no_proxy= cargo fetch --locked
         ) > "$work/cargo-fetch.log" 2>&1 || {

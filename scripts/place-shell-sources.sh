@@ -13,13 +13,14 @@
 # repository is named by the revision the lock holds and checked by build-shells.sh against the
 # tree digest the manifest pins. A shell built this way fetches nothing once these are placed.
 #
-# A crate or a repository that is already in <prefix>/sources stays. Any other is fetched from the URL its manifest
-# or lock names and, for an archive and a repository, when that server does not answer, from each
-# mirror listed below. An archive or a crate that arrives is checked against its pin before it is
-# kept; for an archive the next server is tried when the bytes differ, and a crate has one server.
-# An archive that is already there with other bytes is replaced, in one step, by the pinned bytes,
-# so a cache left by an older pin never blocks a run. A repository, and a crate that was already there, are judged
-# by build-shells.sh before they are used.
+# A crate or a repository that is already in <prefix>/sources stays. Any other is fetched from
+# the URL its manifest or lock names and, for an archive and a repository, when that server does
+# not answer, from each mirror listed below. An archive or a crate that arrives is checked
+# against its pin before it is kept; for an archive the next server is tried when the bytes
+# differ, and a crate has one server. An archive that is already there with other bytes is
+# replaced, in one step, by the pinned bytes, so a cache left by an older pin never blocks a run.
+# A repository, and a crate that was already there, are judged by build-shells.sh before they are
+# used.
 
 set -euo pipefail
 
